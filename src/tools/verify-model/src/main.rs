@@ -1101,13 +1101,26 @@ fn run() -> Result<ExitCode, String> {
 			emit(&plan, json, explain, quiet, &model)?;
 			if !json && !quiet && !plan.nothing_to_do {
 				let share = if whole > 0.0 { scoped / whole * 100.0 } else { 100.0 };
-				println!("estimated {scoped:.0} s against {whole:.0} s for everything - {share:.0}% of a full run.");
+				let mut per_target = std::collections::BTreeMap::new();
+				for test in &model.kernel_tests.tests {
+					for architecture in &test.architectures {
+						*per_target.entry(architecture.clone()).or_default() += 1;
+					}
+				}
+				let model_hash = model.model_hash();
+				let unpriced = verify_model::commands::steps(&plan, &per_target, &model.registry).iter().filter(|step| model_cost.scheduled_seconds(&history, step, &model_hash).is_none()).count();
+				if unpriced > 0 {
+					println!("total scheduled cost is unknown: {unpriced} step(s) have no current measurement or conservative seed and cannot start under a budget.");
+					println!("provisional key estimate: {scoped:.0} s against {whole:.0} s for everything; an unbudgeted run can measure the unpriced work.");
+				} else {
+					println!("estimated {scoped:.0} s against {whole:.0} s for everything - {share:.0}% of a full run.");
+				}
 				// The threshold is about removing a BOOT, not about running fewer tests. The fixed
 				// cost of a run dominates so heavily - `CostModel::default` carries the measured
 				// terms, and the per-test one is a fraction of a second against tens of seconds of
 				// fixed cost on every target - that a selection worth 80% of the whole is
 				// bookkeeping for nothing.
-				if !plan.full && share > 80.0 {
+				if unpriced == 0 && !plan.full && share > 80.0 {
 					println!("that is within 80% of everything, so the scoping is not paying for itself here - consider ./verify.sh --release or a full sweep.");
 				}
 			}
@@ -1143,26 +1156,14 @@ fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result
 		// lines for the reason the id is: a reader that does not know a marker skips it, so
 		// the runner can learn about them without a flag day.
 		//
-		// The cost is an ESTIMATE over the keys this step discharges, which is the only
-		// number available before it has ever run. A budget is a sum of estimates and is not
-		// a timeout: it decides what to START, never what to kill.
+		// A budget decides what to start from measured costs or conservative seeds; it is
+		// not a timeout. A step without either is explicitly unpriced.
 		for required in &step.requires {
 			println!("STEPREQ\t{index}\t{required}");
 		}
-		// MEASURED IF IT HAS BEEN, ESTIMATED IF IT HAS NOT.
-		//
-		// `estimate` sums per-key costs, which for a merged step is the batching's own
-		// arithmetic handed back as a prediction. A step has one duration; once it has been
-		// run under this model, that duration is the answer and the estimate is only the
-		// seed for a step nobody has timed yet.
-		//
-		// AND AN UNMEASURED STEP IS NEVER FREE (corrected 2026-09-02). The estimate is a
-		// floor away from zero for a gate: every gate key is `host`/`host`, whose fixed term
-		// is nothing and whose one key at the default per-key cost rounded to `STEPCOST 0` -
-		// so the profile rows and the concurrency gate, which boot QEMU, were priced as the
-		// cheapest work in the plan and admitted by any budget at all. `seed_seconds` is the
-		// conservative floor M4 asks for, and the round is UP: a sub-second estimate is a
-		// short step, not a free one.
+		// Whole-step measurements replace provisional estimates. Guest seeds remain available;
+		// generic non-guest estimates are not conservative bounds for potentially long rebuilds.
+		// Both ordering and emission consult the same optional cost, rounded upward when known.
 		match cost.scheduled_seconds(&history, &step, &model_hash) {
 			Some(seconds) => println!("STEPCOST\t{index}\t{}", seconds.ceil() as u64),
 			None => {

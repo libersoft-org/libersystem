@@ -209,10 +209,30 @@ fn continuing_traffic_cannot_starve_pending_expiry() {
     unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
     assert_eq!(consume(&mut node), 0);
     assert!(node.beat.expiry_pending());
+    // The standing loop can receive a readable channel after consuming its queue, before
+    // the next heartbeat tick. That intake must also prioritize the pending verdict.
+    unsafe { drain_channel(&mut node, &mut [0; 128]); }
     unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
     assert_eq!(consume(&mut node), 1, "fresh traffic cannot overtake an already pending expiry");
     assert!(node.record.state == BindingState::Stopping);
     assert_eq!(node.beat.wake_at(), 0);
+}
+#[test]
+fn an_expiry_losing_to_exit_cannot_fault_the_replacement_handshake() {
+    let mut node = supervised(1);
+    node.push(BindingEvent::Exited { generation: 1 });
+    FRAMES.with_borrow_mut(|frames| *frames = (1..driver_binding::MAX_NODE_EVENTS).map(|_| pong(2)).collect());
+    unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
+    assert_eq!(consume(&mut node), 0);
+    assert!(node.record.state == BindingState::Stopping && node.beat.expiry_pending());
+    // Confirmed teardown and retry install a new binding before READY rearms its heartbeat.
+    assert!(node.record.move_to(BindingState::Backoff, None));
+    assert!(node.record.move_to(BindingState::Binding, None));
+    node.id.generation = 2;
+    node.ready_deadline = 200;
+    unsafe { drain_channel(&mut node, &mut [0; 128]); }
+    assert!(node.queue.is_empty(), "the previous generation's heartbeat cannot fault a replacement handshake");
+    assert!(node.record.state == BindingState::Binding);
 }
 #[test]
 fn disable_orders_dependency_closure() {
@@ -256,7 +276,7 @@ def main() -> None:
     assert source.count(receipt) == 1 and source.count(order) == 1
     drain = "for _ in 0..MAX_DRIVER_FRAMES_PER_PASS {"
     expiry = "if node.push(BindingEvent::Wedged { generation }) {"
-    pending = "if node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {\n\t\t\t\t\tnode.beat.expiry_queued();\n\t\t\t\t}"
+    pending = "if node.record.state == BindingState::Online && node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {\n\t\t\tnode.beat.expiry_queued();\n\t\t}"
     assert source.count(drain) == 1 and source.count(expiry) == 1 and source.count(pending) == 1
     variants = [
         ("production", source, None),
@@ -265,6 +285,7 @@ def main() -> None:
         ("unbounded driver drain", source.replace(drain, "loop {", 1), "refilled_channel_returns_to_other_nodes"),
         ("refused expiry discarded", source.replace(expiry, "if { node.push(BindingEvent::Wedged { generation }); true } {", 1), "full_queue_preserves_watchdog_expiry"),
         ("pending expiry behind fresh traffic", source.replace(pending, "", 1), "continuing_traffic_cannot_starve_pending_expiry"),
+        ("old expiry faults replacement", source.replace(pending, pending.replace("node.record.state == BindingState::Online && ", ""), 1), "an_expiry_losing_to_exit_cannot_fault_the_replacement_handshake"),
     ]
     with tempfile.TemporaryDirectory(prefix="driver-lifecycle-") as directory:
         root = Path(directory)
@@ -282,7 +303,7 @@ def main() -> None:
                     raise SystemExit(f"{name}: expected the named assertion failure:\n{result.stdout}\n{result.stderr}")
             elif result.returncode:
                 raise SystemExit(f"{name}: {result.stdout}\n{result.stderr}")
-            print(f"driver-lifecycle: {name} {'rejected' if test else 'passed (6 tests)'}")
+            print(f"driver-lifecycle: {name} {'rejected' if test else 'passed (7 tests)'}")
 
 
 if __name__ == "__main__":

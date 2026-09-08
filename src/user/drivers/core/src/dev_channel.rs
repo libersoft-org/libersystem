@@ -117,7 +117,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-console", &device, b"transport");
 		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far)]);
-		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
+		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false, pending_bytes: 0 };
 		pump(&device, &bind, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
 	}
 }
@@ -140,6 +140,8 @@ struct Port<'a> {
 	phys: u64,
 	// The device owns the transmit buffer and has not returned it yet.
 	busy: bool,
+	// Early control intake can observe the replacement before the old agent's channel closes.
+	pending_bytes: u64,
 }
 
 impl Port<'_> {
@@ -155,21 +157,28 @@ impl Port<'_> {
 
 	// Write bytes to the port, waiting - bounded - for the previous write to be taken first.
 	// Returns false when the host has stopped consuming.
-	unsafe fn write(&mut self, payload: &[u8]) -> bool {
+	unsafe fn write(&mut self, payload: &[u8], bind: &common::Bind, bootstrap: u64) -> bool {
 		unsafe {
 			if payload.is_empty() || payload.len() > MAX_FRAME {
 				return false;
 			}
-			self.reclaim();
 			let limit: u64 = clock() + TX_DRAIN_TICKS;
-			while self.busy {
+			loop {
+				// A host that is slow to consume bytes has not stopped this control path.
+				if !heartbeat(bind, bootstrap, self.device.capability, &mut self.pending_bytes) {
+					exit();
+				}
+				self.reclaim();
+				if !self.busy {
+					break;
+				}
 				if clock() >= limit {
 					return false;
 				}
-				wait(self.irq, limit);
-				let _ = self.device.read_isr();
-				interrupt_ack(self.irq);
-				self.reclaim();
+				if wait_any(&[self.irq, bootstrap], limit) == 0 {
+					let _ = self.device.read_isr();
+					interrupt_ack(self.irq);
+				}
 			}
 			core::ptr::copy_nonoverlapping(payload.as_ptr(), self.virt as *mut u8, payload.len());
 			self.busy = self.tx.submit_async(&[(self.phys, payload.len() as u32, false)]);
@@ -187,14 +196,19 @@ impl Port<'_> {
 // Answer whatever the manager has said, without blocking. `false` means this driver is finished:
 // its bootstrap closed, which is how the supervisor tells a driver to shut down.
 //
-// A frame that is not a PING for this generation is dropped, and any handle on it closed - the same
-// answer `adopt` gives, because a driver that is serving has nothing to do with a resource it was not
-// expecting.
-unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64) -> bool {
+// A replacement byte channel remains owned until `adopt` observes the old agent's closure.
+// Other frames must be PING or STOP for this generation; unexpected handles are closed.
+unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64, pending_bytes: &mut u64) -> bool {
 	unsafe {
 		let mut buf: [u8; 64] = [0u8; 64];
 		loop {
 			match try_recv(bootstrap, &mut buf) {
+				Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => {
+					if *pending_bytes != 0 {
+						close(*pending_bytes);
+					}
+					*pending_bytes = handle;
+				}
 				Polled::Message { len, handle } => {
 					if handle != 0 {
 						close(handle);
@@ -248,9 +262,14 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 		let mut outbound: Vec<u8> = alloc::vec![0u8; MAX_FRAME];
 		let mut bytes: u64 = bytes;
 		loop {
+			// Control runs even when either data direction remains continuously ready.
+			if !heartbeat(bind, bootstrap, rx.capability, &mut port.pending_bytes) {
+				exit();
+			}
 			let mut worked: bool = false;
-			// Port to agent.
-			while let Some((id, len)) = rx.take_used() {
+			// At most one receive pool per pass, so replenished data cannot hide control.
+			for _ in 0..RX_SLOTS {
+				let Some((id, len)) = rx.take_used() else { break };
 				if id < RX_SLOTS && len > 0 {
 					let n: usize = if len as u64 > RX_SLOT { RX_SLOT as usize } else { len as usize };
 					let chunk: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT) as *const u8, n);
@@ -259,7 +278,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 					// device down with the process that was using it - the bytes in flight are
 					// lost with the session they belonged to, which is what a disconnect means.
 					if !send_blocking(bytes, chunk, 0) {
-						bytes = adopt(device, bind, irq, bootstrap, bytes, rx, rx_phys);
+						bytes = adopt(device, bind, irq, bootstrap, bytes, &mut port.pending_bytes, rx, rx_phys);
 					}
 					worked = true;
 				}
@@ -278,32 +297,23 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 			// return immediately every time, and this loop would spin at the expense of every
 			// other thread. The closure has to be observed where it is, not inferred from the
 			// absence of a message.
-			loop {
+			for _ in 0..RX_SLOTS {
 				match try_recv(bytes, &mut outbound) {
 					Polled::Message { len, .. } => {
-						if !port.write(&outbound[..len]) && !send_blocking(bytes, &[], 0) {
-							bytes = adopt(device, bind, irq, bootstrap, bytes, rx, rx_phys);
+						if !port.write(&outbound[..len], bind, bootstrap) && !send_blocking(bytes, &[], 0) {
+							bytes = adopt(device, bind, irq, bootstrap, bytes, &mut port.pending_bytes, rx, rx_phys);
 						}
 						worked = true;
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
-						bytes = adopt(device, bind, irq, bootstrap, bytes, rx, rx_phys);
+						bytes = adopt(device, bind, irq, bootstrap, bytes, &mut port.pending_bytes, rx, rx_phys);
 						break;
 					}
 				}
 			}
 			if worked {
 				continue;
-			}
-			// AND THE MANAGER'S OWN CHANNEL, which this loop did not read at all.
-			//
-			// The heartbeat was handled only in `adopt` - the path taken when the agent above the
-			// driver has gone - so a driver serving normally never answered a PING, and its registry
-			// entry declares a 100ms deadline. The manager would have declared it wedged. Every
-			// serving driver answers in its own loop; this one now does too.
-			if !heartbeat(bind, bootstrap, rx.capability) {
-				exit();
 			}
 			// Nothing left either way: block on the device interrupt, the agent's channel and the
 			// manager's, waking on whichever speaks first.
@@ -329,7 +339,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 // the host that reconnects. Turning the ring is right because eight buffers is all the device
 // has: stopping here would leave it with nowhere to put what a host is still writing, and the
 // port would still be stalled once the new agent arrived.
-unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, dead: u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
+unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, dead: u64, pending_bytes: &mut u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
 	unsafe {
 		close(dead);
 		// BIG ENOUGH FOR THE FRAME IT IS MEANT TO READ. This was 16 bytes - smaller than the 20-byte
@@ -338,7 +348,8 @@ unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, 
 		let mut buf: [u8; 64] = [0u8; 64];
 		loop {
 			let mut recycled: bool = false;
-			while let Some((id, _)) = rx.take_used() {
+			for _ in 0..RX_SLOTS {
+				let Some((id, _)) = rx.take_used() else { break };
 				if id < RX_SLOTS {
 					rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);
 					recycled = true;
@@ -346,6 +357,10 @@ unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, 
 			}
 			if recycled {
 				rx.notify();
+			}
+			// Discard the old session's queued receive pool before accepting its replacement.
+			if *pending_bytes != 0 {
+				return core::mem::take(pending_bytes);
 			}
 			loop {
 				match try_recv(bootstrap, &mut buf) {
@@ -359,11 +374,22 @@ unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, 
 						}
 						if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
 							&& header.generation == bind.generation
-							&& header.opcode == driver_protocol::Opcode::Ping
-							&& let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
-							&& !common::pong(bootstrap, bind, sequence)
 						{
-							exit();
+							match header.opcode {
+								driver_protocol::Opcode::Ping => {
+									if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
+										&& !common::pong(bootstrap, bind, sequence)
+									{
+										exit();
+									}
+								}
+								driver_protocol::Opcode::Stop => {
+									common::latch_stop();
+									common::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());
+									exit();
+								}
+								_ => {}
+							}
 						}
 					}
 					Polled::Empty => break,

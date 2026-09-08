@@ -162,6 +162,41 @@ run_plan "$work/measured" --budget 574 || rc=$?
 check "the measured shared branch is admitted with sufficient budget" 0 "$rc"
 check "the admitted prerequisite still runs once" "shared first second independent" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
 
+# Exercise the actual fast-command recorder without touching this checkout's history. The planner
+# fixture persists the exact duration handed to `record`; Rust history tests cover loading it.
+learning="$work/learning"
+mkdir -p "$learning/src/tools" "$learning/bin"
+cp "$repo/verify.sh" "$repo/lib.sh" "$learning/"
+cp "$repo/src/tools/result-logs.sh" "$learning/src/tools/"
+cat >"$learning/bin/cargo" <<'RECORDER'
+#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+	if [[ "$1" == --seconds ]]; then printf '%s\n' "$2" >"$LEARNED_SECONDS"; exit 0; fi
+	shift
+done
+exit 1
+RECORDER
+chmod +x "$learning/bin/cargo"
+plan="$learning/plan"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	step 0 unknown "the fast unpriced gate" "true"
+	printf 'KEY\t0\tgate.fixture host host default\nSTEPUNPRICED\t0\tunmeasured\n'
+} >"$plan"
+out="$learning/unbudgeted.log"
+rc=0
+(cd "$learning" && PATH="$learning/bin:$PATH" LEARNED_SECONDS="$learning/seconds" LIBER_VERIFY_STEPS="$plan" ./verify.sh) >"$out" 2>&1 || rc=$?
+check "a fast unbudgeted command reaches the production recorder" 0 "$rc"
+learned="$(cat "$learning/seconds")"
+check "a completed sub-second command has a positive rounded measurement" 1 "$((learned > 0))"
+sed "/^STEPUNPRICED/d; s/unknown/$learned/" "$plan" >"$learning/measured-plan"
+out="$learning/budgeted.log"
+rc=0
+(cd "$learning" && PATH="$learning/bin:$PATH" LEARNED_SECONDS="$learning/seconds" LIBER_VERIFY_STEPS="$learning/measured-plan" ./verify.sh --budget "$learned") >"$out" 2>&1 || rc=$?
+check "the recorded fast command fits a later budget" 0 "$rc"
+check "the later budget starts the measured command" 1 "$(grep -c 'the fast unpriced gate' "$out" || true)"
+
 # 5. A STEP THAT WANTS MORE GUEST SLOTS THAN `--jobs` HAS IS REFUSED RATHER THAN TRIMMED.
 #    A gate whose subject is overlap and which runs one guest proves nothing and would report a pass.
 plan="$work/slots"

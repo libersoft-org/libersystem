@@ -66,6 +66,7 @@ Commit exactly the tested content, then complete verification with --merge FILE.
                    is how a narrowing earns the evidence its activation demands.
   --jobs N         guest slots (inner default 1, merge default 2; explicit values override either)
   --budget N       estimated seconds the inner run may start, including prerequisites
+                   work without a current measurement or conservative seed is skipped
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
   --json           the plan as JSON, for anything that is not a person
@@ -884,11 +885,15 @@ guest_labels=()
 # written by ONE writer, and parallel steps updating it concurrently is a lost-update race in the
 # file the estimator reads.
 run_one_step() {
-	local index="$1" label="$2" command="$3" outfile="$4" started=$SECONDS status=0
+	local index="$1" label="$2" command="$3" outfile="$4" started=$SECONDS status=0 elapsed
 	if ! eval "$command"; then
 		status=1
 	fi
-	printf '%s\t%s\n' "$status" "$((SECONDS - started))" >"$outfile"
+	elapsed=$((SECONDS - started))
+	# The clock has whole-second resolution. Round an observed successful sub-second run up,
+	# so unbudgeted execution can measure fast host work without inventing a cold-start seed.
+	if ((status == 0 && elapsed == 0)); then elapsed=1; fi
+	printf '%s\t%s\n' "$status" "$elapsed" >"$outfile"
 	return 0
 }
 

@@ -1489,3 +1489,53 @@ and every original audit prefix is preserved byte-for-byte. Scoped whitespace ch
 `./verify.sh --for` selected zero inner and zero deferred checks, then exited 6 (`INCOMPLETE`):
 post-commit merge verification remains required. No full revision-verification pass or commit is
 claimed. This re-audit made no source edits; concurrent work outside these four audits was preserved.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-08T18:06:50Z):
+
+Latest audit reviewed: 2026-09-08T17:53:07Z. **ACCEPTED - no unresolved material findings
+within scope.** The latest audit contains zero numbered findings, so there are no individual
+finding dispositions or corrective plan changes this round. `docs/todo/P02M0172.md` is unchanged.
+This conclusion follows an independent review of the complete current plan and relevant code:
+
+- M1's eight driver names match `src/user/services/manifest.toml`. The current
+  `src/kernel/dma_policy/mod.rs::policy_for` still uses `IOMMU_REQUIRED_TYPES` and the implicit
+  trusted-untranslated fallback. P02M0153 M4 supports virtio-net's protected classification;
+  the plan explicitly accounts for its temporary refusal and networking loss on degraded boots.
+- M2's every-boot-record paragraph now requires the matrix-selected value, with no unconditional
+  development downgrade. `lab.py::run_command` and its development launch pass through `run.sh`;
+  `qemu_run_x86_64` attaches the controller by default outside the ordinary test suite.
+  The host-only run mode, advisory development profile and guest mode/provenance remain separate.
+- `src/boot/protocol/src/manifest.rs` still has the v2 fixed-order signed header, with row count
+  immediately after the UUID, and `BootInfo` remains version 2. M3 consistently specifies the
+  prospective tagged grammar, version/domain evolution, selected-set equality latch and validated
+  handoff. The current x86_64 `fwcfg::read_file` leaves the record readable; the accepted relay
+  fixture keeps it present and checks its full advertised length and canonical bytes. The non-x86
+  per-run `qemu_build_esp` path and loader tree-withholding option support the planned ESP handoff
+  and treeless gates. Early non-x86 entry decoding precedes later `BootInfo` publication, as the
+  direct-carrier ordering requires.
+- `system-manifest::validate_name`, generated registry entries and DeviceManager's persisted
+  `select=<name>` establish one existing identity. The current claim ABI has index/generation but
+  no name, and `device::claim` enables bus mastering after admission and attachment. M4-M6 therefore
+  correctly own the declared name field, exact-candidate validation and enforceable `none` path;
+  they retain DeviceManager's selection authority and generation-based lifecycle.
+
+Rechecked all M1-M8 requirements, their positive/refusal fixtures, rebuild closure, Dependencies and
+Definition of done together. P02M0171's shared manifest evolution remains coordinated; P02M0173 M7
+owns the non-x86 topology and all three later mode transitions. Current architecture documentation
+still records enforcement only on x86_64, so this plan's non-x86 carrier fixtures correctly use the
+pre-transition degraded value. No additional in-scope contradiction or material omission was found.
+The plan is complete, feasible and ready for implementation in its stated dependency order.
+
+No source code was modified, and no implementation tests or guest gates were executed. The plan
+matches its pre-review snapshot byte-for-byte; all preceding audit bytes are preserved. The
+coordinating review records consolidated scoped document verification after all four responses.
+
+Consolidated document verification (2026-09-08T18:09:20Z): all four plans remain byte-for-byte
+unchanged, all four original audit prefixes are preserved, and scoped whitespace checks pass.
+`./verify.sh --for` selected zero inner and zero deferred code checks. The first execution
+exited 3 because its effective-tree snapshot changed during the run; a repeat after the
+responses were appended produced a valid handoff and exited 6 (`INCOMPLETE`), requiring
+post-commit merge verification even for an empty check set. No full revision-verification
+pass or implementation-test pass is claimed. This review changed only the four audit appends;
+concurrent changes elsewhere were not modified or reverted, and no commit was made.

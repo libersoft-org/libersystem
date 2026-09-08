@@ -2997,6 +2997,10 @@ const MAX_DRIVER_FRAMES_PER_PASS: usize = 64;
 // Queue a bounded batch; any remaining frames stay readable for the central loop's next pass.
 unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 	unsafe {
+		// Every intake path gives an already pending expiry priority over new driver traffic.
+		if node.record.state == BindingState::Online && node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {
+			node.beat.expiry_queued();
+		}
 		expire_planned_stop(node, clock());
 		if driver_binding::handshake_expired(node.record.state, node.ready_deadline, clock()) {
 			node.push(BindingEvent::TimedOut { generation: node.id.generation });
@@ -5699,10 +5703,6 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 			// So the CHANNEL is read whenever there is a binding to read from, and only the
 			// HEARTBEAT below is gated on the state that heartbeats belong to.
 			if node.binding.is_some() {
-				// Retry a previously refused verdict before fresh traffic can fill the queue again.
-				if node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {
-					node.beat.expiry_queued();
-				}
 				drain_channel(node, buf);
 			}
 			if !node.beat.supervised() || node.record.state != BindingState::Online {
