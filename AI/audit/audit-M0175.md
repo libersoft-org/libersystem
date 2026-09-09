@@ -2620,3 +2620,47 @@ and P02M0174's provider contract. Previously resolved findings are not repeated.
 assessment; implementation and guest acceptance gates remain planned work.
 
 Only this result was appended. The plan, source code and every preceding audit byte were preserved.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-09T00:23:03Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT dated 2026-09-08T23:59:06Z. It contains no separate
+numbered finding, but explicitly identifies the unresolved shared PTB validation dependency.
+
+1. **ACCEPTED - the P02M0174 quoted-TCP-sequence correction needs its matching consumer change.**
+   The latest audit correctly locates the producer defect in P02M0174. P02M0175's former full-tuple
+   check alone also cannot reject an acknowledged-segment quotation on the same live connection,
+   so correcting only the event shape would leave the dependency incomplete. Current TCP sequence
+   fields in `src/user/services/core/src/net.rs`, M2's already planned retained send state, and
+   P02M0174 M6's guaranteed queued-transmission completion make this a bounded existing-owner change.
+
+   Exact plan changes:
+
+   - M3 consumes the quoted `u32` sequence and applies P02M0174 M6's modular transmitted-flight
+     check after tuple/interface matching and live-route validation, before cache writes, flow-local
+     MTU changes or resegmentation. Accepted but unsent data does not qualify; the guaranteed
+     `Sent(operation_token, monotonic_send_time)` completion commits queued sends through M7's
+     dispatcher. The same validation precedes the existing cache-`Capacity` fallback. Empty or
+     out-of-window reports are ignored/counted; outstanding retransmissions and successive valid
+     lower MTUs remain eligible. The text preserves the producer's correlation limitations.
+   - M10 now compares stale, boundary and unsent quotations with valid outstanding data on the
+     same tuple. It covers the queued-before/after-`Sent` transition, obsolete completion tokens,
+     empty/wrapping flight, partial ACK, successive reductions, unchanged equal/increasing-report
+     expiry, and old-quotation replay after the 600-second cache expiry. Refused and accepted
+     reports also exercise full-cache behavior. The existing QEMU reduced-MTU gate now contrasts
+     acknowledged and outstanding sequence quotations on one real TCP connection.
+   - Definition of done explicitly requires this validation before shared or flow-local changes
+     and limits the rejection guarantee to quotations outside the current transmitted interval.
+
+The acceptance does not turn the sequence check into authentication or promise rejection after
+full sequence reuse. Those limitations are stated in P02M0174; no L3 transport registry, packet
+history, new public API or broader replay-prevention mechanism is introduced. There were no other
+latest-audit findings to accept or reject.
+
+Rechecked the complete plan and coordinated provider contract, including M2's accepted-byte and
+ACK-retirement rules, M5's attempt retirement, M7's dispatcher, capacity fallback and M10's gates.
+The corrected plan is complete, internally consistent, feasible and ready for implementation in
+its declared order. All 13 independent sequence-bound arithmetic cases pass; implementation and
+host/guest acceptance tests remain planned work. Scoped document whitespace checks pass and all
+original audit bytes are preserved. This review modified no source code; unrelated concurrent
+source edits were left untouched.

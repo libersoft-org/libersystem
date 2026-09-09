@@ -2057,8 +2057,8 @@ impl driver_binding::Closes for Syscalls {
 // was decided by parsing a string a driver chose.
 struct Offers {
 	kinds: [u16; driver_protocol::MAX_INITIAL_OFFERS],
-	// The publisher-local token each offer carried. Unique within the driver that sent it, and the
-	// only name that driver has for its own publication.
+	// The publisher-local token each offer carried. Unique for the entire exact binding generation,
+	// including after withdrawal; it is the only name the driver has for its own publication.
 	tokens: [u16; driver_protocol::MAX_INITIAL_OFFERS],
 	handles: [u64; driver_protocol::MAX_INITIAL_OFFERS],
 	count: usize,
@@ -2110,16 +2110,8 @@ impl Offers {
 // the fixed count and the hand-written routing, not the existence of a limit - the registry bounds
 // what each entry may publish, on purpose.
 
-// How many providers the catalogue holds at once - GENERATED, from the sum of every `provides` bound
-// this image's registry declares. See `build.rs`.
-//
-// It was `32`, written here: a number with no relation to the registry, so an image whose drivers
-// declared more than that had a valid publication CLOSED and one that declared far fewer carried a
-// table it could never fill. The definition of done says the count is bounded by what drivers
-// declare and by nothing compiled into this program, and one global fixed table is the same defect
-// the four named locals were, with a larger constant. Nothing in the image can publish past the sum
-// of its own declarations, so the sum is the only number that is neither arbitrary nor a limit of
-// its own - and the `provides` bound is already refused per driver by `publish_all`.
+// The catalogue grows with valid binding instances; registry bounds apply to each binding, not
+// to the number of devices matching one driver program. Memory and the wire slot identity bound it.
 
 // One published provider.
 struct Provider {
@@ -2231,6 +2223,9 @@ unsafe fn send_provider_frame(subscriber: &mut Subscriber, info: &proto::system:
 // WHAT IS PUBLISHED, BY KIND, WITH THE MANAGER OWNING EVERY IDENTITY IN IT.
 struct Catalogue {
 	entries: Vec<Option<Provider>>,
+	// Accepted tokens survive withdrawal: Disconnect has no provider generation, so a retired
+	// connection must never alias a replacement. Released only after the binding is retired.
+	used_tokens: Vec<(BindingId, u16)>,
 	// Bumped every time a slot is filled, so a reused slot is never mistaken for the provider that
 	// left it.
 	generation: u32,
@@ -2281,7 +2276,7 @@ impl driver_binding::Withdrawn<Provider> for Catalogue {
 
 impl Catalogue {
 	const fn new() -> Self {
-		Self { entries: Vec::new(), generation: 0, subscribers: [const { None }; MAX_SUBSCRIBERS] }
+		Self { entries: Vec::new(), used_tokens: Vec::new(), generation: 0, subscribers: [const { None }; MAX_SUBSCRIBERS] }
 	}
 
 	// REGISTER A SUBSCRIBER AND HAND IT WHAT IS ALREADY THERE, in one step, because the two cannot
@@ -2400,10 +2395,9 @@ impl Catalogue {
 					continue;
 				}
 				offers.handles[index] = 0;
-				// Tokens identify publications across all kinds within one live binding. A later
-				// OFFER must not alias a token already used by its initial or earlier publications.
-				if self.entries.iter().flatten().any(|provider| provider.binding_is(binding) && provider.token == offers.tokens[index]) {
-					print(b"DeviceManager: a binding repeated a live provider token; refused\n");
+				// Tokens stay reserved for this exact binding generation, even after withdrawal.
+				if self.used_tokens.contains(&(binding, offers.tokens[index])) {
+					print(b"DeviceManager: a binding repeated a provider token; refused\n");
 					close(handle);
 					continue;
 				}
@@ -2426,6 +2420,13 @@ impl Catalogue {
 					close(handle);
 					continue;
 				}
+				// Reserve identity history before committing or announcing the publication. Refused
+				// offers consume neither a token nor the live declaration allowance.
+				if self.used_tokens.try_reserve(1).is_err() {
+					print(b"DeviceManager: no memory for provider token history; refused\n");
+					close(handle);
+					continue;
+				}
 				let slot = match self.entries.iter().position(Option::is_none) {
 					Some(slot) => slot,
 					None => {
@@ -2438,6 +2439,7 @@ impl Catalogue {
 						self.entries.len() - 1
 					}
 				};
+				self.used_tokens.push((binding, offers.tokens[index]));
 				self.generation = self.generation.wrapping_add(1);
 				// ZERO, BECAUSE NOBODY HAS BEEN GIVEN A CONNECTION YET. This was `1` on the argument
 				// that the offer a publication carries IS a connection - and the offer is not handed
@@ -2509,13 +2511,8 @@ impl Catalogue {
 	}
 
 	fn take(&mut self, kind: u16) -> u64 {
-		// BY THE PUBLISHER'S ADDRESS ON THE BUS, ASCENDING - never by which driver finished first.
-		//
-		// THIS IS THE ORIGIN THE MILESTONE ASKS FOR, and for four identical virtio-blk disks it is
-		// the only thing that separates them: they run the same driver, their formats do not differ,
-		// and a FAT BPB cannot tell a removable medium from a USB stick. What differs is where each
-		// one is plugged in, and the boot scan enumerates the bus ONCE, in bus order - so bus:dev:fn
-		// is stable across boots in a way "whichever answered first" never was.
+		// Deterministic handoff order only. StorageService classifies every probe and ServiceManager
+		// selects media roles from its table; USB discovery matches the exact publishing binding.
 		let Some(slot) = driver_binding::next_handoff_slot(&self.entries, |provider| provider.kind == kind && provider.handle != 0, |provider| provider.id) else {
 			return 0;
 		};
@@ -2564,6 +2561,12 @@ impl Catalogue {
 			gone += driver_binding::apply_withdrawal(&taken, self);
 		}
 		gone
+	}
+
+	// Called after final teardown closes the old binding channel and prevents further offers.
+	// Visibility removal alone must not release these names while old frames can still arrive.
+	fn retire_binding(&mut self, binding: BindingId) {
+		self.used_tokens.retain(|(owner, _)| *owner != binding);
 	}
 
 	// How many providers of `kind` THIS BINDING has published, which is what a per-entry bound is
@@ -2722,6 +2725,11 @@ unsafe fn resolve_teardown(node: &mut Node, driver_name: &[u8], now: u64) -> Opt
 		let (cause, landed, retrying) = (teardown.cause, teardown.landed, teardown.retrying);
 		let (planned_stop, intent) = (teardown.planned_stop, teardown.intent);
 		node.teardown = None;
+		// Cleanup of an empty transaction only proves that this manager owns nothing.
+		// A kernel quarantine observed at acquisition is terminal even when that cleanup succeeds.
+		if node.record.state == BindingState::Quarantined {
+			return Some(BindingState::Quarantined);
+		}
 		if confirmed == BindingState::Quarantined {
 			node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed));
 			print(b"DeviceManager: ");
@@ -2994,14 +3002,20 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 // slot, so draining until Empty would let it prevent all other supervision from running.
 const MAX_DRIVER_FRAMES_PER_PASS: usize = 64;
 
+// Establish an elapsed deadline before any later frame can renew it or fill the event queue.
+// Only the Online binding owns this watchdog; rebind and planned stop have their own deadlines.
+fn expire_heartbeat(node: &mut Node, now: u64) {
+	if node.record.state == BindingState::Online && node.binding.is_some() && node.beat.expire(now) && node.push(BindingEvent::Wedged { generation: node.id.generation }) {
+		node.beat.expiry_queued();
+	}
+}
+
 // Queue a bounded batch; any remaining frames stay readable for the central loop's next pass.
 unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 	unsafe {
-		// Every intake path gives an already pending expiry priority over new driver traffic.
-		if node.record.state == BindingState::Online && node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {
-			node.beat.expiry_queued();
-		}
-		expire_planned_stop(node, clock());
+		let now = clock();
+		expire_heartbeat(node, now);
+		expire_planned_stop(node, now);
 		if driver_binding::handshake_expired(node.record.state, node.ready_deadline, clock()) {
 			node.push(BindingEvent::TimedOut { generation: node.id.generation });
 		}
@@ -3036,6 +3050,7 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 			// than reconstructed later: after the process is gone there is nobody to ask.
 			node.last_opcode = header.opcode as u16;
 			node.last_frame_at = clock();
+			expire_heartbeat(node, node.last_frame_at);
 			match header.opcode {
 				// A DRIVER SENDING `CONNECT` IS SENDING THE MANAGER'S OWN FRAME BACK. This is
 				// manager-to-driver and nothing else; a frame arriving here under it is refused with
@@ -3085,20 +3100,15 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					node.push(BindingEvent::Failed { generation, code });
 				}
 				driver_protocol::Opcode::Pong => {
-					// THE WATCHDOG IS SETTLED HERE, NOT THROUGH THE QUEUE, and the order is why.
-					//
-					// The manager wakes exactly at the deadline it set, drains the channel and then
-					// asks whether the driver answered. With the answer sitting UNREAD in the node's
-					// queue, that question said no - so a driver that replied on time was declared
-					// wedged and its own pong then arrived to a manager that had stopped waiting.
-					// The heartbeat is control-path state, not a lifecycle event, and it is settled
-					// where it is read.
+					// Receipt is the observable deadline boundary: queued frames carry no trusted
+					// arrival timestamp. Settle a timely answer immediately so later lifecycle
+					// processing cannot expire it, and reuse the timestamp already sampled above.
 					//
 					// A MISMATCH STILL BECOMES AN EVENT, because that is the case worth reporting: a
 					// duplicate, one from an earlier round, or a number nobody asked with does NOT
 					// reset the watchdog, and saying so is the whole difference from `rt::heartbeat`.
 					if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(buf)) {
-						if node.beat.answered(sequence, clock(), driver_protocol::heartbeat_period(node.beat.deadline())) {
+						if node.record.state == BindingState::Online && node.beat.answered(sequence, node.last_frame_at, driver_protocol::heartbeat_period(node.beat.deadline())) {
 						} else {
 							node.push(BindingEvent::Ponged { generation, sequence });
 						}
@@ -3599,19 +3609,20 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		let attempts_left = !node.retry_once && may_try_again(&node.incident, node.attempt);
 		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
 			Ok(grant) => grant,
-			// WHICH REFUSAL IT WAS. The kernel keeps two apart and this collapsed them into one:
-			// `ERR_ACCESS_DENIED` is the DMA policy declining to admit the device on a machine that is
-			// not enforcing translation, which is `iommu-required` - a cause M3 kept in the vocabulary
-			// on the explicit condition that the distinguishable kernel path produce it, and nothing
-			// did. Everything else here is "somebody else holds it", which is `claim-refused` and is
-			// not worth waiting on either.
-			Err(errno) if errno == abi::ERR_ACCESS_DENIED => {
+			Err(errno) => {
 				node.refund_unclaimed_attempt();
-				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::IommuRequired, driver_name, attempts_left));
-			}
-			Err(_) => {
-				node.refund_unclaimed_attempt();
-				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ClaimRefused, driver_name, attempts_left));
+				// ATTACH can quarantine the device before the syscall publishes any handles.
+				// Its resulting state outranks the errno, which also represents ordinary refusal
+				// or generation retirement. An empty local ledger cannot establish kernel Free.
+				let cause = match device_claim_snapshot(node.index, device_privilege) {
+					Some(snapshot) if snapshot.state == CLAIM_STATE_QUARANTINED => {
+						observe_claim_snapshot(node, &snapshot, driver_name);
+						FailureCause::TeardownUnconfirmed
+					}
+					_ if errno == abi::ERR_ACCESS_DENIED => FailureCause::IommuRequired,
+					_ => FailureCause::ClaimRefused,
+				};
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, cause, driver_name, attempts_left));
 			}
 		};
 		node.claim_admitted();
@@ -4041,6 +4052,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 		if node.teardown.is_some() {
 			let now: u64 = clock();
 			let Some(landed) = resolve_teardown(node, driver_name, now) else { return Step::Waiting };
+			catalogue.retire_binding(node.id);
 			return match landed {
 				// A confirmed teardown that intends to try again re-opens the transaction from
 				// `Backoff`, which the table allows.
@@ -5448,10 +5460,17 @@ enum ClaimReadiness {
 // | `Claimed` | an invariant violation, reported as one - a correct `domain_kill` cannot leave it here, and a manager that quietly rebound over it would be handing out a device somebody still holds |
 unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u8]) -> ClaimReadiness {
 	unsafe {
-		// A snapshot this manager cannot take is not a licence to assume the device is free.
+		// The claim syscall retains final authority when the advisory snapshot is unavailable.
 		let Some(snapshot) = device_claim_snapshot(node.index, device_privilege) else {
 			return ClaimReadiness::Bindable;
 		};
+		observe_claim_snapshot(node, &snapshot, driver_name)
+	}
+}
+
+// Adopt the same kernel facts before acquisition and after an acquisition that returned no grant.
+unsafe fn observe_claim_snapshot(node: &mut Node, snapshot: &abi::DeviceClaimSnapshot, driver_name: &[u8]) -> ClaimReadiness {
+	unsafe {
 		// WHAT THE CLAIM ALREADY HOLDS, ADOPTED. `granted_resources` counts the RESOURCE frames this
 		// manager sent during the CURRENT bind, so a node reconstructed by a NEW manager - which is
 		// the case M6 is about - started at zero and reported a binding charged with nothing while
@@ -5490,9 +5509,11 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 				// `Failed` for an attempt that had taken no claim. `Binding -> Quarantined` is now in
 				// the table, and a refusal here would be a bug worth seeing rather than a state
 				// quietly replaced by a worse description of it.
-				if !node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed)) {
+				if node.record.state != BindingState::Quarantined && !node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed)) {
 					print(b"DeviceManager: the binding record refused to adopt the device's quarantine\n");
 				}
+				node.record.generation = snapshot.generation;
+				node.id = node.id.rebound(snapshot.generation);
 				ClaimReadiness::Terminal(FailureCause::TeardownUnconfirmed)
 			}
 			// A CORRECT `domain_kill` CANNOT LEAVE IT HERE. Reported as the invariant violation it
@@ -5678,7 +5699,6 @@ unsafe fn settle_shutdown_node(node: &mut Node, catalogue: &mut Catalogue, buf: 
 // for" - which the wait reads as no timeout, correctly, because there is then nothing to time out.
 unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 	unsafe {
-		let now: u64 = clock();
 		let mut soonest: u64 = 0;
 		for node in nodes.iter_mut() {
 			// THE ANSWER IS READ WHERE THE QUESTION IS ASKED.
@@ -5705,6 +5725,7 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 			if node.binding.is_some() {
 				drain_channel(node, buf);
 			}
+			let now: u64 = clock();
 			if !node.beat.supervised() || node.record.state != BindingState::Online {
 				continue;
 			}

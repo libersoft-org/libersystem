@@ -172,6 +172,7 @@ def main():
             rejected_mutations(source)
             regression_mutations()
             subprocess.run([sys.executable, str(ROOT / 'src/tools/check-device-manager-progress.py')], check=True)
+            subprocess.run([sys.executable, str(ROOT / 'src/tools/check-device-claim-result.py')], check=True)
             subprocess.run([sys.executable, str(ROOT / 'src/tools/check-driver-lifecycle.py')], check=True)
             subprocess.run([sys.executable, str(ROOT / 'src/tools/check-dev-channel-control.py')], check=True)
         print('driver-event-dispatch: passed')

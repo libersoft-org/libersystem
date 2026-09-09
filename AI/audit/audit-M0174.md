@@ -1929,3 +1929,51 @@ Current plan rating: 8/10
    [RFC 8201 section 4](https://www.rfc-editor.org/rfc/rfc8201.html#section-4) calls for appropriate validation against transmitted traffic. [RFC 5927 section 4.1](https://www.rfc-editor.org/rfc/rfc5927.html#section-4.1) documents quoted TCP sequence checking against outstanding data as a defensive measure against precisely this stale-error problem; it is not a new mandatory TCP requirement. Here the stronger guarantee is already the plan's own. Preserve the checked quoted TCP sequence in the existing fixed-size event and require the owning consumer to validate it against its live send state before requesting a PMTU write. That state already belongs to TCP (`src/user/services/core/src/net.rs:388-389`); no L3 flow-registration table is needed. Add a boundary fixture pairing an old/out-of-window quotation with a valid outstanding-segment quotation on the same tuple, including replay after cache expiry, and assert that only the latter can lower PMTU.
 
 Verification: read the complete current plan and all preceding audit history, checked the planner's responses against the relevant source and shared P02M0175 contract, and consulted the primary protocol specifications. Only this re-audit was appended; the plan, source code and every preceding audit byte are unchanged. No implementation or host/guest-test result is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-09T00:23:03Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT dated 2026-09-08T23:59:28Z. It contains one finding.
+
+1. **ACCEPTED - quoted TCP sequence information and consumer validation were missing.**
+   The frozen event retained ports but discarded the sequence, while the PTB write precondition
+   required only a live tuple. That cannot distinguish acknowledged data from outstanding data
+   on the same connection. The present TCP control block already has `snd_una` and `snd_nxt`
+   (`src/user/services/core/src/net.rs`), and P02M0175 M2 already owns the retained transmit state
+   needed for the correction. The current builder's advance of `snd_nxt` is not evidence of actual
+   transmission; the corrected consumer contract explicitly separates accepted/queued bytes from
+   the transmitted interval. This belongs at the existing producer/consumer seam.
+
+   Exact plan changes:
+
+   - M3 now requires the consumer's live-operation checks and narrows the absolute replay promise
+     to rejection of quotations outside current transmitted sequence space. Equal/increasing
+     reports do not refresh expiry; the 64-entry cache, 1280 floor and 600-second lifetime remain.
+   - M6 preserves checked TCP ports and the quoted `u32` sequence from eight transport bytes,
+     drops/counts shorter quotations, and keeps the same 32 fixed-size advisory slots. It freezes
+     the consumer's modular outstanding-flight check before either shared-cache or flow-local
+     changes, excludes unsent bytes, and permits outstanding retransmissions and successive valid
+     lower MTUs. The `record path mtu` precondition and former "genuine" wording now describe
+     correlation. Transport state and the check's implementation remain P02M0175's responsibility.
+   - M6/M8 and Definition of done now include seven/eight-byte metadata boundaries, send-window
+     endpoints, empty/wrapping flight, and same-tuple replay after ACK retirement and cache expiry,
+     paired with a valid outstanding quotation. A supplied-state host-test consumer verifies this
+     contract without depending on implementation of P02M0175's TCP stack.
+
+   The finding is not interpreted as an authentication guarantee or a mandatory TCP rule.
+   [RFC 8201 section 4](https://www.rfc-editor.org/rfc/rfc8201.html#section-4) supports appropriate
+   transmission correlation. [RFC 5927 section 4.1](https://www.rfc-editor.org/rfc/rfc5927.html#section-4.1)
+   describes the sequence check and its limits: delayed legitimate errors may be discarded, and
+   sequence reuse can admit old quotations. The corrected plan states those limits and adds no
+   packet-history table, sequence-only deduplication or broader security mechanism.
+
+Rechecked the full plan's scope, L3 ownership, bounded resources, completion path and acceptance
+gates against the coordinated P02M0175 changes. No unresolved in-scope contradiction or missing
+correction was established; the plan is complete, feasible and ready for implementation in its
+declared order. The arithmetic check passed all 13 normal, boundary, empty-flight, wraparound and
+partial-ACK cases. This checks the written decision, not an implemented TCP path; host/guest
+acceptance tests remain implementation work.
+
+Only the two related plans and audit appendices were written by this review. All original audit
+prefixes were verified byte-for-byte, and scoped document whitespace checks pass. Unrelated source
+edits appeared concurrently and were left untouched; this review implemented no source changes.

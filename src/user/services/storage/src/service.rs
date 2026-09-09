@@ -273,13 +273,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// Appending it after a NUL keeps the report the single message it has always been - the
 			// log line is the text before the NUL, unchanged - and a reader that does not look past
 			// it behaves exactly as it did.
-			if block_formats.try_reserve(probe_count).is_ok() {
-				for probe in probes[..probe_count].iter() {
-					// The one being served is known without asking: it is the volume just mounted.
-					block_formats.push(if *probe == serving && serving != 0 { FORMAT_LIBERFS } else { unsafe { classify_block(*probe) } });
-				}
-			} else {
-				unsafe { print(b"StorageService: no room to classify the block providers; the supervisor falls back to bus order and says so\n") };
+			if block_formats.try_reserve_exact(probe_count).is_err() {
+				unsafe { rt::fail_bootstrap(bootstrap, b"classification table", b"allocation failed") };
+			}
+			for probe in probes[..probe_count].iter() {
+				// The one being served is known without asking: it is the volume just mounted.
+				block_formats.push(if *probe == serving && serving != 0 { FORMAT_LIBERFS } else { unsafe { classify_block(*probe) } });
 			}
 			for probe in probes[..probe_count].iter() {
 				if *probe != 0 && *probe != serving {
@@ -364,6 +363,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => {
 			let expected = if len == 11 { u32::from_le_bytes(buf[7..11].try_into().unwrap()) as usize } else { 0 };
 			let probes = unsafe { receive_probes(bootstrap, expected, &mut buf) };
+			if block_formats.try_reserve_exact(expected).is_err() {
+				unsafe { rt::fail_bootstrap(bootstrap, b"classification table", b"allocation failed") };
+			}
 			for probe in probes {
 				block_formats.push(unsafe { classify_block(probe) });
 				if probe != 0 {
@@ -406,26 +408,33 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// because a count was all the line supported. Naming the volume makes the same report say which
 	// of the seven it is, and lets that suite assert the SET that came up.
 	unsafe {
-		// ALLOC-OK: one line, once, on this service's own bootstrap path.
-		let mut report: Vec<u8> = Vec::new();
-		report.extend_from_slice(b"StorageService: online (vol://");
-		report.extend_from_slice(vol.name());
-		report.push(b')');
-		// AND WHETHER THE BLOCK CHANNEL WAS ROUTED, for the one instance where a stand-in and a real
-		// provider are otherwise indistinguishable - see the `USBBLOCK*` arm.
-		if routed {
-			report.extend_from_slice(b" routed");
-		}
-		// AND M2'S FORMAT TABLE BEHIND A NUL, for the one instance that has one - see where it is
-		// built. The text before the NUL is the report exactly as it was, so every reader that does
-		// not look past it is unaffected.
-		if !block_formats.is_empty() && report.try_reserve(block_formats.len() + 1).is_ok() {
-			report.push(0);
-			report.extend_from_slice(&block_formats);
-		}
+		let report = match storage_bootstrap_report(vol.name(), routed, &block_formats) {
+			Ok(report) => report,
+			Err(reason) => rt::fail_bootstrap(bootstrap, b"classification report", reason),
+		};
 		send_blocking(bootstrap, &report, 0);
 	}
 	serve_volume(&mut vol, service, admin, usb);
+}
+
+// Build the entire report or fail; an announced classification tail is never optional.
+fn storage_bootstrap_report(name: &[u8], routed: bool, formats: &[u8]) -> Result<Vec<u8>, &'static [u8]> {
+	let prefix = b"StorageService: online (vol://";
+	let text = prefix.len().checked_add(name.len()).and_then(|size| size.checked_add(1 + if routed { 7 } else { 0 }));
+	let size = text.and_then(|size| size.checked_add(usize::from(!formats.is_empty()))).and_then(|size| size.checked_add(formats.len())).filter(|size| *size <= rt::MAX_MESSAGE_BYTES).ok_or(&b"report exceeds IPC capacity"[..])?;
+	let mut report = Vec::new();
+	report.try_reserve_exact(size).map_err(|_| &b"allocation failed"[..])?;
+	report.extend_from_slice(prefix);
+	report.extend_from_slice(name);
+	report.push(b')');
+	if routed {
+		report.extend_from_slice(b" routed");
+	}
+	if !formats.is_empty() {
+		report.push(0);
+		report.extend_from_slice(formats);
+	}
+	Ok(report)
 }
 
 #[derive(Clone)]
@@ -3870,12 +3879,24 @@ unsafe fn classify_block(chan: u64) -> u8 {
 // Probe messages preserve provider positions even if a connection could not be minted.
 unsafe fn receive_probes(bootstrap: u64, expected: usize, buf: &mut [u8]) -> Vec<u64> {
 	let mut probes = Vec::new();
+	let allocated = expected <= rt::MAX_MESSAGE_BYTES && probes.try_reserve_exact(expected).is_ok();
 	for _ in 0..expected {
-		let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, buf) }) else { exit() };
+		let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, buf) }) else {
+			unsafe { rt::fail_bootstrap(bootstrap, b"classification probes", b"channel closed before announced count") };
+		};
 		if len != 5 || &buf[..5] != b"PROBE" {
-			exit();
+			unsafe { rt::fail_bootstrap(bootstrap, b"classification probes", b"invalid probe message") };
 		}
-		probes.push(handle);
+		if allocated {
+			probes.push(handle);
+		} else if handle != 0 {
+			// Drain the announced messages before reporting allocation failure so the sender
+			// cannot stall on its full queue while it is still delivering the probe list.
+			unsafe { close(handle) };
+		}
+	}
+	if !allocated {
+		unsafe { rt::fail_bootstrap(bootstrap, b"classification probes", b"count or allocation refused") };
 	}
 	probes
 }

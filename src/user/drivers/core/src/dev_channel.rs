@@ -196,7 +196,7 @@ impl Port<'_> {
 // Answer whatever the manager has said, without blocking. `false` means this driver is finished:
 // its bootstrap closed, which is how the supervisor tells a driver to shut down.
 //
-// A replacement byte channel remains owned until `adopt` observes the old agent's closure.
+// A replacement byte channel remains owned until `adopt` discards the old session's receive pool.
 // Other frames must be PING or STOP for this generation; unexpected handles are closed.
 unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64, pending_bytes: &mut u64) -> bool {
 	unsafe {
@@ -257,6 +257,31 @@ unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64,
 	}
 }
 
+// Backpressure retains the current payload while control remains live. SYS_WAIT_ANY observes
+// readability, so wait on bootstrap and retry capacity on the next periodic clock tick.
+unsafe fn send_to_agent(bind: &common::Bind, bootstrap: u64, capability: u64, pending_bytes: &mut u64, bytes: u64, payload: &[u8]) -> bool {
+	unsafe {
+		loop {
+			if !heartbeat(bind, bootstrap, capability, pending_bytes) {
+				exit();
+			}
+			if *pending_bytes != 0 {
+				return false;
+			}
+			match try_send_outcome(bytes, payload, 0) {
+				SendOutcome::Delivered => return true,
+				SendOutcome::Failed => return false,
+				SendOutcome::Stalled => {
+					let ready = wait_any_periodic(&[bootstrap], clock().saturating_add(1));
+					if ready < 0 && ready != ERR_TIMED_OUT {
+						exit();
+					}
+				}
+			}
+		}
+	}
+}
+
 unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
 	unsafe {
 		let mut outbound: Vec<u8> = alloc::vec![0u8; MAX_FRAME];
@@ -277,7 +302,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 					// is fine, so this driver waits for the replacement rather than taking the
 					// device down with the process that was using it - the bytes in flight are
 					// lost with the session they belonged to, which is what a disconnect means.
-					if !send_blocking(bytes, chunk, 0) {
+					if !send_to_agent(bind, bootstrap, rx.capability, &mut port.pending_bytes, bytes, chunk) {
 						bytes = adopt(device, bind, irq, bootstrap, bytes, &mut port.pending_bytes, rx, rx_phys);
 					}
 					worked = true;
@@ -300,7 +325,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 			for _ in 0..RX_SLOTS {
 				match try_recv(bytes, &mut outbound) {
 					Polled::Message { len, .. } => {
-						if !port.write(&outbound[..len], bind, bootstrap) && !send_blocking(bytes, &[], 0) {
+						if !port.write(&outbound[..len], bind, bootstrap) && !send_to_agent(bind, bootstrap, rx.capability, &mut port.pending_bytes, bytes, &[]) {
 							bytes = adopt(device, bind, irq, bootstrap, bytes, &mut port.pending_bytes, rx, rx_phys);
 						}
 						worked = true;

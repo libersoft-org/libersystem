@@ -240,7 +240,9 @@ pub enum Opcode {
 	// declaration says.
 	//
 	// The TOKEN and not the manager's identity, for the same reason `WITHDRAW` names one: a driver
-	// never sees a `ProviderId`. Not terminal, and not a withdrawal: the provider stays published.
+	// never sees a `ProviderId`. Tokens are unique across all kinds for the entire exact binding
+	// generation, including after withdrawal: a late departure for a retired token must not refund
+	// a replacement. A later generation may use the same number. Not terminal or a withdrawal.
 	Disconnect = 12,
 }
 
@@ -614,8 +616,9 @@ pub fn decode_resource(payload: &[u8]) -> Result<ResourceKind, FrameError> {
 // driver publishing two providers of one kind has to be able to say later which of them is going
 // away, and it cannot name an identity it never sees - the manager assigns those, precisely so that
 // a compromised driver cannot advertise itself as the system disk. The token is the driver's own
-// and unique only within that driver, which is enough to name its own publications and useless for
-// naming anybody else's.
+// and unique across every kind for the complete exact binding generation, including after a
+// withdrawal. A replacement uses a fresh token; a different binding or generation may reuse the
+// numeric value. This names only its own publications, never another driver's.
 pub const OFFER_PAYLOAD_LEN: usize = 4;
 
 pub fn encode_offer(kind: u16, token: u16, out: &mut [u8]) -> usize {

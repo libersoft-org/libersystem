@@ -1470,6 +1470,34 @@ fn a_ping_that_is_not_answered_inside_its_deadline_wedges_once_and_not_repeatedl
 }
 
 #[test]
+fn first_pong_receipt_must_precede_expiry_without_a_timer_tick() {
+	for received_at in [14, 15, 16] {
+		let mut beat = armed(0);
+		assert_eq!(beat.tick(5), Beat::Ask(1));
+		beat.asked(5);
+		assert_eq!(beat.answered(1, received_at, PERIOD), received_at < 15);
+		if received_at < 15 {
+			assert_eq!(beat.tick(16), Beat::Idle);
+			assert_eq!(beat.wake_at(), 19);
+		} else {
+			assert!(!beat.awaiting());
+			assert!(beat.expiry_pending());
+			assert_eq!(beat.wake_at(), 15);
+			assert_eq!(beat.tick(100), Beat::Wedged);
+			assert!(!beat.answered(1, 101, PERIOD));
+			beat.expiry_queued();
+			assert_eq!(beat.tick(102), Beat::Idle);
+			assert_eq!(beat.wake_at(), 0);
+		}
+		beat.arm(Some(DEADLINE), 200, PERIOD);
+		assert!(!beat.expire(205), "expiry inspection never schedules a PING");
+		assert_eq!(beat.tick(205), Beat::Ask(1));
+		beat.asked(205);
+		assert!(beat.answered(1, 206, PERIOD));
+	}
+}
+
+#[test]
 fn a_watchdog_expiry_stays_pending_until_its_event_is_queued() {
 	let mut beat = armed(0);
 	assert_eq!(beat.tick(5), Beat::Ask(1));

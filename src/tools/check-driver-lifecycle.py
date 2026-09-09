@@ -15,7 +15,8 @@ item = progress.item
 FIXTURE = r'''
 #![allow(dead_code, unused_unsafe)]
 extern crate alloc;
-use driver_binding::{BindingEvent, BindingQueue, BindingRecord, BindingState, BindingId, StopIntent, Heartbeat, EventDecision};
+mod driver_binding { pub use ::driver_binding::*; pub use super::Beat; }
+use driver_binding::{BindingEvent, BindingQueue, BindingRecord, BindingState, BindingId, StopIntent, EventDecision};
 use std::{cell::RefCell, collections::VecDeque};
 thread_local! {
     static CLOCKS: RefCell<VecDeque<u64>> = RefCell::new(VecDeque::new());
@@ -160,6 +161,9 @@ fn consume(node: &mut Node) -> usize {
     while let Some(event) = node.queue.pop(1) {
         expiries += usize::from(matches!(event, BindingEvent::Wedged { .. }));
         if let EventDecision::Admitted { next_state: Some(next), cause, .. } = driver_binding::reduce_event(node.record.state, event) {
+            if matches!(event, BindingEvent::Wedged { .. }) && node.record.state == BindingState::Online {
+                assert!(cause == Some(driver_binding::FailureCause::Hung), "expiry must use the ordinary Hung fault transition");
+            }
             assert!(node.record.move_to(next, cause));
         }
     }
@@ -183,7 +187,7 @@ fn refilled_channel_returns_to_other_nodes() {
 fn full_queue_preserves_watchdog_expiry() {
     for count in [driver_binding::MAX_NODE_EVENTS - 1, driver_binding::MAX_NODE_EVENTS] {
         let mut node = supervised(1);
-        FRAMES.with_borrow_mut(|frames| *frames = (0..count).map(|_| pong(2)).collect());
+        for _ in 0..count { node.push(BindingEvent::Ponged { generation: 1, sequence: 2 }); }
         let wake = unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]) };
         let delivered = consume(&mut node);
         if count == driver_binding::MAX_NODE_EVENTS {
@@ -204,6 +208,7 @@ fn full_queue_preserves_watchdog_expiry() {
 #[test]
 fn continuing_traffic_cannot_starve_pending_expiry() {
     let mut node = supervised(1);
+    for _ in 0..driver_binding::MAX_NODE_EVENTS { node.push(BindingEvent::Ponged { generation: 1, sequence: 2 }); }
     REFILL.set(1);
     REFILL_FRAME.with_borrow_mut(|frame| *frame = pong(2));
     unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
@@ -221,7 +226,7 @@ fn continuing_traffic_cannot_starve_pending_expiry() {
 fn an_expiry_losing_to_exit_cannot_fault_the_replacement_handshake() {
     let mut node = supervised(1);
     node.push(BindingEvent::Exited { generation: 1 });
-    FRAMES.with_borrow_mut(|frames| *frames = (1..driver_binding::MAX_NODE_EVENTS).map(|_| pong(2)).collect());
+    for _ in 1..driver_binding::MAX_NODE_EVENTS { node.push(BindingEvent::Ponged { generation: 1, sequence: 2 }); }
     unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
     assert_eq!(consume(&mut node), 0);
     assert!(node.record.state == BindingState::Stopping && node.beat.expiry_pending());
@@ -233,6 +238,71 @@ fn an_expiry_losing_to_exit_cannot_fault_the_replacement_handshake() {
     unsafe { drain_channel(&mut node, &mut [0; 128]); }
     assert!(node.queue.is_empty(), "the previous generation's heartbeat cannot fault a replacement handshake");
     assert!(node.record.state == BindingState::Binding);
+}
+#[test]
+fn unrelated_frames_do_not_answer_the_outstanding_ping() {
+    let mut node = supervised(1);
+    let mut stale = driver_protocol::Header { version: driver_protocol::VERSION, opcode: driver_protocol::Opcode::Pong, generation: 2, payload_len: 4 }.encode().to_vec();
+    stale.extend_from_slice(&1u32.to_le_bytes());
+    CLOCKS.with_borrow_mut(|times| *times = [6, 6, 6, 6, 6, 6].into());
+    FRAMES.with_borrow_mut(|frames| *frames = [frame(1), stale, pong(2)].into());
+    unsafe { drain_channel(&mut node, &mut [0; 128]); }
+    assert!(node.beat.awaiting());
+    assert_eq!(node.beat.wake_at(), 15);
+    assert_eq!(consume(&mut node), 0);
+    assert!(node.record.state == BindingState::Online);
+    CLOCKS.with_borrow_mut(|times| *times = [16, 16].into());
+    unsafe { drain_channel(&mut node, &mut [0; 128]); }
+    assert_eq!(consume(&mut node), 1);
+    assert!(node.record.state == BindingState::Stopping);
+}
+#[test]
+fn first_reply_uses_receipt_deadline_even_without_tick() {
+    for (clocks, timely) in [([14, 14, 14, 16], true), ([14, 14, 15, 16], false), ([14, 14, 16, 16], false), ([16, 16, 16, 16], false)] {
+        let mut node = supervised(1);
+        CLOCKS.with_borrow_mut(|times| *times = clocks.into());
+        FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
+        let wake = unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]) };
+        assert_eq!(consume(&mut node), usize::from(!timely), "receipt clocks {clocks:?}");
+        assert!(node.record.state == if timely { BindingState::Online } else { BindingState::Stopping });
+        assert_eq!(wake, if timely { 19 } else { 0 });
+    }
+}
+#[test]
+fn direct_intake_prioritizes_new_expiry_before_traffic() {
+    let mut node = supervised(1);
+    for _ in 1..driver_binding::MAX_NODE_EVENTS { node.push(BindingEvent::Ponged { generation: 1, sequence: 2 }); }
+    CLOCKS.with_borrow_mut(|times| *times = [14, 14, 16].into());
+    FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
+    unsafe { drain_channel(&mut node, &mut [0; 128]); }
+    assert_eq!(consume(&mut node), 1, "new expiry owns the last queue slot before a late reply");
+    assert!(node.record.state == BindingState::Stopping);
+    assert_eq!(node.beat.wake_at(), 0);
+}
+#[test]
+fn timer_refreshes_time_after_bounded_intake() {
+    let mut node = supervised(1);
+    CLOCKS.with_borrow_mut(|times| *times = [14, 14, 16].into());
+    unsafe { tick_heartbeats(core::slice::from_mut(&mut node), &mut [0; 128]); }
+    assert_eq!(consume(&mut node), 1, "time crossing the drain must not defer expiry");
+}
+#[test]
+fn reply_admission_itself_establishes_durable_expiry() {
+    let mut node = supervised(1);
+    assert!(!node.beat.answered(1, 16, 5));
+    assert!(node.beat.expiry_pending());
+    assert_eq!(node.beat.tick(100), driver_binding::Beat::Wedged);
+}
+#[test]
+fn old_heartbeat_cannot_expire_a_planned_stop() {
+    let mut node = supervised(1);
+    assert!(node.record.move_to(BindingState::Stopping, None));
+    node.stop_intent = StopIntent::OperatorDisable;
+    node.stop_deadline = 200;
+    FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
+    unsafe { drain_channel(&mut node, &mut [0; 128]); }
+    assert_eq!(consume(&mut node), 0);
+    assert!(!node.beat.expiry_pending());
 }
 #[test]
 fn disable_orders_dependency_closure() {
@@ -263,10 +333,13 @@ fn disable_orders_dependency_closure() {
 '''
 
 
-def fixture(source: str) -> str:
-    functions = ["unsafe fn drain_channel(", "unsafe fn tick_heartbeats(", "unsafe fn expire_planned_stop(", "unsafe fn planned_stop_deadline(", "unsafe fn apply_policy(", "unsafe fn begin_operator_stop(", "unsafe fn begin_dependency_stop(", "unsafe fn stop_nodes_that_lost_a_dependency(", "fn stoppable_on_a_lost_dependency(", "fn requirements_met(", "fn dependency_depths("]
+def fixture(source: str, beat: str | None = None) -> str:
+    functions = ["fn expire_heartbeat(", "unsafe fn drain_channel(", "unsafe fn tick_heartbeats(", "unsafe fn expire_planned_stop(", "unsafe fn planned_stop_deadline(", "unsafe fn apply_policy(", "unsafe fn begin_operator_stop(", "unsafe fn begin_dependency_stop(", "unsafe fn stop_nodes_that_lost_a_dependency(", "fn stoppable_on_a_lost_dependency(", "fn requirements_met(", "fn dependency_depths("]
     bound = next(line for line in source.splitlines() if line.startswith("const MAX_DRIVER_FRAMES_PER_PASS:"))
-    return FIXTURE.replace("NODE_ENTRY", item(source, "fn entry(&self)")) + bound + "\n" + "\n".join(item(source, start) for start in functions)
+    if beat is None:
+        beat = (ROOT / "src/user/libs/driver/binding/src/lib.rs").read_text()
+    watchdog = "#[derive(Clone, Copy, Default)]\n" + item(beat, "pub struct Heartbeat {") + "\n#[derive(Clone, Copy, PartialEq, Eq, Debug)]\n" + item(beat, "pub enum Beat {") + "\n" + item(beat, "impl Heartbeat {")
+    return FIXTURE.replace("NODE_ENTRY", item(source, "fn entry(&self)")) + watchdog + bound + "\n" + "\n".join(item(source, start) for start in functions)
 
 
 def main() -> None:
@@ -276,24 +349,32 @@ def main() -> None:
     assert source.count(receipt) == 1 and source.count(order) == 1
     drain = "for _ in 0..MAX_DRIVER_FRAMES_PER_PASS {"
     expiry = "if node.push(BindingEvent::Wedged { generation }) {"
-    pending = "if node.record.state == BindingState::Online && node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {\n\t\t\tnode.beat.expiry_queued();\n\t\t}"
+    pending = "node.record.state == BindingState::Online && node.binding.is_some() && "
+    fresh = "expire_heartbeat(node, node.last_frame_at);"
     assert source.count(drain) == 1 and source.count(expiry) == 1 and source.count(pending) == 1
+    beat = (ROOT / "src/user/libs/driver/binding/src/lib.rs").read_text()
     variants = [
-        ("production", source, None),
-        ("late READY admitted", source.replace(receipt, "false", 1), "ready_receipt_deadline"),
-        ("provider stopped first", source.replace(order, "", 1), "disable_orders_dependency_closure"),
-        ("unbounded driver drain", source.replace(drain, "loop {", 1), "refilled_channel_returns_to_other_nodes"),
-        ("refused expiry discarded", source.replace(expiry, "if { node.push(BindingEvent::Wedged { generation }); true } {", 1), "full_queue_preserves_watchdog_expiry"),
-        ("pending expiry behind fresh traffic", source.replace(pending, "", 1), "continuing_traffic_cannot_starve_pending_expiry"),
-        ("old expiry faults replacement", source.replace(pending, pending.replace("node.record.state == BindingState::Online && ", ""), 1), "an_expiry_losing_to_exit_cannot_fault_the_replacement_handshake"),
+        ("production", source, beat, None),
+        ("late READY admitted", source.replace(receipt, "false", 1), beat, "ready_receipt_deadline"),
+        ("provider stopped first", source.replace(order, "", 1), beat, "disable_orders_dependency_closure"),
+        ("unbounded driver drain", source.replace(drain, "loop {", 1), beat, "refilled_channel_returns_to_other_nodes"),
+        ("refused expiry discarded", source.replace("node.beat.expire(now) && node.push(BindingEvent::Wedged { generation: node.id.generation })", "node.beat.expire(now) && { node.push(BindingEvent::Wedged { generation: node.id.generation }); true }").replace(expiry, "if { node.push(BindingEvent::Wedged { generation }); true } {", 1), beat, "full_queue_preserves_watchdog_expiry"),
+        ("pending expiry behind fresh traffic", source.replace("expire_heartbeat(node, now);", "", 1).replace(fresh, "", 1), beat, "continuing_traffic_cannot_starve_pending_expiry"),
+        ("old expiry faults replacement", source.replace(pending, "", 1), beat, "an_expiry_losing_to_exit_cannot_fault_the_replacement_handshake"),
+        ("reply ignores deadline", source, beat.replace("self.expire(now);", "", 1), "reply_admission_itself_establishes_durable_expiry"),
+        ("decoder accepts stale generation", source.replace("header.generation != generation", "false", 1), beat, "unrelated_frames_do_not_answer_the_outstanding_ping"),
+        ("reply accepts wrong sequence", source, beat.replace("sequence != self.sequence", "false", 1), "unrelated_frames_do_not_answer_the_outstanding_ping"),
+        ("crossing receipt misses expiry admission", source.replace(fresh, "", 1), beat, "direct_intake_prioritizes_new_expiry_before_traffic"),
+        ("timer keeps pre-drain time", source.replace(item(source, "unsafe fn tick_heartbeats("), item(source, "unsafe fn tick_heartbeats(").replace("let now: u64 = clock();", "", 1).replace("for node in nodes.iter_mut() {", "for node in nodes.iter_mut() { let now: u64 = clock();", 1)), beat, "timer_refreshes_time_after_bounded_intake"),
+        ("old heartbeat faults planned stop", source.replace(pending, "", 1), beat, "old_heartbeat_cannot_expire_a_planned_stop"),
     ]
     with tempfile.TemporaryDirectory(prefix="driver-lifecycle-") as directory:
         root = Path(directory)
         (root / "src").mkdir()
         (root / "Cargo.toml").write_text('[package]\nname="driver-lifecycle"\nversion="0.1.0"\nedition="2024"\n[dependencies]\ndriver-binding={path="' + str(ROOT / 'src/user/libs/driver/binding') + '"}\ndriver-protocol={path="' + str(ROOT / 'src/user/libs/driver/protocol') + '"}\n')
         (root / "src/tests.rs").write_text(TESTS)
-        for name, variant, test in variants:
-            (root / "src/lib.rs").write_text(fixture(variant))
+        for name, variant, watchdog, test in variants:
+            (root / "src/lib.rs").write_text(fixture(variant, watchdog))
             command = ["cargo", "test", "--offline", "--manifest-path", str(root / "Cargo.toml"), "--target-dir", str(root / "target"), "--lib"]
             if test:
                 command.append(test)
@@ -303,7 +384,7 @@ def main() -> None:
                     raise SystemExit(f"{name}: expected the named assertion failure:\n{result.stdout}\n{result.stderr}")
             elif result.returncode:
                 raise SystemExit(f"{name}: {result.stdout}\n{result.stderr}")
-            print(f"driver-lifecycle: {name} {'rejected' if test else 'passed (7 tests)'}")
+            print(f"driver-lifecycle: {name} {'rejected' if test else 'passed (13 tests)'}")
 
 
 if __name__ == "__main__":

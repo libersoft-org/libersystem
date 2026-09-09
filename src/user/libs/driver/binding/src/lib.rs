@@ -1304,6 +1304,7 @@ impl Heartbeat {
 	// A pong with a sequence nobody is waiting for - a duplicate, one from an earlier round, one
 	// invented - does NOT reset the watchdog. Answers whether it counted, so a caller can say so.
 	pub fn answered(&mut self, sequence: u32, now: u64, period: u32) -> bool {
+		self.expire(now);
 		if self.spent || !self.awaiting || sequence != self.sequence {
 			return false;
 		}
@@ -1312,26 +1313,29 @@ impl Heartbeat {
 		true
 	}
 
+	// Receipt and timer intake share this transition. Unlike `tick`, checking expiry cannot
+	// consume a new sequence or schedule a PING the caller has not actually sent.
+	pub fn expire(&mut self, now: u64) -> bool {
+		if self.awaiting && now >= self.expires {
+			self.awaiting = false;
+			self.spent = true;
+			self.expiry_pending = true;
+		}
+		self.expiry_pending
+	}
+
 	// What to do at `now`. `Ask` hands out the next sequence and starts the deadline; the caller
 	// reports whether the send happened, because a channel that has gone is a driver that ended
 	// rather than one that is slow.
 	pub fn tick(&mut self, now: u64) -> Beat {
-		if self.expiry_pending {
+		if self.expire(now) {
 			return Beat::Wedged;
 		}
 		if !self.supervised() || self.spent {
 			return Beat::Idle;
 		}
 		if self.awaiting {
-			if now < self.expires {
-				return Beat::Idle;
-			}
-			// Keep the verdict runnable until the node queue accepts it. A full queue must not
-			// turn a single failed push into a permanently unsupervised online binding.
-			self.awaiting = false;
-			self.spent = true;
-			self.expiry_pending = true;
-			return Beat::Wedged;
+			return Beat::Idle;
 		}
 		if now < self.due {
 			return Beat::Idle;

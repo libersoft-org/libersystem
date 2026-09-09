@@ -98,11 +98,20 @@ pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut K
 			// manifest cannot say, which is the list of what it would have to grow to say it.
 			if let Some((bytes, handle)) = external(role) {
 				if !send_blocking(manager_side, &bytes, handle) {
+					if MANIFEST[index].name == b"storage_service" && handle != 0 {
+						close(handle);
+					}
 					return false;
 				}
 				// AS MANY AS THAT MESSAGE SAID. Every other role answers with none.
-				for probe in follow(role) {
+				let probes = follow(role);
+				for (at, &probe) in probes.iter().enumerate() {
 					if !send_blocking(manager_side, b"PROBE", probe) {
+						for &unsent in &probes[at..] {
+							if unsent != 0 {
+								close(unsent);
+							}
+						}
 						return false;
 					}
 				}
@@ -341,10 +350,32 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 //
 // The same four values it writes, and it is the producer: this supervisor may not read a filesystem
 // and does not try to. `0` is "could not be classified", which is a real answer on a disk this build
-// does not recognise and is why the fallback below exists at all.
+// does not recognise; it never authorizes a positional fallback.
 const FORMAT_ISO9660: u8 = 2;
 const FORMAT_UDF: u8 = 3;
 const FORMAT_FAT: u8 = 4;
+
+// The system instance appends one classification per announced probe to its ordinary text report.
+// Keep the existing text reserve and IPC ceiling; provider counts do not fit a fixed scratch buffer.
+fn classification_report_buffer(expected: usize) -> Result<Vec<u8>, &'static str> {
+	let size = 256usize.checked_add(expected).filter(|size| *size <= abi::MAX_MESSAGE_BYTES).ok_or("classification report count exceeds IPC capacity")?;
+	let mut report = Vec::new();
+	report.try_reserve_exact(size).map_err(|_| "classification report allocation failed")?;
+	report.resize(size, 0);
+	Ok(report)
+}
+
+fn parse_classification_report(report: &[u8], expected: usize) -> Result<(usize, Vec<u8>), &'static str> {
+	let text = report.iter().position(|byte| *byte == 0).unwrap_or(report.len());
+	let formats = if text == report.len() { &[][..] } else { &report[text + 1..] };
+	if formats.len() != expected || formats.iter().any(|format| *format > 4) {
+		return Err("classification report has an incomplete or invalid format table");
+	}
+	let mut table = Vec::new();
+	table.try_reserve_exact(expected).map_err(|_| "classification table allocation failed")?;
+	table.extend_from_slice(formats);
+	Ok((text, table))
+}
 
 pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut Vec<u64>, role_blocks: &mut Vec<u64>, block_formats: &mut Vec<u8>, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
@@ -352,474 +383,547 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			Some(pair) => pair,
 			None => return (State::Failed, Reason::BootstrapRefused),
 		};
-		// The pinned bootstrap set is raw-spawned from the init package (it is on the path
-		// to mounting the system volume, so it cannot load from it); every other service is
-		// loaded from their manifest-declared volume paths through ProcessService. media / iso /
-		// udf storage are extra instances of the pinned storage_service binary.
-		// A DOMAIN OF ITS OWN FOR THE ONE SERVICE THAT OWNS A SUBTREE.
-		//
-		// DeviceManager launches every driver into a child Domain of its own, so the drivers are
-		// BENEATH it - and killing DeviceManager's Domain is what takes them with it. Without one,
-		// a replacement manager would arrive while the old drivers still held claims it is about to
-		// hand out, which is the whole failure this ownership prevents.
-		//
-		// Every other service is spawned into the supervisor's own Domain as before: a Domain per
-		// service would be a resource boundary nobody asked for, and this one exists because there
-		// is a SUBTREE to kill rather than because the service is special.
-		if name == b"device_manager" && *service_domain == 0 {
-			let created: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
-			if created > 0 {
-				*service_domain = created as u64;
-			}
-		}
-		let proc: i64 = if pinned {
-			let mut artifact: Vec<u8> = program.to_vec();
-			artifact.extend_from_slice(services::executable::SUFFIX.as_bytes());
-			match package.lookup(&artifact) {
-				Some(elf) => spawn_in(elf, service_side, *service_domain),
-				None => return (State::Failed, Reason::BootstrapRefused),
-			}
-		} else {
-			launch_from_volume(*process_client, program, service_side)
-		};
-		if proc < 0 {
-			return (State::Failed, Reason::BootstrapRefused);
-		}
-		// Keep the spawned Process handle so SystemGraphService can be handed a read-only
-		// duplicate of it (the live data source for this component's graph node).
-		*proc_out = proc as u64;
-
-		// MIGRATED TO THE PLAN. These three declare nothing but a serve root, which the executor
-		// resolves entirely from the manifest - it creates the pair, sends the service end and
-		// keeps the client end. There is nothing left for a branch to say about them, so they have
-		// none, and `check-bootstrap-plan` no longer compares them because there is nothing to
-		// compare against.
-		//
-		// One at a time, and the comparison first: the gate proved the executor's sequence equal to
-		// the branch's before the branch was deleted. That order is the whole discipline - a
-		// migration that switches and then checks has already lost the thing it would check
-		// against.
-		// THE PLAN IS THE DEFAULT AND THE LADDER IS THE EXCEPTION, which is the whole of M6. An
-		// ordinary service of an existing shape needs a manifest row and an implementation; this
-		// list is what it does NOT need an edit to, because a name that is not on it is executed
-		// from the plan.
-		//
-		// TWO REMAIN, AND BOTH FOR A STATED REASON:
-		//
-		// PermissionManager holds authority to hand ON, so several of its clients need rights the
-		// plan's client role does not grant - `DUPLICATE`, so it can give a sandboxed component a
-		// narrowed copy. Expressing that would mean per-role rights in the manifest, which is model
-		// growth for one service, and M6 leaves a branch carrying real policy where it is.
-		//
-		// SystemGraphService is handed one message PER RUNNING COMPONENT, each carrying that
-		// component's name, its declared edges and a read-only duplicate of its Process. The plan
-		// has one `NODE` role and no way to say "as many as there are"; a role that expands into a
-		// variable number of messages is a model this milestone did not build.
-		let hand_wired: bool = matches!(name, b"permission_manager" | b"system_graph_service");
-		if !hand_wired {
-			let index: usize = match index_of(name) {
-				Some(index) => index,
-				None => return (State::Failed, Reason::BootstrapRefused),
+		// Keep all failures of this system-storage attempt on one cleanup path. Other services
+		// retain their existing startup behavior.
+		let started = (|| {
+			let expected_probes = if name == b"storage_service" { probe_blocks.len() } else { 0 };
+			let mut system_report = if name == b"storage_service" {
+				block_formats.clear();
+				match classification_report_buffer(expected_probes) {
+					Ok(report) => report,
+					Err(reason) => {
+						*failure_out = String::from(reason);
+						return (State::Failed, Reason::BootstrapRefused);
+					}
+				}
+			} else {
+				Vec::new()
 			};
-			// THE ONE FACT THE PLAN CANNOT CARRY YET, supplied here rather than hidden in a branch.
+			// The pinned bootstrap set is raw-spawned from the init package (it is on the path
+			// to mounting the system volume, so it cannot load from it); every other service is
+			// loaded from their manifest-declared volume paths through ProcessService. media / iso /
+			// udf storage are extra instances of the pinned storage_service binary.
+			// A DOMAIN OF ITS OWN FOR THE ONE SERVICE THAT OWNS A SUBTREE.
 			//
-			// The shell's session is minted ONCE and reused for the life of the system, so its
-			// working directory survives a logout and a reload; a fresh connection per shell would
-			// lose it silently. The plan says the role is a factory of SessionService, which is
-			// true - what it cannot say is that this one is cached, and that is the whole content
-			// of the branch this replaces.
-			// Read before the closure borrows `kept`: the executor needs it mutably to record the
-			// serve roots it creates, and a closure holding a reference alongside would be two
-			// borrows of one table.
-			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
-			let mut probe_handles = if name == b"storage_service" { core::mem::take(probe_blocks) } else { Vec::new() };
-			let probe_count = probe_handles.len() as u32;
-			// Keep every candidate until its content is known, including provider zero. The root
-			// owns a separately minted probe, so choosing a later root cannot consume the FAT disk.
-			let mut take_format = |want: u8| -> u64 {
-				let Some(at) = block_formats.iter().position(|format| *format == want) else { return 0 };
-				role_blocks.get_mut(at).map_or(0, |handle| core::mem::take(handle))
+			// DeviceManager launches every driver into a child Domain of its own, so the drivers are
+			// BENEATH it - and killing DeviceManager's Domain is what takes them with it. Without one,
+			// a replacement manager would arrive while the old drivers still held claims it is about to
+			// hand out, which is the whole failure this ownership prevents.
+			//
+			// Every other service is spawned into the supervisor's own Domain as before: a Domain per
+			// service would be a resource boundary nobody asked for, and this one exists because there
+			// is a SUBTREE to kill rather than because the service is special.
+			if name == b"device_manager" && *service_domain == 0 {
+				let created: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
+				if created > 0 {
+					*service_domain = created as u64;
+				}
+			}
+			let proc: i64 = if pinned {
+				let mut artifact: Vec<u8> = program.to_vec();
+				artifact.extend_from_slice(services::executable::SUFFIX.as_bytes());
+				match package.lookup(&artifact) {
+					Some(elf) => spawn_in(elf, service_side, *service_domain),
+					None => return (State::Failed, Reason::BootstrapRefused),
+				}
+			} else {
+				launch_from_volume(*process_client, program, service_side)
 			};
-			let fat = if name == b"media_storage" { take_format(FORMAT_FAT) } else { 0 };
-			let iso = if name == b"iso_storage" { take_format(FORMAT_ISO9660) } else { 0 };
-			let udf = if name == b"udf_storage" { take_format(FORMAT_UDF) } else { 0 };
-			let block = if name == b"storage_service" && probe_count == 0 { core::mem::take(block_client) } else { 0 };
-
-			let keys: u64 = *raw_keys;
-			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
-			let pointer_forward: u64 = *pointer_console;
-			let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
-				// The shell's session is minted ONCE and reused for the life of the system, so its
-				// working directory survives a logout and a reload; a fresh connection per shell
-				// would lose it silently. The plan says the role is a factory of SessionService,
-				// which is true - what it cannot say is that this one is cached.
-				if name == b"shell" && role.tag == CAP_SESSION {
-					if *session1 == 0 {
-						*session1 = service_connect(session_root)?;
-					}
-					let copy: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-					if copy < 0 {
-						return None;
-					}
-					return Some((role.tag.to_vec(), copy as u64));
-				}
-				// A MEMORY VOLUME IS ASKED FOR ITS SIZE, and a size is content rather than shape. A
-				// payload role says a message of bytes travels here; what those bytes are is the
-				// supervisor's, and putting the number in the manifest would be a policy declared
-				// in the one file that is meant to describe wiring.
-				if name == b"ram_storage" && role.tag == b"RAMVOL" {
-					return Some((memory_volume_request(b"RAMVOL", RAM_VOLUME_BYTES), 0));
-				}
-				if name == b"tmp_storage" && role.tag == b"TMPVOL" {
-					return Some((memory_volume_request(b"TMPVOL", TMP_VOLUME_BYTES), 0));
-				}
-				// A BLOCK SERVICE COMES FROM A DRIVER, not from the service graph: DeviceManager
-				// routes it up and this supervisor is holding it. The plan can say a device role
-				// arrives under this tag and cannot say which local holds it.
-				if name == b"media_storage" && role.tag == b"FATBLOCK" {
-					return Some((role.tag.to_vec(), fat));
-				}
-				if name == b"iso_storage" && role.tag == b"ISOBLOCK" {
-					return Some((role.tag.to_vec(), iso));
-				}
-				if name == b"udf_storage" && role.tag == b"UDFBLOCK" {
-					return Some((role.tag.to_vec(), udf));
-				}
-
-				// THE DISK OR THE IMAGE, IN THE SAME POSITION. A live system serves its volume from a
-				// filesystem image copied into memory and an installed one from the disk, and the
-				// two arrive under different tags in the one place the plan has for them. Sending
-				// an extra message instead would shift every read after it - the desyncs that cost
-				// this milestone the most all came from exactly that.
-				if name == b"storage_service" && role.tag == b"BLOCK" {
-					if live_volume != 0 {
-						// The loader's choice was `Embedded`, and there is nothing to check it
-						// against: the image the kernel handed over IS the one the loader verified.
-						let mut message = b"LIVEVOL".to_vec();
-						message.extend_from_slice(&probe_count.to_le_bytes());
-						return Some((message, live_volume));
-					}
-					// WHAT THE LOADER CHOSE, APPENDED TO THE TAG rather than sent after it.
-					//
-					// The comment above says why, and this milestone paid for the lesson twice: a
-					// separate `ROOTSEL` message parked every OTHER instance of this program - seven
-					// run on an ordinary boot and only this one is given the role - and it would
-					// have owed twenty-six test harnesses a message each. The system instance
-					// already reads this message; the identity travels in it.
-					let mut message: alloc::vec::Vec<u8> = role.tag.to_vec();
-					message.extend_from_slice(&super::ROOT_HEAD.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
-					message.extend_from_slice(&super::ROOT_UUID_LOW.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
-					message.extend_from_slice(&super::ROOT_UUID_HIGH.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
-					// AND HOW MANY PROBE CONNECTIONS FOLLOW, so the instance reads exactly that many
-					// and never one more. A count in the message the reader is already reading, not
-					// a sentinel after the last one: a reader looking for a terminator CONSUMES
-					// whatever comes next, and the kernel's own fixtures send `BLOCK` and then
-					// `SERVE` with no probes at all.
-					message.extend_from_slice(&probe_count.to_le_bytes());
-					return Some((message, block));
-				}
-				// A PRIVILEGE IS THE KERNEL'S, HANDED ON. Duplicated rather than transferred,
-				// because this supervisor keeps its own copy for whoever needs one next.
-				//
-				// AND THE TAG TRAVELS EVEN WHEN THE PRIVILEGE DOES NOT. `send_privilege` sent
-				// NOTHING for a zero handle, while DisplayService reads this position with a
-				// blocking tagged receive - a machine without the privilege would have waited here
-				// for a message nobody was going to send. The plan's rule that the tag always
-				// travels is what removes that.
-				if name == b"display_service" && role.tag == b"DISPLAYCTL" {
-					if display_ctl == 0 {
-						return Some((role.tag.to_vec(), 0));
-					}
-					let copy: i64 = duplicate(display_ctl, RIGHT_TRANSFER | RIGHT_DUPLICATE);
-					return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
-				}
-				// THE RAW EVENT CHANNELS COME FROM DRIVERS, routed up by DeviceManager. A zero handle
-				// is an absent pointer source, and InputService serves an empty stream rather than
-				// refusing to start.
-				if name == b"input_service" && role.tag == b"KEYS" {
-					return Some((role.tag.to_vec(), keys));
-				}
-				// CONFIGSERVICE GETS A CLIENT SCOPED TO ONE DIRECTORY, minted from StorageService's
-				// admin endpoint rather than duplicated from its public root. The plan can say the
-				// role is a factory of that endpoint; the directory is the part it cannot say, and
-				// this is the whole content of the branch it replaces.
-				if name == b"config_service" && role.tag == CAP_STORAGE {
-					if storage_root == 0 {
-						return Some((role.tag.to_vec(), 0));
-					}
-					let scoped: u64 = open_storage_directory(storage_adm, "vol://system/libexec/config_service");
-					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
-				}
-				// THE INIT PACKAGE, under the rights a launcher needs: read it, map it, pass it on.
-				// The message carries its length behind the tag because a memory object does not
-				// say how much of itself is the archive.
-				if role.tag == b"PACKAGE" {
-					let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-					if dup < 0 {
-						return None;
-					}
-					let mut message: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-					message.extend_from_slice(b"PACKAGE");
-					message.extend_from_slice(&(pkg_len as u64).to_le_bytes());
-					return Some((message, dup as u64));
-				}
-				// DEVICEMANAGER CARRIES THE POWER PATH TO THE KEYBOARD DRIVERS, because the Power
-				// key must keep working when this supervisor does not - the whole reason it is a
-				// separate path from `!poweroff`. What travels is a SystemPower connection, not the
-				// root Domain that used to.
-				if name == b"device_manager" {
-					if role.tag == b"SYSPOWER" {
-						return Some((role.tag.to_vec(), service_connect(power)?));
-					}
-					// THE BOOT WINDOW, AND THE DEADLINE ONLY THE FIRST TIME.
-					//
-					// `swap(0)` is the rule, not an optimisation: the boot's own deadline belongs to
-					// the bind that competes with the boot, and there is exactly one of those. Every
-					// DeviceManager started afterwards - a restart, a recovery hours later - reads a
-					// zero deadline and bounds itself by the LENGTH alone, measured from its own now.
-					// A deadline in the past handed to a recovery is a budget that was spent before
-					// the work it is meant to bound was asked for.
-					if role.tag == b"BOOTWIN" {
-						let deadline: u64 = super::BOOT_DEADLINE.swap(0, core::sync::atomic::Ordering::Relaxed);
-						let window: u64 = super::BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
-						let mut message: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-						message.extend_from_slice(b"BOOTWIN");
-						message.extend_from_slice(&deadline.to_le_bytes());
-						message.extend_from_slice(&window.to_le_bytes());
-						return Some((message, 0));
-					}
-					if role.tag == b"CONSOLE" || role.tag == b"DEVPRIV" {
-						let privilege: u64 = if role.tag == b"CONSOLE" { console_input } else { device_manager };
-						if privilege == 0 {
-							return Some((role.tag.to_vec(), 0));
-						}
-						let copy: i64 = duplicate(privilege, RIGHT_TRANSFER | RIGHT_DUPLICATE);
-						return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
-					}
-				}
-				// PROCESSSERVICE HOLDS AN END NOBODY IS ON YET. The development agent is started
-				// later, by DeviceManager, and takes the far end then; making the pair here is what
-				// keeps ProcessService from having to learn about a capability that arrives after
-				// it has begun serving.
-				if name == b"process_service" && role.tag == b"REGISTRY" {
-					let (far, near): (u64, u64) = channel()?;
-					*registry_far = far;
-					return Some((role.tag.to_vec(), near));
-				}
-				if name == b"console_service" {
-					if role.tag == b"CONSOLESINK" {
-						if console_sink == 0 {
-							return Some((role.tag.to_vec(), 0));
-						}
-						let copy: i64 = duplicate(console_sink, RIGHT_TRANSFER | RIGHT_DUPLICATE);
-						return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
-					}
-					// The pointer-forward end InputService was given the other half of. It is a
-					// handle this supervisor is holding for a service that starts later, which the
-					// plan calls a device role because that is where it comes from.
-					if role.tag == CAP_POINTER {
-						return Some((role.tag.to_vec(), pointer_forward));
-					}
-				}
-				None
-			};
-			// THE PROBE CONNECTIONS, for the one instance whose job is to choose among the disks.
-			// Every other role answers with none. TAKEN, not duplicated: these were minted for this
-			// consumer and nobody else holds them.
-			let mut follow = |role: &Role| -> Vec<u64> {
-				if name != b"storage_service" || role.tag != b"BLOCK" {
-					return Vec::new();
-				}
-				core::mem::take(&mut probe_handles)
-			};
-			if !deliver_roles(manager_side, index, kept, &mut external, &mut follow) {
+			if proc < 0 {
 				return (State::Failed, Reason::BootstrapRefused);
 			}
-			// THE ENDS THIS SUPERVISOR KEEPS, copied out of the plan's own table into the names the
-			// remaining hand-written branches still read. Every line here goes when the branch that
-			// reads it goes, so this block empties as the ladder does.
-			match name {
-				b"log_service" => *log_client = kept.end_of(name, CAP_SERVE),
-				b"device_service" => *device_client = kept.end_of(name, CAP_SERVE),
-				b"session_service" => *session_client = kept.end_of(name, CAP_SERVE),
-				b"time_service" => *time_client = kept.end_of(name, CAP_SERVE),
-				// The shell's own serve root is its ADMIN channel, which this supervisor answers on.
-				b"shell" => *admin_server = kept.end_of(name, b"ADMIN"),
-				b"ram_storage" => *ram_client = kept.end_of(name, CAP_SERVE),
-				b"tmp_storage" => *tmp_client = kept.end_of(name, CAP_SERVE),
-				b"media_storage" => *media_client = kept.end_of(name, CAP_SERVE),
-				b"iso_storage" => *iso_client = kept.end_of(name, CAP_SERVE),
-				b"udf_storage" => *udf_client = kept.end_of(name, CAP_SERVE),
-				b"usb_storage" => *usb_client = kept.end_of(name, CAP_SERVE),
-				b"storage_service" => {
-					*storage_client = kept.end_of(name, CAP_SERVE);
-					*storage_admin = kept.end_of(name, b"ADMIN");
-				}
-				b"audio_service" => {
-					*audio_client = kept.end_of(name, CAP_SERVE);
-					*audio_admin = kept.end_of(name, b"ADMIN");
-				}
-				b"network_service" => *net_client = kept.end_of(name, CAP_SERVE),
-				b"display_service" => {
-					*display_client = kept.end_of(name, CAP_SERVE);
-					*display_admin = kept.end_of(name, b"ADMIN");
-				}
-				b"input_service" => {
-					*input_client = kept.end_of(name, CAP_SERVE);
-					*input_admin = kept.end_of(name, b"ADMIN");
-					*input_focus = kept.end_of(name, b"FOCUS");
-					*input_kill = kept.end_of(name, b"KILL");
-					*pointer_console = kept.end_of(name, b"FORWARD");
-				}
-				b"config_service" => *config_client = kept.end_of(name, CAP_SERVE),
-				b"resource_manager" => *res_client = kept.end_of(name, CAP_SERVE),
-				b"process_service" => *process_client = kept.end_of(name, CAP_SERVE),
-				b"console_service" => {
-					*console_client = kept.end_of(name, CAP_CLIENT);
-					*console_control = kept.end_of(name, CAP_CONTROL);
-				}
-				_ => {}
-			}
-		}
-		// DeviceManager also carries the power capability, because it is what starts the
-		// keyboard drivers and the Power key must keep working when this supervisor does not -
-		// that is the whole reason the key exists as a separate path from `!poweroff`.
-		// DEVPRIV is appended AFTER CONSOLE, and every launcher of device_manager owes it: the
-		// bootstrap is read positionally, so `recv_tagged` checks the tag of the next message rather
-		// than searching for one, and anything inserted in the middle shifts every read after it.
-		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), graph_client, stats_server) {
-			return (State::Failed, Reason::BootstrapRefused);
-		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", CAP_SERVE), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
-			return (State::Failed, Reason::BootstrapRefused);
-		}
-		match recv_blocking(manager_side, buf) {
-			Received::Message { len, handle } => {
-				// A service that could not complete a bootstrap step reports the failing step
-				// and the reason (BOOTSTRAP_FAILURE) in place of its "online" report: record it
-				// so the supervisor status and the journal explain the failure, instead of the
-				// supervisor seeing an unexplained peer-close.
-				if len >= BOOTSTRAP_FAILURE.len() && &buf[..BOOTSTRAP_FAILURE.len()] == BOOTSTRAP_FAILURE {
-					let start: usize = (BOOTSTRAP_FAILURE.len() + 1).min(len);
-					*failure_out = String::from_utf8_lossy(&buf[start..len]).into_owned();
-					emit_event(*log_client, name, failure_out.as_bytes());
-					return (State::Failed, Reason::BootstrapRefused);
-				}
-				// DeviceManager hands its block-read service channel up with its report;
-				// keep it so StorageService can be bootstrapped against the disk.
-				if name == b"device_manager" {
-					*block_client = handle;
-				}
-				// M2'S FORMAT TABLE, WHICH RIDES BEHIND A NUL IN THE SYSTEM INSTANCE'S REPORT
-				// (added 2026-09-04). The text is the report; anything after the NUL is one byte per
-				// block provider, in the order the hand-off used - which is now the order the roles
-				// are taken in. Every other service sends no NUL and this finds nothing, which is
-				// why the relay below is unchanged for them.
-				let text: usize = buf[..len].iter().position(|byte| *byte == 0).unwrap_or(len);
-				if name == b"storage_service" && text < len {
-					block_formats.clear();
-					block_formats.extend_from_slice(&buf[text + 1..len]);
-					// The root uses its probe connection. Release unused offered connections once the
-					// table identifies them; retain only the first provider of each declared media role.
-					let mut kept_formats = [false; 5];
-					for (at, handle) in role_blocks.iter_mut().enumerate() {
-						let format = block_formats.get(at).copied().unwrap_or(0) as usize;
-						let wanted = matches!(format, 2 | 3 | 4) && !kept_formats[format];
-						if wanted {
-							kept_formats[format] = true;
-						} else if *handle != 0 {
-							close(core::mem::take(handle));
+			// Keep the spawned Process handle so SystemGraphService can be handed a read-only
+			// duplicate of it (the live data source for this component's graph node).
+			*proc_out = proc as u64;
+
+			// MIGRATED TO THE PLAN. These three declare nothing but a serve root, which the executor
+			// resolves entirely from the manifest - it creates the pair, sends the service end and
+			// keeps the client end. There is nothing left for a branch to say about them, so they have
+			// none, and `check-bootstrap-plan` no longer compares them because there is nothing to
+			// compare against.
+			//
+			// One at a time, and the comparison first: the gate proved the executor's sequence equal to
+			// the branch's before the branch was deleted. That order is the whole discipline - a
+			// migration that switches and then checks has already lost the thing it would check
+			// against.
+			// THE PLAN IS THE DEFAULT AND THE LADDER IS THE EXCEPTION, which is the whole of M6. An
+			// ordinary service of an existing shape needs a manifest row and an implementation; this
+			// list is what it does NOT need an edit to, because a name that is not on it is executed
+			// from the plan.
+			//
+			// TWO REMAIN, AND BOTH FOR A STATED REASON:
+			//
+			// PermissionManager holds authority to hand ON, so several of its clients need rights the
+			// plan's client role does not grant - `DUPLICATE`, so it can give a sandboxed component a
+			// narrowed copy. Expressing that would mean per-role rights in the manifest, which is model
+			// growth for one service, and M6 leaves a branch carrying real policy where it is.
+			//
+			// SystemGraphService is handed one message PER RUNNING COMPONENT, each carrying that
+			// component's name, its declared edges and a read-only duplicate of its Process. The plan
+			// has one `NODE` role and no way to say "as many as there are"; a role that expands into a
+			// variable number of messages is a model this milestone did not build.
+			let hand_wired: bool = matches!(name, b"permission_manager" | b"system_graph_service");
+			if !hand_wired {
+				let index: usize = match index_of(name) {
+					Some(index) => index,
+					None => return (State::Failed, Reason::BootstrapRefused),
+				};
+				// THE ONE FACT THE PLAN CANNOT CARRY YET, supplied here rather than hidden in a branch.
+				//
+				// The shell's session is minted ONCE and reused for the life of the system, so its
+				// working directory survives a logout and a reload; a fresh connection per shell would
+				// lose it silently. The plan says the role is a factory of SessionService, which is
+				// true - what it cannot say is that this one is cached, and that is the whole content
+				// of the branch this replaces.
+				// Read before the closure borrows `kept`: the executor needs it mutably to record the
+				// serve roots it creates, and a closure holding a reference alongside would be two
+				// borrows of one table.
+				let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
+				let mut probe_handles = if name == b"storage_service" { core::mem::take(probe_blocks) } else { Vec::new() };
+				let probe_count = expected_probes as u32;
+				// Keep every candidate until its content is known, including provider zero. The root
+				// owns a separately minted probe, so choosing a later root cannot consume the FAT disk.
+				let mut take_format = |want: u8| -> u64 {
+					let Some(at) = block_formats.iter().position(|format| *format == want) else { return 0 };
+					role_blocks.get_mut(at).map_or(0, |handle| core::mem::take(handle))
+				};
+				let fat = if name == b"media_storage" { take_format(FORMAT_FAT) } else { 0 };
+				let iso = if name == b"iso_storage" { take_format(FORMAT_ISO9660) } else { 0 };
+				let udf = if name == b"udf_storage" { take_format(FORMAT_UDF) } else { 0 };
+				let block = if name == b"storage_service" && probe_count == 0 { core::mem::take(block_client) } else { 0 };
+
+				let keys: u64 = *raw_keys;
+				let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
+				let pointer_forward: u64 = *pointer_console;
+				let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
+					// The shell's session is minted ONCE and reused for the life of the system, so its
+					// working directory survives a logout and a reload; a fresh connection per shell
+					// would lose it silently. The plan says the role is a factory of SessionService,
+					// which is true - what it cannot say is that this one is cached.
+					if name == b"shell" && role.tag == CAP_SESSION {
+						if *session1 == 0 {
+							*session1 = service_connect(session_root)?;
+						}
+						let copy: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+						if copy < 0 {
+							return None;
+						}
+						return Some((role.tag.to_vec(), copy as u64));
+					}
+					// A MEMORY VOLUME IS ASKED FOR ITS SIZE, and a size is content rather than shape. A
+					// payload role says a message of bytes travels here; what those bytes are is the
+					// supervisor's, and putting the number in the manifest would be a policy declared
+					// in the one file that is meant to describe wiring.
+					if name == b"ram_storage" && role.tag == b"RAMVOL" {
+						return Some((memory_volume_request(b"RAMVOL", RAM_VOLUME_BYTES), 0));
+					}
+					if name == b"tmp_storage" && role.tag == b"TMPVOL" {
+						return Some((memory_volume_request(b"TMPVOL", TMP_VOLUME_BYTES), 0));
+					}
+					// A BLOCK SERVICE COMES FROM A DRIVER, not from the service graph: DeviceManager
+					// routes it up and this supervisor is holding it. The plan can say a device role
+					// arrives under this tag and cannot say which local holds it.
+					if name == b"media_storage" && role.tag == b"FATBLOCK" {
+						return Some((role.tag.to_vec(), fat));
+					}
+					if name == b"iso_storage" && role.tag == b"ISOBLOCK" {
+						return Some((role.tag.to_vec(), iso));
+					}
+					if name == b"udf_storage" && role.tag == b"UDFBLOCK" {
+						return Some((role.tag.to_vec(), udf));
+					}
+
+					// THE DISK OR THE IMAGE, IN THE SAME POSITION. A live system serves its volume from a
+					// filesystem image copied into memory and an installed one from the disk, and the
+					// two arrive under different tags in the one place the plan has for them. Sending
+					// an extra message instead would shift every read after it - the desyncs that cost
+					// this milestone the most all came from exactly that.
+					if name == b"storage_service" && role.tag == b"BLOCK" {
+						if live_volume != 0 {
+							// The loader's choice was `Embedded`, and there is nothing to check it
+							// against: the image the kernel handed over IS the one the loader verified.
+							let mut message = b"LIVEVOL".to_vec();
+							message.extend_from_slice(&probe_count.to_le_bytes());
+							return Some((message, live_volume));
+						}
+						// WHAT THE LOADER CHOSE, APPENDED TO THE TAG rather than sent after it.
+						//
+						// The comment above says why, and this milestone paid for the lesson twice: a
+						// separate `ROOTSEL` message parked every OTHER instance of this program - seven
+						// run on an ordinary boot and only this one is given the role - and it would
+						// have owed twenty-six test harnesses a message each. The system instance
+						// already reads this message; the identity travels in it.
+						let mut message: alloc::vec::Vec<u8> = role.tag.to_vec();
+						message.extend_from_slice(&super::ROOT_HEAD.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+						message.extend_from_slice(&super::ROOT_UUID_LOW.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+						message.extend_from_slice(&super::ROOT_UUID_HIGH.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+						// AND HOW MANY PROBE CONNECTIONS FOLLOW, so the instance reads exactly that many
+						// and never one more. A count in the message the reader is already reading, not
+						// a sentinel after the last one: a reader looking for a terminator CONSUMES
+						// whatever comes next, and the kernel's own fixtures send `BLOCK` and then
+						// `SERVE` with no probes at all.
+						message.extend_from_slice(&probe_count.to_le_bytes());
+						return Some((message, block));
+					}
+					// A PRIVILEGE IS THE KERNEL'S, HANDED ON. Duplicated rather than transferred,
+					// because this supervisor keeps its own copy for whoever needs one next.
+					//
+					// AND THE TAG TRAVELS EVEN WHEN THE PRIVILEGE DOES NOT. `send_privilege` sent
+					// NOTHING for a zero handle, while DisplayService reads this position with a
+					// blocking tagged receive - a machine without the privilege would have waited here
+					// for a message nobody was going to send. The plan's rule that the tag always
+					// travels is what removes that.
+					if name == b"display_service" && role.tag == b"DISPLAYCTL" {
+						if display_ctl == 0 {
+							return Some((role.tag.to_vec(), 0));
+						}
+						let copy: i64 = duplicate(display_ctl, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+						return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
+					}
+					// THE RAW EVENT CHANNELS COME FROM DRIVERS, routed up by DeviceManager. A zero handle
+					// is an absent pointer source, and InputService serves an empty stream rather than
+					// refusing to start.
+					if name == b"input_service" && role.tag == b"KEYS" {
+						return Some((role.tag.to_vec(), keys));
+					}
+					// CONFIGSERVICE GETS A CLIENT SCOPED TO ONE DIRECTORY, minted from StorageService's
+					// admin endpoint rather than duplicated from its public root. The plan can say the
+					// role is a factory of that endpoint; the directory is the part it cannot say, and
+					// this is the whole content of the branch it replaces.
+					if name == b"config_service" && role.tag == CAP_STORAGE {
+						if storage_root == 0 {
+							return Some((role.tag.to_vec(), 0));
+						}
+						let scoped: u64 = open_storage_directory(storage_adm, "vol://system/libexec/config_service");
+						return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
+					}
+					// THE INIT PACKAGE, under the rights a launcher needs: read it, map it, pass it on.
+					// The message carries its length behind the tag because a memory object does not
+					// say how much of itself is the archive.
+					if role.tag == b"PACKAGE" {
+						let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+						if dup < 0 {
+							return None;
+						}
+						let mut message: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+						message.extend_from_slice(b"PACKAGE");
+						message.extend_from_slice(&(pkg_len as u64).to_le_bytes());
+						return Some((message, dup as u64));
+					}
+					// DEVICEMANAGER CARRIES THE POWER PATH TO THE KEYBOARD DRIVERS, because the Power
+					// key must keep working when this supervisor does not - the whole reason it is a
+					// separate path from `!poweroff`. What travels is a SystemPower connection, not the
+					// root Domain that used to.
+					if name == b"device_manager" {
+						if role.tag == b"SYSPOWER" {
+							return Some((role.tag.to_vec(), service_connect(power)?));
+						}
+						// THE BOOT WINDOW, AND THE DEADLINE ONLY THE FIRST TIME.
+						//
+						// `swap(0)` is the rule, not an optimisation: the boot's own deadline belongs to
+						// the bind that competes with the boot, and there is exactly one of those. Every
+						// DeviceManager started afterwards - a restart, a recovery hours later - reads a
+						// zero deadline and bounds itself by the LENGTH alone, measured from its own now.
+						// A deadline in the past handed to a recovery is a budget that was spent before
+						// the work it is meant to bound was asked for.
+						if role.tag == b"BOOTWIN" {
+							let deadline: u64 = super::BOOT_DEADLINE.swap(0, core::sync::atomic::Ordering::Relaxed);
+							let window: u64 = super::BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
+							let mut message: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+							message.extend_from_slice(b"BOOTWIN");
+							message.extend_from_slice(&deadline.to_le_bytes());
+							message.extend_from_slice(&window.to_le_bytes());
+							return Some((message, 0));
+						}
+						if role.tag == b"CONSOLE" || role.tag == b"DEVPRIV" {
+							let privilege: u64 = if role.tag == b"CONSOLE" { console_input } else { device_manager };
+							if privilege == 0 {
+								return Some((role.tag.to_vec(), 0));
+							}
+							let copy: i64 = duplicate(privilege, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+							return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
 						}
 					}
+					// PROCESSSERVICE HOLDS AN END NOBODY IS ON YET. The development agent is started
+					// later, by DeviceManager, and takes the far end then; making the pair here is what
+					// keeps ProcessService from having to learn about a capability that arrives after
+					// it has begun serving.
+					if name == b"process_service" && role.tag == b"REGISTRY" {
+						let (far, near): (u64, u64) = channel()?;
+						*registry_far = far;
+						return Some((role.tag.to_vec(), near));
+					}
+					if name == b"console_service" {
+						if role.tag == b"CONSOLESINK" {
+							if console_sink == 0 {
+								return Some((role.tag.to_vec(), 0));
+							}
+							let copy: i64 = duplicate(console_sink, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+							return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
+						}
+						// The pointer-forward end InputService was given the other half of. It is a
+						// handle this supervisor is holding for a service that starts later, which the
+						// plan calls a device role because that is where it comes from.
+						if role.tag == CAP_POINTER {
+							return Some((role.tag.to_vec(), pointer_forward));
+						}
+					}
+					None
+				};
+				// THE PROBE CONNECTIONS, for the one instance whose job is to choose among the disks.
+				// Every other role answers with none. TAKEN, not duplicated: these were minted for this
+				// consumer and nobody else holds them.
+				let mut follow = |role: &Role| -> Vec<u64> {
+					if name != b"storage_service" || role.tag != b"BLOCK" {
+						return Vec::new();
+					}
+					core::mem::take(&mut probe_handles)
+				};
+				let delivered = deliver_roles(manager_side, index, kept, &mut external, &mut follow);
+				// A role before BLOCK may have failed; these probes were then never transferred.
+				for probe in probe_handles {
+					if probe != 0 {
+						close(probe);
+					}
 				}
-				// Relay the service's own report up to SystemManager, in start order, and
-				// keep its report channel as the control channel used to stop it later.
-				send_blocking(up, &buf[..text], 0);
-				*control = manager_side;
-				// Record the lifecycle event in the journal (LogService is up by now).
-				emit_event(*log_client, name, b"online");
-				// The shell is reaped by its console channel closing when it logs out
-				// (Ctrl+D) or exits; release our Process handle to it so a clean exit
-				// drops its handle table - and thus that channel. A leaked handle would
-				// pin the shell alive forever, so the console could never reap the VT.
-				// (Every other service is meant to stand for the life of the system.)
-				if name == b"shell" {
-					close(proc as u64);
-					*proc_out = 0;
+				if !delivered {
+					return (State::Failed, Reason::BootstrapRefused);
 				}
-				// Keep every offered block connection and its independent probe in publication
-				// order. The system instance classifies them before the media roles are selected.
-				// Drivers loaded from the system volume publish in DeviceManager's phase two.
-				if name == b"device_manager" {
-					// HOW MANY BLOCK PROVIDERS THIS MACHINE HAS, CARRIED RATHER THAN ASSUMED
-					// (2026-09-02). DeviceManager used to send three follow-ups and four probes
-					// whatever the machine had, because both sides held the same compiled-in four.
-					// It now says how many, and this reads exactly that many.
-					let mut published: usize = 0;
-					if let Received::Message { len, handle } = recv_blocking(manager_side, buf) {
+				// THE ENDS THIS SUPERVISOR KEEPS, copied out of the plan's own table into the names the
+				// remaining hand-written branches still read. Every line here goes when the branch that
+				// reads it goes, so this block empties as the ladder does.
+				match name {
+					b"log_service" => *log_client = kept.end_of(name, CAP_SERVE),
+					b"device_service" => *device_client = kept.end_of(name, CAP_SERVE),
+					b"session_service" => *session_client = kept.end_of(name, CAP_SERVE),
+					b"time_service" => *time_client = kept.end_of(name, CAP_SERVE),
+					// The shell's own serve root is its ADMIN channel, which this supervisor answers on.
+					b"shell" => *admin_server = kept.end_of(name, b"ADMIN"),
+					b"ram_storage" => *ram_client = kept.end_of(name, CAP_SERVE),
+					b"tmp_storage" => *tmp_client = kept.end_of(name, CAP_SERVE),
+					b"media_storage" => *media_client = kept.end_of(name, CAP_SERVE),
+					b"iso_storage" => *iso_client = kept.end_of(name, CAP_SERVE),
+					b"udf_storage" => *udf_client = kept.end_of(name, CAP_SERVE),
+					b"usb_storage" => *usb_client = kept.end_of(name, CAP_SERVE),
+					b"storage_service" => {
+						*storage_client = kept.end_of(name, CAP_SERVE);
+						*storage_admin = kept.end_of(name, b"ADMIN");
+					}
+					b"audio_service" => {
+						*audio_client = kept.end_of(name, CAP_SERVE);
+						*audio_admin = kept.end_of(name, b"ADMIN");
+					}
+					b"network_service" => *net_client = kept.end_of(name, CAP_SERVE),
+					b"display_service" => {
+						*display_client = kept.end_of(name, CAP_SERVE);
+						*display_admin = kept.end_of(name, b"ADMIN");
+					}
+					b"input_service" => {
+						*input_client = kept.end_of(name, CAP_SERVE);
+						*input_admin = kept.end_of(name, b"ADMIN");
+						*input_focus = kept.end_of(name, b"FOCUS");
+						*input_kill = kept.end_of(name, b"KILL");
+						*pointer_console = kept.end_of(name, b"FORWARD");
+					}
+					b"config_service" => *config_client = kept.end_of(name, CAP_SERVE),
+					b"resource_manager" => *res_client = kept.end_of(name, CAP_SERVE),
+					b"process_service" => *process_client = kept.end_of(name, CAP_SERVE),
+					b"console_service" => {
+						*console_client = kept.end_of(name, CAP_CLIENT);
+						*console_control = kept.end_of(name, CAP_CONTROL);
+					}
+					_ => {}
+				}
+			}
+			// DeviceManager also carries the power capability, because it is what starts the
+			// keyboard drivers and the Power key must keep working when this supervisor does not -
+			// that is the whole reason the key exists as a separate path from `!poweroff`.
+			// DEVPRIV is appended AFTER CONSOLE, and every launcher of device_manager owes it: the
+			// bootstrap is read positionally, so `recv_tagged` checks the tag of the next message rather
+			// than searching for one, and anything inserted in the middle shifts every read after it.
+			if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), graph_client, stats_server) {
+				return (State::Failed, Reason::BootstrapRefused);
+			}
+			if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", CAP_SERVE), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
+				return (State::Failed, Reason::BootstrapRefused);
+			}
+			let report_buf: &mut [u8] = if name == b"storage_service" { &mut system_report } else { buf };
+			match recv_blocking(manager_side, report_buf) {
+				Received::Message { len, handle } => {
+					// A service that could not complete a bootstrap step reports the failing step
+					// and the reason (BOOTSTRAP_FAILURE) in place of its "online" report: record it
+					// so the supervisor status and the journal explain the failure, instead of the
+					// supervisor seeing an unexplained peer-close.
+					if len >= BOOTSTRAP_FAILURE.len() && &report_buf[..BOOTSTRAP_FAILURE.len()] == BOOTSTRAP_FAILURE {
+						if name == b"storage_service" && handle != 0 {
+							close(handle);
+						}
+						let start: usize = (BOOTSTRAP_FAILURE.len() + 1).min(len);
+						*failure_out = String::from_utf8_lossy(&report_buf[start..len]).into_owned();
+						emit_event(*log_client, name, failure_out.as_bytes());
+						return (State::Failed, Reason::BootstrapRefused);
+					}
+					// DeviceManager hands its block-read service channel up with its report;
+					// keep it so StorageService can be bootstrapped against the disk.
+					if name == b"device_manager" {
+						*block_client = handle;
+					}
+					// M2'S FORMAT TABLE, WHICH RIDES BEHIND A NUL IN THE SYSTEM INSTANCE'S REPORT
+					// (added 2026-09-04). The text is the report; anything after the NUL is one byte per
+					// block provider, in the order the hand-off used - which is now the order the roles
+					// are taken in. Every other service sends no NUL and this finds nothing, which is
+					// why the relay below is unchanged for them.
+					let text = if name == b"storage_service" {
 						if handle != 0 {
 							close(handle);
 						}
-						if len >= 10 && &buf[..6] == b"BLOCKS" {
-							published = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+						let (text, table) = match parse_classification_report(&report_buf[..len], expected_probes) {
+							Ok(report) => report,
+							Err(reason) => {
+								*failure_out = String::from(reason);
+								return (State::Failed, Reason::BootstrapRefused);
+							}
+						};
+						*block_formats = table;
+						// Only a complete validated table can decide which role candidates to release.
+						let mut kept_formats = [false; 5];
+						for (at, handle) in role_blocks.iter_mut().enumerate() {
+							let format = block_formats.get(at).copied().unwrap_or(0) as usize;
+							let wanted = matches!(format, 2 | 3 | 4) && !kept_formats[format];
+							if wanted {
+								kept_formats[format] = true;
+							} else if *handle != 0 {
+								close(core::mem::take(handle));
+							}
+						}
+						text
+					} else {
+						report_buf[..len].iter().position(|byte| *byte == 0).unwrap_or(len)
+					};
+
+					// Relay the service's own report up to SystemManager, in start order, and
+					// keep its report channel as the control channel used to stop it later.
+					send_blocking(up, &report_buf[..text], 0);
+					*control = manager_side;
+					// Record the lifecycle event in the journal (LogService is up by now).
+					emit_event(*log_client, name, b"online");
+					// The shell is reaped by its console channel closing when it logs out
+					// (Ctrl+D) or exits; release our Process handle to it so a clean exit
+					// drops its handle table - and thus that channel. A leaked handle would
+					// pin the shell alive forever, so the console could never reap the VT.
+					// (Every other service is meant to stand for the life of the system.)
+					if name == b"shell" {
+						close(proc as u64);
+						*proc_out = 0;
+					}
+					// Keep every offered block connection and its independent probe in publication
+					// order. The system instance classifies them before the media roles are selected.
+					// Drivers loaded from the system volume publish in DeviceManager's phase two.
+					if name == b"device_manager" {
+						// HOW MANY BLOCK PROVIDERS THIS MACHINE HAS, CARRIED RATHER THAN ASSUMED
+						// (2026-09-02). DeviceManager used to send three follow-ups and four probes
+						// whatever the machine had, because both sides held the same compiled-in four.
+						// It now says how many, and this reads exactly that many.
+						let mut published: usize = 0;
+						if let Received::Message { len, handle } = recv_blocking(manager_side, buf) {
+							if handle != 0 {
+								close(handle);
+							}
+							if len >= 10 && &buf[..6] == b"BLOCKS" {
+								published = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+							}
+						}
+						role_blocks.clear();
+						if published != 0 {
+							role_blocks.push(core::mem::take(block_client));
+						}
+						for _ in 0..published.saturating_sub(1) {
+							let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
+							role_blocks.push(handle);
+						}
+						for _ in 0..published {
+							let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
+							probe_blocks.push(handle);
 						}
 					}
-					role_blocks.clear();
-					if published != 0 {
-						role_blocks.push(core::mem::take(block_client));
+					// PermissionManager follows its "online" report with the sandbox proof: the
+					// bytes the sandboxed component read through its one granted capability, then a
+					// decisions summary of exactly which capabilities it was and was not given.
+					// These are the manager's internal verification (and are asserted by the
+					// kernel's permission scenario); the live audit trail is served over the
+					// Permission contract and read with `perm`, so they are drained here rather
+					// than relayed into the boot chain, which carries only state reports.
+					if name == b"permission_manager" {
+						let _ = recv_blocking(manager_side, buf);
+						let _ = recv_blocking(manager_side, buf);
 					}
-					for _ in 0..published.saturating_sub(1) {
-						let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
-						role_blocks.push(handle);
+					// ResourceManager follows its "online" report with the budget proof: a summary of
+					// the pages it granted under the cap, the over-budget refusal it contained, and the
+					// pages it regranted after raising the budget at runtime. This is the manager's
+					// internal verification (and is asserted by the kernel's resource scenario); the
+					// live budgets are served over the resources contract and read with `usage`, so it
+					// is drained here rather than relayed into the boot chain, which carries only state
+					// reports.
+					if name == b"resource_manager" {
+						let _ = recv_blocking(manager_side, buf);
 					}
-					for _ in 0..published {
-						let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
-						probe_blocks.push(handle);
+					// THE BRIDGE, WHILE BOTH DESCRIPTIONS EXIST. A hand-written branch keeps its serve
+					// roots in named locals; a migrated service resolves its clients out of `Kept`. So
+					// every end a branch keeps is recorded here under the name and tag the plan calls
+					// it, and a service can be migrated before the ones it is a client of.
+					//
+					// TEMPORARY BY CONSTRUCTION: each line goes with the branch that made it, and when
+					// the ladder is empty this block is empty too.
+					match name {
+						b"system_graph_service" => kept.register(name, CAP_SERVE, *graph_client),
+						b"permission_manager" => kept.register(name, CAP_SERVE, *perm_client),
+						_ => {}
 					}
+					(State::Ready, Reason::ReportedReady)
 				}
-				// PermissionManager follows its "online" report with the sandbox proof: the
-				// bytes the sandboxed component read through its one granted capability, then a
-				// decisions summary of exactly which capabilities it was and was not given.
-				// These are the manager's internal verification (and are asserted by the
-				// kernel's permission scenario); the live audit trail is served over the
-				// Permission contract and read with `perm`, so they are drained here rather
-				// than relayed into the boot chain, which carries only state reports.
-				if name == b"permission_manager" {
-					let _ = recv_blocking(manager_side, buf);
-					let _ = recv_blocking(manager_side, buf);
+				Received::Closed => {
+					// The service closed its bootstrap channel without reporting - it crashed during
+					// bring-up before it could send a failure report. Record that so the status view
+					// still carries a reason rather than a bare "failed".
+					*failure_out = String::from("bootstrap channel closed without a report");
+					(State::Failed, Reason::NoReport)
 				}
-				// ResourceManager follows its "online" report with the budget proof: a summary of
-				// the pages it granted under the cap, the over-budget refusal it contained, and the
-				// pages it regranted after raising the budget at runtime. This is the manager's
-				// internal verification (and is asserted by the kernel's resource scenario); the
-				// live budgets are served over the resources contract and read with `usage`, so it
-				// is drained here rather than relayed into the boot chain, which carries only state
-				// reports.
-				if name == b"resource_manager" {
-					let _ = recv_blocking(manager_side, buf);
-				}
-				// THE BRIDGE, WHILE BOTH DESCRIPTIONS EXIST. A hand-written branch keeps its serve
-				// roots in named locals; a migrated service resolves its clients out of `Kept`. So
-				// every end a branch keeps is recorded here under the name and tag the plan calls
-				// it, and a service can be migrated before the ones it is a client of.
-				//
-				// TEMPORARY BY CONSTRUCTION: each line goes with the branch that made it, and when
-				// the ladder is empty this block is empty too.
-				match name {
-					b"system_graph_service" => kept.register(name, CAP_SERVE, *graph_client),
-					b"permission_manager" => kept.register(name, CAP_SERVE, *perm_client),
-					_ => {}
-				}
-				(State::Ready, Reason::ReportedReady)
 			}
-			Received::Closed => {
-				// The service closed its bootstrap channel without reporting - it crashed during
-				// bring-up before it could send a failure report. Record that so the status view
-				// still carries a reason rather than a bare "failed".
-				*failure_out = String::from("bootstrap channel closed without a report");
-				(State::Failed, Reason::NoReport)
+		})();
+		if name == b"storage_service" && started.0 == State::Failed {
+			// Stop the failed instance before releasing our process reference. This closes its
+			// received probes; the vectors below contain only capabilities still owned here.
+			if *proc_out != 0 {
+				signal(*proc_out, SIG_KILL);
+				close(core::mem::take(proc_out));
+			} else if object_info(service_side).is_some() {
+				// A failed prepare restores this handle; a later release failure already moved it.
+				close(service_side);
 			}
+			close(manager_side);
+			*control = 0;
+			block_formats.clear();
+			for handles in [probe_blocks, role_blocks] {
+				for handle in handles.iter_mut() {
+					if *handle != 0 {
+						close(core::mem::take(handle));
+					}
+				}
+			}
+			if *block_client != 0 {
+				close(core::mem::take(block_client));
+			}
+			if let Some(index) = index_of(name) {
+				for handle in kept.ends[index].iter_mut() {
+					if *handle != 0 {
+						close(core::mem::take(handle));
+					}
+				}
+			}
+			*storage_client = 0;
+			*storage_admin = 0;
 		}
+		started
 	}
 }
 
@@ -1244,6 +1348,7 @@ pub(super) unsafe fn serve_root(manager_side: u64, tag: &[u8], handed_on: bool, 
 			return false;
 		}
 		if !send_blocking(manager_side, tag, narrowed as u64) {
+			close(narrowed as u64);
 			close(service_client);
 			return false;
 		}

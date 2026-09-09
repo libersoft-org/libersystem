@@ -161,7 +161,8 @@ pub unsafe fn handshake(bootstrap: u64) -> (Bind, Resources) {
 
 // Offer a provider this driver serves. HELD UNPUBLISHED by the manager until `ready`, and closed on
 // `failed` - so a driver that dies half way through announcing itself announces nothing.
-// `token` is this driver's OWN name for the publication, unique only within this driver. It is what
+// `token` is this driver's OWN name for the publication, unique throughout this binding generation
+// even after withdrawal. Replacements must use a fresh token. It is what
 // a later withdrawal names; the identity the rest of the system uses is the manager's and is never
 // something a driver chooses. A driver that publishes one provider of each kind may use the kind as
 // its token and lose nothing.
@@ -186,7 +187,8 @@ pub unsafe fn disconnected(bootstrap: u64, bind: &Bind, token: u16) -> bool {
 //
 // AFTER the handshake, and not terminal: this driver stays bound and its other publications stay
 // published. `token` is the one this driver chose when it offered - `online` uses the offer's
-// position in its own list, so the first offer is token 0.
+// position in its own list, so the first offer is token 0. Withdrawal never frees a token for reuse
+// in the same binding generation, because outstanding consumers can still report their departure.
 pub unsafe fn withdraw(bootstrap: u64, bind: &Bind, token: u16) -> bool {
 	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
 	proto::encode_u16(token, &mut payload);
