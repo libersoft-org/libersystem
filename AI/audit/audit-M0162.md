@@ -2023,3 +2023,16 @@ guest sweep are not claimed. Command logs, frozen source digests and the baselin
 in `/tmp/libersystem-implement-0162-0165-f12wfsw2/`.
 
 Final milestone-index and restored shipping-configuration checks passed. Source digests still match the reviewed 14-file snapshot; audit-prefix integrity and diff whitespace were verified. All original audit content is preserved.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-09T02:29:06Z):
+
+Current implementation rating: **9/10**.
+
+1. **[P2] Standing supervision can sleep past a completed fallback rollback and lose the remaining retry.** The standing loop calls `advance`, then starts the next candidate from its `Step::NextCandidate` arm (`src/user/services/core/src/device_manager.rs:581-598`). If that fallback claims the device but spawning fails, `begin_bind` starts a rollback whose process is absent and whose claim release can already be confirmed, retaining the child Domain for `Pending::settle` (`device_manager.rs:3655-3664`; `src/user/libs/driver/binding/src/lib.rs:1153-1167`). This new teardown is created after the pass's call to `advance`. The subsequent wait preparation checks deadlines and queued events, but never checks for an already-completed `Pending` (`device_manager.rs:719-730`). Its zero process/claim handles cannot wake the manager. Consequently, quiet unrelated channels let it sleep until a deadline before closing the Domain and applying the already-runnable retry decision. The equivalent bring-up check exists at `device_manager.rs:2877-2881`; the standing path remains incomplete under M4's explicit requirement to advance completed zero-handle teardowns before waiting.
+
+   A controlled host reproduction of the unchanged standing node loop, both deadline scans, candidate entry, claim/channel/Domain/spawn failure stage and production ownership/settlement logic starts at tick 850, with incident deadline 1000 and teardown reserve 100. A completed predecessor advances to the fallback, whose spawn fails. The standing wait requests tick 900, retaining `Pending(process=0, claim=0, domain=31, exited=true, state=Free)` throughout that wait. This consumes the remaining bind slice; the next production retry decision ends at Failed with two automatic attempts spent, although one attempt remained. Adding the missing completed-Pending wake predicate only in the temporary fixture changes the wake to tick 850 and rejects the old-behavior assertion. Evidence: `/tmp/reaudit-0162-standing.py` and `/tmp/reaudit-0162-standing-spe_lmyj/{result.log,negative-control.log,src/lib.rs}`.
+
+Verification: reviewed the full audit and implementer-response history against the current milestone requirements and source at `c6ee5c6fc17862d91af3e07f6ca39048fea58714`. The finding above is a remaining standing-loop composition defect, not a repetition of the corrected bring-up case. Reproduction uses controlled syscall, clock and scheduling effects; it is not a guest test. No long build or guest suite was rerun. No source code or preceding audit content was changed.

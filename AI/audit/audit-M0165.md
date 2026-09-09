@@ -2611,3 +2611,18 @@ guest sweep are not claimed. Command logs, frozen source digests and the baselin
 in `/tmp/libersystem-implement-0162-0165-f12wfsw2/`.
 
 Final milestone-index and restored shipping-configuration checks passed. Source digests still match the reviewed 14-file snapshot; audit-prefix integrity and diff whitespace were verified. All original audit content is preserved.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-09T02:29:06Z):
+
+Current implementation rating: **9/10**.
+
+1. **[P2] The reconstructed MMIO ledger counts unrelated objects and loses retained MMIO charges after unconfirmed teardown.** `device::snapshot` derives `mmio_windows` from every live object in `DERIVED`, without filtering its type (`src/kernel/device.rs:594`). That registry includes DMA buffers and interrupts as well as MMIO capabilities (`src/kernel/syscall/mod.rs:677,1226,1663`). The ABI identifies separate MMIO-window, IRQ-vector and IOMMU-grant holdings (`src/abi/src/lib.rs:912-919`), and DeviceManager adds those fields when reconstructing its resource charge (`src/user/services/core/src/device_manager.rs:5479`). One MMIO capability, one interrupt and one translated DMA buffer therefore produce `mmio_windows=3, irq_vectors=1, iommu_grants=1`, inflating the reconstructed total to five instead of three.
+
+   The same counting source also omits retained MMIO holdings after revocation. `revoke_derived` removes each registry row before invoking its teardown effects (`device.rs:1103-1113`). When a mapping's cross-core shootdown fails, `DeviceMemory::teardown_mapping` retains its virtual range (`src/kernel/object/device_memory.rs:272-278`), and `mmio_mapping_torn_down` records that unconfirmed charge in `ClaimSlot::mmio_unconfirmed` (`device.rs:819-823`). The snapshot ignores that retained accounting and reports zero MMIO windows once the derived rows are gone. A replacement manager consequently cannot reconstruct the MMIO charge required by M5/M6. This is an accounting defect; the code still retains the range and quarantines the claim, so this finding does not allege unsafe reuse.
+
+   An unchanged production `snapshot` extraction linked to the actual ABI reproduces both wrong values. With one live object of each registered type, the MMIO assertion observes 3 instead of 1. With a seeded quarantined claim holding one unconfirmed MMIO range and no derived rows, it observes 0 instead of 1. Both intended assertions fail when run serially. The retained-range state is established by the production teardown path above and injected into this fixture; no end-to-end hardware shootdown was performed. Evidence: `/tmp/reaudit0165-mmio-count-ee7k_wp8/{src/lib.rs,result.log}`.
+
+Verification: reviewed the full audit and implementer-response history against the current milestone requirements and source at `c6ee5c6fc17862d91af3e07f6ca39048fea58714`. Fresh development-control checks passed all 16 production scenarios and rejected all 17 deliberate regressions; those checks do not cover the kernel accounting defect above. Only bounded host checks and reproductions were run, with no long build or guest suite. No source code or preceding audit content was changed.
