@@ -1918,3 +1918,14 @@ checks, then exited 6 (`INCOMPLETE`), requiring post-commit merge verification e
 check set. No full revision-verification pass, implementation-test pass or commit is claimed.
 Concurrent edits to other audit files were preserved. Final prefix and whitespace checks cover this
 verification append as well.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-08T23:59:28Z):
+
+Current plan rating: 8/10
+
+1. **Medium - the frozen quoted-error metadata cannot support the promised rejection of stale TCP PTB quotations.** M3 promises that stale and replayed quotations cannot poison the PMTU cache (`docs/todo/P02M0174.md:103-112`), but M6 retains only the quoted TCP addresses and ports, discarding the TCP sequence number before delivery (`:636-649`). Matching that tuple to a live connection (`:665-667`; `docs/todo/P02M0175.md:550-564`) cannot distinguish a quotation of already acknowledged data from one of its currently outstanding segments. For example, after the 600-second PMTU entry expires, replaying an old lower-MTU report for an acknowledged segment of the still-live connection passes the same tuple/interface/route checks and can lower the cache again. Interface and route generations do not distinguish successive segments on that unchanged route. The existing different-flow/no-live-flow and Echo-sequence fixtures do not exercise this case.
+
+   [RFC 8201 section 4](https://www.rfc-editor.org/rfc/rfc8201.html#section-4) calls for appropriate validation against transmitted traffic. [RFC 5927 section 4.1](https://www.rfc-editor.org/rfc/rfc5927.html#section-4.1) documents quoted TCP sequence checking against outstanding data as a defensive measure against precisely this stale-error problem; it is not a new mandatory TCP requirement. Here the stronger guarantee is already the plan's own. Preserve the checked quoted TCP sequence in the existing fixed-size event and require the owning consumer to validate it against its live send state before requesting a PMTU write. That state already belongs to TCP (`src/user/services/core/src/net.rs:388-389`); no L3 flow-registration table is needed. Add a boundary fixture pairing an old/out-of-window quotation with a valid outstanding-segment quotation on the same tuple, including replay after cache expiry, and assert that only the latter can lower PMTU.
+
+Verification: read the complete current plan and all preceding audit history, checked the planner's responses against the relevant source and shared P02M0175 contract, and consulted the primary protocol specifications. Only this re-audit was appended; the plan, source code and every preceding audit byte are unchanged. No implementation or host/guest-test result is claimed.
