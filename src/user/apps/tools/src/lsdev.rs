@@ -25,34 +25,32 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" /
-		//    "json-min" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let args: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the two capabilities the manifest grants: the READ - a DeviceService client -
-		//    and the WRITE, the operator's device-policy endpoint. Two, because nothing that renders
-		//    a device list needs the second, and holding the first gets a component no closer to it.
-		let devsvc: u64 = recv_tagged(bootstrap, &mut buf, b"DEVICE").unwrap_or_else(|| exit());
-		let policy: u64 = recv_tagged(bootstrap, &mut buf, b"DEVPOLICY").unwrap_or(0);
-		// AND THE READ THAT OUTLIVES THE MANAGER. Not a third authority over devices: a client of
-		// ConfigService, where DeviceManager persists each incident, for the case where the endpoint
-		// above cannot answer because the process holding it is gone.
-		let config: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or(0);
-		// A verb, or the listing. `lsdev` with no verb reads and changes nothing, which is what a
-		// command called `ls` had better do.
-		if let Some(request) = parse_verb(&args) {
-			apply_verb(policy, config, devsvc, request);
-			exit();
-		}
-		query_devices(devsvc, JsonMode::parse(&args));
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" /
+	//    "json-min" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let args: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the two capabilities the manifest grants: the READ - a DeviceService client -
+	//    and the WRITE, the operator's device-policy endpoint. Two, because nothing that renders
+	//    a device list needs the second, and holding the first gets a component no closer to it.
+	let devsvc: u64 = recv_tagged(bootstrap, &mut buf, b"DEVICE").unwrap_or_else(|| exit());
+	let policy: u64 = recv_tagged(bootstrap, &mut buf, b"DEVPOLICY").unwrap_or(0);
+	// AND THE READ THAT OUTLIVES THE MANAGER. Not a third authority over devices: a client of
+	// ConfigService, where DeviceManager persists each incident, for the case where the endpoint
+	// above cannot answer because the process holding it is gone.
+	let config: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or(0);
+	// A verb, or the listing. `lsdev` with no verb reads and changes nothing, which is what a
+	// command called `ls` had better do.
+	if let Some(request) = parse_verb(&args) {
+		apply_verb(policy, config, devsvc, request);
+		exit();
 	}
+	query_devices(devsvc, JsonMode::parse(&args));
 	exit();
 }
 
@@ -96,52 +94,50 @@ fn parse_verb(args: &[u8]) -> Option<VerbRequest> {
 }
 
 // Apply one verb and say what happened, in the words the outcome carries.
-unsafe fn apply_verb(policy: u64, config: u64, devsvc: u64, request: VerbRequest) {
-	unsafe {
-		if policy == 0 {
-			eprint(b"lsdev: this boot granted no device-policy authority\n");
-			return;
-		}
-		let mut client = DevicePolicyClient::new(policy);
-		// The display path, marked by a sentinel the command line cannot produce.
-		if request.artifact.starts_with('\u{0}') {
-			match client.incident(&request.index) {
-				Some(Ok(report)) => {
-					if report.present {
-						print(report.to_text().as_bytes());
-					} else {
-						print(b"nothing has gone wrong on this binding");
-					}
-					print(b"\n");
+fn apply_verb(policy: u64, config: u64, devsvc: u64, request: VerbRequest) {
+	if policy == 0 {
+		eprint(b"lsdev: this boot granted no device-policy authority\n");
+		return;
+	}
+	let mut client = DevicePolicyClient::new(policy);
+	// The display path, marked by a sentinel the command line cannot produce.
+	if request.artifact.starts_with('\u{0}') {
+		match client.incident(&request.index) {
+			Some(Ok(report)) => {
+				if report.present {
+					print(report.to_text().as_bytes());
+				} else {
+					print(b"nothing has gone wrong on this binding");
 				}
-				// THE MANAGER IS GONE, WHICH IS WHEN THIS QUESTION MATTERS MOST.
-				//
-				// The live report is held by DeviceManager and dies with it - and DeviceManager
-				// dying is what killed the driver subtree, so an operator asking what happened is
-				// asking a process that is no longer there. The persisted copy is in ConfigService,
-				// which survives, and it carries the whole record rather than a summary of it.
-				//
-				// A GONE MANAGER ARRIVES AS AN ERROR VALUE, NOT AS `None`. The generated client turns
-				// every transport ending into a schema error - `again` for a request that never
-				// left, `commit-uncertain` for a peer that closed or never answered - and `None` is
-				// left for a reply this client could not decode. So the arm below used to be dead:
-				// the endpoint going away was reported as "no device has that index" and the
-				// persisted copy was never consulted, which is the exact case it exists for.
-				Some(Err(proto::system::Error::Again)) | Some(Err(proto::system::Error::CommitUncertain)) | None => stored_incident(config, devsvc, request.index),
-				Some(Err(_)) => eprint(b"lsdev: no device has that index\n"),
-			}
-			return;
-		}
-		match client.apply(&request.index, &request.verb, &request.artifact) {
-			Some(Ok(outcome)) => {
-				print(outcome_text(outcome));
 				print(b"\n");
 			}
-			// The same distinction as above: a transport ending is the endpoint not answering, and
-			// only a decoded schema error is the endpoint refusing.
-			Some(Err(proto::system::Error::Again)) | Some(Err(proto::system::Error::CommitUncertain)) | None => eprint(b"lsdev: the device policy endpoint did not answer\n"),
-			Some(Err(_)) => eprint(b"lsdev: the device policy endpoint refused the request\n"),
+			// THE MANAGER IS GONE, WHICH IS WHEN THIS QUESTION MATTERS MOST.
+			//
+			// The live report is held by DeviceManager and dies with it - and DeviceManager
+			// dying is what killed the driver subtree, so an operator asking what happened is
+			// asking a process that is no longer there. The persisted copy is in ConfigService,
+			// which survives, and it carries the whole record rather than a summary of it.
+			//
+			// A GONE MANAGER ARRIVES AS AN ERROR VALUE, NOT AS `None`. The generated client turns
+			// every transport ending into a schema error - `again` for a request that never
+			// left, `commit-uncertain` for a peer that closed or never answered - and `None` is
+			// left for a reply this client could not decode. So the arm below used to be dead:
+			// the endpoint going away was reported as "no device has that index" and the
+			// persisted copy was never consulted, which is the exact case it exists for.
+			Some(Err(proto::system::Error::Again)) | Some(Err(proto::system::Error::CommitUncertain)) | None => stored_incident(config, devsvc, request.index),
+			Some(Err(_)) => eprint(b"lsdev: no device has that index\n"),
 		}
+		return;
+	}
+	match client.apply(&request.index, &request.verb, &request.artifact) {
+		Some(Ok(outcome)) => {
+			print(outcome_text(outcome));
+			print(b"\n");
+		}
+		// The same distinction as above: a transport ending is the endpoint not answering, and
+		// only a decoded schema error is the endpoint refusing.
+		Some(Err(proto::system::Error::Again)) | Some(Err(proto::system::Error::CommitUncertain)) | None => eprint(b"lsdev: the device policy endpoint did not answer\n"),
+		Some(Err(_)) => eprint(b"lsdev: the device policy endpoint refused the request\n"),
 	}
 }
 
@@ -211,62 +207,60 @@ fn decimal(value: u64, out: &mut [u8; 20]) -> usize {
 	at
 }
 
-unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
-	unsafe {
-		let mut client = DeviceClient::new(devsvc);
-		// THE BINDINGS FIRST, because they are what this command is for: which driver a device got,
-		// under which rule, in which state and why. The device table alone says what hardware is
-		// present, which is the smaller half.
-		//
-		// An older DeviceManager, or a boot that granted no catalogue connection, answers an error
-		// rather than an empty list - and an empty list would read as "nothing is bound", which is a
-		// different claim about the machine.
-		match client.bindings() {
-			Some(Ok(records)) => {
-				if let Some(mode) = mode {
-					let mut out = String::from("[");
-					for (i, r) in records.iter().enumerate() {
-						if i > 0 {
-							out.push(',');
-						}
-						out.push_str(&r.to_json());
+fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
+	let mut client = DeviceClient::new(devsvc);
+	// THE BINDINGS FIRST, because they are what this command is for: which driver a device got,
+	// under which rule, in which state and why. The device table alone says what hardware is
+	// present, which is the smaller half.
+	//
+	// An older DeviceManager, or a boot that granted no catalogue connection, answers an error
+	// rather than an empty list - and an empty list would read as "nothing is bound", which is a
+	// different claim about the machine.
+	match client.bindings() {
+		Some(Ok(records)) => {
+			if let Some(mode) = mode {
+				let mut out = String::from("[");
+				for (i, r) in records.iter().enumerate() {
+					if i > 0 {
+						out.push(',');
 					}
-					out.push(']');
-					print(mode.render(out).as_bytes());
-					print(b"\n");
-					exit();
+					out.push_str(&r.to_json());
 				}
-				for r in &records {
-					print(r.to_text().as_bytes());
+				out.push(']');
+				print(mode.render(out).as_bytes());
+				print(b"\n");
+				exit();
+			}
+			for r in &records {
+				print(r.to_text().as_bytes());
+				print(b"\n");
+			}
+		}
+		Some(Err(_)) => eprint(b"lsdev: this system does not answer the binding query; showing the device table only\n"),
+		None => eprint(b"lsdev: service unavailable\n"),
+	}
+	match client.list() {
+		Some(Ok(entries)) => {
+			if let Some(mode) = mode {
+				let mut out = String::from("[");
+				for (i, e) in entries.iter().enumerate() {
+					if i > 0 {
+						out.push(',');
+					}
+					out.push_str(&e.to_json());
+				}
+				out.push(']');
+				print(mode.render(out).as_bytes());
+				print(b"\n");
+			} else {
+				for e in &entries {
+					print(e.to_text().as_bytes());
 					print(b"\n");
 				}
 			}
-			Some(Err(_)) => eprint(b"lsdev: this system does not answer the binding query; showing the device table only\n"),
-			None => eprint(b"lsdev: service unavailable\n"),
 		}
-		match client.list() {
-			Some(Ok(entries)) => {
-				if let Some(mode) = mode {
-					let mut out = String::from("[");
-					for (i, e) in entries.iter().enumerate() {
-						if i > 0 {
-							out.push(',');
-						}
-						out.push_str(&e.to_json());
-					}
-					out.push(']');
-					print(mode.render(out).as_bytes());
-					print(b"\n");
-				} else {
-					for e in &entries {
-						print(e.to_text().as_bytes());
-						print(b"\n");
-					}
-				}
-			}
-			Some(Err(_)) => eprint(b"lsdev: query error\n"),
-			None => eprint(b"lsdev: service unavailable\n"),
-		}
+		Some(Err(_)) => eprint(b"lsdev: query error\n"),
+		None => eprint(b"lsdev: service unavailable\n"),
 	}
 }
 
@@ -283,87 +277,85 @@ unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 // means DeviceManager is gone. It says so rather than matching a number that named a different
 // device in the boot that wrote it.
 
-unsafe fn stored_incident(config: u64, devsvc: u64, index: u32) {
-	unsafe {
-		if config == 0 {
-			eprint(b"lsdev: the device policy endpoint did not answer, and this boot granted no configuration read to look for the stored copy\n");
-			return;
-		}
-		let mut client = ConfigClient::new(config);
-		// THE ROW NUMBER IS RESOLVED AGAINST THE KERNEL, NOT AGAINST A REMEMBERED LIST.
-		//
-		// `DeviceService` answers the address for that row out of the KERNEL's device table, which is
-		// there whether DeviceManager is or not - so a row number is turned into a device identity by
-		// reading the machine rather than by trusting and re-checking something a dead service wrote.
-		// See `resolved_address`.
-		//
-		// This is what makes `--incident N` answerable on the path where the manager is gone. Listing
-		// everything by address, below, is the fallback for when the service cannot be asked.
-		if let Some(at) = resolved_address(devsvc, index) {
-			let mut key = String::from("device.policy.incident.");
-			key.push_str(&at);
-			match client.get(&key) {
-				Some(Ok(value)) => {
-					print(value.as_bytes());
-					print(b"\n");
-					eprint(b"lsdev: DeviceManager did not answer - this is the persisted copy for the device at that row\n");
-					return;
-				}
-				// The row resolves and has no record: the honest answer, and the same one the live
-				// endpoint gives for a binding that has never failed.
-				Some(Err(_)) | None => {
-					print(b"nothing has gone wrong on this binding\n");
-					eprint(b"lsdev: DeviceManager did not answer - no incident is stored for the device at that row\n");
-					return;
-				}
+fn stored_incident(config: u64, devsvc: u64, index: u32) {
+	if config == 0 {
+		eprint(b"lsdev: the device policy endpoint did not answer, and this boot granted no configuration read to look for the stored copy\n");
+		return;
+	}
+	let mut client = ConfigClient::new(config);
+	// THE ROW NUMBER IS RESOLVED AGAINST THE KERNEL, NOT AGAINST A REMEMBERED LIST.
+	//
+	// `DeviceService` answers the address for that row out of the KERNEL's device table, which is
+	// there whether DeviceManager is or not - so a row number is turned into a device identity by
+	// reading the machine rather than by trusting and re-checking something a dead service wrote.
+	// See `resolved_address`.
+	//
+	// This is what makes `--incident N` answerable on the path where the manager is gone. Listing
+	// everything by address, below, is the fallback for when the service cannot be asked.
+	if let Some(at) = resolved_address(devsvc, index) {
+		let mut key = String::from("device.policy.incident.");
+		key.push_str(&at);
+		match client.get(&key) {
+			Some(Ok(value)) => {
+				print(value.as_bytes());
+				print(b"\n");
+				eprint(b"lsdev: DeviceManager did not answer - this is the persisted copy for the device at that row\n");
+				return;
 			}
-		}
-		// A ROW NUMBER CANNOT BE RESOLVED WITHOUT THE MANAGER, AND THIS PRETENDED IT COULD
-		// (corrected 2026-08-30).
-		//
-		// The record is KEYED by the device's address, which is its identity across boots. It also
-		// carried the row number of the boot that wrote it, and this matched on that - so a record
-		// written when row 3 was the NIC answered a question about row 3 in a boot where that row is
-		// the audio controller, and several old records could match one row. The index is gone from
-		// the record for that reason.
-		//
-		// What is left is honest: this path runs only when DeviceManager is gone, and the row number
-		// is a position in the inventory DeviceManager serves. So the number cannot be turned into a
-		// device here, and rather than guess, this says so and prints every stored incident BY ITS
-		// ADDRESS - which is the durable name the operator can match against `lspci`. Where the
-		// manager is alive the question is answered by index, from the live inventory that gives the
-		// number meaning, and this path is not reached.
-		eprint(
-			b"lsdev: DeviceManager is gone, so a row number cannot be resolved to a device - the stored incidents are listed by the address that identifies them across boots
-",
-		);
-		let _ = index;
-		let mut found = false;
-		match client.list() {
-			Some(Ok(entries)) => {
-				for entry in entries.iter() {
-					// FILTERED HERE, because `list` answers with the whole tree and the incidents
-					// are one prefix of it. An operator asking what went wrong is not asking for
-					// every configuration value this system holds.
-					if !entry.key.starts_with("device.policy.incident.") {
-						continue;
-					}
-					found = true;
-					print(entry.key.as_bytes());
-					print(b"  ");
-					print(entry.value.as_bytes());
-					print(b"\n");
-				}
-			}
-			_ => {
-				eprint(b"lsdev: the device policy endpoint did not answer and the stored copy could not be read either\n");
+			// The row resolves and has no record: the honest answer, and the same one the live
+			// endpoint gives for a binding that has never failed.
+			Some(Err(_)) | None => {
+				print(b"nothing has gone wrong on this binding\n");
+				eprint(b"lsdev: DeviceManager did not answer - no incident is stored for the device at that row\n");
 				return;
 			}
 		}
-		if !found {
-			eprint(b"lsdev: the device policy endpoint did not answer, and no incident is stored for any device\n");
+	}
+	// A ROW NUMBER CANNOT BE RESOLVED WITHOUT THE MANAGER, AND THIS PRETENDED IT COULD
+	// (corrected 2026-08-30).
+	//
+	// The record is KEYED by the device's address, which is its identity across boots. It also
+	// carried the row number of the boot that wrote it, and this matched on that - so a record
+	// written when row 3 was the NIC answered a question about row 3 in a boot where that row is
+	// the audio controller, and several old records could match one row. The index is gone from
+	// the record for that reason.
+	//
+	// What is left is honest: this path runs only when DeviceManager is gone, and the row number
+	// is a position in the inventory DeviceManager serves. So the number cannot be turned into a
+	// device here, and rather than guess, this says so and prints every stored incident BY ITS
+	// ADDRESS - which is the durable name the operator can match against `lspci`. Where the
+	// manager is alive the question is answered by index, from the live inventory that gives the
+	// number meaning, and this path is not reached.
+	eprint(
+		b"lsdev: DeviceManager is gone, so a row number cannot be resolved to a device - the stored incidents are listed by the address that identifies them across boots
+",
+	);
+	let _ = index;
+	let mut found = false;
+	match client.list() {
+		Some(Ok(entries)) => {
+			for entry in entries.iter() {
+				// FILTERED HERE, because `list` answers with the whole tree and the incidents
+				// are one prefix of it. An operator asking what went wrong is not asking for
+				// every configuration value this system holds.
+				if !entry.key.starts_with("device.policy.incident.") {
+					continue;
+				}
+				found = true;
+				print(entry.key.as_bytes());
+				print(b"  ");
+				print(entry.value.as_bytes());
+				print(b"\n");
+			}
+		}
+		_ => {
+			eprint(b"lsdev: the device policy endpoint did not answer and the stored copy could not be read either\n");
 			return;
 		}
-		eprint(b"lsdev: DeviceManager did not answer - the records above are the persisted copies, each keyed by the address of the device it belongs to\n");
 	}
+	if !found {
+		eprint(b"lsdev: the device policy endpoint did not answer, and no incident is stored for any device\n");
+		return;
+	}
+	eprint(b"lsdev: DeviceManager did not answer - the records above are the persisted copies, each keyed by the address of the device it belongs to\n");
 }

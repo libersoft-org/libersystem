@@ -95,35 +95,35 @@ fn a_synchronous_completion_is_accepted_only_for_the_posted_head_within_its_writ
 	// A well-behaved device: one completion, of descriptor 0, 200 of the 513 writable bytes. Each
 	// submission below is one more slot of the used ring, completed by the fake device's thread.
 	let device = ring.complete_later(0, 0, 200);
-	assert_eq!(unsafe { queue.submit_checked(&chain) }, Ok(200));
+	assert_eq!(queue.submit_checked(&chain), Ok(200));
 	device.join().unwrap();
 	assert_eq!(ring.available_index(), 1, "the head was published once");
 	let (phys, len, flags, next) = ring.descriptor(1);
 	assert_eq!((phys, len, flags & DESC_WRITE != 0, flags & DESC_NEXT != 0, next), (0x2000, 512, true, true, 2));
 	// Every device-writable byte, exactly.
 	let device = ring.complete_later(1, 0, 513);
-	assert_eq!(unsafe { queue.submit_checked(&chain) }, Ok(513));
+	assert_eq!(queue.submit_checked(&chain), Ok(513));
 	device.join().unwrap();
 	// One byte more than the chain could take: the device is lying about what it wrote.
 	let device = ring.complete_later(2, 0, 514);
-	assert_eq!(unsafe { queue.submit_checked(&chain) }, Err(UsedFault::Length));
+	assert_eq!(queue.submit_checked(&chain), Err(UsedFault::Length));
 	device.join().unwrap();
 	// The completion names a descriptor that is not the head this path posted.
 	let device = ring.complete_later(3, 1, 16);
-	assert_eq!(unsafe { queue.submit_checked(&chain) }, Err(UsedFault::Id));
+	assert_eq!(queue.submit_checked(&chain), Err(UsedFault::Id));
 	device.join().unwrap();
 	// Two completions for the one chain posted: the device bumps the index twice.
 	ring.set_used_element(4, 0, 16);
 	let device = ring.complete_later(5, 0, 16);
-	assert_eq!(unsafe { queue.submit_checked(&chain) }, Err(UsedFault::Index));
+	assert_eq!(queue.submit_checked(&chain), Err(UsedFault::Index));
 	device.join().unwrap();
 	// A chain the ring cannot hold is refused before anything is written.
-	assert_eq!(unsafe { queue.submit_checked(&[]) }, Err(UsedFault::Chain));
+	assert_eq!(queue.submit_checked(&[]), Err(UsedFault::Chain));
 	let five = [(0u64, 1u32, false); 5];
-	assert_eq!(unsafe { queue.submit_checked(&five) }, Err(UsedFault::Chain));
+	assert_eq!(queue.submit_checked(&five), Err(UsedFault::Chain));
 	// And the wrapper the drivers call keeps its shape: a refusal is `None`.
 	let device = ring.complete_later(6, 3, 16);
-	assert_eq!(unsafe { queue.submit(&chain) }, None);
+	assert_eq!(queue.submit(&chain), None);
 	device.join().unwrap();
 }
 
@@ -132,42 +132,40 @@ fn a_synchronous_completion_is_accepted_only_for_the_posted_head_within_its_writ
 fn the_receive_pool_refuses_what_it_did_not_post_and_what_would_not_fit() {
 	let ring = Ring::new(4);
 	let mut queue = ring.queue();
-	unsafe {
-		queue.post_recv(1, 0x1000, 1500);
-		queue.post_recv(2, 0x2000, 1500);
-	}
-	assert_eq!(unsafe { queue.take_used() }, None, "nothing completed yet");
+	queue.post_recv(1, 0x1000, 1500);
+	queue.post_recv(2, 0x2000, 1500);
+	assert_eq!(queue.take_used(), None, "nothing completed yet");
 	assert_eq!(queue.fault(), None);
 	// The device completes buffer 2 with a frame that fits.
 	ring.set_used_element(0, 2, 60);
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, Some((2, 60)));
-	assert_eq!(unsafe { queue.take_used() }, None);
+	assert_eq!(queue.take_used(), Some((2, 60)));
+	assert_eq!(queue.take_used(), None);
 	// More completions than buffers outstanding: one buffer is left, the index claims three.
 	ring.set_used_index(4);
-	assert_eq!(unsafe { queue.take_used() }, None);
+	assert_eq!(queue.take_used(), None);
 	assert_eq!(queue.fault(), Some(UsedFault::Index));
 	// Back to a plausible index: an id the ring does not have.
 	let mut queue = ring.queue();
-	unsafe { queue.post_recv(3, 0x3000, 1500) };
+	queue.post_recv(3, 0x3000, 1500);
 	ring.set_used_element(0, 7, 60);
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, None);
+	assert_eq!(queue.take_used(), None);
 	assert_eq!(queue.fault(), Some(UsedFault::Id));
 	// A length beyond the buffer that was posted for that id.
 	let mut queue = ring.queue();
-	unsafe { queue.post_recv(3, 0x3000, 1500) };
+	queue.post_recv(3, 0x3000, 1500);
 	ring.set_used_element(0, 3, 1501);
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, None);
+	assert_eq!(queue.take_used(), None);
 	assert_eq!(queue.fault(), Some(UsedFault::Length));
 	// Exactly the buffer: accepted, and the pool count comes down with it.
 	let mut queue = ring.queue();
-	unsafe { queue.post_recv(3, 0x3000, 1500) };
+	queue.post_recv(3, 0x3000, 1500);
 	ring.set_used_element(0, 3, 1500);
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, Some((3, 1500)));
-	assert_eq!(unsafe { queue.take_used() }, None, "and nothing is outstanding to reap");
+	assert_eq!(queue.take_used(), Some((3, 1500)));
+	assert_eq!(queue.take_used(), None, "and nothing is outstanding to reap");
 	assert_eq!(queue.fault(), None);
 }
 
@@ -178,20 +176,20 @@ fn an_asynchronous_submission_is_reaped_within_the_bytes_its_chain_offered() {
 	let ring = Ring::new(4);
 	let mut queue = ring.queue();
 	let chain = [(0x1000u64, 16u32, false), (0x2000u64, 4096u32, true), (0x3000u64, 64u32, true)];
-	assert!(unsafe { queue.submit_async(&chain) });
+	assert!(queue.submit_async(&chain));
 	ring.set_used_element(0, 0, 4160);
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, Some((0, 4160)), "the sum of the two writable links");
+	assert_eq!(queue.take_used(), Some((0, 4160)), "the sum of the two writable links");
 	let mut queue = ring.queue();
-	assert!(unsafe { queue.submit_async(&chain) });
+	assert!(queue.submit_async(&chain));
 	ring.set_used_element(0, 0, 4161);
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, None);
+	assert_eq!(queue.take_used(), None);
 	assert_eq!(queue.fault(), Some(UsedFault::Length));
 	// A chain the ring cannot hold is refused before the count moves.
 	let mut queue = ring.queue();
-	assert!(!unsafe { queue.submit_async(&[]) });
+	assert!(!queue.submit_async(&[]));
 	ring.set_used_index(1);
-	assert_eq!(unsafe { queue.take_used() }, None);
+	assert_eq!(queue.take_used(), None);
 	assert_eq!(queue.fault(), Some(UsedFault::Index), "nothing was posted, so a completion is a completion of nothing");
 }

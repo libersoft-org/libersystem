@@ -13,15 +13,13 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0; 64];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let Some(_) = recv_launch_bytes(bootstrap) else { exit() };
-		let display: u64 = recv_tagged(bootstrap, &mut buf, b"DISPLAY").unwrap_or_else(|| exit());
-		let input: u64 = recv_tagged(bootstrap, &mut buf, b"INPUT_KEYS").unwrap_or_else(|| exit());
-		let audio: u64 = recv_tagged(bootstrap, &mut buf, b"AUDIO_STREAM").unwrap_or_else(|| exit());
-		if display != 0 && input != 0 && audio != 0 {
-			print(b"graphics grants\n");
-		}
+	inherit_stdout(bootstrap);
+	let Some(_) = recv_launch_bytes(bootstrap) else { exit() };
+	let display: u64 = recv_tagged(bootstrap, &mut buf, b"DISPLAY").unwrap_or_else(|| exit());
+	let input: u64 = recv_tagged(bootstrap, &mut buf, b"INPUT_KEYS").unwrap_or_else(|| exit());
+	let audio: u64 = recv_tagged(bootstrap, &mut buf, b"AUDIO_STREAM").unwrap_or_else(|| exit());
+	if display != 0 && input != 0 && audio != 0 {
+		print(b"graphics grants\n");
 	}
 	exit();
 }

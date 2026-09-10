@@ -37,7 +37,7 @@ impl ConsoleWriter {
 impl TerminalWriter for ConsoleWriter {
 	#[inline(always)]
 	fn write(&mut self, bytes: &[u8]) -> bool {
-		self.channel != 0 && unsafe { send_blocking(self.channel, bytes, 0) }
+		self.channel != 0 && send_blocking(self.channel, bytes, 0)
 	}
 }
 
@@ -60,8 +60,8 @@ pub struct VolumeSet {
 impl VolumeSet {
 	/// Receive the fixed-order volume bundle after a tool's argument message.
 	#[inline(always)]
-	pub unsafe fn receive(bootstrap: u64, buffer: &mut [u8]) -> VolumeSet {
-		unsafe { VolumeSet { system: recv_tagged(bootstrap, buffer, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buffer, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buffer, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buffer, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buffer, b"USB").unwrap_or(0), ram: recv_tagged(bootstrap, buffer, b"RAM").unwrap_or(0), tmp: recv_tagged(bootstrap, buffer, b"TMP").unwrap_or(0) } }
+	pub fn receive(bootstrap: u64, buffer: &mut [u8]) -> VolumeSet {
+		VolumeSet { system: recv_tagged(bootstrap, buffer, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buffer, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buffer, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buffer, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buffer, b"USB").unwrap_or(0), ram: recv_tagged(bootstrap, buffer, b"RAM").unwrap_or(0), tmp: recv_tagged(bootstrap, buffer, b"TMP").unwrap_or(0) }
 	}
 
 	/// Route one path argument to its already-granted volume client.
@@ -144,63 +144,61 @@ pub enum ListDirectoryError {
 /// Collect at most `limit` typed directory entries from a granted volume client.
 /// The stream consumer and any unexpected transferred frame handle are closed on every path.
 #[inline(always)]
-pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> Result<Vec<FileInfo>, ListDirectoryError> {
-	unsafe {
-		if storage == 0 {
-			return Err(ListDirectoryError::Unavailable);
-		}
-		let mut client = VolumeClient::new(storage);
-		let consumer = match client.list(path) {
-			Some(Ok(consumer)) => consumer,
-			Some(Err(e)) => return Err(ListDirectoryError::Refused(e)),
-			None => return Err(ListDirectoryError::Unavailable),
-		};
-		let mut entries = Vec::new();
-		loop {
-			let mut frame_handles = proto::codec::Handles::new();
-			match recv_vec_caps_blocking(consumer, &mut frame_handles) {
-				ReceivedVecCaps::Message { bytes } => {
-					// The terminal frame: everything before it was the whole directory.
-					if bytes.is_empty() {
-						close(consumer);
-						return Ok(entries);
-					}
-					let entry = volume::list_read(&bytes, &mut frame_handles);
-					for handle in frame_handles.as_slice() {
-						close(*handle);
-					}
-					// A frame that will not decode ends the listing rather than being dropped from
-					// it: the caller asked what is in a directory and must not be handed a shorter
-					// answer that looks whole.
-					let Some(entry) = entry else {
-						close(consumer);
-						return Err(ListDirectoryError::Malformed);
-					};
-					{
-						if entries.len() == limit {
-							close(consumer);
-							return Err(ListDirectoryError::TooManyEntries);
-						}
-						if entries.try_reserve(1).is_err() {
-							close(consumer);
-							return Err(ListDirectoryError::OutOfMemory);
-						}
-						entries.push(entry);
-					}
+pub fn list_volume_directory(storage: u64, path: &str, limit: usize) -> Result<Vec<FileInfo>, ListDirectoryError> {
+	if storage == 0 {
+		return Err(ListDirectoryError::Unavailable);
+	}
+	let mut client = VolumeClient::new(storage);
+	let consumer = match client.list(path) {
+		Some(Ok(consumer)) => consumer,
+		Some(Err(e)) => return Err(ListDirectoryError::Refused(e)),
+		None => return Err(ListDirectoryError::Unavailable),
+	};
+	let mut entries = Vec::new();
+	loop {
+		let mut frame_handles = proto::codec::Handles::new();
+		match recv_vec_caps_blocking(consumer, &mut frame_handles) {
+			ReceivedVecCaps::Message { bytes } => {
+				// The terminal frame: everything before it was the whole directory.
+				if bytes.is_empty() {
+					close(consumer);
+					return Ok(entries);
 				}
-				// Closed WITHOUT the terminal frame: the producer gave up part way, so what arrived
-				// is a prefix. Returning it as the directory is the defect this marker exists for.
-				ReceivedVecCaps::Closed => {
+				let entry = volume::list_read(&bytes, &mut frame_handles);
+				for handle in frame_handles.as_slice() {
+					close(*handle);
+				}
+				// A frame that will not decode ends the listing rather than being dropped from
+				// it: the caller asked what is in a directory and must not be handed a shorter
+				// answer that looks whole.
+				let Some(entry) = entry else {
 					close(consumer);
 					return Err(ListDirectoryError::Malformed);
+				};
+				{
+					if entries.len() == limit {
+						close(consumer);
+						return Err(ListDirectoryError::TooManyEntries);
+					}
+					if entries.try_reserve(1).is_err() {
+						close(consumer);
+						return Err(ListDirectoryError::OutOfMemory);
+					}
+					entries.push(entry);
 				}
-				// The caller asked for a directory's contents and gets an error instead of a
-				// prefix. `OutOfMemory` already exists for exactly this and is what an abnormal
-				// ending means here.
-				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
-					close(consumer);
-					return Err(ListDirectoryError::OutOfMemory);
-				}
+			}
+			// Closed WITHOUT the terminal frame: the producer gave up part way, so what arrived
+			// is a prefix. Returning it as the directory is the defect this marker exists for.
+			ReceivedVecCaps::Closed => {
+				close(consumer);
+				return Err(ListDirectoryError::Malformed);
+			}
+			// The caller asked for a directory's contents and gets an error instead of a
+			// prefix. `OutOfMemory` already exists for exactly this and is what an abnormal
+			// ending means here.
+			ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+				close(consumer);
+				return Err(ListDirectoryError::OutOfMemory);
 			}
 		}
 	}
@@ -345,7 +343,7 @@ pub enum WalkError {
 /// The visitor is called for EVERY entry, files and directories alike, before the directory is
 /// descended into - so a caller can print a tree as it is discovered rather than after.
 #[inline(always)]
-pub unsafe fn walk<F: FnMut(Visit<'_>) -> Step>(storage: u64, root: &str, max_depth: usize, max_pending: usize, limit: usize, mut visit: F) -> Result<(), WalkError> {
+pub fn walk<F: FnMut(Visit<'_>) -> Step>(storage: u64, root: &str, max_depth: usize, max_pending: usize, limit: usize, mut visit: F) -> Result<(), WalkError> {
 	let mut pending: Vec<(String, usize)> = Vec::new();
 	if pending.try_reserve(1).is_err() {
 		return Err(WalkError::OutOfMemory);
@@ -353,7 +351,7 @@ pub unsafe fn walk<F: FnMut(Visit<'_>) -> Step>(storage: u64, root: &str, max_de
 	pending.push((String::from(root), 0));
 	let mut unreadable = false;
 	while let Some((directory, depth)) = pending.pop() {
-		let entries = match unsafe { list_volume_directory(storage, &directory, limit) } {
+		let entries = match list_volume_directory(storage, &directory, limit) {
 			Ok(entries) => entries,
 			// One directory that cannot be read does not end the walk: a tree with a permission
 			// hole in it is still worth walking, and the hole is reported once at the end.
@@ -533,7 +531,7 @@ impl Source {
 	// the first has one, and that is the whole test - no environment variable, no flag, and
 	// nothing the tool could be lied to about by a caller that cannot forge a capability.
 	#[inline(always)]
-	pub unsafe fn from_stdin() -> Option<Self> {
+	pub fn from_stdin() -> Option<Self> {
 		let input: u64 = rt::stdin();
 		if input == 0 { None } else { Some(Source::Stream(rt::stream::Reader::new(input), Vec::new())) }
 	}
@@ -541,7 +539,7 @@ impl Source {
 	// The next window of input, for the tools that work on windows rather than lines. The ones
 	// that work on lines wrap this same type in `cli::Lines` through the `ChunkSource` impl below.
 	#[inline(always)]
-	pub unsafe fn next(&mut self) -> Window {
+	pub fn next(&mut self) -> Window {
 		use cli::ChunkSource;
 		match self.next_chunk() {
 			Ok(bytes) if bytes.is_empty() => Window::End,
@@ -560,7 +558,7 @@ impl Source {
 	//
 	// Returns false when the input ended before `count` bytes, or failed.
 	#[inline(always)]
-	pub unsafe fn skip(&mut self, count: u64) -> bool {
+	pub fn skip(&mut self, count: u64) -> bool {
 		if count == 0 {
 			return true;
 		}
@@ -572,7 +570,7 @@ impl Source {
 			Source::Stream(..) => {
 				let mut left: u64 = count;
 				while left > 0 {
-					match unsafe { self.next() } {
+					match self.next() {
 						Window::Bytes(bytes) => left = left.saturating_sub(bytes.len() as u64),
 						Window::End | Window::Failed => return false,
 					}
@@ -609,7 +607,7 @@ impl cli::ChunkSource for Source {
 					return Err(cli::ChunkError::OutOfMemory);
 				}
 				held.resize(rt::stream::MAX_CHUNK, 0);
-				match unsafe { reader.read(held) } {
+				match reader.read(held) {
 					rt::stream::Chunk::Data(len) => {
 						held.truncate(len);
 						Ok(held)

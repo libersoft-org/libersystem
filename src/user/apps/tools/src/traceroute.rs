@@ -54,239 +54,235 @@ const PROBE_GAP_TICKS: u64 = 5;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	inherit_stdout(bootstrap);
+	let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
 
-		let mut max_hops = DEFAULT_MAX_HOPS;
-		let mut probes = DEFAULT_PROBES;
-		let mut json: Option<JsonMode> = None;
-		let mut target: Option<&[u8]> = None;
-		let mut expect: Option<u8> = None;
-		for word in split_args(&arguments) {
-			if let Some(which) = expect.take() {
-				let Some(value) = parse_u64(word).filter(|value| *value > 0) else {
-					eprint(b"traceroute: the count is a whole number, at least one\n");
-					exit();
-				};
-				match which {
-					b'm' => max_hops = value.min(HOP_CEILING),
-					_ => probes = value.min(PROBE_CEILING),
-				}
-				continue;
+	let mut max_hops = DEFAULT_MAX_HOPS;
+	let mut probes = DEFAULT_PROBES;
+	let mut json: Option<JsonMode> = None;
+	let mut target: Option<&[u8]> = None;
+	let mut expect: Option<u8> = None;
+	for word in split_args(&arguments) {
+		if let Some(which) = expect.take() {
+			let Some(value) = parse_u64(word).filter(|value| *value > 0) else {
+				eprint(b"traceroute: the count is a whole number, at least one\n");
+				exit();
+			};
+			match which {
+				b'm' => max_hops = value.min(HOP_CEILING),
+				_ => probes = value.min(PROBE_CEILING),
 			}
-			match classify(word) {
-				Arg::Short(b'm') => expect = Some(b'm'),
-				Arg::Short(b'q') => expect = Some(b'q'),
-				Arg::Long(b"max-hops", None) => expect = Some(b'm'),
-				Arg::Long(b"probes", None) => expect = Some(b'q'),
-				Arg::Value(b"json") | Arg::Value(b"json-min") => json = JsonMode::parse(word),
-				Arg::Value(value) if target.is_none() => target = Some(value),
+			continue;
+		}
+		match classify(word) {
+			Arg::Short(b'm') => expect = Some(b'm'),
+			Arg::Short(b'q') => expect = Some(b'q'),
+			Arg::Long(b"max-hops", None) => expect = Some(b'm'),
+			Arg::Long(b"probes", None) => expect = Some(b'q'),
+			Arg::Value(b"json") | Arg::Value(b"json-min") => json = JsonMode::parse(word),
+			Arg::Value(value) if target.is_none() => target = Some(value),
+			_ => {
+				eprint(b"traceroute: usage: traceroute [-m HOPS][-q PROBES] <host> [json]\n");
+				exit();
+			}
+		}
+	}
+	let (Some(target), None) = (target, expect) else {
+		eprint(b"traceroute: usage: traceroute [-m HOPS][-q PROBES] <host> [json]\n");
+		exit();
+	};
+
+	// A NAME OR A NUMBER, resolved the same way `ping` resolves one - through the service's own
+	// DNS, so the tool needs no resolver and no configuration of its own.
+	let mut client = NetworkClient::new(netsvc);
+	let destination: Ipv4Addr = match Ipv4Addr::parse(target) {
+		Some(addr) => addr,
+		None => {
+			let Ok(name) = core::str::from_utf8(target) else {
+				eprint(b"traceroute: the destination is neither an address nor a name\n");
+				exit();
+			};
+			match client.resolve(name) {
+				Some(Ok(addr)) => addr,
 				_ => {
-					eprint(b"traceroute: usage: traceroute [-m HOPS][-q PROBES] <host> [json]\n");
+					eprint(b"traceroute: cannot resolve ");
+					eprint(target);
+					eprint(b"\n");
 					exit();
 				}
 			}
 		}
-		let (Some(target), None) = (target, expect) else {
-			eprint(b"traceroute: usage: traceroute [-m HOPS][-q PROBES] <host> [json]\n");
-			exit();
-		};
-
-		// A NAME OR A NUMBER, resolved the same way `ping` resolves one - through the service's own
-		// DNS, so the tool needs no resolver and no configuration of its own.
-		let mut client = NetworkClient::new(netsvc);
-		let destination: Ipv4Addr = match Ipv4Addr::parse(target) {
-			Some(addr) => addr,
-			None => {
-				let Ok(name) = core::str::from_utf8(target) else {
-					eprint(b"traceroute: the destination is neither an address nor a name\n");
-					exit();
-				};
-				match client.resolve(name) {
-					Some(Ok(addr)) => addr,
-					_ => {
-						eprint(b"traceroute: cannot resolve ");
-						eprint(target);
-						eprint(b"\n");
-						exit();
-					}
-				}
-			}
-		};
-		catch_interrupt();
-		trace(&mut client, &destination, target, max_hops, probes, json);
-		close(netsvc);
-	}
+	};
+	catch_interrupt();
+	trace(&mut client, &destination, target, max_hops, probes, json);
+	close(netsvc);
 	exit();
 }
 
 // Walk the path: one row per TTL, several probes each, stopping at the destination.
-unsafe fn trace(client: &mut NetworkClient, destination: &Ipv4Addr, shown: &[u8], max_hops: u64, probes: u64, json: Option<JsonMode>) {
-	unsafe {
-		let mut document = String::from("{\"target\":");
-		let mut rendered: [u8; 16] = [0u8; 16];
-		let length: usize = destination.render(&mut rendered);
-		json_escape(&String::from_utf8_lossy(shown), &mut document);
-		document.push_str(",\"address\":\"");
-		document.push_str(&String::from_utf8_lossy(&rendered[..length]));
-		document.push_str("\",\"hops\":[");
-		if json.is_none() {
-			print(b"traceroute to ");
-			print(shown);
-			print(b" (");
-			print(&rendered[..length]);
-			print(b"), ");
-			let mut header = String::new();
-			push_decimal(&mut header, max_hops);
-			print(header.as_bytes());
-			print(b" hops max\n");
+fn trace(client: &mut NetworkClient, destination: &Ipv4Addr, shown: &[u8], max_hops: u64, probes: u64, json: Option<JsonMode>) {
+	let mut document = String::from("{\"target\":");
+	let mut rendered: [u8; 16] = [0u8; 16];
+	let length: usize = destination.render(&mut rendered);
+	json_escape(&String::from_utf8_lossy(shown), &mut document);
+	document.push_str(",\"address\":\"");
+	document.push_str(&String::from_utf8_lossy(&rendered[..length]));
+	document.push_str("\",\"hops\":[");
+	if json.is_none() {
+		print(b"traceroute to ");
+		print(shown);
+		print(b" (");
+		print(&rendered[..length]);
+		print(b"), ");
+		let mut header = String::new();
+		push_decimal(&mut header, max_hops);
+		print(header.as_bytes());
+		print(b" hops max\n");
+	}
+	let mut wrote_hop = false;
+	for ttl in 1..=max_hops {
+		if interrupted() {
+			break;
 		}
-		let mut wrote_hop = false;
-		for ttl in 1..=max_hops {
+		// THE ROW IS BUILT FIRST AND PRINTED WHOLE. A row printed piece by piece as the probes
+		// answer would interleave with nothing else here, but it would also mean a trace
+		// interrupted halfway leaves a half-line on the screen.
+		let mut line: Vec<u8> = Vec::new();
+		let mut number = String::new();
+		push_decimal(&mut number, ttl);
+		for _ in number.len()..3 {
+			line.push(b' ');
+		}
+		line.extend_from_slice(number.as_bytes());
+		line.push(b' ');
+		// The address this hop reported, so the row names it once rather than after every
+		// probe - which is what makes three probes of one router read as one hop.
+		let mut named: Option<Ipv4Addr> = None;
+		let mut arrived = false;
+		let mut refused = false;
+		let mut times: Vec<u32> = Vec::new();
+		for probe in 0..probes {
 			if interrupted() {
 				break;
 			}
-			// THE ROW IS BUILT FIRST AND PRINTED WHOLE. A row printed piece by piece as the probes
-			// answer would interleave with nothing else here, but it would also mean a trace
-			// interrupted halfway leaves a half-line on the screen.
-			let mut line: Vec<u8> = Vec::new();
-			let mut number = String::new();
-			push_decimal(&mut number, ttl);
-			for _ in number.len()..3 {
-				line.push(b' ');
+			if probe > 0 {
+				// The pacing: a gap between probes, so an answered hop is not a burst.
+				let deadline = clock() + PROBE_GAP_TICKS;
+				while clock() < deadline {
+					if interrupted() {
+						break;
+					}
+					wait(0, deadline);
+				}
 			}
-			line.extend_from_slice(number.as_bytes());
+			let hop = match client.probe(destination, ttl.min(255) as u8) {
+				Some(Ok(hop)) => hop,
+				// The SERVICE refused or vanished, which is not a property of the path - and
+				// carrying on would turn one broken call into a screen of stars.
+				_ => {
+					eprint(b"traceroute: the network service did not answer\n");
+					return;
+				}
+			};
+			match hop.status {
+				HopStatus::Timeout => times.push(u32::MAX),
+				status => {
+					if named.is_none() {
+						named = Some(hop.addr);
+					}
+					times.push(hop.rtt_us);
+					if matches!(status, HopStatus::Reply) {
+						arrived = true;
+					}
+					if matches!(status, HopStatus::Unreachable) {
+						refused = true;
+					}
+				}
+			}
+		}
+		match &named {
+			Some(addr) => {
+				let length: usize = addr.render(&mut rendered);
+				line.extend_from_slice(&rendered[..length]);
+			}
+			// EVERY PROBE SILENT is the conventional row of stars, and it is not a failure: a
+			// router that does not answer is a router configured not to answer.
+			None => line.extend_from_slice(b"*"),
+		}
+		for time in &times {
 			line.push(b' ');
-			// The address this hop reported, so the row names it once rather than after every
-			// probe - which is what makes three probes of one router read as one hop.
-			let mut named: Option<Ipv4Addr> = None;
-			let mut arrived = false;
-			let mut refused = false;
-			let mut times: Vec<u32> = Vec::new();
-			for probe in 0..probes {
-				if interrupted() {
-					break;
-				}
-				if probe > 0 {
-					// The pacing: a gap between probes, so an answered hop is not a burst.
-					let deadline = clock() + PROBE_GAP_TICKS;
-					while clock() < deadline {
-						if interrupted() {
-							break;
-						}
-						wait(0, deadline);
-					}
-				}
-				let hop = match client.probe(destination, ttl.min(255) as u8) {
-					Some(Ok(hop)) => hop,
-					// The SERVICE refused or vanished, which is not a property of the path - and
-					// carrying on would turn one broken call into a screen of stars.
-					_ => {
-						eprint(b"traceroute: the network service did not answer\n");
-						return;
-					}
-				};
-				match hop.status {
-					HopStatus::Timeout => times.push(u32::MAX),
-					status => {
-						if named.is_none() {
-							named = Some(hop.addr);
-						}
-						times.push(hop.rtt_us);
-						if matches!(status, HopStatus::Reply) {
-							arrived = true;
-						}
-						if matches!(status, HopStatus::Unreachable) {
-							refused = true;
-						}
-					}
-				}
+			if *time == u32::MAX {
+				line.push(b'*');
+				continue;
 			}
+			let mut ms = String::new();
+			push_decimal(&mut ms, (*time / 1000) as u64);
+			ms.push('.');
+			push_decimal(&mut ms, ((*time % 1000) / 100) as u64);
+			line.extend_from_slice(ms.as_bytes());
+			line.extend_from_slice(b"ms");
+		}
+		if refused {
+			line.extend_from_slice(b" !");
+		}
+		line.push(b'\n');
+		if json.is_none() {
+			print(&line);
+		} else {
+			if wrote_hop {
+				document.push(',');
+			}
+			wrote_hop = true;
+			document.push_str("{\"hop\":");
+			push_decimal(&mut document, ttl);
+			document.push_str(",\"address\":");
 			match &named {
 				Some(addr) => {
 					let length: usize = addr.render(&mut rendered);
-					line.extend_from_slice(&rendered[..length]);
+					json_escape(&String::from_utf8_lossy(&rendered[..length]), &mut document);
 				}
-				// EVERY PROBE SILENT is the conventional row of stars, and it is not a failure: a
-				// router that does not answer is a router configured not to answer.
-				None => line.extend_from_slice(b"*"),
+				None => document.push_str("null"),
 			}
-			for time in &times {
-				line.push(b' ');
-				if *time == u32::MAX {
-					line.push(b'*');
-					continue;
-				}
-				let mut ms = String::new();
-				push_decimal(&mut ms, (*time / 1000) as u64);
-				ms.push('.');
-				push_decimal(&mut ms, ((*time % 1000) / 100) as u64);
-				line.extend_from_slice(ms.as_bytes());
-				line.extend_from_slice(b"ms");
-			}
-			if refused {
-				line.extend_from_slice(b" !");
-			}
-			line.push(b'\n');
-			if json.is_none() {
-				print(&line);
+			document.push_str(",\"status\":\"");
+			document.push_str(if arrived {
+				"reply"
+			} else if refused {
+				"unreachable"
+			} else if named.is_some() {
+				"time-exceeded"
 			} else {
-				if wrote_hop {
+				"timeout"
+			});
+			document.push_str("\",\"rtt_us\":[");
+			for (index, time) in times.iter().enumerate() {
+				if index > 0 {
 					document.push(',');
 				}
-				wrote_hop = true;
-				document.push_str("{\"hop\":");
-				push_decimal(&mut document, ttl);
-				document.push_str(",\"address\":");
-				match &named {
-					Some(addr) => {
-						let length: usize = addr.render(&mut rendered);
-						json_escape(&String::from_utf8_lossy(&rendered[..length]), &mut document);
-					}
-					None => document.push_str("null"),
-				}
-				document.push_str(",\"status\":\"");
-				document.push_str(if arrived {
-					"reply"
-				} else if refused {
-					"unreachable"
-				} else if named.is_some() {
-					"time-exceeded"
+				if *time == u32::MAX {
+					document.push_str("null");
 				} else {
-					"timeout"
-				});
-				document.push_str("\",\"rtt_us\":[");
-				for (index, time) in times.iter().enumerate() {
-					if index > 0 {
-						document.push(',');
-					}
-					if *time == u32::MAX {
-						document.push_str("null");
-					} else {
-						push_decimal(&mut document, *time as u64);
-					}
+					push_decimal(&mut document, *time as u64);
 				}
-				document.push_str("]}");
 			}
-			// THE TRACE ENDS WHEN THE DESTINATION ANSWERS, and only then. A refusal is a row and
-			// not an ending: the next hop may well answer, and a tool that stopped at the first
-			// `!` would report a path shorter than the one that exists.
-			if arrived {
-				break;
-			}
-		}
-		if let Some(mode) = json {
 			document.push_str("]}");
-			let out = mode.render(document);
-			print(out.as_bytes());
-			print(b"\n");
 		}
+		// THE TRACE ENDS WHEN THE DESTINATION ANSWERS, and only then. A refusal is a row and
+		// not an ending: the next hop may well answer, and a tool that stopped at the first
+		// `!` would report a path shorter than the one that exists.
+		if arrived {
+			break;
+		}
+	}
+	if let Some(mode) = json {
+		document.push_str("]}");
+		let out = mode.render(document);
+		print(out.as_bytes());
+		print(b"\n");
 	}
 }

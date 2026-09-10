@@ -19,43 +19,41 @@ use rt::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
-		//    output renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" /
-		//    "json-min" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let mode: Option<JsonMode> = JsonMode::parse(argument);
-		let json: bool = mode.is_some();
-		// 3. walk the retained bus scan and render one entry per function.
-		let mut out = String::new();
-		if json {
-			out.push('[');
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our
+	//    output renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" /
+	//    "json-min" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let mode: Option<JsonMode> = JsonMode::parse(argument);
+	let json: bool = mode.is_some();
+	// 3. walk the retained bus scan and render one entry per function.
+	let mut out = String::new();
+	if json {
+		out.push('[');
+	}
+	let mut index: u64 = 0;
+	loop {
+		let mut info = PciInfo::default();
+		if pci_info(index, &mut info) < 0 {
+			break;
 		}
-		let mut index: u64 = 0;
-		loop {
-			let mut info = PciInfo::default();
-			if pci_info(index, &mut info) < 0 {
-				break;
-			}
-			render_function(&mut out, index, &info, json);
-			index += 1;
-		}
-		if let Some(mode) = mode {
-			out.push(']');
-			out = mode.render(out);
-			out.push('\n');
-		}
-		if index == 0 {
-			eprint(b"lspci: query error\n");
-		} else {
-			print(out.as_bytes());
-		}
+		render_function(&mut out, index, &info, json);
+		index += 1;
+	}
+	if let Some(mode) = mode {
+		out.push(']');
+		out = mode.render(out);
+		out.push('\n');
+	}
+	if index == 0 {
+		eprint(b"lspci: query error\n");
+	} else {
+		print(out.as_bytes());
 	}
 	exit();
 }

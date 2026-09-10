@@ -8,6 +8,10 @@
 
 use alloc::vec::Vec;
 
+// The IPv6 host this stack carries for the same link. Sibling module of this one, under the same
+// binary: the two protocols share a NIC and a frame channel and nothing else.
+use super::ipv6_host::Ipv6Host;
+
 // EtherType values (the 2-byte type field of an Ethernet II frame).
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
@@ -429,6 +433,13 @@ pub enum SockEntryState {
 // connections (on the heap - each carries a kilobyte receive buffer, too large for the
 // 16 kB user stack).
 pub struct Stack {
+	// THE IPv6 HOST, CARRIED RATHER THAN THREADED. Every blocking helper in the service pumps frames
+	// through this stack, and an IPv6 frame arriving during a DNS wait must be processed rather than
+	// dropped - which is exactly what M6's seam requires and what threading a second argument
+	// through nine call chains would have made easy to forget in one of them. `None` until the
+	// service stands it up, because forming a link-local address needs a secret and a digest this
+	// module does not own.
+	ipv6: Option<Ipv6Host>,
 	mac: MacAddr,
 	ip: Ipv4Addr,
 	mask: Ipv4Addr,
@@ -454,7 +465,22 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { ipv6: None, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+	}
+
+	// Stand the IPv6 host up on this link.
+	pub fn attach_ipv6(&mut self, host: Ipv6Host) {
+		self.ipv6 = Some(host);
+	}
+
+	// The IPv6 host, if one was attached.
+	pub fn ipv6(&mut self) -> Option<&mut Ipv6Host> {
+		self.ipv6.as_mut()
+	}
+
+	// The IPv6 layer's next deadline, in milliseconds, or None when it has nothing pending.
+	pub fn ipv6_deadline(&self) -> Option<u64> {
+		self.ipv6.as_ref().and_then(|host| host.next_deadline())
 	}
 
 	pub fn mac(&self) -> MacAddr {

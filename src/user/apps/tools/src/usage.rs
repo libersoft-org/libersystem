@@ -22,20 +22,18 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let args: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: a ResourceManager client.
-		let ressvc: u64 = recv_tagged(bootstrap, &mut buf, b"RESOURCE").unwrap_or_else(|| exit());
-		query_resource(ressvc, JsonMode::parse(&args));
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let args: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: a ResourceManager client.
+	let ressvc: u64 = recv_tagged(bootstrap, &mut buf, b"RESOURCE").unwrap_or_else(|| exit());
+	query_resource(ressvc, JsonMode::parse(&args));
 	exit();
 }
 
@@ -43,52 +41,48 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // wire form, one document per budget) or as a compact text table - one line per budget, each
 // resource shown as `kind=used/limit`, with an unlimited limit (u64::MAX, the kernel's
 // UNLIMITED sentinel) shown as `unlimited` rather than the raw number.
-unsafe fn query_resource(ressvc: u64, mode: Option<JsonMode>) {
-	unsafe {
-		let mut client = ResourcesClient::new(ressvc);
-		match client.usage() {
-			Some(Ok(budgets)) => {
-				if let Some(mode) = mode {
-					let mut out = String::from("[");
-					for (i, b) in budgets.iter().enumerate() {
-						if i > 0 {
-							out.push(',');
-						}
-						out.push_str(&b.to_json());
+fn query_resource(ressvc: u64, mode: Option<JsonMode>) {
+	let mut client = ResourcesClient::new(ressvc);
+	match client.usage() {
+		Some(Ok(budgets)) => {
+			if let Some(mode) = mode {
+				let mut out = String::from("[");
+				for (i, b) in budgets.iter().enumerate() {
+					if i > 0 {
+						out.push(',');
 					}
-					out.push(']');
-					print(mode.render(out).as_bytes());
-					print(b"\n");
-				} else {
-					for b in budgets.iter() {
-						print_budget(b);
-					}
+					out.push_str(&b.to_json());
+				}
+				out.push(']');
+				print(mode.render(out).as_bytes());
+				print(b"\n");
+			} else {
+				for b in budgets.iter() {
+					print_budget(b);
 				}
 			}
-			Some(Err(_)) => eprint(b"usage: query error\n"),
-			None => eprint(b"usage: service unavailable\n"),
 		}
+		Some(Err(_)) => eprint(b"usage: query error\n"),
+		None => eprint(b"usage: service unavailable\n"),
 	}
 }
 
 // Render one budget as a compact text line: `<name>: kind=used/limit ...`, with the kernel's
 // UNLIMITED sentinel (u64::MAX) shown as `unlimited`.
-unsafe fn print_budget(budget: &Budget) {
-	unsafe {
-		let mut line = String::new();
-		line.push_str(&budget.name);
-		line.push(':');
-		for u in budget.usage.iter() {
-			line.push(' ');
-			line.push_str(&u.r#type.to_text());
-			line.push('=');
-			push_amount(&mut line, u.used);
-			line.push('/');
-			push_amount(&mut line, u.limit);
-		}
-		line.push('\n');
-		print(line.as_bytes());
+fn print_budget(budget: &Budget) {
+	let mut line = String::new();
+	line.push_str(&budget.name);
+	line.push(':');
+	for u in budget.usage.iter() {
+		line.push(' ');
+		line.push_str(&u.r#type.to_text());
+		line.push('=');
+		push_amount(&mut line, u.used);
+		line.push('/');
+		push_amount(&mut line, u.limit);
 	}
+	line.push('\n');
+	print(line.as_bytes());
 }
 
 // Append a resource amount, rendering the kernel's UNLIMITED sentinel (u64::MAX) as

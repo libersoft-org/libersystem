@@ -41,23 +41,21 @@ enum OutputFormat {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// Governed launch sends arguments first, then the tagged NetworkService grant.
-		inherit_stdout(bootstrap);
-		let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let len: usize = argument.len();
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-		ping(netsvc, &buf[..len]);
-		// Drop our client channel (NetworkService reclaims the slot) and exit; the
-		// kernel closes the bootstrap with the process, which is what a waiting
-		// parent observes.
-		close(netsvc);
-	}
+	// Governed launch sends arguments first, then the tagged NetworkService grant.
+	inherit_stdout(bootstrap);
+	let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let len: usize = argument.len();
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	ping(netsvc, &buf[..len]);
+	// Drop our client channel (NetworkService reclaims the slot) and exit; the
+	// kernel closes the bootstrap with the process, which is what a waiting
+	// parent observes.
+	close(netsvc);
 	exit();
 }
 
@@ -92,176 +90,172 @@ impl Stats {
 
 // Resolve `target` and ping it once per second, printing each reply, until the `-c`
 // count is reached or Ctrl+C is pressed - then print the statistics summary.
-unsafe fn ping(netsvc: u64, args: &[u8]) {
-	unsafe {
-		let (count, format, target): (Option<u32>, OutputFormat, &[u8]) = match parse_args(args) {
-			Some(parsed) => parsed,
-			None => {
-				eprint(b"ping: usage: ping [-c count] [--json] <host>\n");
-				return;
-			}
-		};
-		if target.is_empty() {
+fn ping(netsvc: u64, args: &[u8]) {
+	let (count, format, target): (Option<u32>, OutputFormat, &[u8]) = match parse_args(args) {
+		Some(parsed) => parsed,
+		None => {
 			eprint(b"ping: usage: ping [-c count] [--json] <host>\n");
 			return;
 		}
-		// An unbounded ping never produces its final JSON document, so default to four
-		// probes in JSON mode when no count was given; CLI keeps its infinite default.
-		let count: Option<u32> = match (format, count) {
-			(OutputFormat::Json(_), None) => Some(4),
-			_ => count,
-		};
-		let mut client = NetworkClient::new(netsvc);
-		// Resolve the target: a dotted-decimal address parses directly, otherwise ask
-		// NetworkService to resolve the name over DNS.
-		let addr: Ipv4Addr = match Ipv4Addr::parse(target) {
-			Some(a) => a,
-			None => match core::str::from_utf8(target).ok().and_then(|name: &str| client.resolve(name)) {
-				Some(Ok(a)) => a,
-				_ => {
-					let mut line: String = String::new();
-					line.push_str("ping: cannot resolve ");
-					append_bytes(&mut line, target);
-					line.push_str(": unknown host\n");
-					print(line.as_bytes());
-					return;
-				}
-			},
-		};
-		let mut ip_buf: [u8; 16] = [0u8; 16];
-		let ip_len: usize = addr.render(&mut ip_buf);
-		let ip: &[u8] = &ip_buf[..ip_len];
-		// PING <target> (<ip>) 56(84) bytes of data. (CLI representation only - the JSON
-		// document carries the same target/address in its header fields instead.)
-		if format == OutputFormat::Cli {
-			let mut header: String = String::new();
-			header.push_str("PING ");
-			append_bytes(&mut header, target);
-			header.push_str(" (");
-			append_bytes(&mut header, ip);
-			header.push_str(") 56(84) bytes of data.\n");
-			print(header.as_bytes());
-		}
+	};
+	if target.is_empty() {
+		eprint(b"ping: usage: ping [-c count] [--json] <host>\n");
+		return;
+	}
+	// An unbounded ping never produces its final JSON document, so default to four
+	// probes in JSON mode when no count was given; CLI keeps its infinite default.
+	let count: Option<u32> = match (format, count) {
+		(OutputFormat::Json(_), None) => Some(4),
+		_ => count,
+	};
+	let mut client = NetworkClient::new(netsvc);
+	// Resolve the target: a dotted-decimal address parses directly, otherwise ask
+	// NetworkService to resolve the name over DNS.
+	let addr: Ipv4Addr = match Ipv4Addr::parse(target) {
+		Some(a) => a,
+		None => match core::str::from_utf8(target).ok().and_then(|name: &str| client.resolve(name)) {
+			Some(Ok(a)) => a,
+			_ => {
+				let mut line: String = String::new();
+				line.push_str("ping: cannot resolve ");
+				append_bytes(&mut line, target);
+				line.push_str(": unknown host\n");
+				print(line.as_bytes());
+				return;
+			}
+		},
+	};
+	let mut ip_buf: [u8; 16] = [0u8; 16];
+	let ip_len: usize = addr.render(&mut ip_buf);
+	let ip: &[u8] = &ip_buf[..ip_len];
+	// PING <target> (<ip>) 56(84) bytes of data. (CLI representation only - the JSON
+	// document carries the same target/address in its header fields instead.)
+	if format == OutputFormat::Cli {
+		let mut header: String = String::new();
+		header.push_str("PING ");
+		append_bytes(&mut header, target);
+		header.push_str(" (");
+		append_bytes(&mut header, ip);
+		header.push_str(") 56(84) bytes of data.\n");
+		print(header.as_bytes());
+	}
 
-		// Arm Ctrl+C so we stop cleanly and still emit our output instead of being killed.
-		catch_interrupt();
+	// Arm Ctrl+C so we stop cleanly and still emit our output instead of being killed.
+	catch_interrupt();
 
-		let start_ns: u64 = clock_ns();
-		let mut stats: Stats = Stats::new();
-		let mut attempts: Vec<(u32, PingReply)> = Vec::new();
-		let mut seq: u32 = 0;
-		let mut was_interrupted: bool = false;
-		loop {
-			seq += 1;
-			stats.transmitted += 1;
-			let send_ns: u64 = clock_ns();
-			match client.ping(&addr) {
-				Some(Ok(reply)) => {
-					if reply.status == PingStatus::Reply {
-						stats.add_reply(reply.rtt_us);
-					}
-					match format {
-						// CLI: one line per reply (timeouts are silent losses).
-						OutputFormat::Cli => match reply.status {
-							PingStatus::Reply => {
-								let mut line: String = String::new();
-								line.push_str("64 bytes from ");
-								append_bytes(&mut line, ip);
-								let _ = write!(line, ": icmp_seq={} ttl={} time=", seq, reply.ttl);
-								append_ms2(&mut line, reply.rtt_us);
-								line.push_str(" ms\n");
-								print(line.as_bytes());
-							}
-							PingStatus::Unreachable => {
-								let mut line: String = String::new();
-								line.push_str("From ");
-								append_bytes(&mut line, ip);
-								let _ = write!(line, " icmp_seq={} Destination Host Unreachable\n", seq);
-								print(line.as_bytes());
-							}
-							PingStatus::Timeout => {}
-						},
-						// JSON: collect the wire record for the final document.
-						OutputFormat::Json(_) => attempts.push((seq, reply)),
-					}
+	let start_ns: u64 = clock_ns();
+	let mut stats: Stats = Stats::new();
+	let mut attempts: Vec<(u32, PingReply)> = Vec::new();
+	let mut seq: u32 = 0;
+	let mut was_interrupted: bool = false;
+	loop {
+		seq += 1;
+		stats.transmitted += 1;
+		let send_ns: u64 = clock_ns();
+		match client.ping(&addr) {
+			Some(Ok(reply)) => {
+				if reply.status == PingStatus::Reply {
+					stats.add_reply(reply.rtt_us);
 				}
-				// A service-side error counts as a loss; record it as a timeout in JSON.
-				Some(Err(_)) => {
-					if format != OutputFormat::Cli {
-						attempts.push((seq, PingReply { status: PingStatus::Timeout, ttl: 0, rtt_us: 0 }));
-					}
-				}
-				None => {
-					if format == OutputFormat::Cli {
-						eprint(b"ping: network service unavailable\n");
-					}
-					break;
+				match format {
+					// CLI: one line per reply (timeouts are silent losses).
+					OutputFormat::Cli => match reply.status {
+						PingStatus::Reply => {
+							let mut line: String = String::new();
+							line.push_str("64 bytes from ");
+							append_bytes(&mut line, ip);
+							let _ = write!(line, ": icmp_seq={} ttl={} time=", seq, reply.ttl);
+							append_ms2(&mut line, reply.rtt_us);
+							line.push_str(" ms\n");
+							print(line.as_bytes());
+						}
+						PingStatus::Unreachable => {
+							let mut line: String = String::new();
+							line.push_str("From ");
+							append_bytes(&mut line, ip);
+							let _ = write!(line, " icmp_seq={} Destination Host Unreachable\n", seq);
+							print(line.as_bytes());
+						}
+						PingStatus::Timeout => {}
+					},
+					// JSON: collect the wire record for the final document.
+					OutputFormat::Json(_) => attempts.push((seq, reply)),
 				}
 			}
+			// A service-side error counts as a loss; record it as a timeout in JSON.
+			Some(Err(_)) => {
+				if format != OutputFormat::Cli {
+					attempts.push((seq, PingReply { status: PingStatus::Timeout, ttl: 0, rtt_us: 0 }));
+				}
+			}
+			None => {
+				if format == OutputFormat::Cli {
+					eprint(b"ping: network service unavailable\n");
+				}
+				break;
+			}
+		}
+		if interrupted() {
+			was_interrupted = true;
+			break;
+		}
+		if let Some(c) = count {
+			if seq >= c {
+				break;
+			}
+		}
+		// Sleep until one second after this packet's send time, polling for Ctrl+C
+		// in short steps so the interrupt is noticed promptly.
+		let wake_ns: u64 = send_ns + 1_000_000_000;
+		while clock_ns() < wake_ns {
 			if interrupted() {
 				was_interrupted = true;
 				break;
 			}
-			if let Some(c) = count {
-				if seq >= c {
-					break;
-				}
-			}
-			// Sleep until one second after this packet's send time, polling for Ctrl+C
-			// in short steps so the interrupt is noticed promptly.
-			let wake_ns: u64 = send_ns + 1_000_000_000;
-			while clock_ns() < wake_ns {
-				if interrupted() {
-					was_interrupted = true;
-					break;
-				}
-				wait(netsvc, clock() + 5);
-			}
-			if was_interrupted {
-				break;
-			}
+			wait(netsvc, clock() + 5);
 		}
-		// Render the collected results in the chosen representation.
-		match format {
-			OutputFormat::Cli => print_summary(target, &stats, start_ns, was_interrupted),
-			OutputFormat::Json(mode) => print_json(target, ip, &attempts, &stats, start_ns, mode),
+		if was_interrupted {
+			break;
 		}
+	}
+	// Render the collected results in the chosen representation.
+	match format {
+		OutputFormat::Cli => print_summary(target, &stats, start_ns, was_interrupted),
+		OutputFormat::Json(mode) => print_json(target, ip, &attempts, &stats, start_ns, mode),
 	}
 }
 
 // Print the closing statistics block. A leading blank line separates it from the last reply
 // only when we stopped on the count; on Ctrl+C the console already echoed "^C" on its own line,
 // so none is added.
-unsafe fn print_summary(target: &[u8], stats: &Stats, start_ns: u64, was_interrupted: bool) {
-	unsafe {
-		let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;
-		let lost: u32 = stats.transmitted - stats.received;
-		let loss_pct: u64 = if stats.transmitted > 0 { lost as u64 * 100 / stats.transmitted as u64 } else { 0 };
-		let mut out: String = String::new();
-		if !was_interrupted {
-			out.push('\n');
-		}
-		out.push_str("--- ");
-		append_bytes(&mut out, target);
-		out.push_str(" ping statistics ---\n");
-		let _ = write!(out, "{} packets transmitted, {} received, {}% packet loss, time {}ms\n", stats.transmitted, stats.received, loss_pct, elapsed_ms);
-		if stats.received > 0 {
-			let n: u128 = stats.received as u128;
-			let mean: u128 = stats.sum_us as u128 / n;
-			let variance: u128 = (stats.sum_sq / n).saturating_sub(mean * mean);
-			let mdev_us: u64 = isqrt(variance) as u64;
-			out.push_str("rtt min/avg/max/mdev = ");
-			append_ms3(&mut out, stats.min_us as u64);
-			out.push('/');
-			append_ms3(&mut out, mean as u64);
-			out.push('/');
-			append_ms3(&mut out, stats.max_us as u64);
-			out.push('/');
-			append_ms3(&mut out, mdev_us);
-			out.push_str(" ms\n");
-		}
-		print(out.as_bytes());
+fn print_summary(target: &[u8], stats: &Stats, start_ns: u64, was_interrupted: bool) {
+	let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;
+	let lost: u32 = stats.transmitted - stats.received;
+	let loss_pct: u64 = if stats.transmitted > 0 { lost as u64 * 100 / stats.transmitted as u64 } else { 0 };
+	let mut out: String = String::new();
+	if !was_interrupted {
+		out.push('\n');
 	}
+	out.push_str("--- ");
+	append_bytes(&mut out, target);
+	out.push_str(" ping statistics ---\n");
+	let _ = write!(out, "{} packets transmitted, {} received, {}% packet loss, time {}ms\n", stats.transmitted, stats.received, loss_pct, elapsed_ms);
+	if stats.received > 0 {
+		let n: u128 = stats.received as u128;
+		let mean: u128 = stats.sum_us as u128 / n;
+		let variance: u128 = (stats.sum_sq / n).saturating_sub(mean * mean);
+		let mdev_us: u64 = isqrt(variance) as u64;
+		out.push_str("rtt min/avg/max/mdev = ");
+		append_ms3(&mut out, stats.min_us as u64);
+		out.push('/');
+		append_ms3(&mut out, mean as u64);
+		out.push('/');
+		append_ms3(&mut out, stats.max_us as u64);
+		out.push('/');
+		append_ms3(&mut out, mdev_us);
+		out.push_str(" ms\n");
+	}
+	print(out.as_bytes());
 }
 
 // Render the probe results as one JSON document - the machine-readable representation
@@ -269,42 +263,40 @@ unsafe fn print_summary(target: &[u8], stats: &Stats, start_ns: u64, was_interru
 // with the client-side icmp-seq), so the wire model stays the single source of truth;
 // it is framed with the target, resolved address, and the same statistics the CLI
 // summary reports. Timeouts and lost probes appear as "timeout" replies.
-unsafe fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], stats: &Stats, start_ns: u64, mode: JsonMode) {
-	unsafe {
-		let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;
-		let lost: u32 = stats.transmitted - stats.received;
-		let loss_pct: u64 = if stats.transmitted > 0 { lost as u64 * 100 / stats.transmitted as u64 } else { 0 };
-		let mut out: String = String::new();
-		out.push_str("{\"target\":");
-		json_escape(core::str::from_utf8(target).unwrap_or(""), &mut out);
-		out.push_str(",\"address\":");
-		json_escape(core::str::from_utf8(ip).unwrap_or(""), &mut out);
-		out.push_str(",\"replies\":[");
-		let mut first: bool = true;
-		for (seq, reply) in attempts {
-			if !first {
-				out.push(',');
-			}
-			first = false;
-			// Reuse the wire record's JSON, prepending the client-side sequence number.
-			let _ = write!(out, "{{\"icmp-seq\":{},", seq);
-			out.push_str(&reply.to_json()[1..]);
+fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], stats: &Stats, start_ns: u64, mode: JsonMode) {
+	let elapsed_ms: u64 = clock_ns().saturating_sub(start_ns) / 1_000_000;
+	let lost: u32 = stats.transmitted - stats.received;
+	let loss_pct: u64 = if stats.transmitted > 0 { lost as u64 * 100 / stats.transmitted as u64 } else { 0 };
+	let mut out: String = String::new();
+	out.push_str("{\"target\":");
+	json_escape(core::str::from_utf8(target).unwrap_or(""), &mut out);
+	out.push_str(",\"address\":");
+	json_escape(core::str::from_utf8(ip).unwrap_or(""), &mut out);
+	out.push_str(",\"replies\":[");
+	let mut first: bool = true;
+	for (seq, reply) in attempts {
+		if !first {
+			out.push(',');
 		}
-		out.push_str("],\"statistics\":{");
-		let _ = write!(out, "\"transmitted\":{},\"received\":{},\"packet-loss-pct\":{},\"time-ms\":{},\"rtt\":", stats.transmitted, stats.received, loss_pct, elapsed_ms);
-		if stats.received > 0 {
-			let n: u128 = stats.received as u128;
-			let mean: u128 = stats.sum_us as u128 / n;
-			let variance: u128 = (stats.sum_sq / n).saturating_sub(mean * mean);
-			let mdev_us: u64 = isqrt(variance) as u64;
-			let _ = write!(out, "{{\"min-us\":{},\"avg-us\":{},\"max-us\":{},\"mdev-us\":{}}}", stats.min_us, mean as u64, stats.max_us, mdev_us);
-		} else {
-			out.push_str("null");
-		}
-		out.push_str("}}");
-		print(mode.render(out).as_bytes());
-		print(b"\n");
+		first = false;
+		// Reuse the wire record's JSON, prepending the client-side sequence number.
+		let _ = write!(out, "{{\"icmp-seq\":{},", seq);
+		out.push_str(&reply.to_json()[1..]);
 	}
+	out.push_str("],\"statistics\":{");
+	let _ = write!(out, "\"transmitted\":{},\"received\":{},\"packet-loss-pct\":{},\"time-ms\":{},\"rtt\":", stats.transmitted, stats.received, loss_pct, elapsed_ms);
+	if stats.received > 0 {
+		let n: u128 = stats.received as u128;
+		let mean: u128 = stats.sum_us as u128 / n;
+		let variance: u128 = (stats.sum_sq / n).saturating_sub(mean * mean);
+		let mdev_us: u64 = isqrt(variance) as u64;
+		let _ = write!(out, "{{\"min-us\":{},\"avg-us\":{},\"max-us\":{},\"mdev-us\":{}}}", stats.min_us, mean as u64, stats.max_us, mdev_us);
+	} else {
+		out.push_str("null");
+	}
+	out.push_str("}}");
+	print(mode.render(out).as_bytes());
+	print(b"\n");
 }
 
 // Parse `[-c count] [--json] <host>` (in any order), returning the optional count, the

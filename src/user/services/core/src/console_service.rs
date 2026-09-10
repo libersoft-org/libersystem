@@ -66,9 +66,7 @@ impl Surface for DisplaySurface {
 		let landed = matches!(surface::present(&self.client, Rect { x, y, width: w, height: h }), Some(Ok(())));
 		let want = if landed { PRESENT_OK } else { PRESENT_FAILED };
 		if PRESENTED.load(core::sync::atomic::Ordering::Relaxed) & want == 0 && PRESENTED.fetch_or(want, core::sync::atomic::Ordering::AcqRel) & want == 0 {
-			unsafe {
-				print(if landed { b"ConsoleService: a frame reached the display\n".as_slice() } else { b"ConsoleService: a frame did NOT reach the display\n".as_slice() });
-			}
+			print(if landed { b"ConsoleService: a frame reached the display\n".as_slice() } else { b"ConsoleService: a frame did NOT reach the display\n".as_slice() });
 		}
 		let _ = PRESENT_UNREPORTED;
 	}
@@ -148,13 +146,13 @@ const CLIENT_SEND_TICKS: u64 = 50;
 
 // Deliver bytes the CONSOLE generated to a client - see the rule above. One attempt; a full queue
 // drops it.
-unsafe fn reply_client(client: u64, bytes: &[u8]) -> bool {
-	unsafe { try_send(client, bytes, 0) }
+fn reply_client(client: u64, bytes: &[u8]) -> bool {
+	try_send(client, bytes, 0)
 }
 
 // Deliver bytes the USER produced to a client - see the rule above. Bounded wait, then dropped.
-unsafe fn input_client(client: u64, bytes: &[u8]) -> bool {
-	unsafe { matches!(send_deadline(client, bytes, 0, clock() + CLIENT_SEND_TICKS), SendOutcome::Delivered) }
+fn input_client(client: u64, bytes: &[u8]) -> bool {
+	matches!(send_deadline(client, bytes, 0, clock() + CLIENT_SEND_TICKS), SendOutcome::Delivered)
 }
 
 // The caret blink phase (in 100 Hz ticks): the run loop's periodic wake toggles the
@@ -236,27 +234,25 @@ struct DeadlineTransport {
 
 impl proto::codec::Transport for DeadlineTransport {
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles, _deadline: u64) -> Result<Vec<u8>, proto::codec::TransportError> {
-		unsafe {
-			if !send_caps_blocking(self.chan, request, request_handles) {
-				return Err(proto::codec::TransportError::SendRefused);
+		if !send_caps_blocking(self.chan, request, request_handles) {
+			return Err(proto::codec::TransportError::SendRefused);
+		}
+		// This transport carried its own deadline before the trait could express one; it keeps
+		// its own because it is a fixed service policy rather than a per-call budget, and its
+		// endings are now told apart the way every other transport's are.
+		if wait(self.chan, clock() + self.ticks) != 0 {
+			return Err(proto::codec::TransportError::TimedOut);
+		}
+		let mut reply: [u8; 4096] = [0u8; 4096];
+		// EVERY CAPABILITY THE REPLY CARRIED. This took the first and dropped the rest, which
+		// for a client transport means the schema's second and third out-of-band handles were
+		// destroyed on the way in.
+		match try_recv_caps(self.chan, &mut reply) {
+			PolledCaps::Message { len, handles } => {
+				*reply_handles = handles;
+				Ok(reply[..len].to_vec())
 			}
-			// This transport carried its own deadline before the trait could express one; it keeps
-			// its own because it is a fixed service policy rather than a per-call budget, and its
-			// endings are now told apart the way every other transport's are.
-			if wait(self.chan, clock() + self.ticks) != 0 {
-				return Err(proto::codec::TransportError::TimedOut);
-			}
-			let mut reply: [u8; 4096] = [0u8; 4096];
-			// EVERY CAPABILITY THE REPLY CARRIED. This took the first and dropped the rest, which
-			// for a client transport means the schema's second and third out-of-band handles were
-			// destroyed on the way in.
-			match try_recv_caps(self.chan, &mut reply) {
-				PolledCaps::Message { len, handles } => {
-					*reply_handles = handles;
-					Ok(reply[..len].to_vec())
-				}
-				_ => Err(proto::codec::TransportError::ReceiveFailed),
-			}
+			_ => Err(proto::codec::TransportError::ReceiveFailed),
 		}
 	}
 
@@ -265,7 +261,7 @@ impl proto::codec::Transport for DeadlineTransport {
 	// a default body - a transport whose author forgot this used to compile silently and leak.
 	fn discard_handles(&mut self, handles: &[u64]) {
 		for &handle in handles {
-			unsafe { close(handle) };
+			close(handle);
 		}
 	}
 }
@@ -284,20 +280,18 @@ fn console_sink() -> u64 {
 	CONSOLE_SINK.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-unsafe fn connect_deadline(factory: u64, ticks: u64) -> u64 {
-	unsafe {
-		let req: [u8; 2] = CONNECT_OP.to_le_bytes();
-		if !send_blocking(factory, &req, 0) {
-			return 0;
-		}
-		if wait(factory, clock() + ticks) != 0 {
-			return 0;
-		}
-		let mut buf: [u8; 16] = [0u8; 16];
-		match try_recv(factory, &mut buf) {
-			Polled::Message { handle, .. } if handle != 0 => handle,
-			_ => 0,
-		}
+fn connect_deadline(factory: u64, ticks: u64) -> u64 {
+	let req: [u8; 2] = CONNECT_OP.to_le_bytes();
+	if !send_blocking(factory, &req, 0) {
+		return 0;
+	}
+	if wait(factory, clock() + ticks) != 0 {
+		return 0;
+	}
+	let mut buf: [u8; 16] = [0u8; 16];
+	match try_recv(factory, &mut buf) {
+		Polled::Message { handle, .. } if handle != 0 => handle,
+		_ => 0,
 	}
 }
 
@@ -397,7 +391,7 @@ struct Console {
 // framebuffer (whose writes are visible immediately), a FLUSH to the gpu driver on the
 // virtio-gpu backing carrying just the repainted rectangle. Driven by the surface backend
 // the foreground VT renders onto.
-unsafe fn present_fg(console: &mut Console) {
+fn present_fg(console: &mut Console) {
 	let fg: usize = console.fg;
 	if let Some(t) = console.vts[fg].term.as_mut() {
 		t.present();
@@ -718,90 +712,88 @@ unsafe fn run(console: &mut Console) -> ! {
 // Render a VT's output: append it to that VT's grid, and if it is the foreground VT flush
 // the grid to the framebuffer, ring the visual bell, and mirror the bytes to the serial
 // port.
-unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
-	unsafe {
-		let fg: bool = vi == console.fg;
-		let mut clip_req: Option<Vec<u8>> = None;
-		let mut reply: Vec<u8> = Vec::new();
-		// When a bell rung in this output should stop showing. Recorded rather than waited out;
-		// the run loop takes it down. See `Console::bell_until`.
-		let mut flash_until: u64 = 0;
-		if let Some(t) = console.vts[vi].term.as_mut() {
-			for &b in bytes {
-				t.screen.put_byte(b);
-			}
-			// Pick up an OSC 52 clipboard-set the program emitted in this output.
-			clip_req = t.screen.take_clipboard_set();
-			// AND AN OSC 52 QUERY, which nothing drained.
-			//
-			// The model half was built - `take_clipboard_query` records the selection byte and
-			// `answer_clipboard` writes `OSC 52 ; Pc ; <base64> ST` into the same reply buffer DSR
-			// and DA use - and the milestone item was ticked with a note describing this call. This
-			// call did not exist: `grep clipboard_query` found the model, the model's tests, and the
-			// document. A program sending `OSC 52 ; c ; ?` set a field nobody read.
-			//
-			// FOREGROUND ONLY, and that is the stronger half of the rule rather than a copy of the
-			// SET's. A background program replacing the user's clipboard is a nuisance; a background
-			// program READING it is exfiltration - any component with a terminal could ask for
-			// whatever the user last copied. A background VT is answered with an empty selection,
-			// which is a valid answer meaning "nothing you can have" and tells the program the
-			// exchange completed rather than leaving it waiting.
-			if let Some(selection) = t.screen.take_clipboard_query() {
-				if fg {
-					let held: Vec<u8> = console.clipboard.clone();
-					t.screen.answer_clipboard(selection, &held);
-				} else {
-					t.screen.answer_clipboard(selection, &[]);
-				}
-			}
-			// And anything the terminal owes it in reply to a query - DSR, DA, and the clipboard
-			// answer above. Taken AFTER it, or the answer would wait for the next output.
-			reply = t.screen.take_reply();
-			let bell: bool = t.screen.take_bell();
-			if fg {
-				t.flush();
-				// BEL: invert the foreground screen briefly, then restore. A one-off timed
-				// wait (woken early by a keystroke), not a perpetual re-arm, so it never
-				// stalls the cooperative boot driver.
-				if bell {
-					t.draw_inverted();
-					t.present();
-					flash_until = clock() + BELL_FLASH_TICKS;
-				}
-			}
+fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
+	let fg: bool = vi == console.fg;
+	let mut clip_req: Option<Vec<u8>> = None;
+	let mut reply: Vec<u8> = Vec::new();
+	// When a bell rung in this output should stop showing. Recorded rather than waited out;
+	// the run loop takes it down. See `Console::bell_until`.
+	let mut flash_until: u64 = 0;
+	if let Some(t) = console.vts[vi].term.as_mut() {
+		for &b in bytes {
+			t.screen.put_byte(b);
 		}
-		if flash_until != 0 {
-			console.bell_until = flash_until;
-		}
-		// Adopt an OSC 52 clipboard-set into the console-held clipboard (a program sets
-		// the selection, a later middle-click pastes it) - FROM THE FOREGROUND VT ONLY.
+		// Pick up an OSC 52 clipboard-set the program emitted in this output.
+		clip_req = t.screen.take_clipboard_set();
+		// AND AN OSC 52 QUERY, which nothing drained.
 		//
-		// This was outside the `if fg` guard, so a program on a terminal the user is not looking at
-		// replaced what their next paste would insert. The clipboard is the user's, and the VT they
-		// are watching is the only one they could have meant.
-		if fg && let Some(text) = clip_req {
-			console.clipboard = text;
-		}
-		// Deliver the reply as though the user had typed it: a query's answer arrives on the
-		// program's input, which is where it asked for it.
-		if !reply.is_empty() {
-			let client: u64 = console.vts[vi].client;
-			if client != 0 {
-				// Console-generated: droppable, and never worth stalling every other VT for.
-				reply_client(client, &reply);
+		// The model half was built - `take_clipboard_query` records the selection byte and
+		// `answer_clipboard` writes `OSC 52 ; Pc ; <base64> ST` into the same reply buffer DSR
+		// and DA use - and the milestone item was ticked with a note describing this call. This
+		// call did not exist: `grep clipboard_query` found the model, the model's tests, and the
+		// document. A program sending `OSC 52 ; c ; ?` set a field nobody read.
+		//
+		// FOREGROUND ONLY, and that is the stronger half of the rule rather than a copy of the
+		// SET's. A background program replacing the user's clipboard is a nuisance; a background
+		// program READING it is exfiltration - any component with a terminal could ask for
+		// whatever the user last copied. A background VT is answered with an empty selection,
+		// which is a valid answer meaning "nothing you can have" and tells the program the
+		// exchange completed rather than leaving it waiting.
+		if let Some(selection) = t.screen.take_clipboard_query() {
+			if fg {
+				let held: Vec<u8> = console.clipboard.clone();
+				t.screen.answer_clipboard(selection, &held);
+			} else {
+				t.screen.answer_clipboard(selection, &[]);
 			}
 		}
+		// And anything the terminal owes it in reply to a query - DSR, DA, and the clipboard
+		// answer above. Taken AFTER it, or the answer would wait for the next output.
+		reply = t.screen.take_reply();
+		let bell: bool = t.screen.take_bell();
 		if fg {
-			// Tap the raw output stream (L1) into the serial mirror, alongside the L2 model above;
-			// the session loop drains it after the present, bounded by what the kernel's transmit
-			// ring accepts, so the baud-throttled serial port never delays the display (see `run`).
-			// A backlog past the cap drops its oldest bytes - the newest output is the valuable
-			// part of a debug mirror - and the gap is marked on the next drain. The cap lives in the
-			// sink, which applies it BEFORE allocating; trimming here afterwards let a single large
-			// chunk allocate past the bound first and be cut back only once it was already held.
-			if !console.serial.feed(bytes) {
-				console.serial_gap = true;
+			t.flush();
+			// BEL: invert the foreground screen briefly, then restore. A one-off timed
+			// wait (woken early by a keystroke), not a perpetual re-arm, so it never
+			// stalls the cooperative boot driver.
+			if bell {
+				t.draw_inverted();
+				t.present();
+				flash_until = clock() + BELL_FLASH_TICKS;
 			}
+		}
+	}
+	if flash_until != 0 {
+		console.bell_until = flash_until;
+	}
+	// Adopt an OSC 52 clipboard-set into the console-held clipboard (a program sets
+	// the selection, a later middle-click pastes it) - FROM THE FOREGROUND VT ONLY.
+	//
+	// This was outside the `if fg` guard, so a program on a terminal the user is not looking at
+	// replaced what their next paste would insert. The clipboard is the user's, and the VT they
+	// are watching is the only one they could have meant.
+	if fg && let Some(text) = clip_req {
+		console.clipboard = text;
+	}
+	// Deliver the reply as though the user had typed it: a query's answer arrives on the
+	// program's input, which is where it asked for it.
+	if !reply.is_empty() {
+		let client: u64 = console.vts[vi].client;
+		if client != 0 {
+			// Console-generated: droppable, and never worth stalling every other VT for.
+			reply_client(client, &reply);
+		}
+	}
+	if fg {
+		// Tap the raw output stream (L1) into the serial mirror, alongside the L2 model above;
+		// the session loop drains it after the present, bounded by what the kernel's transmit
+		// ring accepts, so the baud-throttled serial port never delays the display (see `run`).
+		// A backlog past the cap drops its oldest bytes - the newest output is the valuable
+		// part of a debug mirror - and the gap is marked on the next drain. The cap lives in the
+		// sink, which applies it BEFORE allocating; trimming here afterwards let a single large
+		// chunk allocate past the bound first and be cut back only once it was already held.
+		if !console.serial.feed(bytes) {
+			console.serial_gap = true;
 		}
 	}
 }
@@ -811,21 +803,19 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 // the caret-blink tick bounds the wait between drains) - so a burst is paced to the
 // wire instead of truncated, and this thread never blocks on the baud-paced UART. A
 // marked gap (dropped backlog) is announced ahead of the remaining stream, best-effort.
-unsafe fn drain_serial(console: &mut Console) {
-	unsafe {
-		if console.serial.is_empty() {
-			return;
-		}
-		if console.serial_gap {
-			debug_write(SERIAL_GAP_MARKER);
-			console.serial_gap = false;
-		}
-		loop {
-			let accepted: usize = debug_write(console.serial.as_bytes());
-			console.serial.consume(accepted);
-			if accepted == 0 || console.serial.is_empty() {
-				break;
-			}
+fn drain_serial(console: &mut Console) {
+	if console.serial.is_empty() {
+		return;
+	}
+	if console.serial_gap {
+		debug_write(SERIAL_GAP_MARKER);
+		console.serial_gap = false;
+	}
+	loop {
+		let accepted: usize = debug_write(console.serial.as_bytes());
+		console.serial.consume(accepted);
+		if accepted == 0 || console.serial.is_empty() {
+			break;
 		}
 	}
 }
@@ -834,33 +824,31 @@ unsafe fn drain_serial(console: &mut Console) {
 // shell); otherwise the foreground VT's line discipline handles the byte - cooking it
 // into the line editor and delivering a whole line on Enter, or (in raw mode) passing it
 // straight through to the shell.
-unsafe fn handle_keys(console: &mut Console, keys: &[u8], serial_input: bool) {
-	unsafe {
-		if !console.display_focused && !serial_input {
-			return;
-		}
-		for &b in keys {
-			if b == CHORD_NEW {
-				create_vt(console);
-			} else if b == CHORD_NEXT {
-				switch_next(console);
-			} else if b == CHORD_SCROLL_UP {
-				scroll_fg(console, true);
-			} else if b == CHORD_SCROLL_DOWN {
-				scroll_fg(console, false);
-			} else if b == CHORD_COPY {
-				// Ctrl+Shift+C / Ctrl+Insert: copy the current selection to the clipboard.
-				copy_selection(console);
-			} else if b == CHORD_PASTE {
-				// Ctrl+Shift+V / Shift+Insert: paste the clipboard into the foreground shell.
-				let fg: usize = console.fg;
-				let bracketed: bool = console.vts[fg].term.as_ref().is_some_and(|t| t.screen.bracketed_paste());
-				paste_clipboard(console, bracketed);
-			} else {
-				// any other keystroke returns the foreground VT to its live screen first.
-				snap_fg_live(console);
-				feed_key(console, b);
-			}
+fn handle_keys(console: &mut Console, keys: &[u8], serial_input: bool) {
+	if !console.display_focused && !serial_input {
+		return;
+	}
+	for &b in keys {
+		if b == CHORD_NEW {
+			create_vt(console);
+		} else if b == CHORD_NEXT {
+			switch_next(console);
+		} else if b == CHORD_SCROLL_UP {
+			scroll_fg(console, true);
+		} else if b == CHORD_SCROLL_DOWN {
+			scroll_fg(console, false);
+		} else if b == CHORD_COPY {
+			// Ctrl+Shift+C / Ctrl+Insert: copy the current selection to the clipboard.
+			copy_selection(console);
+		} else if b == CHORD_PASTE {
+			// Ctrl+Shift+V / Shift+Insert: paste the clipboard into the foreground shell.
+			let fg: usize = console.fg;
+			let bracketed: bool = console.vts[fg].term.as_ref().is_some_and(|t| t.screen.bracketed_paste());
+			paste_clipboard(console, bracketed);
+		} else {
+			// any other keystroke returns the foreground VT to its live screen first.
+			snap_fg_live(console);
+			feed_key(console, b);
 		}
 	}
 }
@@ -868,7 +856,7 @@ unsafe fn handle_keys(console: &mut Console, keys: &[u8], serial_input: bool) {
 // Copy the foreground VT's current mouse selection to the console clipboard (right-click
 // or the Ctrl+Shift+C / Ctrl+Insert chord), then clear the selection; a no-op when
 // nothing is selected.
-unsafe fn copy_selection(console: &mut Console) {
+fn copy_selection(console: &mut Console) {
 	let fg: usize = console.fg;
 	let text: Vec<u8> = match console.vts[fg].term.as_ref() {
 		Some(t) => t.screen.selection_text(),
@@ -880,19 +868,17 @@ unsafe fn copy_selection(console: &mut Console) {
 			t.screen.selection_clear();
 			t.flush();
 		}
-		unsafe { present_fg(console) };
+		present_fg(console);
 	}
 }
 
 // Feed one keystroke to the foreground VT. In cooked mode the line discipline edits +
 // echoes it and, on Enter, ships the whole line (plus newline) to the shell; in raw mode
 // the byte passes straight through.
-unsafe fn feed_key(console: &mut Console, b: u8) {
-	unsafe {
-		let vocab: Vec<Vec<u8>> = completion_vocab(console, b);
-		let fg: usize = console.fg;
-		feed_tty(&mut console.vts[fg], b, &vocab);
-	}
+fn feed_key(console: &mut Console, b: u8) {
+	let vocab: Vec<Vec<u8>> = completion_vocab(console, b);
+	let fg: usize = console.fg;
+	feed_tty(&mut console.vts[fg], b, &vocab);
 }
 
 // The Tab-completion vocabulary for the segment under the cursor. On the command word (the
@@ -902,49 +888,45 @@ unsafe fn feed_key(console: &mut Console, b: u8) {
 // VT's cwd and listed fresh each time (a directory's contents vary), with a trailing '/' on
 // the sub-directories so the line discipline can keep a directory open for its sub-path. Any
 // key other than Tab answers an empty list without any IPC.
-unsafe fn completion_vocab(console: &mut Console, b: u8) -> Vec<Vec<u8>> {
-	unsafe {
-		if b != b'\t' {
-			return Vec::new();
-		}
-		let fg: usize = console.fg;
-		let vt: &Vt = &console.vts[fg];
-		let line: &[u8] = &vt.ld.line[..vt.ld.len];
-		// The token under the cursor is the run back to the last space; the command word
-		// (no space before it) completes over the runnable programs, a later token over a
-		// directory's entries.
-		let tok_start: usize = line.iter().rposition(|&c: &u8| c == b' ').map_or(0, |p: usize| p + 1);
-		if tok_start == 0 {
-			return command_vocab(console);
-		}
-		path_vocab(console, fg, tok_start)
+fn completion_vocab(console: &mut Console, b: u8) -> Vec<Vec<u8>> {
+	if b != b'\t' {
+		return Vec::new();
 	}
+	let fg: usize = console.fg;
+	let vt: &Vt = &console.vts[fg];
+	let line: &[u8] = &vt.ld.line[..vt.ld.len];
+	// The token under the cursor is the run back to the last space; the command word
+	// (no space before it) completes over the runnable programs, a later token over a
+	// directory's entries.
+	let tok_start: usize = line.iter().rposition(|&c: &u8| c == b' ').map_or(0, |p: usize| p + 1);
+	if tok_start == 0 {
+		return command_vocab(console);
+	}
+	path_vocab(console, fg, tok_start)
 }
 
 // The command-word vocabulary: the shell builtins plus the system volume's bin/ listing,
 // cached for the session (the bin/ set is seeded at format time and static per boot), so the
 // input path pays this IPC round-trip once.
-unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
-	unsafe {
-		if console.vocab.is_none() {
-			let mut names: Vec<Vec<u8>> = Vec::new();
-			if let Some(storage) = service_connect(console.facs.storage) {
-				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
-				if let Some(Ok(consumer)) = client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
-					// Completion again: fewer names, no false claim.
-					names = drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
-				}
-				close(storage);
+fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
+	if console.vocab.is_none() {
+		let mut names: Vec<Vec<u8>> = Vec::new();
+		if let Some(storage) = service_connect(console.facs.storage) {
+			let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
+			if let Some(Ok(consumer)) = client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
+				// Completion again: fewer names, no false claim.
+				names = drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
 			}
-			for &builtin in commands::BUILTINS {
-				names.push(builtin.as_bytes().to_vec());
-			}
-			names.sort();
-			names.dedup();
-			console.vocab = Some(names);
+			close(storage);
 		}
-		console.vocab.clone().unwrap_or_default()
+		for &builtin in commands::BUILTINS {
+			names.push(builtin.as_bytes().to_vec());
+		}
+		names.sort();
+		names.dedup();
+		console.vocab = Some(names);
 	}
+	console.vocab.clone().unwrap_or_default()
 }
 
 // The path-argument vocabulary for a later token: resolve the directory the partial path
@@ -953,39 +935,37 @@ unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
 // the line discipline keeps it open for the sub-path. The line discipline filters these by
 // the trailing path segment, exactly as it filters the command word. Only the system volume
 // is offered (ConsoleService holds only its storage client); any other volume answers empty.
-unsafe fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<Vec<u8>> {
-	unsafe {
-		let vt: &Vt = &console.vts[fg];
-		let line_len: usize = vt.ld.len;
-		let token: Vec<u8> = vt.ld.line[tok_start..line_len].to_vec();
-		let cwd: String = vt.cwd.clone();
-		let dir_arg: &[u8] = match token.iter().rposition(|&c: &u8| c == b'/') {
-			Some(s) => &token[..s],
-			None => b"",
-		};
-		let target: String = match storage_proto::path::resolve(&cwd, dir_arg) {
-			Some(t) => t,
-			None => return Vec::new(),
-		};
-		if target != "vol://system" && !target.starts_with("vol://system/") {
-			return Vec::new();
-		}
-		let mut names: Vec<Vec<u8>> = Vec::new();
-		if let Some(storage) = service_connect(console.facs.storage) {
-			let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
-			if let Some(Ok(consumer)) = client.list(&target) {
-				for f in drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default() {
-					let mut name: Vec<u8> = f.name.into_bytes();
-					if f.r#type == proto::system::FileType::Dir {
-						name.push(b'/');
-					}
-					names.push(name);
-				}
-			}
-			close(storage);
-		}
-		names
+fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<Vec<u8>> {
+	let vt: &Vt = &console.vts[fg];
+	let line_len: usize = vt.ld.len;
+	let token: Vec<u8> = vt.ld.line[tok_start..line_len].to_vec();
+	let cwd: String = vt.cwd.clone();
+	let dir_arg: &[u8] = match token.iter().rposition(|&c: &u8| c == b'/') {
+		Some(s) => &token[..s],
+		None => b"",
+	};
+	let target: String = match storage_proto::path::resolve(&cwd, dir_arg) {
+		Some(t) => t,
+		None => return Vec::new(),
+	};
+	if target != "vol://system" && !target.starts_with("vol://system/") {
+		return Vec::new();
 	}
+	let mut names: Vec<Vec<u8>> = Vec::new();
+	if let Some(storage) = service_connect(console.facs.storage) {
+		let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
+		if let Some(Ok(consumer)) = client.list(&target) {
+			for f in drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default() {
+				let mut name: Vec<u8> = f.name.into_bytes();
+				if f.r#type == proto::system::FileType::Dir {
+					name.push(b'/');
+				}
+				names.push(name);
+			}
+		}
+		close(storage);
+	}
+	names
 }
 
 // Feed one input byte to a terminal's line discipline - shared by the foreground display
@@ -995,97 +975,95 @@ unsafe fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<
 // goes wherever the terminal's master is: a display VT mirrors it to the serial port (and
 // renders live into its grid), a PTY sends it back out its master channel so the host
 // (e.g. a remote terminal over ssh) sees what was typed.
-unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
-	unsafe {
-		let client: u64 = vt.client;
-		// A foreground job owns the tty: the signal keys become signals to it (the tty's
-		// ISIG behaviour) and are consumed here. Every other byte flows on through the line
-		// discipline below to the job's stdin, so an interactive foreground tool reads its
-		// input edited + echoed exactly as the shell reads keystrokes at its prompt.
-		if let Some(proc) = vt.fg_proc {
-			match b {
-				0x03 => {
-					// Ctrl+C: interrupt. The job terminates, its completion channel closes,
-					// and the shell's run_foreground returns to the prompt.
-					signal(proc, SIG_INT);
-					tty_echo(vt, b"^C\n");
-					return;
-				}
-				0x1a => {
-					// Ctrl+Z: suspend the job and tell the shell to background it. Clear
-					// fg_proc so a second Ctrl+Z is not double-reported before CLEAR_FG.
-					signal(proc, SIG_STOP);
-					send_blocking(vt.control, b"JOB_STOPPED", 0);
-					tty_echo(vt, b"^Z\n");
-					if let Some(p) = vt.fg_proc.take() {
-						close(p);
-					}
-					return;
-				}
-				0x1c => {
-					// Ctrl+\: terminate.
-					signal(proc, SIG_TERM);
-					tty_echo(vt, b"^\\\n");
-					return;
-				}
-				_ => {} // any other byte: fall through to the line discipline (the job's stdin)
+fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
+	let client: u64 = vt.client;
+	// A foreground job owns the tty: the signal keys become signals to it (the tty's
+	// ISIG behaviour) and are consumed here. Every other byte flows on through the line
+	// discipline below to the job's stdin, so an interactive foreground tool reads its
+	// input edited + echoed exactly as the shell reads keystrokes at its prompt.
+	if let Some(proc) = vt.fg_proc {
+		match b {
+			0x03 => {
+				// Ctrl+C: interrupt. The job terminates, its completion channel closes,
+				// and the shell's run_foreground returns to the prompt.
+				signal(proc, SIG_INT);
+				tty_echo(vt, b"^C\n");
+				return;
 			}
-		}
-		if !vt.ld.cooked {
-			input_client(client, &[b]);
-			return;
-		}
-		let submitted: bool;
-		let ser: EchoBuf;
-		{
-			let mut echo: Echo = Echo { term: vt.term.as_mut(), ser: EchoBuf::new() };
-			submitted = vt.ld.feed(b, vocab, &mut echo);
-			if let Some(t) = echo.term {
-				t.flush();
-			}
-			ser = echo.ser;
-		}
-		// Deliver the echoed bytes: to the serial mirror for a display VT, to the master
-		// channel for a PTY (its term, if any, was already rendered above).
-		if vt.master == 0 {
-			print(ser.as_slice());
-		} else {
-			// The same bound the slave-output path has, and for the same reason: a host that
-			// stopped draining its terminal must not hold the multiplexing loop. Dropping the echo
-			// past the bound is the lesser harm - the PTY itself is torn down by the output path,
-			// which is the one that sees the stall first and holds the index to act on it.
-			let _ = send_deadline(vt.master, ser.as_slice(), 0, clock() + CLIENT_SEND_TICKS);
-		}
-		if submitted {
-			if vt.ld.relist {
-				// A double Tab found several completions: hand the unfinished line to the
-				// program marked with a leading tab (a cooked line can never contain one),
-				// so it prints the matches and re-draws the prompt. The buffer is NOT
-				// committed - the operator keeps typing right where they were. Only the
-				// prompt owner gets the marker; a foreground job's stdin never sees it.
-				vt.ld.relist = false;
-				if vt.fg_proc.is_none() {
-					let n: usize = vt.ld.len;
-					let mut out: Vec<u8> = Vec::with_capacity(n + 1);
-					out.push(b'\t');
-					out.extend_from_slice(&vt.ld.line[..n]);
-					input_client(client, &out);
+			0x1a => {
+				// Ctrl+Z: suspend the job and tell the shell to background it. Clear
+				// fg_proc so a second Ctrl+Z is not double-reported before CLEAR_FG.
+				signal(proc, SIG_STOP);
+				send_blocking(vt.control, b"JOB_STOPPED", 0);
+				tty_echo(vt, b"^Z\n");
+				if let Some(p) = vt.fg_proc.take() {
+					close(p);
 				}
-			} else if vt.ld.eof {
-				// Ctrl+D on an empty line: deliver a zero-byte read (EOF) so the shell
-				// logs out, the way a tty signals end-of-input.
-				vt.ld.commit();
-				input_client(client, &[]);
-			} else {
+				return;
+			}
+			0x1c => {
+				// Ctrl+\: terminate.
+				signal(proc, SIG_TERM);
+				tty_echo(vt, b"^\\\n");
+				return;
+			}
+			_ => {} // any other byte: fall through to the line discipline (the job's stdin)
+		}
+	}
+	if !vt.ld.cooked {
+		input_client(client, &[b]);
+		return;
+	}
+	let submitted: bool;
+	let ser: EchoBuf;
+	{
+		let mut echo: Echo = Echo { term: vt.term.as_mut(), ser: EchoBuf::new() };
+		submitted = vt.ld.feed(b, vocab, &mut echo);
+		if let Some(t) = echo.term {
+			t.flush();
+		}
+		ser = echo.ser;
+	}
+	// Deliver the echoed bytes: to the serial mirror for a display VT, to the master
+	// channel for a PTY (its term, if any, was already rendered above).
+	if vt.master == 0 {
+		print(ser.as_slice());
+	} else {
+		// The same bound the slave-output path has, and for the same reason: a host that
+		// stopped draining its terminal must not hold the multiplexing loop. Dropping the echo
+		// past the bound is the lesser harm - the PTY itself is torn down by the output path,
+		// which is the one that sees the stall first and holds the index to act on it.
+		let _ = send_deadline(vt.master, ser.as_slice(), 0, clock() + CLIENT_SEND_TICKS);
+	}
+	if submitted {
+		if vt.ld.relist {
+			// A double Tab found several completions: hand the unfinished line to the
+			// program marked with a leading tab (a cooked line can never contain one),
+			// so it prints the matches and re-draws the prompt. The buffer is NOT
+			// committed - the operator keeps typing right where they were. Only the
+			// prompt owner gets the marker; a foreground job's stdin never sees it.
+			vt.ld.relist = false;
+			if vt.fg_proc.is_none() {
 				let n: usize = vt.ld.len;
-				// build the line + newline on the heap: up to LD_LINE_MAX + 1 (4 kB),
-				// too big for this service's stack.
 				let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+				out.push(b'\t');
 				out.extend_from_slice(&vt.ld.line[..n]);
-				out.push(b'\n');
-				vt.ld.commit();
 				input_client(client, &out);
 			}
+		} else if vt.ld.eof {
+			// Ctrl+D on an empty line: deliver a zero-byte read (EOF) so the shell
+			// logs out, the way a tty signals end-of-input.
+			vt.ld.commit();
+			input_client(client, &[]);
+		} else {
+			let n: usize = vt.ld.len;
+			// build the line + newline on the heap: up to LD_LINE_MAX + 1 (4 kB),
+			// too big for this service's stack.
+			let mut out: Vec<u8> = Vec::with_capacity(n + 1);
+			out.extend_from_slice(&vt.ld.line[..n]);
+			out.push(b'\n');
+			vt.ld.commit();
+			input_client(client, &out);
 		}
 	}
 }
@@ -1094,19 +1072,17 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
 // grid and flush (a display VT), then send it on to the master - the serial port for a
 // display VT, the host's master channel for a PTY - the way the line discipline echoes an
 // edit. Only called for the foreground display VT or an active PTY.
-unsafe fn tty_echo(vt: &mut Vt, msg: &[u8]) {
-	unsafe {
-		if let Some(t) = vt.term.as_mut() {
-			for &c in msg {
-				t.screen.put_byte(c);
-			}
-			t.flush();
+fn tty_echo(vt: &mut Vt, msg: &[u8]) {
+	if let Some(t) = vt.term.as_mut() {
+		for &c in msg {
+			t.screen.put_byte(c);
 		}
-		if vt.master == 0 {
-			print(msg);
-		} else {
-			let _ = send_deadline(vt.master, msg, 0, clock() + CLIENT_SEND_TICKS);
-		}
+		t.flush();
+	}
+	if vt.master == 0 {
+		print(msg);
+	} else {
+		let _ = send_deadline(vt.master, msg, 0, clock() + CLIENT_SEND_TICKS);
 	}
 }
 
@@ -1116,49 +1092,47 @@ unsafe fn tty_echo(vt: &mut Vt, msg: &[u8]) {
 // asks the tty to host a program on a new pseudo-terminal (for the `script` tool, a future
 // ssh) and replies the master channel. The shell's end closing is driven by the data
 // channel, so here a close just tears the VT down too.
-unsafe fn handle_control(console: &mut Console, vi: usize) {
-	unsafe {
-		let mut cbuf: [u8; 256] = [0u8; 256];
-		match recv_blocking(console.vts[vi].control, &mut cbuf) {
-			Received::Message { len, handle } => {
-				let msg: &[u8] = &cbuf[..len];
-				if tty_fg_winsize(&mut console.vts[vi], msg, handle) {
-					// SET_FG / CLEAR_FG / GET_WINSIZE handled identically for VTs and PTYs.
-				} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
-					// Resize this VT's terminal to the requested cols x rows.
-					let cols = u16::from_le_bytes([msg[11], msg[12]]) as usize;
-					let rows = u16::from_le_bytes([msg[13], msg[14]]) as usize;
-					resize_vt(console, vi, cols, rows);
-				} else if let Some(path) = msg.strip_prefix(b"SET_CWD") {
-					// The shell reports its working directory (on startup and after `cd`), so
-					// argument Tab completion can resolve a relative path against it.
-					if let Ok(s) = core::str::from_utf8(path) {
-						console.vts[vi].cwd.clear();
-						console.vts[vi].cwd.push_str(s);
-					}
-				} else if msg.starts_with(b"PTY_OPEN") {
-					// `PTY_OPEN` + a program name: open a pty hosting that program and reply
-					// the master channel (the host's data side) to the shell.
-					let mut nbuf: [u8; 32] = [0u8; 32];
-					let name: &[u8] = if len > 8 { &cbuf[8..len] } else { b"shell" };
-					let nn: usize = name.len().min(nbuf.len());
-					nbuf[..nn].copy_from_slice(&name[..nn]);
-					let control: u64 = console.vts[vi].control;
-					match open_pty(console, &nbuf[..nn]) {
-						Some(master) => {
-							send_blocking(control, b"PTY", master);
-						}
-						None => {
-							send_blocking(control, b"PTY_FAIL", 0);
-						}
-					}
-				} else if handle != 0 {
-					// an unexpected transferred handle would otherwise leak.
-					close(handle);
+fn handle_control(console: &mut Console, vi: usize) {
+	let mut cbuf: [u8; 256] = [0u8; 256];
+	match recv_blocking(console.vts[vi].control, &mut cbuf) {
+		Received::Message { len, handle } => {
+			let msg: &[u8] = &cbuf[..len];
+			if tty_fg_winsize(&mut console.vts[vi], msg, handle) {
+				// SET_FG / CLEAR_FG / GET_WINSIZE handled identically for VTs and PTYs.
+			} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
+				// Resize this VT's terminal to the requested cols x rows.
+				let cols = u16::from_le_bytes([msg[11], msg[12]]) as usize;
+				let rows = u16::from_le_bytes([msg[13], msg[14]]) as usize;
+				resize_vt(console, vi, cols, rows);
+			} else if let Some(path) = msg.strip_prefix(b"SET_CWD") {
+				// The shell reports its working directory (on startup and after `cd`), so
+				// argument Tab completion can resolve a relative path against it.
+				if let Ok(s) = core::str::from_utf8(path) {
+					console.vts[vi].cwd.clear();
+					console.vts[vi].cwd.push_str(s);
 				}
+			} else if msg.starts_with(b"PTY_OPEN") {
+				// `PTY_OPEN` + a program name: open a pty hosting that program and reply
+				// the master channel (the host's data side) to the shell.
+				let mut nbuf: [u8; 32] = [0u8; 32];
+				let name: &[u8] = if len > 8 { &cbuf[8..len] } else { b"shell" };
+				let nn: usize = name.len().min(nbuf.len());
+				nbuf[..nn].copy_from_slice(&name[..nn]);
+				let control: u64 = console.vts[vi].control;
+				match open_pty(console, &nbuf[..nn]) {
+					Some(master) => {
+						send_blocking(control, b"PTY", master);
+					}
+					None => {
+						send_blocking(control, b"PTY_FAIL", 0);
+					}
+				}
+			} else if handle != 0 {
+				// an unexpected transferred handle would otherwise leak.
+				close(handle);
 			}
-			Received::Closed => close_vt(console, vi),
 		}
+		Received::Closed => close_vt(console, vi),
 	}
 }
 
@@ -1166,22 +1140,20 @@ unsafe fn handle_control(console: &mut Console, vi: usize) {
 // same SET_FG / CLEAR_FG / GET_WINSIZE / SET_WINSIZE link as a VT (so signals and winsize
 // work over a pty exactly as over the display), but a PTY has no display to repaint and a
 // close tears the pty down rather than the session.
-unsafe fn handle_pty_control(console: &mut Console, pj: usize) {
-	unsafe {
-		let mut cbuf: [u8; 64] = [0u8; 64];
-		match recv_blocking(console.ptys[pj].control, &mut cbuf) {
-			Received::Message { len, handle } => {
-				let msg: &[u8] = &cbuf[..len];
-				if tty_fg_winsize(&mut console.ptys[pj], msg, handle) {
-					// handled
-				} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
-					tty_resize_pty(&mut console.ptys[pj]);
-				} else if handle != 0 {
-					close(handle);
-				}
+fn handle_pty_control(console: &mut Console, pj: usize) {
+	let mut cbuf: [u8; 64] = [0u8; 64];
+	match recv_blocking(console.ptys[pj].control, &mut cbuf) {
+		Received::Message { len, handle } => {
+			let msg: &[u8] = &cbuf[..len];
+			if tty_fg_winsize(&mut console.ptys[pj], msg, handle) {
+				// handled
+			} else if msg.starts_with(b"SET_WINSIZE") && len >= 15 {
+				tty_resize_pty(&mut console.ptys[pj]);
+			} else if handle != 0 {
+				close(handle);
 			}
-			Received::Closed => close_pty(console, pj),
 		}
+		Received::Closed => close_pty(console, pj),
 	}
 }
 
@@ -1189,37 +1161,35 @@ unsafe fn handle_pty_control(console: &mut Console, pj: usize) {
 // VT and a program PTY (they touch only the terminal's own foreground job and size).
 // Returns true if `msg` was one of them; false otherwise, so the caller handles the rest
 // (SET_WINSIZE, which repaints differently between a VT and a PTY, plus a VT's PTY_OPEN).
-unsafe fn tty_fg_winsize(vt: &mut Vt, msg: &[u8], handle: u64) -> bool {
-	unsafe {
-		if msg.starts_with(b"SET_FG") && handle != 0 {
-			if let Some(old) = vt.fg_proc.replace(handle) {
-				close(old);
-			}
-		} else if msg.starts_with(b"CLEAR_FG") {
-			if let Some(p) = vt.fg_proc.take() {
-				close(p);
-			}
-		} else if msg.starts_with(b"SET_MODE") && msg.len() >= 10 {
-			// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED.
-			//
-			// `ESC[?9001h` / `ESC[?9002l` in the OUTPUT stream used to do this, so `cat` on a file
-			// containing those bytes reconfigured the terminal - a program's data and a program's
-			// request were the same bytes, and no filter on a byte stream can tell them apart.
-			// This arrives on the VT's control channel, which the shell hands only to an
-			// interactive foreground job, so having it IS the authority to ask.
-			//
-			// It touches this terminal's own line discipline and nothing else, which is why it
-			// belongs beside SET_FG rather than in the paths that repaint or resize.
-			vt.ld.cooked = msg[8] == 0;
-			vt.ld.echo = msg[9] != 0;
-		} else if msg.starts_with(b"GET_WINSIZE") {
-			let (rows, cols) = tty_dims(vt);
-			send_winsize(vt.control, b"WINSIZE", rows, cols);
-		} else {
-			return false;
+fn tty_fg_winsize(vt: &mut Vt, msg: &[u8], handle: u64) -> bool {
+	if msg.starts_with(b"SET_FG") && handle != 0 {
+		if let Some(old) = vt.fg_proc.replace(handle) {
+			close(old);
 		}
-		true
+	} else if msg.starts_with(b"CLEAR_FG") {
+		if let Some(p) = vt.fg_proc.take() {
+			close(p);
+		}
+	} else if msg.starts_with(b"SET_MODE") && msg.len() >= 10 {
+		// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED.
+		//
+		// `ESC[?9001h` / `ESC[?9002l` in the OUTPUT stream used to do this, so `cat` on a file
+		// containing those bytes reconfigured the terminal - a program's data and a program's
+		// request were the same bytes, and no filter on a byte stream can tell them apart.
+		// This arrives on the VT's control channel, which the shell hands only to an
+		// interactive foreground job, so having it IS the authority to ask.
+		//
+		// It touches this terminal's own line discipline and nothing else, which is why it
+		// belongs beside SET_FG rather than in the paths that repaint or resize.
+		vt.ld.cooked = msg[8] == 0;
+		vt.ld.echo = msg[9] != 0;
+	} else if msg.starts_with(b"GET_WINSIZE") {
+		let (rows, cols) = tty_dims(vt);
+		send_winsize(vt.control, b"WINSIZE", rows, cols);
+	} else {
+		return false;
 	}
+	true
 }
 
 // A fixed default size for a program-hosted PTY (the host owns a pty's size; the slave only
@@ -1238,42 +1208,36 @@ fn tty_dims(vt: &Vt) -> (u16, u16) {
 }
 
 // Send a winsize-bearing control reply: [tag][rows u16 LE][cols u16 LE].
-unsafe fn send_winsize(control: u64, tag: &[u8], rows: u16, cols: u16) {
-	unsafe {
-		let mut r: [u8; 16] = [0u8; 16];
-		let n = tag.len();
-		r[..n].copy_from_slice(tag);
-		r[n..n + 2].copy_from_slice(&rows.to_le_bytes());
-		r[n + 2..n + 4].copy_from_slice(&cols.to_le_bytes());
-		send_blocking(control, &r[..n + 4], 0);
-	}
+fn send_winsize(control: u64, tag: &[u8], rows: u16, cols: u16) {
+	let mut r: [u8; 16] = [0u8; 16];
+	let n = tag.len();
+	r[..n].copy_from_slice(tag);
+	r[n..n + 2].copy_from_slice(&rows.to_le_bytes());
+	r[n + 2..n + 4].copy_from_slice(&cols.to_le_bytes());
+	send_blocking(control, &r[..n + 4], 0);
 }
 
 // Resize VT vi's terminal to cols x rows, repainting it if it is foreground, then send a
 // RESIZE event (the SIGWINCH equivalent) back to its program with the actual (clamped)
 // size so it can re-query and redraw.
-unsafe fn resize_vt(console: &mut Console, vi: usize, cols: usize, rows: usize) {
-	unsafe {
-		let fg: bool = vi == console.fg;
-		if let Some(t) = console.vts[vi].term.as_mut() {
-			t.resize(cols, rows);
-			if fg {
-				t.flush();
-			}
+fn resize_vt(console: &mut Console, vi: usize, cols: usize, rows: usize) {
+	let fg: bool = vi == console.fg;
+	if let Some(t) = console.vts[vi].term.as_mut() {
+		t.resize(cols, rows);
+		if fg {
+			t.flush();
 		}
-		let (rows, cols) = tty_dims(&console.vts[vi]);
-		send_winsize(console.vts[vi].control, b"RESIZE", rows, cols);
 	}
+	let (rows, cols) = tty_dims(&console.vts[vi]);
+	send_winsize(console.vts[vi].control, b"RESIZE", rows, cols);
 }
 
 // Acknowledge a slave program's SET_WINSIZE on a program-hosted PTY: a pty has no display
 // to mode-set and its size is host-owned (fixed), so just reply RESIZE with the current
 // size so the slave can re-query and redraw.
-unsafe fn tty_resize_pty(vt: &mut Vt) {
-	unsafe {
-		let (rows, cols) = tty_dims(vt);
-		send_winsize(vt.control, b"RESIZE", rows, cols);
-	}
+fn tty_resize_pty(vt: &mut Vt) {
+	let (rows, cols) = tty_dims(vt);
+	send_winsize(vt.control, b"RESIZE", rows, cols);
 }
 
 // Forward a PTY slave program's output bytes straight out to the host over the master
@@ -1288,83 +1252,77 @@ unsafe fn tty_resize_pty(vt: &mut Vt) {
 //
 // Returns false when the PTY should be closed; the caller owns the teardown, because it holds the
 // index and closing underneath a borrow is how the pool gets corrupted.
-unsafe fn pty_output(console: &mut Console, pj: usize, bytes: &[u8]) -> bool {
-	unsafe { !matches!(send_deadline(console.ptys[pj].master, bytes, 0, clock() + CLIENT_SEND_TICKS), SendOutcome::Stalled) }
+fn pty_output(console: &mut Console, pj: usize, bytes: &[u8]) -> bool {
+	!matches!(send_deadline(console.ptys[pj].master, bytes, 0, clock() + CLIENT_SEND_TICKS), SendOutcome::Stalled)
 }
 
 // Feed bytes the host wrote on a PTY's master channel through that PTY's line discipline
 // (the typed-keys side): cooked editing + echo back out the master, delivering whole lines
 // to the slave program - exactly as the keyboard drives a display VT.
-unsafe fn pty_master_input(console: &mut Console, pj: usize, bytes: &[u8]) {
-	unsafe {
-		for &b in bytes {
-			let vocab: Vec<Vec<u8>> = completion_vocab(console, b);
-			feed_tty(&mut console.ptys[pj], b, &vocab);
-		}
+fn pty_master_input(console: &mut Console, pj: usize, bytes: &[u8]) {
+	for &b in bytes {
+		let vocab: Vec<Vec<u8>> = completion_vocab(console, b);
+		feed_tty(&mut console.ptys[pj], b, &vocab);
 	}
 }
 
 // A program-hosted PTY ended: its slave program exited (its console channel closed) or the
 // host dropped the master. Close all its channels and remove it from the pool.
-unsafe fn close_pty(console: &mut Console, pj: usize) {
-	unsafe {
-		close(console.ptys[pj].client);
-		close(console.ptys[pj].control);
-		close(console.ptys[pj].master);
-		if let Some(p) = console.ptys[pj].fg_proc.take() {
-			close(p);
-		}
-		console.ptys.remove(pj);
+fn close_pty(console: &mut Console, pj: usize) {
+	close(console.ptys[pj].client);
+	close(console.ptys[pj].control);
+	close(console.ptys[pj].master);
+	if let Some(p) = console.ptys[pj].fg_proc.take() {
+		close(p);
 	}
+	console.ptys.remove(pj);
 }
 
 // Reacquire the native logical surface after a DisplayService resize event. The new
 // MemoryObject is mapped before any VT swaps raster; the old mapping stays alive until
 // all VTs point at the replacement.
-unsafe fn handle_display_resize(console: &mut Console) {
-	unsafe {
-		let mut frame: [u8; 32] = [0u8; 32];
-		// The multi-capability receive, because a frame carries what its element type declares.
-		let (len, mut frame_handles) = match recv_caps_blocking(console.display_events, &mut frame) {
-			ReceivedCaps::Message { len, handles } => (len, handles),
-			ReceivedCaps::Closed => {
-				console.display_events = 0;
-				return;
-			}
-		};
-		// The read spends the list of everything the event adopted, so what is left is what nothing
-		// owns - closed on both paths rather than only on the failure one, which is what the old
-		// `&Handles` signature made this loop decide for itself.
-		let decoded = surface::read_event(&frame[..len], &mut frame_handles);
-		for handle in frame_handles.as_slice() {
-			close(*handle);
-		}
-		if decoded.is_none() {
+fn handle_display_resize(console: &mut Console) {
+	let mut frame: [u8; 32] = [0u8; 32];
+	// The multi-capability receive, because a frame carries what its element type declares.
+	let (len, mut frame_handles) = match recv_caps_blocking(console.display_events, &mut frame) {
+		ReceivedCaps::Message { len, handles } => (len, handles),
+		ReceivedCaps::Closed => {
+			console.display_events = 0;
 			return;
 		}
-		let Some(new_surface) = surface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
-			return;
-		};
-		let new_addr: u64 = new_surface.addr();
-		let new_fb: Framebuffer = new_surface.framebuffer();
-		let old_surface: Option<Mapping> = console.surface.replace(new_surface);
-		console.addr = new_addr;
-		console.fb = new_fb;
-		console.cur_w = new_fb.width;
-		console.cur_h = new_fb.height;
-		console.has_fb = true;
-		let cols: usize = new_fb.width as usize / CELL_W;
-		let rows: usize = new_fb.height as usize / CELL_H;
-		let client: DisplayClient = console.display.clone();
-		let n: usize = console.vts.len();
-		for vi in 0..n {
-			if let (Some(t), Some(surface)) = (console.vts[vi].term.as_mut(), make_surface(new_addr, &new_fb, &client)) {
-				t.set_surface(surface);
-			}
-			resize_vt(console, vi, cols, rows);
-		}
-		drop(old_surface);
+	};
+	// The read spends the list of everything the event adopted, so what is left is what nothing
+	// owns - closed on both paths rather than only on the failure one, which is what the old
+	// `&Handles` signature made this loop decide for itself.
+	let decoded = surface::read_event(&frame[..len], &mut frame_handles);
+	for handle in frame_handles.as_slice() {
+		close(*handle);
 	}
+	if decoded.is_none() {
+		return;
+	}
+	let Some(new_surface) = surface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
+		return;
+	};
+	let new_addr: u64 = new_surface.addr();
+	let new_fb: Framebuffer = new_surface.framebuffer();
+	let old_surface: Option<Mapping> = console.surface.replace(new_surface);
+	console.addr = new_addr;
+	console.fb = new_fb;
+	console.cur_w = new_fb.width;
+	console.cur_h = new_fb.height;
+	console.has_fb = true;
+	let cols: usize = new_fb.width as usize / CELL_W;
+	let rows: usize = new_fb.height as usize / CELL_H;
+	let client: DisplayClient = console.display.clone();
+	let n: usize = console.vts.len();
+	for vi in 0..n {
+		if let (Some(t), Some(surface)) = (console.vts[vi].term.as_mut(), make_surface(new_addr, &new_fb, &client)) {
+			t.set_surface(surface);
+		}
+		resize_vt(console, vi, cols, rows);
+	}
+	drop(old_surface);
 }
 
 // Toggle the foreground VT's caret blink phase, presenting only when a pixel actually
@@ -1383,22 +1341,20 @@ fn blink_fg(console: &mut Console) {
 // Open a new virtual terminal: spawn a fully-capable shell over its own per-VT service
 // connections, make it foreground, and repaint. A no-op when headless; the VT set grows
 // on demand (a VT's cost is its grid, paid only when opened) - never a fixed cap.
-unsafe fn create_vt(console: &mut Console) {
-	unsafe {
-		if !console.has_fb {
-			return;
-		}
-		let broker: u64 = console.broker;
-		if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, &console.fb, &console.display, console.cur_w, console.cur_h) {
-			console.vts.push(vt);
-			console.fg = console.vts.len() - 1;
-			repaint(console);
-		}
+fn create_vt(console: &mut Console) {
+	if !console.has_fb {
+		return;
+	}
+	let broker: u64 = console.broker;
+	if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, &console.fb, &console.display, console.cur_w, console.cur_h) {
+		console.vts.push(vt);
+		console.fg = console.vts.len() - 1;
+		repaint(console);
 	}
 }
 
 // Cycle the foreground to the next VT (round-robin) and repaint it. A no-op with one VT.
-unsafe fn switch_next(console: &mut Console) {
+fn switch_next(console: &mut Console) {
 	if console.vts.len() <= 1 {
 		return;
 	}
@@ -1435,98 +1391,96 @@ fn snap_fg_live(console: &mut Console) {
 // console drives it natively: the wheel pages the scrollback, click-drag selects a range
 // (copied to the clipboard on release), and middle-click pastes the clipboard (bracketed
 // when the program asked for ?2004).
-unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
-	unsafe {
-		if msg.len() == 9 && &msg[..8] == b"KEYFOCUS" {
-			console.display_focused = msg[8] != 0;
-			return;
-		}
-		if !console.display_focused {
-			return;
-		}
-		if msg.len() < 6 {
-			return;
-		}
-		let fg: usize = console.fg;
-		let x: u32 = u16::from_le_bytes([msg[0], msg[1]]) as u32;
-		let y: u32 = u16::from_le_bytes([msg[2], msg[3]]) as u32;
-		let buttons: u8 = msg[4];
-		let wheel: i8 = msg[5] as i8;
-		let prev: u8 = console.ptr_buttons;
-		console.ptr_buttons = buttons;
-		// The foreground VT's grid geometry and its mouse / paste modes.
-		let (cols, rows, tracking, sgr, motion, anymotion, bracket): (usize, usize, bool, bool, bool, bool, bool) = match console.vts[fg].term.as_ref() {
-			Some(t) => (t.screen.cols(), t.screen.rows(), t.screen.mouse_tracking(), t.screen.mouse_sgr(), t.screen.mouse_report_motion(), t.screen.mouse_any_motion(), t.screen.bracketed_paste()),
-			None => return,
-		};
-		if cols == 0 || rows == 0 {
-			return;
-		}
-		// Map the normalized 0..0x10000 position onto the 0-based viewport cell grid.
-		let col: usize = ((x as usize * cols) / 0x1_0000).min(cols - 1);
-		let row: usize = ((y as usize * rows) / 0x1_0000).min(rows - 1);
-		if tracking {
-			// A program owns the mouse: hide the console's own text cursor while it does.
-			if let Some(t) = console.vts[fg].term.as_mut() {
-				if t.screen.set_mouse(None) {
-					t.flush();
-				}
-			}
-			present_fg(console);
-			pointer_report(console, fg, col, row, buttons, prev, wheel, sgr, motion, anymotion);
-			return;
-		}
-		// Native console handling: no program is tracking the mouse. Track the text mouse cursor
-		// (an inverted block on the cell under the pointer) and drive the wheel / selection.
-		let left_now: bool = buttons & 1 != 0;
-		let left_was: bool = prev & 1 != 0;
-		let mid_now: bool = buttons & 4 != 0;
-		let mid_was: bool = prev & 4 != 0;
-		let right_now: bool = buttons & 2 != 0;
-		let right_was: bool = prev & 2 != 0;
+fn handle_pointer(console: &mut Console, msg: &[u8]) {
+	if msg.len() == 9 && &msg[..8] == b"KEYFOCUS" {
+		console.display_focused = msg[8] != 0;
+		return;
+	}
+	if !console.display_focused {
+		return;
+	}
+	if msg.len() < 6 {
+		return;
+	}
+	let fg: usize = console.fg;
+	let x: u32 = u16::from_le_bytes([msg[0], msg[1]]) as u32;
+	let y: u32 = u16::from_le_bytes([msg[2], msg[3]]) as u32;
+	let buttons: u8 = msg[4];
+	let wheel: i8 = msg[5] as i8;
+	let prev: u8 = console.ptr_buttons;
+	console.ptr_buttons = buttons;
+	// The foreground VT's grid geometry and its mouse / paste modes.
+	let (cols, rows, tracking, sgr, motion, anymotion, bracket): (usize, usize, bool, bool, bool, bool, bool) = match console.vts[fg].term.as_ref() {
+		Some(t) => (t.screen.cols(), t.screen.rows(), t.screen.mouse_tracking(), t.screen.mouse_sgr(), t.screen.mouse_report_motion(), t.screen.mouse_any_motion(), t.screen.bracketed_paste()),
+		None => return,
+	};
+	if cols == 0 || rows == 0 {
+		return;
+	}
+	// Map the normalized 0..0x10000 position onto the 0-based viewport cell grid.
+	let col: usize = ((x as usize * cols) / 0x1_0000).min(cols - 1);
+	let row: usize = ((y as usize * rows) / 0x1_0000).min(rows - 1);
+	if tracking {
+		// A program owns the mouse: hide the console's own text cursor while it does.
 		if let Some(t) = console.vts[fg].term.as_mut() {
-			t.screen.set_mouse(Some((col, row)));
-			if wheel != 0 {
-				// Route the wheel to the scrollback view (three lines per notch).
-				if wheel > 0 {
-					t.screen.scroll_view_up_by(3);
-				} else {
-					t.screen.scroll_view_down_by(3);
-				}
-			} else if left_now && !left_was {
-				// Press: anchor a fresh selection at the cell under the pointer.
-				t.screen.selection_begin(col, row);
-			} else if left_now && left_was {
-				// Drag: extend the selection to the cell under the pointer.
-				t.screen.selection_extend(col, row);
+			if t.screen.set_mouse(None) {
+				t.flush();
 			}
-			t.flush();
 		}
 		present_fg(console);
-		if !left_now && left_was {
-			// Release: keep the selection highlighted so it can be copied explicitly
-			// (right-click or Ctrl+Shift+C / Ctrl+Insert). Selecting alone does NOT copy.
-			// A bare click with nothing selected clears the transient highlight.
-			let text: Vec<u8> = match console.vts[fg].term.as_ref() {
-				Some(t) => t.screen.selection_text(),
-				None => Vec::new(),
-			};
-			if text.is_empty() {
-				if let Some(t) = console.vts[fg].term.as_mut() {
-					t.screen.selection_clear();
-					t.flush();
-				}
-				present_fg(console);
+		pointer_report(console, fg, col, row, buttons, prev, wheel, sgr, motion, anymotion);
+		return;
+	}
+	// Native console handling: no program is tracking the mouse. Track the text mouse cursor
+	// (an inverted block on the cell under the pointer) and drive the wheel / selection.
+	let left_now: bool = buttons & 1 != 0;
+	let left_was: bool = prev & 1 != 0;
+	let mid_now: bool = buttons & 4 != 0;
+	let mid_was: bool = prev & 4 != 0;
+	let right_now: bool = buttons & 2 != 0;
+	let right_was: bool = prev & 2 != 0;
+	if let Some(t) = console.vts[fg].term.as_mut() {
+		t.screen.set_mouse(Some((col, row)));
+		if wheel != 0 {
+			// Route the wheel to the scrollback view (three lines per notch).
+			if wheel > 0 {
+				t.screen.scroll_view_up_by(3);
+			} else {
+				t.screen.scroll_view_down_by(3);
 			}
+		} else if left_now && !left_was {
+			// Press: anchor a fresh selection at the cell under the pointer.
+			t.screen.selection_begin(col, row);
+		} else if left_now && left_was {
+			// Drag: extend the selection to the cell under the pointer.
+			t.screen.selection_extend(col, row);
 		}
-		if mid_now && !mid_was {
-			// Middle-click: paste the clipboard (bracketed when the program asked for ?2004).
-			paste_clipboard(console, bracket);
+		t.flush();
+	}
+	present_fg(console);
+	if !left_now && left_was {
+		// Release: keep the selection highlighted so it can be copied explicitly
+		// (right-click or Ctrl+Shift+C / Ctrl+Insert). Selecting alone does NOT copy.
+		// A bare click with nothing selected clears the transient highlight.
+		let text: Vec<u8> = match console.vts[fg].term.as_ref() {
+			Some(t) => t.screen.selection_text(),
+			None => Vec::new(),
+		};
+		if text.is_empty() {
+			if let Some(t) = console.vts[fg].term.as_mut() {
+				t.screen.selection_clear();
+				t.flush();
+			}
+			present_fg(console);
 		}
-		if right_now && !right_was {
-			// Right-click: copy the current selection to the clipboard (select-then-right-click).
-			copy_selection(console);
-		}
+	}
+	if mid_now && !mid_was {
+		// Middle-click: paste the clipboard (bracketed when the program asked for ?2004).
+		paste_clipboard(console, bracket);
+	}
+	if right_now && !right_was {
+		// Right-click: copy the current selection to the clipboard (select-then-right-click).
+		copy_selection(console);
 	}
 }
 
@@ -1537,47 +1491,45 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 // (down); a drag (button held) reports under ?1002 and any bare motion under ?1003 (Cb + 32).
 // Reports are console-generated, so they follow the client-write rule at `CLIENT_SEND_TICKS`: one
 // attempt, and a program that is not draining its input drops them rather than stalling the loop.
-unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usize, buttons: u8, prev: u8, wheel: i8, sgr: bool, motion: bool, anymotion: bool) {
-	unsafe {
-		// `?1000` WITHOUT `?1006` IS ANSWERED, in the legacy X10/normal encoding.
-		//
-		// This opened with `if !sgr { return; }`, so a program that enabled the standard tracking
-		// mode and not the SGR extension received no mouse events at all - the terminal accepted
-		// the mode and then reported nothing, which is the worst of the three possible answers. A
-		// program that is refused can fall back; one that is silently ignored cannot tell.
-		let client: u64 = console.vts[fg].client;
-		let cx: usize = col + 1;
-		let cy: usize = row + 1;
-		if wheel != 0 {
-			let cb: usize = if wheel > 0 { 64 } else { 65 };
-			send_report(client, cb, cx, cy, true, sgr);
-			return;
+fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usize, buttons: u8, prev: u8, wheel: i8, sgr: bool, motion: bool, anymotion: bool) {
+	// `?1000` WITHOUT `?1006` IS ANSWERED, in the legacy X10/normal encoding.
+	//
+	// This opened with `if !sgr { return; }`, so a program that enabled the standard tracking
+	// mode and not the SGR extension received no mouse events at all - the terminal accepted
+	// the mode and then reported nothing, which is the worst of the three possible answers. A
+	// program that is refused can fall back; one that is silently ignored cannot tell.
+	let client: u64 = console.vts[fg].client;
+	let cx: usize = col + 1;
+	let cy: usize = row + 1;
+	if wheel != 0 {
+		let cb: usize = if wheel > 0 { 64 } else { 65 };
+		send_report(client, cb, cx, cy, true, sgr);
+		return;
+	}
+	// Button edges (bit 0 left -> Cb 0, bit 1 right -> Cb 2, bit 2 middle -> Cb 1).
+	for &(bit, code) in &[(1u8, 0usize), (4u8, 1usize), (2u8, 2usize)] {
+		let now: bool = buttons & bit != 0;
+		let was: bool = prev & bit != 0;
+		if now && !was {
+			send_report(client, code, cx, cy, true, sgr);
+		} else if !now && was {
+			send_report(client, code, cx, cy, false, sgr);
 		}
-		// Button edges (bit 0 left -> Cb 0, bit 1 right -> Cb 2, bit 2 middle -> Cb 1).
-		for &(bit, code) in &[(1u8, 0usize), (4u8, 1usize), (2u8, 2usize)] {
-			let now: bool = buttons & bit != 0;
-			let was: bool = prev & bit != 0;
-			if now && !was {
-				send_report(client, code, cx, cy, true, sgr);
-			} else if !now && was {
-				send_report(client, code, cx, cy, false, sgr);
-			}
-		}
-		// Motion (no button change this event): a drag under ?1002, any motion under ?1003.
-		if buttons == prev {
-			let any_button: bool = buttons & 0b111 != 0;
-			if (motion && any_button) || anymotion {
-				let base: usize = if buttons & 1 != 0 {
-					0
-				} else if buttons & 4 != 0 {
-					1
-				} else if buttons & 2 != 0 {
-					2
-				} else {
-					3
-				};
-				send_report(client, 32 + base, cx, cy, true, sgr);
-			}
+	}
+	// Motion (no button change this event): a drag under ?1002, any motion under ?1003.
+	if buttons == prev {
+		let any_button: bool = buttons & 0b111 != 0;
+		if (motion && any_button) || anymotion {
+			let base: usize = if buttons & 1 != 0 {
+				0
+			} else if buttons & 4 != 0 {
+				1
+			} else if buttons & 2 != 0 {
+				2
+			} else {
+				3
+			};
+			send_report(client, 32 + base, cx, cy, true, sgr);
 		}
 	}
 }
@@ -1588,49 +1540,45 @@ unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usiz
 // is `ESC [ M Cb Cx Cy` with each field a single byte biased by 32, which is why it cannot express
 // a coordinate past 223 - that limit is the reason SGR exists, and it is not a reason to answer
 // nothing on the mode every program still starts with.
-unsafe fn send_report(client: u64, cb: usize, cx: usize, cy: usize, press: bool, sgr: bool) {
-	unsafe {
-		if sgr {
-			send_sgr(client, cb, cx, cy, press);
-			return;
-		}
-		// A release in the legacy encoding is button 3 rather than a distinct terminator, so the
-		// program cannot tell WHICH button was released - that is the encoding, not a shortcut.
-		let button: usize = if press { cb } else { 3 };
-		// Past 223 columns or rows the byte would wrap into the control range. Dropping the report
-		// is what every terminal does here; a wrapped coordinate would be a lie.
-		if cx > 223 || cy > 223 {
-			return;
-		}
-		let buf: [u8; 6] = [0x1b, b'[', b'M', (32 + button) as u8, (32 + cx) as u8, (32 + cy) as u8];
-		reply_client(client, &buf);
+fn send_report(client: u64, cb: usize, cx: usize, cy: usize, press: bool, sgr: bool) {
+	if sgr {
+		send_sgr(client, cb, cx, cy, press);
+		return;
 	}
+	// A release in the legacy encoding is button 3 rather than a distinct terminator, so the
+	// program cannot tell WHICH button was released - that is the encoding, not a shortcut.
+	let button: usize = if press { cb } else { 3 };
+	// Past 223 columns or rows the byte would wrap into the control range. Dropping the report
+	// is what every terminal does here; a wrapped coordinate would be a lie.
+	if cx > 223 || cy > 223 {
+		return;
+	}
+	let buf: [u8; 6] = [0x1b, b'[', b'M', (32 + button) as u8, (32 + cx) as u8, (32 + cy) as u8];
+	reply_client(client, &buf);
 }
 
 // Send one SGR mouse report to a tracking program: ESC [ < Cb ; Cx ; Cy followed by M for a
 // press / motion or m for a release, with 1-based cell coordinates. Best-effort: a full or
 // closed input channel drops the report rather than blocking the console.
-unsafe fn send_sgr(client: u64, cb: usize, cx: usize, cy: usize, press: bool) {
-	unsafe {
-		let mut buf: [u8; 24] = [0u8; 24];
-		let mut n: usize = 0;
-		buf[n] = 0x1b;
-		n += 1;
-		buf[n] = b'[';
-		n += 1;
-		buf[n] = b'<';
-		n += 1;
-		n += write_dec(&mut buf[n..], cb);
-		buf[n] = b';';
-		n += 1;
-		n += write_dec(&mut buf[n..], cx);
-		buf[n] = b';';
-		n += 1;
-		n += write_dec(&mut buf[n..], cy);
-		buf[n] = if press { b'M' } else { b'm' };
-		n += 1;
-		reply_client(client, &buf[..n]);
-	}
+fn send_sgr(client: u64, cb: usize, cx: usize, cy: usize, press: bool) {
+	let mut buf: [u8; 24] = [0u8; 24];
+	let mut n: usize = 0;
+	buf[n] = 0x1b;
+	n += 1;
+	buf[n] = b'[';
+	n += 1;
+	buf[n] = b'<';
+	n += 1;
+	n += write_dec(&mut buf[n..], cb);
+	buf[n] = b';';
+	n += 1;
+	n += write_dec(&mut buf[n..], cx);
+	buf[n] = b';';
+	n += 1;
+	n += write_dec(&mut buf[n..], cy);
+	buf[n] = if press { b'M' } else { b'm' };
+	n += 1;
+	reply_client(client, &buf[..n]);
 }
 
 // Write `v` as ASCII decimal into `buf` and return the number of bytes written.
@@ -1657,26 +1605,24 @@ fn write_dec(buf: &mut [u8], v: usize) -> usize {
 // ESC [ 200 ~ ... ESC [ 201 ~ and sent straight to the program, so it can tell a paste from
 // typed input; otherwise the bytes are fed through the line discipline as if typed (so a
 // paste at the prompt enters the line editor and echoes). A no-op with an empty clipboard.
-unsafe fn paste_clipboard(console: &mut Console, bracketed: bool) {
-	unsafe {
-		if console.clipboard.is_empty() {
-			return;
+fn paste_clipboard(console: &mut Console, bracketed: bool) {
+	if console.clipboard.is_empty() {
+		return;
+	}
+	// A paste targets the live screen, so leave any scrollback view first.
+	snap_fg_live(console);
+	let fg: usize = console.fg;
+	if bracketed {
+		let client: u64 = console.vts[fg].client;
+		// A paste is the user's bytes: bounded wait, and the brackets follow the payload only
+		// if it landed, so a program never sees an opening bracket with no close.
+		if input_client(client, b"\x1b[200~") && input_client(client, &console.clipboard) {
+			input_client(client, b"\x1b[201~");
 		}
-		// A paste targets the live screen, so leave any scrollback view first.
-		snap_fg_live(console);
-		let fg: usize = console.fg;
-		if bracketed {
-			let client: u64 = console.vts[fg].client;
-			// A paste is the user's bytes: bounded wait, and the brackets follow the payload only
-			// if it landed, so a program never sees an opening bracket with no close.
-			if input_client(client, b"\x1b[200~") && input_client(client, &console.clipboard) {
-				input_client(client, b"\x1b[201~");
-			}
-		} else {
-			let clip: Vec<u8> = console.clipboard.clone();
-			for &b in &clip {
-				feed_key(console, b);
-			}
+	} else {
+		let clip: Vec<u8> = console.clipboard.clone();
+		for &b in &clip {
+			feed_key(console, b);
 		}
 	}
 }
@@ -1688,33 +1634,31 @@ unsafe fn paste_clipboard(console: &mut Console, bracketed: bool) {
 // kernel console and bringing the machine down - the `exit`/Ctrl+D-to-halt the boot banner
 // promises. (A clean exit only reaches here now that the shell's Process handle is no
 // longer pinned by the supervisor; otherwise its console channel never closed.)
-unsafe fn close_vt(console: &mut Console, vi: usize) {
-	unsafe {
-		close(console.vts[vi].client);
-		close(console.vts[vi].control);
-		if let Some(p) = console.vts[vi].fg_proc.take() {
-			close(p);
-		}
-		// The last VT's shell exiting must NOT halt the machine: reload a fresh shell on
-		// it (a logout returns a clean login prompt, like a real console). A secondary VT
-		// is removed instead, returning the operator to another VT (its still-live shell).
-		if console.vts.len() <= 1 {
-			if reload_vt(console, vi) {
-				repaint(console);
-				return;
-			}
-			// Reloading failed (out of channels, or the shell binary is gone): there is
-			// nothing left to serve, so the console genuinely exits.
-			exit();
-		}
-		console.vts.remove(vi);
-		if console.fg >= console.vts.len() {
-			console.fg = console.vts.len() - 1;
-		} else if console.fg > vi {
-			console.fg -= 1;
-		}
-		repaint(console);
+fn close_vt(console: &mut Console, vi: usize) {
+	close(console.vts[vi].client);
+	close(console.vts[vi].control);
+	if let Some(p) = console.vts[vi].fg_proc.take() {
+		close(p);
 	}
+	// The last VT's shell exiting must NOT halt the machine: reload a fresh shell on
+	// it (a logout returns a clean login prompt, like a real console). A secondary VT
+	// is removed instead, returning the operator to another VT (its still-live shell).
+	if console.vts.len() <= 1 {
+		if reload_vt(console, vi) {
+			repaint(console);
+			return;
+		}
+		// Reloading failed (out of channels, or the shell binary is gone): there is
+		// nothing left to serve, so the console genuinely exits.
+		exit();
+	}
+	console.vts.remove(vi);
+	if console.fg >= console.vts.len() {
+		console.fg = console.vts.len() - 1;
+	} else if console.fg > vi {
+		console.fg -= 1;
+	}
+	repaint(console);
 }
 
 // Reload a fresh shell onto an existing VT (its grid stays; the old shell's channels are
@@ -1724,66 +1668,64 @@ unsafe fn close_vt(console: &mut Console, vi: usize) {
 // primary VT does instead of tearing the session down - the reloaded shell is
 // core-capable (ConsoleService mints per-VT service connections, minus the few
 // single-client capabilities it cannot proxy), the same set every non-primary VT gets.
-unsafe fn reload_vt(console: &mut Console, vi: usize) -> bool {
-	unsafe {
-		let (vt_service, vt_client): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		let (control_console, control_shell): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => {
-				close(vt_service);
-				close(vt_client);
-				return false;
-			}
-		};
-		let broker: u64 = console.broker;
-		// THE PRIMARY VT KEEPS WHAT IT HAD. A logout is not a demotion: the console the machine
-		// boots on could stop the machine before `exit` and can after it. Any other VT gets zero,
-		// which is what it got before this existed.
-		let admin: u64 = if vi == 0 && console.admin != 0 {
-			let copy: i64 = duplicate(console.admin, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-			if copy > 0 { copy as u64 } else { 0 }
-		} else {
-			0
-		};
-		if !spawn_shell(&mut console.facs, broker, vt_client, control_shell, admin) {
+fn reload_vt(console: &mut Console, vi: usize) -> bool {
+	let (vt_service, vt_client): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return false,
+	};
+	let (control_console, control_shell): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => {
 			close(vt_service);
 			close(vt_client);
-			close(control_console);
-			close(control_shell);
-			if admin != 0 {
-				close(admin);
-			}
 			return false;
 		}
-		console.vts[vi].client = vt_service;
-		console.vts[vi].control = control_console;
-		console.vts[vi].fg_proc = None;
-		// A RELOAD IS A LOGOUT/LOGIN BOUNDARY, so it is SESSION ISOLATION and not tidiness.
-		//
-		// This called `screen.clear()`, which empties the active cell buffer, clears its wrap flags
-		// and homes the cursor - and nothing else. The fresh shell could therefore start with the
-		// alternate screen active, a hidden or restyled cursor, live SGR attributes, an OSC-modified
-		// palette, a scroll region, mouse tracking, bracketed paste, a live selection, DECSC saved
-		// cursors and the PREVIOUS SESSION'S SCROLLBACK - readable with Shift+PageUp - and, because
-		// neither was replaced, the previous line discipline (raw/cooked mode, echo state, a
-		// half-typed command line, the command HISTORY, readable with Up) and the previous `cwd`.
-		//
-		// `Screen::reset` already did the right thing and was private, which is why `clear` was
-		// being called; it is `hard_reset` now.
-		if let Some(t) = console.vts[vi].term.as_mut() {
-			t.screen.hard_reset();
-			t.screen.mark_all_dirty();
+	};
+	let broker: u64 = console.broker;
+	// THE PRIMARY VT KEEPS WHAT IT HAD. A logout is not a demotion: the console the machine
+	// boots on could stop the machine before `exit` and can after it. Any other VT gets zero,
+	// which is what it got before this existed.
+	let admin: u64 = if vi == 0 && console.admin != 0 {
+		let copy: i64 = duplicate(console.admin, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if copy > 0 { copy as u64 } else { 0 }
+	} else {
+		0
+	};
+	if !spawn_shell(&mut console.facs, broker, vt_client, control_shell, admin) {
+		close(vt_service);
+		close(vt_client);
+		close(control_console);
+		close(control_shell);
+		if admin != 0 {
+			close(admin);
 		}
-		let history: usize = console.vts[vi].ld.history_capacity();
-		console.vts[vi].ld = Box::new(Ld::new(history));
-		console.vts[vi].cwd = String::from("vol://system");
-		// nudge the fresh shell to print its first prompt (an empty line reprompts).
-		send_blocking(vt_service, b"\n", 0);
-		true
+		return false;
 	}
+	console.vts[vi].client = vt_service;
+	console.vts[vi].control = control_console;
+	console.vts[vi].fg_proc = None;
+	// A RELOAD IS A LOGOUT/LOGIN BOUNDARY, so it is SESSION ISOLATION and not tidiness.
+	//
+	// This called `screen.clear()`, which empties the active cell buffer, clears its wrap flags
+	// and homes the cursor - and nothing else. The fresh shell could therefore start with the
+	// alternate screen active, a hidden or restyled cursor, live SGR attributes, an OSC-modified
+	// palette, a scroll region, mouse tracking, bracketed paste, a live selection, DECSC saved
+	// cursors and the PREVIOUS SESSION'S SCROLLBACK - readable with Shift+PageUp - and, because
+	// neither was replaced, the previous line discipline (raw/cooked mode, echo state, a
+	// half-typed command line, the command HISTORY, readable with Up) and the previous `cwd`.
+	//
+	// `Screen::reset` already did the right thing and was private, which is why `clear` was
+	// being called; it is `hard_reset` now.
+	if let Some(t) = console.vts[vi].term.as_mut() {
+		t.screen.hard_reset();
+		t.screen.mark_all_dirty();
+	}
+	let history: usize = console.vts[vi].ld.history_capacity();
+	console.vts[vi].ld = Box::new(Ld::new(history));
+	console.vts[vi].cwd = String::from("vol://system");
+	// nudge the fresh shell to print its first prompt (an empty line reprompts).
+	send_blocking(vt_service, b"\n", 0);
+	true
 }
 
 // Repaint the foreground VT's whole screen from its grid (after a switch or a VT add /
@@ -1809,146 +1751,142 @@ fn repaint(console: &mut Console) {
 // handle would pin the shell's handle table (and that channel) alive, so the terminal
 // could never be reaped when the shell logs out or exits. Shared by spawn_vt (a display
 // VT) and open_pty (a program-hosted PTY).
-unsafe fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_control: u64, admin: u64) -> bool {
-	unsafe {
-		let storage: u64 = match service_connect(facs.storage) {
-			Some(h) => h,
-			None => return false,
-		};
-		let log: u64 = match service_connect(facs.log) {
-			Some(h) => h,
-			None => return false,
-		};
-		// The config and device factories re-resolve through the broker when dead: their
-		// services restart transparently, so a VT opened after such a restart still gets
-		// live connections (the other factories' services do not restart yet).
-		let device: u64 = match connect_or_resolve(&mut facs.device, broker, CAP_DEVICE) {
-			Some(h) => h,
-			None => return false,
-		};
-		let process: u64 = match service_connect(facs.process) {
-			Some(h) => h,
-			None => return false,
-		};
-		let config: u64 = match connect_or_resolve(&mut facs.config, broker, CAP_CONFIG) {
-			Some(h) => h,
-			None => return false,
-		};
-		let time: u64 = match service_connect(facs.time) {
-			Some(h) => h,
-			None => return false,
-		};
-		let audio: u64 = match service_connect(facs.audio) {
-			Some(h) => h,
-			None => return false,
-		};
-		// A fresh per-VT session: this VT's shell owns it and keeps its cwd for the VT's
-		// lifetime (the VT is torn down on logout, so there is no shell restart to outlive).
-		let session: u64 = match service_connect(facs.session) {
-			Some(h) => h,
-			None => return false,
-		};
-		// A fresh per-VT PermissionManager client: this VT's shell launches commands as
-		// governed processes and drives its `perm` command through it, just like VT 1.
-		let perm: u64 = match service_connect(facs.perm) {
-			Some(h) => h,
-			None => return false,
-		};
-		let mut net = network::Client::new(ChannelTransport { chan: facs.net });
-		let net_client: u64 = match net.open() {
-			Some(Ok(h)) => h,
-			_ => return false,
-		};
-		let (boot_parent, boot_child): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		// Load and start the shell through ProcessService (the sole process-creation
-		// mechanism), which reads its binary from the system volume's `bin/`. The child's
-		// end of its bootstrap channel is handed over as the launch bootstrap; a dedicated
-		// launcher connection to ProcessService is minted for this one call.
-		let launcher: u64 = match service_connect(facs.process) {
-			Some(h) => h,
-			None => return false,
-		};
-		let started = match process::Client::new(ChannelTransport { chan: launcher }).launch("shell", &boot_child) {
-			Some(Ok(s)) => s,
-			_ => {
-				close(launcher);
-				return false;
-			}
-		};
-		close(launcher);
-		let shell_proc: u64 = started.task;
-		// The named capability set, ended by READY: the shell takes each by name, so the
-		// capabilities a non-primary VT does not get are simply not sent - no placeholder
-		// messages keeping an order.
-		send_blocking(boot_parent, CAP_STORAGE, storage);
-		send_blocking(boot_parent, CAP_LOG, log);
-		send_blocking(boot_parent, CAP_DEVICE, device);
-		send_blocking(boot_parent, CAP_PROCESS, process);
-		send_blocking(boot_parent, CAP_CONFIG, config);
-		send_blocking(boot_parent, CAP_NET, net_client);
-		send_blocking(boot_parent, CAP_TIME, time);
-		send_blocking(boot_parent, CAP_AUDIO, audio);
-		send_blocking(boot_parent, CAP_PERM, perm);
-		// This VT's session.
-		send_blocking(boot_parent, CAP_SESSION, session);
-		send_blocking(boot_parent, CAP_CONSOLE, shell_console);
-		send_blocking(boot_parent, CAP_CONTROL, shell_control);
-		// THE SUPERVISOR CHANNEL, FOR THE PRIMARY VT ONLY. Zero everywhere else, and the shell
-		// reads it as "no supervisor connection" and says so rather than pretending - which is what
-		// a secondary VT and a PTY shell have always got, and is the policy this restores rather
-		// than widens.
-		if admin != 0 {
-			send_blocking(boot_parent, CAP_ADMIN, admin);
-		}
-		send_ready(boot_parent);
-		// wait for the shell to report in, then drop its bootstrap.
-		let mut rbuf: [u8; 32] = [0u8; 32];
-		if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
-			close(boot_parent);
-			close(shell_proc);
+fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_control: u64, admin: u64) -> bool {
+	let storage: u64 = match service_connect(facs.storage) {
+		Some(h) => h,
+		None => return false,
+	};
+	let log: u64 = match service_connect(facs.log) {
+		Some(h) => h,
+		None => return false,
+	};
+	// The config and device factories re-resolve through the broker when dead: their
+	// services restart transparently, so a VT opened after such a restart still gets
+	// live connections (the other factories' services do not restart yet).
+	let device: u64 = match connect_or_resolve(&mut facs.device, broker, CAP_DEVICE) {
+		Some(h) => h,
+		None => return false,
+	};
+	let process: u64 = match service_connect(facs.process) {
+		Some(h) => h,
+		None => return false,
+	};
+	let config: u64 = match connect_or_resolve(&mut facs.config, broker, CAP_CONFIG) {
+		Some(h) => h,
+		None => return false,
+	};
+	let time: u64 = match service_connect(facs.time) {
+		Some(h) => h,
+		None => return false,
+	};
+	let audio: u64 = match service_connect(facs.audio) {
+		Some(h) => h,
+		None => return false,
+	};
+	// A fresh per-VT session: this VT's shell owns it and keeps its cwd for the VT's
+	// lifetime (the VT is torn down on logout, so there is no shell restart to outlive).
+	let session: u64 = match service_connect(facs.session) {
+		Some(h) => h,
+		None => return false,
+	};
+	// A fresh per-VT PermissionManager client: this VT's shell launches commands as
+	// governed processes and drives its `perm` command through it, just like VT 1.
+	let perm: u64 = match service_connect(facs.perm) {
+		Some(h) => h,
+		None => return false,
+	};
+	let mut net = network::Client::new(ChannelTransport { chan: facs.net });
+	let net_client: u64 = match net.open() {
+		Some(Ok(h)) => h,
+		_ => return false,
+	};
+	let (boot_parent, boot_child): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return false,
+	};
+	// Load and start the shell through ProcessService (the sole process-creation
+	// mechanism), which reads its binary from the system volume's `bin/`. The child's
+	// end of its bootstrap channel is handed over as the launch bootstrap; a dedicated
+	// launcher connection to ProcessService is minted for this one call.
+	let launcher: u64 = match service_connect(facs.process) {
+		Some(h) => h,
+		None => return false,
+	};
+	let started = match process::Client::new(ChannelTransport { chan: launcher }).launch("shell", &boot_child) {
+		Some(Ok(s)) => s,
+		_ => {
+			close(launcher);
 			return false;
 		}
+	};
+	close(launcher);
+	let shell_proc: u64 = started.task;
+	// The named capability set, ended by READY: the shell takes each by name, so the
+	// capabilities a non-primary VT does not get are simply not sent - no placeholder
+	// messages keeping an order.
+	send_blocking(boot_parent, CAP_STORAGE, storage);
+	send_blocking(boot_parent, CAP_LOG, log);
+	send_blocking(boot_parent, CAP_DEVICE, device);
+	send_blocking(boot_parent, CAP_PROCESS, process);
+	send_blocking(boot_parent, CAP_CONFIG, config);
+	send_blocking(boot_parent, CAP_NET, net_client);
+	send_blocking(boot_parent, CAP_TIME, time);
+	send_blocking(boot_parent, CAP_AUDIO, audio);
+	send_blocking(boot_parent, CAP_PERM, perm);
+	// This VT's session.
+	send_blocking(boot_parent, CAP_SESSION, session);
+	send_blocking(boot_parent, CAP_CONSOLE, shell_console);
+	send_blocking(boot_parent, CAP_CONTROL, shell_control);
+	// THE SUPERVISOR CHANNEL, FOR THE PRIMARY VT ONLY. Zero everywhere else, and the shell
+	// reads it as "no supervisor connection" and says so rather than pretending - which is what
+	// a secondary VT and a PTY shell have always got, and is the policy this restores rather
+	// than widens.
+	if admin != 0 {
+		send_blocking(boot_parent, CAP_ADMIN, admin);
+	}
+	send_ready(boot_parent);
+	// wait for the shell to report in, then drop its bootstrap.
+	let mut rbuf: [u8; 32] = [0u8; 32];
+	if let Received::Closed = recv_blocking(boot_parent, &mut rbuf) {
 		close(boot_parent);
 		close(shell_proc);
-		true
+		return false;
 	}
+	close(boot_parent);
+	close(shell_proc);
+	true
 }
 
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, fb: &Framebuffer, display: &DisplayClient, cur_w: u32, cur_h: u32) -> Option<Vt> {
-	unsafe {
-		let (vt_service, vt_client): (u64, u64) = channel()?;
-		let (control_console, control_shell): (u64, u64) = channel()?;
-		if !spawn_shell(facs, broker, vt_client, control_shell, 0) {
-			close(vt_service);
-			close(vt_client);
-			close(control_console);
-			close(control_shell);
-			return None;
-		}
-		// nudge the new shell to print its first prompt: an empty line dispatches to a
-		// silent reprompt, the same first prompt VT 1 shows at boot.
-		send_blocking(vt_service, b"\n", 0);
-		// the new VT's terminal policy, re-read from the config tree so a `set`
-		// applies here (the next VT) without restarting the console.
-		let (vt_scrollback, vt_history): (usize, usize) = term_policy(config_client);
-		// No drawable surface means this VT has no terminal - the same answer boot gives when the
-		// geometry cannot be addressed, rather than a panic on the first pixel.
-		// `and_then`, not `map`: a VT whose grid cannot be allocated has no terminal, the same answer
-		// an unaddressable geometry gives, rather than aborting the whole console service.
-		let term: Option<Term> = make_surface(addr, fb, display).and_then(|drawable| {
-			let mut t = Term::try_new(drawable, vt_scrollback)?;
-			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
-			t.screen.clear();
-			Some(t)
-		});
-		Some(Vt { term, client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") })
+fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, fb: &Framebuffer, display: &DisplayClient, cur_w: u32, cur_h: u32) -> Option<Vt> {
+	let (vt_service, vt_client): (u64, u64) = channel()?;
+	let (control_console, control_shell): (u64, u64) = channel()?;
+	if !spawn_shell(facs, broker, vt_client, control_shell, 0) {
+		close(vt_service);
+		close(vt_client);
+		close(control_console);
+		close(control_shell);
+		return None;
 	}
+	// nudge the new shell to print its first prompt: an empty line dispatches to a
+	// silent reprompt, the same first prompt VT 1 shows at boot.
+	send_blocking(vt_service, b"\n", 0);
+	// the new VT's terminal policy, re-read from the config tree so a `set`
+	// applies here (the next VT) without restarting the console.
+	let (vt_scrollback, vt_history): (usize, usize) = term_policy(config_client);
+	// No drawable surface means this VT has no terminal - the same answer boot gives when the
+	// geometry cannot be addressed, rather than a panic on the first pixel.
+	// `and_then`, not `map`: a VT whose grid cannot be allocated has no terminal, the same answer
+	// an unaddressable geometry gives, rather than aborting the whole console service.
+	let term: Option<Term> = make_surface(addr, fb, display).and_then(|drawable| {
+		let mut t = Term::try_new(drawable, vt_scrollback)?;
+		t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
+		t.screen.clear();
+		Some(t)
+	});
+	Some(Vt { term, client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") })
 }
 
 // Open a program-hosted PTY: a terminal whose master is another program (the `script`
@@ -1956,65 +1894,61 @@ unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: 
 // a fresh console + control channel pair - a shell gets the full capability set, any other
 // program just its console + control - and return the master channel end the host drives it
 // on. None on failure. The PTY set grows on demand - never a fixed cap.
-unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
-	unsafe {
-		let (slave_service, slave_client): (u64, u64) = channel()?;
-		let (control_console, control_slave): (u64, u64) = channel()?;
-		let (master_console, master_host): (u64, u64) = channel()?;
-		let is_shell: bool = name == b"shell";
-		let broker: u64 = console.broker;
-		let ok: bool = if is_shell { spawn_shell(&mut console.facs, broker, slave_client, control_slave, 0) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
-		if !ok {
-			close(slave_service);
-			close(slave_client);
-			close(control_console);
-			close(control_slave);
-			close(master_console);
-			close(master_host);
-			return None;
-		}
-		// nudge a hosted shell to print its first prompt (an empty line reprompts silently).
-		if is_shell {
-			send_blocking(slave_service, b"\n", 0);
-		}
-		// the slave's line-editor history depth follows the same config policy as a
-		// display VT (a pty has no grid, so only the history applies).
-		let (_, pty_history): (usize, usize) = term_policy(console.config_client);
-		console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(pty_history)), master: master_console, cwd: String::from("vol://system") });
-		Some(master_host)
+fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
+	let (slave_service, slave_client): (u64, u64) = channel()?;
+	let (control_console, control_slave): (u64, u64) = channel()?;
+	let (master_console, master_host): (u64, u64) = channel()?;
+	let is_shell: bool = name == b"shell";
+	let broker: u64 = console.broker;
+	let ok: bool = if is_shell { spawn_shell(&mut console.facs, broker, slave_client, control_slave, 0) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
+	if !ok {
+		close(slave_service);
+		close(slave_client);
+		close(control_console);
+		close(control_slave);
+		close(master_console);
+		close(master_host);
+		return None;
 	}
+	// nudge a hosted shell to print its first prompt (an empty line reprompts silently).
+	if is_shell {
+		send_blocking(slave_service, b"\n", 0);
+	}
+	// the slave's line-editor history depth follows the same config policy as a
+	// display VT (a pty has no grid, so only the history applies).
+	let (_, pty_history): (usize, usize) = term_policy(console.config_client);
+	console.ptys.push(Vt { term: None, client: slave_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(pty_history)), master: master_console, cwd: String::from("vol://system") });
+	Some(master_host)
 }
 
 // Spawn a minimal (non-shell) program as a PTY slave: it gets only its console + control
 // channels (no service factories, no online handshake), the bootstrap a bare terminal
 // client needs. Used to host a simple program on a pty (the pty loopback test slave); a
 // shell uses spawn_shell. Loaded through ProcessService from the system volume's `bin/`.
-unsafe fn spawn_pty_program(facs: &Factories, name: &[u8], program_console: u64, program_control: u64) -> bool {
-	unsafe {
-		let name_str: &str = match core::str::from_utf8(name) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let (boot_parent, boot_child): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		let launcher: u64 = match service_connect(facs.process) {
-			Some(h) => h,
-			None => return false,
-		};
-		let started = match process::Client::new(ChannelTransport { chan: launcher }).launch(name_str, &boot_child) {
-			Some(Ok(s)) => s,
-			_ => {
-				close(launcher);
-				return false;
-			}
-		};
-		close(launcher);
-		send_blocking(boot_parent, CAP_CONSOLE, program_console);
-		send_blocking(boot_parent, CAP_CONTROL, program_control);
-		close(boot_parent);
-		close(started.task);
-		true
-	}
+fn spawn_pty_program(facs: &Factories, name: &[u8], program_console: u64, program_control: u64) -> bool {
+	let name_str: &str = match core::str::from_utf8(name) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let (boot_parent, boot_child): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return false,
+	};
+	let launcher: u64 = match service_connect(facs.process) {
+		Some(h) => h,
+		None => return false,
+	};
+	let started = match process::Client::new(ChannelTransport { chan: launcher }).launch(name_str, &boot_child) {
+		Some(Ok(s)) => s,
+		_ => {
+			close(launcher);
+			return false;
+		}
+	};
+	close(launcher);
+	send_blocking(boot_parent, CAP_CONSOLE, program_console);
+	send_blocking(boot_parent, CAP_CONTROL, program_control);
+	close(boot_parent);
+	close(started.task);
+	true
 }

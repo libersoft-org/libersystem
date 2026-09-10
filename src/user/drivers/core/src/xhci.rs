@@ -186,7 +186,7 @@ unsafe fn w32(addr: u64, v: u32) {
 }
 // A 64-bit register is written as two 32-bit halves (low then high), the portable
 // form; xHCI permits 32-bit accesses to all its registers.
-unsafe fn w64(addr: u64, v: u64) {
+fn w64(addr: u64, v: u64) {
 	unsafe {
 		w32(addr, v as u32);
 		w32(addr + 4, (v >> 32) as u32);
@@ -551,7 +551,7 @@ impl Xhci {
 	// be acknowledged as clean. Returns whether the controller confirmed within the spin budget - a
 	// controller that does not is one whose rings may still be live, and its driver must not report a
 	// clean stop.
-	unsafe fn halt(&self) -> bool {
+	fn halt(&self) -> bool {
 		unsafe {
 			w32(self.op + OP_USBCMD, r32(self.op + OP_USBCMD) & !CMD_RUN);
 			wait_set(self.op + OP_USBSTS, STS_HCHALTED).is_some()
@@ -559,7 +559,7 @@ impl Xhci {
 	}
 }
 
-unsafe fn wait_set(addr: u64, mask: u32) -> Option<()> {
+fn wait_set(addr: u64, mask: u32) -> Option<()> {
 	unsafe {
 		let mut spins: u32 = 0;
 		while r32(addr) & mask != mask {
@@ -576,7 +576,7 @@ unsafe fn wait_set(addr: u64, mask: u32) -> Option<()> {
 }
 
 // Spin until the masked bits at `addr` are all clear. None on budget exhaustion.
-unsafe fn wait_clear(addr: u64, mask: u32) -> Option<()> {
+fn wait_clear(addr: u64, mask: u32) -> Option<()> {
 	unsafe {
 		let mut spins: u32 = 0;
 		while r32(addr) & mask != 0 {
@@ -594,7 +594,7 @@ unsafe fn wait_clear(addr: u64, mask: u32) -> Option<()> {
 
 // Write PORTSC preserving its state: the RW1C change bits are masked out (so the
 // read-modify-write cannot clear them by accident) and `set` is OR-ed in.
-unsafe fn portsc_write(hc: &Xhci, port: u32, set: u32) {
+fn portsc_write(hc: &Xhci, port: u32, set: u32) {
 	unsafe {
 		let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
 		let value: u32 = r32(addr) & !PORTSC_RW1C;
@@ -603,7 +603,7 @@ unsafe fn portsc_write(hc: &Xhci, port: u32, set: u32) {
 }
 
 // Push one TRB onto the command ring and ring the command doorbell.
-unsafe fn command(hc: &mut Xhci, param: u64, status: u32, control: u32) {
+fn command(hc: &mut Xhci, param: u64, status: u32, control: u32) {
 	unsafe {
 		hc.cmd.push(param, status, control);
 		w32(hc.db, 0);
@@ -635,7 +635,7 @@ unsafe fn take_event(hc: &mut Xhci) -> Option<(u64, u32, u32)> {
 // events are skipped (enumeration reads PORTSC directly). Returns (param, status,
 // control) of the matching event, or None on budget exhaustion or an unexpected
 // event type.
-unsafe fn wait_event(hc: &mut Xhci, wanted: u32) -> Option<(u64, u32, u32)> {
+fn wait_event(hc: &mut Xhci, wanted: u32) -> Option<(u64, u32, u32)> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
@@ -662,21 +662,19 @@ unsafe fn wait_event(hc: &mut Xhci, wanted: u32) -> Option<(u64, u32, u32)> {
 
 // Issue one command and wait for its completion event. Returns the event's slot id
 // (control bits 31:24) on success, None on a non-success completion code.
-unsafe fn command_and_wait(hc: &mut Xhci, param: u64, status: u32, control: u32) -> Option<u32> {
-	unsafe {
-		command(hc, param, status, control);
-		let (_p, ev_status, ev_control): (u64, u32, u32) = wait_event(hc, TRB_EV_CMD_COMPLETE)?;
-		if ev_status >> 24 != CC_SUCCESS {
-			return None;
-		}
-		Some(ev_control >> 24)
+fn command_and_wait(hc: &mut Xhci, param: u64, status: u32, control: u32) -> Option<u32> {
+	command(hc, param, status, control);
+	let (_p, ev_status, ev_control): (u64, u32, u32) = wait_event(hc, TRB_EV_CMD_COMPLETE)?;
+	if ev_status >> 24 != CC_SUCCESS {
+		return None;
 	}
+	Some(ev_control >> 24)
 }
 
 // Bring up the device on root-hub port `port`: reset the port if a device is
 // connected, then give it a slot, an address and an identity. Returns None when
 // the port is empty or any step fails.
-unsafe fn attach_port(hc: &mut Xhci, port: u32) -> Option<UsbDevice> {
+fn attach_port(hc: &mut Xhci, port: u32) -> Option<UsbDevice> {
 	unsafe {
 		let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
 		if r32(addr) & PORTSC_CCS == 0 {
@@ -759,7 +757,7 @@ fn initial_packet_size(speed: u32) -> u32 {
 // expanded (its ports enumerated, each downstream device landing back here
 // recursively), every HID device and the first mass-storage device are
 // configured and kept for the service loop, anything else is left addressed.
-unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
+fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		report_device(&dev);
 		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE });
@@ -784,7 +782,7 @@ unsafe fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, 
 // up, and bring up whatever is connected. Each addressed downstream device runs
 // through `register_device`, so a hub found downstream expands recursively and a
 // keyboard or disk behind any tier of hubs is configured like a root one.
-unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
+fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		// no HID device is serving yet, so the control waits see no HID events.
 		let mut pending: Hids = Hids::new();
@@ -822,7 +820,7 @@ unsafe fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devi
 // the reset-change flag), read the attached speed off the port status, and address
 // the device with the hub's route string extended by this port at `shift`. Returns
 // None when the port is empty or any step fails.
-unsafe fn attach_hub_port(hc: &mut Xhci, hub: &mut UsbDevice, port: u32, shift: u32) -> Option<UsbDevice> {
+fn attach_hub_port(hc: &mut Xhci, hub: &mut UsbDevice, port: u32, shift: u32) -> Option<UsbDevice> {
 	unsafe {
 		let mut pending: Hids = Hids::new();
 		// power the port and wait for the power state to read back.
@@ -870,7 +868,7 @@ unsafe fn attach_hub_port(hc: &mut Xhci, hub: &mut UsbDevice, port: u32, shift: 
 }
 
 // Read one hub port's status word (the low half of the GET_STATUS reply).
-unsafe fn hub_port_status(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, port: u32) -> Option<u16> {
+fn hub_port_status(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, port: u32) -> Option<u16> {
 	unsafe {
 		control_in_req(hc, hids, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
 		Some(r8(hub.data_virt) as u16 | (r8(hub.data_virt + 1) as u16) << 8)
@@ -878,7 +876,7 @@ unsafe fn hub_port_status(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, p
 }
 
 // Read one hub port's change word (the high half of the GET_STATUS reply).
-unsafe fn hub_port_change(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, port: u32) -> Option<u16> {
+fn hub_port_change(hc: &mut Xhci, hids: &mut Hids, hub: &mut UsbDevice, port: u32) -> Option<u16> {
 	unsafe {
 		control_in_req(hc, hids, hub, RT_CLASS_PORT_IN, REQ_GET_STATUS, 0, port as u16, 4)?;
 		Some(r8(hub.data_virt + 2) as u16 | (r8(hub.data_virt + 3) as u16) << 8)
@@ -910,8 +908,8 @@ unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, mps: u32) {
 
 // Read `len` bytes of descriptor `desc` from the device into its data page with a
 // standard GET_DESCRIPTOR control transfer on the default endpoint.
-unsafe fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
-	unsafe { control_in_req(hc, hids, dev, 0x80, REQ_GET_DESCRIPTOR, desc << 8, 0, len) }
+fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
+	control_in_req(hc, hids, dev, 0x80, REQ_GET_DESCRIPTOR, desc << 8, 0, len)
 }
 
 // Run one IN control request on the default endpoint, the data landing in the
@@ -920,7 +918,7 @@ unsafe fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: 
 // event. The hub class requests (GET_STATUS on a port, the hub descriptor) ride
 // through here too. A stall halts endpoint 0; it is recovered before reporting
 // failure, so the endpoint stays usable.
-unsafe fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<()> {
+fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<()> {
 	unsafe {
 		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
 		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
@@ -942,7 +940,7 @@ unsafe fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, re
 // stage with no data stage, then the IN-direction status stage, the doorbell and
 // the completion event. A stall halts endpoint 0; it is recovered before reporting
 // failure, so a request the device rejects leaves the endpoint usable.
-unsafe fn control_nodata(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16) -> Option<()> {
+fn control_nodata(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16) -> Option<()> {
 	unsafe {
 		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32;
 		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT);
@@ -961,28 +959,24 @@ unsafe fn control_nodata(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, re
 // clears the controller-side halt, and a Set TR Dequeue Pointer repositions the
 // transfer ring past the abandoned control transfer (at the producer's current
 // position). Endpoint 0 has no device-side halt feature, so no CLEAR_FEATURE.
-unsafe fn recover_ep0(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice) {
-	unsafe {
-		reset_endpoint(hc, hids, dev.slot, 1, dev.ep0.phys + dev.ep0.index * 16 | dev.ep0.cycle as u64);
-	}
+fn recover_ep0(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice) {
+	reset_endpoint(hc, hids, dev.slot, 1, dev.ep0.phys + dev.ep0.index * 16 | dev.ep0.cycle as u64);
 }
 
 // The controller half of stall recovery: Reset Endpoint clears the endpoint's
 // halted state, Set TR Dequeue Pointer repositions its transfer ring to `dequeue`
 // (the producer's current position with the cycle state in bit 0), abandoning the
 // stalled TD. HID events arriving during the command waits are serviced.
-unsafe fn reset_endpoint(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32, dequeue: u64) {
-	unsafe {
-		command(hc, 0, 0, TRB_RESET_ENDPOINT << 10 | dci << 16 | slot << 24);
-		let _ = wait_command(hc, hids);
-		command(hc, dequeue, 0, TRB_SET_TR_DEQUEUE << 10 | dci << 16 | slot << 24);
-		let _ = wait_command(hc, hids);
-	}
+fn reset_endpoint(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32, dequeue: u64) {
+	command(hc, 0, 0, TRB_RESET_ENDPOINT << 10 | dci << 16 | slot << 24);
+	let _ = wait_command(hc, hids);
+	command(hc, dequeue, 0, TRB_SET_TR_DEQUEUE << 10 | dci << 16 | slot << 24);
+	let _ = wait_command(hc, hids);
 }
 
 // Wait for a command completion event, servicing HID events that arrive in the
 // meantime inline. Returns the completion code, or None on budget exhaustion.
-unsafe fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
+fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
@@ -1014,7 +1008,7 @@ unsafe fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 // unplugged one is torn down. The loop sleeps on the controller's MSI-X
 // interrupt and both channels at once, and the synchronous BOT waits service HID
 // events inline, so typing is never lost behind disk traffic.
-unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, pointer: u64, irq: u64) -> ! {
+fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, pointer: u64, irq: u64) -> ! {
 	unsafe {
 		post_reports(hc, &mut hids);
 		let mut req: [u8; 16] = [0u8; 16];
@@ -1199,7 +1193,7 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 // Wait for a transfer event on the given slot/endpoint, servicing HID events
 // that arrive in the meantime inline (a keystroke during a disk transfer). Returns
 // the completion code, or None on budget exhaustion.
-unsafe fn wait_transfer(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<u32> {
+fn wait_transfer(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<u32> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
@@ -1222,32 +1216,30 @@ unsafe fn wait_transfer(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> 
 	}
 }
 // Print one addressed device: its port, vendor:product identity and device class.
-unsafe fn report_device(dev: &UsbDevice) {
-	unsafe {
-		let mut line: [u8; 64] = [0u8; 64];
-		let mut n: usize = 0;
-		for &b in b"driver.xhci: port " {
-			line[n] = b;
-			n += 1;
-		}
-		n += push_decimal(&mut line[n..], dev.port as u64);
-		for &b in b" device " {
-			line[n] = b;
-			n += 1;
-		}
-		n += push_hex16(&mut line[n..], dev.vendor);
-		line[n] = b':';
+fn report_device(dev: &UsbDevice) {
+	let mut line: [u8; 64] = [0u8; 64];
+	let mut n: usize = 0;
+	for &b in b"driver.xhci: port " {
+		line[n] = b;
 		n += 1;
-		n += push_hex16(&mut line[n..], dev.product);
-		for &b in b" class " {
-			line[n] = b;
-			n += 1;
-		}
-		n += push_decimal(&mut line[n..], dev.class as u64);
-		line[n] = b'\n';
-		n += 1;
-		print(&line[..n]);
 	}
+	n += push_decimal(&mut line[n..], dev.port as u64);
+	for &b in b" device " {
+		line[n] = b;
+		n += 1;
+	}
+	n += push_hex16(&mut line[n..], dev.vendor);
+	line[n] = b':';
+	n += 1;
+	n += push_hex16(&mut line[n..], dev.product);
+	for &b in b" class " {
+		line[n] = b;
+		n += 1;
+	}
+	n += push_decimal(&mut line[n..], dev.class as u64);
+	line[n] = b'\n';
+	n += 1;
+	print(&line[..n]);
 }
 
 // Render a small decimal number into `out`, returning the digit count.

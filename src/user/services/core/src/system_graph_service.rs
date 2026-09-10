@@ -111,27 +111,27 @@ impl system_graph::Service for GraphService {
 
 		// Component nodes: read each one's live counters and state from the kernel over
 		// its process handle, timing the whole batch as one "process.stats" trace span.
-		let stats_start: u64 = unsafe { clock_ns() };
+		let stats_start: u64 = clock_ns();
 		for node in &self.nodes {
-			let (state, counters): (ComponentState, Counters) = match unsafe { process_stats(node.process) } {
+			let (state, counters): (ComponentState, Counters) = match process_stats(node.process) {
 				Some(s) => (map_state(s.state), Counters { messages_sent: s.messages_sent, messages_received: s.messages_received, handles: s.handle_count, memory_bytes: s.memory_bytes, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 				None => (ComponentState::Failed, Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 			};
 			components.push(Component { name: node.name.clone(), r#type: ComponentType::Service, state, deps: node.deps.clone(), counters });
 		}
-		spans.push(TraceSpan { name: String::from("process.stats"), duration_ns: unsafe { clock_ns() }.wrapping_sub(stats_start) });
+		spans.push(TraceSpan { name: String::from("process.stats"), duration_ns: clock_ns().wrapping_sub(stats_start) });
 
 		// Device nodes: enumerate the hardware devices over the DeviceService connection,
 		// timing the call as a "device.list" trace span. Each device is a leaf node owned
 		// by DeviceManager, carrying its identity and zero counters. The transport
 		// re-resolves through the broker when the connection died with a restarted
 		// DeviceService, so the device nodes survive the restart.
-		let list_start: u64 = unsafe { clock_ns() };
+		let list_start: u64 = clock_ns();
 		let devices: Vec<DeviceEntry> = match self.device.as_mut().and_then(|t| device::Client::new(t).list()) {
 			Some(Ok(d)) => d,
 			_ => Vec::new(),
 		};
-		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: unsafe { clock_ns() }.wrapping_sub(list_start) });
+		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: clock_ns().wrapping_sub(list_start) });
 		// THE BINDINGS, from the one process that holds them.
 		//
 		// MATCHED BY POSITION, AND THE TWO VECTORS ARE NOT POSITIONALLY EQUIVALENT. DeviceService
@@ -173,7 +173,7 @@ impl system_graph::Service for GraphService {
 		// as a synthetic node carrying just its supervisor counters. Timed as one
 		// "supervisor.status" trace span. A 0 handle (e.g. a non-primary VT) skips the merge.
 		if self.supervisor_client != 0 {
-			let sup_start: u64 = unsafe { clock_ns() };
+			let sup_start: u64 = clock_ns();
 			let mut sup: supervisor::Client<ChannelTransport> = supervisor::Client::new(ChannelTransport { chan: self.supervisor_client });
 			if let Some(Ok(stats)) = sup.status() {
 				for s in &stats {
@@ -190,7 +190,7 @@ impl system_graph::Service for GraphService {
 					}
 				}
 			}
-			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: unsafe { clock_ns() }.wrapping_sub(sup_start) });
+			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: clock_ns().wrapping_sub(sup_start) });
 		}
 
 		Ok(Graph { components, spans })
@@ -234,7 +234,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// nodes carry no state rather than an invented one.
 	let mut bindings_client: u64 = 0;
 	let service: u64 = loop {
-		match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } => {
 				if len >= 4 && &buf[..4] == b"NODE" {
 					nodes.push(parse_node(&buf[4..len], handle));
@@ -253,7 +253,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 
 	// 2. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"SystemGraphService: online", 0);
 	}
 
@@ -267,9 +267,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { system_graph::dispatch(&mut graph, req, handle, out, reply_handle) });
-	}
+	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { system_graph::dispatch(&mut graph, req, handle, out, reply_handle) });
 	exit();
 }
 

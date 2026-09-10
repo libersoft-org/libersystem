@@ -852,8 +852,18 @@ linkage = "dynamic"
 stage = "volume"
 destination = "libexec/network_service.lsexe"
 # `device-proto` because this service DISCOVERS its NIC: it holds a provider-catalogue connection and
-# subscribes to the network kind rather than being handed a frame channel.
-providers = ["network-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+# subscribes to the network kind rather than being handed a frame channel. `service-util` because the
+# IPv6 host beside the IPv4 stack is decisions this service makes and the pure half of them lives
+# there, where a host can run them.
+providers = [
+	"network-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"lsrt",
+]
 
 [[programs]]
 name = "nslookup"

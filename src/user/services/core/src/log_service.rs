@@ -128,7 +128,7 @@ impl Disk {
 			// weaker than they look: reporting "no boots" makes the next boot REUSE a number and
 			// overwrite an existing journal. That hazard predates this change and is recorded
 			// separately; what matters here is that a SHORT listing no longer looks complete.
-			Some(Ok(consumer)) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
+			Some(Ok(consumer)) => match drain_stream_complete(consumer, volume::list_read) {
 				Some(entries) => entries.iter().filter_map(|e| e.name.strip_prefix("boot-").and_then(|n| n.parse::<u32>().ok())).collect(),
 				None => return 0,
 			},
@@ -184,7 +184,7 @@ impl Disk {
 		let mapped: u64 = match unsafe { map_object(result.file) } {
 			Some(base) => base,
 			None => {
-				unsafe { close(result.file) };
+				close(result.file);
 				return None;
 			}
 		};
@@ -202,10 +202,8 @@ impl Disk {
 			}
 			at += len;
 		}
-		unsafe {
-			unmap_object(result.file);
-			close(result.file);
-		}
+		unmap_object(result.file);
+		close(result.file);
 		Some(entries)
 	}
 }
@@ -326,14 +324,14 @@ impl Journal {
 				}
 			}
 		}
-		unsafe { close(config) };
+		close(config);
 	}
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"LogService: online", 0);
 	}
 
@@ -344,8 +342,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    handle. A supervisor that dropped the channel instead (no clients this boot)
 	//    reports as a missing role, and there is nothing left to serve either way.
 	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
-	if let Err(error) = unsafe { receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) } {
-		unsafe { fail_bootstrap(bootstrap, error.tag(), error.reason()) };
+	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
+		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let service: u64 = roles[0];
 
@@ -363,38 +361,36 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut journal: Journal = Journal::new();
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi_ticked(service, &[bootstrap], FLUSH_TICKS, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
-			if chan == 0 {
+	serve_multi_ticked(service, &[bootstrap], FLUSH_TICKS, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+		if chan == 0 {
+			journal.disk.flush();
+			return None;
+		}
+		if chan == bootstrap {
+			if req == b"STORAGE" && !handle.is_empty() {
+				journal.disk.attach(handle.take_first());
+			} else if req == b"CONFIG" && !handle.is_empty() {
+				journal.adopt_config(handle.take_first());
+			} else if req == b"FLUSH" {
+				// The supervisor asks for a flush before a graceful shutdown tears us
+				// down, so the last batch (records emitted since the previous
+				// housekeeping tick) reaches the on-disk journal rather than dying with
+				// the process. Best-effort - a hard power-cut loses it regardless.
 				journal.disk.flush();
-				return None;
 			}
-			if chan == bootstrap {
-				if req == b"STORAGE" && !handle.is_empty() {
-					journal.disk.attach(handle.take_first());
-				} else if req == b"CONFIG" && !handle.is_empty() {
-					journal.adopt_config(handle.take_first());
-				} else if req == b"FLUSH" {
-					// The supervisor asks for a flush before a graceful shutdown tears us
-					// down, so the last batch (records emitted since the previous
-					// housekeeping tick) reaches the on-disk journal rather than dying with
-					// the process. Best-effort - a hard power-cut loses it regardless.
-					journal.disk.flush();
-				}
-				return None;
-			}
-			// OP_TAIL opens a stream served out of band (no byte reply); everything else
-			// dispatches to a single reply. The stream is minted on the channel the
-			// request arrived on, so each client gets its own tail.
-			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-			if op == log::OP_TAIL {
-				stream_tail(&mut journal, chan, req, handle);
-				None
-			} else {
-				log::dispatch(&mut journal, req, handle, out, reply_handle)
-			}
-		});
-	}
+			return None;
+		}
+		// OP_TAIL opens a stream served out of band (no byte reply); everything else
+		// dispatches to a single reply. The stream is minted on the channel the
+		// request arrived on, so each client gets its own tail.
+		let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+		if op == log::OP_TAIL {
+			stream_tail(&mut journal, chan, req, handle);
+			None
+		} else {
+			log::dispatch(&mut journal, req, handle, out, reply_handle)
+		}
+	});
 	exit();
 }
 
@@ -408,32 +404,26 @@ fn stream_tail(journal: &mut Journal, service: u64, request: &[u8], request_hand
 		Some(v) => v,
 		None => return,
 	};
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return,
 	};
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
-	unsafe {
-		send_blocking(service, &corr_bytes, consumer);
-	}
+	send_blocking(service, &corr_bytes, consumer);
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
 		let mut frame_handles = Handles::new();
 		if let Some(n) = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handles) {
-			unsafe {
-				if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
-					for handle in frame_handles.as_slice() {
-						close(*handle);
-					}
+			if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
+				for handle in frame_handles.as_slice() {
+					close(*handle);
 				}
 			}
 		} else {
 			for handle in frame_handles.as_slice() {
-				unsafe { close(*handle) };
+				close(*handle);
 			}
 		}
 	}
-	unsafe {
-		close(producer);
-	}
+	close(producer);
 }

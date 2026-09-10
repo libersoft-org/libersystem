@@ -88,10 +88,8 @@ impl MappedFile {
 
 impl Drop for MappedFile {
 	fn drop(&mut self) {
-		unsafe {
-			unmap_object(self.handle);
-			close(self.handle);
-		}
+		unmap_object(self.handle);
+		close(self.handle);
 	}
 }
 
@@ -182,7 +180,7 @@ enum Image {
 }
 
 impl Image {
-	unsafe fn bytes(&self) -> &[u8] {
+	fn bytes(&self) -> &[u8] {
 		match self {
 			Image::Installed(file) => unsafe { file.bytes() },
 			Image::Registry(bytes) => bytes,
@@ -229,7 +227,7 @@ struct Resolver {
 }
 
 impl Resolver {
-	unsafe fn collect(&mut self, name: &str, depth: usize) -> bool {
+	fn collect(&mut self, name: &str, depth: usize) -> bool {
 		unsafe {
 			if self.modules.iter().any(|module| module.name == name) {
 				return true;
@@ -438,7 +436,7 @@ impl<'a> Processes<'a> {
 				live.push(entry);
 				continue;
 			}
-			match unsafe { process_stats(entry.handle) } {
+			match process_stats(entry.handle) {
 				Some(stats) if stats.state == PROC_STATE_RUNNING => live.push(entry),
 				// STOPPED and never finished: it has not STARTED yet.
 				//
@@ -472,14 +470,14 @@ impl<'a> Processes<'a> {
 				// is a kernel fault rather than a bookkeeping one - and keeping a live process is
 				// the direction this whole function is supposed to err in.
 				Some(stats) if stats.state == PROC_STATE_STOPPED && stats.completion_valid == 0 => live.push(entry),
-				_ => unsafe {
+				_ => {
 					close(entry.handle);
 					// The Domain goes with the process it accounted. The kernel frees it once
 					// nothing holds it, and this record was the last holder.
 					if entry.domain != 0 {
 						close(entry.domain);
 					}
-				},
+				}
 			}
 		}
 		self.started = live;
@@ -498,8 +496,8 @@ impl<'a> Processes<'a> {
 	// on first use and never released, because there was nothing to release them at: a cache
 	// keyed by a number has no idea when the last user is gone. One per launch is handed to the
 	// process and forgotten, and the kernel frees it when the process does.
-	unsafe fn bounded_domain(&mut self, memory_limit: u64) -> Result<u64, Error> {
-		let domain = unsafe { domain_create(memory_limit, u64::MAX, u64::MAX) };
+	fn bounded_domain(&mut self, memory_limit: u64) -> Result<u64, Error> {
+		let domain = domain_create(memory_limit, u64::MAX, u64::MAX);
 		if domain < 0 {
 			return Err(Error::Again);
 		}
@@ -513,55 +511,51 @@ impl<'a> Processes<'a> {
 	// is malformed, absent or cannot be spawned.
 	// Whether the development agent has announced itself on the registry channel. Checked
 	// without blocking, and only until it has: after that the channel is known live.
-	unsafe fn registry_ready(&mut self) -> bool {
-		unsafe {
-			if self.registry == 0 {
-				return false;
-			}
-			if !self.registry_armed && channel_peek(self.registry) >= 0 {
-				let mut buf: [u8; 16] = [0u8; 16];
-				if let Received::Message { .. } = recv_blocking(self.registry, &mut buf) {
-					self.registry_armed = true;
-				}
-			}
-			self.registry_armed
+	fn registry_ready(&mut self) -> bool {
+		if self.registry == 0 {
+			return false;
 		}
+		if !self.registry_armed && channel_peek(self.registry) >= 0 {
+			let mut buf: [u8; 16] = [0u8; 16];
+			if let Received::Message { .. } = recv_blocking(self.registry, &mut buf) {
+				self.registry_armed = true;
+			}
+		}
+		self.registry_armed
 	}
 
-	unsafe fn spawn_program(&mut self, name: &str, bootstrap: u64, domain: u64) -> Option<(Spawned, String)> {
-		unsafe {
-			if let Some((path, basename)) = executable::explicit_path(name) {
-				if self.storage == 0 {
-					return None;
-				}
-				let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
-				let spawned = spawn_from_path(self.storage, registry, path, basename, bootstrap, domain)?;
-				name_process(spawned.process, basename);
-				return Some((spawned, String::from(basename)));
+	fn spawn_program(&mut self, name: &str, bootstrap: u64, domain: u64) -> Option<(Spawned, String)> {
+		if let Some((path, basename)) = executable::explicit_path(name) {
+			if self.storage == 0 {
+				return None;
 			}
 			let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
-			for artifact in executable::launch_candidates(name)? {
-				let spawned = if self.storage != 0 {
-					let logical_name = executable::logical_name(&artifact)?;
-					let path = program_path(logical_name)?;
-					match spawn_from_path(self.storage, registry, path, &artifact, bootstrap, domain) {
+			let spawned = spawn_from_path(self.storage, registry, path, basename, bootstrap, domain)?;
+			name_process(spawned.process, basename);
+			return Some((spawned, String::from(basename)));
+		}
+		let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
+		for artifact in executable::launch_candidates(name)? {
+			let spawned = if self.storage != 0 {
+				let logical_name = executable::logical_name(&artifact)?;
+				let path = program_path(logical_name)?;
+				match spawn_from_path(self.storage, registry, path, &artifact, bootstrap, domain) {
+					Some(spawned) => spawned,
+					None => continue,
+				}
+			} else {
+				match self.package.lookup(artifact.as_bytes()) {
+					Some(elf) => match spawn_program_bytes(self.storage, 0, elf, None, bootstrap, domain) {
 						Some(spawned) => spawned,
 						None => continue,
-					}
-				} else {
-					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => match spawn_program_bytes(self.storage, 0, elf, None, bootstrap, domain) {
-							Some(spawned) => spawned,
-							None => continue,
-						},
-						None => continue,
-					}
-				};
-				name_process(spawned.process, &artifact);
-				return Some((spawned, artifact));
-			}
-			None
+					},
+					None => continue,
+				}
+			};
+			name_process(spawned.process, &artifact);
+			return Some((spawned, artifact));
 		}
+		None
 	}
 }
 
@@ -572,14 +566,14 @@ impl<'a> Processes<'a> {
 // still a process, and refusing the launch over a label would trade a working system for a
 // better log message.
 fn name_process(handle: u64, artifact: &str) {
-	unsafe { set_object_name(handle, artifact) };
+	set_object_name(handle, artifact);
 }
 
 // Read one exact `.lsexe` path through the storage client, map its shared buffer,
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<Spawned> {
+fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<Spawned> {
 	unsafe {
 		let logical_name = executable::logical_name(artifact)?;
 		// Ask the development registry first. It answers with a generation of exactly this
@@ -612,71 +606,69 @@ unsafe fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact:
 // How long a launch waits for the registry to answer, in scheduler ticks (100 Hz).
 const REGISTRY_ANSWER_TICKS: u64 = 100;
 
-unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<u8>> {
-	unsafe {
-		let handle: u64 = *registry;
-		if handle == 0 || artifact.len() > 64 {
-			return None;
-		}
-		// Drop anything already queued before asking. A query whose deadline expired leaves its
-		// reply to arrive later, and reading that as the answer to the NEXT query puts this
-		// channel permanently one answer behind - every launch then loads what the registry
-		// held at the previous launch, which is worse than not resolving at all because it
-		// looks like it worked.
-		while channel_peek(handle) >= 0 {
-			match recv_vec_blocking(handle) {
-				ReceivedVec::Closed | ReceivedVec::Failed => {
-					*registry = 0;
-					return None;
-				}
-				ReceivedVec::Message { .. } => {}
-			}
-		}
-		// Never block on this send. The registry is a development convenience whose whole
-		// contract is that an unanswered end costs a launch nothing, and `send_blocking` breaks
-		// that contract the moment the queue fills: an agent that takes queries and answers none
-		// stops being ignorable and starts stopping the boot, one launch at a time, until
-		// ProcessService is wedged and every service after it never starts. Measured before this
-		// was written: on an aarch64 development boot the 42nd query blocked forever and the
-		// chain ended at DisplayService, with nothing anywhere saying why.
-		//
-		// A refused send means the agent is not keeping up, which is the same answer as no
-		// generation - so the launch reads the volume, which is what it would have done anyway.
-		if !try_send(handle, artifact.as_bytes(), 0) {
-			return None;
-		}
-		// Look before waiting. The agent can answer before this ever reaches the wait, and a
-		// wait that is asked to sleep until something arrives has nothing left to wake it when
-		// it already has - so a fast answer would time out while sitting in the queue. Bounded
-		// even so: an agent that died between announcing itself and this query must not take
-		// every later launch down with it.
-		let limit: u64 = clock() + REGISTRY_ANSWER_TICKS;
-		loop {
-			if channel_peek(handle) >= 0 {
-				return match recv_vec_blocking(handle) {
-					// A replacement agent announcing itself, which can land in the middle of a
-					// query because an agent can be restarted at any moment. It is not an answer
-					// and must not be read as one: a five-byte image would fail to parse and take
-					// the launch down with it. Keep waiting for the real reply instead.
-					ReceivedVec::Message { bytes, .. } if bytes == REGISTRY_ANNOUNCEMENT => continue,
-					ReceivedVec::Message { bytes, .. } if !bytes.is_empty() => Some(bytes),
-					ReceivedVec::Message { .. } => None,
-					// Either way there is no answer coming on this channel.
-					ReceivedVec::Closed | ReceivedVec::Failed => {
-						*registry = 0;
-						None
-					}
-				};
-			}
-			if clock() >= limit || wait(handle, limit) < 0 {
+fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<u8>> {
+	let handle: u64 = *registry;
+	if handle == 0 || artifact.len() > 64 {
+		return None;
+	}
+	// Drop anything already queued before asking. A query whose deadline expired leaves its
+	// reply to arrive later, and reading that as the answer to the NEXT query puts this
+	// channel permanently one answer behind - every launch then loads what the registry
+	// held at the previous launch, which is worse than not resolving at all because it
+	// looks like it worked.
+	while channel_peek(handle) >= 0 {
+		match recv_vec_blocking(handle) {
+			ReceivedVec::Closed | ReceivedVec::Failed => {
 				*registry = 0;
 				return None;
 			}
+			ReceivedVec::Message { .. } => {}
+		}
+	}
+	// Never block on this send. The registry is a development convenience whose whole
+	// contract is that an unanswered end costs a launch nothing, and `send_blocking` breaks
+	// that contract the moment the queue fills: an agent that takes queries and answers none
+	// stops being ignorable and starts stopping the boot, one launch at a time, until
+	// ProcessService is wedged and every service after it never starts. Measured before this
+	// was written: on an aarch64 development boot the 42nd query blocked forever and the
+	// chain ended at DisplayService, with nothing anywhere saying why.
+	//
+	// A refused send means the agent is not keeping up, which is the same answer as no
+	// generation - so the launch reads the volume, which is what it would have done anyway.
+	if !try_send(handle, artifact.as_bytes(), 0) {
+		return None;
+	}
+	// Look before waiting. The agent can answer before this ever reaches the wait, and a
+	// wait that is asked to sleep until something arrives has nothing left to wake it when
+	// it already has - so a fast answer would time out while sitting in the queue. Bounded
+	// even so: an agent that died between announcing itself and this query must not take
+	// every later launch down with it.
+	let limit: u64 = clock() + REGISTRY_ANSWER_TICKS;
+	loop {
+		if channel_peek(handle) >= 0 {
+			return match recv_vec_blocking(handle) {
+				// A replacement agent announcing itself, which can land in the middle of a
+				// query because an agent can be restarted at any moment. It is not an answer
+				// and must not be read as one: a five-byte image would fail to parse and take
+				// the launch down with it. Keep waiting for the real reply instead.
+				ReceivedVec::Message { bytes, .. } if bytes == REGISTRY_ANNOUNCEMENT => continue,
+				ReceivedVec::Message { bytes, .. } if !bytes.is_empty() => Some(bytes),
+				ReceivedVec::Message { .. } => None,
+				// Either way there is no answer coming on this channel.
+				ReceivedVec::Closed | ReceivedVec::Failed => {
+					*registry = 0;
+					None
+				}
+			};
+		}
+		if clock() >= limit || wait(handle, limit) < 0 {
+			*registry = 0;
+			return None;
 		}
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> Option<Spawned> {
+fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> Option<Spawned> {
 	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return None };
 		let Some(dynamic) = elf.dynamic_info() else { return None };
@@ -752,8 +744,8 @@ struct Spawned {
 impl Spawned {
 	// Run it now. Every ordinary launch does this immediately; only a prepared launch holds
 	// the token back.
-	unsafe fn release(self) -> bool {
-		unsafe { process_release(self.thread) >= 0 }
+	fn release(self) -> bool {
+		process_release(self.thread) >= 0
 	}
 
 	// Abandon it: close what this record still holds, leaving nothing running and nothing leaked.
@@ -763,12 +755,10 @@ impl Spawned {
 	// so a record that went on holding it would close, on cancel, whatever handle the kernel had
 	// since handed out under the same number. `hold_prepared` clears it at the moment the task
 	// leaves; the thread token is the whole of what a prepared record owns.
-	unsafe fn abandon(self) {
-		unsafe {
-			close(self.thread);
-			if self.process != 0 {
-				close(self.process);
-			}
+	fn abandon(self) {
+		close(self.thread);
+		if self.process != 0 {
+			close(self.process);
 		}
 	}
 }
@@ -780,7 +770,7 @@ impl Processes<'_> {
 		while index < self.prepared.len() {
 			if self.prepared[index].0 == client {
 				let (_, koid, spawned) = self.prepared.remove(index);
-				unsafe { spawned.abandon() };
+				spawned.abandon();
 				self.forget(koid);
 			} else {
 				index += 1;
@@ -796,18 +786,18 @@ impl Processes<'_> {
 	// `domain` is the Domain a bounded launch runs in (0 for the caller's), recorded so `forget`
 	// closes it with the record.
 	fn hold_prepared(&mut self, spawned: Spawned, artifact: String, domain: u64) -> Result<StartResult, Error> {
-		let Some(koid) = (unsafe { object_info(spawned.process) }).map(|i| i.koid) else {
+		let Some(koid) = (object_info(spawned.process)).map(|i| i.koid) else {
 			// A prepared launch nobody can identify could never be released - a process
 			// stopped forever. Abandoning it closes both handles, so nothing runs and nothing
 			// leaks.
-			unsafe { spawned.abandon() };
+			spawned.abandon();
 			if domain != 0 {
-				unsafe { close(domain) };
+				close(domain);
 			}
 			return Err(Error::Again);
 		};
 		let info = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(spawned.process, RIGHT_READ) };
+		let observer: i64 = duplicate(spawned.process, RIGHT_READ);
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, domain);
 		let task = spawned.process;
 		let mut held = spawned;
@@ -828,13 +818,11 @@ impl Processes<'_> {
 		while index < self.started.len() {
 			if self.started[index].info.koid == koid {
 				let entry = self.started.remove(index);
-				unsafe {
-					if entry.handle != 0 {
-						close(entry.handle);
-					}
-					if entry.domain != 0 {
-						close(entry.domain);
-					}
+				if entry.handle != 0 {
+					close(entry.handle);
+				}
+				if entry.domain != 0 {
+					close(entry.domain);
 				}
 			} else {
 				index += 1;
@@ -848,10 +836,10 @@ impl<'a> Service for Processes<'a> {
 		// spawn with no bootstrap capability (phase 1: started processes run
 		// unattended), then read back the new process's koid and record it. Unlike `launch`
 		// nothing else wants this handle, so it is recorded directly rather than duplicated.
-		let (spawned, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
+		let (spawned, artifact) = self.spawn_program(&name, 0, 0).ok_or(Error::NotFound)?;
 		let process = spawned.process;
-		unsafe { spawned.release() };
-		let koid: u64 = unsafe { object_info(process) }.map(|i| i.koid).ok_or(Error::Again)?;
+		spawned.release();
+		let koid: u64 = object_info(process).map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
 		self.record(info.clone(), process, 0);
 		Ok(info)
@@ -877,7 +865,7 @@ impl<'a> Service for Processes<'a> {
 			if entry.domain == 0 {
 				continue;
 			}
-			let Some(stats) = (unsafe { domain_stats(entry.domain) }) else { continue };
+			let Some(stats) = domain_stats(entry.domain) else { continue };
 			budgets.push(Budget {
 				name: entry.info.name.clone(),
 				usage: alloc::vec![
@@ -898,12 +886,12 @@ impl<'a> Service for Processes<'a> {
 		// the new process's bootstrap), then read back the new process's koid. The live
 		// process handle is handed back to the caller for job control - so unlike `start`
 		// we do not close it here; it is transferred out as the reply's handle.
-		let (spawned, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
+		let (spawned, artifact) = self.spawn_program(&name, bootstrap, 0).ok_or(Error::NotFound)?;
 		let process = spawned.process;
-		unsafe { spawned.release() };
-		let koid: u64 = unsafe { object_info(process) }.map(|i| i.koid).ok_or(Error::Again)?;
+		spawned.release();
+		let koid: u64 = object_info(process).map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(process, RIGHT_READ) };
+		let observer: i64 = duplicate(process, RIGHT_READ);
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
 		Ok(StartResult { task: process, info })
 	}
@@ -912,7 +900,7 @@ impl<'a> Service for Processes<'a> {
 	// not begun: the start token stays here and `release` queues it. This is what lets a
 	// pipeline exist whole before it runs - `a | b` needs b's reader installed before a writes.
 	fn launch_prepared(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error> {
-		let (spawned, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
+		let (spawned, artifact) = self.spawn_program(&name, bootstrap, 0).ok_or(Error::NotFound)?;
 		self.hold_prepared(spawned, artifact, 0)
 	}
 
@@ -921,9 +909,9 @@ impl<'a> Service for Processes<'a> {
 	// started the program first and granted afterwards, which is the one launch shape that could
 	// not be rolled back to "it never ran".
 	fn launch_prepared_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
-		let domain = unsafe { self.bounded_domain(memory_limit)? };
-		let Some((spawned, artifact)) = (unsafe { self.spawn_program(&name, bootstrap, domain) }) else {
-			unsafe { close(domain) };
+		let domain = self.bounded_domain(memory_limit)?;
+		let Some((spawned, artifact)) = self.spawn_program(&name, bootstrap, domain) else {
+			close(domain);
 			return Err(Error::NotFound);
 		};
 		self.hold_prepared(spawned, artifact, domain)
@@ -954,7 +942,7 @@ impl<'a> Service for Processes<'a> {
 			return Ok(false);
 		};
 		let (_, _, spawned) = self.prepared.remove(index);
-		if unsafe { spawned.release() } {
+		if spawned.release() {
 			return Ok(true);
 		}
 		self.forget(koid);
@@ -973,7 +961,7 @@ impl<'a> Service for Processes<'a> {
 			return Ok(false);
 		};
 		let (_, _, spawned) = self.prepared.remove(index);
-		unsafe { spawned.abandon() };
+		spawned.abandon();
 		self.forget(koid);
 		Ok(true)
 	}
@@ -1026,7 +1014,7 @@ impl<'a> Service for Processes<'a> {
 		// ends them.
 		let mut queued = true;
 		for (koid, spawned) in ready {
-			if !unsafe { spawned.release() } {
+			if !spawned.release() {
 				self.forget(koid);
 				queued = false;
 			}
@@ -1035,22 +1023,22 @@ impl<'a> Service for Processes<'a> {
 	}
 
 	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
-		let domain = unsafe { self.bounded_domain(memory_limit)? };
-		let started = unsafe { self.spawn_program(&name, bootstrap, domain) };
+		let domain = self.bounded_domain(memory_limit)?;
+		let started = self.spawn_program(&name, bootstrap, domain);
 		// The Domain was made for this one process, and the handle is kept only so
 		// `accounting` can read its counters. A process holds its own Domain, so the kernel
 		// frees it when the process ends whatever this service does; what the handle changes
 		// is that the freeing waits for the next reap, which is the same bargain the process
 		// handle already makes. A launch that never started keeps nothing.
 		let Some((spawned, artifact)) = started else {
-			unsafe { close(domain) };
+			close(domain);
 			return Err(Error::NotFound);
 		};
 		let process = spawned.process;
-		unsafe { spawned.release() };
-		let koid = unsafe { object_info(process) }.map(|info| info.koid).ok_or(Error::Again)?;
+		spawned.release();
+		let koid = object_info(process).map(|info| info.koid).ok_or(Error::Again)?;
 		let info = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(process, RIGHT_READ) };
+		let observer: i64 = duplicate(process, RIGHT_READ);
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, domain);
 		Ok(StartResult { task: process, info })
 	}
@@ -1061,24 +1049,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the init package shared buffer (the bring-up fallback source) and map it.
-	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package not delivered") });
-	let package: Package = Package::parse(archive).unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package malformed") });
+	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package not delivered"));
+	let package: Package = Package::parse(archive).unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package malformed"));
 
 	// 2. receive the StorageService client the on-disk binaries are loaded through. A 0
 	//    handle (no client wired, e.g. an isolated bring-up) leaves us loading from the
 	//    package instead.
-	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
+	let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or(0);
 
 	// 2b. receive the development registry channel. Handed over even when nothing will ever
 	//     answer on it, so this service never has to learn about a capability arriving after
 	//     it started serving; an unanswered end simply means every launch reads the volume.
-	let registry: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"REGISTRY") }.unwrap_or(0);
+	let registry: u64 = recv_tagged(bootstrap, &mut buf, b"REGISTRY").unwrap_or(0);
 
 	// 3. wait for the serve channel clients reach us on.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
+	let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 
 	// 4. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"ProcessService: online", 0);
 	}
 
@@ -1086,22 +1074,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), prepared: Vec::new(), client: 0 };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi(service, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
-			// The client's identity, carried into the dispatch that cannot take an extra argument:
-			// the generated trait's shape is fixed, and the serve loop is the only place that knows
-			// which channel a request arrived on.
-			procs.client = chan;
-			// A CLIENT THAT SIMPLY GOES (IDL-001). `serve_multi` synthesises this when a client's
-			// channel closes; everything that client prepared and never released is abandoned here,
-			// which is the difference between a transaction that was dropped and a process loaded,
-			// stopped and holding its Domain for the life of the system.
-			if req.len() == 2 && u16::from_le_bytes([req[0], req[1]]) == abi::DISCONNECT_OP {
-				procs.abandon_prepared_of(chan);
-				return None;
-			}
-			process::dispatch(&mut procs, req, handle, out, reply_handle)
-		});
-	}
+	serve_multi(service, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+		// The client's identity, carried into the dispatch that cannot take an extra argument:
+		// the generated trait's shape is fixed, and the serve loop is the only place that knows
+		// which channel a request arrived on.
+		procs.client = chan;
+		// A CLIENT THAT SIMPLY GOES (IDL-001). `serve_multi` synthesises this when a client's
+		// channel closes; everything that client prepared and never released is abandoned here,
+		// which is the difference between a transaction that was dropped and a process loaded,
+		// stopped and holding its Domain for the life of the system.
+		if req.len() == 2 && u16::from_le_bytes([req[0], req[1]]) == abi::DISCONNECT_OP {
+			procs.abandon_prepared_of(chan);
+			return None;
+		}
+		process::dispatch(&mut procs, req, handle, out, reply_handle)
+	});
 	exit();
 }

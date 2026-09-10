@@ -32,8 +32,8 @@ const REQUEST_TAG: &[u8] = b"REQUEST";
 
 // Emit one log entry through the granted LogService client - exercising the probe's one
 // static grant. Best-effort: the demonstration is that the grant works, not its result.
-unsafe fn emit_online(logsvc: u64) {
-	let entry: Entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from("request_probe"), fields: alloc::vec![Field { key: String::from("event"), value: String::from("online") }] };
+fn emit_online(logsvc: u64) {
+	let entry: Entry = Entry { timestamp: clock(), severity: Severity::Info, source: String::from("request_probe"), fields: alloc::vec![Field { key: String::from("event"), value: String::from("online") }] };
 	let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 	let _ = client.emit(&entry);
 }
@@ -44,8 +44,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// Receive the one capability the manifest grants: a LogService client. The probe never
 	// receives anything else statically.
-	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
-	unsafe {
+	let logsvc: u64 = recv_tagged(bootstrap, &mut buf, b"LOG").unwrap_or_else(|| exit());
+	{
 		emit_online(logsvc);
 	}
 
@@ -55,15 +55,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut request: [u8; 8] = [0u8; 8];
 	request[..REQUEST_TAG.len()].copy_from_slice(REQUEST_TAG);
 	request[REQUEST_TAG.len()] = Capability::Storage as u8;
-	let granted: bool = unsafe {
+	let granted: bool = {
 		send_blocking(bootstrap, &request, 0);
 		recv_tagged(bootstrap, &mut buf, b"STORAGE").is_some()
 	};
 
 	// Report the outcome - the proof of whether the runtime request escalated our authority.
 	let report: &[u8] = if granted { b"storage granted" } else { b"storage denied" };
-	unsafe {
-		send_blocking(bootstrap, report, 0);
-	}
+	send_blocking(bootstrap, report, 0);
 	exit();
 }

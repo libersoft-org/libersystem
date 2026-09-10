@@ -21,46 +21,42 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the name of the program to start.
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let name: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: a ProcessService client.
-		let procsvc: u64 = recv_tagged(bootstrap, &mut buf, b"PROCESS").unwrap_or_else(|| exit());
-		run_process(procsvc, &name[..]);
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the name of the program to start.
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let name: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: a ProcessService client.
+	let procsvc: u64 = recv_tagged(bootstrap, &mut buf, b"PROCESS").unwrap_or_else(|| exit());
+	run_process(procsvc, &name[..]);
 	exit();
 }
 
 // Start the program named `name` through the grant and report the new process.
-unsafe fn run_process(procsvc: u64, name: &[u8]) {
-	unsafe {
-		let name = match core::str::from_utf8(name) {
-			Ok(s) => s,
-			Err(_) => {
-				eprint(b"run: invalid name\n");
-				return;
-			}
-		};
-		let mut client = ProcessClient::new(procsvc);
-		match client.start(name) {
-			Some(Ok(info)) => {
-				print(b"started ");
-				print(info.to_text().as_bytes());
-				print(b"\n");
-			}
-			Some(Err(_)) => {
-				eprint(b"run: could not start ");
-				eprint(name.as_bytes());
-				eprint(b"\n");
-			}
-			None => eprint(b"run: service unavailable\n"),
+fn run_process(procsvc: u64, name: &[u8]) {
+	let name = match core::str::from_utf8(name) {
+		Ok(s) => s,
+		Err(_) => {
+			eprint(b"run: invalid name\n");
+			return;
 		}
+	};
+	let mut client = ProcessClient::new(procsvc);
+	match client.start(name) {
+		Some(Ok(info)) => {
+			print(b"started ");
+			print(info.to_text().as_bytes());
+			print(b"\n");
+		}
+		Some(Err(_)) => {
+			eprint(b"run: could not start ");
+			eprint(name.as_bytes());
+			eprint(b"\n");
+		}
+		None => eprint(b"run: service unavailable\n"),
 	}
 }

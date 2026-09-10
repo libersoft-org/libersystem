@@ -157,8 +157,8 @@ pub fn set_console_input(handle: u64) {
 }
 
 // Feed one byte to the console under this driver's capability.
-unsafe fn feed(byte: u8) -> i64 {
-	unsafe { console_feed(CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed), byte) }
+fn feed(byte: u8) -> i64 {
+	console_feed(CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed), byte)
 }
 
 // The system power keys: Power shuts the machine down (wired like the
@@ -302,141 +302,139 @@ impl Default for Mods {
 // character through the layout (Shift / Caps / Ctrl / Alt applied), a navigation,
 // edit or function key into its ANSI escape sequence, and a keypad key into a digit
 // or a navigation sequence by the NumLock state.
-pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
-	unsafe {
-		// Modifier keys track press (1) / release (0); the lock keys (Caps / Num / Scroll)
-		// toggle on press. They emit no character, so handle them before the press-only
-		// gate below.
-		match code {
-			KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
-				mods.shift = value != 0;
-				return;
-			}
-			KEY_LEFTCTRL | KEY_RIGHTCTRL => {
-				mods.ctrl = value != 0;
-				return;
-			}
-			KEY_LEFTALT | KEY_RIGHTALT => {
-				mods.alt = value != 0;
-				return;
-			}
-			KEY_LEFTMETA | KEY_RIGHTMETA => {
-				mods.meta = value != 0;
-				return;
-			}
-			KEY_CAPSLOCK => {
-				if value == 1 {
-					mods.caps = !mods.caps;
-				}
-				return;
-			}
-			KEY_NUMLOCK => {
-				if value == 1 {
-					mods.numlock = !mods.numlock;
-				}
-				return;
-			}
-			KEY_SCROLLLOCK => {
-				if value == 1 {
-					mods.scroll = !mods.scroll;
-				}
-				return;
-			}
-			_ => {}
-		}
-		// 1 = press, 2 = autorepeat (both emit); 0 = release is ignored.
-		if value != 1 && value != 2 {
+pub fn feed_key(code: u16, value: u32, mods: &mut Mods) {
+	// Modifier keys track press (1) / release (0); the lock keys (Caps / Num / Scroll)
+	// toggle on press. They emit no character, so handle them before the press-only
+	// gate below.
+	match code {
+		KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
+			mods.shift = value != 0;
 			return;
 		}
-		// Ctrl+Alt+Delete is the reboot chord: a Delete press while both Ctrl and Alt are
-		// held reboots the machine. The keyboard is interrupt-driven, so it fires and
-		// interrupts whatever userspace is doing, even if the shell is wedged.
-		if code == KEY_DELETE && value == 1 && mods.ctrl && mods.alt {
-			request_reboot();
-		}
-		// The Power key shuts the machine down (interrupt-driven like the reboot chord,
-		// so it works even when userspace is wedged).
-		//
-		// It announces itself first, and that is not decoration. Powering off is the one
-		// action that destroys the evidence of why it happened: the machine simply stops,
-		// QEMU exits 0 with no reset and no fault, and from outside it is indistinguishable
-		// from a clean shutdown - which is exactly how a test suite came to end mid-run with
-		// nothing in the log to say who ended it. Whatever asks for this should be named
-		// while there is still a console to name it on.
-		if code == KEY_POWER {
-			debug_write(b"driver.keys: KEY_POWER - powering off\n");
-			request_power_off();
+		KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+			mods.ctrl = value != 0;
 			return;
 		}
-		// The recognized keys whose subsystem does not exist yet: consumed, no bytes.
-		if RESERVED_KEYS.contains(&code) {
+		KEY_LEFTALT | KEY_RIGHTALT => {
+			mods.alt = value != 0;
 			return;
 		}
-		// Clipboard chords the console intercepts (a private byte, never a normal keystroke):
-		// Copy = Ctrl+Shift+C or Ctrl+Insert; Paste = Ctrl+Shift+V or Shift+Insert. Caught here,
-		// before the layout would turn Ctrl+C into 0x03 or Insert into an escape sequence.
-		if (mods.ctrl && mods.shift && code == KEY_C) || (mods.ctrl && code == KEY_INSERT) {
-			feed(CHORD_COPY);
+		KEY_LEFTMETA | KEY_RIGHTMETA => {
+			mods.meta = value != 0;
 			return;
 		}
-		if (mods.ctrl && mods.shift && code == KEY_V) || (mods.shift && code == KEY_INSERT) {
-			feed(CHORD_PASTE);
-			return;
-		}
-		// PageUp / PageDown: Shift pages the console's own scrollback (a private control
-		// byte the console intercepts); unshifted sends the standard ANSI sequence to the
-		// client. Collapsing the chord here means the console needs no input escape parser.
-		if code == KEY_PAGEUP || code == KEY_PAGEDOWN {
-			if mods.shift {
-				feed(if code == KEY_PAGEUP { 0x1e } else { 0x1f });
-			} else {
-				let seq: &[u8] = if code == KEY_PAGEUP { b"\x1b[5~" } else { b"\x1b[6~" };
-				for &b in seq {
-					feed(b);
-				}
+		KEY_CAPSLOCK => {
+			if value == 1 {
+				mods.caps = !mods.caps;
 			}
 			return;
 		}
-		// Navigation, edit and function keys carry no ASCII glyph; emit the ANSI escape
-		// sequence a serial terminal sends for them, so the shell's line editor decodes
-		// the framebuffer keyboard and a serial terminal identically.
-		if let Some(seq) = escape_sequence(code) {
+		KEY_NUMLOCK => {
+			if value == 1 {
+				mods.numlock = !mods.numlock;
+			}
+			return;
+		}
+		KEY_SCROLLLOCK => {
+			if value == 1 {
+				mods.scroll = !mods.scroll;
+			}
+			return;
+		}
+		_ => {}
+	}
+	// 1 = press, 2 = autorepeat (both emit); 0 = release is ignored.
+	if value != 1 && value != 2 {
+		return;
+	}
+	// Ctrl+Alt+Delete is the reboot chord: a Delete press while both Ctrl and Alt are
+	// held reboots the machine. The keyboard is interrupt-driven, so it fires and
+	// interrupts whatever userspace is doing, even if the shell is wedged.
+	if code == KEY_DELETE && value == 1 && mods.ctrl && mods.alt {
+		request_reboot();
+	}
+	// The Power key shuts the machine down (interrupt-driven like the reboot chord,
+	// so it works even when userspace is wedged).
+	//
+	// It announces itself first, and that is not decoration. Powering off is the one
+	// action that destroys the evidence of why it happened: the machine simply stops,
+	// QEMU exits 0 with no reset and no fault, and from outside it is indistinguishable
+	// from a clean shutdown - which is exactly how a test suite came to end mid-run with
+	// nothing in the log to say who ended it. Whatever asks for this should be named
+	// while there is still a console to name it on.
+	if code == KEY_POWER {
+		debug_write(b"driver.keys: KEY_POWER - powering off\n");
+		request_power_off();
+		return;
+	}
+	// The recognized keys whose subsystem does not exist yet: consumed, no bytes.
+	if RESERVED_KEYS.contains(&code) {
+		return;
+	}
+	// Clipboard chords the console intercepts (a private byte, never a normal keystroke):
+	// Copy = Ctrl+Shift+C or Ctrl+Insert; Paste = Ctrl+Shift+V or Shift+Insert. Caught here,
+	// before the layout would turn Ctrl+C into 0x03 or Insert into an escape sequence.
+	if (mods.ctrl && mods.shift && code == KEY_C) || (mods.ctrl && code == KEY_INSERT) {
+		feed(CHORD_COPY);
+		return;
+	}
+	if (mods.ctrl && mods.shift && code == KEY_V) || (mods.shift && code == KEY_INSERT) {
+		feed(CHORD_PASTE);
+		return;
+	}
+	// PageUp / PageDown: Shift pages the console's own scrollback (a private control
+	// byte the console intercepts); unshifted sends the standard ANSI sequence to the
+	// client. Collapsing the chord here means the console needs no input escape parser.
+	if code == KEY_PAGEUP || code == KEY_PAGEDOWN {
+		if mods.shift {
+			feed(if code == KEY_PAGEUP { 0x1e } else { 0x1f });
+		} else {
+			let seq: &[u8] = if code == KEY_PAGEUP { b"\x1b[5~" } else { b"\x1b[6~" };
 			for &b in seq {
 				feed(b);
 			}
-			return;
 		}
-		// The keypad: the operator keys and KP Enter always type; the digit block types
-		// digits while NumLock is on (a held Shift temporarily reverses it, PC-style) and
-		// doubles as the navigation island (arrows / Home / PgUp / Ins / Del) while it is off.
-		let kp: u8 = keypad_char(code, mods.numlock ^ mods.shift);
-		if kp != 0 {
-			feed(kp);
-			return;
+		return;
+	}
+	// Navigation, edit and function keys carry no ASCII glyph; emit the ANSI escape
+	// sequence a serial terminal sends for them, so the shell's line editor decodes
+	// the framebuffer keyboard and a serial terminal identically.
+	if let Some(seq) = escape_sequence(code) {
+		for &b in seq {
+			feed(b);
 		}
-		if let Some(seq) = keypad_sequence(code) {
-			for &b in seq {
-				feed(b);
-			}
-			return;
+		return;
+	}
+	// The keypad: the operator keys and KP Enter always type; the digit block types
+	// digits while NumLock is on (a held Shift temporarily reverses it, PC-style) and
+	// doubles as the navigation island (arrows / Home / PgUp / Ins / Del) while it is off.
+	let kp: u8 = keypad_char(code, mods.numlock ^ mods.shift);
+	if kp != 0 {
+		feed(kp);
+		return;
+	}
+	if let Some(seq) = keypad_sequence(code) {
+		for &b in seq {
+			feed(b);
 		}
-		// The ISO 102nd key has no slot in the 64-entry maps: on the US layout it is a
-		// second backslash / pipe key, so route it through the backslash keycode.
-		let code: u16 = if code == KEY_102ND { KEY_BACKSLASH } else { code };
-		// Anything else above the maps - the Menu key, Print Screen / SysRq, Pause - has
-		// no byte representation on a terminal: recognized, but inert.
-		if code >= 64 {
-			return;
+		return;
+	}
+	// The ISO 102nd key has no slot in the 64-entry maps: on the US layout it is a
+	// second backslash / pipe key, so route it through the backslash keycode.
+	let code: u16 = if code == KEY_102ND { KEY_BACKSLASH } else { code };
+	// Anything else above the maps - the Menu key, Print Screen / SysRq, Pause - has
+	// no byte representation on a terminal: recognized, but inert.
+	if code >= 64 {
+		return;
+	}
+	let ch: u8 = layout(code, mods);
+	if ch != 0 {
+		// Alt makes the key a "meta" key: prefix the byte with ESC, the convention a
+		// serial terminal uses (Alt+x -> ESC x).
+		if mods.alt {
+			feed(0x1b);
 		}
-		let ch: u8 = layout(code, mods);
-		if ch != 0 {
-			// Alt makes the key a "meta" key: prefix the byte with ESC, the convention a
-			// serial terminal uses (Alt+x -> ESC x).
-			if mods.alt {
-				feed(0x1b);
-			}
-			feed(ch);
-		}
+		feed(ch);
 	}
 }
 

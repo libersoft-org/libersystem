@@ -33,31 +33,29 @@ pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
 // Tear the whole service tree down for a graceful power-off. LogService flushes first;
 // every other service then stops in reverse-dependency order. The issuing shell is
 // excluded from the order and dies with the machine.
-pub(super) unsafe fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) {
-	unsafe {
-		if let Some(log) = index_of(b"log_service") {
-			if state[log] == State::Ready && channels[log] != 0 {
-				send_blocking(channels[log], b"FLUSH", 0);
-			}
+pub(super) fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) {
+	if let Some(log) = index_of(b"log_service") {
+		if state[log] == State::Ready && channels[log] != 0 {
+			send_blocking(channels[log], b"FLUSH", 0);
 		}
-		let order: Vec<usize> = shutdown_order(state);
-		for &idx in &order {
-			if state[idx] != State::Ready {
-				continue;
-			}
-			if procs[idx] != 0 {
-				signal(procs[idx], SIG_KILL);
-			}
-			drain_closed(channels[idx], buf);
-			if channels[idx] != 0 {
-				close(channels[idx]);
-				channels[idx] = 0;
-			}
-			state[idx] = State::Stopped;
-			sup[idx].failure = Failure::Stopped;
-			emit_event(log_client, MANIFEST[idx].name, b"stopped");
-			console_report(MANIFEST[idx].name, b"stopped");
+	}
+	let order: Vec<usize> = shutdown_order(state);
+	for &idx in &order {
+		if state[idx] != State::Ready {
+			continue;
 		}
+		if procs[idx] != 0 {
+			signal(procs[idx], SIG_KILL);
+		}
+		drain_closed(channels[idx], buf);
+		if channels[idx] != 0 {
+			close(channels[idx]);
+			channels[idx] = 0;
+		}
+		state[idx] = State::Stopped;
+		sup[idx].failure = Failure::Stopped;
+		emit_event(log_client, MANIFEST[idx].name, b"stopped");
+		console_report(MANIFEST[idx].name, b"stopped");
 	}
 }
 
@@ -70,27 +68,25 @@ pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool
 
 // Answer one request on a supervisor stats channel. Returns false once the peer is
 // gone, so the standing supervisor drops that channel from its wait set.
-pub(super) unsafe fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desired; N], procs: &[u64; N], lifecycle: &LifecycleLog, sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
-	unsafe {
-		let (len, mut handle) = match recv_caps_blocking(stats, buf) {
-			ReceivedCaps::Message { len, handles } => (len, handles),
-			ReceivedCaps::Closed => return false,
-		};
-		let mut api = StatsApi { state, desired, procs, lifecycle, sup, reason, canary_sup, drivers };
-		let mut reply: [u8; 4096] = [0u8; 4096];
-		let mut reply_handle = proto::codec::Handles::new();
-		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], &mut handle, &mut reply, &mut reply_handle) {
-			if !send_caps_blocking(stats, &reply[..n], reply_handle.as_slice()) {
-				for &leftover in reply_handle.as_slice() {
-					close(leftover);
-				}
+pub(super) fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desired; N], procs: &[u64; N], lifecycle: &LifecycleLog, sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
+	let (len, mut handle) = match recv_caps_blocking(stats, buf) {
+		ReceivedCaps::Message { len, handles } => (len, handles),
+		ReceivedCaps::Closed => return false,
+	};
+	let mut api = StatsApi { state, desired, procs, lifecycle, sup, reason, canary_sup, drivers };
+	let mut reply: [u8; 4096] = [0u8; 4096];
+	let mut reply_handle = proto::codec::Handles::new();
+	if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], &mut handle, &mut reply, &mut reply_handle) {
+		if !send_caps_blocking(stats, &reply[..n], reply_handle.as_slice()) {
+			for &leftover in reply_handle.as_slice() {
+				close(leftover);
 			}
 		}
-		for &unclaimed in handle.as_slice() {
-			close(unclaimed);
-		}
-		true
 	}
+	for &unclaimed in handle.as_slice() {
+		close(unclaimed);
+	}
+	true
 }
 
 // The name a reader sees. `starting` and `stopping` are new words for states that always existed

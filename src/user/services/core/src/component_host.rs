@@ -69,15 +69,15 @@ struct ComponentServices {
 
 impl WorldServices for ComponentServices {
 	fn read(&mut self, dst: &mut [u8]) -> ReadOutcome {
-		unsafe { read_file(self.storage, self.input_path.as_bytes(), dst) }
+		read_file(self.storage, self.input_path.as_bytes(), dst)
 	}
 
 	fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
-		unsafe { write_file(self.storage, self.output_path.as_bytes(), bytes) }
+		write_file(self.storage, self.output_path.as_bytes(), bytes)
 	}
 
 	fn log(&mut self, text: &str) -> LogOutcome {
-		unsafe { emit_log(self.logsvc, text.as_bytes()) }
+		emit_log(self.logsvc, text.as_bytes())
 	}
 }
 
@@ -136,32 +136,30 @@ unsafe fn load_component(storage: u64, uri: &[u8]) -> Option<Vec<u8>> {
 // that is not there - none of them is "you may not", which is the only thing `Denied` means. The
 // full reasoning, including why `NotFound` is not a refusal in a world where the guest never names
 // the path, is with the status codes in `src/wasm/src/world.rs`.
-unsafe fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> ReadOutcome {
-	unsafe {
-		let opts: OpenOpts = OpenOpts { path: String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		let result = match client.open(&opts) {
-			Some(Ok(r)) => r,
-			// The volume answered and said no - or said something else, which is not the same
-			// thing. One classification, in `service-logic` where a host test can reach it.
-			Some(Err(error)) => return read_failure(error),
-			// Nothing came back at all.
-			None => return ReadOutcome::Failed,
-		};
-		if result.file == 0 {
-			return ReadOutcome::Failed;
-		}
-		match read_into(result.file, result.size, dst) {
-			Some(n) => ReadOutcome::Read(n),
-			None => ReadOutcome::Failed,
-		}
+fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> ReadOutcome {
+	let opts: OpenOpts = OpenOpts { path: String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
+	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	let result = match client.open(&opts) {
+		Some(Ok(r)) => r,
+		// The volume answered and said no - or said something else, which is not the same
+		// thing. One classification, in `service-logic` where a host test can reach it.
+		Some(Err(error)) => return read_failure(error),
+		// Nothing came back at all.
+		None => return ReadOutcome::Failed,
+	};
+	if result.file == 0 {
+		return ReadOutcome::Failed;
+	}
+	match read_into(result.file, result.size, dst) {
+		Some(n) => ReadOutcome::Read(n),
+		None => ReadOutcome::Failed,
 	}
 }
 
 // Write `bytes` to the granted output file over StorageService, answering WHY it did not happen
 // rather than whether it did. `WriteOutcome` is the world's - it is the distinction the guest is
 // told, so it belongs beside the status codes that carry it.
-unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> WriteOutcome {
+fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> WriteOutcome {
 	unsafe {
 		let Some(data) = make_buffer(bytes) else { return WriteOutcome::Failed };
 		let path: String = String::from_utf8_lossy(uri).into_owned();
@@ -186,13 +184,13 @@ unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> WriteOutcome {
 // a guest that broke its side of the world - refused here rather than turned into replacement
 // characters somewhere nobody can see. `String::from_utf8_lossy` was answering a question the
 // caller had not asked.
-unsafe fn emit_log(logsvc: u64, msg: &[u8]) -> LogOutcome {
+fn emit_log(logsvc: u64, msg: &[u8]) -> LogOutcome {
 	let Ok(text) = core::str::from_utf8(msg) else {
 		// The world's `log` takes TEXT, and the host has already checked this - reaching here means
 		// the two disagree, which is this host's fault rather than the grant's.
 		return LogOutcome::Failed;
 	};
-	let entry: Entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from("component"), fields: alloc::vec![Field { key: String::from("message"), value: String::from(text) }] };
+	let entry: Entry = Entry { timestamp: clock(), severity: Severity::Info, source: String::from("component"), fields: alloc::vec![Field { key: String::from("message"), value: String::from(text) }] };
 	let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 	match client.emit(&entry) {
 		Some(Ok(())) => LogOutcome::Logged,
@@ -240,8 +238,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. receive the two typed capabilities the host is granted, in order: a
 	//    StorageService client (filesystem) and a LogService client (the console).
 	//    The host never receives - and so can never reach - anything else.
-	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
-	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
+	let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
+	let logsvc: u64 = recv_tagged(bootstrap, &mut buf, b"LOG").unwrap_or_else(|| exit());
 
 	// 2. load the component from storage and parse it. It is an ordinary toolchain
 	//    artifact, not embedded in the kernel image.
@@ -320,7 +318,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the bytes it compared had never been near the filesystem. The host holds the storage grant, so
 	// it is the one that can open the file again; the test compares both.
 	let mut readback: [u8; 512] = [0u8; 512];
-	let written: usize = match unsafe { read_file(storage, output_path.as_bytes(), &mut readback) } {
+	let written: usize = match read_file(storage, output_path.as_bytes(), &mut readback) {
 		ReadOutcome::Read(n) => n,
 		// The readback is the test's evidence that the write landed; a refusal and a failure are
 		// both "nothing to report", and the assertion on the other side is what says so.
@@ -338,8 +336,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	report.extend_from_slice(&(written as u32).to_le_bytes());
 	report.extend_from_slice(&readback[..written]);
 	report.extend_from_slice(host.output());
-	unsafe {
-		send_blocking(bootstrap, &report, 0);
-	}
+	send_blocking(bootstrap, &report, 0);
 	exit();
 }

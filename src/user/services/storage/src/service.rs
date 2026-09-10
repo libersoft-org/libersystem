@@ -175,7 +175,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// arm. Only the USB instance can answer anything but `false`.
 	let mut routed: bool = false;
 	let mut usb: Option<UsbProviders> = None;
-	let mut vol: Volume = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let mut vol: Volume = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
 			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
@@ -223,7 +223,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			} else {
 				0
 			};
-			let probes = unsafe { receive_probes(bootstrap, expected, &mut buf) };
+			let probes = receive_probes(bootstrap, expected, &mut buf);
 
 			let probe_count: usize = probes.len();
 			// NOTHING CHOSEN PROMOTES NOTHING, and that is a rule about the KIND before it is one
@@ -238,13 +238,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if let Some((kind, _)) = chosen
 				&& kind != ROOT_BLOCK
 			{
-				unsafe { print(b"StorageService: the loader promoted no block volume for this boot - refusing to serve one as the system volume\n") };
+				print(b"StorageService: the loader promoted no block volume for this boot - refusing to serve one as the system volume\n");
 				exit();
 			}
 			// THE ONE THE LOADER CHOSE, wherever it is on the bus. The handle this instance was
 			// given is tried first, so a machine whose first disk IS the system volume behaves
 			// exactly as it did; a probe is only reached when it is not.
-			let mounted = unsafe { mount_by_uuid(handle, &probes[..probe_count], chosen.map(|(_, want)| want)) };
+			let mounted = mount_by_uuid(handle, &probes[..probe_count], chosen.map(|(_, want)| want));
 			// EVERY PROBE BUT THE ONE BEING SERVED THROUGH. `mount_by_uuid` answers with the handle
 			// its filesystem reads through, and on the case that function exists for - the chosen
 			// volume is not the first block device - that handle is one of these probes. Closing all
@@ -274,19 +274,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// log line is the text before the NUL, unchanged - and a reader that does not look past
 			// it behaves exactly as it did.
 			if block_formats.try_reserve_exact(probe_count).is_err() {
-				unsafe { rt::fail_bootstrap(bootstrap, b"classification table", b"allocation failed") };
+				rt::fail_bootstrap(bootstrap, b"classification table", b"allocation failed");
 			}
 			for probe in probes[..probe_count].iter() {
 				// The one being served is known without asking: it is the volume just mounted.
-				block_formats.push(if *probe == serving && serving != 0 { FORMAT_LIBERFS } else { unsafe { classify_block(*probe) } });
+				block_formats.push(if *probe == serving && serving != 0 { FORMAT_LIBERFS } else { classify_block(*probe) });
 			}
 			for probe in probes[..probe_count].iter() {
 				if *probe != 0 && *probe != serving {
-					unsafe { close(*probe) };
+					close(*probe);
 				}
 			}
 			if handle != 0 && handle != serving {
-				unsafe { close(handle) };
+				close(handle);
 			}
 			match mounted {
 				Ok((fs, _)) => {
@@ -298,18 +298,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					if let Some((_, want)) = chosen
 						&& fs.uuid() != want
 					{
-						unsafe { print(b"StorageService: the volume this instance mounted is not the one the loader chose - refusing to serve it as the system volume\n") };
+						print(b"StorageService: the volume this instance mounted is not the one the loader chose - refusing to serve it as the system volume\n");
 						exit();
 					}
 					Volume::new(alloc::boxed::Box::new(DiskFs { fs }))
 				}
 				Err(reason) => {
-					unsafe {
-						print(match reason {
-							RootMountError::Missing => b"StorageService: selected root volume is missing; refused\n",
-							RootMountError::Ambiguous => b"StorageService: selected root volume is ambiguous; refused\n",
-						})
-					};
+					print(match reason {
+						RootMountError::Missing => b"StorageService: selected root volume is missing; refused\n",
+						RootMountError::Ambiguous => b"StorageService: selected root volume is ambiguous; refused\n",
+					});
 					exit();
 				}
 			}
@@ -362,17 +360,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// duplication is what the milestone is for. On read-only media there is no first copy.
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => {
 			let expected = if len == 11 { u32::from_le_bytes(buf[7..11].try_into().unwrap()) as usize } else { 0 };
-			let probes = unsafe { receive_probes(bootstrap, expected, &mut buf) };
+			let probes = receive_probes(bootstrap, expected, &mut buf);
 			if block_formats.try_reserve_exact(expected).is_err() {
-				unsafe { rt::fail_bootstrap(bootstrap, b"classification table", b"allocation failed") };
+				rt::fail_bootstrap(bootstrap, b"classification table", b"allocation failed");
 			}
 			for probe in probes {
-				block_formats.push(unsafe { classify_block(probe) });
+				block_formats.push(classify_block(probe));
 				if probe != 0 {
-					unsafe { close(probe) };
+					close(probe);
 				}
 			}
-			match unsafe { live_volume(handle) } {
+			match live_volume(handle) {
 				Some(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME })),
 				None => exit(),
 			}
@@ -390,8 +388,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 2. an optional privileged admin endpoint precedes the public service endpoint.
 	// Ordinary boots and focused scenarios that do not need scoped clients still send
 	// SERVE directly and retain the existing bootstrap contract.
-	let (admin, service): (u64, u64) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle: admin_handle } if admin_handle != 0 && len >= 5 && &buf[..5] == b"ADMIN" => match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let (admin, service): (u64, u64) = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle: admin_handle } if admin_handle != 0 && len >= 5 && &buf[..5] == b"ADMIN" => match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => (admin_handle, handle),
 			_ => exit(),
 		},
@@ -407,13 +405,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// with nothing to tell them apart, and the kernel's boot suite had to assert a COUNT of them
 	// because a count was all the line supported. Naming the volume makes the same report say which
 	// of the seven it is, and lets that suite assert the SET that came up.
-	unsafe {
-		let report = match storage_bootstrap_report(vol.name(), routed, &block_formats) {
-			Ok(report) => report,
-			Err(reason) => rt::fail_bootstrap(bootstrap, b"classification report", reason),
-		};
-		send_blocking(bootstrap, &report, 0);
-	}
+	let report = match storage_bootstrap_report(vol.name(), routed, &block_formats) {
+		Ok(report) => report,
+		Err(reason) => rt::fail_bootstrap(bootstrap, b"classification report", reason),
+	};
+	send_blocking(bootstrap, &report, 0);
 	serve_volume(&mut vol, service, admin, usb);
 }
 
@@ -628,15 +624,13 @@ impl AdminCall<'_> {
 	// One place a narrowed client is made, so a file grant and a directory grant cannot come to
 	// differ in how they are admitted or in what a refusal leaves behind.
 	fn mint(&mut self, scope: Scope) -> Result<u64, Error> {
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		// A refused admission closes BOTH ends: the grant did not happen, so neither handle has an
 		// owner. `Again` is what it is - the table is full or the machine is short, and both are
 		// conditions a caller can retry rather than a fault in the request.
 		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope, quiet: false, writer: None }) {
-			unsafe {
-				close(server);
-				close(client);
-			}
+			close(server);
+			close(client);
 			return Err(Error::Again);
 		}
 		Ok(client)
@@ -768,12 +762,10 @@ impl volume::Service for VolumeCall<'_> {
 			}
 		}
 		let session = WriterSession { name: to_string(core::str::from_utf8(name).map_err(|_| Error::Invalid)?)?, path: to_string(&path)?, staged, cursor, limit, limit_is_policy, closed: false };
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope: self.scope.clone(), quiet: false, writer: Some(session) }) {
-			unsafe {
-				close(server);
-				close(client);
-			}
+			close(server);
+			close(client);
 			return Err(Error::Again);
 		}
 		Ok(client)
@@ -788,15 +780,13 @@ impl volume::Service for VolumeCall<'_> {
 	// refused it again on every connection it makes. That is what makes this safe to hand to a
 	// governed tool - it is the authority the caller already has, arriving on its own wire.
 	fn connect(&mut self) -> Result<u64, Error> {
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		// A refused admission closes BOTH ends, for `open-directory`'s reason: the grant did not
 		// happen, so neither handle has an owner. `Again` is the honest answer - the client table
 		// is full, which a caller can retry rather than a fault in what it asked.
 		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope: self.scope.clone(), quiet: false, writer: None }) {
-			unsafe {
-				close(server);
-				close(client);
-			}
+			close(server);
+			close(client);
 			return Err(Error::Again);
 		}
 		Ok(client)
@@ -982,7 +972,7 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 	request_handle.clear();
 	// Every refusal from here on owns the stream channel and has to close it.
 	let refuse = |e: Error| {
-		unsafe { close(data) };
+		close(data);
 		Err((corr, e))
 	};
 	// The handle has to BE a channel this service can read and wait on.
@@ -993,7 +983,7 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 	// blocking, and the loop's error branch retries, so one bad handle spins the service until the
 	// deadline. Checked here, where refusing costs a parse.
 	const OBJECT_TYPE_CHANNEL: u64 = 5;
-	match unsafe { object_info(data) } {
+	match object_info(data) {
 		Some(info) if info.object_type == OBJECT_TYPE_CHANNEL && info.rights & RIGHT_READ != 0 && info.rights & RIGHT_WAIT != 0 => {}
 		_ => return refuse(Error::Invalid),
 	}
@@ -1004,7 +994,7 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 	if busy {
 		return refuse(Error::Again);
 	}
-	vol.fs.set_clock(unsafe { clock_rtc() });
+	vol.fs.set_clock(clock_rtc());
 	let name: &[u8] = match vol.writable_name(&path) {
 		Ok(name) => name,
 		Err(e) => return refuse(e),
@@ -1019,7 +1009,7 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 		Some(Err(e)) => return refuse(e),
 		None => false,
 	};
-	let now = unsafe { clock() };
+	let now = clock();
 	Ok(PendingWrite { stream: data, stream_koid: 0, client, corr, path, idle: now.saturating_add(STREAM_IDLE_TICKS), expires: now.saturating_add(STREAM_TOTAL_TICKS), incremental, bytes: Vec::new(), received: 0, chunks: 0, limit, limit_is_policy })
 }
 
@@ -1040,7 +1030,7 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 	// buffer, and the pending buffer's old allocation while it grows. That is why a reserved volume
 	// could not promise to take one chunk near its capacity.
 	if p.incremental {
-		let waiting: i64 = unsafe { channel_peek(p.stream) };
+		let waiting: i64 = channel_peek(p.stream);
 		if waiting == ERR_PEER_CLOSED {
 			return StreamStep::Done(Ok(()));
 		}
@@ -1058,7 +1048,7 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 		if want == 0 {
 			// An empty message is the sender saying it is finished; take it and stop.
 			let mut nothing: [u8; 1] = [0u8; 1];
-			let _ = unsafe { recv_into(p.stream, &mut nothing[..0]) };
+			let _ = recv_into(p.stream, &mut nothing[..0]);
 			return StreamStep::Done(Ok(()));
 		}
 		if want > room {
@@ -1073,7 +1063,7 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 		let written = match vol.fs.stream_spare(want) {
 			Some(Ok(spare)) => {
 				opened = true;
-				match unsafe { recv_into(p.stream, spare) } {
+				match recv_into(p.stream, spare) {
 					RecvInto::Received(n) => n,
 					RecvInto::PeerClosed => {
 						if vol.fs.stream_advance(offered, 0).is_err() {
@@ -1104,15 +1094,15 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 		if p.chunks > STREAM_CHUNK_GRACE && p.received / p.chunks < STREAM_MIN_CHUNK {
 			return StreamStep::Done(Err(Error::Invalid));
 		}
-		p.idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+		p.idle = clock().saturating_add(STREAM_IDLE_TICKS);
 		return StreamStep::More;
 	}
-	match unsafe { recv_vec_bounded(p.stream, room) } {
+	match recv_vec_bounded(p.stream, room) {
 		BoundedVec::Message { bytes: chunk, handle } => {
 			// A stream carries plain messages; a capability sent anyway must not leak into this
 			// service's table.
 			if handle != 0 {
-				unsafe { close(handle) };
+				close(handle);
 			}
 			if chunk.is_empty() {
 				return StreamStep::Done(Ok(()));
@@ -1135,7 +1125,7 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 			}
 			// Idle window renewed by arrival; the total deadline is not, which is what stops the
 			// renewal being unbounded.
-			p.idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+			p.idle = clock().saturating_add(STREAM_IDLE_TICKS);
 			StreamStep::More
 		}
 		// The sender is done. The only ending that means the file is whole.
@@ -1185,13 +1175,13 @@ fn reply_outcome(chan: u64, bytes: &[u8], handles: &[u64], wait: bool) -> SendOu
 	// abandoned at once, so its backlog costs the service nothing but the attempts. A deadline of
 	// the current tick is what "try once" looks like to `send_caps_deadline`; zero would mean
 	// forever, which is the opposite.
-	let sent = unsafe {
+	let sent = {
 		let deadline = if wait { clock().saturating_add(REPLY_TICKS) } else { clock().max(1) };
 		send_caps_deadline(chan, bytes, handles, deadline)
 	};
 	if !matches!(sent, SendOutcome::Delivered) {
 		for &leftover in handles {
-			unsafe { close(leftover) };
+			close(leftover);
 		}
 	}
 	sent
@@ -1226,8 +1216,8 @@ fn abandon_pending(set: u64, vol: &mut Volume, pending: &mut Option<PendingWrite
 // notices `pending` is gone, whoever took it has already closed the handle. Joining can be noticed
 // late. Leaving cannot.
 fn leave_stream(set: u64, koid: u64, stream: u64) {
-	let _ = unsafe { waitset_remove(set, koid) };
-	unsafe { close(stream) };
+	let _ = waitset_remove(set, koid);
+	close(stream);
 }
 
 // Finish a write stream and answer the client that asked for it. Returns the client's channel when
@@ -1300,7 +1290,7 @@ fn drop_stalled(set: u64, vol: &mut Volume, clients: &mut Vec<Client>, pending: 
 	}
 	abandon_pending(set, vol, pending, chan);
 	release_client(set, clients, index);
-	unsafe { close(chan) };
+	close(chan);
 }
 
 struct UsbProviders {
@@ -1322,7 +1312,7 @@ impl UsbProviders {
 		if self.selected.as_ref().is_some_and(|selected| !self.blocks.entries.iter().any(|info| same_provider(info, selected)) || !self.buses.entries.iter().any(|info| same_binding(info, selected))) {
 			volume.fs = alloc::boxed::Box::new(FatBacking { chan: 0, name: USB_VOLUME, fs: None });
 			if self.handle != 0 {
-				unsafe { close(self.handle) };
+				close(self.handle);
 			}
 			self.handle = 0;
 			self.selected = None;
@@ -1365,9 +1355,9 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 	// none of them asked for anything. Measured on 2026-08-09: 56,974 ns per round trip at four
 	// clients, 133,811 at sixty-two - about 1,325 ns of tax per additional connection. That slope
 	// is why `MAX_CLIENTS` is 64.
-	let set: i64 = unsafe { waitset_create() };
+	let set: i64 = waitset_create();
 	if set < 0 {
-		unsafe { print(b"storage: cannot create the wait set; the service cannot serve\n") };
+		print(b"storage: cannot create the wait set; the service cannot serve\n");
 		exit();
 	}
 	let set: u64 = set as u64;
@@ -1378,7 +1368,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 			if channel == 0 {
 				continue;
 			}
-			let koid = unsafe { waitset_add(set, channel) };
+			let koid = waitset_add(set, channel);
 			if koid <= 0 {
 				exit();
 			}
@@ -1388,16 +1378,16 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 
 	let mut clients: Vec<Client> = Vec::new();
 	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false, writer: None }) {
-		unsafe { print(b"storage: cannot admit the root client; the service cannot serve\n") };
+		print(b"storage: cannot admit the root client; the service cannot serve\n");
 		exit();
 	}
 	// The admin joins once too, and leaves when its peer closes. Its koid is kept beside the handle
 	// because the wait answers with koids and this comparison happens every pass.
 	let mut admin_koid: u64 = 0;
 	if admin != 0 {
-		let koid = unsafe { waitset_add(set, admin) };
+		let koid = waitset_add(set, admin);
 		if koid <= 0 {
-			unsafe { print(b"storage: cannot watch the admin channel; the service cannot serve\n") };
+			print(b"storage: cannot watch the admin channel; the service cannot serve\n");
 			exit();
 		}
 		admin_koid = koid as u64;
@@ -1436,7 +1426,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		// stopped reading costs this pass and nothing else.
 		if let Some(l) = listing.as_mut() {
 			if pump_list(l) {
-				unsafe { close(l.producer) };
+				close(l.producer);
 				listing = None;
 			}
 		}
@@ -1447,7 +1437,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		if want_stream != stream_chan {
 			stream_koid = 0;
 			if want_stream != 0 {
-				let koid = unsafe { waitset_add(set, want_stream) };
+				let koid = waitset_add(set, want_stream);
 				// A stream the set will not watch is one whose chunks would never wake this loop.
 				// The client is told by the deadline rather than left waiting on a promise.
 				if koid > 0 {
@@ -1474,8 +1464,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		// while a consumer is actually behind. Mixed senses in `wait_any` would remove the poll.
 		let deadline: u64 = match (pending.as_ref(), listing.is_some()) {
 			(Some(p), false) => p.deadline(),
-			(Some(p), true) => core::cmp::min(p.deadline(), unsafe { clock() }.saturating_add(1)),
-			(None, true) => unsafe { clock() }.saturating_add(1),
+			(Some(p), true) => core::cmp::min(p.deadline(), clock().saturating_add(1)),
+			(None, true) => clock().saturating_add(1),
 			(None, false) => 0,
 		};
 		// PERIODIC, for the reason `recv_vec_deadline` gives: a plain timed wait counts as pending
@@ -1483,14 +1473,14 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		// empties. With a stream's deadline in the set, that means the peer which would SEND the
 		// next chunk cannot run - the service sleeps thirty seconds and gives up on a sender that
 		// was never given the chance to speak. This wait is a guard, not progress.
-		let ready: i64 = unsafe { waitset_wait(set, deadline, WAIT_PERIODIC) };
+		let ready: i64 = waitset_wait(set, deadline, WAIT_PERIODIC);
 		if ready > 0 && provider_members.iter().any(|(_, koid)| *koid == ready as u64) {
 			if let Some(providers) = usb.as_mut() {
 				providers.update(vol);
 				provider_members.retain(|(channel, koid)| {
 					let live = *channel == providers.blocks.channel || *channel == providers.buses.channel;
 					if !live {
-						unsafe { waitset_remove(set, *koid) };
+						waitset_remove(set, *koid);
 					}
 					live
 				});
@@ -1511,12 +1501,12 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 					}
 				}
 				if let Some(l) = listing.take() {
-					unsafe { close(l.producer) };
+					close(l.producer);
 				}
 				continue;
 			}
 			if let Some(p) = pending.as_ref() {
-				if unsafe { clock() } >= p.deadline() {
+				if clock() >= p.deadline() {
 					let p = pending.take().expect("checked");
 					let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
 					if let Some(stalled) = finish_stream(set, vol, p, Err(Error::Again), quiet, &mut reply) {
@@ -1548,7 +1538,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 			}
 		}
 		if admin != 0 && ready == admin_koid {
-			match unsafe { recv_caps_blocking(admin, &mut request) } {
+			match recv_caps_blocking(admin, &mut request) {
 				ReceivedCaps::Message { len, handles: caps } => {
 					let mut reply_handle = proto::codec::Handles::new();
 					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
@@ -1575,17 +1565,17 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 						};
 					} else {
 						for &leftover in reply_handle.as_slice() {
-							unsafe { close(leftover) };
+							close(leftover);
 						}
 					}
 					for &unclaimed in handle.as_slice() {
-						unsafe { close(unclaimed) };
+						close(unclaimed);
 					}
 				}
 				ReceivedCaps::Closed => {
 					// Out of the set with it: a member whose handle is closed is a wake that can
 					// never be answered.
-					let _ = unsafe { waitset_remove(set, admin_koid) };
+					let _ = waitset_remove(set, admin_koid);
 					admin = 0;
 					admin_koid = 0;
 				}
@@ -1604,7 +1594,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 		let chan: u64 = clients[index].chan;
 		let scope: Scope = clients[index].scope.clone();
 		let quiet: bool = clients[index].quiet;
-		match unsafe { recv_caps_blocking(chan, &mut request) } {
+		match recv_caps_blocking(chan, &mut request) {
 			ReceivedCaps::Message { len, .. } if len == 0 => {
 				if index == 0 {
 					exit();
@@ -1617,7 +1607,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				// it woke again at once. A livelock rather than a deadlock, which is why it presented as a
 				// test that never finished instead of one that stopped.
 				release_client(set, &mut clients, index);
-				unsafe { close(chan) };
+				close(chan);
 			}
 			ReceivedCaps::Message { len, handles: caps } => {
 				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
@@ -1649,7 +1639,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 						stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
 					} else {
 						for &leftover in reply_handle.as_slice() {
-							unsafe { close(leftover) };
+							close(leftover);
 						}
 					}
 				} else if op == HEARTBEAT_OP {
@@ -1657,15 +1647,13 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				} else if op == CONNECT_OP {
 					// An empty reply with no handle is this call's refusal form, and a table that is
 					// full uses it like a channel that could not be created.
-					match unsafe { channel() } {
+					match channel() {
 						Some((server, client)) if admit_client(set, &mut clients, Client { chan: server, koid: 0, scope, quiet: false, writer: None }) => {
 							stalled = reply_to(chan, &[], &[client], !quiet);
 						}
 						Some((server, client)) => {
-							unsafe {
-								close(server);
-								close(client);
-							}
+							close(server);
+							close(client);
 							stalled = reply_to(chan, &[], &[], !quiet);
 						}
 						None => stalled = reply_to(chan, &[], &[], !quiet),
@@ -1673,7 +1661,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				} else {
 					// Stamp mutations before authorization and dispatch. The clock is a no-op on
 					// read-only backends, while denied requests never reach their filesystem.
-					vol.fs.set_clock(unsafe { clock_rtc() });
+					vol.fs.set_clock(clock_rtc());
 					if op == volume::OP_LIST {
 						// A second listing while one is in flight is refused, like a second stream.
 						if listing.is_some() {
@@ -1725,7 +1713,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 							stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
 						} else {
 							for &leftover in reply_handle.as_slice() {
-								unsafe { close(leftover) };
+								close(leftover);
 							}
 						}
 					}
@@ -1741,7 +1729,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 						// koid means a closed handle can no longer make a member unnameable. See the note at
 						// the first of these.
 						release_client(set, &mut clients, index);
-						unsafe { close(chan) };
+						close(chan);
 					} else {
 						clients[0].quiet = true;
 					}
@@ -1753,7 +1741,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 					}
 				}
 				for &unclaimed in handle.as_slice() {
-					unsafe { close(unclaimed) };
+					close(unclaimed);
 				}
 			}
 			ReceivedCaps::Closed => {
@@ -1768,7 +1756,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<Usb
 				// it woke again at once. A livelock rather than a deadlock, which is why it presented as a
 				// test that never finished instead of one that stopped.
 				release_client(set, &mut clients, index);
-				unsafe { close(chan) };
+				close(chan);
 			}
 		}
 	}
@@ -1810,9 +1798,9 @@ fn pump_list(p: &mut PendingList) -> bool {
 	// alone: closing carries no information, so completion has to be said rather than implied.
 	while p.seq <= p.items.len() {
 		if p.seq == p.items.len() {
-			return match unsafe { try_send_outcome(p.producer, &[], 0) } {
+			return match try_send_outcome(p.producer, &[], 0) {
 				SendOutcome::Delivered | SendOutcome::Failed => true,
-				SendOutcome::Stalled => (unsafe { clock() }) >= p.expires,
+				SendOutcome::Stalled => (clock()) >= p.expires,
 			};
 		}
 		let mut frame_handles = Handles::new();
@@ -1822,11 +1810,11 @@ fn pump_list(p: &mut PendingList) -> bool {
 			// that silently lacked a name - the same defect as a truncated one, one entry at a
 			// time, and the reader cannot see the gap because it ignores the sequence number.
 			for handle in frame_handles.as_slice() {
-				unsafe { close(*handle) };
+				close(*handle);
 			}
 			return true;
 		};
-		match unsafe { try_send_caps_outcome(p.producer, &frame[..n], frame_handles.as_slice()) } {
+		match try_send_caps_outcome(p.producer, &frame[..n], frame_handles.as_slice()) {
 			SendOutcome::Delivered => {
 				p.seq += 1;
 				continue;
@@ -1835,7 +1823,7 @@ fn pump_list(p: &mut PendingList) -> bool {
 			// loop every tick and refuses the next listing, for nothing.
 			SendOutcome::Failed => {
 				for handle in frame_handles.as_slice() {
-					unsafe { close(*handle) };
+					close(*handle);
 				}
 				return true;
 			}
@@ -1843,9 +1831,9 @@ fn pump_list(p: &mut PendingList) -> bool {
 			// come back on the next pass.
 			SendOutcome::Stalled => {
 				for handle in frame_handles.as_slice() {
-					unsafe { close(*handle) };
+					close(*handle);
 				}
-				return unsafe { clock() } >= p.expires;
+				return clock() >= p.expires;
 			}
 		}
 	}
@@ -1910,16 +1898,16 @@ fn deliver_events(watchers: &mut Vec<Watcher>, events: &mut Vec<FileEvent>) {
 			let delivered: bool = match volume::watch_frame(watchers[at].seq, &event, &mut frame, &mut frame_handles) {
 				Some(n) => {
 					for handle in frame_handles.as_slice() {
-						unsafe { close(*handle) };
+						close(*handle);
 					}
-					matches!(unsafe { try_send_outcome(watchers[at].producer, &frame[..n], 0) }, SendOutcome::Delivered)
+					matches!(try_send_outcome(watchers[at].producer, &frame[..n], 0), SendOutcome::Delivered)
 				}
 				// An event that will not encode ends the watch rather than being skipped: a
 				// consumer that ignores the sequence number cannot see a gap, so a silently
 				// dropped event is a watcher that believes it is up to date and is not.
 				None => {
 					for handle in frame_handles.as_slice() {
-						unsafe { close(*handle) };
+						close(*handle);
 					}
 					false
 				}
@@ -1929,7 +1917,7 @@ fn deliver_events(watchers: &mut Vec<Watcher>, events: &mut Vec<FileEvent>) {
 				at += 1;
 			} else {
 				let gone = watchers.swap_remove(at);
-				unsafe { close(gone.producer) };
+				close(gone.producer);
 			}
 		}
 	}
@@ -1983,26 +1971,24 @@ fn start_watch(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, reque
 		Ok(owned) => owned,
 		Err(e) => return refuse(service, e),
 	};
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return refuse(service, Error::Again),
 	};
 	let mut ok_body: [u8; 16] = [0u8; 16];
 	let Some(ok_len) = volume::watch_reply_ok(corr, &mut ok_body) else {
-		unsafe {
-			close(producer);
-			close(consumer);
-		}
+		close(producer);
+		close(consumer);
 		return ListStart::Done;
 	};
 	match reply_outcome(service, &ok_body[..ok_len], &[consumer], !quiet) {
 		SendOutcome::Delivered => {}
 		SendOutcome::Stalled => {
-			unsafe { close(producer) };
+			close(producer);
 			return ListStart::ClientStalled;
 		}
 		SendOutcome::Failed => {
-			unsafe { close(producer) };
+			close(producer);
 			return ListStart::Done;
 		}
 	}
@@ -2073,7 +2059,7 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, reque
 		Ok(items) => items,
 		Err(e) => return refuse(service, e),
 	};
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		// No channel to give: the host is out of resources, not the volume.
 		None => return refuse(service, Error::Again),
@@ -2082,8 +2068,8 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, reque
 	// itself travels in the reply's handle list below.
 	let mut ok_body: [u8; 16] = [0u8; 16];
 	let Some(ok_len) = volume::list_reply_ok(corr, &mut ok_body) else {
-		unsafe { close(producer) };
-		unsafe { close(consumer) };
+		close(producer);
+		close(consumer);
 		return ListStart::Done;
 	};
 	// CHECKED, and it is the send that most needs checking, because it carries a capability. If the
@@ -2096,17 +2082,17 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, reque
 		// The consumer is already closed by `reply_outcome`; the producer is this function's, and
 		// a producer whose peer is gone is a handle nobody will ever take back.
 		SendOutcome::Stalled => {
-			unsafe { close(producer) };
+			close(producer);
 			return ListStart::ClientStalled;
 		}
 		SendOutcome::Failed => {
-			unsafe { close(producer) };
+			close(producer);
 			return ListStart::Done;
 		}
 	}
 	// Handed back to the serve loop rather than produced here. Sending the entries in place is what
 	// let one unreading consumer stop the service; the loop pushes what fits between passes.
-	ListStart::Started(PendingList { producer, items, seq: 0, expires: unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS) })
+	ListStart::Started(PendingList { producer, items, seq: 0, expires: clock().saturating_add(STREAM_IDLE_TICKS) })
 }
 
 // The volume backing, behind the generated Storage.Volume contract: either a
@@ -2161,7 +2147,7 @@ impl FatBacking {
 		let fs: &mut FatFs<FatBlockDevice> = self.ensure_mounted()?;
 		// stamp the wall clock so entries we write carry real timestamps (the same
 		// RTC source the LiberFS volume is stamped with).
-		fs.set_clock(unsafe { clock_rtc() });
+		fs.set_clock(clock_rtc());
 		match op(fs) {
 			Ok(r) => Ok(r),
 			Err(FsError::Io) => {
@@ -2247,7 +2233,7 @@ fn admit_client(set: u64, clients: &mut Vec<Client>, mut client: Client) -> bool
 	if clients.try_reserve(1).is_err() {
 		return false;
 	}
-	let koid = unsafe { waitset_add(set, client.chan) };
+	let koid = waitset_add(set, client.chan);
 	if koid <= 0 {
 		return false;
 	}
@@ -2259,7 +2245,7 @@ fn admit_client(set: u64, clients: &mut Vec<Client>, mut client: Client) -> bool
 // Take a client out of both, in the order that cannot leave a wake for a member that is gone: the
 // set first, the table second, the handle last.
 fn release_client(set: u64, clients: &mut Vec<Client>, index: usize) -> Client {
-	let _ = unsafe { waitset_remove(set, clients[index].koid) };
+	let _ = waitset_remove(set, clients[index].koid);
 	clients.swap_remove(index)
 }
 
@@ -2615,7 +2601,7 @@ impl volume::Service for Volume {
 	// waiting to happen, so the unreachable one is gone rather than maintained.
 	fn write_stream(&mut self, _path: String, data: u64) -> Result<(), Error> {
 		if data != 0 {
-			unsafe { close(data) };
+			close(data);
 		}
 		Err(Error::Invalid)
 	}
@@ -2958,7 +2944,7 @@ impl FileSystem for DiskFs {
 		try_collect(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
-		unsafe { block_capacity(self.fs.device().chan) }
+		block_capacity(self.fs.device().chan)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let block: u64 = liberfs::BLOCK_SIZE as u64;
@@ -3091,7 +3077,7 @@ impl FileSystem for FatBacking {
 		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
-		unsafe { block_capacity(self.chan) }
+		block_capacity(self.chan)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let (kind, total, free): (&'static str, u64, u64) = self.run(|fs| Ok((fs.kind_name(), fs.total_bytes(), fs.free_bytes()?)))?;
@@ -3233,7 +3219,7 @@ impl BlockDevice for ImageDevice {
 //
 // Sized from the image rather than from the scratch sizes the other memory volumes carry: a live
 // session's system volume holds what the medium shipped, plus room to work in.
-unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
+fn live_volume(handle: u64) -> Option<LiberMemFs> {
 	let image = unsafe { read_buffer(&Buffer { handle, len: object_info(handle)?.size }) }?;
 	// Sized from what the image HOLDS, not from how big the image is: a compressed source expands,
 	// names cost, and a buffer keeps the capacity it grew to. Guessing from the image size is how
@@ -3254,9 +3240,7 @@ unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
 	// write was refused half way through is worse than one that refuses to come up: the first is
 	// discovered by whoever needed the missing file.
 	let copied = copy_tree(&mut source, &mut live, b"", 0)?;
-	unsafe {
-		print(b"storage: vol://system is a live copy in memory (the medium is never written)\n");
-	}
+	print(b"storage: vol://system is a live copy in memory (the medium is never written)\n");
 	let _ = copied;
 	Some(live)
 }
@@ -3407,7 +3391,7 @@ impl FileSystem for IsoFs {
 		if self.chan == 0 {
 			return Err(Error::NotFound);
 		}
-		unsafe { block_capacity(self.chan) }
+		block_capacity(self.chan)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
@@ -3466,7 +3450,7 @@ impl FileSystem for UdfFs {
 		if self.chan == 0 {
 			return Err(Error::NotFound);
 		}
-		unsafe { block_capacity(self.chan) }
+		block_capacity(self.chan)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
@@ -3684,7 +3668,7 @@ impl BlockDevice for ChannelBlockDevice {
 	}
 
 	fn flush(&mut self) -> bool {
-		unsafe { block_flush(self.chan) }
+		block_flush(self.chan)
 	}
 }
 
@@ -3712,7 +3696,7 @@ impl fat::BlockDevice for FatBlockDevice {
 	// because `FirmwareDisk` overrides this, and the request-count test saw it because its fake disk
 	// does too, so nothing in the tree was looking at the adapter that did not.
 	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
-		unsafe { read_blocks_chunked(self.chan, 1, index, count, buf, SECTOR_SIZE) }
+		read_blocks_chunked(self.chan, 1, index, count, buf, SECTOR_SIZE)
 	}
 
 	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
@@ -3735,7 +3719,7 @@ impl iso9660::BlockDevice for IsoBlockDevice {
 	}
 
 	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
-		unsafe { read_blocks_chunked(self.chan, ISO_SECTORS, index, count, buf, ISO_SECTORS as usize * SECTOR_SIZE) }
+		read_blocks_chunked(self.chan, ISO_SECTORS, index, count, buf, ISO_SECTORS as usize * SECTOR_SIZE)
 	}
 }
 
@@ -3754,7 +3738,7 @@ impl udf::BlockDevice for UdfBlockDevice {
 	}
 
 	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
-		unsafe { read_blocks_chunked(self.chan, UDF_SECTORS, index, count, buf, UDF_SECTORS as usize * SECTOR_SIZE) }
+		read_blocks_chunked(self.chan, UDF_SECTORS, index, count, buf, UDF_SECTORS as usize * SECTOR_SIZE)
 	}
 
 	// HOW BIG THE DISC IS, which this did not implement and therefore answered `None`.
@@ -3768,7 +3752,7 @@ impl udf::BlockDevice for UdfBlockDevice {
 	// The capacity was already available: `block_capacity` asks the driver, in this file, and is
 	// what the LiberFS and FAT paths use to size their volumes.
 	fn block_count(&mut self) -> Option<u64> {
-		let bytes = unsafe { block_capacity(self.chan) }.ok()?;
+		let bytes = block_capacity(self.chan).ok()?;
 		// In UDF blocks, not disk sectors. A capacity that is not a whole number of 2 KiB blocks is
 		// truncated rather than rounded up: the last partial block is not addressable as a UDF
 		// block, and answering N+1 would send the anchor probe off the end of the medium.
@@ -3789,7 +3773,7 @@ impl udf::BlockDevice for UdfBlockDevice {
 const READ_BLOCKS_PER_REQUEST: u64 = 64;
 
 // One `read_blocks` for both optical backends: same shape, different sectors-per-block.
-unsafe fn read_blocks_chunked(chan: u64, sectors_per_block: u64, index: u64, count: u64, buf: &mut [u8], block_bytes: usize) -> bool {
+fn read_blocks_chunked(chan: u64, sectors_per_block: u64, index: u64, count: u64, buf: &mut [u8], block_bytes: usize) -> bool {
 	if count == 0 {
 		return true;
 	}
@@ -3855,48 +3839,46 @@ const FORMAT_ISO9660: u8 = 2;
 const FORMAT_UDF: u8 = 3;
 const FORMAT_FAT: u8 = 4;
 
-unsafe fn classify_block(chan: u64) -> u8 {
-	unsafe {
-		if chan == 0 {
-			return FORMAT_UNKNOWN;
-		}
-		if mount_system_volume(chan).is_some() {
-			return FORMAT_LIBERFS;
-		}
-		if Iso9660::mount_checked(IsoBlockDevice { chan }).is_ok() {
-			return FORMAT_ISO9660;
-		}
-		if Udf::mount_checked(UdfBlockDevice { chan }).is_ok() {
-			return FORMAT_UDF;
-		}
-		if FatFs::mount_checked(FatBlockDevice { chan }).is_ok() {
-			return FORMAT_FAT;
-		}
-		FORMAT_UNKNOWN
+fn classify_block(chan: u64) -> u8 {
+	if chan == 0 {
+		return FORMAT_UNKNOWN;
 	}
+	if mount_system_volume(chan).is_some() {
+		return FORMAT_LIBERFS;
+	}
+	if Iso9660::mount_checked(IsoBlockDevice { chan }).is_ok() {
+		return FORMAT_ISO9660;
+	}
+	if Udf::mount_checked(UdfBlockDevice { chan }).is_ok() {
+		return FORMAT_UDF;
+	}
+	if FatFs::mount_checked(FatBlockDevice { chan }).is_ok() {
+		return FORMAT_FAT;
+	}
+	FORMAT_UNKNOWN
 }
 
 // Probe messages preserve provider positions even if a connection could not be minted.
-unsafe fn receive_probes(bootstrap: u64, expected: usize, buf: &mut [u8]) -> Vec<u64> {
+fn receive_probes(bootstrap: u64, expected: usize, buf: &mut [u8]) -> Vec<u64> {
 	let mut probes = Vec::new();
 	let allocated = expected <= rt::MAX_MESSAGE_BYTES && probes.try_reserve_exact(expected).is_ok();
 	for _ in 0..expected {
-		let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, buf) }) else {
-			unsafe { rt::fail_bootstrap(bootstrap, b"classification probes", b"channel closed before announced count") };
+		let Received::Message { len, handle } = recv_blocking(bootstrap, buf) else {
+			rt::fail_bootstrap(bootstrap, b"classification probes", b"channel closed before announced count");
 		};
 		if len != 5 || &buf[..5] != b"PROBE" {
-			unsafe { rt::fail_bootstrap(bootstrap, b"classification probes", b"invalid probe message") };
+			rt::fail_bootstrap(bootstrap, b"classification probes", b"invalid probe message");
 		}
 		if allocated {
 			probes.push(handle);
 		} else if handle != 0 {
 			// Drain the announced messages before reporting allocation failure so the sender
 			// cannot stall on its full queue while it is still delivering the probe list.
-			unsafe { close(handle) };
+			close(handle);
 		}
 	}
 	if !allocated {
-		unsafe { rt::fail_bootstrap(bootstrap, b"classification probes", b"count or allocation refused") };
+		rt::fail_bootstrap(bootstrap, b"classification probes", b"count or allocation refused");
 	}
 	probes
 }
@@ -3907,7 +3889,7 @@ enum RootMountError {
 	Ambiguous,
 }
 
-unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Result<(LiberFs<ChannelBlockDevice>, u64), RootMountError> {
+fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Result<(LiberFs<ChannelBlockDevice>, u64), RootMountError> {
 	// The probe list includes the primary provider through an independent connection. Inspect
 	// that list alone when present so one physical volume is not counted twice.
 	let candidates = if probes.is_empty() { core::slice::from_ref(&primary) } else { probes };
@@ -3916,7 +3898,7 @@ unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) ->
 		if chan == 0 {
 			continue;
 		}
-		let Some(fs) = (unsafe { mount_system_volume(chan) }) else { continue };
+		let Some(fs) = mount_system_volume(chan) else { continue };
 		if want.is_some_and(|uuid| fs.uuid() != uuid) {
 			continue;
 		}
@@ -3928,7 +3910,7 @@ unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) ->
 	selected.ok_or(RootMountError::Missing)
 }
 
-unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
+fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
 	// What the disk IS, before deciding what may be written to it. Exactly two answers lead
 	// anywhere near a format, and the difference between them and the rest is the difference
 	// between a blank disk and somebody else's.
@@ -3948,7 +3930,7 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// A disk already carrying this system's own volume at LBA 0 - which is what every system
 		// disk looks like, because the volume is BUILT as a filesystem by `mkpackages` and written
 		// to the medium. Mounting it is not formatting it.
-		partition::Disk::LiberFsWholeDevice => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
+		partition::Disk::LiberFsWholeDevice => (FS_START_SECTOR, disk_pool_blocks(block_client)),
 		// A disk that looks empty. This used to be the one answer that licensed laying a filesystem
 		// over the whole device, and it should never have been: formatting a disk is a decision
 		// somebody makes, not one a service infers at boot from the bytes in front of it.
@@ -3963,9 +3945,7 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// where a person is standing. That is the manual step, it already exists, and it is the
 		// only one.
 		partition::Disk::Blank => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk carries no filesystem. Nothing was changed - write a system volume image to it deliberately; this system does not format disks by itself\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk carries no filesystem. Nothing was changed - write a system volume image to it deliberately; this system does not format disks by itself\n");
 			return None;
 		}
 		// Everything below means the whole-device fallback is not available, because the
@@ -3973,32 +3953,24 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// MBR, the GPT header, the entry array and every partition the disk carries.
 		// Refusing costs a boot; the alternative cost the disk.
 		partition::Disk::GptWithoutLiberFs => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk has a GPT with no LiberFS partition. Nothing was changed - create one, or attach the right disk\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk has a GPT with no LiberFS partition. Nothing was changed - create one, or attach the right disk\n");
 			return None;
 		}
 		// TWO CANDIDATES AND NOTHING TO CHOOSE BETWEEN THEM. Mounting either would be mounting
 		// whichever the entry order happens to name first, which a partitioning tool or a clone can
 		// change without touching either filesystem - and this mount is writable.
 		partition::Disk::AmbiguousLiberFs => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk names MORE THAN ONE LiberFS partition and nothing says which is the system volume. Nothing was changed - remove or retype the one that is not\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk names MORE THAN ONE LiberFS partition and nothing says which is the system volume. Nothing was changed - remove or retype the one that is not\n");
 			return None;
 		}
 		partition::Disk::MbrWithoutLiberFs => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk carries an MBR partition table. Nothing was changed - its partitions are still there; repartition it deliberately if that is what you want\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk carries an MBR partition table. Nothing was changed - its partitions are still there; repartition it deliberately if that is what you want\n");
 			return None;
 		}
 		partition::Disk::ForeignFilesystem { name } => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk carries a filesystem written straight onto the medium (");
-				print(name.as_bytes());
-				print(b"), with no partition table. Nothing was changed - copy the data off before reusing this disk\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk carries a filesystem written straight onto the medium (");
+			print(name.as_bytes());
+			print(b"), with no partition table. Nothing was changed - copy the data off before reusing this disk\n");
 			return None;
 		}
 		// The one that closes the hole this crate was written for and then left open by a
@@ -4007,37 +3979,27 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// evidence of an empty disk - and a raw ext4 begins one sector past where the probe
 		// used to stop looking.
 		partition::Disk::UnknownData => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk carries data this build does not recognise, and no partition table. Nothing was changed - erase it deliberately if it really is scrap\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk carries data this build does not recognise, and no partition table. Nothing was changed - erase it deliberately if it really is scrap\n");
 			return None;
 		}
 		partition::Disk::HybridMbrAndGpt => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk carries BOTH an MBR partition table and a GPT. Nothing was changed - two tables describing one disk disagree by construction, and nothing here can say which you meant\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk carries BOTH an MBR partition table and a GPT. Nothing was changed - two tables describing one disk disagree by construction, and nothing here can say which you meant\n");
 			return None;
 		}
 		partition::Disk::NoMemory => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: this machine could not hold the disk's partition table while checking it. Nothing was changed - the disk may be perfectly fine\n");
-			}
+			print(b"storage: vol://system NOT mounted: this machine could not hold the disk's partition table while checking it. Nothing was changed - the disk may be perfectly fine\n");
 			return None;
 		}
 		partition::Disk::CorruptGpt => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk's GPT does not verify, in neither the primary nor the backup copy. Nothing was changed - this is a damaged partition table, not a blank disk\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk's GPT does not verify, in neither the primary nor the backup copy. Nothing was changed - this is a damaged partition table, not a blank disk\n");
 			return None;
 		}
 		partition::Disk::Io => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the disk did not answer while its partition table was read. Nothing was changed - check the device and reboot\n");
-			}
+			print(b"storage: vol://system NOT mounted: the disk did not answer while its partition table was read. Nothing was changed - check the device and reboot\n");
 			return None;
 		}
 	};
-	let max_sectors: u32 = unsafe { block_request_sectors(block_client) };
+	let max_sectors: u32 = block_request_sectors(block_client);
 	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
 	// the size recorded in its superblock - never silently grown, the free map would
 	// not match. A volume smaller than its container allows is reported.
@@ -4055,34 +4017,30 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// and the probe is damaged. It used to fall through to a format, which destroyed exactly
 		// the volume the contradiction was about.
 		Err(MountError::Unformatted) => {
-			unsafe {
-				print(b"storage: vol://system NOT mounted: the container looks like a LiberFS volume and does not mount as one. Nothing was changed - this is damage, not an empty disk\n");
-			}
+			print(b"storage: vol://system NOT mounted: the container looks like a LiberFS volume and does not mount as one. Nothing was changed - this is damage, not an empty disk\n");
 			return None;
 		}
 		Err(reason) => {
-			unsafe {
-				print(match reason {
-					MountError::Io => b"storage: vol://system NOT mounted: the disk did not answer. Nothing was changed - check the device and reboot; this is not a blank disk
+			print(match reason {
+				MountError::Io => b"storage: vol://system NOT mounted: the disk did not answer. Nothing was changed - check the device and reboot; this is not a blank disk
 "
-					.as_slice(),
-					MountError::Unsupported => b"storage: vol://system NOT mounted: written by a newer or different LiberFS build. Nothing was changed - boot a build that reads it
+				.as_slice(),
+				MountError::Unsupported => b"storage: vol://system NOT mounted: written by a newer or different LiberFS build. Nothing was changed - boot a build that reads it
 "
-					.as_slice(),
-					MountError::DeviceTooSmall => b"storage: vol://system NOT mounted: the medium is smaller than the volume it claims. Nothing was changed
+				.as_slice(),
+				MountError::DeviceTooSmall => b"storage: vol://system NOT mounted: the medium is smaller than the volume it claims. Nothing was changed
 "
-					.as_slice(),
-					// the MACHINE, not the medium. This used to fall through to "its
-					// superblocks are damaged", which sends an operator to look at a disk
-					// that is perfectly fine.
-					MountError::NoMemory => b"storage: vol://system NOT mounted: this machine could not hold the volume's free maps. Nothing was changed - the disk is fine; the memory was not there
+				.as_slice(),
+				// the MACHINE, not the medium. This used to fall through to "its
+				// superblocks are damaged", which sends an operator to look at a disk
+				// that is perfectly fine.
+				MountError::NoMemory => b"storage: vol://system NOT mounted: this machine could not hold the volume's free maps. Nothing was changed - the disk is fine; the memory was not there
 "
-					.as_slice(),
-					_ => b"storage: vol://system NOT mounted: its superblocks are damaged. Nothing was changed - copy data off or restore before reformatting
+				.as_slice(),
+				_ => b"storage: vol://system NOT mounted: its superblocks are damaged. Nothing was changed - copy data off or restore before reformatting
 "
-					.as_slice(),
-				});
-			}
+				.as_slice(),
+			});
 			return None;
 		}
 		Ok(_) => {}
@@ -4091,18 +4049,12 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// SAID OUT LOUD, because it is the one line that proves the block provider SERVED: the
 		// partition table and both superblocks were read over this provider's request channel to
 		// get here, and the enforcing-IOMMU gate's traffic phase asserts on exactly that.
-		unsafe {
-			print(b"storage: vol://system mounted through its block provider - the partition table and the superblocks were read over the provider's request channel\n");
-		}
+		print(b"storage: vol://system mounted through its block provider - the partition table and the superblocks were read over the provider's request channel\n");
 		if fs.num_blocks() != pool {
-			unsafe {
-				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
-			}
+			print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");
 		}
 		if fs.is_read_only() {
-			unsafe {
-				print(b"storage: vol://system mounted READ-ONLY (damaged metadata or snapshot table; copy data off / restore, or reformat to write)\n");
-			}
+			print(b"storage: vol://system mounted READ-ONLY (damaged metadata or snapshot table; copy data off / restore, or reformat to write)\n");
 		}
 		return Some(fs);
 	}
@@ -4115,9 +4067,9 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 // over the capacity query.
 // Falls back to the fixed FS_BLOCKS pool when the disk cannot answer (or is too
 // small for the layout), so an old driver still mounts something.
-unsafe fn disk_pool_blocks(block_client: u64) -> u64 {
+fn disk_pool_blocks(block_client: u64) -> u64 {
 	let fs_start_bytes: u64 = FS_START_SECTOR * SECTOR_SIZE as u64;
-	match unsafe { block_capacity(block_client) } {
+	match block_capacity(block_client) {
 		Ok(bytes) if bytes > fs_start_bytes + liberfs::BLOCK_SIZE as u64 => (bytes - fs_start_bytes) / liberfs::BLOCK_SIZE as u64,
 		_ => FS_BLOCKS,
 	}
@@ -4136,7 +4088,7 @@ impl partition::Sectors for DiskSectors {
 	}
 
 	fn capacity(&mut self) -> Option<u64> {
-		unsafe { block_capacity(self.chan) }.ok().map(|bytes| bytes / SECTOR_SIZE as u64)
+		block_capacity(self.chan).ok().map(|bytes| bytes / SECTOR_SIZE as u64)
 	}
 }
 
@@ -4181,7 +4133,7 @@ impl OwnedHandle {
 impl Drop for OwnedHandle {
 	fn drop(&mut self) {
 		if self.handle != 0 {
-			unsafe { close(self.handle) };
+			close(self.handle);
 		}
 	}
 }
@@ -4197,12 +4149,10 @@ impl MappedBuffer {
 
 impl Drop for MappedBuffer {
 	fn drop(&mut self) {
-		unsafe {
-			if self.base != 0 {
-				unmap_object(self.handle);
-			}
-			close(self.handle);
+		if self.base != 0 {
+			unmap_object(self.handle);
 		}
+		close(self.handle);
 	}
 }
 
@@ -4288,39 +4238,35 @@ unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 // size in bytes. The reply is [status u32][capacity bytes u64][max sectors u32] (the
 // trailing per-request cap is read by `block_request_sectors`). `again`
 // when the driver (or its disk) cannot answer.
-unsafe fn block_capacity(block_client: u64) -> Result<u64, Error> {
-	unsafe {
-		let mut req: [u8; 16] = [0u8; 16];
-		req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
-		if !send_blocking(block_client, &req, 0) {
-			return Err(Error::Again);
-		}
-		let mut rep: [u8; 16] = [0u8; 16];
-		match recv_blocking(block_client, &mut rep) {
-			Received::Message { len, handle } if len >= 12 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => Ok(u64::from_le_bytes([rep[4], rep[5], rep[6], rep[7], rep[8], rep[9], rep[10], rep[11]])),
-			_ => Err(Error::Again),
-		}
+fn block_capacity(block_client: u64) -> Result<u64, Error> {
+	let mut req: [u8; 16] = [0u8; 16];
+	req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
+	if !send_blocking(block_client, &req, 0) {
+		return Err(Error::Again);
+	}
+	let mut rep: [u8; 16] = [0u8; 16];
+	match recv_blocking(block_client, &mut rep) {
+		Received::Message { len, handle } if len >= 12 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => Ok(u64::from_le_bytes([rep[4], rep[5], rep[6], rep[7], rep[8], rep[9], rep[10], rep[11]])),
+		_ => Err(Error::Again),
 	}
 }
 
 // Ask the driver how many sectors one request may move: the capacity reply's
 // trailing [max sectors u32] field. MAX_SECTORS_FALLBACK (one DMA page) for a
 // driver whose reply lacks the field, so an old driver still serves.
-unsafe fn block_request_sectors(block_client: u64) -> u32 {
-	unsafe {
-		let mut req: [u8; 16] = [0u8; 16];
-		req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
-		if !send_blocking(block_client, &req, 0) {
-			return MAX_SECTORS_FALLBACK;
+fn block_request_sectors(block_client: u64) -> u32 {
+	let mut req: [u8; 16] = [0u8; 16];
+	req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
+	if !send_blocking(block_client, &req, 0) {
+		return MAX_SECTORS_FALLBACK;
+	}
+	let mut rep: [u8; 16] = [0u8; 16];
+	match recv_blocking(block_client, &mut rep) {
+		Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
+			let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
+			if max == 0 { MAX_SECTORS_FALLBACK } else { max }
 		}
-		let mut rep: [u8; 16] = [0u8; 16];
-		match recv_blocking(block_client, &mut rep) {
-			Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
-				let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
-				if max == 0 { MAX_SECTORS_FALLBACK } else { max }
-			}
-			_ => MAX_SECTORS_FALLBACK,
-		}
+		_ => MAX_SECTORS_FALLBACK,
 	}
 }
 
@@ -4328,18 +4274,16 @@ unsafe fn block_request_sectors(block_client: u64) -> u32 {
 // far must reach the medium before any later one. The reply is [status u32]. LiberFS
 // brackets its superblock commit with this barrier, so crash atomicity holds on a
 // disk with a volatile write cache.
-unsafe fn block_flush(block_client: u64) -> bool {
-	unsafe {
-		let mut req: [u8; 16] = [0u8; 16];
-		req[..4].copy_from_slice(&OP_FLUSH.to_le_bytes());
-		if !send_blocking(block_client, &req, 0) {
-			return false;
-		}
-		let mut rep: [u8; 16] = [0u8; 16];
-		match recv_blocking(block_client, &mut rep) {
-			Received::Message { len, handle } if len >= 4 && handle == 0 => u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0,
-			_ => false,
-		}
+fn block_flush(block_client: u64) -> bool {
+	let mut req: [u8; 16] = [0u8; 16];
+	req[..4].copy_from_slice(&OP_FLUSH.to_le_bytes());
+	if !send_blocking(block_client, &req, 0) {
+		return false;
+	}
+	let mut rep: [u8; 16] = [0u8; 16];
+	match recv_blocking(block_client, &mut rep) {
+		Received::Message { len, handle } if len >= 4 && handle == 0 => u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0,
+		_ => false,
 	}
 }
 

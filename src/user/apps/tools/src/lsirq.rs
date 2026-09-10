@@ -19,53 +19,51 @@ use rt::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
-		//    output renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" /
-		//    "json-min" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let mode: Option<JsonMode> = JsonMode::parse(argument);
-		let json: bool = mode.is_some();
-		// 3. walk both vector windows and render every vector in use.
-		let mut out = String::new();
-		if json {
-			out.push('[');
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our
+	//    output renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" /
+	//    "json-min" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let mode: Option<JsonMode> = JsonMode::parse(argument);
+	let json: bool = mode.is_some();
+	// 3. walk both vector windows and render every vector in use.
+	let mut out = String::new();
+	if json {
+		out.push('[');
+	}
+	let mut index: u64 = 0;
+	let mut printed: u64 = 0;
+	if !json {
+		// The aligned column header (bold), like lsvol - a table, not a flat list.
+		out.push_str("\x1b[1mvector  type   bound  device  device-type\x1b[0m\n");
+	}
+	loop {
+		let mut info = IrqInfo::default();
+		if irq_info(index, &mut info) < 0 {
+			break;
 		}
-		let mut index: u64 = 0;
-		let mut printed: u64 = 0;
-		if !json {
-			// The aligned column header (bold), like lsvol - a table, not a flat list.
-			out.push_str("\x1b[1mvector  type   bound  device  device-type\x1b[0m\n");
+		index += 1;
+		// An unused vector (nothing bound, no owner) is not inventory.
+		if info.bound == 0 && info.device == IRQ_NO_DEVICE {
+			continue;
 		}
-		loop {
-			let mut info = IrqInfo::default();
-			if irq_info(index, &mut info) < 0 {
-				break;
-			}
-			index += 1;
-			// An unused vector (nothing bound, no owner) is not inventory.
-			if info.bound == 0 && info.device == IRQ_NO_DEVICE {
-				continue;
-			}
-			render_vector(&mut out, printed, &info, json);
-			printed += 1;
-		}
-		if let Some(mode) = mode {
-			out.push(']');
-			out = mode.render(out);
-			out.push('\n');
-		}
-		if index == 0 {
-			eprint(b"lsirq: query error\n");
-		} else {
-			print(out.as_bytes());
-		}
+		render_vector(&mut out, printed, &info, json);
+		printed += 1;
+	}
+	if let Some(mode) = mode {
+		out.push(']');
+		out = mode.render(out);
+		out.push('\n');
+	}
+	if index == 0 {
+		eprint(b"lsirq: query error\n");
+	} else {
+		print(out.as_bytes());
 	}
 	exit();
 }
@@ -137,7 +135,7 @@ fn push_right(out: &mut String, text: &str, width: usize) {
 // The device-type code of the discovered device at `index` (0 = unknown).
 fn owner_type(index: u32) -> u32 {
 	let mut info = DeviceInfo::default();
-	if unsafe { device_info(index as u64, &mut info) } { info.device_type } else { 0 }
+	if device_info(index as u64, &mut info) { info.device_type } else { 0 }
 }
 
 // Append a decimal number to `out`.

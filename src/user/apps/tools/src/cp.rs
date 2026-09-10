@@ -30,61 +30,59 @@ const CHUNK: u32 = 32 * 1024;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut force = false;
-		let mut words: Vec<&[u8]> = Vec::new();
-		for word in split_args(&arguments) {
-			match classify(word) {
-				Arg::Long(b"force", None) => force = true,
-				Arg::Short(b'f') => force = true,
-				Arg::Value(value) => {
-					if words.try_reserve(1).is_err() {
-						eprint(b"cp: out of memory\n");
-						exit();
-					}
-					words.push(value);
-				}
-				_ => {
-					eprint(b"cp: usage: cp [-f] <source> <destination>\n");
+	let mut force = false;
+	let mut words: Vec<&[u8]> = Vec::new();
+	for word in split_args(&arguments) {
+		match classify(word) {
+			Arg::Long(b"force", None) => force = true,
+			Arg::Short(b'f') => force = true,
+			Arg::Value(value) => {
+				if words.try_reserve(1).is_err() {
+					eprint(b"cp: out of memory\n");
 					exit();
 				}
+				words.push(value);
+			}
+			_ => {
+				eprint(b"cp: usage: cp [-f] <source> <destination>\n");
+				exit();
 			}
 		}
-		if words.len() != 2 {
-			eprint(b"cp: usage: cp [-f] <source> <destination>\n");
-			exit();
-		}
-		let (Some(source), Some(destination)) = (storage_proto::path::resolve(&cwd, words[0]), storage_proto::path::resolve(&cwd, words[1])) else {
-			eprint(b"cp: invalid path\n");
-			exit();
-		};
-		// THE SAME PATH IS REFUSED before anything opens: a copy onto itself through a
-		// truncate-first writer is how a file is destroyed by a command that looks harmless.
-		if source == destination {
-			eprint(b"cp: source and destination are the same file\n");
-			exit();
-		}
-		let from: u64 = volumes.client_for(&cwd, words[0]);
-		let to: u64 = volumes.client_for(&cwd, words[1]);
-		if from == 0 || to == 0 {
-			eprint(b"cp: no volume\n");
-			exit();
-		}
-		copy(from, &source, to, &destination, force);
 	}
+	if words.len() != 2 {
+		eprint(b"cp: usage: cp [-f] <source> <destination>\n");
+		exit();
+	}
+	let (Some(source), Some(destination)) = (storage_proto::path::resolve(&cwd, words[0]), storage_proto::path::resolve(&cwd, words[1])) else {
+		eprint(b"cp: invalid path\n");
+		exit();
+	};
+	// THE SAME PATH IS REFUSED before anything opens: a copy onto itself through a
+	// truncate-first writer is how a file is destroyed by a command that looks harmless.
+	if source == destination {
+		eprint(b"cp: source and destination are the same file\n");
+		exit();
+	}
+	let from: u64 = volumes.client_for(&cwd, words[0]);
+	let to: u64 = volumes.client_for(&cwd, words[1]);
+	if from == 0 || to == 0 {
+		eprint(b"cp: no volume\n");
+		exit();
+	}
+	copy(from, &source, to, &destination, force);
 	exit();
 }
 
-unsafe fn copy(from: u64, source: &str, to: u64, destination: &str, force: bool) {
+fn copy(from: u64, source: &str, to: u64, destination: &str, force: bool) {
 	unsafe {
 		let mut source_client = VolumeClient::new(from);
 		let Some(Ok(info)) = source_client.stat(source) else {

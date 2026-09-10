@@ -89,7 +89,7 @@ impl Sink for ChannelSink {
 
 // Serve the session: take whatever the driver forwarded, hand it to the protocol, and block
 // until either more arrives or one of the session's deadlines comes due.
-unsafe fn serve(channel: u64, bootstrap: u64, storage: u64, nonce: [u8; 8]) -> ! {
+fn serve(channel: u64, bootstrap: u64, storage: u64, nonce: [u8; 8]) -> ! {
 	unsafe {
 		let mut session: Session = Session::new(storage, nonce);
 		let mut sink: ChannelSink = ChannelSink { channel, frame: Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD) };

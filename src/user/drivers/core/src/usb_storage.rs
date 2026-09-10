@@ -318,7 +318,7 @@ unsafe fn bot_command(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 // [count u32], count clamped to one TRB's data stage. A read replies [status u32] + a
 // MemoryObject of the sectors; a write carries a MemoryObject in and replies
 // [status u32] - the same wire contract driver.virtio-blk serves.
-pub unsafe fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
+pub fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
 	unsafe {
 		let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
 		let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
@@ -426,7 +426,7 @@ unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 
 // Read (and discard) the unit's sense data, clearing the pending condition a failed
 // command left behind so the next command starts clean.
-unsafe fn read_sense(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) {
+fn read_sense(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) {
 	unsafe {
 		let sense: [u8; 6] = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
 		let _ = bot_command(hc, hids, dev, st, &sense, 18, true);
@@ -438,7 +438,7 @@ unsafe fn read_sense(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &m
 // commits rely on; a unit that rejects the command (no cache to flush, per the SBC
 // spec an optional command) is treated as write-through after the sense read, so the
 // barrier still reports success. No data stage.
-unsafe fn serve_flush(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64) {
+fn serve_flush(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64) {
 	unsafe {
 		let cb: [u8; 10] = [SCSI_SYNCHRONIZE_CACHE10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, 0, false);
@@ -462,44 +462,36 @@ fn read10_cb(opcode: u8, lba: u64, count: u32) -> [u8; 10] {
 }
 
 // Send a block reply: [status u32 LE] carrying the handle `xfer` (0 = none).
-pub unsafe fn reply_block(blk_server: u64, status: u32, xfer: u64) {
-	unsafe {
-		let reply: [u8; 4] = status.to_le_bytes();
-		send_blocking(blk_server, &reply, xfer);
-	}
+pub fn reply_block(blk_server: u64, status: u32, xfer: u64) {
+	let reply: [u8; 4] = status.to_le_bytes();
+	send_blocking(blk_server, &reply, xfer);
 }
 
 // Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE],
 // no handle - the same wire contract driver.virtio-blk serves; the cap here is the
 // TRB data-stage bound.
-unsafe fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
-	unsafe {
-		let mut reply: [u8; 16] = [0u8; 16];
-		reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
-		reply[4..12].copy_from_slice(&bytes.to_le_bytes());
-		reply[12..16].copy_from_slice(&(max_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
-		send_blocking(blk_server, &reply, 0);
-	}
+fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
+	let mut reply: [u8; 16] = [0u8; 16];
+	reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
+	reply[4..12].copy_from_slice(&bytes.to_le_bytes());
+	reply[12..16].copy_from_slice(&(max_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
+	send_blocking(blk_server, &reply, 0);
 }
 
 // Recover one halted bulk endpoint of the storage device after a stall: the
 // controller-side Reset Endpoint + Set TR Dequeue Pointer pair, then the device-side
 // CLEAR_FEATURE(ENDPOINT_HALT) to the endpoint's address, resetting its data toggle.
-unsafe fn recover_bulk(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, dir_in: bool) {
-	unsafe {
-		let (dci, addr, dequeue): (u32, u8, u64) = if dir_in { (st.dci_in, st.ep_in_addr, st.ring_in.phys + st.ring_in.index * 16 | st.ring_in.cycle as u64) } else { (st.dci_out, st.ep_out_addr, st.ring_out.phys + st.ring_out.index * 16 | st.ring_out.cycle as u64) };
-		reset_endpoint(hc, hids, dev.slot, dci, dequeue);
-		let _ = control_nodata(hc, hids, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr as u16);
-	}
+fn recover_bulk(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, dir_in: bool) {
+	let (dci, addr, dequeue): (u32, u8, u64) = if dir_in { (st.dci_in, st.ep_in_addr, st.ring_in.phys + st.ring_in.index * 16 | st.ring_in.cycle as u64) } else { (st.dci_out, st.ep_out_addr, st.ring_out.phys + st.ring_out.index * 16 | st.ring_out.cycle as u64) };
+	reset_endpoint(hc, hids, dev.slot, dci, dequeue);
+	let _ = control_nodata(hc, hids, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, addr as u16);
 }
 
 // The last-resort transport recovery (the Bulk-Only spec's reset sequence): the
 // Mass Storage Reset class request returns the device's BOT state machine to idle,
 // then both bulk endpoints are unhalted, so the next CBW starts a clean transaction.
-unsafe fn bot_reset(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) {
-	unsafe {
-		let _ = control_nodata(hc, hids, dev, RT_CLASS_INTERFACE, BOT_REQ_RESET, 0, st.iface);
-		recover_bulk(hc, hids, dev, st, true);
-		recover_bulk(hc, hids, dev, st, false);
-	}
+fn bot_reset(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) {
+	let _ = control_nodata(hc, hids, dev, RT_CLASS_INTERFACE, BOT_REQ_RESET, 0, st.iface);
+	recover_bulk(hc, hids, dev, st, true);
+	recover_bulk(hc, hids, dev, st, false);
 }

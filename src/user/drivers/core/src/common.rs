@@ -50,113 +50,103 @@ pub struct Resources {
 // THROUGH THE CAPABILITY-AWARE RECEIVE. The ordinary receive takes the first and drops the rest, so
 // a reader that expected one and used it would silently destroy whatever was attached beyond it -
 // capabilities gone, nobody told, on the path this protocol calls hostile input.
-unsafe fn read_frame(channel: u64, buf: &mut [u8]) -> Option<(proto::Header, wire::Handles)> {
-	unsafe {
-		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(channel, buf) else {
-			return None;
-		};
-		let Ok(header) = proto::Header::decode(&buf[..len]) else {
-			// A REFUSED FRAME LEAVES NO CAPABILITY BEHIND, whichever way it was malformed - and
-			// "behind" includes the ones the reader never looked at.
-			close_all(&handles);
-			return None;
-		};
-		if header.check_handles(handles.as_slice().len()).is_err() {
-			close_all(&handles);
-			return None;
-		}
-		Some((header, handles))
+fn read_frame(channel: u64, buf: &mut [u8]) -> Option<(proto::Header, wire::Handles)> {
+	let ReceivedCaps::Message { len, handles } = recv_caps_blocking(channel, buf) else {
+		return None;
+	};
+	let Ok(header) = proto::Header::decode(&buf[..len]) else {
+		// A REFUSED FRAME LEAVES NO CAPABILITY BEHIND, whichever way it was malformed - and
+		// "behind" includes the ones the reader never looked at.
+		close_all(&handles);
+		return None;
+	};
+	if header.check_handles(handles.as_slice().len()).is_err() {
+		close_all(&handles);
+		return None;
 	}
+	Some((header, handles))
 }
 
-unsafe fn close_all(handles: &wire::Handles) {
-	unsafe {
-		for &handle in handles.as_slice() {
-			close(handle);
-		}
+fn close_all(handles: &wire::Handles) {
+	for &handle in handles.as_slice() {
+		close(handle);
 	}
 }
 
 // Send one frame carrying no capability.
-unsafe fn send_frame(channel: u64, opcode: proto::Opcode, generation: u64, payload: &[u8]) -> bool {
-	unsafe {
-		let mut frame = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
-		let header = proto::Header { version: proto::VERSION, opcode, generation, payload_len: payload.len() as u32 };
-		frame[..proto::HEADER_LEN].copy_from_slice(&header.encode());
-		frame[proto::HEADER_LEN..proto::HEADER_LEN + payload.len()].copy_from_slice(payload);
-		send_blocking(channel, &frame[..proto::HEADER_LEN + payload.len()], 0)
-	}
+fn send_frame(channel: u64, opcode: proto::Opcode, generation: u64, payload: &[u8]) -> bool {
+	let mut frame = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	let header = proto::Header { version: proto::VERSION, opcode, generation, payload_len: payload.len() as u32 };
+	frame[..proto::HEADER_LEN].copy_from_slice(&header.encode());
+	frame[proto::HEADER_LEN..proto::HEADER_LEN + payload.len()].copy_from_slice(payload);
+	send_blocking(channel, &frame[..proto::HEADER_LEN + payload.len()], 0)
 }
 
 // The same, moving one capability with it.
-unsafe fn send_frame_with(channel: u64, opcode: proto::Opcode, generation: u64, payload: &[u8], handle: u64) -> bool {
-	unsafe {
-		let mut frame = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
-		let header = proto::Header { version: proto::VERSION, opcode, generation, payload_len: payload.len() as u32 };
-		frame[..proto::HEADER_LEN].copy_from_slice(&header.encode());
-		frame[proto::HEADER_LEN..proto::HEADER_LEN + payload.len()].copy_from_slice(payload);
-		send_blocking(channel, &frame[..proto::HEADER_LEN + payload.len()], handle)
-	}
+fn send_frame_with(channel: u64, opcode: proto::Opcode, generation: u64, payload: &[u8], handle: u64) -> bool {
+	let mut frame = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	let header = proto::Header { version: proto::VERSION, opcode, generation, payload_len: payload.len() as u32 };
+	frame[..proto::HEADER_LEN].copy_from_slice(&header.encode());
+	frame[proto::HEADER_LEN..proto::HEADER_LEN + payload.len()].copy_from_slice(payload);
+	send_blocking(channel, &frame[..proto::HEADER_LEN + payload.len()], handle)
 }
 
 // THE WHOLE OF THE MANAGER-TO-DRIVER HALF: one `BIND`, then exactly the resources it promised.
 //
 // Exits the process on anything that is not that. A driver with no working device has nothing to do,
 // and a driver that has been sent something it cannot parse has no way to ask again.
-pub unsafe fn handshake(bootstrap: u64) -> (Bind, Resources) {
-	unsafe {
-		// THE NOTE THIS BINARY CARRIES, READ BACK OUT OF ITSELF.
-		//
-		// Two things at once, and both matter. It REFERENCES the note's static, which is what keeps
-		// its object file linked in at all - a note nothing mentions is a note the linker never
-		// pulls out of the rlib, and it would then be missing from every driver with no error
-		// anywhere. And it checks what was actually emitted against what this build speaks: a
-		// binary whose note disagrees with what it puts on the wire is the one case that would make
-		// the manager's pre-claim version check a check of nothing.
-		if proto::declared_version() != proto::VERSION {
-			exit();
-		}
-		let mut buf = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
+	// THE NOTE THIS BINARY CARRIES, READ BACK OUT OF ITSELF.
+	//
+	// Two things at once, and both matter. It REFERENCES the note's static, which is what keeps
+	// its object file linked in at all - a note nothing mentions is a note the linker never
+	// pulls out of the rlib, and it would then be missing from every driver with no error
+	// anywhere. And it checks what was actually emitted against what this build speaks: a
+	// binary whose note disagrees with what it puts on the wire is the one case that would make
+	// the manager's pre-claim version check a check of nothing.
+	if proto::declared_version() != proto::VERSION {
+		exit();
+	}
+	let mut buf = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	let Some((header, handles)) = read_frame(bootstrap, &mut buf) else { exit() };
+	if header.opcode != proto::Opcode::Bind {
+		close_all(&handles);
+		exit();
+	}
+	let Ok((info, resource_count)) = proto::decode_bind(header.payload(&buf)) else { exit() };
+	let generation = header.generation;
+	let mut resources = Resources::default();
+	// EXACTLY THE PROMISED NUMBER. A count the manager states and does not keep would leave this
+	// loop waiting for a frame that is not coming, which is the deadlock the count exists to
+	// remove - so the loop is bounded by what was promised and by nothing else.
+	for _ in 0..resource_count {
 		let Some((header, handles)) = read_frame(bootstrap, &mut buf) else { exit() };
-		if header.opcode != proto::Opcode::Bind {
+		if header.opcode != proto::Opcode::Resource || header.generation != generation {
 			close_all(&handles);
 			exit();
 		}
-		let Ok((info, resource_count)) = proto::decode_bind(header.payload(&buf)) else { exit() };
-		let generation = header.generation;
-		let mut resources = Resources::default();
-		// EXACTLY THE PROMISED NUMBER. A count the manager states and does not keep would leave this
-		// loop waiting for a frame that is not coming, which is the deadlock the count exists to
-		// remove - so the loop is bounded by what was promised and by nothing else.
-		for _ in 0..resource_count {
-			let Some((header, handles)) = read_frame(bootstrap, &mut buf) else { exit() };
-			if header.opcode != proto::Opcode::Resource || header.generation != generation {
-				close_all(&handles);
-				exit();
-			}
-			let Ok(kind) = proto::decode_resource(header.payload(&buf)) else {
-				close_all(&handles);
-				exit();
-			};
-			let handle = handles.as_slice()[0];
-			let slot = match kind {
-				proto::ResourceKind::Device => &mut resources.device,
-				proto::ResourceKind::Irq => &mut resources.irq,
-				proto::ResourceKind::Keys => &mut resources.keys,
-				proto::ResourceKind::SysPower => &mut resources.syspower,
-				proto::ResourceKind::Console => &mut resources.console,
-			};
-			// A SECOND RESOURCE OF ONE KIND IS NOT A SPARE. Overwriting the slot would leak the
-			// first capability silently; this keeps the first and closes the second, which is the
-			// same rule a refused frame follows.
-			if *slot != 0 {
-				close(handle);
-			} else {
-				*slot = handle;
-			}
+		let Ok(kind) = proto::decode_resource(header.payload(&buf)) else {
+			close_all(&handles);
+			exit();
+		};
+		let handle = handles.as_slice()[0];
+		let slot = match kind {
+			proto::ResourceKind::Device => &mut resources.device,
+			proto::ResourceKind::Irq => &mut resources.irq,
+			proto::ResourceKind::Keys => &mut resources.keys,
+			proto::ResourceKind::SysPower => &mut resources.syspower,
+			proto::ResourceKind::Console => &mut resources.console,
+		};
+		// A SECOND RESOURCE OF ONE KIND IS NOT A SPARE. Overwriting the slot would leak the
+		// first capability silently; this keeps the first and closes the second, which is the
+		// same rule a refused frame follows.
+		if *slot != 0 {
+			close(handle);
+		} else {
+			*slot = handle;
 		}
-		(Bind { info, generation, resource_count }, resources)
 	}
+	(Bind { info, generation, resource_count }, resources)
 }
 
 // Offer a provider this driver serves. HELD UNPUBLISHED by the manager until `ready`, and closed on
@@ -166,10 +156,10 @@ pub unsafe fn handshake(bootstrap: u64) -> (Bind, Resources) {
 // a later withdrawal names; the identity the rest of the system uses is the manager's and is never
 // something a driver chooses. A driver that publishes one provider of each kind may use the kind as
 // its token and lose nothing.
-pub unsafe fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16, handle: u64) -> bool {
+pub fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16, handle: u64) -> bool {
 	let mut payload = [0u8; proto::OFFER_PAYLOAD_LEN];
 	proto::encode_offer(provider_kind, token, &mut payload);
-	unsafe { send_frame_with(bootstrap, proto::Opcode::Offer, bind.generation, &payload, handle) }
+	send_frame_with(bootstrap, proto::Opcode::Offer, bind.generation, &payload, handle)
 }
 
 // "A CONSUMER of the provider I published under this token has gone."
@@ -177,10 +167,10 @@ pub unsafe fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16,
 // Not a withdrawal: the provider stays published and the driver stays bound. What it releases is one
 // place against the `consumers` bound its registry entry declares - which the manager only ever
 // counted UP, so a provider admitting one consumer was unusable once its first client had left.
-pub unsafe fn disconnected(bootstrap: u64, bind: &Bind, token: u16) -> bool {
+pub fn disconnected(bootstrap: u64, bind: &Bind, token: u16) -> bool {
 	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
 	proto::encode_u16(token, &mut payload);
-	unsafe { send_frame(bootstrap, proto::Opcode::Disconnect, bind.generation, &payload) }
+	send_frame(bootstrap, proto::Opcode::Disconnect, bind.generation, &payload)
 }
 
 // "The provider I published under this token is going away."
@@ -189,15 +179,15 @@ pub unsafe fn disconnected(bootstrap: u64, bind: &Bind, token: u16) -> bool {
 // published. `token` is the one this driver chose when it offered - `online` uses the offer's
 // position in its own list, so the first offer is token 0. Withdrawal never frees a token for reuse
 // in the same binding generation, because outstanding consumers can still report their departure.
-pub unsafe fn withdraw(bootstrap: u64, bind: &Bind, token: u16) -> bool {
+pub fn withdraw(bootstrap: u64, bind: &Bind, token: u16) -> bool {
 	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
 	proto::encode_u16(token, &mut payload);
-	unsafe { send_frame(bootstrap, proto::Opcode::Withdraw, bind.generation, &payload) }
+	send_frame(bootstrap, proto::Opcode::Withdraw, bind.generation, &payload)
 }
 
 // "I am up." Terminal: nothing this driver sends afterwards is part of the handshake.
-pub unsafe fn ready(bootstrap: u64, bind: &Bind) -> bool {
-	unsafe { send_frame(bootstrap, proto::Opcode::Ready, bind.generation, &[]) }
+pub fn ready(bootstrap: u64, bind: &Bind) -> bool {
+	send_frame(bootstrap, proto::Opcode::Ready, bind.generation, &[])
 }
 
 // "I am not up, and here is what I know about why."
@@ -205,21 +195,19 @@ pub unsafe fn ready(bootstrap: u64, bind: &Bind) -> bool {
 // A DRIVER'S OWN VOCABULARY, not the manager's. A driver is hostile input by this protocol's rule,
 // and letting it name the manager's causes would let it declare things only the manager can
 // determine - which would then be recorded as fact.
-pub unsafe fn failed(bootstrap: u64, bind: &Bind, code: proto::DriverFailureCode) -> ! {
+pub fn failed(bootstrap: u64, bind: &Bind, code: proto::DriverFailureCode) -> ! {
 	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
 	proto::encode_u16(code as u16, &mut payload);
-	unsafe {
-		send_frame(bootstrap, proto::Opcode::Failed, bind.generation, &payload);
-		exit()
-	}
+	send_frame(bootstrap, proto::Opcode::Failed, bind.generation, &payload);
+	exit()
 }
 
 // Receive the device from DeviceManager, map its MMIO BAR, and negotiate it up to
 // FEATURES_OK through the virtio transport. Returns the negotiated device; the
 // caller sets up its queues and calls `driver_ok`. Exits the process on any failure
 // (a driver with no working device has nothing to do).
-pub unsafe fn bringup(bootstrap: u64) -> (Bind, Virtio) {
-	unsafe { bringup_features(bootstrap, 0) }
+pub fn bringup(bootstrap: u64) -> (Bind, Virtio) {
+	bringup_features(bootstrap, 0)
 }
 
 // `bringup`, additionally asking the negotiation for the word-0 (device-specific)
@@ -228,7 +216,7 @@ pub unsafe fn bringup(bootstrap: u64) -> (Bind, Virtio) {
 // ANSWERS WITH THE BINDING TOO, because everything this driver says afterwards has to carry the
 // generation. A bring-up that returned only the device left the driver with no way to stamp its own
 // report, which is what let a message from a replaced process be taken for its replacement's.
-pub unsafe fn bringup_features(bootstrap: u64, want_word0: u32) -> (Bind, Virtio) {
+pub fn bringup_features(bootstrap: u64, want_word0: u32) -> (Bind, Virtio) {
 	unsafe {
 		let (bind, resources) = handshake(bootstrap);
 		let device = bringup_bound(bootstrap, &bind, &resources, want_word0);
@@ -320,14 +308,12 @@ pub fn describe_state(out: &mut [u8; 64], name: &[u8], device: &Virtio, state: &
 // `driver.virtio-blk: online (00:02.0)iommu: 00:08.0 attached to domain 4` and then a bare newline,
 // which is two lines a reader cannot read and neither of them the line either component wrote. The
 // gap is what has to go; the terminator belongs to the line.
-unsafe fn print_line(report: &[u8]) {
-	unsafe {
-		let mut out = [0u8; 96];
-		let n = report.len().min(out.len() - 1);
-		out[..n].copy_from_slice(&report[..n]);
-		out[n] = b'\n';
-		print(&out[..n + 1]);
-	}
+fn print_line(report: &[u8]) {
+	let mut out = [0u8; 96];
+	let n = report.len().min(out.len() - 1);
+	out[..n].copy_from_slice(&report[..n]);
+	out[n] = b'\n';
+	print(&out[..n + 1]);
 }
 
 // Append what fits and drop what does not: a report that runs off the end of its buffer is a report,
@@ -352,23 +338,21 @@ pub fn hex2(byte: u8) -> [u8; 2] {
 // drivers that have work to do afterwards rather than standing on the channel. The order is the
 // property: offers are held UNPUBLISHED by the manager until the terminal frame, so a driver that
 // dies between them announces nothing.
-pub unsafe fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16, u64)]) -> bool {
-	unsafe {
-		print_line(report);
-		// THE TOKEN IS THE POSITION IN THIS DRIVER'S OWN OFFER LIST, which is unique within this
-		// driver by construction and costs a driver author no thought at all. The kind would do for
-		// every driver in the tree today, because none publishes two of one kind - and that is
-		// exactly the assumption a token exists to stop being load-bearing.
-		for (token, &(kind, handle)) in offers.iter().enumerate() {
-			if handle == 0 {
-				continue;
-			}
-			if !offer(bootstrap, bind, kind, token as u16, handle) {
-				return false;
-			}
+pub fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16, u64)]) -> bool {
+	print_line(report);
+	// THE TOKEN IS THE POSITION IN THIS DRIVER'S OWN OFFER LIST, which is unique within this
+	// driver by construction and costs a driver author no thought at all. The kind would do for
+	// every driver in the tree today, because none publishes two of one kind - and that is
+	// exactly the assumption a token exists to stop being load-bearing.
+	for (token, &(kind, handle)) in offers.iter().enumerate() {
+		if handle == 0 {
+			continue;
 		}
-		ready(bootstrap, bind)
+		if !offer(bootstrap, bind, kind, token as u16, handle) {
+			return false;
+		}
 	}
+	ready(bootstrap, bind)
 }
 
 // Announce this driver is up and stand holding its device until DeviceManager drops the channel.
@@ -382,17 +366,15 @@ pub unsafe fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16,
 // `service` is the provider this driver serves, or 0 for one that serves none. It travels in an
 // `OFFER` BEFORE the `READY`, because the manager holds offers unpublished until the terminal frame:
 // a driver that dies between the two announces nothing.
-pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], service: u64, provider_kind: u16, device: u64) -> ! {
-	unsafe {
-		print_line(report);
-		if service != 0 && !offer(bootstrap, bind, provider_kind, 0, service) {
-			exit();
-		}
-		if !ready(bootstrap, bind) {
-			exit();
-		}
-		stand(bootstrap, bind, device);
+pub fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], service: u64, provider_kind: u16, device: u64) -> ! {
+	print_line(report);
+	if service != 0 && !offer(bootstrap, bind, provider_kind, 0, service) {
+		exit();
 	}
+	if !ready(bootstrap, bind) {
+		exit();
+	}
+	stand(bootstrap, bind, device);
 }
 
 // Stand holding the device, answering the manager's `PING` until it drops the channel.
@@ -402,63 +384,61 @@ pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], servi
 // answered, so "is this driver's control path making progress" had no way to be asked. The answer
 // echoes the sequence it was asked with, on the same channel and through the same frame codec as
 // every other event.
-pub unsafe fn stand(bootstrap: u64, bind: &Bind, device: u64) -> ! {
-	unsafe {
-		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
-		loop {
-			let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf) else { exit() };
-			let Ok(header) = proto::Header::decode(&buf[..len]) else {
-				if handle != 0 {
-					close(handle);
-				}
-				continue;
-			};
-			// A FRAME FROM A BINDING THAT IS OVER IS NOT THIS BINDING'S. Dropped rather than
-			// answered: answering it would tell the manager a generation it has moved on from is
-			// alive.
-			if header.generation != bind.generation {
-				if handle != 0 {
-					close(handle);
-				}
-				continue;
+pub fn stand(bootstrap: u64, bind: &Bind, device: u64) -> ! {
+	let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	loop {
+		let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf) else { exit() };
+		let Ok(header) = proto::Header::decode(&buf[..len]) else {
+			if handle != 0 {
+				close(handle);
 			}
-			match header.opcode {
-				// A DRIVER THAT STANDS SERVES NOTHING, so there is nowhere to put a second consumer
-				// and the endpoint goes back. Closed rather than dropped: a consumer whose endpoint
-				// is closed learns its connection ended, where one whose endpoint is merely never
-				// read waits for ever.
-				proto::Opcode::Connect => {
-					if handle != 0 {
-						close(handle);
-					}
+			continue;
+		};
+		// A FRAME FROM A BINDING THAT IS OVER IS NOT THIS BINDING'S. Dropped rather than
+		// answered: answering it would tell the manager a generation it has moved on from is
+		// alive.
+		if header.generation != bind.generation {
+			if handle != 0 {
+				close(handle);
+			}
+			continue;
+		}
+		match header.opcode {
+			// A DRIVER THAT STANDS SERVES NOTHING, so there is nowhere to put a second consumer
+			// and the endpoint goes back. Closed rather than dropped: a consumer whose endpoint
+			// is closed learns its connection ended, where one whose endpoint is merely never
+			// read waits for ever.
+			proto::Opcode::Connect => {
+				if handle != 0 {
+					close(handle);
 				}
-				proto::Opcode::Ping => {
-					let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
-					if !pong(bootstrap, bind, sequence) {
-						exit();
-					}
-				}
-				// A STOP IS ANSWERED, AFTER THE DEVICE IS QUIET. `stand` treated every opcode other
-				// than `PING` as terminal and exited, so a driver standing on its channel -
-				// `virtio_console` is one - never sent `STOPPED` at all and the manager waited out
-				// its forced-teardown deadline for a driver that had done exactly what it was asked.
-				//
-				// AND THEN IT ANSWERED TOO EARLY. The first correction called `stopped` directly from
-				// here, which certifies a clean stop - the kernel gives back DMA frames and masked
-				// vectors on the strength of it and cannot check the claim - while the device was
-				// still live with its queues programmed. Having no work to DRAIN is not the same as
-				// having no hardware to STOP. This goes through `finish_stop` like every other
-				// planned-stop path, so the reset happens first and a device that does not confirm
-				// gets no certificate.
-				proto::Opcode::Stop => {
-					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
-					finish_stop(bootstrap, bind, device, quiesce_virtio());
+			}
+			proto::Opcode::Ping => {
+				let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
+				if !pong(bootstrap, bind, sequence) {
 					exit();
 				}
-				// Anything else on this channel ends the stand, which is what dropping the channel
-				// has always meant.
-				_ => exit(),
 			}
+			// A STOP IS ANSWERED, AFTER THE DEVICE IS QUIET. `stand` treated every opcode other
+			// than `PING` as terminal and exited, so a driver standing on its channel -
+			// `virtio_console` is one - never sent `STOPPED` at all and the manager waited out
+			// its forced-teardown deadline for a driver that had done exactly what it was asked.
+			//
+			// AND THEN IT ANSWERED TOO EARLY. The first correction called `stopped` directly from
+			// here, which certifies a clean stop - the kernel gives back DMA frames and masked
+			// vectors on the strength of it and cannot check the claim - while the device was
+			// still live with its queues programmed. Having no work to DRAIN is not the same as
+			// having no hardware to STOP. This goes through `finish_stop` like every other
+			// planned-stop path, so the reset happens first and a device that does not confirm
+			// gets no certificate.
+			proto::Opcode::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+				finish_stop(bootstrap, bind, device, quiesce_virtio());
+				exit();
+			}
+			// Anything else on this channel ends the stand, which is what dropping the channel
+			// has always meant.
+			_ => exit(),
 		}
 	}
 }
@@ -470,34 +450,32 @@ pub unsafe fn stand(bootstrap: u64, bind: &Bind, device: u64) -> ! {
 // A driver calls this instead of `wait_any` and changes nothing else: the manager's channel joins
 // the set it was already waiting on, so the ping is answered by the loop being supervised rather
 // than by a second one that would keep answering after the first had stopped working.
-pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<usize> {
-	unsafe {
-		let mut set: [u64; 8] = [0; 8];
-		let count: usize = handles.len().min(set.len() - 1);
-		set[..count].copy_from_slice(&handles[..count]);
-		set[count] = bootstrap;
-		loop {
-			// DRAINED FIRST, for the reason `serve_or_answer` gives: `wait_any` answers with the
-			// first ready index, so a handle that is always ready starves everything after it - and
-			// what comes after it here is the channel a watchdog is asking on.
-			match drain_control(bootstrap, bind) {
-				Control::Continue => {}
-				Control::Stop => {
-					// LATCHED, NOT ANSWERED - see `finish_stop`. The caller unwinds and answers once
-					// its own work is finished or abandoned, which is what `STOPPED` certifies.
-					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
-					return None;
-				}
-				Control::Ended => return None,
-			}
-			for (at, &handle) in handles[..count].iter().enumerate() {
-				if poll_ready(handle) {
-					return Some(at);
-				}
-			}
-			if wait_any(&set[..count + 1], 0) < 0 {
+pub fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<usize> {
+	let mut set: [u64; 8] = [0; 8];
+	let count: usize = handles.len().min(set.len() - 1);
+	set[..count].copy_from_slice(&handles[..count]);
+	set[count] = bootstrap;
+	loop {
+		// DRAINED FIRST, for the reason `serve_or_answer` gives: `wait_any` answers with the
+		// first ready index, so a handle that is always ready starves everything after it - and
+		// what comes after it here is the channel a watchdog is asking on.
+		match drain_control(bootstrap, bind) {
+			Control::Continue => {}
+			Control::Stop => {
+				// LATCHED, NOT ANSWERED - see `finish_stop`. The caller unwinds and answers once
+				// its own work is finished or abandoned, which is what `STOPPED` certifies.
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
 			}
+			Control::Ended => return None,
+		}
+		for (at, &handle) in handles[..count].iter().enumerate() {
+			if poll_ready(handle) {
+				return Some(at);
+			}
+		}
+		if wait_any(&set[..count + 1], 0) < 0 {
+			return None;
 		}
 	}
 }
@@ -512,25 +490,23 @@ pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Op
 //
 // Answers true when `server` has a request to read. False means the manager dropped the channel,
 // which ends the driver the way it always has.
-pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
-	unsafe {
-		// THE SET IS EPHEMERAL, SO IT MAY NOT ACCEPT - and it used to (corrected 2026-08-30).
-		//
-		// `Serving::new(server)` lives for this call. `drain_control_into` was handed it and would
-		// `accept` a `CONNECT`'s server end into it; this function then returned and the set was
-		// dropped, taking the endpoint with it. A consumer that asked the catalogue for a connection
-		// held a client end whose server half nobody was ever going to read, and waited for ever -
-		// which is worse than being refused, because nothing tells it.
-		//
-		// So this shape REFUSES a second consumer: `drain_control_into(.., None)` closes an endpoint
-		// it cannot place, and a consumer whose endpoint closes learns its connection ended. A driver
-		// that means to serve several holds its own `Serving` across calls and uses
-		// `serve_any_or_answer`; `virtio_blk` is the one that does.
-		// TOKEN ZERO AND NEVER READ: this set does not accept, so no endpoint in it is ever a
-		// provider connection whose end has to be reported. See `accepts` below.
-		let mut one = Serving::new(server, 0);
-		serve_any_or_answer_inner(bootstrap, bind, &mut one, false).is_some()
-	}
+pub fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
+	// THE SET IS EPHEMERAL, SO IT MAY NOT ACCEPT - and it used to (corrected 2026-08-30).
+	//
+	// `Serving::new(server)` lives for this call. `drain_control_into` was handed it and would
+	// `accept` a `CONNECT`'s server end into it; this function then returned and the set was
+	// dropped, taking the endpoint with it. A consumer that asked the catalogue for a connection
+	// held a client end whose server half nobody was ever going to read, and waited for ever -
+	// which is worse than being refused, because nothing tells it.
+	//
+	// So this shape REFUSES a second consumer: `drain_control_into(.., None)` closes an endpoint
+	// it cannot place, and a consumer whose endpoint closes learns its connection ended. A driver
+	// that means to serve several holds its own `Serving` across calls and uses
+	// `serve_any_or_answer`; `virtio_blk` is the one that does.
+	// TOKEN ZERO AND NEVER READ: this set does not accept, so no endpoint in it is ever a
+	// provider connection whose end has to be reported. See `accepts` below.
+	let mut one = Serving::new(server, 0);
+	serve_any_or_answer_inner(bootstrap, bind, &mut one, false).is_some()
 }
 
 // THE SAME, OVER EVERY CONSUMER THIS PROVIDER HAS. Answers WHICH endpoint has work, or `None` when
@@ -539,8 +515,8 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 // `serve_or_answer` is this with a set of one, kept for the loops that serve something which is not
 // a provider - a driver's own control path - and so a caller that will never see a `CONNECT` does
 // not have to hold a set to say so.
-pub unsafe fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving) -> Option<usize> {
-	unsafe { serve_any_or_answer_inner(bootstrap, bind, serving, true) }
+pub fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving) -> Option<usize> {
+	serve_any_or_answer_inner(bootstrap, bind, serving, true)
 }
 
 pub enum ProviderReady {
@@ -551,41 +527,39 @@ pub enum ProviderReady {
 
 // Keep accepting connections while all consumers are gone, alongside a device's IRQs. A newly
 // accepted endpoint is returned before its traffic so a provider can send its initial metadata.
-pub unsafe fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64]) -> Option<ProviderReady> {
-	unsafe {
-		loop {
-			match drain_control_into(bootstrap, bind, Some(serving)) {
-				Control::Continue => {}
-				Control::Stop => {
-					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
-					return None;
-				}
-				Control::Ended => return None,
-			}
-			if let Some(index) = serving.take_new() {
-				return Some(ProviderReady::Connected(index));
-			}
-			for (index, &end) in serving.as_slice().iter().enumerate() {
-				if poll_ready(end) {
-					return Some(ProviderReady::Consumer(index));
-				}
-			}
-			for (index, &device) in devices.iter().enumerate() {
-				if poll_ready(device) {
-					return Some(ProviderReady::Device(index));
-				}
-			}
-			let mut set = [0u64; MAX_PROVIDER_CLIENTS + 8];
-			let live = serving.as_slice();
-			if live.len() + devices.len() + 1 > set.len() {
+pub fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64]) -> Option<ProviderReady> {
+	loop {
+		match drain_control_into(bootstrap, bind, Some(serving)) {
+			Control::Continue => {}
+			Control::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
 			}
-			set[..live.len()].copy_from_slice(live);
-			set[live.len()..live.len() + devices.len()].copy_from_slice(devices);
-			set[live.len() + devices.len()] = bootstrap;
-			if wait_any(&set[..live.len() + devices.len() + 1], 0) < 0 {
-				return None;
+			Control::Ended => return None,
+		}
+		if let Some(index) = serving.take_new() {
+			return Some(ProviderReady::Connected(index));
+		}
+		for (index, &end) in serving.as_slice().iter().enumerate() {
+			if poll_ready(end) {
+				return Some(ProviderReady::Consumer(index));
 			}
+		}
+		for (index, &device) in devices.iter().enumerate() {
+			if poll_ready(device) {
+				return Some(ProviderReady::Device(index));
+			}
+		}
+		let mut set = [0u64; MAX_PROVIDER_CLIENTS + 8];
+		let live = serving.as_slice();
+		if live.len() + devices.len() + 1 > set.len() {
+			return None;
+		}
+		set[..live.len()].copy_from_slice(live);
+		set[live.len()..live.len() + devices.len()].copy_from_slice(devices);
+		set[live.len() + devices.len()] = bootstrap;
+		if wait_any(&set[..live.len() + devices.len() + 1], 0) < 0 {
+			return None;
 		}
 	}
 }
@@ -593,39 +567,37 @@ pub unsafe fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mu
 // The two shapes above, with the one thing that differs between them named: whether a `CONNECT` may
 // be ACCEPTED into `serving`. A caller whose set outlives the call may; one whose set is a local may
 // not, because accepting into a set that is about to be dropped loses the endpoint.
-unsafe fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, accepts: bool) -> Option<usize> {
-	unsafe {
-		loop {
-			// THE MANAGER'S CHANNEL IS DRAINED FIRST, EVERY PASS, and that is not a nicety.
-			//
-			// `wait_any` answers with the FIRST ready index, so a server with work always waiting on
-			// it starves everything after it in the set - and a busy driver would never see a ping,
-			// which is precisely the driver a watchdog must not kill. Measured: every virtio-blk in
-			// the machine was declared wedged while serving StorageService as fast as it could.
-			let placed = if accepts { Some(&mut *serving) } else { None };
-			match drain_control_into(bootstrap, bind, placed) {
-				Control::Continue => {}
-				Control::Stop => {
-					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
-					return None;
-				}
-				Control::Ended => return None,
-			}
-			// THE FIRST WITH WORK, and a set that grew while this was parked is waited on next pass.
-			for index in 0..serving.as_slice().len() {
-				if poll_ready(serving.at(index)) {
-					return Some(index);
-				}
-			}
-			// Nothing on any of them: park until one speaks. The manager's channel goes LAST so a
-			// consumer with work waiting does not starve it - see the note above about the reverse.
-			let mut set: [u64; MAX_PROVIDER_CLIENTS + 1] = [0; MAX_PROVIDER_CLIENTS + 1];
-			let live = serving.as_slice();
-			set[..live.len()].copy_from_slice(live);
-			set[live.len()] = bootstrap;
-			if wait_any(&set[..live.len() + 1], 0) < 0 {
+fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, accepts: bool) -> Option<usize> {
+	loop {
+		// THE MANAGER'S CHANNEL IS DRAINED FIRST, EVERY PASS, and that is not a nicety.
+		//
+		// `wait_any` answers with the FIRST ready index, so a server with work always waiting on
+		// it starves everything after it in the set - and a busy driver would never see a ping,
+		// which is precisely the driver a watchdog must not kill. Measured: every virtio-blk in
+		// the machine was declared wedged while serving StorageService as fast as it could.
+		let placed = if accepts { Some(&mut *serving) } else { None };
+		match drain_control_into(bootstrap, bind, placed) {
+			Control::Continue => {}
+			Control::Stop => {
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				return None;
 			}
+			Control::Ended => return None,
+		}
+		// THE FIRST WITH WORK, and a set that grew while this was parked is waited on next pass.
+		for index in 0..serving.as_slice().len() {
+			if poll_ready(serving.at(index)) {
+				return Some(index);
+			}
+		}
+		// Nothing on any of them: park until one speaks. The manager's channel goes LAST so a
+		// consumer with work waiting does not starve it - see the note above about the reverse.
+		let mut set: [u64; MAX_PROVIDER_CLIENTS + 1] = [0; MAX_PROVIDER_CLIENTS + 1];
+		let live = serving.as_slice();
+		set[..live.len()].copy_from_slice(live);
+		set[live.len()] = bootstrap;
+		if wait_any(&set[..live.len() + 1], 0) < 0 {
+			return None;
 		}
 	}
 }
@@ -704,7 +676,7 @@ impl Serving {
 	// what the registry's `consumers` bound is checked against, and which only ever rose while
 	// nothing said a client had left.
 	pub fn close_at(&mut self, index: usize) -> u16 {
-		unsafe { close(self.ends[index]) };
+		close(self.ends[index]);
 		let token = self.tokens[index];
 		self.count -= 1;
 		self.ends[index] = self.ends[self.count];
@@ -741,75 +713,73 @@ enum Control {
 }
 
 // Answer every `PING` waiting on `bootstrap` right now, without blocking.
-unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
-	unsafe { drain_control_into(bootstrap, bind, None) }
+fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
+	drain_control_into(bootstrap, bind, None)
 }
 
 // The same, for a loop that serves a provider: a `CONNECT` carries an endpoint and there has to be
 // somewhere to put it. `None` is a caller that serves none, and one arriving there is refused with
 // its handle closed rather than silently dropped.
-unsafe fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> Control {
-	unsafe {
-		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
-		loop {
-			let (len, handle) = match try_recv(bootstrap, &mut buf) {
-				Polled::Message { len, handle } => (len, handle),
-				Polled::Empty => return Control::Continue,
-				Polled::Closed => return Control::Ended,
-			};
-			let Ok(header) = proto::Header::decode(&buf[..len]) else {
-				if handle != 0 {
-					close(handle);
-				}
-				continue;
-			};
-			// A frame from a binding that is over is not this binding's: dropped rather than
-			// answered, because answering it would tell the manager a generation it has moved on
-			// from is alive.
-			if header.generation != bind.generation {
-				if handle != 0 {
-					close(handle);
-				}
-				continue;
+fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> Control {
+	let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+	loop {
+		let (len, handle) = match try_recv(bootstrap, &mut buf) {
+			Polled::Message { len, handle } => (len, handle),
+			Polled::Empty => return Control::Continue,
+			Polled::Closed => return Control::Ended,
+		};
+		let Ok(header) = proto::Header::decode(&buf[..len]) else {
+			if handle != 0 {
+				close(handle);
 			}
-			match header.opcode {
-				// ONE MORE CONSUMER. The manager made the pair and kept the client end; this is the
-				// server end, and serving it is the whole of what a driver has to do about it.
-				proto::Opcode::Connect => {
-					// THE TOKEN THE FRAME NAMES, kept with the endpoint. A frame whose payload does
-					// not decode is not a connection this driver can ever report the end of, so it
-					// is refused rather than served under a token nobody chose.
-					let token = proto::decode_connect(header.payload(&buf)).ok();
-					let accepted = handle != 0 && token.is_some_and(|token| serving.as_deref_mut().is_some_and(|serving| serving.accept(handle, token)));
-					if !accepted && handle != 0 {
-						// Full, or a loop that serves no provider. Closed rather than kept, so the
-						// consumer learns its connection ended instead of waiting on a server that
-						// will never read it.
-						close(handle);
-						if let Some(token) = token
-							&& !disconnected(bootstrap, bind, token)
-						{
-							return Control::Ended;
-						}
-					}
-				}
-				proto::Opcode::Ping => {
-					let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
-					if !pong(bootstrap, bind, sequence) {
+			continue;
+		};
+		// A frame from a binding that is over is not this binding's: dropped rather than
+		// answered, because answering it would tell the manager a generation it has moved on
+		// from is alive.
+		if header.generation != bind.generation {
+			if handle != 0 {
+				close(handle);
+			}
+			continue;
+		}
+		match header.opcode {
+			// ONE MORE CONSUMER. The manager made the pair and kept the client end; this is the
+			// server end, and serving it is the whole of what a driver has to do about it.
+			proto::Opcode::Connect => {
+				// THE TOKEN THE FRAME NAMES, kept with the endpoint. A frame whose payload does
+				// not decode is not a connection this driver can ever report the end of, so it
+				// is refused rather than served under a token nobody chose.
+				let token = proto::decode_connect(header.payload(&buf)).ok();
+				let accepted = handle != 0 && token.is_some_and(|token| serving.as_deref_mut().is_some_and(|serving| serving.accept(handle, token)));
+				if !accepted && handle != 0 {
+					// Full, or a loop that serves no provider. Closed rather than kept, so the
+					// consumer learns its connection ended instead of waiting on a server that
+					// will never read it.
+					close(handle);
+					if let Some(token) = token
+						&& !disconnected(bootstrap, bind, token)
+					{
 						return Control::Ended;
 					}
 				}
-				// ASKED TO STOP, AND IT MEANS ALL OF IT. A driver reaching here has nothing in
-				// flight it can finish - the loops that call this are between units of work - so
-				// what it owes is the answer and then its own exit. A driver with something to
-				// drain overrides `Control::Stop` rather than letting this decide for it.
-				proto::Opcode::Stop => return Control::Stop,
-				_ => {
-					if handle != 0 {
-						close(handle);
-					}
+			}
+			proto::Opcode::Ping => {
+				let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
+				if !pong(bootstrap, bind, sequence) {
 					return Control::Ended;
 				}
+			}
+			// ASKED TO STOP, AND IT MEANS ALL OF IT. A driver reaching here has nothing in
+			// flight it can finish - the loops that call this are between units of work - so
+			// what it owes is the answer and then its own exit. A driver with something to
+			// drain overrides `Control::Stop` rather than letting this decide for it.
+			proto::Opcode::Stop => return Control::Stop,
+			_ => {
+				if handle != 0 {
+					close(handle);
+				}
+				return Control::Ended;
 			}
 		}
 	}
@@ -818,16 +788,14 @@ unsafe fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&m
 // Answer one `PING` that is already waiting on `bootstrap`, for a loop that does its own waiting.
 //
 // False when the manager dropped the channel or sent anything else, which ends the driver.
-pub unsafe fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
-	unsafe {
-		match drain_control(bootstrap, bind) {
-			Control::Continue => true,
-			Control::Stop => {
-				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
-				false
-			}
-			Control::Ended => false,
+pub fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
+	match drain_control(bootstrap, bind) {
+		Control::Continue => true,
+		Control::Stop => {
+			STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+			false
 		}
+		Control::Ended => false,
 	}
 }
 
@@ -835,8 +803,8 @@ pub unsafe fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
 //
 // Terminal for the binding. A driver sends this and exits; the manager reads it as the confirmation
 // that a PLANNED stop completed, which is what makes it different from a channel that simply closed.
-pub unsafe fn stopped(bootstrap: u64, bind: &Bind) -> bool {
-	unsafe { send_frame(bootstrap, proto::Opcode::Stopped, bind.generation, &[]) }
+pub fn stopped(bootstrap: u64, bind: &Bind) -> bool {
+	send_frame(bootstrap, proto::Opcode::Stopped, bind.generation, &[])
 }
 
 // A STOP WAS READ AND NOT YET ANSWERED.
@@ -866,12 +834,12 @@ fn remember_virtio(device: &Virtio) {
 // This is what `STOPPED` certifies, and no driver was doing it: the reset happened at BRING-UP and
 // a planned stop left the queues live. Returns whether the device confirmed; a driver whose device
 // does not must not report a clean stop.
-pub unsafe fn quiesce_virtio() -> bool {
+pub fn quiesce_virtio() -> bool {
 	let common = VIRTIO_COMMON.load(core::sync::atomic::Ordering::Acquire);
 	if common == 0 {
 		return false;
 	}
-	unsafe { virtio::quiesce_at(common) }
+	virtio::quiesce_at(common)
 }
 
 // THE MANAGER HAS ASKED THIS DRIVER TO STOP, and the exit path owes a `STOPPED` for it.
@@ -907,25 +875,23 @@ pub fn stop_requested() -> bool {
 //
 // This used to take no such argument, and every caller was therefore certifying quiescence it had
 // not established.
-pub unsafe fn finish_stop(bootstrap: u64, bind: &Bind, device: u64, quiet: bool) {
-	unsafe {
-		if !quiet {
-			print(b"driver: the device did not confirm it stopped - no clean stop is acknowledged for it\n");
-			STOP_PENDING.store(false, core::sync::atomic::Ordering::Release);
-			return;
-		}
-		if device != 0 {
-			device_quiesced(device);
-		}
-		if STOP_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
-			stopped(bootstrap, bind);
-		}
+pub fn finish_stop(bootstrap: u64, bind: &Bind, device: u64, quiet: bool) {
+	if !quiet {
+		print(b"driver: the device did not confirm it stopped - no clean stop is acknowledged for it\n");
+		STOP_PENDING.store(false, core::sync::atomic::Ordering::Release);
+		return;
+	}
+	if device != 0 {
+		device_quiesced(device);
+	}
+	if STOP_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+		stopped(bootstrap, bind);
 	}
 }
 
 // "I am here, and this is the number you asked me with."
-pub unsafe fn pong(bootstrap: u64, bind: &Bind, sequence: u32) -> bool {
+pub fn pong(bootstrap: u64, bind: &Bind, sequence: u32) -> bool {
 	let mut payload = [0u8; proto::SEQUENCE_PAYLOAD_LEN];
 	proto::encode_sequence(sequence, &mut payload);
-	unsafe { send_frame(bootstrap, proto::Opcode::Pong, bind.generation, &payload) }
+	send_frame(bootstrap, proto::Opcode::Pong, bind.generation, &payload)
 }

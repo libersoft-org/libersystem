@@ -80,7 +80,7 @@ struct AdminCall<'a> {
 
 impl AdminService for AdminCall<'_> {
 	fn open_keys(&mut self) -> Result<u64, Error> {
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		self.clients.push(Client { chan: server, scope: Scope::Keys });
 		Ok(client)
 	}
@@ -105,9 +105,7 @@ impl Input {
 		self.send_key(event);
 		if emergency {
 			if self.kill_control != 0 {
-				unsafe {
-					let _ = send_blocking(self.kill_control, b"KILL", 0);
-				}
+				let _ = send_blocking(self.kill_control, b"KILL", 0);
 			}
 			self.set_focus(0);
 		}
@@ -118,7 +116,7 @@ impl Input {
 		let mut frame: [u8; 32] = [0; 32];
 		let mut frame_handles = Handles::new();
 		let sent: bool = match input::subscribe_keys_frame(stream.seq, &event, &mut frame, &mut frame_handles) {
-			Some(len) => unsafe { try_send_caps(stream.producer, &frame[..len], frame_handles.as_slice()) },
+			Some(len) => try_send_caps(stream.producer, &frame[..len], frame_handles.as_slice()),
 			None => false,
 		};
 		if sent {
@@ -126,10 +124,10 @@ impl Input {
 			true
 		} else {
 			for handle in frame_handles.as_slice() {
-				unsafe { close(*handle) };
+				close(*handle);
 			}
 			let dead: KeyStream = self.key_stream.take().unwrap();
-			unsafe { close(dead.producer) };
+			close(dead.producer);
 			false
 		}
 	}
@@ -143,14 +141,14 @@ impl Input {
 			}
 		}
 		if let Some(stream) = self.key_stream.take() {
-			unsafe { close(stream.producer) };
+			close(stream.producer);
 		}
 	}
 
 	fn set_focus(&mut self, peer: u64) {
 		self.close_key_stream(true);
 		if self.focus_peer != 0 {
-			unsafe { close(self.focus_peer) };
+			close(self.focus_peer);
 		}
 		self.focus_peer = peer;
 	}
@@ -160,9 +158,7 @@ impl Input {
 			let mut message: [u8; 9] = [0; 9];
 			message[..8].copy_from_slice(b"KEYFOCUS");
 			message[8] = focused as u8;
-			unsafe {
-				let _ = send_blocking(forward, &message, 0);
-			}
+			let _ = send_blocking(forward, &message, 0);
 		}
 	}
 
@@ -172,11 +168,11 @@ impl Input {
 		}
 		self.proof_nonce = self.proof_nonce.wrapping_add(1);
 		let challenge: [u8; 8] = self.proof_nonce.to_le_bytes();
-		if !unsafe { try_send(proof, &challenge, 0) } {
+		if !try_send(proof, &challenge, 0) {
 			return false;
 		}
 		let mut received: [u8; 8] = [0; 8];
-		matches!(unsafe { try_recv(self.focus_peer, &mut received) }, Polled::Message { len: 8, handle: 0 } if received == challenge)
+		matches!(try_recv(self.focus_peer, &mut received), Polled::Message { len: 8, handle: 0 } if received == challenge)
 	}
 }
 
@@ -189,7 +185,7 @@ impl input::Service for Input {
 
 	fn subscribe_keys(&mut self, focus: u64) -> Vec<KeyEvent> {
 		if focus != 0 {
-			unsafe { close(focus) };
+			close(focus);
 		}
 		Vec::new()
 	}
@@ -208,42 +204,40 @@ impl input::Service for Input {
 // The subscription is CLOSED before returning. This service takes what exists at bootstrap and does
 // not follow a replacement, so an open stream would be a handle nothing reads and a subscriber slot
 // the catalogue could not give to a consumer that does.
-unsafe fn take_published_pointer(catalogue: u64, kind: &ProviderKind) -> u64 {
-	unsafe {
-		if catalogue == 0 {
-			return 0;
-		}
-		let Some(providers) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(kind) else {
-			print(b"InputService: the catalogue refused a pointer subscription\n");
-			return 0;
-		};
-		let mut buf: [u8; 256] = [0; 256];
-		let mut opened: u64 = 0;
-		loop {
-			let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
-			for &handle in handles.as_slice() {
-				close(handle);
-			}
-			let mut frame_handles = wire::Handles::new();
-			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
-				print(b"InputService: a provider frame did not decode\n");
-				continue;
-			};
-			if !info.live {
-				continue;
-			}
-			match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
-				Some(Ok(handle)) => {
-					opened = handle;
-					break;
-				}
-				Some(Err(_)) => print(b"InputService: the catalogue refused a connection to a pointer provider it published\n"),
-				None => print(b"InputService: the catalogue did not answer the connection it published\n"),
-			}
-		}
-		close(providers);
-		opened
+fn take_published_pointer(catalogue: u64, kind: &ProviderKind) -> u64 {
+	if catalogue == 0 {
+		return 0;
 	}
+	let Some(providers) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(kind) else {
+		print(b"InputService: the catalogue refused a pointer subscription\n");
+		return 0;
+	};
+	let mut buf: [u8; 256] = [0; 256];
+	let mut opened: u64 = 0;
+	loop {
+		let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
+		for &handle in handles.as_slice() {
+			close(handle);
+		}
+		let mut frame_handles = wire::Handles::new();
+		let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+			print(b"InputService: a provider frame did not decode\n");
+			continue;
+		};
+		if !info.live {
+			continue;
+		}
+		match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
+			Some(Ok(handle)) => {
+				opened = handle;
+				break;
+			}
+			Some(Err(_)) => print(b"InputService: the catalogue refused a connection to a pointer provider it published\n"),
+			None => print(b"InputService: the catalogue did not answer the connection it published\n"),
+		}
+	}
+	close(providers);
+	opened
 }
 
 fn map_event(raw: &[u8]) -> Option<PointerEvent> {
@@ -265,26 +259,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. the serve channel clients reach us on, and the raw pointer-event channels the
 	//    pointer drivers feed us ("INPUT" = the virtio pointer, "INPUT2" = the xhci
 	//    driver's USB pointer; a handle is 0 when that source is absent).
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
+	let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 	// ConsoleService's pointer sink: we forward every raw event to it so it can drive
 	// selection, scrollback, and mouse reports (handle 0 = no console this boot).
-	let forward: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let forward: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if len >= 7 && &buf[..7] == b"FORWARD" => handle,
 		_ => 0,
 	};
-	let keys: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let keys: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KEYS" => handle,
 		_ => 0,
 	};
-	let focus: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let focus: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"FOCUS" => handle,
 		_ => 0,
 	};
-	let kill: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let kill: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KILL" => handle,
 		_ => 0,
 	};
-	let admin: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let admin: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"ADMIN" => handle,
 		_ => 0,
 	};
@@ -297,20 +291,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// with neither has neither, which is the state a pair of zero handles used to be.
 	//
 	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
-	let catalogue: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CATALOGUE") }.unwrap_or(0);
-	let raw: u64 = unsafe { take_published_pointer(catalogue, &ProviderKind::Input) };
-	let raw2: u64 = unsafe { take_published_pointer(catalogue, &ProviderKind::Pointer) };
+	let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
+	let raw: u64 = take_published_pointer(catalogue, &ProviderKind::Input);
+	let raw2: u64 = take_published_pointer(catalogue, &ProviderKind::Pointer);
 
 	// 2. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"InputService: online", 0);
 	}
 
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new(kill);
-	unsafe {
-		serve(service, admin, [raw, raw2], forward, keys, focus, &mut state);
-	}
+	serve(service, admin, [raw, raw2], forward, keys, focus, &mut state);
 	exit();
 }
 
@@ -319,171 +311,169 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // one client request. Returns when the client side closes (no more clients). Once
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
-unsafe fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u64, state: &mut Input) {
-	unsafe {
-		let mut req: [u8; 64] = [0u8; 64];
-		let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
-		let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
-		let mut keys_open: bool = keys != 0;
-		let mut focus_open: bool = focus != 0;
-		loop {
-			let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 5);
-			if focus_open {
-				waitset.push(focus);
+fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u64, state: &mut Input) {
+	let mut req: [u8; 64] = [0u8; 64];
+	let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
+	let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
+	let mut keys_open: bool = keys != 0;
+	let mut focus_open: bool = focus != 0;
+	loop {
+		let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 5);
+		if focus_open {
+			waitset.push(focus);
+		}
+		if keys_open {
+			waitset.push(keys);
+		}
+		for (i, &raw) in raws.iter().enumerate() {
+			if open[i] {
+				waitset.push(raw);
 			}
-			if keys_open {
-				waitset.push(keys);
-			}
-			for (i, &raw) in raws.iter().enumerate() {
-				if open[i] {
-					waitset.push(raw);
+		}
+		if admin != 0 {
+			waitset.push(admin);
+		}
+		waitset.extend(clients.iter().map(|client| client.chan));
+		let ready: i64 = wait_any(&waitset, 0);
+		if ready < 0 {
+			continue;
+		}
+		let ready_handle: u64 = waitset[ready as usize];
+		if focus_open && ready_handle == focus {
+			let acknowledged: bool = match recv_blocking(focus, &mut req) {
+				Received::Message { len, handle } if len >= 3 && &req[..3] == b"SET" && handle != 0 => {
+					state.notify_console(false, forward);
+					state.set_focus(handle);
+					true
 				}
-			}
-			if admin != 0 {
-				waitset.push(admin);
-			}
-			waitset.extend(clients.iter().map(|client| client.chan));
-			let ready: i64 = wait_any(&waitset, 0);
-			if ready < 0 {
-				continue;
-			}
-			let ready_handle: u64 = waitset[ready as usize];
-			if focus_open && ready_handle == focus {
-				let acknowledged: bool = match recv_blocking(focus, &mut req) {
-					Received::Message { len, handle } if len >= 3 && &req[..3] == b"SET" && handle != 0 => {
-						state.notify_console(false, forward);
-						state.set_focus(handle);
-						true
+				Received::Message { len, handle } if len >= 7 && &req[..7] == b"CONSOLE" => {
+					if handle != 0 {
+						close(handle);
 					}
-					Received::Message { len, handle } if len >= 7 && &req[..7] == b"CONSOLE" => {
+					state.set_focus(0);
+					state.notify_console(true, forward);
+					true
+				}
+				Received::Message { handle, .. } => {
+					if handle != 0 {
+						close(handle);
+					}
+					state.set_focus(0);
+					state.notify_console(false, forward);
+					true
+				}
+				Received::Closed => {
+					focus_open = false;
+					state.set_focus(0);
+					false
+				}
+			};
+			if acknowledged {
+				send_blocking(focus, b"OK", 0);
+			}
+			continue;
+		}
+		if keys_open && ready_handle == keys {
+			loop {
+				match try_recv(keys, &mut req) {
+					Polled::Message { len, handle } => {
 						if handle != 0 {
 							close(handle);
 						}
-						state.set_focus(0);
-						state.notify_console(true, forward);
-						true
+						state.record_key(&req[..len]);
 					}
-					Received::Message { handle, .. } => {
-						if handle != 0 {
-							close(handle);
-						}
-						state.set_focus(0);
-						state.notify_console(false, forward);
-						true
+					Polled::Empty => break,
+					Polled::Closed => {
+						keys_open = false;
+						break;
 					}
-					Received::Closed => {
-						focus_open = false;
-						state.set_focus(0);
-						false
-					}
-				};
-				if acknowledged {
-					send_blocking(focus, b"OK", 0);
 				}
+			}
+			continue;
+		}
+		for (i, &raw) in raws.iter().enumerate() {
+			if !open[i] || ready_handle != raw {
 				continue;
 			}
-			if keys_open && ready_handle == keys {
-				loop {
-					match try_recv(keys, &mut req) {
-						Polled::Message { len, handle } => {
-							if handle != 0 {
-								close(handle);
-							}
-							state.record_key(&req[..len]);
+			loop {
+				match try_recv(raw, &mut req) {
+					Polled::Message { len, .. } => {
+						if let Some(event) = map_event(&req[..len]) {
+							state.record(event);
 						}
-						Polled::Empty => break,
-						Polled::Closed => {
-							keys_open = false;
-							break;
+						if forward != 0 {
+							send_blocking(forward, &req[..len], 0);
 						}
 					}
-				}
-				continue;
-			}
-			for (i, &raw) in raws.iter().enumerate() {
-				if !open[i] || ready_handle != raw {
-					continue;
-				}
-				loop {
-					match try_recv(raw, &mut req) {
-						Polled::Message { len, .. } => {
-							if let Some(event) = map_event(&req[..len]) {
-								state.record(event);
-							}
-							if forward != 0 {
-								send_blocking(forward, &req[..len], 0);
-							}
-						}
-						Polled::Empty => break,
-						Polled::Closed => {
-							open[i] = false;
-							break;
-						}
+					Polled::Empty => break,
+					Polled::Closed => {
+						open[i] = false;
+						break;
 					}
 				}
-				continue;
 			}
-			if admin != 0 && ready_handle == admin {
-				match recv_caps_blocking(admin, &mut req) {
-					ReceivedCaps::Message { len, handles: caps } => {
-						let mut reply: [u8; 64] = [0; 64];
-						let mut reply_handle = proto::codec::Handles::new();
-						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-						// over the single-handle receive, which keeps the first and drops the rest - so a
-						// client sending stdin, stdout and stderr had two destroyed before dispatch.
-						let mut handle = caps;
-						let mut call = AdminCall { clients: &mut clients };
-						if let Some(n) = input_admin::dispatch(&mut call, &req[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
-								}
-							}
-						} else {
+			continue;
+		}
+		if admin != 0 && ready_handle == admin {
+			match recv_caps_blocking(admin, &mut req) {
+				ReceivedCaps::Message { len, handles: caps } => {
+					let mut reply: [u8; 64] = [0; 64];
+					let mut reply_handle = proto::codec::Handles::new();
+					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+					// over the single-handle receive, which keeps the first and drops the rest - so a
+					// client sending stdin, stdout and stderr had two destroyed before dispatch.
+					let mut handle = caps;
+					let mut call = AdminCall { clients: &mut clients };
+					if let Some(n) = input_admin::dispatch(&mut call, &req[..len], &mut handle, &mut reply, &mut reply_handle) {
+						if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
 							for &leftover in reply_handle.as_slice() {
 								close(leftover);
 							}
 						}
-						for &unclaimed in handle.as_slice() {
-							close(unclaimed);
+					} else {
+						for &leftover in reply_handle.as_slice() {
+							close(leftover);
 						}
 					}
-					ReceivedCaps::Closed => return,
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
+					}
 				}
-				continue;
+				ReceivedCaps::Closed => return,
 			}
-			let Some(client_index) = clients.iter().position(|client| client.chan == ready_handle) else { continue };
-			let client: u64 = clients[client_index].chan;
-			let scope: Scope = clients[client_index].scope;
-			match recv_blocking(client, &mut req) {
-				Received::Message { len, mut handle } => {
-					let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-					if op == CONNECT_OP && scope == Scope::Full {
-						if let Some((mine, theirs)) = channel() {
-							clients.push(Client { chan: mine, scope });
-							send_blocking(client, &[], theirs);
-						}
-					} else if op == input::OP_SUBSCRIBE && scope == Scope::Full {
-						stream_subscribe(client, &req[..len], state);
-					} else if op == input::OP_SUBSCRIBE_KEYS {
-						stream_subscribe_keys(client, &req[..len], &mut handle, state);
-					} else if len >= 6 {
-						send_blocking(client, &req[2..6], 0);
+			continue;
+		}
+		let Some(client_index) = clients.iter().position(|client| client.chan == ready_handle) else { continue };
+		let client: u64 = clients[client_index].chan;
+		let scope: Scope = clients[client_index].scope;
+		match recv_blocking(client, &mut req) {
+			Received::Message { len, mut handle } => {
+				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+				if op == CONNECT_OP && scope == Scope::Full {
+					if let Some((mine, theirs)) = channel() {
+						clients.push(Client { chan: mine, scope });
+						send_blocking(client, &[], theirs);
 					}
-					if handle != 0 {
-						close(handle);
-					}
+				} else if op == input::OP_SUBSCRIBE && scope == Scope::Full {
+					stream_subscribe(client, &req[..len], state);
+				} else if op == input::OP_SUBSCRIBE_KEYS {
+					stream_subscribe_keys(client, &req[..len], &mut handle, state);
+				} else if len >= 6 {
+					send_blocking(client, &req[2..6], 0);
 				}
-				Received::Closed => {
-					if state.key_stream.as_ref().is_some_and(|stream| stream.owner == client) {
-						state.close_key_stream(false);
-					}
-					if client_index == 0 {
-						return;
-					}
-					close(client);
-					clients.swap_remove(client_index);
+				if handle != 0 {
+					close(handle);
 				}
+			}
+			Received::Closed => {
+				if state.key_stream.as_ref().is_some_and(|stream| stream.owner == client) {
+					state.close_key_stream(false);
+				}
+				if client_index == 0 {
+					return;
+				}
+				close(client);
+				clients.swap_remove(client_index);
 			}
 		}
 	}
@@ -496,25 +486,21 @@ fn stream_subscribe_keys(service: u64, request: &[u8], request_handle: &mut u64,
 	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
 	let proof: u64 = core::mem::take(request_handle);
 	let valid: bool = state.validate_focus(proof);
-	unsafe { close(proof) };
+	close(proof);
 	if !valid {
-		unsafe {
-			send_blocking(service, &corr.to_le_bytes(), 0);
-		}
+		send_blocking(service, &corr.to_le_bytes(), 0);
 		return;
 	}
 	state.close_key_stream(true);
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return,
 	};
-	if unsafe { send_blocking(service, &corr.to_le_bytes(), consumer) } {
+	if send_blocking(service, &corr.to_le_bytes(), consumer) {
 		state.key_stream = Some(KeyStream { owner: service, producer, seq: 0 });
 	} else {
-		unsafe {
-			close(producer);
-			close(consumer);
-		}
+		close(producer);
+		close(consumer);
 	}
 }
 
@@ -529,32 +515,26 @@ fn stream_subscribe(service: u64, request: &[u8], state: &mut Input) {
 		Some(v) => v,
 		None => return,
 	};
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return,
 	};
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
-	unsafe {
-		send_blocking(service, &corr_bytes, consumer);
-	}
+	send_blocking(service, &corr_bytes, consumer);
 	let mut frame: [u8; 32] = [0u8; 32];
 	for (seq, item) in items.iter().enumerate() {
 		let mut frame_handles = Handles::new();
 		if let Some(n) = input::subscribe_frame(seq as u32, item, &mut frame, &mut frame_handles) {
-			unsafe {
-				if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
-					for handle in frame_handles.as_slice() {
-						close(*handle);
-					}
+			if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
+				for handle in frame_handles.as_slice() {
+					close(*handle);
 				}
 			}
 		} else {
 			for handle in frame_handles.as_slice() {
-				unsafe { close(*handle) };
+				close(*handle);
 			}
 		}
 	}
-	unsafe {
-		close(producer);
-	}
+	close(producer);
 }

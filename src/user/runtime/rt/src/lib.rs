@@ -135,6 +135,10 @@ pub extern "C" fn rust_alloc_error_handler_alias(size: usize, align: usize) -> !
 	__rust_alloc_error_handler(size, align)
 }
 
+// # Safety
+// The C library contract this stands in for: the pointers must be valid for `len` bytes and the
+// destination writable. The compiler emits calls to these for slice and struct moves, so the
+// obligation is discharged wherever it generated the call.
 #[cfg(feature = "shared-image")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liber_memcpy_impl(destination: *mut u8, source: *const u8, len: usize) -> *mut u8 {
@@ -146,6 +150,10 @@ pub unsafe extern "C" fn liber_memcpy_impl(destination: *mut u8, source: *const 
 	destination
 }
 
+// # Safety
+// `destination` and `source` must each be valid for `len` bytes, and `destination` writable. The
+// spans may overlap: this copies in whichever direction keeps the source readable, which is what
+// makes it usable for `memmove` as well as `memcpy`.
 #[cfg(feature = "shared-image")]
 unsafe fn move_bytes(destination: *mut u8, source: *const u8, len: usize) {
 	let destination_address = destination as usize;
@@ -161,6 +169,10 @@ unsafe fn move_bytes(destination: *mut u8, source: *const u8, len: usize) {
 	}
 }
 
+// # Safety
+// The C library contract this stands in for: the pointers must be valid for `len` bytes and the
+// destination writable. The compiler emits calls to these for slice and struct moves, so the
+// obligation is discharged wherever it generated the call.
 #[cfg(feature = "shared-image")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liber_memmove_impl(destination: *mut u8, source: *const u8, len: usize) -> *mut u8 {
@@ -168,6 +180,10 @@ pub unsafe extern "C" fn liber_memmove_impl(destination: *mut u8, source: *const
 	destination
 }
 
+// # Safety
+// The C library contract this stands in for: the pointers must be valid for `len` bytes and the
+// destination writable. The compiler emits calls to these for slice and struct moves, so the
+// obligation is discharged wherever it generated the call.
 #[cfg(feature = "shared-image")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liber_memset_impl(destination: *mut u8, value: i32, len: usize) -> *mut u8 {
@@ -179,6 +195,10 @@ pub unsafe extern "C" fn liber_memset_impl(destination: *mut u8, value: i32, len
 	destination
 }
 
+// # Safety
+// The C library contract this stands in for: the pointers must be valid for `len` bytes and the
+// destination writable. The compiler emits calls to these for slice and struct moves, so the
+// obligation is discharged wherever it generated the call.
 #[cfg(feature = "shared-image")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn liber_memcmp_impl(left: *const u8, right: *const u8, len: usize) -> i32 {
@@ -206,6 +226,12 @@ global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "tail liber_m
 // Issue a syscall: number in rax, up to four args in rdi/rsi/rdx/r10. The
 // `syscall` instruction clobbers rcx and r11; the kernel also uses r8/r9. The
 // result comes back in rax (a success value or a small negative error code).
+//
+// # Safety
+// Every argument the kernel reads as a POINTER must be valid for the length passed beside it, for
+// the whole call, and writable where the kernel writes. Which arguments those are is per syscall
+// number, so this raw form has no contract of its own beyond "the caller knows the number". The
+// typed wrappers below are where that contract is discharged, and they are safe because of it.
 #[cfg(all(target_arch = "x86_64", not(feature = "host-tests")))]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
@@ -228,6 +254,12 @@ pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // aarch64: number in x8, up to four args in x0..x3, result back in x0 (the SVC
 // trap path). SVC preserves the general registers, so nothing else is clobbered.
+//
+// # Safety
+// Every argument the kernel reads as a POINTER must be valid for the length passed beside it, for
+// the whole call, and writable where the kernel writes. Which arguments those are is per syscall
+// number, so this raw form has no contract of its own beyond "the caller knows the number". The
+// typed wrappers below are where that contract is discharged, and they are safe because of it.
 #[cfg(all(target_arch = "aarch64", not(feature = "host-tests")))]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
@@ -247,6 +279,12 @@ pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // riscv64: number in a7, up to four args in a0..a3, result back in a0 (the ecall
 // trap path). ecall preserves the general registers, so nothing else is clobbered.
+//
+// # Safety
+// Every argument the kernel reads as a POINTER must be valid for the length passed beside it, for
+// the whole call, and writable where the kernel writes. Which arguments those are is per syscall
+// number, so this raw form has no contract of its own beyond "the caller knows the number". The
+// typed wrappers below are where that contract is discharged, and they are safe because of it.
 #[cfg(all(target_arch = "riscv64", not(feature = "host-tests")))]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
@@ -288,12 +326,18 @@ pub fn exit_with(status: u64) -> ! {
 // NO KERNEL ON THE HOST: under the host-test seam every syscall answers `ERR_UNSUPPORTED`, so a
 // wrapper reached from a pure-layer test fails the way a missing facility fails instead of
 // executing the host kernel's syscall of the same number with this system's arguments.
+//
+// # Safety
+// Every argument the kernel reads as a POINTER must be valid for the length passed beside it, for
+// the whole call, and writable where the kernel writes. Which arguments those are is per syscall
+// number, so this raw form has no contract of its own beyond "the caller knows the number". The
+// typed wrappers below are where that contract is discharged, and they are safe because of it.
 #[cfg(feature = "host-tests")]
 pub unsafe fn syscall(_number: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
 	ERR_UNSUPPORTED as u64
 }
 
-pub unsafe fn yield_now() {
+pub fn yield_now() {
 	unsafe {
 		syscall(SYS_YIELD, 0, 0, 0, 0);
 	}
@@ -302,7 +346,7 @@ pub unsafe fn yield_now() {
 // Write `bytes` to the debug console. The only output path a ring-3 program has when no
 // stdout console channel is set (the real console service routes through that channel).
 #[unsafe(no_mangle)]
-pub unsafe fn print(bytes: &[u8]) {
+pub fn print(bytes: &[u8]) {
 	unsafe {
 		// If a stdout console channel is set, the program's terminal output goes there
 		// (to the userspace ConsoleService, which renders it and mirrors it to serial)
@@ -338,22 +382,20 @@ pub unsafe fn print(bytes: &[u8]) {
 // far end is gone. A program with no stdout channel at all still gets the debug port, because
 // there "nobody is reading" is not something that happened, it is how the program was launched.
 #[unsafe(no_mangle)]
-pub unsafe fn write_stdout(bytes: &[u8]) -> bool {
-	unsafe {
-		let out: u64 = STDOUT.load(Ordering::Relaxed);
-		if out == 0 {
-			print(bytes);
-			return true;
-		}
-		send_blocking(out, bytes, 0)
+pub fn write_stdout(bytes: &[u8]) -> bool {
+	let out: u64 = STDOUT.load(Ordering::Relaxed);
+	if out == 0 {
+		print(bytes);
+		return true;
 	}
+	send_blocking(out, bytes, 0)
 }
 
 // Write bytes to the kernel debug/serial port, returning how many the kernel's
 // transmit ring accepted (one syscall, no chunk loop). A caller draining a backlog -
 // the console's serial mirror - consumes exactly that many and retries the rest on a
 // later wake, so a burst is paced instead of truncated.
-pub unsafe fn debug_write(bytes: &[u8]) -> usize {
+pub fn debug_write(bytes: &[u8]) -> usize {
 	unsafe {
 		let n = bytes.len().min(DEBUG_WRITE_CHUNK);
 		let accepted: i64 = syscall(SYS_DEBUG_WRITE, bytes.as_ptr() as u64, n as u64, 0, 0) as i64;
@@ -427,12 +469,12 @@ pub fn stderr() -> u64 {
 // Write to this program's error stream: its own channel when it was given one, and stdout when it
 // was not. A diagnostic still reaches the terminal of a launch that separates neither, which is
 // every launch today - so a tool can be written against the distinction before anything redirects.
-pub unsafe fn eprint(bytes: &[u8]) {
+pub fn eprint(bytes: &[u8]) {
 	let error: u64 = STDERR.load(Ordering::Relaxed);
-	if error != 0 && unsafe { send_blocking(error, bytes, 0) } {
+	if error != 0 && send_blocking(error, bytes, 0) {
 		return;
 	}
-	unsafe { print(bytes) };
+	print(bytes);
 }
 
 // Lightweight cross-process perf tracing for latency hunting, off by default. `perf_mark`
@@ -593,42 +635,40 @@ pub fn perf_mark_val(label: &[u8], val: u64) {
 // grants only SEND, so reads return end-of-input. A no-op if the first message is not a
 // STDOUT one (the handle 0 then restores the debug-port fallback and leaves stdin empty).
 #[unsafe(no_mangle)]
-pub unsafe fn inherit_stdout(bootstrap: u64) {
-	unsafe {
-		// Take the launch endpoints BY NAME: output, input and error stream, any of them absent.
-		//
-		// This was one message carrying ordered capabilities - 0 stdout, an optional 1 stdin -
-		// and the ordering was deliberate: at the time a receiver could not tell an endpoint that
-		// was never sent from the next handoff in the sequence, so peeking for a trailing one
-		// swallowed the caller's next message and left the program blocked forever on a sequence
-		// off by one. It broke `imgconv --help` before any sender for it even existed.
-		//
-		// The terminator answers that: a named run ends at READY, so absent is absent. Position
-		// could not have carried the third endpoint anyway - `cmd 2> file &` has an output and an
-		// error stream with no input between them.
-		//
-		// The name is unchanged so every program that calls this keeps working; only what arrives
-		// on the channel changed.
-		let mut endpoints: CapSet = recv_caps(bootstrap);
-		let out: u64 = endpoints.take(CAP_STDOUT);
-		if out == 0 {
-			return;
-		}
-		set_stdout(out);
-		// A controlling terminal is full-duplex, so a launch that sends no separate input reads
-		// from the channel it writes to; a pipeline stage is handed a different one. A background
-		// launch gets a send-only dup, where the read simply fails - which is the end-of-input it
-		// should see.
-		let input: u64 = endpoints.take(CAP_STDIN);
-		set_stdin(if input != 0 { input } else { out });
-		// Absent leaves 0, and `eprint` then writes to stdout - today's behaviour for every
-		// launch, kept until something actually redirects one and not the other.
-		set_stderr(endpoints.take(CAP_STDERR));
-		// The terminal's CONTROL channel, when the launcher gave one. This is what makes a mode
-		// change a REQUEST rather than a byte in the output: `cat` writes data on stdout and has no
-		// way to reach this, whatever its file contains.
-		TTY_CONTROL.store(endpoints.take(CAP_CONTROL), Ordering::Relaxed);
+pub fn inherit_stdout(bootstrap: u64) {
+	// Take the launch endpoints BY NAME: output, input and error stream, any of them absent.
+	//
+	// This was one message carrying ordered capabilities - 0 stdout, an optional 1 stdin -
+	// and the ordering was deliberate: at the time a receiver could not tell an endpoint that
+	// was never sent from the next handoff in the sequence, so peeking for a trailing one
+	// swallowed the caller's next message and left the program blocked forever on a sequence
+	// off by one. It broke `imgconv --help` before any sender for it even existed.
+	//
+	// The terminator answers that: a named run ends at READY, so absent is absent. Position
+	// could not have carried the third endpoint anyway - `cmd 2> file &` has an output and an
+	// error stream with no input between them.
+	//
+	// The name is unchanged so every program that calls this keeps working; only what arrives
+	// on the channel changed.
+	let mut endpoints: CapSet = recv_caps(bootstrap);
+	let out: u64 = endpoints.take(CAP_STDOUT);
+	if out == 0 {
+		return;
 	}
+	set_stdout(out);
+	// A controlling terminal is full-duplex, so a launch that sends no separate input reads
+	// from the channel it writes to; a pipeline stage is handed a different one. A background
+	// launch gets a send-only dup, where the read simply fails - which is the end-of-input it
+	// should see.
+	let input: u64 = endpoints.take(CAP_STDIN);
+	set_stdin(if input != 0 { input } else { out });
+	// Absent leaves 0, and `eprint` then writes to stdout - today's behaviour for every
+	// launch, kept until something actually redirects one and not the other.
+	set_stderr(endpoints.take(CAP_STDERR));
+	// The terminal's CONTROL channel, when the launcher gave one. This is what makes a mode
+	// change a REQUEST rather than a byte in the output: `cat` writes data on stdout and has no
+	// way to reach this, whatever its file contains.
+	TTY_CONTROL.store(endpoints.take(CAP_CONTROL), Ordering::Relaxed);
 }
 
 // The controlling terminal's control channel, if this program was given one.
@@ -655,39 +695,37 @@ static TTY_CONTROL: AtomicU64 = AtomicU64::new(0);
 //
 // A tool that gets None has to choose a size rather than fail: a pager on a terminal that will not
 // say is still a pager, and refusing to run would be a worse answer than a conservative guess.
-pub unsafe fn tty_winsize() -> Option<(u16, u16)> {
+pub fn tty_winsize() -> Option<(u16, u16)> {
 	let control: u64 = TTY_CONTROL.load(Ordering::Relaxed);
 	if control == 0 {
 		return None;
 	}
-	unsafe {
-		if !send_blocking(control, b"GET_WINSIZE", 0) {
-			return None;
-		}
-		let mut buf: [u8; 32] = [0u8; 32];
-		// BOUNDED, unlike the shell's own version of this loop: an interactive tool asking for its
-		// size must not be able to park forever on a control channel that is answering something
-		// else. Sixteen messages is far more than the queue ever holds between a request and its
-		// reply, and running out is a size this tool has to choose for itself.
-		for _ in 0..16 {
-			match recv_blocking(control, &mut buf) {
-				Received::Message { len, .. } => {
-					let message: &[u8] = &buf[..len];
-					if message.starts_with(b"WINSIZE") && len >= b"WINSIZE".len() + 4 {
-						let at = b"WINSIZE".len();
-						let rows = u16::from_le_bytes([message[at], message[at + 1]]);
-						let cols = u16::from_le_bytes([message[at + 2], message[at + 3]]);
-						return if rows == 0 || cols == 0 { None } else { Some((rows, cols)) };
-					}
-				}
-				Received::Closed => return None,
-			}
-		}
-		None
+	if !send_blocking(control, b"GET_WINSIZE", 0) {
+		return None;
 	}
+	let mut buf: [u8; 32] = [0u8; 32];
+	// BOUNDED, unlike the shell's own version of this loop: an interactive tool asking for its
+	// size must not be able to park forever on a control channel that is answering something
+	// else. Sixteen messages is far more than the queue ever holds between a request and its
+	// reply, and running out is a size this tool has to choose for itself.
+	for _ in 0..16 {
+		match recv_blocking(control, &mut buf) {
+			Received::Message { len, .. } => {
+				let message: &[u8] = &buf[..len];
+				if message.starts_with(b"WINSIZE") && len >= b"WINSIZE".len() + 4 {
+					let at = b"WINSIZE".len();
+					let rows = u16::from_le_bytes([message[at], message[at + 1]]);
+					let cols = u16::from_le_bytes([message[at + 2], message[at + 3]]);
+					return if rows == 0 || cols == 0 { None } else { Some((rows, cols)) };
+				}
+			}
+			Received::Closed => return None,
+		}
+	}
+	None
 }
 
-pub unsafe fn tty_set_mode(raw: bool, echo: bool) -> bool {
+pub fn tty_set_mode(raw: bool, echo: bool) -> bool {
 	let control: u64 = TTY_CONTROL.load(Ordering::Relaxed);
 	if control == 0 {
 		return false;
@@ -698,7 +736,7 @@ pub unsafe fn tty_set_mode(raw: bool, echo: bool) -> bool {
 	let mut message: [u8; 10] = *b"SET_MODE\0\0";
 	message[8] = raw as u8;
 	message[9] = echo as u8;
-	unsafe { send_blocking(control, &message, 0) }
+	send_blocking(control, &message, 0)
 }
 
 // The largest launch context a program will accept.
@@ -729,14 +767,14 @@ pub const LAUNCH_CONTEXT_MAX: usize = 64 * 1024;
 // here against `wire`, would put a second definition of the format in the one place that must
 // never disagree with the schema. So the split is: the runtime bounds and delivers the message,
 // and the program that needs the fields links the package that defines them.
-pub unsafe fn recv_launch_bytes(bootstrap: u64) -> Option<alloc::vec::Vec<u8>> {
-	let (bytes, capability) = unsafe { recv_launch_with(bootstrap) }?;
+pub fn recv_launch_bytes(bootstrap: u64) -> Option<alloc::vec::Vec<u8>> {
+	let (bytes, capability) = recv_launch_with(bootstrap)?;
 	// A launcher may attach one capability to this message, and a program that does not expect
 	// one must not simply drop it: a discarded handle stays open for the life of the process,
 	// which is how every governed tool leaked two volume clients per launch. Closing it is the
 	// same rule `CapSet` follows for a grant nobody claims.
 	if capability != 0 {
-		unsafe { close(capability) };
+		close(capability);
 	}
 	Some(bytes)
 }
@@ -748,8 +786,8 @@ pub unsafe fn recv_launch_bytes(bootstrap: u64) -> Option<alloc::vec::Vec<u8>> {
 // rather than the record: the context is data a program inherits, and a capability is not data.
 // Sending it separately would put the receiver back where it cannot tell "none was sent" from
 // "not sent yet", which is the ambiguity this whole shape exists to remove.
-pub unsafe fn recv_launch_with(bootstrap: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
-	match unsafe { recv_vec_bounded(bootstrap, LAUNCH_CONTEXT_MAX) } {
+pub fn recv_launch_with(bootstrap: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
+	match recv_vec_bounded(bootstrap, LAUNCH_CONTEXT_MAX) {
 		BoundedVec::Message { bytes, handle } => Some((bytes, handle)),
 		_ => None,
 	}
@@ -761,18 +799,16 @@ pub unsafe fn recv_launch_with(bootstrap: u64) -> Option<(alloc::vec::Vec<u8>, u
 // terminal closing, or no stdin at all (a background / non-interactive launch). Only a
 // foreground program reads here; the line discipline in ConsoleService edits and echoes
 // the input exactly as it does for the shell's own prompt.
-pub unsafe fn read_line(buf: &mut [u8]) -> Option<usize> {
-	unsafe {
-		let inp: u64 = STDIN.load(Ordering::Relaxed);
-		if inp == 0 {
-			return None;
-		}
-		match recv_blocking(inp, buf) {
-			// A zero-byte read is the tty's EOF (Ctrl+D on an empty line).
-			Received::Message { len: 0, .. } => None,
-			Received::Message { len, .. } => Some(len),
-			Received::Closed => None,
-		}
+pub fn read_line(buf: &mut [u8]) -> Option<usize> {
+	let inp: u64 = STDIN.load(Ordering::Relaxed);
+	if inp == 0 {
+		return None;
+	}
+	match recv_blocking(inp, buf) {
+		// A zero-byte read is the tty's EOF (Ctrl+D on an empty line).
+		Received::Message { len: 0, .. } => None,
+		Received::Message { len, .. } => Some(len),
+		Received::Closed => None,
 	}
 }
 
@@ -780,7 +816,7 @@ pub unsafe fn read_line(buf: &mut [u8]) -> Option<usize> {
 // event signaled, a timer expired) or `deadline` (absolute ticks; 0 = no
 // timeout) passes. Returns 0 when ready, a small negative error otherwise. This
 // sleeps the thread at ~0% CPU instead of busy-yielding.
-pub unsafe fn wait(handle: u64, deadline: u64) -> i64 {
+pub fn wait(handle: u64, deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT, handle, deadline, 0, 0) as i64 }
 }
 
@@ -788,7 +824,7 @@ pub unsafe fn wait(handle: u64, deadline: u64) -> i64 {
 // kernel still wakes the caller when it is due, but the wait never counts as
 // pending progress - the scheduler's boot driver settles across it, so a service
 // may tick forever (a display poll, a blink) without stalling boot or the tests.
-pub unsafe fn wait_periodic(handle: u64, deadline: u64) -> i64 {
+pub fn wait_periodic(handle: u64, deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT, handle, deadline, WAIT_PERIODIC, 0) as i64 }
 }
 
@@ -796,7 +832,7 @@ pub unsafe fn wait_periodic(handle: u64, deadline: u64) -> i64 {
 // handle, or a negative error (ERR_TIMED_OUT at `deadline`; absolute ticks, 0 = no
 // timeout). Lets a driver wait on its device interrupt and a control channel at
 // once, waking on whichever fires first.
-pub unsafe fn wait_any(handles: &[u64], deadline: u64) -> i64 {
+pub fn wait_any(handles: &[u64], deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, 0) as i64 }
 }
 
@@ -806,12 +842,12 @@ pub unsafe fn wait_any(handles: &[u64], deadline: u64) -> i64 {
 // so neither can express "wake me at tick N and nothing else" - the callers that needed it all
 // happened to have a channel to park on, and passed that. A caller with no such handle, or one
 // whose channel might legitimately wake it early, has to arm something.
-pub unsafe fn timer_create() -> i64 {
+pub fn timer_create() -> i64 {
 	unsafe { syscall(SYS_TIMER_CREATE, 0, 0, 0, 0) as i64 }
 }
 
 // Arm `timer` to fire at an absolute tick deadline (see `clock`).
-pub unsafe fn timer_set(timer: u64, deadline: u64) -> i64 {
+pub fn timer_set(timer: u64, deadline: u64) -> i64 {
 	unsafe { syscall(SYS_TIMER_SET, timer, deadline, 0, 0) as i64 }
 }
 
@@ -824,25 +860,23 @@ pub unsafe fn timer_set(timer: u64, deadline: u64) -> i64 {
 //
 // Silently returns at once if a timer cannot be created. A sleep that cannot be performed is a
 // missing delay, and a caller that treated that as fatal would turn a shortage into a failed boot.
-pub unsafe fn sleep_until(deadline: u64) {
-	unsafe {
-		if clock() >= deadline {
-			return;
-		}
-		let timer: i64 = timer_create();
-		if timer < 0 {
-			return;
-		}
-		timer_set(timer as u64, deadline);
-		// The deadline is passed to the wait as well as armed on the timer: the wake comes from
-		// whichever answers first, and a timer that somehow never fires still ends here.
-		wait_periodic(timer as u64, deadline);
-		close(timer as u64);
+pub fn sleep_until(deadline: u64) {
+	if clock() >= deadline {
+		return;
 	}
+	let timer: i64 = timer_create();
+	if timer < 0 {
+		return;
+	}
+	timer_set(timer as u64, deadline);
+	// The deadline is passed to the wait as well as armed on the timer: the wake comes from
+	// whichever answers first, and a timer that somehow never fires still ends here.
+	wait_periodic(timer as u64, deadline);
+	close(timer as u64);
 }
 
 // `wait_any` whose deadline is a recurring housekeeping wake (see wait_periodic).
-pub unsafe fn wait_any_periodic(handles: &[u64], deadline: u64) -> i64 {
+pub fn wait_any_periodic(handles: &[u64], deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, WAIT_PERIODIC) as i64 }
 }
 
@@ -850,7 +884,7 @@ pub unsafe fn wait_any_periodic(handles: &[u64], deadline: u64) -> i64 {
 // sender's half of backpressure. Returns 0 when writable (or the peer is gone -
 // the send then reports the close), a small negative error otherwise (e.g. a
 // handle without the WAIT right).
-pub unsafe fn wait_writable(channel: u64) -> i64 {
+pub fn wait_writable(channel: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT, channel, 0, WAIT_WRITABLE, 0) as i64 }
 }
 
@@ -860,8 +894,8 @@ pub unsafe fn wait_writable(channel: u64) -> i64 {
 // check and returns at once rather than blocking. The shell reaps finished background
 // jobs with it: a terminated child's Process handle reads ready. The handle needs the
 // WAIT right.
-pub unsafe fn poll_ready(handle: u64) -> bool {
-	unsafe { wait(handle, clock().max(1)) == 0 }
+pub fn poll_ready(handle: u64) -> bool {
+	wait(handle, clock().max(1)) == 0
 }
 
 // The outcome of a blocking receive.
@@ -876,7 +910,7 @@ pub enum Received {
 
 // Receive one message into `buf`, blocking while the channel is empty. Returns
 // the payload length and any transferred handle, or Closed once the peer is gone.
-pub unsafe fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
+pub fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
 	unsafe {
 		let mut handle: u64 = 0;
 		loop {
@@ -937,7 +971,7 @@ pub enum BoundedVec {
 
 // The byte length of the next pending message without dequeuing it: >= 0, or
 // ERR_WOULD_BLOCK / ERR_PEER_CLOSED (negative) - the raw peek.
-pub unsafe fn channel_peek(channel: u64) -> i64 {
+pub fn channel_peek(channel: u64) -> i64 {
 	unsafe { syscall(SYS_CHANNEL_PEEK, channel, 0, 0, 0) as i64 }
 }
 
@@ -946,8 +980,8 @@ pub unsafe fn channel_peek(channel: u64) -> i64 {
 // stands anywhere in this path - a reply is as large as the sender made it.
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
-pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
-	match unsafe { recv_vec_bounded(channel, usize::MAX) } {
+pub fn recv_vec_blocking(channel: u64) -> ReceivedVec {
+	match recv_vec_bounded(channel, usize::MAX) {
 		BoundedVec::Message { bytes, handle } => ReceivedVec::Message { bytes, handle },
 		BoundedVec::PeerClosed => ReceivedVec::Closed,
 		// `TooLarge` and `Idle` cannot arise here - this caller sets no ceiling and no deadline -
@@ -974,7 +1008,7 @@ pub enum RecvInto {
 // hand out the space, and the intermediate vector is then a second copy of every chunk, outstanding
 // beside whatever the destination is already holding.
 #[unsafe(no_mangle)]
-pub unsafe fn recv_into(channel: u64, buf: &mut [u8]) -> RecvInto {
+pub fn recv_into(channel: u64, buf: &mut [u8]) -> RecvInto {
 	unsafe {
 		let mut handle: u64 = 0;
 		let got: i64 = syscall(SYS_CHANNEL_RECV, channel, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64) as i64;
@@ -997,8 +1031,8 @@ pub unsafe fn recv_into(channel: u64, buf: &mut [u8]) -> RecvInto {
 // the allocation is the point - checking afterwards means the sender has already chosen how much
 // of the receiver's memory to take.
 #[unsafe(no_mangle)]
-pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
-	unsafe { recv_vec_deadline(channel, max, 0) }
+pub fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
+	recv_vec_deadline(channel, max, 0)
 }
 
 // The same, giving up at `deadline` (absolute LAPIC ticks, the unit `wait` takes and `clock()`
@@ -1013,7 +1047,7 @@ pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
 // service - every other client, every other volume - for as long as it likes. Waiting forever is
 // only safe when the peer is trusted to finish.
 #[unsafe(no_mangle)]
-pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> BoundedVec {
+pub fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> BoundedVec {
 	unsafe {
 		loop {
 			let pending: i64 = channel_peek(channel);
@@ -1083,110 +1117,106 @@ pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> Boun
 // which a plain close cannot express: "the channel closed" is what a finished stream looks like
 // too, so a consumer had no way to tell the whole of a directory from the first sixty-four entries
 // of it. Producers that do not send the marker should use `drain_stream`.
-pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
-	unsafe {
-		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
-		loop {
-			// EVERY CAPABILITY THE FRAME CARRIED. This took the first and dropped the rest, which
-			// was true to a frame transport that sent exactly one - and that transport now sends
-			// what the element type declares. A drainer that keeps one of three is the defect this
-			// milestone is named for wearing its consumer face.
-			let mut handles = wire::Handles::new();
-			match recv_vec_caps_blocking(consumer, &mut handles) {
-				ReceivedVecCaps::Message { bytes } => {
-					// The terminal frame: everything before it was the whole answer.
-					if bytes.is_empty() {
-						for handle in handles.as_slice() {
-							close(*handle);
-						}
-						close(consumer);
-						return Some(items);
-					}
-					// DECODE first, then close what the decoder did not claim - the order
-					// `drain_stream` already uses. Closing first and then handing the same numbers
-					// to `read` gave the decoder handles that were already gone.
-					let decoded = read(&bytes, &mut handles);
-					// WHAT THE DECODER DID NOT TAKE, closed without asking which case this is.
-					//
-					// `read` takes the list by `&mut` and empties it of everything the decoded value
-					// adopted, so a successful frame leaves nothing here and the loop below closes
-					// nothing. It used to take a shared reference and leave the list naming every
-					// handle whether or not the value had adopted them, which made "may I close
-					// these" a question about the element type - answered by a comment, in each
-					// consumer, and answered two different ways in this tree.
+pub fn drain_stream_complete<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+	let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+	loop {
+		// EVERY CAPABILITY THE FRAME CARRIED. This took the first and dropped the rest, which
+		// was true to a frame transport that sent exactly one - and that transport now sends
+		// what the element type declares. A drainer that keeps one of three is the defect this
+		// milestone is named for wearing its consumer face.
+		let mut handles = wire::Handles::new();
+		match recv_vec_caps_blocking(consumer, &mut handles) {
+			ReceivedVecCaps::Message { bytes } => {
+				// The terminal frame: everything before it was the whole answer.
+				if bytes.is_empty() {
 					for handle in handles.as_slice() {
 						close(*handle);
 					}
-					let Some(item) = decoded else {
-						close(consumer);
-						return None;
-					};
-					if items.try_reserve(1).is_err() {
-						close(consumer);
-						return None;
-					}
-					items.push(item);
+					close(consumer);
+					return Some(items);
 				}
-				ReceivedVecCaps::Closed => {
-					// A stream that ended before its terminal frame is an INCOMPLETE answer, which
-					// is what this variant of the drainer refuses to hand back as a whole one.
+				// DECODE first, then close what the decoder did not claim - the order
+				// `drain_stream` already uses. Closing first and then handing the same numbers
+				// to `read` gave the decoder handles that were already gone.
+				let decoded = read(&bytes, &mut handles);
+				// WHAT THE DECODER DID NOT TAKE, closed without asking which case this is.
+				//
+				// `read` takes the list by `&mut` and empties it of everything the decoded value
+				// adopted, so a successful frame leaves nothing here and the loop below closes
+				// nothing. It used to take a shared reference and leave the list naming every
+				// handle whether or not the value had adopted them, which made "may I close
+				// these" a question about the element type - answered by a comment, in each
+				// consumer, and answered two different ways in this tree.
+				for handle in handles.as_slice() {
+					close(*handle);
+				}
+				let Some(item) = decoded else {
+					close(consumer);
+					return None;
+				};
+				if items.try_reserve(1).is_err() {
 					close(consumer);
 					return None;
 				}
-				// A blocking receive cannot time out - the deadline is zero - but the variant must be
-				// handled, and "no message and the peer may still be there" is what `Failed` means
-				// here too: an incomplete answer, refused rather than handed back as a whole one.
-				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
-					close(consumer);
-					return None;
-				}
+				items.push(item);
+			}
+			ReceivedVecCaps::Closed => {
+				// A stream that ended before its terminal frame is an INCOMPLETE answer, which
+				// is what this variant of the drainer refuses to hand back as a whole one.
+				close(consumer);
+				return None;
+			}
+			// A blocking receive cannot time out - the deadline is zero - but the variant must be
+			// handled, and "no message and the peer may still be there" is what `Failed` means
+			// here too: an incomplete answer, refused rather than handed back as a whole one.
+			ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+				close(consumer);
+				return None;
 			}
 		}
 	}
 }
 
-pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
-	unsafe {
-		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
-		loop {
-			let mut handles = wire::Handles::new();
-			match recv_vec_caps_blocking(consumer, &mut handles) {
-				ReceivedVecCaps::Message { bytes } => {
-					let decoded = read(&bytes, &mut handles);
-					// What the decoder did not take, on both paths - see `drain_stream_complete`
-					// above for why this is unconditional and why it is empty after a good frame.
-					for handle in handles.as_slice() {
-						close(*handle);
-					}
-					// A frame that will not decode ENDS the stream. Skipping it and carrying on
-					// returned a short list as a complete one - the same defect the transport was
-					// just fixed for, one layer down in the decoder.
-					let Some(item) = decoded else {
-						close(consumer);
-						return None;
-					};
-					// Fallible for the same reason the message buffer is: growing this vector with
-					// `push` aborts the process through the allocation error handler, so a caller
-					// that asked for a listing could be killed by one instead of being told.
-					if items.try_reserve(1).is_err() {
-						close(consumer);
-						return None;
-					}
-					items.push(item);
+pub fn drain_stream<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+	let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+	loop {
+		let mut handles = wire::Handles::new();
+		match recv_vec_caps_blocking(consumer, &mut handles) {
+			ReceivedVecCaps::Message { bytes } => {
+				let decoded = read(&bytes, &mut handles);
+				// What the decoder did not take, on both paths - see `drain_stream_complete`
+				// above for why this is unconditional and why it is empty after a good frame.
+				for handle in handles.as_slice() {
+					close(*handle);
 				}
-				ReceivedVecCaps::Closed => break,
-				// A blocking receive cannot time out - the deadline is zero - but the variant must be
-				// handled, and "no message and the peer may still be there" is what `Failed` means
-				// here too: an incomplete answer, refused rather than handed back as a whole one.
-				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+				// A frame that will not decode ENDS the stream. Skipping it and carrying on
+				// returned a short list as a complete one - the same defect the transport was
+				// just fixed for, one layer down in the decoder.
+				let Some(item) = decoded else {
+					close(consumer);
+					return None;
+				};
+				// Fallible for the same reason the message buffer is: growing this vector with
+				// `push` aborts the process through the allocation error handler, so a caller
+				// that asked for a listing could be killed by one instead of being told.
+				if items.try_reserve(1).is_err() {
 					close(consumer);
 					return None;
 				}
+				items.push(item);
+			}
+			ReceivedVecCaps::Closed => break,
+			// A blocking receive cannot time out - the deadline is zero - but the variant must be
+			// handled, and "no message and the peer may still be there" is what `Failed` means
+			// here too: an incomplete answer, refused rather than handed back as a whole one.
+			ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+				close(consumer);
+				return None;
 			}
 		}
-		close(consumer);
-		Some(items)
 	}
+	close(consumer);
+	Some(items)
 }
 
 // A non-blocking receive result: a message, an empty-but-open channel, or a closed
@@ -1201,7 +1231,7 @@ pub enum Polled {
 // Receive one message without blocking: returns Empty immediately if the channel has
 // nothing queued (and the peer is still open), Closed once the peer is gone, else the
 // message. The shell polls a background job's channel this way to detect completion.
-pub unsafe fn try_recv(channel: u64, buf: &mut [u8]) -> Polled {
+pub fn try_recv(channel: u64, buf: &mut [u8]) -> Polled {
 	unsafe {
 		let mut handle: u64 = 0;
 		let result: u64 = syscall(SYS_CHANNEL_RECV, channel, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64);
@@ -1227,24 +1257,22 @@ pub enum PolledCaps {
 // `try_recv` that takes EVERY capability the message carried. Same reason as `recv_caps_blocking`:
 // a typed dispatch reached through the single-handle receive loses whatever the client sent past
 // the first.
-pub unsafe fn try_recv_caps(channel: u64, buf: &mut [u8]) -> PolledCaps {
-	unsafe {
-		let mut raw = [0u64; MAX_MESSAGE_CAPS];
-		let (len, count) = recv_message_caps(channel, buf, &mut raw);
-		if len == ERR_WOULD_BLOCK {
-			return PolledCaps::Empty;
-		}
-		if len < 0 {
-			return PolledCaps::Closed;
-		}
-		match wire::Handles::try_from_array(&raw, count) {
-			Some(handles) => PolledCaps::Message { len: len as usize, handles },
-			None => {
-				for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
-					close(handle);
-				}
-				PolledCaps::Closed
+pub fn try_recv_caps(channel: u64, buf: &mut [u8]) -> PolledCaps {
+	let mut raw = [0u64; MAX_MESSAGE_CAPS];
+	let (len, count) = recv_message_caps(channel, buf, &mut raw);
+	if len == ERR_WOULD_BLOCK {
+		return PolledCaps::Empty;
+	}
+	if len < 0 {
+		return PolledCaps::Closed;
+	}
+	match wire::Handles::try_from_array(&raw, count) {
+		Some(handles) => PolledCaps::Message { len: len as usize, handles },
+		None => {
+			for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+				close(handle);
 			}
+			PolledCaps::Closed
 		}
 	}
 }
@@ -1273,7 +1301,7 @@ pub enum SendOutcome {
 // whole service - every other client, every volume - for as long as the client likes. This is the
 // outbound twin of `recv_vec_deadline`, and it was the direction that had no bound at all.
 #[unsafe(no_mangle)]
-pub unsafe fn send_deadline(channel: u64, bytes: &[u8], xfer: u64, deadline: u64) -> SendOutcome {
+pub fn send_deadline(channel: u64, bytes: &[u8], xfer: u64, deadline: u64) -> SendOutcome {
 	unsafe {
 		loop {
 			let signed: i64 = syscall(SYS_CHANNEL_SEND, channel, bytes.as_ptr() as u64, bytes.len() as u64, xfer) as i64;
@@ -1305,7 +1333,7 @@ pub unsafe fn send_deadline(channel: u64, bytes: &[u8], xfer: u64, deadline: u64
 	}
 }
 
-pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
+pub fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	unsafe {
 		loop {
 			let result: u64 = syscall(SYS_CHANNEL_SEND, channel, bytes.as_ptr() as u64, bytes.len() as u64, xfer);
@@ -1331,7 +1359,7 @@ pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 // What it is for: a device capability is minted here WITH RIGHT_TRANSFER, because this process is
 // the one that hands it over, and arrives at the driver WITHOUT it - one attenuating move, and no
 // second one. The rule it states is about the HOLDER: a driver cannot pass its device on.
-pub unsafe fn send_blocking_attenuated(channel: u64, bytes: &[u8], xfer: u64, rights: u32) -> bool {
+pub fn send_blocking_attenuated(channel: u64, bytes: &[u8], xfer: u64, rights: u32) -> bool {
 	let transfer = CapTransfer { handle: xfer, rights, _pad: 0 };
 	unsafe {
 		loop {
@@ -1351,8 +1379,8 @@ pub unsafe fn send_blocking_attenuated(channel: u64, bytes: &[u8], xfer: u64, ri
 // Try to send `bytes` (and optionally one transferred handle) without blocking: returns
 // true on delivery, false if the queue is full (WOULD_BLOCK) or the peer is gone. Used
 // for droppable traffic - e.g. mouse reports to a program that may not be reading them.
-pub unsafe fn try_send(channel: u64, bytes: &[u8], xfer: u64) -> bool {
-	matches!(unsafe { try_send_outcome(channel, bytes, xfer) }, SendOutcome::Delivered)
+pub fn try_send(channel: u64, bytes: &[u8], xfer: u64) -> bool {
+	matches!(try_send_outcome(channel, bytes, xfer), SendOutcome::Delivered)
 }
 
 // `try_send` that says WHY it did not send.
@@ -1362,7 +1390,7 @@ pub unsafe fn try_send(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 // refusing a second listing, for a consumer that was never going to read again. `Stalled` here
 // means "no room now"; `Failed` means "there is nobody there".
 #[unsafe(no_mangle)]
-pub unsafe fn try_send_outcome(channel: u64, bytes: &[u8], xfer: u64) -> SendOutcome {
+pub fn try_send_outcome(channel: u64, bytes: &[u8], xfer: u64) -> SendOutcome {
 	unsafe {
 		let signed: i64 = syscall(SYS_CHANNEL_SEND, channel, bytes.as_ptr() as u64, bytes.len() as u64, xfer) as i64;
 		match signed {
@@ -1374,14 +1402,14 @@ pub unsafe fn try_send_outcome(channel: u64, bytes: &[u8], xfer: u64) -> SendOut
 }
 
 // Create a channel pair, returning its two endpoint handles, or None on failure.
-pub unsafe fn channel() -> Option<(u64, u64)> {
-	unsafe { channel_with_depth(0) }
+pub fn channel() -> Option<(u64, u64)> {
+	channel_with_depth(0)
 }
 
 // Create a channel pair whose endpoints queue up to `depth` messages each (0 =
 // the kernel default), so a creator that knows its traffic picks its own
 // backpressure point.
-pub unsafe fn channel_with_depth(depth: u64) -> Option<(u64, u64)> {
+pub fn channel_with_depth(depth: u64) -> Option<(u64, u64)> {
 	unsafe {
 		let mut a: u64 = 0;
 		let mut b: u64 = 0;
@@ -1645,43 +1673,41 @@ impl RoleError {
 ///
 /// # Safety
 /// `bootstrap` must be a channel this process may receive on.
-pub unsafe fn receive_roles(bootstrap: u64, roles: &[Role], into: &mut [u64]) -> Result<(), RoleError> {
-	unsafe {
-		let mut buf = [0u8; 128];
-		let mut taken = 0usize;
-		for (index, role) in roles.iter().enumerate() {
-			let (len, handle) = match recv_blocking(bootstrap, &mut buf) {
-				Received::Message { len, handle } => (len, handle),
-				Received::Closed => {
-					close_taken(into, taken);
-					return Err(RoleError::Missing(role.tag));
-				}
-			};
-			// The tag is a PREFIX, not the whole message: several roles carry a payload behind it
-			// (the package's length, a memory volume's capacity).
-			if len < role.tag.len() || &buf[..role.tag.len()] != role.tag {
-				if handle != 0 {
-					close(handle);
-				}
+pub fn receive_roles(bootstrap: u64, roles: &[Role], into: &mut [u64]) -> Result<(), RoleError> {
+	let mut buf = [0u8; 128];
+	let mut taken = 0usize;
+	for (index, role) in roles.iter().enumerate() {
+		let (len, handle) = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } => (len, handle),
+			Received::Closed => {
 				close_taken(into, taken);
-				return Err(RoleError::Unexpected(role.tag));
+				return Err(RoleError::Missing(role.tag));
 			}
-			if let Err(error) = check_role(role, handle) {
-				if handle != 0 {
-					close(handle);
-				}
-				close_taken(into, taken);
-				return Err(error);
+		};
+		// The tag is a PREFIX, not the whole message: several roles carry a payload behind it
+		// (the package's length, a memory volume's capacity).
+		if len < role.tag.len() || &buf[..role.tag.len()] != role.tag {
+			if handle != 0 {
+				close(handle);
 			}
-			into[index] = handle;
-			taken = index + 1;
+			close_taken(into, taken);
+			return Err(RoleError::Unexpected(role.tag));
 		}
-		Ok(())
+		if let Err(error) = check_role(role, handle) {
+			if handle != 0 {
+				close(handle);
+			}
+			close_taken(into, taken);
+			return Err(error);
+		}
+		into[index] = handle;
+		taken = index + 1;
 	}
+	Ok(())
 }
 
 // What the kernel can be asked about one delivered handle.
-unsafe fn check_role(role: &Role, handle: u64) -> Result<(), RoleError> {
+fn check_role(role: &Role, handle: u64) -> Result<(), RoleError> {
 	if handle == 0 {
 		// An absent optional role is the ordinary case on a smaller boot, and a payload role never
 		// carries a handle at all.
@@ -1708,10 +1734,10 @@ unsafe fn check_role(role: &Role, handle: u64) -> Result<(), RoleError> {
 	Ok(())
 }
 
-unsafe fn close_taken(into: &mut [u64], taken: usize) {
+fn close_taken(into: &mut [u64], taken: usize) {
 	for slot in into.iter_mut().take(taken) {
 		if *slot != 0 {
-			unsafe { close(*slot) };
+			close(*slot);
 			*slot = 0;
 		}
 	}
@@ -1739,7 +1765,7 @@ impl Drop for CapSet {
 	fn drop(&mut self) {
 		for &(_, handle) in self.entries.iter() {
 			if handle != 0 {
-				unsafe { close(handle) };
+				close(handle);
 			}
 		}
 	}
@@ -1747,30 +1773,28 @@ impl Drop for CapSet {
 
 // Receive a parent's whole bootstrap capability set: named capability messages up
 // to the READY terminator (or the channel closing). The counterpart of send_ready.
-pub unsafe fn recv_caps(bootstrap: u64) -> CapSet {
-	unsafe {
-		let mut entries: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)> = alloc::vec::Vec::new();
-		let mut buf: [u8; 64] = [0u8; 64];
-		loop {
-			match recv_blocking(bootstrap, &mut buf) {
-				Received::Message { len, handle } => {
-					let name: &[u8] = &buf[..len];
-					if name == BOOTSTRAP_READY {
-						break;
-					}
-					entries.push((name.to_vec(), handle));
+pub fn recv_caps(bootstrap: u64) -> CapSet {
+	let mut entries: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)> = alloc::vec::Vec::new();
+	let mut buf: [u8; 64] = [0u8; 64];
+	loop {
+		match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } => {
+				let name: &[u8] = &buf[..len];
+				if name == BOOTSTRAP_READY {
+					break;
 				}
-				Received::Closed => break,
+				entries.push((name.to_vec(), handle));
 			}
+			Received::Closed => break,
 		}
-		CapSet { entries }
 	}
+	CapSet { entries }
 }
 
 // End a bootstrap capability handshake: the child's recv_caps returns once this
 // terminator arrives.
-pub unsafe fn send_ready(bootstrap: u64) -> bool {
-	unsafe { send_blocking(bootstrap, BOOTSTRAP_READY, 0) }
+pub fn send_ready(bootstrap: u64) -> bool {
+	send_blocking(bootstrap, BOOTSTRAP_READY, 0)
 }
 
 // Report a failed bootstrap step and terminate: send BOOTSTRAP_FAILURE with the failing
@@ -1778,18 +1802,16 @@ pub unsafe fn send_ready(bootstrap: u64) -> bool {
 // A service calls this in place of a bare exit() when a required capability or archive is
 // missing, so the supervisor logs the reason and folds it into the service's status
 // instead of recording a silent peer-close.
-pub unsafe fn fail_bootstrap(bootstrap: u64, step: &[u8], reason: &[u8]) -> ! {
-	unsafe {
-		let mut buf: [u8; 128] = [0u8; 128];
-		let mut n: usize = 0;
-		let parts: [&[u8]; 5] = [BOOTSTRAP_FAILURE, b" ", step, b": ", reason];
-		for part in parts {
-			let copy: usize = part.len().min(buf.len() - n);
-			buf[n..n + copy].copy_from_slice(&part[..copy]);
-			n += copy;
-		}
-		send_blocking(bootstrap, &buf[..n], 0);
+pub fn fail_bootstrap(bootstrap: u64, step: &[u8], reason: &[u8]) -> ! {
+	let mut buf: [u8; 128] = [0u8; 128];
+	let mut n: usize = 0;
+	let parts: [&[u8]; 5] = [BOOTSTRAP_FAILURE, b" ", step, b": ", reason];
+	for part in parts {
+		let copy: usize = part.len().min(buf.len() - n);
+		buf[n..n + copy].copy_from_slice(&part[..copy]);
+		n += copy;
 	}
+	send_blocking(bootstrap, &buf[..n], 0);
 	exit();
 }
 
@@ -1798,12 +1820,10 @@ pub unsafe fn fail_bootstrap(bootstrap: u64, step: &[u8], reason: &[u8]) -> ! {
 // accompanied the message, or the payload did not begin with `tag`. This is the
 // "expect a tagged capability over a bootstrap/control channel" handshake the
 // programs share (e.g. recv_tagged(bootstrap, &mut buf, b"SERVE")).
-pub unsafe fn recv_tagged(channel: u64, buf: &mut [u8], tag: &[u8]) -> Option<u64> {
-	unsafe {
-		match recv_blocking(channel, buf) {
-			Received::Message { len, handle } if handle != 0 && len >= tag.len() && &buf[..tag.len()] == tag => Some(handle),
-			_ => None,
-		}
+pub fn recv_tagged(channel: u64, buf: &mut [u8], tag: &[u8]) -> Option<u64> {
+	match recv_blocking(channel, buf) {
+		Received::Message { len, handle } if handle != 0 && len >= tag.len() && &buf[..tag.len()] == tag => Some(handle),
+		_ => None,
 	}
 }
 
@@ -1819,11 +1839,11 @@ pub unsafe fn recv_tagged(channel: u64, buf: &mut [u8], tag: &[u8]) -> Option<u6
 // boot regardless.
 //
 // None when neither arrived, which for these callers is fatal.
-pub unsafe fn granted_capability(bootstrap: u64, attached: u64, tag: &[u8], buf: &mut [u8]) -> Option<u64> {
+pub fn granted_capability(bootstrap: u64, attached: u64, tag: &[u8], buf: &mut [u8]) -> Option<u64> {
 	if attached != 0 {
 		return Some(attached);
 	}
-	unsafe { recv_tagged(bootstrap, buf, tag) }
+	recv_tagged(bootstrap, buf, tag)
 }
 
 // Receive a "PACKAGE" message - the tag, a u64 little-endian byte length, and a
@@ -1832,6 +1852,11 @@ pub unsafe fn granted_capability(bootstrap: u64, attached: u64, tag: &[u8], buf:
 // for the life of the process (these consumers never unmap it), so the slice is
 // handed back with a 'static lifetime. None if the message is not a well-formed
 // PACKAGE or the mapping fails.
+//
+// # Safety
+// The returned slice is a view over a mapping, given a `'static` lifetime this function cannot
+// justify: the caller must keep the returned handle for as long as it reads the archive, and must
+// never unmap the object. That is the contract these consumers hold by never unmapping it.
 pub unsafe fn recv_package(channel: u64, buf: &mut [u8]) -> Option<(u64, &'static [u8])> {
 	unsafe {
 		match recv_blocking(channel, buf) {
@@ -1854,46 +1879,44 @@ pub unsafe fn recv_package(channel: u64, buf: &mut [u8]) -> Option<(u64, &'stati
 // are the caller's scratch buffers, whose sizes bound the largest request/reply. A
 // request that produces no reply (the closure returns None) is simply not answered -
 // which is how a streaming op that replies out of band opts out of the byte reply.
-pub unsafe fn serve<F>(service: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+pub fn serve<F>(service: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
 	F: FnMut(&[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
-	unsafe {
-		loop {
-			// THROUGH THE CAPABILITY-AWARE RECEIVE. See `recv_caps_blocking`: the single-handle
-			// syscall takes the first capability and drops the rest, so a client sending stdin,
-			// stdout and stderr had two destroyed before dispatch was reached.
-			match recv_caps_blocking(service, request) {
-				ReceivedCaps::Message { len, .. } if len == 0 => break,
-				ReceivedCaps::Message { len, mut handles } => {
-					// the reserved heartbeat probe: answer it uniformly without invoking the
-					// typed dispatch, so the supervisor's watchdog can prove this service is
-					// still responsive (a service wedged inside a request never returns here
-					// to answer, so the probe times out - that is how a hang is detected).
-					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
-						send_blocking(service, b"PONG", 0);
-						continue;
-					}
-					let mut reply_handles = wire::Handles::new();
-					if let Some(n) = handle_request(&request[..len], &mut handles, reply, &mut reply_handles) {
-						if !send_caps_blocking(service, &reply[..n], reply_handles.as_slice()) {
-							for &leftover in reply_handles.as_slice() {
-								close(leftover);
-							}
-						}
-					} else {
+	loop {
+		// THROUGH THE CAPABILITY-AWARE RECEIVE. See `recv_caps_blocking`: the single-handle
+		// syscall takes the first capability and drops the rest, so a client sending stdin,
+		// stdout and stderr had two destroyed before dispatch was reached.
+		match recv_caps_blocking(service, request) {
+			ReceivedCaps::Message { len, .. } if len == 0 => break,
+			ReceivedCaps::Message { len, mut handles } => {
+				// the reserved heartbeat probe: answer it uniformly without invoking the
+				// typed dispatch, so the supervisor's watchdog can prove this service is
+				// still responsive (a service wedged inside a request never returns here
+				// to answer, so the probe times out - that is how a hang is detected).
+				if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
+					send_blocking(service, b"PONG", 0);
+					continue;
+				}
+				let mut reply_handles = wire::Handles::new();
+				if let Some(n) = handle_request(&request[..len], &mut handles, reply, &mut reply_handles) {
+					if !send_caps_blocking(service, &reply[..n], reply_handles.as_slice()) {
 						for &leftover in reply_handles.as_slice() {
 							close(leftover);
 						}
 					}
-					for &unclaimed in handles.as_slice() {
-						if unclaimed != 0 {
-							close(unclaimed);
-						}
+				} else {
+					for &leftover in reply_handles.as_slice() {
+						close(leftover);
 					}
 				}
-				ReceivedCaps::Closed => break,
+				for &unclaimed in handles.as_slice() {
+					if unclaimed != 0 {
+						close(unclaimed);
+					}
+				}
 			}
+			ReceivedCaps::Closed => break,
 		}
 	}
 }
@@ -1921,13 +1944,11 @@ where
 // shape, plus the channel it arrived on as the first argument (for ops that stream
 // out of band on that connection). A sub-client channel closing (or sending the empty
 // quit sentinel) is dropped from the set; the loop ends when the root closes.
-pub unsafe fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], handle_request: F)
+pub fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], handle_request: F)
 where
 	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
-	unsafe {
-		serve_multi_seeded(root, &[], request, reply, handle_request);
-	}
+	serve_multi_seeded(root, &[], request, reply, handle_request);
 }
 
 // Like `serve_multi`, but pre-seeds the client set with `seed` channels - service ends the
@@ -1935,13 +1956,11 @@ where
 // for instance), served exactly like ones minted on demand via `CONNECT_OP`. As with any
 // sub-client, a seed channel closing (or sending the empty quit sentinel) is simply dropped
 // from the set; only `root` closing ends the service.
-pub unsafe fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], handle_request: F)
+pub fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], handle_request: F)
 where
 	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
-	unsafe {
-		serve_multi_ticked(root, seed, 0, request, reply, handle_request);
-	}
+	serve_multi_ticked(root, seed, 0, request, reply, handle_request);
 }
 
 // Like `serve_multi_seeded`, but with `period` non-zero the loop also wakes every
@@ -1949,85 +1968,83 @@ where
 // and an empty request - a housekeeping tick a service flushes batched state on
 // (LogService's on-disk journal). The wake is a WAIT_PERIODIC deadline, so it
 // never counts as pending progress for the scheduler's boot driver.
-pub unsafe fn serve_multi_ticked<F>(root: u64, seed: &[u64], period: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
+pub fn serve_multi_ticked<F>(root: u64, seed: &[u64], period: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
 	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
-	unsafe {
-		let mut chans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-		chans.push(root);
-		chans.extend_from_slice(seed);
-		while !chans.is_empty() {
-			let ready: i64 = if period != 0 { wait_any_periodic(&chans, clock() + period) } else { wait_any(&chans, 0) };
-			if ready < 0 {
-				if ready == ERR_TIMED_OUT && period != 0 {
-					// the housekeeping tick: no channel is ready, let the handler flush.
-					let mut reply_handles = wire::Handles::new();
-					let mut handles = wire::Handles::new();
-					let _ = handle_request(0, &[], &mut handles, reply, &mut reply_handles);
-				}
-				continue;
+	let mut chans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	chans.push(root);
+	chans.extend_from_slice(seed);
+	while !chans.is_empty() {
+		let ready: i64 = if period != 0 { wait_any_periodic(&chans, clock() + period) } else { wait_any(&chans, 0) };
+		if ready < 0 {
+			if ready == ERR_TIMED_OUT && period != 0 {
+				// the housekeeping tick: no channel is ready, let the handler flush.
+				let mut reply_handles = wire::Handles::new();
+				let mut handles = wire::Handles::new();
+				let _ = handle_request(0, &[], &mut handles, reply, &mut reply_handles);
 			}
-			let idx: usize = ready as usize;
-			let chan: u64 = chans[idx];
-			// The capability-aware receive here too - `serve_multi_ticked` had the same defect as
-			// `serve`, and for the same reason: `SYS_CHANNEL_RECV` keeps one and drops the rest.
-			match recv_caps_blocking(chan, request) {
-				// the empty quit sentinel: the root ends the service, a sub-client drops.
-				ReceivedCaps::Message { len, .. } if len == 0 => {
-					if idx == 0 {
-						break;
-					}
-					announce_disconnect(chan, request, reply, &mut handle_request);
-					close(chan);
-					chans.swap_remove(idx);
+			continue;
+		}
+		let idx: usize = ready as usize;
+		let chan: u64 = chans[idx];
+		// The capability-aware receive here too - `serve_multi_ticked` had the same defect as
+		// `serve`, and for the same reason: `SYS_CHANNEL_RECV` keeps one and drops the rest.
+		match recv_caps_blocking(chan, request) {
+			// the empty quit sentinel: the root ends the service, a sub-client drops.
+			ReceivedCaps::Message { len, .. } if len == 0 => {
+				if idx == 0 {
+					break;
 				}
-				ReceivedCaps::Message { len, mut handles } => {
-					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
-						// the reserved heartbeat probe: answer uniformly, like serve (above).
-						send_blocking(chan, b"PONG", 0);
-					} else if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == CONNECT_OP {
-						// mint a fresh independent client connection for the caller.
-						match channel() {
-							Some((mine, theirs)) => {
-								chans.push(mine);
-								send_blocking(chan, &[], theirs);
-							}
-							None => {
-								send_blocking(chan, &[], 0);
-							}
+				announce_disconnect(chan, request, reply, &mut handle_request);
+				close(chan);
+				chans.swap_remove(idx);
+			}
+			ReceivedCaps::Message { len, mut handles } => {
+				if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
+					// the reserved heartbeat probe: answer uniformly, like serve (above).
+					send_blocking(chan, b"PONG", 0);
+				} else if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == CONNECT_OP {
+					// mint a fresh independent client connection for the caller.
+					match channel() {
+						Some((mine, theirs)) => {
+							chans.push(mine);
+							send_blocking(chan, &[], theirs);
 						}
-					} else {
-						let mut reply_handles = wire::Handles::new();
-						// The request's capabilities go in as a list and whatever the dispatch
-						// did NOT consume comes back in the same one, so a capability the
-						// schema never accounted for is closed here instead of leaking.
-						if let Some(n) = handle_request(chan, &request[..len], &mut handles, reply, &mut reply_handles) {
-							if !send_caps_blocking(chan, &reply[..n], reply_handles.as_slice()) {
-								for &leftover in reply_handles.as_slice() {
-									close(leftover);
-								}
-							}
-						} else {
+						None => {
+							send_blocking(chan, &[], 0);
+						}
+					}
+				} else {
+					let mut reply_handles = wire::Handles::new();
+					// The request's capabilities go in as a list and whatever the dispatch
+					// did NOT consume comes back in the same one, so a capability the
+					// schema never accounted for is closed here instead of leaking.
+					if let Some(n) = handle_request(chan, &request[..len], &mut handles, reply, &mut reply_handles) {
+						if !send_caps_blocking(chan, &reply[..n], reply_handles.as_slice()) {
 							for &leftover in reply_handles.as_slice() {
 								close(leftover);
 							}
 						}
-						for &unclaimed in handles.as_slice() {
-							if unclaimed != 0 {
-								close(unclaimed);
-							}
+					} else {
+						for &leftover in reply_handles.as_slice() {
+							close(leftover);
+						}
+					}
+					for &unclaimed in handles.as_slice() {
+						if unclaimed != 0 {
+							close(unclaimed);
 						}
 					}
 				}
-				ReceivedCaps::Closed => {
-					if idx == 0 {
-						break;
-					}
-					announce_disconnect(chan, request, reply, &mut handle_request);
-					close(chan);
-					chans.swap_remove(idx);
+			}
+			ReceivedCaps::Closed => {
+				if idx == 0 {
+					break;
 				}
+				announce_disconnect(chan, request, reply, &mut handle_request);
+				close(chan);
+				chans.swap_remove(idx);
 			}
 		}
 	}
@@ -2043,7 +2060,7 @@ where
 // Synthesised as a REQUEST with the reserved `DISCONNECT_OP`, rather than as a second closure,
 // because the handler owns the service's state mutably and two closures cannot both borrow it.
 // Any reply is discarded: the channel is already gone.
-unsafe fn announce_disconnect<F>(chan: u64, request: &mut [u8], reply: &mut [u8], handle_request: &mut F)
+fn announce_disconnect<F>(chan: u64, request: &mut [u8], reply: &mut [u8], handle_request: &mut F)
 where
 	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
@@ -2056,7 +2073,7 @@ where
 	let _ = handle_request(chan, &request[..2], &mut handles, reply, &mut reply_handles);
 	for &leftover in reply_handles.as_slice() {
 		if leftover != 0 {
-			unsafe { close(leftover) };
+			close(leftover);
 		}
 	}
 }
@@ -2066,34 +2083,30 @@ where
 // 0 = forever) for the pong. Returns true if the service answered in time (alive and
 // responsive), false on a timeout (hung) or a closed channel. The watchdog's
 // hung-detection: a service wedged inside a request never returns to answer the probe.
-pub unsafe fn heartbeat(channel: u64, deadline: u64) -> bool {
-	unsafe {
-		let req: [u8; 2] = HEARTBEAT_OP.to_le_bytes();
-		if !send_blocking(channel, &req, 0) {
-			return false;
-		}
-		if wait(channel, deadline) != 0 {
-			return false;
-		}
-		let mut buf: [u8; 8] = [0u8; 8];
-		matches!(try_recv(channel, &mut buf), Polled::Message { .. })
+pub fn heartbeat(channel: u64, deadline: u64) -> bool {
+	let req: [u8; 2] = HEARTBEAT_OP.to_le_bytes();
+	if !send_blocking(channel, &req, 0) {
+		return false;
 	}
+	if wait(channel, deadline) != 0 {
+		return false;
+	}
+	let mut buf: [u8; 8] = [0u8; 8];
+	matches!(try_recv(channel, &mut buf), Polled::Message { .. })
 }
 
 // Mint an independent client connection to a multi-client service reachable on
 // `factory` (a channel served by `serve_multi`): send the reserved connect request
 // and return the fresh client channel the service handed back, or None on failure.
-pub unsafe fn service_connect(factory: u64) -> Option<u64> {
-	unsafe {
-		let req: [u8; 2] = CONNECT_OP.to_le_bytes();
-		if !send_blocking(factory, &req, 0) {
-			return None;
-		}
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(factory, &mut buf) {
-			Received::Message { handle, .. } if handle != 0 => Some(handle),
-			_ => None,
-		}
+pub fn service_connect(factory: u64) -> Option<u64> {
+	let req: [u8; 2] = CONNECT_OP.to_le_bytes();
+	if !send_blocking(factory, &req, 0) {
+		return None;
+	}
+	let mut buf: [u8; 16] = [0u8; 16];
+	match recv_blocking(factory, &mut buf) {
+		Received::Message { handle, .. } if handle != 0 => Some(handle),
+		_ => None,
 	}
 }
 
@@ -2121,10 +2134,8 @@ pub unsafe fn service_connect(factory: u64) -> Option<u64> {
 
 // Announce a clean exit on `channel` (the bootstrap / report channel the supervisor
 // watches). Call it right before `exit()` so a logout reads as a deliberate stop.
-pub unsafe fn announce_exit(channel: u64) {
-	unsafe {
-		send_blocking(channel, &GOODBYE_OP.to_le_bytes(), 0);
-	}
+pub fn announce_exit(channel: u64) {
+	send_blocking(channel, &GOODBYE_OP.to_le_bytes(), 0);
 }
 
 // Re-resolve a named service capability over the broker (bootstrap) channel:
@@ -2133,19 +2144,17 @@ pub unsafe fn announce_exit(channel: u64) {
 // name, the service is gone for good, or the broker itself is gone.
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
-pub unsafe fn resolve(broker: u64, name: &[u8]) -> Option<u64> {
-	unsafe {
-		let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(2 + name.len());
-		req.extend_from_slice(&RESOLVE_OP.to_le_bytes());
-		req.extend_from_slice(name);
-		if !send_blocking(broker, &req, 0) {
-			return None;
-		}
-		let mut buf: [u8; 32] = [0u8; 32];
-		match recv_blocking(broker, &mut buf) {
-			Received::Message { handle, .. } if handle != 0 => Some(handle),
-			_ => None,
-		}
+pub fn resolve(broker: u64, name: &[u8]) -> Option<u64> {
+	let mut req: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(2 + name.len());
+	req.extend_from_slice(&RESOLVE_OP.to_le_bytes());
+	req.extend_from_slice(name);
+	if !send_blocking(broker, &req, 0) {
+		return None;
+	}
+	let mut buf: [u8; 32] = [0u8; 32];
+	match recv_blocking(broker, &mut buf) {
+		Received::Message { handle, .. } if handle != 0 => Some(handle),
+		_ => None,
 	}
 }
 
@@ -2156,24 +2165,22 @@ pub unsafe fn resolve(broker: u64, name: &[u8]) -> Option<u64> {
 // standing holder of a restartable service's factory shares (PermissionManager's
 // grants, ConsoleService's per-VT connections). None when the mint fails and the
 // broker cannot provide a live replacement.
-pub unsafe fn connect_or_resolve(held: &mut u64, broker: u64, name: &[u8]) -> Option<u64> {
-	unsafe {
-		if let Some(minted) = service_connect(*held) {
-			return Some(minted);
-		}
-		let fresh: u64 = resolve(broker, name)?;
-		if *held != 0 {
-			close(*held);
-		}
-		*held = fresh;
-		service_connect(*held)
+pub fn connect_or_resolve(held: &mut u64, broker: u64, name: &[u8]) -> Option<u64> {
+	if let Some(minted) = service_connect(*held) {
+		return Some(minted);
 	}
+	let fresh: u64 = resolve(broker, name)?;
+	if *held != 0 {
+		close(*held);
+	}
+	*held = fresh;
+	service_connect(*held)
 }
 
 // Close `handle`, releasing the object reference it names. A no-op-safe wrapper
 // over the close syscall (the kernel ignores an unknown handle), so callers need
 // not repeat the raw syscall.
-pub unsafe fn close(handle: u64) {
+pub fn close(handle: u64) {
 	unsafe {
 		syscall(SYS_HANDLE_CLOSE, handle, 0, 0, 0);
 	}
@@ -2182,12 +2189,16 @@ pub unsafe fn close(handle: u64) {
 // Create a memory object of `size` bytes (a shared buffer), returning its handle or
 // a negative error. Map it with `map_object` to fill or read its bytes; transfer the
 // handle to hand the buffer to another process zero-copy.
-pub unsafe fn memory_object_create(size: u64) -> i64 {
+pub fn memory_object_create(size: u64) -> i64 {
 	unsafe { syscall(SYS_MEMORY_OBJECT_CREATE, size, 0, 0, 0) as i64 }
 }
 
 // Map the object behind `handle` into our address space (the kernel picks the
 // virtual base), returning that base, or None on failure.
+//
+// # Safety
+// The returned base is a mapping of the whole object; the caller may read and write it only
+// while the mapping is live, and must not use it after `unmap_object` for the same handle.
 pub unsafe fn map_object(handle: u64) -> Option<u64> {
 	unsafe {
 		let base: u64 = syscall(SYS_MEMORY_MAP, handle, 0, 0, 0);
@@ -2196,7 +2207,12 @@ pub unsafe fn map_object(handle: u64) -> Option<u64> {
 }
 
 // Unmap the object behind `handle` from our address space.
-pub unsafe fn unmap_object(handle: u64) {
+//
+// SAFE, AND THE PAIRING IS WHY. This ends a mapping `map_object` began, so an address that call
+// handed out is dangling afterwards - but reaching through such an address is itself an `unsafe`
+// dereference, and that block is where the obligation already sits. Nothing safe can be made to
+// misbehave by this call alone, which is the test.
+pub fn unmap_object(handle: u64) {
 	unsafe {
 		syscall(SYS_MEMORY_UNMAP, handle, 0, 0, 0);
 	}
@@ -2206,7 +2222,7 @@ pub unsafe fn unmap_object(handle: u64) {
 // to `dst.len()` of its `size` bytes into `dst`, then unmap and close it. Returns
 // the number of bytes copied, or None if the mapping fails (the handle is still
 // closed). The canonical "consume a handed-back file handle" path.
-pub unsafe fn read_into(file: u64, size: u64, dst: &mut [u8]) -> Option<usize> {
+pub fn read_into(file: u64, size: u64, dst: &mut [u8]) -> Option<usize> {
 	unsafe {
 		let mapped: u64 = match map_object(file) {
 			Some(base) => base,
@@ -2224,27 +2240,27 @@ pub unsafe fn read_into(file: u64, size: u64, dst: &mut [u8]) -> Option<usize> {
 }
 
 // Read the monotonic clock (LAPIC ticks since boot), used to timestamp records.
-pub unsafe fn clock() -> u64 {
+pub fn clock() -> u64 {
 	unsafe { syscall(SYS_CLOCK_GET, 0, 0, 0, 0) }
 }
 
 // Read the hardware real-time clock as a Unix timestamp (seconds since the epoch,
 // UTC), or 0 if the RTC reports an implausible date. The wall-clock policy
 // (NTP discipline, the monotonic combination) lives in the userspace TimeService.
-pub unsafe fn clock_rtc() -> u64 {
+pub fn clock_rtc() -> u64 {
 	unsafe { syscall(SYS_CLOCK_RTC, 0, 0, 0, 0) }
 }
 
 // Read the monotonic clock in nanoseconds since boot (the calibrated TSC), for
 // measuring latencies finer than a `clock()` tick - an IPC round-trip, a ping RTT.
-pub unsafe fn clock_ns() -> u64 {
+pub fn clock_ns() -> u64 {
 	unsafe { syscall(SYS_CLOCK_MONO_NS, 0, 0, 0, 0) }
 }
 
 // Fill `bytes` with kernel-provided randomness, returning how many bytes were written. Used
 // where a value has to differ per boot and not be guessable - a handshake that proves which
 // boot answered it, rather than one any earlier transcript could replay.
-pub unsafe fn random_get(bytes: &mut [u8]) -> usize {
+pub fn random_get(bytes: &mut [u8]) -> usize {
 	let written: i64 = unsafe { syscall(SYS_RANDOM_GET, bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0) as i64 };
 	if written > 0 { written as usize } else { 0 }
 }
@@ -2258,7 +2274,7 @@ pub unsafe fn random_get(bytes: &mut [u8]) -> usize {
 // quietly handing this back under a name that promises a key. Two of this system's three
 // architectures have no such source today, so that refusal is the ordinary case rather than the
 // exotic one, and a caller that must have a secret has to be able to see it.
-pub unsafe fn random_insecure(bytes: &mut [u8]) -> usize {
+pub fn random_insecure(bytes: &mut [u8]) -> usize {
 	let written: i64 = unsafe { syscall(SYS_RANDOM_INSECURE, bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0) as i64 };
 	if written > 0 { written as usize } else { 0 }
 }
@@ -2271,57 +2287,61 @@ pub unsafe fn random_insecure(bytes: &mut [u8]) -> usize {
 // event it exists to outlast. Never zero: zero means "no boot id", which is what a caller on an
 // older kernel gets.
 #[inline(always)]
-pub unsafe fn boot_id() -> u64 {
+pub fn boot_id() -> u64 {
 	let value: i64 = unsafe { syscall(SYS_BOOT_ID, 0, 0, 0, 0) } as i64;
 	if value < 0 { 0 } else { value as u64 }
 }
 
 // what happens to be attached.
-pub unsafe fn boot_profile(name: &mut [u8]) -> usize {
+pub fn boot_profile(name: &mut [u8]) -> usize {
 	let written: i64 = unsafe { syscall(SYS_BOOT_PROFILE, name.as_mut_ptr() as u64, name.len() as u64, 0, 0) as i64 };
 	if written > 0 { written as usize } else { 0 }
 }
 
 // Read the online CPU set: fills `ids` with one LAPIC id per core (as many as fit)
 // and returns the core count. A free syscall feeding the `lscpu` inventory command.
-pub unsafe fn cpu_info(ids: &mut [u64]) -> i64 {
+pub fn cpu_info(ids: &mut [u64]) -> i64 {
 	unsafe { syscall(SYS_CPU_INFO, ids.as_mut_ptr() as u64, ids.len() as u64 * 8, 0, 0) as i64 }
 }
 
 // Read the CPU model / brand string into `buf`, returning the byte length written
 // (as many bytes as fit). A free syscall feeding the `lscpu` model field.
-pub unsafe fn cpu_name(buf: &mut [u8]) -> i64 {
+pub fn cpu_name(buf: &mut [u8]) -> i64 {
 	unsafe { syscall(SYS_CPU_NAME, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as i64 }
 }
 
 // Read the physical-memory and kernel-heap totals into `stats`. A free syscall
 // feeding the `free` inventory command.
-pub unsafe fn memory_stats(stats: &mut MemoryStats) -> i64 {
+pub fn memory_stats(stats: &mut MemoryStats) -> i64 {
 	unsafe { syscall(SYS_MEMORY_STATS, stats as *mut MemoryStats as u64, core::mem::size_of::<MemoryStats>() as u64, 0, 0) as i64 }
 }
 
 // Read the boot memory-map region at `index` into `region`, returning the region
 // count (negative past the end). A free syscall feeding the `lsmem` command.
+//
+// # Safety
+// The region this fills in names PHYSICAL memory. It is a description, and the caller may only
+// map or hand a span on to a device after checking it against what it actually owns.
 pub unsafe fn memmap_get(index: u64, region: &mut MemmapRegion) -> i64 {
 	unsafe { syscall(SYS_MEMMAP_GET, index, region as *mut MemmapRegion as u64, core::mem::size_of::<MemmapRegion>() as u64, 0) as i64 }
 }
 
 // Read the device-interrupt vector state at `index` into `info`, returning the
 // vector count (negative past the end). A free syscall feeding the `lsirq` command.
-pub unsafe fn irq_info(index: u64, info: &mut IrqInfo) -> i64 {
+pub fn irq_info(index: u64, info: &mut IrqInfo) -> i64 {
 	unsafe { syscall(SYS_IRQ_INFO, index, info as *mut IrqInfo as u64, core::mem::size_of::<IrqInfo>() as u64, 0) as i64 }
 }
 
 // Read the retained PCI function at `index` into `info`, returning the function
 // count (negative past the end). A free syscall feeding the `lspci` command.
-pub unsafe fn pci_info(index: u64, info: &mut PciInfo) -> i64 {
+pub fn pci_info(index: u64, info: &mut PciInfo) -> i64 {
 	unsafe { syscall(SYS_PCI_INFO, index, info as *mut PciInfo as u64, core::mem::size_of::<PciInfo>() as u64, 0) as i64 }
 }
 
 // Arm this process to catch Ctrl+C (SIG_INT): once armed, an interrupt sets a pending
 // flag `interrupted()` polls instead of terminating us, so a long-running tool can
 // stop cleanly and print a summary. Ctrl+\ (SIG_TERM) still force-quits.
-pub unsafe fn catch_interrupt() {
+pub fn catch_interrupt() {
 	unsafe {
 		syscall(SYS_SIGNAL_CATCH, SIG_INT, 0, 0, 0);
 	}
@@ -2329,20 +2349,20 @@ pub unsafe fn catch_interrupt() {
 
 // Poll and clear a pending caught interrupt (Ctrl+C): true if one arrived since the
 // last call. Only meaningful after `catch_interrupt()` has armed the process.
-pub unsafe fn interrupted() -> bool {
+pub fn interrupted() -> bool {
 	unsafe { syscall(SYS_SIGNAL_TAKE, SIG_INT, 0, 0, 0) != 0 }
 }
 
 // Duplicate `handle` into a new handle carrying `rights` (a subset of the
 // original's). Returns the new handle, or a negative error.
-pub unsafe fn duplicate(handle: u64, rights: u32) -> i64 {
+pub fn duplicate(handle: u64, rights: u32) -> i64 {
 	unsafe { syscall(SYS_HANDLE_DUPLICATE, handle, rights as u64, 0, 0) as i64 }
 }
 
 // Introspect the object behind `handle`: its koid, stable type code (Process = 1,
 // ...), the rights the handle confers, its generation, and its byte size for
 // memory-backed objects. Returns None if the handle is unknown.
-pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
+pub fn object_info(handle: u64) -> Option<ObjectInfo> {
 	unsafe {
 		let mut info: ObjectInfo = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
 		let size: u64 = core::mem::size_of::<ObjectInfo>() as u64;
@@ -2363,7 +2383,7 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 // is unknown, which is refused for the same reason as insufficient rights.
 #[unsafe(no_mangle)]
 pub extern "C" fn liber_handle_authority(handle: u64) -> u64 {
-	match unsafe { object_info(handle) } {
+	match object_info(handle) {
 		Some(info) => (info.object_type << 32) | u64::from(info.rights),
 		None => u64::MAX,
 	}
@@ -2374,7 +2394,7 @@ pub extern "C" fn liber_handle_authority(handle: u64) -> u64 {
 // service exits.
 #[unsafe(no_mangle)]
 pub extern "C" fn liber_handle_release(handle: u64) {
-	unsafe { close(handle) }
+	close(handle)
 }
 
 // Read the live per-process counters and state behind a Process `handle` (the IPC
@@ -2382,7 +2402,7 @@ pub extern "C" fn liber_handle_release(handle: u64) {
 // handle must carry RIGHT_READ. Returns None if the handle is unknown or not a
 // process; the SystemGraphService uses this to build the live observability graph
 // from the process handles it holds for each component.
-pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
+pub fn process_stats(handle: u64) -> Option<ProcessStats> {
 	unsafe {
 		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0, completion: 0, completion_valid: 0 };
 		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
@@ -2392,13 +2412,13 @@ pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
 }
 
 // The number of devices the kernel discovered at boot.
-pub unsafe fn device_count() -> u64 {
+pub fn device_count() -> u64 {
 	unsafe { syscall(SYS_DEVICE_COUNT, 0, 0, 0, 0) }
 }
 
 // Read the DeviceInfo for device `index` (its virtio type and MMIO struct
 // offsets). Returns true on success, false for an out-of-range index.
-pub unsafe fn device_info(index: u64, info: &mut DeviceInfo) -> bool {
+pub fn device_info(index: u64, info: &mut DeviceInfo) -> bool {
 	unsafe { syscall(SYS_DEVICE_INFO, index, info as *mut DeviceInfo as u64, core::mem::size_of::<DeviceInfo>() as u64, 0) as i64 == 0 }
 }
 
@@ -2410,7 +2430,7 @@ pub unsafe fn device_info(index: u64, info: &mut DeviceInfo) -> bool {
 // in it and takes them all out again - once per pass, for as long as the service runs. The cost of
 // one pass grows with how many peers a service listens to, which is why StorageService's client
 // ceiling was set where the service is still brisk rather than where a handle table runs out.
-pub unsafe fn waitset_create() -> i64 {
+pub fn waitset_create() -> i64 {
 	unsafe { syscall(SYS_WAITSET_CREATE, 0, 0, 0, 0) as i64 }
 }
 
@@ -2418,7 +2438,7 @@ pub unsafe fn waitset_create() -> i64 {
 // Add an object to the set. Answers the member's KOID - which is what `waitset_wait` will report
 // when it becomes ready - so a caller learns it at the moment it joins rather than paying
 // `SYS_OBJECT_INFO_GET` per member to find out.
-pub unsafe fn waitset_add(set: u64, object: u64) -> i64 {
+pub fn waitset_add(set: u64, object: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_ADD, set, object, 0, 0) as i64 }
 }
 
@@ -2430,7 +2450,7 @@ pub unsafe fn waitset_add(set: u64, object: u64) -> i64 {
 // and the natural thing to do with a dead peer is close it. Closing first left the member behind,
 // and a closed peer is permanently readable, so the set woke on it forever. Taking the koid makes
 // that ordering impossible to get wrong rather than merely documented.
-pub unsafe fn waitset_remove(set: u64, koid: u64) -> i64 {
+pub fn waitset_remove(set: u64, koid: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_REMOVE, set, koid, 0, 0) as i64 }
 }
 
@@ -2441,7 +2461,7 @@ pub unsafe fn waitset_remove(set: u64, koid: u64) -> i64 {
 // mismatch is what forced the first migration attempt to reconcile membership every pass instead of
 // editing it where it changes, and the reconcile was measured as the entire cost of the change. A
 // koid needs no mirror - map it to a client however you already index them.
-pub unsafe fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
+pub fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_WAIT, set, deadline, flags, 0) as i64 }
 }
 
@@ -2462,7 +2482,7 @@ pub unsafe fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
 // caller is attempting, exactly as the manifest declares it. The kernel validates it against the
 // table generated from the same manifest and stamps it, with the entry's DMA policy, on the grant.
 // A name that does not fit the ABI field is refused here, before the kernel is asked.
-pub unsafe fn device_claim(index: u64, privilege: u64, entry: &[u8]) -> Result<ClaimGrant, i64> {
+pub fn device_claim(index: u64, privilege: u64, entry: &[u8]) -> Result<ClaimGrant, i64> {
 	let Some(field) = abi::entry_name_field(entry) else {
 		return Err(abi::ERR_INVALID);
 	};
@@ -2478,14 +2498,14 @@ pub unsafe fn device_claim(index: u64, privilege: u64, entry: &[u8]) -> Result<C
 // mapping is torn out of the address space it was in, the MSI vectors are masked, and the IOMMU
 // teardown is confirmed before any frame or vector goes back into circulation. Nothing asks the
 // driver for anything.
-pub unsafe fn device_release(claim: u64) -> i64 {
+pub fn device_release(claim: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_RELEASE, claim, 0, 0, 0) as i64 }
 }
 
 // Read a claim handle: which binding it names, what state the device is in, and whether the release
 // has settled. The handle is waitable, so a manager parked in `wait_any` reads this once woken
 // rather than polling it.
-pub unsafe fn device_claim_info(claim: u64) -> Result<ClaimInfo, i64> {
+pub fn device_claim_info(claim: u64) -> Result<ClaimInfo, i64> {
 	let mut info = ClaimInfo::default();
 	let size: u64 = core::mem::size_of::<ClaimInfo>() as u64;
 	let result: i64 = unsafe { syscall(SYS_DEVICE_CLAIM_INFO, claim, &mut info as *mut ClaimInfo as u64, size, 0) as i64 };
@@ -2501,7 +2521,7 @@ pub unsafe fn device_claim_info(claim: u64) -> Result<ClaimInfo, i64> {
 // THE CLAIM IS THE AUTHORITY AND IT NAMES THE DEVICE. This took an index plus an ambient
 // DeviceManager privilege, so nothing anywhere said which BINDING the vector belonged to - and
 // ending that binding had no way to find it.
-pub unsafe fn device_msix_acquire(claim: u64) -> i64 {
+pub fn device_msix_acquire(claim: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, claim, 0, 0, 0) as i64 }
 }
 
@@ -2511,7 +2531,7 @@ pub unsafe fn device_msix_acquire(claim: u64) -> i64 {
 // RIGHT_MANAGE - the capability the kernel checks, held by the components that are allowed to
 // stop the machine and by nobody else. Diverges on success; returns ERR_ACCESS_DENIED without
 // the capability, so a caller that was handed none fails instead of halting the system.
-pub unsafe fn system_power(power: u64, action: u64) -> i64 {
+pub fn system_power(power: u64, action: u64) -> i64 {
 	unsafe { syscall(SYS_SYSTEM_POWER, power, action, 0, 0) as i64 }
 }
 
@@ -2520,13 +2540,13 @@ pub unsafe fn system_power(power: u64, action: u64) -> i64 {
 // group cannot be assembled out of processes the caller could not already reach. Membership is
 // sealed at creation: there is no join, and a stage cannot leave the job it belongs to.
 // Returns the group handle, or a negative error.
-pub unsafe fn process_group_create(processes: &[u64]) -> i64 {
+pub fn process_group_create(processes: &[u64]) -> i64 {
 	unsafe { syscall(SYS_PROCESS_GROUP_CREATE, processes.as_ptr() as u64, processes.len() as u64, 0, 0) as i64 }
 }
 
 // Deliver `signal` to every live member of a group. Authority is the group handle carrying
 // RIGHT_MANAGE; being a member grants nothing, so one stage cannot signal its siblings.
-pub unsafe fn process_group_signal(group: u64, signal: u64) -> i64 {
+pub fn process_group_signal(group: u64, signal: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_GROUP_SIGNAL, group, signal, 0, 0) as i64 }
 }
 
@@ -2536,7 +2556,7 @@ pub unsafe fn process_group_signal(group: u64, signal: u64) -> i64 {
 // A CALLER SIZES THE ARRAY, which is why this takes a slice rather than answering a Vec: the shell
 // knows how many stages it launched, and a stats call that allocated would be one more thing that
 // can fail while reporting why something else did.
-pub unsafe fn process_group_stats(group: u64, into: &mut [ProcessStats]) -> usize {
+pub fn process_group_stats(group: u64, into: &mut [ProcessStats]) -> usize {
 	if into.is_empty() {
 		return 0;
 	}
@@ -2552,7 +2572,7 @@ pub unsafe fn process_group_stats(group: u64, into: &mut [ProcessStats]) -> usiz
 // All or nothing: every handle is checked before anything is sent, so a list with one bad entry
 // moves none of them. A partial transfer would leave the sender holding some of what it meant
 // to give away and the receiver wired to half a graph.
-pub unsafe fn send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> i64 {
+pub fn send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> i64 {
 	if handles.is_empty() || handles.len() > MAX_MESSAGE_CAPS {
 		return ERR_INVALID;
 	}
@@ -2586,28 +2606,26 @@ pub enum ReceivedCaps {
 //
 // A typed path may not use the single-handle receive, and `check-single-cap-receive.sh` is what keeps
 // a new one from appearing.
-pub unsafe fn recv_caps_blocking(channel: u64, buf: &mut [u8]) -> ReceivedCaps {
-	unsafe {
-		let mut raw = [0u64; MAX_MESSAGE_CAPS];
-		loop {
-			let (len, count) = recv_message_caps(channel, buf, &mut raw);
-			if len == ERR_WOULD_BLOCK {
-				wait(channel, 0);
-				continue;
-			}
-			if len < 0 {
-				return ReceivedCaps::Closed;
-			}
-			// The kernel cannot report more than it is allowed to transfer, so this cannot fail -
-			// and if it ever did, closing what arrived beats handing on a truncated list.
-			let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
-				for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
-					close(handle);
-				}
-				return ReceivedCaps::Closed;
-			};
-			return ReceivedCaps::Message { len: len as usize, handles };
+pub fn recv_caps_blocking(channel: u64, buf: &mut [u8]) -> ReceivedCaps {
+	let mut raw = [0u64; MAX_MESSAGE_CAPS];
+	loop {
+		let (len, count) = recv_message_caps(channel, buf, &mut raw);
+		if len == ERR_WOULD_BLOCK {
+			wait(channel, 0);
+			continue;
 		}
+		if len < 0 {
+			return ReceivedCaps::Closed;
+		}
+		// The kernel cannot report more than it is allowed to transfer, so this cannot fail -
+		// and if it ever did, closing what arrived beats handing on a truncated list.
+		let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
+			for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+				close(handle);
+			}
+			return ReceivedCaps::Closed;
+		};
+		return ReceivedCaps::Message { len: len as usize, handles };
 	}
 }
 
@@ -2629,51 +2647,49 @@ pub enum DeadlineCaps {
 //
 // `deadline` of 0 means no deadline, matching `wait` - so a caller with no budget behaves exactly
 // as it did before.
-pub unsafe fn recv_caps_deadline(channel: u64, buf: &mut [u8], deadline: u64) -> DeadlineCaps {
-	unsafe {
-		let mut raw = [0u64; MAX_MESSAGE_CAPS];
-		loop {
-			let (len, count) = recv_message_caps(channel, buf, &mut raw);
-			if len == ERR_WOULD_BLOCK {
-				// CHECKED BEFORE THE WAIT AND AFTER IT. Before, because a deadline already passed
-				// must not buy one more wait; after, because `wait` returns for reasons other than
-				// the deadline and a caller that trusted its return value alone would loop.
-				if deadline != 0 && clock() >= deadline {
+pub fn recv_caps_deadline(channel: u64, buf: &mut [u8], deadline: u64) -> DeadlineCaps {
+	let mut raw = [0u64; MAX_MESSAGE_CAPS];
+	loop {
+		let (len, count) = recv_message_caps(channel, buf, &mut raw);
+		if len == ERR_WOULD_BLOCK {
+			// CHECKED BEFORE THE WAIT AND AFTER IT. Before, because a deadline already passed
+			// must not buy one more wait; after, because `wait` returns for reasons other than
+			// the deadline and a caller that trusted its return value alone would loop.
+			if deadline != 0 && clock() >= deadline {
+				return DeadlineCaps::TimedOut;
+			}
+			wait(channel, deadline);
+			if deadline != 0 && clock() >= deadline {
+				// One last look: the message may have arrived in the same tick the deadline
+				// did, and reporting a timeout over a delivered answer would fail a bind that
+				// actually succeeded.
+				let (len, count) = recv_message_caps(channel, buf, &mut raw);
+				if len == ERR_WOULD_BLOCK {
 					return DeadlineCaps::TimedOut;
 				}
-				wait(channel, deadline);
-				if deadline != 0 && clock() >= deadline {
-					// One last look: the message may have arrived in the same tick the deadline
-					// did, and reporting a timeout over a delivered answer would fail a bind that
-					// actually succeeded.
-					let (len, count) = recv_message_caps(channel, buf, &mut raw);
-					if len == ERR_WOULD_BLOCK {
-						return DeadlineCaps::TimedOut;
-					}
-					if len < 0 {
-						return DeadlineCaps::Closed;
-					}
-					let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
-						for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
-							close(handle);
-						}
-						return DeadlineCaps::Closed;
-					};
-					return DeadlineCaps::Message { len: len as usize, handles };
+				if len < 0 {
+					return DeadlineCaps::Closed;
 				}
-				continue;
+				let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
+					for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+						close(handle);
+					}
+					return DeadlineCaps::Closed;
+				};
+				return DeadlineCaps::Message { len: len as usize, handles };
 			}
-			if len < 0 {
-				return DeadlineCaps::Closed;
-			}
-			let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
-				for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
-					close(handle);
-				}
-				return DeadlineCaps::Closed;
-			};
-			return DeadlineCaps::Message { len: len as usize, handles };
+			continue;
 		}
+		if len < 0 {
+			return DeadlineCaps::Closed;
+		}
+		let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
+			for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+				close(handle);
+			}
+			return DeadlineCaps::Closed;
+		};
+		return DeadlineCaps::Message { len: len as usize, handles };
 	}
 }
 
@@ -2683,7 +2699,7 @@ pub unsafe fn recv_caps_deadline(channel: u64, buf: &mut [u8], deadline: u64) ->
 //
 // Named apart from `recv_caps`, which drains a whole bootstrap sequence of named
 // single-capability messages - a different thing that happens to be about capabilities too.
-pub unsafe fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64; MAX_MESSAGE_CAPS]) -> (i64, usize) {
+pub fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64; MAX_MESSAGE_CAPS]) -> (i64, usize) {
 	let mut packed = [0u64; MAX_MESSAGE_CAPS + 1];
 	let len = unsafe { syscall(SYS_CHANNEL_RECV_CAPS, channel, buf.as_mut_ptr() as u64, buf.len() as u64, packed.as_mut_ptr() as u64) as i64 };
 	if len < 0 {
@@ -2708,7 +2724,7 @@ pub unsafe fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64
 // No `no_mangle`: this one is called across the image only through the storage service's own crate,
 // not through the shared-image transport boundary, and an exported symbol nothing imports is a
 // symbol the image checker has to be told about.
-pub unsafe fn send_caps_deadline(channel: u64, bytes: &[u8], handles: &[u64], deadline: u64) -> SendOutcome {
+pub fn send_caps_deadline(channel: u64, bytes: &[u8], handles: &[u64], deadline: u64) -> SendOutcome {
 	unsafe {
 		if handles.is_empty() {
 			return send_deadline(channel, bytes, 0, deadline);
@@ -2735,42 +2751,38 @@ pub unsafe fn send_caps_deadline(channel: u64, bytes: &[u8], handles: &[u64], de
 // that is what `try_send` was for - and a frame now carries what its element type declares rather
 // than exactly one. Empty is the ordinary case and goes through `try_send`, because `send_caps`
 // refuses an empty list by contract.
-pub unsafe fn try_send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
-	unsafe { matches!(try_send_caps_outcome(channel, bytes, handles), SendOutcome::Delivered) }
+pub fn try_send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
+	matches!(try_send_caps_outcome(channel, bytes, handles), SendOutcome::Delivered)
 }
 
 // The same, saying WHY it did not send - `Stalled` is "no room now" and `Failed` is "there is nobody
 // there", which the storage service's stream pump acts on differently.
-pub unsafe fn try_send_caps_outcome(channel: u64, bytes: &[u8], handles: &[u64]) -> SendOutcome {
-	unsafe {
-		if handles.is_empty() {
-			return try_send_outcome(channel, bytes, 0);
-		}
-		match send_caps(channel, bytes, handles) {
-			0 => SendOutcome::Delivered,
-			ERR_WOULD_BLOCK => SendOutcome::Stalled,
-			_ => SendOutcome::Failed,
-		}
+pub fn try_send_caps_outcome(channel: u64, bytes: &[u8], handles: &[u64]) -> SendOutcome {
+	if handles.is_empty() {
+		return try_send_outcome(channel, bytes, 0);
+	}
+	match send_caps(channel, bytes, handles) {
+		0 => SendOutcome::Delivered,
+		ERR_WOULD_BLOCK => SendOutcome::Stalled,
+		_ => SendOutcome::Failed,
 	}
 }
 
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
-pub unsafe fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
-	unsafe {
-		if handles.is_empty() {
-			return send_blocking(channel, bytes, 0);
-		}
-		loop {
-			let signed = send_caps(channel, bytes, handles);
-			if signed == ERR_WOULD_BLOCK {
-				if wait_writable(channel) < 0 {
-					yield_now();
-				}
-				continue;
+pub fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
+	if handles.is_empty() {
+		return send_blocking(channel, bytes, 0);
+	}
+	loop {
+		let signed = send_caps(channel, bytes, handles);
+		if signed == ERR_WOULD_BLOCK {
+			if wait_writable(channel) < 0 {
+				yield_now();
 			}
-			return signed == 0;
+			continue;
 		}
+		return signed == 0;
 	}
 }
 
@@ -2799,8 +2811,8 @@ pub enum ReceivedVecCaps {
 // Sized exactly by peeking first, so a reply is never truncated to a guessed ceiling.
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
-pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> ReceivedVecCaps {
-	unsafe { recv_vec_caps_deadline(channel, out, 0) }
+pub fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> ReceivedVecCaps {
+	recv_vec_caps_deadline(channel, out, 0)
 }
 
 // The same receive with an ABSOLUTE deadline in LAPIC ticks, `0` meaning none.
@@ -2811,59 +2823,57 @@ pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> R
 // restarting the clock.
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
-pub unsafe fn recv_vec_caps_deadline(channel: u64, out: &mut wire::Handles, deadline: u64) -> ReceivedVecCaps {
-	unsafe {
-		loop {
-			let pending: i64 = channel_peek(channel);
-			if pending == ERR_WOULD_BLOCK {
-				if deadline != 0 && clock() >= deadline {
-					return ReceivedVecCaps::TimedOut;
-				}
-				wait(channel, deadline);
-				// `wait` returning on a deadline leaves the channel empty, so the next peek says
-				// WOULD_BLOCK again; the check above is what ends the loop, not this call's answer.
-				if deadline != 0 && clock() >= deadline {
-					return ReceivedVecCaps::TimedOut;
-				}
-				continue;
+pub fn recv_vec_caps_deadline(channel: u64, out: &mut wire::Handles, deadline: u64) -> ReceivedVecCaps {
+	loop {
+		let pending: i64 = channel_peek(channel);
+		if pending == ERR_WOULD_BLOCK {
+			if deadline != 0 && clock() >= deadline {
+				return ReceivedVecCaps::TimedOut;
 			}
-			if pending < 0 {
-				return ReceivedVecCaps::Closed;
+			wait(channel, deadline);
+			// `wait` returning on a deadline leaves the channel empty, so the next peek says
+			// WOULD_BLOCK again; the check above is what ends the loop, not this call's answer.
+			if deadline != 0 && clock() >= deadline {
+				return ReceivedVecCaps::TimedOut;
 			}
-			// Fallibly: a message size the peer chose must not be able to abort this process
-			// through the allocation error handler.
-			let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-			if bytes.try_reserve_exact(pending as usize).is_err() {
-				return ReceivedVecCaps::Failed;
-			}
-			bytes.resize(pending as usize, 0);
-			let mut handles = [0u64; MAX_MESSAGE_CAPS];
-			let (len, count) = recv_message_caps(channel, &mut bytes, &mut handles);
-			if len == ERR_WOULD_BLOCK {
-				continue;
-			}
-			if len < 0 {
-				// A refused receive is not an end-of-stream: the peer may still be there.
-				return ReceivedVecCaps::Failed;
-			}
-			bytes.truncate(len as usize);
-			// The kernel cannot report more than it may transfer, so this cannot fail; closing what
-			// arrived beats handing on a truncated list if it ever did.
-			let Some(taken) = wire::Handles::try_from_array(&handles, count) else {
-				for &handle in handles[..count.min(MAX_MESSAGE_CAPS)].iter() {
-					close(handle);
-				}
-				return ReceivedVecCaps::Failed;
-			};
-			*out = taken;
-			return ReceivedVecCaps::Message { bytes };
+			continue;
 		}
+		if pending < 0 {
+			return ReceivedVecCaps::Closed;
+		}
+		// Fallibly: a message size the peer chose must not be able to abort this process
+		// through the allocation error handler.
+		let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		if bytes.try_reserve_exact(pending as usize).is_err() {
+			return ReceivedVecCaps::Failed;
+		}
+		bytes.resize(pending as usize, 0);
+		let mut handles = [0u64; MAX_MESSAGE_CAPS];
+		let (len, count) = recv_message_caps(channel, &mut bytes, &mut handles);
+		if len == ERR_WOULD_BLOCK {
+			continue;
+		}
+		if len < 0 {
+			// A refused receive is not an end-of-stream: the peer may still be there.
+			return ReceivedVecCaps::Failed;
+		}
+		bytes.truncate(len as usize);
+		// The kernel cannot report more than it may transfer, so this cannot fail; closing what
+		// arrived beats handing on a truncated list if it ever did.
+		let Some(taken) = wire::Handles::try_from_array(&handles, count) else {
+			for &handle in handles[..count.min(MAX_MESSAGE_CAPS)].iter() {
+				close(handle);
+			}
+			return ReceivedVecCaps::Failed;
+		};
+		*out = taken;
+		return ReceivedVecCaps::Message { bytes };
 	}
 }
 
 // Acknowledge a serviced device interrupt, re-arming its source so the next `wait`
 // on the Interrupt handle blocks until the device interrupts again.
-pub unsafe fn interrupt_ack(handle: u64) {
+pub fn interrupt_ack(handle: u64) {
 	unsafe {
 		syscall(SYS_INTERRUPT_ACK, handle, 0, 0, 0);
 	}
@@ -2877,21 +2887,21 @@ pub unsafe fn interrupt_ack(handle: u64) {
 // component that should be able to type into a privileged console. Without it the call is
 // refused: typing at somebody else's shell is not something a process may do because it knows
 // the syscall number.
-pub unsafe fn console_feed(privilege: u64, byte: u8) -> i64 {
+pub fn console_feed(privilege: u64, byte: u8) -> i64 {
 	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 0, privilege, 0) as i64 }
 }
 
 // `console_feed` on the serial arrival path, which the console service accepts whether or
 // not its display is focused - what a driven guest needs, since a runner typing into it
 // has no display to focus.
-pub unsafe fn console_feed_serial(privilege: u64, byte: u8) -> i64 {
+pub fn console_feed_serial(privilege: u64, byte: u8) -> i64 {
 	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 1, privilege, 0) as i64 }
 }
 
 // Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),
 // returning its handle, or a negative error. The buffer names no device, so its frames are
 // recycled as soon as it is dropped - correct for memory that is never handed to hardware.
-pub unsafe fn dma_buffer_create(size: u64) -> i64 {
+pub fn dma_buffer_create(size: u64) -> i64 {
 	unsafe { syscall(SYS_DMA_BUFFER_CREATE, size, 0, 0, 0) as i64 }
 }
 
@@ -2900,28 +2910,41 @@ pub unsafe fn dma_buffer_create(size: u64) -> i64 {
 // holding the buffer, the kernel keeps those frames out of circulation until somebody resets that
 // device, instead of handing them to whoever allocates next while a descriptor still points at
 // them. There is no IOMMU, so nothing else stops that write.
-pub unsafe fn dma_buffer_create_for(device: u64, size: u64) -> i64 {
+pub fn dma_buffer_create_for(device: u64, size: u64) -> i64 {
 	unsafe { syscall(SYS_DMA_BUFFER_CREATE, size, device, 0, 0) as i64 }
 }
 
 // "I have reset this device." Releases the DMA frames the kernel is holding for it - the frames of
 // a driver that died before this one. Call it once, straight after the reset that starts bring-up.
-pub unsafe fn device_quiesced(device: u64) -> i64 {
+pub fn device_quiesced(device: u64) -> i64 {
 	unsafe { syscall(SYS_DEVICE_QUIESCED, device, 0, 0, 0) as i64 }
 }
 
 // Map a DmaBuffer into our address space, returning its virtual base (or a
 // negative error). The driver fills the virtqueue rings through this mapping.
+//
+// # Safety
+// The returned base is the buffer's mapping and is valid for the buffer's whole size while the
+// mapping is live; the caller must not use it after `dma_buffer_unmap` for the same handle.
 pub unsafe fn dma_buffer_map(handle: u64) -> i64 {
 	unsafe { syscall(SYS_DMA_BUFFER_MAP, handle, 0, 0, 0) as i64 }
 }
 
-pub unsafe fn dma_buffer_unmap(handle: u64) -> i64 {
+// Unmap a DmaBuffer from our address space, returning 0 or a negative error.
+//
+// SAFE, for the reason `unmap_object` gives: the address this invalidates was handed out by
+// `dma_buffer_map`, and reaching through it afterwards is an `unsafe` dereference that carries the
+// obligation. Programming a device to touch the span is likewise `unsafe` at the descriptor write.
+pub fn dma_buffer_unmap(handle: u64) -> i64 {
 	unsafe { syscall(SYS_DMA_BUFFER_UNMAP, handle, 0, 0, 0) as i64 }
 }
 
 // The physical base address of a DmaBuffer - the address a driver programs into
 // its device for DMA.
+//
+// # Safety
+// The returned address is what a DEVICE dereferences, not this process. Writing it into a
+// descriptor makes the device read or write that span, so it must name a buffer this process owns.
 pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
 	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, 0, 0, 0) }
 }
@@ -2930,6 +2953,10 @@ pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
 // returning the mapped virtual base (the raw pixel buffer pointer), or a negative
 // error. Hands the display to the caller - the kernel console stops drawing to it -
 // so only the ConsoleService should call it (once; a second call fails).
+//
+// # Safety
+// The `base` this fills in is a mapping of the scanout, valid for the reported stride times
+// height while the framebuffer is mapped; writing outside that span is writing somebody else's memory.
 pub unsafe fn framebuffer_map(privilege: u64, fb: &mut Framebuffer) -> i64 {
 	unsafe { syscall(SYS_FRAMEBUFFER_MAP, fb as *mut Framebuffer as u64, core::mem::size_of::<Framebuffer>() as u64, privilege, 0) as i64 }
 }
@@ -2938,7 +2965,7 @@ pub unsafe fn framebuffer_map(privilege: u64, fb: &mut Framebuffer) -> i64 {
 // written (0 when there is no boot console). The kernel and the ConsoleService share
 // the same `term` stack, so the boot log is handed across as logical text and replayed
 // into VT 1's model at takeover - it stays on screen and in the scrollback afterwards.
-pub unsafe fn console_readlog(buf: &mut [u8]) -> i64 {
+pub fn console_readlog(buf: &mut [u8]) -> i64 {
 	unsafe { syscall(SYS_CONSOLE_READLOG, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as i64 }
 }
 
@@ -2946,6 +2973,10 @@ pub unsafe fn console_readlog(buf: &mut [u8]) -> i64 {
 // one page is mapped contiguously in virtual space but its physical frames are
 // scattered, so a driver that carves it into several device buffers asks for each
 // one's true physical address by its offset rather than adding to the base.
+//
+// # Safety
+// As `dma_buffer_phys`, and `offset` must be inside the buffer: the device is given
+// `base + offset` and the kernel does not re-check what a descriptor then covers.
 pub unsafe fn dma_buffer_phys_at(handle: u64, offset: u64) -> u64 {
 	unsafe { syscall(SYS_DMA_BUFFER_PHYS, handle, offset, 0, 0) }
 }
@@ -2954,12 +2985,19 @@ pub unsafe fn dma_buffer_phys_at(handle: u64, offset: u64) -> u64 {
 // base, physical base): a driver fills the ring/buffer through `virt` and points its
 // device at `phys`. None on allocation or mapping failure. The returned handle keeps
 // the pinned buffer alive for the life of the driver.
+//
+// # Safety
+// The virtual base is valid for `size` bytes while the buffer is mapped, and the physical base
+// is what a device dereferences - see `dma_buffer_map` and `dma_buffer_phys`.
 pub unsafe fn dma_buffer(size: u64) -> Option<(u64, u64, u64)> {
 	unsafe { dma_buffer_for(0, size) }
 }
 
 // `dma_buffer`, naming the device the physical address is for - see `dma_buffer_create_for`.
 // `device` 0 means no device, which is what `dma_buffer` passes.
+//
+// # Safety
+// As `dma_buffer`, with the buffer bound to `device` for its DMA lifetime.
 pub unsafe fn dma_buffer_for(device: u64, size: u64) -> Option<(u64, u64, u64)> {
 	unsafe {
 		let handle: i64 = dma_buffer_create_for(device, size);
@@ -2979,34 +3017,36 @@ pub unsafe fn dma_buffer_for(device: u64, size: u64) -> Option<(u64, u64, u64)> 
 // object handle (0 = none) moved out of this process's table into the child's and
 // delivered to the child's first thread in rdi - the way a process is endowed with
 // its initial capability. Returns the child Process handle, or a negative error.
-pub unsafe fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
-	unsafe { spawn_in(elf, bootstrap, 0) }
+pub fn spawn(elf: &[u8], bootstrap: u64) -> i64 {
+	spawn_in(elf, bootstrap, 0)
 }
 
 // Map one dependency into a process returned by SYS_PROCESS_CREATE. ProcessService
 // calls this in topological order before loading the main image; no thread or stack is
 // created by a module load.
+//
+// # Safety
+// `bias` places the module inside the target process's address space; the caller is
+// responsible for the placement not overlapping anything already loaded there.
 pub unsafe fn process_load_module(process: u64, elf: &[u8], bias: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_LOAD_MODULE, process, elf.as_ptr() as u64, elf.len() as u64, bias) as i64 }
 }
 
-pub unsafe fn process_create(domain: u64) -> i64 {
+pub fn process_create(domain: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_CREATE, domain, 0, 0, 0) as i64 }
 }
 
-pub unsafe fn process_load_main(process: u64, elf: &[u8]) -> i64 {
+pub fn process_load_main(process: u64, elf: &[u8]) -> i64 {
 	unsafe { syscall(SYS_PROCESS_LOAD, process, elf.as_ptr() as u64, elf.len() as u64, 0) as i64 }
 }
 
-pub unsafe fn process_start(process: u64, entry: u64, bootstrap: u64) -> i64 {
-	unsafe {
-		let thread = process_prepare(process, entry, bootstrap);
-		if thread < 0 {
-			return thread;
-		}
-		let started = process_release(thread as u64);
-		if started < 0 { started } else { process as i64 }
+pub fn process_start(process: u64, entry: u64, bootstrap: u64) -> i64 {
+	let thread = process_prepare(process, entry, bootstrap);
+	if thread < 0 {
+		return thread;
 	}
+	let started = process_release(thread as u64);
+	if started < 0 { started } else { process as i64 }
 }
 
 // Create the process's first thread WITHOUT starting it, returning the handle that starts it.
@@ -3022,13 +3062,13 @@ pub unsafe fn process_start(process: u64, entry: u64, bootstrap: u64) -> i64 {
 // The returned handle is the authority to start that one stage and nothing else. Dropping it
 // leaves a process that never runs, which is exactly what a failed transaction wants: no stage
 // observes a half-built graph because no stage has run.
-pub unsafe fn process_prepare(process: u64, entry: u64, bootstrap: u64) -> i64 {
+pub fn process_prepare(process: u64, entry: u64, bootstrap: u64) -> i64 {
 	unsafe { syscall(SYS_THREAD_CREATE, process, entry, USER_STACK_TOP, bootstrap) as i64 }
 }
 
 // Start a thread prepared by `process_prepare`, consuming the handle. Releasing every prepared
 // stage in turn is what makes the graph go live at once rather than piecemeal.
-pub unsafe fn process_release(thread: u64) -> i64 {
+pub fn process_release(thread: u64) -> i64 {
 	unsafe {
 		let started = syscall(SYS_THREAD_START, thread, 0, 0, 0);
 		close(thread);
@@ -3043,44 +3083,40 @@ pub unsafe fn process_release(thread: u64) -> i64 {
 // manager can launch a governed component under a bounded sub-Domain it controls and
 // the kernel contains the component's resource use to that Domain. Returns the child
 // Process handle, or a negative error.
-pub unsafe fn spawn_in(elf: &[u8], bootstrap: u64, domain: u64) -> i64 {
-	unsafe {
-		let (process, thread) = match spawn_prepared_in(elf, bootstrap, domain) {
-			Some(pair) => pair,
-			None => return -1,
-		};
-		let started = process_release(thread);
-		if started < 0 {
-			close(process);
-			return started;
-		}
-		process as i64
+pub fn spawn_in(elf: &[u8], bootstrap: u64, domain: u64) -> i64 {
+	let (process, thread) = match spawn_prepared_in(elf, bootstrap, domain) {
+		Some(pair) => pair,
+		None => return -1,
+	};
+	let started = process_release(thread);
+	if started < 0 {
+		close(process);
+		return started;
 	}
+	process as i64
 }
 
 // Load a static program into a Domain and leave it STOPPED, returning its process and the
 // token that starts it. `spawn_in` is this followed by a release, which keeps the two paths
 // from diverging in how a process is built - the same reason the dynamic loader prepares and
 // lets its caller decide.
-pub unsafe fn spawn_prepared_in(elf: &[u8], bootstrap: u64, domain: u64) -> Option<(u64, u64)> {
-	unsafe {
-		let process = process_create(domain);
-		if process < 0 {
-			return None;
-		}
-		let process = process as u64;
-		let entry = process_load_main(process, elf);
-		if entry < 0 {
-			close(process);
-			return None;
-		}
-		let thread = process_prepare(process, entry as u64, bootstrap);
-		if thread < 0 {
-			close(process);
-			return None;
-		}
-		Some((process, thread as u64))
+pub fn spawn_prepared_in(elf: &[u8], bootstrap: u64, domain: u64) -> Option<(u64, u64)> {
+	let process = process_create(domain);
+	if process < 0 {
+		return None;
 	}
+	let process = process as u64;
+	let entry = process_load_main(process, elf);
+	if entry < 0 {
+		close(process);
+		return None;
+	}
+	let thread = process_prepare(process, entry as u64, bootstrap);
+	if thread < 0 {
+		close(process);
+		return None;
+	}
+	Some((process, thread as u64))
 }
 
 // Create a child Domain of the caller's Domain with the given resource caps (memory
@@ -3089,7 +3125,7 @@ pub unsafe fn spawn_prepared_in(elf: &[u8], bootstrap: u64, domain: u64) -> Opti
 // every ancestor's, so it can only subdivide its parent's budget. A ResourceManager
 // makes one of these to host a governed component, then sets and adjusts its caps
 // with `domain_set_limit` and observes usage with `domain_stats`.
-pub unsafe fn domain_create(memory: u64, handles: u64, threads: u64) -> i64 {
+pub fn domain_create(memory: u64, handles: u64, threads: u64) -> i64 {
 	unsafe { syscall(SYS_DOMAIN_CREATE, memory, handles, threads, 0) as i64 }
 }
 
@@ -3100,7 +3136,7 @@ pub unsafe fn domain_create(memory: u64, handles: u64, threads: u64) -> i64 {
 // handle per member and walking them by hand, which is a list that can be wrong; a Domain cannot
 // be missing one of its own members. SystemManager tears down the control-plane branch this way
 // when the branch loses its supervisor.
-pub unsafe fn domain_kill(domain: u64) -> i64 {
+pub fn domain_kill(domain: u64) -> i64 {
 	unsafe { syscall(SYS_DOMAIN_KILL, domain, 0, 0, 0) as i64 }
 }
 
@@ -3108,7 +3144,7 @@ pub unsafe fn domain_kill(domain: u64) -> i64 {
 // `prop` is one of the PROP_*_LIMIT selectors and `limit` the new cap (u64::MAX =
 // uncapped). Returns 0 on success or a negative error. The cap takes effect at once -
 // the next over-budget allocation in the Domain fails with ERR_RESOURCE_EXHAUSTED.
-pub unsafe fn domain_set_limit(domain: u64, prop: u64, limit: u64) -> i64 {
+pub fn domain_set_limit(domain: u64, prop: u64, limit: u64) -> i64 {
 	unsafe { syscall(SYS_OBJECT_PROPERTY_SET, domain, prop, limit, 0) as i64 }
 }
 
@@ -3117,7 +3153,7 @@ pub unsafe fn domain_set_limit(domain: u64, prop: u64, limit: u64) -> i64 {
 // carries its own name in its identity note and the kernel reads it there, but the static
 // programs in the init package carry no note, so the only place their name exists is in the
 // package entry the launcher looked them up by.
-pub unsafe fn set_object_name(handle: u64, name: &str) -> i64 {
+pub fn set_object_name(handle: u64, name: &str) -> i64 {
 	unsafe { syscall(SYS_OBJECT_PROPERTY_SET, handle, PROP_NAME, name.as_ptr() as u64, name.len() as u64) as i64 }
 }
 
@@ -3131,7 +3167,7 @@ pub unsafe fn set_object_name(handle: u64, name: &str) -> i64 {
 // claim's state BEFORE binding rather than assuming it is free. `Releasing` is a legitimate answer
 // and NOT a refusal - treating it as one would be a permanent `Failed` for a state that was about
 // to clear on its own, because a claim refused is classified as not retryable.
-pub unsafe fn device_claim_snapshot(index: u64, privilege: u64) -> Option<DeviceClaimSnapshot> {
+pub fn device_claim_snapshot(index: u64, privilege: u64) -> Option<DeviceClaimSnapshot> {
 	unsafe {
 		let mut snapshot: DeviceClaimSnapshot = DeviceClaimSnapshot::default();
 		let size: u64 = core::mem::size_of::<DeviceClaimSnapshot>() as u64;
@@ -3140,7 +3176,7 @@ pub unsafe fn device_claim_snapshot(index: u64, privilege: u64) -> Option<Device
 	}
 }
 
-pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
+pub fn domain_stats(handle: u64) -> Option<DomainStats> {
 	unsafe {
 		let mut stats: DomainStats = DomainStats::default();
 		let size: u64 = core::mem::size_of::<DomainStats>() as u64;
@@ -3153,7 +3189,7 @@ pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
 // right - `spawn` returns one that does). The kernel applies the default disposition:
 // SIG_INT / SIG_TERM / SIG_KILL terminate it, SIG_STOP suspends it, SIG_CONT resumes a
 // suspended one. Returns 0 on success or a negative error.
-pub unsafe fn signal(process: u64, signal: u64) -> i64 {
+pub fn signal(process: u64, signal: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_SIGNAL, process, signal, 0, 0) as i64 }
 }
 

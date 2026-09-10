@@ -21,18 +21,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The line buffer matches the terminal's cooked line maximum (4 kB + newline)
 	// and lives on the heap, clear of the 16 kB user stack.
 	let mut buf: alloc::vec::Vec<u8> = alloc::vec![0u8; 4200];
-	unsafe {
-		// Adopt the console as stdout AND stdin (a foreground launch grants RECEIVE too).
-		inherit_stdout(bootstrap);
-		// Drain the argv/capability message so the bootstrap protocol stays in step; readln
-		// takes no arguments.
-		let _ = recv_launch_bytes(bootstrap);
-		// Read cooked input lines and echo each back until end-of-input.
-		while let Some(n) = read_line(&mut buf) {
-			print(b"in> ");
-			// The line already carries its trailing newline from the line discipline.
-			print(&buf[..n]);
-		}
+	// Adopt the console as stdout AND stdin (a foreground launch grants RECEIVE too).
+	inherit_stdout(bootstrap);
+	// Drain the argv/capability message so the bootstrap protocol stays in step; readln
+	// takes no arguments.
+	let _ = recv_launch_bytes(bootstrap);
+	// Read cooked input lines and echo each back until end-of-input.
+	while let Some(n) = read_line(&mut buf) {
+		print(b"in> ");
+		// The line already carries its trailing newline from the line discipline.
+		print(&buf[..n]);
 	}
 	exit();
 }

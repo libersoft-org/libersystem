@@ -22,20 +22,18 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// Governed launch sends arguments first, then the tagged NetworkService grant.
-		inherit_stdout(bootstrap);
-		let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let len: usize = argument.len();
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-		connect(netsvc, &buf[..len]);
-		close(netsvc);
-	}
+	// Governed launch sends arguments first, then the tagged NetworkService grant.
+	inherit_stdout(bootstrap);
+	let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let len: usize = argument.len();
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	connect(netsvc, &buf[..len]);
+	close(netsvc);
 	exit();
 }
 
@@ -65,7 +63,7 @@ fn parse_port(bytes: &[u8]) -> Option<u16> {
 
 // Parse `<ip> <port> [request...]`, open the connection, optionally send the request
 // and stream the response.
-unsafe fn connect(netsvc: u64, args: &[u8]) {
+fn connect(netsvc: u64, args: &[u8]) {
 	unsafe {
 		let sp: usize = match args.iter().position(|&b: &u8| b == b' ') {
 			Some(i) => i,
@@ -170,27 +168,25 @@ unsafe fn send_request(sock: &mut SocketClient, request: &[u8]) -> bool {
 
 // Drain the socket's received-data stream (a sub-channel of framed chunks), printing
 // each chunk, until the producer closes - end of stream (the peer's FIN).
-unsafe fn drain(sock: &mut SocketClient) {
-	unsafe {
-		if let Some(rxstream) = sock.recv() {
-			let mut frame: [u8; 1024] = [0u8; 1024];
-			loop {
-				match recv_caps_blocking(rxstream, &mut frame) {
-					ReceivedCaps::Message { len, handles: mut frame_handles } => {
-						if let Some(chunk) = socket::recv_read(&frame[..len], &mut frame_handles) {
-							print(&chunk.data);
-						}
-						for handle in frame_handles.as_slice() {
-							close(*handle);
-						}
+fn drain(sock: &mut SocketClient) {
+	if let Some(rxstream) = sock.recv() {
+		let mut frame: [u8; 1024] = [0u8; 1024];
+		loop {
+			match recv_caps_blocking(rxstream, &mut frame) {
+				ReceivedCaps::Message { len, handles: mut frame_handles } => {
+					if let Some(chunk) = socket::recv_read(&frame[..len], &mut frame_handles) {
+						print(&chunk.data);
 					}
-					ReceivedCaps::Closed => break,
+					for handle in frame_handles.as_slice() {
+						close(*handle);
+					}
 				}
+				ReceivedCaps::Closed => break,
 			}
-			close(rxstream);
 		}
-		print(b"\n");
+		close(rxstream);
 	}
+	print(b"\n");
 }
 
 // `parse_port` and `trim` come from the shared tools crate.

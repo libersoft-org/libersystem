@@ -27,40 +27,38 @@ const CHUNK: usize = 1024;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
-		//    output renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string (dmesg takes none, but the launch protocol
-		//    sends one).
-		let _ = recv_launch_bytes(bootstrap);
-		// 3. read the kernel boot log and print it, breaking at line boundaries.
-		let mut log: Vec<u8> = alloc::vec![0u8; LOG_CAPACITY];
-		let n: i64 = console_readlog(&mut log);
-		if n <= 0 {
-			eprint(b"dmesg: no kernel log\n");
-			exit();
-		}
-		let text: &[u8] = &log[..n as usize];
-		let mut start: usize = 0;
-		while start < text.len() {
-			let rest: &[u8] = &text[start..];
-			// the whole tail, or the longest run of whole lines within the chunk
-			// (a single overlong line goes out as-is; the relay clips, not us).
-			let len: usize = if rest.len() <= CHUNK {
-				rest.len()
-			} else {
-				match rest[..CHUNK].iter().rposition(|&b| b == b'\n') {
-					Some(i) => i + 1,
-					None => rest.iter().position(|&b| b == b'\n').map_or(rest.len(), |i| i + 1),
-				}
-			};
-			print(&rest[..len]);
-			start += len;
-		}
-		if text.last() != Some(&b'\n') {
-			print(b"\n");
-		}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our
+	//    output renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string (dmesg takes none, but the launch protocol
+	//    sends one).
+	let _ = recv_launch_bytes(bootstrap);
+	// 3. read the kernel boot log and print it, breaking at line boundaries.
+	let mut log: Vec<u8> = alloc::vec![0u8; LOG_CAPACITY];
+	let n: i64 = console_readlog(&mut log);
+	if n <= 0 {
+		eprint(b"dmesg: no kernel log\n");
+		exit();
+	}
+	let text: &[u8] = &log[..n as usize];
+	let mut start: usize = 0;
+	while start < text.len() {
+		let rest: &[u8] = &text[start..];
+		// the whole tail, or the longest run of whole lines within the chunk
+		// (a single overlong line goes out as-is; the relay clips, not us).
+		let len: usize = if rest.len() <= CHUNK {
+			rest.len()
+		} else {
+			match rest[..CHUNK].iter().rposition(|&b| b == b'\n') {
+				Some(i) => i + 1,
+				None => rest.iter().position(|&b| b == b'\n').map_or(rest.len(), |i| i + 1),
+			}
+		};
+		print(&rest[..len]);
+		start += len;
+	}
+	if text.last() != Some(&b'\n') {
+		print(b"\n");
 	}
 	exit();
 }

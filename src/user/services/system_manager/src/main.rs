@@ -22,7 +22,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the init package shared buffer and map it.
-	let (pkg_handle, pkg_base, pkg_len): (u64, u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let (pkg_handle, pkg_base, pkg_len): (u64, u64, usize) = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"PACKAGE" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
 			let base: u64 = unsafe { syscall(SYS_MEMORY_MAP, handle, 0, 0, 0) };
@@ -46,7 +46,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     match, the arm below exited, and the boot chain stopped before its first service with
 	//     nothing said. Hence the report on the way out - a bootstrap that cannot proceed should
 	//     name what it received, not vanish.
-	let (volume_tag, ramdisk_handle, ramdisk_len): ([u8; 7], u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let (volume_tag, ramdisk_handle, ramdisk_len): ([u8; 7], u64, usize) = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && (&buf[..7] == b"RAMDISK" || &buf[..7] == b"LIVEVOL") => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
 			let mut tag: [u8; 7] = [0u8; 7];
@@ -54,7 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			(tag, handle, length)
 		}
 		_ => {
-			unsafe { print(b"SystemManager: expected RAMDISK or LIVEVOL in the bootstrap; boot chain stops here\n") };
+			print(b"SystemManager: expected RAMDISK or LIVEVOL in the bootstrap; boot chain stops here\n");
 			exit()
 		}
 	};
@@ -67,14 +67,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     comment describes as being able to `sys_domain_kill` the whole system, all so that
 	//     Ctrl+Alt+Del would work. What goes down the chain now is a client of the SystemPower
 	//     service below, which can stop the machine and can do nothing else.
-	let power: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let power: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle, .. } if len == 5 && &buf[..5] == b"POWER" && handle != 0 => handle,
 		_ => exit(),
 	};
 
 	// 1c. receive the boot mode flag ("MODE" + one byte, 1 = test boot) to relay down
 	//     to ServiceManager, which gates its bring-up self-tests on it.
-	let mode: u8 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let mode: u8 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, .. } if len == 5 && &buf[..4] == b"MODE" => buf[4],
 		_ => exit(),
 	};
@@ -88,7 +88,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     NEXT message rather than searching for it - so anything inserted in the middle shifts
 	//     every read after it and stops the boot chain where it stands.
 	let mut console_caps: [u64; MAX_MESSAGE_CAPS] = [0; MAX_MESSAGE_CAPS];
-	let console_cap_count: usize = match unsafe { recv_message_caps(bootstrap, &mut buf, &mut console_caps) } {
+	let console_cap_count: usize = match recv_message_caps(bootstrap, &mut buf, &mut console_caps) {
 		(len, count) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => count,
 		_ => 0,
 	};
@@ -102,7 +102,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     published" and falls back to its own default. A boot that stops because a supervisor
 	//     could not be told how long it had would be a worse failure than one that runs on the
 	//     compiled-in number.
-	let (boot_deadline, boot_window): (u64, u64) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let (boot_deadline, boot_window): (u64, u64) = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, .. } if len >= 7 + 16 && &buf[..7] == b"BOOTWIN" => (u64::from_le_bytes(buf[7..15].try_into().unwrap_or([0; 8])), u64::from_le_bytes(buf[15..23].try_into().unwrap_or([0; 8]))),
 		_ => (0, 0),
 	};
@@ -111,7 +111,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     mounts one - a format cannot answer it, because two LiberFS volumes differ only by uuid
 	//     and two FAT volumes not even by that.
 	let mut root_selection: [u8; 24] = [0u8; 24];
-	if let Received::Message { len, .. } = unsafe { recv_blocking(bootstrap, &mut buf) }
+	if let Received::Message { len, .. } = recv_blocking(bootstrap, &mut buf)
 		&& len >= 7 + 24
 		&& &buf[..7] == b"ROOTSEL"
 	{
@@ -125,13 +125,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(elf) => elf,
 		None => exit(),
 	};
-	let (sm_side, svc_side): (u64, u64) = match unsafe { channel() } {
+	let (sm_side, svc_side): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => exit(),
 	};
 	// The SystemPower pair: this process serves on one end and the other travels down the boot
 	// chain in place of the root-Domain handle.
-	let (power_server, power_client): (u64, u64) = match unsafe { channel() } {
+	let (power_server, power_client): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => exit(),
 	};
@@ -148,12 +148,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//
 	// NOT resource-bounded here. Limits are ResourceManager's subject and this milestone says so;
 	// a number invented at this line would be a policy nobody declared.
-	let branch_domain: i64 = unsafe { domain_create(u64::MAX, u64::MAX, u64::MAX) };
+	let branch_domain: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
 	if branch_domain < 0 {
-		unsafe { print(b"SystemManager: cannot create the control-plane Domain; boot chain stops here\n") };
+		print(b"SystemManager: cannot create the control-plane Domain; boot chain stops here\n");
 		exit();
 	}
-	if unsafe { spawn_in(svc_elf, svc_side, branch_domain as u64) } < 0 {
+	if spawn_in(svc_elf, svc_side, branch_domain as u64) < 0 {
 		exit();
 	}
 
@@ -211,7 +211,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// drivers. A manager that relayed reports first and served afterwards would be a manager
 	// nobody could reach during the one phase that needs it - which is a deadlock, and it is
 	// exactly what the first version of this did.
-	unsafe { serve_system_power(power, power_server, sm_side, bootstrap, branch_domain as u64, &mut buf) };
+	serve_system_power(power, power_server, sm_side, bootstrap, branch_domain as u64, &mut buf);
 
 	// 5. STAY. This process used to exit here, which left the ServiceManager branch with no owner
 	//    for the whole life of the system - and left the root-Domain handle needing a home, which
@@ -232,7 +232,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 //
 // TWO CHANNELS, ONE LOOP. A request to stop the machine and the death of ServiceManager are both
 // things this process must notice, and a blocking wait on either alone would miss the other.
-unsafe fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, domain: u64, buf: &mut [u8]) {
+fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, domain: u64, buf: &mut [u8]) {
 	unsafe {
 		// THE BRANCH GOES DOWN WITH ITS SUPERVISOR, through the Domain that contains it.
 		//
@@ -335,7 +335,7 @@ struct BranchGuard {
 
 impl Drop for BranchGuard {
 	fn drop(&mut self) {
-		unsafe { domain_kill(self.domain) };
+		domain_kill(self.domain);
 	}
 }
 
@@ -360,7 +360,7 @@ enum PowerStep {
 //
 // THE AUTHORITY NEVER LEAVES THIS PROCESS. What a caller gets back is whether the request was
 // accepted; the syscall is made here, with the handle that stayed here.
-unsafe fn serve_power_once(power: u64, requests: u64, set: u64, connections: &mut [(u64, u64); MAX_POWER_CLIENTS], buf: &mut [u8]) -> PowerStep {
+fn serve_power_once(power: u64, requests: u64, set: u64, connections: &mut [(u64, u64); MAX_POWER_CLIENTS], buf: &mut [u8]) -> PowerStep {
 	unsafe {
 		let len: usize = match try_recv(requests, buf) {
 			Polled::Message { len, .. } => len,

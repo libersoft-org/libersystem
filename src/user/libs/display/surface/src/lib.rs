@@ -31,14 +31,14 @@ impl Mapping {
 		let expected = (info.pitch as u64).checked_mul(info.height as u64)?;
 		if handle == 0 || info.format != PixelFormat::B8g8r8x8 || info.width == 0 || info.height == 0 || info.pitch < info.width.checked_mul(4)? || info.pixels.len < expected {
 			if handle != 0 {
-				unsafe { close(handle) };
+				close(handle);
 			}
 			return None;
 		}
 		let addr = match unsafe { map_object(handle) } {
 			Some(addr) => addr,
 			None => {
-				unsafe { close(handle) };
+				close(handle);
 				return None;
 			}
 		};
@@ -57,10 +57,8 @@ impl Mapping {
 
 impl Drop for Mapping {
 	fn drop(&mut self) {
-		unsafe {
-			unmap_object(self.handle);
-			close(self.handle);
-		}
+		unmap_object(self.handle);
+		close(self.handle);
 	}
 }
 

@@ -23,7 +23,7 @@ unsafe fn read_fixture(root: u64, path: &str) -> Option<Vec<u8>> {
 	}
 }
 
-pub(super) unsafe fn routed_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64) -> bool {
+pub(super) fn routed_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64) -> bool {
 	unsafe {
 		let Some(expected) = read_fixture(system, "vol://system/hello.txt") else { return false };
 		if expected.is_empty() {

@@ -126,7 +126,7 @@ impl DisplayState {
 		}
 		let pitch: u32 = width.checked_mul(4).ok_or(Error::Invalid)?;
 		let len: u64 = (pitch as u64).checked_mul(height as u64).ok_or(Error::Invalid)?;
-		let handle: i64 = unsafe { memory_object_create(len) };
+		let handle: i64 = memory_object_create(len);
 		if handle < 0 {
 			return Err(Error::Again);
 		}
@@ -134,17 +134,15 @@ impl DisplayState {
 		let addr: u64 = match unsafe { map_object(handle) } {
 			Some(addr) => addr,
 			None => {
-				unsafe { close(handle) };
+				close(handle);
 				return Err(Error::Again);
 			}
 		};
 		unsafe { core::ptr::write_bytes(addr as *mut u8, 0, len as usize) };
-		let granted: i64 = unsafe { duplicate(handle, RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER) };
+		let granted: i64 = duplicate(handle, RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER);
 		if granted < 0 {
-			unsafe {
-				unmap_object(handle);
-				close(handle);
-			}
+			unmap_object(handle);
+			close(handle);
 			return Err(Error::Again);
 		}
 		self.remove_surface(chan, false);
@@ -170,11 +168,11 @@ impl DisplayState {
 			return Ok(());
 		}
 		let source_pixels: u64 = width as u64 * height as u64;
-		let start_ns: u64 = unsafe { clock_ns() };
+		let start_ns: u64 = clock_ns();
 		let blit: pix::BlitResult = self.blit(index, Rect { x, y, width, height });
-		let blit_done_ns: u64 = unsafe { clock_ns() };
+		let blit_done_ns: u64 = clock_ns();
 		let result: Result<(), Error> = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
-		let done_ns: u64 = unsafe { clock_ns() };
+		let done_ns: u64 = clock_ns();
 		let blit_ns: u64 = blit_done_ns.saturating_sub(start_ns);
 		let flush_ns: u64 = done_ns.saturating_sub(blit_done_ns);
 		let total_ns: u64 = done_ns.saturating_sub(start_ns);
@@ -198,9 +196,7 @@ impl DisplayState {
 		// a present that went nowhere a frame that arrived (corrected 2026-09-03).
 		if self.report_present && self.scanout.gpu != 0 {
 			self.report_present = false;
-			unsafe {
-				debug_write(if result.is_ok() { b"DisplayService: a frame reached the display through the provider it adopted\n".as_slice() } else { b"DisplayService: a frame did NOT reach the display through the provider it adopted\n".as_slice() });
-			}
+			debug_write(if result.is_ok() { b"DisplayService: a frame reached the display through the provider it adopted\n".as_slice() } else { b"DisplayService: a frame did NOT reach the display through the provider it adopted\n".as_slice() });
 		}
 		result
 	}
@@ -225,21 +221,21 @@ impl DisplayState {
 	fn revoke_focus(&mut self) {
 		for surface in &mut self.surfaces {
 			if surface.focus_proof != 0 {
-				unsafe { close(surface.focus_proof) };
+				close(surface.focus_proof);
 				surface.focus_proof = 0;
 			}
 		}
 	}
 
 	fn focus_command(&self, command: &[u8], handle: u64) -> bool {
-		if self.focus_control == 0 || !unsafe { send_blocking(self.focus_control, command, handle) } {
+		if self.focus_control == 0 || !send_blocking(self.focus_control, command, handle) {
 			return false;
 		}
 		let mut reply: [u8; 8] = [0; 8];
-		match unsafe { recv_blocking(self.focus_control, &mut reply) } {
+		match recv_blocking(self.focus_control, &mut reply) {
 			Received::Message { len, handle } => {
 				if handle != 0 {
-					unsafe { close(handle) };
+					close(handle);
 				}
 				len >= 2 && &reply[..2] == b"OK"
 			}
@@ -262,30 +258,26 @@ impl DisplayState {
 			return;
 		}
 		let Some(index) = self.surface_index(chan) else { return };
-		let (proof, registered): (u64, u64) = match unsafe { channel() } {
+		let (proof, registered): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return,
 		};
 		if self.focus_command(b"SET", registered) {
 			self.surfaces[index].focus_proof = proof;
 		} else {
-			unsafe {
-				close(proof);
-				close(registered);
-			}
+			close(proof);
+			close(registered);
 		}
 	}
 
 	fn remove_surface(&mut self, chan: u64, restore: bool) {
 		if let Some(index) = self.surface_index(chan) {
 			let surface: Surface = self.surfaces.swap_remove(index);
-			unsafe {
-				if surface.focus_proof != 0 {
-					close(surface.focus_proof);
-				}
-				unmap_object(surface.handle);
-				close(surface.handle);
+			if surface.focus_proof != 0 {
+				close(surface.focus_proof);
 			}
+			unmap_object(surface.handle);
+			close(surface.handle);
 		}
 		if !restore {
 			return;
@@ -306,14 +298,14 @@ impl DisplayState {
 		self.remove_surface(chan, true);
 		if let Some(index) = self.events.iter().position(|stream: &EventStream| stream.chan == chan) {
 			let stream: EventStream = self.events.swap_remove(index);
-			unsafe { close(stream.producer) };
+			close(stream.producer);
 		}
 	}
 
 	fn set_event_stream(&mut self, chan: u64, producer: u64) {
 		if let Some(index) = self.events.iter().position(|stream: &EventStream| stream.chan == chan) {
 			let old: EventStream = self.events.swap_remove(index);
-			unsafe { close(old.producer) };
+			close(old.producer);
 		}
 		self.events.push(EventStream { chan, producer, seq: 0 });
 	}
@@ -325,7 +317,7 @@ impl DisplayState {
 		while i < self.events.len() {
 			let mut frame_handles = Handles::new();
 			let sent: bool = match display::events_frame(self.events[i].seq, &event, &mut frame, &mut frame_handles) {
-				Some(n) => unsafe { send_caps_blocking(self.events[i].producer, &frame[..n], frame_handles.as_slice()) },
+				Some(n) => send_caps_blocking(self.events[i].producer, &frame[..n], frame_handles.as_slice()),
 				None => false,
 			};
 			if sent {
@@ -333,10 +325,10 @@ impl DisplayState {
 				i += 1;
 			} else {
 				for handle in frame_handles.as_slice() {
-					unsafe { close(*handle) };
+					close(*handle);
 				}
 				let dead: EventStream = self.events.swap_remove(i);
-				unsafe { close(dead.producer) };
+				close(dead.producer);
 			}
 		}
 	}
@@ -370,21 +362,21 @@ impl DisplayState {
 		msg[11..15].copy_from_slice(&rect.1.to_le_bytes());
 		msg[15..19].copy_from_slice(&rect.2.to_le_bytes());
 		msg[19..23].copy_from_slice(&rect.3.to_le_bytes());
-		if !unsafe { send_blocking(self.scanout.gpu, &msg, 0) } {
+		if !send_blocking(self.scanout.gpu, &msg, 0) {
 			return Err(Error::Closed);
 		}
 		let mut reply: [u8; 64] = [0; 64];
 		loop {
-			match unsafe { recv_blocking(self.scanout.gpu, &mut reply) } {
+			match recv_blocking(self.scanout.gpu, &mut reply) {
 				Received::Message { len, handle } if len >= 2 && &reply[..2] == b"OK" => {
 					if handle != 0 {
-						unsafe { close(handle) };
+						close(handle);
 					}
 					return Ok(());
 				}
 				Received::Message { len, handle } if len >= 3 && &reply[..3] == b"ERR" => {
 					if handle != 0 {
-						unsafe { close(handle) };
+						close(handle);
 					}
 					return Err(Error::Again);
 				}
@@ -407,7 +399,7 @@ impl DisplayState {
 	// something to replace it with.
 	fn release_scanout(&mut self) {
 		if self.scanout.gpu != 0 {
-			unsafe { close(self.scanout.gpu) };
+			close(self.scanout.gpu);
 			self.scanout.gpu = 0;
 		}
 		// AND THE PENDING REPORT GOES WITH IT (corrected 2026-09-03). The latch is armed by an
@@ -468,7 +460,7 @@ impl DisplayState {
 		if msg.len() >= 5 && &msg[..5] == b"FBNEW" && handle != 0 {
 			let fb_len: usize = core::mem::size_of::<Framebuffer>();
 			if msg.len() < 5 + fb_len + 8 {
-				unsafe { close(handle) };
+				close(handle);
 				return false;
 			}
 			let fb: Framebuffer = unsafe { (msg[5..].as_ptr() as *const Framebuffer).read_unaligned() };
@@ -476,12 +468,10 @@ impl DisplayState {
 			let height: u32 = read_u32(msg, 5 + fb_len + 4);
 			let addr: i64 = unsafe { dma_buffer_map(handle) };
 			if sys_is_err(addr as u64) || !valid_scanout(&fb, width, height) {
-				unsafe {
-					if !sys_is_err(addr as u64) {
-						dma_buffer_unmap(handle);
-					}
-					close(handle);
+				if !sys_is_err(addr as u64) {
+					dma_buffer_unmap(handle);
 				}
+				close(handle);
 				return false;
 			}
 			let old: u64 = self.scanout.handle;
@@ -494,16 +484,14 @@ impl DisplayState {
 				surface.initialized = false;
 			}
 			if old != 0 {
-				unsafe {
-					dma_buffer_unmap(old);
-					close(old);
-				}
+				dma_buffer_unmap(old);
+				close(old);
 			}
 			return true;
 		}
 		if msg.len() >= 14 && &msg[..6] == b"RESIZE" {
 			if handle != 0 {
-				unsafe { close(handle) };
+				close(handle);
 			}
 			let width: u32 = read_u32(msg, 6);
 			let height: u32 = read_u32(msg, 10);
@@ -518,7 +506,7 @@ impl DisplayState {
 			return false;
 		}
 		if handle != 0 {
-			unsafe { close(handle) };
+			close(handle);
 		}
 		false
 	}
@@ -561,10 +549,10 @@ impl AdminService for AdminCall<'_> {
 		if task == 0 {
 			return Err(Error::Invalid);
 		}
-		let (server, client): (u64, u64) = match unsafe { channel() } {
+		let (server, client): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => {
-				unsafe { close(task) };
+				close(task);
 				return Err(Error::Again);
 			}
 		};
@@ -636,18 +624,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Zero is not a failure. A boot that granted no catalogue connection, or a catalogue that refuses
 // the subscription, is a system whose display cannot be replaced - which this service reports and
 // goes on serving whatever scanout it has, the same way it serves a machine with no GPU at all.
-unsafe fn subscribe_to_displays(catalogue: u64) -> u64 {
-	unsafe {
-		if catalogue == 0 {
-			print(b"DisplayService: no provider catalogue - this instance cannot follow a display that rebinds\n");
-			return 0;
-		}
-		let subscription: u64 = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Display).unwrap_or(0);
-		if subscription == 0 {
-			print(b"DisplayService: the catalogue refused a display subscription\n");
-		}
-		subscription
+fn subscribe_to_displays(catalogue: u64) -> u64 {
+	if catalogue == 0 {
+		print(b"DisplayService: no provider catalogue - this instance cannot follow a display that rebinds\n");
+		return 0;
 	}
+	let subscription: u64 = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Display).unwrap_or(0);
+	if subscription == 0 {
+		print(b"DisplayService: the catalogue refused a display subscription\n");
+	}
+	subscription
 }
 
 // OPEN A CONNECTION TO ONE PUBLISHED PROVIDER, or answer zero.
@@ -655,23 +641,21 @@ unsafe fn subscribe_to_displays(catalogue: u64) -> u64 {
 // The catalogue mints the pair and hands the driver the server end; what comes back is the client
 // end this service talks the driver's byte protocol over - the same channel `GPU` used to carry,
 // reached by asking instead of by being given.
-unsafe fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
-	unsafe {
-		if catalogue == 0 {
-			return 0;
+fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
+	if catalogue == 0 {
+		return 0;
+	}
+	match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(info) {
+		Some(Ok(handle)) => handle,
+		// A REFUSAL IS SAID. A kind that admits one consumer refuses the second ask, and a
+		// service that cannot tell that from "no device" cannot report either.
+		Some(Err(_)) => {
+			print(b"DisplayService: the catalogue refused a connection to the display provider it published\n");
+			0
 		}
-		match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(info) {
-			Some(Ok(handle)) => handle,
-			// A REFUSAL IS SAID. A kind that admits one consumer refuses the second ask, and a
-			// service that cannot tell that from "no device" cannot report either.
-			Some(Err(_)) => {
-				print(b"DisplayService: the catalogue refused a connection to the display provider it published\n");
-				0
-			}
-			None => {
-				print(b"DisplayService: the catalogue did not answer the connection it published\n");
-				0
-			}
+		None => {
+			print(b"DisplayService: the catalogue did not answer the connection it published\n");
+			0
 		}
 	}
 }
@@ -685,28 +669,26 @@ unsafe fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
 // It stops at the first provider it CONNECTS to rather than draining the channel: a frame this
 // function reads and drops is a publication the standing loop will never see, and a second display
 // is exactly the thing this milestone exists to stop dropping.
-unsafe fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> u64 {
-	unsafe {
-		if catalogue == 0 || providers == 0 {
-			return 0;
+fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> u64 {
+	if catalogue == 0 || providers == 0 {
+		return 0;
+	}
+	loop {
+		let PolledCaps::Message { len, handles } = try_recv_caps(providers, buf) else { return 0 };
+		for &handle in handles.as_slice() {
+			close(handle);
 		}
-		loop {
-			let PolledCaps::Message { len, handles } = try_recv_caps(providers, buf) else { return 0 };
-			for &handle in handles.as_slice() {
-				close(handle);
-			}
-			let mut frame_handles = wire::Handles::new();
-			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
-				print(b"DisplayService: a provider frame did not decode\n");
-				continue;
-			};
-			if !info.live {
-				continue;
-			}
-			let opened: u64 = open_provider(catalogue, &info);
-			if opened != 0 {
-				return opened;
-			}
+		let mut frame_handles = wire::Handles::new();
+		let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+			print(b"DisplayService: a provider frame did not decode\n");
+			continue;
+		};
+		if !info.live {
+			continue;
+		}
+		let opened: u64 = open_provider(catalogue, &info);
+		if opened != 0 {
+			return opened;
 		}
 	}
 }
@@ -738,226 +720,225 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, buf: &mut [u8]) -> Scanout {
 	}
 }
 
-unsafe fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
-	unsafe {
-		let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
-		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
-		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
-		loop {
-			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 4);
-			if state.scanout.gpu != 0 {
-				waits.push(state.scanout.gpu);
-			}
-			if providers != 0 {
-				waits.push(providers);
-			}
-			if state.kill_control != 0 {
-				waits.push(state.kill_control);
-			}
-			waits.push(admin);
-			waits.extend(clients.iter().map(|client| client.chan));
-			let ready: i64 = wait_any(&waits, 0);
-			if ready < 0 {
-				continue;
-			}
-			let gpu_first: bool = state.scanout.gpu != 0;
-			if gpu_first && ready == 0 {
-				match recv_blocking(state.scanout.gpu, &mut request) {
-					Received::Message { len, handle } => {
-						if state.handle_gpu_message(&request[..len], handle) {
-							state.notify_resize();
-							state.present_active_full();
-						}
-					}
-					// THE DRIVER WENT AWAY, AND WHAT IT LEFT GOES WITH IT. This only cleared the
-					// channel number, so the dead handle stayed open in this process and the
-					// scanout kept pointing into a mapping of a buffer whose owner had gone. A
-					// replacement cannot be adopted on top of that, which is half of why M4's
-					// restore was unreachable.
-					Received::Closed => state.release_scanout(),
-				}
-				continue;
-			}
-			// A PUBLICATION OR A WITHDRAWAL, AND THE ONLY ONE THAT MATTERS IS A DISPLAY ARRIVING
-			// WHILE THIS SERVICE HAS NONE.
-			//
-			// That is M4: a GPU driver crashes, DeviceManager rebinds it, the new binding publishes
-			// its provider, and the display path comes back without restarting the service or
-			// anything above it. A withdrawal needs nothing here - the driver channel closing is the
-			// authoritative signal and the arm above already handles it.
-			let providers_index: usize = gpu_first as usize;
-			let providers_present: bool = providers != 0;
-			if providers_present && ready as usize == providers_index {
-				match recv_blocking(providers, &mut request) {
-					Received::Message { len, handle } => {
-						if handle != 0 {
-							close(handle);
-						}
-						let mut frame_handles = wire::Handles::new();
-						match provider_catalogue::subscribe_read(&request[..len], &mut frame_handles) {
-							Some(info) if info.live && state.scanout.gpu == 0 => {
-								let opened: u64 = open_provider(catalogue, &info);
-								if opened == 0 {
-									print(b"DisplayService: a display provider is published and this service could not connect to it\n");
-								} else if state.adopt_scanout(opened, &mut request) {
-									print(b"DisplayService: a display provider was published and this service presents on it\n");
-									state.notify_resize();
-									state.present_active_full();
-								} else {
-									// A CONNECTION THAT CANNOT ANSWER THE FRAMEBUFFER HANDSHAKE IS
-									// GIVEN BACK, not held: a provider this service keeps and does
-									// not use is a channel the driver waits on forever.
-									close(opened);
-									print(b"DisplayService: a published display provider did not hand over a usable framebuffer\n");
-								}
-							}
-							// A WITHDRAWAL, WHICH THIS SERVICE ACTS ON BY SAYING SO AND NOTHING
-							// MORE - and now it says so (2026-09-03).
-							//
-							// The arm was silent, and silence is the same as the announcement never
-							// arriving: `Catalogue::announce_gone` could be emptied and nothing in
-							// any suite would notice, so the second of M7's two production effects
-							// had no oracle at all. It is a LINE and not a state change on purpose:
-							// the scanout is released when the driver's channel closes, which is the
-							// authoritative signal for a driver that has actually gone, and a
-							// withdrawal frame is a manager saying the publication is over.
-							Some(info) if !info.live => {
-								print(b"DisplayService: a display provider was withdrawn and this service was told\n");
-							}
-							Some(_) => {}
-							None => print(b"DisplayService: a provider frame did not decode\n"),
-						}
-					}
-					// THE SUBSCRIPTION ENDED. DeviceManager is gone or dropped it; this service keeps
-					// whatever scanout it has and stops expecting new ones.
-					Received::Closed => {
-						close(providers);
-						providers = 0;
+fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
+	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
+	let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
+	let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
+	loop {
+		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 4);
+		if state.scanout.gpu != 0 {
+			waits.push(state.scanout.gpu);
+		}
+		if providers != 0 {
+			waits.push(providers);
+		}
+		if state.kill_control != 0 {
+			waits.push(state.kill_control);
+		}
+		waits.push(admin);
+		waits.extend(clients.iter().map(|client| client.chan));
+		let ready: i64 = wait_any(&waits, 0);
+		if ready < 0 {
+			continue;
+		}
+		let gpu_first: bool = state.scanout.gpu != 0;
+		if gpu_first && ready == 0 {
+			match recv_blocking(state.scanout.gpu, &mut request) {
+				Received::Message { len, handle } => {
+					if state.handle_gpu_message(&request[..len], handle) {
+						state.notify_resize();
+						state.present_active_full();
 					}
 				}
-				continue;
+				// THE DRIVER WENT AWAY, AND WHAT IT LEFT GOES WITH IT. This only cleared the
+				// channel number, so the dead handle stayed open in this process and the
+				// scanout kept pointing into a mapping of a buffer whose owner had gone. A
+				// replacement cannot be adopted on top of that, which is half of why M4's
+				// restore was unreachable.
+				Received::Closed => state.release_scanout(),
 			}
-			let kill_index: usize = gpu_first as usize + providers_present as usize;
-			let kill_present: bool = state.kill_control != 0;
-			if kill_present && ready as usize == kill_index {
-				match recv_blocking(state.kill_control, &mut request) {
-					Received::Message { len, handle } => {
-						if handle != 0 {
-							close(handle);
-						}
-						if len >= 4
-							&& &request[..4] == b"KILL"
-							&& state.active != 0 && state.active != state.console
-							&& let Some(victim) = clients.iter().position(|client| client.chan == state.active)
-						{
-							let chan: u64 = clients[victim].chan;
-							if clients[victim].task != 0 {
-								let _ = signal(clients[victim].task, SIG_KILL);
-							}
-							state.drop_client(chan);
-							close(chan);
-							let victim: Client = clients.swap_remove(victim);
-							if victim.task != 0 {
-								close(victim.task);
-							}
-						}
+			continue;
+		}
+		// A PUBLICATION OR A WITHDRAWAL, AND THE ONLY ONE THAT MATTERS IS A DISPLAY ARRIVING
+		// WHILE THIS SERVICE HAS NONE.
+		//
+		// That is M4: a GPU driver crashes, DeviceManager rebinds it, the new binding publishes
+		// its provider, and the display path comes back without restarting the service or
+		// anything above it. A withdrawal needs nothing here - the driver channel closing is the
+		// authoritative signal and the arm above already handles it.
+		let providers_index: usize = gpu_first as usize;
+		let providers_present: bool = providers != 0;
+		if providers_present && ready as usize == providers_index {
+			match recv_blocking(providers, &mut request) {
+				Received::Message { len, handle } => {
+					if handle != 0 {
+						close(handle);
 					}
-					Received::Closed => state.kill_control = 0,
+					let mut frame_handles = wire::Handles::new();
+					match provider_catalogue::subscribe_read(&request[..len], &mut frame_handles) {
+						Some(info) if info.live && state.scanout.gpu == 0 => {
+							let opened: u64 = open_provider(catalogue, &info);
+							if opened == 0 {
+								print(b"DisplayService: a display provider is published and this service could not connect to it\n");
+							} else if state.adopt_scanout(opened, &mut request) {
+								print(b"DisplayService: a display provider was published and this service presents on it\n");
+								state.notify_resize();
+								state.present_active_full();
+							} else {
+								// A CONNECTION THAT CANNOT ANSWER THE FRAMEBUFFER HANDSHAKE IS
+								// GIVEN BACK, not held: a provider this service keeps and does
+								// not use is a channel the driver waits on forever.
+								close(opened);
+								print(b"DisplayService: a published display provider did not hand over a usable framebuffer\n");
+							}
+						}
+						// A WITHDRAWAL, WHICH THIS SERVICE ACTS ON BY SAYING SO AND NOTHING
+						// MORE - and now it says so (2026-09-03).
+						//
+						// The arm was silent, and silence is the same as the announcement never
+						// arriving: `Catalogue::announce_gone` could be emptied and nothing in
+						// any suite would notice, so the second of M7's two production effects
+						// had no oracle at all. It is a LINE and not a state change on purpose:
+						// the scanout is released when the driver's channel closes, which is the
+						// authoritative signal for a driver that has actually gone, and a
+						// withdrawal frame is a manager saying the publication is over.
+						Some(info) if !info.live => {
+							print(b"DisplayService: a display provider was withdrawn and this service was told\n");
+						}
+						Some(_) => {}
+						None => print(b"DisplayService: a provider frame did not decode\n"),
+					}
 				}
-				continue;
+				// THE SUBSCRIPTION ENDED. DeviceManager is gone or dropped it; this service keeps
+				// whatever scanout it has and stops expecting new ones.
+				Received::Closed => {
+					close(providers);
+					providers = 0;
+				}
 			}
-			let admin_index: usize = gpu_first as usize + providers_present as usize + kill_present as usize;
-			if ready as usize == admin_index {
-				match recv_caps_blocking(admin, &mut request) {
-					ReceivedCaps::Message { len, handles: caps } => {
-						let mut reply_handle = proto::codec::Handles::new();
-						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-						// over the single-handle receive, which keeps the first and drops the rest - so a
-						// client sending stdin, stdout and stderr had two destroyed before dispatch.
-						let mut handle = caps;
-						let mut call = AdminCall { clients: &mut clients, stats: &state.stats };
-						if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
-								}
-							}
-						} else {
-							for &leftover in reply_handle.as_slice() {
-								close(leftover);
-							}
+			continue;
+		}
+		let kill_index: usize = gpu_first as usize + providers_present as usize;
+		let kill_present: bool = state.kill_control != 0;
+		if kill_present && ready as usize == kill_index {
+			match recv_blocking(state.kill_control, &mut request) {
+				Received::Message { len, handle } => {
+					if handle != 0 {
+						close(handle);
+					}
+					if len >= 4
+						&& &request[..4] == b"KILL"
+						&& state.active != 0
+						&& state.active != state.console
+						&& let Some(victim) = clients.iter().position(|client| client.chan == state.active)
+					{
+						let chan: u64 = clients[victim].chan;
+						if clients[victim].task != 0 {
+							let _ = signal(clients[victim].task, SIG_KILL);
 						}
-						for &unclaimed in handle.as_slice() {
-							close(unclaimed);
+						state.drop_client(chan);
+						close(chan);
+						let victim: Client = clients.swap_remove(victim);
+						if victim.task != 0 {
+							close(victim.task);
 						}
 					}
-					ReceivedCaps::Closed => exit(),
 				}
-				continue;
+				Received::Closed => state.kill_control = 0,
 			}
-			let client_index: usize = ready as usize - admin_index - 1;
-			let chan: u64 = clients[client_index].chan;
-			match recv_caps_blocking(chan, &mut request) {
-				ReceivedCaps::Message { len, handles: caps } if len == 0 => {
-					for &leftover in caps.as_slice() {
-						close(leftover);
-					}
-					if client_index == 0 {
-						exit();
-					}
-					state.drop_client(chan);
-					close(chan);
-					clients.swap_remove(client_index);
-				}
+			continue;
+		}
+		let admin_index: usize = gpu_first as usize + providers_present as usize + kill_present as usize;
+		if ready as usize == admin_index {
+			match recv_caps_blocking(admin, &mut request) {
 				ReceivedCaps::Message { len, handles: caps } => {
+					let mut reply_handle = proto::codec::Handles::new();
 					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 					// over the single-handle receive, which keeps the first and drops the rest - so a
 					// client sending stdin, stdout and stderr had two destroyed before dispatch.
 					let mut handle = caps;
-					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-					if op == HEARTBEAT_OP {
-						send_blocking(chan, b"PONG", 0);
-					} else if op == CONNECT_OP && clients[client_index].task == 0 {
-						match channel() {
-							Some((mine, theirs)) => {
-								clients.push(Client { chan: mine, task: 0 });
-								send_blocking(chan, &[], theirs);
-							}
-							None => {
-								send_blocking(chan, &[], 0);
-							}
-						}
-					} else if op == display::OP_EVENTS {
-						open_events(chan, &request[..len], &mut handle, &mut state);
-					} else {
-						let mut reply_handle = proto::codec::Handles::new();
-						let mut call = DisplayCall { state: &mut state, chan };
-						if let Some(n) = display::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_caps_blocking(chan, &reply[..n], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
-								}
-							}
-						} else {
+					let mut call = AdminCall { clients: &mut clients, stats: &state.stats };
+					if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+						if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
 							for &leftover in reply_handle.as_slice() {
 								close(leftover);
 							}
+						}
+					} else {
+						for &leftover in reply_handle.as_slice() {
+							close(leftover);
 						}
 					}
 					for &unclaimed in handle.as_slice() {
 						close(unclaimed);
 					}
 				}
-				ReceivedCaps::Closed => {
-					if client_index == 0 {
-						exit();
+				ReceivedCaps::Closed => exit(),
+			}
+			continue;
+		}
+		let client_index: usize = ready as usize - admin_index - 1;
+		let chan: u64 = clients[client_index].chan;
+		match recv_caps_blocking(chan, &mut request) {
+			ReceivedCaps::Message { len, handles: caps } if len == 0 => {
+				for &leftover in caps.as_slice() {
+					close(leftover);
+				}
+				if client_index == 0 {
+					exit();
+				}
+				state.drop_client(chan);
+				close(chan);
+				clients.swap_remove(client_index);
+			}
+			ReceivedCaps::Message { len, handles: caps } => {
+				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+				// over the single-handle receive, which keeps the first and drops the rest - so a
+				// client sending stdin, stdout and stderr had two destroyed before dispatch.
+				let mut handle = caps;
+				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+				if op == HEARTBEAT_OP {
+					send_blocking(chan, b"PONG", 0);
+				} else if op == CONNECT_OP && clients[client_index].task == 0 {
+					match channel() {
+						Some((mine, theirs)) => {
+							clients.push(Client { chan: mine, task: 0 });
+							send_blocking(chan, &[], theirs);
+						}
+						None => {
+							send_blocking(chan, &[], 0);
+						}
 					}
-					state.drop_client(chan);
-					close(chan);
-					let client: Client = clients.swap_remove(client_index);
-					if client.task != 0 {
-						close(client.task);
+				} else if op == display::OP_EVENTS {
+					open_events(chan, &request[..len], &mut handle, &mut state);
+				} else {
+					let mut reply_handle = proto::codec::Handles::new();
+					let mut call = DisplayCall { state: &mut state, chan };
+					if let Some(n) = display::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+						if !send_caps_blocking(chan, &reply[..n], reply_handle.as_slice()) {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
+						}
+					} else {
+						for &leftover in reply_handle.as_slice() {
+							close(leftover);
+						}
 					}
+				}
+				for &unclaimed in handle.as_slice() {
+					close(unclaimed);
+				}
+			}
+			ReceivedCaps::Closed => {
+				if client_index == 0 {
+					exit();
+				}
+				state.drop_client(chan);
+				close(chan);
+				let client: Client = clients.swap_remove(client_index);
+				if client.task != 0 {
+					close(client.task);
 				}
 			}
 		}
@@ -970,17 +951,15 @@ fn open_events(chan: u64, request: &[u8], request_handle: &mut proto::codec::Han
 	}
 	let corr: u32 = read_u32(request, 2);
 	request_handle.clear();
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return,
 	};
-	if unsafe { send_blocking(chan, &corr.to_le_bytes(), consumer) } {
+	if send_blocking(chan, &corr.to_le_bytes(), consumer) {
 		state.set_event_stream(chan, producer);
 	} else {
-		unsafe {
-			close(producer);
-			close(consumer);
-		}
+		close(producer);
+		close(consumer);
 	}
 }
 

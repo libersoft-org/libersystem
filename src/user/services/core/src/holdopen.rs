@@ -35,33 +35,31 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 32] = [0u8; 32];
-	unsafe {
-		loop {
-			// SLEEP UNTIL THERE IS SOMETHING, at ~0% CPU. A spin would be worse than the exit it
-			// replaces: the kernel harness drains with `run_until_idle`, and a process that never
-			// stops running never lets the scheduler go idle.
-			if wait(bootstrap, 0) < 0 {
-				break;
-			}
-			// STATICALLY LINKED and PINNED into the init package, which is what makes it reachable
-			// at all: the test that needs it drives ProcessService with no storage client, so
-			// programs come from the package rather than from the volume, and a volume-staged tool
-			// cannot be launched there. It is a probe rather than a tool for the same reason -
-			// `resource_probe` beside it is pinned too - and the manifest enforces that a tool is
-			// volume-staged.
-			match recv_into(bootstrap, &mut buf) {
-				// Anything at all is a request to stop - the test does not send, so this is only
-				// reached if somebody decides to. Answering it beats ignoring it.
-				RecvInto::Received(_) => break,
-				// The test let go of its end: there is nothing left to be held open for.
-				RecvInto::PeerClosed => break,
-				// `wait` said readable and the message was gone: another reader took it. Back to
-				// waiting - this is the one case that is not a reason to stop.
-				RecvInto::Empty => continue,
-				// The receive itself failed - a handle without the right, or one that is not a
-				// channel. Not reachable in the test that uses this, and breaking beats spinning.
-				RecvInto::Failed => break,
-			}
+	loop {
+		// SLEEP UNTIL THERE IS SOMETHING, at ~0% CPU. A spin would be worse than the exit it
+		// replaces: the kernel harness drains with `run_until_idle`, and a process that never
+		// stops running never lets the scheduler go idle.
+		if wait(bootstrap, 0) < 0 {
+			break;
+		}
+		// STATICALLY LINKED and PINNED into the init package, which is what makes it reachable
+		// at all: the test that needs it drives ProcessService with no storage client, so
+		// programs come from the package rather than from the volume, and a volume-staged tool
+		// cannot be launched there. It is a probe rather than a tool for the same reason -
+		// `resource_probe` beside it is pinned too - and the manifest enforces that a tool is
+		// volume-staged.
+		match recv_into(bootstrap, &mut buf) {
+			// Anything at all is a request to stop - the test does not send, so this is only
+			// reached if somebody decides to. Answering it beats ignoring it.
+			RecvInto::Received(_) => break,
+			// The test let go of its end: there is nothing left to be held open for.
+			RecvInto::PeerClosed => break,
+			// `wait` said readable and the message was gone: another reader took it. Back to
+			// waiting - this is the one case that is not a reason to stop.
+			RecvInto::Empty => continue,
+			// The receive itself failed - a handle without the right, or one that is not a
+			// channel. Not reachable in the test that uses this, and breaking beats spinning.
+			RecvInto::Failed => break,
 		}
 	}
 	exit();

@@ -18,31 +18,29 @@ use rt::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
-		//    output renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" /
-		//    "json-min" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let mode: Option<JsonMode> = JsonMode::parse(argument);
-		// 3. read the online CPU set and the CPU model, and render them.
-		let mut ids: [u64; 64] = [0u64; 64];
-		let count: i64 = cpu_info(&mut ids);
-		if count <= 0 {
-			eprint(b"lscpu: query error\n");
-			exit();
-		}
-		let mut model_buf: [u8; 64] = [0u8; 64];
-		let model_len: i64 = cpu_name(&mut model_buf);
-		let model: &str = if model_len > 0 { core::str::from_utf8(&model_buf[..model_len as usize]).unwrap_or("") } else { "" };
-		let n: usize = (count as usize).min(ids.len());
-		print(render(&ids[..n], count as u64, model, mode).as_bytes());
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our
+	//    output renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" /
+	//    "json-min" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let mode: Option<JsonMode> = JsonMode::parse(argument);
+	// 3. read the online CPU set and the CPU model, and render them.
+	let mut ids: [u64; 64] = [0u64; 64];
+	let count: i64 = cpu_info(&mut ids);
+	if count <= 0 {
+		eprint(b"lscpu: query error\n");
+		exit();
 	}
+	let mut model_buf: [u8; 64] = [0u8; 64];
+	let model_len: i64 = cpu_name(&mut model_buf);
+	let model: &str = if model_len > 0 { core::str::from_utf8(&model_buf[..model_len as usize]).unwrap_or("") } else { "" };
+	let n: usize = (count as usize).min(ids.len());
+	print(render(&ids[..n], count as u64, model, mode).as_bytes());
 	exit();
 }
 

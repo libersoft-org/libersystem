@@ -147,7 +147,7 @@ struct Port<'a> {
 impl Port<'_> {
 	// Reap every transmit completion the device has posted, which is what releases the
 	// buffer for the next write.
-	unsafe fn reclaim(&mut self) {
+	fn reclaim(&mut self) {
 		unsafe {
 			while self.tx.take_used().is_some() {
 				self.busy = false;
@@ -198,7 +198,7 @@ impl Port<'_> {
 //
 // A replacement byte channel remains owned until `adopt` discards the old session's receive pool.
 // Other frames must be PING or STOP for this generation; unexpected handles are closed.
-unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64, pending_bytes: &mut u64) -> bool {
+fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64, pending_bytes: &mut u64) -> bool {
 	unsafe {
 		let mut buf: [u8; 64] = [0u8; 64];
 		loop {
@@ -259,7 +259,7 @@ unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64,
 
 // Backpressure retains the current payload while control remains live. SYS_WAIT_ANY observes
 // readability, so wait on bootstrap and retry capacity on the next periodic clock tick.
-unsafe fn send_to_agent(bind: &common::Bind, bootstrap: u64, capability: u64, pending_bytes: &mut u64, bytes: u64, payload: &[u8]) -> bool {
+fn send_to_agent(bind: &common::Bind, bootstrap: u64, capability: u64, pending_bytes: &mut u64, bytes: u64, payload: &[u8]) -> bool {
 	unsafe {
 		loop {
 			if !heartbeat(bind, bootstrap, capability, pending_bytes) {
@@ -364,7 +364,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 // the host that reconnects. Turning the ring is right because eight buffers is all the device
 // has: stopping here would leave it with nowhere to put what a host is still writing, and the
 // port would still be stalled once the new agent arrived.
-unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, dead: u64, pending_bytes: &mut u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
+fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, dead: u64, pending_bytes: &mut u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
 	unsafe {
 		close(dead);
 		// BIG ENOUGH FOR THE FRAME IT IS MEANT TO READ. This was 16 bytes - smaller than the 20-byte

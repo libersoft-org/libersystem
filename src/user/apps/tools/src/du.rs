@@ -50,102 +50,98 @@ struct DirUsage {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message).
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - flags and an optional path, in any order.
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arg_raw: Vec<u8> = context.arguments.clone().into_bytes();
-		let mut summary_only: bool = false;
-		let mut human: bool = false;
-		let mut mode: Option<JsonMode> = None;
-		let mut arg: Vec<u8> = Vec::new();
-		for token in arg_raw.split(|&b| b == b' ').filter(|t: &&[u8]| !t.is_empty()) {
-			match token {
-				b"-s" => summary_only = true,
-				b"-h" => human = true,
-				b"json" | b"json-min" => mode = JsonMode::parse(token),
-				_ if token.starts_with(b"-") => {
-					print(USAGE);
-					exit();
-				}
-				_ if arg.is_empty() => arg.extend_from_slice(token),
-				_ => {
-					print(USAGE);
-					exit();
-				}
-			}
-		}
-		// 3. receive the five volume clients the `volumes` capability bundles (SYSTEM /
-		//    MEDIA / ISO / UDF / USB, in grant order); a volume whose disk is absent is 0.
-		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
-		// for are simply not taken, and the set closes them when it drops - where before they had
-		// to be drained by hand, because a message left on the channel was read as the NEXT thing
-		// this tool expected, and the thing after the bundle is the working directory.
-		let mut volumes: CapSet = recv_caps(bootstrap);
-		let system: u64 = volumes.take(CAP_SYSTEM);
-		let media: u64 = volumes.take(CAP_MEDIA);
-		let iso: u64 = volumes.take(CAP_ISO);
-		let udf: u64 = volumes.take(CAP_UDF);
-		let usb: u64 = volumes.take(CAP_USB);
-		// 4. receive the inherited working directory and resolve the path against it.
-		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
-		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
-		let uri: String = match path::resolve(cwd_str, &arg) {
-			Some(u) => u,
-			None => {
-				eprint(b"du: invalid path\n");
+	// 1. adopt the forwarded stdout console (the first bootstrap message).
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - flags and an optional path, in any order.
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arg_raw: Vec<u8> = context.arguments.clone().into_bytes();
+	let mut summary_only: bool = false;
+	let mut human: bool = false;
+	let mut mode: Option<JsonMode> = None;
+	let mut arg: Vec<u8> = Vec::new();
+	for token in arg_raw.split(|&b| b == b' ').filter(|t: &&[u8]| !t.is_empty()) {
+		match token {
+			b"-s" => summary_only = true,
+			b"-h" => human = true,
+			b"json" | b"json-min" => mode = JsonMode::parse(token),
+			_ if token.starts_with(b"-") => {
+				print(USAGE);
 				exit();
 			}
-		};
-		let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
-		du(storage, uri, summary_only, human, mode);
+			_ if arg.is_empty() => arg.extend_from_slice(token),
+			_ => {
+				print(USAGE);
+				exit();
+			}
+		}
 	}
+	// 3. receive the five volume clients the `volumes` capability bundles (SYSTEM /
+	//    MEDIA / ISO / UDF / USB, in grant order); a volume whose disk is absent is 0.
+	// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
+	// for are simply not taken, and the set closes them when it drops - where before they had
+	// to be drained by hand, because a message left on the channel was read as the NEXT thing
+	// this tool expected, and the thing after the bundle is the working directory.
+	let mut volumes: CapSet = recv_caps(bootstrap);
+	let system: u64 = volumes.take(CAP_SYSTEM);
+	let media: u64 = volumes.take(CAP_MEDIA);
+	let iso: u64 = volumes.take(CAP_ISO);
+	let udf: u64 = volumes.take(CAP_UDF);
+	let usb: u64 = volumes.take(CAP_USB);
+	// 4. receive the inherited working directory and resolve the path against it.
+	let cwd: Vec<u8> = context.cwd.clone().into_bytes();
+	let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
+	let uri: String = match path::resolve(cwd_str, &arg) {
+		Some(u) => u,
+		None => {
+			eprint(b"du: invalid path\n");
+			exit();
+		}
+	};
+	let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
+	du(storage, uri, summary_only, human, mode);
 	exit();
 }
 
 // Walk the tree rooted at `uri` through the storage grant and print each directory's
 // cumulative size (children before their parent), the whole tree's total last.
-unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: Option<JsonMode>) {
-	unsafe {
-		let mut client = VolumeClient::new(storage);
-		let mut usage: Vec<DirUsage> = Vec::new();
-		let total: Option<u64> = walk(&mut client, &uri, 0, &mut usage);
-		let total: u64 = match total {
-			Some(t) => t,
-			None => {
-				eprint(b"du: cannot read the path\n");
-				return;
-			}
-		};
-		// The argument itself is the last (outermost) directory line.
-		usage.push(DirUsage { path: uri, bytes: total });
-		if let Some(mode) = mode {
-			let mut out = String::from("[");
-			let rows: &[DirUsage] = if summary_only { &usage[usage.len() - 1..] } else { &usage };
-			for (i, u) in rows.iter().enumerate() {
-				if i > 0 {
-					out.push(',');
-				}
-				let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{{\"path\":\"{}\",\"bytes\":{}}}", u.path, u.bytes));
-			}
-			out.push(']');
-			print(mode.render(out).as_bytes());
-			print(b"\n");
+fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: Option<JsonMode>) {
+	let mut client = VolumeClient::new(storage);
+	let mut usage: Vec<DirUsage> = Vec::new();
+	let total: Option<u64> = walk(&mut client, &uri, 0, &mut usage);
+	let total: u64 = match total {
+		Some(t) => t,
+		None => {
+			eprint(b"du: cannot read the path\n");
 			return;
 		}
+	};
+	// The argument itself is the last (outermost) directory line.
+	usage.push(DirUsage { path: uri, bytes: total });
+	if let Some(mode) = mode {
+		let mut out = String::from("[");
 		let rows: &[DirUsage] = if summary_only { &usage[usage.len() - 1..] } else { &usage };
-		for u in rows {
-			let mut line = String::new();
-			push_size(&mut line, u.bytes, human);
-			line.push('\t');
-			line.push_str(&u.path);
-			line.push('\n');
-			print(line.as_bytes());
+		for (i, u) in rows.iter().enumerate() {
+			if i > 0 {
+				out.push(',');
+			}
+			let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{{\"path\":\"{}\",\"bytes\":{}}}", u.path, u.bytes));
 		}
+		out.push(']');
+		print(mode.render(out).as_bytes());
+		print(b"\n");
+		return;
+	}
+	let rows: &[DirUsage] = if summary_only { &usage[usage.len() - 1..] } else { &usage };
+	for u in rows {
+		let mut line = String::new();
+		push_size(&mut line, u.bytes, human);
+		line.push('\t');
+		line.push_str(&u.path);
+		line.push('\n');
+		print(line.as_bytes());
 	}
 }
 
@@ -153,37 +149,35 @@ unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: O
 // child is recorded before its parent). Returns the subtree's total bytes, or None if
 // this directory itself cannot be listed (the caller reports it for the root; a deeper
 // unreadable directory contributes 0 rather than aborting the whole walk).
-unsafe fn walk(client: &mut VolumeClient, uri: &str, depth: u32, usage: &mut Vec<DirUsage>) -> Option<u64> {
-	unsafe {
-		// A directory that cannot be listed contributes nothing and does not abort the walk, which
-		// is what the `?` has always meant here - a refusal is the same answer as an unreachable
-		// service, and the caller reports it for the root.
-		let consumer: u64 = client.list(uri)?.ok()?;
-		// Same as an unreadable directory: a total built from part of a listing is wrong,
-		// not merely small.
-		let entries: Vec<FileInfo> = drain_stream_complete(consumer, volume::list_read)?;
-		let mut total: u64 = 0;
-		for e in &entries {
-			if e.r#type == FileType::Dir {
-				// Descend, unless the depth guard is hit (then count the dir's own entry
-				// size only, without recursing further).
-				if depth < MAX_DEPTH {
-					let child: String = format!("{uri}/{}", e.name);
-					if let Some(sub) = walk(client, &child, depth + 1, usage) {
-						total = total.saturating_add(sub);
-					}
+fn walk(client: &mut VolumeClient, uri: &str, depth: u32, usage: &mut Vec<DirUsage>) -> Option<u64> {
+	// A directory that cannot be listed contributes nothing and does not abort the walk, which
+	// is what the `?` has always meant here - a refusal is the same answer as an unreachable
+	// service, and the caller reports it for the root.
+	let consumer: u64 = client.list(uri)?.ok()?;
+	// Same as an unreadable directory: a total built from part of a listing is wrong,
+	// not merely small.
+	let entries: Vec<FileInfo> = drain_stream_complete(consumer, volume::list_read)?;
+	let mut total: u64 = 0;
+	for e in &entries {
+		if e.r#type == FileType::Dir {
+			// Descend, unless the depth guard is hit (then count the dir's own entry
+			// size only, without recursing further).
+			if depth < MAX_DEPTH {
+				let child: String = format!("{uri}/{}", e.name);
+				if let Some(sub) = walk(client, &child, depth + 1, usage) {
+					total = total.saturating_add(sub);
 				}
-			} else {
-				total = total.saturating_add(e.size);
 			}
+		} else {
+			total = total.saturating_add(e.size);
 		}
-		// Record every directory but the argument root here (the caller pushes the root
-		// last, so it prints outermost); children are already in `usage`, before us.
-		if depth > 0 {
-			usage.push(DirUsage { path: String::from(uri), bytes: total });
-		}
-		Some(total)
 	}
+	// Record every directory but the argument root here (the caller pushes the root
+	// last, so it prints outermost); children are already in `usage`, before us.
+	if depth > 0 {
+		usage.push(DirUsage { path: String::from(uri), bytes: total });
+	}
+	Some(total)
 }
 
 // Append a byte count to `out`: raw when `!human`, else scaled to the largest whole

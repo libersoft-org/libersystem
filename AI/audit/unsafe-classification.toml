@@ -28,11 +28,11 @@ disposition = "keep"
 
 [[group]]
 id = "kernel-syscall-read-user"
-invariant = "`read_user<T>` is a SAFE generic function that builds a `T` from user bytes with `assume_init`. Sound for every instantiation in the tree (u64, [u8; 64], CapTransfer - all plain data), and the signature does not say so: a future `T` with invalid bit patterns would be undefined behaviour with no `unsafe` at the call site."
+invariant = "`read_user<T>` builds a `T` from user bytes with `assume_init`, and now SAYS which types that is sound for: `T: UserPlain`, a sealed marker trait implemented for exactly the three plain-data records it reads (`u64`, `[u8; ENTRY_NAME_LEN]`, `CapTransfer`). The trait is sealed, so the list cannot be extended from outside the syscall module, and it is `unsafe` to implement, so adding one is a deliberate claim about bit patterns. A future `T` with invalid bit patterns is refused at compile time rather than being undefined behaviour with no `unsafe` in sight."
 match = [{ file = "src/kernel/syscall/mod.rs", item = "crate::syscall::read_user" }]
-category = "overly-broad"
+category = "required-caller-enforced"
 owner = "kernel/syscall"
-disposition = "narrow: bound T to plain-old-data (follow-up F2 in the report)"
+disposition = "keep: the bound is the contract, and the caller still validates the pointer with `user_buf_ok`"
 
 [[group]]
 id = "kernel-syscall-user-pointers"
@@ -257,11 +257,11 @@ disposition = "keep"
 
 [[group]]
 id = "rt-propagated-wrappers"
-invariant = "One hundred and thirty typed syscall wrappers declared `unsafe fn` although their parameters are handles (`u64`), slices and values and their bodies uphold the raw call's contract themselves - `yield_now`, `close`, `clock`, `random_get(&mut [u8])`, `send_blocking`, `recv_blocking(&mut [u8])` and their kin. A caller cannot violate memory safety through them; the `unsafe` is propagation from `syscall`, and it is what every service, driver and tool then wraps in an `unsafe {}` of its own."
+invariant = "What the runtime keeps after the wrappers took the signature their contract has. The raw `syscall` is one item per architecture and is inline assembly; the ten wrappers that hand the caller an address or a slice over a mapping - `map_object`, `memmap_get`, `dma_buffer_map`, `dma_buffer_phys`, `dma_buffer_phys_at`, `dma_buffer`, `dma_buffer_for`, `framebuffer_map`, `process_load_module`, `recv_package` - each carry a written `# Safety` contract naming what the caller owes; the `unsafe {}` blocks inside the now-safe wrappers are where the raw call's pointer contract is DISCHARGED, which is what lets their signatures be safe; and the shared-image `mem*` implementations are the C library contract the compiler emits calls to. The hundred and twenty-three wrappers that only propagated are safe `fn` now, and the two unmap wrappers say in as many words why ending a mapping is not itself a caller obligation."
 match = [{ file = "src/user/runtime/rt/src/lib.rs" }]
-category = "overly-broad"
+category = "required-caller-enforced"
 owner = "rt"
-disposition = "narrow: safe signatures where the body upholds the contract (follow-up F1 in the report)"
+disposition = "keep"
 
 [[group]]
 id = "drivers-mmio-and-dma"
@@ -281,11 +281,11 @@ disposition = "keep"
 
 [[group]]
 id = "drivers-propagated-wrappers"
-invariant = "The drivers' `unsafe fn` layer (`common.rs` handshake/offer/online/stand, per-device bring-up) is unsafe because it calls the runtime's propagated wrappers; its own contracts - a bootstrap handle, a bound - are values. Narrows together with the runtime."
+invariant = "The drivers' remaining `unsafe fn`s, after the ones that only called the runtime went safe with it. What is left is the bring-up and ring work whose bodies reach device memory: the MMIO accessors every virtio driver funnels through, the queue and descriptor writers, the xHCI context builders. Their contract is the one `drivers-mmio-and-dma` states - the span is the claim's mapping and nothing else - and `common.rs`, which was twenty-nine `unsafe fn`s of pure propagation, has none left."
 match = [{ file = "src/user/drivers/**", kind = ["unsafe-fn"] }]
-category = "overly-broad"
+category = "contained-implementation"
 owner = "drivers"
-disposition = "narrow with the runtime (follow-up F1)"
+disposition = "keep"
 
 [[group]]
 id = "services-mapped-views"
@@ -317,11 +317,11 @@ disposition = "keep"
 
 [[group]]
 id = "services-wrapped-runtime-calls"
-invariant = "The services' `unsafe {}` blocks and `unsafe fn`s wrap calls into the runtime's propagated wrappers - `close`, `send_blocking`, `recv_*`, `wait_any`, `clock` - and pass handles and slices. Nothing in these blocks dereferences a raw pointer; they are the runtime's propagation counted once per call site."
+invariant = "What is left in the services once the runtime's wrappers are safe: blocks that still hold at least one genuinely unsafe call - a mapped-object view, a `map_object` or `process_load_module`, a provider import - and the `unsafe fn`s whose bodies do that work. A block counts once however many safe calls it also contains, which is why the count does not go to zero: eight hundred and fifty-nine of the nine hundred and eighty-four sites were propagation and are gone."
 match = [{ file = "src/user/services/**" }]
-category = "overly-broad"
+category = "contained-implementation"
 owner = "services"
-disposition = "narrow with the runtime (follow-up F1)"
+disposition = "keep"
 
 [[group]]
 id = "apps-entry-linkage"
@@ -341,11 +341,11 @@ disposition = "keep"
 
 [[group]]
 id = "apps-wrapped-runtime-calls"
-invariant = "The tools' `unsafe {}` blocks and `unsafe fn`s wrap the runtime's propagated wrappers around handles and slices; no raw memory of their own."
+invariant = "What is left in the tools: the entry blocks that still call one `unsafe fn` of their own - a pump or a viewer that reads a mapped file - and the `global_asm!` shims. Three hundred and thirty-two of the three hundred and ninety-three sites were the runtime's propagation and are gone; a block that holds one unsafe call and twenty safe ones still counts once."
 match = [{ file = "src/user/apps/**" }]
-category = "overly-broad"
+category = "contained-implementation"
 owner = "apps"
-disposition = "narrow with the runtime (follow-up F1)"
+disposition = "keep"
 
 [[group]]
 id = "libs-shared-image-exports"
@@ -373,11 +373,11 @@ disposition = "keep"
 
 [[group]]
 id = "libs-wrapped-runtime-calls"
-invariant = "Client libraries' `unsafe {}` blocks around the runtime's propagated wrappers (send, receive, close on a handle)."
+invariant = "The client libraries' remaining blocks, which are calls into the shared-image PROVIDER IMPORTS - `unsafe extern \"C\"` entry points the generated bindings declare and the loader resolves - and not runtime propagation. A foreign function is unsafe because its contract is not Rust's to check; these are the audited export names of `libs-shared-image-exports`, called from the safe client API."
 match = [{ file = "src/user/libs/**" }]
-category = "overly-broad"
+category = "abi-linkage"
 owner = "libs"
-disposition = "narrow with the runtime (follow-up F1)"
+disposition = "keep"
 
 [[group]]
 id = "sdk-component-boundary"

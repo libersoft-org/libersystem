@@ -42,12 +42,12 @@ struct Time {
 impl Time {
 	// The wall clock now: the epoch at tick 0 plus the monotonic seconds since.
 	fn now_unix(&self) -> u64 {
-		self.epoch_at_tick0 + unsafe { clock() } / TICKS_PER_SEC
+		self.epoch_at_tick0 + clock() / TICKS_PER_SEC
 	}
 
 	// Reset the offset so the wall clock reads `unix` at this instant.
 	fn set_now(&mut self, unix: u64) {
-		self.epoch_at_tick0 = unix.saturating_sub(unsafe { clock() } / TICKS_PER_SEC);
+		self.epoch_at_tick0 = unix.saturating_sub(clock() / TICKS_PER_SEC);
 	}
 }
 
@@ -60,38 +60,36 @@ impl Service for Time {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. take the roles the plan says this service is handed: a private NetworkService
-		//    connection for the SNTP query, and the channel clients reach us on. Checked against
-		//    the GENERATED list rather than read by hand, so the tag, the object type and the
-		//    rights are all checked and a wrong bootstrap is refused by the name of the role.
-		//
-		//    THE NETWORK ROLE IS OPTIONAL AND NOW BEHAVES LIKE IT. The manifest has said `optional`
-		//    all along and this refused to start without it, which is a boot with a clock that
-		//    would not tick because a NIC was missing. The RTC seeding below needs no network.
-		let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
-		if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
-			fail_bootstrap(bootstrap, error.tag(), error.reason());
-		}
-		let (netsvc, service): (u64, u64) = (roles[0], roles[1]);
-
-		// 2. seed the offset from the hardware RTC (an immediate, network-free UTC).
-		let mut time = Time { epoch_at_tick0: 0 };
-		time.set_now(clock_rtc());
-
-		// 3. report in - boot does not wait on the network - then discipline against
-		//    SNTP best-effort; on failure the RTC seeding stands.
-		send_blocking(bootstrap, b"TimeService: online", 0);
-		if netsvc != 0 {
-			discipline_sntp(netsvc, &mut time);
-			close(netsvc);
-		}
-
-		// 4. serve now() until the client side closes.
-		let mut request: [u8; 256] = [0u8; 256];
-		let mut reply: [u8; 256] = [0u8; 256];
-		serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { time::dispatch(&mut time, req, handle, out, reply_handle) });
+	// 1. take the roles the plan says this service is handed: a private NetworkService
+	//    connection for the SNTP query, and the channel clients reach us on. Checked against
+	//    the GENERATED list rather than read by hand, so the tag, the object type and the
+	//    rights are all checked and a wrong bootstrap is refused by the name of the role.
+	//
+	//    THE NETWORK ROLE IS OPTIONAL AND NOW BEHAVES LIKE IT. The manifest has said `optional`
+	//    all along and this refused to start without it, which is a boot with a clock that
+	//    would not tick because a NIC was missing. The RTC seeding below needs no network.
+	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
+	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
+		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
+	let (netsvc, service): (u64, u64) = (roles[0], roles[1]);
+
+	// 2. seed the offset from the hardware RTC (an immediate, network-free UTC).
+	let mut time = Time { epoch_at_tick0: 0 };
+	time.set_now(clock_rtc());
+
+	// 3. report in - boot does not wait on the network - then discipline against
+	//    SNTP best-effort; on failure the RTC seeding stands.
+	send_blocking(bootstrap, b"TimeService: online", 0);
+	if netsvc != 0 {
+		discipline_sntp(netsvc, &mut time);
+		close(netsvc);
+	}
+
+	// 4. serve now() until the client side closes.
+	let mut request: [u8; 256] = [0u8; 256];
+	let mut reply: [u8; 256] = [0u8; 256];
+	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { time::dispatch(&mut time, req, handle, out, reply_handle) });
 	exit();
 }
 

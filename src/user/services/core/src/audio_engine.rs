@@ -93,7 +93,7 @@ impl Stream {
 				return Err(Error::Invalid);
 			}
 			let requested: usize = self.format.frames_in(data.len).ok_or(Error::Invalid)?;
-			let info: ObjectInfo = unsafe { object_info(handle) }.ok_or(Error::Invalid)?;
+			let info: ObjectInfo = object_info(handle).ok_or(Error::Invalid)?;
 			if data.len > info.size {
 				return Err(Error::Invalid);
 			}
@@ -105,10 +105,10 @@ impl Stream {
 			let byte_count: usize = accepted * self.format.frame_bytes() as usize;
 			let bytes: &[u8] = unsafe { core::slice::from_raw_parts(mapped as *const u8, byte_count) };
 			self.format.append_i16_le(bytes, accepted, &mut self.samples).ok_or(Error::Invalid)?;
-			unsafe { unmap_object(handle) };
+			unmap_object(handle);
 			Ok(accepted as u32)
 		})();
-		unsafe { close(handle) };
+		close(handle);
 		result
 	}
 }
@@ -239,7 +239,7 @@ impl Audio {
 		let Some(index) = self.captures.iter().position(|capture| capture.pending.is_some() && capture.ready.is_none() && !capture.unavailable) else {
 			return false;
 		};
-		if unsafe { send_blocking(self.snd, &[CMD_CAPTURE], 0) } {
+		if send_blocking(self.snd, &[CMD_CAPTURE], 0) {
 			self.driver_pending = DriverPending::Capture(index);
 			self.capture_running = true;
 			true
@@ -290,7 +290,7 @@ impl Audio {
 		if !self.capture_running {
 			return;
 		}
-		if unsafe { send_blocking(self.snd, &[CMD_CAPTURE_STOP], 0) } {
+		if send_blocking(self.snd, &[CMD_CAPTURE_STOP], 0) {
 			self.driver_pending = DriverPending::CaptureStop;
 			self.capture_running = false;
 		} else {
@@ -304,14 +304,14 @@ impl Audio {
 		}
 		if self.has_audio() {
 			self.fill_period();
-			if unsafe { send_blocking(self.snd, &self.period, 0) } {
+			if send_blocking(self.snd, &self.period, 0) {
 				self.driver_pending = DriverPending::Period;
 				self.driver_running = true;
 			} else {
 				self.driver_failed();
 			}
 		} else if self.driver_running {
-			if unsafe { send_blocking(self.snd, &[], 0) } {
+			if send_blocking(self.snd, &[], 0) {
 				self.driver_pending = DriverPending::Stop;
 			} else {
 				self.driver_failed();
@@ -321,7 +321,7 @@ impl Audio {
 
 	fn driver_ready(&mut self, handle: u64) {
 		if handle != 0 {
-			unsafe { close(handle) };
+			close(handle);
 		}
 		if self.driver_pending == DriverPending::Stop {
 			self.driver_running = false;
@@ -331,7 +331,7 @@ impl Audio {
 
 	fn driver_failed(&mut self) {
 		if self.snd != 0 {
-			unsafe { close(self.snd) };
+			close(self.snd);
 		}
 		self.snd = 0;
 		self.driver_pending = DriverPending::None;
@@ -348,11 +348,11 @@ impl Audio {
 		while let Some(mut stream) = self.streams.pop() {
 			if let Some(pending) = stream.pending.take() {
 				for &handle in pending.caps.as_slice() {
-					unsafe { close(handle) };
+					close(handle);
 				}
 			}
 			if stream.chan != 0 {
-				unsafe { close(stream.chan) };
+				close(stream.chan);
 			}
 		}
 	}
@@ -361,18 +361,18 @@ impl Audio {
 		let mut stream: Stream = self.streams.swap_remove(index);
 		if let Some(pending) = stream.pending.take() {
 			for &handle in pending.caps.as_slice() {
-				unsafe { close(handle) };
+				close(handle);
 			}
 		}
 		if stream.chan != 0 {
-			unsafe { close(stream.chan) };
+			close(stream.chan);
 		}
 	}
 
 	fn remove_capture(&mut self, index: usize) {
 		let capture: Capture = self.captures.swap_remove(index);
 		if capture.chan != 0 {
-			unsafe { close(capture.chan) };
+			close(capture.chan);
 		}
 	}
 
@@ -398,18 +398,18 @@ impl Audio {
 		let mut request_handle = proto::codec::Handles::new();
 		let mut call = CaptureCall { capture: &mut self.captures[index] };
 		if let Some(len) = pcm_capture::dispatch(&mut call, request, &mut request_handle, &mut reply, &mut reply_handle) {
-			if !unsafe { send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) } {
+			if !send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) {
 				for &leftover in reply_handle.as_slice() {
-					unsafe { close(leftover) };
+					close(leftover);
 				}
 			}
 		} else {
 			for &leftover in reply_handle.as_slice() {
-				unsafe { close(leftover) };
+				close(leftover);
 			}
 		}
 		for &unclaimed in request_handle.as_slice() {
-			unsafe { close(unclaimed) };
+			close(unclaimed);
 		}
 	}
 
@@ -422,10 +422,10 @@ impl Audio {
 				continue;
 			}
 			let chan: u64 = self.captures[index].chan;
-			match unsafe { try_recv_caps(chan, &mut request) } {
+			match try_recv_caps(chan, &mut request) {
 				PolledCaps::Message { len, handles } => {
 					for &unclaimed in handles.as_slice() {
-						unsafe { close(unclaimed) };
+						close(unclaimed);
 					}
 					self.take_capture_request(index, &request[..len]);
 					index += 1;
@@ -474,18 +474,18 @@ impl Audio {
 		let mut request_handle = caps;
 		let mut call = StreamCall { stream: &mut self.streams[index] };
 		if let Some(len) = pcm_stream::dispatch(&mut call, request, &mut request_handle, &mut reply, &mut reply_handle) {
-			if !unsafe { send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) } {
+			if !send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) {
 				for &leftover in reply_handle.as_slice() {
-					unsafe { close(leftover) };
+					close(leftover);
 				}
 			}
 		} else {
 			for &leftover in reply_handle.as_slice() {
-				unsafe { close(leftover) };
+				close(leftover);
 			}
 		}
 		for &unclaimed in request_handle.as_slice() {
-			unsafe { close(unclaimed) };
+			close(unclaimed);
 		}
 	}
 
@@ -510,7 +510,7 @@ impl Audio {
 				continue;
 			}
 			let chan: u64 = self.streams[index].chan;
-			match unsafe { try_recv_caps(chan, &mut request) } {
+			match try_recv_caps(chan, &mut request) {
 				PolledCaps::Message { len, handles } => {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 					if op == pcm_stream::OP_WRITE && self.streams[index].capacity() == 0 && !handles.is_empty() {
@@ -523,7 +523,7 @@ impl Audio {
 				PolledCaps::Empty => index += 1,
 				PolledCaps::Closed => {
 					if self.streams[index].closing {
-						unsafe { close(chan) };
+						close(chan);
 						self.streams[index].chan = 0;
 						index += 1;
 					} else {
@@ -570,7 +570,7 @@ impl AudioService for RootCall<'_> {
 		if self.audio.streams.len() >= MAX_STREAMS {
 			return Err(Error::Again);
 		}
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		self.audio.streams.push(Stream { chan: server, format, samples: Vec::new(), read_frame: 0, phase: 0, closing: false, pending: None });
 		Ok(client)
 	}
@@ -593,7 +593,7 @@ impl AudioService for RootCall<'_> {
 		if self.audio.captures.len() >= MAX_CAPTURES {
 			return Err(Error::Again);
 		}
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		self.audio.captures.push(Capture { chan: server, remix, resample, pending: None, ready: None, unavailable: false, closing: false });
 		Ok(client)
 	}
@@ -605,13 +605,13 @@ struct AdminCall<'a> {
 
 impl AdminService for AdminCall<'_> {
 	fn open_streams(&mut self) -> Result<u64, Error> {
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		self.clients.push(Client { chan: server, scope: Scope::StreamOnly });
 		Ok(client)
 	}
 
 	fn open_captures(&mut self) -> Result<u64, Error> {
-		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		let (server, client): (u64, u64) = channel().ok_or(Error::Again)?;
 		self.clients.push(Client { chan: server, scope: Scope::CaptureOnly });
 		Ok(client)
 	}
@@ -657,34 +657,32 @@ impl PcmCaptureService for CaptureCall<'_> {
 
 pub fn run(bootstrap: u64) -> ! {
 	let mut bootstrap_buf: [u8; 256] = [0; 256];
-	unsafe {
-		let admin: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"ADMIN").unwrap_or_else(|| fail_bootstrap(bootstrap, b"admin", b"audio admin channel not delivered"));
-		let root: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
-		// THE DEVICE IS DISCOVERED, NOT HANDED OVER (2026-08-31).
-		//
-		// This service used to be given the sound driver's channel under `SND`, routed to it by
-		// DeviceManager out of a slot of its own - the per-kind injection P02M0164 exists to replace.
-		// What arrives now is a connection to the provider CATALOGUE, and this service asks it for
-		// the audio kind. Two things follow that the injection could not do: a sound card bound
-		// AFTER this service started reaches it, because a subscription answers with what is
-		// published now and continues as a stream; and a machine with two of them has a second
-		// entry to offer rather than a slot that is already full.
-		//
-		// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
-		let catalogue: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"CATALOGUE").unwrap_or(0);
-		send_blocking(bootstrap, b"AudioService: online", 0);
-		// The subscription is opened BEFORE anything is served, so the snapshot and the stream are
-		// one operation - a provider published between the two would otherwise be lost, which is the
-		// same race as a service started later seeing nothing.
-		let providers: u64 = if catalogue == 0 { 0 } else { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Audio).unwrap_or(0) };
-		if providers == 0 {
-			// NOT A FAILURE. A boot that granted no catalogue connection, or a machine whose
-			// catalogue refuses the subscription, is a system with no sound - which this service is
-			// built to report rather than to die of.
-			print(b"AudioService: no provider subscription - this instance serves no device\n");
-		}
-		serve(root, admin, catalogue, providers, Audio::new(0));
+	let admin: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"ADMIN").unwrap_or_else(|| fail_bootstrap(bootstrap, b"admin", b"audio admin channel not delivered"));
+	let root: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
+	// THE DEVICE IS DISCOVERED, NOT HANDED OVER (2026-08-31).
+	//
+	// This service used to be given the sound driver's channel under `SND`, routed to it by
+	// DeviceManager out of a slot of its own - the per-kind injection P02M0164 exists to replace.
+	// What arrives now is a connection to the provider CATALOGUE, and this service asks it for
+	// the audio kind. Two things follow that the injection could not do: a sound card bound
+	// AFTER this service started reaches it, because a subscription answers with what is
+	// published now and continues as a stream; and a machine with two of them has a second
+	// entry to offer rather than a slot that is already full.
+	//
+	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+	let catalogue: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"CATALOGUE").unwrap_or(0);
+	send_blocking(bootstrap, b"AudioService: online", 0);
+	// The subscription is opened BEFORE anything is served, so the snapshot and the stream are
+	// one operation - a provider published between the two would otherwise be lost, which is the
+	// same race as a service started later seeing nothing.
+	let providers: u64 = if catalogue == 0 { 0 } else { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Audio).unwrap_or(0) };
+	if providers == 0 {
+		// NOT A FAILURE. A boot that granted no catalogue connection, or a machine whose
+		// catalogue refuses the subscription, is a system with no sound - which this service is
+		// built to report rather than to die of.
+		print(b"AudioService: no provider subscription - this instance serves no device\n");
 	}
+	serve(root, admin, catalogue, providers, Audio::new(0));
 }
 
 // OPEN A CONNECTION TO ONE PUBLISHED PROVIDER, or answer zero.
@@ -692,7 +690,7 @@ pub fn run(bootstrap: u64) -> ! {
 // The catalogue mints the pair and hands the driver the server end; what comes back is the client
 // end this service talks the driver's byte protocol over - the same channel `SND` used to carry,
 // reached by asking instead of by being given.
-unsafe fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
+fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
 	if catalogue == 0 {
 		return 0;
 	}
@@ -701,145 +699,182 @@ unsafe fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
 		// A REFUSAL IS SAID. A kind that admits one consumer refuses the second ask, and a service
 		// that cannot tell that from "no device" cannot report either.
 		Some(Err(_)) => {
-			unsafe { print(b"AudioService: the catalogue refused a connection to the audio provider it published\n") };
+			print(b"AudioService: the catalogue refused a connection to the audio provider it published\n");
 			0
 		}
 		// A TRANSPORT THAT DID NOT ANSWER IS NOT AN ABSENT DEVICE either, and a service that cannot
 		// tell the two apart cannot report what its machine has.
 		None => {
-			unsafe { print(b"AudioService: the catalogue did not answer the connection it published\n") };
+			print(b"AudioService: the catalogue did not answer the connection it published\n");
 			0
 		}
 	}
 }
 
-unsafe fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: Audio) -> ! {
-	unsafe {
-		let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
-		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
-		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
-		loop {
-			state.poll_streams();
-			state.poll_captures();
-			state.service_pending_writes();
-			state.service_pending_reads();
-			state.cleanup_drained();
-			// The capture side is asked for first and the stop is offered last: a period the device
-			// has already filled is audio that is lost if it is not collected, while a playback
-			// period is one the device's own ring can wait for.
-			if !state.pump_capture() {
-				state.pump();
-				state.stop_capture();
-			}
+fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: Audio) -> ! {
+	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
+	let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
+	let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
+	loop {
+		state.poll_streams();
+		state.poll_captures();
+		state.service_pending_writes();
+		state.service_pending_reads();
+		state.cleanup_drained();
+		// The capture side is asked for first and the stop is offered last: a period the device
+		// has already filled is audio that is lost if it is not collected, while a playback
+		// period is one the device's own ring can wait for.
+		if !state.pump_capture() {
+			state.pump();
+			state.stop_capture();
+		}
 
-			// An idle driver's channel can close too. Observe that before a replacement publication
-			// is consumed, or the stale handle makes us discard the provider we could reconnect to.
-			let driver_first: bool = state.snd != 0;
-			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 2);
-			if driver_first {
-				waits.push(state.snd);
+		// An idle driver's channel can close too. Observe that before a replacement publication
+		// is consumed, or the stale handle makes us discard the provider we could reconnect to.
+		let driver_first: bool = state.snd != 0;
+		let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 2);
+		if driver_first {
+			waits.push(state.snd);
+		}
+		// THE SUBSCRIPTION IS WAITED ON LIKE ANY OTHER ENDPOINT, which is what makes a provider
+		// published after this service started reachable at all. It sits before the clients for
+		// the same reason the manager's channel does elsewhere: a busy service must not starve
+		// the path that tells it its device has arrived or gone.
+		if providers != 0 {
+			waits.push(providers);
+		}
+		waits.push(admin);
+		waits.extend(clients.iter().map(|client| client.chan));
+		for stream in &state.streams {
+			if stream.chan != 0 {
+				waits.push(stream.chan);
 			}
-			// THE SUBSCRIPTION IS WAITED ON LIKE ANY OTHER ENDPOINT, which is what makes a provider
-			// published after this service started reachable at all. It sits before the clients for
-			// the same reason the manager's channel does elsewhere: a busy service must not starve
-			// the path that tells it its device has arrived or gone.
-			if providers != 0 {
-				waits.push(providers);
+		}
+		for capture in &state.captures {
+			if capture.chan != 0 && capture.pending.is_none() {
+				waits.push(capture.chan);
 			}
-			waits.push(admin);
-			waits.extend(clients.iter().map(|client| client.chan));
-			for stream in &state.streams {
-				if stream.chan != 0 {
-					waits.push(stream.chan);
-				}
-			}
-			for capture in &state.captures {
-				if capture.chan != 0 && capture.pending.is_none() {
-					waits.push(capture.chan);
-				}
-			}
-			let ready: i64 = wait_any(&waits, 0);
-			if ready < 0 {
-				continue;
-			}
-			let ready_chan: u64 = waits[ready as usize];
-			// A PUBLICATION OR A WITHDRAWAL. `live` is what tells them apart, and it is the whole of
-			// what this service does about either: take a connection to a device it has none for, and
-			// let go of one whose provider has gone.
-			if providers != 0 && ready_chan == providers {
-				let mut frame: [u8; 256] = [0; 256];
-				match recv_blocking(providers, &mut frame) {
-					Received::Message { len, handle } => {
-						if handle != 0 {
-							close(handle);
-						}
-						let mut frame_handles = wire::Handles::new();
-						let Some(info) = provider_catalogue::subscribe_read(&frame[..len], &mut frame_handles) else {
-							print(b"AudioService: a provider frame did not decode\n");
-							continue;
-						};
-						{
-							if info.live && state.snd == 0 {
-								let opened = open_provider(catalogue, &info);
-								if opened == 0 {
-									print(b"AudioService: an audio provider is published and this service could not connect to it\n");
-								} else {
-									state.snd = opened;
-									print(b"AudioService: an audio provider was published and this service connected to it\n");
-								}
-							} else if !info.live && state.snd != 0 {
-								// The provider this service is on may or may not be the one being
-								// withdrawn, and nothing here can tell: the connection carries no
-								// identity back. What a withdrawal DOES mean is that a driver went
-								// away, and the driver channel closing is the authoritative signal -
-								// which `driver_failed` already handles on the next wait.
-								print(b"AudioService: an audio provider was withdrawn\n");
+		}
+		let ready: i64 = wait_any(&waits, 0);
+		if ready < 0 {
+			continue;
+		}
+		let ready_chan: u64 = waits[ready as usize];
+		// A PUBLICATION OR A WITHDRAWAL. `live` is what tells them apart, and it is the whole of
+		// what this service does about either: take a connection to a device it has none for, and
+		// let go of one whose provider has gone.
+		if providers != 0 && ready_chan == providers {
+			let mut frame: [u8; 256] = [0; 256];
+			match recv_blocking(providers, &mut frame) {
+				Received::Message { len, handle } => {
+					if handle != 0 {
+						close(handle);
+					}
+					let mut frame_handles = wire::Handles::new();
+					let Some(info) = provider_catalogue::subscribe_read(&frame[..len], &mut frame_handles) else {
+						print(b"AudioService: a provider frame did not decode\n");
+						continue;
+					};
+					{
+						if info.live && state.snd == 0 {
+							let opened = open_provider(catalogue, &info);
+							if opened == 0 {
+								print(b"AudioService: an audio provider is published and this service could not connect to it\n");
+							} else {
+								state.snd = opened;
+								print(b"AudioService: an audio provider was published and this service connected to it\n");
 							}
+						} else if !info.live && state.snd != 0 {
+							// The provider this service is on may or may not be the one being
+							// withdrawn, and nothing here can tell: the connection carries no
+							// identity back. What a withdrawal DOES mean is that a driver went
+							// away, and the driver channel closing is the authoritative signal -
+							// which `driver_failed` already handles on the next wait.
+							print(b"AudioService: an audio provider was withdrawn\n");
 						}
-					}
-					// THE SUBSCRIPTION ENDED. DeviceManager is gone or dropped it; this service keeps
-					// whatever device it already has and stops expecting new ones.
-					Received::Closed => {
-						close(providers);
-						providers = 0;
 					}
 				}
-				continue;
+				// THE SUBSCRIPTION ENDED. DeviceManager is gone or dropped it; this service keeps
+				// whatever device it already has and stops expecting new ones.
+				Received::Closed => {
+					close(providers);
+					providers = 0;
+				}
 			}
-			if driver_first && ready_chan == state.snd {
-				// A capture reply carries a whole period, so it is received into a buffer that can
-				// hold one rather than into the small request scratch.
-				match state.driver_pending {
-					DriverPending::Capture(index) => {
-						let mut period: Vec<u8> = alloc::vec![0; PERIOD_BYTES];
-						match recv_blocking(state.snd, &mut period) {
-							Received::Message { len, handle } => {
-								if handle != 0 {
-									close(handle);
-								}
-								state.capture_ready(index, &period[..len]);
+			continue;
+		}
+		if driver_first && ready_chan == state.snd {
+			// A capture reply carries a whole period, so it is received into a buffer that can
+			// hold one rather than into the small request scratch.
+			match state.driver_pending {
+				DriverPending::Capture(index) => {
+					let mut period: Vec<u8> = alloc::vec![0; PERIOD_BYTES];
+					match recv_blocking(state.snd, &mut period) {
+						Received::Message { len, handle } => {
+							if handle != 0 {
+								close(handle);
 							}
-							Received::Closed => state.driver_failed(),
+							state.capture_ready(index, &period[..len]);
 						}
-					}
-					_ => match recv_blocking(state.snd, &mut request) {
-						Received::Message { handle, .. } => state.driver_ready(handle),
 						Received::Closed => state.driver_failed(),
-					},
+					}
 				}
-				continue;
+				_ => match recv_blocking(state.snd, &mut request) {
+					Received::Message { handle, .. } => state.driver_ready(handle),
+					Received::Closed => state.driver_failed(),
+				},
 			}
-			if ready_chan == admin {
-				match recv_caps_blocking(admin, &mut request) {
-					ReceivedCaps::Message { len, handles: caps } => {
+			continue;
+		}
+		if ready_chan == admin {
+			match recv_caps_blocking(admin, &mut request) {
+				ReceivedCaps::Message { len, handles: caps } => {
+					let mut reply_handle = proto::codec::Handles::new();
+					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+					// over the single-handle receive, which keeps the first and drops the rest - so a
+					// client sending stdin, stdout and stderr had two destroyed before dispatch.
+					let mut handle = caps;
+					let mut call = AdminCall { clients: &mut clients };
+					if let Some(reply_len) = audio_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+						if !send_caps_blocking(admin, &reply[..reply_len], reply_handle.as_slice()) {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
+						}
+					} else {
+						for &leftover in reply_handle.as_slice() {
+							close(leftover);
+						}
+					}
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
+					}
+				}
+				ReceivedCaps::Closed => exit(),
+			}
+			continue;
+		}
+		if let Some(index) = clients.iter().position(|client| client.chan == ready_chan) {
+			let scope: Scope = clients[index].scope;
+			match recv_caps_blocking(ready_chan, &mut request) {
+				ReceivedCaps::Message { len, handles: caps } => {
+					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+					// over the single-handle receive, which keeps the first and drops the rest - so a
+					// client sending stdin, stdout and stderr had two destroyed before dispatch.
+					let mut handle = caps;
+					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+					if op == HEARTBEAT_OP {
+						send_blocking(ready_chan, b"PONG", 0);
+					} else if op == CONNECT_OP && scope == Scope::Full {
+						if let Some((server, client)) = channel() {
+							clients.push(Client { chan: server, scope });
+							send_blocking(ready_chan, &[], client);
+						}
+					} else {
 						let mut reply_handle = proto::codec::Handles::new();
-						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-						// over the single-handle receive, which keeps the first and drops the rest - so a
-						// client sending stdin, stdout and stderr had two destroyed before dispatch.
-						let mut handle = caps;
-						let mut call = AdminCall { clients: &mut clients };
-						if let Some(reply_len) = audio_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_caps_blocking(admin, &reply[..reply_len], reply_handle.as_slice()) {
+						let mut call = RootCall { audio: &mut state, scope };
+						if let Some(reply_len) = audio::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+							if !send_caps_blocking(ready_chan, &reply[..reply_len], reply_handle.as_slice()) {
 								for &leftover in reply_handle.as_slice() {
 									close(leftover);
 								}
@@ -849,100 +884,61 @@ unsafe fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut s
 								close(leftover);
 							}
 						}
-						for &unclaimed in handle.as_slice() {
-							close(unclaimed);
-						}
 					}
-					ReceivedCaps::Closed => exit(),
-				}
-				continue;
-			}
-			if let Some(index) = clients.iter().position(|client| client.chan == ready_chan) {
-				let scope: Scope = clients[index].scope;
-				match recv_caps_blocking(ready_chan, &mut request) {
-					ReceivedCaps::Message { len, handles: caps } => {
-						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-						// over the single-handle receive, which keeps the first and drops the rest - so a
-						// client sending stdin, stdout and stderr had two destroyed before dispatch.
-						let mut handle = caps;
-						let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-						if op == HEARTBEAT_OP {
-							send_blocking(ready_chan, b"PONG", 0);
-						} else if op == CONNECT_OP && scope == Scope::Full {
-							if let Some((server, client)) = channel() {
-								clients.push(Client { chan: server, scope });
-								send_blocking(ready_chan, &[], client);
-							}
-						} else {
-							let mut reply_handle = proto::codec::Handles::new();
-							let mut call = RootCall { audio: &mut state, scope };
-							if let Some(reply_len) = audio::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-								if !send_caps_blocking(ready_chan, &reply[..reply_len], reply_handle.as_slice()) {
-									for &leftover in reply_handle.as_slice() {
-										close(leftover);
-									}
-								}
-							} else {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
-								}
-							}
-						}
-						for &unclaimed in handle.as_slice() {
-							close(unclaimed);
-						}
-					}
-					ReceivedCaps::Closed => {
-						if index == 0 {
-							exit();
-						}
-						close(ready_chan);
-						clients.swap_remove(index);
-					}
-				}
-				continue;
-			}
-			if let Some(index) = state.captures.iter().position(|capture| capture.chan == ready_chan) {
-				match recv_caps_blocking(ready_chan, &mut request) {
-					ReceivedCaps::Message { len, handles } => {
-						for &unclaimed in handles.as_slice() {
-							close(unclaimed);
-						}
-						state.take_capture_request(index, &request[..len]);
-					}
-					ReceivedCaps::Closed => state.remove_capture(index),
-				}
-				continue;
-			}
-			let Some(index) = state.streams.iter().position(|stream| stream.chan == ready_chan) else { continue };
-			if state.streams[index].pending.is_some() {
-				match recv_blocking(ready_chan, &mut request) {
-					Received::Message { handle, .. } => {
-						if handle != 0 {
-							close(handle);
-						}
-						state.remove_stream(index);
-					}
-					Received::Closed => state.remove_stream(index),
-				}
-				continue;
-			}
-			match recv_caps_blocking(ready_chan, &mut request) {
-				ReceivedCaps::Message { len, handles } => {
-					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-					if op == pcm_stream::OP_WRITE && state.streams[index].capacity() == 0 && !handles.is_empty() {
-						state.streams[index].pending = Some(PendingWrite { request: request[..len].to_vec(), caps: handles });
-					} else {
-						state.dispatch_stream(index, &request[..len], handles);
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
 					}
 				}
 				ReceivedCaps::Closed => {
-					if state.streams[index].closing {
-						close(ready_chan);
-						state.streams[index].chan = 0;
-					} else {
-						state.remove_stream(index);
+					if index == 0 {
+						exit();
 					}
+					close(ready_chan);
+					clients.swap_remove(index);
+				}
+			}
+			continue;
+		}
+		if let Some(index) = state.captures.iter().position(|capture| capture.chan == ready_chan) {
+			match recv_caps_blocking(ready_chan, &mut request) {
+				ReceivedCaps::Message { len, handles } => {
+					for &unclaimed in handles.as_slice() {
+						close(unclaimed);
+					}
+					state.take_capture_request(index, &request[..len]);
+				}
+				ReceivedCaps::Closed => state.remove_capture(index),
+			}
+			continue;
+		}
+		let Some(index) = state.streams.iter().position(|stream| stream.chan == ready_chan) else { continue };
+		if state.streams[index].pending.is_some() {
+			match recv_blocking(ready_chan, &mut request) {
+				Received::Message { handle, .. } => {
+					if handle != 0 {
+						close(handle);
+					}
+					state.remove_stream(index);
+				}
+				Received::Closed => state.remove_stream(index),
+			}
+			continue;
+		}
+		match recv_caps_blocking(ready_chan, &mut request) {
+			ReceivedCaps::Message { len, handles } => {
+				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+				if op == pcm_stream::OP_WRITE && state.streams[index].capacity() == 0 && !handles.is_empty() {
+					state.streams[index].pending = Some(PendingWrite { request: request[..len].to_vec(), caps: handles });
+				} else {
+					state.dispatch_stream(index, &request[..len], handles);
+				}
+			}
+			ReceivedCaps::Closed => {
+				if state.streams[index].closing {
+					close(ready_chan);
+					state.streams[index].chan = 0;
+				} else {
+					state.remove_stream(index);
 				}
 			}
 		}

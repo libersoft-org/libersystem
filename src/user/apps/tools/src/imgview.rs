@@ -197,7 +197,7 @@ fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: 
 		SerialInput::Ground => match byte {
 			0x1b => {
 				*state = SerialInput::Escape;
-				*escape_deadline = unsafe { clock() }.saturating_add(SERIAL_ESCAPE_TICKS);
+				*escape_deadline = clock().saturating_add(SERIAL_ESCAPE_TICKS);
 				ViewAction::None
 			}
 			b'q' => ViewAction::Exit,
@@ -335,9 +335,9 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
 	bytes
 }
 
-unsafe fn close_if_present(handle: u64) {
+fn close_if_present(handle: u64) {
 	if handle != 0 {
-		unsafe { close(handle) };
+		close(handle);
 	}
 }
 
@@ -389,7 +389,7 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 	}
 }
 
-unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
+fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 	unsafe {
 		let display = surface::connect(display_channel);
 		let Some(surface) = surface::acquire(&display, 0, 0).and_then(Result::ok) else {

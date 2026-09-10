@@ -161,7 +161,7 @@ impl Ctl {
 	}
 
 	// A simple virtio_snd_pcm_hdr { code, stream } command (prepare/start/stop/release).
-	unsafe fn stream_cmd(&self, code: u32, stream: u32) -> bool {
+	fn stream_cmd(&self, code: u32, stream: u32) -> bool {
 		unsafe {
 			wr32(self.cmd_virt, code);
 			wr32(self.cmd_virt + 4, stream);
@@ -185,18 +185,16 @@ impl Tx {
 	// Play one period: the PCM is already in `period_virt` (received straight into it).
 	// Submit [xfer][pcm][status], then block on the device's MSI-X interrupt until it
 	// has consumed the chain, reap the completion, and re-arm the interrupt.
-	unsafe fn play(&mut self, irq: u64) -> bool {
-		unsafe {
-			if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, false), (self.status_phys, 8, true)]) {
-				return false;
-			}
-			// block until the device raises its MSI-X interrupt for the consumed period.
-			wait(irq, 0);
-			self.q.take_used();
-			// clear the pending flag so the next period wakes us (edge-triggered MSI-X).
-			interrupt_ack(irq);
-			true
+	fn play(&mut self, irq: u64) -> bool {
+		if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, false), (self.status_phys, 8, true)]) {
+			return false;
 		}
+		// block until the device raises its MSI-X interrupt for the consumed period.
+		wait(irq, 0);
+		self.q.take_used();
+		// clear the pending flag so the next period wakes us (edge-triggered MSI-X).
+		interrupt_ack(irq);
+		true
 	}
 }
 
@@ -217,16 +215,14 @@ struct Rx {
 impl Rx {
 	// Capture one period into `period_virt`: submit [xfer][space][status], block on the device's
 	// MSI-X interrupt until it has filled the chain, reap the completion and re-arm.
-	unsafe fn capture(&mut self, irq: u64) -> bool {
-		unsafe {
-			if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, true), (self.status_phys, 8, true)]) {
-				return false;
-			}
-			wait(irq, 0);
-			self.q.take_used();
-			interrupt_ack(irq);
-			true
+	fn capture(&mut self, irq: u64) -> bool {
+		if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, true), (self.status_phys, 8, true)]) {
+			return false;
 		}
+		wait(irq, 0);
+		self.q.take_used();
+		interrupt_ack(irq);
+		true
 	}
 }
 
@@ -305,8 +301,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 // Read a little-endian u32 from the device-specific config at `offset`.
-unsafe fn config_u32(device: &Virtio, offset: u64) -> u32 {
-	unsafe { device.config_read(offset) as u32 | (device.config_read(offset + 1) as u32) << 8 | (device.config_read(offset + 2) as u32) << 16 | (device.config_read(offset + 3) as u32) << 24 }
+fn config_u32(device: &Virtio, offset: u64) -> u32 {
+	device.config_read(offset) as u32 | (device.config_read(offset + 1) as u32) << 8 | (device.config_read(offset + 2) as u32) << 16 | (device.config_read(offset + 3) as u32) << 24
 }
 
 // Serve AudioService. The protocol is the three shapes documented beside `CMD_CAPTURE`: a period

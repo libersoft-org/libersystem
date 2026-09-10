@@ -38,7 +38,7 @@ unsafe fn w32(addr: u64, v: u32) {
 }
 // A 64-bit common-config field is written as two 32-bit halves (low then high),
 // the portable form the spec allows.
-unsafe fn w64(addr: u64, v: u64) {
+fn w64(addr: u64, v: u64) {
 	unsafe {
 		w32(addr, v as u32);
 		w32(addr + 4, (v >> 32) as u32);
@@ -188,7 +188,7 @@ impl Queue {
 	// Add a device-writable buffer (descriptor `id`, at physical `phys`, `len` bytes)
 	// to the available ring so the device can fill it. Used to seed the pool and to
 	// re-post each buffer after it is drained. Call `notify` after a batch.
-	pub unsafe fn post_recv(&mut self, id: u16, phys: u64, len: u32) {
+	pub fn post_recv(&mut self, id: u16, phys: u64, len: u32) {
 		unsafe {
 			let d = self.virt + id as u64 * 16;
 			w64(d, phys);
@@ -212,7 +212,7 @@ impl Queue {
 	// The device-writable bytes of the chain that starts at descriptor `head`, which is the most a
 	// completion of that chain may claim to have written. Walks at most one ring's worth of links,
 	// so a chain the device may have corrupted into a loop still ends.
-	unsafe fn writable_bytes_from(&self, head: u16) -> u32 {
+	fn writable_bytes_from(&self, head: u16) -> u32 {
 		unsafe {
 			let mut total: u32 = 0;
 			let mut id: u16 = head;
@@ -235,7 +235,7 @@ impl Queue {
 	}
 
 	// Tell the device this queue has freshly posted buffers.
-	pub unsafe fn notify(&self) {
+	pub fn notify(&self) {
 		unsafe {
 			w16(self.notify_addr, self.index);
 		}
@@ -243,7 +243,7 @@ impl Queue {
 
 	// Clear the available-ring NO_INTERRUPT flag, so the device interrupts when it
 	// fills a buffer on this queue (the interrupt-driven RX flow).
-	pub unsafe fn enable_interrupts(&self) {
+	pub fn enable_interrupts(&self) {
 		unsafe {
 			w16(self.virt + self.avail_off, 0);
 		}
@@ -252,7 +252,7 @@ impl Queue {
 	// Take the next buffer the device filled, as (descriptor id, bytes written), or
 	// None if nothing new since the last take. The driver reads buffer `id`, then
 	// re-posts it with `post_recv`.
-	pub unsafe fn take_used(&mut self) -> Option<(u16, u32)> {
+	pub fn take_used(&mut self) -> Option<(u16, u32)> {
 		unsafe {
 			let used = self.virt + self.used_off;
 			fence(Ordering::SeqCst);
@@ -297,8 +297,8 @@ impl Queue {
 // -> driver -> negotiate VERSION_1 -> features-ok). Returns None (marking the
 // device FAILED) if the device rejects the features. The caller then sets up its
 // queues and calls `driver_ok`.
-pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
-	unsafe { negotiate_features(mmio_base, info, 0) }
+pub fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
+	negotiate_features(mmio_base, info, 0)
 }
 
 // `negotiate_features`, told which capability names the device being reset.
@@ -308,12 +308,12 @@ pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 // this is the moment, and the only moment, at which the frames a dead driver left pointing into
 // this device are safe to recycle. `device_quiesced` is that statement, and it is made here rather
 // than in each driver because this is where the reset is.
-pub unsafe fn negotiate_for(capability: u64, mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
-	let device = unsafe { negotiate_features(mmio_base, info, want_word0) };
+pub fn negotiate_for(capability: u64, mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
+	let device = negotiate_features(mmio_base, info, want_word0);
 	let mut device = device?;
 	device.capability = capability;
 	if capability != 0 {
-		unsafe { device_quiesced(capability) };
+		device_quiesced(capability);
 	}
 	Some(device)
 }
@@ -323,7 +323,7 @@ pub unsafe fn negotiate_for(capability: u64, mmio_base: u64, info: &DeviceInfo, 
 // accepted set is kept on the returned device (`features_word0`), so the driver can
 // tell which of its wants the device granted.
 // The reset above, addressed by the common-configuration base rather than by a `Virtio`.
-pub unsafe fn quiesce_at(common: u64) -> bool {
+pub fn quiesce_at(common: u64) -> bool {
 	unsafe {
 		w8(common + CFG_DEVICE_STATUS, 0);
 		let mut spins: u32 = 0;
@@ -337,7 +337,7 @@ pub unsafe fn quiesce_at(common: u64) -> bool {
 	}
 }
 
-pub unsafe fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
+pub fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
 	unsafe {
 		let common: u64 = mmio_base + info.common_offset as u64;
 
@@ -398,7 +398,7 @@ impl Virtio {
 	// after the kernel has enabled MSI-X on the device and before setup_queue, so each
 	// queue is told to use this vector. INTx / polling drivers never call this and keep
 	// the reset NO_VECTOR.
-	pub unsafe fn set_msix_vector(&mut self, vector: u16) {
+	pub fn set_msix_vector(&mut self, vector: u16) {
 		unsafe {
 			self.msix_vector = vector;
 			w16(self.common + CFG_CONFIG_MSIX_VECTOR, vector);
@@ -451,7 +451,7 @@ impl Virtio {
 	}
 
 	// Tell the device the driver is ready, after the queues are set up.
-	pub unsafe fn driver_ok(&self) {
+	pub fn driver_ok(&self) {
 		unsafe {
 			let status = r8(self.common + CFG_DEVICE_STATUS);
 			w8(self.common + CFG_DEVICE_STATUS, status | STATUS_DRIVER_OK);
@@ -467,8 +467,8 @@ impl Virtio {
 	//
 	// Returns whether the device confirmed. A device that does not is one whose descriptors may
 	// still be live, so its driver must NOT report a clean stop - see `common::finish_stop`.
-	pub unsafe fn quiesce(&self) -> bool {
-		unsafe { quiesce_at(self.common) }
+	pub fn quiesce(&self) -> bool {
+		quiesce_at(self.common)
 	}
 
 	// The common-configuration address, for the stop path that has to reach this device from a loop
@@ -482,18 +482,18 @@ impl Virtio {
 	// so the kernel can complete the source. An interrupt-driven driver reads it once per
 	// IRQ, and must: on INTx the line stays asserted until it is read, and the IRQ storms.
 	// Harmless on MSI-X (edge-triggered), where it reads back zero.
-	pub unsafe fn read_isr(&self) -> u8 {
+	pub fn read_isr(&self) -> u8 {
 		unsafe { r8(self.isr) }
 	}
 
 	// Read one byte of the device-specific config (e.g. a NIC's MAC bytes).
-	pub unsafe fn config_read(&self, offset: u64) -> u8 {
+	pub fn config_read(&self, offset: u64) -> u8 {
 		unsafe { r8(self.device + offset) }
 	}
 
 	// Write one byte of the device-specific config (e.g. a virtio-input select/subsel
 	// pair that chooses which config block the next reads return).
-	pub unsafe fn config_write(&self, offset: u64, value: u8) {
+	pub fn config_write(&self, offset: u64, value: u8) {
 		unsafe { w8(self.device + offset, value) }
 	}
 }
@@ -508,14 +508,14 @@ impl Queue {
 	// the device writes it). Returns the bytes the device reported using, or None if
 	// the queue is too small or the device never completes. Synchronous, with a
 	// single request in flight (the same descriptors are reused each call).
-	pub unsafe fn submit(&self, bufs: &[(u64, u32, bool)]) -> Option<u32> {
-		unsafe { self.submit_checked(bufs).ok() }
+	pub fn submit(&self, bufs: &[(u64, u32, bool)]) -> Option<u32> {
+		self.submit_checked(bufs).ok()
 	}
 
 	// `submit`, with the reason a completion was refused - the device's used element is checked
 	// against the chain that was posted (see `check_used_element`): the head descriptor, and no more
 	// bytes written than the chain offered for writing.
-	pub unsafe fn submit_checked(&self, bufs: &[(u64, u32, bool)]) -> Result<u32, UsedFault> {
+	pub fn submit_checked(&self, bufs: &[(u64, u32, bool)]) -> Result<u32, UsedFault> {
 		unsafe {
 			let n = bufs.len();
 			if n == 0 || n > self.size as usize {
@@ -599,7 +599,7 @@ impl Queue {
 	// reaps the completion with `take_used`. One request in flight (descriptors 0..n
 	// reused each call, head index 0). Returns false if the chain is empty or longer
 	// than the queue.
-	pub unsafe fn submit_async(&mut self, bufs: &[(u64, u32, bool)]) -> bool {
+	pub fn submit_async(&mut self, bufs: &[(u64, u32, bool)]) -> bool {
 		unsafe {
 			let n = bufs.len();
 			if n == 0 || n > self.size as usize {

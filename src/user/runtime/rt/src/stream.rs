@@ -72,12 +72,12 @@ impl Writer {
 	//
 	// Returns false once the far end is gone - the broken-pipe signal. A caller that keeps
 	// writing after that is writing into nothing, so this reports rather than pretends.
-	pub unsafe fn write(&mut self, bytes: &[u8]) -> bool {
+	pub fn write(&mut self, bytes: &[u8]) -> bool {
 		if self.closed {
 			return false;
 		}
 		for chunk in bytes.chunks(MAX_CHUNK) {
-			if !unsafe { send_blocking(self.channel, chunk, 0) } {
+			if !send_blocking(self.channel, chunk, 0) {
 				return false;
 			}
 		}
@@ -87,9 +87,9 @@ impl Writer {
 	// End the stream reporting failure rather than completion. Idempotent, and it deliberately
 	// uses a non-blocking send: a writer that is failing must not block behind a consumer that
 	// has stopped reading, or a broken stage would hang instead of reporting.
-	pub unsafe fn fail(&mut self) {
+	pub fn fail(&mut self) {
 		if !self.closed {
-			unsafe { try_send(self.channel, FAILED_TAG, 0) };
+			try_send(self.channel, FAILED_TAG, 0);
 			self.close();
 		}
 	}
@@ -100,7 +100,7 @@ impl Writer {
 	pub fn close(&mut self) {
 		if !self.closed {
 			self.closed = true;
-			unsafe { close(self.channel) };
+			close(self.channel);
 		}
 	}
 }
@@ -126,13 +126,13 @@ impl Reader {
 
 	// Read one chunk into `buf`, blocking until there is one. `buf` should be MAX_CHUNK bytes;
 	// a shorter one truncates, which the caller sees as a shorter `Data`.
-	pub unsafe fn read(&mut self, buf: &mut [u8]) -> Chunk {
-		match unsafe { recv_blocking(self.channel, buf) } {
+	pub fn read(&mut self, buf: &mut [u8]) -> Chunk {
+		match recv_blocking(self.channel, buf) {
 			Received::Message { len, .. } if len == FAILED_TAG.len() && buf.starts_with(FAILED_TAG) => Chunk::Failed,
 			Received::Message { len, .. } if len > 0 => Chunk::Data(len),
 			// A zero-length message is not data and not a failure report; treating it as the
 			// end would let an empty write truncate a stream, so it is simply skipped.
-			Received::Message { .. } => unsafe { self.read(buf) },
+			Received::Message { .. } => self.read(buf),
 			Received::Closed => Chunk::End,
 		}
 	}
@@ -141,13 +141,13 @@ impl Reader {
 	// an early-exiting consumer - `head` taking ten lines of a huge file - tells the stage
 	// upstream to stop rather than letting it produce output nobody will take.
 	pub fn close(self) {
-		unsafe { close(self.channel) };
+		close(self.channel);
 	}
 
 	// Whether the far end is already gone AND nothing is left to read, without consuming
 	// anything. Both halves matter: a writer that closed after producing output leaves data
 	// behind it, and reporting that stream as gone would discard bytes the consumer is owed.
-	pub unsafe fn writer_gone(&self) -> bool {
-		unsafe { channel_peek(self.channel) == ERR_PEER_CLOSED }
+	pub fn writer_gone(&self) -> bool {
+		channel_peek(self.channel) == ERR_PEER_CLOSED
 	}
 }

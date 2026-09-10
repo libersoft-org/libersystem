@@ -25,31 +25,29 @@ use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let mode: Option<JsonMode> = JsonMode::parse(argument);
-		// 3. receive the five volume clients the `volumes` capability bundles, in grant order;
-		//    a volume whose disk is absent arrives as 0 (no handle) and shows as absent.
-		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
-		// for are simply not taken, and the set closes them when it drops - where before they had
-		// to be drained by hand, because a message left on the channel was read as the NEXT thing
-		// this tool expected, and the thing after the bundle is the working directory.
-		let mut volumes: CapSet = recv_caps(bootstrap);
-		let system: u64 = volumes.take(CAP_SYSTEM);
-		let media: u64 = volumes.take(CAP_MEDIA);
-		let iso: u64 = volumes.take(CAP_ISO);
-		let udf: u64 = volumes.take(CAP_UDF);
-		let usb: u64 = volumes.take(CAP_USB);
-		list_volumes(system, media, iso, udf, usb, mode);
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let mode: Option<JsonMode> = JsonMode::parse(argument);
+	// 3. receive the five volume clients the `volumes` capability bundles, in grant order;
+	//    a volume whose disk is absent arrives as 0 (no handle) and shows as absent.
+	// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
+	// for are simply not taken, and the set closes them when it drops - where before they had
+	// to be drained by hand, because a message left on the channel was read as the NEXT thing
+	// this tool expected, and the thing after the bundle is the working directory.
+	let mut volumes: CapSet = recv_caps(bootstrap);
+	let system: u64 = volumes.take(CAP_SYSTEM);
+	let media: u64 = volumes.take(CAP_MEDIA);
+	let iso: u64 = volumes.take(CAP_ISO);
+	let udf: u64 = volumes.take(CAP_UDF);
+	let usb: u64 = volumes.take(CAP_USB);
+	list_volumes(system, media, iso, udf, usb, mode);
 	exit();
 }
 
@@ -58,28 +56,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // and the size / used / free numbers the filesystem declares, with a notes column
 // for the read-only and compression flags - the `df` view. `mode` selects a JSON
 // array over the table.
-unsafe fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mode: Option<JsonMode>) {
-	unsafe {
-		let json: bool = mode.is_some();
-		let rows: [(&str, u64); 5] = [("vol://system", system), ("vol://media", media), ("vol://iso", iso), ("vol://udf", udf), ("vol://usb", usb)];
-		let mut out = String::new();
-		if json {
-			out.push('[');
-		} else {
-			out.push_str("\x1b[1mvolume        filesystem  files       size       used       free\x1b[0m\n");
-		}
-		for (i, &(uri, chan)) in rows.iter().enumerate() {
-			let status: Option<VolumeStatus> = volume_status(chan);
-			let files: usize = volume_count(chan, uri);
-			render_row(&mut out, i, uri, chan != 0, status.as_ref(), files, json);
-		}
-		if let Some(mode) = mode {
-			out.push(']');
-			out = mode.render(out);
-		}
-		out.push('\n');
-		print(out.as_bytes());
+fn list_volumes(system: u64, media: u64, iso: u64, udf: u64, usb: u64, mode: Option<JsonMode>) {
+	let json: bool = mode.is_some();
+	let rows: [(&str, u64); 5] = [("vol://system", system), ("vol://media", media), ("vol://iso", iso), ("vol://udf", udf), ("vol://usb", usb)];
+	let mut out = String::new();
+	if json {
+		out.push('[');
+	} else {
+		out.push_str("\x1b[1mvolume        filesystem  files       size       used       free\x1b[0m\n");
 	}
+	for (i, &(uri, chan)) in rows.iter().enumerate() {
+		let status: Option<VolumeStatus> = volume_status(chan);
+		let files: usize = volume_count(chan, uri);
+		render_row(&mut out, i, uri, chan != 0, status.as_ref(), files, json);
+	}
+	if let Some(mode) = mode {
+		out.push(']');
+		out = mode.render(out);
+	}
+	out.push('\n');
+	print(out.as_bytes());
 }
 
 // Append one volume row to `out`, as a table line or a JSON object: the filesystem
@@ -187,14 +183,14 @@ fn volume_status(chan: u64) -> Option<VolumeStatus> {
 
 // Count the files on a volume via the StorageService `list` op; 0 if the volume is absent or
 // the service is unavailable.
-unsafe fn volume_count(storage: u64, uri: &str) -> usize {
+fn volume_count(storage: u64, uri: &str) -> usize {
 	if storage == 0 {
 		return 0;
 	}
 	let mut client = VolumeClient::new(storage);
 	match client.list(uri) {
 		// A count is a claim about the whole directory; an abnormal drain cannot support one.
-		Some(Ok(consumer)) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
+		Some(Ok(consumer)) => match drain_stream_complete(consumer, volume::list_read) {
 			Some(entries) => entries.len(),
 			None => 0,
 		},

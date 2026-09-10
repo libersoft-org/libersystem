@@ -30,99 +30,97 @@ const MAX_BYTES: usize = 16 * 1024 * 1024;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut reverse = false;
-		let mut unique = false;
-		let mut numeric = false;
-		let mut field: Option<usize> = None;
-		let mut path: Option<&[u8]> = None;
-		let mut expect = false;
-		for word in split_args(&arguments) {
-			if expect {
-				let Some(value) = parse_u64(word).and_then(|value| usize::try_from(value).ok()).filter(|value| *value > 0) else {
-					eprint(b"sort: not a field number (they start at one)\n");
-					exit();
-				};
-				field = Some(value - 1);
-				expect = false;
-				continue;
-			}
-			match classify(word) {
-				Arg::Long(b"reverse", None) => reverse = true,
-				Arg::Long(b"unique", None) => unique = true,
-				Arg::Long(b"numeric", None) => numeric = true,
-				Arg::Long(b"key", None) => expect = true,
-				Arg::Short(b'r') => reverse = true,
-				Arg::Short(b'u') => unique = true,
-				Arg::Short(b'n') => numeric = true,
-				Arg::Short(b'k') => expect = true,
-				Arg::Value(value) if path.is_none() => path = Some(value),
-				_ => {
-					eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
-					exit();
-				}
-			}
-		}
+	let mut reverse = false;
+	let mut unique = false;
+	let mut numeric = false;
+	let mut field: Option<usize> = None;
+	let mut path: Option<&[u8]> = None;
+	let mut expect = false;
+	for word in split_args(&arguments) {
 		if expect {
-			eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
-			exit();
+			let Some(value) = parse_u64(word).and_then(|value| usize::try_from(value).ok()).filter(|value| *value > 0) else {
+				eprint(b"sort: not a field number (they start at one)\n");
+				exit();
+			};
+			field = Some(value - 1);
+			expect = false;
+			continue;
 		}
-		// NO PATH MEANS STDIN. `sort` has to hold its whole input to order it, so this is the one
-		// migrated tool where the stream case is not also a memory improvement - but `LineBuffer`'s
-		// own bounds are what stop a huge input, and they apply identically either way.
-		let source: Source = match path {
-			Some(argument) => {
-				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-					eprint(b"sort: invalid path\n");
-					exit();
-				};
-				let storage: u64 = volumes.client_for(&cwd, argument);
-				if storage == 0 {
-					eprint(b"sort: no volume\n");
-					exit();
-				}
-				Source::from_path(storage, &uri, WINDOW)
+		match classify(word) {
+			Arg::Long(b"reverse", None) => reverse = true,
+			Arg::Long(b"unique", None) => unique = true,
+			Arg::Long(b"numeric", None) => numeric = true,
+			Arg::Long(b"key", None) => expect = true,
+			Arg::Short(b'r') => reverse = true,
+			Arg::Short(b'u') => unique = true,
+			Arg::Short(b'n') => numeric = true,
+			Arg::Short(b'k') => expect = true,
+			Arg::Value(value) if path.is_none() => path = Some(value),
+			_ => {
+				eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
+				exit();
 			}
-			None => match Source::from_stdin() {
-				Some(source) => source,
-				None => {
-					eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
-					exit();
-				}
-			},
-		};
-		let Some(mut lines) = collect(source) else { exit() };
-		// A STABLE SORT, and the key decides only the comparison: two lines with equal keys keep
-		// the order the file had, which is what makes `-k` predictable and a second sort by another
-		// key meaningful.
-		lines.sort_by(|a, b| {
-			let ordering = if numeric { compare_numeric(key(a, field), key(b, field)) } else { key(a, field).cmp(key(b, field)) };
-			if reverse { ordering.reverse() } else { ordering }
-		});
-		let mut previous: Option<usize> = None;
-		for at in 0..lines.len() {
-			let line = lines.line(at);
-			// `-u` compares WHOLE LINES, not keys: two different lines that share a key are two
-			// lines, and dropping one of them would lose data the caller never asked to lose.
-			if unique && previous.is_some_and(|previous| lines.line(previous) == line) {
-				continue;
-			}
-			// Stops when the consumer does: a `sort | head -3` that kept printing after `head`
-			// exited would be sorting for nobody.
-			if !write_stdout(line) || !write_stdout(b"\n") {
-				break;
-			}
-			previous = Some(at);
 		}
+	}
+	if expect {
+		eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
+		exit();
+	}
+	// NO PATH MEANS STDIN. `sort` has to hold its whole input to order it, so this is the one
+	// migrated tool where the stream case is not also a memory improvement - but `LineBuffer`'s
+	// own bounds are what stop a huge input, and they apply identically either way.
+	let source: Source = match path {
+		Some(argument) => {
+			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+				eprint(b"sort: invalid path\n");
+				exit();
+			};
+			let storage: u64 = volumes.client_for(&cwd, argument);
+			if storage == 0 {
+				eprint(b"sort: no volume\n");
+				exit();
+			}
+			Source::from_path(storage, &uri, WINDOW)
+		}
+		None => match Source::from_stdin() {
+			Some(source) => source,
+			None => {
+				eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
+				exit();
+			}
+		},
+	};
+	let Some(mut lines) = collect(source) else { exit() };
+	// A STABLE SORT, and the key decides only the comparison: two lines with equal keys keep
+	// the order the file had, which is what makes `-k` predictable and a second sort by another
+	// key meaningful.
+	lines.sort_by(|a, b| {
+		let ordering = if numeric { compare_numeric(key(a, field), key(b, field)) } else { key(a, field).cmp(key(b, field)) };
+		if reverse { ordering.reverse() } else { ordering }
+	});
+	let mut previous: Option<usize> = None;
+	for at in 0..lines.len() {
+		let line = lines.line(at);
+		// `-u` compares WHOLE LINES, not keys: two different lines that share a key are two
+		// lines, and dropping one of them would lose data the caller never asked to lose.
+		if unique && previous.is_some_and(|previous| lines.line(previous) == line) {
+			continue;
+		}
+		// Stops when the consumer does: a `sort | head -3` that kept printing after `head`
+		// exited would be sorting for nobody.
+		if !write_stdout(line) || !write_stdout(b"\n") {
+			break;
+		}
+		previous = Some(at);
 	}
 	exit();
 }
@@ -151,39 +149,37 @@ fn compare_numeric(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
 	}
 }
 
-unsafe fn collect(source: Source) -> Option<LineBuffer> {
-	unsafe {
-		let label: alloc::vec::Vec<u8> = source.label().to_vec();
-		let mut lines = LineBuffer::new(MAX_LINES, MAX_BYTES);
-		let mut reader = Lines::new(source, MAX_LINE);
-		loop {
-			match reader.next_line() {
-				LineOutcome::Line => match lines.push(reader.line()) {
-					Ok(()) => {}
-					Err(HoldError::Full) => {
-						eprint(b"sort: the input is larger than this sort will hold; nothing was printed\n");
-						return None;
-					}
-					Err(HoldError::OutOfMemory) => {
-						eprint(b"sort: out of memory\n");
-						return None;
-					}
-				},
-				LineOutcome::End => return Some(lines),
-				LineOutcome::TooLong => {
-					eprint(b"sort: a line is longer than this tool will hold\n");
+fn collect(source: Source) -> Option<LineBuffer> {
+	let label: alloc::vec::Vec<u8> = source.label().to_vec();
+	let mut lines = LineBuffer::new(MAX_LINES, MAX_BYTES);
+	let mut reader = Lines::new(source, MAX_LINE);
+	loop {
+		match reader.next_line() {
+			LineOutcome::Line => match lines.push(reader.line()) {
+				Ok(()) => {}
+				Err(HoldError::Full) => {
+					eprint(b"sort: the input is larger than this sort will hold; nothing was printed\n");
 					return None;
 				}
-				LineOutcome::Failed(ChunkError::Unavailable) => {
-					eprint(b"sort: cannot read ");
-					eprint(&label);
-					eprint(b"\n");
-					return None;
-				}
-				LineOutcome::Failed(_) => {
+				Err(HoldError::OutOfMemory) => {
 					eprint(b"sort: out of memory\n");
 					return None;
 				}
+			},
+			LineOutcome::End => return Some(lines),
+			LineOutcome::TooLong => {
+				eprint(b"sort: a line is longer than this tool will hold\n");
+				return None;
+			}
+			LineOutcome::Failed(ChunkError::Unavailable) => {
+				eprint(b"sort: cannot read ");
+				eprint(&label);
+				eprint(b"\n");
+				return None;
+			}
+			LineOutcome::Failed(_) => {
+				eprint(b"sort: out of memory\n");
+				return None;
 			}
 		}
 	}

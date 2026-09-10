@@ -25,175 +25,163 @@ use volume_client::VolumeClient;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the volume sub-form.
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let args: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: a StorageService client.
-		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
-		run(storage, &args);
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the volume sub-form.
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let args: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: a StorageService client.
+	let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
+	run(storage, &args);
 	exit();
 }
 
 // Route the volume sub-form to its handler: the first token is the subcommand, the rest its
 // argument(s). All operate on the system volume through the one storage grant.
-unsafe fn run(storage: u64, args: &[u8]) {
-	unsafe {
-		let (sub, rest): (&[u8], &[u8]) = match args.iter().position(|&b: &u8| b == b' ') {
-			Some(sp) => (&args[..sp], &args[sp + 1..]),
-			None => (args, b""),
-		};
-		match sub {
-			b"status" | b"" => status(storage),
-			b"compress" => match rest {
-				b"on" => set_compression(storage, true),
-				b"off" => set_compression(storage, false),
-				_ => print(b"usage: volume compress on|off\n"),
-			},
-			b"fsck" => fsck(storage),
-			b"restore" => match rest.iter().position(|&b: &u8| b == b' ') {
-				Some(sp) => restore(storage, &rest[..sp], &rest[sp + 1..]),
-				None if !rest.is_empty() => restore(storage, rest, b""),
-				None => print(b"usage: volume restore <vol://...> [snapshot]\n"),
-			},
-			_ => eprint(b"volume: unknown subcommand (status, compress on|off, fsck, restore)\n"),
-		}
+fn run(storage: u64, args: &[u8]) {
+	let (sub, rest): (&[u8], &[u8]) = match args.iter().position(|&b: &u8| b == b' ') {
+		Some(sp) => (&args[..sp], &args[sp + 1..]),
+		None => (args, b""),
+	};
+	match sub {
+		b"status" | b"" => status(storage),
+		b"compress" => match rest {
+			b"on" => set_compression(storage, true),
+			b"off" => set_compression(storage, false),
+			_ => print(b"usage: volume compress on|off\n"),
+		},
+		b"fsck" => fsck(storage),
+		b"restore" => match rest.iter().position(|&b: &u8| b == b' ') {
+			Some(sp) => restore(storage, &rest[..sp], &rest[sp + 1..]),
+			None if !rest.is_empty() => restore(storage, rest, b""),
+			None => print(b"usage: volume restore <vol://...> [snapshot]\n"),
+		},
+		_ => eprint(b"volume: unknown subcommand (status, compress on|off, fsck, restore)\n"),
 	}
 }
 
 // Report the filesystem's identity and health: label, pool and free bytes, the compression
 // switch, and whether the mount is read-only.
-unsafe fn status(storage: u64) {
-	unsafe {
-		let mut client = VolumeClient::new(storage);
-		let st = match client.status() {
-			Some(Ok(st)) => st,
-			_ => {
-				eprint(b"volume: StorageService unavailable\n");
-				return;
-			}
-		};
-		let mut out = String::new();
-		{
-			use core::fmt::Write as _;
-			let used: u64 = st.total_bytes - st.free_bytes;
-			let _ = writeln!(out, "vol://system \"{}\"", st.label);
-			let _ = writeln!(out, "  filesystem:  {}", st.filesystem);
-			let _ = writeln!(out, "  size:        {} ({} bytes)", human(st.total_bytes), st.total_bytes);
-			let _ = writeln!(out, "  used:        {} ({} bytes)", human(used), used);
-			let _ = writeln!(out, "  free:        {} ({} bytes)", human(st.free_bytes), st.free_bytes);
-			let _ = writeln!(out, "  compression: {}", if st.compression { "on" } else { "off" });
-			let _ = writeln!(out, "  mount:       {}", if st.read_only { "READ-ONLY (degraded or snapshot)" } else { "read-write" });
+fn status(storage: u64) {
+	let mut client = VolumeClient::new(storage);
+	let st = match client.status() {
+		Some(Ok(st)) => st,
+		_ => {
+			eprint(b"volume: StorageService unavailable\n");
+			return;
 		}
-		print(out.as_bytes());
+	};
+	let mut out = String::new();
+	{
+		use core::fmt::Write as _;
+		let used: u64 = st.total_bytes - st.free_bytes;
+		let _ = writeln!(out, "vol://system \"{}\"", st.label);
+		let _ = writeln!(out, "  filesystem:  {}", st.filesystem);
+		let _ = writeln!(out, "  size:        {} ({} bytes)", human(st.total_bytes), st.total_bytes);
+		let _ = writeln!(out, "  used:        {} ({} bytes)", human(used), used);
+		let _ = writeln!(out, "  free:        {} ({} bytes)", human(st.free_bytes), st.free_bytes);
+		let _ = writeln!(out, "  compression: {}", if st.compression { "on" } else { "off" });
+		let _ = writeln!(out, "  mount:       {}", if st.read_only { "READ-ONLY (degraded or snapshot)" } else { "read-write" });
 	}
+	print(out.as_bytes());
 }
 
 // Flip transparent compression for new whole-file writes.
-unsafe fn set_compression(storage: u64, enabled: bool) {
-	unsafe {
-		let mut client = VolumeClient::new(storage);
-		match client.set_compression(&enabled) {
-			Some(Ok(())) => print(if enabled { b"compression on (new writes compress)\n" as &[u8] } else { b"compression off (new writes stay raw)\n" }),
-			Some(Err(_)) => print(b"volume compress: refused (read-only volume?)\n"),
-			None => eprint(b"volume: StorageService unavailable\n"),
-		}
+fn set_compression(storage: u64, enabled: bool) {
+	let mut client = VolumeClient::new(storage);
+	match client.set_compression(&enabled) {
+		Some(Ok(())) => print(if enabled { b"compression on (new writes compress)\n" as &[u8] } else { b"compression off (new writes stay raw)\n" }),
+		Some(Err(_)) => print(b"volume compress: refused (read-only volume?)\n"),
+		None => eprint(b"volume: StorageService unavailable\n"),
 	}
 }
 
 // Verify every live block against its checksum and name the damaged files.
-unsafe fn fsck(storage: u64) {
-	unsafe {
-		let mut client = VolumeClient::new(storage);
-		let report = match client.fsck() {
-			Some(Ok(r)) => r,
-			_ => {
-				eprint(b"volume: StorageService unavailable\n");
-				return;
-			}
-		};
-		// FOUR CATEGORIES, BECAUSE THEY MEAN DIFFERENT THINGS TO WHOEVER IS READING.
-		//
-		// This printed `checksum_failures` and nothing else, and answered "clean" whenever that one
-		// number was zero - so a volume with wrong metadata, an unreadable disk or an undecodable
-		// compressed stream reported itself CLEAN at the only place a person ever looks. The
-		// backend had kept the categories apart for several rounds; the wire record and this tool
-		// were where they were thrown away.
-		let total = report.checksum_failures + report.structural_failures + report.stream_failures + report.io_failures;
-		if total == 0 {
-			print(b"fsck: clean\n");
+fn fsck(storage: u64) {
+	let mut client = VolumeClient::new(storage);
+	let report = match client.fsck() {
+		Some(Ok(r)) => r,
+		_ => {
+			eprint(b"volume: StorageService unavailable\n");
 			return;
 		}
-		let mut out = String::new();
-		{
-			use core::fmt::Write as _;
-			// Each line only when it has something to say, so an ordinary checksum fault does not
-			// arrive buried in three zeroes.
-			if report.checksum_failures > 0 {
-				let _ = writeln!(out, "fsck: {} checksum failure(s) - the medium gave back bytes that are not what was written", report.checksum_failures);
-			}
-			if report.io_failures > 0 {
-				let _ = writeln!(out, "fsck: {} read failure(s) - the medium would not answer; copy the volume elsewhere and check it there", report.io_failures);
-			}
-			if report.structural_failures > 0 {
-				let _ = writeln!(out, "fsck: {} structural failure(s) - the metadata is wrong, and re-reading will not change it", report.structural_failures);
-			}
-			if report.stream_failures > 0 {
-				let _ = writeln!(out, "fsck: {} undecodable stream(s) - every block matched its checksum and the compressed data still will not decode", report.stream_failures);
-			}
-			if !report.damaged.is_empty() {
-				let _ = writeln!(out, "damaged file(s):");
-				for path in &report.damaged {
-					let _ = writeln!(out, "  {path}");
-				}
-			}
-			// What the structural pass has to SAY. A count tells an operator something is wrong;
-			// these tell them what, which is the difference between a report and an alarm.
-			if !report.faults.is_empty() {
-				let _ = writeln!(out, "faults:");
-				for fault in &report.faults {
-					let _ = writeln!(out, "  {fault}");
-				}
-			}
-			let _ = writeln!(out, "restore with: volume restore <vol://system/...> [snapshot]");
-		}
-		print(out.as_bytes());
+	};
+	// FOUR CATEGORIES, BECAUSE THEY MEAN DIFFERENT THINGS TO WHOEVER IS READING.
+	//
+	// This printed `checksum_failures` and nothing else, and answered "clean" whenever that one
+	// number was zero - so a volume with wrong metadata, an unreadable disk or an undecodable
+	// compressed stream reported itself CLEAN at the only place a person ever looks. The
+	// backend had kept the categories apart for several rounds; the wire record and this tool
+	// were where they were thrown away.
+	let total = report.checksum_failures + report.structural_failures + report.stream_failures + report.io_failures;
+	if total == 0 {
+		print(b"fsck: clean\n");
+		return;
 	}
+	let mut out = String::new();
+	{
+		use core::fmt::Write as _;
+		// Each line only when it has something to say, so an ordinary checksum fault does not
+		// arrive buried in three zeroes.
+		if report.checksum_failures > 0 {
+			let _ = writeln!(out, "fsck: {} checksum failure(s) - the medium gave back bytes that are not what was written", report.checksum_failures);
+		}
+		if report.io_failures > 0 {
+			let _ = writeln!(out, "fsck: {} read failure(s) - the medium would not answer; copy the volume elsewhere and check it there", report.io_failures);
+		}
+		if report.structural_failures > 0 {
+			let _ = writeln!(out, "fsck: {} structural failure(s) - the metadata is wrong, and re-reading will not change it", report.structural_failures);
+		}
+		if report.stream_failures > 0 {
+			let _ = writeln!(out, "fsck: {} undecodable stream(s) - every block matched its checksum and the compressed data still will not decode", report.stream_failures);
+		}
+		if !report.damaged.is_empty() {
+			let _ = writeln!(out, "damaged file(s):");
+			for path in &report.damaged {
+				let _ = writeln!(out, "  {path}");
+			}
+		}
+		// What the structural pass has to SAY. A count tells an operator something is wrong;
+		// these tell them what, which is the difference between a report and an alarm.
+		if !report.faults.is_empty() {
+			let _ = writeln!(out, "faults:");
+			for fault in &report.faults {
+				let _ = writeln!(out, "  {fault}");
+			}
+		}
+		let _ = writeln!(out, "restore with: volume restore <vol://system/...> [snapshot]");
+	}
+	print(out.as_bytes());
 }
 
 // Copy a file out of a named snapshot (or, with no name, the previous generation) over the
 // live file - the recovery verb for what fsck named.
-unsafe fn restore(storage: u64, uri: &[u8], snapshot: &[u8]) {
-	unsafe {
-		let path: String = String::from_utf8_lossy(uri).into_owned();
-		let snap: String = String::from_utf8_lossy(snapshot).into_owned();
-		let mut client = VolumeClient::new(storage);
-		match client.restore(&path, &snap) {
-			Some(Ok(())) => {
-				print(b"restored ");
-				print(uri);
-				if !snapshot.is_empty() {
-					print(b" from snapshot ");
-					print(snapshot);
-				} else {
-					print(b" from the previous generation");
-				}
-				print(b"\n");
+fn restore(storage: u64, uri: &[u8], snapshot: &[u8]) {
+	let path: String = String::from_utf8_lossy(uri).into_owned();
+	let snap: String = String::from_utf8_lossy(snapshot).into_owned();
+	let mut client = VolumeClient::new(storage);
+	match client.restore(&path, &snap) {
+		Some(Ok(())) => {
+			print(b"restored ");
+			print(uri);
+			if !snapshot.is_empty() {
+				print(b" from snapshot ");
+				print(snapshot);
+			} else {
+				print(b" from the previous generation");
 			}
-			Some(Err(_)) => {
-				print(b"volume restore: could not restore ");
-				print(uri);
-				print(b" (missing file or snapshot?)\n");
-			}
-			None => eprint(b"volume: StorageService unavailable\n"),
+			print(b"\n");
 		}
+		Some(Err(_)) => {
+			print(b"volume restore: could not restore ");
+			print(uri);
+			print(b" (missing file or snapshot?)\n");
+		}
+		None => eprint(b"volume: StorageService unavailable\n"),
 	}
 }
 

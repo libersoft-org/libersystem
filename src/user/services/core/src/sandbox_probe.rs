@@ -52,8 +52,8 @@ unsafe fn read_granted_file(storage: u64) -> Option<Vec<u8>> {
 
 // Emit one log entry through the granted LogService client - exercising the probe's
 // second grant. Best-effort: the demonstration is that the grant works, not its result.
-unsafe fn emit_online(logsvc: u64) {
-	let entry: Entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from("sandbox_probe"), fields: alloc::vec![Field { key: String::from("event"), value: String::from("online") }] };
+fn emit_online(logsvc: u64) {
+	let entry: Entry = Entry { timestamp: clock(), severity: Severity::Info, source: String::from("sandbox_probe"), fields: alloc::vec![Field { key: String::from("event"), value: String::from("online") }] };
 	let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 	let _ = client.emit(&entry);
 }
@@ -65,18 +65,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// Receive exactly the two capabilities the manifest grants, in the order the
 	// PermissionManager transfers them: the StorageService client, then the LogService
 	// client. The probe never receives (and so can never reach) anything else.
-	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
-	let logsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or_else(|| exit());
+	let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
+	let logsvc: u64 = recv_tagged(bootstrap, &mut buf, b"LOG").unwrap_or_else(|| exit());
 
 	// Exercise both grants: emit one log entry, then read the one granted file.
-	unsafe {
-		emit_online(logsvc);
-	}
+	emit_online(logsvc);
 	let contents: Vec<u8> = unsafe { read_granted_file(storage) }.unwrap_or_default();
 
 	// Report the bytes read back to the manager - its proof the storage grant is live.
-	unsafe {
-		send_blocking(bootstrap, &contents, 0);
-	}
+	send_blocking(bootstrap, &contents, 0);
 	exit();
 }

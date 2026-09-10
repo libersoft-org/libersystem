@@ -165,7 +165,7 @@ fn read_tree(volume: u64) -> Vec<(String, String)> {
 	let mapped: u64 = match unsafe { map_object(result.file) } {
 		Some(base) => base,
 		None => {
-			unsafe { close(result.file) };
+			close(result.file);
 			return Vec::new();
 		}
 	};
@@ -181,10 +181,8 @@ fn read_tree(volume: u64) -> Vec<(String, String)> {
 			at = next;
 		}
 	}
-	unsafe {
-		unmap_object(result.file);
-		close(result.file);
-	}
+	unmap_object(result.file);
+	close(result.file);
 	entries
 }
 
@@ -265,7 +263,7 @@ impl Service for Config {
 				}
 				None => self.entries.retain(|e| e.key != key),
 			}
-			unsafe { print(b"ConfigService: the tree could not be written through to its volume - the value is refused rather than served from memory\n") };
+			print(b"ConfigService: the tree could not be written through to its volume - the value is refused rather than served from memory\n");
 			return Err(Error::Io);
 		}
 		Ok(())
@@ -299,7 +297,7 @@ impl Service for Config {
 			&& !self.persist()
 		{
 			self.entries.push(entry);
-			unsafe { print(b"ConfigService: a removal could not be written through to its volume - the key is refused rather than removed from memory alone\n") };
+			print(b"ConfigService: a removal could not be written through to its volume - the key is refused rather than removed from memory alone\n");
 			return Err(Error::Io);
 		}
 		Ok(())
@@ -341,7 +339,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"ConfigService: online", 0);
 	}
 
@@ -355,7 +353,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// because the loop below ends on `SERVE` - see the role's comment in the manifest.
 	let mut owner_server: u64 = 0;
 	let service: u64 = loop {
-		match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if len >= 7 && &buf[..7] == b"STORAGE" => vol = handle,
 			Received::Message { len, handle } if len >= 11 && &buf[..11] == b"POLICYOWNER" => owner_server = handle,
 			Received::Message { len, handle } if len >= 5 && &buf[..5] == b"SERVE" && handle != 0 => break handle,
@@ -376,14 +374,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// root of its own: the supervisor minted the pair and gave this end to this program, and seeding
 	// it into the serve set is what makes its channel value the identity `Config::set` compares
 	// against. The supervisor keeps the client end and hands it to DeviceManager.
-	unsafe {
-		let seed: [u64; 1] = [owner_server];
-		let seeded: &[u64] = if owner_server != 0 { &seed } else { &[] };
-		serve_multi_seeded(service, seeded, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
-			config.privileged = owner_server != 0 && chan == owner_server;
-			config.current = chan;
-			config::dispatch(&mut config, req, handle, out, reply_handle)
-		});
-	}
+	let seed: [u64; 1] = [owner_server];
+	let seeded: &[u64] = if owner_server != 0 { &seed } else { &[] };
+	serve_multi_seeded(service, seeded, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+		config.privileged = owner_server != 0 && chan == owner_server;
+		config.current = chan;
+		config::dispatch(&mut config, req, handle, out, reply_handle)
+	});
 	exit();
 }

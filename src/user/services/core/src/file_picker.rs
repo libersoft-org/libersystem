@@ -55,13 +55,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 
 	// 1. receive the StorageService client the picker is trusted with.
-	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or_else(|| exit());
+	let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
 
 	// 2. wait for the serve channel clients reach us on.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| exit());
 
 	// 3. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"FilePicker: online", 0);
 	}
 
@@ -70,8 +70,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut picker: Picker = Picker { storage };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 256] = [0u8; 256];
-	unsafe {
-		serve(service, &mut request, &mut reply, |req, handle, out, reply_handle| -> Option<usize> { picker::dispatch(&mut picker, req, handle, out, reply_handle) });
-	}
+	serve(service, &mut request, &mut reply, |req, handle, out, reply_handle| -> Option<usize> { picker::dispatch(&mut picker, req, handle, out, reply_handle) });
 	exit();
 }

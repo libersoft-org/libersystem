@@ -32,11 +32,11 @@ impl ProviderWatch {
 		}
 		let mut frame = [0u8; 256];
 		loop {
-			match unsafe { try_recv_caps(self.channel, &mut frame) } {
+			match try_recv_caps(self.channel, &mut frame) {
 				PolledCaps::Message { len, mut handles } => {
 					let info = provider_catalogue::subscribe_read(&frame[..len], &mut handles);
 					for handle in handles.as_slice() {
-						unsafe { close(*handle) };
+						close(*handle);
 					}
 					let Some(info) = info else { continue };
 					self.entries.retain(|held| !same_provider(held, &info));
@@ -46,7 +46,7 @@ impl ProviderWatch {
 				}
 				PolledCaps::Empty => break,
 				PolledCaps::Closed => {
-					unsafe { close(self.channel) };
+					close(self.channel);
 					self.channel = 0;
 					self.entries.clear();
 					break;

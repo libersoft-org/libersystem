@@ -24,20 +24,18 @@ use security_client::PermissionClient;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let args: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: a PermissionManager client.
-		let permsvc: u64 = recv_tagged(bootstrap, &mut buf, b"PERMISSION").unwrap_or_else(|| exit());
-		query_permission(permsvc, JsonMode::parse(&args));
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let args: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: a PermissionManager client.
+	let permsvc: u64 = recv_tagged(bootstrap, &mut buf, b"PERMISSION").unwrap_or_else(|| exit());
+	query_permission(permsvc, JsonMode::parse(&args));
 	exit();
 }
 
@@ -45,50 +43,48 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // generated wire form, one document per entry) or as text - one line per entry, each showing
 // the component, the capability, and whether it was granted. The trail arrives as a
 // stream of entries, rendered as they arrive - it never has to fit one reply.
-unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
-	unsafe {
-		let mut client = PermissionClient::new(permsvc);
-		let consumer: u64 = match client.audit() {
-			Some(c) => c,
-			None => {
-				eprint(b"perm: service unavailable\n");
-				return;
-			}
-		};
-		let mut out = String::from("[");
-		let mut first: bool = true;
-		loop {
-			let mut frame_handles = proto::codec::Handles::new();
-			match recv_vec_caps_blocking(consumer, &mut frame_handles) {
-				ReceivedVecCaps::Message { bytes } => {
-					if let Some(e) = permission::audit_read(&bytes, &mut frame_handles) {
-						if mode.is_some() {
-							if !first {
-								out.push(',');
-							}
-							first = false;
-							out.push_str(&e.to_json());
-						} else {
-							print(e.to_text().as_bytes());
-							print(b"\n");
+fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
+	let mut client = PermissionClient::new(permsvc);
+	let consumer: u64 = match client.audit() {
+		Some(c) => c,
+		None => {
+			eprint(b"perm: service unavailable\n");
+			return;
+		}
+	};
+	let mut out = String::from("[");
+	let mut first: bool = true;
+	loop {
+		let mut frame_handles = proto::codec::Handles::new();
+		match recv_vec_caps_blocking(consumer, &mut frame_handles) {
+			ReceivedVecCaps::Message { bytes } => {
+				if let Some(e) = permission::audit_read(&bytes, &mut frame_handles) {
+					if mode.is_some() {
+						if !first {
+							out.push(',');
 						}
-					}
-					for handle in frame_handles.as_slice() {
-						close(*handle);
+						first = false;
+						out.push_str(&e.to_json());
+					} else {
+						print(e.to_text().as_bytes());
+						print(b"\n");
 					}
 				}
-				ReceivedVecCaps::Closed => break,
-				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
-					eprint(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
-					break;
+				for handle in frame_handles.as_slice() {
+					close(*handle);
 				}
 			}
+			ReceivedVecCaps::Closed => break,
+			ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+				eprint(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
+				break;
+			}
 		}
-		close(consumer);
-		if let Some(mode) = mode {
-			out.push(']');
-			print(mode.render(out).as_bytes());
-			print(b"\n");
-		}
+	}
+	close(consumer);
+	if let Some(mode) = mode {
+		out.push(']');
+		print(mode.render(out).as_bytes());
+		print(b"\n");
 	}
 }

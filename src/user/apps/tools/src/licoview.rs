@@ -40,88 +40,86 @@ enum ViewAction {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arg: Vec<u8> = context.arguments.clone().into_bytes();
-		// THE SELECTED-FILE TAG COMES FIRST, where the launcher sends it - before the vocabulary
-		// grants. It is always sent to this program, bare when there was no file, because a tag read
-		// where nothing arrives consumes the next message and then blocks forever.
-		let selected: u64 = recv_tagged(bootstrap, &mut buf, CAP_SELECTED_FILE).unwrap_or(0);
-		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
-		let volumes = VolumeSet::receive(bootstrap, &mut buf);
-		// THIS APPLICATION'S OWN ASSET DIRECTORY, and nothing else on the volume.
-		//
-		// The syntax descriptors live under `bin/lico/`, the bundle LiberCommander's three programs
-		// share, and reading them
-		// through the volume bundle above would mean the viewer had every file on every mounted
-		// volume in order to colour some keywords. This client is minted by PermissionManager from
-		// the private admin endpoint and carries the directory as its SCOPE: a path outside it is
-		// refused by StorageService, and the client cannot mint a broader one.
-		//
-		// Absent on a boot that grants no assets, which is a viewer that highlights nothing rather
-		// than a viewer that fails - see `load_descriptors`.
-		let assets: u64 = recv_tagged(bootstrap, &mut buf, CAP_APP_ASSETS).unwrap_or(0);
-		let descriptors: Vec<SyntaxDescriptor> = load_descriptors(assets);
-		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
-		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
-		let arg = trim(&arg);
-		// THE SELECTED-FILE GRANT, WHEN THERE IS ONE. A launch over one file hands this program a
-		// client scoped to exactly that path - not the directory it sits in, not a sibling - so the
-		// viewer opened on a file cannot reopen the file beside it or list the directory to find
-		// out what those are. The record that follows says which URI to open through it.
-		//
-		// ABSENT IS THE ORDINARY LAUNCH, which is why this is an `Option` rather than a
-		// requirement: `licoview PATH` typed at a shell still resolves a path against the volume
-		// bundle its own manifest grants, and that path is checked the way it always was.
-		let (uri, storage) = match opened.as_ref() {
-			Some(opened) => (String::from(opened.uri.as_str()), selected),
-			None => {
-				if arg.is_empty() || arg.iter().any(u8::is_ascii_whitespace) {
-					print(b"Usage: licoview PATH\n");
-					exit();
-				}
-				let Some(uri) = path::resolve(cwd, arg) else {
-					eprint(b"licoview: invalid path\n");
-					exit();
-				};
-				let storage = volumes.client_for(cwd, arg);
-				(uri, storage)
-			}
-		};
-		let arg: &[u8] = match opened.as_ref() {
-			Some(opened) => opened.name.as_bytes(),
-			None => arg,
-		};
-		let mut source = match Source::open(storage, &uri) {
-			Some(source) => source,
-			None => {
-				eprint(b"licoview: cannot open that file\n");
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arg: Vec<u8> = context.arguments.clone().into_bytes();
+	// THE SELECTED-FILE TAG COMES FIRST, where the launcher sends it - before the vocabulary
+	// grants. It is always sent to this program, bare when there was no file, because a tag read
+	// where nothing arrives consumes the next message and then blocks forever.
+	let selected: u64 = recv_tagged(bootstrap, &mut buf, CAP_SELECTED_FILE).unwrap_or(0);
+	let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
+	let volumes = VolumeSet::receive(bootstrap, &mut buf);
+	// THIS APPLICATION'S OWN ASSET DIRECTORY, and nothing else on the volume.
+	//
+	// The syntax descriptors live under `bin/lico/`, the bundle LiberCommander's three programs
+	// share, and reading them
+	// through the volume bundle above would mean the viewer had every file on every mounted
+	// volume in order to colour some keywords. This client is minted by PermissionManager from
+	// the private admin endpoint and carries the directory as its SCOPE: a path outside it is
+	// refused by StorageService, and the client cannot mint a broader one.
+	//
+	// Absent on a boot that grants no assets, which is a viewer that highlights nothing rather
+	// than a viewer that fails - see `load_descriptors`.
+	let assets: u64 = recv_tagged(bootstrap, &mut buf, CAP_APP_ASSETS).unwrap_or(0);
+	let descriptors: Vec<SyntaxDescriptor> = load_descriptors(assets);
+	let cwd: Vec<u8> = context.cwd.clone().into_bytes();
+	let cwd = core::str::from_utf8(&cwd).unwrap_or("");
+	let arg = trim(&arg);
+	// THE SELECTED-FILE GRANT, WHEN THERE IS ONE. A launch over one file hands this program a
+	// client scoped to exactly that path - not the directory it sits in, not a sibling - so the
+	// viewer opened on a file cannot reopen the file beside it or list the directory to find
+	// out what those are. The record that follows says which URI to open through it.
+	//
+	// ABSENT IS THE ORDINARY LAUNCH, which is why this is an `Option` rather than a
+	// requirement: `licoview PATH` typed at a shell still resolves a path against the volume
+	// bundle its own manifest grants, and that path is checked the way it always was.
+	let (uri, storage) = match opened.as_ref() {
+		Some(opened) => (String::from(opened.uri.as_str()), selected),
+		None => {
+			if arg.is_empty() || arg.iter().any(u8::is_ascii_whitespace) {
+				print(b"Usage: licoview PATH\n");
 				exit();
 			}
-		};
-		if stdin() == 0 || stdout() == 0 {
-			eprint(b"licoview: interactive terminal unavailable\n");
-		} else {
-			catch_interrupt();
-			let mut output = ConsoleWriter::new(stdout());
-			let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Press, bracketed_paste: false };
-			// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED. These were `ESC[?9001h` / `ESC[?9002l`
-			// in this program's own OUTPUT, where a program's data and its requests are the same bytes -
-			// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
-			// control channel the shell hands to an interactive foreground job; false means there is no
-			// terminal to ask, and the program runs cooked rather than failing.
-			let owns_tty: bool = tty_set_mode(true, false);
-			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
-				let _ = view_file(terminal.writer(), &mut source, arg, &descriptors);
-			}
-			// And back to cooked input and echo, through the same request path.
-			if owns_tty {
-				tty_set_mode(false, true);
-			}
+			let Some(uri) = path::resolve(cwd, arg) else {
+				eprint(b"licoview: invalid path\n");
+				exit();
+			};
+			let storage = volumes.client_for(cwd, arg);
+			(uri, storage)
+		}
+	};
+	let arg: &[u8] = match opened.as_ref() {
+		Some(opened) => opened.name.as_bytes(),
+		None => arg,
+	};
+	let mut source = match Source::open(storage, &uri) {
+		Some(source) => source,
+		None => {
+			eprint(b"licoview: cannot open that file\n");
+			exit();
+		}
+	};
+	if stdin() == 0 || stdout() == 0 {
+		eprint(b"licoview: interactive terminal unavailable\n");
+	} else {
+		catch_interrupt();
+		let mut output = ConsoleWriter::new(stdout());
+		let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Press, bracketed_paste: false };
+		// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED. These were `ESC[?9001h` / `ESC[?9002l`
+		// in this program's own OUTPUT, where a program's data and its requests are the same bytes -
+		// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
+		// control channel the shell hands to an interactive foreground job; false means there is no
+		// terminal to ask, and the program runs cooked rather than failing.
+		let owns_tty: bool = tty_set_mode(true, false);
+		if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
+			let _ = view_file(terminal.writer(), &mut source, arg, &descriptors);
+		}
+		// And back to cooked input and echo, through the same request path.
+		if owns_tty {
+			tty_set_mode(false, true);
 		}
 	}
 	exit();
@@ -133,7 +131,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // is this milestone's rule and is why every failure here is a `continue`: no assets granted, a
 // directory that will not list, a file that will not read, a descriptor that does not parse. The
 // viewer's job is to show the file.
-unsafe fn load_descriptors(assets: u64) -> Vec<SyntaxDescriptor> {
+fn load_descriptors(assets: u64) -> Vec<SyntaxDescriptor> {
 	let mut loaded: Vec<SyntaxDescriptor> = Vec::new();
 	if assets == 0 {
 		return loaded;
@@ -179,7 +177,7 @@ enum Source {
 
 impl Source {
 	// Read the file, or - when it is past the bound - index it and page it.
-	unsafe fn open(storage: u64, uri: &str) -> Option<Source> {
+	fn open(storage: u64, uri: &str) -> Option<Source> {
 		if let Ok(bytes) = unsafe { read_volume_file(storage, uri, MAX_VIEW_BYTES) } {
 			let lines = line_index(&bytes);
 			return Some(Source::Held { bytes, lines });
@@ -393,51 +391,49 @@ struct View {
 	last_match: Option<usize>,
 }
 
-unsafe fn view_file(output: &mut impl TerminalWriter, source: &mut Source, name: &[u8], descriptors: &[SyntaxDescriptor]) -> bool {
-	unsafe {
-		let input = stdin();
-		let mut decoder = InputDecoder::new();
-		let head = source.read(0, 32);
-		let kind = detect_file_type(name, &head, false);
-		// A FILE THAT IS NOT TEXT OPENS AS BYTES. Showing a decoded rendering of an executable is
-		// showing a reader something that is not there, and the first thing they would do is switch.
-		let mode = if matches!(kind, FileType::Binary | FileType::Archive | FileType::Executable | FileType::Image | FileType::Audio) { Mode::Hex } else { Mode::Text };
-		let mut view = View { mode, position: 0, wrap: true, numbers: false, highlight: true, prompt: Prompt::None, entry: Vec::new(), text_needle: Vec::new(), hex_needle: None, hex_last: false, ignore_case: false, whole_word: false, status: Vec::new(), last_match: None };
-		view.say(b"t/r/x mode  w wrap  # numbers  h light  / find  \\ hex  i case  W word  g/o/% goto  n/p repeat  q quit");
-		let mut redraw = true;
+fn view_file(output: &mut impl TerminalWriter, source: &mut Source, name: &[u8], descriptors: &[SyntaxDescriptor]) -> bool {
+	let input = stdin();
+	let mut decoder = InputDecoder::new();
+	let head = source.read(0, 32);
+	let kind = detect_file_type(name, &head, false);
+	// A FILE THAT IS NOT TEXT OPENS AS BYTES. Showing a decoded rendering of an executable is
+	// showing a reader something that is not there, and the first thing they would do is switch.
+	let mode = if matches!(kind, FileType::Binary | FileType::Archive | FileType::Executable | FileType::Image | FileType::Audio) { Mode::Hex } else { Mode::Text };
+	let mut view = View { mode, position: 0, wrap: true, numbers: false, highlight: true, prompt: Prompt::None, entry: Vec::new(), text_needle: Vec::new(), hex_needle: None, hex_last: false, ignore_case: false, whole_word: false, status: Vec::new(), last_match: None };
+	view.say(b"t/r/x mode  w wrap  # numbers  h light  / find  \\ hex  i case  W word  g/o/% goto  n/p repeat  q quit");
+	let mut redraw = true;
+	loop {
+		if redraw {
+			if !render(output, source, name, &view, kind, descriptors) {
+				return false;
+			}
+			redraw = false;
+		}
+		if interrupted() {
+			return true;
+		}
+		let ready = wait_any(&[input], 0);
+		if interrupted() || ready < 0 {
+			return true;
+		}
+		if ready != 0 {
+			continue;
+		}
+		let mut input_bytes = [0u8; 64];
 		loop {
-			if redraw {
-				if !render(output, source, name, &view, kind, descriptors) {
-					return false;
-				}
-				redraw = false;
-			}
-			if interrupted() {
-				return true;
-			}
-			let ready = wait_any(&[input], 0);
-			if interrupted() || ready < 0 {
-				return true;
-			}
-			if ready != 0 {
-				continue;
-			}
-			let mut input_bytes = [0u8; 64];
-			loop {
-				match try_recv(input, &mut input_bytes) {
-					Polled::Message { len, .. } => {
-						for &byte in &input_bytes[..len] {
-							let Some(event) = decoder.feed(byte) else { continue };
-							match view.apply(event, source) {
-								ViewAction::None => {}
-								ViewAction::Redraw => redraw = true,
-								ViewAction::Exit => return true,
-							}
+			match try_recv(input, &mut input_bytes) {
+				Polled::Message { len, .. } => {
+					for &byte in &input_bytes[..len] {
+						let Some(event) = decoder.feed(byte) else { continue };
+						match view.apply(event, source) {
+							ViewAction::None => {}
+							ViewAction::Redraw => redraw = true,
+							ViewAction::Exit => return true,
 						}
 					}
-					Polled::Empty => break,
-					Polled::Closed => return true,
 				}
+				Polled::Empty => break,
+				Polled::Closed => return true,
 			}
 		}
 	}

@@ -55,118 +55,116 @@ struct Target {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut append = false;
-		let mut fail_fast = false;
-		let mut paths: Vec<&[u8]> = Vec::new();
-		for word in split_args(&arguments) {
-			match classify(word) {
-				Arg::Long(b"append", None) => append = true,
-				Arg::Short(b'a') => append = true,
-				Arg::Long(b"fail-fast", None) => fail_fast = true,
-				Arg::Value(value) => {
-					if paths.len() >= MAX_TARGETS {
-						eprint(b"tee: too many destinations\n");
-						exit();
-					}
-					if paths.try_reserve(1).is_err() {
-						eprint(b"tee: out of memory\n");
-						exit();
-					}
-					paths.push(value);
-				}
-				_ => {
-					eprint(b"tee: usage: tee [-a] [--fail-fast] <path> [path...]\n");
+	let mut append = false;
+	let mut fail_fast = false;
+	let mut paths: Vec<&[u8]> = Vec::new();
+	for word in split_args(&arguments) {
+		match classify(word) {
+			Arg::Long(b"append", None) => append = true,
+			Arg::Short(b'a') => append = true,
+			Arg::Long(b"fail-fast", None) => fail_fast = true,
+			Arg::Value(value) => {
+				if paths.len() >= MAX_TARGETS {
+					eprint(b"tee: too many destinations\n");
 					exit();
 				}
+				if paths.try_reserve(1).is_err() {
+					eprint(b"tee: out of memory\n");
+					exit();
+				}
+				paths.push(value);
+			}
+			_ => {
+				eprint(b"tee: usage: tee [-a] [--fail-fast] <path> [path...]\n");
+				exit();
 			}
 		}
-		// NO STDIN IS NOT A USAGE ERROR, it is the whole reason this tool exists. `tee` with no
-		// input stream was launched as the first stage of something, which is a line that cannot
-		// mean anything - it would copy nothing to everywhere.
-		let Some(mut source) = Source::from_stdin() else {
-			eprint(b"tee: nothing is wired to this stage's input\n");
-			exit();
+	}
+	// NO STDIN IS NOT A USAGE ERROR, it is the whole reason this tool exists. `tee` with no
+	// input stream was launched as the first stage of something, which is a line that cannot
+	// mean anything - it would copy nothing to everywhere.
+	let Some(mut source) = Source::from_stdin() else {
+		eprint(b"tee: nothing is wired to this stage's input\n");
+		exit();
+	};
+	// EVERY DESTINATION IS OPENED BEFORE A BYTE IS READ, for `redirect_out`'s reason: a
+	// destination that cannot be written should fail while the producer is still at its first
+	// write, not after its output has been consumed and thrown away.
+	let mut targets: Vec<Target> = Vec::new();
+	let mode: WriterMode = if append { WriterMode::Append } else { WriterMode::Replace };
+	let mut refused = false;
+	for argument in &paths {
+		let Some(uri) = path::resolve(&cwd, argument) else {
+			eprint(b"tee: ");
+			eprint(argument);
+			eprint(b": invalid path\n");
+			refused = true;
+			continue;
 		};
-		// EVERY DESTINATION IS OPENED BEFORE A BYTE IS READ, for `redirect_out`'s reason: a
-		// destination that cannot be written should fail while the producer is still at its first
-		// write, not after its output has been consumed and thrown away.
-		let mut targets: Vec<Target> = Vec::new();
-		let mode: WriterMode = if append { WriterMode::Append } else { WriterMode::Replace };
-		let mut refused = false;
-		for argument in &paths {
-			let Some(uri) = path::resolve(&cwd, argument) else {
+		let storage: u64 = volumes.client_for(&cwd, argument);
+		let mut client = VolumeClient::new(storage);
+		match client.open_writer(&uri, mode) {
+			Some(Ok(writer)) => {
+				if targets.try_reserve(1).is_err() {
+					eprint(b"tee: out of memory\n");
+					exit();
+				}
+				targets.push(Target { uri, writer, failed: false });
+			}
+			_ => {
 				eprint(b"tee: ");
-				eprint(argument);
-				eprint(b": invalid path\n");
+				eprint(uri.as_bytes());
+				eprint(b": cannot open for writing\n");
 				refused = true;
-				continue;
-			};
-			let storage: u64 = volumes.client_for(&cwd, argument);
-			let mut client = VolumeClient::new(storage);
-			match client.open_writer(&uri, mode) {
-				Some(Ok(writer)) => {
-					if targets.try_reserve(1).is_err() {
-						eprint(b"tee: out of memory\n");
-						exit();
-					}
-					targets.push(Target { uri, writer, failed: false });
-				}
-				_ => {
-					eprint(b"tee: ");
-					eprint(uri.as_bytes());
-					eprint(b": cannot open for writing\n");
-					refused = true;
-				}
 			}
 		}
-		// A DESTINATION THAT COULD NOT BE OPENED ENDS THE RUN UNDER `--fail-fast`, before a byte is
-		// read - which is the only point at which stopping costs nothing, because the producer is
-		// still at its first write.
-		if fail_fast && refused {
-			for target in &mut targets {
-				let _ = target.writer.abort();
-				close(target.writer.handle());
-			}
-			eprint(b"tee: --fail-fast: a destination could not be opened\n");
-			exit();
-		}
-		let outcome = pump(&mut source, &mut targets, fail_fast);
-		// The destinations are published only when the INPUT ended normally. A producer that
-		// failed mid-stream leaves every one of them exactly as it was - that is the difference
-		// between a `tee` that records a run and a `tee` that records half of one as if it were
-		// whole.
-		let publish: bool = outcome != Outcome::InputFailed;
+	}
+	// A DESTINATION THAT COULD NOT BE OPENED ENDS THE RUN UNDER `--fail-fast`, before a byte is
+	// read - which is the only point at which stopping costs nothing, because the producer is
+	// still at its first write.
+	if fail_fast && refused {
 		for target in &mut targets {
-			if publish && !target.failed {
-				if !matches!(target.writer.commit(), Some(Ok(_))) {
-					eprint(b"tee: ");
-					eprint(target.uri.as_bytes());
-					eprint(b": could not publish\n");
-					refused = true;
-					let _ = target.writer.abort();
-				}
-			} else {
-				let _ = target.writer.abort();
-			}
+			let _ = target.writer.abort();
 			close(target.writer.handle());
 		}
-		if outcome == Outcome::InputFailed {
-			eprint(b"tee: the input stream failed; no destination was published\n");
-			exit();
+		eprint(b"tee: --fail-fast: a destination could not be opened\n");
+		exit();
+	}
+	let outcome = pump(&mut source, &mut targets, fail_fast);
+	// The destinations are published only when the INPUT ended normally. A producer that
+	// failed mid-stream leaves every one of them exactly as it was - that is the difference
+	// between a `tee` that records a run and a `tee` that records half of one as if it were
+	// whole.
+	let publish: bool = outcome != Outcome::InputFailed;
+	for target in &mut targets {
+		if publish && !target.failed {
+			if !matches!(target.writer.commit(), Some(Ok(_))) {
+				eprint(b"tee: ");
+				eprint(target.uri.as_bytes());
+				eprint(b": could not publish\n");
+				refused = true;
+				let _ = target.writer.abort();
+			}
+		} else {
+			let _ = target.writer.abort();
 		}
-		if refused || targets.iter().any(|target| target.failed) {
-			exit();
-		}
+		close(target.writer.handle());
+	}
+	if outcome == Outcome::InputFailed {
+		eprint(b"tee: the input stream failed; no destination was published\n");
+		exit();
+	}
+	if refused || targets.iter().any(|target| target.failed) {
+		exit();
 	}
 	exit();
 }
@@ -188,35 +186,33 @@ enum Outcome {
 // failed and skipped from then on, rather than being retried per window - a half-written
 // destination that then resumes would hold a file with a hole in it, which is the one result worse
 // than not having the file.
-unsafe fn pump(source: &mut Source, targets: &mut [Target], fail_fast: bool) -> Outcome {
-	unsafe {
-		loop {
-			let window = match source.next() {
-				Window::Bytes(bytes) => bytes,
-				Window::End => return Outcome::Done,
-				Window::Failed => return Outcome::InputFailed,
-			};
-			for target in targets.iter_mut() {
-				if target.failed {
-					continue;
-				}
-				if !matches!(target.writer.write(&window), Some(Ok(_))) {
-					eprint(b"tee: ");
-					eprint(target.uri.as_bytes());
-					eprint(b": write failed\n");
-					target.failed = true;
-					if fail_fast {
-						return Outcome::InputFailed;
-					}
+fn pump(source: &mut Source, targets: &mut [Target], fail_fast: bool) -> Outcome {
+	loop {
+		let window = match source.next() {
+			Window::Bytes(bytes) => bytes,
+			Window::End => return Outcome::Done,
+			Window::Failed => return Outcome::InputFailed,
+		};
+		for target in targets.iter_mut() {
+			if target.failed {
+				continue;
+			}
+			if !matches!(target.writer.write(&window), Some(Ok(_))) {
+				eprint(b"tee: ");
+				eprint(target.uri.as_bytes());
+				eprint(b": write failed\n");
+				target.failed = true;
+				if fail_fast {
+					return Outcome::InputFailed;
 				}
 			}
-			// STDOUT LAST, because it is the one that blocks. Writing the destinations first means
-			// a stalled consumer holds up the staging by exactly one window rather than getting
-			// ahead of it - and the block is the backpressure that keeps this stage from becoming
-			// the place where a pipeline's memory goes.
-			if !write_stdout(&window) {
-				return Outcome::ConsumerGone;
-			}
+		}
+		// STDOUT LAST, because it is the one that blocks. Writing the destinations first means
+		// a stalled consumer holds up the staging by exactly one window rather than getting
+		// ahead of it - and the block is the backpressure that keeps this stage from becoming
+		// the place where a pipeline's memory goes.
+		if !write_stdout(&window) {
+			return Outcome::ConsumerGone;
 		}
 	}
 }

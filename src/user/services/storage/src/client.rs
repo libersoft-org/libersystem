@@ -23,7 +23,7 @@ const TARGET_URI: &[u8] = b"vol://system/hello.txt";
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	// 1. connect: receive the manager's service channel.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONNECT") }.unwrap_or_else(|| exit());
+	let service: u64 = recv_tagged(bootstrap, &mut buf, b"CONNECT").unwrap_or_else(|| exit());
 	// 2. open the target file over the generated volume client (read-only view).
 	let mut client = volume::Client::new(ChannelTransport { chan: service });
 	let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(TARGET_URI).into_owned(), write: false, create: false };
@@ -40,9 +40,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		None => exit(),
 	};
 	let contents: &[u8] = unsafe { core::slice::from_raw_parts(mapped as *const u8, result.size as usize) };
-	unsafe {
-		send_blocking(bootstrap, contents, 0);
-		unmap_object(result.file);
-	}
+	send_blocking(bootstrap, contents, 0);
+	unmap_object(result.file);
 	exit();
 }

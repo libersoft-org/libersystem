@@ -149,18 +149,16 @@ unsafe fn read_file(storage: u64, uri: &str) -> Option<Vec<u8>> {
 	}
 }
 
-unsafe fn exists(storage: u64, uri: &str) -> bool {
-	unsafe {
-		let mut client = VolumeClient::new(storage);
-		match client.open(&OpenOpts { path: String::from(uri), write: false, create: false }) {
-			Some(Ok(opened)) => {
-				if opened.file != 0 {
-					close(opened.file);
-				}
-				true
+fn exists(storage: u64, uri: &str) -> bool {
+	let mut client = VolumeClient::new(storage);
+	match client.open(&OpenOpts { path: String::from(uri), write: false, create: false }) {
+		Some(Ok(opened)) => {
+			if opened.file != 0 {
+				close(opened.file);
 			}
-			_ => false,
+			true
 		}
+		_ => false,
 	}
 }
 
@@ -179,6 +177,6 @@ fn fail(error: Error) -> ! {
 		Error::NotImplemented => b"audioconv: writing that format is not implemented yet\n".as_slice(),
 		Error::TooLarge => b"audioconv: the conversion does not fit\n".as_slice(),
 	};
-	unsafe { print(message) };
+	print(message);
 	exit()
 }

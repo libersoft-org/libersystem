@@ -23,51 +23,47 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the name of the service to stop.
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let name: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: a ServiceManager admin channel.
-		let admin: u64 = recv_tagged(bootstrap, &mut buf, b"SUPERVISOR").unwrap_or_else(|| exit());
-		stop_service(admin, &name[..]);
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the name of the service to stop.
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let name: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: a ServiceManager admin channel.
+	let admin: u64 = recv_tagged(bootstrap, &mut buf, b"SUPERVISOR").unwrap_or_else(|| exit());
+	stop_service(admin, &name[..]);
 	exit();
 }
 
 // Ask ServiceManager to stop a service and its dependents over the admin channel: send the
 // bare service name and print the reply - the newline-joined teardown order on success, or a
 // not-found notice.
-unsafe fn stop_service(admin: u64, name: &[u8]) {
-	unsafe {
-		if name.is_empty() {
-			eprint(b"stop: usage: stop <service>\n");
-			return;
-		}
-		if !send_blocking(admin, name, 0) {
-			eprint(b"stop: request failed\n");
-			return;
-		}
-		let mut rbuf: [u8; 512] = [0u8; 512];
-		match recv_blocking(admin, &mut rbuf) {
-			Received::Message { len, .. } => {
-				if rbuf[..len].starts_with(b"STOPPED\n") {
-					print(b"stopped:\n");
-					print(&rbuf[8..len]);
-					print(b"\n");
-				} else if len >= 8 && &rbuf[..8] == b"NOTFOUND" {
-					eprint(b"stop: no such running service\n");
-				} else {
-					print(&rbuf[..len]);
-					print(b"\n");
-				}
+fn stop_service(admin: u64, name: &[u8]) {
+	if name.is_empty() {
+		eprint(b"stop: usage: stop <service>\n");
+		return;
+	}
+	if !send_blocking(admin, name, 0) {
+		eprint(b"stop: request failed\n");
+		return;
+	}
+	let mut rbuf: [u8; 512] = [0u8; 512];
+	match recv_blocking(admin, &mut rbuf) {
+		Received::Message { len, .. } => {
+			if rbuf[..len].starts_with(b"STOPPED\n") {
+				print(b"stopped:\n");
+				print(&rbuf[8..len]);
+				print(b"\n");
+			} else if len >= 8 && &rbuf[..8] == b"NOTFOUND" {
+				eprint(b"stop: no such running service\n");
+			} else {
+				print(&rbuf[..len]);
+				print(b"\n");
 			}
-			Received::Closed => eprint(b"stop: supervisor gone\n"),
 		}
+		Received::Closed => eprint(b"stop: supervisor gone\n"),
 	}
 }

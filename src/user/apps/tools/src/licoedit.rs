@@ -239,41 +239,39 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-unsafe fn edit(output: &mut impl TerminalWriter, editor: &mut Editor, volumes: &VolumeSet) -> bool {
-	unsafe {
-		let input = stdin();
-		let mut decoder = InputDecoder::new();
-		let mut redraw = true;
+fn edit(output: &mut impl TerminalWriter, editor: &mut Editor, volumes: &VolumeSet) -> bool {
+	let input = stdin();
+	let mut decoder = InputDecoder::new();
+	let mut redraw = true;
+	loop {
+		if redraw {
+			if !render(output, editor) {
+				return false;
+			}
+			redraw = false;
+		}
+		if interrupted() {
+			return true;
+		}
+		let ready = wait_any(&[input], 0);
+		if interrupted() || ready < 0 {
+			return true;
+		}
+		let mut bytes = [0u8; 64];
 		loop {
-			if redraw {
-				if !render(output, editor) {
-					return false;
-				}
-				redraw = false;
-			}
-			if interrupted() {
-				return true;
-			}
-			let ready = wait_any(&[input], 0);
-			if interrupted() || ready < 0 {
-				return true;
-			}
-			let mut bytes = [0u8; 64];
-			loop {
-				match try_recv(input, &mut bytes) {
-					Polled::Message { len, .. } => {
-						for &byte in &bytes[..len] {
-							let Some(event) = decoder.feed(byte) else { continue };
-							match editor.apply(event, volumes) {
-								EditAction::None => {}
-								EditAction::Redraw => redraw = true,
-								EditAction::Exit => return true,
-							}
+			match try_recv(input, &mut bytes) {
+				Polled::Message { len, .. } => {
+					for &byte in &bytes[..len] {
+						let Some(event) = decoder.feed(byte) else { continue };
+						match editor.apply(event, volumes) {
+							EditAction::None => {}
+							EditAction::Redraw => redraw = true,
+							EditAction::Exit => return true,
 						}
 					}
-					Polled::Empty => break,
-					Polled::Closed => return true,
 				}
+				Polled::Empty => break,
+				Polled::Closed => return true,
 			}
 		}
 	}
@@ -973,17 +971,17 @@ impl Editor {
 		}
 		if !published {
 			let _ = writer.abort();
-			unsafe { close(writer.handle()) };
+			close(writer.handle());
 			self.say(b"the write failed - nothing was published and the file is unchanged");
 			return EditAction::Redraw;
 		}
 		if !matches!(writer.commit(), Some(Ok(_))) {
 			let _ = writer.abort();
-			unsafe { close(writer.handle()) };
+			close(writer.handle());
 			self.say(b"the publication failed - the file is unchanged");
 			return EditAction::Redraw;
 		}
-		unsafe { close(writer.handle()) };
+		close(writer.handle());
 		self.buffers[self.active].text.mark_clean();
 		self.buffers[self.active].overwrite_confirmed = false;
 		self.buffers[self.active].read_only = false;
@@ -1024,7 +1022,7 @@ fn parse_decimal(bytes: &[u8]) -> Option<usize> {
 // A MISSING OR BAD DESCRIPTOR FALLS BACK TO PLAIN TEXT AND CANNOT PREVENT OPENING THE FILE, which
 // is this milestone's rule and is why every failure here is a `continue`: no assets granted, a
 // directory that will not list, a file that will not read, a descriptor that does not parse.
-unsafe fn load_descriptors(assets: u64) -> Vec<SyntaxDescriptor> {
+fn load_descriptors(assets: u64) -> Vec<SyntaxDescriptor> {
 	let mut loaded: Vec<SyntaxDescriptor> = Vec::new();
 	if assets == 0 {
 		return loaded;

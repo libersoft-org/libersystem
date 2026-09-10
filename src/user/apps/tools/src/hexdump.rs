@@ -26,84 +26,82 @@ const PER_LINE: usize = 16;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut skip: u64 = 0;
-		let mut length: Option<u64> = None;
-		let mut path: Option<&[u8]> = None;
-		let mut expect: Option<u8> = None;
-		for word in split_args(&arguments) {
-			if let Some(letter) = expect.take() {
-				let Some(value) = parse_size(word) else {
-					eprint(b"hexdump: not a size\n");
-					exit();
-				};
-				if letter == b's' {
-					skip = value
-				} else {
-					length = Some(value)
-				}
-				continue;
+	let mut skip: u64 = 0;
+	let mut length: Option<u64> = None;
+	let mut path: Option<&[u8]> = None;
+	let mut expect: Option<u8> = None;
+	for word in split_args(&arguments) {
+		if let Some(letter) = expect.take() {
+			let Some(value) = parse_size(word) else {
+				eprint(b"hexdump: not a size\n");
+				exit();
+			};
+			if letter == b's' {
+				skip = value
+			} else {
+				length = Some(value)
 			}
-			match classify(word) {
-				Arg::Long(b"skip", Some(value)) => skip = size_or_die(value),
-				Arg::Long(b"length", Some(value)) => length = Some(size_or_die(value)),
-				Arg::Long(b"skip", None) => expect = Some(b's'),
-				Arg::Long(b"length", None) => expect = Some(b'n'),
-				Arg::Short(b's') => expect = Some(b's'),
-				Arg::Short(b'n') => expect = Some(b'n'),
-				Arg::Value(value) if path.is_none() => path = Some(value),
-				_ => {
-					eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
-					exit();
-				}
+			continue;
+		}
+		match classify(word) {
+			Arg::Long(b"skip", Some(value)) => skip = size_or_die(value),
+			Arg::Long(b"length", Some(value)) => length = Some(size_or_die(value)),
+			Arg::Long(b"skip", None) => expect = Some(b's'),
+			Arg::Long(b"length", None) => expect = Some(b'n'),
+			Arg::Short(b's') => expect = Some(b's'),
+			Arg::Short(b'n') => expect = Some(b'n'),
+			Arg::Value(value) if path.is_none() => path = Some(value),
+			_ => {
+				eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
+				exit();
 			}
 		}
-		if expect.is_some() {
-			eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
-			exit();
-		}
-		// NO PATH MEANS STDIN. `-s` still means "start this many bytes in", which on a stream is
-		// bytes read and thrown away rather than a seek - see `Source::skip`. The OFFSET COLUMN
-		// still counts from the skip, because it is an offset into the input and not into whatever
-		// part of it this run happened to read.
-		let (mut source, label): (Source, Vec<u8>) = match path {
-			Some(argument) => {
-				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-					eprint(b"hexdump: invalid path\n");
-					exit();
-				};
-				let storage: u64 = volumes.client_for(&cwd, argument);
-				if storage == 0 {
-					eprint(b"hexdump: cannot read ");
-					eprint(uri.as_bytes());
-					eprint(b"\n");
-					exit();
-				}
-				let bytes: Vec<u8> = uri.as_bytes().to_vec();
-				(Source::from_path(storage, &uri, WINDOW), bytes)
+	}
+	if expect.is_some() {
+		eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
+		exit();
+	}
+	// NO PATH MEANS STDIN. `-s` still means "start this many bytes in", which on a stream is
+	// bytes read and thrown away rather than a seek - see `Source::skip`. The OFFSET COLUMN
+	// still counts from the skip, because it is an offset into the input and not into whatever
+	// part of it this run happened to read.
+	let (mut source, label): (Source, Vec<u8>) = match path {
+		Some(argument) => {
+			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+				eprint(b"hexdump: invalid path\n");
+				exit();
+			};
+			let storage: u64 = volumes.client_for(&cwd, argument);
+			if storage == 0 {
+				eprint(b"hexdump: cannot read ");
+				eprint(uri.as_bytes());
+				eprint(b"\n");
+				exit();
 			}
-			None => match Source::from_stdin() {
-				Some(source) => (source, b"-".to_vec()),
-				None => {
-					eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
-					exit();
-				}
-			},
-		};
-		if !dump(&mut source, skip, length) {
-			eprint(b"hexdump: cannot read ");
-			eprint(&label);
-			eprint(b"\n");
+			let bytes: Vec<u8> = uri.as_bytes().to_vec();
+			(Source::from_path(storage, &uri, WINDOW), bytes)
 		}
+		None => match Source::from_stdin() {
+			Some(source) => (source, b"-".to_vec()),
+			None => {
+				eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
+				exit();
+			}
+		},
+	};
+	if !dump(&mut source, skip, length) {
+		eprint(b"hexdump: cannot read ");
+		eprint(&label);
+		eprint(b"\n");
 	}
 	exit();
 }
@@ -111,118 +109,112 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 fn size_or_die(value: &[u8]) -> u64 {
 	match parse_size(value) {
 		Some(value) => value,
-		None => unsafe {
+		None => {
 			eprint(b"hexdump: not a size\n");
 			exit()
-		},
+		}
 	}
 }
 
-unsafe fn dump(source: &mut Source, skip: u64, length: Option<u64>) -> bool {
-	unsafe {
-		if !source.skip(skip) {
-			// Nothing to dump is not a failure: a file shorter than the skip is an empty answer,
-			// which is what `hexdump -s` past the end has always printed.
-			return true;
-		}
-		let mut left: u64 = length.unwrap_or(u64::MAX);
-		// One line's worth carried between windows, so a window boundary does not break the
-		// sixteen-byte rows - a dump whose row width depended on the chunking would not line up
-		// with a second dump of the same file.
-		let mut row: Vec<u8> = Vec::new();
-		let mut row_offset: u64 = skip;
-		let mut previous: Vec<u8> = Vec::new();
-		let mut folding = false;
-		while left > 0 {
-			let window = match source.next() {
-				Window::Bytes(bytes) => bytes,
-				Window::End => break,
-				Window::Failed => return false,
-			};
-			// A WINDOW CAN NOW OVERSHOOT `-n`, because a stream window is whatever the producer
-			// sent rather than a size this asked for. Cut here, on the bytes in hand.
-			let take: usize = core::cmp::min(left, window.len() as u64) as usize;
-			left = left.saturating_sub(take as u64);
-			for &byte in &window[..take] {
-				if row.try_reserve(1).is_err() {
-					eprint(b"hexdump: out of memory\n");
-					return false;
-				}
-				row.push(byte);
-				if row.len() == PER_LINE {
-					emit(&row, row_offset, &mut previous, &mut folding);
-					row_offset = row_offset.saturating_add(PER_LINE as u64);
-					row.clear();
-				}
+fn dump(source: &mut Source, skip: u64, length: Option<u64>) -> bool {
+	if !source.skip(skip) {
+		// Nothing to dump is not a failure: a file shorter than the skip is an empty answer,
+		// which is what `hexdump -s` past the end has always printed.
+		return true;
+	}
+	let mut left: u64 = length.unwrap_or(u64::MAX);
+	// One line's worth carried between windows, so a window boundary does not break the
+	// sixteen-byte rows - a dump whose row width depended on the chunking would not line up
+	// with a second dump of the same file.
+	let mut row: Vec<u8> = Vec::new();
+	let mut row_offset: u64 = skip;
+	let mut previous: Vec<u8> = Vec::new();
+	let mut folding = false;
+	while left > 0 {
+		let window = match source.next() {
+			Window::Bytes(bytes) => bytes,
+			Window::End => break,
+			Window::Failed => return false,
+		};
+		// A WINDOW CAN NOW OVERSHOOT `-n`, because a stream window is whatever the producer
+		// sent rather than a size this asked for. Cut here, on the bytes in hand.
+		let take: usize = core::cmp::min(left, window.len() as u64) as usize;
+		left = left.saturating_sub(take as u64);
+		for &byte in &window[..take] {
+			if row.try_reserve(1).is_err() {
+				eprint(b"hexdump: out of memory\n");
+				return false;
+			}
+			row.push(byte);
+			if row.len() == PER_LINE {
+				emit(&row, row_offset, &mut previous, &mut folding);
+				row_offset = row_offset.saturating_add(PER_LINE as u64);
+				row.clear();
 			}
 		}
-		if !row.is_empty() {
-			// The last, short row is never folded: it is the end of the file and a `*` in its
-			// place would hide where the file stops.
-			folding = false;
-			previous.clear();
-			emit(&row, row_offset, &mut previous, &mut folding);
-			row_offset = row_offset.saturating_add(row.len() as u64);
-		}
-		// The final offset line, so a reader can see the length without counting rows.
-		let mut tail = String::new();
-		push_hex_offset(&mut tail, row_offset);
-		tail.push('\n');
-		print(tail.as_bytes());
-		true
 	}
+	if !row.is_empty() {
+		// The last, short row is never folded: it is the end of the file and a `*` in its
+		// place would hide where the file stops.
+		folding = false;
+		previous.clear();
+		emit(&row, row_offset, &mut previous, &mut folding);
+		row_offset = row_offset.saturating_add(row.len() as u64);
+	}
+	// The final offset line, so a reader can see the length without counting rows.
+	let mut tail = String::new();
+	push_hex_offset(&mut tail, row_offset);
+	tail.push('\n');
+	print(tail.as_bytes());
+	true
 }
 
 // One row, unless it repeats the row before it - in which case a single `*` stands for the run.
-unsafe fn emit(row: &[u8], offset: u64, previous: &mut Vec<u8>, folding: &mut bool) {
-	unsafe {
-		if row == previous.as_slice() {
-			if !*folding {
-				print(b"*\n");
-				*folding = true;
-			}
-			return;
+fn emit(row: &[u8], offset: u64, previous: &mut Vec<u8>, folding: &mut bool) {
+	if row == previous.as_slice() {
+		if !*folding {
+			print(b"*\n");
+			*folding = true;
 		}
-		*folding = false;
-		previous.clear();
-		if previous.try_reserve_exact(row.len()).is_err() {
-			// A row that cannot be remembered simply is not folded against; the dump is still
-			// correct, only longer.
-			print_row(row, offset);
-			return;
-		}
-		previous.extend_from_slice(row);
-		print_row(row, offset);
+		return;
 	}
+	*folding = false;
+	previous.clear();
+	if previous.try_reserve_exact(row.len()).is_err() {
+		// A row that cannot be remembered simply is not folded against; the dump is still
+		// correct, only longer.
+		print_row(row, offset);
+		return;
+	}
+	previous.extend_from_slice(row);
+	print_row(row, offset);
 }
 
-unsafe fn print_row(row: &[u8], offset: u64) {
-	unsafe {
-		let mut line = String::new();
-		push_hex_offset(&mut line, offset);
-		line.push(' ');
-		for index in 0..PER_LINE {
-			match row.get(index) {
-				Some(&byte) => {
-					line.push(' ');
-					push_hex_byte(&mut line, byte);
-				}
-				None => line.push_str("   "),
-			}
-			if index == PER_LINE / 2 - 1 {
+fn print_row(row: &[u8], offset: u64) {
+	let mut line = String::new();
+	push_hex_offset(&mut line, offset);
+	line.push(' ');
+	for index in 0..PER_LINE {
+		match row.get(index) {
+			Some(&byte) => {
 				line.push(' ');
+				push_hex_byte(&mut line, byte);
 			}
+			None => line.push_str("   "),
 		}
-		line.push_str("  |");
-		for &byte in row {
-			// The printable ASCII range, and a dot for everything else. A byte rendered as itself
-			// would put control characters on the terminal, which is how a dump of a binary file
-			// changes the terminal's mode.
-			line.push(if (0x20..0x7f).contains(&byte) { byte as char } else { '.' });
+		if index == PER_LINE / 2 - 1 {
+			line.push(' ');
 		}
-		line.push_str("|\n");
-		print(line.as_bytes());
 	}
+	line.push_str("  |");
+	for &byte in row {
+		// The printable ASCII range, and a dot for everything else. A byte rendered as itself
+		// would put control characters on the terminal, which is how a dump of a binary file
+		// changes the terminal's mode.
+		line.push(if (0x20..0x7f).contains(&byte) { byte as char } else { '.' });
+	}
+	line.push_str("|\n");
+	print(line.as_bytes());
 }
 
 fn push_hex_offset(out: &mut String, value: u64) {

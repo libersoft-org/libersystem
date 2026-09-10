@@ -66,7 +66,7 @@ fn prop_for(r#type: ResourceType) -> u64 {
 // read straight from the kernel's per-Domain counters. The typed form `usage` serves and
 // `set-limit` returns updated.
 fn budget_of(domain: u64) -> Budget {
-	let stats: DomainStats = unsafe { domain_stats(domain) }.unwrap_or_default();
+	let stats: DomainStats = domain_stats(domain).unwrap_or_default();
 	let usage: Vec<ResourceUsage> = alloc::vec![
 		ResourceUsage { r#type: ResourceType::Memory, used: stats.memory_used, limit: stats.memory_limit },
 		ResourceUsage { r#type: ResourceType::Handles, used: stats.handles_used, limit: stats.handles_limit },
@@ -107,7 +107,7 @@ impl Service for Manager {
 		if name.as_bytes() != BUDGET_NAME.as_bytes() {
 			return Err(Error::NotFound);
 		}
-		if unsafe { domain_set_limit(self.domain, prop_for(r#type), limit) } != 0 {
+		if domain_set_limit(self.domain, prop_for(r#type), limit) != 0 {
 			return Err(Error::Denied);
 		}
 		Ok(budget_of(self.domain))
@@ -117,13 +117,11 @@ impl Service for Manager {
 // Send one command to the probe and wait for its DONE acknowledgement. Returns true if the
 // probe answered - proof it survived the round (it did not crash on an over-budget refusal)
 // - or false if the channel send failed or the probe's side is gone.
-unsafe fn drive(channel: u64, command: &[u8], buf: &mut [u8]) -> bool {
-	unsafe {
-		if !send_blocking(channel, command, 0) {
-			return false;
-		}
-		matches!(recv_blocking(channel, buf), Received::Message { .. })
+fn drive(channel: u64, command: &[u8], buf: &mut [u8]) -> bool {
+	if !send_blocking(channel, command, 0) {
+		return false;
 	}
+	matches!(recv_blocking(channel, buf), Received::Message { .. })
 }
 
 // Govern the component: launch resource_probe into the bounded `domain`, set a memory
@@ -133,46 +131,44 @@ unsafe fn drive(channel: u64, command: &[u8], buf: &mut [u8]) -> bool {
 // more fit after the budget was raised at runtime. The probe and its channel are left open
 // (never closed) so it stays parked holding its objects alive and the manager can keep
 // observing its live usage.
-unsafe fn govern(package: &Package, domain: u64, buf: &mut [u8]) -> (u64, u64, u64) {
-	unsafe {
-		let elf: &[u8] = match package.lookup(b"resource_probe.lsexe") {
-			Some(e) => e,
-			None => return (0, 0, 0),
-		};
-		let (manager_side, child_side): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return (0, 0, 0),
-		};
-		if spawn_in(elf, child_side, domain) < 0 {
-			close(manager_side);
-			return (0, 0, 0);
-		}
-
-		// The Domain's baseline charge: the probe's eagerly-mapped image and stack, read
-		// before it allocates anything. Every page the Domain accounts beyond this is one
-		// of the probe's explicit one-page objects (it is heap-free), so the budget
-		// arithmetic below is exact.
-		let base: u64 = domain_stats(domain).map(|s| s.memory_used).unwrap_or(0);
-
-		// Set the initial memory budget: room for exactly GRANT_PAGES one-page objects above
-		// the baseline. Then drive the probe to fill it and be refused the next allocation.
-		domain_set_limit(domain, PROP_MEMORY_LIMIT, base + GRANT_PAGES * PAGE);
-		let survived: bool = drive(manager_side, b"GO", buf);
-		let after_first: u64 = domain_stats(domain).map(|s| s.memory_used).unwrap_or(base);
-		let granted: u64 = after_first.saturating_sub(base) / PAGE;
-
-		// Raise the budget at runtime by the same headroom again, then drive the probe into
-		// the new room - observing that an adjusted budget takes effect live.
-		domain_set_limit(domain, PROP_MEMORY_LIMIT, base + 2 * GRANT_PAGES * PAGE);
-		drive(manager_side, b"MORE", buf);
-		let after_second: u64 = domain_stats(domain).map(|s| s.memory_used).unwrap_or(after_first);
-		let regranted: u64 = after_second.saturating_sub(after_first) / PAGE;
-
-		// The probe answered round 1, so the one over-budget refusal it hit there was
-		// contained to its Domain and handled gracefully rather than crashing it.
-		let denied: u64 = u64::from(survived);
-		(granted, denied, regranted)
+fn govern(package: &Package, domain: u64, buf: &mut [u8]) -> (u64, u64, u64) {
+	let elf: &[u8] = match package.lookup(b"resource_probe.lsexe") {
+		Some(e) => e,
+		None => return (0, 0, 0),
+	};
+	let (manager_side, child_side): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return (0, 0, 0),
+	};
+	if spawn_in(elf, child_side, domain) < 0 {
+		close(manager_side);
+		return (0, 0, 0);
 	}
+
+	// The Domain's baseline charge: the probe's eagerly-mapped image and stack, read
+	// before it allocates anything. Every page the Domain accounts beyond this is one
+	// of the probe's explicit one-page objects (it is heap-free), so the budget
+	// arithmetic below is exact.
+	let base: u64 = domain_stats(domain).map(|s| s.memory_used).unwrap_or(0);
+
+	// Set the initial memory budget: room for exactly GRANT_PAGES one-page objects above
+	// the baseline. Then drive the probe to fill it and be refused the next allocation.
+	domain_set_limit(domain, PROP_MEMORY_LIMIT, base + GRANT_PAGES * PAGE);
+	let survived: bool = drive(manager_side, b"GO", buf);
+	let after_first: u64 = domain_stats(domain).map(|s| s.memory_used).unwrap_or(base);
+	let granted: u64 = after_first.saturating_sub(base) / PAGE;
+
+	// Raise the budget at runtime by the same headroom again, then drive the probe into
+	// the new room - observing that an adjusted budget takes effect live.
+	domain_set_limit(domain, PROP_MEMORY_LIMIT, base + 2 * GRANT_PAGES * PAGE);
+	drive(manager_side, b"MORE", buf);
+	let after_second: u64 = domain_stats(domain).map(|s| s.memory_used).unwrap_or(after_first);
+	let regranted: u64 = after_second.saturating_sub(after_first) / PAGE;
+
+	// The probe answered round 1, so the one over-budget refusal it hit there was
+	// contained to its Domain and handled gracefully rather than crashing it.
+	let denied: u64 = u64::from(survived);
+	(granted, denied, regranted)
 }
 
 // Build the human-readable budget summary the supervisor relays as the manager's proof:
@@ -191,9 +187,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 1. receive the init package (to launch the governed component from), then the serve
 	//    channel clients reach us on.
-	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package not delivered") });
-	let package: Package = Package::parse(archive).unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package malformed") });
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
+	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package not delivered"));
+	let package: Package = Package::parse(archive).unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package malformed"));
+	let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
 	// A ProcessService client, so `usage` can report the Domains this manager did not create.
 	// Every governed launch runs in a Domain of its own and this service is only ever handed
 	// the ones it made itself, so isolation was enforced and unobservable - a scenario asking
@@ -205,22 +201,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// service - including the kernel harness, where the idiom is a client whose peer is
 	// dropped. A handoff the sender skips is not skipped: it swallows the next message and
 	// then blocks forever.
-	let process_client: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"missing process client") });
+	let process_client: u64 = recv_tagged(bootstrap, &mut buf, b"PROCESS").unwrap_or_else(|| fail_bootstrap(bootstrap, b"process", b"missing process client"));
 
 	// 2. create the bounded sub-Domain that hosts the governed component. It starts
 	//    uncapped; govern() sets and adjusts its memory budget around the probe.
-	let domain: i64 = unsafe { domain_create(u64::MAX, u64::MAX, u64::MAX) };
+	let domain: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
 	if domain < 0 {
-		unsafe { fail_bootstrap(bootstrap, b"domain", b"could not create governed sub-domain") }
+		fail_bootstrap(bootstrap, b"domain", b"could not create governed sub-domain")
 	}
 	let domain: u64 = domain as u64;
 
 	// 3. govern the component under its budget: cap the Domain, observe the over-budget
 	//    refusal being contained, raise the cap at runtime, and observe usage.
-	let (granted, denied, regranted): (u64, u64, u64) = unsafe { govern(&package, domain, &mut buf) };
+	let (granted, denied, regranted): (u64, u64, u64) = govern(&package, domain, &mut buf);
 
 	// 4. report in to the supervisor, then relay the budget proof.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"ResourceManager: online", 0);
 		send_blocking(bootstrap, &summarize(granted, denied, regranted), 0);
 	}
@@ -230,8 +226,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut manager: Manager = Manager { domain, process: process_client };
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { resources::dispatch(&mut manager, req, handle, out, reply_handle) });
-	}
+	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { resources::dispatch(&mut manager, req, handle, out, reply_handle) });
 	exit();
 }

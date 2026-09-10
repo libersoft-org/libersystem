@@ -139,9 +139,9 @@ impl Service for Session {
 		let mut done: Vec<JobInfo> = Vec::new();
 		let mut i: usize = 0;
 		while i < self.jobs.len() {
-			if !self.jobs[i].stopped && unsafe { poll_ready(self.jobs[i].handle()) } {
+			if !self.jobs[i].stopped && poll_ready(self.jobs[i].handle()) {
 				let job: Job = self.jobs.remove(i);
-				unsafe { close(job.handle()) };
+				close(job.handle());
 				let is_group = job.is_group();
 				done.push(JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: is_group });
 			} else {
@@ -159,12 +159,10 @@ impl Service for Session {
 			// A group resumes every live stage; a single process resumes itself. Sending the
 			// process signal to a group handle would simply be refused, leaving a pipeline
 			// stopped forever with the session believing it had resumed.
-			unsafe {
-				if self.jobs[pos].is_group() {
-					process_group_signal(self.jobs[pos].handle(), SIG_CONT);
-				} else {
-					signal(self.jobs[pos].handle(), SIG_CONT);
-				}
+			if self.jobs[pos].is_group() {
+				process_group_signal(self.jobs[pos].handle(), SIG_CONT);
+			} else {
+				signal(self.jobs[pos].handle(), SIG_CONT);
 			}
 			self.jobs[pos].stopped = false;
 		}
@@ -195,12 +193,10 @@ impl Service for Session {
 		use rt::signal as send_signal;
 		// A group signals every live stage; a single process signals itself. Sending the process
 		// signal to a group handle is refused, which is how `job-resume` learned the difference.
-		unsafe {
-			if self.jobs[pos].is_group() {
-				process_group_signal(self.jobs[pos].handle(), number);
-			} else {
-				send_signal(self.jobs[pos].handle(), number);
-			}
+		if self.jobs[pos].is_group() {
+			process_group_signal(self.jobs[pos].handle(), number);
+		} else {
+			send_signal(self.jobs[pos].handle(), number);
 		}
 		// The session's idea of the job's state, updated to what the signal asked for: a stop
 		// suspends it and a continue resumes it, and the two terminating signals leave the flag
@@ -270,7 +266,7 @@ impl Sessions {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"SessionService: online", 0);
 	}
 
@@ -281,8 +277,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    handle. A supervisor that dropped the channel instead (no clients this boot)
 	//    reports as a missing role, and there is nothing left to serve either way.
 	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
-	if let Err(error) = unsafe { receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) } {
-		unsafe { fail_bootstrap(bootstrap, error.tag(), error.reason()) };
+	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
+		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let service: u64 = roles[0];
 
@@ -291,8 +287,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut sessions: Sessions = Sessions::new();
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi(service, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> { session::dispatch(sessions.for_channel(chan), req, handle, out, reply_handle) });
-	}
+	serve_multi(service, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> { session::dispatch(sessions.for_channel(chan), req, handle, out, reply_handle) });
 	exit();
 }

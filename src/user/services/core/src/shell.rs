@@ -45,9 +45,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    dependent command then reports the service unavailable. Grants the thin launcher
 	//    does not use (log / device / config / time / audio, the resource client, ADMIN)
 	//    are not taken and close with the set.
-	let mut caps: CapSet = unsafe { recv_caps(bootstrap) };
+	let mut caps: CapSet = recv_caps(bootstrap);
 	let storage: u64 = match caps.take(CAP_STORAGE) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"storage", b"required capability not granted") },
+		0 => fail_bootstrap(bootstrap, b"storage", b"required capability not granted"),
 		h => h,
 	};
 	let media: u64 = caps.take(CAP_MEDIA);
@@ -55,11 +55,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let udf: u64 = caps.take(CAP_UDF);
 	let usb: u64 = caps.take(CAP_USB);
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"required capability not granted") },
+		0 => fail_bootstrap(bootstrap, b"process", b"required capability not granted"),
 		h => h,
 	};
 	let netsvc: u64 = match caps.take(CAP_NET) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"net", b"required capability not granted") },
+		0 => fail_bootstrap(bootstrap, b"net", b"required capability not granted"),
 		h => h,
 	};
 	let inputsvc: u64 = caps.take(CAP_INPUT);
@@ -80,7 +80,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// via stdout) and reads its keystrokes from it. The userspace terminal renders the
 	// output and forwards the input, so the shell talks to the console, not the kernel.
 	let console: u64 = match caps.take(CAP_CONSOLE) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"console", b"required capability not granted") },
+		0 => fail_bootstrap(bootstrap, b"console", b"required capability not granted"),
 		h => h,
 	};
 	set_stdout(console);
@@ -88,7 +88,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// job on it (SET_FG / CLEAR_FG) so the tty signals it on Ctrl+C / Ctrl+Z / Ctrl+\,
 	// and learns of a Ctrl+Z suspend (JOB_STOPPED) so it can background the job.
 	let control: u64 = match caps.take(CAP_CONTROL) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"control", b"required capability not granted") },
+		0 => fail_bootstrap(bootstrap, b"control", b"required capability not granted"),
 		h => h,
 	};
 	// Kept here as well as threaded through the call chain, because `send_stdout` needs it to hand
@@ -98,26 +98,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	drop(caps);
 
 	// 2. report in.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"Shell: online", 0);
 	}
 
 	// 3. greet the operator with the product banner (the message of the day) - one blank
 	//    line first, separating userspace from the kernel's boot log - then become the
 	//    interactive console and run the read-eval-print loop.
-	unsafe {
-		print(b"\n");
-	}
+	print(b"\n");
 	print_motd();
-	unsafe {
+	{
 		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, bootstrap);
 	}
 	// The REPL returned: the operator logged out (`exit` / Ctrl+D). Tell the supervisor
 	// this is a deliberate exit before the bootstrap channel peer-closes, so a logout is
 	// recorded as a clean stop instead of a crash (ConsoleService reloads a fresh shell).
-	unsafe {
-		announce_exit(bootstrap);
-	}
+	announce_exit(bootstrap);
 	exit();
 }
 
@@ -162,9 +158,7 @@ fn print_banner(lines: &[&str]) {
 	}
 	out.push_str(&border);
 	out.push('\n');
-	unsafe {
-		print(out.as_bytes());
-	}
+	print(out.as_bytes());
 }
 
 // Run the read-eval-print loop over the console channel from ConsoleService. The
@@ -172,183 +166,181 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64, broker: u64) {
+fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64, broker: u64) {
 	// The system graph is resolved by name rather than held: it can be stopped and started
 	// again under this shell, and a channel from bring-up would be dead afterwards. The
 	// bootstrap channel is what a resolve travels on - the supervisor answers on the other end.
 	let mut graphsvc: u64 = graphsvc;
-	unsafe {
-		let mut jobs: Jobs = Jobs::new(control, session);
-		// The cwd is owned by the session (so it survives a shell restart); read it once at
-		// startup, then keep a local cache so the prompt and path resolution need no IPC
-		// round-trip each line. `cd` updates the session and refreshes this cache. With no
-		// session (a minimal boot) the cwd is local-only and starts at the default volume.
-		let mut cwd: String = if session != 0 {
-			match session::Client::new(ChannelTransport { chan: session }).cwd() {
-				Some(Ok(c)) => c,
-				_ => String::from(DEFAULT_CWD),
-			}
-		} else {
-			String::from(DEFAULT_CWD)
+	let mut jobs: Jobs = Jobs::new(control, session);
+	// The cwd is owned by the session (so it survives a shell restart); read it once at
+	// startup, then keep a local cache so the prompt and path resolution need no IPC
+	// round-trip each line. `cd` updates the session and refreshes this cache. With no
+	// session (a minimal boot) the cwd is local-only and starts at the default volume.
+	let mut cwd: String = if session != 0 {
+		match session::Client::new(ChannelTransport { chan: session }).cwd() {
+			Some(Ok(c)) => c,
+			_ => String::from(DEFAULT_CWD),
+		}
+	} else {
+		String::from(DEFAULT_CWD)
+	};
+	// The environment variables are owned by the session too; read them once at startup
+	// into a local cache (name -> value) so `$`-expansion needs no IPC per line, then
+	// keep the cache in step whenever an assignment or `unset` writes through. With no
+	// session (a minimal boot) the environment is local-only and starts empty.
+	let mut vars: Vec<(String, String)> = if session != 0 {
+		match session::Client::new(ChannelTransport { chan: session }).env_list() {
+			Some(Ok(list)) => list.into_iter().map(|v: EnvVar| (v.name, v.value)).collect(),
+			_ => Vec::new(),
+		}
+	} else {
+		Vec::new()
+	};
+	// Mirror our starting cwd to ConsoleService so argument Tab completion can resolve a
+	// relative path from the very first prompt; refreshed after each `cd` below.
+	send_set_cwd(control, &cwd);
+	loop {
+		// The line buffer matches the terminal's cooked line maximum (4 kB + the
+		// newline) and lives on the heap - the kernel truncates a message to the
+		// receiver's buffer silently, so it must never be smaller than a line.
+		let mut line_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; 4200];
+		let n: usize = match recv_blocking(console, &mut line_buf) {
+			Received::Message { len, .. } => len,
+			Received::Closed => return,
 		};
-		// The environment variables are owned by the session too; read them once at startup
-		// into a local cache (name -> value) so `$`-expansion needs no IPC per line, then
-		// keep the cache in step whenever an assignment or `unset` writes through. With no
-		// session (a minimal boot) the environment is local-only and starts empty.
-		let mut vars: Vec<(String, String)> = if session != 0 {
-			match session::Client::new(ChannelTransport { chan: session }).env_list() {
-				Some(Ok(list)) => list.into_iter().map(|v: EnvVar| (v.name, v.value)).collect(),
-				_ => Vec::new(),
-			}
-		} else {
-			Vec::new()
-		};
-		// Mirror our starting cwd to ConsoleService so argument Tab completion can resolve a
-		// relative path from the very first prompt; refreshed after each `cd` below.
-		send_set_cwd(control, &cwd);
-		loop {
-			// The line buffer matches the terminal's cooked line maximum (4 kB + the
-			// newline) and lives on the heap - the kernel truncates a message to the
-			// receiver's buffer silently, so it must never be smaller than a line.
-			let mut line_buf: alloc::vec::Vec<u8> = alloc::vec![0u8; 4200];
-			let n: usize = match recv_blocking(console, &mut line_buf) {
-				Received::Message { len, .. } => len,
-				Received::Closed => return,
-			};
-			// A zero-byte read is the tty's EOF (Ctrl+D on an empty line): log out.
-			if n == 0 {
-				print(b"\n");
-				return;
-			}
-			// A line led by a tab is the line discipline's completion request (a cooked
-			// line can never contain one): the bytes after the marker are the partial
-			// command word. Print the matching commands - the builtins plus the live
-			// bin/ listing, the way bash lists builtins plus $PATH - and re-draw the
-			// prompt with the partial line (the discipline kept its buffer, so typing
-			// continues in place).
-			if line_buf[0] == b'\t' {
-				let partial: &[u8] = &line_buf[1..n];
-				print(b"\n");
-				// The token under the cursor: the command word (no space before it) lists the
-				// runnable programs, a later token lists the target directory's entries - the
-				// same candidate sets the line discipline completes against.
-				let tok_start: usize = partial.iter().rposition(|&c: &u8| c == b' ').map_or(0, |p: usize| p + 1);
-				let token: &[u8] = &partial[tok_start..];
-				let names: Vec<Vec<u8>> = if tok_start == 0 {
-					let mut names: Vec<Vec<u8>> = bin_names(storage);
-					for &builtin in commands::BUILTINS {
-						names.push(builtin.as_bytes().to_vec());
-					}
-					names.sort();
-					names.dedup();
-					names
-				} else {
-					completion_dir_entries(&cwd, token, storage, media, iso, udf, usb)
-				};
-				// The filter prefix is the trailing path segment (after the last '/'), so a
-				// directory's entries match on their bare name, the way the line discipline does.
-				let seg_start: usize = token.iter().rposition(|&c: &u8| c == b'/').map_or(0, |p: usize| p + 1);
-				let seg: &[u8] = &token[seg_start..];
-				let mut listing: Vec<u8> = Vec::new();
-				for name in &names {
-					if name.starts_with(seg) {
-						if !listing.is_empty() {
-							listing.extend_from_slice(b"  ");
-						}
-						listing.extend_from_slice(name);
-					}
+		// A zero-byte read is the tty's EOF (Ctrl+D on an empty line): log out.
+		if n == 0 {
+			print(b"\n");
+			return;
+		}
+		// A line led by a tab is the line discipline's completion request (a cooked
+		// line can never contain one): the bytes after the marker are the partial
+		// command word. Print the matching commands - the builtins plus the live
+		// bin/ listing, the way bash lists builtins plus $PATH - and re-draw the
+		// prompt with the partial line (the discipline kept its buffer, so typing
+		// continues in place).
+		if line_buf[0] == b'\t' {
+			let partial: &[u8] = &line_buf[1..n];
+			print(b"\n");
+			// The token under the cursor: the command word (no space before it) lists the
+			// runnable programs, a later token lists the target directory's entries - the
+			// same candidate sets the line discipline completes against.
+			let tok_start: usize = partial.iter().rposition(|&c: &u8| c == b' ').map_or(0, |p: usize| p + 1);
+			let token: &[u8] = &partial[tok_start..];
+			let names: Vec<Vec<u8>> = if tok_start == 0 {
+				let mut names: Vec<Vec<u8>> = bin_names(storage);
+				for &builtin in commands::BUILTINS {
+					names.push(builtin.as_bytes().to_vec());
 				}
-				listing.push(b'\n');
-				print(&listing);
-				print(b"\x1b[1;32m");
-				print(cwd.as_bytes());
-				print(b"> \x1b[0m");
-				print(partial);
-				continue;
-			}
-			// The terminal delivers a whole submitted line (with a trailing newline); trim
-			// it, expand any `$NAME` / `${NAME}` against the environment, normalize its flags,
-			// then dispatch it, reap finished jobs, and print the next prompt.
-			// A multi-stage line goes to the broker as one pipeline transaction. Parsed from
-			// the RAW line, not the expanded one: `parse_pipeline` lexes operators before any
-			// variable is substituted, so a variable holding `|` cannot turn a single command
-			// into a pipeline. Anything else - including a one-stage line, which needs no
-			// transaction - takes today's path unchanged.
-			let cwd_before: String = cwd.clone();
-			let pipeline = parse_pipeline(&line_buf[..n], &vars);
-			// A REDIRECTION IS A PIPELINE, which is what lets one path serve both.
-			//
-			// `cmd < a > b` expands to `redirect_in a | cmd | redirect_out b` before anything is
-			// launched, so the line goes to the broker as an ordinary transaction and the two halves
-			// of the redirection are governed programs granted `volumes` - while `cmd` in the middle
-			// receives one stream endpoint and no file capability at all. That is the milestone's
-			// rule, and it falls out of the shape rather than being enforced on top of it.
-			//
-			// So "does this need the broker" is a question about the EXPANDED line: a single command
-			// with a redirection needs it, and a single command without one still takes today's
-			// path, where the builtins live.
-			// A LINE THE GRAMMAR REFUSED IS NOT RUN AS AN ORDINARY COMMAND.
-			//
-			// Every parse failure fell through to `dispatch`, which knows nothing about operators -
-			// so `cat 3>&1` ran `cat` with two literal arguments, and `cd x | grep y` ran `cd` with
-			// four. The parser had already decided the line could not mean what it looks like, and
-			// the answer to that was to run something else instead of saying so.
-			//
-			// TWO ERRORS STILL FALL THROUGH, and they are the two where falling through is what the
-			// person meant. An empty line is not a mistake. And an unterminated quote is most often
-			// an apostrophe in ordinary text - `echo it's fine` - where refusing would be correct
-			// about the grammar and wrong about the sentence; bash asks for more input there, which
-			// this shell has no continuation state for, so it runs the line as typed.
-			if let Err(reason) = &pipeline
-				&& !matches!(reason, ParseError::Empty | ParseError::UnterminatedQuote)
-			{
-				print(parse_refusal(reason));
-				jobs.reap();
-				print(b"\x1b[1;32m");
-				print(cwd.as_bytes());
-				print(b"> \x1b[0m");
-				continue;
-			}
-			let expanded: Option<Result<Expansion, RedirectError>> = pipeline.as_ref().ok().map(expand_redirects);
-			let needs_broker: bool = match &expanded {
-				// `2>&1` ON A LINE OF ONE STAGE IS NOT A REASON TO GO THROUGH THE BROKER. It asks
-				// for the diagnostics to follow the output, and on a bare command the output IS the
-				// terminal that the diagnostics already go to - so honouring it means doing nothing,
-				// and routing the line through a launch service to do nothing would be worse than
-				// the no-op. On every other shape the stage's output is an edge, which is exactly
-				// when the flag has something to say and exactly when this is already true.
-				Some(Ok(expansion)) => expansion.stages.len() > 1,
-				// A line whose redirections cannot be expanded is reported below rather than run.
-				Some(Err(_)) => true,
-				None => false,
-			};
-			if needs_broker {
-				match expanded.expect("checked by needs_broker") {
-					Err(reason) => print(redirect_refusal(&reason)),
-					Ok(expansion) => {
-						let parsed = pipeline.as_ref().expect("checked by needs_broker");
-						if !run_pipeline_line(&mut jobs, permsvc, &expansion.stages, parsed.background, cwd.as_bytes(), &mut vars, session) {
-							print(b"shell: pipeline could not be started\n");
-						}
-					}
-				}
+				names.sort();
+				names.dedup();
+				names
 			} else {
-				let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
-				if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, &mut graphsvc, broker, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
-					return;
+				completion_dir_entries(&cwd, token, storage, media, iso, udf, usb)
+			};
+			// The filter prefix is the trailing path segment (after the last '/'), so a
+			// directory's entries match on their bare name, the way the line discipline does.
+			let seg_start: usize = token.iter().rposition(|&c: &u8| c == b'/').map_or(0, |p: usize| p + 1);
+			let seg: &[u8] = &token[seg_start..];
+			let mut listing: Vec<u8> = Vec::new();
+			for name in &names {
+				if name.starts_with(seg) {
+					if !listing.is_empty() {
+						listing.extend_from_slice(b"  ");
+					}
+					listing.extend_from_slice(name);
 				}
 			}
-			// A `cd` moved the prompt: refresh ConsoleService's copy so argument completion
-			// resolves against the new directory.
-			if cwd != cwd_before {
-				send_set_cwd(control, &cwd);
-			}
-			jobs.reap();
-			// the prompt shows the current working directory, so it sits in real storage.
+			listing.push(b'\n');
+			print(&listing);
 			print(b"\x1b[1;32m");
 			print(cwd.as_bytes());
 			print(b"> \x1b[0m");
+			print(partial);
+			continue;
 		}
+		// The terminal delivers a whole submitted line (with a trailing newline); trim
+		// it, expand any `$NAME` / `${NAME}` against the environment, normalize its flags,
+		// then dispatch it, reap finished jobs, and print the next prompt.
+		// A multi-stage line goes to the broker as one pipeline transaction. Parsed from
+		// the RAW line, not the expanded one: `parse_pipeline` lexes operators before any
+		// variable is substituted, so a variable holding `|` cannot turn a single command
+		// into a pipeline. Anything else - including a one-stage line, which needs no
+		// transaction - takes today's path unchanged.
+		let cwd_before: String = cwd.clone();
+		let pipeline = parse_pipeline(&line_buf[..n], &vars);
+		// A REDIRECTION IS A PIPELINE, which is what lets one path serve both.
+		//
+		// `cmd < a > b` expands to `redirect_in a | cmd | redirect_out b` before anything is
+		// launched, so the line goes to the broker as an ordinary transaction and the two halves
+		// of the redirection are governed programs granted `volumes` - while `cmd` in the middle
+		// receives one stream endpoint and no file capability at all. That is the milestone's
+		// rule, and it falls out of the shape rather than being enforced on top of it.
+		//
+		// So "does this need the broker" is a question about the EXPANDED line: a single command
+		// with a redirection needs it, and a single command without one still takes today's
+		// path, where the builtins live.
+		// A LINE THE GRAMMAR REFUSED IS NOT RUN AS AN ORDINARY COMMAND.
+		//
+		// Every parse failure fell through to `dispatch`, which knows nothing about operators -
+		// so `cat 3>&1` ran `cat` with two literal arguments, and `cd x | grep y` ran `cd` with
+		// four. The parser had already decided the line could not mean what it looks like, and
+		// the answer to that was to run something else instead of saying so.
+		//
+		// TWO ERRORS STILL FALL THROUGH, and they are the two where falling through is what the
+		// person meant. An empty line is not a mistake. And an unterminated quote is most often
+		// an apostrophe in ordinary text - `echo it's fine` - where refusing would be correct
+		// about the grammar and wrong about the sentence; bash asks for more input there, which
+		// this shell has no continuation state for, so it runs the line as typed.
+		if let Err(reason) = &pipeline
+			&& !matches!(reason, ParseError::Empty | ParseError::UnterminatedQuote)
+		{
+			print(parse_refusal(reason));
+			jobs.reap();
+			print(b"\x1b[1;32m");
+			print(cwd.as_bytes());
+			print(b"> \x1b[0m");
+			continue;
+		}
+		let expanded: Option<Result<Expansion, RedirectError>> = pipeline.as_ref().ok().map(expand_redirects);
+		let needs_broker: bool = match &expanded {
+			// `2>&1` ON A LINE OF ONE STAGE IS NOT A REASON TO GO THROUGH THE BROKER. It asks
+			// for the diagnostics to follow the output, and on a bare command the output IS the
+			// terminal that the diagnostics already go to - so honouring it means doing nothing,
+			// and routing the line through a launch service to do nothing would be worse than
+			// the no-op. On every other shape the stage's output is an edge, which is exactly
+			// when the flag has something to say and exactly when this is already true.
+			Some(Ok(expansion)) => expansion.stages.len() > 1,
+			// A line whose redirections cannot be expanded is reported below rather than run.
+			Some(Err(_)) => true,
+			None => false,
+		};
+		if needs_broker {
+			match expanded.expect("checked by needs_broker") {
+				Err(reason) => print(redirect_refusal(&reason)),
+				Ok(expansion) => {
+					let parsed = pipeline.as_ref().expect("checked by needs_broker");
+					if !run_pipeline_line(&mut jobs, permsvc, &expansion.stages, parsed.background, cwd.as_bytes(), &mut vars, session) {
+						print(b"shell: pipeline could not be started\n");
+					}
+				}
+			}
+		} else {
+			let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
+			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, &mut graphsvc, broker, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
+				return;
+			}
+		}
+		// A `cd` moved the prompt: refresh ConsoleService's copy so argument completion
+		// resolves against the new directory.
+		if cwd != cwd_before {
+			send_set_cwd(control, &cwd);
+		}
+		jobs.reap();
+		// the prompt shows the current working directory, so it sits in real storage.
+		print(b"\x1b[1;32m");
+		print(cwd.as_bytes());
+		print(b"> \x1b[0m");
 	}
 }
 
@@ -411,56 +403,50 @@ impl Jobs {
 	// Run a job in the foreground; if Ctrl+Z suspends it, hand the stopped job to the
 	// session as a background job. With no session to hold it, resume it instead (so it is
 	// not left suspended) and stop tracking it.
-	unsafe fn run_foreground_tracked(&mut self, job: Job) {
-		unsafe {
-			if let Some(suspended) = run_foreground(self.control, job) {
-				if self.register(suspended.proc, &suspended.name, true).is_none() {
-					signal(suspended.proc, SIG_CONT);
-					close(suspended.proc);
-				}
+	fn run_foreground_tracked(&mut self, job: Job) {
+		if let Some(suspended) = run_foreground(self.control, job) {
+			if self.register(suspended.proc, &suspended.name, true).is_none() {
+				signal(suspended.proc, SIG_CONT);
+				close(suspended.proc);
 			}
 		}
 	}
 
 	// Reap finished background jobs: ask the session which have terminated and announce
 	// each. Called before each prompt, the way a shell reports a background job's completion.
-	unsafe fn reap(&mut self) {
-		unsafe {
-			if self.session == 0 {
-				return;
-			}
-			if let Some(Ok(finished)) = session::Client::new(ChannelTransport { chan: self.session }).job_reap() {
-				for job in &finished {
-					print(b"[");
-					print_usize(job.id as usize);
-					print(b"] done   ");
-					print(job.name.as_bytes());
-					print(b"\n");
-				}
+	fn reap(&mut self) {
+		if self.session == 0 {
+			return;
+		}
+		if let Some(Ok(finished)) = session::Client::new(ChannelTransport { chan: self.session }).job_reap() {
+			for job in &finished {
+				print(b"[");
+				print_usize(job.id as usize);
+				print(b"] done   ");
+				print(job.name.as_bytes());
+				print(b"\n");
 			}
 		}
 	}
 
 	// `jobs`: list the session's tracked background / stopped jobs.
-	unsafe fn list(&self) {
-		unsafe {
-			if self.session == 0 {
-				print(b"no jobs\n");
-				return;
-			}
-			match session::Client::new(ChannelTransport { chan: self.session }).job_list() {
-				Some(Ok(jobs)) if !jobs.is_empty() => {
-					for job in &jobs {
-						print(b"[");
-						print_usize(job.id as usize);
-						print(b"] ");
-						print(if job.stopped { b"stopped  " } else { b"running  " });
-						print(job.name.as_bytes());
-						print(b"\n");
-					}
+	fn list(&self) {
+		if self.session == 0 {
+			print(b"no jobs\n");
+			return;
+		}
+		match session::Client::new(ChannelTransport { chan: self.session }).job_list() {
+			Some(Ok(jobs)) if !jobs.is_empty() => {
+				for job in &jobs {
+					print(b"[");
+					print_usize(job.id as usize);
+					print(b"] ");
+					print(if job.stopped { b"stopped  " } else { b"running  " });
+					print(job.name.as_bytes());
+					print(b"\n");
 				}
-				_ => print(b"no jobs\n"),
 			}
+			_ => print(b"no jobs\n"),
 		}
 	}
 
@@ -484,77 +470,71 @@ impl Jobs {
 	// `fg [id]`: bring a job to the foreground. Take it from the session (which transfers
 	// us its Process handle back), resume it if stopped (SIG_CONT), then run it foreground
 	// so it can be interrupted / suspended once more.
-	unsafe fn fg(&mut self, arg: &[u8]) {
-		unsafe {
-			let id: u32 = match self.resolve_id(arg) {
-				Some(i) => i,
-				None => {
-					print(b"fg: no such job\n");
-					return;
-				}
-			};
-			let entry: JobEntry = match session::Client::new(ChannelTransport { chan: self.session }).job_take(&id) {
-				Some(Ok(e)) => e,
-				_ => {
-					print(b"fg: no such job\n");
-					return;
-				}
-			};
-			let stopped: bool = entry.info.stopped;
-			let handle: u64 = match entry.target {
-				JobTarget::Process(handle) | JobTarget::Group(handle) => handle,
-			};
-			let job: Job = Job { proc: handle, name: entry.info.name.into_bytes() };
-			if stopped {
-				signal(job.proc, SIG_CONT);
+	fn fg(&mut self, arg: &[u8]) {
+		let id: u32 = match self.resolve_id(arg) {
+			Some(i) => i,
+			None => {
+				print(b"fg: no such job\n");
+				return;
 			}
-			print(&job.name);
-			print(b"\n");
-			self.run_foreground_tracked(job);
+		};
+		let entry: JobEntry = match session::Client::new(ChannelTransport { chan: self.session }).job_take(&id) {
+			Some(Ok(e)) => e,
+			_ => {
+				print(b"fg: no such job\n");
+				return;
+			}
+		};
+		let stopped: bool = entry.info.stopped;
+		let handle: u64 = match entry.target {
+			JobTarget::Process(handle) | JobTarget::Group(handle) => handle,
+		};
+		let job: Job = Job { proc: handle, name: entry.info.name.into_bytes() };
+		if stopped {
+			signal(job.proc, SIG_CONT);
 		}
+		print(&job.name);
+		print(b"\n");
+		self.run_foreground_tracked(job);
 	}
 
 	// `bg [id]`: resume a stopped job in the background (SIG_CONT), leaving it tracked in
 	// the session.
-	unsafe fn bg(&mut self, arg: &[u8]) {
-		unsafe {
-			let id: u32 = match self.resolve_id(arg) {
-				Some(i) => i,
-				None => {
-					print(b"bg: no such job\n");
-					return;
-				}
-			};
-			match session::Client::new(ChannelTransport { chan: self.session }).job_resume(&id) {
-				Some(Ok(info)) => {
-					print(b"[");
-					print_usize(info.id as usize);
-					print(b"] ");
-					print(info.name.as_bytes());
-					print(b" &\n");
-				}
-				_ => print(b"bg: no such job\n"),
+	fn bg(&mut self, arg: &[u8]) {
+		let id: u32 = match self.resolve_id(arg) {
+			Some(i) => i,
+			None => {
+				print(b"bg: no such job\n");
+				return;
 			}
+		};
+		match session::Client::new(ChannelTransport { chan: self.session }).job_resume(&id) {
+			Some(Ok(info)) => {
+				print(b"[");
+				print_usize(info.id as usize);
+				print(b"] ");
+				print(info.name.as_bytes());
+				print(b" &\n");
+			}
+			_ => print(b"bg: no such job\n"),
 		}
 	}
 }
 
 // Print a usize in decimal.
-unsafe fn print_usize(mut n: usize) {
-	unsafe {
-		if n == 0 {
-			print(b"0");
-			return;
-		}
-		let mut buf: [u8; 20] = [0u8; 20];
-		let mut i: usize = 20;
-		while n > 0 {
-			i -= 1;
-			buf[i] = b'0' + (n % 10) as u8;
-			n /= 10;
-		}
-		print(&buf[i..]);
+fn print_usize(mut n: usize) {
+	if n == 0 {
+		print(b"0");
+		return;
 	}
+	let mut buf: [u8; 20] = [0u8; 20];
+	let mut i: usize = 20;
+	while n > 0 {
+		i -= 1;
+		buf[i] = b'0' + (n % 10) as u8;
+		n /= 10;
+	}
+	print(&buf[i..]);
 }
 
 // Parse a decimal job id, or None if empty / non-numeric.
@@ -583,52 +563,50 @@ fn parse_usize(s: &[u8]) -> Option<usize> {
 // kernel's process-terminated signal - so the shell waits for it directly instead of a
 // separate completion channel. CLEAR_FG releases the tty's hold on the job before
 // returning to the prompt.
-unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
-	unsafe {
-		// Discard any stale JOB_STOPPED a previous job's Ctrl+Z left queued, so the wait
-		// below cannot mistake it for this job being suspended.
-		drain_control(control);
-		// Hand the tty a MANAGE+TRANSFER dup of the job (the spawn handle carries ALL
-		// rights), so it can signal it; the shell keeps its own handle for fg / bg.
-		let dup: i64 = duplicate(job.proc, RIGHT_MANAGE | RIGHT_TRANSFER);
-		if dup >= 0 {
-			send_blocking(control, b"SET_FG", dup as u64);
+fn run_foreground(control: u64, job: Job) -> Option<Job> {
+	// Discard any stale JOB_STOPPED a previous job's Ctrl+Z left queued, so the wait
+	// below cannot mistake it for this job being suspended.
+	drain_control(control);
+	// Hand the tty a MANAGE+TRANSFER dup of the job (the spawn handle carries ALL
+	// rights), so it can signal it; the shell keeps its own handle for fg / bg.
+	let dup: i64 = duplicate(job.proc, RIGHT_MANAGE | RIGHT_TRANSFER);
+	if dup >= 0 {
+		send_blocking(control, b"SET_FG", dup as u64);
+	}
+	let waits: [u64; 2] = [job.proc, control];
+	let mut cbuf: [u8; 32] = [0u8; 32];
+	loop {
+		let ready: i64 = wait_any(&waits, 0);
+		// A NEGATIVE ANSWER IS NOT "THE CONTROL CHANNEL IS READY". Anything but 0 fell through
+		// to a blocking receive on the control channel, so a `wait_any` that REFUSED - a handle
+		// without WAIT, a set it could not size - parked the shell forever on a channel only the
+		// terminal ever writes to. That is a prompt that never comes back, from a syscall that
+		// answered immediately.
+		if ready < 0 {
+			send_blocking(control, b"CLEAR_FG", 0);
+			close(job.proc);
+			return None;
 		}
-		let waits: [u64; 2] = [job.proc, control];
-		let mut cbuf: [u8; 32] = [0u8; 32];
-		loop {
-			let ready: i64 = wait_any(&waits, 0);
-			// A NEGATIVE ANSWER IS NOT "THE CONTROL CHANNEL IS READY". Anything but 0 fell through
-			// to a blocking receive on the control channel, so a `wait_any` that REFUSED - a handle
-			// without WAIT, a set it could not size - parked the shell forever on a channel only the
-			// terminal ever writes to. That is a prompt that never comes back, from a syscall that
-			// answered immediately.
-			if ready < 0 {
+		if ready == 0 {
+			// The Process handle is ready: the process has terminated (it exited or a
+			// signal killed it). The job is done; release the tty and reap it.
+			send_blocking(control, b"CLEAR_FG", 0);
+			close(job.proc);
+			return None;
+		}
+		match recv_blocking(control, &mut cbuf) {
+			Received::Message { len, .. } if cbuf[..len].starts_with(b"JOB_STOPPED") => {
+				// The tty suspended the job (Ctrl+Z): release the tty and hand the job
+				// back to be tracked as a stopped background job.
 				send_blocking(control, b"CLEAR_FG", 0);
+				return Some(job);
+			}
+			Received::Closed => {
+				// The console is gone; treat the job as finished.
 				close(job.proc);
 				return None;
 			}
-			if ready == 0 {
-				// The Process handle is ready: the process has terminated (it exited or a
-				// signal killed it). The job is done; release the tty and reap it.
-				send_blocking(control, b"CLEAR_FG", 0);
-				close(job.proc);
-				return None;
-			}
-			match recv_blocking(control, &mut cbuf) {
-				Received::Message { len, .. } if cbuf[..len].starts_with(b"JOB_STOPPED") => {
-					// The tty suspended the job (Ctrl+Z): release the tty and hand the job
-					// back to be tracked as a stopped background job.
-					send_blocking(control, b"CLEAR_FG", 0);
-					return Some(job);
-				}
-				Received::Closed => {
-					// The console is gone; treat the job as finished.
-					close(job.proc);
-					return None;
-				}
-				_ => {} // an unknown control message; keep waiting
-			}
+			_ => {} // an unknown control message; keep waiting
 		}
 	}
 }
@@ -636,80 +614,72 @@ unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 // Discard any messages queued on the control channel without blocking - used to clear a
 // stale JOB_STOPPED (a Ctrl+Z that raced a job's exit) before arming a new foreground
 // job.
-unsafe fn drain_control(control: u64) {
-	unsafe {
-		let mut cbuf: [u8; 32] = [0u8; 32];
-		while let Polled::Message { .. } = try_recv(control, &mut cbuf) {}
-	}
+fn drain_control(control: u64) {
+	let mut cbuf: [u8; 32] = [0u8; 32];
+	while let Polled::Message { .. } = try_recv(control, &mut cbuf) {}
 }
 
 // `size`: query the terminal size from ConsoleService over the control channel (the typed
 // winsize / TIOCGWINSZ route) and print it.
-unsafe fn show_size(control: u64) {
-	unsafe {
-		send_blocking(control, b"GET_WINSIZE", 0);
-		match recv_winsize(control, b"WINSIZE") {
-			Some((rows, cols)) if rows != 0 && cols != 0 => {
-				print(b"size: ");
-				print_usize(cols as usize);
-				print(b" cols x ");
-				print_usize(rows as usize);
-				print(b" rows\n");
-			}
-			_ => print(b"size: unavailable\n"),
+fn show_size(control: u64) {
+	send_blocking(control, b"GET_WINSIZE", 0);
+	match recv_winsize(control, b"WINSIZE") {
+		Some((rows, cols)) if rows != 0 && cols != 0 => {
+			print(b"size: ");
+			print_usize(cols as usize);
+			print(b" cols x ");
+			print_usize(rows as usize);
+			print(b" rows\n");
 		}
+		_ => print(b"size: unavailable\n"),
 	}
 }
 
 // `resize <cols> <rows>`: ask ConsoleService to resize the terminal (the local stand-in
 // for a display mode-set until virtio-gpu drives it), then report the new size from
 // the RESIZE event it sends back.
-unsafe fn resize_console(control: u64, args: &[u8]) {
-	unsafe {
-		let mut it = args.split(|&b| b == b' ').filter(|s: &&[u8]| !s.is_empty());
-		let cols = it.next().and_then(parse_usize);
-		let rows = it.next().and_then(parse_usize);
-		let (cols, rows) = match (cols, rows) {
-			(Some(c), Some(r)) if c > 0 && r > 0 => (c, r),
-			_ => {
-				print(b"usage: resize <cols> <rows>\n");
-				return;
-			}
-		};
-		let mut m: [u8; 15] = [0u8; 15];
-		m[..11].copy_from_slice(b"SET_WINSIZE");
-		m[11..13].copy_from_slice(&(cols as u16).to_le_bytes());
-		m[13..15].copy_from_slice(&(rows as u16).to_le_bytes());
-		send_blocking(control, &m, 0);
-		if let Some((rows, cols)) = recv_winsize(control, b"RESIZE") {
-			print(b"resized to ");
-			print_usize(cols as usize);
-			print(b" x ");
-			print_usize(rows as usize);
-			print(b"\n");
+fn resize_console(control: u64, args: &[u8]) {
+	let mut it = args.split(|&b| b == b' ').filter(|s: &&[u8]| !s.is_empty());
+	let cols = it.next().and_then(parse_usize);
+	let rows = it.next().and_then(parse_usize);
+	let (cols, rows) = match (cols, rows) {
+		(Some(c), Some(r)) if c > 0 && r > 0 => (c, r),
+		_ => {
+			print(b"usage: resize <cols> <rows>\n");
+			return;
 		}
+	};
+	let mut m: [u8; 15] = [0u8; 15];
+	m[..11].copy_from_slice(b"SET_WINSIZE");
+	m[11..13].copy_from_slice(&(cols as u16).to_le_bytes());
+	m[13..15].copy_from_slice(&(rows as u16).to_le_bytes());
+	send_blocking(control, &m, 0);
+	if let Some((rows, cols)) = recv_winsize(control, b"RESIZE") {
+		print(b"resized to ");
+		print_usize(cols as usize);
+		print(b" x ");
+		print_usize(rows as usize);
+		print(b"\n");
 	}
 }
 
 // Receive a winsize-bearing control reply with the given tag ([tag][rows u16][cols u16]),
 // skipping any unrelated control message; returns (rows, cols).
-unsafe fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
-	unsafe {
-		let mut buf: [u8; 32] = [0u8; 32];
-		loop {
-			match recv_blocking(control, &mut buf) {
-				Received::Message { len, .. } => {
-					let m: &[u8] = &buf[..len];
-					if m.starts_with(tag) && len >= tag.len() + 4 {
-						let n = tag.len();
-						let rows = u16::from_le_bytes([m[n], m[n + 1]]);
-						let cols = u16::from_le_bytes([m[n + 2], m[n + 3]]);
-						return Some((rows, cols));
-					}
-					// an unrelated control message: ignore it and keep waiting.
+fn recv_winsize(control: u64, tag: &[u8]) -> Option<(u16, u16)> {
+	let mut buf: [u8; 32] = [0u8; 32];
+	loop {
+		match recv_blocking(control, &mut buf) {
+			Received::Message { len, .. } => {
+				let m: &[u8] = &buf[..len];
+				if m.starts_with(tag) && len >= tag.len() + 4 {
+					let n = tag.len();
+					let rows = u16::from_le_bytes([m[n], m[n + 1]]);
+					let cols = u16::from_le_bytes([m[n + 2], m[n + 3]]);
+					return Some((rows, cols));
 				}
-				Received::Closed => return None,
+				// an unrelated control message: ignore it and keep waiting.
 			}
+			Received::Closed => return None,
 		}
 	}
 }
@@ -900,97 +870,91 @@ fn strip_word_or_bare<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 // Print command help: with `Some(cmd)`, that command's one-line synopsis (or an
 // "unknown command" note); with `None`, every command's synopsis, sorted. The synopsis
 // table lives in `commands` so it is shared with completion and stays in one place.
-unsafe fn print_help(cmd: Option<&[u8]>) {
-	unsafe {
-		if let Some(cmd) = cmd {
-			match synopses::synopsis(cmd) {
-				Some(text) => {
-					print(text.as_bytes());
-					print(b"\n");
-				}
-				None => {
-					print(b"help: unknown command: ");
-					print(cmd);
-					print(b"\n");
-				}
+fn print_help(cmd: Option<&[u8]>) {
+	if let Some(cmd) = cmd {
+		match synopses::synopsis(cmd) {
+			Some(text) => {
+				print(text.as_bytes());
+				print(b"\n");
 			}
-			return;
+			None => {
+				print(b"help: unknown command: ");
+				print(cmd);
+				print(b"\n");
+			}
 		}
-		let mut rows: Vec<&'static str> = synopses::SYNOPSES.iter().map(|&(_, text)| text).collect();
-		rows.sort_unstable();
-		for text in rows {
-			print(text.as_bytes());
-			print(b"\n");
-		}
+		return;
+	}
+	let mut rows: Vec<&'static str> = synopses::SYNOPSES.iter().map(|&(_, text)| text).collect();
+	rows.sort_unstable();
+	for text in rows {
+		print(text.as_bytes());
+		print(b"\n");
 	}
 }
 
-unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8], vars: &[(String, String)]) -> bool {
-	unsafe {
-		for &(name, shape) in TOOLS {
-			match shape {
-				Shape::Bare => {
-					if line == name {
-						run_tool(permsvc, name, b"", cwd, vars);
-						return true;
-					}
+fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8], vars: &[(String, String)]) -> bool {
+	for &(name, shape) in TOOLS {
+		match shape {
+			Shape::Bare => {
+				if line == name {
+					run_tool(permsvc, name, b"", cwd, vars);
+					return true;
 				}
-				Shape::Json => {
-					if line == name {
-						run_tool(permsvc, name, b"", cwd, vars);
-						return true;
-					}
-					if let Some(args) = json_subform(line, name) {
-						run_tool(permsvc, name, args, cwd, vars);
-						return true;
-					}
+			}
+			Shape::Json => {
+				if line == name {
+					run_tool(permsvc, name, b"", cwd, vars);
+					return true;
 				}
-				Shape::Rest => {
-					if line == name {
-						run_tool(permsvc, name, b"", cwd, vars);
-						return true;
-					}
-					if let Some(rest) = strip_word(line, name) {
-						run_tool(permsvc, name, trim(rest), cwd, vars);
-						return true;
-					}
+				if let Some(args) = json_subform(line, name) {
+					run_tool(permsvc, name, args, cwd, vars);
+					return true;
 				}
-				Shape::Args => {
-					if let Some(rest) = strip_word_or_bare(line, name) {
-						run_tool(permsvc, name, trim(rest), cwd, vars);
-						return true;
-					}
+			}
+			Shape::Rest => {
+				if line == name {
+					run_tool(permsvc, name, b"", cwd, vars);
+					return true;
 				}
-				Shape::InteractiveArgs => {
-					if let Some(rest) = strip_word_or_bare(line, name) {
-						run_tool_interactive(jobs, permsvc, name, trim(rest), cwd, vars);
-						return true;
-					}
+				if let Some(rest) = strip_word(line, name) {
+					run_tool(permsvc, name, trim(rest), cwd, vars);
+					return true;
+				}
+			}
+			Shape::Args => {
+				if let Some(rest) = strip_word_or_bare(line, name) {
+					run_tool(permsvc, name, trim(rest), cwd, vars);
+					return true;
+				}
+			}
+			Shape::InteractiveArgs => {
+				if let Some(rest) = strip_word_or_bare(line, name) {
+					run_tool_interactive(jobs, permsvc, name, trim(rest), cwd, vars);
+					return true;
 				}
 			}
 		}
-		false
 	}
+	false
 }
 
 // Route a line to a net tool from `NET_TOOLS`, returning whether it matched one. Each is
 // spawned over a fresh NetworkService client, foreground or (with a trailing `&`, the
 // caller's `bg`) background; the arg-taking forms pass the rest of the line through.
-unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, cwd: &[u8], vars: &[(String, String)], bg: bool) -> bool {
-	unsafe {
-		for &(word, tool, takes_args) in NET_TOOLS {
-			if takes_args {
-				if let Some(rest) = strip_word(line, word) {
-					spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), cwd, vars, bg);
-					return true;
-				}
-			} else if line == word {
-				spawn_net_tool(jobs, netsvc, procsvc, tool, b"", cwd, vars, bg);
+fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, cwd: &[u8], vars: &[(String, String)], bg: bool) -> bool {
+	for &(word, tool, takes_args) in NET_TOOLS {
+		if takes_args {
+			if let Some(rest) = strip_word(line, word) {
+				spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), cwd, vars, bg);
 				return true;
 			}
+		} else if line == word {
+			spawn_net_tool(jobs, netsvc, procsvc, tool, b"", cwd, vars, bg);
+			return true;
 		}
-		false
 	}
+	false
 }
 
 // Power the machine down gracefully. With a ServiceManager admin channel (VT 1), drive
@@ -1011,278 +975,274 @@ unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, 
 // backstop that bypasses the supervisor is a second, unsupervised way to halt the system, and
 // removing it leaves exactly two holders - the supervisor's graceful path, and the keyboard
 // driver's Power key, which exists to work when the supervisor does not.
-unsafe fn graceful_power(admin: u64, action: u64) {
-	unsafe {
-		if admin == 0 {
-			print(b"power: no supervisor connection; cannot stop the machine from here\n");
-			return;
-		}
-		print(if action == POWER_REBOOT { b"rebooting...\n" } else { b"powering off...\n" });
-		let req: &[u8] = if action == POWER_REBOOT { b"!reboot" } else { b"!poweroff" };
-		if !send_blocking(admin, req, 0) {
-			print(b"power: the supervisor did not accept the request\n");
-			return;
-		}
-		// The supervisor powers the machine off after the teardown, so this recv normally
-		// never returns - the machine is gone. If it does return, the supervisor closed the
-		// channel without acting, and saying so is the whole of what this can do now.
-		let mut rbuf: [u8; 64] = [0u8; 64];
-		let _ = recv_blocking(admin, &mut rbuf);
-		print(b"power: the supervisor closed the request without stopping the machine\n");
+fn graceful_power(admin: u64, action: u64) {
+	if admin == 0 {
+		print(b"power: no supervisor connection; cannot stop the machine from here\n");
+		return;
 	}
+	print(if action == POWER_REBOOT { b"rebooting...\n" } else { b"powering off...\n" });
+	let req: &[u8] = if action == POWER_REBOOT { b"!reboot" } else { b"!poweroff" };
+	if !send_blocking(admin, req, 0) {
+		print(b"power: the supervisor did not accept the request\n");
+		return;
+	}
+	// The supervisor powers the machine off after the teardown, so this recv normally
+	// never returns - the machine is gone. If it does return, the supervisor closed the
+	// channel without acting, and saying so is the whole of what this can do now.
+	let mut rbuf: [u8; 64] = [0u8; 64];
+	let _ = recv_blocking(admin, &mut rbuf);
+	print(b"power: the supervisor closed the request without stopping the machine\n");
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: &mut u64, broker: u64, permsvc: u64, session: u64, admin: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
-	unsafe {
-		// The line arrives already trimmed, `$`-expanded, and flag-normalized by
-		// `parse_and_expand`; trim again so the recursive `time <command>` path (which passes
-		// a slice of it) is clean too.
-		let line = trim(line);
-		if line.is_empty() {
-			return false;
-		}
-		// `help` lists every command's synopsis; `help <command>` shows one. And a
-		// `--help` anywhere on the line prints the leading command's synopsis instead of
-		// launching it - so every command answers `--help` from one central table, with
-		// no per-tool usage string. (`-h` is NOT intercepted: `free -h` / `du -h` mean
-		// human-readable; only the unambiguous long form is help.)
-		if line == b"help" {
-			print_help(None);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"help ") {
-			print_help(Some(trim(rest)));
-			return false;
-		}
-		if line.split(|&b| b == b' ').any(|t: &[u8]| t == b"--help") {
-			let cmd: &[u8] = line.split(|&b| b == b' ').next().unwrap_or(b"");
-			print_help(Some(cmd));
-			return false;
-		}
-		// A bare `NAME=VALUE` sets a shell variable (write it through to the session so it
-		// persists, and update the cache); the value was already `$`-expanded upstream, so
-		// `FOO=$BAR` copies BAR's value. Checked before the `&` split so a value may hold one.
-		if let Some((name, value)) = parse_assignment(line) {
-			set_var(vars, session, name, value);
-			return false;
-		}
-		// A trailing `&` runs a spawnable command in the background.
-		let (line, bg): (&[u8], bool) = match line.strip_suffix(b"&") {
-			Some(rest) => (trim(rest), true),
-			None => (line, false),
-		};
-		if line.is_empty() {
-			return false;
-		}
-		// `time <command>` dispatches the command and prints its wall time from the
-		// monotonic clock - the measuring instrument for throughput work (a foreground
-		// tool runs to completion inside the dispatch, so the time covers it whole).
-		if let Some(rest) = line.strip_prefix(b"time ") {
-			let t0: u64 = clock_ns();
-			let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, broker, permsvc, session, admin, jobs, vars, cwd);
-			let us: u64 = (clock_ns() - t0) / 1_000;
-			let line: String = alloc::format!("time: {}.{:03} s\n", us / 1_000_000, us % 1_000_000 / 1_000);
-			print(line.as_bytes());
-			return quit;
-		}
-		if line == b"env" {
-			// List the environment the way `env` does, one `NAME=VALUE` per line, from the cache.
-			for (name, value) in vars.iter() {
-				print(name.as_bytes());
-				print(b"=");
-				print(value.as_bytes());
-				print(b"\n");
-			}
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"unset ") {
-			// Remove a variable: write through to the session, then drop it from the cache.
-			if let Ok(name) = core::str::from_utf8(trim(rest)) {
-				unset_var(vars, session, name);
-			}
-			return false;
-		}
-		if line == b"jobs" {
-			jobs.list();
-			return false;
-		}
-		if line == b"fg" {
-			jobs.fg(b"");
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"fg ") {
-			jobs.fg(trim(rest));
-			return false;
-		}
-		if line == b"bg" {
-			jobs.bg(b"");
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"bg ") {
-			jobs.bg(trim(rest));
-			return false;
-		}
-		if line == b"exit" || line == b"quit" {
-			print(b"shell: exiting\n");
-			return true;
-		}
-		if line == b"reboot" {
-			graceful_power(admin, POWER_REBOOT);
-			print(b"reboot: failed\n");
-			return false;
-		}
-		if line == b"poweroff" || line == b"shutdown" {
-			graceful_power(admin, POWER_OFF);
-			print(b"poweroff: failed\n");
-			return false;
-		}
-		if line == b"clear" {
-			// ED (erase the whole display) + CUP (home the cursor) - the console's
-			// cell-buffer terminal interprets these the same as any VT100 terminal.
-			print(b"\x1b[2J\x1b[H");
-			return false;
-		}
-		if line == b"size" {
-			show_size(jobs.control);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"resize ") {
-			resize_console(jobs.control, trim(rest));
-			return false;
-		}
-		// The governed-tool routing (`date`, `ls`, `cat`, the `ls*` queries, ...) is a table
-		// at the end of `dispatch` (`dispatch_tool`); only the commands that do not fit a table
-		// shape stay as their own arms here: the graph/mouse views, the `cd` builtin, the
-		// process-launcher tools (`echo` / `readln` / `script`), the multi-verb `snap` /
-		// `volume`, the interactive `ps -i`, the flagged `free -h`, and the net tools.
-		if line == b"graph" {
-			query_graph(graphsvc, broker, GraphFmt::Text);
-			return false;
-		}
-		if line == b"graph json" {
-			query_graph(graphsvc, broker, GraphFmt::Json(JsonMode::Pretty));
-			return false;
-		}
-		if line == b"graph json-min" {
-			query_graph(graphsvc, broker, GraphFmt::Json(JsonMode::Min));
-			return false;
-		}
-		if line == b"graph cbor" {
-			query_graph(graphsvc, broker, GraphFmt::Cbor);
-			return false;
-		}
-		if line == b"ps -i" {
-			// The live view needs the terminal itself (raw input, in-place redraws), so it
-			// launches through the interactive path: the same governed PermissionManager
-			// launch, but handed a full-duplex dup of this console instead of a relay, and
-			// set as the tty's foreground job.
-			run_tool_interactive(jobs, permsvc, b"ps", b"-i", cwd.as_bytes(), vars);
-			return false;
-		}
-		if line == b"free -h" {
-			run_tool(permsvc, b"free", b"-h", cwd.as_bytes(), vars);
-			return false;
-		}
-		if line == b"mouse" {
-			mouse_cmd(inputsvc);
-			return false;
-		}
-		// the network views: a table of net tools spawned over a fresh NetworkService client
-		// (`httpd` is separate - it always backgrounds).
-		if dispatch_net(line, jobs, netsvc, procsvc, cwd.as_bytes(), vars, bg) {
-			return false;
-		}
-		if line == b"httpd" {
-			spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", cwd.as_bytes(), vars, true);
-			return false;
-		}
-		if line == b"echo" {
-			exec(jobs, procsvc, b"echo", b"", cwd.as_bytes(), vars, 0, bg);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"echo ") {
-			exec(jobs, procsvc, b"echo", trim(rest), cwd.as_bytes(), vars, 0, bg);
-			return false;
-		}
-		if line == b"readln" {
-			// readln reads its stdin and echoes each line - the interactive counterpart to
-			// echo, proving a foreground tool reads keyboard input, not just prints.
-			exec(jobs, procsvc, b"readln", b"", cwd.as_bytes(), vars, 0, bg);
-			return false;
-		}
-		if line == b"cd" {
-			// no argument returns to the home volume
-			cwd.clear();
-			cwd.push_str(DEFAULT_CWD);
-			if session != 0 {
-				let _ = session::Client::new(ChannelTransport { chan: session }).chdir(DEFAULT_CWD);
-			}
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"cd ") {
-			cd_cmd(cwd, trim(rest), session, storage, media, iso, udf, usb);
-			return false;
-		}
-		if line == b"snap" || line == b"snap list" {
-			// Launch `snap` as its own sandboxed ELF through PermissionManager (the launcher /
-			// granter), which grants it a storage client and forwards this terminal and the
-			// snapshot sub-form.
-			run_tool(permsvc, b"snap", b"list", cwd.as_bytes(), vars);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"snap create ") {
-			let name: &[u8] = trim(rest);
-			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
-			arg.extend_from_slice(b"create ");
-			arg.extend_from_slice(name);
-			run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"snap delete ") {
-			let name: &[u8] = trim(rest);
-			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
-			arg.extend_from_slice(b"delete ");
-			arg.extend_from_slice(name);
-			run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"snap cat ") {
-			let rest = trim(rest);
-			let mut arg: Vec<u8> = Vec::with_capacity(4 + rest.len());
-			arg.extend_from_slice(b"cat ");
-			arg.extend_from_slice(rest);
-			run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
-			return false;
-		}
-		if line == b"volume" || line == b"volume status" {
-			// Launch `volume` as its own sandboxed ELF through PermissionManager: the
-			// filesystem's identity and health (label, size, free, compression, mount mode).
-			run_tool(permsvc, b"volume", b"status", cwd.as_bytes(), vars);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"volume ") {
-			// the other volume verbs (compress on|off, fsck, restore <uri> [snapshot])
-			// pass through whole; the tool validates the sub-form.
-			run_tool(permsvc, b"volume", trim(rest), cwd.as_bytes(), vars);
-			return false;
-		}
-		if line == b"script" {
-			run_script(jobs, procsvc, b"", cwd.as_bytes(), vars);
-			return false;
-		}
-		if let Some(rest) = line.strip_prefix(b"script ") {
-			run_script(jobs, procsvc, trim(rest), cwd.as_bytes(), vars);
-			return false;
-		}
-		// everything else is a governed tool: match it against the tool table.
-		if dispatch_tool(line, jobs, permsvc, cwd.as_bytes(), vars) {
-			return false;
-		}
-		print(b"\x1b[31munknown command: ");
-		print(line);
-		print(b" (Tab Tab lists the commands)\x1b[0m\n");
-		false
+fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: &mut u64, broker: u64, permsvc: u64, session: u64, admin: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
+	// The line arrives already trimmed, `$`-expanded, and flag-normalized by
+	// `parse_and_expand`; trim again so the recursive `time <command>` path (which passes
+	// a slice of it) is clean too.
+	let line = trim(line);
+	if line.is_empty() {
+		return false;
 	}
+	// `help` lists every command's synopsis; `help <command>` shows one. And a
+	// `--help` anywhere on the line prints the leading command's synopsis instead of
+	// launching it - so every command answers `--help` from one central table, with
+	// no per-tool usage string. (`-h` is NOT intercepted: `free -h` / `du -h` mean
+	// human-readable; only the unambiguous long form is help.)
+	if line == b"help" {
+		print_help(None);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"help ") {
+		print_help(Some(trim(rest)));
+		return false;
+	}
+	if line.split(|&b| b == b' ').any(|t: &[u8]| t == b"--help") {
+		let cmd: &[u8] = line.split(|&b| b == b' ').next().unwrap_or(b"");
+		print_help(Some(cmd));
+		return false;
+	}
+	// A bare `NAME=VALUE` sets a shell variable (write it through to the session so it
+	// persists, and update the cache); the value was already `$`-expanded upstream, so
+	// `FOO=$BAR` copies BAR's value. Checked before the `&` split so a value may hold one.
+	if let Some((name, value)) = parse_assignment(line) {
+		set_var(vars, session, name, value);
+		return false;
+	}
+	// A trailing `&` runs a spawnable command in the background.
+	let (line, bg): (&[u8], bool) = match line.strip_suffix(b"&") {
+		Some(rest) => (trim(rest), true),
+		None => (line, false),
+	};
+	if line.is_empty() {
+		return false;
+	}
+	// `time <command>` dispatches the command and prints its wall time from the
+	// monotonic clock - the measuring instrument for throughput work (a foreground
+	// tool runs to completion inside the dispatch, so the time covers it whole).
+	if let Some(rest) = line.strip_prefix(b"time ") {
+		let t0: u64 = clock_ns();
+		let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, broker, permsvc, session, admin, jobs, vars, cwd);
+		let us: u64 = (clock_ns() - t0) / 1_000;
+		let line: String = alloc::format!("time: {}.{:03} s\n", us / 1_000_000, us % 1_000_000 / 1_000);
+		print(line.as_bytes());
+		return quit;
+	}
+	if line == b"env" {
+		// List the environment the way `env` does, one `NAME=VALUE` per line, from the cache.
+		for (name, value) in vars.iter() {
+			print(name.as_bytes());
+			print(b"=");
+			print(value.as_bytes());
+			print(b"\n");
+		}
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"unset ") {
+		// Remove a variable: write through to the session, then drop it from the cache.
+		if let Ok(name) = core::str::from_utf8(trim(rest)) {
+			unset_var(vars, session, name);
+		}
+		return false;
+	}
+	if line == b"jobs" {
+		jobs.list();
+		return false;
+	}
+	if line == b"fg" {
+		jobs.fg(b"");
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"fg ") {
+		jobs.fg(trim(rest));
+		return false;
+	}
+	if line == b"bg" {
+		jobs.bg(b"");
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"bg ") {
+		jobs.bg(trim(rest));
+		return false;
+	}
+	if line == b"exit" || line == b"quit" {
+		print(b"shell: exiting\n");
+		return true;
+	}
+	if line == b"reboot" {
+		graceful_power(admin, POWER_REBOOT);
+		print(b"reboot: failed\n");
+		return false;
+	}
+	if line == b"poweroff" || line == b"shutdown" {
+		graceful_power(admin, POWER_OFF);
+		print(b"poweroff: failed\n");
+		return false;
+	}
+	if line == b"clear" {
+		// ED (erase the whole display) + CUP (home the cursor) - the console's
+		// cell-buffer terminal interprets these the same as any VT100 terminal.
+		print(b"\x1b[2J\x1b[H");
+		return false;
+	}
+	if line == b"size" {
+		show_size(jobs.control);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"resize ") {
+		resize_console(jobs.control, trim(rest));
+		return false;
+	}
+	// The governed-tool routing (`date`, `ls`, `cat`, the `ls*` queries, ...) is a table
+	// at the end of `dispatch` (`dispatch_tool`); only the commands that do not fit a table
+	// shape stay as their own arms here: the graph/mouse views, the `cd` builtin, the
+	// process-launcher tools (`echo` / `readln` / `script`), the multi-verb `snap` /
+	// `volume`, the interactive `ps -i`, the flagged `free -h`, and the net tools.
+	if line == b"graph" {
+		query_graph(graphsvc, broker, GraphFmt::Text);
+		return false;
+	}
+	if line == b"graph json" {
+		query_graph(graphsvc, broker, GraphFmt::Json(JsonMode::Pretty));
+		return false;
+	}
+	if line == b"graph json-min" {
+		query_graph(graphsvc, broker, GraphFmt::Json(JsonMode::Min));
+		return false;
+	}
+	if line == b"graph cbor" {
+		query_graph(graphsvc, broker, GraphFmt::Cbor);
+		return false;
+	}
+	if line == b"ps -i" {
+		// The live view needs the terminal itself (raw input, in-place redraws), so it
+		// launches through the interactive path: the same governed PermissionManager
+		// launch, but handed a full-duplex dup of this console instead of a relay, and
+		// set as the tty's foreground job.
+		run_tool_interactive(jobs, permsvc, b"ps", b"-i", cwd.as_bytes(), vars);
+		return false;
+	}
+	if line == b"free -h" {
+		run_tool(permsvc, b"free", b"-h", cwd.as_bytes(), vars);
+		return false;
+	}
+	if line == b"mouse" {
+		mouse_cmd(inputsvc);
+		return false;
+	}
+	// the network views: a table of net tools spawned over a fresh NetworkService client
+	// (`httpd` is separate - it always backgrounds).
+	if dispatch_net(line, jobs, netsvc, procsvc, cwd.as_bytes(), vars, bg) {
+		return false;
+	}
+	if line == b"httpd" {
+		spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", cwd.as_bytes(), vars, true);
+		return false;
+	}
+	if line == b"echo" {
+		exec(jobs, procsvc, b"echo", b"", cwd.as_bytes(), vars, 0, bg);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"echo ") {
+		exec(jobs, procsvc, b"echo", trim(rest), cwd.as_bytes(), vars, 0, bg);
+		return false;
+	}
+	if line == b"readln" {
+		// readln reads its stdin and echoes each line - the interactive counterpart to
+		// echo, proving a foreground tool reads keyboard input, not just prints.
+		exec(jobs, procsvc, b"readln", b"", cwd.as_bytes(), vars, 0, bg);
+		return false;
+	}
+	if line == b"cd" {
+		// no argument returns to the home volume
+		cwd.clear();
+		cwd.push_str(DEFAULT_CWD);
+		if session != 0 {
+			let _ = session::Client::new(ChannelTransport { chan: session }).chdir(DEFAULT_CWD);
+		}
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"cd ") {
+		cd_cmd(cwd, trim(rest), session, storage, media, iso, udf, usb);
+		return false;
+	}
+	if line == b"snap" || line == b"snap list" {
+		// Launch `snap` as its own sandboxed ELF through PermissionManager (the launcher /
+		// granter), which grants it a storage client and forwards this terminal and the
+		// snapshot sub-form.
+		run_tool(permsvc, b"snap", b"list", cwd.as_bytes(), vars);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"snap create ") {
+		let name: &[u8] = trim(rest);
+		let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
+		arg.extend_from_slice(b"create ");
+		arg.extend_from_slice(name);
+		run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"snap delete ") {
+		let name: &[u8] = trim(rest);
+		let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
+		arg.extend_from_slice(b"delete ");
+		arg.extend_from_slice(name);
+		run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"snap cat ") {
+		let rest = trim(rest);
+		let mut arg: Vec<u8> = Vec::with_capacity(4 + rest.len());
+		arg.extend_from_slice(b"cat ");
+		arg.extend_from_slice(rest);
+		run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
+		return false;
+	}
+	if line == b"volume" || line == b"volume status" {
+		// Launch `volume` as its own sandboxed ELF through PermissionManager: the
+		// filesystem's identity and health (label, size, free, compression, mount mode).
+		run_tool(permsvc, b"volume", b"status", cwd.as_bytes(), vars);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"volume ") {
+		// the other volume verbs (compress on|off, fsck, restore <uri> [snapshot])
+		// pass through whole; the tool validates the sub-form.
+		run_tool(permsvc, b"volume", trim(rest), cwd.as_bytes(), vars);
+		return false;
+	}
+	if line == b"script" {
+		run_script(jobs, procsvc, b"", cwd.as_bytes(), vars);
+		return false;
+	}
+	if let Some(rest) = line.strip_prefix(b"script ") {
+		run_script(jobs, procsvc, trim(rest), cwd.as_bytes(), vars);
+		return false;
+	}
+	// everything else is a governed tool: match it against the tool table.
+	if dispatch_tool(line, jobs, permsvc, cwd.as_bytes(), vars) {
+		return false;
+	}
+	print(b"\x1b[31munknown command: ");
+	print(line);
+	print(b" (Tab Tab lists the commands)\x1b[0m\n");
+	false
 }
 
 // Launch a standalone program `name` through ProcessService as a foreground child, hand
@@ -1305,82 +1265,80 @@ fn environment_snapshot(vars: &[(String, String)]) -> Vec<EnvVar> {
 	vars.iter().map(|(name, value): &(String, String)| EnvVar { name: name.clone(), value: value.clone() }).collect()
 }
 
-unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)], cap: u64, bg: bool) {
-	unsafe {
-		let name_str: &str = match core::str::from_utf8(name) {
-			Ok(s) => s,
-			Err(_) => {
-				print(name);
-				print(b": invalid name\n");
-				return;
-			}
-		};
-		let (parent, child): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return,
-		};
-		// LAUNCH the program via ProcessService: the child end is transferred to it as the new
-		// process's bootstrap handle, and it replies the live Process handle. On any failure the
-		// child end has already been transferred (or never created), so we drop only our parent
-		// end - the same posture the raw spawn took on a failed start.
-		let mut client = process::Client::new(ChannelTransport { chan: procsvc });
-		let proc: u64 = match client.launch(name_str, &child) {
-			Some(Ok(started)) => started.task,
-			Some(Err(_)) => {
-				print(name);
-				print(b": could not start\n");
-				close(parent);
-				return;
-			}
-			None => {
-				print(name);
-				print(b": process service unavailable\n");
-				close(parent);
-				return;
-			}
-		};
-		// Hand the child our console as its stdout - and, for a foreground job, its stdin too
-		// (a full-duplex dup of our console channel, the controlling terminal) - then its
-		// arguments + an optional inherited capability (e.g. a NetworkService client).
-		send_stdout(parent, !bg);
-		// The launch context - the arguments and the working directory - in one versioned record,
-		// with the optional inherited capability riding the same message so the child receives
-		// both or neither. The arguments used to be the message; the working directory reached a
-		// child only through PermissionManager, so a shell-spawned tool had none.
-		let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: environment_snapshot(vars) };
-		match context.encode_vec() {
-			Some(bytes) if bytes.len() <= rt::LAUNCH_CONTEXT_MAX => {
-				send_blocking(parent, &bytes, cap);
-			}
-			_ => {
-				print(name);
-				print(b": could not encode the launch context\n");
-				close(parent);
-				return;
-			}
+fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)], cap: u64, bg: bool) {
+	let name_str: &str = match core::str::from_utf8(name) {
+		Ok(s) => s,
+		Err(_) => {
+			print(name);
+			print(b": invalid name\n");
+			return;
 		}
-		// The bootstrap is delivered; the child drains it from its own end, so the shell no
-		// longer needs the parent end. Drop it - the shell now tracks the job solely by its
-		// waitable Process handle (ready once the child terminates), not a completion channel.
-		close(parent);
-		let job: Job = Job { proc, name: name.to_vec() };
-		if bg {
-			// Background: hand the job to the session (which holds the table, so it survives a
-			// shell restart) and return to the prompt; its completion is reaped before a later
-			// prompt. With no session to track it, run it in the foreground instead.
-			match jobs.register(job.proc, &job.name, false) {
-				Some(id) => {
-					print(b"[");
-					print_usize(id as usize);
-					print(b"] ");
-					print(name);
-					print(b" &\n");
-				}
-				None => jobs.run_foreground_tracked(job),
-			}
-		} else {
-			jobs.run_foreground_tracked(job);
+	};
+	let (parent, child): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return,
+	};
+	// LAUNCH the program via ProcessService: the child end is transferred to it as the new
+	// process's bootstrap handle, and it replies the live Process handle. On any failure the
+	// child end has already been transferred (or never created), so we drop only our parent
+	// end - the same posture the raw spawn took on a failed start.
+	let mut client = process::Client::new(ChannelTransport { chan: procsvc });
+	let proc: u64 = match client.launch(name_str, &child) {
+		Some(Ok(started)) => started.task,
+		Some(Err(_)) => {
+			print(name);
+			print(b": could not start\n");
+			close(parent);
+			return;
 		}
+		None => {
+			print(name);
+			print(b": process service unavailable\n");
+			close(parent);
+			return;
+		}
+	};
+	// Hand the child our console as its stdout - and, for a foreground job, its stdin too
+	// (a full-duplex dup of our console channel, the controlling terminal) - then its
+	// arguments + an optional inherited capability (e.g. a NetworkService client).
+	send_stdout(parent, !bg);
+	// The launch context - the arguments and the working directory - in one versioned record,
+	// with the optional inherited capability riding the same message so the child receives
+	// both or neither. The arguments used to be the message; the working directory reached a
+	// child only through PermissionManager, so a shell-spawned tool had none.
+	let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: environment_snapshot(vars) };
+	match context.encode_vec() {
+		Some(bytes) if bytes.len() <= rt::LAUNCH_CONTEXT_MAX => {
+			send_blocking(parent, &bytes, cap);
+		}
+		_ => {
+			print(name);
+			print(b": could not encode the launch context\n");
+			close(parent);
+			return;
+		}
+	}
+	// The bootstrap is delivered; the child drains it from its own end, so the shell no
+	// longer needs the parent end. Drop it - the shell now tracks the job solely by its
+	// waitable Process handle (ready once the child terminates), not a completion channel.
+	close(parent);
+	let job: Job = Job { proc, name: name.to_vec() };
+	if bg {
+		// Background: hand the job to the session (which holds the table, so it survives a
+		// shell restart) and return to the prompt; its completion is reaped before a later
+		// prompt. With no session to track it, run it in the foreground instead.
+		match jobs.register(job.proc, &job.name, false) {
+			Some(id) => {
+				print(b"[");
+				print_usize(id as usize);
+				print(b"] ");
+				print(name);
+				print(b" &\n");
+			}
+			None => jobs.run_foreground_tracked(job),
+		}
+	} else {
+		jobs.run_foreground_tracked(job);
 	}
 }
 
@@ -1401,41 +1359,39 @@ fn tty_control() -> u64 {
 	TTY_CONTROL.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-unsafe fn send_stdout(parent: u64, interactive: bool) {
-	unsafe {
-		let so: u64 = stdout();
-		let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER };
-		let dup: u64 = if so != 0 {
-			let d: i64 = duplicate(so, rights);
-			if d > 0 { d as u64 } else { 0 }
-		} else {
-			0
-		};
-		// A named run, ended by READY. The shell hands over one endpoint - its console, which is
-		// full duplex, so the child reads and writes the same channel - and names it rather than
-		// relying on its position. What it does not send simply does not arrive.
-		send_blocking(parent, CAP_STDOUT, dup);
-		// AND THE TERMINAL'S CONTROL CHANNEL, for an interactive foreground job only.
-		//
-		// This is what lets a full-screen program ask for raw mode without printing an escape
-		// sequence into its own output - where its data and its requests were the same bytes, so
-		// `cat` on a file containing them reconfigured the terminal. Send-only: the child asks, it
-		// does not listen in on what the shell and the console say to each other.
-		//
-		// A background job gets nothing, and neither does a pipeline stage: the tty belongs to
-		// whoever is in the foreground, and that is the shell's own bookkeeping (it is what sets
-		// SET_FG) rather than something the console has to infer.
-		if interactive {
-			let control: u64 = tty_control();
-			if control != 0 {
-				let sendable: i64 = duplicate(control, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
-				if sendable > 0 {
-					send_blocking(parent, CAP_CONTROL, sendable as u64);
-				}
+fn send_stdout(parent: u64, interactive: bool) {
+	let so: u64 = stdout();
+	let rights: u32 = if interactive { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER } else { RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER };
+	let dup: u64 = if so != 0 {
+		let d: i64 = duplicate(so, rights);
+		if d > 0 { d as u64 } else { 0 }
+	} else {
+		0
+	};
+	// A named run, ended by READY. The shell hands over one endpoint - its console, which is
+	// full duplex, so the child reads and writes the same channel - and names it rather than
+	// relying on its position. What it does not send simply does not arrive.
+	send_blocking(parent, CAP_STDOUT, dup);
+	// AND THE TERMINAL'S CONTROL CHANNEL, for an interactive foreground job only.
+	//
+	// This is what lets a full-screen program ask for raw mode without printing an escape
+	// sequence into its own output - where its data and its requests were the same bytes, so
+	// `cat` on a file containing them reconfigured the terminal. Send-only: the child asks, it
+	// does not listen in on what the shell and the console say to each other.
+	//
+	// A background job gets nothing, and neither does a pipeline stage: the tty belongs to
+	// whoever is in the foreground, and that is the shell's own bookkeeping (it is what sets
+	// SET_FG) rather than something the console has to infer.
+	if interactive {
+		let control: u64 = tty_control();
+		if control != 0 {
+			let sendable: i64 = duplicate(control, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+			if sendable > 0 {
+				send_blocking(parent, CAP_CONTROL, sendable as u64);
 			}
 		}
-		send_ready(parent);
 	}
+	send_ready(parent);
 }
 
 // Spawn a network tool as a foreground program, giving it its OWN NetworkService
@@ -1443,24 +1399,22 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
 // channel rather than sharing the shell's (a shared channel would race), and the
 // shell keeps its own `netsvc`.
-unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)], bg: bool) {
-	unsafe {
-		if netsvc == 0 {
+fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)], bg: bool) {
+	if netsvc == 0 {
+		print(name);
+		print(b": no network interface\n");
+		return;
+	}
+	let mut client = network::Client::new(ChannelTransport { chan: netsvc });
+	let tool_netsvc: u64 = match client.open() {
+		Some(Ok(h)) => h,
+		_ => {
 			print(name);
-			print(b": no network interface\n");
+			print(b": network service unavailable\n");
 			return;
 		}
-		let mut client = network::Client::new(ChannelTransport { chan: netsvc });
-		let tool_netsvc: u64 = match client.open() {
-			Some(Ok(h)) => h,
-			_ => {
-				print(name);
-				print(b": network service unavailable\n");
-				return;
-			}
-		};
-		exec(jobs, procsvc, name, args, cwd, vars, tool_netsvc, bg);
-	}
+	};
+	exec(jobs, procsvc, name, args, cwd, vars, tool_netsvc, bg);
 }
 
 // Launch a system command as its own sandboxed ELF through PermissionManager and render
@@ -1477,49 +1431,47 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 // PermissionManager (the launcher / granter), never the raw process loader, so each command
 // runs with exactly its manifest's capabilities. Foreground only for now (no
 // background / job control).
-unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)]) -> bool {
-	unsafe {
-		let name_str: &str = match core::str::from_utf8(name) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let args_str: &str = match core::str::from_utf8(args) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let cwd_str: &str = match core::str::from_utf8(cwd) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let (out_read, out_write): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		// Ask PermissionManager to launch the command, handing it the write end of our stdout
-		// channel. On the request that end is transferred away (to PermissionManager and on to
-		// the command), so we keep only the read end and never close the write end ourselves.
-		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let task: u64 = match client.run(name_str, args_str, cwd_str, &environment_snapshot(vars), &out_write) {
-			Some(Ok(started)) => started.task,
-			_ => {
-				close(out_read);
-				return false;
-			}
-		};
-		// Relay the command's output to our console as it prints, until it exits and its stdout
-		// end closes. The buffer matches the console's own per-write size, so a single message
-		// renders the same as it would straight from the command.
-		let mut obuf: [u8; 4096] = [0u8; 4096];
-		loop {
-			match recv_blocking(out_read, &mut obuf) {
-				Received::Message { len, .. } => print(&obuf[..len]),
-				Received::Closed => break,
-			}
+fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)]) -> bool {
+	let name_str: &str = match core::str::from_utf8(name) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let args_str: &str = match core::str::from_utf8(args) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let cwd_str: &str = match core::str::from_utf8(cwd) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let (out_read, out_write): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return false,
+	};
+	// Ask PermissionManager to launch the command, handing it the write end of our stdout
+	// channel. On the request that end is transferred away (to PermissionManager and on to
+	// the command), so we keep only the read end and never close the write end ourselves.
+	let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+	let task: u64 = match client.run(name_str, args_str, cwd_str, &environment_snapshot(vars), &out_write) {
+		Some(Ok(started)) => started.task,
+		_ => {
+			close(out_read);
+			return false;
 		}
-		close(out_read);
-		close(task);
-		true
+	};
+	// Relay the command's output to our console as it prints, until it exits and its stdout
+	// end closes. The buffer matches the console's own per-write size, so a single message
+	// renders the same as it would straight from the command.
+	let mut obuf: [u8; 4096] = [0u8; 4096];
+	loop {
+		match recv_blocking(out_read, &mut obuf) {
+			Received::Message { len, .. } => print(&obuf[..len]),
+			Received::Closed => break,
+		}
 	}
+	close(out_read);
+	close(task);
+	true
 }
 
 // Run a multi-stage pipeline through PermissionManager as ONE transaction and relay the last
@@ -1564,113 +1516,111 @@ fn redirect_refusal(reason: &RedirectError) -> &'static [u8] {
 	}
 }
 
-unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStage], background: bool, cwd: &[u8], vars: &mut Vec<(String, String)>, session: u64) -> bool {
-	unsafe {
-		let cwd_str: &str = match core::str::from_utf8(cwd) {
+fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStage], background: bool, cwd: &[u8], vars: &mut Vec<(String, String)>, session: u64) -> bool {
+	let cwd_str: &str = match core::str::from_utf8(cwd) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let mut stages: Vec<PipelineStage> = Vec::new();
+	for stage in words {
+		let Some(first) = stage.words.first() else { return false };
+		let name: &str = match core::str::from_utf8(first) {
 			Ok(s) => s,
 			Err(_) => return false,
 		};
-		let mut stages: Vec<PipelineStage> = Vec::new();
-		for stage in words {
-			let Some(first) = stage.words.first() else { return false };
-			let name: &str = match core::str::from_utf8(first) {
-				Ok(s) => s,
-				Err(_) => return false,
-			};
-			// The words after the command, rejoined as the argument string the governed launch
-			// contract passes. A redirection is already one of these stages by the time this runs -
-			// `redirect_in` and `redirect_out` carry their path as an ordinary argument.
-			let mut args: Vec<u8> = Vec::new();
-			for word in stage.words.iter().skip(1) {
-				if !args.is_empty() {
-					args.push(b' ');
-				}
-				args.extend_from_slice(word);
+		// The words after the command, rejoined as the argument string the governed launch
+		// contract passes. A redirection is already one of these stages by the time this runs -
+		// `redirect_in` and `redirect_out` carry their path as an ordinary argument.
+		let mut args: Vec<u8> = Vec::new();
+		for word in stage.words.iter().skip(1) {
+			if !args.is_empty() {
+				args.push(b' ');
 			}
-			let args_str: String = match String::from_utf8(args) {
-				Ok(s) => s,
-				Err(_) => return false,
-			};
-			// `merge_errors` TRAVELS AS A FLAG AND NOT AS AN ENDPOINT. The shell cannot hand the
-			// stage its own output channel because the shell does not have one: the broker allocates
-			// every edge inside the launch transaction, so which handle "wherever the output goes"
-			// names is knowable only there. The flag says what the user asked for; the broker
-			// decides which handle answers it.
-			stages.push(PipelineStage { name: String::from(name), args: args_str, merge_errors: stage.merge_errors });
+			args.extend_from_slice(word);
 		}
-		// THE LAST STAGE WRITES TO THE TERMINAL ITSELF, and this used to be a relay: a channel
-		// pair, with the shell parked in a receive loop copying the far end onto its console until
-		// the pipe closed.
-		//
-		// The relay is what made a foreground pipeline UNINTERRUPTIBLE. A shell blocked in
-		// `recv_blocking` is not waiting on the job, so it cannot be handed to the tty as the
-		// foreground one, and Ctrl+C reached nobody - which is this milestone's "terminal interrupt
-		// targets the whole ProcessGroup", not implemented and not visibly missing, because a
-		// pipeline that finishes quickly never gives anybody a chance to press it. Ctrl+Z was worse
-		// than missing: with a relay in the middle there is no honest way to suspend, since resuming
-		// the job would need the relay resumed too, and the shell has gone back to its prompt.
-		//
-		// Handing the stage the console removes the question. There is nothing in the middle to
-		// suspend, the shell waits on the GROUP handle exactly as it waits on a single job's
-		// process handle, and interrupt, quit, suspend, `fg` and `bg` are the code that already
-		// exists rather than a second copy of it for pipelines.
-		//
-		// SEND-ONLY, unlike `run_tool_interactive`'s full-duplex dup. A pipeline stage has no
-		// business reading the keyboard: the shell is still reading the console, and a stage that
-		// could take from that queue would eat the next line the user typed.
-		let console: u64 = stdout();
-		if console == 0 {
-			return false;
-		}
-		let out_write: i64 = duplicate(console, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
-		if out_write < 0 {
-			return false;
-		}
-		let out_write: u64 = out_write as u64;
-		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let group: u64 = match client.run_pipeline(&stages, cwd_str, &environment_snapshot(vars), &out_write) {
-			Some(Ok(result)) => result.group,
-			// The broker closes the handle it was given on every refusal, so there is nothing to
-			// clean up here - the transaction either took it or ended it.
-			_ => return false,
+		let args_str: String = match String::from_utf8(args) {
+			Ok(s) => s,
+			Err(_) => return false,
 		};
-		let mut label: Vec<u8> = Vec::new();
-		for (index, stage) in words.iter().enumerate() {
-			if index > 0 {
-				label.extend_from_slice(b" | ");
-			}
-			if let Some(first) = stage.words.first() {
-				label.extend_from_slice(first);
-			}
-		}
-		if background {
-			// A background pipeline becomes ONE job over its group, so `jobs`, `fg` and
-			// completion reaping treat it exactly like a background command.
-			if jobs.register_group(group, &label, false).is_none() {
-				close(group);
-			}
-			return true;
-		}
-		// A SECOND HANDLE, kept for the status. `run_foreground_tracked` owns the one it is given and
-		// closes it when the job ends, and the per-stage records have to be read after that - so the
-		// alternative to a duplicate is asking the job control machinery to hand something back,
-		// which would make every caller of it carry a pipeline's concern.
-		//
-		// READ only: this copy exists to ask what the job did, and giving it the authority to end
-		// the job as well would be authority nobody here uses.
-		let observer: i64 = duplicate(group, RIGHT_READ | RIGHT_WAIT);
-		// AND A FOREGROUND ONE IS ONE JOB TOO, over the same handle. `run_foreground_tracked` hands
-		// the tty a MANAGE dup so the signal keys reach it, waits for the group to terminate, and
-		// on a Ctrl+Z hands it back as a stopped background job. None of that is pipeline-specific:
-		// a ProcessGroup is waitable and - since the signal syscall learned to take one - signalable
-		// exactly where a Process was.
-		jobs.run_foreground_tracked(Job { proc: group, name: label });
-		if observer >= 0 {
-			report_pipeline_status(observer as u64, words, vars, session);
-			close(observer as u64);
-		}
-		true
+		// `merge_errors` TRAVELS AS A FLAG AND NOT AS AN ENDPOINT. The shell cannot hand the
+		// stage its own output channel because the shell does not have one: the broker allocates
+		// every edge inside the launch transaction, so which handle "wherever the output goes"
+		// names is knowable only there. The flag says what the user asked for; the broker
+		// decides which handle answers it.
+		stages.push(PipelineStage { name: String::from(name), args: args_str, merge_errors: stage.merge_errors });
 	}
+	// THE LAST STAGE WRITES TO THE TERMINAL ITSELF, and this used to be a relay: a channel
+	// pair, with the shell parked in a receive loop copying the far end onto its console until
+	// the pipe closed.
+	//
+	// The relay is what made a foreground pipeline UNINTERRUPTIBLE. A shell blocked in
+	// `recv_blocking` is not waiting on the job, so it cannot be handed to the tty as the
+	// foreground one, and Ctrl+C reached nobody - which is this milestone's "terminal interrupt
+	// targets the whole ProcessGroup", not implemented and not visibly missing, because a
+	// pipeline that finishes quickly never gives anybody a chance to press it. Ctrl+Z was worse
+	// than missing: with a relay in the middle there is no honest way to suspend, since resuming
+	// the job would need the relay resumed too, and the shell has gone back to its prompt.
+	//
+	// Handing the stage the console removes the question. There is nothing in the middle to
+	// suspend, the shell waits on the GROUP handle exactly as it waits on a single job's
+	// process handle, and interrupt, quit, suspend, `fg` and `bg` are the code that already
+	// exists rather than a second copy of it for pipelines.
+	//
+	// SEND-ONLY, unlike `run_tool_interactive`'s full-duplex dup. A pipeline stage has no
+	// business reading the keyboard: the shell is still reading the console, and a stage that
+	// could take from that queue would eat the next line the user typed.
+	let console: u64 = stdout();
+	if console == 0 {
+		return false;
+	}
+	let out_write: i64 = duplicate(console, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+	if out_write < 0 {
+		return false;
+	}
+	let out_write: u64 = out_write as u64;
+	let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+	let group: u64 = match client.run_pipeline(&stages, cwd_str, &environment_snapshot(vars), &out_write) {
+		Some(Ok(result)) => result.group,
+		// The broker closes the handle it was given on every refusal, so there is nothing to
+		// clean up here - the transaction either took it or ended it.
+		_ => return false,
+	};
+	let mut label: Vec<u8> = Vec::new();
+	for (index, stage) in words.iter().enumerate() {
+		if index > 0 {
+			label.extend_from_slice(b" | ");
+		}
+		if let Some(first) = stage.words.first() {
+			label.extend_from_slice(first);
+		}
+	}
+	if background {
+		// A background pipeline becomes ONE job over its group, so `jobs`, `fg` and
+		// completion reaping treat it exactly like a background command.
+		if jobs.register_group(group, &label, false).is_none() {
+			close(group);
+		}
+		return true;
+	}
+	// A SECOND HANDLE, kept for the status. `run_foreground_tracked` owns the one it is given and
+	// closes it when the job ends, and the per-stage records have to be read after that - so the
+	// alternative to a duplicate is asking the job control machinery to hand something back,
+	// which would make every caller of it carry a pipeline's concern.
+	//
+	// READ only: this copy exists to ask what the job did, and giving it the authority to end
+	// the job as well would be authority nobody here uses.
+	let observer: i64 = duplicate(group, RIGHT_READ | RIGHT_WAIT);
+	// AND A FOREGROUND ONE IS ONE JOB TOO, over the same handle. `run_foreground_tracked` hands
+	// the tty a MANAGE dup so the signal keys reach it, waits for the group to terminate, and
+	// on a Ctrl+Z hands it back as a stopped background job. None of that is pipeline-specific:
+	// a ProcessGroup is waitable and - since the signal syscall learned to take one - signalable
+	// exactly where a Process was.
+	jobs.run_foreground_tracked(Job { proc: group, name: label });
+	if observer >= 0 {
+		report_pipeline_status(observer as u64, words, vars, session);
+		close(observer as u64);
+	}
+	true
 }
 
 // The name of the session setting that changes which stage decides a pipeline's status, and the
@@ -1693,59 +1643,57 @@ const STATUS_VAR: &str = "?";
 // either way. That is the opposite of the Unix setting, where turning it off makes the failure
 // invisible rather than merely non-fatal, and there is no reason for a person to have to opt in to
 // being told.
-unsafe fn report_pipeline_status(group: u64, words: &[ExpandedStage], vars: &mut Vec<(String, String)>, session: u64) {
-	unsafe {
-		let mut stats: Vec<ProcessStats> = Vec::new();
-		if stats.try_reserve(words.len()).is_err() {
-			return;
+fn report_pipeline_status(group: u64, words: &[ExpandedStage], vars: &mut Vec<(String, String)>, session: u64) {
+	let mut stats: Vec<ProcessStats> = Vec::new();
+	if stats.try_reserve(words.len()).is_err() {
+		return;
+	}
+	stats.resize(words.len(), ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0, completion: 0, completion_valid: 0 });
+	let written: usize = process_group_stats(group, &mut stats);
+	if written == 0 {
+		return;
+	}
+	let failed = |stat: &ProcessStats| stat.state == PROC_STATE_FAILED || (stat.completion_valid != 0 && stat.completion != 0);
+	// The rightmost failing stage, which is what `pipefail` adopts and what the report names.
+	// Rightmost rather than leftmost because a pipeline's failures cascade: `b` dying breaks
+	// `c`'s input, and the interesting one is the furthest along that still had something to
+	// say about itself.
+	let mut culprit: Option<usize> = None;
+	for index in 0..written {
+		if failed(&stats[index]) {
+			culprit = Some(index);
 		}
-		stats.resize(words.len(), ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0, completion: 0, completion_valid: 0 });
-		let written: usize = process_group_stats(group, &mut stats);
-		if written == 0 {
-			return;
-		}
-		let failed = |stat: &ProcessStats| stat.state == PROC_STATE_FAILED || (stat.completion_valid != 0 && stat.completion != 0);
-		// The rightmost failing stage, which is what `pipefail` adopts and what the report names.
-		// Rightmost rather than leftmost because a pipeline's failures cascade: `b` dying breaks
-		// `c`'s input, and the interesting one is the furthest along that still had something to
-		// say about itself.
-		let mut culprit: Option<usize> = None;
-		for index in 0..written {
-			if failed(&stats[index]) {
-				culprit = Some(index);
-			}
-		}
-		let last: &ProcessStats = &stats[written - 1];
-		let pipefail: bool = vars.iter().any(|(name, value)| name == PIPEFAIL && (value == "on" || value == "1"));
-		let status: u64 = match culprit {
-			Some(index) if pipefail => status_of(&stats[index]),
-			_ => status_of(last),
-		};
-		let mut rendered = String::new();
-		push_decimal_u64(&mut rendered, status);
-		set_var(vars, session, STATUS_VAR, rendered.as_bytes());
-		// A stage that failed and is NOT the last one is invisible in the status either way, so it
-		// is named. The last stage's own failure is not announced: its output is on the screen and
-		// its diagnostic went to the terminal a moment ago, and a shell that adds a line after every
-		// non-zero exit is a shell people stop reading.
-		let Some(index) = culprit else { return };
-		if index + 1 == written {
-			return;
-		}
-		print(b"shell: stage ");
-		print_usize(index + 1);
-		print(b" (");
-		if let Some(name) = words.get(index).and_then(|stage| stage.words.first()) {
-			print(name);
-		}
-		print(b") ");
-		if stats[index].state == PROC_STATE_FAILED {
-			print(b"was killed or faulted\n");
-		} else {
-			print(b"exited ");
-			print_usize(stats[index].completion as usize);
-			print(b"\n");
-		}
+	}
+	let last: &ProcessStats = &stats[written - 1];
+	let pipefail: bool = vars.iter().any(|(name, value)| name == PIPEFAIL && (value == "on" || value == "1"));
+	let status: u64 = match culprit {
+		Some(index) if pipefail => status_of(&stats[index]),
+		_ => status_of(last),
+	};
+	let mut rendered = String::new();
+	push_decimal_u64(&mut rendered, status);
+	set_var(vars, session, STATUS_VAR, rendered.as_bytes());
+	// A stage that failed and is NOT the last one is invisible in the status either way, so it
+	// is named. The last stage's own failure is not announced: its output is on the screen and
+	// its diagnostic went to the terminal a moment ago, and a shell that adds a line after every
+	// non-zero exit is a shell people stop reading.
+	let Some(index) = culprit else { return };
+	if index + 1 == written {
+		return;
+	}
+	print(b"shell: stage ");
+	print_usize(index + 1);
+	print(b" (");
+	if let Some(name) = words.get(index).and_then(|stage| stage.words.first()) {
+		print(name);
+	}
+	print(b") ");
+	if stats[index].state == PROC_STATE_FAILED {
+		print(b"was killed or faulted\n");
+	} else {
+		print(b"exited ");
+		print_usize(stats[index].completion as usize);
+		print(b"\n");
 	}
 }
 
@@ -1787,58 +1735,56 @@ fn push_decimal_u64(out: &mut String, mut value: u64) {
 // needs to flip the tty raw and redraw in place. The shell parks until the command
 // exits (or hands it to the session on a Ctrl+Z suspend), exactly like an exec'd
 // foreground job. Returns false if the command could not be launched.
-unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)]) -> bool {
-	unsafe {
-		let name_str: &str = match core::str::from_utf8(name) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let args_str: &str = match core::str::from_utf8(args) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let cwd_str: &str = match core::str::from_utf8(cwd) {
-			Ok(s) => s,
-			Err(_) => return false,
-		};
-		let so: u64 = stdout();
-		if so == 0 {
-			return false;
-		}
-		let dup: i64 = duplicate(so, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if dup < 0 {
-			return false;
-		}
-		// AND THE TERMINAL GOES WITH THE JOB. `send_stdout` on the direct-spawn path has always
-		// duplicated this channel for an interactive child; the GOVERNED launch had no way to carry
-		// it, so every full-screen program started from this shell - `licoview`, `licoedit`, `lico`,
-		// `imgview`, `less`, `watch`, `ps -i` - ran with `tty_set_mode` answering false. They
-		// rendered, and then every key meant for them was echoed and kept by the line editor, so
-		// nothing could quit them but Ctrl+C.
-		//
-		// Send, receive, wait AND TRANSFER - the same set the stdout duplicate above carries, and
-		// transfer is not optional however narrow the intent: a handle is only SENDABLE if it
-		// carries it, and this one crosses two channels to get where it is going (this shell to the
-		// launcher, the launcher to the child). Left out, the send is refused before the request
-		// leaves this process, which the client reports as `again` - a launch that never happened
-		// and says nothing about why.
-		//
-		// Send and receive because the child asks the terminal for a mode and reads back how big it
-		// is. It cannot listen in on what this shell and the console say to each other: this is a
-		// duplicate of the shell's own control channel, not the console's end of it.
-		let control: i64 = duplicate(tty_control(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if control < 0 {
-			close(dup as u64);
-			return false;
-		}
-		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let task: u64 = match client.run_interactive(name_str, args_str, cwd_str, &environment_snapshot(vars), &(dup as u64), &(control as u64)) {
-			Some(Ok(started)) => started.task,
-			Some(Err(_)) | None => return false,
-		};
-		jobs.run_foreground_tracked(Job { proc: task, name: name.to_vec() });
-		true
+fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)]) -> bool {
+	let name_str: &str = match core::str::from_utf8(name) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let args_str: &str = match core::str::from_utf8(args) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let cwd_str: &str = match core::str::from_utf8(cwd) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
+	let so: u64 = stdout();
+	if so == 0 {
+		return false;
 	}
+	let dup: i64 = duplicate(so, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+	if dup < 0 {
+		return false;
+	}
+	// AND THE TERMINAL GOES WITH THE JOB. `send_stdout` on the direct-spawn path has always
+	// duplicated this channel for an interactive child; the GOVERNED launch had no way to carry
+	// it, so every full-screen program started from this shell - `licoview`, `licoedit`, `lico`,
+	// `imgview`, `less`, `watch`, `ps -i` - ran with `tty_set_mode` answering false. They
+	// rendered, and then every key meant for them was echoed and kept by the line editor, so
+	// nothing could quit them but Ctrl+C.
+	//
+	// Send, receive, wait AND TRANSFER - the same set the stdout duplicate above carries, and
+	// transfer is not optional however narrow the intent: a handle is only SENDABLE if it
+	// carries it, and this one crosses two channels to get where it is going (this shell to the
+	// launcher, the launcher to the child). Left out, the send is refused before the request
+	// leaves this process, which the client reports as `again` - a launch that never happened
+	// and says nothing about why.
+	//
+	// Send and receive because the child asks the terminal for a mode and reads back how big it
+	// is. It cannot listen in on what this shell and the console say to each other: this is a
+	// duplicate of the shell's own control channel, not the console's end of it.
+	let control: i64 = duplicate(tty_control(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+	if control < 0 {
+		close(dup as u64);
+		return false;
+	}
+	let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+	let task: u64 = match client.run_interactive(name_str, args_str, cwd_str, &environment_snapshot(vars), &(dup as u64), &(control as u64)) {
+		Some(Ok(started)) => started.task,
+		Some(Err(_)) | None => return false,
+	};
+	jobs.run_foreground_tracked(Job { proc: task, name: name.to_vec() });
+	true
 }
 
 // Record a session: ask the console (over the tty control channel) to host a shell on a
@@ -1846,32 +1792,28 @@ unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args:
 // pty's shell with `cmd` and prints the captured session. This is the foreground side of
 // the PTY abstraction - a program (script) hosting a terminal it is not the hardware
 // console for (the same path a future ssh drives).
-unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8], cwd: &[u8], vars: &[(String, String)]) {
-	unsafe {
-		// `PTY_OPEN` + the program to host (a shell); the console replies `PTY` + the master.
-		let mut req: [u8; 13] = [0u8; 13];
-		req[..8].copy_from_slice(b"PTY_OPEN");
-		req[8..13].copy_from_slice(b"shell");
-		send_blocking(jobs.control, &req[..13], 0);
-		let mut rbuf: [u8; 32] = [0u8; 32];
-		let master: u64 = match recv_blocking(jobs.control, &mut rbuf) {
-			Received::Message { len, handle } if len >= 3 && &rbuf[..3] == b"PTY" && handle != 0 => handle,
-			_ => {
-				print(b"script: the console could not open a pty\n");
-				return;
-			}
-		};
-		exec(jobs, procsvc, b"script", cmd, cwd, vars, master, false);
-	}
+fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8], cwd: &[u8], vars: &[(String, String)]) {
+	// `PTY_OPEN` + the program to host (a shell); the console replies `PTY` + the master.
+	let mut req: [u8; 13] = [0u8; 13];
+	req[..8].copy_from_slice(b"PTY_OPEN");
+	req[8..13].copy_from_slice(b"shell");
+	send_blocking(jobs.control, &req[..13], 0);
+	let mut rbuf: [u8; 32] = [0u8; 32];
+	let master: u64 = match recv_blocking(jobs.control, &mut rbuf) {
+		Received::Message { len, handle } if len >= 3 && &rbuf[..3] == b"PTY" && handle != 0 => handle,
+		_ => {
+			print(b"script: the console could not open a pty\n");
+			return;
+		}
+	};
+	exec(jobs, procsvc, b"script", cmd, cwd, vars, master, false);
 }
 
 // Render typed records as text, one per line, each via its generated to_text().
-unsafe fn print_text_lines<T, F: Fn(&T) -> String>(items: &[T], to_text: F) {
-	unsafe {
-		for item in items {
-			print(to_text(item).as_bytes());
-			print(b"\n");
-		}
+fn print_text_lines<T, F: Fn(&T) -> String>(items: &[T], to_text: F) {
+	for item in items {
+		print(to_text(item).as_bytes());
+		print(b"\n");
 	}
 }
 
@@ -1879,44 +1821,42 @@ unsafe fn print_text_lines<T, F: Fn(&T) -> String>(items: &[T], to_text: F) {
 // text-cell positions and button state - the plumbing echo (no mouse-driven UI yet).
 // The stream is a bounded snapshot of the recent events, so it ends on its own; move
 // the pointer in the graphical display first to populate it.
-unsafe fn mouse_cmd(inputsvc: u64) {
-	unsafe {
-		let mut client = input::Client::new(ChannelTransport { chan: inputsvc });
-		let consumer: u64 = match client.subscribe() {
-			Some(handle) => handle,
-			None => {
-				print(b"mouse: service unavailable\n");
-				return;
-			}
-		};
-		let mut buf: [u8; 32] = [0u8; 32];
-		let mut count: usize = 0;
-		loop {
-			// The multi-capability receive: a frame carries what its element type declares, and
-			// `recv_blocking` takes the first and drops the rest.
-			match recv_caps_blocking(consumer, &mut buf) {
-				ReceivedCaps::Message { len, handles: mut frame_handles } => {
-					if let Some(event) = input::subscribe_read(&buf[..len], &mut frame_handles) {
-						print(b"  (");
-						print_usize(event.col as usize);
-						print(b", ");
-						print_usize(event.row as usize);
-						print(b") buttons=");
-						print_usize(event.buttons as usize);
-						print(b"\n");
-						count += 1;
-					}
-					for handle in frame_handles.as_slice() {
-						close(*handle);
-					}
+fn mouse_cmd(inputsvc: u64) {
+	let mut client = input::Client::new(ChannelTransport { chan: inputsvc });
+	let consumer: u64 = match client.subscribe() {
+		Some(handle) => handle,
+		None => {
+			print(b"mouse: service unavailable\n");
+			return;
+		}
+	};
+	let mut buf: [u8; 32] = [0u8; 32];
+	let mut count: usize = 0;
+	loop {
+		// The multi-capability receive: a frame carries what its element type declares, and
+		// `recv_blocking` takes the first and drops the rest.
+		match recv_caps_blocking(consumer, &mut buf) {
+			ReceivedCaps::Message { len, handles: mut frame_handles } => {
+				if let Some(event) = input::subscribe_read(&buf[..len], &mut frame_handles) {
+					print(b"  (");
+					print_usize(event.col as usize);
+					print(b", ");
+					print_usize(event.row as usize);
+					print(b") buttons=");
+					print_usize(event.buttons as usize);
+					print(b"\n");
+					count += 1;
 				}
-				ReceivedCaps::Closed => break,
+				for handle in frame_handles.as_slice() {
+					close(*handle);
+				}
 			}
+			ReceivedCaps::Closed => break,
 		}
-		close(consumer);
-		if count == 0 {
-			print(b"mouse: no pointer events yet (move the pointer in the graphical display)\n");
-		}
+	}
+	close(consumer);
+	if count == 0 {
+		print(b"mouse: no pointer events yet (move the pointer in the graphical display)\n");
 	}
 }
 
@@ -1935,49 +1875,45 @@ enum GraphFmt {
 // generated to_text / to_json / to_cbor on the client side - the one typed API, many
 // representations rule. A 0 handle means the service is not wired (e.g. a non-primary
 // VT for now), reported as unavailable rather than blocking.
-unsafe fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
-	unsafe {
-		// A fresh sub-connection per query, re-resolving the root through the supervisor when
-		// the held one is dead. That is what lets the service be stopped and started again
-		// under a running shell: the durable reference is the capability name, not the channel.
-		let Some(connection) = connect_or_resolve(graphsvc, broker, CAP_GRAPH) else {
-			print(b"graph: service unavailable\n");
-			return;
-		};
-		let mut client = system_graph::Client::new(ChannelTransport { chan: connection });
-		match client.snapshot() {
-			Some(Ok(graph)) => match fmt {
-				GraphFmt::Text => {
-					print_text_lines(&graph.components, |c: &Component| -> String { c.to_text() });
-					print_text_lines(&graph.spans, |s: &TraceSpan| -> String { s.to_text() });
-				}
-				GraphFmt::Json(mode) => {
-					print(mode.render(graph.to_json()).as_bytes());
-					print(b"\n");
-				}
-				GraphFmt::Cbor => print_hex(&graph.to_cbor()),
-			},
-			Some(Err(_)) => print(b"graph: query error\n"),
-			None => print(b"graph: service unavailable\n"),
-		}
-		// The connection was minted for this query; the root stays.
-		close(connection);
+fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
+	// A fresh sub-connection per query, re-resolving the root through the supervisor when
+	// the held one is dead. That is what lets the service be stopped and started again
+	// under a running shell: the durable reference is the capability name, not the channel.
+	let Some(connection) = connect_or_resolve(graphsvc, broker, CAP_GRAPH) else {
+		print(b"graph: service unavailable\n");
+		return;
+	};
+	let mut client = system_graph::Client::new(ChannelTransport { chan: connection });
+	match client.snapshot() {
+		Some(Ok(graph)) => match fmt {
+			GraphFmt::Text => {
+				print_text_lines(&graph.components, |c: &Component| -> String { c.to_text() });
+				print_text_lines(&graph.spans, |s: &TraceSpan| -> String { s.to_text() });
+			}
+			GraphFmt::Json(mode) => {
+				print(mode.render(graph.to_json()).as_bytes());
+				print(b"\n");
+			}
+			GraphFmt::Cbor => print_hex(&graph.to_cbor()),
+		},
+		Some(Err(_)) => print(b"graph: query error\n"),
+		None => print(b"graph: service unavailable\n"),
 	}
+	// The connection was minted for this query; the root stays.
+	close(connection);
 }
 
 // Print bytes as a lowercase hex string on its own line - used to show a binary CBOR
 // document on the text console (the same bytes a remote consumer reads off the wire).
-unsafe fn print_hex(bytes: &[u8]) {
-	unsafe {
-		const HEX: &[u8; 16] = b"0123456789abcdef";
-		let mut line: Vec<u8> = Vec::with_capacity(bytes.len() * 2 + 1);
-		for &b in bytes {
-			line.push(HEX[(b >> 4) as usize]);
-			line.push(HEX[(b & 0x0f) as usize]);
-		}
-		line.push(b'\n');
-		print(&line);
+fn print_hex(bytes: &[u8]) {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+	let mut line: Vec<u8> = Vec::with_capacity(bytes.len() * 2 + 1);
+	for &b in bytes {
+		line.push(HEX[(b >> 4) as usize]);
+		line.push(HEX[(b & 0x0f) as usize]);
 	}
+	line.push(b'\n');
+	print(&line);
 }
 
 // Trim leading and trailing ASCII spaces from a byte slice.
@@ -1990,7 +1926,7 @@ fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	match client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 		// Name completion: offering fewer names claims nothing, so an abnormal drain
 		// degrades to none rather than failing the shell.
-		Some(Ok(consumer)) => unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
+		Some(Ok(consumer)) => drain_stream_complete(consumer, volume::list_read).unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
 		Some(Err(_)) | None => Vec::new(),
 	}
 }
@@ -1998,13 +1934,11 @@ fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 // Mirror the working directory to ConsoleService over the control channel (SET_CWD), so its
 // line discipline can resolve a relative path argument for Tab completion. Sent at startup
 // and after every `cd`.
-unsafe fn send_set_cwd(control: u64, cwd: &str) {
-	unsafe {
-		let mut m: Vec<u8> = Vec::with_capacity(b"SET_CWD".len() + cwd.len());
-		m.extend_from_slice(b"SET_CWD");
-		m.extend_from_slice(cwd.as_bytes());
-		send_blocking(control, &m, 0);
-	}
+fn send_set_cwd(control: u64, cwd: &str) {
+	let mut m: Vec<u8> = Vec::with_capacity(b"SET_CWD".len() + cwd.len());
+	m.extend_from_slice(b"SET_CWD");
+	m.extend_from_slice(cwd.as_bytes());
+	send_blocking(control, &m, 0);
 }
 
 // The entries of the directory a partial path argument names, for the double-Tab listing:
@@ -2025,7 +1959,7 @@ fn completion_dir_entries(cwd: &str, token: &[u8], storage: u64, media: u64, iso
 	let mut client = volume::Client::new(ChannelTransport { chan });
 	let mut names: Vec<Vec<u8>> = Vec::new();
 	if let Some(Ok(consumer)) = client.list(&target) {
-		for f in unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default() {
+		for f in drain_stream_complete(consumer, volume::list_read).unwrap_or_default() {
 			let mut name: Vec<u8> = f.name.into_bytes();
 			if f.r#type == proto::system::FileType::Dir {
 				name.push(b'/');
@@ -2057,49 +1991,47 @@ fn storage_for(uri: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u6
 // Change the working directory. The target is resolved against the current cwd and
 // must be an existing directory, which we confirm by listing it through the owning
 // StorageService; only then does the prompt move there.
-unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64) {
-	unsafe {
-		let target: String = match path::resolve(cwd, arg) {
-			Some(t) => t,
-			None => {
-				print(b"cd: invalid path\n");
-				return;
+fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64) {
+	let target: String = match path::resolve(cwd, arg) {
+		Some(t) => t,
+		None => {
+			print(b"cd: invalid path\n");
+			return;
+		}
+	};
+	let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf, usb);
+	let mut client = volume::Client::new(ChannelTransport { chan });
+	match client.list(&target) {
+		Some(Ok(consumer)) => {
+			// a valid directory is enough - drain the entry stream unused.
+			let _ = drain_stream_complete(consumer, volume::list_read);
+			cwd.clear();
+			cwd.push_str(&target);
+			// Persist the new cwd in the session so it outlives this shell; the local
+			// cache above is what the prompt and path resolution read each line.
+			if session != 0 {
+				let _ = session::Client::new(ChannelTransport { chan: session }).chdir(&target);
 			}
-		};
-		let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf, usb);
-		let mut client = volume::Client::new(ChannelTransport { chan });
-		match client.list(&target) {
-			Some(Ok(consumer)) => {
-				// a valid directory is enough - drain the entry stream unused.
-				let _ = drain_stream_complete(consumer, volume::list_read);
-				cwd.clear();
-				cwd.push_str(&target);
-				// Persist the new cwd in the session so it outlives this shell; the local
-				// cache above is what the prompt and path resolution read each line.
-				if session != 0 {
-					let _ = session::Client::new(ChannelTransport { chan: session }).chdir(&target);
-				}
-			}
-			// THE REASON, now that there is one. `cd` into a path outside the grant used to print
-			// "not a directory", which is what a client can say when its only signal is "no
-			// stream" - and it is the wrong thing to tell somebody whose path exists and is
-			// refused.
-			Some(Err(e)) => {
-				print(b"cd: ");
-				print(match e {
-					Error::Denied => b"permission denied: ".as_slice(),
-					Error::NotFound => b"no such directory: ".as_slice(),
-					Error::Again => b"volume busy: ".as_slice(),
-					_ => b"not a directory: ".as_slice(),
-				});
-				print(target.as_bytes());
-				print(b"\n");
-			}
-			None => {
-				print(b"cd: not a directory: ");
-				print(target.as_bytes());
-				print(b"\n");
-			}
+		}
+		// THE REASON, now that there is one. `cd` into a path outside the grant used to print
+		// "not a directory", which is what a client can say when its only signal is "no
+		// stream" - and it is the wrong thing to tell somebody whose path exists and is
+		// refused.
+		Some(Err(e)) => {
+			print(b"cd: ");
+			print(match e {
+				Error::Denied => b"permission denied: ".as_slice(),
+				Error::NotFound => b"no such directory: ".as_slice(),
+				Error::Again => b"volume busy: ".as_slice(),
+				_ => b"not a directory: ".as_slice(),
+			});
+			print(target.as_bytes());
+			print(b"\n");
+		}
+		None => {
+			print(b"cd: not a directory: ");
+			print(target.as_bytes());
+			print(b"\n");
 		}
 	}
 }

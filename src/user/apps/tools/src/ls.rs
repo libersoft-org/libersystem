@@ -67,111 +67,109 @@ const USAGE: &[u8] = b"usage: ls [-s KEY[a|d]] [-u UNIT] [json | json-min] [path
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - flags and the directory path (relative to cwd
-		//    or an absolute URI), in any order.
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arg_raw: Vec<u8> = context.arguments.clone().into_bytes();
-		let mut key: SortKey = SortKey::Name;
-		let mut reverse: bool = false;
-		let mut unit: Unit = Unit::Bytes;
-		let mut mode: Option<JsonMode> = None;
-		let mut arg: Vec<u8> = Vec::new();
-		let mut want_unit: bool = false;
-		let mut want_sort: bool = false;
-		for token in arg_raw.split(|&b| b == b' ').filter(|t: &&[u8]| !t.is_empty()) {
-			if want_unit {
-				unit = match parse_unit(token) {
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - flags and the directory path (relative to cwd
+	//    or an absolute URI), in any order.
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arg_raw: Vec<u8> = context.arguments.clone().into_bytes();
+	let mut key: SortKey = SortKey::Name;
+	let mut reverse: bool = false;
+	let mut unit: Unit = Unit::Bytes;
+	let mut mode: Option<JsonMode> = None;
+	let mut arg: Vec<u8> = Vec::new();
+	let mut want_unit: bool = false;
+	let mut want_sort: bool = false;
+	for token in arg_raw.split(|&b| b == b' ').filter(|t: &&[u8]| !t.is_empty()) {
+		if want_unit {
+			unit = match parse_unit(token) {
+				Some(u) => u,
+				None => {
+					print(USAGE);
+					exit();
+				}
+			};
+			want_unit = false;
+			continue;
+		}
+		if want_sort {
+			(key, reverse) = match parse_sort(token) {
+				Some(s) => s,
+				None => {
+					print(USAGE);
+					exit();
+				}
+			};
+			want_sort = false;
+			continue;
+		}
+		match token {
+			b"-u" => want_unit = true,
+			b"-s" => want_sort = true,
+			b"json" | b"json-min" => mode = JsonMode::parse(token),
+			_ if token.starts_with(b"-u") && token.len() > 2 => {
+				unit = match parse_unit(&token[2..]) {
 					Some(u) => u,
 					None => {
 						print(USAGE);
 						exit();
 					}
 				};
-				want_unit = false;
-				continue;
 			}
-			if want_sort {
-				(key, reverse) = match parse_sort(token) {
+			_ if token.starts_with(b"-s") && token.len() > 2 => {
+				(key, reverse) = match parse_sort(&token[2..]) {
 					Some(s) => s,
 					None => {
 						print(USAGE);
 						exit();
 					}
 				};
-				want_sort = false;
-				continue;
 			}
-			match token {
-				b"-u" => want_unit = true,
-				b"-s" => want_sort = true,
-				b"json" | b"json-min" => mode = JsonMode::parse(token),
-				_ if token.starts_with(b"-u") && token.len() > 2 => {
-					unit = match parse_unit(&token[2..]) {
-						Some(u) => u,
-						None => {
-							print(USAGE);
-							exit();
-						}
-					};
-				}
-				_ if token.starts_with(b"-s") && token.len() > 2 => {
-					(key, reverse) = match parse_sort(&token[2..]) {
-						Some(s) => s,
-						None => {
-							print(USAGE);
-							exit();
-						}
-					};
-				}
-				_ if token.starts_with(b"-") => {
-					print(USAGE);
-					exit();
-				}
-				_ if arg.is_empty() => arg.extend_from_slice(token),
-				_ => {
-					print(USAGE);
-					exit();
-				}
-			}
-		}
-		if want_unit || want_sort {
-			print(USAGE);
-			exit();
-		}
-		// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
-		//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
-		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
-		// for are simply not taken, and the set closes them when it drops - where before they had
-		// to be drained by hand, because a message left on the channel was read as the NEXT thing
-		// this tool expected, and the thing after the bundle is the working directory.
-		let mut volumes: CapSet = recv_caps(bootstrap);
-		let system: u64 = volumes.take(CAP_SYSTEM);
-		let media: u64 = volumes.take(CAP_MEDIA);
-		let iso: u64 = volumes.take(CAP_ISO);
-		let udf: u64 = volumes.take(CAP_UDF);
-		let usb: u64 = volumes.take(CAP_USB);
-		// 4. receive the inherited working directory (the last bootstrap message), and resolve
-		//    the path argument against it so a relative path reaches the same directory the shell would.
-		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
-		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
-		let uri: String = match path::resolve(cwd_str, &arg) {
-			Some(u) => u,
-			None => {
-				eprint(b"ls: invalid path\n");
+			_ if token.starts_with(b"-") => {
+				print(USAGE);
 				exit();
 			}
-		};
-		// route the path to the client for the volume it names.
-		let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
-		ls(storage, uri.as_bytes(), key, reverse, unit, mode);
+			_ if arg.is_empty() => arg.extend_from_slice(token),
+			_ => {
+				print(USAGE);
+				exit();
+			}
+		}
 	}
+	if want_unit || want_sort {
+		print(USAGE);
+		exit();
+	}
+	// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
+	//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
+	// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
+	// for are simply not taken, and the set closes them when it drops - where before they had
+	// to be drained by hand, because a message left on the channel was read as the NEXT thing
+	// this tool expected, and the thing after the bundle is the working directory.
+	let mut volumes: CapSet = recv_caps(bootstrap);
+	let system: u64 = volumes.take(CAP_SYSTEM);
+	let media: u64 = volumes.take(CAP_MEDIA);
+	let iso: u64 = volumes.take(CAP_ISO);
+	let udf: u64 = volumes.take(CAP_UDF);
+	let usb: u64 = volumes.take(CAP_USB);
+	// 4. receive the inherited working directory (the last bootstrap message), and resolve
+	//    the path argument against it so a relative path reaches the same directory the shell would.
+	let cwd: Vec<u8> = context.cwd.clone().into_bytes();
+	let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
+	let uri: String = match path::resolve(cwd_str, &arg) {
+		Some(u) => u,
+		None => {
+			eprint(b"ls: invalid path\n");
+			exit();
+		}
+	};
+	// route the path to the client for the volume it names.
+	let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
+	ls(storage, uri.as_bytes(), key, reverse, unit, mode);
 	exit();
 }
 
@@ -217,125 +215,123 @@ fn parse_sort(token: &[u8]) -> Option<(SortKey, bool)> {
 // by the chosen key (directories grouped first, ties broken by name), one aligned row per
 // entry (name, size, modification time) and a closing summary - reporting a concise error
 // if it cannot be listed.
-unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, mode: Option<JsonMode>) {
-	unsafe {
-		let path: &str = match core::str::from_utf8(uri) {
-			Ok(s) => s,
-			Err(_) => {
-				eprint(b"ls: invalid path\n");
-				return;
-			}
-		};
-		let mut client = VolumeClient::new(storage);
-		// the listing arrives as a stream of entries (one frame each), so a big
-		// directory never has to fit one reply.
-		let consumer: u64 = match client.list(path) {
-			Some(Ok(c)) => c,
-			// SAY WHICH FAILURE IT WAS. Every one of these arrived as "StorageService unavailable"
-			// while the listing had no error arm, so a path outside the grant and a service that
-			// was not running printed the same line.
-			Some(Err(e)) => {
-				eprint(match e {
-					proto::system::Error::Denied => b"ls: permission denied\n".as_slice(),
-					proto::system::Error::NotFound => b"ls: no such directory\n".as_slice(),
-					proto::system::Error::Again => b"ls: the volume is busy; try again\n".as_slice(),
-					_ => b"ls: the volume refused the listing\n".as_slice(),
-				});
-				return;
-			}
-			None => {
-				eprint(b"ls: StorageService unavailable\n");
-				return;
-			}
-		};
-		// JSON: an array of the entries' generated records, in the chosen order (the
-		// sort applies like in the text form; the sizes stay raw bytes - units are a
-		// text-rendering concern).
-		if let Some(mode) = mode {
-			// A listing printed to the user IS a claim about the directory. Say it failed
-			// rather than print a prefix of it as though it were everything.
-			let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
-				eprint(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
-				return;
-			};
-			sort_files(&mut files, key, reverse);
-			let mut out = String::from("[");
-			for (i, f) in files.iter().enumerate() {
-				if i > 0 {
-					out.push(',');
-				}
-				out.push_str(&f.to_json());
-			}
-			out.push(']');
-			print(mode.render(out).as_bytes());
-			print(b"\n");
+fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, mode: Option<JsonMode>) {
+	let path: &str = match core::str::from_utf8(uri) {
+		Ok(s) => s,
+		Err(_) => {
+			eprint(b"ls: invalid path\n");
 			return;
 		}
-		if key == SortKey::None {
-			// unsorted: render each entry as its frame arrives, so a huge listing
-			// starts printing immediately (per-row widths - global column alignment
-			// would need the whole set first).
-			print(uri);
-			print(b":\n");
-			let mut dirs: usize = 0;
-			let mut plain: usize = 0;
-			let mut total: u64 = 0;
-			loop {
-				let mut frame_handles = proto::codec::Handles::new();
-				match recv_vec_caps_blocking(consumer, &mut frame_handles) {
-					ReceivedVecCaps::Message { bytes } => {
-						if let Some(f) = volume::list_read(&bytes, &mut frame_handles) {
-							let shown: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
-							row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
-						}
-						// What the decode did not adopt, which after a successful read is nothing:
-						// `list_read` empties the list of everything the value took. Closing here
-						// unconditionally is right in both cases, and it is the reader's signature
-						// that makes it right rather than this loop knowing which case it is in.
-						for handle in frame_handles.as_slice() {
-							close(*handle);
-						}
-					}
-					ReceivedVecCaps::Closed => break,
-					ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
-						eprint(b"ls: listing failed partway through; what is shown above is incomplete\n");
-						break;
-					}
-				}
-			}
-			close(consumer);
-			summary(dirs, plain, total, unit);
+	};
+	let mut client = VolumeClient::new(storage);
+	// the listing arrives as a stream of entries (one frame each), so a big
+	// directory never has to fit one reply.
+	let consumer: u64 = match client.list(path) {
+		Some(Ok(c)) => c,
+		// SAY WHICH FAILURE IT WAS. Every one of these arrived as "StorageService unavailable"
+		// while the listing had no error arm, so a path outside the grant and a service that
+		// was not running printed the same line.
+		Some(Err(e)) => {
+			eprint(match e {
+				proto::system::Error::Denied => b"ls: permission denied\n".as_slice(),
+				proto::system::Error::NotFound => b"ls: no such directory\n".as_slice(),
+				proto::system::Error::Again => b"ls: the volume is busy; try again\n".as_slice(),
+				_ => b"ls: the volume refused the listing\n".as_slice(),
+			});
 			return;
 		}
+		None => {
+			eprint(b"ls: StorageService unavailable\n");
+			return;
+		}
+	};
+	// JSON: an array of the entries' generated records, in the chosen order (the
+	// sort applies like in the text form; the sizes stay raw bytes - units are a
+	// text-rendering concern).
+	if let Some(mode) = mode {
+		// A listing printed to the user IS a claim about the directory. Say it failed
+		// rather than print a prefix of it as though it were everything.
 		let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
 			eprint(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
 			return;
 		};
 		sort_files(&mut files, key, reverse);
+		let mut out = String::from("[");
+		for (i, f) in files.iter().enumerate() {
+			if i > 0 {
+				out.push(',');
+			}
+			out.push_str(&f.to_json());
+		}
+		out.push(']');
+		print(mode.render(out).as_bytes());
+		print(b"\n");
+		return;
+	}
+	if key == SortKey::None {
+		// unsorted: render each entry as its frame arrives, so a huge listing
+		// starts printing immediately (per-row widths - global column alignment
+		// would need the whole set first).
 		print(uri);
 		print(b":\n");
-		// column widths: the display name (a directory carries a trailing '/') and the
-		// size, so the rows align whatever the mix.
-		let mut name_w: usize = 0;
-		let mut size_w: usize = 0;
-		for f in &files {
-			let nw: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
-			if nw > name_w {
-				name_w = nw;
-			}
-			let sw: usize = size_text(f, unit).len();
-			if sw > size_w {
-				size_w = sw;
-			}
-		}
 		let mut dirs: usize = 0;
 		let mut plain: usize = 0;
 		let mut total: u64 = 0;
-		for f in &files {
-			row(f, name_w, size_w, unit, &mut dirs, &mut plain, &mut total);
+		loop {
+			let mut frame_handles = proto::codec::Handles::new();
+			match recv_vec_caps_blocking(consumer, &mut frame_handles) {
+				ReceivedVecCaps::Message { bytes } => {
+					if let Some(f) = volume::list_read(&bytes, &mut frame_handles) {
+						let shown: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
+						row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
+					}
+					// What the decode did not adopt, which after a successful read is nothing:
+					// `list_read` empties the list of everything the value took. Closing here
+					// unconditionally is right in both cases, and it is the reader's signature
+					// that makes it right rather than this loop knowing which case it is in.
+					for handle in frame_handles.as_slice() {
+						close(*handle);
+					}
+				}
+				ReceivedVecCaps::Closed => break,
+				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
+					eprint(b"ls: listing failed partway through; what is shown above is incomplete\n");
+					break;
+				}
+			}
 		}
+		close(consumer);
 		summary(dirs, plain, total, unit);
+		return;
 	}
+	let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
+		eprint(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
+		return;
+	};
+	sort_files(&mut files, key, reverse);
+	print(uri);
+	print(b":\n");
+	// column widths: the display name (a directory carries a trailing '/') and the
+	// size, so the rows align whatever the mix.
+	let mut name_w: usize = 0;
+	let mut size_w: usize = 0;
+	for f in &files {
+		let nw: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
+		if nw > name_w {
+			name_w = nw;
+		}
+		let sw: usize = size_text(f, unit).len();
+		if sw > size_w {
+			size_w = sw;
+		}
+	}
+	let mut dirs: usize = 0;
+	let mut plain: usize = 0;
+	let mut total: u64 = 0;
+	for f in &files {
+		row(f, name_w, size_w, unit, &mut dirs, &mut plain, &mut total);
+	}
+	summary(dirs, plain, total, unit);
 }
 
 // Order the entries: directories first under every key but `u`, then the chosen key
@@ -368,41 +364,37 @@ fn sort_files(files: &mut [FileInfo], key: SortKey, reverse: bool) {
 
 // Print one listing row (padded to the given column widths), counting it into the
 // summary tallies.
-unsafe fn row(f: &FileInfo, name_w: usize, size_w: usize, unit: Unit, dirs: &mut usize, plain: &mut usize, total: &mut u64) {
-	unsafe {
-		let is_dir: bool = f.r#type == FileType::Dir;
-		let shown: usize = f.name.len() + if is_dir { 1 } else { 0 };
-		print(b"  ");
-		if is_dir {
-			*dirs += 1;
-			print(b"\x1b[1;34m");
-			print(f.name.as_bytes());
-			print(b"/\x1b[0m");
-		} else {
-			*plain += 1;
-			*total += f.size;
-			print(f.name.as_bytes());
-		}
-		pad(name_w - shown);
-		let size: String = size_text(f, unit);
-		pad(1 + size_w - size.len());
-		print(size.as_bytes());
-		print(b"  ");
-		print_mtime(f.mtime);
-		print(b"\n");
+fn row(f: &FileInfo, name_w: usize, size_w: usize, unit: Unit, dirs: &mut usize, plain: &mut usize, total: &mut u64) {
+	let is_dir: bool = f.r#type == FileType::Dir;
+	let shown: usize = f.name.len() + if is_dir { 1 } else { 0 };
+	print(b"  ");
+	if is_dir {
+		*dirs += 1;
+		print(b"\x1b[1;34m");
+		print(f.name.as_bytes());
+		print(b"/\x1b[0m");
+	} else {
+		*plain += 1;
+		*total += f.size;
+		print(f.name.as_bytes());
 	}
+	pad(name_w - shown);
+	let size: String = size_text(f, unit);
+	pad(1 + size_w - size.len());
+	print(size.as_bytes());
+	print(b"  ");
+	print_mtime(f.mtime);
+	print(b"\n");
 }
 
 // The closing summary: how much lives here, at a glance.
-unsafe fn summary(dirs: usize, plain: usize, total: u64, unit: Unit) {
-	unsafe {
-		print_usize(dirs);
-		print(if dirs == 1 { b" directory, " } else { b" directories, " });
-		print_usize(plain);
-		print(if plain == 1 { b" file, " } else { b" files, " });
-		print(render_size(total, unit).as_bytes());
-		print(b" total\n");
-	}
+fn summary(dirs: usize, plain: usize, total: u64, unit: Unit) {
+	print_usize(dirs);
+	print(if dirs == 1 { b" directory, " } else { b" directories, " });
+	print_usize(plain);
+	print(if plain == 1 { b" file, " } else { b" files, " });
+	print(render_size(total, unit).as_bytes());
+	print(b" total\n");
 }
 
 // The extension a `-s e` sort orders by: the bytes after the name's last '.', or the
@@ -468,48 +460,42 @@ fn scaled(bytes: u64, shift: u32, name: &str) -> String {
 
 // Print the modification-time column: "YYYY-MM-DD HH:MM" UTC, or "-" when the backing
 // filesystem carries no timestamp (mtime 0).
-unsafe fn print_mtime(mtime: u64) {
-	unsafe {
-		if mtime == 0 {
-			print(b"-");
-			return;
-		}
-		let ts: Timestamp = Timestamp { unix_secs: mtime };
-		let mut out: [u8; 24] = [0u8; 24];
-		let n: usize = ts.render(&mut out);
-		if n >= 16 {
-			// the ISO instant, cut to the minute, with a space for the 'T'.
-			out[10] = b' ';
-			print(&out[..16]);
-		} else {
-			print(b"-");
-		}
+fn print_mtime(mtime: u64) {
+	if mtime == 0 {
+		print(b"-");
+		return;
+	}
+	let ts: Timestamp = Timestamp { unix_secs: mtime };
+	let mut out: [u8; 24] = [0u8; 24];
+	let n: usize = ts.render(&mut out);
+	if n >= 16 {
+		// the ISO instant, cut to the minute, with a space for the 'T'.
+		out[10] = b' ';
+		print(&out[..16]);
+	} else {
+		print(b"-");
 	}
 }
 
 // Print `n` spaces (column padding).
-unsafe fn pad(n: usize) {
-	unsafe {
-		for _ in 0..n {
-			print(b" ");
-		}
+fn pad(n: usize) {
+	for _ in 0..n {
+		print(b" ");
 	}
 }
 
 // Print a usize as decimal digits to stdout.
-unsafe fn print_usize(mut n: usize) {
-	unsafe {
-		if n == 0 {
-			print(b"0");
-			return;
-		}
-		let mut buf: [u8; 20] = [0u8; 20];
-		let mut i: usize = 20;
-		while n > 0 {
-			i -= 1;
-			buf[i] = b'0' + (n % 10) as u8;
-			n /= 10;
-		}
-		print(&buf[i..]);
+fn print_usize(mut n: usize) {
+	if n == 0 {
+		print(b"0");
+		return;
 	}
+	let mut buf: [u8; 20] = [0u8; 20];
+	let mut i: usize = 20;
+	while n > 0 {
+		i -= 1;
+		buf[i] = b'0' + (n % 10) as u8;
+		n /= 10;
+	}
+	print(&buf[i..]);
 }

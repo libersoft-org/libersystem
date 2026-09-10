@@ -29,153 +29,149 @@ const MAX_LINE: usize = 64 * 1024;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut ignore_case = false;
-		let mut invert = false;
-		let mut numbers = false;
-		let mut count_only = false;
-		let mut names_only = false;
-		let mut words: Vec<&[u8]> = Vec::new();
-		for word in split_args(&arguments) {
-			match classify(word) {
-				Arg::Long(b"ignore-case", None) => ignore_case = true,
-				Arg::Long(b"invert", None) => invert = true,
-				Arg::Long(b"number", None) => numbers = true,
-				Arg::Long(b"count", None) => count_only = true,
-				Arg::Long(b"files", None) => names_only = true,
-				Arg::Short(b'i') => ignore_case = true,
-				Arg::Short(b'v') => invert = true,
-				Arg::Short(b'n') => numbers = true,
-				Arg::Short(b'c') => count_only = true,
-				Arg::Short(b'l') => names_only = true,
-				Arg::Value(value) => {
-					if words.try_reserve(1).is_err() {
-						eprint(b"grep: out of memory\n");
-						exit();
-					}
-					words.push(value);
-				}
-				_ => {
-					eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
+	let mut ignore_case = false;
+	let mut invert = false;
+	let mut numbers = false;
+	let mut count_only = false;
+	let mut names_only = false;
+	let mut words: Vec<&[u8]> = Vec::new();
+	for word in split_args(&arguments) {
+		match classify(word) {
+			Arg::Long(b"ignore-case", None) => ignore_case = true,
+			Arg::Long(b"invert", None) => invert = true,
+			Arg::Long(b"number", None) => numbers = true,
+			Arg::Long(b"count", None) => count_only = true,
+			Arg::Long(b"files", None) => names_only = true,
+			Arg::Short(b'i') => ignore_case = true,
+			Arg::Short(b'v') => invert = true,
+			Arg::Short(b'n') => numbers = true,
+			Arg::Short(b'c') => count_only = true,
+			Arg::Short(b'l') => names_only = true,
+			Arg::Value(value) => {
+				if words.try_reserve(1).is_err() {
+					eprint(b"grep: out of memory\n");
 					exit();
 				}
+				words.push(value);
+			}
+			_ => {
+				eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
+				exit();
 			}
 		}
-		if words.is_empty() {
-			eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
-			exit();
-		}
-		let needle: &[u8] = words[0];
-		let paths = &words[1..];
-		// A PATTERN AND NO PATH MEANS STDIN, which is the shape `cat log | grep error` needs and
-		// the shape the milestone's own example uses. With no stream either there is nothing to
-		// search and the usage line is the honest answer.
-		if paths.is_empty() {
-			match Source::from_stdin() {
-				Some(source) => search(source, b"-", needle, ignore_case, invert, numbers, count_only, names_only, false),
-				None => {
-					eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
-					exit();
-				}
+	}
+	if words.is_empty() {
+		eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
+		exit();
+	}
+	let needle: &[u8] = words[0];
+	let paths = &words[1..];
+	// A PATTERN AND NO PATH MEANS STDIN, which is the shape `cat log | grep error` needs and
+	// the shape the milestone's own example uses. With no stream either there is nothing to
+	// search and the usage line is the honest answer.
+	if paths.is_empty() {
+		match Source::from_stdin() {
+			Some(source) => search(source, b"-", needle, ignore_case, invert, numbers, count_only, names_only, false),
+			None => {
+				eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
+				exit();
 			}
-			exit();
 		}
-		let many = paths.len() > 1;
-		for argument in paths {
-			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-				eprint(b"grep: invalid path\n");
-				continue;
-			};
-			let storage: u64 = volumes.client_for(&cwd, argument);
-			if storage == 0 {
-				eprint(b"grep: no volume\n");
-				continue;
-			}
-			search(Source::from_path(storage, &uri, WINDOW), uri.as_bytes(), needle, ignore_case, invert, numbers, count_only, names_only, many);
+		exit();
+	}
+	let many = paths.len() > 1;
+	for argument in paths {
+		let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+			eprint(b"grep: invalid path\n");
+			continue;
+		};
+		let storage: u64 = volumes.client_for(&cwd, argument);
+		if storage == 0 {
+			eprint(b"grep: no volume\n");
+			continue;
 		}
+		search(Source::from_path(storage, &uri, WINDOW), uri.as_bytes(), needle, ignore_case, invert, numbers, count_only, names_only, many);
 	}
 	exit();
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn search(source: Source, label: &[u8], needle: &[u8], ignore_case: bool, invert: bool, numbers: bool, count_only: bool, names_only: bool, many: bool) {
-	unsafe {
-		let mut lines = Lines::new(source, MAX_LINE);
-		let mut matches: u64 = 0;
-		let mut number: u64 = 0;
-		loop {
-			match lines.next_line() {
-				LineOutcome::Line => {
-					number += 1;
-					let hit = contains(lines.line(), needle, ignore_case) != invert;
-					if !hit {
-						continue;
-					}
-					matches += 1;
-					if names_only {
-						print(label);
-						print(b"\n");
-						return;
-					}
-					if count_only {
-						continue;
-					}
-					let mut prefix = String::new();
-					if many {
-						prefix.push_str(&String::from_utf8_lossy(label));
-						prefix.push(':');
-					}
-					if numbers {
-						push_decimal(&mut prefix, number);
-						prefix.push(':');
-					}
-					// Stops when the consumer does - `grep x big | head -1` should not search the
-					// rest of a large file to print into a channel nobody holds.
-					if !write_stdout(prefix.as_bytes()) || !write_stdout(lines.line()) || !write_stdout(b"\n") {
-						return;
-					}
+fn search(source: Source, label: &[u8], needle: &[u8], ignore_case: bool, invert: bool, numbers: bool, count_only: bool, names_only: bool, many: bool) {
+	let mut lines = Lines::new(source, MAX_LINE);
+	let mut matches: u64 = 0;
+	let mut number: u64 = 0;
+	loop {
+		match lines.next_line() {
+			LineOutcome::Line => {
+				number += 1;
+				let hit = contains(lines.line(), needle, ignore_case) != invert;
+				if !hit {
+					continue;
 				}
-				LineOutcome::End => break,
-				// A LINE TOO LONG IS REPORTED, not skipped. A `grep` that silently ignored the one
-				// line it could not hold would answer "not found" about a file that contains the
-				// text - the exact shape of a wrong answer that looks right.
-				LineOutcome::TooLong => {
-					eprint(b"grep: ");
-					eprint(label);
-					eprint(b": a line is longer than this tool will hold\n");
+				matches += 1;
+				if names_only {
+					print(label);
+					print(b"\n");
 					return;
 				}
-				LineOutcome::Failed(ChunkError::Unavailable) => {
-					eprint(b"grep: cannot read ");
-					eprint(label);
-					eprint(b"\n");
-					return;
+				if count_only {
+					continue;
 				}
-				LineOutcome::Failed(_) => {
-					eprint(b"grep: out of memory\n");
+				let mut prefix = String::new();
+				if many {
+					prefix.push_str(&String::from_utf8_lossy(label));
+					prefix.push(':');
+				}
+				if numbers {
+					push_decimal(&mut prefix, number);
+					prefix.push(':');
+				}
+				// Stops when the consumer does - `grep x big | head -1` should not search the
+				// rest of a large file to print into a channel nobody holds.
+				if !write_stdout(prefix.as_bytes()) || !write_stdout(lines.line()) || !write_stdout(b"\n") {
 					return;
 				}
 			}
-		}
-		if count_only {
-			let mut out = String::new();
-			if many {
-				out.push_str(&String::from_utf8_lossy(label));
-				out.push(':');
+			LineOutcome::End => break,
+			// A LINE TOO LONG IS REPORTED, not skipped. A `grep` that silently ignored the one
+			// line it could not hold would answer "not found" about a file that contains the
+			// text - the exact shape of a wrong answer that looks right.
+			LineOutcome::TooLong => {
+				eprint(b"grep: ");
+				eprint(label);
+				eprint(b": a line is longer than this tool will hold\n");
+				return;
 			}
-			push_decimal(&mut out, matches);
-			out.push('\n');
-			print(out.as_bytes());
+			LineOutcome::Failed(ChunkError::Unavailable) => {
+				eprint(b"grep: cannot read ");
+				eprint(label);
+				eprint(b"\n");
+				return;
+			}
+			LineOutcome::Failed(_) => {
+				eprint(b"grep: out of memory\n");
+				return;
+			}
 		}
+	}
+	if count_only {
+		let mut out = String::new();
+		if many {
+			out.push_str(&String::from_utf8_lossy(label));
+			out.push(':');
+		}
+		push_decimal(&mut out, matches);
+		out.push('\n');
+		print(out.as_bytes());
 	}
 }
 

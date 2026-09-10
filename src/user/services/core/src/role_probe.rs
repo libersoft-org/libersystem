@@ -43,83 +43,81 @@ const ROLES: [Role; 3] = [
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// THE REPORT CHANNEL ARRIVES FIRST AND SEPARATELY, so the caller can CLOSE the bootstrap
-		// channel to make a role never arrive and still hear what happened. Reporting on the
-		// channel the roles come in on would make the one case that needs a closed peer the one
-		// case that cannot be observed.
-		let mut buf = [0u8; 32];
-		let (case, report): (u8, u64) = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 1 && handle != 0 => (buf[0], handle),
-			_ => exit(),
+	// THE REPORT CHANNEL ARRIVES FIRST AND SEPARATELY, so the caller can CLOSE the bootstrap
+	// channel to make a role never arrive and still hear what happened. Reporting on the
+	// channel the roles come in on would make the one case that needs a closed peer the one
+	// case that cannot be observed.
+	let mut buf = [0u8; 32];
+	let (case, report): (u8, u64) = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 1 && handle != 0 => (buf[0], handle),
+		_ => exit(),
+	};
+	// THE DEAD-PEER CASE TAKES NO ROLES AT ALL. It is handed one channel whose other end the
+	// caller has dropped, calls a real service op on it through the generated client, and
+	// reports the error code that came back - which is the whole of what this case measures.
+	if case == CASE_DEAD_PEER {
+		let dead: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { handle, .. } => handle,
+			Received::Closed => exit(),
 		};
-		// THE DEAD-PEER CASE TAKES NO ROLES AT ALL. It is handed one channel whose other end the
-		// caller has dropped, calls a real service op on it through the generated client, and
-		// reports the error code that came back - which is the whole of what this case measures.
-		if case == CASE_DEAD_PEER {
-			let dead: u64 = match recv_blocking(bootstrap, &mut buf) {
-				Received::Message { handle, .. } => handle,
-				Received::Closed => exit(),
-			};
-			let answer = proto::system::volume::Client::new(ChannelTransport { chan: dead }).remove("vol://ram/anything");
-			let mut out = alloc::vec::Vec::new();
-			match answer {
-				// The distinction this case exists for: a typed answer rather than a bare "it
-				// did not work", and one that says which side of the line the request is on.
-				Some(Err(error)) => {
-					out.extend_from_slice(b"err ");
-					// IN DECIMAL, because the enum reaches two digits. `b'0' + code` is fine while
-					// every answer is single-digit and silently prints punctuation the moment one
-					// is not - and the answer this case exists to tell apart from `again` is
-					// `commit-uncertain`, which is 12.
-					let code: u8 = error as u8;
-					if code >= 10 {
-						out.push(b'0' + code / 10);
-					}
-					out.push(b'0' + code % 10);
+		let answer = proto::system::volume::Client::new(ChannelTransport { chan: dead }).remove("vol://ram/anything");
+		let mut out = alloc::vec::Vec::new();
+		match answer {
+			// The distinction this case exists for: a typed answer rather than a bare "it
+			// did not work", and one that says which side of the line the request is on.
+			Some(Err(error)) => {
+				out.extend_from_slice(b"err ");
+				// IN DECIMAL, because the enum reaches two digits. `b'0' + code` is fine while
+				// every answer is single-digit and silently prints punctuation the moment one
+				// is not - and the answer this case exists to tell apart from `again` is
+				// `commit-uncertain`, which is 12.
+				let code: u8 = error as u8;
+				if code >= 10 {
+					out.push(b'0' + code / 10);
 				}
-				Some(Ok(())) => out.extend_from_slice(b"ok"),
-				None => out.extend_from_slice(b"none"),
+				out.push(b'0' + code % 10);
 			}
-			let _ = send_blocking(report, &out, 0);
-			exit();
+			Some(Ok(())) => out.extend_from_slice(b"ok"),
+			None => out.extend_from_slice(b"none"),
 		}
-		// A shorter list for the case that ends early, so the probe asks for a role the caller
-		// deliberately never sends rather than waiting on a peer that has already finished.
-		let roles: &[Role] = match case {
-			CASE_REQUIRED_MISSING => &ROLES[..2],
-			_ => &ROLES,
-		};
-		let mut handles = [0u64; ROLES.len()];
-		let outcome = receive_roles(bootstrap, roles, &mut handles);
-
-		// HOW MANY CAPABILITIES THIS PROCESS STILL HOLDS is the assertion the caller cannot make
-		// from outside without this. A refusal that left handles behind would be a bootstrap that
-		// failed and kept authority anyway.
-		let mut report_bytes = alloc::vec::Vec::new();
-		match outcome {
-			Ok(()) => report_bytes.extend_from_slice(b"ok"),
-			Err(error) => {
-				report_bytes.extend_from_slice(error.tag());
-				report_bytes.push(b':');
-				report_bytes.extend_from_slice(error.reason());
-			}
-		}
-		report_bytes.push(b' ');
-		let mut held = 0usize;
-		for handle in handles.iter() {
-			if *handle != 0 {
-				held += 1;
-			}
-		}
-		report_bytes.push(b'0' + held as u8);
-		let _ = send_blocking(report, &report_bytes, 0);
-		let _ = case;
-		let _ = CASE_ALL_PRESENT;
-		let _ = CASE_WRONG_TYPE;
-		let _ = CASE_TOO_FEW_RIGHTS;
-		let _ = CASE_OPTIONAL_ABSENT;
-		let _ = CASE_DEAD_PEER;
+		let _ = send_blocking(report, &out, 0);
 		exit();
 	}
+	// A shorter list for the case that ends early, so the probe asks for a role the caller
+	// deliberately never sends rather than waiting on a peer that has already finished.
+	let roles: &[Role] = match case {
+		CASE_REQUIRED_MISSING => &ROLES[..2],
+		_ => &ROLES,
+	};
+	let mut handles = [0u64; ROLES.len()];
+	let outcome = receive_roles(bootstrap, roles, &mut handles);
+
+	// HOW MANY CAPABILITIES THIS PROCESS STILL HOLDS is the assertion the caller cannot make
+	// from outside without this. A refusal that left handles behind would be a bootstrap that
+	// failed and kept authority anyway.
+	let mut report_bytes = alloc::vec::Vec::new();
+	match outcome {
+		Ok(()) => report_bytes.extend_from_slice(b"ok"),
+		Err(error) => {
+			report_bytes.extend_from_slice(error.tag());
+			report_bytes.push(b':');
+			report_bytes.extend_from_slice(error.reason());
+		}
+	}
+	report_bytes.push(b' ');
+	let mut held = 0usize;
+	for handle in handles.iter() {
+		if *handle != 0 {
+			held += 1;
+		}
+	}
+	report_bytes.push(b'0' + held as u8);
+	let _ = send_blocking(report, &report_bytes, 0);
+	let _ = case;
+	let _ = CASE_ALL_PRESENT;
+	let _ = CASE_WRONG_TYPE;
+	let _ = CASE_TOO_FEW_RIGHTS;
+	let _ = CASE_OPTIONAL_ABSENT;
+	let _ = CASE_DEAD_PEER;
+	exit();
 }

@@ -299,7 +299,7 @@ struct Policy {
 // Read the supervision policy (`service.watchdog-ticks`, `service.restart-budget`)
 // over the supervisor's ConfigService client; defaults stand when the tree is not
 // up (config_client 0) or a key does not parse.
-unsafe fn read_policy(config_client: u64) -> Policy {
+fn read_policy(config_client: u64) -> Policy {
 	let mut policy: Policy = Policy { watchdog_ticks: WATCHDOG_TICKS, restart_budget: MAX_RESTARTS };
 	if config_client == 0 {
 		return policy;
@@ -410,12 +410,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// A LIVE medium sends `LIVEVOL` instead: a whole LiberFS image the running system copies into
 	// memory, because the medium it booted from is read-only. That one is KEPT and handed to the
 	// storage service; the legacy archive is still dropped, since the volume comes off the disk.
-	let live_volume: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let live_volume: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => handle,
-		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"RAMDISK" => unsafe {
+		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"RAMDISK" => {
 			close(handle);
 			0
-		},
+		}
 		_ => exit(),
 	};
 
@@ -423,7 +423,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     from the kernel. `SYS_SYSTEM_POWER` checks it, so this is what makes the graceful
 	//     `!poweroff` / `!reboot` path work; a duplicate goes to DeviceManager for the
 	//     keyboard driver's Power key, which must keep working when this supervisor does not.
-	let power: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let power: u64 = match recv_blocking(bootstrap, &mut buf) {
 		// A CLIENT OF SYSTEMPOWER, NOT THE ROOT DOMAIN. This supervisor used to hold a capability
 		// that could kill the whole system, for no reason other than being on the path between the
 		// kernel and the keyboard driver. What it holds now can ask for a reboot and nothing else.
@@ -435,7 +435,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     the kernel). The bring-up self-tests - the stop-path exercise and the canary
 	//     crash / hang drills - run only in a test boot (1); a production boot (0)
 	//     never deliberately faults a process or stops a service.
-	let selftest: bool = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let selftest: bool = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, .. } if len == 5 && &buf[..4] == b"MODE" => buf[4] == 1,
 		_ => exit(),
 	};
@@ -452,7 +452,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// FOUR now: the device authority joined them, appended after the three so every reader that
 	// counted three still finds the same three in the same places. A boot that hands over fewer
 	// leaves the missing ones zero, which each holder already treats as "not granted".
-	let (display_ctl, console_input, console_sink, device_manager): (u64, u64, u64, u64) = match unsafe { recv_message_caps(bootstrap, &mut buf, &mut console_caps) } {
+	let (display_ctl, console_input, console_sink, device_manager): (u64, u64, u64, u64) = match recv_message_caps(bootstrap, &mut buf, &mut console_caps) {
 		(len, 4) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => (console_caps[0], console_caps[1], console_caps[2], console_caps[3]),
 		(len, 3) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => (console_caps[0], console_caps[1], console_caps[2], 0),
 		_ => (0, 0, 0, 0),
@@ -470,7 +470,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     So: the length is kept here for the life of the system and handed to every DeviceManager
 	//     this supervisor starts, and the deadline goes with it only for the first one - that is
 	//     the bind that really does compete with the boot.
-	let (boot_deadline, boot_window): (u64, u64) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let (boot_deadline, boot_window): (u64, u64) = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, .. } if len >= 7 + 16 && &buf[..7] == b"BOOTWIN" => (u64::from_le_bytes(buf[7..15].try_into().unwrap_or([0; 8])), u64::from_le_bytes(buf[15..23].try_into().unwrap_or([0; 8]))),
 		_ => (0, 0),
 	};
@@ -481,7 +481,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     StorageService, which is the process that mounts one - and the only one that should,
 	//     because matching a `Block(uuid)` means reading a LiberFS superblock and keeping a
 	//     filesystem out of the process that hands out device authority is worth one hand-off.
-	if let Received::Message { len, .. } = unsafe { recv_blocking(bootstrap, &mut buf) }
+	if let Received::Message { len, .. } = recv_blocking(bootstrap, &mut buf)
 		&& len >= 7 + 24
 		&& &buf[..7] == b"ROOTSEL"
 	{
@@ -649,7 +649,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while let Some(i) = service_logic::service_lifecycle::next_startable(cursor, N, |i| state[i] == State::Absent, |i| MANIFEST[i].deps, |dep| index_of(dep).is_some_and(|idx| state[idx] == State::Ready)) {
 			cursor = i + 1;
 			let mut proc_handle: u64 = 0;
-			let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut role_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+			let (started, why): (State, Reason) = start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut role_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf);
 			// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
 			// bring-up waits for the report, but it is the honest name for the window between
 			// a process existing and a service answering, and it is what a later non-blocking
@@ -672,17 +672,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// that loop and is the only thing allowed to hand this connection on, so an endpoint
 			// created afterwards would have nobody to give it to.
 			if MANIFEST[i].name == b"device_manager" && started == State::Ready && policy_admin_server == 0 {
-				unsafe {
-					match channel() {
-						Some((server, client)) => {
-							if send_blocking(channels[i], b"POLICY", client) {
-								policy_admin_server = server;
-							} else {
-								close(server);
-							}
+				match channel() {
+					Some((server, client)) => {
+						if send_blocking(channels[i], b"POLICY", client) {
+							policy_admin_server = server;
+						} else {
+							close(server);
 						}
-						None => print(b"ServiceManager: no channel for the device policy endpoint; the operator verbs are unreachable this boot\n"),
 					}
+					None => print(b"ServiceManager: no channel for the device policy endpoint; the operator verbs are unreachable this boot\n"),
 				}
 			}
 			// A SERVICE THAT DID NOT START SAYS SO, on the console, by name.
@@ -693,27 +691,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// appearing, four services later. The journal had the event; the console, which is
 			// what a person is watching while a machine boots, did not.
 			if started == State::Failed {
-				unsafe {
+				print(b"ServiceManager: ");
+				print(MANIFEST[i].name);
+				print(b": FAILED to start\n");
+				if !failure_reason[i].is_empty() {
 					print(b"ServiceManager: ");
 					print(MANIFEST[i].name);
-					print(b": FAILED to start\n");
-					if !failure_reason[i].is_empty() {
-						print(b"ServiceManager: ");
-						print(MANIFEST[i].name);
-						print(b": ");
-						print(failure_reason[i].as_bytes());
-						print(b"\n");
-					}
+					print(b": ");
+					print(failure_reason[i].as_bytes());
+					print(b"\n");
 				}
 			}
 			if MANIFEST[i].name == b"process_service" && started == State::Ready {
-				broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
+				broker_process = service_connect(process_client).unwrap_or(0);
 			}
 			if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 				broker_storage_admin = storage_admin;
 			}
 			if MANIFEST[i].name == b"permission_manager" && started == State::Ready && selftest {
-				drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
+				drill_perm = service_connect(perm_client).unwrap_or(0);
 			}
 			// The development agent launches through PermissionManager like anything else,
 			// so it needs a client of it - and cannot have been given one when it started,
@@ -723,14 +719,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// Ignored entirely by a boot that has no agent.
 			if MANIFEST[i].name == b"permission_manager" && started == State::Ready {
 				if let Some(dm) = index_of(b"device_manager") {
-					let launcher: u64 = unsafe { service_connect(perm_client) }.unwrap_or(0);
+					let launcher: u64 = service_connect(perm_client).unwrap_or(0);
 					if launcher != 0 {
-						unsafe { send_blocking(channels[dm], b"DEVPERM", launcher) };
+						send_blocking(channels[dm], b"DEVPERM", launcher);
 					}
 					// The other end of the pair ProcessService already holds. Sending it now
 					// connects the two without either having had to wait for the other.
 					if registry_far != 0 {
-						unsafe { send_blocking(channels[dm], b"DEVREG", registry_far) };
+						send_blocking(channels[dm], b"DEVREG", registry_far);
 						registry_far = 0;
 					}
 				}
@@ -741,16 +737,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// on process_service, so come up later), so their driver channels are ready.
 			if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 				if let Some(dm) = index_of(b"device_manager") {
-					unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut usb_online, &mut usb_pointer_online, &mut raw_keys, &mut buf) };
+					drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut usb_online, &mut usb_pointer_online, &mut raw_keys, &mut buf);
 				}
 				// LogService starts before StorageService, so its volume client (the
 				// on-disk journal) is delivered late, like its config client: minted
 				// from the freshly mounted system volume and sent on LogService's
 				// control channel.
 				if let Some(lg) = index_of(b"log_service") {
-					let journal: u64 = unsafe { open_storage_directory(storage_admin, "vol://system/log") };
+					let journal: u64 = open_storage_directory(storage_admin, "vol://system/log");
 					if journal != 0 {
-						unsafe { send_blocking(channels[lg], b"STORAGE", journal) };
+						send_blocking(channels[lg], b"STORAGE", journal);
 					}
 				}
 			}
@@ -771,20 +767,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Absent {
-				unsafe {
-					print(b"ServiceManager: ");
-					print(MANIFEST[i].name);
-					print(b": never started - waiting for");
-					for dependency in MANIFEST[i].deps {
-						if let Some(idx) = index_of(dependency) {
-							if state[idx] != State::Ready {
-								print(b" ");
-								print(dependency);
-							}
+				print(b"ServiceManager: ");
+				print(MANIFEST[i].name);
+				print(b": never started - waiting for");
+				for dependency in MANIFEST[i].deps {
+					if let Some(idx) = index_of(dependency) {
+						if state[idx] != State::Ready {
+							print(b" ");
+							print(dependency);
 						}
 					}
-					print(b"\n");
 				}
+				print(b"\n");
 			}
 			i += 1;
 		}
@@ -852,8 +846,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	if selftest {
-		let valid = unsafe { provider_checks::routed_volumes(storage_client, media_client, iso_client, udf_client, usb_client) };
-		unsafe { send_blocking(bootstrap, if valid { b"ServiceManager: routed volumes read correctly" } else { b"ServiceManager: routed volume read FAILED" }, 0) };
+		let valid = provider_checks::routed_volumes(storage_client, media_client, iso_client, udf_client, usb_client);
+		send_blocking(bootstrap, if valid { b"ServiceManager: routed volumes read correctly" } else { b"ServiceManager: routed volume read FAILED" }, 0);
 	}
 
 	// 3. bring up the managed canary and, in a test boot, exercise the restart policy
@@ -865,17 +859,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    heartbeat and recovered by a kill + restart. Each transition is reported up
 	//    the boot chain and journaled. A production boot spawns and supervises the
 	//    canary but never deliberately faults it.
-	let (park, _park_peer): (u64, u64) = match unsafe { channel() } {
+	let (park, _park_peer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => (0, 0),
 	};
 	// The supervision knobs, read from the freshly-serving config tree (the canary
 	// below and the standing supervisor both run under them).
-	let policy: Policy = unsafe { read_policy(config_client) };
+	let policy: Policy = read_policy(config_client);
 	let mut canary_proc: u64 = 0;
 	let mut canary_ctrl: u64 = 0;
 	let mut canary_sup: Supervised = Supervised::new();
-	unsafe {
+	{
 		let (proc, ctrl): (u64, u64) = spawn_canary(&package, &mut buf);
 		if proc != 0 {
 			canary_proc = proc;
@@ -991,10 +985,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if selftest {
 		if let Some(dev) = index_of(b"device_manager") {
 			if state[dev] == State::Ready {
-				state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
+				state[dev] = stop_service(channels[dev], bootstrap, &mut buf);
 				sup[dev].failure = Failure::Stopped;
 				channels[dev] = 0;
-				unsafe { emit_event(log_client, b"device_manager", b"stopped") };
+				emit_event(log_client, b"device_manager", b"stopped");
 			}
 		}
 	}
@@ -1011,9 +1005,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	if selftest {
 		let order: Vec<usize> = shutdown_order(&state);
 		if verify_shutdown_order(&order, &state) {
-			unsafe {
-				send_blocking(bootstrap, b"ServiceManager: shutdown order ok", 0);
-			}
+			send_blocking(bootstrap, b"ServiceManager: shutdown order ok", 0);
 		}
 	}
 
@@ -1023,9 +1015,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    failure), so StorageService's service channel does not peer-close prematurely;
 	//    once the shell owns it, the shell keeps the service standing.
 	if all_settled(&state) {
-		unsafe {
-			send_blocking(bootstrap, b"ServiceManager: online", 0);
-		}
+		send_blocking(bootstrap, b"ServiceManager: online", 0);
 	}
 	let _ = storage_client;
 
@@ -1040,30 +1030,28 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// verbs on, then its OWN ConfigService connection - the bytes live there, the decision lives in
 	// DeviceManager, and that division is what stops a component holding `CAP_CONFIG` from changing
 	// a binding.
-	unsafe {
-		if let Some(dm) = index_of(b"device_manager")
-			&& channels[dm] != 0
-			&& state[dm] == State::Ready
-		{
-			// A connection of DeviceManager's own, so its writes are its own. Sent whether or not
-			// one could be minted: the read is positional.
-			// THE OWNER CONNECTION, NOT AN ORDINARY ONE. `service_connect` mints a connection
-			// indistinguishable from every other component's, so ConfigService could not tell whose
-			// request was whose and `set` let any `CAP_CONFIG` holder write under `device.policy.`.
-			// ConfigService mints this pair itself and hands the client end up under `POLICYOWNER`;
-			// routing it here is what makes the namespace DeviceManager's.
-			// TAKEN, not read: it is handed to DeviceManager below, and a handle two places believe
-			// they own is exactly what `take_end_of` exists to prevent.
-			let owner: u64 = kept.take_end_of(b"config_service", b"POLICYOWNER");
-			let config_for_dm: u64 = if owner != 0 {
-				owner
-			} else if config_client != 0 {
-				service_connect(config_client).unwrap_or(0)
-			} else {
-				0
-			};
-			send_blocking(channels[dm], b"POLICYCFG", config_for_dm);
-		}
+	if let Some(dm) = index_of(b"device_manager")
+		&& channels[dm] != 0
+		&& state[dm] == State::Ready
+	{
+		// A connection of DeviceManager's own, so its writes are its own. Sent whether or not
+		// one could be minted: the read is positional.
+		// THE OWNER CONNECTION, NOT AN ORDINARY ONE. `service_connect` mints a connection
+		// indistinguishable from every other component's, so ConfigService could not tell whose
+		// request was whose and `set` let any `CAP_CONFIG` holder write under `device.policy.`.
+		// ConfigService mints this pair itself and hands the client end up under `POLICYOWNER`;
+		// routing it here is what makes the namespace DeviceManager's.
+		// TAKEN, not read: it is handed to DeviceManager below, and a handle two places believe
+		// they own is exactly what `take_end_of` exists to prevent.
+		let owner: u64 = kept.take_end_of(b"config_service", b"POLICYOWNER");
+		let config_for_dm: u64 = if owner != 0 {
+			owner
+		} else if config_client != 0 {
+			service_connect(config_client).unwrap_or(0)
+		} else {
+			0
+		};
+		send_blocking(channels[dm], b"POLICYCFG", config_for_dm);
 	}
 
 	// 5. stand as the supervisor. Unlike the earlier design, ServiceManager does not
@@ -1072,13 +1060,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    the canary failing (restart per policy), the shell asking to `stop` a service
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
-	unsafe {
-		// AND THE ONE CONSOLESERVICE HANDS TO EVERY SHELL IT SPAWNS. Read from the plan's own table
-		// rather than threaded out through `start_service`: the end is recorded there when the role
-		// is delivered, and this is the only place that needs it.
-		let admin_server3: u64 = kept.end_of(b"console_service", b"ADMIN");
-		supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut device_manager_domain, &mut buf);
-	}
+	// AND THE ONE CONSOLESERVICE HANDS TO EVERY SHELL IT SPAWNS. Read from the plan's own table
+	// rather than threaded out through `start_service`: the end is recorded there when the role
+	// is delivered, and this is the only place that needs it.
+	let admin_server3: u64 = kept.end_of(b"console_service", b"ADMIN");
+	supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut device_manager_domain, &mut buf);
 	exit();
 }
 
@@ -1115,33 +1101,31 @@ fn index_of(name: &[u8]) -> Option<usize> {
 // exercising the restart and watchdog paths against it. The canary is raw-spawned from
 // the package (not loaded from the volume) because the supervisor exercises it after
 // stopping DeviceManager - which drops virtio_blk, so the system volume is unavailable.
-unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
-	unsafe {
-		let elf: &[u8] = match package.lookup(b"watchdog_probe.lsexe") {
-			Some(e) => e,
-			None => return (0, 0),
-		};
-		let (ctrl, probe_side): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return (0, 0),
-		};
-		let proc: i64 = spawn(elf, probe_side);
-		if proc < 0 {
-			return (0, 0);
-		}
-		// Label it, because this is the process a booted system faults on purpose: the
-		// self-test commands it to CRASH so the restart path is exercised on every boot.
-		// Unlabelled it reported as `unnamed` in the fault line and read like an unexplained
-		// null-pointer write in a booted system, which is exactly how it was mistaken for
-		// one. The supervisor spawns it directly rather than through ProcessService, so this
-		// is the only place its name is known.
-		set_object_name(proc as u64, "watchdog_probe");
-		match recv_blocking(ctrl, buf) {
-			Received::Message { .. } => (proc as u64, ctrl),
-			Received::Closed => {
-				close(proc as u64);
-				(0, 0)
-			}
+fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
+	let elf: &[u8] = match package.lookup(b"watchdog_probe.lsexe") {
+		Some(e) => e,
+		None => return (0, 0),
+	};
+	let (ctrl, probe_side): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return (0, 0),
+	};
+	let proc: i64 = spawn(elf, probe_side);
+	if proc < 0 {
+		return (0, 0);
+	}
+	// Label it, because this is the process a booted system faults on purpose: the
+	// self-test commands it to CRASH so the restart path is exercised on every boot.
+	// Unlabelled it reported as `unnamed` in the fault line and read like an unexplained
+	// null-pointer write in a booted system, which is exactly how it was mistaken for
+	// one. The supervisor spawns it directly rather than through ProcessService, so this
+	// is the only place its name is known.
+	set_object_name(proc as u64, "watchdog_probe");
+	match recv_blocking(ctrl, buf) {
+		Received::Message { .. } => (proc as u64, ctrl),
+		Received::Closed => {
+			close(proc as u64);
+			(0, 0)
 		}
 	}
 }
@@ -1151,49 +1135,45 @@ unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
 // (longer after repeated failures) and respawn, charging one restart. Returns true if a
 // replacement is running, false if the budget is exhausted (the caller escalates). The
 // canary stands in for the policy a real service restart would follow.
-unsafe fn restart_canary(package: &Package, proc: &mut u64, ctrl: &mut u64, sup: &mut Supervised, failure: Failure, budget: u32, park: u64, buf: &mut [u8]) -> bool {
-	unsafe {
-		sup.failure = failure;
-		// Reap the old endpoints so the dead process is fully gone before its replacement.
-		drain_closed(*ctrl, buf);
-		if *ctrl != 0 {
-			close(*ctrl);
-			*ctrl = 0;
-		}
-		if *proc != 0 {
-			close(*proc);
-			*proc = 0;
-		}
-		// Spend from the restart budget; once exhausted, escalate rather than restart again.
-		if sup.restarts >= budget {
-			return false;
-		}
-		// Back off before the respawn, scaled by the attempt count. A bounded one-shot
-		// sleep, so the test scheduler still advances it deterministically.
-		sleep_ticks(park, RESTART_BACKOFF_TICKS * (sup.restarts as u64 + 1));
-		let (new_proc, new_ctrl): (u64, u64) = spawn_canary(package, buf);
-		if new_proc == 0 {
-			return false;
-		}
-		*proc = new_proc;
-		*ctrl = new_ctrl;
-		sup.restarts += 1;
-		true
+fn restart_canary(package: &Package, proc: &mut u64, ctrl: &mut u64, sup: &mut Supervised, failure: Failure, budget: u32, park: u64, buf: &mut [u8]) -> bool {
+	sup.failure = failure;
+	// Reap the old endpoints so the dead process is fully gone before its replacement.
+	drain_closed(*ctrl, buf);
+	if *ctrl != 0 {
+		close(*ctrl);
+		*ctrl = 0;
 	}
+	if *proc != 0 {
+		close(*proc);
+		*proc = 0;
+	}
+	// Spend from the restart budget; once exhausted, escalate rather than restart again.
+	if sup.restarts >= budget {
+		return false;
+	}
+	// Back off before the respawn, scaled by the attempt count. A bounded one-shot
+	// sleep, so the test scheduler still advances it deterministically.
+	sleep_ticks(park, RESTART_BACKOFF_TICKS * (sup.restarts as u64 + 1));
+	let (new_proc, new_ctrl): (u64, u64) = spawn_canary(package, buf);
+	if new_proc == 0 {
+		return false;
+	}
+	*proc = new_proc;
+	*ctrl = new_ctrl;
+	sup.restarts += 1;
+	true
 }
 
 // Drain a channel until its peer is gone, discarding any queued messages. Used to wait
 // out a dying process so its control channel is fully closed before it is replaced.
-unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
-	unsafe {
-		if channel == 0 {
-			return;
-		}
-		loop {
-			match recv_blocking(channel, buf) {
-				Received::Message { .. } => {}
-				Received::Closed => return,
-			}
+fn drain_closed(channel: u64, buf: &mut [u8]) {
+	if channel == 0 {
+		return;
+	}
+	loop {
+		match recv_blocking(channel, buf) {
+			Received::Message { .. } => {}
+			Received::Closed => return,
 		}
 	}
 }
@@ -1263,34 +1243,32 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 // Answer one RESOLVE request from `requester` arriving on `chan`: check the grant,
 // check the service is alive, and mint a fresh client connection from its live root.
 // The reply is b"OK" + the minted channel, or b"DENIED" / b"DOWN" with no handle.
-unsafe fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, state: &[State; N]) {
-	unsafe {
-		let name: &[u8] = &request[2..];
-		if !cap_grants(requester).iter().any(|&g| g == name) {
-			send_blocking(chan, b"DENIED", 0);
-			return;
+fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, state: &[State; N]) {
+	let name: &[u8] = &request[2..];
+	if !cap_grants(requester).iter().any(|&g| g == name) {
+		send_blocking(chan, b"DENIED", 0);
+		return;
+	}
+	let root: u64 = match name {
+		CAP_CONFIG => broker.config,
+		CAP_DEVICE => broker.device,
+		CAP_GRAPH => broker.graph,
+		_ => 0,
+	};
+	let alive: bool = match service_of_cap(name).and_then(index_of) {
+		Some(idx) => state[idx] == State::Ready,
+		None => false,
+	};
+	if root == 0 || !alive {
+		send_blocking(chan, b"DOWN", 0);
+		return;
+	}
+	match service_connect(root) {
+		Some(minted) => {
+			send_blocking(chan, b"OK", minted);
 		}
-		let root: u64 = match name {
-			CAP_CONFIG => broker.config,
-			CAP_DEVICE => broker.device,
-			CAP_GRAPH => broker.graph,
-			_ => 0,
-		};
-		let alive: bool = match service_of_cap(name).and_then(index_of) {
-			Some(idx) => state[idx] == State::Ready,
-			None => false,
-		};
-		if root == 0 || !alive {
+		None => {
 			send_blocking(chan, b"DOWN", 0);
-			return;
-		}
-		match service_connect(root) {
-			Some(minted) => {
-				send_blocking(chan, b"OK", minted);
-			}
-			None => {
-				send_blocking(chan, b"DOWN", 0);
-			}
 		}
 	}
 }
@@ -1318,7 +1296,7 @@ fn is_goodbye(request: &[u8]) -> bool {
 // failure the service is left Failed (the caller escalates). Clients holding
 // channels to the dead instance reconnect through the broker (serve_resolve above) -
 // that is the whole point.
-unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, budget: u32, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) -> bool {
+fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, budget: u32, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		sup[idx].failure = Failure::Crashed;
 		// THE INSTANCE BEING REPLACED IS RECORDED BEFORE IT IS GONE, with its own epoch, so a late
@@ -1385,17 +1363,15 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 // failure, an asked-for start records neither, and there is nothing to reap because the stop
 // already did it. Refused for anything not stopped, and for anything this ladder cannot bring
 // back - saying no is better than a service that starts with clients holding dead channels.
-unsafe fn start_stopped_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
-	unsafe {
-		if state[idx] != State::Stopped || !restartable(idx) {
-			return false;
-		}
-		if !relaunch_service(broker, idx, state, channels, procs, stats_server, buf) {
-			return false;
-		}
-		sup[idx].failure = Failure::None;
-		true
+fn start_stopped_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
+	if state[idx] != State::Stopped || !restartable(idx) {
+		return false;
 	}
+	if !relaunch_service(broker, idx, state, channels, procs, stats_server, buf) {
+		return false;
+	}
+	sup[idx].failure = Failure::None;
+	true
 }
 
 // Whether this ladder can bring a service back at all. It can when the supervisor holds a
@@ -1416,7 +1392,7 @@ fn restartable(idx: usize) -> bool {
 // Launch a fresh instance from the volume and re-run the bootstrap that brought the first one
 // up, then adopt it. Shared by the crash restart and the deliberate start above; it assumes
 // the previous instance's endpoints are already released.
-unsafe fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
+fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		let (process, storage_admin, device): (u64, u64, u64) = (broker.process, broker.storage_admin, broker.device);
 		let root: &mut u64 = match MANIFEST[idx].name {
@@ -1492,23 +1468,21 @@ unsafe fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; 
 // non-resolve reply (the verdict) arrives. Both sides are single-threaded, so the
 // interleaving is deterministic. Returns the verdict length in `buf` (0 = the canary
 // died mid-check).
-unsafe fn drive_check(canary_ctrl: u64, broker: &Broker, state: &[State; N], buf: &mut [u8]) -> usize {
-	unsafe {
-		if !send_blocking(canary_ctrl, b"CHECK", 0) {
-			return 0;
-		}
-		loop {
-			match recv_blocking(canary_ctrl, buf) {
-				Received::Message { len, .. } if is_resolve(&buf[..len]) => {
-					// Copy the request out of `buf`: serve_resolve round-trips reuse it.
-					let mut req: [u8; 64] = [0u8; 64];
-					let rlen: usize = len.min(req.len());
-					req[..rlen].copy_from_slice(&buf[..rlen]);
-					serve_resolve(canary_ctrl, b"watchdog_probe", &req[..rlen], broker, state);
-				}
-				Received::Message { len, .. } => return len,
-				Received::Closed => return 0,
+fn drive_check(canary_ctrl: u64, broker: &Broker, state: &[State; N], buf: &mut [u8]) -> usize {
+	if !send_blocking(canary_ctrl, b"CHECK", 0) {
+		return 0;
+	}
+	loop {
+		match recv_blocking(canary_ctrl, buf) {
+			Received::Message { len, .. } if is_resolve(&buf[..len]) => {
+				// Copy the request out of `buf`: serve_resolve round-trips reuse it.
+				let mut req: [u8; 64] = [0u8; 64];
+				let rlen: usize = len.min(req.len());
+				req[..rlen].copy_from_slice(&buf[..rlen]);
+				serve_resolve(canary_ctrl, b"watchdog_probe", &req[..rlen], broker, state);
 			}
+			Received::Message { len, .. } => return len,
+			Received::Closed => return 0,
 		}
 	}
 }
@@ -1529,28 +1503,26 @@ struct DrillTransport<'a> {
 
 impl proto::codec::Transport for DrillTransport<'_> {
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles, _deadline: u64) -> Result<Vec<u8>, proto::codec::TransportError> {
-		unsafe {
-			if !send_caps_blocking(self.perm, request, request_handles) {
-				return Err(proto::codec::TransportError::SendRefused);
-			}
-			let mut buf: [u8; 64] = [0u8; 64];
-			loop {
-				let pair: [u64; 2] = [self.perm, self.pm_ctrl];
-				match wait_any(&pair, 0) {
-					1 => {
-						if let Polled::Message { len, .. } = try_recv(self.pm_ctrl, &mut buf) {
-							if is_resolve(&buf[..len]) {
-								serve_resolve(self.pm_ctrl, b"permission_manager", &buf[..len], self.broker, self.state);
-							}
+		if !send_caps_blocking(self.perm, request, request_handles) {
+			return Err(proto::codec::TransportError::SendRefused);
+		}
+		let mut buf: [u8; 64] = [0u8; 64];
+		loop {
+			let pair: [u64; 2] = [self.perm, self.pm_ctrl];
+			match wait_any(&pair, 0) {
+				1 => {
+					if let Polled::Message { len, .. } = try_recv(self.pm_ctrl, &mut buf) {
+						if is_resolve(&buf[..len]) {
+							serve_resolve(self.pm_ctrl, b"permission_manager", &buf[..len], self.broker, self.state);
 						}
 					}
-					0 => match recv_vec_caps_blocking(self.perm, reply_handles) {
-						ReceivedVecCaps::Message { bytes } => return Ok(bytes),
-						ReceivedVecCaps::Closed => return Err(proto::codec::TransportError::PeerClosed),
-						ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => return Err(proto::codec::TransportError::ReceiveFailed),
-					},
-					_ => return Err(proto::codec::TransportError::ReceiveFailed),
 				}
+				0 => match recv_vec_caps_blocking(self.perm, reply_handles) {
+					ReceivedVecCaps::Message { bytes } => return Ok(bytes),
+					ReceivedVecCaps::Closed => return Err(proto::codec::TransportError::PeerClosed),
+					ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => return Err(proto::codec::TransportError::ReceiveFailed),
+				},
+				_ => return Err(proto::codec::TransportError::ReceiveFailed),
 			}
 		}
 	}
@@ -1558,7 +1530,7 @@ impl proto::codec::Transport for DrillTransport<'_> {
 	// Same reason as `DeadlineTransport`: these came from the kernel, so nothing else closes them.
 	fn discard_handles(&mut self, handles: &[u64]) {
 		for &handle in handles {
-			unsafe { close(handle) };
+			close(handle);
 		}
 	}
 }
@@ -1566,13 +1538,11 @@ impl proto::codec::Transport for DrillTransport<'_> {
 // Sleep for `ticks` by waiting on the never-written `park` channel until the deadline
 // passes. A bounded one-shot wait that sleeps the thread at ~0% CPU; the test scheduler
 // advances the finite deadline, so the sleep is deterministic under test.
-unsafe fn sleep_ticks(park: u64, ticks: u64) {
-	unsafe {
-		if park == 0 {
-			return;
-		}
-		wait(park, clock() + ticks);
+fn sleep_ticks(park: u64, ticks: u64) {
+	if park == 0 {
+		return;
 	}
+	wait(park, clock() + ticks);
 }
 
 // Stand as the supervisor after bring-up. Each iteration builds a wait set from every
@@ -1587,7 +1557,7 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // dropped from the wait set. The canary is restarted per policy; an admin message
 // drives a reverse-dependency stop; a stats request is answered over the `supervisor`
 // interface. Returns when nothing is left to watch.
-unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) {
+fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1782,95 +1752,93 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 // its dependents are torn down and the newline-joined list of what stopped is replied
 // for the shell to print. Returns false once the admin channel's peer (the shell) is
 // gone, so the supervisor drops it from its wait set.
-unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
-	unsafe {
-		let len: usize = match recv_blocking(admin, buf) {
-			Received::Message { len, .. } => len,
-			Received::Closed => return false,
+fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
+	let len: usize = match recv_blocking(admin, buf) {
+		Received::Message { len, .. } => len,
+		Received::Closed => return false,
+	};
+	// Copy the name out of `buf`, since the teardown reuses it to drain control channels.
+	let mut namebuf: [u8; 64] = [0u8; 64];
+	let nlen: usize = len.min(namebuf.len()).min(buf.len());
+	namebuf[..nlen].copy_from_slice(&buf[..nlen]);
+	let name: &[u8] = &namebuf[..nlen];
+	// A power verb (the shell's graceful `poweroff` / `reboot`): the reserved names
+	// `!poweroff` / `!reboot` (a real service name can never start with `!`) mean tear
+	// the whole service tree down in reverse-dependency order - flushing LogService's
+	// last journal batch first - then power the machine off (or reboot) from here, so no
+	// service is killed while a dependent still needs it. system_power does not return;
+	// if it somehow does (an unsupported machine), the loop stays alive.
+	if name == b"!poweroff" || name == b"!reboot" {
+		let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
+		shutdown_all(state, channels, sup, procs, log_client, buf);
+		// Say so before doing it. Powering off destroys the evidence of why: the machine
+		// stops, QEMU exits 0 with no reset and no fault, and from outside that is
+		// indistinguishable from a clean shutdown - which is how a suite came to end
+		// mid-run with nothing naming who ended it. The comment on the self-test path
+		// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
+		// just never reached the log.
+		debug_write(b"service_manager: power verb - shutting down\n");
+		// THROUGH THE SERVICE THAT HOLDS THE AUTHORITY, not through the syscall.
+		//
+		// `power` is a CLIENT CHANNEL of the `system_power` service SystemManager serves - it
+		// stopped being a root-Domain handle when that authority became a service. The syscall
+		// this used to call looks its argument up as a Domain carrying MANAGE, so it answered
+		// with an error every time: every `shutdown` tore the whole service tree down and then
+		// LEFT THE MACHINE RUNNING, with the kernel printing `halting` and QEMU still alive.
+		// The keyboard driver's Power key has always gone through the client and has always
+		// worked, which is how one of the two holders of this authority stayed correct.
+		//
+		// The call RETURNS ONLY WHEN IT FAILED - a machine that stops does not come back - so
+		// what follows is the refusal path, and this process is the last thing running: if it
+		// does not say so, nothing will.
+		let stopped = if action == POWER_REBOOT { system_power::Client::new(ChannelTransport { chan: power }).reboot() } else { system_power::Client::new(ChannelTransport { chan: power }).power_off() };
+		match stopped {
+			Some(Ok(())) => debug_write(b"service_manager: the machine did not stop, and the power service reported no error\n"),
+			Some(Err(_)) => debug_write(b"service_manager: the power service refused to stop the machine\n"),
+			None => debug_write(b"service_manager: the power service did not answer; the machine is still running\n"),
 		};
-		// Copy the name out of `buf`, since the teardown reuses it to drain control channels.
-		let mut namebuf: [u8; 64] = [0u8; 64];
-		let nlen: usize = len.min(namebuf.len()).min(buf.len());
-		namebuf[..nlen].copy_from_slice(&buf[..nlen]);
-		let name: &[u8] = &namebuf[..nlen];
-		// A power verb (the shell's graceful `poweroff` / `reboot`): the reserved names
-		// `!poweroff` / `!reboot` (a real service name can never start with `!`) mean tear
-		// the whole service tree down in reverse-dependency order - flushing LogService's
-		// last journal batch first - then power the machine off (or reboot) from here, so no
-		// service is killed while a dependent still needs it. system_power does not return;
-		// if it somehow does (an unsupported machine), the loop stays alive.
-		if name == b"!poweroff" || name == b"!reboot" {
-			let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
-			shutdown_all(state, channels, sup, procs, log_client, buf);
-			// Say so before doing it. Powering off destroys the evidence of why: the machine
-			// stops, QEMU exits 0 with no reset and no fault, and from outside that is
-			// indistinguishable from a clean shutdown - which is how a suite came to end
-			// mid-run with nothing naming who ended it. The comment on the self-test path
-			// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
-			// just never reached the log.
-			debug_write(b"service_manager: power verb - shutting down\n");
-			// THROUGH THE SERVICE THAT HOLDS THE AUTHORITY, not through the syscall.
-			//
-			// `power` is a CLIENT CHANNEL of the `system_power` service SystemManager serves - it
-			// stopped being a root-Domain handle when that authority became a service. The syscall
-			// this used to call looks its argument up as a Domain carrying MANAGE, so it answered
-			// with an error every time: every `shutdown` tore the whole service tree down and then
-			// LEFT THE MACHINE RUNNING, with the kernel printing `halting` and QEMU still alive.
-			// The keyboard driver's Power key has always gone through the client and has always
-			// worked, which is how one of the two holders of this authority stayed correct.
-			//
-			// The call RETURNS ONLY WHEN IT FAILED - a machine that stops does not come back - so
-			// what follows is the refusal path, and this process is the last thing running: if it
-			// does not say so, nothing will.
-			let stopped = if action == POWER_REBOOT { system_power::Client::new(ChannelTransport { chan: power }).reboot() } else { system_power::Client::new(ChannelTransport { chan: power }).power_off() };
-			match stopped {
-				Some(Ok(())) => debug_write(b"service_manager: the machine did not stop, and the power service reported no error\n"),
-				Some(Err(_)) => debug_write(b"service_manager: the power service refused to stop the machine\n"),
-				None => debug_write(b"service_manager: the power service did not answer; the machine is still running\n"),
-			};
-			return true;
-		}
-		// `+name` starts a service that was stopped, the inverse of the bare name below. The
-		// reserved prefix follows the power verbs' `!`: a real service name can never begin
-		// with one, so the verb needs no separate field and an old client cannot stumble into
-		// it. Refused unless the service is stopped AND this supervisor can bring it back -
-		// which is the same question as whether its clients resolve it by name, since a
-		// replacement nobody can re-resolve is a service its clients cannot reach.
-		if let Some(wanted) = name.strip_prefix(b"+") {
-			match index_of(wanted) {
-				Some(target) if start_stopped_service(broker, target, state, channels, procs, sup, stats_server, buf) => {
-					// WHAT WAS ASKED FOR, recorded beside what was observed. The operator asking for
-					// a service back is the only thing that can undo the `stopped` the stop below
-					// set; without this the two fields disagree for the rest of the boot, and the
-					// disagreement is what a drift check would report as a fault.
-					desired[target] = Desired::Running;
-					emit_event(log_client, MANIFEST[target].name, b"started");
-					console_report(MANIFEST[target].name, b"started");
-					let mut reply: Vec<u8> = Vec::new();
-					reply.extend_from_slice(b"STARTED\n");
-					reply.extend_from_slice(MANIFEST[target].name);
-					send_blocking(admin, &reply, 0);
-				}
-				_ => {
-					send_blocking(admin, b"NOTSTARTED", 0);
-				}
-			}
-			return true;
-		}
-		match index_of(name) {
-			Some(target) if state[target] == State::Ready => {
-				let stopped: Vec<u8> = stop_subtree(target, state, desired, &mut broker.lifecycle, channels, sup, procs, log_client, buf);
+		return true;
+	}
+	// `+name` starts a service that was stopped, the inverse of the bare name below. The
+	// reserved prefix follows the power verbs' `!`: a real service name can never begin
+	// with one, so the verb needs no separate field and an old client cannot stumble into
+	// it. Refused unless the service is stopped AND this supervisor can bring it back -
+	// which is the same question as whether its clients resolve it by name, since a
+	// replacement nobody can re-resolve is a service its clients cannot reach.
+	if let Some(wanted) = name.strip_prefix(b"+") {
+		match index_of(wanted) {
+			Some(target) if start_stopped_service(broker, target, state, channels, procs, sup, stats_server, buf) => {
+				// WHAT WAS ASKED FOR, recorded beside what was observed. The operator asking for
+				// a service back is the only thing that can undo the `stopped` the stop below
+				// set; without this the two fields disagree for the rest of the boot, and the
+				// disagreement is what a drift check would report as a fault.
+				desired[target] = Desired::Running;
+				emit_event(log_client, MANIFEST[target].name, b"started");
+				console_report(MANIFEST[target].name, b"started");
 				let mut reply: Vec<u8> = Vec::new();
-				reply.extend_from_slice(b"STOPPED\n");
-				reply.extend_from_slice(&stopped);
+				reply.extend_from_slice(b"STARTED\n");
+				reply.extend_from_slice(MANIFEST[target].name);
 				send_blocking(admin, &reply, 0);
 			}
 			_ => {
-				send_blocking(admin, b"NOTFOUND", 0);
+				send_blocking(admin, b"NOTSTARTED", 0);
 			}
 		}
-		true
+		return true;
 	}
+	match index_of(name) {
+		Some(target) if state[target] == State::Ready => {
+			let stopped: Vec<u8> = stop_subtree(target, state, desired, &mut broker.lifecycle, channels, sup, procs, log_client, buf);
+			let mut reply: Vec<u8> = Vec::new();
+			reply.extend_from_slice(b"STOPPED\n");
+			reply.extend_from_slice(&stopped);
+			send_blocking(admin, &reply, 0);
+		}
+		_ => {
+			send_blocking(admin, b"NOTFOUND", 0);
+		}
+	}
+	true
 }
 
 // Tear down a service and every component that transitively depends on it, dependents
@@ -1883,7 +1851,7 @@ unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut 
 // their bootstrap, so the cooperative STOP protocol does not reach them) and draining
 // its control channel to the peer-close. Returns the newline-joined names of everything
 // stopped, in teardown order.
-unsafe fn stop_subtree(target: usize, state: &mut [State; N], desired: &mut [Desired; N], lifecycle: &mut LifecycleLog, channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) -> Vec<u8> {
+fn stop_subtree(target: usize, state: &mut [State; N], desired: &mut [Desired; N], lifecycle: &mut LifecycleLog, channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) -> Vec<u8> {
 	unsafe {
 		let mut scope: [bool; N] = [false; N];
 		scope[target] = true;

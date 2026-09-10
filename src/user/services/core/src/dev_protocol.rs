@@ -1261,7 +1261,7 @@ fn declared_path(name: &[u8]) -> Option<&'static str> {
 // Write `body` to `path` on the volume through the agent's storage client. The buffer the
 // write takes is a transferred MemoryObject, and the call consumes it either way, so there is
 // nothing to release here on a failure.
-unsafe fn write_volume_file(storage: u64, path: &str, body: &[u8]) -> bool {
+fn write_volume_file(storage: u64, path: &str, body: &[u8]) -> bool {
 	unsafe {
 		if storage == 0 {
 			return false;
@@ -1274,7 +1274,7 @@ unsafe fn write_volume_file(storage: u64, path: &str, body: &[u8]) -> bool {
 
 // Remove `path` from the volume. Only names this session wrote are ever passed here, so a
 // removal that fails means the file is still there and the caller is told so.
-unsafe fn remove_volume_file(storage: u64, path: &str) -> bool {
+fn remove_volume_file(storage: u64, path: &str) -> bool {
 	if storage == 0 {
 		return false;
 	}

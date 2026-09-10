@@ -113,7 +113,7 @@ impl Gpu {
 
 	// GET_DISPLAY_INFO -> (width, height) of scanout 0, falling back to a default if the
 	// device reports nothing enabled yet.
-	unsafe fn display_size(&self) -> (u32, u32) {
+	fn display_size(&self) -> (u32, u32) {
 		unsafe {
 			self.hdr(CMD_GET_DISPLAY_INFO);
 			// response: hdr(24) + 16 * virtio_gpu_display_one{ rect(16), enabled(4), flags(4) }.
@@ -128,7 +128,7 @@ impl Gpu {
 	}
 
 	// RESOURCE_CREATE_2D: create the host-side B8G8R8X8 resource `id` of the given size.
-	unsafe fn create_2d(&self, id: u32, w: u32, h: u32) -> bool {
+	fn create_2d(&self, id: u32, w: u32, h: u32) -> bool {
 		unsafe {
 			self.hdr(CMD_RESOURCE_CREATE_2D);
 			wr32(self.cmd_virt + 24, id);
@@ -140,7 +140,7 @@ impl Gpu {
 	}
 
 	// RESOURCE_DETACH_BACKING: release resource `id`'s guest backing store.
-	unsafe fn detach_backing(&self, id: u32) -> bool {
+	fn detach_backing(&self, id: u32) -> bool {
 		unsafe {
 			self.hdr(CMD_RESOURCE_DETACH_BACKING);
 			wr32(self.cmd_virt + 24, id);
@@ -150,7 +150,7 @@ impl Gpu {
 	}
 
 	// RESOURCE_UNREF: destroy the host-side resource `id`.
-	unsafe fn unref(&self, id: u32) -> bool {
+	fn unref(&self, id: u32) -> bool {
 		unsafe {
 			self.hdr(CMD_RESOURCE_UNREF);
 			wr32(self.cmd_virt + 24, id);
@@ -228,7 +228,7 @@ impl Gpu {
 	}
 
 	// SET_SCANOUT: bind resource `id` to scanout 0 covering the whole display.
-	unsafe fn set_scanout(&self, id: u32, w: u32, h: u32) -> bool {
+	fn set_scanout(&self, id: u32, w: u32, h: u32) -> bool {
 		unsafe {
 			self.hdr(CMD_SET_SCANOUT);
 			self.rect(24, 0, 0, w, h);
@@ -242,7 +242,7 @@ impl Gpu {
 	// host resource `id`, then flush that rectangle to the display. `stride` is the
 	// resource's pixel width (the backing's allocated geometry), which fixes the byte
 	// offset of the rectangle's first pixel in the backing.
-	unsafe fn present(&self, id: u32, x: u32, y: u32, w: u32, h: u32, stride: u32) -> bool {
+	fn present(&self, id: u32, x: u32, y: u32, w: u32, h: u32, stride: u32) -> bool {
 		unsafe {
 			// TRANSFER_TO_HOST_2D: rect, offset(u64), resource_id, padding.
 			self.hdr(CMD_TRANSFER_TO_HOST_2D);
@@ -263,7 +263,7 @@ impl Gpu {
 	}
 
 	// Write a virtio_gpu_rect (x, y, width, height) at offset `at` in the command buffer.
-	unsafe fn rect(&self, at: u64, x: u32, y: u32, w: u32, h: u32) {
+	fn rect(&self, at: u64, x: u32, y: u32, w: u32, h: u32) {
 		unsafe {
 			wr32(self.cmd_virt + at, x);
 			wr32(self.cmd_virt + at + 4, y);
@@ -306,7 +306,7 @@ struct Backing {
 // DmaBuffer backing, its mem-entry list, RESOURCE_CREATE_2D and ATTACH_BACKING.
 // None on any failure, with everything allocated so far released (the caller keeps
 // its old backing).
-unsafe fn create_backing(gpu: &Gpu, id: u32, w: u32, h: u32) -> Option<Backing> {
+fn create_backing(gpu: &Gpu, id: u32, w: u32, h: u32) -> Option<Backing> {
 	unsafe {
 		let fb_size = align_up(w as u64 * h as u64 * 4, PAGE);
 		let pages = fb_size / PAGE;
@@ -334,13 +334,11 @@ unsafe fn create_backing(gpu: &Gpu, id: u32, w: u32, h: u32) -> Option<Backing> 
 // Release a replaced backing: unbind and destroy its host resource, then close our
 // guest handles (ConsoleService's dup keeps the old buffer alive until it swaps to
 // the replacement, so its mapping never dangles).
-unsafe fn release_backing(gpu: &Gpu, old: Backing) {
-	unsafe {
-		gpu.detach_backing(old.id);
-		gpu.unref(old.id);
-		close(old.entries.handle);
-		close(old.handle);
-	}
+fn release_backing(gpu: &Gpu, old: Backing) {
+	gpu.detach_backing(old.id);
+	gpu.unref(old.id);
+	close(old.entries.handle);
+	close(old.handle);
 }
 
 #[unsafe(no_mangle)]

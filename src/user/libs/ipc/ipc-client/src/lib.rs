@@ -37,26 +37,24 @@ pub struct ChannelTransport {
 
 impl Transport for ChannelTransport {
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
-		unsafe {
-			if !send_caps_blocking(self.chan, request, request_handles) {
-				return Err(TransportError::SendRefused);
-			}
-			// EACH ENDING KEPT DISTINCT. These were one `None`, so a caller could not tell a
-			// departed peer (retry impossible) from a refused receive (peer still there) from a
-			// deadline (the request may already have been acted on).
-			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
-				ReceivedVecCaps::Message { bytes } => Ok(bytes),
-				ReceivedVecCaps::Closed => Err(TransportError::PeerClosed),
-				ReceivedVecCaps::Failed => Err(TransportError::ReceiveFailed),
-				ReceivedVecCaps::TimedOut => Err(TransportError::TimedOut),
-			}
+		if !send_caps_blocking(self.chan, request, request_handles) {
+			return Err(TransportError::SendRefused);
+		}
+		// EACH ENDING KEPT DISTINCT. These were one `None`, so a caller could not tell a
+		// departed peer (retry impossible) from a refused receive (peer still there) from a
+		// deadline (the request may already have been acted on).
+		match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+			ReceivedVecCaps::Message { bytes } => Ok(bytes),
+			ReceivedVecCaps::Closed => Err(TransportError::PeerClosed),
+			ReceivedVecCaps::Failed => Err(TransportError::ReceiveFailed),
+			ReceivedVecCaps::TimedOut => Err(TransportError::TimedOut),
 		}
 	}
 
 	fn discard_handles(&mut self, handles: &[u64]) {
 		for &handle in handles {
 			if handle != 0 {
-				unsafe { close(handle) };
+				close(handle);
 			}
 		}
 	}
@@ -73,44 +71,40 @@ impl SvcTransport {
 		SvcTransport { broker, name, chan }
 	}
 
-	pub unsafe fn channel(&mut self) -> u64 {
+	pub fn channel(&mut self) -> u64 {
 		if self.chan == 0 {
-			self.chan = unsafe { resolve(self.broker, self.name) }.unwrap_or(0);
+			self.chan = resolve(self.broker, self.name).unwrap_or(0);
 		}
 		self.chan
 	}
 
-	pub unsafe fn reconnect(&mut self) -> bool {
-		unsafe {
-			if self.chan != 0 {
-				close(self.chan);
-				self.chan = 0;
-			}
-			self.channel() != 0
+	pub fn reconnect(&mut self) -> bool {
+		if self.chan != 0 {
+			close(self.chan);
+			self.chan = 0;
 		}
+		self.channel() != 0
 	}
 }
 
 impl Transport for SvcTransport {
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
-		unsafe {
-			let chan = self.channel();
-			if chan == 0 {
-				return Err(TransportError::NoRoute);
+		let chan = self.channel();
+		if chan == 0 {
+			return Err(TransportError::NoRoute);
+		}
+		if !send_caps_blocking(chan, request, request_handles) {
+			if !self.reconnect() || !send_caps_blocking(self.chan, request, request_handles) {
+				return Err(TransportError::SendRefused);
 			}
-			if !send_caps_blocking(chan, request, request_handles) {
-				if !self.reconnect() || !send_caps_blocking(self.chan, request, request_handles) {
-					return Err(TransportError::SendRefused);
-				}
-			}
-			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
-				ReceivedVecCaps::Message { bytes } => Ok(bytes),
-				ReceivedVecCaps::Failed => Err(TransportError::ReceiveFailed),
-				ReceivedVecCaps::TimedOut => Err(TransportError::TimedOut),
-				ReceivedVecCaps::Closed => {
-					let _ = self.reconnect();
-					Err(TransportError::PeerClosed)
-				}
+		}
+		match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+			ReceivedVecCaps::Message { bytes } => Ok(bytes),
+			ReceivedVecCaps::Failed => Err(TransportError::ReceiveFailed),
+			ReceivedVecCaps::TimedOut => Err(TransportError::TimedOut),
+			ReceivedVecCaps::Closed => {
+				let _ = self.reconnect();
+				Err(TransportError::PeerClosed)
 			}
 		}
 	}
@@ -118,7 +112,7 @@ impl Transport for SvcTransport {
 	fn discard_handles(&mut self, handles: &[u64]) {
 		for &handle in handles {
 			if handle != 0 {
-				unsafe { close(handle) };
+				close(handle);
 			}
 		}
 	}

@@ -490,58 +490,56 @@ impl Clients {
 // Mint a launch-scoped capability. Display binding consumes a duplicate of the exact
 // task ProcessService just returned and atomically returns its associated connection;
 // input/audio admins mint connections narrowed to their advertised operation subset.
-unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: &str) -> u64 {
-	unsafe {
-		match cap {
-			Capability::Display => {
-				if clients.display_admin == 0 {
-					return 0;
-				}
-				let bound_task: i64 = duplicate(task, RIGHT_MANAGE | RIGHT_TRANSFER);
-				if bound_task < 0 {
-					return 0;
-				}
-				match display_admin::Client::new(ChannelTransport { chan: clients.display_admin }).bind(&(bound_task as u64)) {
-					Some(Ok(display)) => display,
-					_ => {
-						close(bound_task as u64);
-						0
-					}
+fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: &str) -> u64 {
+	match cap {
+		Capability::Display => {
+			if clients.display_admin == 0 {
+				return 0;
+			}
+			let bound_task: i64 = duplicate(task, RIGHT_MANAGE | RIGHT_TRANSFER);
+			if bound_task < 0 {
+				return 0;
+			}
+			match display_admin::Client::new(ChannelTransport { chan: clients.display_admin }).bind(&(bound_task as u64)) {
+				Some(Ok(display)) => display,
+				_ => {
+					close(bound_task as u64);
+					0
 				}
 			}
-			Capability::InputKeys => {
-				if clients.input_admin == 0 {
-					return 0;
-				}
-				match input_admin::Client::new(ChannelTransport { chan: clients.input_admin }).open_keys() {
-					Some(Ok(input)) => input,
-					_ => 0,
-				}
-			}
-			Capability::AudioStream => {
-				if clients.audio_admin == 0 {
-					return 0;
-				}
-				match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_streams() {
-					Some(Ok(audio)) => audio,
-					_ => 0,
-				}
-			}
-			// THE OTHER DIRECTION, FROM THE SAME ADMIN CHANNEL AND NOT THE SAME GRANT. The
-			// connection this mints refuses `open-stream` and refuses `beep`, so a recorder holding
-			// it cannot make a sound - which is what makes granting a microphone a decision the
-			// manifest states rather than one that comes along with playback.
-			Capability::AudioCapture => {
-				if clients.audio_admin == 0 {
-					return 0;
-				}
-				match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_captures() {
-					Some(Ok(audio)) => audio,
-					_ => 0,
-				}
-			}
-			_ => grant_handle(clients, cap, component),
 		}
+		Capability::InputKeys => {
+			if clients.input_admin == 0 {
+				return 0;
+			}
+			match input_admin::Client::new(ChannelTransport { chan: clients.input_admin }).open_keys() {
+				Some(Ok(input)) => input,
+				_ => 0,
+			}
+		}
+		Capability::AudioStream => {
+			if clients.audio_admin == 0 {
+				return 0;
+			}
+			match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_streams() {
+				Some(Ok(audio)) => audio,
+				_ => 0,
+			}
+		}
+		// THE OTHER DIRECTION, FROM THE SAME ADMIN CHANNEL AND NOT THE SAME GRANT. The
+		// connection this mints refuses `open-stream` and refuses `beep`, so a recorder holding
+		// it cannot make a sound - which is what makes granting a microphone a decision the
+		// manifest states rather than one that comes along with playback.
+		Capability::AudioCapture => {
+			if clients.audio_admin == 0 {
+				return 0;
+			}
+			match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_captures() {
+				Some(Ok(audio)) => audio,
+				_ => 0,
+			}
+		}
+		_ => grant_handle(clients, cap, component),
 	}
 }
 
@@ -581,89 +579,87 @@ fn asset_bundle(component: &str) -> &str {
 // Returns 0 when no live client can be produced. (A re-resolving grant assumes the
 // broker peer answers RESOLVE - ServiceManager does; a scenario that grants config or
 // device must stand in for the broker or keep the service alive.)
-unsafe fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 {
-	unsafe {
-		// A LAUNCH-SCOPED, DIRECTORY-CONFINED CLIENT, minted fresh for every launch.
-		//
-		// The scope is DERIVED FROM WHO IS BEING LAUNCHED rather than written in the manifest beside
-		// the grant, so a component cannot be given somebody else's assets by a typo: `asset_bundle`
-		// is a function, and the manifest says only whether the capability is granted at all.
-		// Minting per launch also means the grant dies with the process rather than being a handle
-		// the manager keeps and hands out repeatedly.
-		if cap == Capability::AppAssets {
-			if clients.storage_admin == 0 {
-				return 0;
-			}
-			let mut path = String::from("vol://system/bin/");
-			path.push_str(asset_bundle(component));
-			let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_directory(&path) {
-				Some(Ok(client)) => client,
-				_ => return 0,
-			};
-			let dup = duplicate(minted, GRANT_RIGHTS);
-			close(minted);
-			return if dup >= 0 { dup as u64 } else { 0 };
-		}
-		if cap == Capability::Usb {
-			clients.usb_providers.poll();
-			if clients.usb_providers.channel == 0 {
-				clients.usb_providers = ProviderWatch::subscribe(clients.usb_catalogue, ProviderKind::UsbBus);
-			}
-			for info in &clients.usb_providers.entries {
-				let minted = open_provider(clients.usb_catalogue, info);
-				if minted == 0 {
-					continue;
-				}
-				let narrowed = duplicate(minted, GRANT_RIGHTS);
-				close(minted);
-				return if narrowed > 0 { narrowed as u64 } else { 0 };
-			}
+fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 {
+	// A LAUNCH-SCOPED, DIRECTORY-CONFINED CLIENT, minted fresh for every launch.
+	//
+	// The scope is DERIVED FROM WHO IS BEING LAUNCHED rather than written in the manifest beside
+	// the grant, so a component cannot be given somebody else's assets by a typo: `asset_bundle`
+	// is a function, and the manifest says only whether the capability is granted at all.
+	// Minting per launch also means the grant dies with the process rather than being a handle
+	// the manager keeps and hands out repeatedly.
+	if cap == Capability::AppAssets {
+		if clients.storage_admin == 0 {
 			return 0;
 		}
-		if cap == Capability::Network {
-			let mut client = network::Client::new(ChannelTransport { chan: clients.network });
-			let minted = match client.open() {
-				Some(Ok(minted)) => minted,
-				_ => return 0,
-			};
-			let dup = duplicate(minted, GRANT_RIGHTS);
-			close(minted);
-			return if dup >= 0 { dup as u64 } else { 0 };
-		}
-		let (held, name): (&mut u64, &'static [u8]) = match cap {
-			Capability::Config => (&mut clients.config, CAP_CONFIG),
-			Capability::Device => (&mut clients.device, CAP_DEVICE),
-			_ => {
-				let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
-				return if dup >= 0 { dup as u64 } else { 0 };
-			}
+		let mut path = String::from("vol://system/bin/");
+		path.push_str(asset_bundle(component));
+		let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_directory(&path) {
+			Some(Ok(client)) => client,
+			_ => return 0,
 		};
-		// Mint a fresh sub-connection, re-resolving a dead held client through the
-		// broker (answered once the restarted instance serves).
-		let minted: u64 = match connect_or_resolve(held, clients.broker, name) {
-			Some(m) => m,
-			None => return 0,
-		};
-		// AND A READ-ONLY CONFIGURATION GRANT IS SEALED BEFORE IT IS HANDED OVER.
-		//
-		// `lsdev` needs to read one persisted record - a device's last incident, under the reserved
-		// prefix - after DeviceManager has died. Granting it `Capability::Config` for that gave it a
-		// full configuration client, whose `set` accepts any key outside the reserved namespace:
-		// authority over unrelated system configuration, granted to a status tool, to answer a
-		// question about a device.
-		//
-		// The connection is sealed HERE, by the authority that mints it, so what the tool receives
-		// can only read. Sealing is irreversible and belongs to the connection, so asking again
-		// produces another sealed one.
-		if cap == Capability::Config && config_is_read_only(component) && config::Client::new(ChannelTransport { chan: minted }).seal().is_none_or(|answer| answer.is_err()) {
-			close(minted);
-			return 0;
-		}
-		// Narrow the minted connection to a client's rights, like every other grant.
-		let dup: i64 = duplicate(minted, GRANT_RIGHTS);
+		let dup = duplicate(minted, GRANT_RIGHTS);
 		close(minted);
-		if dup >= 0 { dup as u64 } else { 0 }
+		return if dup >= 0 { dup as u64 } else { 0 };
 	}
+	if cap == Capability::Usb {
+		clients.usb_providers.poll();
+		if clients.usb_providers.channel == 0 {
+			clients.usb_providers = ProviderWatch::subscribe(clients.usb_catalogue, ProviderKind::UsbBus);
+		}
+		for info in &clients.usb_providers.entries {
+			let minted = open_provider(clients.usb_catalogue, info);
+			if minted == 0 {
+				continue;
+			}
+			let narrowed = duplicate(minted, GRANT_RIGHTS);
+			close(minted);
+			return if narrowed > 0 { narrowed as u64 } else { 0 };
+		}
+		return 0;
+	}
+	if cap == Capability::Network {
+		let mut client = network::Client::new(ChannelTransport { chan: clients.network });
+		let minted = match client.open() {
+			Some(Ok(minted)) => minted,
+			_ => return 0,
+		};
+		let dup = duplicate(minted, GRANT_RIGHTS);
+		close(minted);
+		return if dup >= 0 { dup as u64 } else { 0 };
+	}
+	let (held, name): (&mut u64, &'static [u8]) = match cap {
+		Capability::Config => (&mut clients.config, CAP_CONFIG),
+		Capability::Device => (&mut clients.device, CAP_DEVICE),
+		_ => {
+			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
+			return if dup >= 0 { dup as u64 } else { 0 };
+		}
+	};
+	// Mint a fresh sub-connection, re-resolving a dead held client through the
+	// broker (answered once the restarted instance serves).
+	let minted: u64 = match connect_or_resolve(held, clients.broker, name) {
+		Some(m) => m,
+		None => return 0,
+	};
+	// AND A READ-ONLY CONFIGURATION GRANT IS SEALED BEFORE IT IS HANDED OVER.
+	//
+	// `lsdev` needs to read one persisted record - a device's last incident, under the reserved
+	// prefix - after DeviceManager has died. Granting it `Capability::Config` for that gave it a
+	// full configuration client, whose `set` accepts any key outside the reserved namespace:
+	// authority over unrelated system configuration, granted to a status tool, to answer a
+	// question about a device.
+	//
+	// The connection is sealed HERE, by the authority that mints it, so what the tool receives
+	// can only read. Sealing is irreversible and belongs to the connection, so asking again
+	// produces another sealed one.
+	if cap == Capability::Config && config_is_read_only(component) && config::Client::new(ChannelTransport { chan: minted }).seal().is_none_or(|answer| answer.is_err()) {
+		close(minted);
+		return 0;
+	}
+	// Narrow the minted connection to a client's rights, like every other grant.
+	let dup: i64 = duplicate(minted, GRANT_RIGHTS);
+	close(minted);
+	if dup >= 0 { dup as u64 } else { 0 }
 }
 
 // The manager's serve state. The manifest table is fixed policy (served read-only by
@@ -689,10 +685,10 @@ impl Service for Manager {
 	}
 	fn run(&mut self, name: String, args: String, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<StartResult, Error> {
 		if !environment_is_acceptable(&environment) {
-			unsafe { close(stdout) };
+			close(stdout);
 			return Err(Error::Invalid);
 		}
-		unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, 0, &mut self.clients, &mut self.audit) }
+		run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, 0, &mut self.clients, &mut self.audit)
 	}
 
 	// The same launch, and the caller's terminal with it. See the op's own comment in
@@ -706,13 +702,11 @@ impl Service for Manager {
 	// point, which is why it is the one place both are closed here.
 	fn run_interactive(&mut self, name: String, args: String, cwd: String, environment: Vec<EnvVar>, stdout: u64, control: u64) -> Result<StartResult, Error> {
 		if !environment_is_acceptable(&environment) {
-			unsafe {
-				close(stdout);
-				close(control);
-			}
+			close(stdout);
+			close(control);
 			return Err(Error::Invalid);
 		}
-		unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, control, &mut self.clients, &mut self.audit) }
+		run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, control, &mut self.clients, &mut self.audit)
 	}
 
 	// Start a program over ONE SELECTED FILE, with an attenuated grant in place of the volume
@@ -729,10 +723,10 @@ impl Service for Manager {
 		// and the closed set is checked here as well as in the caller because the caller is not the
 		// thing being trusted.
 		if !matches!(name.as_str(), "licoview" | "licoedit" | "imgview" | "play") {
-			unsafe { close(stdout) };
+			close(stdout);
 			return Err(Error::Denied);
 		}
-		unsafe { run_tool_over_file(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &file, writable, stdout, &mut self.clients, &mut self.audit) }
+		run_tool_over_file(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &file, writable, stdout, &mut self.clients, &mut self.audit)
 	}
 
 	// Start a pipeline as one transaction. The broker allocates every edge itself: the caller
@@ -741,71 +735,69 @@ impl Service for Manager {
 	// the LAST stage - every earlier stage writes into the edge made for it.
 	fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<PipelineResult, Error> {
 		if !environment_is_acceptable(&environment) {
-			unsafe { close(stdout) };
+			close(stdout);
 			return Err(Error::Invalid);
 		}
 		if stages.is_empty() || stages.len() > MAX_PIPELINE_STAGES {
 			// Bounded like every other resource here: a caller cannot ask for an unbounded
 			// number of processes and endpoints in one request.
-			unsafe { close(stdout) };
+			close(stdout);
 			return Err(Error::Invalid);
 		}
-		unsafe {
-			// One edge per `A | B`. Allocated up front so a failure to make one costs nothing
-			// but the endpoints already made - no stage exists yet.
-			let mut edges: Vec<(u64, u64)> = Vec::new();
-			for _ in 1..stages.len() {
-				match channel() {
-					Some(pair) => edges.push(pair),
-					None => {
-						for (read, write) in edges {
-							close(read);
-							close(write);
-						}
-						close(stdout);
-						return Err(Error::Invalid);
+		// One edge per `A | B`. Allocated up front so a failure to make one costs nothing
+		// but the endpoints already made - no stage exists yet.
+		let mut edges: Vec<(u64, u64)> = Vec::new();
+		for _ in 1..stages.len() {
+			match channel() {
+				Some(pair) => edges.push(pair),
+				None => {
+					for (read, write) in edges {
+						close(read);
+						close(write);
 					}
+					close(stdout);
+					return Err(Error::Invalid);
 				}
 			}
-			// Stage i writes to edge i (or the terminal, if it is last) and reads from
-			// edge i-1 (or nothing, if it is first). `channel()` returns (a, b) as a connected
-			// pair; a stage writes into one end and its consumer reads the other.
-			let mut requests: Vec<StageRequest> = Vec::new();
-			for (index, stage) in stages.iter().enumerate() {
-				let out: u64 = if index + 1 == stages.len() { stdout } else { edges[index].1 };
-				let input: u64 = if index == 0 { 0 } else { edges[index - 1].0 };
-				// A stage's diagnostics belong on the TERMINAL, not in the pipe.
-				//
-				// Every stage but the last writes into an edge, and until the error endpoint
-				// existed a diagnostic had nowhere else to go: `eprint` falls back to stdout, so
-				// `cat missing | readln` would hand "cat: invalid path" to `readln` as if it were
-				// data. Each stage gets its own send-only duplicate of the terminal, so a message
-				// reaches the person and the pipe carries only what the tool produced.
-				//
-				// Send-only deliberately: a stage has no business READING the terminal through the
-				// channel it reports errors on.
-				//
-				// UNLESS THE STAGE ASKED FOR `2>&1`, which is the opposite request: fold the
-				// diagnostics into the stream. Only the broker can serve it, because only the broker
-				// knows which endpoint a stage's output actually IS - an edge for every stage but
-				// the last, and the caller's terminal for that one. The shell cannot name it and
-				// deliberately cannot: the record's own comment says a caller names no stdio at all.
-				let error: u64 = {
-					let source: u64 = if stage.merge_errors { out } else { stdout };
-					let dup: i64 = duplicate(source, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
-					if dup > 0 { dup as u64 } else { 0 }
-				};
-				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input, stderr: error });
-			}
-			// EVERY ENDPOINT IS THE TRANSACTION'S FROM HERE. Each edge end, the terminal and the error
-			// duplicates are handed to the stage that owns them as it is installed, and the ones a
-			// failed transaction never installed are closed by the transaction itself - it is the only
-			// thing that knows which numbers were transferred and which are still this broker's.
-			// (This used to close every edge on failure, including the ones a stage had already been
-			// handed: a consumed handle number, closed again after the grants in between had minted
-			// new handles, is somebody else's handle.)
-			run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &environment, &mut self.clients, &mut self.audit)
 		}
+		// Stage i writes to edge i (or the terminal, if it is last) and reads from
+		// edge i-1 (or nothing, if it is first). `channel()` returns (a, b) as a connected
+		// pair; a stage writes into one end and its consumer reads the other.
+		let mut requests: Vec<StageRequest> = Vec::new();
+		for (index, stage) in stages.iter().enumerate() {
+			let out: u64 = if index + 1 == stages.len() { stdout } else { edges[index].1 };
+			let input: u64 = if index == 0 { 0 } else { edges[index - 1].0 };
+			// A stage's diagnostics belong on the TERMINAL, not in the pipe.
+			//
+			// Every stage but the last writes into an edge, and until the error endpoint
+			// existed a diagnostic had nowhere else to go: `eprint` falls back to stdout, so
+			// `cat missing | readln` would hand "cat: invalid path" to `readln` as if it were
+			// data. Each stage gets its own send-only duplicate of the terminal, so a message
+			// reaches the person and the pipe carries only what the tool produced.
+			//
+			// Send-only deliberately: a stage has no business READING the terminal through the
+			// channel it reports errors on.
+			//
+			// UNLESS THE STAGE ASKED FOR `2>&1`, which is the opposite request: fold the
+			// diagnostics into the stream. Only the broker can serve it, because only the broker
+			// knows which endpoint a stage's output actually IS - an edge for every stage but
+			// the last, and the caller's terminal for that one. The shell cannot name it and
+			// deliberately cannot: the record's own comment says a caller names no stdio at all.
+			let error: u64 = {
+				let source: u64 = if stage.merge_errors { out } else { stdout };
+				let dup: i64 = duplicate(source, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+				if dup > 0 { dup as u64 } else { 0 }
+			};
+			requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input, stderr: error });
+		}
+		// EVERY ENDPOINT IS THE TRANSACTION'S FROM HERE. Each edge end, the terminal and the error
+		// duplicates are handed to the stage that owns them as it is installed, and the ones a
+		// failed transaction never installed are closed by the transaction itself - it is the only
+		// thing that knows which numbers were transferred and which are still this broker's.
+		// (This used to close every edge on failure, including the ones a stage had already been
+		// handed: a consumed handle number, closed again after the grants in between had minted
+		// new handles, is somebody else's handle.)
+		run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &environment, &mut self.clients, &mut self.audit)
 	}
 }
 
@@ -902,8 +894,8 @@ const RECOVERY_TICKS: u64 = 500;
 impl Transaction {
 	// Mint the connection. A mint that fails is the cleanest refusal there is: nothing was
 	// prepared, nothing ran, and there is no record anywhere to cancel.
-	unsafe fn open(procsvc: u64) -> Option<Transaction> {
-		let chan: u64 = unsafe { service_connect(procsvc) }?;
+	fn open(procsvc: u64) -> Option<Transaction> {
+		let chan: u64 = service_connect(procsvc)?;
 		Some(Transaction { chan, client: process::Client::new(ChannelTransport { chan }), stages: Vec::new() })
 	}
 
@@ -928,7 +920,7 @@ impl Transaction {
 	// Prepare one stage on this connection and hold its handles until the transaction ends.
 	// `child_side` is the bootstrap end the service hands the program; it is transferred by the
 	// request and belongs to the service from then on, except when the request never left.
-	unsafe fn prepare(&mut self, name: &str, child_side: u64, manager_side: u64, memory_limit: Option<u64>) -> Result<usize, Fault> {
+	fn prepare(&mut self, name: &str, child_side: u64, manager_side: u64, memory_limit: Option<u64>) -> Result<usize, Fault> {
 		let answer: Option<Result<StartResult, Error>> = match memory_limit {
 			Some(limit) => self.client.launch_prepared_bounded(name, &limit, &child_side),
 			None => self.client.launch_prepared(name, &child_side),
@@ -940,12 +932,10 @@ impl Transaction {
 			}
 			other => {
 				let fault = Transaction::fault(&other);
-				unsafe {
-					if self.send_refused() {
-						close(child_side);
-					}
-					close(manager_side);
+				if self.send_refused() {
+					close(child_side);
 				}
+				close(manager_side);
 				Err(fault)
 			}
 		}
@@ -957,7 +947,7 @@ impl Transaction {
 
 	// Release one stage. The transaction goes on holding its handles either way; what the outcome
 	// means for them is the caller's decision.
-	unsafe fn release(&mut self, stage: usize) -> Release {
+	fn release(&mut self, stage: usize) -> Release {
 		let koid: u64 = self.stages[stage].started.info.koid;
 		match self.client.release(&koid) {
 			Some(Ok(true)) => Release::Started,
@@ -969,7 +959,7 @@ impl Transaction {
 	}
 
 	// Release every stage as one group.
-	unsafe fn release_group(&mut self) -> GroupRelease {
+	fn release_group(&mut self) -> GroupRelease {
 		let koids: Vec<u64> = self.stages.iter().map(|stage| stage.started.info.koid).collect();
 		match self.client.release_group(&koids) {
 			Some(Ok(true)) => GroupRelease::Committed,
@@ -987,31 +977,29 @@ impl Transaction {
 	// first, which is what makes the cleanup SYNCHRONOUS: by the time this returns the record and
 	// its Domain are gone rather than pending the service's next turn. On an `Uncertain` fault
 	// nothing is asked on the connection at all, because the next reply on it may be the late one.
-	unsafe fn abandon(self, fault: Fault) {
+	fn abandon(self, fault: Fault) {
 		let Transaction { chan, mut client, stages } = self;
 		let mut cancelling: bool = fault == Fault::Refused;
-		unsafe {
-			for stage in stages {
-				close(stage.manager_side);
-				if cancelling {
-					let cancelled = client.cancel(&stage.started.info.koid);
-					// A cancel that came back uncertain means the connection cannot be trusted
-					// for the next one either; the close below finishes the job.
-					if Transaction::fault(&cancelled) == Fault::Uncertain {
-						cancelling = false;
-					}
+		for stage in stages {
+			close(stage.manager_side);
+			if cancelling {
+				let cancelled = client.cancel(&stage.started.info.koid);
+				// A cancel that came back uncertain means the connection cannot be trusted
+				// for the next one either; the close below finishes the job.
+				if Transaction::fault(&cancelled) == Fault::Uncertain {
+					cancelling = false;
 				}
-				close(stage.started.task);
 			}
-			close(chan);
+			close(stage.started.task);
 		}
+		close(chan);
 	}
 
 	// Commit: the caller takes the stages - their tasks are its job-control handles now - and the
 	// connection is closed. Every launch on it was released, so nothing is prepared on it any more
 	// and its closing abandons nothing.
-	unsafe fn commit(self) -> Vec<Stage> {
-		unsafe { close(self.chan) };
+	fn commit(self) -> Vec<Stage> {
+		close(self.chan);
 		self.stages
 	}
 }
@@ -1022,26 +1010,22 @@ impl Transaction {
 // it can `SIG_KILL` the program and wait for the kernel to say it is gone. Returns whether it did
 // within the bound; a program that could not be confirmed dead is reported as such rather than
 // assumed.
-unsafe fn recover_started(task: u64) -> bool {
-	unsafe {
-		signal(task, SIG_KILL);
-		wait(task, clock() + RECOVERY_TICKS) == 0
-	}
+fn recover_started(task: u64) -> bool {
+	signal(task, SIG_KILL);
+	wait(task, clock() + RECOVERY_TICKS) == 0
 }
 
 // The same for a pipeline, through the group handle that was minted over its prepared members
 // before any of them was released - which is why it exists before a release can go wrong.
-unsafe fn recover_group(group: u64) -> bool {
-	unsafe {
-		process_group_signal(group, SIG_KILL);
-		wait(group, clock() + RECOVERY_TICKS) == 0
-	}
+fn recover_group(group: u64) -> bool {
+	process_group_signal(group, SIG_KILL);
+	wait(group, clock() + RECOVERY_TICKS) == 0
 }
 
 // Ask ProcessService to reap what has ended, on the manager's ordinary client. A killed launch's
 // record - and the Domain a bounded one ran in - goes at the service's next reap, and this is that
 // reap rather than whenever the next launch happens to trigger one.
-unsafe fn reap_through(procsvc: u64) {
+fn reap_through(procsvc: u64) {
 	let _ = process::Client::new(ChannelTransport { chan: procsvc }).list();
 }
 
@@ -1054,111 +1038,107 @@ unsafe fn reap_through(procsvc: u64) {
 // is decided by the headless policy default and recorded in the same audit trail as a
 // dynamic decision. Returns the bytes the component reported back (its proof the granted
 // capabilities are live), or None if the launch failed.
-unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
-	unsafe {
-		let name: String = String::from_utf8_lossy(component).into_owned();
-		let mut transaction: Transaction = Transaction::open(procsvc)?;
-		let Some((manager_side, child_side)) = channel() else {
-			transaction.abandon(Fault::Refused);
+fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
+	let name: String = String::from_utf8_lossy(component).into_owned();
+	let mut transaction: Transaction = Transaction::open(procsvc)?;
+	let Some((manager_side, child_side)) = channel() else {
+		transaction.abandon(Fault::Refused);
+		return None;
+	};
+	// PREPARED, not started: the component is built but does not run until every grant
+	// below has been installed. A launch that fails partway is then a process that never
+	// ran at all, rather than one that observed half its capabilities and started work on
+	// the strength of them.
+	let stage: usize = match transaction.prepare(&name, child_side, manager_side, None) {
+		Ok(stage) => stage,
+		Err(fault) => {
+			transaction.abandon(fault);
 			return None;
-		};
-		// PREPARED, not started: the component is built but does not run until every grant
-		// below has been installed. A launch that fails partway is then a process that never
-		// ran at all, rather than one that observed half its capabilities and started work on
-		// the strength of them.
-		let stage: usize = match transaction.prepare(&name, child_side, manager_side, None) {
-			Ok(stage) => stage,
-			Err(fault) => {
-				transaction.abandon(fault);
-				return None;
-			}
-		};
-		let task: u64 = transaction.task(stage);
-		let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
-			transaction.abandon(Fault::Refused);
-			return None;
-		};
-		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
-			transaction.abandon(Fault::Refused);
-			return None;
-		};
-		// Grant exactly the manifest's capabilities, auditing every decision. A granted
-		// client is duplicated (the manager keeps its own) with only the rights a client
-		// needs, then transferred under its tag; a withheld capability is recorded denied
-		// and simply never handed over - so the component cannot reach it. A capability the
-		// manifest grants and the manager cannot produce is a FAILED LAUNCH, not a program
-		// started without the authority it asked for.
-		for &cap in VOCABULARY.iter() {
-			let granted: bool = manifest.grants.contains(&cap);
-			if granted {
-				let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
-				if handle == 0 || !hand_over(manager_side, tag_for(cap), handle) {
-					transaction.abandon(Fault::Refused);
-					return None;
-				}
-			}
-			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 		}
-		// Every static grant is installed, so the graph this component can see is complete:
-		// release it. This MUST happen before the receive loop below - the manager waits on
-		// the component there, and waiting on a process that was never started is a hang, not
-		// an error. It is also the transaction's commit point: everything above can fail and
-		// leave nothing running, and nothing below can.
-		match transaction.release(stage) {
-			Release::Started => {}
-			Release::Refused | Release::StartFailed => {
+	};
+	let task: u64 = transaction.task(stage);
+	let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
+		transaction.abandon(Fault::Refused);
+		return None;
+	};
+	let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+		transaction.abandon(Fault::Refused);
+		return None;
+	};
+	// Grant exactly the manifest's capabilities, auditing every decision. A granted
+	// client is duplicated (the manager keeps its own) with only the rights a client
+	// needs, then transferred under its tag; a withheld capability is recorded denied
+	// and simply never handed over - so the component cannot reach it. A capability the
+	// manifest grants and the manager cannot produce is a FAILED LAUNCH, not a program
+	// started without the authority it asked for.
+	for &cap in VOCABULARY.iter() {
+		let granted: bool = manifest.grants.contains(&cap);
+		if granted {
+			let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+			if handle == 0 || !hand_over(manager_side, tag_for(cap), handle) {
 				transaction.abandon(Fault::Refused);
 				return None;
 			}
-			Release::Uncertain => {
-				recover_started(task);
-				transaction.abandon(Fault::Uncertain);
-				reap_through(procsvc);
-				return None;
-			}
 		}
-		let mut stages: Vec<Stage> = transaction.commit();
-		let Stage { started, manager_side } = stages.remove(stage);
-		// Handle any runtime permission requests, then capture the component's final report. A
-		// request is `REQUEST` + a capability ordinal for a capability outside the manifest;
-		// the headless policy default decides it (recorded as a dynamic audit entry), and the
-		// manager replies with the granted client or a bare DENY. Any other message is the
-		// component's final report - the bytes it produced through its grants - and ends the
-		// launch.
-		let result: Option<Vec<u8>> = loop {
-			match recv_blocking(manager_side, buf) {
-				Received::Message { len, .. } => {
-					if let Some(cap) = parse_request(&buf[..len]) {
-						let granted: bool = grant_dynamic(policy_name.as_bytes(), cap, clients, manager_side);
-						audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: true });
-						continue;
-					}
-					break Some(buf[..len].to_vec());
-				}
-				Received::Closed => break None,
-			}
-		};
-		close(manager_side);
-		close(started.task);
-		result
+		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 	}
+	// Every static grant is installed, so the graph this component can see is complete:
+	// release it. This MUST happen before the receive loop below - the manager waits on
+	// the component there, and waiting on a process that was never started is a hang, not
+	// an error. It is also the transaction's commit point: everything above can fail and
+	// leave nothing running, and nothing below can.
+	match transaction.release(stage) {
+		Release::Started => {}
+		Release::Refused | Release::StartFailed => {
+			transaction.abandon(Fault::Refused);
+			return None;
+		}
+		Release::Uncertain => {
+			recover_started(task);
+			transaction.abandon(Fault::Uncertain);
+			reap_through(procsvc);
+			return None;
+		}
+	}
+	let mut stages: Vec<Stage> = transaction.commit();
+	let Stage { started, manager_side } = stages.remove(stage);
+	// Handle any runtime permission requests, then capture the component's final report. A
+	// request is `REQUEST` + a capability ordinal for a capability outside the manifest;
+	// the headless policy default decides it (recorded as a dynamic audit entry), and the
+	// manager replies with the granted client or a bare DENY. Any other message is the
+	// component's final report - the bytes it produced through its grants - and ends the
+	// launch.
+	let result: Option<Vec<u8>> = loop {
+		match recv_blocking(manager_side, buf) {
+			Received::Message { len, .. } => {
+				if let Some(cap) = parse_request(&buf[..len]) {
+					let granted: bool = grant_dynamic(policy_name.as_bytes(), cap, clients, manager_side);
+					audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: true });
+					continue;
+				}
+				break Some(buf[..len].to_vec());
+			}
+			Received::Closed => break None,
+		}
+	};
+	close(manager_side);
+	close(started.task);
+	result
 }
 
 // Decide and act on one runtime permission request: apply the headless policy default and,
 // if it allows the request and the manager actually holds the capability, duplicate that
 // client (with only the rights a client needs) and transfer it under its tag; otherwise
 // reply with a bare DENY (no handle). Returns whether the capability was handed over.
-unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients, manager_side: u64) -> bool {
-	unsafe {
-		if dynamic_policy(component, cap) {
-			let handle: u64 = grant_handle(clients, cap, &String::from_utf8_lossy(component));
-			if handle != 0 && hand_over(manager_side, tag_for(cap), handle) {
-				return true;
-			}
+fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients, manager_side: u64) -> bool {
+	if dynamic_policy(component, cap) {
+		let handle: u64 = grant_handle(clients, cap, &String::from_utf8_lossy(component));
+		if handle != 0 && hand_over(manager_side, tag_for(cap), handle) {
+			return true;
 		}
-		send_blocking(manager_side, DENY_REPLY, 0);
-		false
 	}
+	send_blocking(manager_side, DENY_REPLY, 0);
+	false
 }
 
 // Run a named system tool on demand under its permission manifest - the launcher / granter
@@ -1173,147 +1153,145 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients
 // `stdout` and `control` belong to the child from the moment they are queued on its bootstrap
 // channel; a failure after that closes the channel, which drops them with it, and a failure
 // before it closes them here. Either way the caller does not close them - see `run_interactive`.
-unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, control: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<StartResult, Error> {
-	unsafe {
-		// The endpoints are ours until they are queued. Every refusal before that point closes
-		// them; every refusal after it closes the channel they were queued on.
-		let close_endpoints = |stdout: u64, control: u64| {
-			close(stdout);
-			if control != 0 {
-				close(control);
-			}
-		};
-		let Ok(name_str) = core::str::from_utf8(name) else {
+fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, control: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<StartResult, Error> {
+	// The endpoints are ours until they are queued. Every refusal before that point closes
+	// them; every refusal after it closes the channel they were queued on.
+	let close_endpoints = |stdout: u64, control: u64| {
+		close(stdout);
+		if control != 0 {
+			close(control);
+		}
+	};
+	let Ok(name_str) = core::str::from_utf8(name) else {
+		close_endpoints(stdout, control);
+		return Err(Error::NotFound);
+	};
+	let Some(mut transaction) = Transaction::open(procsvc) else {
+		close_endpoints(stdout, control);
+		return Err(Error::NotFound);
+	};
+	let Some((manager_side, child_side)) = channel() else {
+		close_endpoints(stdout, control);
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	// Prepared, never started here: every tool goes through the same gate a pipeline stage
+	// does, so the single-stage and multi-stage paths cannot drift in how a process is
+	// built. The release is at the bottom, once the whole graph this tool can see exists.
+	//
+	// THE BOUNDED TOOL IS PREPARED TOO. `imgconv` runs in a Domain of its own with a memory
+	// limit; it used to be the one tool that was STARTED first and granted afterwards, because
+	// the only bounded launch was a live one - so a grant that failed could not be restored to
+	// "the tool never ran". `launch-prepared-bounded` is the same limit behind the same gate.
+	let memory_limit: Option<u64> = if name == b"imgconv" { Some(IMGCONV_MEMORY_LIMIT) } else { None };
+	let stage: usize = match transaction.prepare(name_str, child_side, manager_side, memory_limit) {
+		Ok(stage) => stage,
+		Err(fault) => {
+			debug_write(name);
+			debug_write(b"\n");
 			close_endpoints(stdout, control);
-			return Err(Error::NotFound);
-		};
-		let Some(mut transaction) = Transaction::open(procsvc) else {
-			close_endpoints(stdout, control);
-			return Err(Error::NotFound);
-		};
-		let Some((manager_side, child_side)) = channel() else {
-			close_endpoints(stdout, control);
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		// Prepared, never started here: every tool goes through the same gate a pipeline stage
-		// does, so the single-stage and multi-stage paths cannot drift in how a process is
-		// built. The release is at the bottom, once the whole graph this tool can see exists.
-		//
-		// THE BOUNDED TOOL IS PREPARED TOO. `imgconv` runs in a Domain of its own with a memory
-		// limit; it used to be the one tool that was STARTED first and granted afterwards, because
-		// the only bounded launch was a live one - so a grant that failed could not be restored to
-		// "the tool never ran". `launch-prepared-bounded` is the same limit behind the same gate.
-		let memory_limit: Option<u64> = if name == b"imgconv" { Some(IMGCONV_MEMORY_LIMIT) } else { None };
-		let stage: usize = match transaction.prepare(name_str, child_side, manager_side, memory_limit) {
-			Ok(stage) => stage,
-			Err(fault) => {
-				debug_write(name);
-				debug_write(b"\n");
-				close_endpoints(stdout, control);
-				transaction.abandon(fault);
-				return Err(Error::NotFound);
-			}
-		};
-		let task: u64 = transaction.task(stage);
-		let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
-			close_endpoints(stdout, control);
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
-			close_endpoints(stdout, control);
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		// Forward the stdout console first (the tool's `inherit_stdout` reads the first
-		// message), then the argument string, then the manifest grants.
-		// The launch endpoints, named and ended by READY. A governed tool gets the caller's
-		// console, which is full duplex, so it reads and writes the same channel.
-		// CHECKED, AND CLOSED ON FAILURE: a prepared launch whose bootstrap end is gone cannot take the
-		// console, and a manager that went on would keep the caller's stdout for ever.
-		if !hand_over(manager_side, CAP_STDOUT, stdout) {
-			if control != 0 {
-				close(control);
-			}
-			transaction.abandon(Fault::Refused);
+			transaction.abandon(fault);
 			return Err(Error::NotFound);
 		}
-		// AND THE TERMINAL, when this launch is a foreground job on one. `run` passes zero and nothing
-		// is sent; `run-interactive` passes the caller's control channel and the child finds it under
-		// `CONTROL`, which is what makes `tty_set_mode` answer true instead of false - and a
-		// full-screen program that cannot ask runs cooked, with every key meant for it swallowed by
-		// the line editor.
-		//
-		// A NAMED CAPABILITY, so its absence is not a hole in a sequence: the child takes each one by
-		// name out of the set this ends with READY, and reads zero for a name that never arrived. That
-		// is how a pipeline stage and a background job go on getting no terminal at all.
-		if control != 0 && !hand_over(manager_side, CAP_CONTROL, control) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
+	};
+	let task: u64 = transaction.task(stage);
+	let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
+		close_endpoints(stdout, control);
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+		close_endpoints(stdout, control);
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	// Forward the stdout console first (the tool's `inherit_stdout` reads the first
+	// message), then the argument string, then the manifest grants.
+	// The launch endpoints, named and ended by READY. A governed tool gets the caller's
+	// console, which is full duplex, so it reads and writes the same channel.
+	// CHECKED, AND CLOSED ON FAILURE: a prepared launch whose bootstrap end is gone cannot take the
+	// console, and a manager that went on would keep the caller's stdout for ever.
+	if !hand_over(manager_side, CAP_STDOUT, stdout) {
+		if control != 0 {
+			close(control);
 		}
-		send_ready(manager_side);
-		if !send_launch_context(manager_side, args, cwd, environment) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		}
-		// THE PLACEHOLDER IS NOT OPTIONAL. A program that reads `SELECTED_FILE` has to find the tag
-		// in a fixed position whether or not it was opened over a file: `recv_tagged` BLOCKS, and a
-		// tag read where nothing was sent consumes the message that was actually next and then waits
-		// forever for one nobody will send. That is the recorded ordered-bootstrap hazard,
-		// and it reappeared here the moment a grant became conditional.
-		//
-		// Sent only to the programs that READ it, because sending it to the other fifty would shift
-		// their sequences by one - the same trap from the other side.
-		if reads_selected_file(&policy_name) && !send_blocking(manager_side, CAP_SELECTED_FILE, 0) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		}
-		for &cap in VOCABULARY.iter() {
-			let granted: bool = manifest.grants.contains(&cap);
-			if granted {
-				// Most capabilities are a single channel: duplicate the held client (narrowed)
-				// and transfer it under its tag. The `volumes` capability instead bundles the
-				// four volume StorageService clients, handed over under their own per-volume
-				// tags by `grant_volumes`.
-				let ok: bool = if cap == Capability::Volumes {
-					grant_volumes(manager_side, clients)
-				} else {
-					let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
-					handle != 0 && hand_over(manager_side, tag_for(cap), handle)
-				};
-				if !ok {
-					transaction.abandon(Fault::Refused);
-					return Err(Error::NotFound);
-				}
-			}
-			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
-		}
-		// Commit: the tool's stdout, arguments, grants and cwd are all queued, so what it will
-		// observe is complete. Anything that failed above returned without releasing, which
-		// leaves a process that never ran rather than one that started on half a grant set.
-		// AND THE THREE ENDINGS OF A RELEASE ARE THREE ANSWERS. A refusal and a start failure both
-		// leave nothing running and are reported as a launch that did not happen; a lost reply is
-		// recovered - the program is killed and its ending confirmed - and reported as what it is,
-		// a commit whose outcome could not be known, never as a refusal.
-		match transaction.release(stage) {
-			Release::Started => {}
-			Release::Refused | Release::StartFailed => {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	// AND THE TERMINAL, when this launch is a foreground job on one. `run` passes zero and nothing
+	// is sent; `run-interactive` passes the caller's control channel and the child finds it under
+	// `CONTROL`, which is what makes `tty_set_mode` answer true instead of false - and a
+	// full-screen program that cannot ask runs cooked, with every key meant for it swallowed by
+	// the line editor.
+	//
+	// A NAMED CAPABILITY, so its absence is not a hole in a sequence: the child takes each one by
+	// name out of the set this ends with READY, and reads zero for a name that never arrived. That
+	// is how a pipeline stage and a background job go on getting no terminal at all.
+	if control != 0 && !hand_over(manager_side, CAP_CONTROL, control) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	send_ready(manager_side);
+	if !send_launch_context(manager_side, args, cwd, environment) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	// THE PLACEHOLDER IS NOT OPTIONAL. A program that reads `SELECTED_FILE` has to find the tag
+	// in a fixed position whether or not it was opened over a file: `recv_tagged` BLOCKS, and a
+	// tag read where nothing was sent consumes the message that was actually next and then waits
+	// forever for one nobody will send. That is the recorded ordered-bootstrap hazard,
+	// and it reappeared here the moment a grant became conditional.
+	//
+	// Sent only to the programs that READ it, because sending it to the other fifty would shift
+	// their sequences by one - the same trap from the other side.
+	if reads_selected_file(&policy_name) && !send_blocking(manager_side, CAP_SELECTED_FILE, 0) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	for &cap in VOCABULARY.iter() {
+		let granted: bool = manifest.grants.contains(&cap);
+		if granted {
+			// Most capabilities are a single channel: duplicate the held client (narrowed)
+			// and transfer it under its tag. The `volumes` capability instead bundles the
+			// four volume StorageService clients, handed over under their own per-volume
+			// tags by `grant_volumes`.
+			let ok: bool = if cap == Capability::Volumes {
+				grant_volumes(manager_side, clients)
+			} else {
+				let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+				handle != 0 && hand_over(manager_side, tag_for(cap), handle)
+			};
+			if !ok {
 				transaction.abandon(Fault::Refused);
 				return Err(Error::NotFound);
 			}
-			Release::Uncertain => {
-				recover_started(task);
-				transaction.abandon(Fault::Uncertain);
-				reap_through(procsvc);
-				return Err(Error::CommitUncertain);
-			}
 		}
-		let mut stages: Vec<Stage> = transaction.commit();
-		let Stage { started, manager_side } = stages.remove(stage);
-		close(manager_side);
-		Ok(started)
+		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 	}
+	// Commit: the tool's stdout, arguments, grants and cwd are all queued, so what it will
+	// observe is complete. Anything that failed above returned without releasing, which
+	// leaves a process that never ran rather than one that started on half a grant set.
+	// AND THE THREE ENDINGS OF A RELEASE ARE THREE ANSWERS. A refusal and a start failure both
+	// leave nothing running and are reported as a launch that did not happen; a lost reply is
+	// recovered - the program is killed and its ending confirmed - and reported as what it is,
+	// a commit whose outcome could not be known, never as a refusal.
+	match transaction.release(stage) {
+		Release::Started => {}
+		Release::Refused | Release::StartFailed => {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
+		Release::Uncertain => {
+			recover_started(task);
+			transaction.abandon(Fault::Uncertain);
+			reap_through(procsvc);
+			return Err(Error::CommitUncertain);
+		}
+	}
+	let mut stages: Vec<Stage> = transaction.commit();
+	let Stage { started, manager_side } = stages.remove(stage);
+	close(manager_side);
+	Ok(started)
 }
 
 // A pipeline stage as the broker needs it: the tool to run, its argument string, and the
@@ -1356,148 +1334,146 @@ struct StageRequest<'a> {
 // What comes back is the shell's job: the group and the stage count. The refusals are
 // `not-found`, and a commit that went wrong and was recovered - some stage may have run - is
 // `commit-uncertain`, never relabelled as a refusal.
-unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<PipelineResult, Error> {
-	unsafe {
-		// The stdio endpoints a stage has not been handed yet are still this broker's, and a
-		// transaction that fails closes exactly those: everything from the first stage whose
-		// installation did not complete onward. (An endpoint whose send succeeded inside a
-		// partially installed stage is a spent number; closing it again here, with nothing
-		// allocated in between, is refused by the kernel rather than aimed at somebody else.)
-		let close_from = |first: usize| {
-			for stage in &stages[first..] {
-				close(stage.stdout);
-				if stage.stdin != 0 {
-					close(stage.stdin);
-				}
-				if stage.stderr != 0 {
-					close(stage.stderr);
-				}
+fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<PipelineResult, Error> {
+	// The stdio endpoints a stage has not been handed yet are still this broker's, and a
+	// transaction that fails closes exactly those: everything from the first stage whose
+	// installation did not complete onward. (An endpoint whose send succeeded inside a
+	// partially installed stage is a spent number; closing it again here, with nothing
+	// allocated in between, is refused by the kernel rather than aimed at somebody else.)
+	let close_from = |first: usize| {
+		for stage in &stages[first..] {
+			close(stage.stdout);
+			if stage.stdin != 0 {
+				close(stage.stdin);
 			}
-		};
-		let Some(mut transaction) = Transaction::open(procsvc) else {
-			close_from(0);
-			return Err(Error::NotFound);
-		};
-		for (index, stage) in stages.iter().enumerate() {
-			let Ok(name_str) = core::str::from_utf8(stage.name) else {
-				close_from(index);
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			};
-			let Some((manager_side, child_side)) = channel() else {
-				close_from(index);
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			};
-			let prepared: usize = match transaction.prepare(name_str, child_side, manager_side, None) {
-				Ok(prepared) => prepared,
-				Err(fault) => {
-					close_from(index);
-					transaction.abandon(fault);
-					return Err(Error::NotFound);
-				}
-			};
-			let task: u64 = transaction.task(prepared);
-			let Some(policy_name) = executable::logical_name(&transaction.stages[prepared].started.info.name).map(String::from) else {
-				close_from(index);
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			};
-			let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
-				close_from(index);
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			};
-			// stdout, then stdin when there is one, as ordered capabilities in one message.
-			// A stage writes into one edge and reads from another, so the two endpoints are
-			// named separately rather than told apart by how many arrived.
-			let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && (stage.stderr == 0 || send_blocking(manager_side, CAP_STDERR, stage.stderr)) && send_ready(manager_side);
-			if !installed {
-				close_from(index);
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			}
-			if !send_launch_context(manager_side, stage.args, cwd, environment) {
-				close_from(index + 1);
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			}
-			for &cap in VOCABULARY.iter() {
-				let granted: bool = manifest.grants.contains(&cap);
-				if granted {
-					let ok: bool = if cap == Capability::Volumes {
-						grant_volumes(manager_side, clients)
-					} else {
-						let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
-						handle != 0 && hand_over(manager_side, tag_for(cap), handle)
-					};
-					if !ok {
-						close_from(index + 1);
-						transaction.abandon(Fault::Refused);
-						return Err(Error::NotFound);
-					}
-				}
-				audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+			if stage.stderr != 0 {
+				close(stage.stderr);
 			}
 		}
-		// SEAL, over the prepared members. Each task carries MANAGE - it is the same handle the
-		// caller signals with - and membership is fixed at creation, so the group is the one
-		// object that can end the whole pipeline whatever the release below does.
-		let tasks: Vec<u64> = transaction.stages.iter().map(|stage| stage.started.task).collect();
-		let group: i64 = process_group_create(&tasks);
-		if group < 0 {
+	};
+	let Some(mut transaction) = Transaction::open(procsvc) else {
+		close_from(0);
+		return Err(Error::NotFound);
+	};
+	for (index, stage) in stages.iter().enumerate() {
+		let Ok(name_str) = core::str::from_utf8(stage.name) else {
+			close_from(index);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		};
+		let Some((manager_side, child_side)) = channel() else {
+			close_from(index);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		};
+		let prepared: usize = match transaction.prepare(name_str, child_side, manager_side, None) {
+			Ok(prepared) => prepared,
+			Err(fault) => {
+				close_from(index);
+				transaction.abandon(fault);
+				return Err(Error::NotFound);
+			}
+		};
+		let task: u64 = transaction.task(prepared);
+		let Some(policy_name) = executable::logical_name(&transaction.stages[prepared].started.info.name).map(String::from) else {
+			close_from(index);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		};
+		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+			close_from(index);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		};
+		// stdout, then stdin when there is one, as ordered capabilities in one message.
+		// A stage writes into one edge and reads from another, so the two endpoints are
+		// named separately rather than told apart by how many arrived.
+		let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && (stage.stderr == 0 || send_blocking(manager_side, CAP_STDERR, stage.stderr)) && send_ready(manager_side);
+		if !installed {
+			close_from(index);
 			transaction.abandon(Fault::Refused);
 			return Err(Error::NotFound);
 		}
-		let group: u64 = group as u64;
-		// COMMIT, IN ONE TRANSITION (IDL-002).
-		//
-		// `release-group` is the primitive that makes "a failure at any stage starts none of them"
-		// true: ProcessService checks every token first - every koid prepared, and every one of
-		// them this connection's - and only then queues them. A refusal therefore comes back with
-		// nothing started, and this can return having run nothing at all rather than having
-		// half-run a pipeline.
-		let count: u32 = transaction.stages.len() as u32;
-		match transaction.release_group() {
-			GroupRelease::Committed => {
-				// The broker's own copies of the edge endpoints are spent: each was transferred to
-				// the stage that owns it, and holding a duplicate here would keep a pipe open after
-				// its writer exits, so the reader would never see end-of-stream. The tasks go too:
-				// the group is the job-control handle now.
-				for stage in transaction.commit() {
-					close(stage.manager_side);
-					close(stage.started.task);
+		if !send_launch_context(manager_side, stage.args, cwd, environment) {
+			close_from(index + 1);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
+		for &cap in VOCABULARY.iter() {
+			let granted: bool = manifest.grants.contains(&cap);
+			if granted {
+				let ok: bool = if cap == Capability::Volumes {
+					grant_volumes(manager_side, clients)
+				} else {
+					let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+					handle != 0 && hand_over(manager_side, tag_for(cap), handle)
+				};
+				if !ok {
+					close_from(index + 1);
+					transaction.abandon(Fault::Refused);
+					return Err(Error::NotFound);
 				}
-				Ok(PipelineResult { group, stages: count })
 			}
-			GroupRelease::Refused => {
-				// Nothing ran, so there is nothing to signal - only the handles this transaction
-				// opened, which go back the way a refused preparation's do.
-				close(group);
-				transaction.abandon(Fault::Refused);
-				Err(Error::NotFound)
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+		}
+	}
+	// SEAL, over the prepared members. Each task carries MANAGE - it is the same handle the
+	// caller signals with - and membership is fixed at creation, so the group is the one
+	// object that can end the whole pipeline whatever the release below does.
+	let tasks: Vec<u64> = transaction.stages.iter().map(|stage| stage.started.task).collect();
+	let group: i64 = process_group_create(&tasks);
+	if group < 0 {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	let group: u64 = group as u64;
+	// COMMIT, IN ONE TRANSITION (IDL-002).
+	//
+	// `release-group` is the primitive that makes "a failure at any stage starts none of them"
+	// true: ProcessService checks every token first - every koid prepared, and every one of
+	// them this connection's - and only then queues them. A refusal therefore comes back with
+	// nothing started, and this can return having run nothing at all rather than having
+	// half-run a pipeline.
+	let count: u32 = transaction.stages.len() as u32;
+	match transaction.release_group() {
+		GroupRelease::Committed => {
+			// The broker's own copies of the edge endpoints are spent: each was transferred to
+			// the stage that owns it, and holding a duplicate here would keep a pipe open after
+			// its writer exits, so the reader would never see end-of-stream. The tasks go too:
+			// the group is the job-control handle now.
+			for stage in transaction.commit() {
+				close(stage.manager_side);
+				close(stage.started.task);
 			}
-			GroupRelease::Partial => {
-				// The service took every token: some members are running and the rest are
-				// forgotten. What is running is ended through the group, and the fault is
-				// reported as what it is rather than as a refusal - a stage may have written,
-				// sent or printed before the kill reached it.
-				recover_group(group);
-				close(group);
-				transaction.abandon(Fault::Refused);
-				reap_through(procsvc);
-				Err(Error::CommitUncertain)
-			}
-			GroupRelease::Uncertain => {
-				// The reply is lost, so any prefix may be running: the group ends it, dropping
-				// the connection abandons whatever was still prepared, and nothing more is asked
-				// on the connection the late reply may still land on.
-				recover_group(group);
-				close(group);
-				transaction.abandon(Fault::Uncertain);
-				reap_through(procsvc);
-				Err(Error::CommitUncertain)
-			}
+			Ok(PipelineResult { group, stages: count })
+		}
+		GroupRelease::Refused => {
+			// Nothing ran, so there is nothing to signal - only the handles this transaction
+			// opened, which go back the way a refused preparation's do.
+			close(group);
+			transaction.abandon(Fault::Refused);
+			Err(Error::NotFound)
+		}
+		GroupRelease::Partial => {
+			// The service took every token: some members are running and the rest are
+			// forgotten. What is running is ended through the group, and the fault is
+			// reported as what it is rather than as a refusal - a stage may have written,
+			// sent or printed before the kill reached it.
+			recover_group(group);
+			close(group);
+			transaction.abandon(Fault::Refused);
+			reap_through(procsvc);
+			Err(Error::CommitUncertain)
+		}
+		GroupRelease::Uncertain => {
+			// The reply is lost, so any prefix may be running: the group ends it, dropping
+			// the connection abandons whatever was still prepared, and nothing more is asked
+			// on the connection the late reply may still land on.
+			recover_group(group);
+			close(group);
+			transaction.abandon(Fault::Uncertain);
+			reap_through(procsvc);
+			Err(Error::CommitUncertain)
 		}
 	}
 }
@@ -1559,13 +1535,13 @@ fn environment_is_acceptable(environment: &[EnvVar]) -> bool {
 //
 // Returns false if the context cannot be encoded or sent, which the callers treat like any other
 // failed grant: the process is abandoned rather than started with half a context.
-unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8], environment: &[EnvVar]) -> bool {
+fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8], environment: &[EnvVar]) -> bool {
 	let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: environment.to_vec() };
 	let Some(bytes) = context.encode_vec() else { return false };
 	if bytes.len() > rt::LAUNCH_CONTEXT_MAX {
 		return false;
 	}
-	unsafe { send_blocking(manager_side, &bytes, 0) }
+	send_blocking(manager_side, &bytes, 0)
 }
 
 // Start a tool over ONE selected file.
@@ -1579,115 +1555,113 @@ unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8], enviro
 // A FAILURE TO MINT THE GRANT ENDS THE LAUNCH. Starting the program without it would give it a
 // process, a terminal and no file, which is a window with nothing in it and no way to say why.
 #[allow(clippy::too_many_arguments)]
-unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: &str, writable: bool, stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<StartResult, Error> {
-	unsafe {
-		if clients.storage_admin == 0 {
-			close(stdout);
-			return Err(Error::NotFound);
-		}
-		let Ok(name_str) = core::str::from_utf8(name) else {
-			close(stdout);
-			return Err(Error::NotFound);
-		};
-		let Some(mut transaction) = Transaction::open(procsvc) else {
-			close(stdout);
-			return Err(Error::NotFound);
-		};
-		let Some((manager_side, child_side)) = channel() else {
-			close(stdout);
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		let stage: usize = match transaction.prepare(name_str, child_side, manager_side, None) {
-			Ok(stage) => stage,
-			Err(fault) => {
-				close(stdout);
-				transaction.abandon(fault);
-				return Err(Error::NotFound);
-			}
-		};
-		let task: u64 = transaction.task(stage);
-		let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
-			close(stdout);
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
-			close(stdout);
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		if !hand_over(manager_side, CAP_STDOUT, stdout) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		}
-		send_ready(manager_side);
-		if !send_launch_context(manager_side, args, cwd, &[]) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		}
-		// THE ATTENUATED GRANT, minted from the private admin endpoint the manager holds and grants
-		// to nobody - the thing that hands out a narrowed authority must not itself be one of the
-		// things handed out.
-		let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_file(file, &writable) {
-			Some(Ok(client)) => client,
-			_ => {
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			}
-		};
-		let granted: i64 = duplicate(minted, GRANT_RIGHTS);
-		close(minted);
-		if granted < 0 || !hand_over(manager_side, CAP_SELECTED_FILE, granted as u64) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		}
-		// The record travels AFTER the capability and says what the capability cannot: which URI to
-		// open through it, what to show a person, and whether a write-back will be accepted.
-		let selected = SelectedFile { uri: String::from(file), name: String::from(last_path_component(file)), writable };
-		let Some(bytes) = selected.encode_vec() else {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		};
-		if !send_blocking(manager_side, &bytes, 0) {
-			transaction.abandon(Fault::Refused);
-			return Err(Error::NotFound);
-		}
-		// EVERY OTHER GRANT IS UNCHANGED, except `volumes` - which is exactly what the selected
-		// file replaced. The audit records the substitution rather than hiding it.
-		for &cap in VOCABULARY.iter() {
-			if cap == Capability::Volumes {
-				audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: false, dynamic: true });
-				continue;
-			}
-			let want: bool = manifest.grants.contains(&cap);
-			if want {
-				let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
-				if handle == 0 || !hand_over(manager_side, tag_for(cap), handle) {
-					transaction.abandon(Fault::Refused);
-					return Err(Error::NotFound);
-				}
-			}
-			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: want, dynamic: false });
-		}
-		match transaction.release(stage) {
-			Release::Started => {}
-			Release::Refused | Release::StartFailed => {
-				transaction.abandon(Fault::Refused);
-				return Err(Error::NotFound);
-			}
-			Release::Uncertain => {
-				recover_started(task);
-				transaction.abandon(Fault::Uncertain);
-				reap_through(procsvc);
-				return Err(Error::CommitUncertain);
-			}
-		}
-		let mut stages: Vec<Stage> = transaction.commit();
-		let Stage { started, manager_side } = stages.remove(stage);
-		close(manager_side);
-		Ok(started)
+fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: &str, writable: bool, stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<StartResult, Error> {
+	if clients.storage_admin == 0 {
+		close(stdout);
+		return Err(Error::NotFound);
 	}
+	let Ok(name_str) = core::str::from_utf8(name) else {
+		close(stdout);
+		return Err(Error::NotFound);
+	};
+	let Some(mut transaction) = Transaction::open(procsvc) else {
+		close(stdout);
+		return Err(Error::NotFound);
+	};
+	let Some((manager_side, child_side)) = channel() else {
+		close(stdout);
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	let stage: usize = match transaction.prepare(name_str, child_side, manager_side, None) {
+		Ok(stage) => stage,
+		Err(fault) => {
+			close(stdout);
+			transaction.abandon(fault);
+			return Err(Error::NotFound);
+		}
+	};
+	let task: u64 = transaction.task(stage);
+	let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
+		close(stdout);
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+		close(stdout);
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	if !hand_over(manager_side, CAP_STDOUT, stdout) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	send_ready(manager_side);
+	if !send_launch_context(manager_side, args, cwd, &[]) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	// THE ATTENUATED GRANT, minted from the private admin endpoint the manager holds and grants
+	// to nobody - the thing that hands out a narrowed authority must not itself be one of the
+	// things handed out.
+	let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_file(file, &writable) {
+		Some(Ok(client)) => client,
+		_ => {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
+	};
+	let granted: i64 = duplicate(minted, GRANT_RIGHTS);
+	close(minted);
+	if granted < 0 || !hand_over(manager_side, CAP_SELECTED_FILE, granted as u64) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	// The record travels AFTER the capability and says what the capability cannot: which URI to
+	// open through it, what to show a person, and whether a write-back will be accepted.
+	let selected = SelectedFile { uri: String::from(file), name: String::from(last_path_component(file)), writable };
+	let Some(bytes) = selected.encode_vec() else {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	};
+	if !send_blocking(manager_side, &bytes, 0) {
+		transaction.abandon(Fault::Refused);
+		return Err(Error::NotFound);
+	}
+	// EVERY OTHER GRANT IS UNCHANGED, except `volumes` - which is exactly what the selected
+	// file replaced. The audit records the substitution rather than hiding it.
+	for &cap in VOCABULARY.iter() {
+		if cap == Capability::Volumes {
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: false, dynamic: true });
+			continue;
+		}
+		let want: bool = manifest.grants.contains(&cap);
+		if want {
+			let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+			if handle == 0 || !hand_over(manager_side, tag_for(cap), handle) {
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
+			}
+		}
+		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: want, dynamic: false });
+	}
+	match transaction.release(stage) {
+		Release::Started => {}
+		Release::Refused | Release::StartFailed => {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
+		Release::Uncertain => {
+			recover_started(task);
+			transaction.abandon(Fault::Uncertain);
+			reap_through(procsvc);
+			return Err(Error::CommitUncertain);
+		}
+	}
+	let mut stages: Vec<Stage> = transaction.commit();
+	let Stage { started, manager_side } = stages.remove(stage);
+	close(manager_side);
+	Ok(started)
 }
 
 // Which programs read a `SELECTED_FILE` tag out of their bootstrap, and therefore must be sent one
@@ -1723,63 +1697,59 @@ fn last_path_component(uri: &str) -> &str {
 // that then abandons the launch. The fault cohort counted it: one handle more in the manager's
 // Domain after a bounded launch whose grant could not be delivered. A zero handle is a placeholder
 // tag with nothing to close. On failure the caller owns nothing it did not send.
-unsafe fn hand_over(manager_side: u64, tag: &[u8], handle: u64) -> bool {
-	unsafe {
-		if send_blocking(manager_side, tag, handle) {
-			return true;
-		}
-		if handle != 0 {
-			close(handle);
-		}
-		false
+fn hand_over(manager_side: u64, tag: &[u8], handle: u64) -> bool {
+	if send_blocking(manager_side, tag, handle) {
+		return true;
 	}
+	if handle != 0 {
+		close(handle);
+	}
+	false
 }
 
-unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
-	unsafe {
-		let volumes: [(&[u8], u64); 7] = [
-			(CAP_SYSTEM, clients.storage),
-			(CAP_MEDIA, clients.storage_media),
-			(CAP_ISO, clients.storage_iso),
-			(CAP_UDF, clients.storage_udf),
-			(CAP_USB, clients.storage_usb),
-			(CAP_RAM, clients.storage_ram),
-			(CAP_TMP, clients.storage_tmp),
-		];
-		for &(tag, client) in volumes.iter() {
-			// A FRESH SUB-CONNECTION PER GRANT, not a duplicate of the manager's own.
-			//
-			// `grant_handle` states the rule for network - "Network is always a fresh `open`
-			// sub-connection, so concurrent tools never share one reply queue" - and this path
-			// duplicated instead, which was invisible while tools ran one at a time. A pipeline
-			// runs them at once: `redirect_in f | tee g | wc` had two stages sending on two names
-			// for ONE endpoint, and one of them took the other's reply and reported that the file
-			// could not be opened. See `volume.connect` in `storage.lsidl`.
-			//
-			// A VOLUME THAT CANNOT MINT ONE IS GRANTED AS ZERO rather than failing the launch. The
-			// manager holds seven volume clients and several are routinely absent (no USB, no ISO);
-			// a stage that asks such a volume for anything already gets nothing, and turning a
-			// missing volume into a failed pipeline would break every line that touches storage on
-			// a machine with one disk.
-			let minted: u64 = if client == 0 {
-				0
-			} else {
-				let mut volume_client = volume::Client::new(ChannelTransport { chan: client });
-				match volume_client.connect() {
-					Some(Ok(fresh)) => {
-						let dup: i64 = duplicate(fresh, GRANT_RIGHTS);
-						close(fresh);
-						if dup >= 0 { dup as u64 } else { 0 }
-					}
-					_ => 0,
+fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
+	let volumes: [(&[u8], u64); 7] = [
+		(CAP_SYSTEM, clients.storage),
+		(CAP_MEDIA, clients.storage_media),
+		(CAP_ISO, clients.storage_iso),
+		(CAP_UDF, clients.storage_udf),
+		(CAP_USB, clients.storage_usb),
+		(CAP_RAM, clients.storage_ram),
+		(CAP_TMP, clients.storage_tmp),
+	];
+	for &(tag, client) in volumes.iter() {
+		// A FRESH SUB-CONNECTION PER GRANT, not a duplicate of the manager's own.
+		//
+		// `grant_handle` states the rule for network - "Network is always a fresh `open`
+		// sub-connection, so concurrent tools never share one reply queue" - and this path
+		// duplicated instead, which was invisible while tools ran one at a time. A pipeline
+		// runs them at once: `redirect_in f | tee g | wc` had two stages sending on two names
+		// for ONE endpoint, and one of them took the other's reply and reported that the file
+		// could not be opened. See `volume.connect` in `storage.lsidl`.
+		//
+		// A VOLUME THAT CANNOT MINT ONE IS GRANTED AS ZERO rather than failing the launch. The
+		// manager holds seven volume clients and several are routinely absent (no USB, no ISO);
+		// a stage that asks such a volume for anything already gets nothing, and turning a
+		// missing volume into a failed pipeline would break every line that touches storage on
+		// a machine with one disk.
+		let minted: u64 = if client == 0 {
+			0
+		} else {
+			let mut volume_client = volume::Client::new(ChannelTransport { chan: client });
+			match volume_client.connect() {
+				Some(Ok(fresh)) => {
+					let dup: i64 = duplicate(fresh, GRANT_RIGHTS);
+					close(fresh);
+					if dup >= 0 { dup as u64 } else { 0 }
 				}
-			};
-			if !hand_over(manager_side, tag, minted) {
-				return false;
+				_ => 0,
 			}
+		};
+		if !hand_over(manager_side, tag, minted) {
+			return false;
 		}
-		send_ready(manager_side)
 	}
+	send_ready(manager_side)
 }
 
 // Demonstrate the on-demand tool launcher (the `run` op's mechanism) at startup: stand in
@@ -1788,30 +1758,28 @@ unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 // capability and that its complete output was forwarded to the caller's terminal. The shell reaches this same path live
 // over the `run` op; here the manager plays both launcher and terminal so the path is
 // exercised end to end. Returns the bytes the tool printed, or empty if it could not start.
-unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Vec<u8> {
-	unsafe {
-		let (output, console): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return Vec::new(),
-		};
-		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", &[], console, 0, clients, audit) {
-			Ok(s) => s,
-			Err(_) => {
-				close(output);
-				return Vec::new();
-			}
-		};
-		let mut printed: Vec<u8> = Vec::new();
-		loop {
-			match recv_blocking(output, buf) {
-				Received::Message { len, .. } => printed.extend_from_slice(&buf[..len]),
-				Received::Closed => break,
-			}
+fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Vec<u8> {
+	let (output, console): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return Vec::new(),
+	};
+	let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", &[], console, 0, clients, audit) {
+		Ok(s) => s,
+		Err(_) => {
+			close(output);
+			return Vec::new();
 		}
-		close(output);
-		close(started.task);
-		printed
+	};
+	let mut printed: Vec<u8> = Vec::new();
+	loop {
+		match recv_blocking(output, buf) {
+			Received::Message { len, .. } => printed.extend_from_slice(&buf[..len]),
+			Received::Closed => break,
+		}
 	}
+	close(output);
+	close(started.task);
+	printed
 }
 
 // Build the human-readable decisions summary for one launched component from the audit
@@ -1862,7 +1830,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// steps from the edit. `recv_caps` reads to the READY terminator and `take` matches on the
 	// tag, so a capability that is absent reads as absent and an order that has changed does not
 	// read as anything at all.
-	let mut caps: CapSet = unsafe { recv_caps(bootstrap) };
+	let mut caps: CapSet = recv_caps(bootstrap);
 	let storage: u64 = caps.take(CAP_STORAGE);
 	let log: u64 = caps.take(CAP_LOG);
 	let network: u64 = caps.take(CAP_NETWORK);
@@ -1915,16 +1883,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// `perm` command thus reaches the very audit trail this manager serves over a connection of
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
-	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
+	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
 	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") },
+		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,
 	};
 
 	// 2. wait for the serve channel clients reach us on.
 	let service: u64 = match caps.take(CAP_SERVE) {
-		0 => unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") },
+		0 => fail_bootstrap(bootstrap, b"serve", b"missing serve channel"),
 		handle => handle,
 	};
 
@@ -1936,11 +1904,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    path; `cat` (granted only volumes) prints a file; and `ip` (granted only network)
 	//    queries a fresh NetworkService sub-connection and renders it to captured stdout.
 	let mut audit: Vec<AuditEntry> = Vec::new();
-	let probe_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, PROBE_NAME, &mut clients, &mut audit, &mut buf) }.unwrap_or_default();
-	let date_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, DATE_NAME, b"", &mut clients, &mut audit, &mut buf) };
-	let request_read: Vec<u8> = unsafe { launch_under_manifest(procsvc, REQUEST_NAME, &mut clients, &mut audit, &mut buf) }.unwrap_or_default();
-	let cat_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &mut clients, &mut audit, &mut buf) };
-	let ip_read: Vec<u8> = unsafe { demonstrate_tool(procsvc, IP_NAME, b"", &mut clients, &mut audit, &mut buf) };
+	let probe_read: Vec<u8> = launch_under_manifest(procsvc, PROBE_NAME, &mut clients, &mut audit, &mut buf).unwrap_or_default();
+	let date_read: Vec<u8> = demonstrate_tool(procsvc, DATE_NAME, b"", &mut clients, &mut audit, &mut buf);
+	let request_read: Vec<u8> = launch_under_manifest(procsvc, REQUEST_NAME, &mut clients, &mut audit, &mut buf).unwrap_or_default();
+	let cat_read: Vec<u8> = demonstrate_tool(procsvc, CAT_NAME, b"vol://system/hello.txt", &mut clients, &mut audit, &mut buf);
+	let ip_read: Vec<u8> = demonstrate_tool(procsvc, IP_NAME, b"", &mut clients, &mut audit, &mut buf);
 
 	// 4. report in to the supervisor, then relay each governed component's proof and its
 	//    decisions summary (exactly which capabilities it was and was not given): the bytes
@@ -1949,7 +1917,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    undeclared capability (its summary marks that refused request as a dynamic decision),
 	//    then the complete stdout from the on-demand `cat` and `ip` tools plus `ip`'s exact
 	//    network-only capability decisions.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"PermissionManager: online", 0);
 		send_blocking(bootstrap, &probe_read, 0);
 		send_blocking(bootstrap, &summarize_for(&audit, PROBE_NAME), 0);
@@ -1970,16 +1938,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut manager: Manager = Manager { audit, procsvc, clients };
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
-			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-			if op == permission::OP_AUDIT {
-				stream_audit(&mut manager, chan, req, handle);
-				return None;
-			}
-			permission::dispatch(&mut manager, req, handle, out, reply_handle)
-		});
-	}
+	serve_multi_seeded(service, &[perm_self_server], &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+		let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+		if op == permission::OP_AUDIT {
+			stream_audit(&mut manager, chan, req, handle);
+			return None;
+		}
+		permission::dispatch(&mut manager, req, handle, out, reply_handle)
+	});
 	exit();
 }
 
@@ -1991,32 +1957,26 @@ fn stream_audit(manager: &mut Manager, service: u64, request: &[u8], request_han
 		Some(v) => v,
 		None => return,
 	};
-	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+	let (producer, consumer): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return,
 	};
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
-	unsafe {
-		send_blocking(service, &corr_bytes, consumer);
-	}
+	send_blocking(service, &corr_bytes, consumer);
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
 		let mut frame_handles = Handles::new();
 		if let Some(n) = permission::audit_frame(seq as u32, item, &mut frame, &mut frame_handles) {
-			unsafe {
-				if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
-					for handle in frame_handles.as_slice() {
-						close(*handle);
-					}
+			if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
+				for handle in frame_handles.as_slice() {
+					close(*handle);
 				}
 			}
 		} else {
 			for handle in frame_handles.as_slice() {
-				unsafe { close(*handle) };
+				close(*handle);
 			}
 		}
 	}
-	unsafe {
-		close(producer);
-	}
+	close(producer);
 }

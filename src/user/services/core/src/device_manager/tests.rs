@@ -3,7 +3,7 @@ use super::*;
 // Development boot exercises the real catalogue and the real kernel handle table. The provider
 // has no consumer, so its offered endpoint remains the catalogue's responsibility at withdrawal.
 // A recorder in a host test cannot establish that this syscall closes the actual endpoint.
-pub unsafe fn unopened_provider_withdrawal() {
+pub fn unopened_provider_withdrawal() {
 	unsafe {
 		let (server, offered) = channel().expect("withdrawal fixture channel");
 		let binding = BindingId::new(0, 0, 0, 1);
@@ -46,7 +46,7 @@ pub unsafe fn unopened_provider_withdrawal() {
 
 // Real waitable handles drive the production shutdown composition. The ready endpoint represents
 // a process-exit event without spawning another driver or touching a real device in this fixture.
-pub unsafe fn pending_shutdown_outcomes() {
+pub fn pending_shutdown_outcomes() {
 	unsafe {
 		for ready in [true, false] {
 			let (event, peer) = channel().expect("shutdown fixture channel");
@@ -73,7 +73,7 @@ pub unsafe fn pending_shutdown_outcomes() {
 }
 
 // Exercise real STOPPED decoding before and after expiry through both supervision callers.
-unsafe fn planned_stop_deadlines() {
+fn planned_stop_deadlines() {
 	unsafe {
 		for shutdown in [false, true] {
 			for timely in [true, false] {
@@ -117,7 +117,7 @@ unsafe fn planned_stop_deadlines() {
 
 // Exercise the production Node admission, READY/fault reducer and live policy actions. Empty
 // holdings keep the fixture away from real devices while still traversing the manager's paths.
-pub unsafe fn boot_attempt_budget() {
+pub fn boot_attempt_budget() {
 	unsafe {
 		let mut node = Node::new(0, &DeviceInfo::default(), Vec::new());
 		let mut catalogue = Catalogue::new();

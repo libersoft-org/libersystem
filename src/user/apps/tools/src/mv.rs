@@ -27,97 +27,95 @@ const CHUNK: u32 = 32 * 1024;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut force = false;
-		let mut words: Vec<&[u8]> = Vec::new();
-		for word in split_args(&arguments) {
-			match classify(word) {
-				Arg::Long(b"force", None) => force = true,
-				Arg::Short(b'f') => force = true,
-				Arg::Value(value) => {
-					if words.try_reserve(1).is_err() {
-						eprint(b"mv: out of memory\n");
-						exit();
-					}
-					words.push(value);
-				}
-				_ => {
-					eprint(b"mv: usage: mv [-f] <source> <destination>\n");
+	let mut force = false;
+	let mut words: Vec<&[u8]> = Vec::new();
+	for word in split_args(&arguments) {
+		match classify(word) {
+			Arg::Long(b"force", None) => force = true,
+			Arg::Short(b'f') => force = true,
+			Arg::Value(value) => {
+				if words.try_reserve(1).is_err() {
+					eprint(b"mv: out of memory\n");
 					exit();
 				}
+				words.push(value);
 			}
-		}
-		if words.len() != 2 {
-			eprint(b"mv: usage: mv [-f] <source> <destination>\n");
-			exit();
-		}
-		let (Some(source), Some(destination)) = (storage_proto::path::resolve(&cwd, words[0]), storage_proto::path::resolve(&cwd, words[1])) else {
-			eprint(b"mv: invalid path\n");
-			exit();
-		};
-		if source == destination {
-			eprint(b"mv: source and destination are the same file\n");
-			exit();
-		}
-		let from: u64 = volumes.client_for(&cwd, words[0]);
-		let to: u64 = volumes.client_for(&cwd, words[1]);
-		if from == 0 || to == 0 {
-			eprint(b"mv: no volume\n");
-			exit();
-		}
-		let same_volume = storage_proto::path::volume(&cwd, words[0]) == storage_proto::path::volume(&cwd, words[1]);
-		let mut destination_client = VolumeClient::new(to);
-		// The destination is checked ONCE, here, for both paths: `rename` refuses an existing
-		// destination and so does the cross-volume form, so `-f` means the same thing either way.
-		if matches!(destination_client.stat(&destination), Some(Ok(_))) {
-			if !force {
-				eprint(b"mv: ");
-				eprint(destination.as_bytes());
-				eprint(b" exists; pass -f to replace it\n");
-				exit();
-			}
-			if !matches!(destination_client.remove(&destination), Some(Ok(()))) {
-				eprint(b"mv: cannot replace ");
-				eprint(destination.as_bytes());
-				eprint(b"\n");
+			_ => {
+				eprint(b"mv: usage: mv [-f] <source> <destination>\n");
 				exit();
 			}
 		}
-		if same_volume {
-			match VolumeClient::new(from).rename(&source, &destination) {
-				Some(Ok(())) => {
-					print(b"moved ");
-					print(destination.as_bytes());
-					print(b"\n");
-				}
-				// A backend that cannot rename atomically says `invalid` rather than doing it in
-				// two steps behind the caller's back; the cross-volume path is where two steps are
-				// declared, and it is not taken silently.
-				_ => {
-					eprint(b"mv: this volume cannot rename ");
-					eprint(source.as_bytes());
-					eprint(b"\n");
-				}
-			}
-			exit();
-		}
-		transfer(from, &source, to, &destination);
 	}
+	if words.len() != 2 {
+		eprint(b"mv: usage: mv [-f] <source> <destination>\n");
+		exit();
+	}
+	let (Some(source), Some(destination)) = (storage_proto::path::resolve(&cwd, words[0]), storage_proto::path::resolve(&cwd, words[1])) else {
+		eprint(b"mv: invalid path\n");
+		exit();
+	};
+	if source == destination {
+		eprint(b"mv: source and destination are the same file\n");
+		exit();
+	}
+	let from: u64 = volumes.client_for(&cwd, words[0]);
+	let to: u64 = volumes.client_for(&cwd, words[1]);
+	if from == 0 || to == 0 {
+		eprint(b"mv: no volume\n");
+		exit();
+	}
+	let same_volume = storage_proto::path::volume(&cwd, words[0]) == storage_proto::path::volume(&cwd, words[1]);
+	let mut destination_client = VolumeClient::new(to);
+	// The destination is checked ONCE, here, for both paths: `rename` refuses an existing
+	// destination and so does the cross-volume form, so `-f` means the same thing either way.
+	if matches!(destination_client.stat(&destination), Some(Ok(_))) {
+		if !force {
+			eprint(b"mv: ");
+			eprint(destination.as_bytes());
+			eprint(b" exists; pass -f to replace it\n");
+			exit();
+		}
+		if !matches!(destination_client.remove(&destination), Some(Ok(()))) {
+			eprint(b"mv: cannot replace ");
+			eprint(destination.as_bytes());
+			eprint(b"\n");
+			exit();
+		}
+	}
+	if same_volume {
+		match VolumeClient::new(from).rename(&source, &destination) {
+			Some(Ok(())) => {
+				print(b"moved ");
+				print(destination.as_bytes());
+				print(b"\n");
+			}
+			// A backend that cannot rename atomically says `invalid` rather than doing it in
+			// two steps behind the caller's back; the cross-volume path is where two steps are
+			// declared, and it is not taken silently.
+			_ => {
+				eprint(b"mv: this volume cannot rename ");
+				eprint(source.as_bytes());
+				eprint(b"\n");
+			}
+		}
+		exit();
+	}
+	transfer(from, &source, to, &destination);
 	exit();
 }
 
 // Copy, verify, publish, then delete the source - and stop at the first failure, which always
 // leaves the source intact.
-unsafe fn transfer(from: u64, source: &str, to: u64, destination: &str) {
+fn transfer(from: u64, source: &str, to: u64, destination: &str) {
 	unsafe {
 		let mut source_client = VolumeClient::new(from);
 		let Some(Ok(info)) = source_client.stat(source) else {

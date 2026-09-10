@@ -159,8 +159,8 @@ impl wasm::world::WorldServices for WasiServices {
 	// the disagreement visible; only the helpers classifying their own answers removes it.
 	fn read(&mut self, dst: &mut [u8]) -> wasm::world::ReadOutcome {
 		match self.grant {
-			Grant::Storage(storage) => unsafe { read_fixed(storage, dst) },
-			Grant::Picker(picker) => unsafe { read_picked(picker, dst) },
+			Grant::Storage(storage) => read_fixed(storage, dst),
+			Grant::Picker(picker) => read_picked(picker, dst),
 		}
 	}
 
@@ -200,27 +200,25 @@ impl wasm::world::WorldServices for WasiServices {
 //
 // The vocabulary is the world's, decided once beside the status codes in `src/wasm/src/world.rs`:
 // `Denied` is the grant and everything else is a fault on the way there.
-unsafe fn read_fixed(storage: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
+fn read_fixed(storage: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
 	use wasm::world::ReadOutcome;
-	unsafe {
-		let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(GRANTED).into_owned(), write: false, create: false };
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		let result = match client.open(&opts) {
-			Some(Ok(r)) => r,
-			// The volume answered and said no - or said something else, which is not the same
-			// thing. The same classification `component_host` uses, from the one place that makes
-			// it, which is what stops the two hosts drifting apart again.
-			Some(Err(error)) => return read_failure(error),
-			// Nothing came back at all.
-			None => return ReadOutcome::Failed,
-		};
-		if result.file == 0 {
-			return ReadOutcome::Failed;
-		}
-		match read_into(result.file, result.size, dst) {
-			Some(n) => ReadOutcome::Read(n),
-			None => ReadOutcome::Failed,
-		}
+	let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(GRANTED).into_owned(), write: false, create: false };
+	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	let result = match client.open(&opts) {
+		Some(Ok(r)) => r,
+		// The volume answered and said no - or said something else, which is not the same
+		// thing. The same classification `component_host` uses, from the one place that makes
+		// it, which is what stops the two hosts drifting apart again.
+		Some(Err(error)) => return read_failure(error),
+		// Nothing came back at all.
+		None => return ReadOutcome::Failed,
+	};
+	if result.file == 0 {
+		return ReadOutcome::Failed;
+	}
+	match read_into(result.file, result.size, dst) {
+		Some(n) => ReadOutcome::Read(n),
+		None => ReadOutcome::Failed,
 	}
 }
 
@@ -231,22 +229,20 @@ unsafe fn read_fixed(storage: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
 // Classified the same way as `read_fixed`, for the same reason: a picker that answered `Denied` -
 // the user declined - is the grant and not the machine, and it is the one answer here a component
 // can genuinely act on.
-unsafe fn read_picked(picker: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
+fn read_picked(picker: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
 	use wasm::world::ReadOutcome;
-	unsafe {
-		let mut client = picker::Client::new(ChannelTransport { chan: picker });
-		let picked = match client.pick() {
-			Some(Ok(p)) => p,
-			Some(Err(error)) => return read_failure(error),
-			None => return ReadOutcome::Failed,
-		};
-		if picked.file == 0 {
-			return ReadOutcome::Failed;
-		}
-		match read_into(picked.file, picked.size, dst) {
-			Some(n) => ReadOutcome::Read(n),
-			None => ReadOutcome::Failed,
-		}
+	let mut client = picker::Client::new(ChannelTransport { chan: picker });
+	let picked = match client.pick() {
+		Some(Ok(p)) => p,
+		Some(Err(error)) => return read_failure(error),
+		None => return ReadOutcome::Failed,
+	};
+	if picked.file == 0 {
+		return ReadOutcome::Failed;
+	}
+	match read_into(picked.file, picked.size, dst) {
+		Some(n) => ReadOutcome::Read(n),
+		None => ReadOutcome::Failed,
 	}
 }
 
@@ -257,7 +253,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. receive the capability the host is granted: a StorageService client (read a
 	//    fixed file) or a FilePicker client (read the user-picked file - the powerbox:
 	//    no filesystem access of our own).
-	let grant: Grant = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	let grant: Grant = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"STORAGE" => Grant::Storage(handle),
 		Received::Message { len, handle } if handle != 0 && len >= 6 && &buf[..6] == b"PICKER" => Grant::Picker(handle),
 		_ => exit(),
@@ -319,8 +315,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let n: usize = (count as usize).min(instance.memory().len());
 		report.extend_from_slice(&instance.memory()[..n]);
 	}
-	unsafe {
-		send_blocking(bootstrap, &report, 0);
-	}
+	send_blocking(bootstrap, &report, 0);
 	exit();
 }

@@ -12,6 +12,18 @@ extern crate alloc;
 
 pub mod executable;
 pub mod graph_limits;
+pub mod ipv6;
+pub mod ipv6_budget;
+pub mod ipv6_events;
+pub mod ipv6_icmp;
+pub mod ipv6_mld;
+pub mod ipv6_nd;
+pub mod ipv6_neighbour;
+pub mod ipv6_packet;
+pub mod ipv6_router;
+pub mod ipv6_slaac;
+pub mod ipv6_solicit;
+pub mod ipv6_timers;
 pub mod service_lifecycle;
 pub mod shell_language;
 pub mod world_errors;

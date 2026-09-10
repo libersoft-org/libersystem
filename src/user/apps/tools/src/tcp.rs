@@ -21,20 +21,18 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 128] = [0u8; 128];
-	unsafe {
-		// Governed launch sends arguments first, then the tagged NetworkService grant.
-		inherit_stdout(bootstrap);
-		let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let len: usize = argument.len();
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-		connect(netsvc, &buf[..len]);
-		close(netsvc);
-	}
+	// Governed launch sends arguments first, then the tagged NetworkService grant.
+	inherit_stdout(bootstrap);
+	let Some((context_bytes, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let len: usize = argument.len();
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	connect(netsvc, &buf[..len]);
+	close(netsvc);
 	exit();
 }
 
@@ -63,7 +61,7 @@ fn parse_port(bytes: &[u8]) -> Option<u16> {
 }
 
 // Parse `<ip> <port>`, open the connection, send a probe, and stream the response.
-unsafe fn connect(netsvc: u64, args: &[u8]) {
+fn connect(netsvc: u64, args: &[u8]) {
 	unsafe {
 		let sp: usize = match args.iter().position(|&b: &u8| b == b' ') {
 			Some(i) => i,

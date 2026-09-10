@@ -1,6 +1,6 @@
 # Unsafe-boundary inventory
 
-Schema `libersystem-unsafe-inventory/1`, revision `f76cbb521695d707b6a777cd3af6306473bfaca7` (dirty (123 changed path(s))), rustc `rustc 1.93.1 (01f6ddf75 2026-02-11)`, cargo `cargo 1.93.1 (083ac5135 2025-12-15)`.
+Schema `libersystem-unsafe-inventory/1`, revision `5340fa0b7a22f03411af6e0204cd6a44fc43681f` (dirty (131 changed path(s))), rustc `rustc 1.93.1 (01f6ddf75 2026-02-11)`, cargo `cargo 1.93.1 (083ac5135 2025-12-15)`.
 
 Regenerate: `cd src/tools/unsafe-inventory && cargo run --quiet -- --repo ../../.. [--expand]`. This file is rendered from `unsafe-inventory.json`; edit the classification, not this.
 
@@ -8,13 +8,13 @@ Regenerate: `cd src/tools/unsafe-inventory && cargo run --quiet -- --repo ../../
 
 | row | kind | target | profile | features | build-std | rustflags | crates | third-party excluded | files |
 | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| `kernel-x86_64` | shipping | `x86_64-unknown-none` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static` | 17 | 0 | 226 |
-| `kernel-aarch64` | shipping | `aarch64-unknown-none` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static -C link-arg=-no-pie` | 17 | 0 | 226 |
-| `kernel-riscv64` | shipping | `riscv64gc-unknown-none-elf` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static -C link-arg=-no-pie -C code-model=medium` | 17 | 0 | 226 |
-| `static-user-x86_64` | shipping | `src/user/x86_64-unknown-none.json` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static` | 41 | 0 | 266 |
-| `static-user-aarch64` | shipping | `aarch64-unknown-none` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static` | 41 | 0 | 266 |
-| `static-user-riscv64` | shipping | `riscv64gc-unknown-none-elf` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static -C code-model=medium` | 41 | 0 | 266 |
-| `development-user-x86_64` | development | `src/user/x86_64-unknown-none.json` | dev | development | core,compiler_builtins,alloc | `-C relocation-model=static` | 32 | 0 | 241 |
+| `kernel-x86_64` | shipping | `x86_64-unknown-none` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static` | 17 | 0 | 225 |
+| `kernel-aarch64` | shipping | `aarch64-unknown-none` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static -C link-arg=-no-pie` | 17 | 0 | 225 |
+| `kernel-riscv64` | shipping | `riscv64gc-unknown-none-elf` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static -C link-arg=-no-pie -C code-model=medium` | 17 | 0 | 225 |
+| `static-user-x86_64` | shipping | `src/user/x86_64-unknown-none.json` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static` | 41 | 0 | 269 |
+| `static-user-aarch64` | shipping | `aarch64-unknown-none` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static` | 41 | 0 | 269 |
+| `static-user-riscv64` | shipping | `riscv64gc-unknown-none-elf` | dev | default | core,compiler_builtins,alloc | `-C relocation-model=static -C code-model=medium` | 41 | 0 | 269 |
+| `development-user-x86_64` | development | `src/user/x86_64-unknown-none.json` | dev | development | core,compiler_builtins,alloc | `-C relocation-model=static` | 32 | 0 | 244 |
 | `shared-image-x86_64` | shipping | `src/user/x86_64-unknown-none.json` | release | default | core,alloc,compiler_builtins | `-C relocation-model=pic` | 93 | 11 | 461 |
 | `shared-image-aarch64` | shipping | `aarch64-unknown-none` | release | default | core,alloc,compiler_builtins | `-C relocation-model=pic` | 93 | 11 | 461 |
 | `shared-image-riscv64` | shipping | `riscv64gc-unknown-none-elf` | release | default | core,alloc,compiler_builtins | `-C relocation-model=pic -C code-model=medium` | 93 | 11 | 461 |
@@ -46,88 +46,88 @@ Each row's build command, `cfg` set and crate closure are in the JSON. A crate w
 
 | sites | reachable in a shipping row | test-only | generated | macro templates | present in no row | unclassified |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 5736 | 4779 | 936 | 0 | 34 | 0 | 0 |
+| 4112 | 3139 | 953 | 0 | 34 | 8 | 0 |
 
 | kind | sites |
 | --- | ---: |
 | `extern-abi-fn` | 299 |
 | `extern-block` | 37 |
 | `global-asm` | 45 |
-| `inline-asm` | 189 |
+| `inline-asm` | 188 |
 | `linkage-attr` | 284 |
 | `macro-template` | 34 |
-| `raw-pointer` | 1047 |
+| `raw-pointer` | 1050 |
 | `static-mut` | 31 |
-| `unsafe-block` | 2841 |
-| `unsafe-fn` | 918 |
-| `unsafe-impl` | 11 |
+| `unsafe-block` | 1819 |
+| `unsafe-fn` | 310 |
+| `unsafe-impl` | 14 |
+| `unsafe-trait` | 1 |
 
 | row | reachable sites |
 | --- | ---: |
-| `development-user-x86_64` | 1818 |
-| `kernel-aarch64` | 666 |
-| `kernel-riscv64` | 567 |
-| `kernel-x86_64` | 574 |
-| `loader-aarch64` | 580 |
-| `loader-riscv64` | 605 |
-| `loader-x86_64` | 589 |
-| `shared-image-aarch64` | 2353 |
-| `shared-image-riscv64` | 2353 |
-| `shared-image-x86_64` | 2353 |
-| `static-user-aarch64` | 2017 |
-| `static-user-riscv64` | 2017 |
-| `static-user-x86_64` | 2017 |
+| `development-user-x86_64` | 687 |
+| `kernel-aarch64` | 645 |
+| `kernel-riscv64` | 576 |
+| `kernel-x86_64` | 583 |
+| `loader-aarch64` | 584 |
+| `loader-riscv64` | 609 |
+| `loader-x86_64` | 593 |
+| `shared-image-aarch64` | 911 |
+| `shared-image-riscv64` | 911 |
+| `shared-image-x86_64` | 911 |
+| `static-user-aarch64` | 730 |
+| `static-user-riscv64` | 730 |
+| `static-user-x86_64` | 730 |
 | `wasm-component` | 8 |
 | `wasm-component-dev-diagnostics` | 8 |
 
 | category | sites |
 | --- | ---: |
-| abi-linkage | 489 |
-| contained-implementation | 2294 |
-| overly-broad | 1937 |
-| required-caller-enforced | 1016 |
+| abi-linkage | 563 |
+| contained-implementation | 2391 |
+| required-caller-enforced | 1158 |
 
 ## Groups
 
 | group | category | owner | disposition | sites | invariant |
 | --- | --- | --- | --- | ---: | --- |
-| `test-only` | contained-implementation | tests | keep (test-only) | 936 | Compiled only under `cfg(test)` (the kernel test suite, host tests): not in any shipping row. Recorded so the count is visible, not judged as production. |
+| `test-only` | contained-implementation | tests | keep (test-only) | 953 | Compiled only under `cfg(test)` (the kernel test suite, host tests): not in any shipping row. Recorded so the count is visible, not judged as production. |
 | `kernel-usercopy` | required-caller-enforced | kernel/arch | keep | 30 | Every instruction that touches a user address is registered in `.extable` with a fixup; a faulting user page becomes a short count, never a kernel fault. The `unsafe fn` contract is on the KERNEL buffer (readable/writable for `len`), which the syscall layer's fixed-size callers uphold. SMAP is opened only inside `paging::user_access`. |
-| `kernel-syscall-read-user` | overly-broad | kernel/syscall | narrow: bound T to plain-old-data (follow-up F2 in the report) | 5 | `read_user<T>` is a SAFE generic function that builds a `T` from user bytes with `assume_init`. Sound for every instantiation in the tree (u64, [u8; 64], CapTransfer - all plain data), and the signature does not say so: a future `T` with invalid bit patterns would be undefined behaviour with no `unsafe` at the call site. |
-| `kernel-syscall-user-pointers` | contained-implementation | kernel/syscall | keep | 12 | User pointers are validated by `user_buf_ok`/`user_buf_writable` and copied through the faultable usercopy under `user_access`; the raw pointers are the kernel-side buffers of fixed-size ABI records. A short copy is an error, never a success. |
+| `kernel-syscall-read-user` | required-caller-enforced | kernel/syscall | keep: the bound is the contract, and the caller still validates the pointer with `user_buf_ok` | 5 | `read_user<T>` builds a `T` from user bytes with `assume_init`, and now SAYS which types that is sound for: `T: UserPlain`, a sealed marker trait implemented for exactly the three plain-data records it reads (`u64`, `[u8; ENTRY_NAME_LEN]`, `CapTransfer`). The trait is sealed, so the list cannot be extended from outside the syscall module, and it is `unsafe` to implement, so adding one is a deliberate claim about bit patterns. A future `T` with invalid bit patterns is refused at compile time rather than being undefined behaviour with no `unsafe` in sight. |
+| `kernel-syscall-user-pointers` | contained-implementation | kernel/syscall | keep | 16 | User pointers are validated by `user_buf_ok`/`user_buf_writable` and copied through the faultable usercopy under `user_access`; the raw pointers are the kernel-side buffers of fixed-size ABI records. A short copy is an error, never a success. |
 | `kernel-arch-paging` | required-caller-enforced | kernel/arch | keep | 17 | Page tables are reached through the physical direct map (`phys_to_virt`); an `unsafe fn` takes a table pointer that its SAFETY line requires to be a valid table at that level, owned by the address space being edited under its lock. TLB and control-register writes are the assembly the hardware requires. Falsified by a mapping visible after unmap (the shootdown tests) or a table freed while referenced (frame accounting tests). |
 | `kernel-arch-paging-internals` | contained-implementation | kernel/arch | keep | 183 | The blocks, raw pointers and assembly inside the page-table code: table walks over tables the caller vouched for, `invlpg`/`tlbi`/`sfence.vma`, and control-register reads. Contained behind the safe map/unmap API. |
 | `kernel-arch-usermode-and-context` | required-caller-enforced | kernel/arch | keep | 93 | Ring transitions and context switches: `global_asm!` entry/exit stubs, `switch_context`, `write_cr3`/TTBR/SATP writes and the user-mode entry. Their contracts are the calling convention and the saved-frame layout the assembly defines; `enter` requires user-mapped entry and stack addresses that the loader established. |
 | `kernel-arch-interrupt-controllers` | contained-implementation | kernel/arch | keep | 125 | MMIO to the interrupt controllers (LAPIC/IOAPIC, GIC/ITS, IMSIC/APLIC) at addresses from the device tree or firmware tables, volatile and behind the controller's own lock; the IDT/vector tables are `static mut` written before interrupts are enabled and read-only afterwards. |
 | `kernel-arch-percpu-and-smp` | contained-implementation | kernel/smp | keep | 166 | Per-CPU blocks are leaked once at boot, indexed by a CPU number below the online count the census established (the 64-CPU portable cap and the backend caps); the `unsafe impl Sync` on trap-stack pools holds because each CPU touches only its own slot. AP bring-up writes trampolines and stacks the BSP owns until the AP reports in. Falsified by a CPU index at or past the count, which the census refuses. |
-| `kernel-arch-early-virtio-blk-aarch64` | contained-implementation | kernel/arch/aarch64 | family work: P02M0173 M3 (the early bootstrap access) | 30 | The AArch64 bring-up block driver programs PHYSICAL queue and buffer addresses into the device and enables bus mastering before the IOMMU and the device manager exist: untranslated DMA by construction, inside the ports' produced `no-iommu` mode. Not an unsoundness of the Rust code - the frames are its own - but the boundary P02M0173 M3 requires to move behind confirmed IOMMU initialisation or off the enforcing path. |
+| `kernel-arch-early-virtio-blk-aarch64` | contained-implementation | kernel/arch/aarch64 | family work: P02M0173 M3 (the early bootstrap access) | 0 | The AArch64 bring-up block driver programs PHYSICAL queue and buffer addresses into the device and enables bus mastering before the IOMMU and the device manager exist: untranslated DMA by construction, inside the ports' produced `no-iommu` mode. Not an unsoundness of the Rust code - the frames are its own - but the boundary P02M0173 M3 requires to move behind confirmed IOMMU initialisation or off the enforcing path. |
 | `kernel-arch-boot` | contained-implementation | kernel/arch | keep | 191 | Early boot before the allocator: BootInfo and firmware-handed memory read at the addresses the loader (or the device tree) gave, single-threaded on the boot CPU, `static mut` probes written once. Contained: nothing after `main` reaches these paths. |
 | `kernel-arch-port-io-and-fwcfg` | required-caller-enforced | kernel/arch/x86_64 | keep | 31 | x86_64 port I/O (`in`/`out`) to fixed legacy ports and the `fw_cfg` selector/data ports: the `unsafe fn` says which port is being driven and the callers are the kernel's own console, PCI configuration and the harness carrier read. |
-| `kernel-dtb-parsing` | required-caller-enforced | fdt | keep | 108 | The device tree is parsed at a physical address the loader handed over; `Fdt::new` requires a valid tree there (its SAFETY contract) and every read inside is bounds-checked against the header's declared sizes (`Bounds`, `be32_in`, `prop_in`). Shared with the loader and host-tested in the `fdt` crate. |
-| `kernel-iommu` | contained-implementation | kernel/iommu | keep | 60 | The virtio-IOMMU backend's request/event queues and DMA scratch live in frames the module owns and pins; every access carries a SAFETY line naming the frame and the bound; MMIO is to the controller's own configuration structures resolved from its PCI capabilities. Falsified by the hostile EDU gate and the fault-drain tests. |
+| `kernel-dtb-parsing` | required-caller-enforced | fdt | keep | 110 | The device tree is parsed at a physical address the loader handed over; `Fdt::new` requires a valid tree there (its SAFETY contract) and every read inside is bounds-checked against the header's declared sizes (`Bounds`, `be32_in`, `prop_in`). Shared with the loader and host-tested in the `fdt` crate. |
+| `kernel-iommu` | contained-implementation | kernel/iommu | keep | 63 | The virtio-IOMMU backend's request/event queues and DMA scratch live in frames the module owns and pins; every access carries a SAFETY line naming the frame and the bound; MMIO is to the controller's own configuration structures resolved from its PCI capabilities. Falsified by the hostile EDU gate and the fault-drain tests. |
 | `kernel-mem` | contained-implementation | kernel/mem | keep | 34 | The heap (`GlobalAlloc` over a free-region list of `&'static mut` nodes under a spin lock), the frame allocator (poisoning and accounting under `debug_assertions`, which IS the shipping profile) and the TLB shootdown. The contracts are the allocator's: a freed region was allocated here and is not referenced. `unsafe impl GlobalAlloc` is the ABI the language requires. |
 | `kernel-sync` | contained-implementation | kernel | keep | 8 | `SpinLock<T>: Send + Sync` for `T: Send` and `Console: Send` - the standard exclusion argument: the lock hands out one `&mut T` at a time. |
 | `kernel-sched-and-objects` | contained-implementation | kernel/sched | keep | 22 | The scheduler's per-CPU run queues (a leaked table indexed by the current CPU), the context-switch calls whose saved-frame contract is the arch's, thread stacks (frames owned by the stack for its life, guard-page checks by volatile read) and the idle hook stored as an integer and restored to the `fn()` it came from. |
 | `kernel-main-loader-device` | contained-implementation | kernel | keep | 27 | Kernel entry (the `#[no_mangle]` entry point), user program loading (writes into a freshly created address space through kernel mappings the loader owns), PCI device enumeration and MMIO to configuration space and BARs the device census resolved. Contained behind the object layer. |
 | `kernel-remaining` | contained-implementation | kernel | keep | 41 | The remaining kernel sites: named in the report's kernel table by file; each reviewed as contained behind a safe API, with its invariant stated there. |
-| `rt-raw-syscall` | required-caller-enforced | rt | keep | 9 | The raw `syscall` entry: inline assembly issuing the trap with the register convention the kernel expects. The caller contract is the whole syscall ABI - every argument that is a pointer must be valid for the kernel's copy - and it is genuinely the caller's. |
-| `rt-address-returning` | required-caller-enforced | rt | keep | 23 | Wrappers that hand the caller a raw ADDRESS to dereference - a mapped MemoryObject, a DMA buffer, the framebuffer, the memory map: the returned address is valid for the object's length until unmapped, and that is the caller's obligation to respect, so `unsafe fn` is the honest signature. |
-| `rt-heap-stream-and-linkage` | abi-linkage | rt | keep | 74 | The runtime's own allocator (`GlobalAlloc`, `Sync` for the locked heap), the stream frame reader over a mapped object, the process entry (`liber_rt_start`, `__user_main`) and the shared-image `memcpy`/`memset` forwarding stubs: the language's and the linker's ABI. |
-| `rt-propagated-wrappers` | overly-broad | rt | narrow: safe signatures where the body upholds the contract (follow-up F1 in the report) | 304 | One hundred and thirty typed syscall wrappers declared `unsafe fn` although their parameters are handles (`u64`), slices and values and their bodies uphold the raw call's contract themselves - `yield_now`, `close`, `clock`, `random_get(&mut [u8])`, `send_blocking`, `recv_blocking(&mut [u8])` and their kin. A caller cannot violate memory safety through them; the `unsafe` is propagation from `syscall`, and it is what every service, driver and tool then wraps in an `unsafe {}` of its own. |
-| `drivers-mmio-and-dma` | contained-implementation | drivers | keep | 287 | Device registers are reached through the MMIO span the kernel mapped for the claim, DMA rings and buffers through `DmaAddress`-backed buffers the kernel handed out; descriptor and ring writes are volatile and ordered by the barriers the virtio and xHCI specifications require. The raw pointers name those spans and nothing else. Falsified by the enforcing-IOMMU gate (a physical address in a descriptor faults) and the drivers' hostile-device host tests. |
+| `rt-raw-syscall` | required-caller-enforced | rt | keep | 10 | The raw `syscall` entry: inline assembly issuing the trap with the register convention the kernel expects. The caller contract is the whole syscall ABI - every argument that is a pointer must be valid for the kernel's copy - and it is genuinely the caller's. |
+| `rt-address-returning` | required-caller-enforced | rt | keep | 22 | Wrappers that hand the caller a raw ADDRESS to dereference - a mapped MemoryObject, a DMA buffer, the framebuffer, the memory map: the returned address is valid for the object's length until unmapped, and that is the caller's obligation to respect, so `unsafe fn` is the honest signature. |
+| `rt-heap-stream-and-linkage` | abi-linkage | rt | keep | 63 | The runtime's own allocator (`GlobalAlloc`, `Sync` for the locked heap), the stream frame reader over a mapped object, the process entry (`liber_rt_start`, `__user_main`) and the shared-image `memcpy`/`memset` forwarding stubs: the language's and the linker's ABI. |
+| `rt-propagated-wrappers` | required-caller-enforced | rt | keep | 133 | What the runtime keeps after the wrappers took the signature their contract has. The raw `syscall` is one item per architecture and is inline assembly; the ten wrappers that hand the caller an address or a slice over a mapping - `map_object`, `memmap_get`, `dma_buffer_map`, `dma_buffer_phys`, `dma_buffer_phys_at`, `dma_buffer`, `dma_buffer_for`, `framebuffer_map`, `process_load_module`, `recv_package` - each carry a written `# Safety` contract naming what the caller owes; the `unsafe {}` blocks inside the now-safe wrappers are where the raw call's pointer contract is DISCHARGED, which is what lets their signatures be safe; and the shared-image `mem*` implementations are the C library contract the compiler emits calls to. The hundred and twenty-three wrappers that only propagated are safe `fn` now, and the two unmap wrappers say in as many words why ending a mapping is not itself a caller obligation. |
+| `drivers-mmio-and-dma` | contained-implementation | drivers | keep | 235 | Device registers are reached through the MMIO span the kernel mapped for the claim, DMA rings and buffers through `DmaAddress`-backed buffers the kernel handed out; descriptor and ring writes are volatile and ordered by the barriers the virtio and xHCI specifications require. The raw pointers name those spans and nothing else. Falsified by the enforcing-IOMMU gate (a physical address in a descriptor faults) and the drivers' hostile-device host tests. |
 | `drivers-entry-linkage` | abi-linkage | drivers | keep | 16 | Each driver's `extern "C" fn __user_main` and its `#[unsafe(no_mangle)]`: the runtime's entry ABI. |
-| `drivers-propagated-wrappers` | overly-broad | drivers | narrow with the runtime (follow-up F1) | 159 | The drivers' `unsafe fn` layer (`common.rs` handshake/offer/online/stand, per-device bring-up) is unsafe because it calls the runtime's propagated wrappers; its own contracts - a bootstrap handle, a bound - are values. Narrows together with the runtime. |
-| `services-mapped-views` | contained-implementation | services | keep | 124 | Raw pointers in services are views over MemoryObjects the kernel mapped whole (`map_object`) at the length the same service or the kernel reported, unmapped and closed after use; the display and audio engines additionally write into DMA-visible buffers the driver published for that purpose. |
+| `drivers-propagated-wrappers` | contained-implementation | drivers | keep | 56 | The drivers' remaining `unsafe fn`s, after the ones that only called the runtime went safe with it. What is left is the bring-up and ring work whose bodies reach device memory: the MMIO accessors every virtio driver funnels through, the queue and descriptor writers, the xHCI context builders. Their contract is the one `drivers-mmio-and-dma` states - the span is the claim's mapping and nothing else - and `common.rs`, which was twenty-nine `unsafe fn`s of pure propagation, has none left. |
+| `services-mapped-views` | contained-implementation | services | keep | 45 | Raw pointers in services are views over MemoryObjects the kernel mapped whole (`map_object`) at the length the same service or the kernel reported, unmapped and closed after use; the display and audio engines additionally write into DMA-visible buffers the driver published for that purpose. |
 | `services-entry-linkage` | abi-linkage | services | keep | 58 | Every service's `extern "C" fn __user_main` and `#[unsafe(no_mangle)]`: the runtime's entry ABI. |
-| `services-wrapped-runtime-calls` | overly-broad | services | narrow with the runtime (follow-up F1) | 984 | The services' `unsafe {}` blocks and `unsafe fn`s wrap calls into the runtime's propagated wrappers - `close`, `send_blocking`, `recv_*`, `wait_any`, `clock` - and pass handles and slices. Nothing in these blocks dereferences a raw pointer; they are the runtime's propagation counted once per call site. |
+| `services-wrapped-runtime-calls` | contained-implementation | services | keep | 125 | What is left in the services once the runtime's wrappers are safe: blocks that still hold at least one genuinely unsafe call - a mapped-object view, a `map_object` or `process_load_module`, a provider import - and the `unsafe fn`s whose bodies do that work. A block counts once however many safe calls it also contains, which is why the count does not go to zero: eight hundred and fifty-nine of the nine hundred and eighty-four sites were propagation and are gone. |
 | `apps-entry-linkage` | abi-linkage | apps | keep | 154 | Each tool's `extern "C" fn __user_main` and `#[unsafe(no_mangle)]`: the runtime's entry ABI (seventy-five programs). |
 | `apps-mapped-views` | contained-implementation | apps | keep | 14 | The tools' raw pointers: `from_raw_parts` over a file the storage service mapped whole, read once and unmapped. |
-| `apps-wrapped-runtime-calls` | overly-broad | apps | narrow with the runtime (follow-up F1) | 393 | The tools' `unsafe {}` blocks and `unsafe fn`s wrap the runtime's propagated wrappers around handles and slices; no raw memory of their own. |
+| `apps-wrapped-runtime-calls` | contained-implementation | apps | keep | 61 | What is left in the tools: the entry blocks that still call one `unsafe fn` of their own - a pump or a viewer that reads a mapped file - and the `global_asm!` shims. Three hundred and thirty-two of the three hundred and ninety-three sites were the runtime's propagation and are gone; a block that holds one unsafe call and twenty safe ones still counts once. |
 | `libs-shared-image-exports` | abi-linkage | libs (generated) | keep | 179 | The shared-image provider ABI: generated `#[unsafe(export_name)]` wrappers in the protocol crates, the `forward!` `global_asm!` templates that alias an exported symbol to its implementation per architecture, and the `extern` blocks a client crate declares for its provider's entry points. All of it is generated from the interface definitions and audited by the package identity and the export-owner checks. |
-| `libs-ipc-and-driver-protocol` | contained-implementation | libs | keep | 17 | The IPC client's `unsafe fn`s over runtime calls, and the driver protocol's raw pointers into DMA-visible frames it describes for the drivers. |
-| `libs-wrapped-runtime-calls` | overly-broad | libs | narrow with the runtime (follow-up F1) | 92 | Client libraries' `unsafe {}` blocks around the runtime's propagated wrappers (send, receive, close on a handle). |
+| `libs-ipc-and-driver-protocol` | contained-implementation | libs | keep | 9 | The IPC client's `unsafe fn`s over runtime calls, and the driver protocol's raw pointers into DMA-visible frames it describes for the drivers. |
+| `libs-wrapped-runtime-calls` | abi-linkage | libs | keep | 85 | The client libraries' remaining blocks, which are calls into the shared-image PROVIDER IMPORTS - `unsafe extern "C"` entry points the generated bindings declare and the loader resolves - and not runtime propagation. A foreign function is unsafe because its contract is not Rust's to check; these are the audited export names of `libs-shared-image-exports`, called from the safe client API. |
 | `sdk-component-boundary` | abi-linkage | sdk | keep | 8 | The WASM component's side of the host contract: the host imports it declares (`unsafe extern "C"` in the SDK's world module, wrapped by the SDK's safe API) and the `#[unsafe(no_mangle)] extern "C"` exports the interpreter calls by name. The interpreter's side (`src/wasm`) contains no unsafe code: every import is dispatched by name and validated by the host. |
-| `loader-firmware-and-handoff` | required-caller-enforced | boot | keep | 704 | The UEFI loader: firmware tables and protocols are raw pointers the firmware handed the image entry (boot services, file and block protocols, variables), used while boot services are live and never after; the memory map, the ELF placement and the kernel hand-off write physical memory the firmware's map declared free; `static mut` state is single-threaded and reached only from the boot path (said at each one). The port hand-offs are inline assembly. |
+| `loader-firmware-and-handoff` | required-caller-enforced | boot | keep | 706 | The UEFI loader: firmware tables and protocols are raw pointers the firmware handed the image entry (boot services, file and block protocols, variables), used while boot services are live and never after; the memory map, the ELF placement and the kernel hand-off write physical memory the firmware's map declared free; `static mut` state is single-threaded and reached only from the boot path (said at each one). The port hand-offs are inline assembly. |
 | `term-raster` | required-caller-enforced | term | keep | 1 | The terminal raster draws into a framebuffer mapping through a raw address. `Raster::new` is `unsafe fn` with a written contract - a readable, writable, unaliased mapping of at least `pitch * height` bytes for the raster's life - and validates the geometry itself; every pixel write and read is bounds-checked against that geometry before the volatile access. Shared by the kernel console and the userspace display path. |
 | `term-raster-internals` | contained-implementation | term | keep | 8 | The pixel accesses inside the raster: bounds-checked offsets into the mapping `Raster::new` vouched for, written and read volatile. |
 | `shared-crates-misc` | contained-implementation | shared | keep | 9 | The remaining shared crates: the DMA address contract's raw-pointer views, the wire codec's provider externs. |
@@ -149,15 +149,15 @@ Each row's build command, `cfg` set and crate closure are in the JSON. A crate w
 | `display-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 7 | 0 |
 | `dma` | 1 | 2 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 0 |
 | `driver-protocol` | 0 | 2 | 0 | 4 | 0 | 0 | 0 | 0 | 1 | 0 |
-| `drivers` | 159 | 169 | 0 | 118 | 0 | 0 | 0 | 8 | 8 | 0 |
+| `drivers` | 56 | 117 | 0 | 118 | 0 | 0 | 0 | 8 | 8 | 0 |
 | `dyn_probe` | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 0 | 0 | 0 |
-| `fdt` | 27 | 45 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `fdt` | 28 | 46 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
 | `input-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 0 |
-| `ipc-client` | 3 | 7 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
-| `kernel` | 94 | 535 | 6 | 258 | 6 | 133 | 22 | 40 | 12 | 4 |
+| `ipc-client` | 1 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `kernel` | 86 | 525 | 10 | 250 | 6 | 132 | 22 | 40 | 12 | 4 |
 | `liber-sdk` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 |
 | `liber_component` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 3 | 0 |
-| `loader` | 18 | 206 | 2 | 144 | 18 | 33 | 1 | 2 | 1 | 0 |
+| `loader` | 19 | 207 | 2 | 144 | 18 | 33 | 1 | 2 | 1 | 0 |
 | `log-client` | 0 | 3 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `log-client-provider` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 |
 | `log-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 0 |
@@ -174,26 +174,26 @@ Each row's build command, `cfg` set and crate closure are in the JSON. A crate w
 | `resources-client` | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `resources-client-provider` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 |
 | `resources-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 0 |
-| `rt` | 148 | 169 | 2 | 39 | 0 | 6 | 6 | 13 | 27 | 0 |
+| `rt` | 22 | 113 | 2 | 39 | 0 | 6 | 3 | 10 | 25 | 0 |
 | `security-client` | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `security-client-provider` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 |
 | `security-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 6 | 0 |
-| `services` | 253 | 619 | 0 | 20 | 0 | 0 | 0 | 27 | 27 | 0 |
+| `services` | 14 | 85 | 0 | 20 | 0 | 0 | 0 | 27 | 27 | 0 |
 | `session-client` | 0 | 3 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `session-client-provider` | 0 | 0 | 0 | 0 | 0 | 0 | 9 | 0 | 0 | 0 |
 | `session-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 12 | 0 |
-| `storage` | 15 | 162 | 0 | 9 | 0 | 0 | 0 | 2 | 2 | 0 |
+| `storage` | 5 | 24 | 0 | 9 | 0 | 0 | 0 | 2 | 2 | 0 |
 | `storage-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 32 | 0 |
-| `surface` | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| `system_manager` | 3 | 23 | 0 | 2 | 0 | 0 | 0 | 1 | 1 | 0 |
+| `surface` | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `system_manager` | 1 | 8 | 0 | 2 | 0 | 0 | 0 | 1 | 1 | 0 |
 | `term` | 1 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0 |
 | `time-client` | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |
 | `time-client-provider` | 0 | 0 | 0 | 0 | 0 | 0 | 3 | 0 | 0 | 0 |
 | `time-proto` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |
-| `tools` | 132 | 258 | 0 | 14 | 0 | 0 | 0 | 77 | 77 | 0 |
+| `tools` | 14 | 44 | 0 | 14 | 0 | 0 | 0 | 77 | 77 | 0 |
 | `uefi` | 17 | 69 | 0 | 177 | 0 | 0 | 0 | 0 | 0 | 0 |
 | `volume-client` | 0 | 30 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 |
-| `volume-client-provider` | 2 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 3 |
+| `volume-client-provider` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 | 3 |
 | `wire` | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 0 |
 
 ## Unclassified sites (0)

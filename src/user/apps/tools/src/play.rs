@@ -66,10 +66,8 @@ impl MappedFile {
 
 impl Drop for MappedFile {
 	fn drop(&mut self) {
-		unsafe {
-			unmap_object(self.handle);
-			close(self.handle);
-		}
+		unmap_object(self.handle);
+		close(self.handle);
 	}
 }
 
@@ -145,36 +143,36 @@ fn push_decimal(out: &mut String, value: u64) {
 	}
 }
 
-unsafe fn play_audio(audio_channel: u64, bytes: &[u8]) -> Result<(), ()> {
+fn play_audio(audio_channel: u64, bytes: &[u8]) -> Result<(), ()> {
 	if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
 		let wav = Wav::parse(bytes).map_err(|_| ())?;
 		let metadata = wav.metadata();
-		return unsafe { play_decoded(audio_channel, "WAV", metadata.rate, metadata.channels, metadata.frames, wav.decoder()) };
+		return play_decoded(audio_channel, "WAV", metadata.rate, metadata.channels, metadata.frames, wav.decoder());
 	}
 	if bytes.starts_with(b"FORM") && matches!(bytes.get(8..12), Some(b"AIFF") | Some(b"AIFC")) {
 		let aiff = Aiff::parse(bytes).map_err(|_| ())?;
 		let metadata = aiff.metadata();
-		return unsafe { play_decoded(audio_channel, if bytes.get(8..12) == Some(b"AIFF") { "AIFF" } else { "AIFC" }, metadata.rate, metadata.channels, metadata.frames, aiff.decoder()) };
+		return play_decoded(audio_channel, if bytes.get(8..12) == Some(b"AIFF") { "AIFF" } else { "AIFC" }, metadata.rate, metadata.channels, metadata.frames, aiff.decoder());
 	}
 	if bytes.starts_with(b"fLaC") {
 		let flac = Flac::parse(bytes).map_err(|_| ())?;
 		let metadata = flac.metadata();
-		return unsafe { play_decoded(audio_channel, "FLAC", metadata.rate, metadata.channels, metadata.frames, flac.decoder()) };
+		return play_decoded(audio_channel, "FLAC", metadata.rate, metadata.channels, metadata.frames, flac.decoder());
 	}
 	if bytes.starts_with(b"wvpk") {
 		let wavpack = WavPack::parse(bytes).map_err(|_| ())?;
 		let metadata = wavpack.metadata();
-		return unsafe { play_decoded(audio_channel, "WavPack", metadata.rate, metadata.channels, metadata.frames, wavpack.decoder()) };
+		return play_decoded(audio_channel, "WavPack", metadata.rate, metadata.channels, metadata.frames, wavpack.decoder());
 	}
 	if bytes.starts_with(b"OggS") {
 		let vorbis = Vorbis::parse(bytes).map_err(|_| ())?;
 		let metadata = vorbis.metadata();
-		return unsafe { play_decoded(audio_channel, "Ogg Vorbis", metadata.rate, metadata.channels, metadata.frames, vorbis.decoder()) };
+		return play_decoded(audio_channel, "Ogg Vorbis", metadata.rate, metadata.channels, metadata.frames, vorbis.decoder());
 	}
 	if bytes.starts_with(b"ID3") || bytes.first() == Some(&0xff) && bytes.get(1).is_some_and(|byte| byte & 0xe0 == 0xe0) {
 		let mp3 = Mp3::parse(bytes).map_err(|_| ())?;
 		let metadata = mp3.metadata();
-		return unsafe { play_decoded(audio_channel, "MP3", metadata.rate, metadata.channels, metadata.frames, mp3.decoder()) };
+		return play_decoded(audio_channel, "MP3", metadata.rate, metadata.channels, metadata.frames, mp3.decoder());
 	}
 	Err(())
 }
@@ -244,14 +242,14 @@ impl PcmDecoder for vorbis::Decoder<'_> {
 	}
 }
 
-unsafe fn play_decoded(audio_channel: u64, container: &str, rate: u32, channels: u8, frames_total: u64, mut decoder: impl PcmDecoder) -> Result<(), ()> {
+fn play_decoded(audio_channel: u64, container: &str, rate: u32, channels: u8, frames_total: u64, mut decoder: impl PcmDecoder) -> Result<(), ()> {
 	let mut root = AudioClient::new(audio_channel);
 	let stream_channel = root.open_stream(&rate, &channels).and_then(Result::ok).ok_or(())?;
 	let mut stream = PcmStreamClient::new(stream_channel);
 	print_metadata(container, rate, channels, frames_total);
 	let mut pcm = Vec::new();
 	while decoder.remaining_frames() != 0 {
-		if unsafe { interrupted() } {
+		if interrupted() {
 			let _ = stream.close();
 			return Ok(());
 		}
@@ -262,7 +260,7 @@ unsafe fn play_decoded(audio_channel: u64, container: &str, rate: u32, channels:
 		let frame_bytes = channels as usize * 2;
 		let mut accepted = 0usize;
 		while accepted < frames {
-			if unsafe { interrupted() } {
+			if interrupted() {
 				let _ = stream.close();
 				return Ok(());
 			}
@@ -288,5 +286,5 @@ fn print_metadata(container: &str, rate: u32, channels: u8, frames: u64) {
 	line.push_str(if channels == 1 { " channel, " } else { " channels, " });
 	push_decimal(&mut line, frames);
 	line.push_str(" frames\n");
-	unsafe { print(line.as_bytes()) };
+	print(line.as_bytes());
 }

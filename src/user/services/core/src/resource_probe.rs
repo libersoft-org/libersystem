@@ -47,7 +47,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	loop {
 		// Wait for the manager's next command. The manager drops the channel (or never
 		// sends again) when it is done, which parks us here holding our objects alive.
-		match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { .. } => {}
 			Received::Closed => exit(),
 		}
@@ -56,7 +56,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// memory budget). A refusal is a typed error, not a crash: we stop and keep every
 		// object we did get, then report DONE and wait for the next command.
 		while count < CAPACITY {
-			let handle: i64 = unsafe { memory_object_create(OBJECT_SIZE) };
+			let handle: i64 = memory_object_create(OBJECT_SIZE);
 			if handle < 0 {
 				break;
 			}
@@ -64,8 +64,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			count += 1;
 		}
 
-		unsafe {
-			send_blocking(bootstrap, b"DONE", 0);
-		}
+		send_blocking(bootstrap, b"DONE", 0);
 	}
 }

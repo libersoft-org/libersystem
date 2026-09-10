@@ -24,20 +24,18 @@ const ARCH: &str = "riscv64";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
-		//    output renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string (uname takes none, but the launch protocol
-		//    sends one).
-		let _ = recv_launch_bytes(bootstrap);
-		// 3. print the identity: "<name> <version> <arch>".
-		print(env!("PRODUCT_NAME").as_bytes());
-		print(b" ");
-		print(env!("PRODUCT_VERSION").as_bytes());
-		print(b" ");
-		print(ARCH.as_bytes());
-		print(b"\n");
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our
+	//    output renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string (uname takes none, but the launch protocol
+	//    sends one).
+	let _ = recv_launch_bytes(bootstrap);
+	// 3. print the identity: "<name> <version> <arch>".
+	print(env!("PRODUCT_NAME").as_bytes());
+	print(b" ");
+	print(env!("PRODUCT_VERSION").as_bytes());
+	print(b" ");
+	print(ARCH.as_bytes());
+	print(b"\n");
 	exit();
 }

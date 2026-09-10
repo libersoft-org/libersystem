@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+mod ipv6_host;
 mod net;
 
 use alloc::string::String;
@@ -88,9 +89,9 @@ const MAX_LISTEN: usize = 2;
 // ConfigService client and the client closed - both feed allocations made with the
 // stack, so a later `set` applies at the next boot. The defaults stand in when no
 // config tree serves this boot (handle 0, a test scenario) or a key does not parse.
-fn net_policy(config: u64) -> (usize, usize) {
+fn net_policy(config: u64) -> (usize, usize, Option<alloc::string::String>) {
 	if config == 0 {
-		return (NEIGH_MAX, DEFAULT_MTU);
+		return (NEIGH_MAX, DEFAULT_MTU, None);
 	}
 	let mut client = config::Client::new(ChannelTransport { chan: config });
 	let neigh: usize = match client.get("net.arp-cache") {
@@ -101,102 +102,113 @@ fn net_policy(config: u64) -> (usize, usize) {
 		Some(Ok(value)) => value.parse::<usize>().ok().filter(|&n| n >= 576).unwrap_or(DEFAULT_MTU),
 		_ => DEFAULT_MTU,
 	};
-	unsafe { close(config) };
-	(neigh, mtu)
+	// READ ONCE, HERE. The ICMPv6 error bucket's rate is a boot-time decision: a value that could
+	// change under a running host would be a limit whose current value nothing could state.
+	let icmpv6_rate: Option<alloc::string::String> = match client.get("net.icmpv6-error-rate") {
+		Some(Ok(value)) => Some(value),
+		_ => None,
+	};
+	close(config);
+	(neigh, mtu, icmpv6_rate)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
-	unsafe {
-		// 1. receive the driver's frame channel (we move frames over it), the
-		//    ConfigService client the supervisor minted for us (handle 0 when no
-		//    config tree serves this boot - a test scenario), and the client channel
-		//    the shell reaches us on (the `ip` / `ping` / `nslookup` control
-		//    protocol).
-		let config: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 6 && &buf[..6] == b"CONFIG" => handle,
-			_ => fail_bootstrap(bootstrap, b"config", b"config client not delivered"),
-		};
-		let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
-		// THE NIC IS DISCOVERED, NOT HANDED OVER.
+	// 1. receive the driver's frame channel (we move frames over it), the
+	//    ConfigService client the supervisor minted for us (handle 0 when no
+	//    config tree serves this boot - a test scenario), and the client channel
+	//    the shell reaches us on (the `ip` / `ping` / `nslookup` control
+	//    protocol).
+	let config: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 6 && &buf[..6] == b"CONFIG" => handle,
+		_ => fail_bootstrap(bootstrap, b"config", b"config client not delivered"),
+	};
+	let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
+	// THE NIC IS DISCOVERED, NOT HANDED OVER.
+	//
+	// This service used to be given the network driver's frame channel under `FRAMES`, taken by
+	// DeviceManager into a slot of its own and routed down the boot chain - the per-kind
+	// injection the provider catalogue replaces. What arrives now is a connection to the
+	// CATALOGUE, and this service asks it for the network kind: a NIC bound after this service
+	// started reaches it, and a machine with two of them has a second entry to offer rather than
+	// a slot that is already full.
+	//
+	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+	let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
+	// THE SNAPSHOT IS ALREADY IN THE CHANNEL when `subscribe` answers - the catalogue registers a
+	// subscriber and sends it everything published in one step - so this is a poll and never a
+	// block. A machine with no NIC published has none, which is the same state a zero `FRAMES`
+	// handle used to be - and is served without a link below rather than refused.
+	let frames: u64 = take_published_nic(catalogue);
+	if frames == 0 {
+		// NO NETWORK PROVIDER ON THIS BOOT, AND THE SERVICE COMES UP ANYWAY - WITHOUT A LINK.
 		//
-		// This service used to be given the network driver's frame channel under `FRAMES`, taken by
-		// DeviceManager into a slot of its own and routed down the boot chain - the per-kind
-		// injection the provider catalogue replaces. What arrives now is a connection to the
-		// CATALOGUE, and this service asks it for the network kind: a NIC bound after this service
-		// started reaches it, and a machine with two of them has a second entry to offer rather than
-		// a slot that is already full.
+		// This used to fail the bootstrap, and a failed NetworkService is not "no network": the
+		// time service, PermissionManager, ConsoleService, SystemGraphService and the shell all
+		// depend on this service by manifest, so ServiceManager never started any of them and
+		// the machine came up with no shell at all. A boot whose DMA mode refuses the network
+		// driver by policy - a `no-iommu` boot, where `virtio_net` declares that it requires
+		// translation - is a machine with every OTHER driver and no NIC, and that is a state
+		// this service has to be able to stand in: online, answering every link-bound
+		// operation with a typed refusal, minting a fresh connection for every caller that
+		// asks for one, and holding no stack, no lease and no frame buffers.
 		//
-		// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
-		let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
-		// THE SNAPSHOT IS ALREADY IN THE CHANNEL when `subscribe` answers - the catalogue registers a
-		// subscriber and sends it everything published in one step - so this is a poll and never a
-		// block. A machine with no NIC published has none, which is the same state a zero `FRAMES`
-		// handle used to be - and is served without a link below rather than refused.
-		let frames: u64 = take_published_nic(catalogue);
-		if frames == 0 {
-			// NO NETWORK PROVIDER ON THIS BOOT, AND THE SERVICE COMES UP ANYWAY - WITHOUT A LINK.
-			//
-			// This used to fail the bootstrap, and a failed NetworkService is not "no network": the
-			// time service, PermissionManager, ConsoleService, SystemGraphService and the shell all
-			// depend on this service by manifest, so ServiceManager never started any of them and
-			// the machine came up with no shell at all. A boot whose DMA mode refuses the network
-			// driver by policy - a `no-iommu` boot, where `virtio_net` declares that it requires
-			// translation - is a machine with every OTHER driver and no NIC, and that is a state
-			// this service has to be able to stand in: online, answering every link-bound
-			// operation with a typed refusal, minting a fresh connection for every caller that
-			// asks for one, and holding no stack, no lease and no frame buffers.
-			//
-			// Said on the console in the same breath as the DHCP report would have been, so a
-			// reader of the boot log sees WHY there is no address rather than a service that went
-			// quiet.
-			print(b"network: no network provider on this boot - NetworkService is up without a link\n");
-			send_blocking(bootstrap, b"NetworkService: online", 0);
-			serve_unlinked(client);
-		}
-		// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
-		//    the frame channel (it owns the device; we own the protocol), so we can
-		//    build the stack - its neighbor-cache sized by the config tree's
-		//    `net.arp-cache` policy, its MTU the smaller of the link's report and the
-		//    `net.mtu` knob.
-		let (mac, link_mtu): (MacAddr, usize) = match recv_blocking(frames, &mut buf) {
-			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => {
-				let link: usize = if len >= 11 { u16::from_le_bytes([buf[9], buf[10]]) as usize } else { DEFAULT_MTU };
-				(MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), if link == 0 { DEFAULT_MTU } else { link })
-			}
-			_ => fail_bootstrap(bootstrap, b"driver", b"NIC did not report its MAC"),
-		};
-		let (neigh_cap, mtu_knob): (usize, usize) = net_policy(config);
-		let mtu: usize = mtu_knob.min(link_mtu);
-		let frame_max: usize = mtu + 14;
-		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, neigh_cap, mtu as u16);
-		// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
-		//    static config above if no server answers. The frame buffers are heap Vecs
-		//    scoped so they are freed before serve allocates its own.
-		let mut lease: LeaseClock = LeaseClock::none();
-		{
-			let mut drx: Vec<u8> = alloc::vec![0u8; frame_max];
-			let mut dtx: Vec<u8> = alloc::vec![0u8; frame_max];
-			// WHAT IT GOT, NOT ONLY THAT IT GOT SOMETHING. Every other line in the boot report
-			// carries its own fact - the frame count, the core count, the volume name, the release -
-			// and this one said a transaction had completed and left the reader to go and look.
-			if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
-				print(b"network: configured via DHCP - ");
-				print_address(&stack);
-				print(b"\n");
-				lease = LeaseClock::bound(&stack);
-			} else {
-				print(b"network: DHCP unanswered, using static config - ");
-				print_address(&stack);
-				print(b"\n");
-			}
-		}
-		// 4. report in, then serve the network and the client at once (serve announces
-		//    us on the link with a gratuitous ARP first).
+		// Said on the console in the same breath as the DHCP report would have been, so a
+		// reader of the boot log sees WHY there is no address rather than a service that went
+		// quiet.
+		print(b"network: no network provider on this boot - NetworkService is up without a link\n");
 		send_blocking(bootstrap, b"NetworkService: online", 0);
-		serve(frames, client, &mut stack, lease, frame_max);
+		serve_unlinked(client);
 	}
+	// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
+	//    the frame channel (it owns the device; we own the protocol), so we can
+	//    build the stack - its neighbor-cache sized by the config tree's
+	//    `net.arp-cache` policy, its MTU the smaller of the link's report and the
+	//    `net.mtu` knob.
+	let (mac, link_mtu): (MacAddr, usize) = match recv_blocking(frames, &mut buf) {
+		Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => {
+			let link: usize = if len >= 11 { u16::from_le_bytes([buf[9], buf[10]]) as usize } else { DEFAULT_MTU };
+			(MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), if link == 0 { DEFAULT_MTU } else { link })
+		}
+		_ => fail_bootstrap(bootstrap, b"driver", b"NIC did not report its MAC"),
+	};
+	let (neigh_cap, mtu_knob, icmpv6_rate): (usize, usize, Option<alloc::string::String>) = net_policy(config);
+	let mtu: usize = mtu_knob.min(link_mtu);
+	let frame_max: usize = mtu + 14;
+	let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, neigh_cap, mtu as u16);
+	// THE IPv6 HOST BESIDE IT, on the same link and the same MAC, with its own state and its own
+	// deadline. It shares nothing with the IPv4 stack, so a link with no IPv6 router behaves exactly
+	// as it did before: the host keeps soliciting at a widening interval and costs one packet.
+	let mut host: ipv6_host::Ipv6Host = ipv6_host::Ipv6Host::new(mac.0, 0, 1, mtu as u16, ipv6_entropy);
+	host.set_error_rate(icmpv6_rate.as_deref());
+	host.bring_up(now_ms());
+	stack.attach_ipv6(host);
+	// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
+	//    static config above if no server answers. The frame buffers are heap Vecs
+	//    scoped so they are freed before serve allocates its own.
+	let mut lease: LeaseClock = LeaseClock::none();
+	{
+		let mut drx: Vec<u8> = alloc::vec![0u8; frame_max];
+		let mut dtx: Vec<u8> = alloc::vec![0u8; frame_max];
+		// WHAT IT GOT, NOT ONLY THAT IT GOT SOMETHING. Every other line in the boot report
+		// carries its own fact - the frame count, the core count, the volume name, the release -
+		// and this one said a transaction had completed and left the reader to go and look.
+		if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
+			print(b"network: configured via DHCP - ");
+			print_address(&stack);
+			print(b"\n");
+			lease = LeaseClock::bound(&stack);
+		} else {
+			print(b"network: DHCP unanswered, using static config - ");
+			print_address(&stack);
+			print(b"\n");
+		}
+	}
+	// 4. report in, then serve the network and the client at once (serve announces
+	//    us on the link with a gratuitous ARP first).
+	send_blocking(bootstrap, b"NetworkService: online", 0);
+	serve(frames, client, &mut stack, lease, frame_max);
 }
 
 // Send a built frame to the driver to transmit. A zero-length frame (the stack
@@ -207,57 +219,53 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // channel: a frame this function reads and drops is a publication nothing will see again. Zero for a
 // boot that granted no catalogue connection or a machine with no NIC, which the caller serves
 // without a link.
-unsafe fn take_published_nic(catalogue: u64) -> u64 {
-	unsafe {
-		if catalogue == 0 {
-			print(b"NetworkService: no provider catalogue - this instance has no way to find a NIC\n");
+fn take_published_nic(catalogue: u64) -> u64 {
+	if catalogue == 0 {
+		print(b"NetworkService: no provider catalogue - this instance has no way to find a NIC\n");
+		return 0;
+	}
+	let providers: u64 = match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Net) {
+		Some(subscription) => subscription,
+		None => {
+			print(b"NetworkService: the catalogue refused a network subscription\n");
 			return 0;
 		}
-		let providers: u64 = match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Net) {
-			Some(subscription) => subscription,
-			None => {
-				print(b"NetworkService: the catalogue refused a network subscription\n");
-				return 0;
-			}
-		};
-		let mut buf: [u8; 256] = [0; 256];
-		let mut opened: u64 = 0;
-		loop {
-			let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
-			for &handle in handles.as_slice() {
-				close(handle);
-			}
-			let mut frame_handles = wire::Handles::new();
-			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
-				print(b"NetworkService: a provider frame did not decode\n");
-				continue;
-			};
-			if !info.live {
-				continue;
-			}
-			match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
-				Some(Ok(handle)) => {
-					opened = handle;
-					break;
-				}
-				Some(Err(_)) => print(b"NetworkService: the catalogue refused a connection to the network provider it published\n"),
-				None => print(b"NetworkService: the catalogue did not answer the connection it published\n"),
-			}
+	};
+	let mut buf: [u8; 256] = [0; 256];
+	let mut opened: u64 = 0;
+	loop {
+		let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
+		for &handle in handles.as_slice() {
+			close(handle);
 		}
-		// THE SUBSCRIPTION IS GIVEN BACK. This service takes one NIC at bootstrap and does not follow
-		// a replacement - its whole stack is built on the link it opened - so holding the stream open
-		// would be a handle nothing reads and a slot the catalogue could not give to a consumer that
-		// does follow one.
-		close(providers);
-		opened
+		let mut frame_handles = wire::Handles::new();
+		let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+			print(b"NetworkService: a provider frame did not decode\n");
+			continue;
+		};
+		if !info.live {
+			continue;
+		}
+		match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
+			Some(Ok(handle)) => {
+				opened = handle;
+				break;
+			}
+			Some(Err(_)) => print(b"NetworkService: the catalogue refused a connection to the network provider it published\n"),
+			None => print(b"NetworkService: the catalogue did not answer the connection it published\n"),
+		}
 	}
+	// THE SUBSCRIPTION IS GIVEN BACK. This service takes one NIC at bootstrap and does not follow
+	// a replacement - its whole stack is built on the link it opened - so holding the stream open
+	// would be a handle nothing reads and a slot the catalogue could not give to a consumer that
+	// does follow one.
+	close(providers);
+	opened
 }
 
-unsafe fn send_frame(frames: u64, frame: &[u8]) {
-	unsafe {
-		if !frame.is_empty() {
-			send_blocking(frames, frame, 0);
-		}
+fn send_frame(frames: u64, frame: &[u8]) {
+	if !frame.is_empty() {
+		send_blocking(frames, frame, 0);
 	}
 }
 
@@ -267,16 +275,165 @@ unsafe fn send_frame(frames: u64, frame: &[u8]) {
 // closing means the driver is gone - there is no network left to serve, and a wait
 // on the closed channel would be forever-ready, so the service exits instead of
 // spinning on it.
-unsafe fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Event {
-	unsafe {
-		match recv_blocking(frames, rx) {
-			Received::Message { len, .. } => {
-				let outcome: net::Outcome = stack.on_frame(&rx[..len], tx);
-				send_frame(frames, &tx[..outcome.reply_len]);
-				outcome.event
+fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Event {
+	match recv_blocking(frames, rx) {
+		Received::Message { len, .. } => {
+			// AN IPv6 FRAME GOES TO THE IPv6 HOST AND NOWHERE ELSE. The two stacks share the link
+			// and nothing else, so neither can be made to misbehave by the other's traffic.
+			if len > 13 && u16::from_be_bytes([rx[12], rx[13]]) == 0x86dd {
+				if let Some(host) = stack.ipv6() {
+					host.receive(&rx[..len], now_ms());
+				}
+				drain_ipv6(frames, stack);
+				report_ipv6(stack);
+				return Event::None;
 			}
-			Received::Closed => exit(),
+			let outcome: net::Outcome = stack.on_frame(&rx[..len], tx);
+			send_frame(frames, &tx[..outcome.reply_len]);
+			outcome.event
 		}
+		Received::Closed => exit(),
+	}
+}
+
+// The monotonic clock in milliseconds, which is what the IPv6 layer's deadlines are in.
+fn now_ms() -> u64 {
+	clock_ns() / 1_000_000
+}
+
+// An IPv6 deadline, in milliseconds, expressed as the tick the scheduler waits on.
+//
+// ROUNDED UP, not down: a deadline rounded down fires early and the layer above computes the same
+// deadline again, which is a busy loop at one tick per iteration.
+fn ticks_from_ms(deadline_ms: u64) -> u64 {
+	let now_tick = clock();
+	let now = now_ms();
+	let remaining_ms = deadline_ms.saturating_sub(now);
+	now_tick + remaining_ms.div_ceil(1000 / TICKS_PER_SEC)
+}
+
+// Sixty-four bits of kernel randomness for one prefix's interface identifier.
+//
+// THE KERNEL'S, NOT THIS SERVICE'S. The identifier must not be derived from anything the NIC knows,
+// and the one source of randomness a userspace program has that nothing on the link can predict is
+// the syscall. The policy this feeds, and the reboot limit it carries, are written at
+// `service_logic::ipv6::interface_identifier`.
+fn ipv6_entropy() -> [u8; 8] {
+	let mut drawn = [0u8; 8];
+	random_get(&mut drawn);
+	drawn
+}
+
+// Say what the IPv6 layer has, once per change.
+//
+// THE GUEST LOG IS THE ORACLE for a layer with no transport above it yet. Address configuration,
+// router discovery and the seam's own health are things a booted system can be asked about only if
+// it says them, and the transport that will consume them is the next milestone's.
+fn report_ipv6(stack: &mut Stack) {
+	let Some(host) = stack.ipv6() else {
+		return;
+	};
+	let invalidations = host.drain_invalidations();
+	let errors = host.drain_quoted_errors();
+	for delivery in host.take_deliveries() {
+		print(b"ipv6: delivered ");
+		print_u64(u64::from(delivery.next_header));
+		print(b" bytes=");
+		print_u64(delivery.payload.len() as u64);
+		print(b" hops=");
+		print_u64(u64::from(delivery.hop_limit));
+		print(b" from ");
+		print_ipv6_address(delivery.source);
+		print(b" to ");
+		print_ipv6_address(delivery.destination);
+		print(b"\n");
+	}
+	if invalidations.is_empty() && errors.is_empty() {
+		return;
+	}
+	let snapshot = host.snapshot();
+	print(b"ipv6: ");
+	match host.link_local() {
+		Some(address) => {
+			print(b"link-local ");
+			print_ipv6_address(address);
+			if let Some(scoped) = host.scoped(address) {
+				// A LINK-LOCAL ADDRESS WITHOUT ITS LINK IS NOT AN ADDRESS, so the line carries the
+				// scope rather than leaving a reader to assume there is only ever one interface.
+				if let Some(interface) = scoped.interface() {
+					print(b"%if");
+					print_u64(u64::from(interface.index));
+					print(b".");
+					print_u64(u64::from(interface.generation));
+				}
+			}
+		}
+		None => print(b"link-local pending"),
+	}
+	print(b", addresses=");
+	print_u64(host.addresses().len() as u64);
+	print(b", routers=");
+	print_u64(host.routers().len() as u64);
+	print(b", mtu=");
+	print_u64(u64::from(host.mtu()));
+	print(b", events=");
+	print_u64(invalidations.len() as u64);
+	print(b", errors=");
+	print_u64(errors.len() as u64);
+	print(b", dropped=");
+	print_u64(u64::from(host.outbound_dropped()));
+	if host.resync_required() {
+		print(b", RESYNC REQUIRED");
+	}
+	if snapshot.any_saturated() {
+		print(b", a bound is saturated");
+	}
+	print(b"\n");
+}
+
+// The canonical text form of an address, for the lines above.
+fn print_ipv6_address(address: service_logic::ipv6::Address) {
+	let groups = address.groups();
+	let mut index = 0usize;
+	while index < 8 {
+		if index > 0 {
+			print(b":");
+		}
+		print_hex(groups[index]);
+		index += 1;
+	}
+}
+
+fn print_hex(value: u16) {
+	const DIGITS: &[u8; 16] = b"0123456789abcdef";
+	let mut buffer = [0u8; 4];
+	for (index, slot) in buffer.iter_mut().enumerate() {
+		*slot = DIGITS[((value >> (12 - index * 4)) & 0xf) as usize];
+	}
+	print(&buffer);
+}
+
+fn print_u64(mut value: u64) {
+	let mut buffer = [0u8; 20];
+	let mut index = buffer.len();
+	loop {
+		index -= 1;
+		buffer[index] = b'0' + (value % 10) as u8;
+		value /= 10;
+		if value == 0 {
+			break;
+		}
+	}
+	print(&buffer[index..]);
+}
+
+// Send everything the IPv6 host has queued.
+fn drain_ipv6(frames: u64, stack: &mut Stack) {
+	let Some(host) = stack.ipv6() else {
+		return;
+	};
+	for frame in host.take_outbound() {
+		send_frame(frames, &frame);
 	}
 }
 
@@ -299,76 +456,74 @@ fn place_client(clients: &mut Vec<u64>, chan: u64) {
 // under it gets a typed refusal rather than a hang; `capacity` counts the clients; `sockets` is
 // empty. The service ends when its last client is gone, which is what `serve_multi` does for every
 // other service whose serve root closes.
-unsafe fn serve_unlinked(client: u64) -> ! {
-	unsafe {
-		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
-		let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
-		let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
-		clients.push(client);
-		loop {
-			let mut waits: Vec<u64> = Vec::with_capacity(clients.len());
-			let mut slot_of: Vec<usize> = Vec::with_capacity(clients.len());
-			let mut i: usize = 0;
-			while i < clients.len() {
-				if clients[i] != 0 {
-					waits.push(clients[i]);
-					slot_of.push(i);
-				}
-				i += 1;
+fn serve_unlinked(client: u64) -> ! {
+	let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
+	let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
+	let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
+	clients.push(client);
+	loop {
+		let mut waits: Vec<u64> = Vec::with_capacity(clients.len());
+		let mut slot_of: Vec<usize> = Vec::with_capacity(clients.len());
+		let mut i: usize = 0;
+		while i < clients.len() {
+			if clients[i] != 0 {
+				waits.push(clients[i]);
+				slot_of.push(i);
 			}
-			if waits.is_empty() {
-				exit();
-			}
-			let ready_raw: i64 = wait_any(&waits, 0);
-			if ready_raw < 0 {
-				continue;
-			}
-			let slot: usize = slot_of[ready_raw as usize];
-			let chan: u64 = clients[slot];
-			match recv_caps_blocking(chan, &mut req) {
-				ReceivedCaps::Message { len, handles: caps } => {
-					// A FRESH CONNECTION PER CALLER, answered by hand for the same reason the
-					// linked loop answers it by hand: this service does not stand on `serve_multi`.
-					if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
-						for &unclaimed in caps.as_slice() {
-							close(unclaimed);
-						}
-						match channel() {
-							Some((mine, theirs)) => {
-								place_client(&mut clients, mine);
-								send_blocking(chan, &[], theirs);
-							}
-							None => {
-								send_blocking(chan, &[], 0);
-							}
-						}
-						continue;
-					}
-					let mut handle = caps;
-					let mut new_client: u64 = 0;
-					let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
-					{
-						let mut svc: Unlinked = Unlinked { new_client: &mut new_client, clients_used };
-						let mut reply_handle = proto::codec::Handles::new();
-						if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
-							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
-								}
-							}
-						}
-					}
-					for &unclaimed in handle.as_slice() {
+			i += 1;
+		}
+		if waits.is_empty() {
+			exit();
+		}
+		let ready_raw: i64 = wait_any(&waits, 0);
+		if ready_raw < 0 {
+			continue;
+		}
+		let slot: usize = slot_of[ready_raw as usize];
+		let chan: u64 = clients[slot];
+		match recv_caps_blocking(chan, &mut req) {
+			ReceivedCaps::Message { len, handles: caps } => {
+				// A FRESH CONNECTION PER CALLER, answered by hand for the same reason the
+				// linked loop answers it by hand: this service does not stand on `serve_multi`.
+				if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
+					for &unclaimed in caps.as_slice() {
 						close(unclaimed);
 					}
-					if new_client != 0 {
-						place_client(&mut clients, new_client);
+					match channel() {
+						Some((mine, theirs)) => {
+							place_client(&mut clients, mine);
+							send_blocking(chan, &[], theirs);
+						}
+						None => {
+							send_blocking(chan, &[], 0);
+						}
+					}
+					continue;
+				}
+				let mut handle = caps;
+				let mut new_client: u64 = 0;
+				let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
+				{
+					let mut svc: Unlinked = Unlinked { new_client: &mut new_client, clients_used };
+					let mut reply_handle = proto::codec::Handles::new();
+					if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
+						if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
+						}
 					}
 				}
-				ReceivedCaps::Closed => {
-					close(chan);
-					clients[slot] = 0;
+				for &unclaimed in handle.as_slice() {
+					close(unclaimed);
 				}
+				if new_client != 0 {
+					place_client(&mut clients, new_client);
+				}
+			}
+			ReceivedCaps::Closed => {
+				close(chan);
+				clients[slot] = 0;
 			}
 		}
 	}
@@ -418,14 +573,12 @@ impl network::Service for Unlinked<'_> {
 	// A fresh client channel, exactly as the linked service mints one: a caller granted the
 	// network capability holds a connection of its own, and what it learns on it is the refusal.
 	fn open(&mut self) -> Result<u64, Error> {
-		unsafe {
-			match channel() {
-				Some((server, peer)) => {
-					*self.new_client = server;
-					Ok(peer)
-				}
-				None => Err(Error::Again),
+		match channel() {
+			Some((server, peer)) => {
+				*self.new_client = server;
+				Ok(peer)
 			}
+			None => Err(Error::Again),
 		}
 	}
 
@@ -453,199 +606,211 @@ impl network::Service for Unlinked<'_> {
 // gratuitous ARP that announces us on the link goes out first. While a DHCP lease
 // is held, its clock arms the wait's deadline (a periodic housekeeping wake) and
 // `lease_due` extends the lease when a threshold comes due.
-unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, frame_max: usize) -> ! {
-	unsafe {
-		// The frame and reply buffers live on the heap, not in this function's frame:
-		// serve holds all of them for its whole lifetime and the connect handshake
-		// nests a deep call chain on top, which would overflow the 16 kB user stack.
-		let mut rx: Vec<u8> = alloc::vec![0u8; frame_max];
-		let mut tx: Vec<u8> = alloc::vec![0u8; frame_max];
-		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
-		let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
-		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
-		send_frame(frames, &tx[..arp]);
-		// The client channels we serve the `network` interface on: the shell's
-		// (clients[0]) plus any minted by `network.open` for a spawned net tool.
-		// Each set below reuses free slots and grows on demand - never a fixed cap.
-		let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
-		clients.push(client);
-		// The active sockets (chan 0 = empty slot). Each is handed out by `network.connect`
-		// (later `listener.accept`): its channel, the stack connection index it drives, and
-		// its received-data stream producer (0 = none) plus that stream's frame sequence.
-		// The serve loop waits on every active socket channel at once.
-		let mut socks: Vec<SockSlot> = Vec::with_capacity(MAX_SOCKS);
-		// The active listeners (chan 0 = empty), each from `network.listen`: its channel,
-		// the port it accepts on, and a deferred `accept` (the correlation id to answer
-		// once an inbound connection completes, if accept was called with none pending).
-		let mut listeners: Vec<Listener> = Vec::with_capacity(MAX_LISTEN);
-		loop {
-			// Build the wait set: the driver frame channel always (index 0), every active
-			// client channel, then every active socket channel, then every listener. `kind`
-			// tags each wait index (0 = client, 1 = socket, 2 = listener) and `slot_of` maps
-			// it back to its slot.
-			let capacity: usize = 1 + clients.len() + socks.len() + listeners.len();
-			let mut waits: Vec<u64> = Vec::with_capacity(capacity);
-			let mut kind: Vec<u8> = Vec::with_capacity(capacity);
-			let mut slot_of: Vec<usize> = Vec::with_capacity(capacity);
-			waits.push(frames);
-			kind.push(0);
-			slot_of.push(usize::MAX);
-			let mut i: usize = 0;
-			while i < clients.len() {
-				if clients[i] != 0 {
-					waits.push(clients[i]);
-					kind.push(0);
-					slot_of.push(i);
-				}
-				i += 1;
+fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, frame_max: usize) -> ! {
+	// The frame and reply buffers live on the heap, not in this function's frame:
+	// serve holds all of them for its whole lifetime and the connect handshake
+	// nests a deep call chain on top, which would overflow the 16 kB user stack.
+	let mut rx: Vec<u8> = alloc::vec![0u8; frame_max];
+	let mut tx: Vec<u8> = alloc::vec![0u8; frame_max];
+	let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
+	let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
+	let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
+	send_frame(frames, &tx[..arp]);
+	// The client channels we serve the `network` interface on: the shell's
+	// (clients[0]) plus any minted by `network.open` for a spawned net tool.
+	// Each set below reuses free slots and grows on demand - never a fixed cap.
+	let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
+	clients.push(client);
+	// The active sockets (chan 0 = empty slot). Each is handed out by `network.connect`
+	// (later `listener.accept`): its channel, the stack connection index it drives, and
+	// its received-data stream producer (0 = none) plus that stream's frame sequence.
+	// The serve loop waits on every active socket channel at once.
+	let mut socks: Vec<SockSlot> = Vec::with_capacity(MAX_SOCKS);
+	// The active listeners (chan 0 = empty), each from `network.listen`: its channel,
+	// the port it accepts on, and a deferred `accept` (the correlation id to answer
+	// once an inbound connection completes, if accept was called with none pending).
+	let mut listeners: Vec<Listener> = Vec::with_capacity(MAX_LISTEN);
+	loop {
+		// Build the wait set: the driver frame channel always (index 0), every active
+		// client channel, then every active socket channel, then every listener. `kind`
+		// tags each wait index (0 = client, 1 = socket, 2 = listener) and `slot_of` maps
+		// it back to its slot.
+		let capacity: usize = 1 + clients.len() + socks.len() + listeners.len();
+		let mut waits: Vec<u64> = Vec::with_capacity(capacity);
+		let mut kind: Vec<u8> = Vec::with_capacity(capacity);
+		let mut slot_of: Vec<usize> = Vec::with_capacity(capacity);
+		waits.push(frames);
+		kind.push(0);
+		slot_of.push(usize::MAX);
+		let mut i: usize = 0;
+		while i < clients.len() {
+			if clients[i] != 0 {
+				waits.push(clients[i]);
+				kind.push(0);
+				slot_of.push(i);
 			}
-			let mut i: usize = 0;
-			while i < socks.len() {
-				if socks[i].chan != 0 {
-					waits.push(socks[i].chan);
-					kind.push(1);
-					slot_of.push(i);
-				}
-				i += 1;
+			i += 1;
+		}
+		let mut i: usize = 0;
+		while i < socks.len() {
+			if socks[i].chan != 0 {
+				waits.push(socks[i].chan);
+				kind.push(1);
+				slot_of.push(i);
 			}
-			let mut i: usize = 0;
-			while i < listeners.len() {
-				if listeners[i].chan != 0 {
-					waits.push(listeners[i].chan);
-					kind.push(2);
-					slot_of.push(i);
-				}
-				i += 1;
+			i += 1;
+		}
+		let mut i: usize = 0;
+		while i < listeners.len() {
+			if listeners[i].chan != 0 {
+				waits.push(listeners[i].chan);
+				kind.push(2);
+				slot_of.push(i);
 			}
-			let n: usize = waits.len();
-			// While a lease clock runs, its next threshold bounds the wait as a periodic
-			// housekeeping wake; without one the wait has no deadline at all.
-			let ready_raw: i64 = match lease.next_due() {
-				Some(deadline) => wait_any_periodic(&waits[..n], deadline),
-				None => wait_any(&waits[..n], 0),
-			};
-			if ready_raw == ERR_TIMED_OUT {
-				lease_due(frames, stack, &mut lease, &mut rx, &mut tx);
-				continue;
+			i += 1;
+		}
+		let n: usize = waits.len();
+		// While a lease clock runs, its next threshold bounds the wait as a periodic
+		// housekeeping wake; without one the wait has no deadline at all.
+		// ONE AGGREGATED DEADLINE. Whatever this loop is blocked on, it must not block past the next
+		// thing that has to happen - and after the lease clock, that is the IPv6 layer's own next
+		// timer: a detection probe, a router solicitation, a neighbour retry or a listener report.
+		// Without this, a blocking client request starves every one of them.
+		let ipv6_due: Option<u64> = stack.ipv6_deadline().map(ticks_from_ms);
+		let next: Option<u64> = match (lease.next_due(), ipv6_due) {
+			(Some(left), Some(right)) => Some(left.min(right)),
+			(left, right) => left.or(right),
+		};
+		let ready_raw: i64 = match next {
+			Some(deadline) => wait_any_periodic(&waits[..n], deadline),
+			None => wait_any(&waits[..n], 0),
+		};
+		if ready_raw == ERR_TIMED_OUT {
+			if let Some(host) = stack.ipv6() {
+				host.on_timer(now_ms());
 			}
-			let ready: usize = ready_raw as usize;
-			if ready == 0 {
-				if let Event::DhcpReply(msg_type) = pump(frames, stack, &mut rx, &mut tx) {
-					lease.on_reply(msg_type, stack);
+			drain_ipv6(frames, stack);
+			report_ipv6(stack);
+			lease_due(frames, stack, &mut lease, &mut rx, &mut tx);
+			continue;
+		}
+		let ready: usize = ready_raw as usize;
+		if ready == 0 {
+			if let Event::DhcpReply(msg_type) = pump(frames, stack, &mut rx, &mut tx) {
+				lease.on_reply(msg_type, stack);
+			}
+			// Feed any newly received bytes to each active recv stream, closing the
+			// producer (end of stream) once that connection's peer closes or resets.
+			let mut si: usize = 0;
+			while si < socks.len() {
+				if socks[si].chan != 0 && socks[si].stream_prod != 0 {
+					let ci: usize = socks[si].ci;
+					let prod: u64 = stream_pump(ci, frames, stack, &mut tx, socks[si].stream_prod, &mut socks[si].stream_seq);
+					socks[si].stream_prod = prod;
+					if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
+						close(prod);
+						socks[si].stream_prod = 0;
+					}
 				}
-				// Feed any newly received bytes to each active recv stream, closing the
-				// producer (end of stream) once that connection's peer closes or resets.
-				let mut si: usize = 0;
-				while si < socks.len() {
-					if socks[si].chan != 0 && socks[si].stream_prod != 0 {
-						let ci: usize = socks[si].ci;
-						let prod: u64 = stream_pump(ci, frames, stack, &mut tx, socks[si].stream_prod, &mut socks[si].stream_seq);
-						socks[si].stream_prod = prod;
-						if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
-							close(prod);
-							socks[si].stream_prod = 0;
+				si += 1;
+			}
+			// Answer any deferred `accept`: a frame may have completed an inbound
+			// handshake, so a listener that was waiting for a connection gets one now.
+			let mut li: usize = 0;
+			while li < listeners.len() {
+				if listeners[li].chan != 0 && listeners[li].pending {
+					if let Some(ci) = stack.take_accepted(listeners[li].port) {
+						if accept_handoff(listeners[li].chan, listeners[li].pending_corr, ci, &mut socks, stack) {
+							listeners[li].pending = false;
 						}
 					}
-					si += 1;
 				}
-				// Answer any deferred `accept`: a frame may have completed an inbound
-				// handshake, so a listener that was waiting for a connection gets one now.
-				let mut li: usize = 0;
-				while li < listeners.len() {
-					if listeners[li].chan != 0 && listeners[li].pending {
-						if let Some(ci) = stack.take_accepted(listeners[li].port) {
-							if accept_handoff(listeners[li].chan, listeners[li].pending_corr, ci, &mut socks, stack) {
-								listeners[li].pending = false;
-							}
-						}
-					}
-					li += 1;
-				}
-			} else if kind[ready] == 1 {
-				serve_socket(&mut socks[slot_of[ready]], frames, stack, &mut rx, &mut tx, &mut out, &mut req);
-			} else if kind[ready] == 2 {
-				serve_listener(&mut listeners[slot_of[ready]], &mut socks, stack, &mut req);
-			} else {
-				// A client request on clients[slot_of[ready]]: dispatch the `network`
-				// interface. `open` may mint another client channel, `connect` may open a
-				// socket, `listen` a listener; a closed channel is dropped from the set.
-				let slot: usize = slot_of[ready];
-				let chan: u64 = clients[slot];
-				match recv_caps_blocking(chan, &mut req) {
-					ReceivedCaps::Message { len, handles: caps } => {
-						// A FRESH CONNECTION PER CALLER, answered here because it cannot be
-						// answered generically.
-						//
-						// This service is not built on `serve_multi` - it stands on the driver's
-						// frame channel, every client, every socket and every listener at once -
-						// so the reserved connect request has to be handled by hand, as
-						// InputService, DisplayService and the audio engine already do. Without
-						// it `service_connect` waits forever against this service and no other,
-						// and a `factory` role in the bootstrap plan would mean one thing here
-						// and another everywhere else.
-						if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
-							for &unclaimed in caps.as_slice() {
-								close(unclaimed);
-							}
-							match channel() {
-								Some((mine, theirs)) => {
-									place_client(&mut clients, mine);
-									send_blocking(chan, &[], theirs);
-								}
-								// Refused by replying with no capability: a caller that gets none
-								// knows it has no connection, which is better than a channel
-								// nobody is waiting on.
-								None => {
-									send_blocking(chan, &[], 0);
-								}
-							}
-							continue;
-						}
-						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-						// over the single-handle receive, which keeps the first and drops the rest - so a
-						// client sending stdin, stdout and stderr had two destroyed before dispatch.
-						let mut handle = caps;
-						let mut new_sock: u64 = 0;
-						let mut new_sock_ci: usize = 0;
-						let mut new_client: u64 = 0;
-						let mut new_listener: u64 = 0;
-						let mut new_listener_port: u16 = 0;
-						// every set grows on demand, so there is always room.
-						let client_room: bool = true;
-						let sock_room: bool = true;
-						let listener_room: bool = true;
-						// the live pool utilization, for the `capacity` reply (observability).
-						let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
-						let sockets_used: u32 = socks.iter().filter(|s| s.chan != 0).count() as u32;
-						let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
-						{
-							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
-							let mut reply_handle = proto::codec::Handles::new();
-							if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
-								if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
-									for &leftover in reply_handle.as_slice() {
-										close(leftover);
-									}
-								}
-							}
-						}
-						for &unclaimed in handle.as_slice() {
+				li += 1;
+			}
+		} else if kind[ready] == 1 {
+			serve_socket(&mut socks[slot_of[ready]], frames, stack, &mut rx, &mut tx, &mut out, &mut req);
+		} else if kind[ready] == 2 {
+			serve_listener(&mut listeners[slot_of[ready]], &mut socks, stack, &mut req);
+		} else {
+			// A client request on clients[slot_of[ready]]: dispatch the `network`
+			// interface. `open` may mint another client channel, `connect` may open a
+			// socket, `listen` a listener; a closed channel is dropped from the set.
+			let slot: usize = slot_of[ready];
+			let chan: u64 = clients[slot];
+			match recv_caps_blocking(chan, &mut req) {
+				ReceivedCaps::Message { len, handles: caps } => {
+					// A FRESH CONNECTION PER CALLER, answered here because it cannot be
+					// answered generically.
+					//
+					// This service is not built on `serve_multi` - it stands on the driver's
+					// frame channel, every client, every socket and every listener at once -
+					// so the reserved connect request has to be handled by hand, as
+					// InputService, DisplayService and the audio engine already do. Without
+					// it `service_connect` waits forever against this service and no other,
+					// and a `factory` role in the bootstrap plan would mean one thing here
+					// and another everywhere else.
+					if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
+						for &unclaimed in caps.as_slice() {
 							close(unclaimed);
 						}
-						if new_sock != 0 {
-							place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
+						match channel() {
+							Some((mine, theirs)) => {
+								place_client(&mut clients, mine);
+								send_blocking(chan, &[], theirs);
+							}
+							// Refused by replying with no capability: a caller that gets none
+							// knows it has no connection, which is better than a channel
+							// nobody is waiting on.
+							None => {
+								send_blocking(chan, &[], 0);
+							}
 						}
-						if new_listener != 0 {
-							place_listener(&mut listeners, Listener { chan: new_listener, port: new_listener_port, pending_corr: 0, pending: false });
-						}
-						if new_client != 0 {
-							place_client(&mut clients, new_client);
+						continue;
+					}
+					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+					// over the single-handle receive, which keeps the first and drops the rest - so a
+					// client sending stdin, stdout and stderr had two destroyed before dispatch.
+					let mut handle = caps;
+					let mut new_sock: u64 = 0;
+					let mut new_sock_ci: usize = 0;
+					let mut new_client: u64 = 0;
+					let mut new_listener: u64 = 0;
+					let mut new_listener_port: u16 = 0;
+					// every set grows on demand, so there is always room.
+					let client_room: bool = true;
+					let sock_room: bool = true;
+					let listener_room: bool = true;
+					// the live pool utilization, for the `capacity` reply (observability).
+					let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
+					let sockets_used: u32 = socks.iter().filter(|s| s.chan != 0).count() as u32;
+					let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
+					{
+						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
+						let mut reply_handle = proto::codec::Handles::new();
+						if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
+							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
+							}
 						}
 					}
-					ReceivedCaps::Closed => {
-						close(chan);
-						clients[slot] = 0;
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
 					}
+					if new_sock != 0 {
+						place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
+					}
+					if new_listener != 0 {
+						place_listener(&mut listeners, Listener { chan: new_listener, port: new_listener_port, pending_corr: 0, pending: false });
+					}
+					if new_client != 0 {
+						place_client(&mut clients, new_client);
+					}
+				}
+				ReceivedCaps::Closed => {
+					close(chan);
+					clients[slot] = 0;
 				}
 			}
 		}
@@ -679,86 +844,82 @@ fn place_sock(socks: &mut Vec<SockSlot>, sock: SockSlot) {
 // OP_RECV opens the received-data stream out of band (a fresh sub-channel handed back
 // with the correlation id, then any already-buffered bytes framed onto the producer;
 // the serve loop streams everything that arrives afterwards).
-unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], out: &mut [u8], req: &mut [u8]) {
-	unsafe {
-		let chan: u64 = slot.chan;
-		let ci: usize = slot.ci;
-		match recv_caps_blocking(chan, req) {
-			ReceivedCaps::Message { len, handles: caps } => {
-				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-				// over the single-handle receive, which keeps the first and drops the rest - so a
-				// client sending stdin, stdout and stderr had two destroyed before dispatch.
-				let mut handle = caps;
-				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-				let mut closing: bool = false;
-				{
-					let mut svc: Sock = Sock { ci, frames, stack: &mut *stack, tx, closing: &mut closing };
-					if op == socket::OP_RECV {
-						if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len], &mut handle) {
-							if slot.stream_prod != 0 {
-								close(slot.stream_prod);
-								slot.stream_prod = 0;
-							}
-							if let Some((producer, consumer)) = channel() {
-								send_blocking(chan, &corr.to_le_bytes(), consumer);
-								slot.stream_seq = 0;
-								for item in &items {
-									let mut frame_handles = Handles::new();
-									if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out, &mut frame_handles) {
-										if !send_caps_blocking(producer, &out[..fl], frame_handles.as_slice()) {
-											for handle in frame_handles.as_slice() {
-												close(*handle);
-											}
-										}
-										slot.stream_seq += 1;
-									} else {
+fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], out: &mut [u8], req: &mut [u8]) {
+	let chan: u64 = slot.chan;
+	let ci: usize = slot.ci;
+	match recv_caps_blocking(chan, req) {
+		ReceivedCaps::Message { len, handles: caps } => {
+			// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+			// over the single-handle receive, which keeps the first and drops the rest - so a
+			// client sending stdin, stdout and stderr had two destroyed before dispatch.
+			let mut handle = caps;
+			let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+			let mut closing: bool = false;
+			{
+				let mut svc: Sock = Sock { ci, frames, stack: &mut *stack, tx, closing: &mut closing };
+				if op == socket::OP_RECV {
+					if let Some((corr, items)) = socket::recv_open(&mut svc, &req[..len], &mut handle) {
+						if slot.stream_prod != 0 {
+							close(slot.stream_prod);
+							slot.stream_prod = 0;
+						}
+						if let Some((producer, consumer)) = channel() {
+							send_blocking(chan, &corr.to_le_bytes(), consumer);
+							slot.stream_seq = 0;
+							for item in &items {
+								let mut frame_handles = Handles::new();
+								if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out, &mut frame_handles) {
+									if !send_caps_blocking(producer, &out[..fl], frame_handles.as_slice()) {
 										for handle in frame_handles.as_slice() {
 											close(*handle);
 										}
 									}
-								}
-								slot.stream_prod = producer;
-							}
-						}
-					} else {
-						let mut reply_handle = proto::codec::Handles::new();
-						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle) {
-							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
+									slot.stream_seq += 1;
+								} else {
+									for handle in frame_handles.as_slice() {
+										close(*handle);
+									}
 								}
 							}
+							slot.stream_prod = producer;
 						}
 					}
-					for &unclaimed in handle.as_slice() {
-						close(unclaimed);
+				} else {
+					let mut reply_handle = proto::codec::Handles::new();
+					if let Some(n2) = socket::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle) {
+						if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
+						}
 					}
 				}
-				if closing {
-					teardown_socket(slot, frames, stack, rx, tx);
+				for &unclaimed in handle.as_slice() {
+					close(unclaimed);
 				}
 			}
-			// The client dropped its socket without calling close(): tear it down.
-			ReceivedCaps::Closed => {
+			if closing {
 				teardown_socket(slot, frames, stack, rx, tx);
 			}
+		}
+		// The client dropped its socket without calling close(): tear it down.
+		ReceivedCaps::Closed => {
+			teardown_socket(slot, frames, stack, rx, tx);
 		}
 	}
 }
 
 // Tear a socket slot down: close its recv stream, send the connection's FIN, free the
 // stack connection, close the channel, and empty the slot.
-unsafe fn teardown_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
-	unsafe {
-		if slot.stream_prod != 0 {
-			close(slot.stream_prod);
-			slot.stream_prod = 0;
-		}
-		socket_teardown(slot.ci, frames, stack, rx, tx);
-		stack.tcp_free(slot.ci);
-		close(slot.chan);
-		slot.chan = 0;
+fn teardown_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
+	if slot.stream_prod != 0 {
+		close(slot.stream_prod);
+		slot.stream_prod = 0;
 	}
+	socket_teardown(slot.ci, frames, stack, rx, tx);
+	stack.tcp_free(slot.ci);
+	close(slot.chan);
+	slot.chan = 0;
 }
 
 // One active listening socket the serve loop multiplexes: the channel the `listener`
@@ -787,30 +948,28 @@ fn place_listener(listeners: &mut Vec<Listener>, listener: Listener) {
 // Service one ready listener: an `accept` request is answered now (an inbound
 // connection has completed its handshake) or deferred (its correlation id remembered)
 // to be answered when one does. A closed listener channel stops listening on its port.
-unsafe fn serve_listener(listener: &mut Listener, socks: &mut Vec<SockSlot>, stack: &mut Stack, req: &mut [u8]) {
-	unsafe {
-		match recv_blocking(listener.chan, req) {
-			Received::Message { len, .. } => {
-				// The request frames as [op u16][corr u32]; OP_ACCEPT is the only op.
-				if len >= 6 {
-					let op: u16 = u16::from_le_bytes([req[0], req[1]]);
-					let corr: u32 = u32::from_le_bytes([req[2], req[3], req[4], req[5]]);
-					if op == listener::OP_ACCEPT {
-						match stack.take_accepted(listener.port) {
-							Some(ci) if accept_handoff(listener.chan, corr, ci, socks, stack) => {}
-							_ => {
-								listener.pending_corr = corr;
-								listener.pending = true;
-							}
+fn serve_listener(listener: &mut Listener, socks: &mut Vec<SockSlot>, stack: &mut Stack, req: &mut [u8]) {
+	match recv_blocking(listener.chan, req) {
+		Received::Message { len, .. } => {
+			// The request frames as [op u16][corr u32]; OP_ACCEPT is the only op.
+			if len >= 6 {
+				let op: u16 = u16::from_le_bytes([req[0], req[1]]);
+				let corr: u32 = u32::from_le_bytes([req[2], req[3], req[4], req[5]]);
+				if op == listener::OP_ACCEPT {
+					match stack.take_accepted(listener.port) {
+						Some(ci) if accept_handoff(listener.chan, corr, ci, socks, stack) => {}
+						_ => {
+							listener.pending_corr = corr;
+							listener.pending = true;
 						}
 					}
 				}
 			}
-			Received::Closed => {
-				stack.unlisten(listener.port);
-				close(listener.chan);
-				listener.chan = 0;
-			}
+		}
+		Received::Closed => {
+			stack.unlisten(listener.port);
+			close(listener.chan);
+			listener.chan = 0;
 		}
 	}
 }
@@ -820,21 +979,19 @@ unsafe fn serve_listener(listener: &mut Listener, socks: &mut Vec<SockSlot>, sta
 // `accept` (correlation `corr`) with the client end out of band. The reply frames a
 // `result<handle<channel>, error>` Ok: [corr u32][tag 1][u32 0] inline, the channel
 // out of band. The connection is dropped if the channel cannot be minted.
-unsafe fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut Vec<SockSlot>, stack: &mut Stack) -> bool {
-	unsafe {
-		match channel() {
-			Some((server, peer)) => {
-				place_sock(socks, SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0 });
-				let mut reply: [u8; 9] = [0u8; 9];
-				reply[0..4].copy_from_slice(&corr.to_le_bytes());
-				reply[4] = 1;
-				send_blocking(listener_chan, &reply, peer);
-				true
-			}
-			None => {
-				stack.tcp_free(ci);
-				false
-			}
+fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut Vec<SockSlot>, stack: &mut Stack) -> bool {
+	match channel() {
+		Some((server, peer)) => {
+			place_sock(socks, SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0 });
+			let mut reply: [u8; 9] = [0u8; 9];
+			reply[0..4].copy_from_slice(&corr.to_le_bytes());
+			reply[4] = 1;
+			send_blocking(listener_chan, &reply, peer);
+			true
+		}
+		None => {
+			stack.tcp_free(ci);
+			false
 		}
 	}
 }
@@ -916,35 +1073,29 @@ impl network::Service for Net<'_> {
 
 	// Resolve a name to an address via the DNS client.
 	fn resolve(&mut self, name: String) -> Result<WireIp, Error> {
-		unsafe {
-			match do_dns(name.as_bytes(), self.frames, self.stack, &mut self.seq, self.rx, self.tx) {
-				Some(addr) => Ok(to_wire(addr)),
-				None => Err(Error::NotFound),
-			}
+		match do_dns(name.as_bytes(), self.frames, self.stack, &mut self.seq, self.rx, self.tx) {
+			Some(addr) => Ok(to_wire(addr)),
+			None => Err(Error::NotFound),
 		}
 	}
 
 	// Ping an address: a reply (with its TTL and round-trip time), a timeout, or
 	// unreachable (no route / no ARP).
 	fn ping(&mut self, addr: WireIp) -> Result<PingReply, Error> {
-		unsafe {
-			let (status, ttl, rtt_us): (u8, u8, u32) = do_ping(from_wire(&addr), self.frames, self.stack, &mut self.seq, self.rx, self.tx);
-			let status: PingStatus = match status {
-				1 => PingStatus::Reply,
-				2 => PingStatus::Unreachable,
-				_ => PingStatus::Timeout,
-			};
-			Ok(PingReply { status, ttl, rtt_us })
-		}
+		let (status, ttl, rtt_us): (u8, u8, u32) = do_ping(from_wire(&addr), self.frames, self.stack, &mut self.seq, self.rx, self.tx);
+		let status: PingStatus = match status {
+			1 => PingStatus::Reply,
+			2 => PingStatus::Unreachable,
+			_ => PingStatus::Timeout,
+		};
+		Ok(PingReply { status, ttl, rtt_us })
 	}
 
 	// One traceroute probe. See the op's own comment in `network.lsidl` for why this is an
 	// operation rather than a raw socket handed to a tool.
 	fn probe(&mut self, addr: WireIp, ttl: u8) -> Result<TraceHop, Error> {
-		unsafe {
-			let (status, who, rtt_us) = do_probe(from_wire(&addr), ttl.max(1), self.frames, self.stack, &mut self.seq, self.rx, self.tx);
-			Ok(TraceHop { status, addr: to_wire(who), rtt_us })
-		}
+		let (status, who, rtt_us) = do_probe(from_wire(&addr), ttl.max(1), self.frames, self.stack, &mut self.seq, self.rx, self.tx);
+		Ok(TraceHop { status, addr: to_wire(who), rtt_us })
 	}
 
 	// A one-shot TCP exchange: connect, send the request, read the response, close.
@@ -952,20 +1103,18 @@ impl network::Service for Net<'_> {
 	// in a Vec and rides an exactly-sized reply - its size is bounded by the peer
 	// closing, never by a wire constant.
 	fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error> {
-		unsafe {
-			let ci: usize = match self.stack.tcp_alloc() {
-				Some(i) => i,
-				None => return Err(Error::Again),
-			};
-			let mut data: Vec<u8> = Vec::new();
-			let status: u8 = do_tcp(ci, from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
-			self.stack.tcp_free(ci);
-			match status {
-				1 => Ok(data),
-				2 => Err(Error::NotFound),
-				3 => Err(Error::Denied),
-				_ => Err(Error::Again),
-			}
+		let ci: usize = match self.stack.tcp_alloc() {
+			Some(i) => i,
+			None => return Err(Error::Again),
+		};
+		let mut data: Vec<u8> = Vec::new();
+		let status: u8 = do_tcp(ci, from_wire(&req.ep.addr), req.ep.port, &req.request, self.frames, self.stack, self.rx, self.tx, &mut data);
+		self.stack.tcp_free(ci);
+		match status {
+			1 => Ok(data),
+			2 => Err(Error::NotFound),
+			3 => Err(Error::Denied),
+			_ => Err(Error::Again),
 		}
 	}
 
@@ -978,35 +1127,33 @@ impl network::Service for Net<'_> {
 		if !self.sock_room {
 			return Err(Error::Again);
 		}
-		unsafe {
-			let ci: usize = match self.stack.tcp_alloc() {
-				Some(i) => i,
-				None => return Err(Error::Again),
-			};
-			match tcp_establish(ci, from_wire(&ep.addr), ep.port, self.frames, self.stack, self.rx, self.tx) {
-				1 => match channel() {
-					Some((server, peer)) => {
-						*self.new_sock = server;
-						*self.new_sock_ci = ci;
-						Ok(peer)
-					}
-					None => {
-						self.stack.tcp_free(ci);
-						Err(Error::Again)
-					}
-				},
-				2 => {
-					self.stack.tcp_free(ci);
-					Err(Error::NotFound)
+		let ci: usize = match self.stack.tcp_alloc() {
+			Some(i) => i,
+			None => return Err(Error::Again),
+		};
+		match tcp_establish(ci, from_wire(&ep.addr), ep.port, self.frames, self.stack, self.rx, self.tx) {
+			1 => match channel() {
+				Some((server, peer)) => {
+					*self.new_sock = server;
+					*self.new_sock_ci = ci;
+					Ok(peer)
 				}
-				3 => {
-					self.stack.tcp_free(ci);
-					Err(Error::Denied)
-				}
-				_ => {
+				None => {
 					self.stack.tcp_free(ci);
 					Err(Error::Again)
 				}
+			},
+			2 => {
+				self.stack.tcp_free(ci);
+				Err(Error::NotFound)
+			}
+			3 => {
+				self.stack.tcp_free(ci);
+				Err(Error::Denied)
+			}
+			_ => {
+				self.stack.tcp_free(ci);
+				Err(Error::Again)
 			}
 		}
 	}
@@ -1020,14 +1167,12 @@ impl network::Service for Net<'_> {
 		if !self.client_room {
 			return Err(Error::Again);
 		}
-		unsafe {
-			match channel() {
-				Some((server, peer)) => {
-					*self.new_client = server;
-					Ok(peer)
-				}
-				None => Err(Error::Again),
+		match channel() {
+			Some((server, peer)) => {
+				*self.new_client = server;
+				Ok(peer)
 			}
+			None => Err(Error::Again),
 		}
 	}
 
@@ -1041,17 +1186,15 @@ impl network::Service for Net<'_> {
 		if !self.listener_room || !self.stack.listen(port) {
 			return Err(Error::Again);
 		}
-		unsafe {
-			match channel() {
-				Some((server, peer)) => {
-					*self.new_listener = server;
-					*self.new_listener_port = port;
-					Ok(peer)
-				}
-				None => {
-					self.stack.unlisten(port);
-					Err(Error::Again)
-				}
+		match channel() {
+			Some((server, peer)) => {
+				*self.new_listener = server;
+				*self.new_listener_port = port;
+				Ok(peer)
+			}
+			None => {
+				self.stack.unlisten(port);
+				Err(Error::Again)
 			}
 		}
 	}
@@ -1065,11 +1208,9 @@ impl network::Service for Net<'_> {
 	// Query an NTP server for the wall-clock time, returning the Unix epoch seconds from
 	// its reply. The TimeService combines this with the monotonic clock and the RTC.
 	fn sntp(&mut self, server: WireIp) -> Result<u64, Error> {
-		unsafe {
-			match do_sntp(from_wire(&server), self.frames, self.stack, self.rx, self.tx) {
-				Some(unix) => Ok(unix),
-				None => Err(Error::Again),
-			}
+		match do_sntp(from_wire(&server), self.frames, self.stack, self.rx, self.tx) {
+			Some(unix) => Ok(unix),
+			None => Err(Error::Again),
 		}
 	}
 }
@@ -1093,7 +1234,7 @@ impl socket::Service for Sock<'_> {
 	// serve loop's frame pump. Closed once the connection is reset or gone.
 	fn send(&mut self, data: Buffer) -> Result<u32, Error> {
 		if !self.stack.tcp_established(self.ci) || self.stack.tcp_aborted(self.ci) {
-			unsafe { close(data.handle) };
+			close(data.handle);
 			return Err(Error::Closed);
 		}
 		unsafe {
@@ -1124,10 +1265,8 @@ impl socket::Service for Sock<'_> {
 		let mut chunks: Vec<Chunk> = Vec::new();
 		let data: Vec<u8> = self.stack.tcp_take_rx_all(self.ci);
 		if !data.is_empty() {
-			unsafe {
-				let w: usize = self.stack.tcp_build_window_update(self.ci, self.tx);
-				send_frame(self.frames, &self.tx[..w]);
-			}
+			let w: usize = self.stack.tcp_build_window_update(self.ci, self.tx);
+			send_frame(self.frames, &self.tx[..w]);
 			chunks.push(Chunk { data });
 		}
 		chunks
@@ -1143,53 +1282,49 @@ impl socket::Service for Sock<'_> {
 
 // ARP-resolve `ip` to its MAC, sending a request and pumping received frames if it
 // is not already cached. None if it does not answer in time.
-unsafe fn resolve(ip: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<MacAddr> {
-	unsafe {
-		if stack.lookup(ip).is_none() {
-			let arp: usize = stack.build_arp_request(ip, tx);
-			send_frame(frames, &tx[..arp]);
-			let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
-			while clock() < deadline && stack.lookup(ip).is_none() {
-				if wait(frames, deadline) != 0 {
-					break;
-				}
-				pump(frames, stack, rx, tx);
+fn resolve(ip: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<MacAddr> {
+	if stack.lookup(ip).is_none() {
+		let arp: usize = stack.build_arp_request(ip, tx);
+		send_frame(frames, &tx[..arp]);
+		let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
+		while clock() < deadline && stack.lookup(ip).is_none() {
+			if wait(frames, deadline) != 0 {
+				break;
 			}
+			pump(frames, stack, rx, tx);
 		}
-		stack.lookup(ip)
 	}
+	stack.lookup(ip)
 }
 
 // Send an ICMP echo request to `ip` and wait for the reply, pumping received frames
 // as they arrive. Returns (status, ttl, rtt_us): status 1 = reply received (ttl is
 // the reply's IP TTL, rtt_us the round-trip time in microseconds), 0 = timed out,
 // 2 = unresolved (ttl/rtt 0 in both).
-unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> (u8, u8, u32) {
-	unsafe {
-		let hop: Ipv4Addr = stack.next_hop(ip);
-		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-			Some(m) => m,
-			None => return (2, 0, 0),
-		};
-		*seq = seq.wrapping_add(1);
-		let sent_seq: u16 = *seq;
-		let echo: usize = stack.build_icmp_echo(mac, ip, 1, sent_seq, tx);
-		let start: u64 = clock_ns();
-		send_frame(frames, &tx[..echo]);
-		let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
-		while clock() < deadline {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			if let Event::EchoReply(reply, ttl, rseq) = pump(frames, stack, rx, tx) {
-				if reply == ip && rseq == sent_seq {
-					let rtt_us: u32 = (clock_ns().saturating_sub(start) / 1000).min(u32::MAX as u64) as u32;
-					return (1, ttl, rtt_us);
-				}
+fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> (u8, u8, u32) {
+	let hop: Ipv4Addr = stack.next_hop(ip);
+	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+		Some(m) => m,
+		None => return (2, 0, 0),
+	};
+	*seq = seq.wrapping_add(1);
+	let sent_seq: u16 = *seq;
+	let echo: usize = stack.build_icmp_echo(mac, ip, 1, sent_seq, tx);
+	let start: u64 = clock_ns();
+	send_frame(frames, &tx[..echo]);
+	let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
+	while clock() < deadline {
+		if wait(frames, deadline) != 0 {
+			break;
+		}
+		if let Event::EchoReply(reply, ttl, rseq) = pump(frames, stack, rx, tx) {
+			if reply == ip && rseq == sent_seq {
+				let rtt_us: u32 = (clock_ns().saturating_sub(start) / 1000).min(u32::MAX as u64) as u32;
+				return (1, ttl, rtt_us);
 			}
 		}
-		(0, 0, 0)
 	}
+	(0, 0, 0)
 }
 
 // Send one echo with a chosen TTL and report what answered.
@@ -1203,35 +1338,33 @@ unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, r
 // A hop that does not report itself is a TIMEOUT and not a failure: routers are commonly
 // configured not to answer, and the conventional `* * *` row says exactly that. It is distinct
 // from `unreachable`, which is somebody answering to refuse.
-unsafe fn do_probe(ip: Ipv4Addr, ttl: u8, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> (HopStatus, Ipv4Addr, u32) {
-	unsafe {
-		let hop: Ipv4Addr = stack.next_hop(ip);
-		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-			Some(m) => m,
-			// The FIRST hop cannot be resolved, which is not a hop refusing us - it is this machine
-			// having no way to send at all.
-			None => return (HopStatus::Unreachable, Ipv4Addr([0, 0, 0, 0]), 0),
-		};
-		*seq = seq.wrapping_add(1);
-		let sent_seq: u16 = *seq;
-		let echo: usize = stack.build_icmp_echo_ttl(mac, ip, 1, sent_seq, ttl, tx);
-		let start: u64 = clock_ns();
-		send_frame(frames, &tx[..echo]);
-		let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
-		while clock() < deadline {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			let elapsed = || (clock_ns().saturating_sub(start) / 1000).min(u32::MAX as u64) as u32;
-			match pump(frames, stack, rx, tx) {
-				Event::EchoReply(reply, _, rseq) if rseq == sent_seq => return (HopStatus::Reply, reply, elapsed()),
-				Event::TimeExceeded(router, rseq) if rseq == sent_seq => return (HopStatus::TimeExceeded, router, elapsed()),
-				Event::Unreachable(who, rseq) if rseq == sent_seq => return (HopStatus::Unreachable, who, elapsed()),
-				_ => {}
-			}
+fn do_probe(ip: Ipv4Addr, ttl: u8, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> (HopStatus, Ipv4Addr, u32) {
+	let hop: Ipv4Addr = stack.next_hop(ip);
+	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+		Some(m) => m,
+		// The FIRST hop cannot be resolved, which is not a hop refusing us - it is this machine
+		// having no way to send at all.
+		None => return (HopStatus::Unreachable, Ipv4Addr([0, 0, 0, 0]), 0),
+	};
+	*seq = seq.wrapping_add(1);
+	let sent_seq: u16 = *seq;
+	let echo: usize = stack.build_icmp_echo_ttl(mac, ip, 1, sent_seq, ttl, tx);
+	let start: u64 = clock_ns();
+	send_frame(frames, &tx[..echo]);
+	let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
+	while clock() < deadline {
+		if wait(frames, deadline) != 0 {
+			break;
 		}
-		(HopStatus::Timeout, Ipv4Addr([0, 0, 0, 0]), 0)
+		let elapsed = || (clock_ns().saturating_sub(start) / 1000).min(u32::MAX as u64) as u32;
+		match pump(frames, stack, rx, tx) {
+			Event::EchoReply(reply, _, rseq) if rseq == sent_seq => return (HopStatus::Reply, reply, elapsed()),
+			Event::TimeExceeded(router, rseq) if rseq == sent_seq => return (HopStatus::TimeExceeded, router, elapsed()),
+			Event::Unreachable(who, rseq) if rseq == sent_seq => return (HopStatus::Unreachable, who, elapsed()),
+			_ => {}
+		}
 	}
+	(HopStatus::Timeout, Ipv4Addr([0, 0, 0, 0]), 0)
 }
 
 // The held DHCP lease's renewal clock, ticked by the serve loop: at T1 the lease is
@@ -1269,15 +1402,13 @@ impl LeaseClock {
 
 	// The clock for the lease just learned by the stack: thresholds from its T1 /
 	// T2 / duration, or an idle clock when there is nothing to renew.
-	unsafe fn bound(stack: &Stack) -> LeaseClock {
-		unsafe {
-			match stack.dhcp_times() {
-				Some((t1, t2, lease)) => {
-					let now: u64 = clock();
-					LeaseClock { phase: LeasePhase::Bound, t1: now + t1 as u64 * TICKS_PER_SEC, t2: now + t2 as u64 * TICKS_PER_SEC, expiry: now + lease as u64 * TICKS_PER_SEC, retry: 0 }
-				}
-				None => LeaseClock::none(),
+	fn bound(stack: &Stack) -> LeaseClock {
+		match stack.dhcp_times() {
+			Some((t1, t2, lease)) => {
+				let now: u64 = clock();
+				LeaseClock { phase: LeasePhase::Bound, t1: now + t1 as u64 * TICKS_PER_SEC, t2: now + t2 as u64 * TICKS_PER_SEC, expiry: now + lease as u64 * TICKS_PER_SEC, retry: 0 }
 			}
+			None => LeaseClock::none(),
 		}
 	}
 
@@ -1302,19 +1433,17 @@ impl LeaseClock {
 	// is the server's lease extension - re-apply the configuration and restart the
 	// clock; a NAK is a refusal - the address is forfeit, re-acquire from scratch
 	// at once. Replies in any other phase belong to no exchange of ours.
-	unsafe fn on_reply(&mut self, msg_type: u8, stack: &mut Stack) {
-		unsafe {
-			if self.phase != LeasePhase::Renewing && self.phase != LeasePhase::Rebinding {
-				return;
-			}
-			if msg_type == DHCP_ACK {
-				stack.apply_dhcp();
-				*self = LeaseClock::bound(stack);
-				print(b"network: DHCP lease renewed\n");
-			} else if msg_type == DHCP_NAK {
-				self.phase = LeasePhase::Expired;
-				self.retry = clock();
-			}
+	fn on_reply(&mut self, msg_type: u8, stack: &mut Stack) {
+		if self.phase != LeasePhase::Renewing && self.phase != LeasePhase::Rebinding {
+			return;
+		}
+		if msg_type == DHCP_ACK {
+			stack.apply_dhcp();
+			*self = LeaseClock::bound(stack);
+			print(b"network: DHCP lease renewed\n");
+		} else if msg_type == DHCP_NAK {
+			self.phase = LeasePhase::Expired;
+			self.retry = clock();
 		}
 	}
 }
@@ -1324,49 +1453,47 @@ impl LeaseClock {
 // ACK arrives through the standing loop's pump (`LeaseClock::on_reply`); only a
 // full re-acquisition after expiry runs the blocking handshake, since there is no
 // held address left to serve with in the meantime.
-unsafe fn lease_due(frames: u64, stack: &mut Stack, lease: &mut LeaseClock, rx: &mut [u8], tx: &mut [u8]) {
-	unsafe {
-		let now: u64 = clock();
-		// Cross into the later phase first, so its transmission form is used at once.
-		if lease.phase == LeasePhase::Bound && now >= lease.t1 {
-			lease.phase = LeasePhase::Renewing;
+fn lease_due(frames: u64, stack: &mut Stack, lease: &mut LeaseClock, rx: &mut [u8], tx: &mut [u8]) {
+	let now: u64 = clock();
+	// Cross into the later phase first, so its transmission form is used at once.
+	if lease.phase == LeasePhase::Bound && now >= lease.t1 {
+		lease.phase = LeasePhase::Renewing;
+	}
+	if lease.phase == LeasePhase::Renewing && now >= lease.t2 {
+		lease.phase = LeasePhase::Rebinding;
+	}
+	if lease.phase == LeasePhase::Rebinding && now >= lease.expiry {
+		lease.phase = LeasePhase::Expired;
+		lease.retry = now;
+		print(b"network: DHCP lease expired\n");
+	}
+	match lease.phase {
+		LeasePhase::Renewing => {
+			// Unicast to the holding server when its MAC is known (the usual case -
+			// the gateway answered ARP long ago); a cache miss falls back to the
+			// broadcast form rather than blocking the serve loop on an ARP exchange.
+			let server: Ipv4Addr = stack.dhcp_server();
+			let unicast: Option<MacAddr> = stack.lookup(stack.next_hop(server));
+			let renew: usize = stack.build_dhcp_renew(unicast, tx);
+			send_frame(frames, &tx[..renew]);
+			lease.retry = now + LeaseClock::pace(now, lease.t2);
 		}
-		if lease.phase == LeasePhase::Renewing && now >= lease.t2 {
-			lease.phase = LeasePhase::Rebinding;
+		LeasePhase::Rebinding => {
+			let renew: usize = stack.build_dhcp_renew(None, tx);
+			send_frame(frames, &tx[..renew]);
+			lease.retry = now + LeaseClock::pace(now, lease.expiry);
 		}
-		if lease.phase == LeasePhase::Rebinding && now >= lease.expiry {
-			lease.phase = LeasePhase::Expired;
-			lease.retry = now;
-			print(b"network: DHCP lease expired\n");
-		}
-		match lease.phase {
-			LeasePhase::Renewing => {
-				// Unicast to the holding server when its MAC is known (the usual case -
-				// the gateway answered ARP long ago); a cache miss falls back to the
-				// broadcast form rather than blocking the serve loop on an ARP exchange.
-				let server: Ipv4Addr = stack.dhcp_server();
-				let unicast: Option<MacAddr> = stack.lookup(stack.next_hop(server));
-				let renew: usize = stack.build_dhcp_renew(unicast, tx);
-				send_frame(frames, &tx[..renew]);
-				lease.retry = now + LeaseClock::pace(now, lease.t2);
+		LeasePhase::Expired => {
+			// Re-acquire from scratch. The stale address stays applied while this
+			// retries - there is no better configuration to fall back to.
+			if do_dhcp(frames, stack, rx, tx) {
+				*lease = LeaseClock::bound(stack);
+				print(b"network: DHCP lease reacquired\n");
+			} else {
+				lease.retry = now + DHCP_RETRY_MAX_TICKS;
 			}
-			LeasePhase::Rebinding => {
-				let renew: usize = stack.build_dhcp_renew(None, tx);
-				send_frame(frames, &tx[..renew]);
-				lease.retry = now + LeaseClock::pace(now, lease.expiry);
-			}
-			LeasePhase::Expired => {
-				// Re-acquire from scratch. The stale address stays applied while this
-				// retries - there is no better configuration to fall back to.
-				if do_dhcp(frames, stack, rx, tx) {
-					*lease = LeaseClock::bound(stack);
-					print(b"network: DHCP lease reacquired\n");
-				} else {
-					lease.retry = now + DHCP_RETRY_MAX_TICKS;
-				}
-			}
-			_ => {}
 		}
+		_ => {}
 	}
 }
 
@@ -1412,7 +1539,7 @@ fn push_ipv4(line: &mut [u8; 64], at: &mut usize, octets: [u8; 4]) {
 	}
 }
 
-unsafe fn print_address(stack: &Stack) {
+fn print_address(stack: &Stack) {
 	let mut line = [0u8; 64];
 	let mut at = 0usize;
 	push_ipv4(&mut line, &mut at, stack.ip().0);
@@ -1422,102 +1549,96 @@ unsafe fn print_address(stack: &Stack) {
 	push_decimal(&mut line, &mut at, prefix as u8);
 	push(&mut line, &mut at, b" via ");
 	push_ipv4(&mut line, &mut at, stack.gateway().0);
-	unsafe { print(&line[..at]) };
+	print(&line[..at]);
 }
 
-unsafe fn do_dhcp(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> bool {
-	unsafe {
-		// Broadcast a DISCOVER and wait for the server's OFFER.
-		let discover: usize = stack.build_dhcp_discover(tx);
-		send_frame(frames, &tx[..discover]);
-		let mut offered: bool = false;
-		let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
-		while clock() < deadline && !offered {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			if let Event::DhcpReply(msg_type) = pump(frames, stack, rx, tx) {
-				if msg_type == DHCP_OFFER {
-					offered = true;
-				}
+fn do_dhcp(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> bool {
+	// Broadcast a DISCOVER and wait for the server's OFFER.
+	let discover: usize = stack.build_dhcp_discover(tx);
+	send_frame(frames, &tx[..discover]);
+	let mut offered: bool = false;
+	let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
+	while clock() < deadline && !offered {
+		if wait(frames, deadline) != 0 {
+			break;
+		}
+		if let Event::DhcpReply(msg_type) = pump(frames, stack, rx, tx) {
+			if msg_type == DHCP_OFFER {
+				offered = true;
 			}
 		}
-		if !offered {
-			return false;
-		}
-		// REQUEST the offered address and wait for the server's ACK.
-		let request: usize = stack.build_dhcp_request(tx);
-		send_frame(frames, &tx[..request]);
-		let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
-		while clock() < deadline {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			if let Event::DhcpReply(msg_type) = pump(frames, stack, rx, tx) {
-				if msg_type == DHCP_ACK {
-					stack.apply_dhcp();
-					return true;
-				}
-			}
-		}
-		false
 	}
+	if !offered {
+		return false;
+	}
+	// REQUEST the offered address and wait for the server's ACK.
+	let request: usize = stack.build_dhcp_request(tx);
+	send_frame(frames, &tx[..request]);
+	let deadline: u64 = clock() + DHCP_TIMEOUT_TICKS;
+	while clock() < deadline {
+		if wait(frames, deadline) != 0 {
+			break;
+		}
+		if let Event::DhcpReply(msg_type) = pump(frames, stack, rx, tx) {
+			if msg_type == DHCP_ACK {
+				stack.apply_dhcp();
+				return true;
+			}
+		}
+	}
+	false
 }
 
 // Resolve `name` to an IPv4 address via a DNS A-record query to the SLIRP DNS
 // server, pumping received frames for the response. None on timeout or failure.
-unsafe fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> Option<Ipv4Addr> {
-	unsafe {
-		let dns: Ipv4Addr = stack.dns();
-		let hop: Ipv4Addr = stack.next_hop(dns);
-		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-			Some(m) => m,
-			None => return None,
-		};
-		*txn = txn.wrapping_add(1);
-		let query: usize = stack.build_dns_query(mac, dns, name, *txn, DNS_SRC_PORT, tx);
-		if query == 0 {
-			return None;
-		}
-		send_frame(frames, &tx[..query]);
-		let deadline: u64 = clock() + DNS_TIMEOUT_TICKS;
-		while clock() < deadline {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			if let Event::DnsReply(addr) = pump(frames, stack, rx, tx) {
-				return Some(addr);
-			}
-		}
-		None
+fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> Option<Ipv4Addr> {
+	let dns: Ipv4Addr = stack.dns();
+	let hop: Ipv4Addr = stack.next_hop(dns);
+	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+		Some(m) => m,
+		None => return None,
+	};
+	*txn = txn.wrapping_add(1);
+	let query: usize = stack.build_dns_query(mac, dns, name, *txn, DNS_SRC_PORT, tx);
+	if query == 0 {
+		return None;
 	}
+	send_frame(frames, &tx[..query]);
+	let deadline: u64 = clock() + DNS_TIMEOUT_TICKS;
+	while clock() < deadline {
+		if wait(frames, deadline) != 0 {
+			break;
+		}
+		if let Event::DnsReply(addr) = pump(frames, stack, rx, tx) {
+			return Some(addr);
+		}
+	}
+	None
 }
 
 // Send an SNTP request to `server` and return the Unix epoch seconds from its reply,
 // or None on timeout / no route. A one-shot UDP query/response, mirroring do_dns.
-unsafe fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<u64> {
-	unsafe {
-		let hop: Ipv4Addr = stack.next_hop(server);
-		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-			Some(m) => m,
-			None => return None,
-		};
-		let query: usize = stack.build_sntp_request(mac, server, NTP_SRC_PORT, tx);
-		if query == 0 {
-			return None;
-		}
-		send_frame(frames, &tx[..query]);
-		let deadline: u64 = clock() + NTP_TIMEOUT_TICKS;
-		while clock() < deadline {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			if let Event::SntpReply(unix) = pump(frames, stack, rx, tx) {
-				return Some(unix);
-			}
-		}
-		None
+fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<u64> {
+	let hop: Ipv4Addr = stack.next_hop(server);
+	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+		Some(m) => m,
+		None => return None,
+	};
+	let query: usize = stack.build_sntp_request(mac, server, NTP_SRC_PORT, tx);
+	if query == 0 {
+		return None;
 	}
+	send_frame(frames, &tx[..query]);
+	let deadline: u64 = clock() + NTP_TIMEOUT_TICKS;
+	while clock() < deadline {
+		if wait(frames, deadline) != 0 {
+			break;
+		}
+		if let Event::SntpReply(unix) = pump(frames, stack, rx, tx) {
+			return Some(unix);
+		}
+	}
+	None
 }
 
 // Open a TCP connection to `ip`:`port` (next-hop via the gateway when off-link),
@@ -1529,94 +1650,88 @@ unsafe fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8
 // accumulate the response into `reply` until the peer closes or it falls quiet.
 // Returns the establish status (1 = ok, 2 = unreachable, 3 = refused, 0 = timeout).
 #[allow(clippy::too_many_arguments)]
-unsafe fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut Vec<u8>) -> u8 {
-	unsafe {
-		// Establish the connection; on failure report the status and stop (the
-		// establish status bytes 2 / 3 / 0 map straight onto the fetch errors).
-		match tcp_establish(ci, ip, port, frames, stack, rx, tx) {
-			1 => {}
-			other => return other,
-		}
-		// Send the request, then read the response until the peer closes or it
-		// falls quiet - the response grows in the Vec, never against a cap.
-		if !request.is_empty() {
-			let d: usize = stack.tcp_build_data(ci, request, tx);
-			send_frame(frames, &tx[..d]);
-		}
-		let recv_deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
-		while clock() < recv_deadline && !stack.tcp_peer_fin(ci) && !stack.tcp_aborted(ci) {
-			if wait(frames, recv_deadline) != 0 {
-				break;
-			}
-			pump(frames, stack, rx, tx);
-			let data: Vec<u8> = stack.tcp_take_rx_all(ci);
-			if !data.is_empty() {
-				// the drain reopened the receive window; tell the peer.
-				let w: usize = stack.tcp_build_window_update(ci, tx);
-				send_frame(frames, &tx[..w]);
-			}
-			reply.extend_from_slice(&data);
-		}
-		reply.extend_from_slice(&stack.tcp_take_rx_all(ci));
-		// Close our half and briefly pump to acknowledge the peer's FIN.
-		let fin: usize = stack.tcp_build_fin(ci, tx);
-		send_frame(frames, &tx[..fin]);
-		let close_deadline: u64 = clock() + TCP_RETX_TICKS;
-		while clock() < close_deadline && !stack.tcp_aborted(ci) && !stack.tcp_peer_fin(ci) {
-			if wait(frames, close_deadline) != 0 {
-				break;
-			}
-			pump(frames, stack, rx, tx);
-		}
-		1
+fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut Vec<u8>) -> u8 {
+	// Establish the connection; on failure report the status and stop (the
+	// establish status bytes 2 / 3 / 0 map straight onto the fetch errors).
+	match tcp_establish(ci, ip, port, frames, stack, rx, tx) {
+		1 => {}
+		other => return other,
 	}
+	// Send the request, then read the response until the peer closes or it
+	// falls quiet - the response grows in the Vec, never against a cap.
+	if !request.is_empty() {
+		let d: usize = stack.tcp_build_data(ci, request, tx);
+		send_frame(frames, &tx[..d]);
+	}
+	let recv_deadline: u64 = clock() + TCP_RECV_TIMEOUT_TICKS;
+	while clock() < recv_deadline && !stack.tcp_peer_fin(ci) && !stack.tcp_aborted(ci) {
+		if wait(frames, recv_deadline) != 0 {
+			break;
+		}
+		pump(frames, stack, rx, tx);
+		let data: Vec<u8> = stack.tcp_take_rx_all(ci);
+		if !data.is_empty() {
+			// the drain reopened the receive window; tell the peer.
+			let w: usize = stack.tcp_build_window_update(ci, tx);
+			send_frame(frames, &tx[..w]);
+		}
+		reply.extend_from_slice(&data);
+	}
+	reply.extend_from_slice(&stack.tcp_take_rx_all(ci));
+	// Close our half and briefly pump to acknowledge the peer's FIN.
+	let fin: usize = stack.tcp_build_fin(ci, tx);
+	send_frame(frames, &tx[..fin]);
+	let close_deadline: u64 = clock() + TCP_RETX_TICKS;
+	while clock() < close_deadline && !stack.tcp_aborted(ci) && !stack.tcp_peer_fin(ci) {
+		if wait(frames, close_deadline) != 0 {
+			break;
+		}
+		pump(frames, stack, rx, tx);
+	}
+	1
 }
 
 // Establish a TCP connection to `ip`:`port` (next-hop via the gateway when off-link):
 // resolve the next hop, open the connection, and send the SYN, retransmitting it
 // until the handshake completes. Returns 1 = established, 2 = unreachable (no ARP),
 // 3 = refused (reset), 0 = timed out. Shared by `fetch` (do_tcp) and `connect`.
-unsafe fn tcp_establish(ci: usize, ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
-	unsafe {
-		let hop: Ipv4Addr = stack.next_hop(ip);
-		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-			Some(m) => m,
-			None => return 2,
-		};
-		let iss: u32 = clock() as u32;
-		let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
-		stack.tcp_open(ci, ip, port, mac, local_port, iss);
-		let syn: usize = stack.tcp_build_syn(ci, tx);
-		send_frame(frames, &tx[..syn]);
-		let overall: u64 = clock() + TCP_SYN_TIMEOUT_TICKS;
-		while clock() < overall && !stack.tcp_established(ci) && !stack.tcp_aborted(ci) {
-			let attempt: u64 = clock() + TCP_RETX_TICKS;
-			let until: u64 = if attempt < overall { attempt } else { overall };
-			if wait(frames, until) != 0 {
-				let s: usize = stack.tcp_build_syn(ci, tx);
-				send_frame(frames, &tx[..s]);
-			} else {
-				pump(frames, stack, rx, tx);
-			}
+fn tcp_establish(ci: usize, ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
+	let hop: Ipv4Addr = stack.next_hop(ip);
+	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+		Some(m) => m,
+		None => return 2,
+	};
+	let iss: u32 = clock() as u32;
+	let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
+	stack.tcp_open(ci, ip, port, mac, local_port, iss);
+	let syn: usize = stack.tcp_build_syn(ci, tx);
+	send_frame(frames, &tx[..syn]);
+	let overall: u64 = clock() + TCP_SYN_TIMEOUT_TICKS;
+	while clock() < overall && !stack.tcp_established(ci) && !stack.tcp_aborted(ci) {
+		let attempt: u64 = clock() + TCP_RETX_TICKS;
+		let until: u64 = if attempt < overall { attempt } else { overall };
+		if wait(frames, until) != 0 {
+			let s: usize = stack.tcp_build_syn(ci, tx);
+			send_frame(frames, &tx[..s]);
+		} else {
+			pump(frames, stack, rx, tx);
 		}
-		if stack.tcp_aborted(ci) {
-			return 3;
-		}
-		if !stack.tcp_established(ci) {
-			return 0;
-		}
-		1
 	}
+	if stack.tcp_aborted(ci) {
+		return 3;
+	}
+	if !stack.tcp_established(ci) {
+		return 0;
+	}
+	1
 }
 
 // Send `data` on connection `ci` as a single TCP data segment; the ack arrives later
 // via the serve loop's frame pump.
-unsafe fn socket_send(ci: usize, data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]) {
-	unsafe {
-		if !data.is_empty() {
-			let d: usize = stack.tcp_build_data(ci, data, tx);
-			send_frame(frames, &tx[..d]);
-		}
+fn socket_send(ci: usize, data: &[u8], frames: u64, stack: &mut Stack, tx: &mut [u8]) {
+	if !data.is_empty() {
+		let d: usize = stack.tcp_build_data(ci, data, tx);
+		send_frame(frames, &tx[..d]);
 	}
 }
 
@@ -1625,37 +1740,35 @@ unsafe fn socket_send(ci: usize, data: &[u8], frames: u64, stack: &mut Stack, tx
 // buffer held; each drained chunk is followed by a window-update ACK to the peer
 // (the drain reopened the receive window). Returns the producer handle, or 0 if
 // the consumer was dropped (in which case the producer is closed here).
-unsafe fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
-	unsafe {
-		loop {
-			let data: Vec<u8> = stack.tcp_take_rx_all(ci);
-			if data.is_empty() {
-				return producer;
-			}
-			let w: usize = stack.tcp_build_window_update(ci, tx);
-			send_frame(frames, &tx[..w]);
-			let chunk: Chunk = Chunk { data };
-			// the frame grows with the chunk: encoded exactly, sent as one message
-			// (the consumer receives it exactly-sized via the peek).
-			let mut frame: Vec<u8> = alloc::vec![0u8; 8 + chunk.data.len() + 16];
-			let mut frame_handles = Handles::new();
-			match socket::recv_frame(*seq, &chunk, &mut frame, &mut frame_handles) {
-				Some(fl) => {
-					if !send_caps_blocking(producer, &frame[..fl], frame_handles.as_slice()) {
-						for handle in frame_handles.as_slice() {
-							close(*handle);
-						}
-						close(producer);
-						return 0;
-					}
-					*seq += 1;
-				}
-				None => {
+fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], producer: u64, seq: &mut u32) -> u64 {
+	loop {
+		let data: Vec<u8> = stack.tcp_take_rx_all(ci);
+		if data.is_empty() {
+			return producer;
+		}
+		let w: usize = stack.tcp_build_window_update(ci, tx);
+		send_frame(frames, &tx[..w]);
+		let chunk: Chunk = Chunk { data };
+		// the frame grows with the chunk: encoded exactly, sent as one message
+		// (the consumer receives it exactly-sized via the peek).
+		let mut frame: Vec<u8> = alloc::vec![0u8; 8 + chunk.data.len() + 16];
+		let mut frame_handles = Handles::new();
+		match socket::recv_frame(*seq, &chunk, &mut frame, &mut frame_handles) {
+			Some(fl) => {
+				if !send_caps_blocking(producer, &frame[..fl], frame_handles.as_slice()) {
 					for handle in frame_handles.as_slice() {
 						close(*handle);
 					}
-					return producer;
+					close(producer);
+					return 0;
 				}
+				*seq += 1;
+			}
+			None => {
+				for handle in frame_handles.as_slice() {
+					close(*handle);
+				}
+				return producer;
 			}
 		}
 	}
@@ -1664,18 +1777,16 @@ unsafe fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], 
 // Close our half of connection `ci`: send a FIN (unless already reset) and briefly
 // pump to acknowledge the peer's FIN, so the connection winds down before its slot is
 // freed.
-unsafe fn socket_teardown(ci: usize, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
-	unsafe {
-		if !stack.tcp_aborted(ci) {
-			let fin: usize = stack.tcp_build_fin(ci, tx);
-			send_frame(frames, &tx[..fin]);
+fn socket_teardown(ci: usize, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) {
+	if !stack.tcp_aborted(ci) {
+		let fin: usize = stack.tcp_build_fin(ci, tx);
+		send_frame(frames, &tx[..fin]);
+	}
+	let deadline: u64 = clock() + TCP_RETX_TICKS;
+	while clock() < deadline && !stack.tcp_aborted(ci) && !stack.tcp_peer_fin(ci) {
+		if wait(frames, deadline) != 0 {
+			break;
 		}
-		let deadline: u64 = clock() + TCP_RETX_TICKS;
-		while clock() < deadline && !stack.tcp_aborted(ci) && !stack.tcp_peer_fin(ci) {
-			if wait(frames, deadline) != 0 {
-				break;
-			}
-			pump(frames, stack, rx, tx);
-		}
+		pump(frames, stack, rx, tx);
 	}
 }

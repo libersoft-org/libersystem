@@ -139,39 +139,35 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Whether the device reports events of type `ev`: select its EV_BITS block for that
 // type and read the block's byte length - a non-zero length means the device emits
 // it. Used to tell a pointer (EV_ABS / EV_REL) from a keyboard (EV_KEY only).
-unsafe fn ev_supported(device: &Virtio, ev: u8) -> bool {
-	unsafe {
-		device.config_write(CFG_SELECT, CFG_EV_BITS);
-		device.config_write(CFG_SUBSEL, ev);
-		device.config_read(CFG_SIZE) > 0
-	}
+fn ev_supported(device: &Virtio, ev: u8) -> bool {
+	device.config_write(CFG_SELECT, CFG_EV_BITS);
+	device.config_write(CFG_SUBSEL, ev);
+	device.config_read(CFG_SIZE) > 0
 }
 
 // The maximum value an absolute axis reports, read from its ABS_INFO block (the union
 // is min/max/fuzz/flat/res, u32 each; max is the second word). Returns 0 if the axis
 // has no ABS_INFO (a relative device), so the caller falls back to a default range.
-unsafe fn axis_max(device: &Virtio, axis: u16) -> i32 {
-	unsafe {
-		device.config_write(CFG_SELECT, CFG_ABS_INFO);
-		device.config_write(CFG_SUBSEL, axis as u8);
-		if device.config_read(CFG_SIZE) < 8 {
-			return 0;
-		}
-		let mut max: u32 = 0;
-		let mut i: u64 = 0;
-		while i < 4 {
-			max |= (device.config_read(CFG_DATA + 4 + i) as u32) << (8 * i);
-			i += 1;
-		}
-		max as i32
+fn axis_max(device: &Virtio, axis: u16) -> i32 {
+	device.config_write(CFG_SELECT, CFG_ABS_INFO);
+	device.config_write(CFG_SUBSEL, axis as u8);
+	if device.config_read(CFG_SIZE) < 8 {
+		return 0;
 	}
+	let mut max: u32 = 0;
+	let mut i: u64 = 0;
+	while i < 4 {
+		max |= (device.config_read(CFG_DATA + 4 + i) as u32) << (8 * i);
+		i += 1;
+	}
+	max as i32
 }
 
 // Block on the device interrupt forever: each time it fires, drain every event buffer
 // the device filled (translating key presses to console input), re-post the drained
 // buffers, and re-arm the interrupt. MSI-X is edge-triggered, so there is no ISR line
 // to deassert and no GSI to unmask - the interrupt_ack just clears the pending flag.
-unsafe fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
+fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
 	unsafe {
 		let mut mods: Mods = Mods::default();
 		loop {
@@ -213,7 +209,7 @@ struct Pointer {
 // position and buttons to InputService (which maps them to the text-cell grid). The
 // send coalesces motion within one interrupt (the latest position wins). Consumer closure returns
 // its allowance while the provider keeps accepting replacements, even with no pointer activity.
-unsafe fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: i32, max_y: i32) -> ! {
+fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: i32, max_y: i32) -> ! {
 	unsafe {
 		let bound_x: i32 = if max_x > 0 { max_x } else { REL_RANGE };
 		let bound_y: i32 = if max_y > 0 { max_y } else { REL_RANGE };

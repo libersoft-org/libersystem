@@ -101,7 +101,7 @@ impl Panel {
 
 	fn refresh(&mut self, volumes: &VolumeSet) -> Result<(), ListDirectoryError> {
 		let storage = volumes.client_for(&self.path, self.path.as_bytes());
-		let entries = unsafe { list_volume_directory(storage, &self.path, MAX_PANEL_ENTRIES)? };
+		let entries = list_volume_directory(storage, &self.path, MAX_PANEL_ENTRIES)?;
 		self.entries = entries;
 		self.results = None;
 		// TAGS ARE CLEARED BY A REFRESH. A tag is a thing the reader made on the screen in front of
@@ -370,160 +370,156 @@ struct Manager {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut bootstrap_buffer = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: Vec<u8> = context.arguments.clone().into_bytes();
-		// THE READS ARE IN THE ORDER THE LAUNCHER SENDS, and that order is `VOCABULARY`: Permission
-		// before Volumes before AppAssets. It has to be, because `recv_tagged` BLOCKS and a tag read
-		// out of turn consumes the message that was actually next - which is the ordered-bootstrap
-		// recorded hazard, reached again here by reading three grants in the wrong sequence.
-		//
-		// THE NARROW LAUNCH BROKER AND NOTHING MORE. `lico` cannot create a process; it can ask
-		// PermissionManager to start a NAMED program, which then runs under that program's own
-		// manifest. Launching from a panel lends the child nothing, because this holds nothing it
-		// could lend.
-		let permission: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, b"PERMISSION").unwrap_or(0);
-		let volumes = VolumeSet::receive(bootstrap, &mut bootstrap_buffer);
-		// This application's own asset directory, where the settings live beside the descriptors.
-		// Last in the vocabulary, so last here.
-		let assets: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_APP_ASSETS).unwrap_or(0);
-		let environment: Vec<EnvVar> = context.environment.clone();
-		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
-		let cwd = core::str::from_utf8(&cwd).unwrap_or("vol://system");
-		let argument = trim(&argument);
-		let initial = if argument.is_empty() {
-			if cwd.starts_with("vol://") { String::from(cwd) } else { String::from("vol://system") }
-		} else if argument.iter().any(u8::is_ascii_whitespace) {
-			print(b"Usage: lico [DIRECTORY]\n");
-			exit();
-		} else {
-			match path::resolve(cwd, argument) {
-				Some(path) => path,
-				None => {
-					eprint(b"lico: invalid path\n");
-					exit();
-				}
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: Vec<u8> = context.arguments.clone().into_bytes();
+	// THE READS ARE IN THE ORDER THE LAUNCHER SENDS, and that order is `VOCABULARY`: Permission
+	// before Volumes before AppAssets. It has to be, because `recv_tagged` BLOCKS and a tag read
+	// out of turn consumes the message that was actually next - which is the ordered-bootstrap
+	// recorded hazard, reached again here by reading three grants in the wrong sequence.
+	//
+	// THE NARROW LAUNCH BROKER AND NOTHING MORE. `lico` cannot create a process; it can ask
+	// PermissionManager to start a NAMED program, which then runs under that program's own
+	// manifest. Launching from a panel lends the child nothing, because this holds nothing it
+	// could lend.
+	let permission: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, b"PERMISSION").unwrap_or(0);
+	let volumes = VolumeSet::receive(bootstrap, &mut bootstrap_buffer);
+	// This application's own asset directory, where the settings live beside the descriptors.
+	// Last in the vocabulary, so last here.
+	let assets: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_APP_ASSETS).unwrap_or(0);
+	let environment: Vec<EnvVar> = context.environment.clone();
+	let cwd: Vec<u8> = context.cwd.clone().into_bytes();
+	let cwd = core::str::from_utf8(&cwd).unwrap_or("vol://system");
+	let argument = trim(&argument);
+	let initial = if argument.is_empty() {
+		if cwd.starts_with("vol://") { String::from(cwd) } else { String::from("vol://system") }
+	} else if argument.iter().any(u8::is_ascii_whitespace) {
+		print(b"Usage: lico [DIRECTORY]\n");
+		exit();
+	} else {
+		match path::resolve(cwd, argument) {
+			Some(path) => path,
+			None => {
+				eprint(b"lico: invalid path\n");
+				exit();
 			}
-		};
-		if stdin() == 0 || stdout() == 0 {
-			eprint(b"lico: interactive terminal unavailable\n");
-		} else {
-			catch_interrupt();
-			let mut output = ConsoleWriter::new(stdout());
-			let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Press, bracketed_paste: false };
-			// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED. These were `ESC[?9001h` / `ESC[?9002l`
-			// in this program's own OUTPUT, where a program's data and its requests are the same bytes -
-			// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
-			// control channel the shell hands to an interactive foreground job; false means there is no
-			// terminal to ask, and the program runs cooked rather than failing.
-			let owns_tty: bool = tty_set_mode(true, false);
-			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
-				let _ = manage(terminal.writer(), &volumes, initial, permission, assets, environment);
-			}
-			// And back to cooked input and echo, through the same request path.
-			if owns_tty {
-				tty_set_mode(false, true);
-			}
+		}
+	};
+	if stdin() == 0 || stdout() == 0 {
+		eprint(b"lico: interactive terminal unavailable\n");
+	} else {
+		catch_interrupt();
+		let mut output = ConsoleWriter::new(stdout());
+		let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Press, bracketed_paste: false };
+		// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED. These were `ESC[?9001h` / `ESC[?9002l`
+		// in this program's own OUTPUT, where a program's data and its requests are the same bytes -
+		// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
+		// control channel the shell hands to an interactive foreground job; false means there is no
+		// terminal to ask, and the program runs cooked rather than failing.
+		let owns_tty: bool = tty_set_mode(true, false);
+		if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
+			let _ = manage(terminal.writer(), &volumes, initial, permission, assets, environment);
+		}
+		// And back to cooked input and echo, through the same request path.
+		if owns_tty {
+			tty_set_mode(false, true);
 		}
 	}
 	exit();
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial: String, permission: u64, assets: u64, environment: Vec<EnvVar>) -> bool {
-	unsafe {
-		// SETTINGS ARE READ BEFORE THE FIRST LISTING, so the panels come up ordered the way they
-		// were left. A file that will not read, will not parse or names a version this build does
-		// not know yields DEFAULTS - which is exactly what no file at all yields, and is why a
-		// corrupt settings file can never stop the manager starting.
-		let settings = load_settings(assets);
-		let mut manager = Manager { panels: [Panel::new(initial.clone()), Panel::new(initial)], focus: Focus::new(2), bookmarks: Bookmarks::new(), bar: CommandBar::new(), prompt: Prompt::None, pending_search: Vec::new(), job: None, menu: None, entry: Vec::new(), status: Vec::new(), settings, permission, assets, environment };
-		for panel in &mut manager.panels {
-			panel.sort = SortSpec { key: settings.sort_key, reverse: settings.reverse, directories_first: settings.directories_first, show_hidden: settings.show_hidden };
+fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial: String, permission: u64, assets: u64, environment: Vec<EnvVar>) -> bool {
+	// SETTINGS ARE READ BEFORE THE FIRST LISTING, so the panels come up ordered the way they
+	// were left. A file that will not read, will not parse or names a version this build does
+	// not know yields DEFAULTS - which is exactly what no file at all yields, and is why a
+	// corrupt settings file can never stop the manager starting.
+	let settings = load_settings(assets);
+	let mut manager = Manager { panels: [Panel::new(initial.clone()), Panel::new(initial)], focus: Focus::new(2), bookmarks: Bookmarks::new(), bar: CommandBar::new(), prompt: Prompt::None, pending_search: Vec::new(), job: None, menu: None, entry: Vec::new(), status: Vec::new(), settings, permission, assets, environment };
+	for panel in &mut manager.panels {
+		panel.sort = SortSpec { key: settings.sort_key, reverse: settings.reverse, directories_first: settings.directories_first, show_hidden: settings.show_hidden };
+	}
+	manager.say(b"F1 help  F3 view  F4 edit  F5 copy  F6 move  F7 mkdir  F8 delete  F9 menu  F10 exit");
+	for index in 0..2 {
+		if let Err(error) = manager.panels[index].refresh(volumes) {
+			manager.say(list_error(error));
 		}
-		manager.say(b"F1 help  F3 view  F4 edit  F5 copy  F6 move  F7 mkdir  F8 delete  F9 menu  F10 exit");
-		for index in 0..2 {
-			if let Err(error) = manager.panels[index].refresh(volumes) {
-				manager.say(list_error(error));
+		manager.refresh_free_space(index, volumes);
+	}
+	let input = stdin();
+	let mut decoder = InputDecoder::new();
+	let mut redraw = true;
+	loop {
+		if redraw {
+			if !render(output, &manager) {
+				return false;
 			}
-			manager.refresh_free_space(index, volumes);
+			redraw = false;
 		}
-		let input = stdin();
-		let mut decoder = InputDecoder::new();
-		let mut redraw = true;
+		if interrupted() {
+			// AN INTERRUPT CANCELS THE JOB rather than the program, when one is running. What a
+			// reader means by Ctrl+C over a running copy is "stop the copy", and leaving the
+			// manager is what F10 is for.
+			if manager.job.is_some() {
+				manager.cancel_job(volumes);
+				redraw = true;
+				continue;
+			}
+			return true;
+		}
+		// A RUNNING JOB MUST NOT BLOCK THE LOOP. With one in progress the wait is a short
+		// deadline rather than "until a key arrives", which is what keeps the panels navigable
+		// while a copy runs - and with none it blocks, so an idle manager costs nothing.
+		//
+		// TICKS. The deadline `wait_any` takes is an ABSOLUTE LAPIC TICK COUNT, and this passed
+		// `clock_ns()` - a different clock, reading nanoseconds. Seconds after boot that is a
+		// tick number years away, so the wait never expired: a started operation advanced only
+		// when a key happened to arrive, and one left alone made no progress at all. `rt` warns
+		// about exactly this substitution, in as many words - "a hang that looks like a deadlock
+		// rather than a wrong unit" - and this is what it looks like from the other side. The
+		// governed `F8` test measures it: with `clock_ns()` here, the delete never completes.
+		//
+		// PERIODIC because this wake is HOUSEKEEPING rather than pending progress - a judgement
+		// about what the wait MEANS, and not something that test distinguishes, since it passes
+		// either way. A plain timed wait holds `run_until_idle` until its deadline, and the loop
+		// driving the console polls the serial wire only BETWEEN those calls; a job re-arming a
+		// deadline every tick would therefore keep typed input from being forwarded for as long
+		// as it ran - including the interrupt that cancels it. A periodic waiter lets the system
+		// settle each round and is still woken when it comes due.
+		let ready = if manager.job.is_some() { wait_any_periodic(&[input], clock().saturating_add(1)) } else { wait_any(&[input], 0) };
+		if interrupted() {
+			if manager.job.is_some() {
+				manager.cancel_job(volumes);
+				redraw = true;
+				continue;
+			}
+			return true;
+		}
+		if ready < 0 && manager.job.is_none() {
+			return true;
+		}
+		let mut bytes = [0u8; 64];
 		loop {
-			if redraw {
-				if !render(output, &manager) {
-					return false;
-				}
-				redraw = false;
-			}
-			if interrupted() {
-				// AN INTERRUPT CANCELS THE JOB rather than the program, when one is running. What a
-				// reader means by Ctrl+C over a running copy is "stop the copy", and leaving the
-				// manager is what F10 is for.
-				if manager.job.is_some() {
-					manager.cancel_job(volumes);
-					redraw = true;
-					continue;
-				}
-				return true;
-			}
-			// A RUNNING JOB MUST NOT BLOCK THE LOOP. With one in progress the wait is a short
-			// deadline rather than "until a key arrives", which is what keeps the panels navigable
-			// while a copy runs - and with none it blocks, so an idle manager costs nothing.
-			//
-			// TICKS. The deadline `wait_any` takes is an ABSOLUTE LAPIC TICK COUNT, and this passed
-			// `clock_ns()` - a different clock, reading nanoseconds. Seconds after boot that is a
-			// tick number years away, so the wait never expired: a started operation advanced only
-			// when a key happened to arrive, and one left alone made no progress at all. `rt` warns
-			// about exactly this substitution, in as many words - "a hang that looks like a deadlock
-			// rather than a wrong unit" - and this is what it looks like from the other side. The
-			// governed `F8` test measures it: with `clock_ns()` here, the delete never completes.
-			//
-			// PERIODIC because this wake is HOUSEKEEPING rather than pending progress - a judgement
-			// about what the wait MEANS, and not something that test distinguishes, since it passes
-			// either way. A plain timed wait holds `run_until_idle` until its deadline, and the loop
-			// driving the console polls the serial wire only BETWEEN those calls; a job re-arming a
-			// deadline every tick would therefore keep typed input from being forwarded for as long
-			// as it ran - including the interrupt that cancels it. A periodic waiter lets the system
-			// settle each round and is still woken when it comes due.
-			let ready = if manager.job.is_some() { wait_any_periodic(&[input], clock().saturating_add(1)) } else { wait_any(&[input], 0) };
-			if interrupted() {
-				if manager.job.is_some() {
-					manager.cancel_job(volumes);
-					redraw = true;
-					continue;
-				}
-				return true;
-			}
-			if ready < 0 && manager.job.is_none() {
-				return true;
-			}
-			let mut bytes = [0u8; 64];
-			loop {
-				match try_recv(input, &mut bytes) {
-					Polled::Message { len, .. } => {
-						for &byte in &bytes[..len] {
-							let Some(event) = decoder.feed(byte) else { continue };
-							match manager.apply(event, volumes, output) {
-								ManagerAction::None => {}
-								ManagerAction::Redraw => redraw = true,
-								ManagerAction::Exit => return true,
-							}
+			match try_recv(input, &mut bytes) {
+				Polled::Message { len, .. } => {
+					for &byte in &bytes[..len] {
+						let Some(event) = decoder.feed(byte) else { continue };
+						match manager.apply(event, volumes, output) {
+							ManagerAction::None => {}
+							ManagerAction::Redraw => redraw = true,
+							ManagerAction::Exit => return true,
 						}
 					}
-					Polled::Empty => break,
-					Polled::Closed => return true,
 				}
+				Polled::Empty => break,
+				Polled::Closed => return true,
 			}
-			if manager.advance_job(volumes) {
-				redraw = true;
-			}
+		}
+		if manager.advance_job(volumes) {
+			redraw = true;
 		}
 	}
 }
@@ -1072,12 +1068,10 @@ impl Manager {
 			}
 			let step = &job.plan.steps[job.at];
 			let (source, destination, is_dir, size) = (step.source.clone(), step.destination.clone(), step.is_dir, step.size);
-			let outcome = unsafe {
-				match operation {
-					Operation::Delete => remove_entry(volumes, &source, is_dir),
-					Operation::Copy => copy_entry(volumes, &source, &destination, is_dir),
-					Operation::Move => move_entry(volumes, &source, &destination, is_dir),
-				}
+			let outcome = match operation {
+				Operation::Delete => remove_entry(volumes, &source, is_dir),
+				Operation::Copy => copy_entry(volumes, &source, &destination, is_dir),
+				Operation::Move => move_entry(volumes, &source, &destination, is_dir),
 			};
 			let Some(job) = self.job.as_mut() else { return true };
 			match outcome {
@@ -1121,7 +1115,7 @@ impl Manager {
 		let mut at = 0;
 		let mut depth = 1;
 		while at < planned.steps.len() {
-			if unsafe { interrupted() } {
+			if interrupted() {
 				return true;
 			}
 			if !planned.steps[at].is_dir {
@@ -1134,7 +1128,7 @@ impl Manager {
 				continue;
 			};
 			let storage = volumes.client_for(uri, uri.as_bytes());
-			let Ok(entries) = (unsafe { list_volume_directory(storage, uri, MAX_PANEL_ENTRIES) }) else {
+			let Ok(entries) = list_volume_directory(storage, uri, MAX_PANEL_ENTRIES) else {
 				at += 1;
 				continue;
 			};
@@ -1197,7 +1191,7 @@ impl Manager {
 			let Some(child_uri) = join(base.as_bytes(), self.panels[panel].entries[row].name.as_bytes()) else { continue };
 			let Ok(child_uri) = core::str::from_utf8(&child_uri) else { continue };
 			let storage = volumes.client_for(child_uri, child_uri.as_bytes());
-			let Ok(children) = (unsafe { list_volume_directory(storage, child_uri, MAX_PANEL_ENTRIES) }) else { continue };
+			let Ok(children) = list_volume_directory(storage, child_uri, MAX_PANEL_ENTRIES) else { continue };
 			for child in children {
 				let key = Panel::key_of(&child);
 				if !self.panels[panel].sort.admits(&key) {
@@ -1282,16 +1276,16 @@ impl Manager {
 		let mut results = Results::new();
 		frontier.push(self.panels[active].path.as_bytes(), 0);
 		while let Some((directory, depth)) = frontier.pop() {
-			if unsafe { interrupted() } {
+			if interrupted() {
 				break;
 			}
 			let Ok(uri) = core::str::from_utf8(&directory) else { continue };
 			let storage = volumes.client_for(uri, uri.as_bytes());
-			let Ok(entries) = (unsafe { list_volume_directory(storage, uri, MAX_PANEL_ENTRIES) }) else { continue };
+			let Ok(entries) = list_volume_directory(storage, uri, MAX_PANEL_ENTRIES) else { continue };
 			for entry in &entries {
 				let key = Panel::key_of(entry);
 				let Some(child) = join(&directory, entry.name.as_bytes()) else { continue };
-				if criteria.admits(&key, depth + 1) && (content.is_empty() || unsafe { file_contains(volumes, &child, content) }) {
+				if criteria.admits(&key, depth + 1) && (content.is_empty() || file_contains(volumes, &child, content)) {
 					results.push(&child);
 				}
 				// A DIRECTORY WHOSE NAME DOES NOT MATCH IS STILL WALKED INTO: the files somebody is
@@ -1340,7 +1334,7 @@ impl Manager {
 			self.say(b"nothing selected");
 			return ManagerAction::Redraw;
 		};
-		let head = unsafe { peek(volumes, &uri, 32) };
+		let head = peek(volumes, &uri, 32);
 		let kind = detect_file_type(last_component(&uri).as_bytes(), &head, false);
 		let association = resolve(lico::DEFAULT_ASSOCIATIONS, kind);
 		let program = if wanted == Action::View && association.action == Action::Edit { "licoview" } else { association.program };
@@ -1362,7 +1356,7 @@ impl Manager {
 			self.say(b"this boot granted no launch broker, so nothing can be opened from here");
 			return ManagerAction::Redraw;
 		}
-		let Some((read_end, write_end)) = (unsafe { channel() }) else {
+		let Some((read_end, write_end)) = channel() else {
 			self.say(b"could not make an output channel");
 			return ManagerAction::Redraw;
 		};
@@ -1370,7 +1364,7 @@ impl Manager {
 		let mut client = PermissionClient::new(self.permission);
 		let started = matches!(client.run_with_file(program, "", &cwd, uri, &writable, &write_end), Some(Ok(_)));
 		if !started {
-			unsafe { close(read_end) };
+			close(read_end);
 			self.say(b"the broker refused to open that file with that program");
 			return ManagerAction::Redraw;
 		}
@@ -1429,7 +1423,7 @@ impl Manager {
 			self.say(b"this boot granted no launch broker, so nothing can be started from here");
 			return ManagerAction::Redraw;
 		}
-		let Some((read_end, write_end)) = (unsafe { channel() }) else {
+		let Some((read_end, write_end)) = channel() else {
 			self.say(b"could not make an output channel");
 			return ManagerAction::Redraw;
 		};
@@ -1444,7 +1438,7 @@ impl Manager {
 		let _started = match client.run(program, args, &cwd, &self.environment, &write_end) {
 			Some(Ok(started)) => started,
 			_ => {
-				unsafe { close(read_end) };
+				close(read_end);
 				self.say(b"the broker refused that program - it may not be a governed executable");
 				return ManagerAction::Redraw;
 			}
@@ -1453,7 +1447,7 @@ impl Manager {
 			// A BACKGROUND COMMAND BECOMES A SESSION JOB, so `jobs` and `fg` can see it and
 			// something eventually reaps it. Without that it would be a process nobody is tracking,
 			// which is the thing an `&` must not quietly produce.
-			unsafe { close(read_end) };
+			close(read_end);
 			self.say(b"started in the background; it is not a session job, because nothing sends this program a session grant - see the note in the milestone");
 			return ManagerAction::Redraw;
 		}
@@ -1468,21 +1462,21 @@ impl Manager {
 		output.write(b"\x1b[?1049l");
 		let mut buffer = [0u8; 512];
 		loop {
-			if unsafe { interrupted() } {
+			if interrupted() {
 				break;
 			}
-			match unsafe { recv_blocking(read_end, &mut buffer) } {
+			match recv_blocking(read_end, &mut buffer) {
 				Received::Closed => break,
 				Received::Message { len, .. } => {
 					output.write(&buffer[..len]);
 				}
 			}
 		}
-		unsafe { close(read_end) };
+		close(read_end);
 		output.write(b"\n[press a key to return to lico]\n");
-		unsafe { wait_any(&[stdin()], 0) };
+		wait_any(&[stdin()], 0);
 		let mut drain = [0u8; 64];
-		while let Polled::Message { .. } = unsafe { try_recv(stdin(), &mut drain) } {}
+		while let Polled::Message { .. } = try_recv(stdin(), &mut drain) {}
 		output.write(b"\x1b[?1049h");
 		self.say(b"");
 		ManagerAction::Redraw
@@ -1558,7 +1552,7 @@ impl Manager {
 			self.panels[passive].preview.clear();
 			return;
 		};
-		let preview = unsafe { peek(volumes, &uri, 2048) };
+		let preview = peek(volumes, &uri, 2048);
 		self.panels[passive].preview = preview;
 	}
 
@@ -1587,7 +1581,7 @@ impl Manager {
 				if !committed {
 					let _ = writer.abort();
 				}
-				unsafe { close(writer.handle()) };
+				close(writer.handle());
 				committed
 			}
 			_ => false,
@@ -1684,7 +1678,7 @@ fn split_words(words: &[Vec<u8>]) -> (String, String) {
 
 // Read at most `limit` bytes from the front of a file. Used for content sniffing and the quick
 // view; a short answer is the end of the file rather than a failure.
-unsafe fn peek(volumes: &VolumeSet, uri: &str, limit: u32) -> Vec<u8> {
+fn peek(volumes: &VolumeSet, uri: &str, limit: u32) -> Vec<u8> {
 	let storage = volumes.client_for(uri, uri.as_bytes());
 	unsafe { read_volume_window(storage, uri, 0, limit) }.unwrap_or_default()
 }
@@ -1727,7 +1721,7 @@ fn answer_words(answer: Option<Result<(), Error>>) -> Result<(), &'static [u8]> 
 // A STEP'S OUTCOME, not a yes-or-no. Each of these used to return `bool`, so a job could count its
 // refusals and never say what any of them was; the reason is available at every one of these call
 // sites and was being dropped one line after it arrived.
-unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
+fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
 	let (Ok(source), Ok(destination)) = (core::str::from_utf8(source), core::str::from_utf8(destination)) else {
 		return Err(b"that name is not text");
 	};
@@ -1748,7 +1742,7 @@ unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_
 			Ok(window) => window,
 			Err(_) => {
 				let _ = writer.abort();
-				unsafe { close(writer.handle()) };
+				close(writer.handle());
 				return Err(b"the source could not be read");
 			}
 		};
@@ -1765,7 +1759,7 @@ unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_
 		for piece in window.chunks(WRITER_CHUNK) {
 			if let Err(reason) = answer_words(writer.write(piece).map(|answer| answer.map(|_| ()))) {
 				let _ = writer.abort();
-				unsafe { close(writer.handle()) };
+				close(writer.handle());
 				return Err(reason);
 			}
 		}
@@ -1773,13 +1767,13 @@ unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_
 	// NOTHING IS VISIBLE UNDER THE DESTINATION'S NAME UNTIL HERE, so a copy that failed at any
 	// point above leaves whatever was there before exactly as it was.
 	let committed = answer_words(writer.commit().map(|answer| answer.map(|_| ())));
-	unsafe { close(writer.handle()) };
+	close(writer.handle());
 	committed
 }
 
 // Move: `rename` within a volume, copy-then-remove across one - and the source is removed only
 // after the destination has been published, so an interruption leaves two files rather than none.
-unsafe fn move_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
+fn move_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
 	let (Ok(source_text), Ok(destination_text)) = (core::str::from_utf8(source), core::str::from_utf8(destination)) else {
 		return Err(b"that name is not text");
 	};
@@ -1792,13 +1786,11 @@ unsafe fn move_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_
 	// A rename that did not take is not reported: the copy-then-remove below is the answer for
 	// every cross-volume move, and it reaches the same destination by the long road. What it
 	// reports is what the reader sees.
-	unsafe {
-		copy_entry(volumes, source, destination, is_dir)?;
-		remove_entry(volumes, source, is_dir)
-	}
+	copy_entry(volumes, source, destination, is_dir)?;
+	remove_entry(volumes, source, is_dir)
 }
 
-unsafe fn remove_entry(volumes: &VolumeSet, target: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
+fn remove_entry(volumes: &VolumeSet, target: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
 	let Ok(uri) = core::str::from_utf8(target) else { return Err(b"that name is not text") };
 	let storage = volumes.client_for(uri, target);
 	let mut client = VolumeClient::new(storage);
@@ -1832,7 +1824,7 @@ fn last_component(uri: &str) -> &str {
 	}
 }
 
-unsafe fn load_settings(assets: u64) -> Settings {
+fn load_settings(assets: u64) -> Settings {
 	if assets == 0 {
 		return Settings::default();
 	}
@@ -1845,7 +1837,7 @@ unsafe fn load_settings(assets: u64) -> Settings {
 // Whether a file holds `needle`, read in bounded windows that OVERLAP by the needle's length minus
 // one - so a match straddling a window boundary is still found, which is the whole difficulty of
 // searching a file you are not holding.
-unsafe fn file_contains(volumes: &VolumeSet, uri: &[u8], needle: &[u8]) -> bool {
+fn file_contains(volumes: &VolumeSet, uri: &[u8], needle: &[u8]) -> bool {
 	let Ok(uri) = core::str::from_utf8(uri) else { return false };
 	if needle.is_empty() || needle.len() > CONTENT_CHUNK as usize {
 		return false;
@@ -1855,7 +1847,7 @@ unsafe fn file_contains(volumes: &VolumeSet, uri: &[u8], needle: &[u8]) -> bool 
 	let mut offset: u64 = 0;
 	let mut carry: Vec<u8> = Vec::new();
 	loop {
-		if unsafe { interrupted() } {
+		if interrupted() {
 			return false;
 		}
 		let Ok(window) = (unsafe { read_volume_window(storage, uri, offset, CONTENT_CHUNK) }) else { return false };

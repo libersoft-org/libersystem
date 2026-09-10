@@ -19,73 +19,69 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
-	unsafe {
-		// Governed launch sends arguments first, then the tagged NetworkService grant.
-		inherit_stdout(bootstrap);
-		let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-		show(netsvc);
-		close(netsvc);
-	}
+	// Governed launch sends arguments first, then the tagged NetworkService grant.
+	inherit_stdout(bootstrap);
+	let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	show(netsvc);
+	close(netsvc);
 	exit();
 }
 
 // Query the socket table and render it: a header, then one `<state> <local> <peer>`
 // row per socket - a listening socket shows `*` for its peer.
-unsafe fn show(netsvc: u64) {
-	unsafe {
-		let mut client = NetworkClient::new(netsvc);
-		match client.sockets() {
-			Some(Ok(socks)) => {
-				if socks.is_empty() {
-					eprint(b"ss: no sockets\n");
-				} else {
-					print(b"State     Local            Peer\n");
-					for s in &socks {
-						let mut line: [u8; 80] = [0u8; 80];
-						let mut pos: usize = 0;
-						pos = put(&mut line, pos, state_label(s.state));
-						pos = pad_col(&mut line, pos, 10);
-						line[pos] = b':';
-						pos += 1;
-						pos += write_u16(s.local_port, &mut line[pos..]);
-						pos = pad_col(&mut line, pos, 27);
-						match s.state {
-							SockState::Listen => pos = put(&mut line, pos, b"*"),
-							_ => {
-								pos += s.remote.addr.render(&mut line[pos..]);
-								line[pos] = b':';
-								pos += 1;
-								pos += write_u16(s.remote.port, &mut line[pos..]);
-							}
+fn show(netsvc: u64) {
+	let mut client = NetworkClient::new(netsvc);
+	match client.sockets() {
+		Some(Ok(socks)) => {
+			if socks.is_empty() {
+				eprint(b"ss: no sockets\n");
+			} else {
+				print(b"State     Local            Peer\n");
+				for s in &socks {
+					let mut line: [u8; 80] = [0u8; 80];
+					let mut pos: usize = 0;
+					pos = put(&mut line, pos, state_label(s.state));
+					pos = pad_col(&mut line, pos, 10);
+					line[pos] = b':';
+					pos += 1;
+					pos += write_u16(s.local_port, &mut line[pos..]);
+					pos = pad_col(&mut line, pos, 27);
+					match s.state {
+						SockState::Listen => pos = put(&mut line, pos, b"*"),
+						_ => {
+							pos += s.remote.addr.render(&mut line[pos..]);
+							line[pos] = b':';
+							pos += 1;
+							pos += write_u16(s.remote.port, &mut line[pos..]);
 						}
-						line[pos] = b'\n';
-						pos += 1;
-						print(&line[..pos]);
 					}
+					line[pos] = b'\n';
+					pos += 1;
+					print(&line[..pos]);
 				}
 			}
-			Some(Err(_)) => eprint(b"ss: network error\n"),
-			None => eprint(b"ss: service unavailable\n"),
 		}
-		// The pool utilization footer: the client, socket and listener channels the
-		// service currently stands on, and its live TCP connections. Every set grows on
-		// demand, so these are live counts against the domain's handle budget, not a cap.
-		if let Some(Ok(cap)) = client.capacity() {
-			let mut line: [u8; 96] = [0u8; 96];
-			let mut pos: usize = 0;
-			pos = put(&mut line, pos, b"channels: clients ");
-			pos += write_u16(cap.clients as u16, &mut line[pos..]);
-			pos = put(&mut line, pos, b", sockets ");
-			pos += write_u16(cap.sockets as u16, &mut line[pos..]);
-			pos = put(&mut line, pos, b", listeners ");
-			pos += write_u16(cap.listeners as u16, &mut line[pos..]);
-			pos = put(&mut line, pos, b"; connections ");
-			pos += write_u16(cap.connections as u16, &mut line[pos..]);
-			line[pos] = b'\n';
-			pos += 1;
-			print(&line[..pos]);
-		}
+		Some(Err(_)) => eprint(b"ss: network error\n"),
+		None => eprint(b"ss: service unavailable\n"),
+	}
+	// The pool utilization footer: the client, socket and listener channels the
+	// service currently stands on, and its live TCP connections. Every set grows on
+	// demand, so these are live counts against the domain's handle budget, not a cap.
+	if let Some(Ok(cap)) = client.capacity() {
+		let mut line: [u8; 96] = [0u8; 96];
+		let mut pos: usize = 0;
+		pos = put(&mut line, pos, b"channels: clients ");
+		pos += write_u16(cap.clients as u16, &mut line[pos..]);
+		pos = put(&mut line, pos, b", sockets ");
+		pos += write_u16(cap.sockets as u16, &mut line[pos..]);
+		pos = put(&mut line, pos, b", listeners ");
+		pos += write_u16(cap.listeners as u16, &mut line[pos..]);
+		pos = put(&mut line, pos, b"; connections ");
+		pos += write_u16(cap.connections as u16, &mut line[pos..]);
+		line[pos] = b'\n';
+		pos += 1;
+		print(&line[..pos]);
 	}
 }
 

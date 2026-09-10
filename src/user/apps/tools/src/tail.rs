@@ -29,143 +29,139 @@ const DEFAULT_LINES: u64 = 10;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut lines: u64 = DEFAULT_LINES;
-		let mut follow = false;
-		let mut path: Option<&[u8]> = None;
-		let mut expect = false;
-		for word in split_args(&arguments) {
-			if expect {
-				let Some(count) = parse_u64(word) else {
+	let mut lines: u64 = DEFAULT_LINES;
+	let mut follow = false;
+	let mut path: Option<&[u8]> = None;
+	let mut expect = false;
+	for word in split_args(&arguments) {
+		if expect {
+			let Some(count) = parse_u64(word) else {
+				eprint(b"tail: not a count\n");
+				exit();
+			};
+			lines = count;
+			expect = false;
+			continue;
+		}
+		match classify(word) {
+			Arg::Long(b"lines", Some(value)) => match parse_u64(value) {
+				Some(count) => lines = count,
+				None => {
 					eprint(b"tail: not a count\n");
 					exit();
-				};
-				lines = count;
-				expect = false;
-				continue;
-			}
-			match classify(word) {
-				Arg::Long(b"lines", Some(value)) => match parse_u64(value) {
-					Some(count) => lines = count,
-					None => {
-						eprint(b"tail: not a count\n");
-						exit();
-					}
-				},
-				Arg::Long(b"lines", None) => expect = true,
-				Arg::Long(b"follow", None) => follow = true,
-				Arg::Short(b'n') => expect = true,
-				Arg::Short(b'f') => follow = true,
-				// ONE PATH. A followed tail of several files would interleave two streams with no
-				// way to tell them apart, so the multi-file form waits until there is a header
-				// convention worth having.
-				Arg::Value(value) if path.is_none() => path = Some(value),
-				_ => {
-					eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
-					exit();
 				}
+			},
+			Arg::Long(b"lines", None) => expect = true,
+			Arg::Long(b"follow", None) => follow = true,
+			Arg::Short(b'n') => expect = true,
+			Arg::Short(b'f') => follow = true,
+			// ONE PATH. A followed tail of several files would interleave two streams with no
+			// way to tell them apart, so the multi-file form waits until there is a header
+			// convention worth having.
+			Arg::Value(value) if path.is_none() => path = Some(value),
+			_ => {
+				eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
+				exit();
 			}
 		}
-		if expect {
-			eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
-			exit();
-		}
-		// NO PATH MEANS STDIN, and `tail` needs no restructuring for it: it already finds the last
-		// lines by scanning FORWARD through a ring rather than by seeking to the end, so the same
-		// loop works on an input it cannot seek at all.
-		//
-		// `-f` IS REFUSED BY NAME ON A STREAM, not ignored. Following means asking the volume to
-		// say when the file changed; a pipe has no such thing - it ends, and the end is the end.
-		// A `tail -f` that silently behaved as `tail` would look like it was watching.
-		let (mut source, storage, uri): (Source, u64, String) = match path {
-			Some(argument) => {
-				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-					eprint(b"tail: invalid path\n");
-					exit();
-				};
-				let storage: u64 = volumes.client_for(&cwd, argument);
-				if storage == 0 {
-					eprint(b"tail: no volume\n");
-					exit();
-				}
-				(Source::from_path(storage, &uri, WINDOW), storage, uri)
+	}
+	if expect {
+		eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
+		exit();
+	}
+	// NO PATH MEANS STDIN, and `tail` needs no restructuring for it: it already finds the last
+	// lines by scanning FORWARD through a ring rather than by seeking to the end, so the same
+	// loop works on an input it cannot seek at all.
+	//
+	// `-f` IS REFUSED BY NAME ON A STREAM, not ignored. Following means asking the volume to
+	// say when the file changed; a pipe has no such thing - it ends, and the end is the end.
+	// A `tail -f` that silently behaved as `tail` would look like it was watching.
+	let (mut source, storage, uri): (Source, u64, String) = match path {
+		Some(argument) => {
+			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+				eprint(b"tail: invalid path\n");
+				exit();
+			};
+			let storage: u64 = volumes.client_for(&cwd, argument);
+			if storage == 0 {
+				eprint(b"tail: no volume\n");
+				exit();
 			}
-			None => {
-				let Some(source) = Source::from_stdin() else {
-					eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
-					exit();
-				};
-				if follow {
-					eprint(b"tail: -f needs a file to watch; a pipe ends rather than growing\n");
-					exit();
-				}
-				(source, 0, String::new())
-			}
-		};
-		let Some(end) = tail(&mut source, lines) else {
-			eprint(b"tail: cannot read ");
-			eprint(uri.as_bytes());
-			eprint(b"\n");
-			exit();
-		};
-		if follow {
-			follow_file(storage, &uri, end);
+			(Source::from_path(storage, &uri, WINDOW), storage, uri)
 		}
+		None => {
+			let Some(source) = Source::from_stdin() else {
+				eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
+				exit();
+			};
+			if follow {
+				eprint(b"tail: -f needs a file to watch; a pipe ends rather than growing\n");
+				exit();
+			}
+			(source, 0, String::new())
+		}
+	};
+	let Some(end) = tail(&mut source, lines) else {
+		eprint(b"tail: cannot read ");
+		eprint(uri.as_bytes());
+		eprint(b"\n");
+		exit();
+	};
+	if follow {
+		follow_file(storage, &uri, end);
 	}
 	exit();
 }
 
 // Print the last `lines` lines and return the offset the file ended at, which is where a follow
 // resumes.
-unsafe fn tail(source: &mut Source, lines: u64) -> Option<u64> {
-	unsafe {
-		let mut ring = LastLines::new(usize::try_from(lines).ok()?);
-		let mut offset: u64 = 0;
-		let mut partial: Vec<u8> = Vec::new();
-		loop {
-			let window = match source.next() {
-				Window::Bytes(bytes) => bytes,
-				Window::End => break,
-				Window::Failed => return None,
-			};
-			offset = offset.saturating_add(window.len() as u64);
-			for &byte in &window {
-				if byte == b'\n' {
-					if !ring.push(&partial) {
-						eprint(b"tail: out of memory\n");
-						return None;
-					}
-					partial.clear();
-					continue;
-				}
-				if partial.try_reserve(1).is_err() {
+fn tail(source: &mut Source, lines: u64) -> Option<u64> {
+	let mut ring = LastLines::new(usize::try_from(lines).ok()?);
+	let mut offset: u64 = 0;
+	let mut partial: Vec<u8> = Vec::new();
+	loop {
+		let window = match source.next() {
+			Window::Bytes(bytes) => bytes,
+			Window::End => break,
+			Window::Failed => return None,
+		};
+		offset = offset.saturating_add(window.len() as u64);
+		for &byte in &window {
+			if byte == b'\n' {
+				if !ring.push(&partial) {
 					eprint(b"tail: out of memory\n");
 					return None;
 				}
-				partial.push(byte);
+				partial.clear();
+				continue;
 			}
-		}
-		// A trailing line without a newline is a line, for the reason `head` gives.
-		if !partial.is_empty() && !ring.push(&partial) {
-			eprint(b"tail: out of memory\n");
-			return None;
-		}
-		for line in ring.lines() {
-			if !write_stdout(line) || !write_stdout(b"\n") {
-				break;
+			if partial.try_reserve(1).is_err() {
+				eprint(b"tail: out of memory\n");
+				return None;
 			}
+			partial.push(byte);
 		}
-		Some(offset)
 	}
+	// A trailing line without a newline is a line, for the reason `head` gives.
+	if !partial.is_empty() && !ring.push(&partial) {
+		eprint(b"tail: out of memory\n");
+		return None;
+	}
+	for line in ring.lines() {
+		if !write_stdout(line) || !write_stdout(b"\n") {
+			break;
+		}
+	}
+	Some(offset)
 }
 
 // Follow the file: wait for the service to say it changed, then print what was appended.
@@ -174,7 +170,7 @@ unsafe fn tail(source: &mut Source, lines: u64) -> Option<u64> {
 // truncated, and continuing from the old offset would print whatever now happens to be there - so
 // the follow restarts from the beginning of the new contents, which is what a reader wants and what
 // a naive `tail -f` gets wrong.
-unsafe fn follow_file(storage: u64, path: &str, mut offset: u64) {
+fn follow_file(storage: u64, path: &str, mut offset: u64) {
 	unsafe {
 		let mut client = VolumeClient::new(storage);
 		let events: u64 = match client.watch(path) {

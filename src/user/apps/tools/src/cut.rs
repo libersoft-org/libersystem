@@ -33,138 +33,136 @@ enum Mode {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		inherit_stdout(bootstrap);
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let arguments: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
-		let cwd: String = context.cwd.clone();
+	inherit_stdout(bootstrap);
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let arguments: Vec<u8> = context.arguments.clone().into_bytes();
+	let volumes: VolumeSet = VolumeSet::receive(bootstrap, &mut buf);
+	let cwd: String = context.cwd.clone();
 
-		let mut mode: Option<Mode> = None;
-		let mut ranges: Option<Vec<Range>> = None;
-		let mut delimiter: u8 = b'\t';
-		let mut output_delimiter: Option<u8> = None;
-		let mut complement = false;
-		let mut path: Option<&[u8]> = None;
-		let mut expect: Option<u8> = None;
-		for word in split_args(&arguments) {
-			if let Some(letter) = expect.take() {
-				match letter {
-					b'd' | b'o' => {
-						// ONE BYTE. A multi-byte delimiter is a different feature (it needs a
-						// matcher rather than a comparison), and accepting the first byte of one
-						// would split on something the caller did not name.
-						if word.len() != 1 {
-							eprint(b"cut: the delimiter is one byte\n");
+	let mut mode: Option<Mode> = None;
+	let mut ranges: Option<Vec<Range>> = None;
+	let mut delimiter: u8 = b'\t';
+	let mut output_delimiter: Option<u8> = None;
+	let mut complement = false;
+	let mut path: Option<&[u8]> = None;
+	let mut expect: Option<u8> = None;
+	for word in split_args(&arguments) {
+		if let Some(letter) = expect.take() {
+			match letter {
+				b'd' | b'o' => {
+					// ONE BYTE. A multi-byte delimiter is a different feature (it needs a
+					// matcher rather than a comparison), and accepting the first byte of one
+					// would split on something the caller did not name.
+					if word.len() != 1 {
+						eprint(b"cut: the delimiter is one byte\n");
+						exit();
+					}
+					if letter == b'd' { delimiter = word[0] } else { output_delimiter = Some(word[0]) }
+				}
+				kind => {
+					mode = Some(match kind {
+						b'b' => Mode::Bytes,
+						b'c' => Mode::Chars,
+						_ => Mode::Fields,
+					});
+					// Byte and character positions count from one, like the fields.
+					match parse_ranges(word, false) {
+						Some(parsed) => ranges = Some(parsed),
+						None => {
+							eprint(b"cut: not a range list\n");
 							exit();
 						}
-						if letter == b'd' { delimiter = word[0] } else { output_delimiter = Some(word[0]) }
-					}
-					kind => {
-						mode = Some(match kind {
-							b'b' => Mode::Bytes,
-							b'c' => Mode::Chars,
-							_ => Mode::Fields,
-						});
-						// Byte and character positions count from one, like the fields.
-						match parse_ranges(word, false) {
-							Some(parsed) => ranges = Some(parsed),
-							None => {
-								eprint(b"cut: not a range list\n");
-								exit();
-							}
-						}
 					}
 				}
-				continue;
 			}
-			match classify(word) {
-				Arg::Short(b'b') => expect = Some(b'b'),
-				Arg::Short(b'c') => expect = Some(b'c'),
-				Arg::Short(b'f') => expect = Some(b'f'),
-				Arg::Short(b'd') => expect = Some(b'd'),
-				Arg::Long(b"complement", None) => complement = true,
-				Arg::Long(b"output-delimiter", None) => expect = Some(b'o'),
-				Arg::Value(value) if path.is_none() => path = Some(value),
-				_ => {
-					usage();
-					exit();
-				}
+			continue;
+		}
+		match classify(word) {
+			Arg::Short(b'b') => expect = Some(b'b'),
+			Arg::Short(b'c') => expect = Some(b'c'),
+			Arg::Short(b'f') => expect = Some(b'f'),
+			Arg::Short(b'd') => expect = Some(b'd'),
+			Arg::Long(b"complement", None) => complement = true,
+			Arg::Long(b"output-delimiter", None) => expect = Some(b'o'),
+			Arg::Value(value) if path.is_none() => path = Some(value),
+			_ => {
+				usage();
+				exit();
 			}
 		}
-		let (Some(mode), Some(ranges)) = (mode, ranges) else {
-			usage();
-			exit();
-		};
-		if expect.is_some() {
-			usage();
-			exit();
-		}
-		// NO PATH MEANS STDIN, which is what makes `cut` usable at all in a pipeline - selecting
-		// columns out of another tool's output is most of what it is for.
-		let source: Source = match path {
-			Some(argument) => {
-				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-					eprint(b"cut: invalid path\n");
-					exit();
-				};
-				let storage: u64 = volumes.client_for(&cwd, argument);
-				if storage == 0 {
-					eprint(b"cut: no volume\n");
-					exit();
-				}
-				Source::from_path(storage, &uri, WINDOW)
+	}
+	let (Some(mode), Some(ranges)) = (mode, ranges) else {
+		usage();
+		exit();
+	};
+	if expect.is_some() {
+		usage();
+		exit();
+	}
+	// NO PATH MEANS STDIN, which is what makes `cut` usable at all in a pipeline - selecting
+	// columns out of another tool's output is most of what it is for.
+	let source: Source = match path {
+		Some(argument) => {
+			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+				eprint(b"cut: invalid path\n");
+				exit();
+			};
+			let storage: u64 = volumes.client_for(&cwd, argument);
+			if storage == 0 {
+				eprint(b"cut: no volume\n");
+				exit();
 			}
-			None => match Source::from_stdin() {
-				Some(source) => source,
-				None => {
-					usage();
-					exit();
-				}
-			},
-		};
-		let label: Vec<u8> = source.label().to_vec();
-		let out_delimiter: u8 = output_delimiter.unwrap_or(delimiter);
-		let mut lines = Lines::new(source, MAX_LINE);
-		loop {
-			match lines.next_line() {
-				LineOutcome::Line => {
-					let mut out: Vec<u8> = Vec::new();
-					let selected = select(lines.line(), mode, &ranges, complement, delimiter, out_delimiter, &mut out);
-					if !selected {
-						eprint(b"cut: out of memory\n");
-						exit();
-					}
-					if !write_stdout(&out) || !write_stdout(b"\n") {
-						exit();
-					}
-				}
-				LineOutcome::End => break,
-				LineOutcome::TooLong => {
-					eprint(b"cut: a line is longer than this tool will hold\n");
-					exit();
-				}
-				LineOutcome::Failed(ChunkError::Unavailable) => {
-					eprint(b"cut: cannot read ");
-					eprint(&label);
-					eprint(b"\n");
-					exit();
-				}
-				LineOutcome::Failed(_) => {
+			Source::from_path(storage, &uri, WINDOW)
+		}
+		None => match Source::from_stdin() {
+			Some(source) => source,
+			None => {
+				usage();
+				exit();
+			}
+		},
+	};
+	let label: Vec<u8> = source.label().to_vec();
+	let out_delimiter: u8 = output_delimiter.unwrap_or(delimiter);
+	let mut lines = Lines::new(source, MAX_LINE);
+	loop {
+		match lines.next_line() {
+			LineOutcome::Line => {
+				let mut out: Vec<u8> = Vec::new();
+				let selected = select(lines.line(), mode, &ranges, complement, delimiter, out_delimiter, &mut out);
+				if !selected {
 					eprint(b"cut: out of memory\n");
 					exit();
 				}
+				if !write_stdout(&out) || !write_stdout(b"\n") {
+					exit();
+				}
+			}
+			LineOutcome::End => break,
+			LineOutcome::TooLong => {
+				eprint(b"cut: a line is longer than this tool will hold\n");
+				exit();
+			}
+			LineOutcome::Failed(ChunkError::Unavailable) => {
+				eprint(b"cut: cannot read ");
+				eprint(&label);
+				eprint(b"\n");
+				exit();
+			}
+			LineOutcome::Failed(_) => {
+				eprint(b"cut: out of memory\n");
+				exit();
 			}
 		}
 	}
 	exit();
 }
 
-unsafe fn usage() {
-	unsafe { eprint(b"cut: usage: cut -b|-c|-f RANGES [-d CHAR] [--output-delimiter CHAR] [--complement] <path>\n") };
+fn usage() {
+	eprint(b"cut: usage: cut -b|-c|-f RANGES [-d CHAR] [--output-delimiter CHAR] [--complement] <path>\n");
 }
 
 // Build one output line. Returns false only when the line could not be held.

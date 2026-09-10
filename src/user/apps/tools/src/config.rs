@@ -24,99 +24,91 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" lists all, "<key>" reads one node).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let args: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: a ConfigService client.
-		let cfgsvc: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or_else(|| exit());
-		if args.is_empty() {
-			list_config(cfgsvc);
-		} else if let Some(rest) = args.strip_prefix(b"set ") {
-			set_config(cfgsvc, rest);
-		} else {
-			get_config(cfgsvc, &args[..]);
-		}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" lists all, "<key>" reads one node).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let args: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: a ConfigService client.
+	let cfgsvc: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or_else(|| exit());
+	if args.is_empty() {
+		list_config(cfgsvc);
+	} else if let Some(rest) = args.strip_prefix(b"set ") {
+		set_config(cfgsvc, rest);
+	} else {
+		get_config(cfgsvc, &args[..]);
 	}
 	exit();
 }
 
 // List the whole configuration store through the grant, printing each node as one text line.
-unsafe fn list_config(cfgsvc: u64) {
-	unsafe {
-		let mut client = ConfigClient::new(cfgsvc);
-		match client.list() {
-			Some(Ok(entries)) => {
-				for e in &entries {
-					print(e.to_text().as_bytes());
-					print(b"\n");
-				}
+fn list_config(cfgsvc: u64) {
+	let mut client = ConfigClient::new(cfgsvc);
+	match client.list() {
+		Some(Ok(entries)) => {
+			for e in &entries {
+				print(e.to_text().as_bytes());
+				print(b"\n");
 			}
-			Some(Err(_)) => eprint(b"config: query error\n"),
-			None => eprint(b"config: service unavailable\n"),
 		}
+		Some(Err(_)) => eprint(b"config: query error\n"),
+		None => eprint(b"config: service unavailable\n"),
 	}
 }
 
 // Read one configuration node by key through the grant and print its value.
-unsafe fn get_config(cfgsvc: u64, key: &[u8]) {
-	unsafe {
-		let key = match core::str::from_utf8(key) {
-			Ok(s) => s,
-			Err(_) => {
-				eprint(b"config: invalid key\n");
-				return;
-			}
-		};
-		let mut client = ConfigClient::new(cfgsvc);
-		match client.get(key) {
-			Some(Ok(value)) => {
-				print(value.as_bytes());
-				print(b"\n");
-			}
-			Some(Err(_)) => {
-				eprint(b"config: no such key ");
-				eprint(key.as_bytes());
-				eprint(b"\n");
-			}
-			None => eprint(b"config: service unavailable\n"),
+fn get_config(cfgsvc: u64, key: &[u8]) {
+	let key = match core::str::from_utf8(key) {
+		Ok(s) => s,
+		Err(_) => {
+			eprint(b"config: invalid key\n");
+			return;
 		}
+	};
+	let mut client = ConfigClient::new(cfgsvc);
+	match client.get(key) {
+		Some(Ok(value)) => {
+			print(value.as_bytes());
+			print(b"\n");
+		}
+		Some(Err(_)) => {
+			eprint(b"config: no such key ");
+			eprint(key.as_bytes());
+			eprint(b"\n");
+		}
+		None => eprint(b"config: service unavailable\n"),
 	}
 }
 
 // Write one configuration node ("<key> <value>") through the grant and print the node
 // back, confirming what the store now holds.
-unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
-	unsafe {
-		let split: usize = match rest.iter().position(|&b| b == b' ') {
-			Some(i) if i > 0 && i + 1 < rest.len() => i,
-			_ => {
-				eprint(b"config: usage: config set <key> <value>\n");
-				return;
-			}
-		};
-		let (key, value): (&str, &str) = match (core::str::from_utf8(&rest[..split]), core::str::from_utf8(&rest[split + 1..])) {
-			(Ok(k), Ok(v)) => (k, v),
-			_ => {
-				eprint(b"config: invalid key or value\n");
-				return;
-			}
-		};
-		let entry: ConfigEntry = ConfigEntry { key: String::from(key), value: String::from(value) };
-		let mut client = ConfigClient::new(cfgsvc);
-		match client.set(&entry) {
-			Some(Ok(())) => {
-				print(entry.to_text().as_bytes());
-				print(b"\n");
-			}
-			Some(Err(_)) => eprint(b"config: set refused\n"),
-			None => eprint(b"config: service unavailable\n"),
+fn set_config(cfgsvc: u64, rest: &[u8]) {
+	let split: usize = match rest.iter().position(|&b| b == b' ') {
+		Some(i) if i > 0 && i + 1 < rest.len() => i,
+		_ => {
+			eprint(b"config: usage: config set <key> <value>\n");
+			return;
 		}
+	};
+	let (key, value): (&str, &str) = match (core::str::from_utf8(&rest[..split]), core::str::from_utf8(&rest[split + 1..])) {
+		(Ok(k), Ok(v)) => (k, v),
+		_ => {
+			eprint(b"config: invalid key or value\n");
+			return;
+		}
+	};
+	let entry: ConfigEntry = ConfigEntry { key: String::from(key), value: String::from(value) };
+	let mut client = ConfigClient::new(cfgsvc);
+	match client.set(&entry) {
+		Some(Ok(())) => {
+			print(entry.to_text().as_bytes());
+			print(b"\n");
+		}
+		Some(Err(_)) => eprint(b"config: set refused\n"),
+		None => eprint(b"config: service unavailable\n"),
 	}
 }

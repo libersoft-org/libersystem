@@ -43,10 +43,10 @@ impl Service for Devices {
 
 	fn list(&mut self) -> Result<Vec<DeviceEntry>, Error> {
 		let mut out: Vec<DeviceEntry> = Vec::new();
-		let count: u64 = unsafe { device_count() };
+		let count: u64 = device_count();
 		let mut i: u64 = 0;
 		while i < count {
-			if let Some(entry) = unsafe { device_entry(i) } {
+			if let Some(entry) = device_entry(i) {
 				out.push(entry);
 			}
 			i += 1;
@@ -55,22 +55,20 @@ impl Service for Devices {
 	}
 
 	fn get(&mut self, index: u32) -> Result<DeviceEntry, Error> {
-		unsafe { device_entry(index as u64) }.ok_or(Error::NotFound)
+		device_entry(index as u64).ok_or(Error::NotFound)
 	}
 }
 
 // Read device `i` from the kernel table and map it to a typed entry, or None if the
 // index is out of range.
-unsafe fn device_entry(i: u64) -> Option<DeviceEntry> {
-	unsafe {
-		let mut info: DeviceInfo = DeviceInfo::default();
-		if !device_info(i, &mut info) {
-			return None;
-		}
-		// The address comes straight from the kernel table, which is what makes a row number
-		// resolvable to a device without asking any service. See `device-entry`.
-		Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32 })
+fn device_entry(i: u64) -> Option<DeviceEntry> {
+	let mut info: DeviceInfo = DeviceInfo::default();
+	if !device_info(i, &mut info) {
+		return None;
 	}
+	// The address comes straight from the kernel table, which is what makes a row number
+	// resolvable to a device without asking any service. See `device-entry`.
+	Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32 })
 }
 
 // Map a kernel device-type code to the typed device type.
@@ -87,7 +85,7 @@ fn type_of(device_type: u32) -> DeviceType {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 1. report in to the supervisor that started us.
-	unsafe {
+	{
 		send_blocking(bootstrap, b"DeviceService: online", 0);
 	}
 
@@ -98,8 +96,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    handle. A supervisor that dropped the channel instead (no clients this boot)
 	//    reports as a missing role, and there is nothing left to serve either way.
 	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
-	if let Err(error) = unsafe { receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) } {
-		unsafe { fail_bootstrap(bootstrap, error.tag(), error.reason()) };
+	if let Err(error) = receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) {
+		fail_bootstrap(bootstrap, error.tag(), error.reason());
 	}
 	let service: u64 = roles[0];
 	// The catalogue connection, if the plan handed one over. Its position in `BOOTSTRAP_ROLES` is
@@ -110,8 +108,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut devices: Devices = Devices { bindings };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { device::dispatch(&mut devices, req, handle, out, reply_handle) });
-	}
+	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { device::dispatch(&mut devices, req, handle, out, reply_handle) });
 	exit();
 }

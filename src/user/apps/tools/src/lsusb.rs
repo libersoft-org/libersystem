@@ -21,52 +21,48 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for text, "json" /
-		//    "json-min" for JSON).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let mode: Option<JsonMode> = JsonMode::parse(argument);
-		// 3. receive the one capability the manifest grants: the USB bus query client.
-		let ussvc: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or_else(|| exit());
-		query_bus(ussvc, mode);
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for text, "json" /
+	//    "json-min" for JSON).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let mode: Option<JsonMode> = JsonMode::parse(argument);
+	// 3. receive the one capability the manifest grants: the USB bus query client.
+	let ussvc: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or_else(|| exit());
+	query_bus(ussvc, mode);
 	exit();
 }
 
 // Query the driver's live inventory through the grant and print each device, as text
 // (the default) or as a JSON array.
-unsafe fn query_bus(ussvc: u64, mode: Option<JsonMode>) {
-	unsafe {
-		let mut client = UsbClient::new(ussvc);
-		match client.list() {
-			Some(Ok(entries)) => {
-				if let Some(mode) = mode {
-					let mut out = String::from("[");
-					for (i, e) in entries.iter().enumerate() {
-						if i > 0 {
-							out.push(',');
-						}
-						out.push_str(&e.to_json());
+fn query_bus(ussvc: u64, mode: Option<JsonMode>) {
+	let mut client = UsbClient::new(ussvc);
+	match client.list() {
+		Some(Ok(entries)) => {
+			if let Some(mode) = mode {
+				let mut out = String::from("[");
+				for (i, e) in entries.iter().enumerate() {
+					if i > 0 {
+						out.push(',');
 					}
-					out.push(']');
-					print(mode.render(out).as_bytes());
+					out.push_str(&e.to_json());
+				}
+				out.push(']');
+				print(mode.render(out).as_bytes());
+				print(b"\n");
+			} else {
+				for e in &entries {
+					print(e.to_text().as_bytes());
 					print(b"\n");
-				} else {
-					for e in &entries {
-						print(e.to_text().as_bytes());
-						print(b"\n");
-					}
 				}
 			}
-			Some(Err(_)) => eprint(b"lsusb: query error\n"),
-			None => eprint(b"lsusb: service unavailable\n"),
 		}
+		Some(Err(_)) => eprint(b"lsusb: query error\n"),
+		None => eprint(b"lsusb: service unavailable\n"),
 	}
 }

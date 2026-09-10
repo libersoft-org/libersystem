@@ -406,11 +406,46 @@ fn current_typed<T: KernelObject>(handle: u64, ty: ObjectType, rights: Rights) -
 	Ok(current_object(handle, ty, rights)?.into_any_arc().downcast::<T>().ok().expect("type checked by lookup_typed"))
 }
 
+// The types `read_user` is allowed to build out of user bytes, and the reason it needs saying.
+//
+// `read_user` fills a `MaybeUninit<T>` from a caller-controlled address, zero-fills the tail on a
+// short read, and calls `assume_init`. That is sound for a `T` whose EVERY BIT PATTERN is a valid
+// value, and unsound for anything else: a `bool` built from the byte 2, a `char` from a surrogate,
+// an enum from a discriminant it does not have, a reference from an address userspace chose. The
+// function used to be generic over every `T`, sound only because the three types it happened to be
+// instantiated with are plain integers - a fact its signature did not state and a future call site
+// could not be stopped from breaking.
+//
+// The trait is SEALED, so the list of permitted types is this module's and cannot be extended from
+// elsewhere, and it is `unsafe` to implement, so adding one is a deliberate claim about bit
+// patterns rather than an `impl` somebody wrote to make a call compile.
+mod plain_data {
+	pub trait Sealed {}
+}
+
+// # Safety
+// Every bit pattern of `Self` must be a valid value of `Self`, including a pattern of all zeroes -
+// the tail `read_user` writes when the caller's page went away mid-copy.
+unsafe trait UserPlain: plain_data::Sealed + Copy {}
+
+impl plain_data::Sealed for u64 {}
+// SAFETY: an integer; every bit pattern is a value, zero included.
+unsafe impl UserPlain for u64 {}
+
+impl plain_data::Sealed for [u8; abi::ENTRY_NAME_LEN] {}
+// SAFETY: an array of integers; every bit pattern is a value, and all-zero is the empty name.
+unsafe impl UserPlain for [u8; abi::ENTRY_NAME_LEN] {}
+
+impl plain_data::Sealed for abi::CapTransfer {}
+// SAFETY: `repr(C)` over `u64` and two `u32`s and nothing else, so every bit pattern is a value;
+// all-zero is handle 0 with no rights, which the handlers refuse on its own terms.
+unsafe impl UserPlain for abi::CapTransfer {}
+
 // Write `value` to a caller-supplied buffer through the sanctioned SMAP window
 // (arch::paging::user_access): under SMAP a plain kernel store to a user page
 // faults, so every copy-out goes through here. The caller has already validated
 // the pointer with user_buf_ok.
-fn read_user<T>(ptr: u64) -> T {
+fn read_user<T: UserPlain>(ptr: u64) -> T {
 	let mut value = core::mem::MaybeUninit::<T>::uninit();
 	// Through the faultable copy, so a page that goes away between `user_buf_ok` and here is a
 	// short read rather than a kernel fault. A short read leaves the tail of `value` as whatever

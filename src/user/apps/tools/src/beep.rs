@@ -21,55 +21,51 @@ use tools::{parse_u64, split_args};
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
-		//    renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - "[hz] [ms]" (both optional).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let args: Vec<u8> = context.arguments.clone().into_bytes();
-		// 3. receive the one capability the manifest grants: an AudioService client.
-		let audiosvc: u64 = recv_tagged(bootstrap, &mut buf, b"AUDIO").unwrap_or_else(|| exit());
-		beep(audiosvc, &args[..]);
-	}
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
+	//    renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - "[hz] [ms]" (both optional).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let args: Vec<u8> = context.arguments.clone().into_bytes();
+	// 3. receive the one capability the manifest grants: an AudioService client.
+	let audiosvc: u64 = recv_tagged(bootstrap, &mut buf, b"AUDIO").unwrap_or_else(|| exit());
+	beep(audiosvc, &args[..]);
 	exit();
 }
 
 // Play a tone through the grant. Both arguments are optional and default to a 440 Hz tone for
 // 200 ms; AudioService clamps them to its supported range. A "no audio device" error is
 // reported when the system has no virtio-sound device, so the command degrades cleanly.
-unsafe fn beep(audiosvc: u64, args: &[u8]) {
-	unsafe {
-		let mut freq: u16 = 440;
-		let mut millis: u32 = 200;
-		let mut parts = split_args(args);
-		if let Some(f) = parts.next() {
-			match parse_u64(f) {
-				Some(v) => freq = v.min(u16::MAX as u64) as u16,
-				None => {
-					eprint(b"beep: invalid frequency\n");
-					return;
-				}
+fn beep(audiosvc: u64, args: &[u8]) {
+	let mut freq: u16 = 440;
+	let mut millis: u32 = 200;
+	let mut parts = split_args(args);
+	if let Some(f) = parts.next() {
+		match parse_u64(f) {
+			Some(v) => freq = v.min(u16::MAX as u64) as u16,
+			None => {
+				eprint(b"beep: invalid frequency\n");
+				return;
 			}
 		}
-		if let Some(m) = parts.next() {
-			match parse_u64(m) {
-				Some(v) => millis = v.min(u32::MAX as u64) as u32,
-				None => {
-					eprint(b"beep: invalid duration\n");
-					return;
-				}
+	}
+	if let Some(m) = parts.next() {
+		match parse_u64(m) {
+			Some(v) => millis = v.min(u32::MAX as u64) as u32,
+			None => {
+				eprint(b"beep: invalid duration\n");
+				return;
 			}
 		}
-		let mut client = AudioClient::new(audiosvc);
-		match client.beep(&freq, &millis) {
-			Some(Ok(())) => {}
-			Some(Err(_)) => eprint(b"beep: no audio device\n"),
-			None => eprint(b"beep: service unavailable\n"),
-		}
+	}
+	let mut client = AudioClient::new(audiosvc);
+	match client.beep(&freq, &millis) {
+		Some(Ok(())) => {}
+		Some(Err(_)) => eprint(b"beep: no audio device\n"),
+		None => eprint(b"beep: service unavailable\n"),
 	}
 }
 

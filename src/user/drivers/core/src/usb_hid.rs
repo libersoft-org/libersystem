@@ -201,7 +201,7 @@ fn ep_interval(speed: u32, b_interval: u32) -> u32 {
 
 // Post a HID device's next input-report TRB (sized by its layout) and ring its
 // doorbell.
-unsafe fn post_report(hc: &Xhci, dev: &UsbDevice, h: &mut Hid) {
+fn post_report(hc: &Xhci, dev: &UsbDevice, h: &mut Hid) {
 	unsafe {
 		h.ring.push(dev.data_phys, h.layout.report_bytes(), TRB_NORMAL << 10 | TRB_IOC);
 		w32(hc.db + dev.slot as u64 * 4, h.dci);
@@ -211,12 +211,10 @@ unsafe fn post_report(hc: &Xhci, dev: &UsbDevice, h: &mut Hid) {
 
 // Post the first report TRB of every HID device that is not serving yet (at the
 // service loop's start, and after a runtime attach).
-pub unsafe fn post_reports(hc: &Xhci, hids: &mut Hids) {
-	unsafe {
-		for (dev, h) in hids.entries.iter_mut() {
-			if !h.posted {
-				post_report(hc, dev, h);
-			}
+pub fn post_reports(hc: &Xhci, hids: &mut Hids) {
+	for (dev, h) in hids.entries.iter_mut() {
+		if !h.posted {
+			post_report(hc, dev, h);
 		}
 	}
 }
@@ -226,7 +224,7 @@ pub unsafe fn post_reports(hc: &Xhci, hids: &mut Hids) {
 // which is decoded through its layout and the next report TRB posted. A stalled
 // report is recovered (the endpoint unhalted, its ring repositioned, the
 // device-side halt cleared) and reposted. Every other event is ignored.
-pub unsafe fn handle_hid_event(hc: &mut Xhci, hids: &mut Hids, status: u32, control: u32) {
+pub fn handle_hid_event(hc: &mut Xhci, hids: &mut Hids, status: u32, control: u32) {
 	unsafe {
 		let kind: u32 = control >> 10 & 0x3f;
 		let code: u32 = status >> 24;
@@ -271,51 +269,49 @@ pub unsafe fn handle_hid_event(hc: &mut Xhci, hids: &mut Hids, status: u32, cont
 // running pointer state, sent to InputService when it changed - the same
 // [x u16 LE][y u16 LE][buttons u8][wheel i8] frame the virtio pointer sends.
 unsafe fn feed_hid_report(h: &mut Hid, report: &[u8]) {
-	unsafe {
-		if report.is_empty() {
-			return;
-		}
-		let (id, body): (u8, &[u8]) = if h.layout.uses_ids() { (report[0], &report[1..]) } else { (0, report) };
-		let prev_i: usize = match h.prevs.iter().position(|&(pid, _)| pid == id) {
-			Some(i) => i,
-			None => {
-				h.prevs.push((id, [0u8; 64]));
-				h.prevs.len() - 1
-			}
-		};
-		let (layout, prevs, mods): (&hid::Layout, &mut Vec<(u8, [u8; 64])>, &mut Mods) = (&h.layout, &mut h.prevs, &mut h.mods);
-		layout.keys_diff(id, &prevs[prev_i].1, body, &mut |usage, down| {
-			let page: u16 = (usage >> 16) as u16;
-			let raw: u16 = usage as u16;
-			let key_sink: u64 = KEY_SINK.load(Ordering::Relaxed);
-			if page == 0x07 && key_sink != 0 {
-				let event: [u8; 3] = [raw as u8, (raw >> 8) as u8, down as u8];
-				let _ = send_blocking(key_sink, &event, 0);
-			}
-			let code: u16 = usage_keycode(usage);
-			if code != 0 {
-				keys::feed_key(code, down as u32, mods);
-			}
-		});
-		let (mut x, mut y, mut buttons, mut wheel): (i32, i32, u8, i32) = (h.x, h.y, h.buttons, 0);
-		if layout.pointer_fold(id, body, &mut x, &mut y, &mut buttons, &mut wheel) && (x != h.x || y != h.y || buttons != h.buttons || wheel != 0) {
-			let mut msg: [u8; 6] = [0u8; 6];
-			msg[0..2].copy_from_slice(&(x as u16).to_le_bytes());
-			msg[2..4].copy_from_slice(&(y as u16).to_le_bytes());
-			msg[4] = buttons;
-			msg[5] = wheel.clamp(-127, 127) as i8 as u8;
-			let sink: u64 = PTR_SINK.load(Ordering::Relaxed);
-			if sink != 0 {
-				// non-blocking: with no consumer routed, pointer events just drop.
-				let _ = try_send(sink, &msg, 0);
-			}
-			h.x = x;
-			h.y = y;
-			h.buttons = buttons;
-		}
-		let body_len: usize = body.len().min(64);
-		prevs[prev_i].1[..body_len].copy_from_slice(&body[..body_len]);
+	if report.is_empty() {
+		return;
 	}
+	let (id, body): (u8, &[u8]) = if h.layout.uses_ids() { (report[0], &report[1..]) } else { (0, report) };
+	let prev_i: usize = match h.prevs.iter().position(|&(pid, _)| pid == id) {
+		Some(i) => i,
+		None => {
+			h.prevs.push((id, [0u8; 64]));
+			h.prevs.len() - 1
+		}
+	};
+	let (layout, prevs, mods): (&hid::Layout, &mut Vec<(u8, [u8; 64])>, &mut Mods) = (&h.layout, &mut h.prevs, &mut h.mods);
+	layout.keys_diff(id, &prevs[prev_i].1, body, &mut |usage, down| {
+		let page: u16 = (usage >> 16) as u16;
+		let raw: u16 = usage as u16;
+		let key_sink: u64 = KEY_SINK.load(Ordering::Relaxed);
+		if page == 0x07 && key_sink != 0 {
+			let event: [u8; 3] = [raw as u8, (raw >> 8) as u8, down as u8];
+			let _ = send_blocking(key_sink, &event, 0);
+		}
+		let code: u16 = usage_keycode(usage);
+		if code != 0 {
+			keys::feed_key(code, down as u32, mods);
+		}
+	});
+	let (mut x, mut y, mut buttons, mut wheel): (i32, i32, u8, i32) = (h.x, h.y, h.buttons, 0);
+	if layout.pointer_fold(id, body, &mut x, &mut y, &mut buttons, &mut wheel) && (x != h.x || y != h.y || buttons != h.buttons || wheel != 0) {
+		let mut msg: [u8; 6] = [0u8; 6];
+		msg[0..2].copy_from_slice(&(x as u16).to_le_bytes());
+		msg[2..4].copy_from_slice(&(y as u16).to_le_bytes());
+		msg[4] = buttons;
+		msg[5] = wheel.clamp(-127, 127) as i8 as u8;
+		let sink: u64 = PTR_SINK.load(Ordering::Relaxed);
+		if sink != 0 {
+			// non-blocking: with no consumer routed, pointer events just drop.
+			let _ = try_send(sink, &msg, 0);
+		}
+		h.x = x;
+		h.y = y;
+		h.buttons = buttons;
+	}
+	let body_len: usize = body.len().min(64);
+	prevs[prev_i].1[..body_len].copy_from_slice(&body[..body_len]);
 }
 
 // Resolve a page-extended HID usage to its keycode: the keyboard page through

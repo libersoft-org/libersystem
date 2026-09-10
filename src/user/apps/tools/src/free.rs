@@ -21,29 +21,27 @@ const FRAME_SIZE: u64 = 4096;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	unsafe {
-		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
-		//    output renders on the same terminal as the shell that launched us.
-		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the sub-form ("" for bytes, "-h" for
-		//    human-readable units).
-		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
-			Some(context) => context,
-			None => exit(),
-		};
-		let argument: &[u8] = context.arguments.as_bytes();
-		let human: bool = argument == b"-h";
-		// 3. read the totals and render one row per pool.
-		let mut stats = MemoryStats::default();
-		if memory_stats(&mut stats) <= 0 {
-			eprint(b"free: query error\n");
-			exit();
-		}
-		let mut out = String::new();
-		render_row(&mut out, "Mem:  ", stats.total_frames * FRAME_SIZE, stats.free_frames * FRAME_SIZE, human);
-		render_row(&mut out, "Heap: ", stats.heap_total, stats.heap_free, human);
-		print(out.as_bytes());
+	// 1. adopt the forwarded stdout console (the first bootstrap message), so our
+	//    output renders on the same terminal as the shell that launched us.
+	inherit_stdout(bootstrap);
+	// 2. receive the argument string - the sub-form ("" for bytes, "-h" for
+	//    human-readable units).
+	let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+		Some(context) => context,
+		None => exit(),
+	};
+	let argument: &[u8] = context.arguments.as_bytes();
+	let human: bool = argument == b"-h";
+	// 3. read the totals and render one row per pool.
+	let mut stats = MemoryStats::default();
+	if memory_stats(&mut stats) <= 0 {
+		eprint(b"free: query error\n");
+		exit();
 	}
+	let mut out = String::new();
+	render_row(&mut out, "Mem:  ", stats.total_frames * FRAME_SIZE, stats.free_frames * FRAME_SIZE, human);
+	render_row(&mut out, "Heap: ", stats.heap_total, stats.heap_free, human);
+	print(out.as_bytes());
 	exit();
 }
 

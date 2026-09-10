@@ -18,40 +18,36 @@ use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
-	unsafe {
-		// Governed launch sends arguments first, then the tagged NetworkService grant.
-		inherit_stdout(bootstrap);
-		let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-		show(netsvc);
-		close(netsvc);
-	}
+	// Governed launch sends arguments first, then the tagged NetworkService grant.
+	inherit_stdout(bootstrap);
+	let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	show(netsvc);
+	close(netsvc);
 	exit();
 }
 
 // Query the interface state and render just the neighbor cache (the ARP table), one
 // `<addr> at <mac>` line per entry.
-unsafe fn show(netsvc: u64) {
-	unsafe {
-		let mut client = NetworkClient::new(netsvc);
-		match client.info() {
-			Some(Ok(info)) => {
-				if info.neighbors.is_empty() {
-					eprint(b"arp: no neighbors\n");
-					return;
-				}
-				let mut tmp: [u8; 18] = [0u8; 18];
-				for ngh in &info.neighbors {
-					let n: usize = ngh.addr.render(&mut tmp);
-					print(&tmp[..n]);
-					print(b" at ");
-					let n: usize = write_mac(&ngh.mac, &mut tmp);
-					print(&tmp[..n]);
-					print(b"\n");
-				}
+fn show(netsvc: u64) {
+	let mut client = NetworkClient::new(netsvc);
+	match client.info() {
+		Some(Ok(info)) => {
+			if info.neighbors.is_empty() {
+				eprint(b"arp: no neighbors\n");
+				return;
 			}
-			Some(Err(_)) => eprint(b"arp: network error\n"),
-			None => eprint(b"arp: service unavailable\n"),
+			let mut tmp: [u8; 18] = [0u8; 18];
+			for ngh in &info.neighbors {
+				let n: usize = ngh.addr.render(&mut tmp);
+				print(&tmp[..n]);
+				print(b" at ");
+				let n: usize = write_mac(&ngh.mac, &mut tmp);
+				print(&tmp[..n]);
+				print(b"\n");
+			}
 		}
+		Some(Err(_)) => eprint(b"arp: network error\n"),
+		None => eprint(b"arp: service unavailable\n"),
 	}
 }

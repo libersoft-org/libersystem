@@ -25,49 +25,45 @@ const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnecti
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
-	unsafe {
-		// Governed launch sends arguments first, then the tagged NetworkService grant.
-		inherit_stdout(bootstrap);
-		let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
-		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-		serve(netsvc);
-		close(netsvc);
-	}
+	// Governed launch sends arguments first, then the tagged NetworkService grant.
+	inherit_stdout(bootstrap);
+	let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
+	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
+	serve(netsvc);
+	close(netsvc);
 	exit();
 }
 
 // Open the listening socket and accept connections forever, serving each one.
-unsafe fn serve(netsvc: u64) {
-	unsafe {
-		let mut net = NetworkClient::new(netsvc);
-		let listen_chan: u64 = match net.listen(&HTTP_PORT) {
-			Some(Ok(h)) => h,
-			_ => {
-				eprint(b"httpd: listen failed\n");
-				return;
-			}
-		};
-		eprint(b"httpd: listening on port 80\n");
-		let mut lis = ListenerClient::new(listen_chan);
-		// accept() blocks until an inbound connection completes; the loop ends when the
-		// listener channel closes (NetworkService gone).
-		loop {
-			let sockh: u64 = match lis.accept() {
-				Some(Ok(h)) => h,
-				_ => break,
-			};
-			respond(sockh);
-			close(sockh);
+fn serve(netsvc: u64) {
+	let mut net = NetworkClient::new(netsvc);
+	let listen_chan: u64 = match net.listen(&HTTP_PORT) {
+		Some(Ok(h)) => h,
+		_ => {
+			eprint(b"httpd: listen failed\n");
+			return;
 		}
-		close(listen_chan);
+	};
+	eprint(b"httpd: listening on port 80\n");
+	let mut lis = ListenerClient::new(listen_chan);
+	// accept() blocks until an inbound connection completes; the loop ends when the
+	// listener channel closes (NetworkService gone).
+	loop {
+		let sockh: u64 = match lis.accept() {
+			Some(Ok(h)) => h,
+			_ => break,
+		};
+		respond(sockh);
+		close(sockh);
 	}
+	close(listen_chan);
 }
 
 // Serve one connection: send the canned response zero-copy (a shared memory object
 // whose handle transfers to NetworkService) and close. We respond without reading the
 // request first - `Connection: close` plus a fixed body is a complete exchange, and
 // not blocking on a read keeps a request-less connection from wedging the accept loop.
-unsafe fn respond(sockh: u64) {
+fn respond(sockh: u64) {
 	unsafe {
 		let mut sock = SocketClient::new(sockh);
 		match make_buffer(RESPONSE) {
