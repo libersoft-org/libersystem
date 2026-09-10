@@ -200,6 +200,13 @@ fn a_configuration_that_cannot_be_true_is_refused_rather_than_used() {
 fn the_input_range_is_inclusive_at_both_ends() {
 	let config = Config::parse(&config_bytes()).expect("valid");
 	assert_eq!(config.input_len(), 0x1_0000_0000, "a range of 0..=0xFFFF_FFFF is four gigabytes, not one byte less");
+	// THE FULL 64-BIT INPUT RANGE, which QEMU's riscv64 virtio-iommu advertises. Its inclusive
+	// length is 2^64, one more than a u64 holds; `input_len` saturates rather than overflowing
+	// (the debug build panicked here on riscv64 before the backend stopped assuming a bounded
+	// range - M0173's portability fix).
+	let full = Config { page_size_mask: 0x1000, input_start: 0, input_end: u64::MAX, domain_start: 0, domain_end: 0xffff, probe_size: 0, bypass: 1 };
+	assert_eq!(full.input_len(), u64::MAX, "a full 64-bit range saturates instead of overflowing");
+	assert!(full.contains(0x4000, 0x1000), "an ordinary mapping is inside the full range");
 	assert!(config.contains(0xFFFF_F000, 0x1000), "the last page is inside the range");
 	assert!(!config.contains(0xFFFF_F000, 0x2000), "and one page past the end is not");
 	assert_eq!(config.smallest_page(), 0x1000);

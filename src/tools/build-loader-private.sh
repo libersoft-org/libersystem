@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build one signed-boot trust profile and acquire its immutable copy under the producer lock.
 set -euo pipefail
-profile="${1:?usage: build-loader-private.sh <test-trust|external-release> <private-output>}"
+profile="${1:?usage: build-loader-private.sh <test-trust|external-release|rollback-enforcing> <private-output>}"
 output="$(realpath -m "${2:?a private output path is required}")"
 target="$(dirname "$output")/cargo-loader"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 case "$profile" in
-test-trust | external-release) ;;
+test-trust | external-release | rollback-enforcing) ;;
 *)
 	echo "build-loader-private: unknown profile: $profile" >&2
 	exit 2

@@ -60,6 +60,11 @@ cleanup() {
 		rm -f "$path"
 	done
 	rm -f "$BUILD/$SLUG.iso.build-key.tmp.$$" "$BUILD/$SLUG.img.build-key.tmp.$$"
+	# This run's input snapshot: read-only files under a directory this run owns.
+	[[ -z "${IN:-}" || ! -d "$IN" ]] || {
+		chmod -R u+w "$IN" 2>/dev/null
+		rm -rf "$IN"
+	}
 }
 trap cleanup EXIT
 
@@ -156,7 +161,7 @@ esac
 # staged path on stdout.
 stage_kernel() {
 	local src="$1" out="$BUILD/kernel"
-	"$REPO_ROOT/src/tools/stage-kernel.sh" "$STRIP" "$src" "$out"
+	"$IN/stage-kernel.sh" "$STRIP" "$src" "$out"
 	info "kernel: staged ($STRIP) $(stat -c %s "$src") -> $(stat -c %s "$out") bytes"
 	echo "$out"
 }
@@ -272,7 +277,7 @@ stage_signed_boot_manifest() {
 	local image="$1" staged_kernel="$2" arch="$3" payload="${4:-}" payload_name="${5:-}" pair_arch="${6:-}"
 	local out="$BUILD/boot.manifest2.$$"
 	local release
-	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$REPO_ROOT/product.conf")"
+	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$IN/product.conf")"
 	local -a rows=(--row "kernel:kernel=$staged_kernel")
 	# THE PAYLOAD THIS MEDIUM CARRIES, whichever of the two it is. A boot medium that hands the
 	# kernel a system volume as a module is a medium whose manifest has to cover that whole image -
@@ -295,9 +300,14 @@ stage_signed_boot_manifest() {
 	if [[ -n "$pair_arch" ]]; then
 		paired="$(resolve_volume_pairing "$pair_arch")"
 	fi
+	# THE DMA MODE THIS MEDIUM IS SIGNED FOR - the same value the volume it carries was signed for,
+	# because the loader latches the whole selected set and a medium and a volume that disagree
+	# refuse to boot together. `harness` signs a tag-0 manifest whose boot takes the mode from the
+	# harness carrier: the test medium, and the development image.
 	(cd "$REPO_ROOT/src/tools/sign-manifest" && cargo run --quiet -- \
 		--profile test-trust --product LiberSystem --arch "${arch:-x86_64}" --source boot-medium \
 		--release "$release" --volume-uuid "$paired" \
+		--generation "${LIBER_SECURITY_GENERATION:-1}" --purpose "${LIBER_MANIFEST_PURPOSE:-boot}" --signing-key "${LIBER_MANIFEST_PURPOSE:-boot}" --dma-mode "$DMA_MODE" \
 		"${rows[@]}" --out "$out") >&2 || die "the boot medium's manifest could not be signed"
 	ensure_dir "$image" ::/etc
 	stamp_epoch "$out"
@@ -322,8 +332,8 @@ stage_signed_boot_manifest() {
 # is signed over this medium, and there is no second copy of it anywhere for anyone to edit.
 resolve_volume_pairing() {
 	local arch="${1:-x86_64}"
-	local uuid_file="$BUILD/system-volume-bootable-${arch}.uuid"
-	local volume="$BUILD/system-volume-bootable-${arch}.img"
+	local uuid_file="$IN/system-volume-bootable-${arch}.uuid"
+	local volume="$IN/system-volume-bootable-${arch}.img"
 	if [[ ! -f "$uuid_file" ]]; then
 		# A MEDIUM CARRYING A VOLUME AND NO PAIRING IS A BUILD ERROR, not a warning.
 		#
@@ -390,12 +400,12 @@ make_iso() {
 	# booted the archive-carrying ISO. The device-tree runners do build their own ESP - but the
 	# x86_64 runner calls this script and boots what it returns, which is how a shipping medium and
 	# a test medium had become one artifact in the first place.
-	local payload="$BUILD/system-volume-bootable-x86_64.img" payload_name="system-volume.img"
+	local payload="$IN/system-volume-bootable-x86_64.img" payload_name="system-volume.img"
 	if [[ "$test_medium" == "1" ]]; then
 		# Architecture-qualified in the build directory, staged under the plain name the kernel
 		# looks it up by. The unqualified BUILD file no longer exists: every architecture wrote it,
 		# so it held whichever ran last.
-		payload="$BUILD/volume-x86_64.pkg"
+		payload="$IN/volume-x86_64.pkg"
 		payload_name="$VOLUME_PACKAGE"
 		[[ -f "$payload" ]] || die "testiso: no volume package at $payload (run \`just packages\`)"
 	else
@@ -406,7 +416,7 @@ make_iso() {
 	fi
 	# The init package is counted whether or not it is staged: it is the smaller of the two payloads
 	# and over-sizing a FAT image by a few megabytes is cheaper than getting it wrong.
-	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/init-x86_64.pkg") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
+	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$IN/init-x86_64.pkg") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
 	# FAT overhead + slack, rounded up to a whole MiB (min 32 MiB).
 	total=$(((bytes + 16 * 1024 * 1024) / (1024 * 1024) + 1))
 	((total < 32)) && total=32
@@ -532,7 +542,7 @@ make_img() {
 
 	# Lay the system volume into partition 2. Built by `just system-volume`, which runs after the
 	# kernel so the image carries the kernel that was just linked.
-	local volume="$BUILD/system-volume-bootable-x86_64.img"
+	local volume="$IN/system-volume-bootable-x86_64.img"
 	if [[ -f "$volume" ]]; then
 		local sys_start sys_sectors
 		sys_start="$(sgdisk -i 2 "$out" | awk '/^First sector:/ {print $3}')"
@@ -566,9 +576,79 @@ command -v sha256sum >/dev/null
 exec 9>"$BUILD/$SLUG.image.lock"
 flock 9
 
+# THE INPUTS ARE ACQUIRED ONCE, INTO A RUN-PRIVATE, READ-ONLY SNAPSHOT, AND ASSEMBLY READS ONLY THAT.
+#
+# This script's own lock covers its assembly and nothing else: the producers of its inputs -
+# `build.sh`'s loader step, `mkpackages` for the packages, the volume and the fallback set - are not
+# under it, so an input could be replaced while the image was being written, and what this script
+# did about it was recompute the key afterwards and DIE. That made a corrupt medium impossible and a
+# concurrent run FAIL, which is the wrong half of the property.
+#
+# Acquisition is made atomic with respect to the PRODUCERS: every producer publishes by rename and,
+# through `LIBER_PUBLISH_LOCK`, renames its whole output set under `kernel-test-build.lock`; the copy
+# below takes the same lock, for the duration of the copy only - never across an assembly and never
+# across a compile - so it sees a complete generation and no torn or mixed one. The key is computed
+# over the snapshot, which is what the medium is built from, and the recheck after assembly is over
+# the same snapshot: the recorded digests prove the boundary held, they no longer make it hold.
+#
+# Every input that reaches the medium is here: the kernel, the loader, the init package, the payload
+# (the bootable volume with its pairing and mode sidecars, or the test volume package), the fallback
+# bootstrap set, the service manifest, `product.conf` and the kernel-staging script. The manifest's
+# normalized row export is read by `tools/system-manifest.sh` from the tracked source, which no
+# producer rewrites; its bytes are in the snapshot for the key.
+IN="$BUILD/tmp/image-inputs.$$"
+# The live build directory the snapshot is taken FROM; every read after the snapshot goes to `$IN`.
+BUILD_LIVE="$BUILD"
+snapshot_inputs() {
+	mkdir -p "$IN" "$REPO_ROOT/.build/state"
+	(
+		flock 10
+		cp --reflink=auto "$kernel" "$IN/kernel" || exit 1
+		cp --reflink=auto "$LOADER_EFI" "$IN/loader.efi" || exit 1
+		cp --reflink=auto "$REPO_ROOT/src/user/services/manifest.toml" "$IN/manifest.toml" || exit 1
+		cp --reflink=auto "$REPO_ROOT/product.conf" "$IN/product.conf" || exit 1
+		cp --reflink=auto "$REPO_ROOT/src/tools/stage-kernel.sh" "$IN/stage-kernel.sh" || exit 1
+		[[ ! -f "$BUILD_LIVE/init-x86_64.pkg" ]] || cp --reflink=auto "$BUILD_LIVE/init-x86_64.pkg" "$IN/init-x86_64.pkg" || exit 1
+		[[ ! -f "$BUILD_LIVE/volume-x86_64.pkg" ]] || cp --reflink=auto "$BUILD_LIVE/volume-x86_64.pkg" "$IN/volume-x86_64.pkg" || exit 1
+		local sidecar
+		for sidecar in img uuid dma-mode; do
+			[[ ! -f "$BUILD_LIVE/system-volume-bootable-x86_64.$sidecar" ]] || cp --reflink=auto "$BUILD_LIVE/system-volume-bootable-x86_64.$sidecar" "$IN/system-volume-bootable-x86_64.$sidecar" || exit 1
+		done
+		[[ ! -d "$BUILD_LIVE/bootstrap-x86_64" ]] || cp -a --reflink=auto "$BUILD_LIVE/bootstrap-x86_64" "$IN/bootstrap-x86_64" || exit 1
+	) 10>"$REPO_ROOT/.build/state/kernel-test-build.lock" || die "the medium's inputs could not be acquired into this run's snapshot"
+	# Read-only for the life of the run: nothing that runs afterwards can move what the key is over.
+	find "$IN" -type f -exec chmod 0444 {} +
+	chmod +x "$IN/stage-kernel.sh"
+}
+snapshot_inputs
+kernel="$IN/kernel"
+LOADER_EFI="$IN/loader.efi"
+
+# THE DMA MODE THE MEDIUM IS SIGNED FOR, from `LIBER_DMA_MODE`, and the name the output carries.
+#
+# TWO SHIPPING IMAGES, NOT ONE, because the signed field is frozen at assembly and `--no-iommu` is a
+# flag at boot: `run.sh --no-iommu` SELECTS the degraded artifact, it does not modify one. The
+# enforcing image keeps the plain name; the degraded one is `-no-iommu`; the development image -
+# signed with tag 0, so its boot takes the mode from the harness carrier - is `-dev`. The test
+# medium is always tag 0: the suite's runner writes the record.
+case "$cmd" in
+testiso) DMA_MODE=harness ;;
+*)
+	DMA_MODE="${LIBER_DMA_MODE:-enforcing-required}"
+	case "$DMA_MODE" in
+	enforcing-required | no-iommu | harness) ;;
+	*) die "LIBER_DMA_MODE='$DMA_MODE' is not one of enforcing-required, no-iommu or harness" ;;
+	esac
+	;;
+esac
+case "$DMA_MODE" in
+enforcing-required) DMA_SUFFIX="" ;;
+no-iommu) DMA_SUFFIX="-no-iommu" ;;
+harness) DMA_SUFFIX="-dev" ;;
+esac
 case "$cmd" in
 iso)
-	output="${LIBER_IMAGE_OUTPUT:-$BUILD/$SLUG.iso}"
+	output="${LIBER_IMAGE_OUTPUT:-$BUILD/$SLUG$DMA_SUFFIX.iso}"
 	mode_input="iso"
 	;;
 testiso)
@@ -576,7 +656,7 @@ testiso)
 	mode_input="testiso"
 	;;
 img)
-	output="$BUILD/$SLUG.img"
+	output="$BUILD/$SLUG$DMA_SUFFIX.img"
 	mode_input="img:${3:-64M}"
 	;;
 *) die "unknown subcommand '$cmd' (expected 'iso', 'testiso' or 'img')" ;;
@@ -594,9 +674,15 @@ verify_boot_artifacts "$kernel"
 # absent. A medium whose whole purpose is to carry a system volume, published without one, is a
 # medium that fails at boot with nothing on it to explain why.
 if [[ "$cmd" != testiso ]]; then
-	for required in "$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid"; do
-		[[ -f "$required" ]] || die "no $required - build it with:  ./build.sh --arch x86_64 --kernel-on-volume --part volume"
+	for required in "$IN/system-volume-bootable-x86_64.img" "$IN/system-volume-bootable-x86_64.uuid" "$IN/system-volume-bootable-x86_64.dma-mode"; do
+		[[ -f "$required" ]] || die "no $required - build it with:  ./build.sh --arch x86_64 --kernel-on-volume --dma-mode $DMA_MODE --part volume"
 	done
+	# AND THE VOLUME WAS SIGNED FOR THE SAME MODE. The loader latches every selected manifest and
+	# refuses a set that disagrees, so a medium signed for one value around a volume signed for
+	# another is an image that cannot boot - refused here, where the two halves are being paired,
+	# rather than on somebody's machine.
+	volume_mode="$(<"$IN/system-volume-bootable-x86_64.dma-mode")"
+	[[ "$volume_mode" == "$DMA_MODE" ]] || die "the bootable volume was signed for DMA mode '$volume_mode' and this medium is being signed for '$DMA_MODE' - rebuild the volume for it:  ./build.sh --arch x86_64 --kernel-on-volume --dma-mode $DMA_MODE --part volume"
 fi
 
 # EVERY COPIED BYTE, not the subset that was easy to name.
@@ -623,18 +709,20 @@ hash_inputs() {
 }
 
 image_input_key() {
-	printf 'format=liber-boot-image-input-v3\n'
+	printf 'format=liber-boot-image-input-v4\n'
 	printf 'mode=%s\n' "$mode_input"
+	# The signed DMA mode is an input: two images of one tree differ in exactly this byte.
+	printf 'dma-mode=%s\n' "$DMA_MODE"
 	printf 'strip=%s\n' "$STRIP"
 	printf 'epoch=%s\n' "$SOURCE_DATE_EPOCH"
 	tool_identity
 	# The manifest's own bytes AND its normalized projection: the file catches an edit, the export
 	# catches a generator change that produces a different layout from the same file.
-	printf 'manifest=%s\n' "$(sha256sum "$REPO_ROOT/src/user/services/manifest.toml" | awk '{print $1}')"
+	printf 'manifest=%s\n' "$(sha256sum "$IN/manifest.toml" | awk '{print $1}')"
 	printf 'layout=%s\n' "$(printf '%s' "$manifest_rows" | sha256sum | awk '{print $1}')"
 	# The fallback bootstrap set, file by file in a stable order - it is copied onto the ESP and was
 	# in no key at all.
-	local bootstrap_root="$BUILD/bootstrap-x86_64"
+	local bootstrap_root="$IN/bootstrap-x86_64"
 	if [[ -d "$bootstrap_root" ]]; then
 		# RELATIVE TO THAT ROOT, for the reason `hash_inputs` gives: the absolute prefix is a
 		# property of who invoked this script, not of what the medium carries.
@@ -650,16 +738,16 @@ image_input_key() {
 	# collide with the other. What the old rule did instead was make `testiso` - which carries the
 	# factory archive and no volume at all - depend on the bootable volume: on a clean tree that is
 	# `sha256sum` failing on a missing file, before the preflight that would have explained it.
-	hash_inputs "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg"
+	hash_inputs "$0" "$IN/stage-kernel.sh" "$IN/product.conf" "$kernel" "$LOADER_EFI" "$IN/init-x86_64.pkg"
 	case "$cmd" in
 	testiso)
 		# The archive it stages, and nothing about a volume it does not carry.
-		hash_inputs "$BUILD/volume-x86_64.pkg"
+		hash_inputs "$IN/volume-x86_64.pkg"
 		;;
 	*)
 		# The bootable volume and the pairing sidecar that says which volume this medium declares
 		# itself paired with. Both are required before the key is computed - see the check above.
-		hash_inputs "$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid"
+		hash_inputs "$IN/system-volume-bootable-x86_64.img" "$IN/system-volume-bootable-x86_64.uuid"
 		;;
 	esac
 }

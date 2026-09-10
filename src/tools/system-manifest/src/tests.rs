@@ -218,7 +218,7 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	// A driver program appended to the ordinary fixture, so everything else about it is valid and
 	// only the thing under test is wrong.
 	let with = |driver: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n{driver}", valid_fixture()) };
-	const ORDINARY: &str = "\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{ transport = \"virtio-pci\", virtio-type = 2 }]\n";
+	const ORDINARY: &str = "\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"trusted-untranslated\"\nmatch = [{ transport = \"virtio-pci\", virtio-type = 2 }]\n";
 
 	// The shape it is built for parses, so every refusal below is about the one thing it changes.
 	assert_eq!(errors(&with(ORDINARY)), "", "the ordinary shape must validate");
@@ -246,7 +246,7 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	// getting this wrong in the other direction is what the first version did: predicates named for
 	// one field under two names could not be compared at all, and the check refused the real
 	// manifest on its first run.
-	let narrowed = format!("{}{}\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2, pci-address = {{ bus = 0, dev = 30, func = 0 }} }}]\npriority = \"quirk\"\n", with(ORDINARY), "\n[[programs]]\nname = \"b_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/b_driver.lsexe\"\n");
+	let narrowed = format!("{}{}\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"trusted-untranslated\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2, pci-address = {{ bus = 0, dev = 30, func = 0 }} }}]\npriority = \"quirk\"\n", with(ORDINARY), "\n[[programs]]\nname = \"b_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/b_driver.lsexe\"\n");
 	assert_eq!(errors(&narrowed), "", "a narrower rule at a higher priority is arbitration, not ambiguity");
 
 	// ------------------------------------------------- the keys have relations
@@ -396,7 +396,7 @@ fn a_requirement_nothing_in_the_image_produces_is_refused_when_the_registry_is_b
 	// like. Decidable here, over a closed set of kinds, and nowhere else.
 	let root = fixture_workspace();
 	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
-	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
+	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"trusted-untranslated\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
 
 	// The shape it is built for parses.
 	assert_eq!(errors(&driver("provides = [{ kind = \"block\", most = 1 }]\n")), "", "a driver that publishes what it declares must validate");
@@ -440,7 +440,7 @@ fn two_drivers_each_waiting_for_the_other_are_refused_rather_than_discovered_on_
 	// come up - which looks like two absent devices and is actually a broken image.
 	let root = fixture_workspace();
 	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
-	let entry = |name: &str, kind: &str, wants: &str, virtio: u32| -> String { format!("\n[[programs]]\nname = \"{name}\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/{name}.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = {virtio} }}]\nrequires = [\"{wants}\"]\nprovides = [{{ kind = \"{kind}\", most = 1 }}]\n") };
+	let entry = |name: &str, kind: &str, wants: &str, virtio: u32| -> String { format!("\n[[programs]]\nname = \"{name}\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/{name}.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"trusted-untranslated\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = {virtio} }}]\nrequires = [\"{wants}\"]\nprovides = [{{ kind = \"{kind}\", most = 1 }}]\n") };
 	// a publishes block and wants usb-bus; b publishes usb-bus and wants block.
 	let cycle = format!("{}{}{}", valid_fixture(), entry("a_driver", "block", "usb-bus", 2), entry("b_driver", "usb-bus", "block", 16));
 	assert!(errors(&cycle).contains("structural cycle"), "{}", errors(&cycle));
@@ -459,7 +459,7 @@ fn a_heartbeat_deadline_of_zero_or_past_the_ceiling_is_refused() {
 	// ceiling is one shared policy constant rather than a per-entry opinion.
 	let root = fixture_workspace();
 	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
-	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
+	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"trusted-untranslated\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
 
 	// Absent is legitimate: a driver that stands on its channel and does nothing else is not
 	// heartbeat-supervised, and saying so by leaving the key out is honest.
@@ -521,4 +521,54 @@ fn generated_volume_services_wait_for_storage_despite_name_order() {
 	}
 	let negative_order = startup(&negative);
 	assert!(!["iso_storage", "media_storage", "udf_storage"].iter().all(|volume| follows_storage(&negative_order, volume)), "removing the dependencies must fail the same startup-order oracle");
+}
+
+#[test]
+fn every_driver_declares_its_dma_policy_and_nothing_else_may() {
+	// THE POLICY IS A REQUIRED, CLOSED FIELD. Absence is refused rather than defaulted - a driver
+	// that masters the bus without saying so is the silent default this field removes - an unknown
+	// value fails to parse rather than never matching, and a non-driver row cannot carry one because
+	// only `[programs.driver]` can, and that table is refused on every other role.
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let with = |driver: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n{driver}", valid_fixture()) };
+	let declared = |policy: &str| -> String { format!("\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"{policy}\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n") };
+	for policy in ["none", "iommu-required", "trusted-untranslated"] {
+		assert_eq!(errors(&with(&declared(policy))), "", "{policy} is one of the three declared policies");
+		let manifest = Manifest::parse(&with(&declared(policy)), &root).unwrap();
+		let driver = manifest.programs.values().find(|program| program.name.as_str() == "a_driver").and_then(|program| program.driver.as_ref()).expect("the driver row");
+		assert_eq!(driver.dma.name(), policy, "and it reads back as itself");
+	}
+	assert_eq!(DmaPolicy::None.wire(), 0);
+	assert_eq!(DmaPolicy::IommuRequired.wire(), 1);
+	assert_eq!(DmaPolicy::TrustedUntranslated.wire(), 2);
+	// Absent: refused, not defaulted.
+	let absent = "\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{ transport = \"virtio-pci\", virtio-type = 2 }]\n";
+	let missing = errors(&with(absent));
+	assert!(missing.contains("missing field `dma`"), "a driver with no DMA policy must be refused: {missing}");
+	// Unknown: refused at parse time.
+	let unknown = errors(&with(&declared("untranslated")));
+	assert!(unknown.contains("unknown variant"), "an unknown policy must fail to parse: {unknown}");
+	// On a service: the whole `[programs.driver]` table is refused there, policy and all.
+	let on_service = format!("{}\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"none\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n", valid_fixture());
+	let refused = errors(&on_service);
+	assert!(refused.contains("rules nothing will consult"), "a policy on a non-driver row must be refused: {refused}");
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn the_production_manifest_classifies_every_staged_driver() {
+	// THE MIGRATION TABLE, ASSERTED. Every driver row the image stages carries a policy, and the one
+	// row whose buffers are migrated to the DMA-address contract is the one that requires
+	// translation - so a new driver cannot arrive unclassified, and `virtio_net` cannot quietly be
+	// reclassified to keep a degraded machine's network.
+	let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+	let manifest = Manifest::load_workspace(&workspace).expect("the production manifest must validate");
+	let drivers: Vec<(&str, DmaPolicy)> = manifest.programs.values().filter_map(|program| program.driver.as_ref().map(|driver| (program.name.as_str(), driver.dma))).collect();
+	assert!(!drivers.is_empty(), "the image stages drivers");
+	for (name, policy) in &drivers {
+		let expected = if *name == "virtio_net" { DmaPolicy::IommuRequired } else { DmaPolicy::TrustedUntranslated };
+		assert_eq!(*policy, expected, "{name} carries the migration table's value");
+	}
+	assert!(drivers.iter().any(|(name, _)| *name == "virtio_net"), "the network driver is staged");
 }

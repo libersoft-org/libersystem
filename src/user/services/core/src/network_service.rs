@@ -133,10 +133,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// THE SNAPSHOT IS ALREADY IN THE CHANNEL when `subscribe` answers - the catalogue registers a
 		// subscriber and sends it everything published in one step - so this is a poll and never a
 		// block. A machine with no NIC published has none, which is the same state a zero `FRAMES`
-		// handle used to be and is refused the same way below.
+		// handle used to be - and is served without a link below rather than refused.
 		let frames: u64 = take_published_nic(catalogue);
 		if frames == 0 {
-			fail_bootstrap(bootstrap, b"frames", b"no network provider to serve");
+			// NO NETWORK PROVIDER ON THIS BOOT, AND THE SERVICE COMES UP ANYWAY - WITHOUT A LINK.
+			//
+			// This used to fail the bootstrap, and a failed NetworkService is not "no network": the
+			// time service, PermissionManager, ConsoleService, SystemGraphService and the shell all
+			// depend on this service by manifest, so ServiceManager never started any of them and
+			// the machine came up with no shell at all. A boot whose DMA mode refuses the network
+			// driver by policy - a `no-iommu` boot, where `virtio_net` declares that it requires
+			// translation - is a machine with every OTHER driver and no NIC, and that is a state
+			// this service has to be able to stand in: online, answering every link-bound
+			// operation with a typed refusal, minting a fresh connection for every caller that
+			// asks for one, and holding no stack, no lease and no frame buffers.
+			//
+			// Said on the console in the same breath as the DHCP report would have been, so a
+			// reader of the boot log sees WHY there is no address rather than a service that went
+			// quiet.
+			print(b"network: no network provider on this boot - NetworkService is up without a link\n");
+			send_blocking(bootstrap, b"NetworkService: online", 0);
+			serve_unlinked(client);
 		}
 		// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
 		//    the frame channel (it owns the device; we own the protocol), so we can
@@ -188,7 +205,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 //
 // POLLED, NEVER BLOCKED, and it stops at the first provider it CONNECTS to rather than draining the
 // channel: a frame this function reads and drops is a publication nothing will see again. Zero for a
-// boot that granted no catalogue connection or a machine with no NIC, which the caller refuses.
+// boot that granted no catalogue connection or a machine with no NIC, which the caller serves
+// without a link.
 unsafe fn take_published_nic(catalogue: u64) -> u64 {
 	unsafe {
 		if catalogue == 0 {
@@ -271,6 +289,157 @@ fn place_client(clients: &mut Vec<u64>, chan: u64) {
 		}
 	}
 	clients.push(chan);
+}
+
+// THE SERVICE WITHOUT A LINK. Stand on every client channel and nothing else: there is no frame
+// channel to pump, no socket and no listener can exist, and every operation that would need the
+// NIC answers `Io` - the device this service moves frames through is not there. What does work is
+// exactly what does not need a link: the reserved connect request and `open` mint fresh
+// connections, so PermissionManager can still grant the network capability and a tool launched
+// under it gets a typed refusal rather than a hang; `capacity` counts the clients; `sockets` is
+// empty. The service ends when its last client is gone, which is what `serve_multi` does for every
+// other service whose serve root closes.
+unsafe fn serve_unlinked(client: u64) -> ! {
+	unsafe {
+		let mut req: [u8; REQ_MAX] = [0u8; REQ_MAX];
+		let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
+		let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
+		clients.push(client);
+		loop {
+			let mut waits: Vec<u64> = Vec::with_capacity(clients.len());
+			let mut slot_of: Vec<usize> = Vec::with_capacity(clients.len());
+			let mut i: usize = 0;
+			while i < clients.len() {
+				if clients[i] != 0 {
+					waits.push(clients[i]);
+					slot_of.push(i);
+				}
+				i += 1;
+			}
+			if waits.is_empty() {
+				exit();
+			}
+			let ready_raw: i64 = wait_any(&waits, 0);
+			if ready_raw < 0 {
+				continue;
+			}
+			let slot: usize = slot_of[ready_raw as usize];
+			let chan: u64 = clients[slot];
+			match recv_caps_blocking(chan, &mut req) {
+				ReceivedCaps::Message { len, handles: caps } => {
+					// A FRESH CONNECTION PER CALLER, answered by hand for the same reason the
+					// linked loop answers it by hand: this service does not stand on `serve_multi`.
+					if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
+						for &unclaimed in caps.as_slice() {
+							close(unclaimed);
+						}
+						match channel() {
+							Some((mine, theirs)) => {
+								place_client(&mut clients, mine);
+								send_blocking(chan, &[], theirs);
+							}
+							None => {
+								send_blocking(chan, &[], 0);
+							}
+						}
+						continue;
+					}
+					let mut handle = caps;
+					let mut new_client: u64 = 0;
+					let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
+					{
+						let mut svc: Unlinked = Unlinked { new_client: &mut new_client, clients_used };
+						let mut reply_handle = proto::codec::Handles::new();
+						if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
+							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
+							}
+						}
+					}
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
+					}
+					if new_client != 0 {
+						place_client(&mut clients, new_client);
+					}
+				}
+				ReceivedCaps::Closed => {
+					close(chan);
+					clients[slot] = 0;
+				}
+			}
+		}
+	}
+}
+
+// The typed `network` service with no link behind it - see `serve_unlinked`.
+struct Unlinked<'a> {
+	new_client: &'a mut u64,
+	clients_used: u32,
+}
+
+// The one answer for an operation that needs the NIC this boot does not have. `Io` rather than
+// `not-found` or `unsupported`: the request is understood and this implementation would serve it,
+// and what is missing is the device underneath - which is what `io` means - and `resolve` already
+// answers `not-found` for a name that does not resolve, so the two must not read alike.
+const NO_LINK: Error = Error::Io;
+
+impl network::Service for Unlinked<'_> {
+	fn info(&mut self) -> Result<NetInfo, Error> {
+		Err(NO_LINK)
+	}
+
+	fn capacity(&mut self) -> Result<NetCapacity, Error> {
+		Ok(NetCapacity { clients: self.clients_used, sockets: 0, listeners: 0, connections: 0 })
+	}
+
+	fn resolve(&mut self, _name: String) -> Result<WireIp, Error> {
+		Err(NO_LINK)
+	}
+
+	fn ping(&mut self, _addr: WireIp) -> Result<PingReply, Error> {
+		Err(NO_LINK)
+	}
+
+	fn probe(&mut self, _addr: WireIp, _ttl: u8) -> Result<TraceHop, Error> {
+		Err(NO_LINK)
+	}
+
+	fn fetch(&mut self, _req: TcpRequest) -> Result<Vec<u8>, Error> {
+		Err(NO_LINK)
+	}
+
+	fn connect(&mut self, _ep: Endpoint) -> Result<u64, Error> {
+		Err(NO_LINK)
+	}
+
+	// A fresh client channel, exactly as the linked service mints one: a caller granted the
+	// network capability holds a connection of its own, and what it learns on it is the refusal.
+	fn open(&mut self) -> Result<u64, Error> {
+		unsafe {
+			match channel() {
+				Some((server, peer)) => {
+					*self.new_client = server;
+					Ok(peer)
+				}
+				None => Err(Error::Again),
+			}
+		}
+	}
+
+	fn listen(&mut self, _port: u16) -> Result<u64, Error> {
+		Err(NO_LINK)
+	}
+
+	fn sockets(&mut self) -> Result<Vec<SockInfo>, Error> {
+		Ok(Vec::new())
+	}
+
+	fn sntp(&mut self, _server: WireIp) -> Result<u64, Error> {
+		Err(NO_LINK)
+	}
 }
 
 // Stand on the driver's frame channel, every client's typed request channel, and

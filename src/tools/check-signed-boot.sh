@@ -8,12 +8,19 @@
 #
 # x86_64 ONLY, and by design: this is one reproducible chain rather than a claim about every port.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 cd "$(dirname "$0")/../.."
 # The pairing question, asked through the same code that writes it - see the file for why.
 source "src/tools/volume-pairing.sh"
 BUILD=".build/boot"
-ISO="$BUILD/libersystem.iso"
 OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
 OVMF_VARS="${OVMF_VARS_SRC:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
 
@@ -22,12 +29,15 @@ fail() {
 	exit 1
 }
 
+# THE IMAGE THIS RUN PRODUCED, when a run is collecting evidence; the tree's own otherwise.
+ISO="$(evidence_image libersystem.iso)" || fail "no libersystem.iso produced by this run"
 [[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso"
+echo "signed-boot: medium $ISO sha256=$(sha256sum "$ISO" | cut -d' ' -f1)"
 [[ -f "$OVMF_CODE" && -f "$OVMF_VARS" ]] || fail "OVMF firmware not found (install the 'ovmf' package)"
 command -v qemu-system-x86_64 >/dev/null || fail "qemu-system-x86_64 is required"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log "$work"/*/*.log; rm -rf "$work"' EXIT
 
 # THE ESP THIS GATE TESTS COMES OUT OF THE ISO IT NAMES.
 #

@@ -30,10 +30,17 @@ Boots the system in QEMU, headless, with the serial console on your terminal. On
   --spice-addr A  SPICE bind address (default 0.0.0.0 - EVERY interface, and with no password and
                   no TLS: use 127.0.0.1 on a network you do not trust)
   --spice-port P  SPICE port (default 5930)
-  --no-iommu      x86_64: boot WITHOUT a virtio-iommu. The default machine has one and every virtio
-                  endpoint behind it. Reach for this to reproduce a machine whose firmware offers no
-                  IOMMU, or to bisect a driver that misbehaves only under translation - the boot
-                  then reports DEGRADED ISOLATION, which is that machine's real state
+  --no-iommu      boot WITHOUT a virtio-iommu, on every target. The default machine has a
+                  controller and every virtio endpoint behind it - x86_64, aarch64 and riscv64
+                  alike - and the harness record says which machine was built. On x86_64 the
+                  image is SIGNED for the machine, so this flag also selects
+                  .build/boot/libersystem-no-iommu.iso, which ./image.sh assembles beside the
+                  enforcing one: a signed DMA mode is frozen when the image is assembled, and the
+                  run refuses - before QEMU starts, with both values named - an image whose signed
+                  mode does not match the machine about to be built. On the ports the per-run
+                  medium carries the harness record and no image is selected. The degraded boot
+                  reports DEGRADED ISOLATION, which is that machine's real state, and it has NO
+                  NETWORK: virtio_net declares it requires translation
   --debug         wait for GDB on :1234, no KVM
   --gdb           ATTACH gdb to a guest already waiting - run in a second panel after --debug,
                   and it boots nothing itself
@@ -70,6 +77,11 @@ displays=()
 debug=0
 image=""
 attach=()
+no_iommu=0
+
+# THE RUN MODE, set only when unset: the development instance boots THROUGH this script and says
+# `development` first, and a gate says `gate`; a person typing ./run.sh is the public row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-public}"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -141,6 +153,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--no-iommu)
 		export IOMMU=0
+		no_iommu=1
 		shift
 		;;
 	--debug)
@@ -188,11 +201,35 @@ fi
 # device-tree targets do not have distributable media yet; their explicit --arch workflows retain
 # the per-run ESP assembled from already-built architecture artifacts.
 if [[ "$arch" == x86_64 ]]; then
-	[[ -z "$image" ]] && image="$BUILD_DIR/boot/libersystem.iso"
+	# THE FLAG SELECTS AN IMAGE. The signed DMA mode is frozen at assembly, so the degraded machine
+	# boots the artifact assembled for it - and a missing one says how to assemble it.
+	if [[ -z "$image" ]]; then
+		if ((no_iommu)); then
+			image="$BUILD_DIR/boot/libersystem-no-iommu.iso"
+			[[ -f "$image" ]] || die "no degraded boot image at '$image' - the --no-iommu machine boots the image signed for it. Assemble it with:  ./image.sh --format iso --dma-mode no-iommu"
+		else
+			image="$BUILD_DIR/boot/libersystem.iso"
+			[[ -f "$image" ]] || die "no boot image at '$image' - run: ./image.sh"
+		fi
+	fi
 	[[ -f "$image" ]] || die "no boot image at '$image' - run: ./image.sh"
 	# Absolute: qemu-run.sh runs from src/, so a path relative to where you typed it would otherwise
 	# resolve somewhere else entirely.
 	image="$(realpath "$image")"
+	# AND IT VALIDATES, BEFORE QEMU STARTS: the signed mode of the image about to be booted against
+	# the machine about to be built. An enforcing image with --no-iommu, or a degraded image without
+	# it, is a pairing the kernel refuses at admission - refused here instead, with both values
+	# named, rather than booted into a refusal to decode from a guest log. An image signed with no
+	# mode (a development image) takes the mode from the harness, and either machine is fine.
+	signed_mode="$("$SRC_DIR/harness/image-dma-mode.sh" "$image")" || die "could not read the signed DMA mode of $image"
+	wanted="enforcing-required"
+	((no_iommu)) && wanted="no-iommu"
+	case "$signed_mode" in
+	harness) ;;
+	legacy) die "$image was signed before the DMA-mode record existed and the loader refuses it - assemble it again:  ./image.sh" ;;
+	"$wanted") ;;
+	*) die "$image is signed for DMA mode '$signed_mode' and this machine is built for '$wanted' - boot the image assembled for it:  ./image.sh writes libersystem.iso (enforcing-required) and libersystem-no-iommu.iso (no-iommu)" ;;
+	esac
 	export BOOT_IMAGE="$image"
 elif [[ -n "$image" ]]; then
 	die "--image is currently supported only for x86_64; use ./run.sh --arch $arch after ./build.sh --arch $arch"

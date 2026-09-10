@@ -212,6 +212,20 @@ const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 
+// The boot-policy node's identity and property, as the harness writes them and this reader finds
+// them. Spelled here as well as in the boot protocol's shared codec because this crate is the
+// loader's and the kernel's tree reader and links neither; the carrier gate compares the two.
+pub const BOOT_POLICY_COMPATIBLE: &[u8] = b"libersystem,boot-policy";
+pub const BOOT_POLICY_PROPERTY: &[u8] = b"libersystem,dma-mode";
+
+// What `boot_policy_record` found: the property's declared length, and its first eight bytes
+// (zero-padded where it is shorter). The caller decides what a length other than eight means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PolicyProperty {
+	pub len: usize,
+	pub bytes: [u8; 8],
+}
+
 // A flattened device tree at a physical base, read through a backend-supplied
 // `phys_to_virt` (the kernel runs higher-half, so every FDT byte is reached through
 // the direct map rather than a raw physical pointer).
@@ -1862,6 +1876,82 @@ impl Fdt {
 	// `/aliases/<name>`.
 	unsafe fn alias(&self, name: &[u8], out: &mut [u8; MAX_PATH]) -> Option<usize> {
 		unsafe { self.property_string(&[b"aliases"], name, out) }
+	}
+
+	// THE BOOT-POLICY RECORD THE HARNESS PLACED IN THIS TREE - the bytes of `libersystem,dma-mode`
+	// on the first node whose `compatible` names `libersystem,boot-policy`, wherever that node is.
+	//
+	// FOUND BY `compatible`, NOT BY PATH. The harness writes the node as `/libersystem`, and a tree
+	// that places it elsewhere is still read correctly; a node with the right name and the wrong
+	// `compatible` is not this record. The property comes back as it stands - its length and its
+	// first eight bytes - and the CALLER decides what a length other than eight means, because the
+	// rule that a malformed record is refused rather than interpreted belongs to the codec that
+	// defines the record, not to the reader that found it.
+	//
+	// `None` is a tree with no such node or no such property, which on an ordinary machine is every
+	// tree there is.
+	pub fn boot_policy_record(&self) -> Option<PolicyProperty> {
+		if !self.is_valid() {
+			return None;
+		}
+		let b = self.bounds()?;
+		// SAFETY: the header was validated, so every read below is bounded by the blocks it declares
+		// - the same contract every other walk in this file relies on.
+		unsafe {
+			let mut p = b.struct_start;
+			let mut depth: i32 = -1;
+			// Per open node: whether its `compatible` names the record, and where its property is.
+			let mut compatible = [false; MAX_DEPTH + 1];
+			let mut property: [Option<(u64, u32)>; MAX_DEPTH + 1] = [None; MAX_DEPTH + 1];
+			loop {
+				let token = self.be32_in(p, b.struct_end)?;
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						if depth as usize > MAX_DEPTH {
+							return None;
+						}
+						let (_, next) = self.node_name_in(p, &b)?;
+						p = next;
+						compatible[depth as usize] = false;
+						property[depth as usize] = None;
+					}
+					FDT_END_NODE => {
+						if depth < 0 {
+							return None;
+						}
+						if compatible[depth as usize]
+							&& let Some((value, len)) = property[depth as usize]
+						{
+							let mut bytes = [0u8; 8];
+							for (index, byte) in bytes.iter_mut().enumerate() {
+								if (index as u32) < len {
+									*byte = self.u8_at(value + index as u64);
+								}
+							}
+							return Some(PolicyProperty { len: len as usize, bytes });
+						}
+						depth -= 1;
+					}
+					FDT_PROP => {
+						let (name, len, value, next) = self.prop_in(p, &b)?;
+						p = next;
+						if depth < 0 {
+							return None;
+						}
+						if self.str_eq(name, "compatible") && self.stringlist_contains(value, len, BOOT_POLICY_COMPATIBLE) {
+							compatible[depth as usize] = true;
+						} else if self.str_eq_bytes(name, BOOT_POLICY_PROPERTY) {
+							property[depth as usize] = Some((value, len));
+						}
+					}
+					FDT_NOP => {}
+					FDT_END => return None,
+					_ => return None,
+				}
+			}
+		}
 	}
 
 	// Which instruction reaches this platform's PSCI implementation, as the tree states it.

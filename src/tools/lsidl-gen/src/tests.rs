@@ -160,6 +160,87 @@ fn rejects_handle_to_non_resource() {
 	assert_err_contains(&wrap("record entry { a: u8 }\nenum error { x }\ninterface i { @op(1) m: func() -> result<handle<entry>, error>; }"), "to be a resource");
 }
 
+// EVERY `@rights` SHAPE THE GENERATOR CANNOT GUARD IS REFUSED BEFORE GENERATION. Each of these used
+// to compile and generate an UNGUARDED method that read in the schema exactly like a guarded one.
+const GUARDED: &str = "resource file;\nenum error { denied, not-found }\n";
+
+#[test]
+fn rejects_rights_on_anything_but_a_bare_handle() {
+	assert_err_contains(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights(read) f: option<handle<file>>) -> result<unit, error>; }}")), "not written as `handle<resource>`");
+	assert_err_contains(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights(read) f: list<handle<file>>) -> result<unit, error>; }}")), "not written as `handle<resource>`");
+	assert_err_contains(&wrap(&format!("{GUARDED}record holder {{ f: handle<file> }}\ninterface i {{ @op(1) m: func(@rights(read) h: holder) -> result<unit, error>; }}")), "rather than a parameter written as `handle<resource>`");
+	assert_err_contains(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights(read) f: result<handle<file>, error>) -> result<unit, error>; }}")), "not written as `handle<resource>`");
+}
+
+#[test]
+fn rejects_rights_on_a_local_alias_even_where_it_resolves_to_a_handle() {
+	assert_err_contains(&wrap(&format!("{GUARDED}type opened = handle<file>;\ninterface i {{ @op(1) m: func(@rights(read) f: opened) -> result<unit, error>; }}")), "a named alias (`opened`)");
+	// And the bare spelling of the same handle is accepted, which is what makes the alias refusal a
+	// refusal of the SHAPE and not of the resource.
+	parse_ok(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights(read) f: handle<file>) -> result<unit, error>; }}")));
+}
+
+#[test]
+fn rejects_rights_on_an_imported_alias_after_resolution() {
+	let files = vec![
+		parse_only("package liber:app@1; use liber:shared@1.{opened, error}; interface app { @op(1) m: func(@rights(read) f: opened) -> result<unit, error>; }"),
+		parse_only("package liber:shared@1; resource file; type opened = handle<file>; enum error { denied }"),
+	];
+	let packages = resolve::resolve(&files).expect("resolve");
+	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
+	let errors = validate::validate_resolved(&files[app.file], &app.imports);
+	assert!(errors.iter().any(|e| e.msg.contains("a named alias (`opened`)")), "{:?}", errors.iter().map(|e| &e.msg).collect::<Vec<_>>());
+	// The imported resource, written as a handle, is the accepted shape - and its `denied` comes
+	// from the imported enum the resolver read.
+	let files = vec![
+		parse_only("package liber:app@1; use liber:shared@1.{file, error}; interface app { @op(1) m: func(@rights(read) f: handle<file>) -> result<unit, error>; }"),
+		parse_only("package liber:shared@1; resource file; enum error { denied }"),
+	];
+	let packages = resolve::resolve(&files).expect("resolve");
+	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
+	assert!(validate::validate_resolved(&files[app.file], &app.imports).is_empty());
+}
+
+#[test]
+fn rejects_rights_on_a_method_whose_result_cannot_say_denied() {
+	assert_err_contains(&wrap("resource file;\nenum error { not-found }\ninterface i { @op(1) m: func(@rights(read) f: handle<file>) -> result<unit, error>; }"), "cannot answer `denied`");
+	assert_err_contains(&wrap("resource file;\ninterface i { @op(1) m: func(@rights(read) f: handle<file>) -> unit; }"), "cannot answer `denied`");
+	assert_err_contains(&wrap("resource file;\ninterface i { @op(1) m: func(@rights(read) f: handle<file>) -> u32; }"), "cannot answer `denied`");
+}
+
+#[test]
+fn rejects_rights_on_a_stream_method() {
+	assert_err_contains(&wrap(&format!("{GUARDED}record item {{ v: u32 }}\ninterface i {{ @op(1) m: func(@rights(read) f: handle<file>) -> stream<item>; }}")), "returns a stream");
+	assert_err_contains(&wrap(&format!("{GUARDED}record item {{ v: u32 }}\ninterface i {{ @op(1) m: func(@rights(read) f: handle<file>) -> result<stream<item>, error>; }}")), "returns a stream");
+}
+
+#[test]
+fn rejects_an_empty_numeric_or_repeated_rights_annotation() {
+	assert_err_contains(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights() f: handle<file>) -> result<unit, error>; }}")), "names no right");
+	assert_err_contains(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights(1) f: handle<file>) -> result<unit, error>; }}")), "names a number");
+	assert_err_contains(&wrap(&format!("{GUARDED}interface i {{ @op(1) m: func(@rights(read, read) f: handle<file>) -> result<unit, error>; }}")), "names `read` twice");
+}
+
+// THE POSITIVE HALF, read from the generated source: a bare handle on a method with a denied case
+// emits the rights-and-type guard ahead of the service and releases what it decoded on refusal. A
+// generator that stopped emitting either fails here, which is the mutation the guard tests in the
+// protocol crates cannot see from their side.
+#[test]
+fn a_bare_handle_generates_the_guard_and_the_denial_release() {
+	let file = parse_ok(&wrap("@kernel(process)\nresource task;\nenum error { denied, not-found }\ninterface i { @op(1) m: func(@rights(manage) t: handle<task>) -> result<unit, error>; }"));
+	let rust = crate::codegen::rust(&file, "t.lsidl", &std::collections::HashMap::new()).expect("codegen");
+	assert!(rust.contains("crate::codec::handle_carries(t, 1024, 1)"), "the guard checks MANAGE (1 << 10) and the Process object type: {rust}");
+	assert!(rust.contains("if !authorized {"), "the denial path exists");
+	assert!(rust.contains("crate::codec::release_handle(taken)"), "the denial path releases every decoded handle");
+	assert!(rust.contains("Err(Error::Denied)"), "the refusal is the schema's own denied case");
+	// The clear comes AFTER the release, so the serve loop's leftover sweep cannot close a released
+	// handle a second time.
+	let release_at = rust.find("crate::codec::release_handle(taken)").unwrap();
+	let clear_at = rust[release_at..].find("request_handles.clear();").unwrap();
+	let call_at = rust[release_at..].find("let result = if authorized").unwrap();
+	assert!(clear_at < call_at, "the list is cleared between the release and the service call");
+}
+
 #[test]
 fn rejects_unknown_right() {
 	assert_err_contains(&wrap("resource file;\nenum error { x }\ninterface i { @op(1) m: func(@rights(bogus) f: handle<file>) -> result<unit, error>; }"), "unknown right");

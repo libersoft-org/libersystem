@@ -756,11 +756,19 @@ impl Spawned {
 		unsafe { process_release(self.thread) >= 0 }
 	}
 
-	// Abandon it: close both handles, leaving nothing running and nothing leaked.
+	// Abandon it: close what this record still holds, leaving nothing running and nothing leaked.
+	//
+	// `process` IS ZERO FOR A PREPARED LAUNCH. Its process handle is the `task` the reply
+	// transfers to the caller, and the transfer CONSUMES the number from this service's table -
+	// so a record that went on holding it would close, on cancel, whatever handle the kernel had
+	// since handed out under the same number. `hold_prepared` clears it at the moment the task
+	// leaves; the thread token is the whole of what a prepared record owns.
 	unsafe fn abandon(self) {
 		unsafe {
 			close(self.thread);
-			close(self.process);
+			if self.process != 0 {
+				close(self.process);
+			}
 		}
 	}
 }
@@ -778,6 +786,34 @@ impl Processes<'_> {
 				index += 1;
 			}
 		}
+	}
+
+	// Hold a loaded, stopped program behind the start gate and hand its task out.
+	//
+	// The record is made before the token is held, so a `cancel` finds something to forget; the
+	// task handle is taken OUT of the token before the token is stored, because the reply
+	// transfers it and a transferred number must not be closed twice (see `Spawned::abandon`).
+	// `domain` is the Domain a bounded launch runs in (0 for the caller's), recorded so `forget`
+	// closes it with the record.
+	fn hold_prepared(&mut self, spawned: Spawned, artifact: String, domain: u64) -> Result<StartResult, Error> {
+		let Some(koid) = (unsafe { object_info(spawned.process) }).map(|i| i.koid) else {
+			// A prepared launch nobody can identify could never be released - a process
+			// stopped forever. Abandoning it closes both handles, so nothing runs and nothing
+			// leaks.
+			unsafe { spawned.abandon() };
+			if domain != 0 {
+				unsafe { close(domain) };
+			}
+			return Err(Error::Again);
+		};
+		let info = ProcessInfo { koid, name: artifact };
+		let observer: i64 = unsafe { duplicate(spawned.process, RIGHT_READ) };
+		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, domain);
+		let task = spawned.process;
+		let mut held = spawned;
+		held.process = 0;
+		self.prepared.push((self.client, koid, held));
+		Ok(StartResult { task, info })
 	}
 
 	// Drop this service's OWN record of a launch that never ran.
@@ -877,25 +913,38 @@ impl<'a> Service for Processes<'a> {
 	// pipeline exist whole before it runs - `a | b` needs b's reader installed before a writes.
 	fn launch_prepared(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error> {
 		let (spawned, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
-		let Some(koid) = (unsafe { object_info(spawned.process) }).map(|i| i.koid) else {
-			// A prepared launch nobody can identify could never be released - a process
-			// stopped forever. Abandoning it closes both handles, so nothing runs and nothing
-			// leaks.
-			unsafe { spawned.abandon() };
-			return Err(Error::Again);
-		};
-		let info = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(spawned.process, RIGHT_READ) };
-		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
-		let task = spawned.process;
-		self.prepared.push((self.client, koid, spawned));
-		Ok(StartResult { task, info })
+		self.hold_prepared(spawned, artifact, 0)
 	}
 
-	// Start a launch prepared earlier. Returns false when that koid has no pending launch -
-	// already released, never prepared, or reaped - which a caller building a pipeline needs
-	// to distinguish from an error, because releasing twice is a bug in the caller and not a
-	// condition the system should hide.
+	// The same gate under a Domain of its own: `launch-bounded`'s limit, `launch-prepared`'s
+	// hold. This is what lets a bounded tool be granted BEFORE it runs - the live bounded launch
+	// started the program first and granted afterwards, which is the one launch shape that could
+	// not be rolled back to "it never ran".
+	fn launch_prepared_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
+		let domain = unsafe { self.bounded_domain(memory_limit)? };
+		let Some((spawned, artifact)) = (unsafe { self.spawn_program(&name, bootstrap, domain) }) else {
+			unsafe { close(domain) };
+			return Err(Error::NotFound);
+		};
+		self.hold_prepared(spawned, artifact, domain)
+	}
+
+	// Start a launch prepared earlier.
+	//
+	// THREE ANSWERS, because a caller that has granted a program its capabilities needs to know
+	// which one it is before it can undo anything:
+	//   `Ok(true)`   started - the thread is queued;
+	//   `Ok(false)`  a PRE-START REFUSAL - no pending launch of this caller's by that koid (already
+	//                released, never prepared, cancelled, or somebody else's). Nothing changed,
+	//                nothing ran, and there is no record to cancel;
+	//   `Err(..)`    a POST-REMOVAL START FAILURE - the token was taken out of the prepared list and
+	//                the kernel refused to queue the thread. The token is spent either way
+	//                (`process_release` closes it), so the launch cannot be cancelled afterwards;
+	//                this service forgets the record and its Domain HERE, synchronously, which is
+	//                the only place that can. Nothing is running: a thread that failed to start
+	//                never ran.
+	// These used to collapse into one `false`, and the front end could not tell a refusal it
+	// should cancel from a failure it could not.
 	fn release(&mut self, koid: u64) -> Result<bool, Error> {
 		// ITS OWN CLIENT'S, or nobody's. A koid names a prepared launch and proves nothing about who
 		// prepared it; matching the owner too is what stops one client starting another's program.
@@ -905,7 +954,11 @@ impl<'a> Service for Processes<'a> {
 			return Ok(false);
 		};
 		let (_, _, spawned) = self.prepared.remove(index);
-		Ok(unsafe { spawned.release() })
+		if unsafe { spawned.release() } {
+			return Ok(true);
+		}
+		self.forget(koid);
+		Err(Error::Invalid)
 	}
 
 	// The other end of `release`: drop a prepared launch and tear the loaded process down.
@@ -956,18 +1009,27 @@ impl<'a> Service for Processes<'a> {
 		}
 		// Taken high index first so the ones not yet removed keep their positions.
 		indices.sort_unstable();
-		let mut ready: Vec<Spawned> = Vec::new();
+		let mut ready: Vec<(u64, Spawned)> = Vec::new();
 		for index in indices.iter().rev() {
-			let (_, _, spawned) = self.prepared.remove(*index);
-			ready.push(spawned);
+			let (_, koid, spawned) = self.prepared.remove(*index);
+			ready.push((koid, spawned));
 		}
 		// PAST HERE IT IS NOT A POLICY DECISION ANY MORE. Queueing a thread that already exists is a
 		// local operation; if one refuses, the group is half-started and no answer this returns can
 		// make that untrue, so it is reported as a fault rather than as a refusal a caller could
 		// mistake for "nothing happened".
+		//
+		// A MEMBER THAT FAILED TO START IS FORGOTTEN HERE, the way a single failed release is: its
+		// token is spent, so nothing can cancel it later, and a record kept for a process that never
+		// ran would be reported by `list` until the next reap noticed it had no thread. The members
+		// that DID start keep their records - they are running, and the caller's group handle is what
+		// ends them.
 		let mut queued = true;
-		for spawned in ready {
-			queued &= unsafe { spawned.release() };
+		for (koid, spawned) in ready {
+			if !unsafe { spawned.release() } {
+				self.forget(koid);
+				queued = false;
+			}
 		}
 		if queued { Ok(true) } else { Err(Error::Invalid) }
 	}

@@ -18,6 +18,14 @@
 # aarch64 and riscv64 are emulated on an x86_64 host, so this is minutes rather than seconds. It is
 # separate from `arch-surface` for that reason: that one is a static scan and belongs in every run.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 # shellcheck source=/dev/null
 source "$(dirname "$0")/result-logs.sh"
@@ -44,7 +52,7 @@ fi
 # (the `run_profile` calls) rather than being duplicated here to be validated against.
 RAN=0
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log "$work"/*/*.log; rm -rf "$work"' EXIT
 
 fail() {
 	echo "arch-profiles: $*" >&2
@@ -276,6 +284,20 @@ run_profile() {
 		echo "arch-profiles:     and the static no-DT descriptor was NOT selected - this boot read a tree"
 	fi
 	timer_ticked "$log" || exit 1
+	# THE DMA MODE THIS ROW BOOTED UNDER, and where admission took it from. Every profile is a
+	# device-tree boot until the ports gain a controller, and every one carries `no-iommu` with
+	# `harness` provenance - through the loader's `BootInfo` on a firmware boot, the tree's own
+	# record on a direct one. Asserted on every row, because the every-boot rule has no exception
+	# to remember; the treeless rows are the ones where a carrier that needed a tree could not have
+	# answered, which is what makes the rule a rule.
+	local dma_source="the device tree's boot-policy record"
+	[[ "$PROFILE_UEFI" == 1 ]] && dma_source="the loader's BootInfo"
+	grep -aq "dma: boot DMA mode no-iommu (harness provenance, $dma_source)" "$log" || {
+		echo "arch-profiles: $arch $label did not reach admission with no-iommu from $dma_source" >&2
+		grep -a -m 5 "dma:\|loader: DMA\|qemu-run: run mode" "$log" >&2 || echo "    (it printed no DMA-mode line at all)" >&2
+		exit 1
+	}
+	echo "arch-profiles:     DMA mode no-iommu, harness provenance, from $dma_source"
 	# THE NAMED ORACLES, BY TEST ID. A profile that boots and counts its cores has shown that
 	# discovery worked; it has not shown that anything discovered can be USED. Each id below is a
 	# test that drives one of the five paths the milestone names, and requiring it by name is what
@@ -485,6 +507,37 @@ for no_dt_arch in aarch64 riscv64; do
 	run_profile "$no_dt_arch" no-dt 1 "$no_dt_want"
 	PROFILE_UEFI=0
 	PROFILE_LOADER=""
+done
+
+# THE SAME TREELESS ROWS WITH THE DMA-MODE RECORD ABSENT: the fail-closed half on the path where no
+# carrier that depends on a tree could answer. The loader that withholds the tree finds no
+# `EFI/BOOT/LSDM` on its ESP either, and halts before it loads a kernel - so the row PASSES when the
+# suite does NOT run and the loader's refusal names the absence.
+for absent_arch in aarch64 riscv64; do
+	if [[ -n "$ONLY" && "$ONLY" != "$absent_arch:no-dt-absent:1" ]]; then
+		continue
+	fi
+	RAN=$((RAN + 1))
+	echo "arch-profiles: $absent_arch no-dt, 1 core(s), with the DMA-mode record withheld"
+	absent_loader="$(build_no_dt_loader "$absent_arch")"
+	absent_out="$work/$absent_arch-no-dt-absent-1.log"
+	# Bounded tightly: the loader halts within the first minute of an emulated boot, and the
+	# harness's ordinary budget is for a suite that runs.
+	if env UEFI=1 "LOADER_EFI=$absent_loader" LIBER_NO_DT_PROFILE=1 DMA_RECORD=absent ./test.sh --arch "$absent_arch" --tags smoke --smp 1 --timeout 300 >"$absent_out" 2>&1; then
+		echo "arch-profiles: $absent_arch no-dt booted its suite with NO DMA-mode record - the refusal did not happen" >&2
+		exit 1
+	fi
+	absent_log="$(grep -a -o '/[^ ]*-guest\.log' "$absent_out" | tail -1 || true)"
+	[[ -n "$absent_log" && -f "$absent_log" ]] || fail "$absent_arch no-dt-absent did not say which guest log it wrote"
+	grep -aq "loader: FATAL - no DMA mode can be handed to the kernel: the selected manifests carry no DMA mode and this path's harness carrier is absent" "$absent_log" || {
+		echo "arch-profiles: $absent_arch no-dt-absent did not refuse for the absent record" >&2
+		grep -a -m 10 "loader:" "$absent_log" >&2 || true
+		exit 1
+	}
+	if grep -aq "loader: kernel loaded" "$absent_log"; then
+		fail "$absent_arch no-dt-absent loaded a kernel after refusing the DMA mode"
+	fi
+	echo "arch-profiles:     the loader refused the absent record before loading a kernel"
 done
 
 # WHAT IS STILL NOT REGISTERED HERE, AND WHY (2026-08-30, narrowed 2026-09-02).

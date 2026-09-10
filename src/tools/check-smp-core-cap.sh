@@ -15,6 +15,14 @@
 # THREE ASSERTIONS, AND THE LAST TWO ARE ABSENCES ON PURPOSE. That the cap happened is a line; that
 # it WORKED is that neither of the two consequences of not capping appears anywhere in the boot.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
@@ -37,7 +45,7 @@ supported="$(sed -n 's/^pub const MAX_CPUS: usize = \([0-9]*\);.*/\1/p' src/kern
 cores=$((supported + 8))
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log "$work"/*/*.log; rm -rf "$work"' EXIT
 
 echo "smp-core-cap: booting x86_64 with $cores cores against a supported count of $supported"
 ./test.sh --arch x86_64 --tags smoke --smp "$cores" >"$work/run.log" 2>&1 || {

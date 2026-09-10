@@ -180,6 +180,27 @@ impl StartResult {
 /// is the transition the guarantee needs and which no sequence of single releases can provide.
 /// Queueing after validation is a local operation on threads that already exist; a failure there is
 /// a fault rather than a policy answer, and it is reported as an error rather than as `false`.
+///
+/// `release` answers the same three ways, and a caller that has granted a program its capabilities
+/// needs all three: `true` started it; `false` is a PRE-START REFUSAL - no pending launch of the
+/// caller's by that koid, nothing ran, nothing to cancel; and an error is a POST-REMOVAL START
+/// FAILURE - the token was taken and the kernel refused to queue the thread, so the launch cannot be
+/// cancelled afterwards and this service forgets the record and its Domain itself. A group release
+/// that reports an error has forgotten every member that failed to start the same way; the ones
+/// that started are running, and the caller's group handle is what ends them.
+///
+/// `launch-prepared-bounded` is `launch-bounded`'s limit behind `launch-prepared`'s gate. The live
+/// bounded launch starts the program and is granted afterwards, which is the one launch shape a
+/// failed grant could not roll back to "it never ran"; a prepared one is released only after the
+/// same complete grant transaction as every other tool, and cancelled - record, Domain and all -
+/// when that transaction fails.
+///
+/// AND A TRANSACTION IS A CONNECTION. Prepared state is keyed by the channel it was prepared on, and
+/// a client's channel closing abandons everything it prepared - so a caller that has lost a reply
+/// recovers by DROPPING the connection it made the call on rather than by asking again on it: the
+/// late reply lands on a dead endpoint instead of being taken as the answer to the next call. A
+/// pipeline is prepared, sealed and group-released over ONE connection for the same reason:
+/// `release-group` requires every koid to be the caller's, and two connections are two callers.
 // interface `process` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod process {
 	use super::*;
@@ -195,6 +216,7 @@ pub mod process {
 	pub const OP_RELEASE: u16 = 7;
 	pub const OP_RELEASE_GROUP: u16 = 8;
 	pub const OP_CANCEL: u16 = 9;
+	pub const OP_LAUNCH_PREPARED_BOUNDED: u16 = 10;
 
 	pub trait Service {
 		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
@@ -206,6 +228,7 @@ pub mod process {
 		fn release(&mut self, koid: Koid) -> Result<bool, Error>;
 		fn release_group(&mut self, koids: Vec<Koid>) -> Result<bool, Error>;
 		fn cancel(&mut self, koid: Koid) -> Result<bool, Error>;
+		fn launch_prepared_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -593,6 +616,48 @@ pub mod process {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_LAUNCH_PREPARED_BOUNDED => {
+				let name = r.string_lp()?;
+				let memory_limit = r.u64()?;
+				let bootstrap = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.launch_prepared_bounded(name, memory_limit, bootstrap);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v22) => {
+							w.u8(1)?;
+							v22.write(w)?;
+						}
+						Err(v23) => {
+							w.u8(0)?;
+							v23.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -734,13 +799,13 @@ pub mod process {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v22 = r.u16()? as usize;
-						let mut v23 = Vec::new();
-						v23.try_reserve_exact(v22).ok()?;
-						for _ in 0..v22 {
-							v23.push(ProcessInfo::read(r)?);
+						let v24 = r.u16()? as usize;
+						let mut v25 = Vec::new();
+						v25.try_reserve_exact(v24).ok()?;
+						for _ in 0..v24 {
+							v25.push(ProcessInfo::read(r)?);
 						}
-						v23
+						v25
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -849,13 +914,13 @@ pub mod process {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v24 = r.u16()? as usize;
-						let mut v25 = Vec::new();
-						v25.try_reserve_exact(v24).ok()?;
-						for _ in 0..v24 {
-							v25.push(Budget::read(r)?);
+						let v26 = r.u16()? as usize;
+						let mut v27 = Vec::new();
+						v27.try_reserve_exact(v26).ok()?;
+						for _ in 0..v26 {
+							v27.push(Budget::read(r)?);
 						}
-						v25
+						v27
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -947,8 +1012,8 @@ pub mod process {
 				return None;
 			}
 			w.u16(koids.len() as u16)?;
-			for v26 in koids.iter() {
-				w.u64(*v26)?;
+			for v28 in koids.iter() {
+				w.u64(*v28)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -1000,6 +1065,42 @@ pub mod process {
 					return None;
 				}
 				let value = if r.tag()? { Ok(r.boolean()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn launch_prepared_bounded(&mut self, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LAUNCH_PREPARED_BOUNDED)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			w.u64(*memory_limit)?;
+			w.set_handle(*bootstrap)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -1082,6 +1183,14 @@ pub mod process {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.cancel(koid)
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_launch_prepared_bounded")]
+	fn channel_invoke_launch_prepared_bounded(chan: u64, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.launch_prepared_bounded(name, memory_limit, bootstrap)
+	}
 }
 
 /// THE NARROW DOOR TO STOPPING THE MACHINE.
@@ -1144,12 +1253,12 @@ pub mod system_power {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v27) => {
+						Ok(v29) => {
 							w.u8(1)?;
 						}
-						Err(v28) => {
+						Err(v30) => {
 							w.u8(0)?;
-							v28.write(w)?;
+							v30.write(w)?;
 						}
 					}
 					Some(())
@@ -1179,12 +1288,12 @@ pub mod system_power {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v29) => {
+						Ok(v31) => {
 							w.u8(1)?;
 						}
-						Err(v30) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v30.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())

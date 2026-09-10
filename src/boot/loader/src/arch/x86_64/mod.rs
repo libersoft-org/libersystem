@@ -7,6 +7,8 @@
 // from the `bootproto::BootInfo` this backend fills in. The architecture-neutral file
 // I/O + entry live in main.rs; only this placement/hand-off is x86-specific.
 
+// The harness's DMA-mode input on this path: one `fw_cfg` file.
+mod fwcfg;
 pub mod paging;
 pub mod serial;
 
@@ -55,6 +57,25 @@ pub fn halt() -> ! {
 	loop {
 		unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
 	}
+}
+
+// THIS PATH'S DMA-MODE INPUTS. The harness input is the `fw_cfg` file and nothing else; an
+// `EFI/BOOT/LSDM` file on the boot medium is the device-tree ports' input and is an INDEPENDENT
+// producer here, refused whether or not `fw_cfg` is present.
+pub fn dma_mode_inputs(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, _system_table: *mut SystemTable) -> crate::dma_mode::Inputs {
+	// One byte more than the record, so a longer file is seen as longer rather than truncated to
+	// fit: the length is part of what the record is.
+	let mut bytes = [0u8; bootproto::dma_mode::RECORD_LEN + 1];
+	let carrier = match fwcfg::read_file(bootproto::dma_mode::FW_CFG_FILE, &mut bytes) {
+		None => bootproto::dma_mode::Carrier::Absent,
+		Some(size) if size > bytes.len() => bootproto::dma_mode::Carrier::Malformed(bootproto::dma_mode::Malformed::Length(size)),
+		Some(size) => bootproto::dma_mode::Carrier::from_bytes(Some(&bytes[..size])),
+	};
+	let independent = match crate::read_boot_file_reported(bs, root, crate::ESP_DMA_MODE_FILE) {
+		crate::MediumRead::Absent => None,
+		crate::MediumRead::Bytes(_) | crate::MediumRead::Unreadable => Some("an EFI/BOOT/LSDM file on the boot medium"),
+	};
+	crate::dma_mode::Inputs { carrier, independent }
 }
 
 // Place the kernel and jump into it. Reads the init/volume packages off the boot
@@ -215,6 +236,10 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		// thrown away, and everything downstream re-derived it from what happened to be lying on
 		// the medium - which for a shipping ISO is two answers at once.
 		(*boot_info).root = crate::root_selection();
+		// THE BOOT'S DMA MODE AND ITS PROVENANCE, resolved before this function was entered.
+		let (dma_mode, dma_provenance) = crate::dma_mode::handoff_words();
+		(*boot_info).dma_mode = dma_mode;
+		(*boot_info).dma_provenance = dma_provenance;
 	}
 
 	// Snapshot the memory map and exit boot services. GetMemoryMap must be the

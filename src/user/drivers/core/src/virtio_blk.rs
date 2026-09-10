@@ -39,6 +39,11 @@ const OP_FLUSH: u32 = 3;
 // Block-service reply status codes.
 const STATUS_OK: u32 = 0;
 const STATUS_ERR: u32 = 1;
+// A request refused before the device was asked: a count of zero or above what one request may
+// carry, a range past the last sector, or a write whose transferred object is not a readable memory
+// object at least as long as the request says (see `drivers::blk`). Typed apart from `STATUS_ERR`
+// so a caller can tell a request it got wrong from a device that failed one it got right.
+const STATUS_INVALID: u32 = 2;
 
 // The fixed control page: a 16-byte request header and the 1-byte status. The
 // data rides its own contiguous DMA span, grown to the largest request seen, so
@@ -287,10 +292,28 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 				Received::Message { len, handle } if len >= 16 => {
 					let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
 					let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
-					let count: u32 = (u32::from_le_bytes([req[12], req[13], req[14], req[15]]) as u64).clamp(1, max_sectors) as u32;
+					// AS SENT, NOT CLAMPED. The count used to be clamped into `1..=max_sectors`
+					// before anything looked at it, and the LBA was never checked at all - so a
+					// request past the end of the disk reached the device as written and an
+					// oversized one became a smaller one nobody asked for. Both are refused now,
+					// with `STATUS_INVALID`, and the device is not asked (DRV-002).
+					let count_sent: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
+					let admitted = match op {
+						OP_READ | OP_WRITE => match drivers::blk::request_range(lba, count_sent, capacity_sectors, max_sectors) {
+							Ok(count) => Some(count),
+							Err(_) => {
+								if handle != 0 {
+									close(handle);
+								}
+								reply_block(blk_server, STATUS_INVALID, 0);
+								continue;
+							}
+						},
+						_ => None,
+					};
 					match op {
-						OP_READ => serve_read(queue, blk_server, virt, phys, &mut span, lba, count),
-						OP_WRITE => serve_write(queue, blk_server, virt, phys, &mut span, lba, count, handle),
+						OP_READ => serve_read(queue, blk_server, virt, phys, &mut span, lba, admitted.unwrap_or(0)),
+						OP_WRITE => serve_write(queue, blk_server, virt, phys, &mut span, lba, admitted.unwrap_or(0), handle),
 						OP_CAPACITY => reply_capacity(blk_server, capacity_sectors * SECTOR as u64, max_sectors),
 						OP_FLUSH => {
 							let ok: bool = !has_flush || flush_request(queue, virt, phys);
@@ -373,6 +396,20 @@ unsafe fn serve_write(queue: &Queue, blk_server: u64, virt: u64, phys: u64, span
 			return;
 		}
 		let bytes: u64 = count as u64 * SECTOR as u64;
+		// THE TRANSFERRED OBJECT, BEFORE IT IS MAPPED (DRV-003 / WIRE-002). A memory object,
+		// readable through this handle, and at least `bytes` long - all three from one
+		// `object_info` call - or a typed refusal and no copy. The span check below bounds the
+		// DESTINATION; this bounds the SOURCE, which nothing did: `count = 1000` against a
+		// 512-byte object drove a 512 kB read out of a 512-byte mapping.
+		let source = match object_info(src_handle) {
+			Some(info) => drivers::blk::write_source(&info, bytes),
+			None => Err(drivers::blk::Refusal::ObjectType),
+		};
+		if source.is_err() {
+			close(src_handle);
+			reply_block(blk_server, STATUS_INVALID, 0);
+			return;
+		}
 		if !span.fit(bytes) {
 			close(src_handle);
 			reply_block(blk_server, STATUS_ERR, 0);

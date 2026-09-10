@@ -1427,6 +1427,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "boot-critical"
+dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 2 }]
 provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
@@ -1442,6 +1443,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
+dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 3 }]
 provides = [{ kind = "console-bytes", most = 1 }]
 heartbeat-deadline = 100
@@ -1463,6 +1465,7 @@ development = true
 # target, and nothing above the port depends on it.
 [programs.driver]
 lifecycle = "controller"
+dma = "trusted-untranslated"
 match = [
 	{ transport = "virtio-pci", virtio-type = 3, pci-address = { bus = 0, dev = 30, func = 0 } },
 ]
@@ -1491,6 +1494,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
+dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 16 }]
 provides = [{ kind = "display", most = 1 }]
 heartbeat-deadline = 100
@@ -1506,6 +1510,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
+dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 18 }]
 provides = [{ kind = "input", most = 1 }]
 heartbeat-deadline = 100
@@ -1519,8 +1524,15 @@ stage = "volume"
 destination = "drivers/virtio_net.lsexe"
 providers = []
 
+# THE ONE DRIVER THAT REQUIRES TRANSLATION. Its queue and packet buffers are on the DMA-address
+# contract, so it binds only behind an enforcing controller and REFUSES on a `no-iommu` machine -
+# which is every AArch64 and RISC-V boot, and an x86_64 `--no-iommu` one, until those profiles gain
+# a controller. The other seven rows are `trusted-untranslated`: translated where translation exists,
+# and admitted into the loud degraded inventory where the boot's mode says there is none. Each
+# becomes `iommu-required` when its own buffers are migrated, in that driver's own change.
 [programs.driver]
 lifecycle = "controller"
+dma = "iommu-required"
 match = [{ transport = "virtio-pci", virtio-type = 1 }]
 provides = [{ kind = "net", most = 1 }]
 heartbeat-deadline = 100
@@ -1536,6 +1548,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
+dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 25 }]
 provides = [{ kind = "audio", most = 1 }]
 heartbeat-deadline = 100
@@ -1587,6 +1600,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
+dma = "trusted-untranslated"
 match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x30 }]
 provides = [
 	{ kind = "block", most = 1 },

@@ -373,6 +373,16 @@ pub const SYS_BOOT_ID: u64 = 76;
 // `SYS_DEVICE_RELEASE` takes the whole key and starts the teardown; a key naming a generation that
 // is no longer current is refused rather than applied to whoever holds the device now.
 // `SYS_DEVICE_CLAIM_INFO` reads the claim's state and its terminal result out of the handle.
+//
+// THE FOURTH ARGUMENT NAMES THE REGISTRY ENTRY. `SYS_DEVICE_CLAIM(index, privilege, grant_ptr,
+// entry_ptr)`: `entry_ptr` points at `ENTRY_NAME_LEN` bytes holding the NUL-padded program name of
+// the registry entry DeviceManager selected for this device - the exact priority or fallback
+// candidate it is attempting, which is the identity the manifest already validates and the
+// operator's stored `select=` already carries. The kernel validates that the entry EXISTS in the
+// table generated from the same manifest, that its match rules admit THIS device, and that its
+// declared DMA policy is admissible under the boot's DMA mode; it does not recompute priority, so an
+// operator's deliberate lower-priority choice is honoured. The grant carries the entry, the policy
+// and the newly minted generation back, and the claim handle reports the same three.
 pub const SYS_DEVICE_CLAIM: u64 = 77;
 pub const SYS_DEVICE_RELEASE: u64 = 78;
 pub const SYS_DEVICE_CLAIM_INFO: u64 = 79;
@@ -446,6 +456,24 @@ pub const PROP_THREAD_LIMIT: u64 = 3;
 pub const PROP_DMA_LIMIT: u64 = 4;
 pub const PROP_IPC_QUEUE_LIMIT: u64 = 5;
 pub const PROP_STACK_LIMIT: u64 = 6;
+
+// THE REGISTRY ENTRY IDENTITY ON THE CLAIM BOUNDARY: the manifest's program name, which
+// `system-manifest` bounds to 1-64 bytes of `[A-Za-z0-9_-]`, carried as a FIXED 64-byte NUL-padded
+// field. Fixed because the claim ABI is `repr(C)` and a variable-length field there is a second
+// parser; 64 because that is the manifest's own bound, so the two cannot drift. A name is canonical
+// or it was refused at manifest validation - there is no normalisation step anywhere.
+pub const ENTRY_NAME_LEN: usize = 64;
+
+// THE THREE DMA POLICIES A REGISTRY ENTRY DECLARES, as `ClaimGrant::policy` and `ClaimInfo::policy`
+// report them. The same numbers `system_manifest::DmaPolicy::wire` produces.
+//
+// `none`: the driver receives its MMIO and interrupt resources, bus mastering stays OFF, and the
+// binding cannot mint a DMA buffer. `iommu-required`: binds only behind an enforcing controller.
+// `trusted-untranslated`: translated where translation exists, and admitted untranslated - loudly,
+// into the degraded inventory - only on a boot whose mode says it has no controller.
+pub const DMA_POLICY_NONE: u32 = 0;
+pub const DMA_POLICY_IOMMU_REQUIRED: u32 = 1;
+pub const DMA_POLICY_TRUSTED_UNTRANSLATED: u32 = 2;
 
 // virtio device type codes, as written into `DeviceInfo::device_type` (the modern
 // virtio-pci `device_id - 0x1040`). The single source of truth for the kernel's PCI
@@ -870,17 +898,29 @@ pub struct ClaimKey {
 // The two handles are why this is not just a `ClaimKey`. `memory` is the device's MMIO capability -
 // what travels on to the driver - and `claim` is what STAYS with the manager.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct ClaimGrant {
 	pub key: ClaimKey,
 	pub memory: u64,
 	pub claim: u64,
+	// THE KERNEL'S STAMP: the entry the claim was validated against, byte for byte what the caller
+	// named, and the DMA policy that entry declares - one of the `DMA_POLICY_*` codes. Declared
+	// fields, never reserved padding.
+	pub entry: [u8; ENTRY_NAME_LEN],
+	pub policy: u32,
+	pub _pad: u32,
+}
+
+impl Default for ClaimGrant {
+	fn default() -> Self {
+		ClaimGrant { key: ClaimKey::default(), memory: 0, claim: 0, entry: [0; ENTRY_NAME_LEN], policy: 0, _pad: 0 }
+	}
 }
 
 // What `SYS_DEVICE_CLAIM_INFO` answers with: which binding this claim handle names, what state the
 // device is in, and - once a release has finished - how it ended.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct ClaimInfo {
 	pub key: ClaimKey,
 	// One of the CLAIM_STATE_* codes below.
@@ -889,6 +929,35 @@ pub struct ClaimInfo {
 	// claim is live. This is the bit the claim handle's readiness is defined by, so a manager parked
 	// in `wait_any` learns the device is back without polling.
 	pub settled: u32,
+	// The same stamp `ClaimGrant` carries, read back through the handle: the entry this binding was
+	// validated against and its declared policy. What a manager that did not make the binding
+	// reads to learn which entry holds the device.
+	pub entry: [u8; ENTRY_NAME_LEN],
+	pub policy: u32,
+	pub _pad: u32,
+}
+
+impl Default for ClaimInfo {
+	fn default() -> Self {
+		ClaimInfo { key: ClaimKey::default(), state: 0, settled: 0, entry: [0; ENTRY_NAME_LEN], policy: 0, _pad: 0 }
+	}
+}
+
+// The NUL-padded 64-byte form of an entry name, for the claim request. A name longer than the field
+// is not an entry the manifest could have declared, and the kernel refuses the request.
+pub fn entry_name_field(name: &[u8]) -> Option<[u8; ENTRY_NAME_LEN]> {
+	if name.is_empty() || name.len() > ENTRY_NAME_LEN {
+		return None;
+	}
+	let mut field = [0u8; ENTRY_NAME_LEN];
+	field[..name.len()].copy_from_slice(name);
+	Some(field)
+}
+
+// The name inside a 64-byte field: the bytes before the first NUL, or the whole field.
+pub fn entry_name_of(field: &[u8; ENTRY_NAME_LEN]) -> &[u8] {
+	let end = field.iter().position(|byte| *byte == 0).unwrap_or(ENTRY_NAME_LEN);
+	&field[..end]
 }
 
 // What `SYS_DEVICE_CLAIM_SNAPSHOT` answers with, for a manager that holds no claim handle.

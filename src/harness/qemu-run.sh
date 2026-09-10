@@ -30,10 +30,41 @@
 #   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
+#   LIBER_RUN_MODE=test|development|public|gate
+#             THE RUN MODE, and the one carrier of it. It is REQUIRED: the outermost entry point
+#             that knows sets it - `test.sh` says `test`, `run.sh` says `public`, the lab says
+#             `development`, `check.sh` and every named gate say `gate` - each only when it is
+#             unset, so the outermost one wins. This runner never reads `TEST`, the development
+#             profile scalar, `IOMMU` or `BOOT_IMAGE` as a run mode. What the mode decides is the
+#             VALUE of the DMA-mode record this runner writes for a boot whose manifests carry
+#             none; it never reaches the guest.
+#   LIBER_DMA_MODE=enforcing-required|no-iommu
+#             A gate that states its own DMA mode. Otherwise the matrix decides on every target:
+#             whatever the machine is - `enforcing-required` with a virtio-iommu, `no-iommu`
+#             without one - and the machine has one unless `IOMMU=0` (`./run.sh --no-iommu`) or
+#             the test row (`TEST=1`), which stays untranslated on all three targets.
+#   DMA_RECORD=absent|malformed|other|signed-provenance
+#             Refusal fixtures for the carrier: write no record, a malformed one, one naming the
+#             other mode, or one whose provenance byte claims `signed`. Used by the DMA-mode gates.
+#   DMA_DTB_NODE=1
+#             aarch64/riscv64 UEFI: ALSO put the boot-policy node into the firmware's device tree -
+#             an independent producer beside the ESP file, which the loader must refuse.
 #   DAMAGE_SIGNED_MANIFEST=1
 #             aarch64/riscv64 UEFI: flip one byte of the signed manifest on the ESP this script
 #             assembles, so a gate can prove the loader refuses a tampered one on the two ports that
 #             have no shipping ISO to tamper with. Used by `check-signed-boot.sh` and nothing else.
+#   LIBER_HARNESS_HOLD=FIFO
+#             A fixture hook: after every input is BOUND - the medium, the firmware image and the
+#             kernel opened once and hashed through their descriptors, the QEMU executable copied to
+#             a content-addressed run-private path and hashed there - and before QEMU is started,
+#             block until a line is read from FIFO. The evidence gate
+#             replaces the tool and the firmware at their PATHNAMES inside that window and requires
+#             the boot to use the bound bytes anyway. Never set outside that fixture.
+#   LIBER_DEV_STATE=DIR
+#             The development instance's run-private state: its control channel, monitor and QMP
+#             sockets live in DIR rather than in .build/boot, and its writable image set is named
+#             after DIR, so a lifecycle gate's instance never touches a person's and is never
+#             refused by its lock.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
 #   GIC=      aarch64: which interrupt controller the machine has - 2 (default: GICv2 with a
@@ -722,7 +753,68 @@ qemu_build_esp() {
 	fi
 	# The factory archive still travels for the tests that read it as a fixture.
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
+	# THE DMA-MODE RECORD, staged beside the loader. This medium's manifest is signed with tag 0 - a
+	# test-trust builder's - so the loader takes the mode from this file, validated as the frozen
+	# eight bytes, and relays it with `harness` provenance. The device-tree ports carry `no-iommu`
+	# on every row until they gain a controller; a gate may state its own value.
+	local dma_mode record
+	dma_mode="$(dma_mode_value "${PORT_IOMMU:-0}")"
+	record="$(dma_record_path "$dma_mode")"
+	if [[ -n "$record" ]]; then
+		mcopy -i "$ESP" "$record" ::/EFI/BOOT/LSDM
+		dma_mode_announce "$dma_mode" "EFI/BOOT/LSDM on the per-run ESP"
+	else
+		echo "qemu-run: run mode ${LIBER_RUN_MODE}, DMA-mode record ABSENT on purpose (DMA_RECORD=absent)" >&2
+	fi
 	return 0
+}
+
+# THE DIRECT-BOOT CARRIER: the same record, as a property under this product's own node in the tree
+# the guest is handed. `$1` is the dumped tree, `$2` where the annotated copy goes. Prints the path
+# to use - the annotated copy, or the original for the `absent` fixture.
+dma_annotate_dtb() {
+	local dumped="$1" annotated="$2" dma_mode shape="ok" mode
+	dma_mode="$(dma_mode_value "${PORT_IOMMU:-0}")"
+	mode="$dma_mode"
+	case "${DMA_RECORD:-}" in
+	absent)
+		echo "qemu-run: run mode ${LIBER_RUN_MODE}, DMA-mode record ABSENT from the device tree on purpose (DMA_RECORD=absent)" >&2
+		printf '%s' "$dumped"
+		return 0
+		;;
+	"" | ok) ;;
+	other) if [[ "$mode" == "no-iommu" ]]; then mode=enforcing-required; else mode=no-iommu; fi ;;
+	malformed) shape=short ;;
+	signed-provenance) shape=signed-provenance ;;
+	*)
+		echo "qemu-run: DMA_RECORD='${DMA_RECORD}' is not one of absent, malformed, other or signed-provenance" >&2
+		exit 1
+		;;
+	esac
+	python3 "$HERE/dma-mode-record.py" dtb "$dumped" "$annotated" "$mode" --shape "$shape" || {
+		echo "qemu-run: the device tree could not be annotated with the DMA-mode record" >&2
+		exit 1
+	}
+	dma_mode_announce "$dma_mode" "the device tree's boot-policy node"
+	printf '%s' "$annotated"
+}
+
+# A UEFI boot that ALSO carries the node in the firmware's tree - the independent-producer fixture.
+# QEMU builds the `virt` tree itself, so the machine is dumped first and handed back annotated.
+dma_independent_dtb_args() {
+	local qemu="$1"
+	shift
+	[[ "${DMA_DTB_NODE:-0}" == "1" ]] || return 0
+	local dumped annotated
+	dumped="$(mktemp "$QEMU_BUILD_DIR/dma-independent-XXXXXX.dtb")"
+	annotated="${dumped%.dtb}.annotated.dtb"
+	"$qemu" "$@" -machine "$MACHINE_FOR_DUMP,dumpdtb=$dumped" -display none >/dev/null 2>&1 || {
+		echo "qemu-run: the machine's device tree could not be dumped for the independent-producer fixture" >&2
+		exit 1
+	}
+	python3 "$HERE/dma-mode-record.py" dtb "$dumped" "$annotated" "$(dma_mode_value "${PORT_IOMMU:-0}")" || exit 1
+	echo "qemu-run: the firmware's device tree ALSO carries the boot-policy node (DMA_DTB_NODE=1) - an independent producer the loader must refuse" >&2
+	printf -- '-dtb\n%s\n' "$annotated"
 }
 
 # The SIGNED manifest for the boot medium, beside the text one.
@@ -752,9 +844,15 @@ stage_signed_boot_manifest() {
 	if [[ -n "$package" && -f "$package" ]]; then
 		rows+=(--row "package:volume.pkg=$package")
 	fi
+	# `--dma-mode harness`: this is a test-trust medium whose boot takes its DMA mode from the
+	# harness carrier - the `EFI/BOOT/LSDM` file staged beside the loader, which carries the row's
+	# actual `enforcing-required` or `no-iommu`. The manifest says only "take the mode from the
+	# carrier", exactly as a shipping development image does. `sign-manifest` began REQUIRING this
+	# flag with the DMA-mode field (P02M0172); this harness caller did not pass it, and nothing
+	# noticed until a device-tree port's UEFI boot ran, which happens only in the emulated sweep.
 	(cd "$HERE/../tools/sign-manifest" && cargo run --quiet -- \
 		--profile test-trust --product LiberSystem --arch "$arch" --source boot-medium \
-		--release "$PRODUCT_VERSION_FOR_MANIFEST" \
+		--release "$PRODUCT_VERSION_FOR_MANIFEST" --dma-mode harness \
 		--volume-uuid 00000000000000000000000000000000 \
 		"${rows[@]}" --out "$out") >&2 || {
 		echo "qemu-run: the boot medium's manifest could not be signed" >&2
@@ -828,6 +926,134 @@ else
 	exit 1
 fi
 
+# THE RUN MODE IS REQUIRED, AND IT IS THE ONLY THING CONSULTED TO PICK THE MATRIX ROW.
+#
+# `TEST=1` selects the test kernel and the test medium, which is a different question from what
+# policy the boot runs under: the enforcing IOMMU gate runs a test-kernel phase under `gate`, and a
+# runner that read `TEST` as the mode would put that boot on the `test` row with the wrong value.
+# A boot whose run mode was lost is not a boot without an opinion - it is a broken producer, and
+# it refuses here.
+case "${LIBER_RUN_MODE:-}" in
+test | development | public | gate) ;;
+"")
+	echo "qemu-run: LIBER_RUN_MODE is unset - a boot has to say whether it is a test, development, public or gate run, and the entry point that started it is what knows" >&2
+	exit 1
+	;;
+*)
+	echo "qemu-run: LIBER_RUN_MODE='${LIBER_RUN_MODE}' is not one of test, development, public or gate" >&2
+	exit 1
+	;;
+esac
+
+# THE DMA MODE THIS BOOT'S RECORD CARRIES, from the matrix. `LIBER_DMA_MODE` is a gate stating its
+# own value; otherwise the row is decided by the target and, on x86_64, by whether the machine has
+# a controller - which the caller passes as `$1`, because only the x86_64 arm knows.
+dma_mode_value() {
+	local has_controller="${1:-0}"
+	if [[ -n "${LIBER_DMA_MODE:-}" ]]; then
+		case "$LIBER_DMA_MODE" in
+		enforcing-required | no-iommu) printf '%s' "$LIBER_DMA_MODE" ;;
+		*)
+			echo "qemu-run: LIBER_DMA_MODE='${LIBER_DMA_MODE}' is not one of enforcing-required or no-iommu" >&2
+			exit 1
+			;;
+		esac
+		return
+	fi
+	case "$TARGET_ARCH" in
+	x86_64)
+		# The x86_64 rows: the machine has a controller unless it was taken out, and the record
+		# says what the machine is. The test row builds no controller and says `no-iommu`; the
+		# enforcing gate builds one and says so.
+		if [[ "$has_controller" == "1" ]]; then printf 'enforcing-required'; else printf 'no-iommu'; fi
+		;;
+	*)
+		# THE DEVICE-TREE PORTS FLIPPED WITH THEIR TOPOLOGY (2026-09-09). They carried `no-iommu`
+		# on every row until they gained a controller; the enforcing profiles put a virtio-iommu in
+		# front of their endpoints now, and the record says what the machine is, exactly as on
+		# x86_64: the caller passes whether it built the controller.
+		if [[ "$has_controller" == "1" ]]; then printf 'enforcing-required'; else printf 'no-iommu'; fi
+		;;
+	esac
+}
+
+# THE PORTS' MACHINES HAVE AN IOMMU IN THEM TOO, decided the way the x86_64 arm decides: `IOMMU`
+# when the caller said, otherwise a controller on every row but the test one. The value is kept in
+# `PORT_IOMMU` so the record producers - the ESP file and the device-tree node, both called from
+# inside the port arms - name the machine that was actually built.
+PORT_IOMMU=""
+port_iommu_decide() {
+	if [[ -n "${IOMMU:-}" ]]; then
+		printf '%s' "$IOMMU"
+	elif [[ "${TEST:-0}" == "1" ]]; then
+		printf '0'
+	else
+		printf '1'
+	fi
+}
+
+# THE UPSTREAM BRIDGE IS PINNED, AND A QEMU THAT CANNOT PIN IT IS REFUSED. Reading the controller's
+# bypass byte as off does not say the PCI host routes endpoint DMA through it; the `virt` machine's
+# `default-bus-bypass-iommu` and the GPEX host bridge's `bypass-iommu` do, and the qualified QEMU
+# defaults the second to off - which is precisely the kind of fact a version bump can change under a
+# gate without anything failing. So the property is asked for by name before an enforcing topology
+# relies on it, and a QEMU without it refuses rather than builds the machine with a default.
+# Captured whole, then matched: a `grep -q` on the pipe would close it on QEMU (pipefail).
+port_iommu_probe() {
+	local arch="$1" properties=""
+	case "$arch" in
+	aarch64)
+		properties="$(qemu-system-aarch64 -machine virt,help 2>/dev/null || true)"
+		grep -q "default-bus-bypass-iommu" <<<"$properties" || {
+			echo "qemu-run: this qemu-system-aarch64 offers no default-bus-bypass-iommu on the virt machine - an enforcing topology cannot pin the root bus, so it is REFUSED rather than built on a default" >&2
+			exit 1
+		}
+		;;
+	riscv64)
+		properties="$(qemu-system-riscv64 -device gpex-pcihost,help 2>/dev/null || true)"
+		grep -q "bypass-iommu" <<<"$properties" || {
+			echo "qemu-run: this qemu-system-riscv64 offers no bypass-iommu on gpex-pcihost - an enforcing topology cannot pin the host bridge, so it is REFUSED rather than built on a default" >&2
+			exit 1
+		}
+		;;
+	esac
+}
+
+# The eight-byte record file for `$1`, honouring the `DMA_RECORD` refusal fixtures. Prints the
+# path, or nothing for `absent`.
+dma_record_path() {
+	local mode="$1" other shape="ok"
+	[[ "${DMA_RECORD:-}" == "absent" ]] && return 0
+	scratch_sweep "$QEMU_BUILD_DIR/dma-mode" .record
+	local path="$QEMU_BUILD_DIR/dma-mode.$$.record"
+	case "${DMA_RECORD:-}" in
+	"" | ok) ;;
+	other)
+		if [[ "$mode" == "no-iommu" ]]; then mode=enforcing-required; else mode=no-iommu; fi
+		;;
+	malformed)
+		# Seven bytes: the length is part of what the record is, and a truncated one is malformed.
+		shape=short
+		;;
+	signed-provenance) shape=signed-provenance ;;
+	*)
+		echo "qemu-run: DMA_RECORD='${DMA_RECORD}' is not one of absent, malformed, other or signed-provenance" >&2
+		exit 1
+		;;
+	esac
+	python3 "$HERE/dma-mode-record.py" record "$mode" --shape "$shape" >"$path" || {
+		echo "qemu-run: the DMA-mode record could not be produced" >&2
+		exit 1
+	}
+	printf '%s' "$path"
+}
+
+# Say which row this boot is on, so a gate can assert it ran under its own mode.
+dma_mode_announce() {
+	local mode="$1" carrier="$2"
+	echo "qemu-run: run mode ${LIBER_RUN_MODE}, DMA mode ${mode} (harness provenance) via ${carrier}${DMA_RECORD:+, record fixture ${DMA_RECORD}}" >&2
+}
+
 # Reject an unsupported development profile before any image work: the profile changes
 # which host workflow owns the instance, so a request it cannot honour must fail loudly
 # rather than boot an ordinary guest that merely looks like a development one.
@@ -874,7 +1100,7 @@ dev_channel_socket() {
 	if [[ "${COLD:-0}" == "1" ]]; then
 		printf '%s/dev-channel-cold-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
 	elif [[ "$TARGET_ARCH" == "x86_64" ]]; then
-		printf '%s/dev-channel.sock' "$QEMU_BUILD_DIR"
+		printf '%s/dev-channel.sock' "${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}"
 	else
 		printf '%s/dev-channel-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
 	fi
@@ -888,6 +1114,77 @@ mkdir -p "$QEMU_BUILD_DIR"
 
 timing_event() {
 	if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\t%s\t%s\n' "$(date +%s%N)" "$1" "$2" >>"$LIBER_TIMING_LOG"; fi
+}
+
+# BOUND TO THE OBJECT, NOT THE NAME.
+#
+# A tool or a firmware image that is hashed by PATHNAME and then used by pathname is a check-then-use
+# race: QEMU is executed through `PATH` after its arguments are built, and it opens the firmware
+# pathname later still, so either can be replaced between the hash and the use and restored before
+# anything looks again - and the run log then names bytes the guest did not use. Narrowing the
+# window to a few syscalls is still a window.
+#
+# So every input the run log names is opened ONCE, hashed through that descriptor, and used through
+# it: `/proc/self/fd/N` resolves to the inode the descriptor holds whatever the pathname holds by
+# then, and QEMU inherits the descriptor. The executable takes the other form - a verified copy, see
+# `bind_tool` - for a reason of its own. The medium was bound this way first; the firmware, the
+# kernel and the tool follow the same rule so a reader does not have to work out why one input is
+# bound more weakly than another.
+BOUND_INPUTS=()
+bind_object() {
+	local target="$1" path="$2" label="$3" fd digest
+	exec {fd}<"$path" || {
+		echo "qemu-run: cannot open $label $path" >&2
+		exit 1
+	}
+	digest="$(sha256sum "/proc/self/fd/$fd" | awk '{print $1}')"
+	echo "qemu-run: $label sha256=$digest ($path, held as descriptor $fd)" >&2
+	BOUND_INPUTS+=("$label=$digest")
+	printf -v "$target" '%s' "/proc/self/fd/$fd"
+}
+
+# THE EXECUTABLE TAKES THE VERIFIED-COPY FORM, NOT THE DESCRIPTOR. Executing `/proc/self/fd/N`
+# binds the bytes, and it also names the process after the descriptor: the kernel takes `comm` from
+# the executed path, so every QEMU became a process called `12`, and `test.sh`'s stray-guest check,
+# the lab's bring-up wait and the concurrent gate's watcher all look for `qemu-system-<arch>` by
+# name. So the tool is copied ONCE per distinct content into a run-private, content-addressed,
+# read-only path that carries its own name - `.build/boot/tools/<digest>/qemu-system-x86_64` -
+# hashed THERE, and executed from there. What is on `PATH` afterwards does not matter; what is in
+# that directory is written by this function alone, atomically, and never rewritten. A packaged QEMU
+# finds its data directory through its compiled-in path when its executable is not under
+# `/usr/bin`, which is the case here and the case for `/proc/self/exe` alike.
+bind_tool() {
+	local target="$1" name="$2" path digest store copy
+	path="$(command -v "$name")" || {
+		echo "qemu-run: $name is not installed" >&2
+		exit 1
+	}
+	digest="$(sha256sum "$path" | awk '{print $1}')"
+	store="$QEMU_BUILD_DIR/tools/$digest"
+	copy="$store/$name"
+	if [[ ! -f "$copy" ]]; then
+		mkdir -p "$store"
+		cp "$path" "$copy.tmp.$$" && chmod 0555 "$copy.tmp.$$" && mv -f "$copy.tmp.$$" "$copy" || {
+			echo "qemu-run: cannot copy $name to $copy" >&2
+			rm -f "$copy.tmp.$$"
+			exit 1
+		}
+	fi
+	# Hashed where it is executed from, which is the binding; the name's digest is only how the copy
+	# was found.
+	digest="$(sha256sum "$copy" | awk '{print $1}')"
+	echo "qemu-run: $name sha256=$digest ($path, executed as the verified copy $copy)" >&2
+	BOUND_INPUTS+=("$name=$digest")
+	printf -v "$target" '%s' "$copy"
+}
+
+# The fixture hook described at the top: every input is bound by the time this is reached.
+harness_hold() {
+	[[ -n "${LIBER_HARNESS_HOLD:-}" ]] || return 0
+	echo "qemu-run: HELD - every input is bound (${BOUND_INPUTS[*]}); waiting on $LIBER_HARNESS_HOLD" >&2
+	local _release
+	read -r _release <"$LIBER_HARNESS_HOLD" || true
+	echo "qemu-run: released - starting QEMU on the bound objects" >&2
 }
 
 watch_test_timing() {
@@ -936,6 +1233,7 @@ fi
 
 qemu_run_x86_64() {
 	local kernel="$1"
+	local qemu_args_dma=()
 	# WHICH SET OF WRITABLE IMAGES THIS GUEST GETS.
 	#
 	# A guest writes to its system volume, its media and its USB stick, and QEMU takes a write lock
@@ -947,6 +1245,10 @@ qemu_run_x86_64() {
 	local artifact_suffix=""
 	[[ "${TEST:-0}" == "1" ]] && artifact_suffix="-test"
 	[[ "${COLD:-0}" == "1" ]] && artifact_suffix="-cold-$TARGET_ARCH"
+	# A RUN-PRIVATE DEVELOPMENT INSTANCE gets a set named after its state directory, for the same
+	# reason a cold run does: it must not attach the persistent instance's images, and having a
+	# set of its own is what lets the disk-conflict check below let it through.
+	[[ -n "${LIBER_DEV_STATE:-}" ]] && artifact_suffix="-dev-$(basename "$LIBER_DEV_STATE")"
 	timing_event runner start
 	timing_event image start
 	# Select an already-assembled ISO, or build the internal test/development medium for callers that
@@ -1072,6 +1374,48 @@ qemu_run_x86_64() {
 	else
 		iommu=1
 	fi
+	# THE DMA-MODE RECORD, OR THE SIGNED FIELD - never both. A medium whose every manifest carries no
+	# mode (the test and development builders' tag-0 set) takes the mode from the harness, over
+	# `fw_cfg`; a medium signed for a mode (a shipping image) carries it itself, and a harness record
+	# beside it would be a second producer the loader refuses. So the medium is asked which it is,
+	# off the medium itself, and a signed image is also checked against the machine about to be
+	# built: an enforcing image on a machine with no controller, or a degraded image on one with a
+	# controller, is refused HERE with both values named rather than booted into the kernel's
+	# refusal.
+	local signed_mode
+	signed_mode="$("$HERE/image-dma-mode.sh" "$iso")" || {
+		echo "qemu-run: could not read the signed DMA mode of $iso" >&2
+		exit 1
+	}
+	local dma_mode
+	dma_mode="$(dma_mode_value "$iommu")"
+	case "$signed_mode" in
+	harness)
+		local record
+		record="$(dma_record_path "$dma_mode")"
+		if [[ -n "$record" ]]; then
+			qemu_args_dma=(-fw_cfg "name=opt/org.libersystem.dma-mode,file=$record")
+			dma_mode_announce "$dma_mode" "fw_cfg"
+		else
+			qemu_args_dma=()
+			echo "qemu-run: run mode ${LIBER_RUN_MODE}, DMA-mode record ABSENT on purpose (DMA_RECORD=absent)" >&2
+		fi
+		;;
+	enforcing-required | no-iommu)
+		if [[ "$signed_mode" != "$dma_mode" ]]; then
+			echo "qemu-run: $iso is signed for DMA mode '$signed_mode' and this machine is built for '$dma_mode' (IOMMU=$iommu) - refusing to boot a pairing the kernel would refuse" >&2
+			echo "qemu-run:   boot the image assembled for this machine: ./image.sh writes libersystem.iso (enforcing-required) and libersystem-no-iommu.iso (no-iommu)" >&2
+			exit 1
+		fi
+		qemu_args_dma=()
+		[[ "${DMA_RECORD:-}" == "" ]] || qemu_args_dma=(-fw_cfg "name=opt/org.libersystem.dma-mode,file=$(dma_record_path "$dma_mode")")
+		echo "qemu-run: run mode ${LIBER_RUN_MODE}, DMA mode ${signed_mode} (signed by the medium)" >&2
+		;;
+	legacy)
+		echo "qemu-run: $iso was signed before the DMA-mode record existed - the loader refuses a legacy manifest; rebuild it:  ./image.sh" >&2
+		exit 1
+		;;
+	esac
 	# Two option strings, because not every virtio device here takes the same ones: `virtio-vga` and
 	# the sound device are attached without `disable-legacy=on` and must not acquire it now.
 	local virtio_opts virtio_plain
@@ -1088,14 +1432,34 @@ qemu_run_x86_64() {
 	# refused were refused on a topology the milestone does not describe.
 	local machine="q35"
 	[[ "$iommu" == "1" ]] && machine="q35,default-bus-bypass-iommu=off"
+	# THE MEDIUM IS BOUND TO THE OBJECT, NOT THE NAME. QEMU opens `-cdrom` AFTER the exec, so a
+	# pathname handed over here is a check-then-use window as long as QEMU's startup: an ISO
+	# replaced at its content-keyed path in that window would boot under the digest of the one that
+	# was there when this script looked. The file is therefore opened ONCE, hashed through that
+	# descriptor, and QEMU is given the descriptor - `/proc/self/fd/N` resolves to the inode the
+	# descriptor holds, whatever the pathname holds by then. The kernel it carries is bound the same
+	# way by the suite's staging; the two digests are printed together so one run log names both.
+	local iso_fd iso_digest
+	exec {iso_fd}<"$iso" || {
+		echo "qemu-run: cannot open $iso" >&2
+		exit 1
+	}
+	iso_digest="$(sha256sum "/proc/self/fd/$iso_fd" | awk '{print $1}')"
+	echo "qemu-run: medium sha256=$iso_digest ($iso, held as descriptor $iso_fd)${LIBER_STAGED_KERNEL_DIGEST:+; staged kernel sha256=$LIBER_STAGED_KERNEL_DIGEST}" >&2
+	BOUND_INPUTS+=("medium=$iso_digest")
+	# The firmware and the executable, bound the same way - see `bind_object`.
+	local ovmf_code_bound qemu_bin
+	bind_object ovmf_code_bound "$ovmf_code" "firmware OVMF_CODE"
+	bind_tool qemu_bin qemu-system-x86_64
 	local qemu_args=(
 		-machine "$machine"
 		-m "${MEM:-4G}"
-		-drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
+		-drive "if=pflash,format=raw,readonly=on,file=$ovmf_code_bound"
 		-drive "if=pflash,format=raw,file=$ovmf_vars"
-		-cdrom "$iso"
+		-cdrom "/proc/self/fd/$iso_fd"
 		-boot d
 		-serial "${SERIAL:-stdio}"
+		"${qemu_args_dma[@]}"
 	)
 	# BEFORE THE ENDPOINTS IT TRANSLATES, which is the order the gate boots and the order QEMU
 	# realizes devices in.
@@ -1328,8 +1692,9 @@ qemu_run_x86_64() {
 		# QEMU arguments and did not apply here, which is the one configuration where it is
 		# most wanted: diagnosing a guest that resets needs `-d int,cpu_reset` on the run that
 		# reproduces it, and a test run is what reproduces it.
+		harness_hold
 		if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
-			qemu-system-x86_64 "${qemu_args[@]}" ${QEMU_EXTRA:-} &
+			"$qemu_bin" "${qemu_args[@]}" ${QEMU_EXTRA:-} &
 			local qemu_pid=$!
 			watch_test_timing "$qemu_pid" &
 			local watcher_pid=$!
@@ -1337,7 +1702,7 @@ qemu_run_x86_64() {
 			local code=$?
 			wait "$watcher_pid" || true
 		else
-			qemu-system-x86_64 "${qemu_args[@]}" ${QEMU_EXTRA:-}
+			"$qemu_bin" "${qemu_args[@]}" ${QEMU_EXTRA:-}
 			local code=$?
 		fi
 		set -e
@@ -1376,8 +1741,8 @@ qemu_run_x86_64() {
 	# Interactive control sockets used by screenshot.sh and lab.py.
 	# Same rule as `dev_channel_socket`: a cold run gets its own monitor and QMP names, so it cannot
 	# remove or bind the persistent instance's.
-	local monitor_socket="$QEMU_BUILD_DIR/qemu-monitor.sock"
-	local qmp_socket="$QEMU_BUILD_DIR/qemu-qmp.sock"
+	local monitor_socket="${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}/qemu-monitor.sock"
+	local qmp_socket="${LIBER_DEV_STATE:-$QEMU_BUILD_DIR}/qemu-qmp.sock"
 	if [[ "${COLD:-0}" == "1" ]]; then
 		monitor_socket="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
 		qmp_socket="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
@@ -1386,7 +1751,8 @@ qemu_run_x86_64() {
 	qemu_args+=(-monitor "unix:$monitor_socket,server,nowait")
 	qemu_args+=(-qmp "unix:$qmp_socket,server,nowait")
 
-	exec qemu-system-x86_64 "${qemu_args[@]}" ${QEMU_EXTRA:-}
+	harness_hold
+	exec "$qemu_bin" "${qemu_args[@]}" ${QEMU_EXTRA:-}
 }
 
 qemu_run_aarch64() {
@@ -1424,6 +1790,27 @@ qemu_run_aarch64() {
 	local cpu_args=()
 	qemu_select_cpu cpu_args aarch64 cortex-a72
 
+	# THE ENFORCING TOPOLOGY (P02M0173): the controller FIRST, so it is realized before the
+	# endpoints it translates; every virtio endpoint modern-only and told `iommu_platform=on`; the
+	# root bus pinned so no function is placed outside the controller's reach by default. One
+	# decision, one option string, one machine - an endpoint cannot be added behind the controller
+	# without the matching access-platform decision, because there is no other string to attach it
+	# with. `DMA_FIXTURE=1` is the hostile phase's machine, as on x86_64: the kernel, the controller,
+	# virtio-net and the `edu` functions `QEMU_EXTRA` adds - every other bus master is omitted,
+	# because the transition quiesces them and a hostile case refused on a topology the milestone
+	# does not describe proves nothing about it.
+	local iommu
+	iommu="$(port_iommu_decide)"
+	PORT_IOMMU="$iommu"
+	local virtio_opts="disable-legacy=on"
+	local dma_fixture="${DMA_FIXTURE:-0}"
+	if [[ "$iommu" == "1" ]]; then
+		port_iommu_probe aarch64
+		machine="$machine,default-bus-bypass-iommu=off"
+		virtio_opts="disable-legacy=on,iommu_platform=on"
+		qemu_args+=(-device "virtio-iommu-pci,boot-bypass=on")
+	fi
+
 	# System volume disk: virtio-blk holding the factory archive.
 	#
 	# A cold run gets writable images of its own, like every other target: it shares this machine's
@@ -1439,39 +1826,43 @@ qemu_run_aarch64() {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
-		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "disable-legacy=on"
+		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "$virtio_opts"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	qemu_prepare_media_images "$media_suffix" -a64
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "disable-legacy=on" readonly
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "disable-legacy=on" readonly
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "disable-legacy=on" readonly
+	if [[ "$dma_fixture" != "1" ]]; then
+		qemu_prepare_media_images "$media_suffix" -a64
+		[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "$virtio_opts" readonly
+		[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "$virtio_opts" readonly
+		[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "$virtio_opts" readonly
+	fi
 
 	# Network: user-mode virtio-net.
-	qemu_attach_virtio_net qemu_args vnet0 "" "disable-legacy=on"
+	qemu_attach_virtio_net qemu_args vnet0 "" "$virtio_opts"
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
-	qemu_prepare_usb_image "$media_suffix"
-	# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
-	#
-	# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
-	# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
-	# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
-	# system disk already takes, and `scratch_sweep` inside it is the cleanup.
-	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
-		# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+	if [[ "$dma_fixture" != "1" ]]; then
+		qemu_prepare_usb_image "$media_suffix"
+		# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
 		#
-		# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
-		# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
-		# So a full disk, a permission problem or any other copy failure silently turned isolation off,
-		# and two guests of one architecture wrote into one fixture again. There is no degraded form of
-		# "this run has its own copy": either it does or the run is not the thing that was asked for.
-		echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
-		exit 1
-	}
-	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
-	qemu_attach_xhci qemu_args vusb
+		# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
+		# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
+		# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
+		# system disk already takes, and `scratch_sweep` inside it is the cleanup.
+		usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
+			# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+			#
+			# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
+			# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
+			# So a full disk, a permission problem or any other copy failure silently turned isolation off,
+			# and two guests of one architecture wrote into one fixture again. There is no degraded form of
+			# "this run has its own copy": either it does or the run is not the thing that was asked for.
+			echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
+			exit 1
+		}
+		qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
+		qemu_attach_xhci qemu_args vusb
+	fi
 
 	# Test mode: enable Arm semihosting while retaining the selected serial backend.
 	local test_args=()
@@ -1480,29 +1871,31 @@ qemu_run_aarch64() {
 		# The boot-chain test includes DisplayService and its Console/Shell dependents.
 		# Unlike x86, the virt machine has no default VGA device, so test mode supplies
 		# the same discoverable GPU path without enabling the interactive peripherals.
-		qemu_args+=(-device virtio-gpu-pci,disable-legacy=on)
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.$$.sock" "disable-legacy=on"
-		# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
-		# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
-		# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
-		# path run exactly as they would with a microphone. See the same block in the x86_64 test
-		# arm for what the recording test can and cannot prove with it.
-		qemu_append_audio qemu_args
-		qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,disable-legacy=on")
+		if [[ "$dma_fixture" != "1" ]]; then
+			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+			qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.$$.sock" "$virtio_opts"
+			# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
+			# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
+			# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
+			# path run exactly as they would with a microphone. See the same block in the x86_64 test
+			# arm for what the recording test can and cannot prove with it.
+			qemu_append_audio qemu_args
+			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,$virtio_opts")
+		fi
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
-		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
+		qemu_attach_virt_interactive qemu_args -aarch64 "$virtio_opts"
 		# The development profile is not x86_64's alone: a scenario has to be runnable against
 		# a cold boot of every target, and what that needs is a guest that names the profile
 		# (so DeviceManager starts an agent) and a channel for the agent to answer on.
 		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
-			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "disable-legacy=on"
+			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
 			# The same discoverable GPU the test configuration supplies, and for the same
 			# reason: the virt machine has no VGA device, the interactive set offers ramfb
 			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
 			# ConsoleService and the shell down with it. A driven guest needs all three.
-			qemu_args+=(-device "virtio-gpu-pci,disable-legacy=on")
+			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
 			# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
 			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
 			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
@@ -1538,6 +1931,9 @@ qemu_run_aarch64() {
 			exit 1
 		}
 		qemu_build_esp aarch64 "$kernel" "$loader_efi" BOOTAA64.EFI
+		local aavmf_code_bound qemu_bin
+		bind_object aavmf_code_bound "$aavmf_code" "firmware AAVMF_CODE"
+		bind_tool qemu_bin qemu-system-aarch64
 		# A private copy per run, like the OVMF path above. One shared file means two aarch64 runs
 		# write each other's firmware variables, and the script `exec`s QEMU so no trap can clean up
 		# afterwards - stale copies from earlier runs are unlinked here instead, while a still-
@@ -1546,13 +1942,18 @@ qemu_run_aarch64() {
 		local vars="$QEMU_BUILD_DIR/aavmf-vars.$$.fd"
 		cp "$aavmf_vars" "$vars"
 		# ESP goes last so system volume enumerates ahead of it.
-		qemu_attach_virtio_blk qemu_args "$ESP" esp "disable-legacy=on"
-		exec qemu-system-aarch64 \
+		qemu_attach_virtio_blk qemu_args "$ESP" esp "$virtio_opts"
+		local -a independent=()
+		MACHINE_FOR_DUMP="$machine"
+		mapfile -t independent < <(dma_independent_dtb_args qemu-system-aarch64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		harness_hold
+		exec "$qemu_bin" \
 			-machine "$machine" \
 			"${cpu_args[@]}" \
 			-smp "$smp" \
 			-m "$mem" \
-			-drive "if=pflash,format=raw,file=$aavmf_code,readonly=on" \
+			"${independent[@]}" \
+			-drive "if=pflash,format=raw,file=$aavmf_code_bound,readonly=on" \
 			-drive "if=pflash,format=raw,file=$vars" \
 			-serial "$serial" \
 			"${DISPLAY_ARGS[@]}" \
@@ -1592,13 +1993,15 @@ qemu_run_aarch64() {
 			echo "qemu-run: init package not found: $init_pkg (run 'just build --arch aarch64')" >&2
 			exit 1
 		}
-		module_args+=(-device "loader,file=$init_pkg,addr=$modules_addr")
+		local init_pkg_bound
+		bind_object init_pkg_bound "$init_pkg" "init package"
+		module_args+=(-device "loader,file=$init_pkg_bound,addr=$modules_addr")
 	fi
 
 	# Direct -kernel boot: dump DTB and load it at DTB_ADDR.
 	local dtb_file
 	dtb_file="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
-	trap 'rm -f "$dtb_file"' EXIT
+	trap 'rm -f "$dtb_file" "${dtb_file%.dtb}.annotated.dtb"' EXIT
 	# THE DUMPED TREE MUST DESCRIBE THE MACHINE THE GUEST ACTUALLY RUNS ON, so the dump carries the
 	# same extra arguments the run below does. Without that, a machine given `-numa` boots with a
 	# device tree dumped from a machine that was not - and the guest reads one memory node where its
@@ -1610,19 +2013,27 @@ qemu_run_aarch64() {
 		-m "$mem" \
 		-display none ${QEMU_EXTRA:-} >/dev/null 2>&1
 
+	# THE DIRECT-BOOT DMA-MODE CARRIER: the dumped tree gains this product's boot-policy node before
+	# it is loaded, so the kernel reads the mode in the same pass that reads the memory map and the
+	# interrupt controller - before anything is admitted.
+	local annotated_dtb
+	annotated_dtb="$(dma_annotate_dtb "$dtb_file" "${dtb_file%.dtb}.annotated.dtb")"
 	# NOT `exec`, and the difference is the trap above. Bash does not run an EXIT trap when the
 	# shell successfully replaces itself, so every direct aarch64 start since this path existed
 	# abandoned its `/tmp/qemu-virt-XXXXXX.dtb`. QEMU runs as a child instead and this shell waits
 	# for it, keeping the same foreground process group - a terminal interrupt still reaches QEMU -
 	# and then removes exactly the file it created and exits with the child's status.
-	local qemu_status=0
-	qemu-system-aarch64 \
+	local qemu_status=0 kernel_bound qemu_bin
+	bind_object kernel_bound "$kernel" kernel
+	bind_tool qemu_bin qemu-system-aarch64
+	harness_hold
+	"$qemu_bin" \
 		-machine "$machine" \
 		"${cpu_args[@]}" \
 		-smp "$smp" \
 		-m "$mem" \
-		-kernel "$kernel" \
-		-device "loader,file=$dtb_file,addr=$dtb_addr" \
+		-kernel "$kernel_bound" \
+		-device "loader,file=$annotated_dtb,addr=$dtb_addr" \
 		"${module_args[@]}" \
 		-serial "$serial" \
 		"${DISPLAY_ARGS[@]}" \
@@ -1632,7 +2043,7 @@ qemu_run_aarch64() {
 		${QEMU_EXTRA:-} &
 	local qemu_pid=$!
 	wait "$qemu_pid" || qemu_status=$?
-	rm -f "$dtb_file"
+	rm -f "$dtb_file" "${dtb_file%.dtb}.annotated.dtb"
 	trap - EXIT
 	exit "$qemu_status"
 }
@@ -1652,6 +2063,33 @@ qemu_run_riscv64() {
 	local cpu_args=()
 	qemu_select_cpu cpu_args riscv64 rv64
 
+	# THE ENFORCING TOPOLOGY (P02M0173), as on aarch64 - with two differences this machine has. The
+	# `virt` machine has no `default-bus-bypass-iommu`; the equivalent is the GPEX host bridge's own
+	# `bypass-iommu`, forced off through `-global`. And every virtio function is MODERN-ONLY from
+	# here on, enforcing or not: QEMU cannot offer `VIRTIO_F_ACCESS_PLATFORM` through a transitional
+	# function, so `iommu_platform=on` alone is a configuration that cannot negotiate.
+	local iommu
+	iommu="$(port_iommu_decide)"
+	PORT_IOMMU="$iommu"
+	local virtio_opts="disable-legacy=on"
+	local dma_fixture="${DMA_FIXTURE:-0}"
+	local -a bridge_args=()
+	# THE CONTROLLER IS NOT IN `qemu_args`, and that is the riscv64 difference. The direct boot below
+	# hands the guest the DUMPED tree with `-dtb`, and `virtio-iommu-pci` is the one device that
+	# writes a device-tree node (`/soc/pci@.../virtio_iommu@...`) - so if it were in the dump AND on
+	# the `-dtb` boot, QEMU would add that node twice and abort with FDT_ERR_EXISTS. The endpoints
+	# add no node (they are discovered through ECAM, as is the controller itself - the kernel finds
+	# it by PCI device type, never by this node). So the controller goes in its own array, added to
+	# the real boot commands and left out of the dump; the dumped tree carries no iommu node and the
+	# real boot adds it exactly once.
+	local -a iommu_args=()
+	if [[ "$iommu" == "1" ]]; then
+		port_iommu_probe riscv64
+		bridge_args=(-global gpex-pcihost.bypass-iommu=off)
+		virtio_opts="disable-legacy=on,iommu_platform=on"
+		iommu_args=(-device "virtio-iommu-pci,boot-bypass=on")
+	fi
+
 	# System volume disk: virtio-blk holding the factory archive.
 	#
 	# A cold run gets writable images of its own, like every other target: it shares this machine's
@@ -1667,39 +2105,43 @@ qemu_run_riscv64() {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
-		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 ""
+		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "$virtio_opts"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	qemu_prepare_media_images "$media_suffix" -rv64
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "" readonly
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "" readonly
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "" readonly
+	if [[ "$dma_fixture" != "1" ]]; then
+		qemu_prepare_media_images "$media_suffix" -rv64
+		[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "$virtio_opts" readonly
+		[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "$virtio_opts" readonly
+		[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "$virtio_opts" readonly
+	fi
 
-	# Network: user-mode virtio-net (no disable-legacy for riscv64).
-	qemu_attach_virtio_net qemu_args vnet0 "" ""
+	# Network: user-mode virtio-net, modern-only like every other function here.
+	qemu_attach_virtio_net qemu_args vnet0 "" "$virtio_opts"
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
-	qemu_prepare_usb_image "$media_suffix"
-	# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
-	#
-	# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
-	# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
-	# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
-	# system disk already takes, and `scratch_sweep` inside it is the cleanup.
-	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
-		# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+	if [[ "$dma_fixture" != "1" ]]; then
+		qemu_prepare_usb_image "$media_suffix"
+		# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
 		#
-		# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
-		# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
-		# So a full disk, a permission problem or any other copy failure silently turned isolation off,
-		# and two guests of one architecture wrote into one fixture again. There is no degraded form of
-		# "this run has its own copy": either it does or the run is not the thing that was asked for.
-		echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
-		exit 1
-	}
-	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
-	qemu_attach_xhci qemu_args vusb
+		# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
+		# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
+		# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
+		# system disk already takes, and `scratch_sweep` inside it is the cleanup.
+		usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
+			# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+			#
+			# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
+			# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
+			# So a full disk, a permission problem or any other copy failure silently turned isolation off,
+			# and two guests of one architecture wrote into one fixture again. There is no degraded form of
+			# "this run has its own copy": either it does or the run is not the thing that was asked for.
+			echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
+			exit 1
+		}
+		qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
+		qemu_attach_xhci qemu_args vusb
+	fi
 
 	# Test mode: enable RISC-V semihosting while retaining the selected serial backend.
 	local test_args=()
@@ -1707,26 +2149,28 @@ qemu_run_riscv64() {
 		test_args+=(-semihosting)
 		# The RISC-V virt machine has no default VGA device, while the boot-chain test
 		# requires DisplayService and its Console/Shell dependents.
-		qemu_args+=(-device virtio-gpu-pci)
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.$$.sock" ""
-		# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
-		# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
-		# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
-		# path run exactly as they would with a microphone. See the same block in the x86_64 test
-		# arm for what the recording test can and cannot prove with it.
-		qemu_append_audio qemu_args
-		qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
+		if [[ "$dma_fixture" != "1" ]]; then
+			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+			qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.$$.sock" "$virtio_opts"
+			# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
+			# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
+			# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
+			# path run exactly as they would with a microphone. See the same block in the x86_64 test
+			# arm for what the recording test can and cannot prove with it.
+			qemu_append_audio qemu_args
+			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,$virtio_opts")
+		fi
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
-		qemu_attach_virt_interactive qemu_args -riscv64 ""
+		qemu_attach_virt_interactive qemu_args -riscv64 "$virtio_opts"
 		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
-			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" ""
+			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
 			# The same discoverable GPU the test configuration supplies, and for the same
 			# reason: the virt machine has no VGA device, the interactive set offers ramfb
 			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
 			# ConsoleService and the shell down with it. A driven guest needs all three.
-			qemu_args+=(-device "virtio-gpu-pci")
+			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
 			# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
 			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
 			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
@@ -1777,18 +2221,29 @@ qemu_run_riscv64() {
 			exit 1
 		}
 		qemu_build_esp riscv64 "$kernel" "$loader_efi" BOOTRISCV64.EFI
+		local uboot_bound bios_bound="$bios" qemu_bin
+		bind_object uboot_bound "$uboot" "firmware UBOOT"
+		[[ "$bios" == default ]] || bind_object bios_bound "$bios" "firmware BIOS"
+		bind_tool qemu_bin qemu-system-riscv64
 		# ESP is NVMe so U-Boot's default boot order tries nvme0 first.
 		qemu_args+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
-		exec qemu-system-riscv64 \
+		local -a independent=()
+		MACHINE_FOR_DUMP="virt,aia=aplic-imsic"
+		mapfile -t independent < <(dma_independent_dtb_args qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
+		harness_hold
+		exec "$qemu_bin" \
 			-machine "virt,aia=aplic-imsic" \
+			"${bridge_args[@]}" \
 			"${cpu_args[@]}" \
 			-smp "$smp" \
 			-m "$mem" \
-			-bios "$bios" \
-			-kernel "$uboot" \
+			"${independent[@]}" \
+			-bios "$bios_bound" \
+			-kernel "$uboot_bound" \
 			-serial "$serial" \
 			"${DISPLAY_ARGS[@]}" \
 			-no-reboot \
+			"${iommu_args[@]}" \
 			"${qemu_args[@]}" \
 			"${test_args[@]}" \
 			${QEMU_EXTRA:-}
@@ -1813,24 +2268,65 @@ qemu_run_riscv64() {
 			echo "qemu-run: init package not found: $init_pkg (run 'just build --arch riscv64')" >&2
 			exit 1
 		}
-		initrd_args+=(-initrd "$init_pkg")
+		local init_pkg_bound
+		bind_object init_pkg_bound "$init_pkg" "init package"
+		initrd_args+=(-initrd "$init_pkg_bound")
 	fi
 
-	# Direct -kernel boot: OpenSBI jumps to kernel entry.
-	exec qemu-system-riscv64 \
-		-machine "virt,aia=aplic-imsic" \
+	# THE DIRECT-BOOT DMA-MODE CARRIER. OpenSBI hands the kernel the tree QEMU generated for THIS
+	# invocation, so the tree is dumped with the same arguments, annotated with this product's
+	# boot-policy node, and handed back with `-dtb` - the initrd annotation the kernel reads its
+	# archive from is QEMU's, made on the tree it is given, so it survives the round trip.
+	local dtb_file annotated_dtb
+	dtb_file="$(mktemp "$QEMU_BUILD_DIR/qemu-virt-riscv64-XXXXXX.dtb")"
+	trap 'rm -f "$dtb_file" "${dtb_file%.dtb}.annotated.dtb"' EXIT
+	# NO `-initrd` HERE, and no `-kernel`: `dumpdtb` generates the tree from the machine and its
+	# devices alone, and QEMU refuses `-initrd` without `-kernel`. The real boot below keeps
+	# `-initrd`, and QEMU adds the `/chosen` initrd properties to the annotated tree it is given -
+	# which is the round trip the comment above describes. The enforcing controller and its
+	# endpoints ARE in `qemu_args`, so the dumped tree describes the machine that boots; the bridge
+	# pin is a `-global` that changes no device-tree node, so it is not needed for the dump.
+	qemu-system-riscv64 \
+		-machine "virt,aia=aplic-imsic,dumpdtb=$dtb_file" \
 		"${cpu_args[@]}" \
 		-smp "$smp" \
 		-m "$mem" \
 		-bios "$bios" \
-		-kernel "$kernel" \
+		"${qemu_args[@]}" \
+		-display none ${QEMU_EXTRA:-} >/dev/null 2>&1 || {
+		echo "qemu-run: the riscv64 machine's device tree could not be dumped" >&2
+		exit 1
+	}
+	annotated_dtb="$(dma_annotate_dtb "$dtb_file" "${dtb_file%.dtb}.annotated.dtb")"
+	# Direct -kernel boot: OpenSBI jumps to kernel entry. NOT `exec`, for the reason the aarch64
+	# arm gives: the EXIT trap has a file to remove.
+	local qemu_status=0 kernel_bound bios_bound="$bios" qemu_bin
+	bind_object kernel_bound "$kernel" kernel
+	[[ "$bios" == default ]] || bind_object bios_bound "$bios" "firmware BIOS"
+	bind_tool qemu_bin qemu-system-riscv64
+	harness_hold
+	"$qemu_bin" \
+		-machine "virt,aia=aplic-imsic" \
+		"${bridge_args[@]}" \
+		"${cpu_args[@]}" \
+		-smp "$smp" \
+		-m "$mem" \
+		-bios "$bios_bound" \
+		-kernel "$kernel_bound" \
+		-dtb "$annotated_dtb" \
 		"${initrd_args[@]}" \
 		-serial "$serial" \
 		"${DISPLAY_ARGS[@]}" \
 		-no-reboot \
+		"${iommu_args[@]}" \
 		"${qemu_args[@]}" \
 		"${test_args[@]}" \
-		${QEMU_EXTRA:-}
+		${QEMU_EXTRA:-} &
+	local qemu_pid=$!
+	wait "$qemu_pid" || qemu_status=$?
+	rm -f "$dtb_file" "${dtb_file%.dtb}.annotated.dtb"
+	trap - EXIT
+	exit "$qemu_status"
 }
 
 case "$TARGET_ARCH" in

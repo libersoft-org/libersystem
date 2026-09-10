@@ -192,7 +192,15 @@ pub struct Param {
 	pub ty: Type,
 	// `@bound(n)` - see `Field::bound`.
 	pub bound: Option<u32>,
+	// The right NAMES a `@rights(...)` annotation resolved to.
 	pub rights: Vec<String>,
+	// Whether a `@rights` annotation was WRITTEN, whatever it resolved to. `@rights()` and
+	// `@rights(1)` both resolve to no names, and a schema that wrote either meant to guard the
+	// parameter - so the validator refuses them, rather than generation quietly emitting the
+	// unguarded method an empty list used to produce.
+	pub rights_declared: bool,
+	// How many of the annotation's arguments were not names. A number is not a right.
+	pub rights_non_names: usize,
 	pub doc: Vec<Doc>,
 	pub evolution: Evolution,
 	pub span: Span,

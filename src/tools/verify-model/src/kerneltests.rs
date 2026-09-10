@@ -517,7 +517,16 @@ fn reached_in(body: &str) -> BTreeSet<String> {
 	}
 	// These fixture helpers launch the literal service/program argument. A dynamic argument is
 	// not attributed to a later string in the body; it needs a literal at the actual call site.
-	for (helper, argument) in [("spawn_service(", 0), ("spawn_service_with_package(", 0), ("launch_volume_program(", 2)] {
+	// `permission_run_request(corr, b"kill", ..)` and its selected-file form launch the named tool
+	// through the governed path - PermissionManager asks ProcessService for it by name - which is
+	// how the launch fixtures reach a tool without a `program_elf` of their own.
+	for (helper, argument) in [
+		("spawn_service(", 0),
+		("spawn_service_with_package(", 0),
+		("launch_volume_program(", 2),
+		("permission_run_request(", 1),
+		("permission_run_with_file_request(", 1),
+	] {
 		let mut rest = body;
 		while let Some(index) = rest.find(helper) {
 			rest = &rest[index + helper.len()..];

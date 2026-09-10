@@ -202,7 +202,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// only its BAR would bring its rings up, ring the doorbell, and wait forever for a completion the
 	// bus would not let it write. Bus mastering goes off when the driver process dies and the
 	// transferred capability dies with it; the CLAIM ends with this test kernel.
-	let key = device::claim(index).expect("the xHCI controller is taken, as DeviceManager takes it");
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the xHCI controller")).expect("the xHCI controller is taken, as DeviceManager takes it");
 	// THE HANDSHAKE THIS HARNESS SENDS IS THE ONE DEVICEMANAGER SENDS. `BIND` states how many
 	// resources follow and each one says which kind it is, so the driver no longer has to know an
 	// order nobody told it - which is what the five positional messages here used to require, and
@@ -777,7 +777,7 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the virtio-snd driver should load");
 	// Taken as DeviceManager takes it, so the device may write to the capture buffer at all - see
 	// `a_device_masters_the_bus_only_while_it_is_claimed`.
-	let key = device::claim(index).expect("the sound device is taken, as DeviceManager takes it");
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the sound device")).expect("the sound device is taken, as DeviceManager takes it");
 	// THE SAME HANDSHAKE DEVICEMANAGER SENDS: one `BIND` naming the device and the two resources
 	// that follow, each saying which kind it is.
 	send_bind(&kernel_ep, &info, key.generation, 2).expect("the BIND should send");

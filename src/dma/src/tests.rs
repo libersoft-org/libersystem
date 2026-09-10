@@ -332,6 +332,10 @@ fn the_bind_decision_has_exactly_three_answers() {
 	assert_eq!(decide_bind(Policy::IommuRequired, false), BindDecision::Refused, "an untrusted DMA driver does not start without enforcement");
 	assert_eq!(decide_bind(Policy::TrustedUntranslated, false), BindDecision::DegradedUntranslated, "and a trusted one starts loudly");
 	assert_eq!(decide_bind(Policy::TrustedUntranslated, true), BindDecision::Translated, "trust is permission to run without translation, not a preference for it");
+	// A `none` driver is admitted without the bus in either state - the one answer that does not
+	// depend on enforcement, because the device it drives never reaches memory on its own.
+	assert_eq!(decide_bind(Policy::None, false), BindDecision::NonMastering);
+	assert_eq!(decide_bind(Policy::None, true), BindDecision::NonMastering);
 }
 
 #[test]

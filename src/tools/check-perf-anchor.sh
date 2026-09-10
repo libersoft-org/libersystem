@@ -14,6 +14,14 @@
 # This is M0158's M4 gate: without it the condition is a comment, and the day it stops holding the
 # only witness is somebody trying to take a measurement.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
@@ -28,7 +36,7 @@ KERNEL=".build/cargo/kernel/x86_64-unknown-none/debug/kernel"
 [[ -f "$KERNEL" ]] || fail "no built kernel at $KERNEL - build first:  ./build.sh --arch x86_64"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log "$work"/*/*.log; rm -rf "$work"' EXIT
 
 # ONE ANCHOR IS ALL THIS NEEDS, so the boot is cut as soon as the report is out rather than run to a
 # shell: the line is printed by `boot_main` before userspace starts, and waiting for a prompt would

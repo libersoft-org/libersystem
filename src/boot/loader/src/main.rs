@@ -28,8 +28,11 @@ extern crate alloc;
 mod arch;
 mod blockio;
 mod console;
+// The boot's DMA mode: latched over every verified manifest, resolved before the hand-off.
+mod dma_mode;
 mod elf;
 mod heap;
+mod rollback;
 // The public keys this loader accepts a signed boot manifest from, and the profile it was built
 // for. Public halves only - see the module.
 mod trust;
@@ -498,6 +501,16 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	if let Some(reason) = unsafe { BOOTSTRAP_REFUSED } {
 		panic!("loader: a boot source was selected and failed its manifest ({reason:?}) - refusing to hand off");
 	}
+	// THE DMA MODE, RESOLVED OVER THE WHOLE SELECTED SET, before anything is handed off. Every
+	// manifest verified above recorded its tag into the latch; this is where the set is judged as
+	// one, this entry path's harness input is read, and an independent input is refused. A boot
+	// that cannot state its mode halts here, with the reason, rather than handing the kernel a
+	// value it would refuse anyway or - worse - none.
+	dma_mode::resolve(arch::dma_mode_inputs(bs, root, system_table));
+	// AND THE ROLLBACK FLOOR, LAST: the complete selected set is verified and its DMA mode judged,
+	// so the one generation that set carries is the only input to the floor. Below it halts here;
+	// equal or above converges both slots and reads them back before anything is handed off.
+	rollback::enforce(system_table);
 	#[cfg(target_arch = "x86_64")]
 	arch::hand_off(bs, image_handle, system_table, root, kernel);
 	#[cfg(not(target_arch = "x86_64"))]
@@ -535,6 +548,10 @@ pub(crate) enum VolumeRead {
 // The bootstrap archive assembled from the volume, if there was one. Read in the SAME mount as
 // the kernel: mounting twice would walk every block device twice and, worse, could pick a
 // different volume for the two halves of one boot on a machine with more than one.
+// THE HARNESS DMA-MODE FILE on a runner-assembled ESP, in the `/`-separated spelling every other
+// boot-medium read here uses; the readers translate it for the firmware API.
+pub(crate) const ESP_DMA_MODE_FILE: &str = "EFI/BOOT/LSDM";
+
 pub(crate) static mut BOOTSTRAP: Option<&'static [u8]> = None;
 // WHERE the bootstrap set came from. Three sources now answer in turn, and a boot that used the
 // last one looks identical to a boot that used the first unless it says so - which is the same

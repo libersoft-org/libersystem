@@ -263,13 +263,25 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 		// it, so it holds whichever built last.
 		let arch: String = env::args().nth(1).unwrap_or_default();
 		let root = boot_dir().join(format!("bootstrap-{arch}"));
-		let _ = fs::remove_dir_all(&root);
+		// A SET, NOT FILES: under `LIBER_PUBLISH_LOCK` the whole directory is written fresh beside
+		// the old one and swapped into place with the other outputs, so the fallback set a consumer
+		// snapshots is one generation of it. Without the lock it is rewritten in place, as before.
+		let deferred = env::var_os("LIBER_PUBLISH_LOCK").is_some();
+		let target = if deferred { boot_dir().join(format!("bootstrap-{arch}.{}.new", std::process::id())) } else { root.clone() };
+		let _ = fs::remove_dir_all(&target);
 		for (name, bytes) in &fallback {
-			let path = root.join(name);
+			let path = target.join(name);
 			if let Some(parent) = path.parent() {
 				let _ = fs::create_dir_all(parent);
 			}
-			write_if_changed(&path, bytes);
+			if deferred {
+				fs::write(&path, bytes).unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+			} else {
+				write_if_changed(&path, bytes);
+			}
+		}
+		if deferred {
+			PENDING_DIRS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((target, root));
 		}
 	}
 
@@ -350,6 +362,18 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// decline the volume it could see, correctly and for a reason nothing on the medium explained.
 	let out_uuid: PathBuf = out_dir.join(format!("{name}{shape}-{arch}.uuid"));
 	write_if_changed(&out_uuid, hex.as_bytes());
+	// AND THE DMA MODE THE VOLUME'S MANIFEST WAS SIGNED FOR, for the same reason the pairing is a
+	// sidecar: the medium is laid down by `mkimage.sh`, which has to sign the medium for the SAME
+	// value or produce an image whose loader refuses the set as disagreeing. The bootable shape
+	// only - the test shape is always tag 0 and nothing pairs a medium with it by value.
+	if bootable {
+		let mode = match dma_mode().and_then(bootproto::dma_mode::Mode::from_code) {
+			Some(mode) => mode.name(),
+			None => "harness",
+		};
+		let out_mode: PathBuf = out_dir.join(format!("{name}{shape}-{arch}.dma-mode"));
+		write_if_changed(&out_mode, format!("{mode}\n").as_bytes());
+	}
 }
 
 // `init.pkg` -> `init-riscv64.pkg`. Every architecture's build writes these, so an unqualified name
@@ -387,12 +411,14 @@ fn main() {
 	if env::args().nth(2).as_deref() == Some("system-volume") {
 		verify_artifacts();
 		assemble_system_volume(&conf, &volume_files(&conf));
+		publish_pending();
 		return;
 	}
 
 	verify_artifacts();
 	assemble_init_package(&conf);
 	assemble_volume_package(&conf);
+	publish_pending();
 }
 
 #[derive(Clone)]
@@ -444,7 +470,51 @@ fn write_if_changed(path: &Path, bytes: &[u8]) {
 	let file_name = path.file_name().and_then(|name| name.to_str()).expect("output file name");
 	let temporary = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
 	fs::write(&temporary, bytes).unwrap_or_else(|error| panic!("cannot write {}: {error}", temporary.display()));
+	// PUBLISHED BY RENAME, so a reader sees the whole previous file or the whole new one and never
+	// a partial one. Under `LIBER_PUBLISH_LOCK` the rename is DEFERRED to `publish_pending`, which
+	// renames every output of this run in one lock-held step: a consumer that snapshots the medium
+	// inputs under the same lock then sees a complete generation, never one file from before a
+	// publication and the next from after it.
+	if std::env::var_os("LIBER_PUBLISH_LOCK").is_some() {
+		PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((temporary, path.to_path_buf()));
+		return;
+	}
 	fs::rename(&temporary, path).unwrap_or_else(|error| panic!("cannot publish {}: {error}", path.display()));
+}
+
+// The outputs written but not yet renamed into place (with `LIBER_PUBLISH_LOCK`), and the
+// directories to be swapped whole.
+static PENDING: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+static PENDING_DIRS: std::sync::Mutex<Vec<(PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+// Rename every pending output into place under the producers' lock, as ONE step. `flock(1)` holds
+// the lock file for the shell it runs, and the shell performs every rename; a consumer taking the
+// same lock for its copy therefore sees either the previous generation or this one, whole.
+fn publish_pending() {
+	let Some(lock) = std::env::var_os("LIBER_PUBLISH_LOCK") else { return };
+	let files: Vec<(PathBuf, PathBuf)> = std::mem::take(&mut *PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+	let dirs: Vec<(PathBuf, PathBuf)> = std::mem::take(&mut *PENDING_DIRS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+	if files.is_empty() && dirs.is_empty() {
+		return;
+	}
+	let mut script = String::from("set -e\n");
+	for (temporary, path) in &files {
+		script.push_str(&format!("mv -f {} {}\n", shell_quote(temporary), shell_quote(path)));
+	}
+	for (fresh, path) in &dirs {
+		// The old directory is moved aside first, so the name is never absent for longer than one
+		// rename, then removed once the new one is in place.
+		let aside = path.with_file_name(format!("{}.{}.old", path.file_name().and_then(|n| n.to_str()).unwrap_or("dir"), std::process::id()));
+		script.push_str(&format!("if [ -e {p} ]; then mv -f {p} {a}; fi\nmv -f {f} {p}\nrm -rf {a}\n", p = shell_quote(path), a = shell_quote(&aside), f = shell_quote(fresh)));
+	}
+	let status = std::process::Command::new("flock").arg(&lock).arg("sh").arg("-c").arg(&script).status().unwrap_or_else(|error| panic!("mkpackages: cannot run flock to publish: {error}"));
+	if !status.success() {
+		panic!("mkpackages: publishing this run's outputs under {} failed", Path::new(&lock).display());
+	}
+}
+
+fn shell_quote(path: &Path) -> String {
+	format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 // The userspace target triple matching the kernel's target arch.
@@ -578,8 +648,47 @@ fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8, source_kind: u8, volum
 			digest: bootproto::sha256::digest(bytes),
 		})
 		.collect();
-	let header = bootproto::manifest::Header { key_id: sign_manifest::TEST_KEY_ID, product: b"LiberSystem", arch, source_kind, release: release.as_bytes(), volume_uuid };
-	sign_manifest::sign_with_test_key(&header, &mut rows).unwrap_or_else(|e| panic!("mkpackages: the signed manifest could not be made: {e}"))
+	let (purpose, key) = manifest_purpose();
+	let header = bootproto::manifest::Header { key_id: key.key_id(), product: b"LiberSystem", arch, source_kind, release: release.as_bytes(), security_generation: security_generation(), purpose, volume_uuid, dma_mode: dma_mode() };
+	sign_manifest::sign_with_published_key(&header, &mut rows, key).unwrap_or_else(|e| panic!("mkpackages: the signed manifest could not be made: {e}"))
+}
+
+// THE PURPOSE THIS VOLUME IS SIGNED FOR, and the published key that may sign for it, from
+// `LIBER_MANIFEST_PURPOSE`. `boot` - the default, and what every ordinary build gets - signs an
+// ordinary set with the boot key; `recovery` signs a recovery set with the recovery key, which is
+// what the rollback-floor gate builds its recovery medium from. The two are chosen together here
+// because a volume claiming one purpose under the other's key is refused by the loader, and a
+// builder that could produce one would be producing a volume that cannot boot.
+fn manifest_purpose() -> (u32, sign_manifest::TestKey) {
+	match env::var("LIBER_MANIFEST_PURPOSE").as_deref() {
+		Err(_) | Ok("boot") => (bootproto::manifest::PURPOSE_BOOT, sign_manifest::TestKey::Boot),
+		Ok("recovery") => (bootproto::manifest::PURPOSE_RECOVERY, sign_manifest::TestKey::Recovery),
+		Ok(other) => panic!("mkpackages: LIBER_MANIFEST_PURPOSE='{other}' is not one of boot or recovery"),
+	}
+}
+
+// THE DMA MODE THIS VOLUME IS SIGNED FOR, from `LIBER_DMA_MODE`. `harness` - the default, and what
+// every test build gets - signs a tag-0 manifest whose boot takes the mode from the harness carrier;
+// `enforcing-required` and `no-iommu` sign the value, and are what `image.sh` sets when it assembles
+// a shipping medium around this volume. The medium's builder refuses to pair a volume with a medium
+// signed for another value, which is what stops the two halves of one image from disagreeing.
+fn dma_mode() -> Option<u32> {
+	match env::var("LIBER_DMA_MODE").as_deref() {
+		Ok("harness") | Err(_) => None,
+		Ok("enforcing-required") => Some(bootproto::dma_mode::MODE_ENFORCING_REQUIRED),
+		Ok("no-iommu") => Some(bootproto::dma_mode::MODE_NO_IOMMU),
+		Ok(other) => panic!("mkpackages: LIBER_DMA_MODE='{other}' is not one of harness, enforcing-required or no-iommu"),
+	}
+}
+
+// The security generation the manifest carries. One, unless the build says otherwise: the test key
+// signs nothing an anti-rollback floor is kept for, and an external release names its generation
+// explicitly through the signing tool rather than through this default.
+fn security_generation() -> u64 {
+	match env::var("LIBER_SECURITY_GENERATION") {
+		Ok(raw) => raw.parse().unwrap_or_else(|_| panic!("mkpackages: LIBER_SECURITY_GENERATION='{raw}' is not an unsigned 64-bit number")),
+		Err(_) => 1,
+	}
 }
 
 // The boot manifest for one source: a version line, then one `sha256  path` row per file the loader

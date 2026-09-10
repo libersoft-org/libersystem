@@ -12,13 +12,40 @@ much code it shares, and not a claim about hardware nobody has run it on.
 | Interrupt controller | APIC / IO-APIC, MSI-X | GICv2, GICv2m, GICv3, GICv3+ITS | AIA/IMSIC. The PLIC is READ FROM THE TREE AND DISCARDED - `boot.rs` prints its address and then drops it, and the only external-interrupt handler dispatches IMSIC EIDs. A machine with no IMSIC has no external interrupts here. |
 | Timer | local APIC, TSC-calibrated | CNTP (generic timer) | SBI timer |
 | SMP bring-up | ACPI MADT + INIT-SIPI-SIPI | PSCI `CPU_ON` | SBI HSM |
-| DMA isolation | virtio-iommu, on by default | none yet | none yet |
+| DMA isolation | virtio-iommu, on by default; the boot's DMA mode is `enforcing-required` on the default machine and `no-iommu` under `--no-iommu`, each from its own signed image | virtio-iommu, on by default, the root bus pinned with `default-bus-bypass-iommu=off`; the per-run medium carries the produced mode: `enforcing-required` with the controller, `no-iommu` under `--no-iommu` | virtio-iommu, on by default, the GPEX host bridge pinned with `bypass-iommu=off` and every virtio function modern-only; the produced mode as on aarch64 |
 | QEMU profiles | `q35` with and without a controller | `virt` at GICv2, GICv3, GICv3/ITS | `virt` with `aia=aplic-imsic` |
 | Physical hardware | not qualified | not qualified | not qualified |
 
 **No line of this table is a claim about a physical machine.** Every profile named here is an
 emulated one, and passing on it is evidence that the discovery path works on the machine QEMU
 describes - not that any real board has been booted.
+
+## The DMA mode every boot carries
+
+Whether a machine translates DMA is not something the kernel discovers from whether a controller
+happens to be on its bus: a controller that is absent looks the same on a machine built without one
+and on a machine whose attacker removed one. So every boot STATES its mode - `enforcing-required`
+or the explicit degraded `no-iommu` - and admission compares the machine against the statement.
+Each entry path has exactly one producer:
+
+| Entry path | Producer | Provenance |
+| --- | --- | --- |
+| x86_64 UEFI, a shipping image | the signed manifest's DMA field, in every selected manifest | `signed` |
+| x86_64 UEFI, a test or development image | the harness, as a `fw_cfg` file the loader relays and the kernel revalidates | `harness` |
+| aarch64 / riscv64 UEFI | the harness, as `EFI/BOOT/LSDM` on the per-run ESP, relayed by the loader | `harness` |
+| aarch64 / riscv64 direct `-kernel` | the harness, as a property under the `/libersystem` node of the device tree, read before anything is admitted | `harness` |
+
+A boot with no mode is a boot whose producer failed, and it refuses every device claim - on every
+path, with no row that reads absence as a default. A second producer beside the path's own is
+refused even when the values agree. The harness record is the same eight bytes on every input
+(`LSDM`, version, mode, provenance, reserved), and the run mode that decides the value (`test`,
+`development`, `public`, `gate`) lives on the host in `LIBER_RUN_MODE` and never reaches the guest.
+
+Every staged driver declares its policy in `services/manifest.toml`: `none`, `iommu-required` or
+`trusted-untranslated`. The kernel admits a claim only under a registry entry the image declares for
+that device, with that entry's policy under the boot's mode; `iommu-required` refuses on a
+`no-iommu` boot, which is why a `--no-iommu` boot comes up without a network on every target - the
+explicit degraded machine, loud about what it is.
 
 ## The rule the table exists to state
 

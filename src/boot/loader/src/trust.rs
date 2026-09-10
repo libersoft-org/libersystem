@@ -5,20 +5,37 @@
 // whole of what makes them something an attacker holding the disk cannot replace: a manifest names a
 // KEY ID, and a key id this loader does not carry is a refusal - it can never nominate a key.
 //
-// TWO PROFILES, CHOSEN AT BUILD TIME AND NAMED IN THE BINARY.
+// THREE PROFILES, CHOSEN AT BUILD TIME AND NAMED IN THE BINARY.
 //
-// `test-trust` is the host/QEMU-closing profile. Its key's private half is a published fixture, so a
-// build made with it is reproducible and cannot be mistaken for a release. The loader says TEST
+// `test-trust` is the host/QEMU-closing profile. Its keys' private halves are published fixtures, so
+// a build made with it is reproducible and cannot be mistaken for a release. The loader says TEST
 // TRUST before it loads anything, because a boot that trusts a published key and does not say so is
 // the failure this whole milestone is about.
 //
 // `external-release` carries one key given at build time - `LIBER_TRUST_KEY` and
 // `LIBER_TRUST_KEY_ID` - and no test key at all. A build that asks for it without them does not
-// compile, which is the only place the failure costs nothing.
+// compile, which is the only place the failure costs nothing. A recovery key may be given beside it
+// (`LIBER_TRUST_RECOVERY_KEY` and `_ID`); without one, no recovery manifest is accepted.
+//
+// `rollback-enforcing` is the anti-rollback build: it keeps the monotonic boot floor in firmware
+// NVRAM and refuses a correctly signed release below it. Enforcement is a build identity exactly as
+// trust is - never a value read from replaceable media. Its manifest roots are the release keys when
+// they are given and the published test keys otherwise, because the x86_64 OVMF gate that proves the
+// floor signs its own artifacts with the published keys; a loader of this profile with the test keys
+// says TEST TRUST like any other that carries them.
+//
+// EVERY ROOT IS SCOPED TO THE PURPOSES IT MAY SIGN FOR. A manifest carries a purpose - ordinary boot
+// or recovery - and a root accepted for recovery is not accepted for ordinary boot, nor the reverse:
+// recovery credentials cannot sign an ordinary boot set and ordinary credentials cannot claim
+// recovery. Adding a recovery key to the ordinary set would not be an implementation of that.
 
-// The published test key's PUBLIC half. Its private half is in `tools/sign-manifest`, in the open.
+// The published test keys' PUBLIC halves. Their private halves are in `tools/sign-manifest`, in the
+// open. One signs ordinary boot sets, the other recovery sets, so the cross-use negatives can be
+// signed with the wrong one on purpose.
 const TEST_KEY: [u8; 32] = hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
 const TEST_KEY_ID: u32 = 0x7e57_0001;
+const TEST_RECOVERY_KEY: [u8; 32] = hex32("cd267d8f9c9013744f42374272d6c5b3be33c7a6c3bb3b90bcb4318cc7fac439");
+const TEST_RECOVERY_KEY_ID: u32 = 0x7e57_0002;
 
 // The marker a test-trust loader prints and a release loader does not contain. The gate greps for
 // exactly this string, so it is written once and never assembled from pieces.
@@ -31,17 +48,41 @@ const PROFILE: &str = match option_env!("LIBER_TRUST_PROFILE") {
 	None => "test-trust",
 };
 
-pub const IS_TEST_TRUST: bool = konst_eq(PROFILE, "test-trust");
+pub const IS_ROLLBACK_ENFORCING: bool = konst_eq(PROFILE, "rollback-enforcing");
+const HAS_RELEASE_KEY: bool = option_env!("LIBER_TRUST_KEY").is_some();
+const HAS_RECOVERY_KEY: bool = option_env!("LIBER_TRUST_RECOVERY_KEY").is_some();
+pub const IS_TEST_TRUST: bool = konst_eq(PROFILE, "test-trust") || (IS_ROLLBACK_ENFORCING && !HAS_RELEASE_KEY);
+// A profile this file does not name does not compile: a misspelt profile that silently became the
+// default would be a release loader carrying the published key.
+const _: () = assert!(konst_eq(PROFILE, "test-trust") || konst_eq(PROFILE, "external-release") || IS_ROLLBACK_ENFORCING, "LIBER_TRUST_PROFILE is one of test-trust, external-release or rollback-enforcing");
 
-// One key this loader accepts manifests from.
+// One key this loader accepts manifests from, and the purposes it may sign for - a bitmask over
+// the manifest's purpose values.
 pub struct Root {
 	pub key_id: u32,
 	pub key: [u8; 32],
+	pub purposes: u32,
 }
 
+const TEST_ROOTS: &[Root] = &[
+	Root { key_id: TEST_KEY_ID, key: TEST_KEY, purposes: bootproto::manifest::PURPOSE_BOOT },
+	Root { key_id: TEST_RECOVERY_KEY_ID, key: TEST_RECOVERY_KEY, purposes: bootproto::manifest::PURPOSE_RECOVERY },
+];
+
 // THE ROOTS, and the compile stops here if a release build was asked for without a key. "Fails
-// before an image is written" is a rule about when, and there is no earlier when than this.
-pub const ROOTS: &[Root] = if IS_TEST_TRUST { &[Root { key_id: TEST_KEY_ID, key: TEST_KEY }] } else { &[Root { key_id: release_key_id(), key: hex32(release_key()) }] };
+// before an image is written" is a rule about when, and there is no earlier when than this. The
+// release arrays are written inside the branches rather than as items of their own, because a
+// const item is evaluated whether or not it is selected, and evaluating one is what asks for the key.
+pub const ROOTS: &[Root] = if IS_TEST_TRUST {
+	TEST_ROOTS
+} else if HAS_RECOVERY_KEY {
+	&[
+		Root { key_id: release_key_id(), key: hex32(release_key()), purposes: bootproto::manifest::PURPOSE_BOOT },
+		Root { key_id: recovery_key_id(), key: hex32(recovery_key()), purposes: bootproto::manifest::PURPOSE_RECOVERY },
+	]
+} else {
+	&[Root { key_id: release_key_id(), key: hex32(release_key()), purposes: bootproto::manifest::PURPOSE_BOOT }]
+};
 
 const fn release_key() -> &'static str {
 	match option_env!("LIBER_TRUST_KEY") {
@@ -57,6 +98,23 @@ const fn release_key_id() -> u32 {
 			None => panic!("LIBER_TRUST_KEY_ID is a decimal number"),
 		},
 		None => panic!("an external-release loader needs LIBER_TRUST_KEY_ID: the key id its manifests will name"),
+	}
+}
+
+const fn recovery_key() -> &'static str {
+	match option_env!("LIBER_TRUST_RECOVERY_KEY") {
+		Some(key) => key,
+		None => panic!("a recovery root needs LIBER_TRUST_RECOVERY_KEY"),
+	}
+}
+
+const fn recovery_key_id() -> u32 {
+	match option_env!("LIBER_TRUST_RECOVERY_KEY_ID") {
+		Some(id) => match konst_u32(id) {
+			Some(id) => id,
+			None => panic!("LIBER_TRUST_RECOVERY_KEY_ID is a decimal number"),
+		},
+		None => panic!("a recovery root needs LIBER_TRUST_RECOVERY_KEY_ID: the key id its recovery manifests will name"),
 	}
 }
 
@@ -282,6 +340,27 @@ pub(crate) fn verify_for<'a>(bytes: &'a [u8], expected: &Expected, scratch: &mut
 		crate::arch::serial::write_str("loader: this source belongs to a different release than the one already verified in this boot - refusing to compose a system from two of them\n");
 		return None;
 	}
+	// AND ITS GENERATION AND PURPOSE JOIN THE SAME LATCH. A set that agrees on its release string and
+	// mixes generations is a floor comparison against a number nobody signed for the whole set; a
+	// set that mixes purposes is recovery-authorised content entering part of an ordinary boot.
+	// SAFETY: the loader is single-threaded and this is reached only from its own boot path.
+	if let Err(conflict) = unsafe { (*(&raw mut GENERATION)).record(manifest.security_generation) } {
+		crate::arch::serial::write_str("loader: this source carries security generation ");
+		crate::serial_write_usize(conflict.offered as usize);
+		crate::arch::serial::write_str(" while the one already verified in this boot carries ");
+		crate::serial_write_usize(conflict.held as usize);
+		crate::arch::serial::write_str(" - refusing to compose a system from two generations\n");
+		return None;
+	}
+	if unsafe { (*(&raw mut PURPOSE)).record(manifest.purpose) }.is_err() {
+		crate::arch::serial::write_str("loader: this source is signed for a different purpose than the one already verified in this boot - refusing to compose recovery content with an ordinary boot set\n");
+		return None;
+	}
+	// AND ITS DMA-MODE TAG JOINS THE BOOT-WIDE LATCH, over the same set the release latch is taken
+	// over: every manifest this boot verified. The set is judged as one before the hand-off - see
+	// `dma_mode::resolve` - so a later manifest that contradicts an earlier one is a refusal there
+	// rather than a precedence decided by whichever was read first.
+	crate::dma_mode::record(manifest.dma_mode);
 	Some(manifest)
 }
 
@@ -293,6 +372,17 @@ pub(crate) fn verify_for<'a>(bytes: &'a [u8], expected: &Expected, scratch: &mut
 // which release this is; every later one has to agree.
 static mut RELEASE: [u8; bootproto::manifest::MAX_NAME_BYTES] = [0u8; bootproto::manifest::MAX_NAME_BYTES];
 static mut RELEASE_LEN: usize = 0;
+
+// THE GENERATION AND THE PURPOSE, latched over the same set through one mechanism.
+static mut GENERATION: bootproto::latch::Latch<u64> = bootproto::latch::Latch::new();
+static mut PURPOSE: bootproto::latch::Latch<u32> = bootproto::latch::Latch::new();
+
+// The security generation every verified manifest of this boot carries, once one has been
+// verified. The rollback floor compares exactly this number and nothing else.
+pub(crate) fn latched_generation() -> Option<u64> {
+	// SAFETY: as for the release latch.
+	unsafe { (*(&raw const GENERATION)).value() }
+}
 
 fn same_release(release: &[u8]) -> bool {
 	// SAFETY: the loader is single-threaded and this is reached only from its own boot path. The
@@ -323,6 +413,7 @@ fn verify<'a>(bytes: &'a [u8], scratch: &mut [u8]) -> Option<bootproto::manifest
 			crate::arch::serial::write_str("loader: etc/boot.manifest2 is not a manifest this loader reads (");
 			crate::arch::serial::write_str(match reason {
 				bootproto::manifest::Refusal::NotAManifest => "not this format",
+				bootproto::manifest::Refusal::LegacyVersion => "an earlier version of this format, which carries no DMA-mode record and is refused rather than read as one that declares none",
 				bootproto::manifest::Refusal::TooLarge => "too large",
 				bootproto::manifest::Refusal::Truncated => "truncated",
 				bootproto::manifest::Refusal::TrailingBytes => "trailing bytes",
@@ -344,6 +435,13 @@ fn verify<'a>(bytes: &'a [u8], scratch: &mut [u8]) -> Option<bootproto::manifest
 		crate::arch::serial::write_str("loader: the manifest's signature does not check out - refusing to boot from it\n");
 		return None;
 	}
+	// AND THE KEY MAY SIGN FOR THIS PURPOSE. Checked after the signature, so the refusal is about a
+	// manifest that is genuinely this key's - a recovery set signed with the boot key, or an
+	// ordinary set signed with the recovery key - and not about a forgery.
+	if root.purposes & manifest.purpose == 0 {
+		crate::arch::serial::write_str("loader: the manifest's purpose is not one its key may sign for - refusing to boot from it\n");
+		return None;
+	}
 	Some(manifest)
 }
 
@@ -355,6 +453,13 @@ pub(crate) fn announce() {
 		crate::arch::serial::write_str(TEST_TRUST_MARKER);
 		crate::arch::serial::write_str(" - this build accepts a manifest signed by a key whose private half is published in this repository\n");
 	} else {
-		crate::arch::serial::write_str("loader: release trust - one compiled-in public key\n");
+		crate::arch::serial::write_str("loader: release trust - compiled-in public keys only\n");
+	}
+	// AND WHETHER THE FLOOR IS ENFORCED, in the same breath and before anything is loaded: a build
+	// that keeps a monotonic floor says so, and one that does not is not mistaken for one that does.
+	if IS_ROLLBACK_ENFORCING {
+		crate::arch::serial::write_str("loader: ");
+		crate::arch::serial::write_str(crate::rollback::ENFORCING_MARKER);
+		crate::arch::serial::write_str(" - this build keeps the highest accepted security generation in firmware NVRAM and refuses a signed release below it\n");
 	}
 }

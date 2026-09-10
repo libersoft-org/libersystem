@@ -58,7 +58,6 @@ mod its;
 pub mod psci;
 pub mod serial;
 pub mod usercopy;
-mod virtio_blk;
 
 // halt the kernel forever (wait-for-event)
 pub fn halt_loop() -> ! {

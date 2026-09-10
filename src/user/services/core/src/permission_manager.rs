@@ -40,6 +40,11 @@
 
 #![no_std]
 #![no_main]
+// `core::mem::variant_count` is what lets the grant vocabulary be checked against the SCHEMA at
+// compile time - see the assertion beside `VOCABULARY`. Unstable, and pinned with the rest of the
+// toolchain: a stabilisation turns this line into a warning, which this crate denies, which is
+// the moment to delete it.
+#![feature(variant_count)]
 
 extern crate alloc;
 
@@ -111,23 +116,20 @@ const DENY_REPLY: &[u8] = b"DENY";
 // names every system service a component may be declared to reach; the manager holds a live
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
-// over nothing).
+// over nothing, and the launch is REFUSED rather than started without the authority it asked for).
 // EVERY CAPABILITY THE GRANT LOOP CAN SEND, and the order it sends them in.
 //
-// `Session` IS DELIBERATELY ABSENT, and it is a defect rather than a policy - recorded here because
-// the obvious fix makes things worse and the next reader should find that out from this comment
-// rather than from a red suite.
-//
-// `kill` holds `Capability::Session` and waits for the tag; the loop never walks past it, so `kill`
-// launches into a hang. Adding `Session` here was tried on 2026-08-16 and turned that hang into
-// something worse: the manager holds no session client to grant, so `grant_for_task` answers 0, the
-// grant fails, and the failure path below closes the bootstrap channel WITHOUT closing the prepared
-// task - leaving a process that will never be released and never exit. The suite measured it two
-// hundred tests later, as ProcessService reporting one live program where two had started.
-//
-// So the fix is two changes and not one: the manager has to HOLD a session client to grant, and the
-// grant loop's failure path has to close the task it prepared. Until both, this list stays as it is
-// and `kill`'s hang is the lesser fault.
+// IT IS EXHAUSTIVE AGAINST THE SCHEMA, AND THE BUILD SAYS SO. This array is what the grant loop
+// WALKS, so a capability the generated `Capability` enum declares and this array omits is one no
+// manifest row can deliver, however plainly the row grants it - and the failure is silent on both
+// sides: the manager sends nothing and reports success, and a program reading its grants
+// positionally takes the next capability under the missing one's tag. That happened twice
+// (`Session`, `DevicePolicy`), and both were written down as known before anything checked.
+// The anonymous constant below is the check: every schema variant is here exactly once, and a
+// variant added to `security.lsidl` without a deliberate place in this order fails to compile.
+// There is no second classification: every capability the schema declares is walked, because the
+// manager is the one owner of every grant, and a capability it has no client for is a typed failed
+// grant at launch rather than a quiet omission from this list.
 const VOCABULARY: [Capability; 23] = [
 	Capability::Storage,
 	Capability::Log,
@@ -171,6 +173,24 @@ const VOCABULARY: [Capability; 23] = [
 	Capability::AudioCapture,
 	Capability::AppAssets,
 ];
+
+// THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
+// long as the enum (so nothing declared is missing), and no ordinal appears twice (so the length
+// is not made up of a repeat). Together they say the array IS the enum, in some order - and the
+// order is the delivery order, which the receive sequences of the granted tools pin.
+// ANONYMOUS, because a named constant is evaluated only where it is used and this one has no user
+// but the compiler.
+const _: () = {
+	assert!(VOCABULARY.len() == core::mem::variant_count::<Capability>(), "a capability the schema declares is not in the grant vocabulary");
+	let mut seen: [bool; 64] = [false; 64];
+	let mut index = 0;
+	while index < VOCABULARY.len() {
+		let ordinal = VOCABULARY[index] as usize;
+		assert!(!seen[ordinal], "a capability is walked twice by the grant loop");
+		seen[ordinal] = true;
+		index += 1;
+	}
+};
 
 // A store row where the policy allows everything the component requests - the
 // common case for the curated first-party tools, whose requests were written
@@ -672,10 +692,7 @@ impl Service for Manager {
 			unsafe { close(stdout) };
 			return Err(Error::Invalid);
 		}
-		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, 0, &mut self.clients, &mut self.audit) } {
-			Some(started) => Ok(started),
-			None => Err(Error::NotFound),
-		}
+		unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, 0, &mut self.clients, &mut self.audit) }
 	}
 
 	// The same launch, and the caller's terminal with it. See the op's own comment in
@@ -695,10 +712,7 @@ impl Service for Manager {
 			}
 			return Err(Error::Invalid);
 		}
-		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, control, &mut self.clients, &mut self.audit) } {
-			Some(started) => Ok(started),
-			None => Err(Error::NotFound),
-		}
+		unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, control, &mut self.clients, &mut self.audit) }
 	}
 
 	// Start a program over ONE SELECTED FILE, with an attenuated grant in place of the volume
@@ -718,10 +732,7 @@ impl Service for Manager {
 			unsafe { close(stdout) };
 			return Err(Error::Denied);
 		}
-		match unsafe { run_tool_over_file(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &file, writable, stdout, &mut self.clients, &mut self.audit) } {
-			Some(started) => Ok(started),
-			None => Err(Error::NotFound),
-		}
+		unsafe { run_tool_over_file(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &file, writable, stdout, &mut self.clients, &mut self.audit) }
 	}
 
 	// Start a pipeline as one transaction. The broker allocates every edge itself: the caller
@@ -786,32 +797,14 @@ impl Service for Manager {
 				};
 				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input, stderr: error });
 			}
-			let started: Vec<StartResult> = match run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &environment, &mut self.clients, &mut self.audit) {
-				Some(started) => started,
-				None => {
-					// The transaction released nothing, so nothing ran. The endpoints are the
-					// only thing to clean up.
-					for (read, write) in edges {
-						close(read);
-						close(write);
-					}
-					close(stdout);
-					return Err(Error::NotFound);
-				}
-			};
-			// The broker's own copies of the edge endpoints are spent: each was transferred to
-			// the stage that owns it, and holding a duplicate here would keep a pipe open after
-			// its writer exits, so the reader would never see end-of-stream.
-			let count: u32 = started.len() as u32;
-			let tasks: Vec<u64> = started.iter().map(|s| s.task).collect();
-			let group: i64 = process_group_create(&tasks);
-			for task in tasks {
-				close(task);
-			}
-			if group < 0 {
-				return Err(Error::Invalid);
-			}
-			Ok(PipelineResult { group: group as u64, stages: count })
+			// EVERY ENDPOINT IS THE TRANSACTION'S FROM HERE. Each edge end, the terminal and the error
+			// duplicates are handed to the stage that owns them as it is installed, and the ones a
+			// failed transaction never installed are closed by the transaction itself - it is the only
+			// thing that knows which numbers were transferred and which are still this broker's.
+			// (This used to close every edge on failure, including the ones a stage had already been
+			// handed: a consumed handle number, closed again after the grants in between had minted
+			// new handles, is somebody else's handle.)
+			run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &environment, &mut self.clients, &mut self.audit)
 		}
 	}
 }
@@ -819,6 +812,238 @@ impl Service for Manager {
 // A pipeline may not ask for more stages than the shell grammar can express, so the two
 // bounds cannot disagree about what is a legal line.
 const MAX_PIPELINE_STAGES: usize = 8;
+
+// ONE LAUNCH TRANSACTION IS ONE CONNECTION TO PROCESSSERVICE.
+//
+// `procsvc` is the ProcessService client the supervisor minted for this manager, and it is a
+// client of a `serve_multi` service - so it can MINT: `service_connect` sends the reserved CONNECT
+// request and the service answers with a fresh, independent connection. Every launch transaction
+// runs on one of those, from its first prepare to its release, and the connection is closed on
+// every path out. `procsvc` itself goes on serving what is not a transaction: the CONNECT that
+// mints these, and the `list` that reaps.
+//
+// The connection IS the transaction, and that is what makes the rollback structural:
+//   - ProcessService keys prepared state by the channel it was prepared on, and abandons everything
+//     a departed client prepared. A failure this manager can NAME is cancelled through the service
+//     - synchronously, so the record and its Domain are gone when this returns - and the connection
+//     is closed behind it;
+//   - a reply that never comes, or comes back unreadable, is recovered by DROPPING the connection.
+//     Nothing more is asked on it: a generated client consumes exactly the next reply on its
+//     channel, so asking for status where a late reply may still land would take that reply as the
+//     status answer and leave the real one queued to poison the call after it. Dropped, the late
+//     reply lands on a dead endpoint, and the service's disconnect cleanup abandons what was
+//     prepared;
+//   - two transactions at once cannot read each other's replies, because they are two channels;
+//   - a pipeline is prepared, sealed and group-released on ONE connection, because `release-group`
+//     requires every koid to be the caller's, and two connections are two callers.
+//
+// NO DEADLINE IS SET ON THESE CALLS, deliberately. ProcessService is the loading mechanism - a
+// prepare reads the program off the volume, which on an emulated target takes as long as it takes -
+// and a deadline that fired on a slow-but-healthy load would turn a launch into a kill. Its death is
+// a closed peer, which is handled; a hang in the one service every launch goes through stalls the
+// caller either way. The `TimedOut` ending is still classified below, so a deadline can be added
+// without the recovery changing shape.
+struct Transaction {
+	chan: u64,
+	client: process::Client<ChannelTransport>,
+	// Every stage prepared on this connection, in order: its start result - whose `task` is the
+	// manager's job-control handle - and the manager's end of its bootstrap channel.
+	stages: Vec<Stage>,
+}
+
+struct Stage {
+	started: StartResult,
+	manager_side: u64,
+}
+
+// How a request on the transaction connection ended without the answer the caller wanted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+	// The request never reached the service, or the service answered a typed refusal: nothing
+	// changed on its side. What this transaction had already prepared is cancelled by name.
+	Refused,
+	// The reply is lost, malformed, or came from a peer that then went away: the service MAY have
+	// acted. Nothing more is asked on this connection - dropping it is the recovery.
+	Uncertain,
+}
+
+// What a single release came back as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Release {
+	Started,
+	// A PRE-START REFUSAL: the service holds no such prepared launch of this transaction's, or the
+	// request never left. Nothing ran and there is nothing to recover.
+	Refused,
+	// A POST-REMOVAL START FAILURE: the token is spent, the service has forgotten the record and
+	// its Domain, nothing runs. There is nothing left to cancel and nothing to kill.
+	StartFailed,
+	// The reply is missing: the program may be running.
+	Uncertain,
+}
+
+// What a group release came back as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupRelease {
+	Committed,
+	// A pre-commit refusal: no stage ran.
+	Refused,
+	// A partial commit: the service took every token, started some members and could not start
+	// the rest. The ones that started are running; the ones that did not are forgotten.
+	Partial,
+	// The reply is missing: any prefix of the group may be running.
+	Uncertain,
+}
+
+// How long a killed launch is given to confirm its termination before the fault is reported
+// anyway. Termination is the kernel's work and takes a tick or two; this is a bound against a
+// wedged process, not an expectation.
+const RECOVERY_TICKS: u64 = 500;
+
+impl Transaction {
+	// Mint the connection. A mint that fails is the cleanest refusal there is: nothing was
+	// prepared, nothing ran, and there is no record anywhere to cancel.
+	unsafe fn open(procsvc: u64) -> Option<Transaction> {
+		let chan: u64 = unsafe { service_connect(procsvc) }?;
+		Some(Transaction { chan, client: process::Client::new(ChannelTransport { chan }), stages: Vec::new() })
+	}
+
+	// Classify an answer that was not the one wanted. The generated client folds the four transport
+	// endings into two typed errors - `again` for a request that never left, `commit-uncertain` for a
+	// closed peer, a refused receive and a deadline - and answers `None` for a reply it could not
+	// decode, which is as uncertain as no reply at all: bytes arrived and said nothing this caller
+	// can act on. A typed service refusal is exactly that, a refusal.
+	fn fault<T>(answer: &Option<Result<T, Error>>) -> Fault {
+		match answer {
+			Some(Err(Error::CommitUncertain)) | None => Fault::Uncertain,
+			Some(Err(_)) | Some(Ok(_)) => Fault::Refused,
+		}
+	}
+
+	// Whether the last request never left this process: the one ending after which a handle the
+	// request was carrying is still ours to close.
+	fn send_refused(&self) -> bool {
+		matches!(self.client.last_error(), Some(proto::codec::TransportError::SendRefused | proto::codec::TransportError::NoRoute))
+	}
+
+	// Prepare one stage on this connection and hold its handles until the transaction ends.
+	// `child_side` is the bootstrap end the service hands the program; it is transferred by the
+	// request and belongs to the service from then on, except when the request never left.
+	unsafe fn prepare(&mut self, name: &str, child_side: u64, manager_side: u64, memory_limit: Option<u64>) -> Result<usize, Fault> {
+		let answer: Option<Result<StartResult, Error>> = match memory_limit {
+			Some(limit) => self.client.launch_prepared_bounded(name, &limit, &child_side),
+			None => self.client.launch_prepared(name, &child_side),
+		};
+		match answer {
+			Some(Ok(started)) => {
+				self.stages.push(Stage { started, manager_side });
+				Ok(self.stages.len() - 1)
+			}
+			other => {
+				let fault = Transaction::fault(&other);
+				unsafe {
+					if self.send_refused() {
+						close(child_side);
+					}
+					close(manager_side);
+				}
+				Err(fault)
+			}
+		}
+	}
+
+	fn task(&self, stage: usize) -> u64 {
+		self.stages[stage].started.task
+	}
+
+	// Release one stage. The transaction goes on holding its handles either way; what the outcome
+	// means for them is the caller's decision.
+	unsafe fn release(&mut self, stage: usize) -> Release {
+		let koid: u64 = self.stages[stage].started.info.koid;
+		match self.client.release(&koid) {
+			Some(Ok(true)) => Release::Started,
+			Some(Ok(false)) => Release::Refused,
+			Some(Err(Error::CommitUncertain)) | None => Release::Uncertain,
+			Some(Err(_)) if self.send_refused() => Release::Refused,
+			Some(Err(_)) => Release::StartFailed,
+		}
+	}
+
+	// Release every stage as one group.
+	unsafe fn release_group(&mut self) -> GroupRelease {
+		let koids: Vec<u64> = self.stages.iter().map(|stage| stage.started.info.koid).collect();
+		match self.client.release_group(&koids) {
+			Some(Ok(true)) => GroupRelease::Committed,
+			Some(Ok(false)) => GroupRelease::Refused,
+			Some(Err(Error::CommitUncertain)) | None => GroupRelease::Uncertain,
+			Some(Err(_)) if self.send_refused() => GroupRelease::Refused,
+			Some(Err(_)) => GroupRelease::Partial,
+		}
+	}
+
+	// Roll the transaction back: close every stage's handles and the connection.
+	//
+	// The connection closing is what guarantees the cleanup - the service abandons a departed
+	// client's prepared launches - and on a `Refused` fault each stage is also cancelled by name
+	// first, which is what makes the cleanup SYNCHRONOUS: by the time this returns the record and
+	// its Domain are gone rather than pending the service's next turn. On an `Uncertain` fault
+	// nothing is asked on the connection at all, because the next reply on it may be the late one.
+	unsafe fn abandon(self, fault: Fault) {
+		let Transaction { chan, mut client, stages } = self;
+		let mut cancelling: bool = fault == Fault::Refused;
+		unsafe {
+			for stage in stages {
+				close(stage.manager_side);
+				if cancelling {
+					let cancelled = client.cancel(&stage.started.info.koid);
+					// A cancel that came back uncertain means the connection cannot be trusted
+					// for the next one either; the close below finishes the job.
+					if Transaction::fault(&cancelled) == Fault::Uncertain {
+						cancelling = false;
+					}
+				}
+				close(stage.started.task);
+			}
+			close(chan);
+		}
+	}
+
+	// Commit: the caller takes the stages - their tasks are its job-control handles now - and the
+	// connection is closed. Every launch on it was released, so nothing is prepared on it any more
+	// and its closing abandons nothing.
+	unsafe fn commit(self) -> Vec<Stage> {
+		unsafe { close(self.chan) };
+		self.stages
+	}
+}
+
+// A LAUNCH THAT MAY BE RUNNING IS ENDED, and its ending is confirmed.
+//
+// This is the recovery for a release whose reply was lost: the manager still holds the task, so
+// it can `SIG_KILL` the program and wait for the kernel to say it is gone. Returns whether it did
+// within the bound; a program that could not be confirmed dead is reported as such rather than
+// assumed.
+unsafe fn recover_started(task: u64) -> bool {
+	unsafe {
+		signal(task, SIG_KILL);
+		wait(task, clock() + RECOVERY_TICKS) == 0
+	}
+}
+
+// The same for a pipeline, through the group handle that was minted over its prepared members
+// before any of them was released - which is why it exists before a release can go wrong.
+unsafe fn recover_group(group: u64) -> bool {
+	unsafe {
+		process_group_signal(group, SIG_KILL);
+		wait(group, clock() + RECOVERY_TICKS) == 0
+	}
+}
+
+// Ask ProcessService to reap what has ended, on the manager's ordinary client. A killed launch's
+// record - and the Domain a bounded one ran in - goes at the service's next reap, and this is that
+// reap rather than whenever the next launch happens to trigger one.
+unsafe fn reap_through(procsvc: u64) {
+	let _ = process::Client::new(ChannelTransport { chan: procsvc }).list();
+}
 
 // Launch a component under its permission manifest: ask ProcessService (the loading
 // mechanism) to start it with a fresh bootstrap channel, then for every capability in the
@@ -831,54 +1056,44 @@ const MAX_PIPELINE_STAGES: usize = 8;
 // capabilities are live), or None if the launch failed.
 unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>, buf: &mut [u8]) -> Option<Vec<u8>> {
 	unsafe {
-		let (manager_side, child_side): (u64, u64) = channel()?;
-		// Hand the child end to ProcessService, which loads the component and starts it with
-		// that end as its bootstrap; the manager keeps `manager_side` to grant over. The
-		// returned process handle is the manager's job-control handle on the component.
 		let name: String = String::from_utf8_lossy(component).into_owned();
-		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
+		let mut transaction: Transaction = Transaction::open(procsvc)?;
+		let Some((manager_side, child_side)) = channel() else {
+			transaction.abandon(Fault::Refused);
+			return None;
+		};
 		// PREPARED, not started: the component is built but does not run until every grant
 		// below has been installed. A launch that fails partway is then a process that never
 		// ran at all, rather than one that observed half its capabilities and started work on
 		// the strength of them.
-		let started: StartResult = match process_client.launch_prepared(&name, &child_side) {
-			Some(Ok(started)) => started,
-			_ => {
-				close(manager_side);
+		let stage: usize = match transaction.prepare(&name, child_side, manager_side, None) {
+			Ok(stage) => stage,
+			Err(fault) => {
+				transaction.abandon(fault);
 				return None;
 			}
 		};
-		let task: u64 = started.task;
-		let koid: u64 = started.info.koid;
-		let policy_name: String = match executable::logical_name(&started.info.name) {
-			Some(name) => String::from(name),
-			None => {
-				// Abandoned rather than released: dropping a prepared launch is how a failed
-				// transaction unwinds, and it leaves nothing that ever ran.
-				close(manager_side);
-				close(task);
-				return None;
-			}
+		let task: u64 = transaction.task(stage);
+		let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
+			transaction.abandon(Fault::Refused);
+			return None;
 		};
-		let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
-			Some(manifest) => manifest,
-			None => {
-				close(manager_side);
-				close(task);
-				return None;
-			}
+		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+			transaction.abandon(Fault::Refused);
+			return None;
 		};
 		// Grant exactly the manifest's capabilities, auditing every decision. A granted
 		// client is duplicated (the manager keeps its own) with only the rights a client
 		// needs, then transferred under its tag; a withheld capability is recorded denied
-		// and simply never handed over - so the component cannot reach it.
+		// and simply never handed over - so the component cannot reach it. A capability the
+		// manifest grants and the manager cannot produce is a FAILED LAUNCH, not a program
+		// started without the authority it asked for.
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
 			if granted {
 				let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
-				if handle == 0 || !send_blocking(manager_side, tag_for(cap), handle) {
-					close(manager_side);
-					close(task);
+				if handle == 0 || !hand_over(manager_side, tag_for(cap), handle) {
+					transaction.abandon(Fault::Refused);
 					return None;
 				}
 			}
@@ -889,11 +1104,21 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 		// the component there, and waiting on a process that was never started is a hang, not
 		// an error. It is also the transaction's commit point: everything above can fail and
 		// leave nothing running, and nothing below can.
-		if !matches!(process_client.release(&koid), Some(Ok(true))) {
-			close(manager_side);
-			close(task);
-			return None;
+		match transaction.release(stage) {
+			Release::Started => {}
+			Release::Refused | Release::StartFailed => {
+				transaction.abandon(Fault::Refused);
+				return None;
+			}
+			Release::Uncertain => {
+				recover_started(task);
+				transaction.abandon(Fault::Uncertain);
+				reap_through(procsvc);
+				return None;
+			}
 		}
+		let mut stages: Vec<Stage> = transaction.commit();
+		let Stage { started, manager_side } = stages.remove(stage);
 		// Handle any runtime permission requests, then capture the component's final report. A
 		// request is `REQUEST` + a capability ordinal for a capability outside the manifest;
 		// the headless policy default decides it (recorded as a dynamic audit entry), and the
@@ -914,7 +1139,7 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 			}
 		};
 		close(manager_side);
-		close(task);
+		close(started.task);
 		result
 	}
 }
@@ -927,7 +1152,7 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients
 	unsafe {
 		if dynamic_policy(component, cap) {
 			let handle: u64 = grant_handle(clients, cap, &String::from_utf8_lossy(component));
-			if handle != 0 && send_blocking(manager_side, tag_for(cap), handle) {
+			if handle != 0 && hand_over(manager_side, tag_for(cap), handle) {
 				return true;
 			}
 		}
@@ -944,45 +1169,76 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients
 // manifest's capabilities in vocabulary order (auditing each decision). Returns the live
 // process handle (for the caller's job control) and the per-capability decisions, or None if
 // the tool has no manifest, the argument is not a known program name, or the launch fails.
-unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, control: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+//
+// `stdout` and `control` belong to the child from the moment they are queued on its bootstrap
+// channel; a failure after that closes the channel, which drops them with it, and a failure
+// before it closes them here. Either way the caller does not close them - see `run_interactive`.
+unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, control: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<StartResult, Error> {
 	unsafe {
-		let name_str: &str = core::str::from_utf8(name).ok()?;
-		let (manager_side, child_side): (u64, u64) = channel()?;
-		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
+		// The endpoints are ours until they are queued. Every refusal before that point closes
+		// them; every refusal after it closes the channel they were queued on.
+		let close_endpoints = |stdout: u64, control: u64| {
+			close(stdout);
+			if control != 0 {
+				close(control);
+			}
+		};
+		let Ok(name_str) = core::str::from_utf8(name) else {
+			close_endpoints(stdout, control);
+			return Err(Error::NotFound);
+		};
+		let Some(mut transaction) = Transaction::open(procsvc) else {
+			close_endpoints(stdout, control);
+			return Err(Error::NotFound);
+		};
+		let Some((manager_side, child_side)) = channel() else {
+			close_endpoints(stdout, control);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		};
 		// Prepared, never started here: every tool goes through the same gate a pipeline stage
 		// does, so the single-stage and multi-stage paths cannot drift in how a process is
 		// built. The release is at the bottom, once the whole graph this tool can see exists.
-		let started: StartResult = match if name == b"imgconv" { process_client.launch_bounded(name_str, &IMGCONV_MEMORY_LIMIT, &child_side) } else { process_client.launch_prepared(name_str, &child_side) } {
-			Some(Ok(s)) => s,
-			_ => {
+		//
+		// THE BOUNDED TOOL IS PREPARED TOO. `imgconv` runs in a Domain of its own with a memory
+		// limit; it used to be the one tool that was STARTED first and granted afterwards, because
+		// the only bounded launch was a live one - so a grant that failed could not be restored to
+		// "the tool never ran". `launch-prepared-bounded` is the same limit behind the same gate.
+		let memory_limit: Option<u64> = if name == b"imgconv" { Some(IMGCONV_MEMORY_LIMIT) } else { None };
+		let stage: usize = match transaction.prepare(name_str, child_side, manager_side, memory_limit) {
+			Ok(stage) => stage,
+			Err(fault) => {
 				debug_write(name);
 				debug_write(b"\n");
-				close(manager_side);
-				return None;
+				close_endpoints(stdout, control);
+				transaction.abandon(fault);
+				return Err(Error::NotFound);
 			}
 		};
-		let prepared: bool = name != b"imgconv";
-		let policy_name: String = match executable::logical_name(&started.info.name) {
-			Some(name) => String::from(name),
-			None => {
-				close(manager_side);
-				close(started.task);
-				return None;
-			}
+		let task: u64 = transaction.task(stage);
+		let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
+			close_endpoints(stdout, control);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		};
-		let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
-			Some(manifest) => manifest,
-			None => {
-				close(manager_side);
-				close(started.task);
-				return None;
-			}
+		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+			close_endpoints(stdout, control);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		};
 		// Forward the stdout console first (the tool's `inherit_stdout` reads the first
 		// message), then the argument string, then the manifest grants.
 		// The launch endpoints, named and ended by READY. A governed tool gets the caller's
 		// console, which is full duplex, so it reads and writes the same channel.
-		send_blocking(manager_side, CAP_STDOUT, stdout);
+		// CHECKED, AND CLOSED ON FAILURE: a prepared launch whose bootstrap end is gone cannot take the
+		// console, and a manager that went on would keep the caller's stdout for ever.
+		if !hand_over(manager_side, CAP_STDOUT, stdout) {
+			if control != 0 {
+				close(control);
+			}
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
 		// AND THE TERMINAL, when this launch is a foreground job on one. `run` passes zero and nothing
 		// is sent; `run-interactive` passes the caller's control channel and the child finds it under
 		// `CONTROL`, which is what makes `tty_set_mode` answer true instead of false - and a
@@ -992,14 +1248,14 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// A NAMED CAPABILITY, so its absence is not a hole in a sequence: the child takes each one by
 		// name out of the set this ends with READY, and reads zero for a name that never arrived. That
 		// is how a pipeline stage and a background job go on getting no terminal at all.
-		if control != 0 {
-			send_blocking(manager_side, CAP_CONTROL, control);
+		if control != 0 && !hand_over(manager_side, CAP_CONTROL, control) {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		}
 		send_ready(manager_side);
 		if !send_launch_context(manager_side, args, cwd, environment) {
-			close(manager_side);
-			close(started.task);
-			return None;
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		}
 		// THE PLACEHOLDER IS NOT OPTIONAL. A program that reads `SELECTED_FILE` has to find the tag
 		// in a fixed position whether or not it was opened over a file: `recv_tagged` BLOCKS, and a
@@ -1010,9 +1266,8 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// Sent only to the programs that READ it, because sending it to the other fifty would shift
 		// their sequences by one - the same trap from the other side.
 		if reads_selected_file(&policy_name) && !send_blocking(manager_side, CAP_SELECTED_FILE, 0) {
-			close(manager_side);
-			close(started.task);
-			return None;
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		}
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
@@ -1024,12 +1279,12 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 				let ok: bool = if cap == Capability::Volumes {
 					grant_volumes(manager_side, clients)
 				} else {
-					let handle: u64 = grant_for_task(clients, cap, started.task, &policy_name);
-					handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
+					let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+					handle != 0 && hand_over(manager_side, tag_for(cap), handle)
 				};
 				if !ok {
-					close(manager_side);
-					return None;
+					transaction.abandon(Fault::Refused);
+					return Err(Error::NotFound);
 				}
 			}
 			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
@@ -1037,12 +1292,27 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// Commit: the tool's stdout, arguments, grants and cwd are all queued, so what it will
 		// observe is complete. Anything that failed above returned without releasing, which
 		// leaves a process that never ran rather than one that started on half a grant set.
-		if prepared && !matches!(process_client.release(&started.info.koid), Some(Ok(true))) {
-			close(manager_side);
-			return None;
+		// AND THE THREE ENDINGS OF A RELEASE ARE THREE ANSWERS. A refusal and a start failure both
+		// leave nothing running and are reported as a launch that did not happen; a lost reply is
+		// recovered - the program is killed and its ending confirmed - and reported as what it is,
+		// a commit whose outcome could not be known, never as a refusal.
+		match transaction.release(stage) {
+			Release::Started => {}
+			Release::Refused | Release::StartFailed => {
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
+			}
+			Release::Uncertain => {
+				recover_started(task);
+				transaction.abandon(Fault::Uncertain);
+				reap_through(procsvc);
+				return Err(Error::CommitUncertain);
+			}
 		}
+		let mut stages: Vec<Stage> = transaction.commit();
+		let Stage { started, manager_side } = stages.remove(stage);
 		close(manager_side);
-		Some(started)
+		Ok(started)
 	}
 }
 
@@ -1059,7 +1329,8 @@ struct StageRequest<'a> {
 }
 
 // Build a whole pipeline as one transaction: prepare every stage, install every stage's
-// stdio and grants, and only then release them together.
+// stdio and grants, SEAL the group over the prepared members, and only then release them
+// together.
 //
 // The ordering is the point. Every stage is created behind the start gate, so a failure at
 // ANY stage - an unknown tool, a missing manifest, an endpoint that cannot be transferred -
@@ -1072,77 +1343,84 @@ struct StageRequest<'a> {
 // never sent from the next handoff in its bootstrap sequence. That is what the handle-migration
 // multi-capability work exists for, and it is why this needs no "does this stage have
 // stdin?" agreement between the two sides.
-unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<Vec<StartResult>> {
+//
+// THE GROUP IS CREATED BEFORE THE RELEASE, over the prepared members' task handles. It used to
+// be minted afterwards, from stages that were already running - so a group-creation failure
+// arrived when nothing could be undone, and a group handle that failed to exist left the running
+// pipeline with no owner able to signal, wait for or reap it. `sys_process_group_create` asks
+// nothing of a member that a prepared process cannot satisfy - a Process handle with MANAGE,
+// sealed at creation - so the seal is pre-commit, always: a creation failure is an ordinary
+// refusal that cancels every prepared member and starts none, and a release that goes wrong has
+// the group handle as its cleanup owner from the first moment anything could be running.
+//
+// What comes back is the shell's job: the group and the stage count. The refusals are
+// `not-found`, and a commit that went wrong and was recovered - some stage may have run - is
+// `commit-uncertain`, never relabelled as a refusal.
+unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<PipelineResult, Error> {
 	unsafe {
-		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
-		let mut prepared: Vec<(StartResult, u64)> = Vec::new();
-		// Unwind that runs on every early return: abandoning a prepared launch is how this
-		// transaction rolls back, because a stage that was never released never ran.
-		//
-		// AND THE SERVICE HAS TO BE TOLD (IDL-001). Closing `started.task` drops the BROKER's
-		// handle and says nothing to ProcessService, which is still holding the prepared launch -
-		// the loaded process, its stopped first thread, its Domain and its bootstrap channel - with
-		// no way left to reach it. Every early return here leaked one of those, and a shell that
-		// mistypes a pipeline takes that path. `cancel` is the operation that was missing.
-		macro_rules! abandon {
-			($built:expr) => {{
-				for (started, manager_side) in $built {
-					close(manager_side);
-					let _ = process_client.cancel(&started.info.koid);
-					close(started.task);
+		// The stdio endpoints a stage has not been handed yet are still this broker's, and a
+		// transaction that fails closes exactly those: everything from the first stage whose
+		// installation did not complete onward. (An endpoint whose send succeeded inside a
+		// partially installed stage is a spent number; closing it again here, with nothing
+		// allocated in between, is refused by the kernel rather than aimed at somebody else.)
+		let close_from = |first: usize| {
+			for stage in &stages[first..] {
+				close(stage.stdout);
+				if stage.stdin != 0 {
+					close(stage.stdin);
 				}
-				return None;
-			}};
-		}
-		for stage in stages {
-			let name_str: &str = match core::str::from_utf8(stage.name) {
-				Ok(s) => s,
-				Err(_) => abandon!(prepared),
-			};
-			let (manager_side, child_side): (u64, u64) = match channel() {
-				Some(pair) => pair,
-				None => abandon!(prepared),
-			};
-			let started: StartResult = match process_client.launch_prepared(name_str, &child_side) {
-				Some(Ok(s)) => s,
-				_ => {
-					close(manager_side);
-					abandon!(prepared);
+				if stage.stderr != 0 {
+					close(stage.stderr);
 				}
+			}
+		};
+		let Some(mut transaction) = Transaction::open(procsvc) else {
+			close_from(0);
+			return Err(Error::NotFound);
+		};
+		for (index, stage) in stages.iter().enumerate() {
+			let Ok(name_str) = core::str::from_utf8(stage.name) else {
+				close_from(index);
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
 			};
-			let policy_name: String = match executable::logical_name(&started.info.name) {
-				Some(name) => String::from(name),
-				None => {
-					close(manager_side);
-					let _ = process_client.cancel(&started.info.koid);
-					close(started.task);
-					abandon!(prepared);
+			let Some((manager_side, child_side)) = channel() else {
+				close_from(index);
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
+			};
+			let prepared: usize = match transaction.prepare(name_str, child_side, manager_side, None) {
+				Ok(prepared) => prepared,
+				Err(fault) => {
+					close_from(index);
+					transaction.abandon(fault);
+					return Err(Error::NotFound);
 				}
 			};
-			let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
-				Some(manifest) => manifest,
-				None => {
-					close(manager_side);
-					let _ = process_client.cancel(&started.info.koid);
-					close(started.task);
-					abandon!(prepared);
-				}
+			let task: u64 = transaction.task(prepared);
+			let Some(policy_name) = executable::logical_name(&transaction.stages[prepared].started.info.name).map(String::from) else {
+				close_from(index);
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
+			};
+			let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+				close_from(index);
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
 			};
 			// stdout, then stdin when there is one, as ordered capabilities in one message.
 			// A stage writes into one edge and reads from another, so the two endpoints are
 			// named separately rather than told apart by how many arrived.
 			let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && (stage.stderr == 0 || send_blocking(manager_side, CAP_STDERR, stage.stderr)) && send_ready(manager_side);
 			if !installed {
-				close(manager_side);
-				let _ = process_client.cancel(&started.info.koid);
-				close(started.task);
-				abandon!(prepared);
+				close_from(index);
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
 			}
 			if !send_launch_context(manager_side, stage.args, cwd, environment) {
-				close(manager_side);
-				let _ = process_client.cancel(&started.info.koid);
-				close(started.task);
-				abandon!(prepared);
+				close_from(index + 1);
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
 			}
 			for &cap in VOCABULARY.iter() {
 				let granted: bool = manifest.grants.contains(&cap);
@@ -1150,50 +1428,77 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 					let ok: bool = if cap == Capability::Volumes {
 						grant_volumes(manager_side, clients)
 					} else {
-						let handle: u64 = grant_for_task(clients, cap, started.task, &policy_name);
-						handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
+						let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+						handle != 0 && hand_over(manager_side, tag_for(cap), handle)
 					};
 					if !ok {
-						close(manager_side);
-						let _ = process_client.cancel(&started.info.koid);
-						close(started.task);
-						abandon!(prepared);
+						close_from(index + 1);
+						transaction.abandon(Fault::Refused);
+						return Err(Error::NotFound);
 					}
 				}
 				audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 			}
-			prepared.push((started, manager_side));
 		}
+		// SEAL, over the prepared members. Each task carries MANAGE - it is the same handle the
+		// caller signals with - and membership is fixed at creation, so the group is the one
+		// object that can end the whole pipeline whatever the release below does.
+		let tasks: Vec<u64> = transaction.stages.iter().map(|stage| stage.started.task).collect();
+		let group: i64 = process_group_create(&tasks);
+		if group < 0 {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
+		let group: u64 = group as u64;
 		// COMMIT, IN ONE TRANSITION (IDL-002).
 		//
-		// This released the stages one koid at a time, and the comment where the loop handled a
-		// refusal said what that cost: "past the first release the transaction can no longer be
-		// unwound cleanly: stages already running are told to stop rather than left orphaned". A
-		// stage that has run may already have written, sent or printed, so a `SIG_KILL` afterwards
-		// is not the same as it never having started - which made "a failure at any stage starts
-		// none of them" false exactly in the case the promise exists for.
-		//
-		// `release-group` is the primitive that was missing: ProcessService checks every token
-		// first - every koid prepared, and every one of them this client's - and only then queues
-		// them. A refusal therefore comes back with nothing started, and this can return having run
-		// nothing at all rather than having half-run a pipeline.
-		let koids: Vec<u64> = prepared.iter().map(|(result, _)| result.info.koid).collect();
-		let committed = matches!(process_client.release_group(&koids), Some(Ok(true)));
-		let mut started: Vec<StartResult> = Vec::new();
-		for (result, manager_side) in prepared {
-			close(manager_side);
-			if committed {
-				started.push(result);
-			} else {
+		// `release-group` is the primitive that makes "a failure at any stage starts none of them"
+		// true: ProcessService checks every token first - every koid prepared, and every one of
+		// them this connection's - and only then queues them. A refusal therefore comes back with
+		// nothing started, and this can return having run nothing at all rather than having
+		// half-run a pipeline.
+		let count: u32 = transaction.stages.len() as u32;
+		match transaction.release_group() {
+			GroupRelease::Committed => {
+				// The broker's own copies of the edge endpoints are spent: each was transferred to
+				// the stage that owns it, and holding a duplicate here would keep a pipe open after
+				// its writer exits, so the reader would never see end-of-stream. The tasks go too:
+				// the group is the job-control handle now.
+				for stage in transaction.commit() {
+					close(stage.manager_side);
+					close(stage.started.task);
+				}
+				Ok(PipelineResult { group, stages: count })
+			}
+			GroupRelease::Refused => {
 				// Nothing ran, so there is nothing to signal - only the handles this transaction
 				// opened, which go back the way a refused preparation's do.
-				close(result.task);
+				close(group);
+				transaction.abandon(Fault::Refused);
+				Err(Error::NotFound)
+			}
+			GroupRelease::Partial => {
+				// The service took every token: some members are running and the rest are
+				// forgotten. What is running is ended through the group, and the fault is
+				// reported as what it is rather than as a refusal - a stage may have written,
+				// sent or printed before the kill reached it.
+				recover_group(group);
+				close(group);
+				transaction.abandon(Fault::Refused);
+				reap_through(procsvc);
+				Err(Error::CommitUncertain)
+			}
+			GroupRelease::Uncertain => {
+				// The reply is lost, so any prefix may be running: the group ends it, dropping
+				// the connection abandons whatever was still prepared, and nothing more is asked
+				// on the connection the late reply may still land on.
+				recover_group(group);
+				close(group);
+				transaction.abandon(Fault::Uncertain);
+				reap_through(procsvc);
+				Err(Error::CommitUncertain)
 			}
 		}
-		if !committed {
-			return None;
-		}
-		Some(started)
 	}
 }
 
@@ -1274,47 +1579,52 @@ unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8], enviro
 // A FAILURE TO MINT THE GRANT ENDS THE LAUNCH. Starting the program without it would give it a
 // process, a terminal and no file, which is a window with nothing in it and no way to say why.
 #[allow(clippy::too_many_arguments)]
-unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: &str, writable: bool, stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: &str, writable: bool, stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Result<StartResult, Error> {
 	unsafe {
 		if clients.storage_admin == 0 {
 			close(stdout);
-			return None;
+			return Err(Error::NotFound);
 		}
-		let name_str: &str = core::str::from_utf8(name).ok()?;
-		let (manager_side, child_side): (u64, u64) = channel()?;
-		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
-		let started: StartResult = match process_client.launch_prepared(name_str, &child_side) {
-			Some(Ok(s)) => s,
-			_ => {
-				close(manager_side);
+		let Ok(name_str) = core::str::from_utf8(name) else {
+			close(stdout);
+			return Err(Error::NotFound);
+		};
+		let Some(mut transaction) = Transaction::open(procsvc) else {
+			close(stdout);
+			return Err(Error::NotFound);
+		};
+		let Some((manager_side, child_side)) = channel() else {
+			close(stdout);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		};
+		let stage: usize = match transaction.prepare(name_str, child_side, manager_side, None) {
+			Ok(stage) => stage,
+			Err(fault) => {
 				close(stdout);
-				return None;
+				transaction.abandon(fault);
+				return Err(Error::NotFound);
 			}
 		};
-		let policy_name: String = match executable::logical_name(&started.info.name) {
-			Some(name) => String::from(name),
-			None => {
-				close(manager_side);
-				close(started.task);
-				close(stdout);
-				return None;
-			}
+		let task: u64 = transaction.task(stage);
+		let Some(policy_name) = executable::logical_name(&transaction.stages[stage].started.info.name).map(String::from) else {
+			close(stdout);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		};
-		let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
-			Some(manifest) => manifest,
-			None => {
-				close(manager_side);
-				close(started.task);
-				close(stdout);
-				return None;
-			}
+		let Some(manifest) = manifest_for(policy_name.as_bytes()) else {
+			close(stdout);
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		};
-		send_blocking(manager_side, CAP_STDOUT, stdout);
+		if !hand_over(manager_side, CAP_STDOUT, stdout) {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
+		}
 		send_ready(manager_side);
 		if !send_launch_context(manager_side, args, cwd, &[]) {
-			close(manager_side);
-			close(started.task);
-			return None;
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		}
 		// THE ATTENUATED GRANT, minted from the private admin endpoint the manager holds and grants
 		// to nobody - the thing that hands out a narrowed authority must not itself be one of the
@@ -1322,30 +1632,26 @@ unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8],
 		let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_file(file, &writable) {
 			Some(Ok(client)) => client,
 			_ => {
-				close(manager_side);
-				close(started.task);
-				return None;
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
 			}
 		};
 		let granted: i64 = duplicate(minted, GRANT_RIGHTS);
 		close(minted);
-		if granted < 0 || !send_blocking(manager_side, CAP_SELECTED_FILE, granted as u64) {
-			close(manager_side);
-			close(started.task);
-			return None;
+		if granted < 0 || !hand_over(manager_side, CAP_SELECTED_FILE, granted as u64) {
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		}
 		// The record travels AFTER the capability and says what the capability cannot: which URI to
 		// open through it, what to show a person, and whether a write-back will be accepted.
 		let selected = SelectedFile { uri: String::from(file), name: String::from(last_path_component(file)), writable };
 		let Some(bytes) = selected.encode_vec() else {
-			close(manager_side);
-			close(started.task);
-			return None;
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		};
 		if !send_blocking(manager_side, &bytes, 0) {
-			close(manager_side);
-			close(started.task);
-			return None;
+			transaction.abandon(Fault::Refused);
+			return Err(Error::NotFound);
 		}
 		// EVERY OTHER GRANT IS UNCHANGED, except `volumes` - which is exactly what the selected
 		// file replaced. The audit records the substitution rather than hiding it.
@@ -1356,20 +1662,31 @@ unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8],
 			}
 			let want: bool = manifest.grants.contains(&cap);
 			if want {
-				let handle: u64 = grant_for_task(clients, cap, started.task, &policy_name);
-				if handle == 0 || !send_blocking(manager_side, tag_for(cap), handle) {
-					close(manager_side);
-					return None;
+				let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
+				if handle == 0 || !hand_over(manager_side, tag_for(cap), handle) {
+					transaction.abandon(Fault::Refused);
+					return Err(Error::NotFound);
 				}
 			}
 			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: want, dynamic: false });
 		}
-		if !matches!(process_client.release(&started.info.koid), Some(Ok(true))) {
-			close(manager_side);
-			return None;
+		match transaction.release(stage) {
+			Release::Started => {}
+			Release::Refused | Release::StartFailed => {
+				transaction.abandon(Fault::Refused);
+				return Err(Error::NotFound);
+			}
+			Release::Uncertain => {
+				recover_started(task);
+				transaction.abandon(Fault::Uncertain);
+				reap_through(procsvc);
+				return Err(Error::CommitUncertain);
+			}
 		}
+		let mut stages: Vec<Stage> = transaction.commit();
+		let Stage { started, manager_side } = stages.remove(stage);
 		close(manager_side);
-		Some(started)
+		Ok(started)
 	}
 }
 
@@ -1400,6 +1717,24 @@ fn last_path_component(uri: &str) -> &str {
 // receiver's order stays aligned", and by then it sent seven. That is the failure this shape
 // removes rather than a comment that needed updating: keeping a count in prose, in one file, that
 // twelve others depend on positionally. Returns false only if a transfer itself fails.
+// HAND ONE CAPABILITY TO A PREPARED LAUNCH, OR CLOSE IT. `send_blocking` leaves the handle in this
+// process's table when the send fails - the prepared launch's bootstrap end is gone, or the queue
+// cannot take it - so a hand-over that only reads the result LEAKS the handle on exactly the path
+// that then abandons the launch. The fault cohort counted it: one handle more in the manager's
+// Domain after a bounded launch whose grant could not be delivered. A zero handle is a placeholder
+// tag with nothing to close. On failure the caller owns nothing it did not send.
+unsafe fn hand_over(manager_side: u64, tag: &[u8], handle: u64) -> bool {
+	unsafe {
+		if send_blocking(manager_side, tag, handle) {
+			return true;
+		}
+		if handle != 0 {
+			close(handle);
+		}
+		false
+	}
+}
+
 unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 	unsafe {
 		let volumes: [(&[u8], u64); 7] = [
@@ -1439,7 +1774,7 @@ unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 					_ => 0,
 				}
 			};
-			if !send_blocking(manager_side, tag, minted) {
+			if !hand_over(manager_side, tag, minted) {
 				return false;
 			}
 		}
@@ -1460,8 +1795,8 @@ unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut
 			None => return Vec::new(),
 		};
 		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", &[], console, 0, clients, audit) {
-			Some(s) => s,
-			None => {
+			Ok(s) => s,
+			Err(_) => {
 				close(output);
 				return Vec::new();
 			}

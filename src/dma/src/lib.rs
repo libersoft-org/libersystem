@@ -317,6 +317,12 @@ pub enum Policy {
 	// The minimal boot-critical set, which may run untranslated - LOUDLY. Binding one of these
 	// without an IOMMU puts the system into a degraded-isolation state that names the driver.
 	TrustedUntranslated,
+	// A driver that performs no DMA at all, and is HELD to that: it receives its registers and its
+	// interrupts, bus mastering stays off, and no DMA buffer can be minted under its claim. Not a
+	// statement that the driver happens not to ask - an enforceable claim mode, in either machine
+	// state, because a device that cannot master the bus cannot reach memory whether or not
+	// anything translates.
+	None,
 }
 
 // What a bind attempt is allowed to do, given the policy and whether enforcement is actually there.
@@ -329,9 +335,12 @@ pub enum BindDecision {
 	DegradedUntranslated,
 	// Refused. An `iommu-required` driver without enforcement does not start.
 	Refused,
+	// Admitted WITHOUT the bus: the device may be programmed and may interrupt, and it never masters
+	// the bus. The Goal's claim covers this driver trivially - it has no DMA to isolate.
+	NonMastering,
 }
 
-// The decision, in one place, so no call site can invent a fourth answer.
+// The decision, in one place, so no call site can invent a fifth answer.
 pub fn decide_bind(policy: Policy, enforcing: bool) -> BindDecision {
 	match (policy, enforcing) {
 		(Policy::IommuRequired, true) => BindDecision::Translated,
@@ -340,6 +349,8 @@ pub fn decide_bind(policy: Policy, enforcing: bool) -> BindDecision {
 		// to run WITHOUT it, not a preference for running without it.
 		(Policy::TrustedUntranslated, true) => BindDecision::Translated,
 		(Policy::TrustedUntranslated, false) => BindDecision::DegradedUntranslated,
+		// Enforcement changes nothing for a driver that never reaches memory on its own.
+		(Policy::None, _) => BindDecision::NonMastering,
 	}
 }
 

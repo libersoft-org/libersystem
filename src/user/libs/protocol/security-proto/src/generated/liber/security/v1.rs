@@ -505,8 +505,10 @@ pub mod permission {
 		/// tree says which KIND of launch is being asked for - `run-pipeline` and `run-with-file` are
 		/// the same shape - and a caller with no terminal keeps calling `run`, unchanged. And the
 		/// generator emits the `@rights` guard only for a bare `handle<...>` parameter: expressed as
-		/// `option<handle<channel>>` the check on this capability would be silently skipped, which is
-		/// the one thing a capability boundary must not do quietly.
+		/// `option<handle<channel>>` the check on this capability could not be generated - and the
+		/// validator now REFUSES the annotation on that shape rather than letting the schema read as
+		/// guarded while the generated method was not, which is the one thing a capability boundary
+		/// must not do quietly.
 		///
 		/// NOT FOR A PIPELINE STAGE OR A BACKGROUND JOB. The terminal belongs to whoever is in the
 		/// foreground, which is the caller's own bookkeeping - the shell sets it with SET_FG - and a
@@ -593,8 +595,15 @@ pub mod permission {
 					r.take_handle()?
 				};
 				r.finish()?;
-				request_handles.clear();
 				let authorized = crate::codec::handle_carries(stdout, 16, 5);
+				if !authorized {
+					for &taken in request_handles.as_slice() {
+						if taken != 0 {
+							crate::codec::release_handle(taken);
+						}
+					}
+				}
+				request_handles.clear();
 				let result = if authorized { service.run(name, args, cwd, environment, stdout) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -654,8 +663,15 @@ pub mod permission {
 					r.take_handle()?
 				};
 				r.finish()?;
-				request_handles.clear();
 				let authorized = crate::codec::handle_carries(stdout, 16, 5);
+				if !authorized {
+					for &taken in request_handles.as_slice() {
+						if taken != 0 {
+							crate::codec::release_handle(taken);
+						}
+					}
+				}
+				request_handles.clear();
 				let result = if authorized { service.run_pipeline(stages, cwd, environment, stdout) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -700,8 +716,15 @@ pub mod permission {
 					r.take_handle()?
 				};
 				r.finish()?;
-				request_handles.clear();
 				let authorized = crate::codec::handle_carries(stdout, 16, 5);
+				if !authorized {
+					for &taken in request_handles.as_slice() {
+						if taken != 0 {
+							crate::codec::release_handle(taken);
+						}
+					}
+				}
+				request_handles.clear();
 				let result = if authorized { service.run_with_file(name, args, cwd, file, writable, stdout) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -757,8 +780,15 @@ pub mod permission {
 					r.take_handle()?
 				};
 				r.finish()?;
-				request_handles.clear();
 				let authorized = crate::codec::handle_carries(stdout, 16, 5) && crate::codec::handle_carries(control, 48, 5);
+				if !authorized {
+					for &taken in request_handles.as_slice() {
+						if taken != 0 {
+							crate::codec::release_handle(taken);
+						}
+					}
+				}
+				request_handles.clear();
 				let result = if authorized { service.run_interactive(name, args, cwd, environment, stdout, control) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;

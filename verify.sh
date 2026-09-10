@@ -14,6 +14,7 @@
 
 SCRIPT_NAME=verify.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+source "$SRC_DIR/tools/evidence.sh"
 
 PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
 # The candidate overlay to plan against, if one was named. Empty for an ordinary run.
@@ -55,7 +56,10 @@ Commit exactly the tested content, then complete verification with --merge FILE.
   --for PATH       plan for these paths instead of asking git
   --for-range A..B plan for the paths a commit range touched
   --merge FILE     complete an inner handoff at HEAD; no budget, two guest slots by default
-  --release        the release gate: build all, check all, boot all three, no optimisation applied
+  --release        the release run: one sealed snapshot, every release-required key, one dossier
+    --out-root DIR   where the run's evidence is published (default .build/runs, outside the snapshot)
+    --required FILE  a narrowed required set - a REHEARSAL, and the dossier says so
+    --in-place       run over this tree as it stands, unsealed - a REHEARSAL, and the dossier says so
   --sweep          the whole suite on every target at one immutable revision, in a git worktree
   --shadow         run the FULL suite and compare it against what this change would have scoped
   --shadow-exec    the same, but RUN the selection first and compare the two runs (one target)
@@ -118,6 +122,13 @@ range=""
 action=run
 planner_flags=()
 
+release_out_root=""
+release_required_file=""
+release_in_place=0
+release_snapshot=""
+release_run_dir=""
+release_rehearsal=""
+release_main_root="$REPO_ROOT"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-h | --help) help ;;
@@ -145,6 +156,20 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--release)
 		mode=release
+		shift
+		;;
+	--out-root)
+		[[ $# -ge 2 ]] || die "--out-root needs a directory"
+		release_out_root="$2"
+		shift 2
+		;;
+	--required)
+		[[ $# -ge 2 ]] || die "--required needs a file of keys"
+		release_required_file="$2"
+		shift 2
+		;;
+	--in-place)
+		release_in_place=1
 		shift
 		;;
 	--sweep)
@@ -288,19 +313,97 @@ if ((BUDGET_SET == 1)); then
 	[[ "$action" == shadow ]] && die "--budget cannot be combined with --shadow: a shadow compares a scoped run against the FULL suite, and a bounded full suite is not one"
 fi
 
-if [[ "$mode" == release ]]; then
-	# Deliberately outside everything else in this file. TRUSTED evidence, the cost estimator, the
-	# age bound and the selector are all mechanisms for spending less on an ORDINARY change, and
-	# every one of them is ignored here. Releases are rare and the insurance is nearly free; a wrong
-	# selector decision shipped in an image is not.
-	note "release gate: every optimisation in this script is ignored"
-	note "revision: $(git rev-parse HEAD 2>/dev/null || echo 'not a git repository')"
-	if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
-		die "the working tree is dirty; a release is cut from a revision, not from a desk"
+# THE RELEASE RUN: one immutable snapshot, one identity, every release-required key, one durable
+# dossier.
+#
+# TRUSTED evidence, the cost estimator, the age bound and the selector are all mechanisms for
+# spending less on an ORDINARY change, and every one of them is ignored here: the plan is the
+# release plan - every release-required key at this revision, from the catalog - and the executor
+# below runs it exactly as it runs any other plan. What the release adds is around the steps:
+#
+#   the SNAPSHOT     a detached worktree of HEAD, sealed read-only except `.build`, so a producer
+#                    cannot consume an edit nobody sees (`--in-place` skips both and is a rehearsal)
+#   the RUN          `verify-model run-start` in a durable root OUTSIDE the snapshot: the run id and
+#                    the identity block - source, tools, firmware, configurations, permitted
+#                    environment - collected before anything runs, and an undeclared override
+#                    refuses the run before it starts
+#   the EVIDENCE     `LIBER_VERIFY_RUN` tells every producer to publish: the gate runner, the guest
+#                    runner, the image builder and the lifecycle gate publish their own envelopes and
+#                    keep their logs; `record_one_step` publishes for a required key whose producer
+#                    did not, from the step's captured output
+#   the DOSSIER      collected at the end whatever happened: every required key with its outcome,
+#                    inputs, outputs and logs by digest, refusals for anything missing, foreign,
+#                    stale, altered or duplicated, and the tree compared against the identity it
+#                    started with; the run directory is then made read-only
+release_cleanup() {
+	if [[ -n "$release_snapshot" && "$release_snapshot" != "$release_main_root" ]]; then
+		(cd "$release_main_root" && src/tools/release-snapshot.sh remove "$release_snapshot")
 	fi
-	run_full
-	note "release gate passed"
+}
+release_prepare() {
+	local revision out_root="${release_out_root:-$release_main_root/.build/runs}"
+	[[ "$out_root" == /* ]] || out_root="$PWD/$out_root"
+	if ((release_in_place == 1)); then
+		release_snapshot="$release_main_root"
+		release_rehearsal="in place: the tree was neither snapshotted nor sealed"
+		note "release REHEARSAL, in place: the tree is used as it stands, writable; the dossier will say so"
+	else
+		[[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "the working tree is dirty; a release is cut from a revision, not from a desk (--in-place rehearses the release path over this tree and never produces a release)"
+		revision="$(git rev-parse HEAD)"
+		release_snapshot="$BUILD_DIR/release/$revision"
+		[[ "$out_root" != "$release_snapshot"* ]] || die "--out-root must be OUTSIDE the snapshot, which is removed when the run ends"
+		note "release snapshot: $revision at $release_snapshot"
+		src/tools/release-snapshot.sh create "$release_snapshot" "$revision" >/dev/null || die "could not create the snapshot"
+		trap release_cleanup EXIT
+	fi
+	if [[ -n "$release_required_file" ]]; then
+		[[ "$release_required_file" == /* ]] || release_required_file="$PWD/$release_required_file"
+		[[ -r "$release_required_file" ]] || die "--required names a file this cannot read: $release_required_file"
+		release_rehearsal="${release_rehearsal:+$release_rehearsal; }narrowed required set: $release_required_file"
+		note "release REHEARSAL: the required set is $release_required_file, not the frozen list"
+	fi
+	mkdir -p "$out_root"
+	# THE RUN AND ITS IDENTITY, before anything runs. Collected by the snapshot's own model, so a
+	# release's identity is computed by the revision it describes.
+	release_run_dir="$(cd "$release_snapshot" && cargo run --quiet --manifest-path src/tools/verify-model/Cargo.toml -- run-start --out-root "$out_root")" || die "the run could not be started: an undeclared environment override, or a tree the identity cannot read"
+	note "run: $release_run_dir"
+	if ((release_in_place == 0)); then
+		src/tools/release-snapshot.sh seal "$release_snapshot" || die "the snapshot could not be sealed"
+	fi
+	export LIBER_VERIFY_RUN="$release_run_dir"
+	export LIBER_RELEASE_REQUIRED="${release_required_file:-$release_snapshot/src/tools/verify-model/model/release-required.toml}"
+	# THE EXECUTOR'S HOME IS THE SNAPSHOT from here on: every step, every producer, every model query.
+	cd "$release_snapshot"
+	REPO_ROOT="$release_snapshot"
+	SRC_DIR="$REPO_ROOT/src"
+	BUILD_DIR="$REPO_ROOT/.build"
+	PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
+	# shellcheck source=src/tools/evidence.sh
+	source "$SRC_DIR/tools/evidence.sh"
+}
+release_finish() {
+	local failures="$1" status=0 state
+	local -a rehearsal=()
+	[[ -z "$release_rehearsal" ]] || rehearsal=(--rehearsal "$release_rehearsal")
+	echo
+	note "release: collecting the dossier for run $release_run_dir"
+	(cd "$SRC_DIR/tools/verify-model" && cargo run --quiet --manifest-path Cargo.toml -- dossier --run "$release_run_dir" --required "$LIBER_RELEASE_REQUIRED" "${rehearsal[@]}") || status=$?
+	state="$(sed -n 's/^# Release dossier - run [^ ]* (\(.*\))$/\1/p' "$release_run_dir/dossier.md" 2>/dev/null | head -1)"
+	# FINALIZED IMMUTABLY: the run directory and everything in it is read-only from here on. A failed
+	# or incomplete run keeps its evidence with its state rather than losing it with the snapshot.
+	chmod -R a-w "$release_run_dir" 2>/dev/null || true
+	note "release: dossier $release_run_dir/dossier.md (state: ${state:-not rendered})"
+	if ((failures > 0 || status != 0)); then
+		die "the release run is NOT complete: $failures failed step(s); dossier state: ${state:-not rendered}"
+	fi
+	note "release run finished: ${state}"
 	exit 0
+}
+if [[ "$mode" == release ]]; then
+	note "release: every optimisation in this script is ignored"
+	release_prepare
+elif [[ -n "$release_out_root" || -n "$release_required_file" || "$release_in_place" == 1 ]]; then
+	die "--out-root, --required and --in-place belong to --release"
 fi
 
 if [[ "$mode" == sweep ]]; then
@@ -656,7 +759,7 @@ fi
 
 # Ask for the commands, and treat every way of not getting them as the same answer.
 steps_file="$(mktemp)"
-trap 'rm -f "$steps_file"' EXIT
+trap 'rm -f "$steps_file"; release_cleanup' EXIT
 tier_mode=""
 tier_state=""
 tier_outcomes=""
@@ -676,6 +779,12 @@ tier_handoff=""
 if [[ -n "${LIBER_VERIFY_STEPS:-}" ]]; then
 	[[ -r "$LIBER_VERIFY_STEPS" ]] || die "LIBER_VERIFY_STEPS names a file this cannot read: $LIBER_VERIFY_STEPS"
 	cat "$LIBER_VERIFY_STEPS" >"$steps_file"
+elif [[ "$mode" == release ]]; then
+	# THE RELEASE PLAN, from the snapshot's model: every release-required key, producers before the
+	# gates that read what they build, the suites before the gate that reads a guest log.
+	release_plan_args=()
+	[[ -z "$release_required_file" ]] || release_plan_args=(--required "$LIBER_RELEASE_REQUIRED")
+	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- release-plan "${release_plan_args[@]}" >"$steps_file" || planner_failed "the release plan could not be produced"
 else
 	mkdir -p "$BUILD_DIR/state/verify-tiers"
 	tier_run="$(mktemp -d "$BUILD_DIR/state/verify-tiers/run.XXXXXX")"
@@ -719,6 +828,9 @@ full)
 	;;
 scoped)
 	note "scoped: $status_detail"
+	;;
+release)
+	note "RELEASE: $status_detail"
 	;;
 *)
 	planner_failed "unknown status '$status'"
@@ -886,7 +998,14 @@ guest_labels=()
 # file the estimator reads.
 run_one_step() {
 	local index="$1" label="$2" command="$3" outfile="$4" started=$SECONDS status=0 elapsed
-	if ! eval "$command"; then
+	if [[ -n "${LIBER_VERIFY_RUN:-}" ]]; then
+		# INSIDE A RUN THE STEP'S OUTPUT IS ITS RESULT LOG: streamed as before, through `tee`, and
+		# copied into the run by the envelope `record_one_step` publishes for a producer that did not
+		# publish its own. `pipefail` makes the pipeline's status the step's.
+		if ! eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"; then
+			status=1
+		fi
+	elif ! eval "$command"; then
 		status=1
 	fi
 	elapsed=$((SECONDS - started))
@@ -921,6 +1040,9 @@ record_one_step() {
 	fi
 	keys_file="$(mktemp)"
 	awk -v want="$index" -F'\t' '$1 == "KEY" && $2 == want { print $3 }' "$steps_file" >"$keys_file"
+	if [[ -n "${LIBER_VERIFY_RUN:-}" ]]; then
+		release_publish_fallback "$index" "${outcome#--}" "$seconds" "$keys_file"
+	fi
 	if [[ -s "$keys_file" ]]; then
 		if [[ -n "$tier_outcomes" ]]; then
 			# The handoff's evidence is recorded before the best-effort mutable history.
@@ -929,6 +1051,24 @@ record_one_step() {
 		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --step-id "${step_ids[$index]:-}" --keys-file "$keys_file" "$outcome" --seconds "$seconds") || note "        (the run happened; recording it did not)"
 	fi
 	rm -f "$keys_file" "$outfile"
+}
+
+# THE RUNNER'S OWN ENVELOPE FOR A REQUIRED KEY WHOSE PRODUCER PUBLISHED NONE.
+#
+# Builds, host suites and conformance suites publish nothing themselves: this step ran their command
+# and is their producer, and it says so. A gate, a whole suite, an image producer and the lifecycle
+# publish their own, with their inputs and their kept logs; `--if-absent` leaves those standing and
+# writes one only for a producer that crashed before it could publish, whose outcome is `failed`.
+# Only REQUIRED keys, so a whole-suite step's kernel tests are discharged by the guest runner's
+# envelope rather than given hundreds of envelopes of their own.
+release_publish_fallback() {
+	local index="$1" outcome="$2" seconds="$3" keys_file="$4" key step_log="$LIBER_VERIFY_RUN/logs/.step-$index.log"
+	while IFS= read -r key; do
+		[[ -n "$key" ]] || continue
+		grep -qF "\"$key\"" "${LIBER_RELEASE_REQUIRED:-/dev/null}" || continue
+		evidence_publish "$key" "verify.sh step ${step_ids[$index]:-$index}" "$outcome" "$seconds" --if-absent --log "$step_log"
+	done <"$keys_file"
+	rm -f "$step_log"
 }
 
 # Wait for every guest in flight and record each one. A BARRIER, and everything that is not a guest
@@ -1112,6 +1252,8 @@ if ((${#failed[@]} > 0)); then
 	if ((${#blocked[@]} > 0)); then
 		note "and ${#blocked[@]} step(s) were not run because what they read failed: ${blocked[*]}"
 	fi
+	# A RELEASE RUN COLLECTS ITS DOSSIER WHATEVER HAPPENED, and the dossier says what is missing.
+	[[ -z "$release_run_dir" ]] || release_finish "${#failed[@]}"
 	die "${#failed[@]} of $count step(s) failed: ${failed[*]}"
 fi
 if ((${#skipped[@]} > 0)); then
@@ -1122,6 +1264,7 @@ if ((${#skipped[@]} > 0)); then
 	exit 6
 fi
 note "all $count step(s) passed"
+[[ -z "$release_run_dir" ]] || release_finish 0
 
 if [[ "$tier_mode" == inner ]]; then
 	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-inner-finish --state "$tier_state" --outcomes "$tier_outcomes" --handoff "$tier_handoff" || planner_failed "the inner snapshot or its evidence changed; no usable handoff was produced"

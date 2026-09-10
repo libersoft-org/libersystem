@@ -178,6 +178,20 @@ pub fn boot_profile() -> Option<&'static str> {
 	}
 }
 
+// THE HARNESS DMA-MODE INPUT, as the kernel sees it: the `fw_cfg` file the x86_64 harness writes,
+// read back in full so the loader's relay can be checked against the bytes it relayed. A file that
+// is absent, of another length or malformed is what the shared codec says it is; nothing here
+// interprets a record the codec refused.
+pub fn dma_mode_carrier() -> bootproto::dma_mode::Carrier {
+	// One byte more than the record, so a longer file is seen as longer rather than truncated to
+	// fit - the length is part of what the record is.
+	let mut bytes = [0u8; bootproto::dma_mode::RECORD_LEN + 1];
+	match fwcfg::read_file(bootproto::dma_mode::FW_CFG_FILE, &mut bytes) {
+		None => bootproto::dma_mode::Carrier::Absent,
+		Some(len) => bootproto::dma_mode::Carrier::from_bytes(Some(&bytes[..len])),
+	}
+}
+
 // Write the CPU's model / brand string into `out`, returning the byte count. The
 // CPUID brand string (leaves 0x8000_0002..0x8000_0004, 48 bytes) when the CPU
 // advertises it - under KVM this is the host CPU's real model - trimmed of the

@@ -10,18 +10,26 @@ description = "Userspace virtio drivers (blk, net, console, input)"
 [[bin]]
 name = "virtio_blk"
 path = "src/virtio_blk.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "virtio_net"
 path = "src/virtio_net.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "virtio_console"
 path = "src/virtio_console.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "dev_channel"
 path = "src/dev_channel.rs"
+test = false
+bench = false
 # The control port's transport, absent from a shipped image for the same reason the agent
 # above it is.
 required-features = ["development"]
@@ -29,18 +37,26 @@ required-features = ["development"]
 [[bin]]
 name = "virtio_input"
 path = "src/virtio_input.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "virtio_gpu"
 path = "src/virtio_gpu.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "virtio_snd"
 path = "src/virtio_snd.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "xhci"
 path = "src/xhci.rs"
+test = false
+bench = false
 
 [features]
 default = []
@@ -67,6 +83,16 @@ proto = { path = "../../../proto" }
 # SystemManager to stop the machine instead of holding the capability that would let them do it.
 ipc-client = { path = "../../libs/ipc/ipc-client" }
 
+
+# THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are
+# tested on the host; the runtime they link is built with its `host-tests` feature for the test
+# build alone (cargo unifies a dev-dependency's features into `cargo test` and into nothing else),
+# which drops the entry stub, the panic handler and the allocator that would otherwise collide with
+# the std the harness needs. The bins declare `test = false` above: they are `no_std` programs with
+# no harness of their own, and `cargo test --manifest-path src/user/drivers/core/Cargo.toml` from
+# the repository root - the host target - runs the library's suite and nothing else.
+[dev-dependencies]
+rt = { path = "../../runtime/rt", features = ["host-tests"] }
 
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

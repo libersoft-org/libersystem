@@ -173,8 +173,9 @@ pub(crate) fn firmware_tables() -> (u64, u64) {
 }
 
 // Physical addresses are reachable as themselves in the loader; exposed so the backends can read
-// the same tables through the same translation this module uses.
-#[cfg(target_arch = "aarch64")]
+// the same tables through the same translation this module uses. Both device-tree ports read the
+// tree's boot-policy node through it before the hand-off.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn identity_map(address: u64) -> u64 {
 	identity(address)
 }

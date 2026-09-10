@@ -81,6 +81,63 @@ pub struct Variant {
 	pub configuration: String,
 }
 
+// THE CLOSED CLASS OF A ROW, from which the release obligation is DERIVED. A concrete required
+// profile, an umbrella name, a fallback row and a producer are distinguishable by data rather than
+// by convention: deleting one row cannot quietly shrink the obligation, because the obligation is
+// a property of the class and a frozen key list (`release-required.toml`) is compared against the
+// derived set exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckClass {
+	// A build part on a target: release-required.
+	Build,
+	// A crate's host suite in one configuration: release-required.
+	HostSuite,
+	// A concrete gate (one profile, one command): release-required.
+	Profile,
+	// An umbrella over several profiles, kept for a person: never required, never a planner step.
+	Umbrella,
+	// A guest step chosen by a target's state: never required.
+	Fallback,
+	// The whole kernel suite on one target, which the release boots: release-required, and it
+	// discharges every kernel test key of that target.
+	WholeSuite,
+	// One kernel test: covered by the whole suite, never required on its own.
+	KernelTest,
+	// An image conformance suite: release-required.
+	Conformance,
+	// A check that needs the development guest: release-required, with the lifecycle rows as its
+	// prerequisites.
+	DevCheck,
+	// A step that BUILDS an artifact another row consumes - an image, the development instance:
+	// release-required whenever a required row names its product.
+	Producer,
+}
+
+impl CheckClass {
+	pub fn release_required(self) -> bool {
+		match self {
+			CheckClass::Build | CheckClass::HostSuite | CheckClass::Profile | CheckClass::WholeSuite | CheckClass::Conformance | CheckClass::DevCheck | CheckClass::Producer => true,
+			CheckClass::Umbrella | CheckClass::Fallback | CheckClass::KernelTest => false,
+		}
+	}
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			CheckClass::Build => "build",
+			CheckClass::HostSuite => "host-suite",
+			CheckClass::Profile => "profile",
+			CheckClass::Umbrella => "umbrella",
+			CheckClass::Fallback => "fallback",
+			CheckClass::WholeSuite => "whole-suite",
+			CheckClass::KernelTest => "kernel-test",
+			CheckClass::Conformance => "conformance",
+			CheckClass::DevCheck => "dev-check",
+			CheckClass::Producer => "producer",
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Check {
 	pub id: String,
@@ -90,7 +147,57 @@ pub struct Check {
 	// How the runner invokes it. Kept in the catalog so the plan is executable rather than a
 	// description of one.
 	pub command: String,
+	pub class: CheckClass,
+	// Derived from the class - see `CheckClass::release_required` - and carried so a consumer
+	// reading the JSON does not have to know the derivation.
+	pub release_required: bool,
+	// Check ids that must have run, in this run, before this one: the producers of its inputs.
+	#[serde(default)]
+	pub prerequisites: Vec<String>,
+	// Artifact ids this row consumes, produced by the rows in `prerequisites`.
+	#[serde(default)]
+	pub inputs: Vec<String>,
+	// Artifact ids this row produces.
+	#[serde(default)]
+	pub produces: Vec<String>,
+	// What the row must publish: `envelope` always; `result-log`, `guest-log` where a guest boots.
+	#[serde(default)]
+	pub evidence: Vec<String>,
 }
+
+impl Check {
+	fn classified(id: String, kind: CheckKind, covers: Vec<String>, variants: Vec<Variant>, command: String, class: CheckClass) -> Check {
+		Check { id, kind, covers, variants, command, class, release_required: class.release_required(), prerequisites: Vec::new(), inputs: Vec::new(), produces: Vec::new(), evidence: vec![String::from("envelope")] }
+	}
+
+	// The fully qualified keys of this row: one per variant.
+	pub fn keys(&self) -> Vec<crate::plan::PlanItemKey> {
+		self.variants.iter().map(|variant| crate::plan::PlanItemKey { check: self.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() }).collect()
+	}
+}
+
+// THE SHIPPING IMAGES ARE BUILT WORK, NOT FOUND WORK: each construction the mandatory gates consume
+// is a producer row with a key of its own, and the gates that read one name it as a prerequisite.
+// `(id, command, artifact)`.
+pub const IMAGE_PRODUCERS: [(&str, &str, &str); 3] = [
+	("image.libersystem-iso", "./image.sh --format iso --dma-mode enforcing-required", "artifact:libersystem.iso"),
+	("image.libersystem-no-iommu-iso", "./image.sh --format iso --dma-mode no-iommu", "artifact:libersystem-no-iommu.iso"),
+	("image.libersystem-dev-iso", "./image.sh --format iso --dma-mode harness", "artifact:libersystem-dev.iso"),
+];
+
+// Which gates consume which image. A gate not listed here reads no shipping image.
+//
+// A gate that ASSEMBLES the media it boots is its own producer and is not listed: `dma-mode-x86_64`
+// builds all three images because its subject is the signed field each assembly freezes,
+// `rollback-floor-x86_64` builds four media at three generations, and `qemu-virtio-iommu-x86_64`
+// assembles the degraded image itself after its traffic phase. What they CONSUME from the release
+// run is the shipping image the traffic half boots, and only that.
+pub const GATE_IMAGE_INPUTS: [(&str, &[&str]); 3] = [("secure-boot", &["artifact:libersystem.iso"]), ("signed-boot", &["artifact:libersystem.iso"]), ("qemu-virtio-iommu-x86_64", &["artifact:libersystem.iso"])];
+
+// THE DEVELOPMENT GUEST HAS A RUNNABLE LIFECYCLE. One self-contained producer row owns setup,
+// build, the immutable image, boot, readiness and teardown; the development checks name it as
+// their prerequisite instead of depending on a guest a person happened to leave running.
+pub const DEV_LIFECYCLE_PRODUCER: (&str, &str, &str) = ("dev.lifecycle", "./check.sh --gate development-lifecycle", "artifact:development-instance");
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Catalog {
@@ -123,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 74] = [
+const GATES: [(&str, &str); 99] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -178,6 +285,9 @@ const GATES: [(&str, &str); 74] = [
 	// kernel selects the static descriptor its named profile authorises.
 	("arch-profile-aarch64-no-dt-1", "kernel"),
 	("arch-profile-riscv64-no-dt-1", "kernel"),
+	// The same treeless rows with the DMA-mode record withheld: the boot must refuse.
+	("arch-profile-aarch64-no-dt-absent-1", "kernel"),
+	("arch-profile-riscv64-no-dt-absent-1", "kernel"),
 	// The staged tree's provider chains, and the eight ways the check that reads them can be given
 	// input it cannot read. Its subject is what the build stages, so a userspace change selects it.
 	("staged-consistency", "userspace.build"),
@@ -202,6 +312,40 @@ const GATES: [(&str, &str); 74] = [
 	("numa-profile-aarch64", "kernel"),
 	("numa-profile-riscv64", "kernel"),
 	("qemu-virtio-iommu-x86_64", "kernel"),
+	// THE DMA MODE. The carrier's format is host work over the harness producer and the two
+	// consumer crates, so it belongs to the harness and every change selects it. The boot gates'
+	// subject is the kernel's admission decision and the loader's hand-off, so a kernel change
+	// selects them - and they boot guests, x86_64 under KVM and the two ports emulated.
+	("dma-mode-carrier", "harness.tools"),
+	("dma-mode-x86_64", "kernel"),
+	// The ports umbrella and its two rows, exactly as `qemu-arch-profiles` and its profiles: the
+	// umbrella stays runnable by name and is never selected, the rows carry the keys.
+	("dma-mode-ports", "kernel"),
+	("dma-mode-aarch64", "kernel"),
+	("dma-mode-riscv64", "kernel"),
+	// THE VIRTIO-IOMMU PROFILES OF THE PORTS, ONE ROW PER PHASE. A profile row spans two artifacts
+	// - the hostile and transition phases boot the TEST kernel, the ordinary phases the built
+	// system through `run.sh` - and the evidence of the one cannot stand for the other, so each
+	// PHASE is the catalog row: its own key, its own command, its own log, its own envelope, its
+	// own measured cost, release-required by class. The five composites below them are umbrellas:
+	// runnable by name, never selected, never required. A row with a missing phase is a missing
+	// REQUIRED key, which the dossier refuses by name rather than inferring the row from an exit.
+	("iommu-ports", "kernel"),
+	("iommu-aarch64-direct-gicv2", "kernel"),
+	("iommu-aarch64-direct-gicv2-hostile", "kernel"),
+	("iommu-aarch64-direct-gicv2-ordinary", "kernel"),
+	("iommu-aarch64-direct-gicv3-its", "kernel"),
+	("iommu-aarch64-direct-gicv3-its-transition", "kernel"),
+	("iommu-aarch64-direct-gicv3-its-ordinary", "kernel"),
+	("iommu-aarch64-uefi-gicv2", "kernel"),
+	("iommu-aarch64-uefi-gicv2-transition", "kernel"),
+	("iommu-aarch64-uefi-gicv2-ordinary", "kernel"),
+	("iommu-riscv64-direct-aia", "kernel"),
+	("iommu-riscv64-direct-aia-hostile", "kernel"),
+	("iommu-riscv64-direct-aia-ordinary", "kernel"),
+	("iommu-riscv64-uefi-aia", "kernel"),
+	("iommu-riscv64-uefi-aia-transition", "kernel"),
+	("iommu-riscv64-uefi-aia-ordinary", "kernel"),
 	("implementation-mutations", "kernel"),
 	// The model's invariants proved capable of failing. Same subject as the model
 	// itself, because a mutation is a statement about the code the model describes.
@@ -214,6 +358,7 @@ const GATES: [(&str, &str); 74] = [
 	("signed-boot", "bin.libersystem-loader"),
 	// The firmware's own verification of the loader. Subject is the loader.
 	("secure-boot", "bin.libersystem-loader"),
+	("rollback-floor-x86_64", "bin.libersystem-loader"),
 	// The development configuration COMPILES. Its subject is every services and
 	// drivers crate at once, which is a set no single component names - so it takes the
 	// always-selected label for the reason the entry above it does, and for a second one: the fault
@@ -242,6 +387,11 @@ const GATES: [(&str, &str); 74] = [
 	("verify-scheduler", "verify-model"),
 	("verify-model", "verify-model"),
 	("verify-model-tests", "verify-model"),
+	// The evidence path's own fixtures: a producer's envelope survives its cleanup, a tool or a
+	// firmware image replaced after it was hashed is not what boots, a release snapshot refuses a
+	// write, a tree that moved fails its dossier, and a rehearsal run renders one. Host work,
+	// minutes; it boots two short x86_64 guests.
+	("verify-evidence", "verify-model"),
 	// The 1 -> 4 handle migration's gate: building a capability list from ONE received
 	// handle is banned outside the runtime primitive. It was added to `check.sh` and not here, so
 	// `verify-model check` reported a gate nothing would ever select - which is the same class of
@@ -434,7 +584,17 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 // The entry stays in `GATES` so the two lists still agree - check.sh really does run it - and it gets
 // no catalog check, so nothing can select it. Running the union by hand stays a command a person can
 // type; paying for it twice in a sweep does not.
-const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
+const UMBRELLA_GATES: [&str; 9] = [
+	"qemu-arch-profiles",
+	"qemu-numa",
+	"dma-mode-ports",
+	"iommu-ports",
+	"iommu-aarch64-direct-gicv2",
+	"iommu-aarch64-direct-gicv3-its",
+	"iommu-aarch64-uefi-gicv2",
+	"iommu-riscv64-direct-aia",
+	"iommu-riscv64-uefi-aia",
+];
 
 // THE ROWS OF THOSE UMBRELLAS, WHICH MUST EACH BE A STEP OF THEIR OWN.
 //
@@ -452,7 +612,17 @@ const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
 // NOT one step per profile with a `--jobs` of its own - that is the second scheduler M3.6 refuses.
 // Each is an ordinary serial step that boots its guests one at a time; what it gains is an identity
 // and a duration of its own.
-pub const PROFILE_ROW_GATES: [&str; 16] = [
+pub const PROFILE_ROW_GATES: [&str; 30] = [
+	"iommu-aarch64-direct-gicv2-hostile",
+	"iommu-aarch64-direct-gicv2-ordinary",
+	"iommu-aarch64-direct-gicv3-its-transition",
+	"iommu-aarch64-direct-gicv3-its-ordinary",
+	"iommu-aarch64-uefi-gicv2-transition",
+	"iommu-aarch64-uefi-gicv2-ordinary",
+	"iommu-riscv64-direct-aia-hostile",
+	"iommu-riscv64-direct-aia-ordinary",
+	"iommu-riscv64-uefi-aia-transition",
+	"iommu-riscv64-uefi-aia-ordinary",
 	"arch-profile-aarch64-gicv2-1",
 	"arch-profile-aarch64-gicv2-4",
 	"arch-profile-aarch64-gicv3-1",
@@ -466,6 +636,10 @@ pub const PROFILE_ROW_GATES: [&str; 16] = [
 	"arch-profile-riscv64-uefi-1",
 	"arch-profile-aarch64-no-dt-1",
 	"arch-profile-riscv64-no-dt-1",
+	"arch-profile-aarch64-no-dt-absent-1",
+	"arch-profile-riscv64-no-dt-absent-1",
+	"dma-mode-aarch64",
+	"dma-mode-riscv64",
 	"numa-profile-x86_64",
 	"numa-profile-aarch64",
 	"numa-profile-riscv64",
@@ -485,7 +659,26 @@ pub const PROFILE_ROW_GATES: [&str; 16] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 9] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 29] = [
+	"dma-mode-x86_64",
+	"iommu-ports",
+	"iommu-aarch64-direct-gicv2",
+	"iommu-aarch64-direct-gicv2-hostile",
+	"iommu-aarch64-direct-gicv2-ordinary",
+	"iommu-aarch64-direct-gicv3-its",
+	"iommu-aarch64-direct-gicv3-its-transition",
+	"iommu-aarch64-direct-gicv3-its-ordinary",
+	"iommu-aarch64-uefi-gicv2",
+	"iommu-aarch64-uefi-gicv2-transition",
+	"iommu-aarch64-uefi-gicv2-ordinary",
+	"iommu-riscv64-direct-aia",
+	"iommu-riscv64-direct-aia-hostile",
+	"iommu-riscv64-direct-aia-ordinary",
+	"iommu-riscv64-uefi-aia",
+	"iommu-riscv64-uefi-aia-transition",
+	"iommu-riscv64-uefi-aia-ordinary",
+	"verify-evidence",
+	"dma-mode-ports",
 	"provider-media-order",
 	"implementation-mutations",
 	"perf-anchor",
@@ -493,6 +686,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 9] = [
 	"qemu-numa",
 	"qemu-virtio-iommu-x86_64",
 	"secure-boot",
+	"rollback-floor-x86_64",
 	"signed-boot",
 	"smp-core-cap",
 ];
@@ -526,8 +720,16 @@ pub fn gate_concurrent_guests(gate: &str) -> usize {
 	}
 }
 
+// The gate name check.sh runs the development lifecycle under. It is a `check.sh` gate so that
+// `./check.sh` alone brings the guest up and runs the development checks, and it is NOT a `gate.*`
+// row: the lifecycle producer row owns it, with its own key, its own class and the development
+// checks as its dependents.
+pub const DEV_LIFECYCLE_GATE: &str = "development-lifecycle";
+
 pub fn catalog_gate_names() -> BTreeSet<String> {
-	GATES.iter().map(|(name, _)| (*name).to_string()).collect()
+	let mut names: BTreeSet<String> = GATES.iter().map(|(name, _)| (*name).to_string()).collect();
+	names.insert(String::from(DEV_LIFECYCLE_GATE));
+	names
 }
 
 impl Catalog {
@@ -536,7 +738,7 @@ impl Catalog {
 
 		// Builds. Every part on every target, in the configuration that ships.
 		for part in BUILD_PARTS {
-			catalog.checks.push(Check { id: format!("build.{part}"), kind: CheckKind::Build, covers: build_covers(part, crates, staged), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::Host, configuration: String::from("shared-image") }).collect(), command: format!("./build.sh --arch {{arch}} --part {part}") });
+			catalog.checks.push(Check::classified(format!("build.{part}"), CheckKind::Build, build_covers(part, crates, staged), ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::Host, configuration: String::from("shared-image") }).collect(), format!("./build.sh --arch {{arch}} --part {part}"), CheckClass::Build));
 		}
 
 		// Host suites. One per crate that has a `#[test]`, in every configuration that crate can
@@ -556,31 +758,60 @@ impl Catalog {
 			if entry.features.contains("shared-image") && registry.configuration("shared-image").is_some() && configuration_runnable(registry, graph, &entry.name, "shared-image") {
 				variants.push(Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("shared-image") });
 			}
-			catalog.checks.push(Check { id: format!("host.{}", entry.name), kind: CheckKind::HostSuite, covers: vec![entry.name.clone()], variants, command: format!("cargo test --manifest-path {}/Cargo.toml", entry.dir) });
+			catalog.checks.push(Check::classified(format!("host.{}", entry.name), CheckKind::HostSuite, vec![entry.name.clone()], variants, format!("cargo test --manifest-path {}/Cargo.toml", entry.dir), CheckClass::HostSuite));
+		}
+
+		// THE PRODUCERS FIRST, so a gate's prerequisite names a row the catalog has. They carry NO
+		// `covers` on purpose, like the fallbacks: a producer is an obligation of the release run and a
+		// prerequisite of the rows that consume its artifact, not a check a change selects - the
+		// gate that reads the image is what a change selects, and the release run builds the image
+		// before it.
+		for (id, command, artifact) in IMAGE_PRODUCERS {
+			let mut check = Check::classified(id.to_string(), CheckKind::Gate, Vec::new(), vec![Variant { architecture: String::from("x86_64"), environment: Environment::Host, configuration: String::from("shared-image") }], command.to_string(), CheckClass::Producer);
+			check.produces = vec![artifact.to_string()];
+			check.prerequisites = BUILD_PARTS.iter().map(|part| format!("build.{part}")).collect();
+			check.evidence.push(String::from("artifact-digest"));
+			catalog.checks.push(check);
+		}
+		{
+			let (id, command, artifact) = DEV_LIFECYCLE_PRODUCER;
+			let mut check = Check::classified(id.to_string(), CheckKind::Gate, Vec::new(), vec![Variant { architecture: String::from("x86_64"), environment: Environment::DevGuest, configuration: String::from("development") }], command.to_string(), CheckClass::Producer);
+			check.produces = vec![artifact.to_string()];
+			check.prerequisites = vec![String::from("image.libersystem-dev-iso")];
+			check.inputs = vec![String::from("artifact:libersystem-dev.iso")];
+			check.evidence.extend([String::from("artifact-digest"), String::from("guest-log")]);
+			catalog.checks.push(check);
 		}
 
 		for (gate, subject) in GATES {
-			// The union entries are declared and never selected - see UMBRELLA_GATES.
-			if UMBRELLA_GATES.contains(&gate) {
-				continue;
-			}
 			let mut covers = vec![subject.to_string()];
 			// This gate requires a DHCP lease through the real translated NIC: both transmit and
 			// receive must work, beyond the provider connection exercised by the boot-chain test.
 			if gate == "qemu-virtio-iommu-x86_64" {
 				covers.push("bin.virtio_net".to_string());
 			}
-			catalog.checks.push(Check { id: format!("gate.{gate}"), kind: CheckKind::Gate, covers, variants: vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], command: format!("./check.sh --gate {gate}") });
+			// THE UNION ENTRIES ARE IN THE CATALOG WITH THEIR CLASS, and never selected or required:
+			// a person may run `--gate arch-profiles`, but the obligation is the profiles.
+			let class = if UMBRELLA_GATES.contains(&gate) { CheckClass::Umbrella } else { CheckClass::Profile };
+			let mut check = Check::classified(format!("gate.{gate}"), CheckKind::Gate, covers, vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], format!("./check.sh --gate {gate}"), class);
+			if let Some((_, inputs)) = GATE_IMAGE_INPUTS.iter().find(|(name, _)| *name == gate) {
+				check.inputs = inputs.iter().map(|i| i.to_string()).collect();
+				check.prerequisites = IMAGE_PRODUCERS.iter().filter(|(_, _, artifact)| inputs.contains(artifact)).map(|(id, _, _)| id.to_string()).collect();
+			}
+			if GATES_THAT_BOOT_A_GUEST.contains(&gate) {
+				check.evidence.push(String::from("guest-log"));
+			}
+			catalog.checks.push(check);
 		}
 
 		for format in CONFORMANCE_FORMATS {
-			catalog.checks.push(Check { id: format!("conformance.{format}"), kind: CheckKind::Conformance, covers: vec![format.to_string()], variants: vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], command: format!("./check.sh --conformance {format}") });
+			catalog.checks.push(Check::classified(format!("conformance.{format}"), CheckKind::Conformance, vec![format.to_string()], vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], format!("./check.sh --conformance {format}"), CheckClass::Conformance));
 		}
 
 		// Kernel tests: derived per target from the compiled test binaries, so the variant list is
 		// the truth about where each test exists rather than a guess from its path.
 		for test in kernel_tests {
-			catalog.checks.push(Check { id: test.id.clone(), kind: CheckKind::KernelTest, covers: test.covers.clone(), variants: test.architectures.iter().map(|architecture| Variant { architecture: architecture.clone(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch}") });
+			catalog.checks.push(Check::classified(test.id.clone(), CheckKind::KernelTest, test.covers.clone(), test.architectures.iter().map(|architecture| Variant { architecture: architecture.clone(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), String::from("./test.sh --arch {arch}"), CheckClass::KernelTest));
 		}
 
 		// THE TWO GUEST STEPS THAT ARE NOT A TEST LIST, in the catalog so that each has an id, a
@@ -594,8 +825,17 @@ impl Catalog {
 		// Both carry no `covers` on purpose and are skipped by `select`; the planner adds the one the
 		// target's state calls for. Giving them a real `covers` would run them BESIDE the tests they
 		// stand in for, which is the opposite of what they are.
-		catalog.checks.push(Check { id: String::from("guest.boot-smoke"), kind: CheckKind::GuestFallback, covers: Vec::new(), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch} --tags smoke") });
-		catalog.checks.push(Check { id: String::from("guest.whole-suite"), kind: CheckKind::GuestFallback, covers: Vec::new(), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch}") });
+		catalog.checks.push(Check::classified(String::from("guest.boot-smoke"), CheckKind::GuestFallback, Vec::new(), ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), String::from("./test.sh --arch {arch} --tags smoke"), CheckClass::Fallback));
+		catalog.checks.push(Check::classified(String::from("guest.whole-suite"), CheckKind::GuestFallback, Vec::new(), ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), String::from("./test.sh --arch {arch}"), CheckClass::Fallback));
+		// THE RELEASE'S OWN GUEST STEP, one per target: the whole kernel suite, which discharges every
+		// kernel test key of that target. Distinct from the fallback of the same command, because a
+		// fallback is chosen by a target's state and this is an obligation.
+		{
+			let mut check = Check::classified(String::from("suite.kernel"), CheckKind::GuestFallback, Vec::new(), ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), String::from("./test.sh --arch {arch}"), CheckClass::WholeSuite);
+			check.prerequisites = BUILD_PARTS.iter().map(|part| format!("build.{part}")).collect();
+			check.evidence.extend([String::from("result-log"), String::from("guest-log"), String::from("staged-kernel-digest"), String::from("medium-digest")]);
+			catalog.checks.push(check);
+		}
 
 		// The development guest. qemu-run.sh refuses DEV_PROFILE together with TEST, so these can
 		// never share a boot with the kernel suite - which is why the environment is part of the
@@ -639,7 +879,13 @@ impl Catalog {
 				covers.sort();
 				covers.dedup();
 			}
-			catalog.checks.push(Check { id: id.to_string(), kind: CheckKind::DevCheck, covers, variants: vec![Variant { architecture: String::from("x86_64"), environment: Environment::DevGuest, configuration: String::from("development") }], command: format!("(cd src && {script})") });
+			let mut check = Check::classified(id.to_string(), CheckKind::DevCheck, covers, vec![Variant { architecture: String::from("x86_64"), environment: Environment::DevGuest, configuration: String::from("development") }], format!("(cd src && {script})"), CheckClass::DevCheck);
+			// The development guest is BUILT WORK: the lifecycle row brings it up, and these run
+			// against that instance rather than one somebody left running.
+			check.prerequisites = vec![DEV_LIFECYCLE_PRODUCER.0.to_string()];
+			check.inputs = vec![DEV_LIFECYCLE_PRODUCER.2.to_string()];
+			check.evidence.push(String::from("guest-log"));
+			catalog.checks.push(check);
 		}
 
 		catalog.checks.sort();

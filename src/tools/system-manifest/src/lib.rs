@@ -102,6 +102,47 @@ struct RawDriver {
 	// that can opt out.
 	#[serde(default, rename = "heartbeat-deadline")]
 	heartbeat_deadline: Option<u32>,
+	// WHAT THIS DRIVER DOES TO MEMORY ON ITS OWN, declared rather than defaulted. REQUIRED: absence
+	// is a parse failure, not `trusted-untranslated` by omission, because a driver that masters the
+	// bus without saying so is exactly the silent default this field exists to remove. A closed
+	// enum, so an unknown value fails to parse rather than never matching. Only a `[programs.driver]`
+	// table can carry it, which is what keeps it off every non-driver row.
+	dma: DmaPolicy,
+}
+
+// HOW A DRIVER REACHES MEMORY, as the kernel's admission decision reads it.
+//
+// `none` is an enforceable claim: the driver receives its MMIO and interrupt resources and bus
+// mastering stays OFF, and the binding cannot mint a DMA buffer. `iommu-required` binds only where
+// an enforcing controller translates it, and refuses on a `no-iommu` machine. `trusted-untranslated`
+// is the explicit exception: translated where translation exists, and admitted UNTRANSLATED into
+// the loud degraded inventory on a machine whose mode says it has no controller.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum DmaPolicy {
+	None,
+	IommuRequired,
+	TrustedUntranslated,
+}
+
+impl DmaPolicy {
+	// The code the generated registries carry. The same numbers `abi::DMA_POLICY_*` are, written
+	// here because this crate is a build-time tool and does not link the kernel ABI.
+	pub fn wire(self) -> u8 {
+		match self {
+			DmaPolicy::None => 0,
+			DmaPolicy::IommuRequired => 1,
+			DmaPolicy::TrustedUntranslated => 2,
+		}
+	}
+
+	pub fn name(self) -> &'static str {
+		match self {
+			DmaPolicy::None => "none",
+			DmaPolicy::IommuRequired => "iommu-required",
+			DmaPolicy::TrustedUntranslated => "trusted-untranslated",
+		}
+	}
 }
 
 // The provider kinds a manifest may name, spelled once. A closed set for the reason the match rules
@@ -477,6 +518,8 @@ pub struct Driver {
 	pub requires: Vec<ProviderKindName>,
 	pub provides: Vec<Provides>,
 	pub heartbeat_deadline: Option<u32>,
+	// The declared DMA policy. Present on every driver that validated - see `RawDriver::dma`.
+	pub dma: DmaPolicy,
 }
 
 // The longest a driver may be given to answer a `PING`, in monotonic ticks. The same number
@@ -886,6 +929,7 @@ impl Manifest {
 			let driver = raw_program.driver.as_ref().map(|raw| Driver {
 				lifecycle: raw.lifecycle,
 				priority: raw.priority,
+				dma: raw.dma,
 				requires: raw.requires.clone(),
 				provides: raw.provides.iter().map(|entry| Provides { kind: entry.kind, most: entry.most, consumers: entry.consumers.unwrap_or(1).max(1) }).collect(),
 				heartbeat_deadline: raw.heartbeat_deadline,

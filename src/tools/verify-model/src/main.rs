@@ -104,6 +104,23 @@ fn run() -> Result<ExitCode, String> {
 	let mut passed = true;
 	let mut seconds = 0.0f64;
 	let mut positional: Vec<String> = Vec::new();
+	// The evidence commands' arguments.
+	let mut run_dir: Option<PathBuf> = None;
+	let mut evidence_key: Option<String> = None;
+	let mut producer: Option<String> = None;
+	let mut outcome: Option<String> = None;
+	let mut inputs: Vec<String> = Vec::new();
+	let mut outputs: Vec<String> = Vec::new();
+	let mut logs: Vec<String> = Vec::new();
+	let mut discharges_file: Option<PathBuf> = None;
+	let mut out_path: Option<PathBuf> = None;
+	let mut out_root: Option<PathBuf> = None;
+	let mut required_path: Option<PathBuf> = None;
+	let mut out_md: Option<PathBuf> = None;
+	let mut write = false;
+	let mut if_absent = false;
+	let mut rehearsal: Option<String> = None;
+	let mut source_root: Option<PathBuf> = None;
 
 	let mut index = 0;
 	while index < arguments.len() {
@@ -208,6 +225,64 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				seconds = arguments.get(index).ok_or("--seconds needs a number")?.parse().map_err(|_| "--seconds takes a number")?;
 			}
+			"--run" => {
+				index += 1;
+				run_dir = Some(PathBuf::from(arguments.get(index).ok_or("--run needs a directory")?));
+			}
+			"--key" => {
+				index += 1;
+				evidence_key = Some(arguments.get(index).ok_or("--key needs a plan-item key")?.clone());
+			}
+			"--producer" => {
+				index += 1;
+				producer = Some(arguments.get(index).ok_or("--producer needs a name")?.clone());
+			}
+			"--outcome" => {
+				index += 1;
+				outcome = Some(arguments.get(index).ok_or("--outcome needs passed or failed")?.clone());
+			}
+			"--input" => {
+				index += 1;
+				inputs.push(arguments.get(index).ok_or("--input needs a path")?.clone());
+			}
+			"--output" => {
+				index += 1;
+				outputs.push(arguments.get(index).ok_or("--output needs a path")?.clone());
+			}
+			"--log" => {
+				index += 1;
+				logs.push(arguments.get(index).ok_or("--log needs a path")?.clone());
+			}
+			"--discharges-file" => {
+				index += 1;
+				discharges_file = Some(PathBuf::from(arguments.get(index).ok_or("--discharges-file needs a path")?));
+			}
+			"--out" => {
+				index += 1;
+				out_path = Some(PathBuf::from(arguments.get(index).ok_or("--out needs a path")?));
+			}
+			"--out-root" => {
+				index += 1;
+				out_root = Some(PathBuf::from(arguments.get(index).ok_or("--out-root needs a directory")?));
+			}
+			"--required" => {
+				index += 1;
+				required_path = Some(PathBuf::from(arguments.get(index).ok_or("--required needs a path")?));
+			}
+			"--out-md" => {
+				index += 1;
+				out_md = Some(PathBuf::from(arguments.get(index).ok_or("--out-md needs a path")?));
+			}
+			"--write" => write = true,
+			"--if-absent" => if_absent = true,
+			"--rehearsal" => {
+				index += 1;
+				rehearsal = Some(arguments.get(index).ok_or("--rehearsal needs a reason")?.clone());
+			}
+			"--source" => {
+				index += 1;
+				source_root = Some(PathBuf::from(arguments.get(index).ok_or("--source needs a directory")?));
+			}
 			"--paths" => {
 				index += 1;
 				let value = arguments.get(index).ok_or("--paths needs a value")?;
@@ -223,7 +298,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate" | "identity" | "run-start" | "envelope" | "keep-log" | "dossier" | "release-required" | "release-plan")
 	{
 		command = positional.remove(0);
 	}
@@ -254,6 +329,9 @@ fn run() -> Result<ExitCode, String> {
 	}
 
 	let repo_root = find_repo_root()?;
+	if matches!(command.as_str(), "identity" | "run-start" | "envelope" | "keep-log") {
+		return evidence_command(&command, &repo_root, run_dir, evidence_key, outcome, producer, &inputs, &outputs, &logs, discharges_file, seconds, out_path, out_root, if_absent);
+	}
 	// THE MODEL EVERY COMMAND WORKS AGAINST, and `--candidate` is what makes a NARROWER one available
 	// without installing it.
 	//
@@ -492,6 +570,73 @@ fn run() -> Result<ExitCode, String> {
 			Ok(ExitCode::SUCCESS)
 		}
 		"check" => self_check(&model),
+		// THE RELEASE PLAN, in the executor's own format: every release-required key at this revision.
+		"release-plan" => {
+			let mut steps = verify_model::commands::release_steps(&model.catalog, &model.registry);
+			// A NARROWED REQUIRED SET narrows the plan to the steps discharging those keys and
+			// everything they require, transitively - a rehearsal of the release path in minutes.
+			// A required key no step discharges is refused here, before anything runs.
+			if let Some(path) = &required_path {
+				let required = verify_model::evidence::load_required(path)?;
+				for key in &required {
+					if !steps.iter().any(|step| step.keys.iter().any(|k| &k.display() == key)) {
+						return Err(format!("--required names `{key}`, which no release step discharges"));
+					}
+				}
+				let mut keep: BTreeSet<String> = steps.iter().filter(|step| step.keys.iter().any(|k| required.contains(&k.display()))).map(|step| step.id.clone()).collect();
+				loop {
+					let before = keep.len();
+					for step in &steps {
+						if keep.contains(&step.id) {
+							keep.extend(step.requires.iter().cloned());
+						}
+					}
+					if keep.len() == before {
+						break;
+					}
+				}
+				steps.retain(|step| keep.contains(&step.id));
+			}
+			let keys: usize = steps.iter().map(|step| step.keys.len()).sum();
+			println!("STATUS\trelease\t{keys} release-required key(s) over {} step(s)", steps.len());
+			emit_steps(&model, steps)?;
+			Ok(ExitCode::SUCCESS)
+		}
+		"dossier" => {
+			let run = verify_model::evidence::Run::new(&run_dir.ok_or("dossier needs --run DIR")?);
+			let required_path = required_path.unwrap_or_else(|| repo_root.join("src/tools/verify-model/model/release-required.toml"));
+			let required = verify_model::evidence::load_required(&required_path)?;
+			let known: BTreeSet<String> = universe(&model).iter().map(|key| key.display()).collect();
+			// The tree as it stands NOW, against the identity the run started with: this tree, or the
+			// one `--source` names when the run's tree is a snapshot this binary is collecting for.
+			let current = verify_model::identity::source_identity(source_root.as_deref().unwrap_or(&repo_root))?;
+			let dossier = verify_model::evidence::collect(&run, &required, &known, &format!("verify-model {}", env!("CARGO_PKG_VERSION")), Some(&current.value), rehearsal.as_deref())?;
+			let rendered_at = verify_model::evidence::now_utc();
+			let json = serde_json::to_string_pretty(&dossier).map_err(|error| error.to_string())?;
+			verify_model::evidence::write_atomically(&run.root.join("dossier.json"), json.as_bytes())?;
+			let markdown = verify_model::evidence::render(&dossier, &rendered_at);
+			verify_model::evidence::write_atomically(&out_md.unwrap_or_else(|| run.root.join("dossier.md")), markdown.as_bytes())?;
+			for refusal in &dossier.refusals {
+				eprintln!("verify-model: dossier: {}", refusal.message());
+			}
+			eprintln!("verify-model: dossier {} - {} row(s), {} required key(s), {} refusal(s)", dossier.state, dossier.rows.len(), dossier.required_keys, dossier.refusals.len());
+			if dossier.refusals.is_empty() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::FAILURE) }
+		}
+		// THE FROZEN RELEASE SET: derived from the catalog's classes, compared against the checked-in
+		// list exactly, in both directions. `--write` regenerates the list, which is a reviewed act.
+		"release-required" => {
+			let derived = verify_model::evidence::derived_release_required(&model.catalog);
+			if write {
+				let path = repo_root.join("src/tools/verify-model/model/release-required.toml");
+				verify_model::evidence::write_atomically(&path, verify_model::evidence::render_required(&derived).as_bytes())?;
+				eprintln!("verify-model: wrote {} required key(s) to {}", derived.len(), path.display());
+			} else {
+				for key in &derived {
+					println!("{key}");
+				}
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		// What each kernel test can reach, one line per test. Written for the person annotating
 		// `covers`: a declaration has to be something the test can back up, and this is the set it
 		// has to choose from rather than guess at.
@@ -1443,6 +1588,26 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 		}
 	}
 
+	// THE RELEASE SET IS A CLOSED, CHECKED-IN LIST, compared with the derived one EXACTLY. Cardinality
+	// and per-target presence do not detect a substitution - delete one mandatory row and insert
+	// another of the same class and both still hold - so the comparison is by key, both ways: a
+	// required key the catalog no longer derives fails, and a derived required key the list does not
+	// carry fails. Adding a required profile is an edit to the list, which is the point.
+	match verify_model::evidence::load_required(&model.repo_root.join("src/tools/verify-model/model/release-required.toml")) {
+		Ok(frozen) => {
+			let derived = verify_model::evidence::derived_release_required(&model.catalog);
+			for key in frozen.difference(&derived) {
+				failures.push(format!("release-required.toml requires `{key}`, which the catalog no longer derives as release-required - a mandatory row was deleted, reclassified or replaced"));
+			}
+			for key in derived.difference(&frozen) {
+				failures.push(format!("the catalog derives `{key}` as release-required and release-required.toml does not list it - add it there, as a reviewed change"));
+			}
+			for (key, reason) in verify_model::evidence::release_invariants(&model.catalog) {
+				failures.push(format!("release set: {key}: {reason}"));
+			}
+		}
+		Err(error) => failures.push(format!("release-required.toml: {error}")),
+	}
 	// The catalog's gate list against check.sh's own. Two lists that must agree are two chances to
 	// disagree, and the direction that hurts is a gate check.sh runs that the catalog never selects.
 	match verify_model::catalog::gates_declared_in_check_sh(&model.repo_root) {
@@ -1721,4 +1886,77 @@ fn find_repo_root() -> Result<PathBuf, String> {
 
 fn is_repo_root(directory: &Path) -> bool {
 	directory.join("lib.sh").is_file() && directory.join("src/kernel").is_dir()
+}
+
+// THE COMMANDS THAT NEED NO MODEL: the identity and the evidence envelopes. They run before the
+// model is loaded so a snapshot of another revision - whose manifest this binary may not parse -
+// can still have its identity collected and its run started by the tree's own tooling.
+#[allow(clippy::too_many_arguments)]
+fn evidence_command(command: &str, repo_root: &Path, run_dir: Option<PathBuf>, evidence_key: Option<String>, outcome: Option<String>, producer: Option<String>, inputs: &[String], outputs: &[String], logs: &[String], discharges_file: Option<PathBuf>, seconds: f64, out_path: Option<PathBuf>, out_root: Option<PathBuf>, if_absent: bool) -> Result<ExitCode, String> {
+	match command {
+		// THE ONE SOURCE IDENTITY AND THE INFLUENCING-INPUT MANIFEST, collected here and written
+		// atomically; `run-start` writes it into a fresh run directory beside the run id.
+		"identity" => {
+			let identity = verify_model::identity::collect(&repo_root)?;
+			let text = serde_json::to_string_pretty(&identity).map_err(|error| error.to_string())?;
+			match out_path {
+				Some(path) => verify_model::evidence::write_atomically(&path, text.as_bytes())?,
+				None => println!("{text}"),
+			}
+			eprintln!("verify-model: source identity {} {} ({} tracked file(s), {} changed)", identity.source.kind, identity.source.value, identity.source.tracked_files, identity.source.changed_paths);
+			Ok(ExitCode::SUCCESS)
+		}
+		"run-start" => {
+			let root = out_root.ok_or("run-start needs --out-root DIR: a durable directory OUTSIDE the worktree")?;
+			let run = verify_model::evidence::start_run(&root, &repo_root)?;
+			println!("{}", run.root.display());
+			Ok(ExitCode::SUCCESS)
+		}
+		"envelope" => {
+			let run = verify_model::evidence::Run::new(&run_dir.ok_or("envelope needs --run DIR")?);
+			let key = evidence_key.ok_or("envelope needs --key")?;
+			let outcome = outcome.ok_or("envelope needs --outcome passed|failed")?;
+			if outcome != "passed" && outcome != "failed" {
+				return Err(format!("--outcome is passed or failed, not `{outcome}`"));
+			}
+			// The logs the producer already kept under this key (from inside its cleanup), then the
+			// ones handed over now.
+			let mut kept = run.kept_logs(&key)?;
+			for log in logs {
+				kept.push(run.keep_log(&key, Path::new(log))?);
+			}
+			let artifact = |path: &String| -> Result<verify_model::evidence::Artifact, String> { Ok(verify_model::evidence::Artifact { path: path.clone(), sha256: verify_model::evidence::sha256_file(Path::new(path))? }) };
+			let inputs: Vec<verify_model::evidence::Artifact> = inputs.iter().map(artifact).collect::<Result<_, _>>()?;
+			let outputs: Vec<verify_model::evidence::Artifact> = outputs.iter().map(artifact).collect::<Result<_, _>>()?;
+			let mut discharges = Vec::new();
+			if let Some(path) = discharges_file {
+				let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+				discharges = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+			}
+			let envelope = verify_model::evidence::Envelope { schema: String::from(verify_model::evidence::ENVELOPE_SCHEMA), run: run.id()?, key: key.clone(), identity: run.identity_digest()?, producer: producer.unwrap_or_else(|| String::from("unnamed")), outcome, duration_seconds: seconds.round() as u64, inputs, outputs, logs: kept, discharges, published_at: verify_model::evidence::now_utc() };
+			if if_absent {
+				match run.publish_if_absent(&envelope)? {
+					Some(path) => eprintln!("verify-model: published {}", path.display()),
+					None => eprintln!("verify-model: `{key}` already has an envelope in this run - the producer's stands"),
+				}
+			} else {
+				let path = run.publish(&envelope)?;
+				eprintln!("verify-model: published {}", path.display());
+			}
+			Ok(ExitCode::SUCCESS)
+		}
+		// COPY THE LOG BYTES INTO THE RUN BEFORE THE PRODUCER'S CLEANUP. A multi-boot gate keeps its
+		// phase logs in a temporary directory removed by an EXIT trap - on failure too - so the
+		// envelope written afterwards names copies that outlive the producer.
+		"keep-log" => {
+			let run = verify_model::evidence::Run::new(&run_dir.ok_or("keep-log needs --run DIR")?);
+			let key = evidence_key.ok_or("keep-log needs --key")?;
+			for log in logs {
+				let kept = run.keep_log(&key, Path::new(log))?;
+				println!("{}", kept.path);
+			}
+			Ok(ExitCode::SUCCESS)
+		}
+		_ => Err(format!("`{command}` is not an evidence command")),
+	}
 }

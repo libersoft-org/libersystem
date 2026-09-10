@@ -161,7 +161,16 @@ impl Config {
 
 	pub fn input_len(&self) -> u64 {
 		// The range is inclusive at both ends, so a range of one page has `end = start + page - 1`.
-		self.input_end - self.input_start + 1
+		//
+		// SATURATING, BECAUSE THE RANGE CAN BE THE WHOLE ADDRESS SPACE. QEMU's x86_64 and aarch64
+		// virtio-iommu advertise a bounded input range, but its riscv64 one advertises the full
+		// 64-bit space (`input_start = 0`, `input_end = u64::MAX`), whose inclusive length is 2^64 -
+		// one more than a `u64` holds. Assuming the range is smaller than the space is exactly the
+		// portability defect M0173 removes from this shared backend: the debug build panicked on the
+		// overflow here, and the release build would have wrapped it to zero. A full-space range
+		// reports `u64::MAX`, which loses only the single top byte as an IOVA - none is ever handed
+		// out near there - and `IovaSpace::end` already clamps with `saturating_add`.
+		self.input_end.saturating_sub(self.input_start).saturating_add(1)
 	}
 
 	pub fn contains(&self, address: u64, len: u64) -> bool {

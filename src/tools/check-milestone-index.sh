@@ -21,6 +21,21 @@
 # adversarial tests do not exist, because the marker its test item used was not the one being
 # counted. One item in the whole tree at the time, which is why closing it while it was one was
 # cheap.
+#
+# `[i]` IS AN INDEX ROW, AND IT IS NEITHER OPEN NOR DONE. Two documents in the index are not
+# milestones at all: a cross-phase umbrella of driver candidates that closes item by item and never
+# as a whole, and a future-phase vision activated part by part on explicit approval. Both used to sit
+# here as `[~]`, which this gate defines as an ordinary open state - so a tool and a reader both saw
+# two open Phase-2 milestones, which is exactly the claim their own status lines refuse. An `[i]` row
+# KEEPS the title check (that is the half of this gate worth having on a row nobody ever ticks), is
+# never counted as unfinished work of its phase, and can never be ticked: the marker is the
+# statement that there is nothing to tick.
+#
+# AND EVERY OTHER CHARACTER BETWEEN THE BRACKETS IS REFUSED. The row parser used to accept any one
+# character as a mark and then treat whatever it was as "not x", so a marker nobody had taught this
+# gate would have passed by not being understood - which is how `[i]` itself would have entered the
+# tree if it had not come with this rule. The four markers are ` `, `x`, `~` and `i`, and a fifth is a
+# change to this script first.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,6 +51,17 @@ check_index() {
 		file="${line##*\(}"
 		file="${file%%\)*}"
 		[[ "$file" == *.md ]] || continue
+
+		# AN UNKNOWN MARKER IS A REFUSAL, NOT A FOURTH STATE. See the header: a character this gate
+		# has not been taught is a row it cannot read, and a row it cannot read must not pass.
+		case "$mark" in
+		' ' | x | '~' | i) ;;
+		*)
+			echo "milestone-index: $file is marked '[$mark]' in the index, which is not a marker this gate knows (' ', 'x', '~' or 'i')" >&2
+			failed=1
+			continue
+			;;
+		esac
 		if [[ ! -f "$todo_dir/$file" ]]; then
 			# Only a row claiming DONE is worth failing over here; an open row naming a file that
 			# does not exist yet is a plan, which is what this index is for.
@@ -68,6 +94,18 @@ check_index() {
 			failed=1
 		fi
 
+		# An index row says so in the document too. The marker is a claim about the KIND of document -
+		# one that never closes as a whole - and the document is where that is decided, so a row
+		# marked `[i]` over a document whose status line does not say it is such a thing is a marker
+		# somebody reached for to park an ordinary milestone outside the open count.
+		if [[ "$mark" == "i" ]]; then
+			if ! grep -qE '^Status: .*(NON-COMPLETABLE INDEX|NOT AN ACTIVE PRODUCT MILESTONE)' "$todo_dir/$file"; then
+				echo "milestone-index: the index marks $file as a reference row ([i]) and the document's status line does not call itself a non-completable index or an inactive vision" >&2
+				failed=1
+			fi
+			continue
+		fi
+
 		[[ "$mark" == "x" ]] || continue
 		local open
 		open="$(grep -cE '^- \[[ ~]\]' "$todo_dir/$file" || true)"
@@ -77,6 +115,12 @@ check_index() {
 		fi
 	done < <(grep '^- \[.\] \[P' "$index" || true)
 	return "$failed"
+}
+
+# The open rows of the index, for anything that reads the index as a work list. `[i]` rows are not
+# in it: they are the reference rows the marker exists to keep out of a phase's open count.
+open_rows() {
+	grep -E '^- \[[ ~]\] \[P' "$1" || true
 }
 
 # Prove the gate REFUSES before letting it approve. The tree is consistent right now, so a run over
@@ -127,6 +171,41 @@ self_test() {
 	printf -- '- [x] [P99M0009 - gone](P99M0009.md)\n' >"$scratch/missing.md"
 	if check_index "$scratch/missing.md" "$scratch" 2>/dev/null; then
 		echo "milestone-index: SELF-TEST FAILED - an index entry naming a file that does not exist was accepted" >&2
+		exit 1
+	fi
+
+	# THE INDEX ROW. A reference document with open items under it is ACCEPTED as `[i]` - that is
+	# the whole point of the marker - and it is not counted among the open rows.
+	printf '# P99M0004 - d\n\nStatus: NON-COMPLETABLE INDEX. NEVER TICKED.\n\n- [ ] one candidate\n- [ ] another\n' >"$scratch/P99M0004.md"
+	printf -- '- [x] [P99M0001 - a](P99M0001.md)\n- [i] [P99M0004 - d](P99M0004.md)\n' >"$scratch/index-row.md"
+	if ! check_index "$scratch/index-row.md" "$scratch" 2>/dev/null; then
+		echo "milestone-index: SELF-TEST FAILED - a reference row marked [i] over a non-completable index was refused" >&2
+		exit 1
+	fi
+	if [[ "$(open_rows "$scratch/index-row.md" | wc -l)" != "0" ]]; then
+		echo "milestone-index: SELF-TEST FAILED - an [i] row was counted as an open row" >&2
+		exit 1
+	fi
+
+	# The title check survives on an index row: the marker excuses the checkbox, not the summary.
+	printf -- '- [i] [P99M0004 - what it used to be called](P99M0004.md)\n' >"$scratch/index-title.md"
+	if check_index "$scratch/index-title.md" "$scratch" 2>/dev/null; then
+		echo "milestone-index: SELF-TEST FAILED - an [i] row carrying a stale title was accepted" >&2
+		exit 1
+	fi
+
+	# An ordinary milestone cannot be parked as an index row: the document has to say it is one.
+	printf -- '- [i] [P99M0002 - b](P99M0002.md)\n' >"$scratch/index-ordinary.md"
+	if check_index "$scratch/index-ordinary.md" "$scratch" 2>/dev/null; then
+		echo "milestone-index: SELF-TEST FAILED - an ordinary milestone marked [i] was accepted" >&2
+		exit 1
+	fi
+
+	# THE UNKNOWN MARKER, which is the case that makes every other one meaningful: a character this
+	# gate was never taught must be refused, not read as \"some open state\".
+	printf -- '- [?] [P99M0002 - b](P99M0002.md)\n' >"$scratch/unknown-mark.md"
+	if check_index "$scratch/unknown-mark.md" "$scratch" 2>/dev/null; then
+		echo "milestone-index: SELF-TEST FAILED - an index row with an unknown marker was accepted" >&2
 		exit 1
 	fi
 }

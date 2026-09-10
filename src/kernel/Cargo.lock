@@ -99,6 +99,13 @@ name = "dma"
 version = "0.0.0"
 
 [[package]]
+name = "driver-binding"
+version = "0.0.0"
+dependencies = [
+ "driver-protocol",
+]
+
+[[package]]
 name = "driver-protocol"
 version = "0.0.0"
 dependencies = [
@@ -189,6 +196,7 @@ dependencies = [
  "buddy",
  "device-proto",
  "dma",
+ "driver-binding",
  "driver-protocol",
  "fdt",
  "flac",

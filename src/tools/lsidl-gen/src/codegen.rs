@@ -563,13 +563,17 @@ impl Cg {
 				// answers both halves and is the primitive `decode` has always used - it was
 				// called at the codec boundary and at none of the framing boundaries.
 				self.line("\t\t\t\tr.finish()?;");
-				self.line("\t\t\t\trequest_handles.clear();");
 				// `@rights` ENFORCED HERE, between a well-formed request and the service seeing it.
 				//
 				// The annotation used to reach the ABI signature and no generated code, so what a
 				// service could assume about a handle it was sent was prose that held while every
 				// caller remembered. A handle that does not already carry what the schema declares
 				// is refused with the method's own error type; the service is not called at all.
+				//
+				// The validator has already refused every annotation this cannot guard - an option
+				// or record around the handle, an alias, a method whose result cannot say `denied`,
+				// a stream return, an empty or numeric or repeated argument - so what reaches here
+				// is exactly a bare `handle<resource>` on a method with a denied case.
 				let mut guards: Vec<String> = Vec::new();
 				for p in &m.params {
 					if p.rights.is_empty() || !matches!(p.ty, Type::Handle(_)) {
@@ -609,10 +613,27 @@ impl Cg {
 				};
 				match &denied {
 					Some(error_type) => {
+						// A DENIAL CLOSES WHAT IT DECODED. The handles were taken out of the reader's
+						// copy of the list while the parameters were decoded; `clear` only zeroes the
+						// list, and the serve loop's leftover sweep closes only what is still in it.
+						// So a refusal that cleared and answered kept every capability it refused -
+						// which is worse than never checking, because the caller believes the handle
+						// was rejected. Every handle the request carried is released on the denial
+						// path, whatever parameter it was decoded into, and the list is cleared
+						// AFTER, so the sweep cannot close them a second time.
 						self.line(&format!("\t\t\t\tlet authorized = {};", guards.join(" && ")));
+						self.line("\t\t\t\tif !authorized {");
+						self.line("\t\t\t\t\tfor &taken in request_handles.as_slice() {");
+						self.line("\t\t\t\t\t\tif taken != 0 {");
+						self.line("\t\t\t\t\t\t\tcrate::codec::release_handle(taken);");
+						self.line("\t\t\t\t\t\t}");
+						self.line("\t\t\t\t\t}");
+						self.line("\t\t\t\t}");
+						self.line("\t\t\t\trequest_handles.clear();");
 						self.line(&format!("\t\t\t\tlet result = if authorized {{ service.{}({}) }} else {{ Err({error_type}::Denied) }};", field_ident(&m.name), args.join(", ")));
 					}
 					None => {
+						self.line("\t\t\t\trequest_handles.clear();");
 						self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
 					}
 				}

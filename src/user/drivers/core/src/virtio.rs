@@ -49,6 +49,70 @@ fn align_up(x: u64, a: u64) -> u64 {
 	(x + a - 1) & !(a - 1)
 }
 
+// WHAT THE DEVICE'S HALF OF THE RING MAY SAY, CHECKED ONCE FOR EVERY DRIVER (DRV-001).
+//
+// A used-ring element is two fields the DEVICE writes - which descriptor completed and how many
+// bytes it wrote - and the used index is the device's count of completions. Nothing validated any
+// of the three: a driver took the id as an index into its own tables, took the length as the number
+// of bytes now valid in its buffer, and took each index bump as one more completion whether or not
+// it had posted that many. A device, or anything acting as one on the bus, controls all three
+// fields. So they are checked here, in the one path every virtio driver reaps completions through,
+// against what the driver itself posted: the id is one the ring has and - on the synchronous path -
+// the head it published; the length is at most the device-writable bytes the chain offered; and the
+// index never moves further than the number of buffers outstanding. A device that fails a check is
+// reported as a fault by the queue, never trusted a little.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsedFault {
+	// The completed descriptor id is not one this ring has, or not the head that was posted.
+	Id,
+	// The device claims to have written more than the chain it was given could take.
+	Length,
+	// The used index moved past the number of buffers the driver had outstanding.
+	Index,
+	// A chain this ring cannot hold: empty, or longer than the ring.
+	Chain,
+	// The device never completed a synchronous request inside the spin budget.
+	NoCompletion,
+}
+
+// One used element against what was posted: `expected_id` pins the head on the synchronous path
+// (the RX pool accepts any posted id), `max_len` is the device-writable byte count of that chain.
+pub fn check_used_element(id: u32, len: u32, size: u16, expected_id: Option<u16>, max_len: u32) -> Result<(u16, u32), UsedFault> {
+	if id >= size as u32 {
+		return Err(UsedFault::Id);
+	}
+	if let Some(expected) = expected_id
+		&& id != expected as u32
+	{
+		return Err(UsedFault::Id);
+	}
+	if len > max_len {
+		return Err(UsedFault::Length);
+	}
+	Ok((id as u16, len))
+}
+
+// How many completions the used index announces since `last`, refused when it announces more than
+// were outstanding. The index is a free-running `u16`, so the difference wraps like the ring does.
+pub fn check_used_advance(last: u16, now: u16, outstanding: u16) -> Result<u16, UsedFault> {
+	let advanced = now.wrapping_sub(last);
+	if advanced > outstanding {
+		return Err(UsedFault::Index);
+	}
+	Ok(advanced)
+}
+
+// The split-ring layout for `size` descriptors: the descriptor table (16 bytes each), then the
+// available ring (2-byte aligned), then the used ring (4-byte aligned) - contiguous, as the rings
+// require. Returned as (available offset, used offset, total bytes) so the queue and the host-side
+// fake controller agree on one arithmetic.
+pub fn ring_layout(size: u16) -> (u64, u64, u64) {
+	let avail_off: u64 = 16 * size as u64;
+	let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
+	let ring_bytes: u64 = used_off + 6 + 8 * size as u64;
+	(avail_off, used_off, ring_bytes)
+}
+
 // A virtio device negotiated up to FEATURES_OK. The driver sets up the virtqueues
 // it needs, then calls `driver_ok`; afterwards it drives those queues.
 pub struct Virtio {
@@ -94,9 +158,26 @@ pub struct Queue {
 	// The used-ring index consumed so far, so `take_used` knows what is new (the RX
 	// flow; unused by the synchronous `submit` path).
 	last_used: u16,
+	// How many buffers the driver has posted and not yet reaped on the asynchronous path -
+	// `post_recv` and `submit_async` count up, `take_used` counts down - which is the bound the
+	// used index is checked against (see `check_used_advance`).
+	posted: u16,
+	// The last refusal `take_used` made of the device's ring, for a driver that wants the reason.
+	fault: Option<UsedFault>,
 	// The device this queue belongs to, so a driver holding only a `Queue` can still name the
 	// device its data buffers are for - see `Virtio::capability`.
 	pub capability: u64,
+}
+
+// THE FAKE-CONTROLLER SEAM. A ring is memory, and the checks above are about what is in it, so a
+// host test builds a queue over a buffer of its own, writes the device's half by hand and drives the
+// same `submit_checked` / `take_used` the drivers use.
+#[cfg(test)]
+impl Queue {
+	pub(crate) fn over(virt: u64, size: u16, notify_addr: u64) -> Queue {
+		let (avail_off, used_off, _) = ring_layout(size);
+		Queue { index: 0, notify_addr, size, virt, avail_off, used_off, last_used: 0, posted: 0, fault: None, capability: 0 }
+	}
 }
 
 // The RX / event-queue flow: the device pushes to the driver. The driver posts a
@@ -107,7 +188,7 @@ impl Queue {
 	// Add a device-writable buffer (descriptor `id`, at physical `phys`, `len` bytes)
 	// to the available ring so the device can fill it. Used to seed the pool and to
 	// re-post each buffer after it is drained. Call `notify` after a batch.
-	pub unsafe fn post_recv(&self, id: u16, phys: u64, len: u32) {
+	pub unsafe fn post_recv(&mut self, id: u16, phys: u64, len: u32) {
 		unsafe {
 			let d = self.virt + id as u64 * 16;
 			w64(d, phys);
@@ -119,6 +200,37 @@ impl Queue {
 			w16(avail + 4 + (idx % self.size) as u64 * 2, id);
 			fence(Ordering::SeqCst);
 			w16(avail + 2, idx.wrapping_add(1));
+			self.posted = self.posted.saturating_add(1);
+		}
+	}
+
+	// The last refusal this queue made of what the device wrote into its used ring, if any.
+	pub fn fault(&self) -> Option<UsedFault> {
+		self.fault
+	}
+
+	// The device-writable bytes of the chain that starts at descriptor `head`, which is the most a
+	// completion of that chain may claim to have written. Walks at most one ring's worth of links,
+	// so a chain the device may have corrupted into a loop still ends.
+	unsafe fn writable_bytes_from(&self, head: u16) -> u32 {
+		unsafe {
+			let mut total: u32 = 0;
+			let mut id: u16 = head;
+			for _ in 0..self.size {
+				let d = self.virt + id as u64 * 16;
+				let flags = r16(d + 12);
+				if flags & DESC_WRITE != 0 {
+					total = total.saturating_add(r32(d + 8));
+				}
+				if flags & DESC_NEXT == 0 {
+					break;
+				}
+				id = r16(d + 14);
+				if id >= self.size {
+					break;
+				}
+			}
+			total
 		}
 	}
 
@@ -144,7 +256,17 @@ impl Queue {
 		unsafe {
 			let used = self.virt + self.used_off;
 			fence(Ordering::SeqCst);
-			if r16(used + 2) == self.last_used {
+			let now = r16(used + 2);
+			// THE INDEX IS CHECKED BEFORE IT IS BELIEVED: more completions than buffers outstanding
+			// is a device inventing work, and the element it points at is never read.
+			let advanced = match check_used_advance(self.last_used, now, self.posted) {
+				Ok(advanced) => advanced,
+				Err(fault) => {
+					self.fault = Some(fault);
+					return None;
+				}
+			};
+			if advanced == 0 {
 				return None;
 			}
 			// Acquire barrier: order the observed completion before the buffer reads the
@@ -152,10 +274,21 @@ impl Queue {
 			// writes rather than stale data (see `submit`).
 			fence(Ordering::SeqCst);
 			let elem = used + 4 + (self.last_used % self.size) as u64 * 8;
-			let id = r32(elem) as u16;
+			let id = r32(elem);
 			let len = r32(elem + 4);
-			self.last_used = self.last_used.wrapping_add(1);
-			Some((id, len))
+			// The id is checked before the descriptor it names is read for its bound.
+			let max_len = if id < self.size as u32 { self.writable_bytes_from(id as u16) } else { 0 };
+			match check_used_element(id, len, self.size, None, max_len) {
+				Ok((id, len)) => {
+					self.last_used = self.last_used.wrapping_add(1);
+					self.posted = self.posted.saturating_sub(1);
+					Some((id, len))
+				}
+				Err(fault) => {
+					self.fault = Some(fault);
+					None
+				}
+			}
 		}
 	}
 }
@@ -292,9 +425,7 @@ impl Virtio {
 			// layout: descriptor table (16 bytes each), then the available ring
 			// (2-byte aligned), then the used ring (4-byte aligned) - contiguous, as
 			// the rings require; the whole span is one contiguous DMA allocation.
-			let avail_off: u64 = 16 * size as u64;
-			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
-			let ring_bytes: u64 = used_off + 6 + 8 * size as u64;
+			let (avail_off, used_off, ring_bytes) = ring_layout(size);
 			// THE RING HANDLE IS DELIBERATELY NOT KEPT, the way every other `dma_buffer_for` call
 			// in this crate does not keep it. `Queue` held it in a field with the comment "keeps
 			// the ring DMA buffer alive" - which nothing enforced: no `Drop` closed it, so the
@@ -315,7 +446,7 @@ impl Virtio {
 			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
 			w16(self.common + CFG_QUEUE_ENABLE, 1);
 
-			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, capability: self.capability })
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, posted: 0, fault: None, capability: self.capability })
 		}
 	}
 
@@ -378,10 +509,17 @@ impl Queue {
 	// the queue is too small or the device never completes. Synchronous, with a
 	// single request in flight (the same descriptors are reused each call).
 	pub unsafe fn submit(&self, bufs: &[(u64, u32, bool)]) -> Option<u32> {
+		unsafe { self.submit_checked(bufs).ok() }
+	}
+
+	// `submit`, with the reason a completion was refused - the device's used element is checked
+	// against the chain that was posted (see `check_used_element`): the head descriptor, and no more
+	// bytes written than the chain offered for writing.
+	pub unsafe fn submit_checked(&self, bufs: &[(u64, u32, bool)]) -> Result<u32, UsedFault> {
 		unsafe {
 			let n = bufs.len();
 			if n == 0 || n > self.size as usize {
-				return None;
+				return Err(UsedFault::Chain);
 			}
 			for (i, &(phys, len, device_writes)) in bufs.iter().enumerate() {
 				let d = self.virt + i as u64 * 16;
@@ -424,7 +562,7 @@ impl Queue {
 				}
 				spins += 1;
 				if spins > 10_000_000 {
-					return None;
+					return Err(UsedFault::NoCompletion);
 				}
 				// The fast common case completes within the spin budget below and never
 				// yields, keeping device control paths low-latency. A slow completion
@@ -443,8 +581,15 @@ impl Queue {
 			// callers), so the sectors the device DMA'd are visible. On x86 (TSO) load-load
 			// order is implicit, so this only bites the weakly ordered arches.
 			fence(Ordering::SeqCst);
-			// Each used-ring element is { id u32, len u32 }; return the used length.
-			Some(r32(used + 4 + (old_used % self.size) as u64 * 8 + 4))
+			// ONE COMPLETION, OF THE HEAD, WITHIN THE CHAIN'S WRITABLE BYTES. Each used-ring element
+			// is { id u32, len u32 }; the device's index moved exactly once for the one chain posted,
+			// the element names descriptor 0, and the length is bounded by what the chain offered.
+			let now = r16(used + 2);
+			check_used_advance(old_used, now, 1)?;
+			let elem = used + 4 + (old_used % self.size) as u64 * 8;
+			let writable: u32 = bufs.iter().filter(|buf| buf.2).fold(0u32, |total, buf| total.saturating_add(buf.1));
+			let (_, len) = check_used_element(r32(elem), r32(elem + 4), self.size, Some(0), writable)?;
+			Ok(len)
 		}
 	}
 
@@ -454,12 +599,13 @@ impl Queue {
 	// reaps the completion with `take_used`. One request in flight (descriptors 0..n
 	// reused each call, head index 0). Returns false if the chain is empty or longer
 	// than the queue.
-	pub unsafe fn submit_async(&self, bufs: &[(u64, u32, bool)]) -> bool {
+	pub unsafe fn submit_async(&mut self, bufs: &[(u64, u32, bool)]) -> bool {
 		unsafe {
 			let n = bufs.len();
 			if n == 0 || n > self.size as usize {
 				return false;
 			}
+			self.posted = self.posted.saturating_add(1);
 			for (i, &(phys, len, device_writes)) in bufs.iter().enumerate() {
 				let d = self.virt + i as u64 * 16;
 				w64(d, phys);
@@ -488,3 +634,6 @@ impl Queue {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests;

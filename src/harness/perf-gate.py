@@ -31,6 +31,7 @@
 
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -216,10 +217,20 @@ def main():
 	# publication, was made from it. A measurement tool has no business changing the tree it
 	# measures, and if it must, undoing that is not conditional on the measurement working.
 	consistent = True
+	# A RELEASE SNAPSHOT IS READ-ONLY, and this gate's probe is a deliberate, declared edit of one
+	# tracked file that it undoes itself: the file is made writable for exactly that span and sealed
+	# again afterwards, so the snapshot's immutability holds for everything else and the release's
+	# before-and-after identity check sees the restored bytes.
+	sealed = not (os.stat(source_path).st_mode & stat.S_IWUSR)
+	snapshot_tool = os.path.join(lab.SRC, 'tools', 'release-snapshot.sh')
+	if sealed:
+		subprocess.run([snapshot_tool, 'unseal', source_path], check=True)
 	try:
 		result = measure_leaf(source_path)
 	finally:
 		consistent = restore(source_path, original)
+		if sealed:
+			subprocess.run([snapshot_tool, 'reseal', source_path], check=False)
 		with open(source_path, encoding='utf-8') as handle:
 			if handle.read() != original:
 				fail(f'{SOURCE} was not restored; fix it before trusting anything else in the tree')

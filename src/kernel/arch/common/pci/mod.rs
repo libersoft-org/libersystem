@@ -254,8 +254,8 @@ pub struct XhciDevice {
 // The identity of one function, or `None` where nothing is there.
 //
 // The public form of `read_function`, for a caller that has a bus address and needs the device
-// behind it - the IOMMU fixture, which works with a function this kernel binds no driver to.
-#[cfg(test)]
+// behind it - the IOMMU fixture, which works with a function this kernel binds no driver to, and
+// the bypass transition, which resolves an NVMe controller's registers to quiesce it (P02M0173).
 pub fn probe_function<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
 	let vendor = A::read16(bus, dev, func, 0x00);
 	if vendor == 0xFFFF || vendor == 0 {

@@ -29,6 +29,27 @@ pub fn halt() -> ! {
 
 // Place the kernel at its physical link addresses, find the device tree, exit boot
 // services, and enter the kernel's boot stub with the MMU off and the DTB in x0.
+// THIS PATH'S DMA-MODE INPUTS. The harness input is `EFI/BOOT/LSDM` on the boot medium the runner
+// assembles, read from this loader's own boot filesystem and nothing else. The device tree's
+// boot-policy node is the DIRECT entry's carrier and is an INDEPENDENT producer here - checked on
+// the firmware's tree BEFORE the no-device-tree profile withholds it, so a gate that withholds the
+// tree cannot also hide a second producer in it.
+pub fn dma_mode_inputs(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, system_table: *mut SystemTable) -> crate::dma_mode::Inputs {
+	let carrier = match crate::read_boot_file_reported(bs, root, crate::ESP_DMA_MODE_FILE) {
+		crate::MediumRead::Bytes(bytes) => bootproto::dma_mode::Carrier::from_bytes(Some(bytes)),
+		crate::MediumRead::Absent => bootproto::dma_mode::Carrier::Absent,
+		crate::MediumRead::Unreadable => {
+			serial::write_str("loader: FATAL - EFI/BOOT/LSDM is on the boot medium and could not be read, so this path's DMA-mode input cannot be established\n");
+			crate::arch::halt();
+		}
+	};
+	let tree = find_dtb(system_table);
+	// SAFETY: the firmware published this table for exactly this reading, and the loader runs under
+	// the firmware's identity map - the same terms `psci_conduit` reads it on.
+	let independent = if tree != 0 && unsafe { fdt::Fdt::new(tree, crate::console::identity_map) }.boot_policy_record().is_some() { Some("the device tree's boot-policy node") } else { None };
+	crate::dma_mode::Inputs { carrier, independent }
+}
+
 pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8], reserved: &crate::ReservedKernel) -> ! {
 	let entry = load_kernel(kernel, reserved);
 	serial::write_str("loader: kernel ELF loaded at its physical link addresses\n");
@@ -298,7 +319,9 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 		let current_el: u64;
 		core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack));
 		let psci_conduit = psci_conduit(current_el, dtb);
-		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit, rsdp: 0, smp_trampoline: 0, dtb, root: crate::root_selection() };
+		// THE BOOT'S DMA MODE AND ITS PROVENANCE, resolved before this function was entered.
+		let (dma_mode, dma_provenance) = crate::dma_mode::handoff_words();
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit, rsdp: 0, smp_trampoline: 0, dtb, root: crate::root_selection(), dma_mode, dma_provenance };
 	}
 	phys
 }

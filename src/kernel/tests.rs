@@ -546,7 +546,7 @@ pub(crate) enum PermissionCohort {
 	Scoped,
 }
 
-pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 12] = [
+pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 15] = [
 	("kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy", PermissionCohort::Base),
 	("kernel.applications.permission_manager_runs_tools_with_minimal_grants", PermissionCohort::Base),
 	("kernel.applications.permission_manager_mints_scoped_application_grants", PermissionCohort::Scoped),
@@ -559,6 +559,9 @@ pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 12] = [
 	("kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", PermissionCohort::Base),
 	("kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", PermissionCohort::Base),
 	("kernel.applications.the_command_tools_run_governed_and_read_in_windows", PermissionCohort::Base),
+	("kernel.applications.the_governed_kill_receives_its_session_client_and_signals_a_job", PermissionCohort::Base),
+	("kernel.applications.the_governed_lsdev_receives_the_policy_endpoint_and_its_config_read_stays_aligned", PermissionCohort::Base),
+	("kernel.applications.a_group_release_across_two_connections_is_refused_and_starts_nothing", PermissionCohort::Base),
 ];
 
 // The marker each consumer puts in its own body. It fails IN THE GUEST on a class that disagrees
@@ -644,6 +647,22 @@ pub(crate) struct PermissionScenarioResult {
 	ip_summary: alloc::vec::Vec<u8>,
 	graphics_read: alloc::vec::Vec<u8>,
 	graphics_start_ns: u64,
+	// What the governed `kill` printed after signalling a job through the session client it was
+	// granted, and the job-signal request the session stand-in received from it.
+	kill_read: alloc::vec::Vec<u8>,
+	kill_request: alloc::vec::Vec<u8>,
+	// What the governed `lsdev --incident 0` printed, the incident request its policy endpoint
+	// received, and the configuration `list` its READ-ONLY config grant made after the policy
+	// endpoint went away - the read that is downstream of the policy tag and desynchronises when a
+	// grant is skipped.
+	lsdev_read: alloc::vec::Vec<u8>,
+	lsdev_policy_request: alloc::vec::Vec<u8>,
+	lsdev_config_request: alloc::vec::Vec<u8>,
+	// The cross-owner refusal: two stages prepared on two connections to the REAL ProcessService,
+	// a group release naming both from one of them, and the process list afterwards.
+	cross_owner_release: alloc::vec::Vec<u8>,
+	cross_owner_cancels: alloc::vec::Vec<bool>,
+	cross_owner_listed: alloc::vec::Vec<alloc::string::String>,
 }
 
 // Build the permission topology and run it to completion. A StorageService serves
@@ -781,7 +800,7 @@ pub(crate) fn permission_result_for_regression(cell: &'static sync::SpinLock<Per
 
 // A result carrying nothing, for a regression that is about the machine rather than the scenario.
 pub(crate) fn empty_permission_result() -> PermissionScenarioResult {
-	PermissionScenarioResult { pipeline_read: alloc::vec::Vec::new(), pipeline_started: false, diagnostic_read: alloc::vec::Vec::new(), redirect_read: alloc::vec::Vec::new(), merged_read: alloc::vec::Vec::new(), stream_reads: alloc::vec::Vec::new(), shell_read: alloc::vec::Vec::new(), expected: alloc::vec::Vec::new(), probe_read: alloc::vec::Vec::new(), probe_summary: alloc::vec::Vec::new(), date_read: alloc::vec::Vec::new(), date_summary: alloc::vec::Vec::new(), command_read: alloc::vec::Vec::new(), request_read: alloc::vec::Vec::new(), request_summary: alloc::vec::Vec::new(), cat_read: alloc::vec::Vec::new(), ip_read: alloc::vec::Vec::new(), ip_summary: alloc::vec::Vec::new(), graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 }
+	PermissionScenarioResult { pipeline_read: alloc::vec::Vec::new(), pipeline_started: false, diagnostic_read: alloc::vec::Vec::new(), redirect_read: alloc::vec::Vec::new(), merged_read: alloc::vec::Vec::new(), stream_reads: alloc::vec::Vec::new(), shell_read: alloc::vec::Vec::new(), expected: alloc::vec::Vec::new(), probe_read: alloc::vec::Vec::new(), probe_summary: alloc::vec::Vec::new(), date_read: alloc::vec::Vec::new(), date_summary: alloc::vec::Vec::new(), command_read: alloc::vec::Vec::new(), request_read: alloc::vec::Vec::new(), request_summary: alloc::vec::Vec::new(), cat_read: alloc::vec::Vec::new(), ip_read: alloc::vec::Vec::new(), ip_summary: alloc::vec::Vec::new(), graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0, kill_read: alloc::vec::Vec::new(), kill_request: alloc::vec::Vec::new(), lsdev_read: alloc::vec::Vec::new(), lsdev_policy_request: alloc::vec::Vec::new(), lsdev_config_request: alloc::vec::Vec::new(), cross_owner_release: alloc::vec::Vec::new(), cross_owner_cancels: alloc::vec::Vec::new(), cross_owner_listed: alloc::vec::Vec::new() }
 }
 
 // Leave `Building`, whatever it takes. A state machine whose builder can strand it has no terminal
@@ -948,12 +967,20 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// still serves the RTC-seeded wall clock to the governed `date` command.
 	let (time_net_server, time_net_client) = Channel::create();
 	core::mem::drop(time_net_server);
-	// The manager's config / device / audio / resource capabilities: real, dead-peer clients (no
-	// such services run in this scenario), held but never granted to the governed components here.
+	// The manager's config and device capabilities: LIVE stand-ins whose server ends this test
+	// holds, because the governed `lsdev` below is granted both and its bootstrap reads them by
+	// position. The manager mints each grant as a fresh sub-connection through the reserved CONNECT
+	// request, so what arrives here is a CONNECT to answer with a channel of this test's choosing -
+	// which is how the test then sees exactly what `lsdev` asks each grant. (They were dead-peer
+	// clients until the `lsdev` fixture was added; nothing else in this scenario reaches them.)
 	let (config_server, config_client) = Channel::create();
-	core::mem::drop(config_server);
 	let (device_server, device_client) = Channel::create();
-	core::mem::drop(device_server);
+	// The operator's device-policy endpoint, granted to `lsdev` as a narrowed duplicate of this
+	// client - so the policy request `lsdev` makes arrives HERE, on the server end the test keeps.
+	let (device_policy_server, device_policy_client) = Channel::create();
+	// VT 1's SessionService, granted to the governed `kill` the same way: the job-signal request
+	// it makes through the grant arrives on this server end, and the test answers as the session.
+	let (session_server, session_client) = Channel::create();
 	let (audio_server, audio_client) = Channel::create();
 	core::mem::drop(audio_server);
 	let (resource_server, resource_client) = Channel::create();
@@ -1053,6 +1080,8 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	send_cap(&pm_boot_kernel, b"TIME", time_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"CONFIG", config_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"DEVICE", device_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"DEVPOLICY", device_policy_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"SESSION", session_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"AUDIO", audio_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"DISPLAY_ADMIN", display_admin_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"INPUT_ADMIN", input_admin_client, Rights::ALL)?;
@@ -1403,6 +1432,171 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		}
 	}
 
+	// THE GOVERNED `kill`, WHICH RECEIVES A SESSION CLIENT AND SIGNALS A JOB WITH IT.
+	//
+	// `kill` is granted exactly `session`, reads that one grant by name, and asks the session to
+	// signal a job by id - it never holds the job's Process handle. This test IS the session: the
+	// grant the manager hands `kill` is a duplicate of the client whose server end is
+	// `session_server`, so the job-signal request arrives here, is answered as the session would
+	// answer it, and what `kill` prints afterwards is the proof that the grant was live and
+	// correctly tagged. A `kill` that received nothing under `SESSION` says "no session" and exits.
+	let (kill_output, kill_stdout) = Channel::create();
+	send_cap(&perm_client, &permission_run_request(0x201, b"kill", b"--kill 1"), kill_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let kill_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer the kill run")?;
+	if kill_reply.bytes.len() < 5 || kill_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused the governed kill");
+	}
+	let kill_request = session_server.recv().map_err(|_| "the governed kill made no job-signal request through its session grant")?;
+	// The reply the session gives: the job as it looks afterwards. Encoded as `job-info`.
+	let mut kill_answer: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	kill_answer.extend_from_slice(&kill_request.bytes[2..6]);
+	kill_answer.push(1);
+	kill_answer.extend_from_slice(&1u32.to_le_bytes());
+	kill_answer.extend_from_slice(&(b"sleep".len() as u16).to_le_bytes());
+	kill_answer.extend_from_slice(b"sleep");
+	kill_answer.push(0);
+	kill_answer.push(0);
+	session_server.send(Message::new(kill_answer, alloc::vec::Vec::new())).map_err(|_| "could not answer the governed kill's job-signal request")?;
+	let mut kill_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..16 {
+		sched::run_until_idle();
+		while let Ok(message) = kill_output.recv() {
+			kill_read.extend_from_slice(&message.bytes);
+		}
+	}
+
+	// THE GOVERNED `lsdev`, WHICH RECEIVES THE POLICY ENDPOINT AND WHOSE CONFIG READ STAYS ALIGNED.
+	//
+	// `lsdev` reads three grants by position - `DEVICE`, `DEVPOLICY`, `CONFIG` - and a manager that
+	// skipped the middle one would hand it the configuration client under the policy tag, which is
+	// exactly how this defect presented: every operator verb answered "no device-policy authority"
+	// while the read that came after it took the wrong message. `--incident 0` is the verb that
+	// exercises BOTH halves: it asks the policy endpoint first, and when that endpoint does not
+	// answer it falls back to a configuration read for the persisted copy. So the policy request
+	// arriving here proves the second grant was delivered under the right tag, and the config
+	// request arriving on the config connection AFTERWARDS proves the third was still aligned.
+	//
+	// The device and config grants are fresh sub-connections the manager mints with CONNECT on the
+	// held clients, whose server ends this test holds - so each mint is answered here with a channel
+	// the test keeps the other end of. The config connection is SEALED by the manager before it is
+	// handed over (a status tool gets a read, never a write), and the seal is answered here too.
+	let (lsdev_output, lsdev_stdout) = Channel::create();
+	send_cap(&perm_client, &permission_run_request(0x202, b"lsdev", b"--incident 0"), lsdev_stdout, Rights::ALL)?;
+	sched::run_until_idle();
+	let device_mint = device_server.recv().map_err(|_| "PermissionManager did not mint a device sub-connection for lsdev")?;
+	if device_mint.bytes.len() != 2 || le_u16(&device_mint.bytes, 0) != abi::CONNECT_OP {
+		return Err("PermissionManager sent something other than CONNECT to mint lsdev's device grant");
+	}
+	let (lsdev_device_server, lsdev_device_client) = Channel::create();
+	send_cap(&device_server, &[], lsdev_device_client, Rights::ALL)?;
+	sched::run_until_idle();
+	let config_mint = config_server.recv().map_err(|_| "PermissionManager did not mint a config sub-connection for lsdev")?;
+	if config_mint.bytes.len() != 2 || le_u16(&config_mint.bytes, 0) != abi::CONNECT_OP {
+		return Err("PermissionManager sent something other than CONNECT to mint lsdev's config grant");
+	}
+	let (lsdev_config_server, lsdev_config_client) = Channel::create();
+	send_cap(&config_server, &[], lsdev_config_client, Rights::ALL)?;
+	sched::run_until_idle();
+	let seal = lsdev_config_server.recv().map_err(|_| "PermissionManager did not seal lsdev's configuration grant")?;
+	if seal.bytes.len() < 6 || le_u16(&seal.bytes, 0) != 5 {
+		return Err("PermissionManager's first request on lsdev's config grant was not a seal");
+	}
+	lsdev_config_server.send(Message::new([&seal.bytes[2..6], &[1u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not answer the seal")?;
+	sched::run_until_idle();
+	let lsdev_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer the lsdev run")?;
+	if lsdev_reply.bytes.len() < 5 || lsdev_reply.bytes[4] == 0 {
+		return Err("PermissionManager refused the governed lsdev");
+	}
+	// `lsdev` asks the policy endpoint for the incident. The endpoint GOES AWAY without answering -
+	// which is the case the fallback exists for, DeviceManager being gone - and the request it made
+	// is kept as the proof the grant reached it.
+	let lsdev_policy_request = device_policy_server.recv().map_err(|_| "the governed lsdev made no request on its device-policy grant")?;
+	core::mem::drop(device_policy_server);
+	sched::run_until_idle();
+	// The fallback resolves the row through the device grant first; a `not-found` there sends it
+	// to the configuration listing, which is the read this fixture is about.
+	let lookup = lsdev_device_server.recv().map_err(|_| "lsdev did not ask its device grant to resolve the row")?;
+	if lookup.bytes.len() < 6 {
+		return Err("lsdev's device request is malformed");
+	}
+	lsdev_device_server.send(Message::new([&lookup.bytes[2..6], &[0u8, 1u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not answer lsdev's device lookup")?;
+	sched::run_until_idle();
+	let lsdev_config_request = lsdev_config_server.recv().map_err(|_| "lsdev made no configuration read after its policy endpoint went away - the CONFIG grant was not where lsdev expected it")?;
+	if lsdev_config_request.bytes.len() >= 6 {
+		// An empty tree: nothing is stored, which is the answer `lsdev` then reports.
+		lsdev_config_server.send(Message::new([&lsdev_config_request.bytes[2..6], &[1u8], &0u16.to_le_bytes()].concat(), alloc::vec::Vec::new())).map_err(|_| "could not answer lsdev's configuration read")?;
+	}
+	let mut lsdev_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..16 {
+		sched::run_until_idle();
+		while let Ok(message) = lsdev_output.recv() {
+			lsdev_read.extend_from_slice(&message.bytes);
+		}
+	}
+
+	// A GROUP RELEASE ACROSS TWO CONNECTIONS IS REFUSED, against the REAL ProcessService.
+	//
+	// The manager prepares, seals and group-releases a pipeline on ONE connection, and this is the
+	// negative that makes that a rule rather than a habit: two independent connections are two
+	// owners, and a group release that names a launch prepared on the other one is refused with
+	// nothing started - the prepared launches are then cancelled by their owners and the process
+	// list shows neither ever ran. Driven here with the shell's client to the service, which the
+	// manager is not using at this moment.
+	let mint_connection = |root: &Channel| -> Result<alloc::sync::Arc<Channel>, &'static str> {
+		root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not ask ProcessService for a connection")?;
+		sched::run_until_idle();
+		let minted = root.recv().map_err(|_| "ProcessService did not answer CONNECT")?;
+		minted.caps.first().ok_or("ProcessService's CONNECT reply carried no channel")?.object().into_any_arc().downcast::<Channel>().map_err(|_| "ProcessService's CONNECT reply was not a channel")
+	};
+	let owner_a = mint_connection(&process_client_for_shell)?;
+	let owner_b = mint_connection(&process_client_for_shell)?;
+	let prepare_on = |owner: &Channel, corr: u32, name: &[u8]| -> Result<u64, &'static str> {
+		let (_manager_side, child_side) = Channel::create();
+		let mut request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		request.extend_from_slice(&6u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+		request.extend_from_slice(name);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(owner, &request, child_side, Rights::ALL)?;
+		sched::run_until_idle();
+		let reply = owner.recv().map_err(|_| "ProcessService did not answer a prepare")?;
+		if reply.bytes.len() < 17 || reply.bytes[4] != 1 {
+			return Err("ProcessService refused a prepare this fixture needs");
+		}
+		Ok(le_u64(&reply.bytes, 9))
+	};
+	let koid_a = prepare_on(&owner_a, 0x301, b"echo")?;
+	let koid_b = prepare_on(&owner_b, 0x302, b"readln")?;
+	let mut group_release: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	group_release.extend_from_slice(&8u16.to_le_bytes());
+	group_release.extend_from_slice(&0x303u32.to_le_bytes());
+	group_release.extend_from_slice(&2u16.to_le_bytes());
+	group_release.extend_from_slice(&koid_a.to_le_bytes());
+	group_release.extend_from_slice(&koid_b.to_le_bytes());
+	owner_a.send(Message::new(group_release, alloc::vec::Vec::new())).map_err(|_| "could not send the cross-owner group release")?;
+	sched::run_until_idle();
+	let cross_owner_release = owner_a.recv().map_err(|_| "ProcessService did not answer the cross-owner group release")?.bytes;
+	let cancel_on = |owner: &Channel, corr: u32, koid: u64| -> Result<bool, &'static str> {
+		let mut request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		request.extend_from_slice(&9u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&koid.to_le_bytes());
+		owner.send(Message::new(request, alloc::vec::Vec::new())).map_err(|_| "could not send a cancel")?;
+		sched::run_until_idle();
+		let reply = owner.recv().map_err(|_| "ProcessService did not answer a cancel")?;
+		Ok(reply.bytes.len() >= 6 && reply.bytes[4] == 1 && reply.bytes[5] == 1)
+	};
+	let cross_owner_cancels: alloc::vec::Vec<bool> = alloc::vec![cancel_on(&owner_a, 0x304, koid_a)?, cancel_on(&owner_b, 0x305, koid_b)?];
+	core::mem::drop(owner_a);
+	core::mem::drop(owner_b);
+	sched::run_until_idle();
+	process_client_for_shell.send(Message::new([2u16.to_le_bytes().as_slice(), &0x306u32.to_le_bytes()].concat(), alloc::vec::Vec::new())).map_err(|_| "could not ask ProcessService for its list")?;
+	sched::run_until_idle();
+	let listed = process_client_for_shell.recv().map_err(|_| "ProcessService did not answer the list")?;
+	let cross_owner_listed: alloc::vec::Vec<alloc::string::String> = process_list_names(&listed.bytes);
+
 	// PermissionManager reports its "online" line, then each governed component's proof and
 	// decisions summary: the bytes sandbox_probe read through its one granted storage
 	// capability and its summary, the instant `date` printed through its one granted time
@@ -1526,7 +1720,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 
 	if scenario != PermissionScenario::ScopedGrants {
 		record_permission_setup(PermissionCohort::Base);
-		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), merged_read: merged_read.clone(), stream_reads: stream_reads.clone(), shell_read: shell_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), merged_read: merged_read.clone(), stream_reads: stream_reads.clone(), shell_read: shell_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0, kill_read, kill_request: kill_request.bytes, lsdev_read, lsdev_policy_request: lsdev_policy_request.bytes, lsdev_config_request: lsdev_config_request.bytes, cross_owner_release, cross_owner_cancels, cross_owner_listed });
 	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
@@ -1778,7 +1972,462 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		return Err("MP3 play did not exit");
 	}
 	record_permission_setup(PermissionCohort::Scoped);
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, shell_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read, graphics_start_ns })
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, shell_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read, graphics_start_ns, kill_read, kill_request: kill_request.bytes, lsdev_read, lsdev_policy_request: lsdev_policy_request.bytes, lsdev_config_request: lsdev_config_request.bytes, cross_owner_release, cross_owner_cancels, cross_owner_listed })
+}
+
+// A `run` request as the shell sends it: op 3, a correlation id, the name, the arguments, the
+// working directory, an empty environment, and the placeholder for the stdout capability that
+// travels beside the bytes.
+fn permission_run_request(corr: u32, name: &[u8], args: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	request.extend_from_slice(&3u16.to_le_bytes());
+	request.extend_from_slice(&corr.to_le_bytes());
+	for value in [name, args, &b"vol://system"[..]] {
+		request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		request.extend_from_slice(value);
+	}
+	request.extend_from_slice(&0u16.to_le_bytes());
+	request.extend_from_slice(&0u32.to_le_bytes());
+	request
+}
+
+// A `run-pipeline` request: op 4, the stages with `merge-errors` clear, the working directory, an
+// empty environment and the terminal placeholder.
+fn permission_pipeline_request(corr: u32, stages: &[(&[u8], &[u8])]) -> alloc::vec::Vec<u8> {
+	let mut request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	request.extend_from_slice(&4u16.to_le_bytes());
+	request.extend_from_slice(&corr.to_le_bytes());
+	request.extend_from_slice(&(stages.len() as u16).to_le_bytes());
+	for (name, args) in stages {
+		for value in [*name, *args] {
+			request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			request.extend_from_slice(value);
+		}
+		request.push(0);
+	}
+	request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
+	request.extend_from_slice(b"vol://system");
+	request.extend_from_slice(&0u16.to_le_bytes());
+	request.extend_from_slice(&0u32.to_le_bytes());
+	request
+}
+
+// A `run-with-file` request: op 6, name, arguments, working directory, the file, `writable` and the
+// stdout placeholder.
+fn permission_run_with_file_request(corr: u32, name: &[u8], file: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	// `run-with-file` is op 5 of `liber:security@1.permission`; op 6 is `run-interactive`, whose
+	// shape this request does not decode as - and a request the dispatch cannot decode is answered
+	// with nothing at all, which is how this encoder's first version hung the selected-file case.
+	request.extend_from_slice(&5u16.to_le_bytes());
+	request.extend_from_slice(&corr.to_le_bytes());
+	for value in [name, &b""[..], &b"vol://system"[..], file] {
+		request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		request.extend_from_slice(value);
+	}
+	request.push(0);
+	request.extend_from_slice(&0u32.to_le_bytes());
+	request
+}
+
+// The names in a `process.list` reply.
+fn process_list_names(reply: &[u8]) -> alloc::vec::Vec<alloc::string::String> {
+	let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	if reply.len() < 7 || reply[4] != 1 {
+		return names;
+	}
+	let count = le_u16(reply, 5) as usize;
+	let mut at = 7usize;
+	for _ in 0..count {
+		if at + 10 > reply.len() {
+			break;
+		}
+		let len = le_u16(reply, at + 8) as usize;
+		at += 10;
+		if at + len > reply.len() {
+			break;
+		}
+		names.push(alloc::string::String::from_utf8_lossy(&reply[at..at + len]).into_owned());
+		at += len;
+	}
+	names
+}
+
+// ---- THE FAULT COHORT: the launch transaction, observed from ProcessService's side ----
+//
+// PermissionManager runs every launch as one transaction on one connection to ProcessService, and
+// what it does at each way a call can END is the whole of its rollback. A real ProcessService
+// cannot be told to lose a reply, answer garbage or refuse a release on demand, so this scenario
+// PLAYS ProcessService: the manager's `PROCESS` capability is a channel this test serves, and every
+// request the manager makes - the CONNECT that mints a transaction, each prepare, each release, each
+// cancel, the group release and the reaping `list` - arrives here, where the test decides how it
+// ends and records what the manager did next.
+//
+// The "processes" a prepare answers with are real kernel Process objects with no thread, created
+// in the fixture's own domain, so a `SIG_KILL` the manager sends in recovery is observable as
+// `is_killed()` and a launch it did NOT kill is observable as the opposite.
+
+// How the stand-in ends one request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StandInEnding {
+	// Answer as a healthy service would.
+	Answer,
+	// A typed `not-found`: nothing was prepared, or no such launch.
+	Refuse,
+	// Close the connection without answering: the peer is gone.
+	Vanish,
+	// Answer with bytes the client cannot decode.
+	Garble,
+	// Answer a release with `false`: no such prepared launch of yours.
+	Deny,
+	// Answer a release with `invalid`: the token was taken and the start failed.
+	Fail,
+}
+
+// One case's script and what the stand-in observed while running it.
+pub(crate) struct FaultCase {
+	pub(crate) label: &'static str,
+	// The request the manager is driven with.
+	request: alloc::vec::Vec<u8>,
+	// Whether a CONNECT is answered with a connection at all.
+	mint: bool,
+	// How each prepare ends, in order; a prepare past the end of the list is answered.
+	prepares: alloc::vec::Vec<StandInEnding>,
+	// How the (single or group) release ends.
+	release: StandInEnding,
+	// Arm the kernel's one-shot group-creation fault before the request.
+	fail_group_creation: bool,
+	// Whether the stand-in DROPS the bootstrap end a prepare carried instead of holding it: the
+	// prepared launch is gone on the service's side, so the next grant the manager sends cannot be
+	// delivered. That is the one way a grant of the volume bundle fails - a missing volume is
+	// granted as zero by design - and it is the fault the bounded tool's case injects.
+	drop_bootstrap: bool,
+	// OBSERVATIONS.
+	// The manager's reply: `[corr][tag]...`.
+	pub(crate) reply: alloc::vec::Vec<u8>,
+	// Every request the stand-in saw, as (connection index, opcode); the root is index 0 and every
+	// minted transaction connection numbers from 1 in the order it was minted.
+	pub(crate) requests: alloc::vec::Vec<(usize, u16)>,
+	// Whether each process a prepare answered with was killed by the time the reply arrived.
+	pub(crate) killed: alloc::vec::Vec<bool>,
+	// The fixture domain's handle count before the request and after the reply.
+	pub(crate) handles_before: u64,
+	pub(crate) handles_after: u64,
+	// For the garbled case: whether a well-formed LATE reply, sent after the manager gave up, could
+	// still be delivered on that connection.
+	pub(crate) late_reply_delivered: Option<bool>,
+}
+
+impl FaultCase {
+	fn new(label: &'static str, request: alloc::vec::Vec<u8>, prepares: &[StandInEnding], release: StandInEnding) -> FaultCase {
+		FaultCase { label, request, mint: true, prepares: prepares.to_vec(), release, fail_group_creation: false, drop_bootstrap: false, reply: alloc::vec::Vec::new(), requests: alloc::vec::Vec::new(), killed: alloc::vec::Vec::new(), handles_before: 0, handles_after: 0, late_reply_delivered: None }
+	}
+}
+
+pub(crate) fn permission_fault_cases() -> alloc::vec::Vec<FaultCase> {
+	use StandInEnding::*;
+	let mut cases: alloc::vec::Vec<FaultCase> = alloc::vec::Vec::new();
+	let mut mint_refused = FaultCase::new("mint refused", permission_run_request(0x401, b"date", b""), &[], Answer);
+	mint_refused.mint = false;
+	cases.push(mint_refused);
+	cases.push(FaultCase::new("prepare refused", permission_run_request(0x402, b"date", b""), &[Refuse], Answer));
+	cases.push(FaultCase::new("prepare reply lost", permission_run_request(0x403, b"date", b""), &[Vanish], Answer));
+	cases.push(FaultCase::new("prepare reply garbled, then late", permission_run_request(0x404, b"date", b""), &[Garble], Answer));
+	cases.push(FaultCase::new("grant fails after prepare", permission_run_request(0x405, b"lsusb", b""), &[Answer], Answer));
+	// THE BOUNDED TOOL'S OWN ENDING. `imgconv` is the one tool prepared under a memory limit, and
+	// its manifest grants the volume bundle. A volume this manager holds no client for is granted
+	// as ZERO by design, so the bundle itself never refuses; what makes the grant fail AFTER the
+	// prepare is the prepared launch being gone on the service's side - the stand-in drops the
+	// bootstrap end the prepare carried, and the first grant the manager sends has no peer. That is
+	// the case the bounded path exists for: a live bounded launch could not roll a failed grant
+	// back to "it never ran", and a prepared one cancels. The refused-release ending of the same
+	// code path is the `date` case below; a second copy of it under a limit would prove the limit
+	// and nothing else.
+	let mut bounded = FaultCase::new("bounded prepare, then a grant fails", permission_run_request(0x406, b"imgconv", b"a b"), &[Answer], Answer);
+	bounded.drop_bootstrap = true;
+	cases.push(bounded);
+	cases.push(FaultCase::new("selected-file grant fails after prepare", permission_run_with_file_request(0x407, b"licoview", b"vol://system/not-there.txt"), &[Answer], Answer));
+	cases.push(FaultCase::new("release refused", permission_run_request(0x408, b"date", b""), &[Answer], Deny));
+	cases.push(FaultCase::new("release start failed", permission_run_request(0x409, b"date", b""), &[Answer], Fail));
+	cases.push(FaultCase::new("release reply lost", permission_run_request(0x40a, b"date", b""), &[Answer], Vanish));
+	cases.push(FaultCase::new("group release refused", permission_pipeline_request(0x40b, &[(b"echo", b"hi"), (b"readln", b"")]), &[Answer, Answer], Deny));
+	cases.push(FaultCase::new("group release partial", permission_pipeline_request(0x40c, &[(b"echo", b"hi"), (b"readln", b"")]), &[Answer, Answer], Fail));
+	cases.push(FaultCase::new("group release reply lost", permission_pipeline_request(0x40d, &[(b"echo", b"hi"), (b"readln", b"")]), &[Answer, Answer], Vanish));
+	let mut group_creation = FaultCase::new("group creation fails", permission_pipeline_request(0x40e, &[(b"echo", b"hi"), (b"readln", b"")]), &[Answer, Answer], Answer);
+	group_creation.fail_group_creation = true;
+	cases.push(group_creation);
+	cases.push(FaultCase::new("pipeline committed", permission_pipeline_request(0x40f, &[(b"echo", b"hi"), (b"readln", b"")]), &[Answer, Answer], Answer));
+	cases
+}
+
+// The stand-in's connections: the root the manager was given, and every transaction it minted.
+struct ProcessStandIn {
+	root: alloc::sync::Arc<object::channel::Channel>,
+	// The time service's root, held so the manager's TIME client has a live peer. `date`'s one
+	// grant is a narrowed DUPLICATE of that client - no mint, nothing to answer here.
+	time: alloc::sync::Arc<object::channel::Channel>,
+	connections: alloc::vec::Vec<Option<alloc::sync::Arc<object::channel::Channel>>>,
+	// The processes handed out by prepares in the current case, in order.
+	processes: alloc::vec::Vec<alloc::sync::Arc<object::process::Process>>,
+	// EVERY PREPARE REQUEST, HELD FOR THE CASE. A prepare carries the CHILD'S END of the bootstrap
+	// channel, which the real ProcessService keeps in the prepared record until the launch is
+	// released or cancelled. Dropping the message dropped that end, so the manager's next send on
+	// its own end - the stdout console, READY, the launch context - failed with a closed peer and
+	// every case that should have reached a release cancelled first, for a fault the script never
+	// injected. The one that is scripted arrives through the connection's ending, not through the
+	// bootstrap.
+	held: alloc::vec::Vec<object::channel::Message>,
+	domain: alloc::sync::Arc<object::domain::Domain>,
+}
+
+impl ProcessStandIn {
+	// Serve requests until the manager answers on `answer_on`, or nothing moves for a while.
+	fn serve(&mut self, case: &mut FaultCase, answer_on: &object::channel::Channel, script_prepares: bool) -> Result<alloc::vec::Vec<u8>, &'static str> {
+		use object::channel::Message;
+		use object::rights::Rights;
+		let mut prepared: usize = 0;
+		let mut quiet_rounds: usize = 0;
+		loop {
+			sched::run_until_idle();
+			let mut progressed = false;
+			// Nothing is expected on the time root - the grant is a duplicate of the held client -
+			// and anything that does arrive is drained rather than left to fill the queue.
+			while self.time.recv().is_ok() {
+				progressed = true;
+			}
+			while let Ok(message) = self.root.recv() {
+				progressed = true;
+				let op = if message.bytes.len() >= 2 { le_u16(&message.bytes, 0) } else { 0 };
+				case.requests.push((0, op));
+				if op == abi::CONNECT_OP {
+					if case.mint {
+						let (mine, theirs) = object::channel::Channel::create();
+						self.connections.push(Some(mine));
+						send_cap(&self.root, &[], theirs, Rights::ALL)?;
+					} else {
+						self.root.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).map_err(|_| "could not refuse a CONNECT")?;
+					}
+				} else if op == 2 {
+					// `list`: an empty tree, which is what a reap sees when nothing is running.
+					self.root.send(Message::new([&message.bytes[2..6], &[1u8], &0u16.to_le_bytes()].concat(), alloc::vec::Vec::new())).map_err(|_| "could not answer list")?;
+				} else {
+					return Err("the manager sent something other than CONNECT or list on the root");
+				}
+			}
+			for index in 0..self.connections.len() {
+				let Some(connection) = self.connections[index].clone() else { continue };
+				while let Ok(message) = connection.recv() {
+					progressed = true;
+					let op = if message.bytes.len() >= 2 { le_u16(&message.bytes, 0) } else { 0 };
+					case.requests.push((index + 1, op));
+					let corr = &message.bytes[2..6];
+					match op {
+						6 | 10 => {
+							let ending = if script_prepares { case.prepares.get(prepared).copied().unwrap_or(StandInEnding::Answer) } else { StandInEnding::Refuse };
+							prepared += 1;
+							match ending {
+								StandInEnding::Answer => {
+									let space = object::address_space::AddressSpace::create_in(&self.domain).ok_or("no address space for a stand-in process")?;
+									let process = object::process::Process::new(space, self.domain.clone()).ok_or("no stand-in process")?;
+									let koid = object::KernelObject::header(&*process).koid();
+									let name = &message.bytes[8..8 + le_u16(&message.bytes, 6) as usize];
+									// THE ARTIFACT'S NAME, as the real service reports it: `date.lsexe`, not
+									// `date`. The manager derives the policy name from the start-result by
+									// stripping the executable suffix, and a bare name has none to strip -
+									// so echoing the request's name back cancelled every launch before a
+									// grant was minted, for a fault no case had scripted.
+									let mut artifact: alloc::vec::Vec<u8> = name.to_vec();
+									artifact.extend_from_slice(abi::EXECUTABLE_SUFFIX.as_bytes());
+									let mut reply: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+									reply.extend_from_slice(corr);
+									reply.push(1);
+									reply.extend_from_slice(&0u32.to_le_bytes());
+									reply.extend_from_slice(&koid.to_le_bytes());
+									reply.extend_from_slice(&(artifact.len() as u16).to_le_bytes());
+									reply.extend_from_slice(&artifact);
+									send_cap(&connection, &reply, process.clone(), Rights::ALL)?;
+									self.processes.push(process);
+									if !case.drop_bootstrap {
+										self.held.push(message);
+									}
+								}
+								StandInEnding::Refuse => connection.send(Message::new([corr, &[0u8, 1u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not refuse a prepare")?,
+								StandInEnding::Vanish => {
+									self.connections[index] = None;
+								}
+								StandInEnding::Garble => connection.send(Message::new(alloc::vec![0xde, 0xad], alloc::vec::Vec::new())).map_err(|_| "could not garble a prepare")?,
+								StandInEnding::Deny | StandInEnding::Fail => return Err("a prepare cannot be denied or failed the way a release can"),
+							}
+						}
+						7 | 8 => match case.release {
+							StandInEnding::Answer => connection.send(Message::new([corr, &[1u8, 1u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not answer a release")?,
+							StandInEnding::Deny => connection.send(Message::new([corr, &[1u8, 0u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not deny a release")?,
+							StandInEnding::Fail => connection.send(Message::new([corr, &[0u8, 2u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not fail a release")?,
+							StandInEnding::Vanish => {
+								self.connections[index] = None;
+							}
+							StandInEnding::Refuse | StandInEnding::Garble => return Err("a release is not scripted to be refused or garbled here"),
+						},
+						9 => connection.send(Message::new([corr, &[1u8, 1u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not answer a cancel")?,
+						_ => return Err("the manager sent an opcode the stand-in does not serve on a transaction connection"),
+					}
+				}
+			}
+			if let Ok(reply) = answer_on.recv() {
+				return Ok(reply.bytes);
+			}
+			if progressed {
+				quiet_rounds = 0;
+			} else {
+				quiet_rounds += 1;
+				if quiet_rounds > 64 {
+					crate::serial_println!("fault case {}: the stand-in saw {:?} and no answer arrived", case.label, case.requests);
+					return Err("the manager neither asked the stand-in anything nor answered");
+				}
+			}
+		}
+	}
+}
+
+// What the fault scenario observed: every scripted transaction case, and the generated guard's
+// own resource baseline - a `run` whose stdout capability lacks the `send` right the schema demands
+// is refused by the generated dispatch before the manager's own code runs, and the handle the
+// refused request carried must be gone from the manager's table afterwards. Repeated, because one
+// leaked capability per refused request is the shape of the defect.
+pub(crate) struct FaultReport {
+	pub(crate) cases: alloc::vec::Vec<FaultCase>,
+	// Per refused request: the reply bytes, and the domain's handle count before and after.
+	pub(crate) rights_denials: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64, u64)>,
+}
+
+// Build the fault scenario and run every case. The result carries observations only.
+pub(crate) fn run_permission_fault_scenario() -> Result<FaultReport, &'static str> {
+	let domain = object::domain::Domain::new(PERMISSION_FIXTURE_MEMORY, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	let before = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
+	let outcome = run_permission_fault_scenario_in(&domain);
+	let reaped = reap_permission_fixture(&domain, before);
+	match (outcome, reaped) {
+		(Err(diagnostic), _) => Err(diagnostic),
+		(Ok(_), Err(diagnostic)) => Err(diagnostic),
+		(Ok(report), Ok(())) => Ok(report),
+	}
+}
+
+fn run_permission_fault_scenario_in(domain: &alloc::sync::Arc<object::domain::Domain>) -> Result<FaultReport, &'static str> {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages()?;
+	let pm_elf = program_elf(&package, volume, b"permission_manager").ok_or("permission_manager missing from the package or volume")?;
+	let (pm_boot_kernel, pm_boot_user) = Channel::create();
+	let (perm_server, perm_client) = Channel::create();
+	// THE STAND-IN'S ROOT: the manager's `PROCESS` capability.
+	let (process_server, process_client) = Channel::create();
+	// THE TIME SERVICE'S ROOT, held by the stand-in so the manager's TIME client has a peer. `date`'s
+	// one grant is a narrowed duplicate of that client, so nothing is ever asked on it; what the
+	// release endings below need from the stand-in is the bootstrap end every prepare carries, kept
+	// for the case rather than dropped with the request.
+	let (time_server, time_client) = Channel::create();
+	// A dead-peer client for the USB bus: `lsusb`'s grant is the one this scenario wants to FAIL.
+	let (usb_server, usb_client) = Channel::create();
+	core::mem::drop(usb_server);
+	// The storage-admin endpoint the selected-file path mints from: this test answers its
+	// `open-file` with a refusal, which is the fault that case injects.
+	let (storage_admin_server, storage_admin_client) = Channel::create();
+
+	let _permission_manager = spawn_dynamic_test_process(domain.clone(), pm_elf, pm_boot_user);
+	send_cap(&pm_boot_kernel, b"TIME", time_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"USBBUS", usb_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"STORAGE_ADMIN", storage_admin_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
+	pm_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not end PermissionManager's bootstrap")?;
+
+	let mut stand_in = ProcessStandIn { root: process_server, time: time_server, connections: alloc::vec::Vec::new(), processes: alloc::vec::Vec::new(), held: alloc::vec::Vec::new(), domain: domain.clone() };
+	// THE MANAGER'S OWN START-UP LAUNCHES, refused. It launches its probes and demonstration tools
+	// through the same client before it reports online, and each of those is a transaction the
+	// stand-in refuses at the prepare - so the manager comes up having run nothing, and reports so.
+	let mut startup = FaultCase::new("startup", alloc::vec::Vec::new(), &[], StandInEnding::Answer);
+	let _online = stand_in.serve(&mut startup, &pm_boot_kernel, false)?;
+	stand_in.connections.clear();
+
+	// THE GUARD'S RESOURCE BASELINE. `run` declares `@rights(send)` on its stdout capability; a
+	// request whose capability carries everything but `send` is refused by the generated dispatch
+	// and never reaches a transaction - so the stand-in must see no CONNECT, and the handle the
+	// refused request carried must be closed, which the domain's handle count is the witness of.
+	let mut rights_denials: alloc::vec::Vec<(alloc::vec::Vec<u8>, u64, u64)> = alloc::vec::Vec::new();
+	for attempt in 0..8u32 {
+		sched::run_until_idle();
+		let handles_before = domain.account().handles().used();
+		let (_output, stdout) = Channel::create();
+		send_cap(&perm_client, &permission_run_request(0x500 + attempt, b"date", b""), stdout, Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER)?;
+		let mut refused = FaultCase::new("refused by rights", alloc::vec::Vec::new(), &[], StandInEnding::Answer);
+		let reply = stand_in.serve(&mut refused, &perm_client, true)?;
+		if !refused.requests.is_empty() {
+			return Err("a request the guard refused still reached ProcessService");
+		}
+		sched::run_until_idle();
+		let handles_after = domain.account().handles().used();
+		rights_denials.push((reply, handles_before, handles_after));
+	}
+
+	let mut cases = permission_fault_cases();
+	for case in cases.iter_mut() {
+		// Named on the console as it starts, so a case that hangs is a case whose label the log
+		// carries rather than a timeout the reader has to attribute by counting.
+		crate::serial_println!("fault case: {}", case.label);
+		stand_in.connections.clear();
+		stand_in.processes.clear();
+		stand_in.held.clear();
+		sched::run_until_idle();
+		case.handles_before = domain.account().handles().used();
+		if case.fail_group_creation {
+			crate::syscall::FAIL_NEXT_GROUP_CREATE.store(true, core::sync::atomic::Ordering::Release);
+		}
+		let (output, stdout) = Channel::create();
+		send_cap(&perm_client, &case.request, stdout, Rights::ALL)?;
+		// The selected-file case: the manager asks the storage-admin stand-in for the file, and is
+		// refused. Served inside the same pump, so the order of requests is the manager's.
+		let reply = loop {
+			match stand_in.serve(case, &perm_client, true) {
+				Ok(reply) => break reply,
+				Err(diagnostic) => {
+					// A pause with nothing on the process side may be the admin mint waiting.
+					let Ok(open) = storage_admin_server.recv() else { return Err(diagnostic) };
+					storage_admin_server.send(Message::new([&open.bytes[2..6], &[0u8, 1u8]].concat(), alloc::vec::Vec::new())).map_err(|_| "could not refuse the selected file")?;
+				}
+			}
+		};
+		case.reply = reply;
+		// A committed pipeline hands its group back; the test holds it only long enough to end the
+		// stand-in processes the way the shell would, then lets go. Nothing else is running.
+		for process in &stand_in.processes {
+			if !process.is_killed() && case.label == "pipeline committed" {
+				process.terminate();
+			}
+		}
+		core::mem::drop(output);
+		sched::run_until_idle();
+		case.killed = stand_in.processes.iter().map(|process| process.is_killed()).collect();
+		if case.prepares.first() == Some(&StandInEnding::Garble) {
+			// The late reply: well-formed, on the connection the manager gave up on. It must land
+			// nowhere - the manager has closed its end - and the manager's next transaction must
+			// begin with a fresh CONNECT rather than a call on this channel.
+			let late = stand_in.connections.first().cloned().flatten().ok_or("the garbled case minted no connection")?;
+			let delivered = late.send(Message::new(alloc::vec![0u8, 0, 0, 0, 0, 1], alloc::vec::Vec::new())).is_ok();
+			case.late_reply_delivered = Some(delivered);
+		}
+		stand_in.processes.clear();
+		stand_in.connections.clear();
+		stand_in.held.clear();
+		sched::run_until_idle();
+		case.handles_after = domain.account().handles().used();
+		if case.fail_group_creation {
+			crate::syscall::FAIL_NEXT_GROUP_CREATE.store(false, core::sync::atomic::Ordering::Release);
+		}
+	}
+	core::mem::drop(perm_client);
+	Ok(FaultReport { cases, rights_denials })
 }
 
 // Build the component topology and run it to completion. A StorageService serves
@@ -2254,10 +2903,28 @@ pub(crate) fn device_privilege() -> u64 {
 // `SYS_DEVICE_ACQUIRE` is retired: it minted a `DeviceMemory` for anyone with the privilege who
 // named an index, counted owners instead of having one, and answered with nothing the caller could
 // later release the device by. Every test that used to call it goes through here.
+//
+// UNDER THE ENTRY THE REGISTRY DECLARES FOR THE DEVICE, resolved the way DeviceManager resolves it -
+// the first entry whose rules admit the device - so a test claims by name like the manager does and
+// the kernel's identity check is exercised rather than bypassed. A device nothing declares for is a
+// device the manager could not bind either, and the claim is refused by name.
 pub(crate) fn claim_device(index: u64) -> Result<abi::ClaimGrant, i64> {
+	let entry = entry_for_device(index).unwrap_or([0; abi::ENTRY_NAME_LEN]);
+	claim_device_as(index, &entry)
+}
+
+// The same claim, under a NAMED entry - for the fixtures whose subject is the name.
+pub(crate) fn claim_device_as(index: u64, entry: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi::ClaimGrant, i64> {
 	let mut grant = abi::ClaimGrant::default();
-	let result = unsafe { arch::syscall::invoke(syscall::SYS_DEVICE_CLAIM, index, device_privilege(), &mut grant as *mut _ as u64, 0) } as i64;
+	let result = unsafe { arch::syscall::invoke(syscall::SYS_DEVICE_CLAIM, index, device_privilege(), &mut grant as *mut _ as u64, entry.as_ptr() as u64) } as i64;
 	if result < 0 { Err(result) } else { Ok(grant) }
+}
+
+// Which registry entry a test would claim the device at `index` under. The synthetic devices are
+// declared for by the synthetic entries; a real device by the manifest's rows.
+pub(crate) fn entry_for_device(index: u64) -> Option<[u8; abi::ENTRY_NAME_LEN]> {
+	let discovered = device::with(index as usize, |d| driver_binding::Discovered { transport: d.transport, virtio_type: d.device_type as u32, class: d.class, subclass: d.subclass, prog_if: d.prog_if, vendor: d.vendor, product: d.product, bus: d.bus, dev: d.dev, func: d.func })?;
+	dma_policy::entry_matching(&discovered)
 }
 
 // AND GIVE IT BACK, which the old call had no way of doing and no need to.

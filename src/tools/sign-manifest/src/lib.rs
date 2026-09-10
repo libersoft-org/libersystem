@@ -44,19 +44,92 @@ pub const TEST_SIGNING_KEY: [u8; 32] = [
 ];
 pub const TEST_KEY_ID: u32 = 0x7e57_0001;
 
+// THE PUBLISHED RECOVERY TEST KEY'S PRIVATE HALF, in the open for the same reason. Its public half
+// is scoped to the recovery purpose in the loader, and this one exists so the cross-use negatives
+// - a recovery set signed with the boot key, an ordinary set signed with this one - can be made.
+// The seed is SHA-256 of the sentence in the comment of the gate that uses it, so it is
+// reproducible without this file.
+pub const TEST_RECOVERY_SIGNING_KEY: [u8; 32] = [
+	0x17,
+	0x4c,
+	0xe8,
+	0x79,
+	0x40,
+	0x38,
+	0xab,
+	0x36,
+	0x13,
+	0x47,
+	0x92,
+	0xc9,
+	0xe9,
+	0xc7,
+	0x21,
+	0xbe,
+	0x93,
+	0xfc,
+	0x56,
+	0x17,
+	0xd1,
+	0xf1,
+	0xe7,
+	0x20,
+	0x2f,
+	0x45,
+	0x4a,
+	0x59,
+	0xad,
+	0xb7,
+	0x29,
+	0xe0,
+];
+pub const TEST_RECOVERY_KEY_ID: u32 = 0x7e57_0002;
+
+// Which published key signs. The purpose a manifest CLAIMS is a header field; which key signs it
+// is this - and the two are chosen independently on purpose, so a manifest can be made that claims
+// a purpose its key may not sign for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TestKey {
+	Boot,
+	Recovery,
+}
+
+impl TestKey {
+	pub fn key_id(self) -> u32 {
+		match self {
+			TestKey::Boot => TEST_KEY_ID,
+			TestKey::Recovery => TEST_RECOVERY_KEY_ID,
+		}
+	}
+
+	pub fn signing_key(self) -> ed25519_dalek::SigningKey {
+		ed25519_dalek::SigningKey::from_bytes(match self {
+			TestKey::Boot => &TEST_SIGNING_KEY,
+			TestKey::Recovery => &TEST_RECOVERY_SIGNING_KEY,
+		})
+	}
+}
+
 // Encode a manifest, sign it with the published test key, and VERIFY WHAT WAS PRODUCED with the
 // same parser and verifier the loader carries. A signing step that cannot check its own output
 // moves every one of its failures to a boot.
 pub fn sign_with_test_key(header: &bootproto::manifest::Header<'_>, rows: &mut [bootproto::manifest::Row<'_>]) -> Result<Vec<u8>, String> {
-	if header.key_id != TEST_KEY_ID {
-		return Err(String::from("a manifest signed with the test key must name the test key id"));
+	sign_with_published_key(header, rows, TestKey::Boot)
+}
+
+// The same, with the published key named: the boot key for an ordinary set, the recovery key for a
+// recovery set - and the header must name that key's id, because a manifest naming one key and
+// signed with another is a manifest the loader refuses before it reads a row.
+pub fn sign_with_published_key(header: &bootproto::manifest::Header<'_>, rows: &mut [bootproto::manifest::Row<'_>], key: TestKey) -> Result<Vec<u8>, String> {
+	if header.key_id != key.key_id() {
+		return Err(String::from("a manifest signed with a published key must name that key's id"));
 	}
 	let mut record = vec![0u8; bootproto::manifest::MAX_MANIFEST_BYTES];
 	let payload_len = bootproto::manifest::encode_payload(header, rows, &mut record).map_err(|e| format!("the manifest will not encode: {e:?}"))?;
 	let mut message = Vec::with_capacity(bootproto::manifest::DOMAIN.len() + payload_len);
 	message.extend_from_slice(bootproto::manifest::DOMAIN);
 	message.extend_from_slice(&record[..payload_len]);
-	let signing = ed25519_dalek::SigningKey::from_bytes(&TEST_SIGNING_KEY);
+	let signing = key.signing_key();
 	let signature = {
 		use ed25519_dalek::Signer;
 		signing.sign(&message).to_bytes()
@@ -81,7 +154,7 @@ mod tests {
 	// could reach is present.
 	fn signed() -> (Vec<u8>, [u8; 32]) {
 		let mut rows = [Row { kind: KIND_KERNEL, path: b"kernel", length: 4, digest: sha(b"abcd") }, Row { kind: KIND_PROGRAM, path: b"libexec/init", length: 2, digest: sha(b"hi") }];
-		let header = Header { key_id: TEST_KEY_ID, product: b"LiberSystem", arch: ARCH_X86_64, source_kind: SOURCE_SYSTEM_VOLUME, release: b"0.0.1", volume_uuid: [0x33; 16] };
+		let header = Header { key_id: TEST_KEY_ID, product: b"LiberSystem", arch: ARCH_X86_64, source_kind: SOURCE_SYSTEM_VOLUME, release: b"0.0.1", security_generation: 1, purpose: PURPOSE_BOOT, volume_uuid: [0x33; 16], dma_mode: None };
 		let record = sign_with_test_key(&header, &mut rows).expect("it signs");
 		let public = ed25519_dalek::SigningKey::from_bytes(&TEST_SIGNING_KEY).verifying_key().to_bytes();
 		(record, public)
@@ -171,12 +244,36 @@ mod tests {
 		assert_eq!(manifest.volume_uuid, [0x33; 16]);
 
 		let mut rows = [Row { kind: KIND_KERNEL, path: b"kernel", length: 4, digest: sha(b"abcd") }];
-		let other = Header { key_id: TEST_KEY_ID, product: b"SomethingElse", arch: ARCH_AARCH64, source_kind: SOURCE_BOOT_MEDIUM, release: b"0.0.1", volume_uuid: [0; 16] };
+		let other = Header { key_id: TEST_KEY_ID, product: b"SomethingElse", arch: ARCH_AARCH64, source_kind: SOURCE_BOOT_MEDIUM, release: b"0.0.1", security_generation: 1, purpose: PURPOSE_BOOT, volume_uuid: [0; 16], dma_mode: None };
 		let elsewhere = sign_with_test_key(&other, &mut rows).expect("it signs");
 		let read = Manifest::decode(&elsewhere).expect("decodes");
 		assert!(accepted(&elsewhere, &public), "it is correctly signed - the signature is not what makes it wrong");
 		assert_ne!(read.arch, ARCH_X86_64, "and it is not for this machine");
 		assert_ne!(read.product, b"LiberSystem");
+	}
+
+	#[test]
+	fn a_signed_dma_mode_round_trips_and_its_presence_tag_is_covered_by_the_signature() {
+		// The DMA record travels inside the signed payload: a tag-1 manifest reads back its mode, and
+		// altering the presence tag without resigning fails signature validation - which the
+		// every-byte sweep above also proves, byte by byte, and this states for the one byte the
+		// milestone names.
+		let mut rows = [Row { kind: KIND_KERNEL, path: b"kernel", length: 4, digest: sha(b"abcd") }];
+		let header = Header { key_id: TEST_KEY_ID, product: b"LiberSystem", arch: ARCH_X86_64, source_kind: SOURCE_BOOT_MEDIUM, release: b"0.0.1", security_generation: 1, purpose: PURPOSE_BOOT, volume_uuid: [0x44; 16], dma_mode: Some(bootproto::dma_mode::MODE_NO_IOMMU) };
+		let record = sign_with_test_key(&header, &mut rows).expect("it signs");
+		let public = ed25519_dalek::SigningKey::from_bytes(&TEST_SIGNING_KEY).verifying_key().to_bytes();
+		assert!(accepted(&record, &public));
+		let read = Manifest::decode(&record).expect("decodes");
+		assert_eq!(read.dma_mode, Some(bootproto::dma_mode::MODE_NO_IOMMU));
+		// The tag byte is the one right after the sixteen-byte uuid.
+		let tag_at = record.windows(16).position(|window| window == [0x44u8; 16]).expect("the uuid is in the record") + 16;
+		assert_eq!(record[tag_at], DMA_MODE_PRESENT);
+		let mut cleared = record.clone();
+		cleared[tag_at] = DMA_MODE_ABSENT;
+		assert!(!accepted(&cleared, &public), "a presence tag altered without resigning fails validation");
+		let mut flipped = record.clone();
+		flipped[tag_at + 1] = bootproto::dma_mode::MODE_ENFORCING_REQUIRED as u8;
+		assert!(!accepted(&flipped, &public), "and so does the mode value");
 	}
 
 	#[test]
@@ -186,7 +283,7 @@ mod tests {
 		// does - and it must, because the alternative would be an anti-rollback property the
 		// mechanism does not have and the documentation must never acquire.
 		let mut rows = [Row { kind: KIND_KERNEL, path: b"kernel", length: 4, digest: sha(b"abcd") }];
-		let old = Header { key_id: TEST_KEY_ID, product: b"LiberSystem", arch: ARCH_X86_64, source_kind: SOURCE_SYSTEM_VOLUME, release: b"0.0.0", volume_uuid: [0x33; 16] };
+		let old = Header { key_id: TEST_KEY_ID, product: b"LiberSystem", arch: ARCH_X86_64, source_kind: SOURCE_SYSTEM_VOLUME, release: b"0.0.0", security_generation: 1, purpose: PURPOSE_BOOT, volume_uuid: [0x33; 16], dma_mode: None };
 		let record = sign_with_test_key(&old, &mut rows).expect("it signs");
 		let public = ed25519_dalek::SigningKey::from_bytes(&TEST_SIGNING_KEY).verifying_key().to_bytes();
 		assert!(accepted(&record, &public), "an older release signed by the same key verifies");

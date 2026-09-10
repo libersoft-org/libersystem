@@ -114,14 +114,21 @@ unsafe fn apply_verb(policy: u64, config: u64, devsvc: u64, request: VerbRequest
 					}
 					print(b"\n");
 				}
-				Some(Err(_)) => eprint(b"lsdev: no device has that index\n"),
 				// THE MANAGER IS GONE, WHICH IS WHEN THIS QUESTION MATTERS MOST.
 				//
 				// The live report is held by DeviceManager and dies with it - and DeviceManager
 				// dying is what killed the driver subtree, so an operator asking what happened is
 				// asking a process that is no longer there. The persisted copy is in ConfigService,
 				// which survives, and it carries the whole record rather than a summary of it.
-				None => stored_incident(config, devsvc, request.index),
+				//
+				// A GONE MANAGER ARRIVES AS AN ERROR VALUE, NOT AS `None`. The generated client turns
+				// every transport ending into a schema error - `again` for a request that never
+				// left, `commit-uncertain` for a peer that closed or never answered - and `None` is
+				// left for a reply this client could not decode. So the arm below used to be dead:
+				// the endpoint going away was reported as "no device has that index" and the
+				// persisted copy was never consulted, which is the exact case it exists for.
+				Some(Err(proto::system::Error::Again)) | Some(Err(proto::system::Error::CommitUncertain)) | None => stored_incident(config, devsvc, request.index),
+				Some(Err(_)) => eprint(b"lsdev: no device has that index\n"),
 			}
 			return;
 		}
@@ -130,8 +137,10 @@ unsafe fn apply_verb(policy: u64, config: u64, devsvc: u64, request: VerbRequest
 				print(outcome_text(outcome));
 				print(b"\n");
 			}
+			// The same distinction as above: a transport ending is the endpoint not answering, and
+			// only a decoded schema error is the endpoint refusing.
+			Some(Err(proto::system::Error::Again)) | Some(Err(proto::system::Error::CommitUncertain)) | None => eprint(b"lsdev: the device policy endpoint did not answer\n"),
 			Some(Err(_)) => eprint(b"lsdev: the device policy endpoint refused the request\n"),
-			None => eprint(b"lsdev: the device policy endpoint did not answer\n"),
 		}
 	}
 }

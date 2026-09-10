@@ -63,7 +63,7 @@ Two commands sit deliberately outside the optimisation:
 
 ```sh
 ./verify.sh --sweep      # the whole suite on all three targets at one revision, in a git worktree
-./verify.sh --release    # the release gate: build all, check all, boot all three, nothing skipped
+./verify.sh --release    # the release run: one sealed snapshot, every required key, one dossier
 ```
 
 `--sweep` is not what the age bound does. Stale keys joining the next manual run spreads coverage
@@ -209,7 +209,44 @@ a device told to reach past its mapping, requires a real DHCP lease through the 
 then boots the DEFAULT machine to check that an ordinary run really is the isolated one.
 
 So: a failing test is a failure of what the test is about, and a failure that appears only under
-translation belongs to that gate. `./run.sh --no-iommu` reproduces the machine the suite boots.
+translation belongs to that gate. `./run.sh --no-iommu` reproduces the machine the suite boots on
+every target - and on x86_64 boots the image signed for it, `libersystem-no-iommu.iso`, because a
+shipping image's DMA mode is a signed field frozen when it is assembled; the ports' per-run media
+carry the harness record and need no second image.
+
+Every boot carries that mode, and the runner writes it for every boot whose manifests carry none:
+`test.sh` says `LIBER_RUN_MODE=test`, `run.sh` says `public`, the lab says `development` and every
+gate says `gate`, each only when the variable is unset, and the value the harness writes follows
+from the run mode and the machine - `no-iommu` for the suite, which builds no controller on any
+target, and under `--no-iommu`; `enforcing-required` where a virtio-iommu is in the machine, which
+is every ordinary boot on all three targets. The suite therefore refuses `virtio_net` by name (it
+declares `iommu-required`), and NetworkService comes up WITHOUT A LINK on that row - online, so the
+services that depend on it start, and answering every link-bound operation with a typed `io`
+refusal; the console says `network: no network provider on this boot` where the DHCP line would
+be. The enforcing gates are where the network is proved. The format is `dma-mode-carrier`, the
+x86_64 rows are `dma-mode-x86_64`, and the two ports' rows are `dma-mode-aarch64` and
+`dma-mode-riscv64` (emulated, slow, last): the enforcing machine on both entry paths, the explicit
+degraded machine on both, and the refusals.
+
+The ports' enforcing profiles have gates of their own, one per phase: `iommu-<arch>-<profile>-<phase>`
+- `aarch64-direct-gicv2`, `aarch64-direct-gicv3-its`, `aarch64-uefi-gicv2`, `riscv64-direct-aia`
+and `riscv64-uefi-aia`, each a `hostile` or `transition` phase on the test kernel (the `edu`
+fixture exists only there) and an `ordinary` phase on the built system through `run.sh`. Every
+phase requires the kernel to confirm the bypass-off transition, every firmware-touched endpoint to
+have confirmed its reset by class before its bus mastering was cleared - a virtio device to status
+zero, an xHCI controller halted and reset, an NVMe controller with `CC.EN` clear and `CSTS.RDY`
+zero - and keeps the kernel's own census of the bus masters it admitted. The rows (`iommu-aarch64-
+direct-gicv2` and so on, and `iommu-ports` for all of them) are umbrellas a person runs by name; the
+release obligation is the phases.
+
+The rollback floor has its own x86_64 OVMF gate, `rollback-floor-x86_64` (emulated firmware under
+KVM, one persistent variables image across the whole sequence, run last like every other gate that
+assembles media): it provisions the floor with the ceremony tool, boots generation N, refuses N-1
+from the original and a cloned disk, advances on N+1, deletes either slot and requires N still
+refused, boots the interrupted-advance state and the partial provisioning states, runs the recovery
+and cross-use manifests, the mixed-generation set, and the pre-policy and non-enforcing loaders
+against the rotated signer. The record format, the state table and the compare-and-advance order are
+host tests in `bootproto::rollback`; the three trust profiles are told apart by `trust-profile`.
 
 ## Shadow and trust
 
@@ -234,6 +271,60 @@ the check catalog, the actual `covers` declarations, the architecture and enviro
 configuration catalog and the selector version. Change any of them and every certificate lapses -
 evidence proves that a particular selector over a particular model did not miss anything, and a new
 model has no evidence yet however clean the old record looked.
+
+## Release evidence
+
+A release is one run over one sealed revision, and it produces one dossier that proves every
+release-required key ran - not an umbrella exit code.
+
+```sh
+./verify.sh --release                           # a clean tree: snapshot, seal, run everything, dossier
+./verify.sh --release --out-root /srv/runs      # publish the run somewhere durable (default .build/runs)
+./verify.sh --release --in-place --required FILE  # a REHEARSAL over this tree and a narrowed key set
+```
+
+What the run is made of:
+
+- **The release set is frozen.** `src/tools/verify-model/model/release-required.toml` lists every
+  required key; the catalog derives the same set from each row's class and `verify-model check`
+  compares the two exactly, both ways. Deleting, reclassifying or replacing a mandatory row fails
+  before anything runs. Adding a required profile is an edit to that file, reviewed as its own
+  artifact - `verify-model release-required --write` regenerates it.
+- **The plan is the release plan.** `verify-model release-plan` lowers every required key into the
+  executor's own steps: builds, then the three shipping-image producers, the three whole suites,
+  every host suite, conformance suite and gate profile, and one development-lifecycle step. A gate
+  that boots a shipping image requires the producer that built it; the gate that reads a guest log
+  requires the suites.
+- **The snapshot is sealed.** A detached worktree of `HEAD`, made read-only except `.build`, so a
+  producer cannot consume an edit nobody sees; `--in-place` skips both and is a rehearsal. The
+  identity block - the Git tree id (or a content digest of a working tree), the resolved tools by
+  hash and version, the firmware images by hash, the compiler configurations, and every permitted
+  environment variable - is collected before anything runs. An undeclared `LIBER_*`, `OVMF_*`,
+  `AAVMF_*`, `QEMU_*` or `TEST_*` override refuses the run.
+- **Producers publish.** With `LIBER_VERIFY_RUN` set, `check.sh` publishes an envelope per gate with
+  the gate's captured output, `test-kernel.sh` publishes the whole-suite key with the staged kernel
+  and the medium by digest and every `[ok]` test as a discharge, `image.sh` stores each shipping ISO
+  in the run (immutable, with its receipts) and publishes it, and the lifecycle gate publishes its
+  own key and the four development checks'. Multi-boot gates copy their phase logs into the run from
+  their exit traps, before cleanup and on failure too. For a required key whose producer published
+  nothing, the executor publishes one from the step's captured output.
+- **Everything the guest uses is bound to the object.** The staged test kernel is published
+  atomically, read-only, and digested under the build lock; the medium's inputs are snapshotted
+  under the producers' lock; and the runner opens the medium, the firmware image, the kernel and the
+  QEMU executable once, hashes each through its descriptor and uses that descriptor - so a file
+  replaced at its pathname after the hash is not what boots. `LIBER_HARNESS_HOLD` is the fixture
+  hook that proves it.
+- **The dossier is fail-closed.** `verify-model dossier` refuses a required key with no envelope,
+  distinctly from one that ran and failed; a duplicate, an unknown key, an envelope from another run
+  or another identity, a kept log that is missing or altered, an unparsable file, and a tree whose
+  source identity moved during the run. Re-rendering the same result set is byte-identical apart
+  from its last `rendered-at:` line. The run directory is made read-only when the run ends, whatever
+  its state.
+
+`./check.sh --gate verify-evidence` is the fixture gate for all of this, and
+`./check.sh --gate development-lifecycle` brings the development guest up in run-private state, runs
+the four development checks against it and tears it down - `./dev.sh up` by hand is no longer what
+those rows depend on.
 
 ## Where the reasoning lives
 

@@ -15,6 +15,14 @@
 # and the tests that steer an allocation - by name - and it fails if any of them reports itself
 # skipped, which is exactly what the same tests do on the one-node profile.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
@@ -52,7 +60,7 @@ wanted() { [[ -z "$only" || "$only" == "$1" ]]; }
 command -v qemu-system-x86_64 >/dev/null || fail "qemu-system-x86_64 is not installed"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log "$work"/*/*.log; rm -rf "$work"' EXIT
 
 # TWO BACKENDS SUMMING TO WHAT THE HARNESS GIVES THE GUEST. QEMU refuses a NUMA configuration whose
 # nodes do not add up to `-m`, which is the check that keeps this profile honest about its own size.

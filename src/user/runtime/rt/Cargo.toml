@@ -10,6 +10,15 @@ description = "Shared ring-3 userspace runtime: entry stub, syscall wrapper, pan
 [features]
 default = []
 shared-image = []
+# THE HOST-TEST SEAM. A crate that links this runtime cannot run `cargo test` on the host: the
+# panic handler and the global allocator collide with the std the test harness needs (E0152), and
+# the entry stub and the allocation-error hook are symbols the host has its own definitions of. This
+# feature drops those five and keeps everything else - the syscall wrappers, the ABI re-exports,
+# the helpers - so a driver crate's PURE layers (ring validation, request validation) can be tested
+# on the host through a fake-controller seam. It is enabled by a crate's `[dev-dependencies]` entry
+# for this runtime and by nothing else: cargo unifies a dev-dependency's features into a test build
+# and into no other build, so the shipped programs never see it.
+host-tests = []
 
 [dependencies]
 # Shared kernel/userspace ABI constants (the single source of truth), re-exported

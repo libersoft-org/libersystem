@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 // WHAT EVERY DRIVER BINARY SHARES, as a library, because that is what it already was.
 //
@@ -11,6 +11,7 @@
 // A library says it properly: this is the surface a driver may use, and no binary owes it a caller.
 // Nothing here is exempt from having ONE - the items with no caller anywhere in the tree were
 // deleted before the move, not carried across by it.
+pub mod blk;
 pub mod common;
 pub mod keys;
 pub mod virtio;

@@ -2872,3 +2872,267 @@ fn every_profile_row_is_a_step_of_its_own() {
 		assert!(known.contains(name), "{name} is named as a profile row and is not a registered gate");
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// The release obligation (P02M0170 M4/M7/M10): classes, the frozen key set, and the fail-closed
+// collector
+
+fn required_set(model: &Model) -> std::collections::BTreeSet<String> {
+	crate::evidence::derived_release_required(&model.catalog)
+}
+
+#[test]
+fn the_frozen_release_set_equals_the_derived_one_and_every_invariant_holds() {
+	let model = model();
+	let frozen = crate::evidence::load_required(&repo_root().join("src/tools/verify-model/model/release-required.toml")).expect("the frozen list loads");
+	let derived = required_set(&model);
+	assert_eq!(frozen, derived, "release-required.toml and the catalog's derived set are one set");
+	assert!(crate::evidence::release_invariants(&model.catalog).is_empty(), "{:?}", crate::evidence::release_invariants(&model.catalog));
+	// No required row is an umbrella or a fallback, and every producer a required gate names exists.
+	for check in &model.catalog.checks {
+		if check.release_required {
+			assert!(!matches!(check.class, crate::catalog::CheckClass::Umbrella | crate::catalog::CheckClass::Fallback), "{}", check.id);
+		}
+	}
+}
+
+// THE THREE MUTATIONS THAT MUST FAIL BEFORE ANY WORK EXECUTES: deleting a mandatory row,
+// reclassifying one out of the release set, and REPLACING one with a different row of the same
+// class and cardinality - which cardinality and per-target invariants do not detect.
+#[test]
+fn deleting_reclassifying_or_replacing_a_mandatory_row_is_detected_against_the_frozen_set() {
+	let model = model();
+	let frozen = required_set(&model);
+	let mutate = |f: &dyn Fn(&mut crate::catalog::Catalog)| {
+		let mut catalog = model.catalog.clone();
+		f(&mut catalog);
+		crate::evidence::derived_release_required(&catalog)
+	};
+	// delete
+	let deleted = mutate(&|catalog| catalog.checks.retain(|c| c.id != "gate.secure-boot"));
+	assert!(!frozen.difference(&deleted).collect::<Vec<_>>().is_empty(), "a deleted required row is a key the frozen list has and the catalog no longer derives");
+	// reclassify
+	let reclassified = mutate(&|catalog| {
+		let check = catalog.checks.iter_mut().find(|c| c.id == "gate.secure-boot").expect("secure-boot");
+		check.class = crate::catalog::CheckClass::Umbrella;
+		check.release_required = check.class.release_required();
+	});
+	assert!(frozen.difference(&reclassified).any(|k| k.starts_with("gate.secure-boot")), "a row reclassified out of the set is missing from the derived set");
+	// replace with a same-class row: the count is unchanged and the key set is not
+	let replaced = mutate(&|catalog| {
+		let check = catalog.checks.iter_mut().find(|c| c.id == "gate.secure-boot").expect("secure-boot");
+		check.id = String::from("gate.secure-boot-renamed");
+	});
+	assert_eq!(replaced.len(), frozen.len(), "the substitution preserves cardinality, which is why cardinality is not the check");
+	assert!(frozen != replaced, "and the exact comparison sees it");
+	assert!(frozen.difference(&replaced).any(|k| k.starts_with("gate.secure-boot /")));
+	assert!(replaced.difference(&frozen).any(|k| k.starts_with("gate.secure-boot-renamed /")));
+}
+
+#[test]
+fn producers_prerequisites_and_inputs_are_closed_over_the_catalog() {
+	let model = model();
+	let ids: std::collections::BTreeSet<&str> = model.catalog.checks.iter().map(|c| c.id.as_str()).collect();
+	let produced: std::collections::BTreeSet<&str> = model.catalog.checks.iter().flat_map(|c| c.produces.iter().map(String::as_str)).collect();
+	let iommu = model.catalog.checks.iter().find(|c| c.id == "gate.qemu-virtio-iommu-x86_64").expect("the iommu gate");
+	assert!(iommu.prerequisites.iter().all(|p| ids.contains(p.as_str())), "{:?}", iommu.prerequisites);
+	assert!(iommu.inputs.iter().all(|i| produced.contains(i.as_str())), "every image the gate reads is built work: {:?}", iommu.inputs);
+	assert!(iommu.prerequisites.contains(&String::from("image.libersystem-iso")));
+	let dev = model.catalog.checks.iter().find(|c| c.id == "dev.selftest").expect("dev.selftest");
+	assert_eq!(dev.prerequisites, vec![String::from("dev.lifecycle")], "a development check depends on the lifecycle row, not on a guest somebody left running");
+	// The producers and the whole-suite row are never selected by a change - not even by a full plan.
+	let plan = plan_for(&model, &["src/kernel/mem/mod.rs"]);
+	assert!(plan.items.iter().all(|item| !item.key.check.starts_with("image.") && item.key.check != "dev.lifecycle" && item.key.check != "suite.kernel"), "producers are the release run's to run, by name");
+}
+
+// THE COLLECTOR IS FAIL-CLOSED, each refusal its own reason.
+#[test]
+fn the_dossier_refuses_missing_substituted_foreign_stale_duplicate_and_corrupt_evidence_distinctly() {
+	use crate::evidence::{Artifact, ENVELOPE_SCHEMA, Envelope, Refusal, Run};
+	let dir = std::env::temp_dir().join(format!("verify-dossier-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(dir.join("evidence")).unwrap();
+	std::fs::write(dir.join("run-id"), "run-A\n").unwrap();
+	std::fs::write(dir.join("identity.json"), "{\"schema\":\"libersystem-identity/1\"}").unwrap();
+	let run = Run::new(&dir);
+	let identity = run.identity_digest().unwrap();
+	let required: std::collections::BTreeSet<String> = ["k.one / host / host / default", "k.two / host / host / default"].iter().map(|s| s.to_string()).collect();
+	let known: std::collections::BTreeSet<String> = ["k.one / host / host / default", "k.two / host / host / default", "k.three / host / host / default"].iter().map(|s| s.to_string()).collect();
+	let log_source = dir.join("producer.log");
+	std::fs::write(&log_source, "phase one\n").unwrap();
+	let kept = run.keep_log("k.one / host / host / default", &log_source).unwrap();
+	std::fs::remove_file(&log_source).unwrap();
+	assert!(dir.join(&kept.path).exists(), "the log bytes were copied into the run before the producer's cleanup");
+	let envelope = |key: &str, run_id: &str, identity: &str, outcome: &str, logs: Vec<Artifact>| Envelope { schema: String::from(ENVELOPE_SCHEMA), run: run_id.to_string(), key: key.to_string(), identity: identity.to_string(), producer: String::from("test"), outcome: outcome.to_string(), duration_seconds: 1, inputs: vec![], outputs: vec![], logs, discharges: vec![], published_at: String::from("2026-09-09T00:00:00Z") };
+	run.publish(&envelope("k.one / host / host / default", "run-A", &identity, "passed", vec![kept.clone()])).unwrap();
+	// missing required
+	let dossier = crate::evidence::collect(&run, &required, &known, "test", None, None).unwrap();
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::MissingRequired { key } if key == "k.two / host / host / default")), "{:?}", dossier.refusals);
+	assert_eq!(dossier.state, "incomplete");
+	// a duplicate is refused at the producer
+	assert!(run.publish(&envelope("k.one / host / host / default", "run-A", &identity, "passed", vec![])).is_err());
+	// foreign run, stale identity, unknown key, failed required, altered log - each its own reason
+	std::fs::write(dir.join("evidence").join("k.two+host+host+default.json"), serde_json::to_string(&envelope("k.two / host / host / default", "run-B", &identity, "passed", vec![])).unwrap()).unwrap();
+	std::fs::write(dir.join("evidence").join("k.three+host+host+default.json"), serde_json::to_string(&envelope("k.three / host / host / default", "run-A", "0000", "passed", vec![])).unwrap()).unwrap();
+	std::fs::write(dir.join("evidence").join("k.four+host+host+default.json"), serde_json::to_string(&envelope("k.four / host / host / default", "run-A", &identity, "passed", vec![])).unwrap()).unwrap();
+	std::fs::write(dir.join("evidence").join("corrupt.json"), "{not json").unwrap();
+	std::fs::write(dir.join(&kept.path), "phase one, altered\n").unwrap();
+	let dossier = crate::evidence::collect(&run, &required, &known, "test", None, None).unwrap();
+	let reasons: Vec<String> = dossier.refusals.iter().map(|r| serde_json::to_string(r).unwrap()).collect();
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::CrossRun { key, .. } if key == "k.two / host / host / default")), "{reasons:?}");
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::Stale { key, .. } if key == "k.three / host / host / default")), "{reasons:?}");
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::Unknown { key, .. } if key == "k.four / host / host / default")), "{reasons:?}");
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::Unparsable { .. })), "{reasons:?}");
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::LogAltered { key, .. } if key == "k.one / host / host / default")), "{reasons:?}");
+	// a required key that RAN AND FAILED is distinct from one that is missing
+	std::fs::remove_file(dir.join("evidence").join("k.two+host+host+default.json")).unwrap();
+	std::fs::write(dir.join("evidence").join("k.two+host+host+default.json"), serde_json::to_string(&envelope("k.two / host / host / default", "run-A", &identity, "failed", vec![])).unwrap()).unwrap();
+	let dossier = crate::evidence::collect(&run, &required, &known, "test", None, None).unwrap();
+	assert!(dossier.refusals.iter().any(|r| matches!(r, Refusal::FailedRequired { key, outcome } if key == "k.two / host / host / default" && outcome == "failed")));
+	assert!(!dossier.refusals.iter().any(|r| matches!(r, Refusal::MissingRequired { key } if key == "k.two / host / host / default")));
+	// deterministic rendering apart from the timestamp line
+	let a = crate::evidence::render(&dossier, "2026-01-01T00:00:00Z");
+	let b = crate::evidence::render(&dossier, "2026-01-02T00:00:00Z");
+	let strip = |s: &str| s.lines().filter(|l| !l.starts_with("rendered-at:")).collect::<Vec<_>>().join("\n");
+	assert_eq!(strip(&a), strip(&b));
+	assert!(a.lines().last().unwrap().starts_with("rendered-at: "));
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn undeclared_environment_overrides_are_refused_and_permitted_ones_are_recorded() {
+	let overrides = crate::identity::undeclared_overrides(&[
+		(String::from("LIBER_RUN_MODE"), String::from("gate")),
+		(String::from("LIBER_SECRET_KNOB"), String::from("1")),
+		(String::from("QEMU_EXTRA"), String::from("")),
+		(String::from("PATH"), String::from("/bin")),
+		(String::from("OVMF_FANCY"), String::from("x")),
+	]);
+	assert_eq!(overrides, vec![String::from("LIBER_SECRET_KNOB"), String::from("OVMF_FANCY")]);
+}
+
+#[test]
+fn the_source_identity_is_a_tree_id_for_a_clean_checkout_and_a_content_digest_otherwise() {
+	let identity = crate::identity::source_identity(&repo_root()).expect("identity");
+	assert!(identity.tracked_files > 1000);
+	assert!(matches!(identity.kind.as_str(), "git-tree" | "working-tree"));
+	if identity.changed_paths == 0 {
+		assert_eq!(identity.kind, "git-tree");
+	} else {
+		assert_eq!(identity.kind, "working-tree");
+		assert_eq!(identity.value.len(), 64);
+	}
+	assert!(identity.lockfiles.keys().any(|k| k.ends_with("Cargo.lock")));
+}
+
+// THE RELEASE PLAN DISCHARGES EVERY REQUIRED KEY EXACTLY ONCE, and its edges put producers before
+// consumers: an image before the gates that boot it, the suites before the gate that reads a guest
+// log, the builds before everything that runs what they built.
+#[test]
+fn the_release_plan_discharges_every_required_key_once_with_producers_before_consumers() {
+	let model = model();
+	let steps = crate::commands::release_steps(&model.catalog, &model.registry);
+	crate::commands::validate(&steps).unwrap_or_else(|faults| panic!("{faults:?}"));
+	let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	for step in &steps {
+		for key in &step.keys {
+			*seen.entry(key.display()).or_default() += 1;
+		}
+	}
+	let required = required_set(&model);
+	for key in &required {
+		assert_eq!(seen.get(key).copied().unwrap_or(0), 1, "required key {key} is discharged by exactly one step");
+	}
+	for (key, count) in &seen {
+		assert!(required.contains(key), "the release plan carries {key}, which is not release-required");
+		assert_eq!(*count, 1, "{key} appears {count} times");
+	}
+	let ordered = crate::commands::order_by_cost(steps.clone(), |_| 1.0).expect("orderable");
+	let position = |id: &str| ordered.iter().position(|step| step.id == id).unwrap_or_else(|| panic!("no step {id}"));
+	let producer = "producer:x86_64:image.libersystem-iso";
+	for gate in ["secure-boot", "signed-boot", "qemu-virtio-iommu-x86_64"] {
+		let step = steps.iter().find(|step| step.keys.iter().any(|key| key.check == format!("gate.{gate}"))).unwrap_or_else(|| panic!("no step for {gate}"));
+		assert!(step.requires.contains(&String::from(producer)), "{gate} requires the image it boots: {:?}", step.requires);
+		assert!(position(&step.id) > position(producer));
+	}
+	let after_guest = steps.iter().find(|step| step.id.starts_with("gate-after-guest")).expect("the gate that reads a guest log");
+	for architecture in crate::registry::ARCHITECTURES {
+		assert!(after_guest.requires.contains(&format!("guest:{architecture}:all")), "{:?}", after_guest.requires);
+		assert!(position(&format!("guest:{architecture}:all")) > position(&format!("build:{architecture}:volume")));
+	}
+	let lifecycle = steps.iter().find(|step| step.id == "dev:lifecycle").expect("the lifecycle step");
+	assert_eq!(lifecycle.keys.len(), 5, "the lifecycle carries its own key and the four development checks: {:?}", lifecycle.keys);
+	assert!(lifecycle.requires.contains(&String::from("producer:x86_64:image.libersystem-dev-iso")));
+	assert_eq!(lifecycle.guests, 1);
+	assert!(steps.iter().all(|step| step.kind_is_not_a_dev_check_of_its_own()), "no development check is a step of its own in a release");
+}
+
+impl crate::commands::Step {
+	fn kind_is_not_a_dev_check_of_its_own(&self) -> bool {
+		!(self.id.starts_with("dev:") && self.id != "dev:lifecycle")
+	}
+}
+
+// A LOG KEPT BEFORE THE ENVELOPE IS NAMED BY IT, and the runner's fallback publication defers to a
+// producer's own envelope instead of duplicating it.
+#[test]
+fn kept_logs_are_named_by_the_envelope_and_the_fallback_defers_to_the_producer() {
+	use crate::evidence::{ENVELOPE_SCHEMA, Envelope, Run};
+	let dir = std::env::temp_dir().join(format!("verify-kept-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(dir.join("evidence")).unwrap();
+	std::fs::write(dir.join("run-id"), "run-K\n").unwrap();
+	std::fs::write(dir.join("identity.json"), "{\"schema\":\"libersystem-identity/1\",\"source\":{\"value\":\"abc\"}}").unwrap();
+	let run = Run::new(&dir);
+	let key = "gate.k / host / host / default";
+	let phase = dir.join("phase-one.log");
+	std::fs::write(&phase, "booted\n").unwrap();
+	let kept = run.keep_log(key, &phase).unwrap();
+	std::fs::remove_file(&phase).unwrap();
+	let listed = run.kept_logs(key).unwrap();
+	assert_eq!(listed, vec![kept.clone()], "the kept log is listed under its key after the producer's file is gone");
+	let identity = run.identity_digest().unwrap();
+	let envelope = |producer: &str| Envelope { schema: String::from(ENVELOPE_SCHEMA), run: String::from("run-K"), key: key.to_string(), identity: identity.clone(), producer: producer.to_string(), outcome: String::from("passed"), duration_seconds: 2, inputs: vec![], outputs: vec![], logs: listed.clone(), discharges: vec![], published_at: String::from("2026-09-09T00:00:00Z") };
+	assert!(run.publish_if_absent(&envelope("the producer")).unwrap().is_some());
+	assert!(run.publish_if_absent(&envelope("the runner")).unwrap().is_none(), "the runner's fallback writes nothing over the producer's envelope");
+	let (_, published) = &run.envelopes().unwrap()[0];
+	assert_eq!(published.producer, "the producer");
+	// A tree that moved during the run is its own refusal, and a rehearsal never reads complete.
+	let required: std::collections::BTreeSet<String> = [key.to_string()].into_iter().collect();
+	let known = required.clone();
+	let dossier = crate::evidence::collect(&run, &required, &known, "test", Some("abc"), None).unwrap();
+	assert_eq!(dossier.state, "complete", "{:?}", dossier.refusals);
+	let dossier = crate::evidence::collect(&run, &required, &known, "test", Some("moved"), None).unwrap();
+	assert!(dossier.refusals.iter().any(|r| matches!(r, crate::evidence::Refusal::SourceChanged { recorded, current } if recorded == "abc" && current == "moved")), "{:?}", dossier.refusals);
+	let dossier = crate::evidence::collect(&run, &required, &known, "test", Some("abc"), Some("in place")).unwrap();
+	assert_eq!(dossier.state, "rehearsal (in place)");
+	let _ = std::fs::remove_dir_all(&dir);
+}
+
+// THE STRICT SCOPED CONTRACT, PINNED IN ONE PLACE: a scoped run is TRUSTED only when evidence under
+// the CURRENT model covers its change class and its targets, and is SHADOW in every other case - a
+// certificate from another model, a scope the change is not inside, a universe nothing compared.
+// `verify.sh` maps Shadow to exit 4 and Stale to exit 5 unless `--allow-shadow` is given; this is
+// the judgement those exits are made from. The candidate half - a frozen candidate cannot activate
+// on evidence from another model or against different canonical inputs - is pinned by
+// `evidence_under_another_model_does_not_qualify_a_candidate` and
+// `trust_lapses_when_the_model_hash_moves`. No selector rewrite followed from these.
+#[test]
+fn a_scoped_run_is_trusted_only_under_current_model_evidence_covering_its_change_and_targets() {
+	use crate::shadow::{Scope, Universe};
+	use crate::trust::Level;
+	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let earned = Scope::from_kinds(vec![String::from("modified")], vec![String::from("link.static")]);
+	store.grant("audio", "hash-current", Universe::TestGuest, 9, vec![String::from("x86_64"), String::from("riscv64")], earned.clone(), 1);
+	// The change class and targets the evidence was earned over: TRUSTED.
+	assert_eq!(store.level("audio", "hash-current", Universe::TestGuest, &earned), Level::Trusted);
+	// Evidence from ANOTHER model does not count, however clean it looked.
+	assert_eq!(store.level("audio", "hash-previous", Universe::TestGuest, &earned), Level::Shadow);
+	// A change class the evidence never walked: SHADOW, not a smaller TRUSTED.
+	let renamed = Scope::from_kinds(vec![String::from("renamed")], vec![String::from("link.static")]);
+	assert_eq!(store.level("audio", "hash-current", Universe::TestGuest, &renamed), Level::Shadow);
+	// A universe nothing compared - the same component's host suites - is SHADOW too.
+	assert_eq!(store.level("audio", "hash-current", Universe::Host, &earned), Level::Shadow);
+	// A component nothing certified is SHADOW by default, which is the safe default.
+	assert_eq!(store.level("wire", "hash-current", Universe::TestGuest, &earned), Level::Shadow);
+}

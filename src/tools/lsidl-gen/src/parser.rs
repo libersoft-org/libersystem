@@ -447,12 +447,12 @@ impl Parser {
 		let anns = self.annotations()?;
 		reject_anns_except(&anns, &["rights", "bound", "since", "deprecated"])?;
 		let evolution = parse_evolution(&anns)?;
-		let rights = collect_rights(&anns);
+		let (rights, rights_declared, rights_non_names) = collect_rights(&anns);
 		let bound = parse_bound(&anns)?;
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Colon)?;
 		let ty = self.ty()?;
-		Ok(Param { name, ty, bound, rights, doc: pdoc, evolution, span })
+		Ok(Param { name, ty, bound, rights, rights_declared, rights_non_names, doc: pdoc, evolution, span })
 	}
 
 	fn ty(&mut self) -> Result<Type, Error> {
@@ -576,16 +576,25 @@ fn parse_bound(anns: &[Ann]) -> Result<Option<u32>, Error> {
 	}
 }
 
-fn collect_rights(anns: &[Ann]) -> Vec<String> {
+// The names a `@rights` annotation carries, whether one was written at all, and how many of its
+// arguments were not names. The three are kept apart because an annotation with no usable name is
+// not the same as no annotation: the first is a schema asking for a guard it did not spell, the
+// second is a parameter nobody meant to guard, and only the validator can refuse the first if the
+// parser has told it which one it is.
+fn collect_rights(anns: &[Ann]) -> (Vec<String>, bool, usize) {
 	let mut rights = Vec::new();
+	let mut declared = false;
+	let mut non_names = 0usize;
 	for a in anns.iter().filter(|a| a.name == "rights") {
+		declared = true;
 		for arg in &a.args {
-			if let Arg::Name(s) = arg {
-				rights.push(s.clone());
+			match arg {
+				Arg::Name(s) => rights.push(s.clone()),
+				Arg::Num(_) => non_names += 1,
 			}
 		}
 	}
-	rights
+	(rights, declared, non_names)
 }
 
 // The ABI object-type code a `@kernel(...)` word names, or None for a word the ABI has no code for.

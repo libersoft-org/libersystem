@@ -154,7 +154,10 @@ pub fn msi_doorbell() -> Option<(u64, u64)> {
 // functions only, and the IOMMU fixture needs the PCI `edu` device - which is neither. Retaining a
 // window for an arbitrary function is what that fixture needs and what this provides; it does not
 // map anything or grant anything, it reads two registers.
-#[cfg(test)]
+//
+// NOT TEST-ONLY ANY MORE (P02M0173): the bypass transition quiesces every firmware-touched
+// function by its class before it clears bus mastering, and an NVMe controller - the riscv64 UEFI
+// boot's ESP - is admitted to the table without a BAR, so its registers are resolved here.
 pub fn function_bar(bus: u8, dev: u8, func: u8, index: usize) -> Option<(u64, u64)> {
 	let device = common::probe_function::<Access>(bus, dev, func)?;
 	let base = common::bar_address::<Access>(&device, index)?;

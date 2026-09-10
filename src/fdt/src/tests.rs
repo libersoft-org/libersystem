@@ -2236,3 +2236,124 @@ fn an_undersized_its_is_not_published() {
 	assert_eq!(at(with_its(0x20000)).parse().expect("parses").gic_its, 0x0808_0000, "a whole ITS window is taken");
 	assert_eq!(at(with_its(0x1000)).parse().expect("parses").gic_its, 0, "and one that does not reach GITS_TRANSLATER is not an ITS this kernel can command");
 }
+
+// ------------------------------------------------------------------- the boot-policy carrier
+//
+// THE PRODUCER/CONSUMER PAIR. The harness writes the eight-byte DMA-mode record into a `/libersystem`
+// node with its `compatible`, through `src/harness/dma-mode-record.py`; this reader parses it back.
+// A frozen record that only one side has ever written is a record with one implementation, so the
+// producer is RUN here - on every fixture tree, for both modes - and its output is read by the same
+// code the kernel boots on. The negatives are the ones that distinguish a frozen identity from a
+// convention: the wrong `compatible`, the right `compatible` under another node name (which must
+// still be FOUND), the wrong length, and a provenance byte that claims `signed`.
+
+fn producer(args: &[&str]) -> std::process::Output {
+	let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../harness/dma-mode-record.py");
+	// python3 is part of this tree's toolchain - the lab and the scenario runner are written in it -
+	// so its absence is a failure here rather than a reason to skip.
+	std::process::Command::new("python3").arg(&script).args(args).output().expect("python3 runs the harness producer")
+}
+
+fn produced_tree(fixture: &'static [u8], mode: &str, shape: Option<&str>) -> &'static [u8] {
+	let dir = std::env::temp_dir().join(format!("liber-fdt-policy-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let input = dir.join("in.dtb");
+	let output = dir.join("out.dtb");
+	std::fs::write(&input, fixture).unwrap();
+	let mut args = vec!["dtb", input.to_str().unwrap(), output.to_str().unwrap(), mode];
+	if let Some(shape) = shape {
+		args.push("--shape");
+		args.push(shape);
+	}
+	let run = producer(&args);
+	assert!(run.status.success(), "the producer failed: {}", String::from_utf8_lossy(&run.stderr));
+	let bytes = std::fs::read(&output).unwrap();
+	std::fs::remove_dir_all(&dir).unwrap();
+	Vec::leak(bytes)
+}
+
+#[test]
+fn the_harness_record_reads_back_from_every_fixture_tree_in_both_modes() {
+	for (name, fixture) in [("aarch64", AARCH64), ("riscv64", RISCV64), ("riscv64-aia", RISCV64_AIA)] {
+		for (mode, code) in [("enforcing-required", 1u8), ("no-iommu", 2u8)] {
+			let tree = produced_tree(fixture, mode, None);
+			let found = at(tree).boot_policy_record().unwrap_or_else(|| panic!("{name}: the producer's node was not found"));
+			assert_eq!(found.len, 8, "{name} {mode}: the property is exactly the eight-byte record");
+			assert_eq!(&found.bytes[..4], b"LSDM", "{name} {mode}: the magic");
+			assert_eq!(found.bytes[4], 1, "{name} {mode}: the format version");
+			assert_eq!(found.bytes[5], code, "{name} {mode}: the mode byte");
+			assert_eq!(found.bytes[6], 2, "{name} {mode}: harness provenance");
+			assert_eq!(found.bytes[7], 0, "{name} {mode}: the reserved byte");
+			// AND THE REST OF THE TREE STILL PARSES AS THE SAME MACHINE: the appended node moved the
+			// strings block and every offset, and a reader that lost the memory map to that would be a
+			// harness that broke the boot it was annotating.
+			let before = at(fixture).parse().expect("the fixture parses");
+			let after = at(tree).parse().expect("the produced tree parses");
+			assert_eq!((before.ram_base, before.ram_size, before.cpu_count), (after.ram_base, after.ram_size, after.cpu_count), "{name} {mode}: the machine is unchanged");
+		}
+		// An untouched tree carries no record.
+		assert_eq!(at(fixture).boot_policy_record(), None, "{name}: the ordinary machine has no boot-policy node");
+	}
+}
+
+#[test]
+fn the_record_is_found_by_compatible_and_not_by_the_node_name() {
+	// The right record and `compatible` under a node named `policy`: FOUND, because the consumer
+	// matches on `compatible`. A node named `libersystem` with another `compatible`: NOT this
+	// record, whatever its property says.
+	let other_name = produced_tree(RISCV64, "no-iommu", Some("other-node-name"));
+	let found = at(other_name).boot_policy_record().expect("found under a different node name");
+	assert_eq!(found.len, 8);
+	assert_eq!(found.bytes[5], 2);
+	let wrong_compatible = produced_tree(RISCV64, "no-iommu", Some("wrong-compatible"));
+	assert_eq!(at(wrong_compatible).boot_policy_record(), None, "the node name alone does not make a record");
+}
+
+#[test]
+fn a_record_of_the_wrong_length_or_provenance_comes_back_as_it_stands_for_the_codec_to_refuse() {
+	// The reader reports what it found; the codec is what refuses. A seven-byte property is
+	// reported as seven bytes, and a `signed` provenance byte is reported as the byte it is - so a
+	// consumer that read only the mode byte could not be built on this reader by accident.
+	let short = produced_tree(AARCH64, "enforcing-required", Some("short"));
+	let found = at(short).boot_policy_record().expect("a short property is still found");
+	assert_eq!(found.len, 7, "reported at its real length");
+	assert_eq!(&found.bytes[..7], b"LSDM\x01\x01\x02");
+	let signed = produced_tree(AARCH64, "enforcing-required", Some("signed-provenance"));
+	let found = at(signed).boot_policy_record().expect("found");
+	assert_eq!(found.len, 8);
+	assert_eq!(found.bytes[6], 1, "the provenance byte says `signed`, which only the codec may refuse");
+	// And the same shapes written by hand rather than by the producer: the reader does not depend on
+	// the producer's layout.
+	let hand = machine(|b| {
+		b.begin("libersystem").prop_str("compatible", "libersystem,boot-policy").prop("libersystem,dma-mode", b"LSDM\x01\x02\x02\x00").end();
+	});
+	let found = at(hand).boot_policy_record().expect("found");
+	assert_eq!((found.len, found.bytes), (8, *b"LSDM\x01\x02\x02\x00"));
+	let long = machine(|b| {
+		b.begin("libersystem").prop_str("compatible", "libersystem,boot-policy").prop("libersystem,dma-mode", b"LSDM\x01\x02\x02\x00\x00").end();
+	});
+	assert_eq!(at(long).boot_policy_record().map(|p| p.len), Some(9), "a longer property is reported as longer");
+	let compatible_list = machine(|b| {
+		b.begin("policy").prop("compatible", b"vendor,thing\0libersystem,boot-policy\0").prop("libersystem,dma-mode", b"LSDM\x01\x01\x02\x00").end();
+	});
+	assert_eq!(at(compatible_list).boot_policy_record().map(|p| p.bytes[5]), Some(1), "the compatible may be one entry of a list");
+	let no_property = machine(|b| {
+		b.begin("libersystem").prop_str("compatible", "libersystem,boot-policy").end();
+	});
+	assert_eq!(at(no_property).boot_policy_record(), None, "a node with the compatible and no property carries no record");
+}
+
+#[test]
+fn the_fw_cfg_and_device_tree_carriers_share_one_record() {
+	// The same producer writes the `fw_cfg` file and the tree property, and the bytes are the same
+	// bytes: what the x86_64 loader reads over the port interface is byte-identical to what the
+	// device-tree ports read out of the node, which is what lets one codec refuse both.
+	for (mode, code) in [("enforcing-required", 1u8), ("no-iommu", 2u8)] {
+		let file = producer(&["record", mode]);
+		assert!(file.status.success());
+		assert_eq!(file.stdout, [b'L', b'S', b'D', b'M', 1, code, 2, 0], "{mode}: the fw_cfg record is the frozen eight bytes");
+		let tree = produced_tree(RISCV64, mode, None);
+		let found = at(tree).boot_policy_record().expect("found");
+		assert_eq!(found.bytes.to_vec(), file.stdout, "{mode}: the tree carries the same eight bytes");
+	}
+}

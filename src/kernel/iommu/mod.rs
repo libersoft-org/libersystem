@@ -378,6 +378,7 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 	// reach. It is the one endpoint for which that is not a hole: it is the device doing the
 	// translating.
 	crate::arch::pci::set_bus_master(bus, dev, func, true);
+	crate::serial_println!("iommu: the controller at {:02x}:{:02x}.{} masters the bus - the one function that does before bypass is off", bus, dev, func);
 
 	// SAFETY: `common` is this device's common configuration structure, resolved from its own PCI
 	// capabilities by the boot scan.
@@ -436,7 +437,7 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 	// point: an endpoint still mastering when translation turns on is an endpoint whose in-flight
 	// DMA lands wherever it was already aimed. Quiescing them first makes the transition a moment
 	// with no traffic across it rather than one that races whatever the firmware left running.
-	quiesce_other_endpoints(index);
+	quiesce_other_endpoints(index)?;
 
 	// The transition, and the read-back that is the only reason to believe it.
 	if accepted & dma::virtio_iommu::F_BYPASS_CONFIG == 0 {
@@ -468,18 +469,126 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 // INCLUDING THE FIRMWARE'S. OVMF read the boot medium through a SATA function with bus mastering on
 // and bypass on; that function has no driver in this kernel and no reason to keep the ability. This
 // is where it loses it.
-fn quiesce_other_endpoints(controller: usize) {
+// WHAT A FIRMWARE-TOUCHED ENDPOINT IS PUT THROUGH BEFORE ITS BUS MASTERING IS CLEARED (P02M0173).
+//
+// Clearing BME alone does not drain work the firmware already issued: a virtio device with a
+// posted request completes it into memory whenever it gets round to it, an xHCI host controller
+// keeps its rings and its ports running, an NVMe controller its queues. So every function that is
+// not the controller is quiesced by the procedure written for ITS CLASS first, and only then loses
+// bus mastering:
+//
+//   virtio    status written zero and READ BACK zero - the device has forgotten its queues
+//   xHCI      run/stop cleared and HCHalted read back set, then HCRST and both HCRST and CNR read
+//             back clear - halted, then reset, then ready for a driver that starts from nothing
+//   NVMe      `CC.EN` cleared and `CSTS.RDY` read back zero - the admin and I/O queues are gone
+//
+// Every wait is bounded, and a device that does not confirm makes the TRANSITION fail: the
+// controller comes up "present but NOT enforcing", every `iommu-required` binding is refused, and
+// nothing is inferred from a bit nobody read back. A class this kernel has no procedure for keeps
+// only the BME clear it always had, which the profile's endpoint census is what bounds.
+const QUIESCE_SPINS: u32 = 4_000_000;
+
+fn spin_until(done: impl Fn() -> bool) -> bool {
+	let mut spins = 0u32;
+	while !done() {
+		spins += 1;
+		if spins > QUIESCE_SPINS {
+			return false;
+		}
+		core::hint::spin_loop();
+	}
+	true
+}
+
+fn quiesce_virtio(bar: u64, bar_len: u64, common_offset: u32) -> bool {
+	let common = map_registers(bar, bar_len) + common_offset as u64;
+	// SAFETY: the function's common configuration structure, resolved from its own PCI capabilities
+	// by the boot scan and mapped uncached just above; writing status zero is the reset the
+	// specification defines and reading it back is the confirmation.
+	unsafe {
+		write8(common + abi::VIRTIO_CFG_DEVICE_STATUS, 0);
+		spin_until(|| read8(common + abi::VIRTIO_CFG_DEVICE_STATUS) == 0)
+	}
+}
+
+// The xHCI operational registers sit `CAPLENGTH` bytes into BAR0: USBCMD at +0 (bit 0 run/stop,
+// bit 1 HCRST), USBSTS at +4 (bit 0 HCHalted, bit 11 controller-not-ready).
+fn quiesce_xhci(bar: u64, bar_len: u64) -> bool {
+	let base = map_registers(bar, bar_len);
+	// SAFETY: BAR0 of a function the boot scan resolved as an xHCI host controller, mapped uncached
+	// just above; the registers and their bits are the ones the xHCI specification fixes.
+	unsafe {
+		let caplength = read8(base) as u64;
+		let usbcmd = base + caplength;
+		let usbsts = usbcmd + 4;
+		write32(usbcmd, read32(usbcmd) & !1);
+		if !spin_until(|| read32(usbsts) & 1 != 0) {
+			return false;
+		}
+		write32(usbcmd, read32(usbcmd) | 2);
+		spin_until(|| read32(usbcmd) & 2 == 0 && read32(usbsts) & (1 << 11) == 0)
+	}
+}
+
+// The NVMe controller registers at BAR0: CC at 0x14 (bit 0 EN), CSTS at 0x1c (bit 0 RDY).
+fn quiesce_nvme(bar: u64, bar_len: u64) -> bool {
+	let base = map_registers(bar, bar_len);
+	// SAFETY: BAR0 of a function whose class triple says NVMe, mapped uncached just above; CC and
+	// CSTS are at the offsets the NVMe specification fixes.
+	unsafe {
+		let cc = read32(base + 0x14);
+		if cc & 1 != 0 {
+			write32(base + 0x14, cc & !1);
+		}
+		spin_until(|| read32(base + 0x1c) & 1 == 0) && read32(base + 0x14) & 1 == 0
+	}
+}
+
+fn quiesce_other_endpoints(controller: usize) -> Result<(), Fault> {
 	let keep = crate::device::with(controller, |entry| (entry.bus, entry.dev, entry.func));
+	// The functions the table resolved with a register window: virtio (its common configuration)
+	// and xHCI (its capability registers). Each is quiesced by its class before anything else.
+	for index in 0..crate::device::count() {
+		let Some((transport, kind, bar, bar_len, common_offset, bus, dev, func)) = crate::device::with(index, |entry| (entry.transport, entry.device_type, entry.bar_phys, entry.bar_len, entry.common_offset, entry.bus, entry.dev, entry.func)) else { continue };
+		if Some((bus, dev, func)) == keep || bar_len == 0 {
+			continue;
+		}
+		let (class, confirmed) = if transport == abi::TRANSPORT_VIRTIO_PCI {
+			("virtio", quiesce_virtio(bar, bar_len, common_offset))
+		} else if kind == abi::DEVICE_TYPE_XHCI as u16 {
+			("xhci", quiesce_xhci(bar, bar_len))
+		} else {
+			continue;
+		};
+		if !confirmed {
+			crate::serial_println!("iommu: the {class} function at {:02x}:{:02x}.{} did not confirm its reset before bypass-off - the transition is REFUSED", bus, dev, func);
+			return Err(Fault::Unconfirmed);
+		}
+		crate::serial_println!("iommu: quiesced {class} at {:02x}:{:02x}.{} - reset confirmed before bypass-off", bus, dev, func);
+	}
 	// THE WHOLE BUS, NOT THE DRIVER TABLE. The device table holds the functions this kernel binds
 	// drivers to; the firmware's SATA controller is not one of them and is exactly the endpoint
-	// that was mastering the bus a moment ago. `pci_get` walks every function the boot scan found.
+	// that was mastering the bus a moment ago. `pci_get` walks every function the boot scan found:
+	// an NVMe controller is quiesced by its class, and every function loses bus mastering.
 	for index in 0..crate::device::pci_count() {
 		let Some(function) = crate::device::pci_get(index) else { continue };
 		if Some((function.bus, function.dev, function.func)) == keep {
 			continue;
 		}
+		if function.class == 0x01 && function.subclass == 0x08 && function.prog_if == 0x02 {
+			let confirmed = match crate::arch::pci::function_bar(function.bus, function.dev, function.func, 0) {
+				Some((base, len)) if len >= 0x1000 => quiesce_nvme(base, len),
+				_ => false,
+			};
+			if !confirmed {
+				crate::serial_println!("iommu: the nvme function at {:02x}:{:02x}.{} did not confirm CC.EN clear and CSTS.RDY zero before bypass-off - the transition is REFUSED", function.bus, function.dev, function.func);
+				return Err(Fault::Unconfirmed);
+			}
+			crate::serial_println!("iommu: quiesced nvme at {:02x}:{:02x}.{} - CC.EN clear, CSTS.RDY zero before bypass-off", function.bus, function.dev, function.func);
+		}
 		crate::arch::pci::set_bus_master(function.bus, function.dev, function.func, false);
 	}
+	Ok(())
 }
 
 impl Controller {

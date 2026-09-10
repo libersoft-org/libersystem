@@ -15,7 +15,10 @@
 
 extern crate alloc;
 
-use core::arch::{asm, global_asm};
+use core::arch::asm;
+#[cfg(not(feature = "host-tests"))]
+use core::arch::global_asm;
+#[cfg(not(feature = "host-tests"))]
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
@@ -34,18 +37,18 @@ pub mod stream;
 // ELF entry: the kernel drops us into ring 3 / EL0 here with the bootstrap channel
 // handle in the first argument register. Align the stack to the ABI boundary, then
 // call the runtime entry (keeping the bootstrap handle in that register).
-#[cfg(all(target_arch = "x86_64", not(feature = "shared-image")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "shared-image", feature = "host-tests"))))]
 global_asm!(".text", ".global _start", "_start:", "and rsp, -16", "call __rt_start", "ud2");
 
 // aarch64: the kernel enters EL0 with the bootstrap handle in x0. SP is already
 // 16-aligned; clear the frame pointer and call the runtime entry.
-#[cfg(all(target_arch = "aarch64", not(feature = "shared-image")))]
+#[cfg(all(target_arch = "aarch64", not(any(feature = "shared-image", feature = "host-tests"))))]
 global_asm!(".text", ".global _start", "_start:", "mov x29, xzr", "bl __rt_start", "brk #0");
 
 // riscv64: the kernel enters U-mode with the bootstrap handle in a0 and sp at the
 // user stack top. Align sp to the 16-byte ABI boundary, clear the frame pointer (s0),
 // and call the runtime entry (a0 preserved).
-#[cfg(all(target_arch = "riscv64", not(feature = "shared-image")))]
+#[cfg(all(target_arch = "riscv64", not(any(feature = "shared-image", feature = "host-tests"))))]
 global_asm!(".text", ".global _start", "_start:", "andi sp, sp, -16", "mv s0, zero", "call __rt_start", "ebreak");
 
 // The runtime entry the assembly stub calls: verify the kernel's ABI matches the one
@@ -58,7 +61,7 @@ global_asm!(".text", ".global _start", "_start:", "andi sp, sp, -16", "mv s0, ze
 // and old ones never renumber, so SYS_ABI_CHECK and this comparison stay valid across
 // revisions; a match is silent, a mismatch prints a clear line and exits.
 #[unsafe(no_mangle)]
-#[cfg(not(feature = "shared-image"))]
+#[cfg(not(any(feature = "shared-image", feature = "host-tests")))]
 pub extern "C" fn __rt_start(bootstrap: u64) -> ! {
 	liber_rt_start(bootstrap, __user_main)
 }
@@ -74,7 +77,7 @@ pub extern "C" fn liber_rt_start(bootstrap: u64, main: unsafe extern "C" fn(u64)
 	}
 }
 
-#[cfg(not(feature = "shared-image"))]
+#[cfg(not(any(feature = "shared-image", feature = "host-tests")))]
 unsafe extern "C" {
 	// Each program defines this (a `#[no_mangle] pub extern "C" fn __user_main`); the
 	// runtime's `__rt_start` calls it once the ABI handshake passes.
@@ -85,12 +88,14 @@ unsafe extern "C" {
 // already had: an infallible allocation that cannot be satisfied says so and exits, rather than
 // dying without a word. Fallible allocations never reach here - they get their null back and
 // answer for themselves.
-#[cfg(not(feature = "shared-image"))]
+#[cfg(not(any(feature = "shared-image", feature = "host-tests")))]
 #[unsafe(no_mangle)]
 pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
 	alloc_failure()
 }
 
+// ABSENT UNDER `host-tests`: the std the test harness links has its own, and two is E0152.
+#[cfg(not(feature = "host-tests"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
 	unsafe {
@@ -109,6 +114,8 @@ pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
 	alloc_failure()
 }
 
+// Reached only through the allocator hooks, which the host-test seam leaves unregistered.
+#[cfg_attr(feature = "host-tests", allow(dead_code))]
 fn alloc_failure() -> ! {
 	let pointer = ALLOC_ERROR_MESSAGE.load(Ordering::Relaxed);
 	let length = ALLOC_ERROR_MESSAGE_LEN.load(Ordering::Relaxed);
@@ -199,7 +206,7 @@ global_asm!(".global memcpy", ".type memcpy,@function", "memcpy:", "tail liber_m
 // Issue a syscall: number in rax, up to four args in rdi/rsi/rdx/r10. The
 // `syscall` instruction clobbers rcx and r11; the kernel also uses r8/r9. The
 // result comes back in rax (a success value or a small negative error code).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "host-tests")))]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
 		let result: u64;
@@ -221,7 +228,7 @@ pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // aarch64: number in x8, up to four args in x0..x3, result back in x0 (the SVC
 // trap path). SVC preserves the general registers, so nothing else is clobbered.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(feature = "host-tests")))]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
 		let result: u64;
@@ -240,7 +247,7 @@ pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // riscv64: number in a7, up to four args in a0..a3, result back in a0 (the ecall
 // trap path). ecall preserves the general registers, so nothing else is clobbered.
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(target_arch = "riscv64", not(feature = "host-tests")))]
 pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	unsafe {
 		let result: u64;
@@ -278,6 +285,14 @@ pub fn exit_with(status: u64) -> ! {
 
 // Yield the CPU to another runnable thread (used to spin on a would-block call
 // without busy-waiting against the kernel).
+// NO KERNEL ON THE HOST: under the host-test seam every syscall answers `ERR_UNSUPPORTED`, so a
+// wrapper reached from a pure-layer test fails the way a missing facility fails instead of
+// executing the host kernel's syscall of the same number with this system's arguments.
+#[cfg(feature = "host-tests")]
+pub unsafe fn syscall(_number: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64) -> u64 {
+	ERR_UNSUPPORTED as u64
+}
+
 pub unsafe fn yield_now() {
 	unsafe {
 		syscall(SYS_YIELD, 0, 0, 0, 0);
@@ -2354,6 +2369,14 @@ pub extern "C" fn liber_handle_authority(handle: u64) -> u64 {
 	}
 }
 
+// And the release a refusal owes: a generated guard that refused a handle closes it here, so the
+// capability a caller believes was rejected is not sitting in the service's table until the
+// service exits.
+#[unsafe(no_mangle)]
+pub extern "C" fn liber_handle_release(handle: u64) {
+	unsafe { close(handle) }
+}
+
 // Read the live per-process counters and state behind a Process `handle` (the IPC
 // volume it has done, the handles and user memory it holds, and its liveness). The
 // handle must carry RIGHT_READ. Returns None if the handle is unknown or not a
@@ -2434,9 +2457,17 @@ pub unsafe fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
 //
 // `ERR_ALREADY_CLAIMED` means somebody else holds it, which is worth waiting on. `ERR_UNSUPPORTED`
 // means it is quarantined or retired, which lasts the rest of the boot.
-pub unsafe fn device_claim(index: u64, privilege: u64) -> Result<ClaimGrant, i64> {
+//
+// `entry` is the registry entry this claim is made under - the program name of the candidate the
+// caller is attempting, exactly as the manifest declares it. The kernel validates it against the
+// table generated from the same manifest and stamps it, with the entry's DMA policy, on the grant.
+// A name that does not fit the ABI field is refused here, before the kernel is asked.
+pub unsafe fn device_claim(index: u64, privilege: u64, entry: &[u8]) -> Result<ClaimGrant, i64> {
+	let Some(field) = abi::entry_name_field(entry) else {
+		return Err(abi::ERR_INVALID);
+	};
 	let mut grant = ClaimGrant::default();
-	let result: i64 = unsafe { syscall(SYS_DEVICE_CLAIM, index, privilege, &mut grant as *mut ClaimGrant as u64, 0) as i64 };
+	let result: i64 = unsafe { syscall(SYS_DEVICE_CLAIM, index, privilege, &mut grant as *mut ClaimGrant as u64, field.as_ptr() as u64) as i64 };
 	if result < 0 { Err(result) } else { Ok(grant) }
 }
 

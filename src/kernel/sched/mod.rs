@@ -1,11 +1,20 @@
 // Threads, run queues, and the scheduler.
 //
-// Each core owns a run queue and a "current thread" slot behind a per-CPU
-// spinlock, so the design is SMP-correct from the start. Scheduling is
-// cooperative round-robin: a running thread calls yield_now() or returns (which
-// exits it), and the scheduler context-switches to the next ready thread on the
-// same core. Threads do not migrate between cores in the current design, so a core
-// only ever touches its own queue; cross-core balancing is a later refinement.
+// Each core owns a run queue and a "current thread" slot behind a per-CPU spinlock, and a core
+// only ever runs threads out of its own queue. Scheduling is TIMER-PREEMPTIVE round robin with a
+// one-tick quantum: once `init()` has armed `PREEMPTION_ENABLED`, `on_timer_preempt` rotates the
+// running thread to the back of its core's queue on every tick, and a thread gives the core up
+// sooner by calling yield_now(), by blocking in `wait`, or by returning (which exits it). Ring-0
+// and ring-3 threads are preempted alike.
+//
+// Threads DO migrate, and the migration is explicit rather than balanced. Placement onto another
+// core is `enqueue_on` plus a wake IPI to that core (`arch::apic::send_wake_ipi`), and a wake is
+// wake-side migration: `wake_object` puts the woken thread on the WAKER's run queue, so a thread
+// can resume on a different core than it blocked on - see the migration note in `enqueue`. There
+// is no load balancer and no affinity; a runnable thread stays on the core it was placed on until
+// it blocks and something wakes it elsewhere. An address space that is live on several cores is
+// kept coherent by the synchronous cross-core shootdown in `mem::tlb`, which the same note
+// describes.
 //
 // The bootstrap/idle context of each core (the stack the kernel booted on, and
 // the AP idle loop) is the fallback that runs when no thread is ready. Its stack
@@ -1022,10 +1031,15 @@ fn enqueue(thread: Arc<Thread>) {
 	//   - the interrupt state, restored by the guard that took it, which is now pinned to
 	//     one CPU so it cannot be dropped on another.
 	//
-	// What still does NOT survive it is the TLB: an address space live on two cores has
-	// no shootdown, so a thread migrating away from a core leaves translations behind it.
-	// That is the open item in Phase 2, and it is the reason migration is not yet safe for
-	// a process with threads on several cores rather than a reason to stop migrating.
+	// AND THE TLB, which this note used to list as the thing that did NOT survive migration:
+	// "an address space live on two cores has no shootdown" was true when it was written and is
+	// not now. `mem::tlb::shootdown` flushes the WHOLE translation buffer on every other online
+	// core and WAITS for each to acknowledge, and the page-table paths call it after the entries
+	// are gone and BEFORE the frames they named are handed back to the allocator - so a thread
+	// that migrated away leaves no translation another core could still use once the memory is
+	// reused. It is deliberately blunt, and the waiting is the correctness argument. What remains
+	// open there is refinement, not safety: a per-address-space active-CPU mask (flush only the
+	// cores the space has run on) and per-page invalidation instead of the whole buffer.
 	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(current_cpu_id(), thread);
 }
@@ -1214,10 +1228,12 @@ fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
 // emulation. Work another core enqueues onto this core's run queue (rare - wakeups
 // land on the waker's core, not here) is picked up at the next wake.
 //
-// APs deliberately do NOT touch the wait registry: in this cooperative model
-// blocked threads and their deadlines are driven by run_until_idle on the BSP, so
-// only the BSP wakes them. A waiter blocked on the BSP must not be stolen onto an
-// AP's run queue. True per-core timed waits arrive with preemption.
+// APs deliberately do NOT drive the wait registry's DEADLINES: expiry is checked by
+// `check_deadlines`, which only the BSP's bounded drain (`run_until_idle_until`) runs, so a
+// timed-out waiter is always woken by the BSP. That is a statement about timeouts, not about
+// wakes in general - `wake_object` runs on whichever core signals the object and enqueues the
+// waiter THERE, which is the wake-side migration described at the top of this file. Per-core
+// deadline expiry is still a refinement, and the timer tick preempts without consulting it.
 pub fn cpu_idle_loop() -> ! {
 	loop {
 		reschedule(Disposition::Requeue);
@@ -1424,7 +1440,7 @@ fn reschedule(disp: Disposition) {
 			let new_cr3 = next.address_space().cr3();
 			// Track the incoming thread's parked syscall stack on this core, so a
 			// ring-3 syscall it issues after resuming lands on its own kernel stack
-			// even though cooperative services share the per-CPU block.
+			// even though every thread this core runs shares the one per-CPU block.
 			let new_syscall_rsp = next.syscall_rsp_load();
 			// AND WHICH STACK THIS CORE IS ABOUT TO BE ON, so the exception entry can refuse to
 			// save a trap frame anywhere else. Published here, with the rest of the incoming

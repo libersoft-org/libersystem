@@ -1,5 +1,6 @@
-// The boot manifest, version 2: what the loader checks the bytes it is about to execute against,
-// and who says so.
+// The boot manifest, version 3: what the loader checks the bytes it is about to execute against,
+// who says so - and, since this version, under which DMA mode the boot may run, which security
+// generation the release is, and what the manifest is for.
 //
 // WHAT v1 PROVED AND WHAT IT DID NOT. `boot_manifest` is a text file of `<sha256>  <path>` rows
 // beside the payloads. It catches corruption, a half-written image and artifacts from two builds
@@ -15,10 +16,28 @@
 //
 // THE PARSER IS SHARED. The loader and the host signing tool use this module - not two readings of
 // one format, which is how a signed thing and a verified thing stop being the same thing.
+//
+// VERSION 3 EVOLVED THE HEADER ONCE FOR TWO MILESTONES. After the release string come two fields
+// the rollback floor needs - a canonical `u64` security generation and a `u32` purpose - and after
+// the volume uuid comes the DMA-mode record: one mandatory presence tag byte, followed by a
+// little-endian `u32` mode ONLY when the tag is 1. Tag 0 declares that this signed build supplies no
+// DMA mode and has no mode bytes at all; the loader then requires the entry path's harness carrier.
+// Tag 1 carries `1` = enforcing-required or `2` = no-iommu, and any other tag or mode is refused.
+// The record is exactly one byte or exactly five, at a fixed position before the row count, covered
+// by the same signature as everything else. There is no optionality in the tag - only the VALUE is
+// optional, and its authenticated tag decides its exact extent.
+//
+// A VERSION-2 RECORD IS REFUSED, BY VERSION. It has no tag, and it must never be read as tag 0: a
+// legacy manifest beside a harness carrier would otherwise boot under a mode nothing signed for.
+// Two different header layouts never share one version, so the magic and the signature domain both
+// moved with the layout.
 
 // `LBRMAN` and the format version. A reader that does not find this exact byte string is not
 // looking at a manifest, and says so rather than guessing.
-pub const MAGIC: [u8; 8] = *b"LBRMAN\x02\x00";
+pub const MAGIC: [u8; 8] = *b"LBRMAN\x03\x00";
+// The bytes every version of this format starts with. A record carrying them and another version
+// is a manifest this reader refuses BY VERSION, which is a different refusal from "not a manifest".
+pub const MAGIC_PREFIX: [u8; 6] = *b"LBRMAN";
 
 // The one signature algorithm this version defines. The field exists so a second one can be added
 // without a new format; an unknown value is a refusal rather than an assumption.
@@ -28,7 +47,7 @@ pub const ALG_ED25519: u16 = 1;
 // only the bytes could be replayed under any other protocol that happens to sign the same bytes.
 // The domain string makes a manifest's signature mean "this is a LiberSystem boot manifest" and
 // nothing else.
-pub const DOMAIN: &[u8] = b"libersystem-boot-manifest-v2\0";
+pub const DOMAIN: &[u8] = b"libersystem-boot-manifest-v3\0";
 
 // Bounds, checked BEFORE anything is allocated or indexed. Each is far above any real manifest and
 // far below what would make the arithmetic below interesting.
@@ -58,6 +77,17 @@ pub const KIND_PROGRAM: u8 = 3;
 pub const KIND_SYSTEM_VOLUME: u8 = 4;
 pub const KIND_PACKAGE: u8 = 5;
 
+// What a manifest is FOR. An ordinary boot set, or a recovery set - and a root that may sign for
+// one may not sign for the other, which is what the loader's purpose-scoped roots enforce. Any
+// other value is refused here, before a root is consulted.
+pub const PURPOSE_BOOT: u32 = 1;
+pub const PURPOSE_RECOVERY: u32 = 2;
+
+// The DMA-mode presence tag. Exactly these two values; the mode that follows a 1 is one of
+// `dma_mode::MODE_ENFORCING_REQUIRED` and `dma_mode::MODE_NO_IOMMU`.
+pub const DMA_MODE_ABSENT: u8 = 0;
+pub const DMA_MODE_PRESENT: u8 = 1;
+
 // WHY A MANIFEST WAS REFUSED. Each is a different fact about the bytes, and the loader prints which
 // - "this is not a manifest" and "this manifest is for another architecture" are different
 // machines to be standing in front of.
@@ -65,6 +95,9 @@ pub const KIND_PACKAGE: u8 = 5;
 pub enum Refusal {
 	// Not this format at all: too short to hold a header, or the magic does not match.
 	NotAManifest,
+	// This format at an earlier version. Refused rather than read: a version-2 record has no DMA
+	// record and must never be interpreted as one that declares none.
+	LegacyVersion,
 	// Longer than this reader will look at. Stated before anything is indexed.
 	TooLarge,
 	// A field's declared extent runs past the end of what was read.
@@ -101,7 +134,7 @@ pub struct Row<'a> {
 // anything.
 impl core::fmt::Debug for Manifest<'_> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-		write!(f, "Manifest {{ key_id: {}, arch: {}, source: {}, rows: {} }}", self.key_id, self.arch, self.source_kind, self.row_count)
+		write!(f, "Manifest {{ key_id: {}, arch: {}, source: {}, generation: {}, purpose: {}, dma_mode: {:?}, rows: {} }}", self.key_id, self.arch, self.source_kind, self.security_generation, self.purpose, self.dma_mode, self.row_count)
 	}
 }
 
@@ -118,7 +151,14 @@ pub struct Manifest<'a> {
 	pub arch: u8,
 	pub source_kind: u8,
 	pub release: &'a [u8],
+	// The rollback floor's input: a canonical unsigned 64-bit number, independent of the human
+	// release string. Every manifest composed into one boot must carry the same one.
+	pub security_generation: u64,
+	// `PURPOSE_BOOT` or `PURPOSE_RECOVERY`.
+	pub purpose: u32,
 	pub volume_uuid: [u8; 16],
+	// `None` for tag 0 - this build supplies no mode - and the signed mode for tag 1.
+	pub dma_mode: Option<u32>,
 	rows_at: usize,
 	row_count: usize,
 }
@@ -177,6 +217,12 @@ impl<'a> Manifest<'a> {
 			return Err(Refusal::TooLarge);
 		}
 		if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
+			// The prefix with another version byte is this format at a version this reader does not
+			// read - which is a refusal of its own, so a loader can say "this medium predates the DMA
+			// record" rather than "this is not a manifest".
+			if bytes.len() >= MAGIC.len() && bytes[..MAGIC_PREFIX.len()] == MAGIC_PREFIX {
+				return Err(Refusal::LegacyVersion);
+			}
 			return Err(Refusal::NotAManifest);
 		}
 		let mut at = MAGIC.len();
@@ -215,10 +261,37 @@ impl<'a> Manifest<'a> {
 			return Err(Refusal::InvalidPath);
 		}
 
+		// THE VERSION-3 FIELDS BEFORE THE UUID: the generation and the purpose, in one fixed position.
+		let (security_generation, next) = u64_at(bytes, at)?;
+		at = next;
+		let (purpose, next) = u32_at(bytes, at)?;
+		at = next;
+		if !matches!(purpose, PURPOSE_BOOT | PURPOSE_RECOVERY) {
+			return Err(Refusal::UnknownValue);
+		}
+
 		let (uuid, next) = take(bytes, at, 16)?;
 		at = next;
 		let mut volume_uuid = [0u8; 16];
 		volume_uuid.copy_from_slice(uuid);
+
+		// THE DMA RECORD, immediately after the uuid: one tag byte, and four mode bytes only after a
+		// 1. The tag decides the record's extent, so a tag-0 record followed by mode bytes is read
+		// as a row count that is not one - a malformed row boundary - rather than as a mode.
+		let (tag, next) = take(bytes, at, 1)?;
+		at = next;
+		let dma_mode = match tag[0] {
+			DMA_MODE_ABSENT => None,
+			DMA_MODE_PRESENT => {
+				let (mode, next) = u32_at(bytes, at)?;
+				at = next;
+				if !matches!(mode, crate::dma_mode::MODE_ENFORCING_REQUIRED | crate::dma_mode::MODE_NO_IOMMU) {
+					return Err(Refusal::UnknownValue);
+				}
+				Some(mode)
+			}
+			_ => return Err(Refusal::UnknownValue),
+		};
 
 		let (row_count, next) = u16_at(bytes, at)?;
 		at = next;
@@ -264,7 +337,7 @@ impl<'a> Manifest<'a> {
 			return Err(Refusal::TrailingBytes);
 		}
 
-		Ok(Manifest { bytes, payload_len, alg, key_id, product, arch: arch[0], source_kind: source[0], release, volume_uuid, rows_at, row_count: row_count as usize })
+		Ok(Manifest { bytes, payload_len, alg, key_id, product, arch: arch[0], source_kind: source[0], release, security_generation, purpose, volume_uuid, dma_mode, rows_at, row_count: row_count as usize })
 	}
 
 	// EXACTLY WHAT A SIGNATURE MUST COVER, domain string included. A caller cannot ask about
@@ -322,7 +395,11 @@ pub struct Header<'a> {
 	pub arch: u8,
 	pub source_kind: u8,
 	pub release: &'a [u8],
+	pub security_generation: u64,
+	pub purpose: u32,
 	pub volume_uuid: [u8; 16],
+	// `None` writes tag 0 and no mode bytes; `Some(mode)` writes tag 1 and the mode.
+	pub dma_mode: Option<u32>,
 }
 
 // Write the canonical payload into `out` and answer its length. The caller signs exactly those
@@ -346,6 +423,12 @@ pub fn encode_payload(header: &Header<'_>, rows: &mut [Row<'_>], out: &mut [u8])
 		return Err(Refusal::UnknownValue);
 	}
 	if !matches!(header.source_kind, SOURCE_SYSTEM_VOLUME | SOURCE_LIVE_IMAGE | SOURCE_BOOT_MEDIUM) {
+		return Err(Refusal::UnknownValue);
+	}
+	if !matches!(header.purpose, PURPOSE_BOOT | PURPOSE_RECOVERY) {
+		return Err(Refusal::UnknownValue);
+	}
+	if header.dma_mode.is_some_and(|mode| !matches!(mode, crate::dma_mode::MODE_ENFORCING_REQUIRED | crate::dma_mode::MODE_NO_IOMMU)) {
 		return Err(Refusal::UnknownValue);
 	}
 	if rows.len() > MAX_ROWS {
@@ -387,7 +470,16 @@ pub fn encode_payload(header: &Header<'_>, rows: &mut [Row<'_>], out: &mut [u8])
 	put(&[header.source_kind], &mut at)?;
 	put(&[header.release.len() as u8], &mut at)?;
 	put(header.release, &mut at)?;
+	put(&header.security_generation.to_le_bytes(), &mut at)?;
+	put(&header.purpose.to_le_bytes(), &mut at)?;
 	put(&header.volume_uuid, &mut at)?;
+	match header.dma_mode {
+		None => put(&[DMA_MODE_ABSENT], &mut at)?,
+		Some(mode) => {
+			put(&[DMA_MODE_PRESENT], &mut at)?;
+			put(&mode.to_le_bytes(), &mut at)?;
+		}
+	}
 	put(&(rows.len() as u16).to_le_bytes(), &mut at)?;
 	for row in rows.iter() {
 		put(&[row.kind], &mut at)?;

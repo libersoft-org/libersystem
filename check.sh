@@ -8,7 +8,13 @@
 
 SCRIPT_NAME=check.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+source "$SRC_DIR/tools/evidence.sh"
 install_guest_cleanup
+
+# EVERY GATE RUNS UNDER `gate`, set here only when unset so an outer runner's value survives: a gate
+# is the outermost entry point that knows what kind of boot it is starting, and the test runner it
+# invokes for its phases leaves the value alone.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 # name -> command, run from src/. The static-injection family shares one script and differs by its
 # argument, which is exactly the shape that became six recipe names.
@@ -49,6 +55,35 @@ declare -A GATES=(
 	# QEMU profile with a virtio-iommu and two hostile `edu` endpoints, each told to reach memory it
 	# was never given. What is checked is the SENTINEL MEMORY, not the error code.
 	["qemu-virtio-iommu-x86_64"]="tools/check-qemu-virtio-iommu-x86_64.sh"
+	# THE DMA MODE. The frozen carrier record, its producer and its consumer, on the host in
+	# milliseconds; then every row of the x86_64 matrix booted - the development pair, the shipping
+	# pair, the host pairing check and every producible refusal; then the two device-tree ports on
+	# both entry paths, emulated and slow.
+	["dma-mode-carrier"]="tools/check-dma-mode-carrier.sh"
+	["dma-mode-x86_64"]="tools/check-dma-mode-x86_64.sh"
+	["dma-mode-ports"]="tools/check-dma-mode-ports.sh"
+	["dma-mode-aarch64"]="tools/check-dma-mode-ports.sh --only aarch64"
+	["dma-mode-riscv64"]="tools/check-dma-mode-ports.sh --only riscv64"
+	# THE VIRTIO-IOMMU PROFILES OF THE PORTS: five rows of two phases each - a hostile or transition
+	# phase on the test kernel, an ordinary phase on the built system - every phase its own gate and
+	# its own catalog key, the rows and `iommu-ports` umbrellas a person runs by name. Emulated, so
+	# minutes per phase.
+	["iommu-ports"]="tools/check-qemu-iommu-ports.sh"
+	["iommu-aarch64-direct-gicv2"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2"
+	["iommu-aarch64-direct-gicv2-hostile"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2:hostile"
+	["iommu-aarch64-direct-gicv2-ordinary"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2:ordinary"
+	["iommu-aarch64-direct-gicv3-its"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv3-its"
+	["iommu-aarch64-direct-gicv3-its-transition"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv3-its:transition"
+	["iommu-aarch64-direct-gicv3-its-ordinary"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv3-its:ordinary"
+	["iommu-aarch64-uefi-gicv2"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2"
+	["iommu-aarch64-uefi-gicv2-transition"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2:transition"
+	["iommu-aarch64-uefi-gicv2-ordinary"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2:ordinary"
+	["iommu-riscv64-direct-aia"]="tools/check-qemu-iommu-ports.sh --only riscv64:direct-aia"
+	["iommu-riscv64-direct-aia-hostile"]="tools/check-qemu-iommu-ports.sh --only riscv64:direct-aia:hostile"
+	["iommu-riscv64-direct-aia-ordinary"]="tools/check-qemu-iommu-ports.sh --only riscv64:direct-aia:ordinary"
+	["iommu-riscv64-uefi-aia"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia"
+	["iommu-riscv64-uefi-aia-transition"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia:transition"
+	["iommu-riscv64-uefi-aia-ordinary"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia:ordinary"
 	# TWO SUITES OF ONE ARCHITECTURE AT ONCE, each proving it ran its OWN selection. The per-run
 	# staging of the kernel, the medium and the loader was argued for in comments and reproduced by
 	# hand once; this is the standing proof, and it is the one gate here that deliberately overlaps
@@ -74,6 +109,7 @@ declare -A GATES=(
 	# The firmware verifies the LOADER, or the loader does not run. Preflights its four
 	# host tools by name and skips nothing when one is missing.
 	["secure-boot"]="tools/check-secure-boot.sh"
+	["rollback-floor-x86_64"]="tools/check-rollback-floor-x86_64.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
 	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
 	# guards stopped compiling twice in one release without anything noticing.
@@ -97,6 +133,15 @@ declare -A GATES=(
 	["verify-scheduler"]="tools/check-verify-scheduler.sh"
 	["verify-model"]="cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- check"
 	["verify-model-tests"]="cargo test --quiet --manifest-path tools/verify-model/Cargo.toml"
+	# The evidence path's own fixtures: a kept log outlives its producer, a replaced tool or
+	# firmware image is not what boots, a release snapshot refuses a write, a moved tree fails
+	# its dossier. Boots two short x86_64 guests.
+	["verify-evidence"]="tools/check-verify-evidence.sh"
+	# THE DEVELOPMENT GUEST'S LIFECYCLE: image, boot, readiness, the four development checks
+	# against that instance, teardown - run-private state throughout, so it never depends on a
+	# guest somebody left running and never disturbs one. Its catalog row is the lifecycle
+	# producer, not a gate row: the development checks name it as their prerequisite.
+	["development-lifecycle"]="tools/check-development-lifecycle.sh"
 	["static-image"]="tools/check-static-injection.sh static"
 	["undeclared-edge"]="tools/check-static-injection.sh undeclared-edge"
 	["duplicate-edge"]="tools/check-static-injection.sh duplicate-edge"
@@ -180,6 +225,10 @@ declare -A GATES=(
 	# profile authorises - the half a boot WITH a tree cannot show.
 	["arch-profile-aarch64-no-dt-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:no-dt:1"
 	["arch-profile-riscv64-no-dt-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:no-dt:1"
+	# THE SAME TREELESS ROWS WITH THE DMA-MODE RECORD ABSENT: the fail-closed half on the one path
+	# where no carrier that depends on a tree could answer. The loader halts before a kernel loads.
+	["arch-profile-aarch64-no-dt-absent-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:no-dt-absent:1"
+	["arch-profile-riscv64-no-dt-absent-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:no-dt-absent:1"
 	# THE THREE NUMA PROFILES, ONE STEP EACH, for the reason directly above.
 	#
 	# `qemu-numa` boots x86_64 under KVM and then aarch64 and riscv64 under emulation, and as one
@@ -274,14 +323,40 @@ EOF
 # taken out from under us. A status is not a diagnosis, but it separates those two: an ordinary
 # non-zero exit means the gate decided, and a signal means something else decided for it.
 run_gate() {
-	local name="$1" cmd="${GATES[$1]:-}" status=0
+	local name="$1" cmd="${GATES[$1]:-}" status=0 started=$SECONDS
 	[[ -n "$cmd" ]] || die "unknown gate '$name' (--list to see them)"
 	note "gate: $name"
+	# THE KEY THIS GATE DISCHARGES, told to the gate so it can keep its phase logs under it, and
+	# used here to publish its envelope. The lifecycle gate is the one `check.sh` gate whose catalog
+	# row is not a gate row: it is the development-instance producer, and the development checks
+	# it runs publish their own envelopes from inside it.
+	local key="gate.$name / host / host / default"
+	[[ "$name" == development-lifecycle ]] && key="dev.lifecycle / x86_64 / dev-guest / development"
+	export LIBER_GATE_KEY="$key"
 	# Backgrounded and waited for, so a signal to this script is acted on now rather than after the
 	# gate finishes - see `guest_cleanup` in lib.sh. A gate is also a SUBSHELL, which is why a trap
 	# inside the gate script itself does not help: it never hears the signal.
-	(cd "$SRC_DIR" && eval "$cmd") &
+	#
+	# INSIDE A RUN THE GATE'S OUTPUT IS ALSO ITS RESULT LOG: captured through `tee` - the person
+	# watching still sees it - and copied into the run by the envelope. `pipefail` makes the
+	# pipeline's status the gate's, a killed gate included.
+	local gate_log=""
+	if evidence_active; then
+		gate_log="$(mktemp "${TMPDIR:-/tmp}/liber-gate-$name.XXXXXX")"
+		{ (cd "$SRC_DIR" && eval "$cmd") 2>&1 | tee "$gate_log"; } &
+	else
+		(cd "$SRC_DIR" && eval "$cmd") &
+	fi
 	wait $! || status=$?
+	unset LIBER_GATE_KEY
+	if [[ -n "$gate_log" ]]; then
+		# PUBLISHED BEFORE THE FAILURE IS REPORTED, because reporting returns. `--if-absent`: a gate
+		# that published its own envelope - the lifecycle producer - is not published over.
+		local outcome=passed
+		[[ "$status" -eq 0 ]] || outcome=failed
+		evidence_publish "$key" "check.sh gate $name" "$outcome" "$((SECONDS - started))" --if-absent --log "$gate_log"
+		rm -f "$gate_log"
+	fi
 	if [[ "$status" -ne 0 ]]; then
 		# Bash reports a killed child as 128 + the signal number.
 		if [[ "$status" -gt 128 ]]; then

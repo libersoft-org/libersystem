@@ -58,7 +58,11 @@ if ! grep -qa "$MARKER" "$OUT"; then
 	echo "trust-profile: the test-trust loader does not carry its marker - see above" >&2
 	exit 1
 fi
-echo "trust-profile: the test-trust loader carries the published key and says so"
+if grep -qa "ROLLBACK FLOOR ENFORCED" "$OUT"; then
+	echo "trust-profile: the test-trust loader CONTAINS the enforcing marker - it keeps no floor" >&2
+	exit 1
+fi
+echo "trust-profile: the test-trust loader carries the published key and says so, and keeps no floor"
 
 echo "trust-profile: building the external-release loader"
 build LIBER_TRUST_PROFILE=external-release LIBER_TRUST_KEY="$RELEASE_KEY" LIBER_TRUST_KEY_ID=42
@@ -82,6 +86,48 @@ if ! grep -q "$RELEASE_KEY" <<<"$release_hex"; then
 fi
 if ((status == 0)); then
 	echo "trust-profile: the release loader carries its own key and none of the test profile's identity"
+fi
+
+# AND THE ENFORCING PROFILE IS A THIRD IDENTITY, told apart the same way: built with the release
+# key it carries that key and the enforcing marker and none of the test profile's identity; the two
+# non-enforcing loaders above carry no enforcing marker, so a build cannot claim a floor it does not
+# keep. The published RECOVERY key is checked beside the boot key, because a release loader that
+# carried either could accept a manifest anyone can sign.
+ENFORCING_MARKER="ROLLBACK FLOOR ENFORCED"
+TEST_RECOVERY_KEY_HEX="cd267d8f9c9013744f42374272d6c5b3be33c7a6c3bb3b90bcb4318cc7fac439"
+if grep -qa "$ENFORCING_MARKER" "$OUT"; then
+	echo "trust-profile: a release loader CONTAINS the enforcing marker - it does not keep a floor and must not say it does" >&2
+	status=1
+fi
+if grep -q "$TEST_RECOVERY_KEY_HEX" <<<"$release_hex"; then
+	echo "trust-profile: a release loader CONTAINS the published recovery test key" >&2
+	status=1
+fi
+echo "trust-profile: building the rollback-enforcing loader with the release key"
+build LIBER_TRUST_PROFILE=rollback-enforcing LIBER_TRUST_KEY="$RELEASE_KEY" LIBER_TRUST_KEY_ID=42
+enforcing_hex="$(hexdump_of "$OUT")"
+if ! grep -qa "$ENFORCING_MARKER" "$OUT"; then
+	echo "trust-profile: the rollback-enforcing loader does not carry its marker" >&2
+	status=1
+fi
+if grep -q "$TEST_KEY_HEX" <<<"$enforcing_hex" || grep -q "$TEST_RECOVERY_KEY_HEX" <<<"$enforcing_hex" || grep -qa "$MARKER" "$OUT"; then
+	echo "trust-profile: an enforcing loader built with the release key CONTAINS the test profile's identity" >&2
+	status=1
+fi
+if ! grep -q "$RELEASE_KEY" <<<"$enforcing_hex"; then
+	echo "trust-profile: the enforcing loader does not contain the key it was built for" >&2
+	status=1
+fi
+if ((status == 0)); then
+	echo "trust-profile: the enforcing loader carries its marker and the release key, and the non-enforcing loaders carry no marker"
+fi
+# AND A PROFILE THIS TREE DOES NOT NAME DOES NOT BUILD, which is what keeps a misspelt profile from
+# silently becoming the default.
+if (cd "$LOADER" && LIBER_TRUST_PROFILE=rollback-enforcin cargo build --quiet >/dev/null 2>&1); then
+	echo "trust-profile: a loader built with an unknown profile name COMPILED - a misspelling would have become a default" >&2
+	status=1
+else
+	echo "trust-profile: an unknown profile name does not compile"
 fi
 
 # THE BUILD DIRECTORY IS LEFT AS THE DEVELOPMENT PROFILE. A gate that leaves a release loader in the

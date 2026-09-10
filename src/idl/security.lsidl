@@ -185,8 +185,10 @@ interface permission {
 	/// tree says which KIND of launch is being asked for - `run-pipeline` and `run-with-file` are
 	/// the same shape - and a caller with no terminal keeps calling `run`, unchanged. And the
 	/// generator emits the `@rights` guard only for a bare `handle<...>` parameter: expressed as
-	/// `option<handle<channel>>` the check on this capability would be silently skipped, which is
-	/// the one thing a capability boundary must not do quietly.
+	/// `option<handle<channel>>` the check on this capability could not be generated - and the
+	/// validator now REFUSES the annotation on that shape rather than letting the schema read as
+	/// guarded while the generated method was not, which is the one thing a capability boundary
+	/// must not do quietly.
 	///
 	/// NOT FOR A PIPELINE STAGE OR A BACKGROUND JOB. The terminal belongs to whoever is in the
 	/// foreground, which is the caller's own bookkeeping - the shell sets it with SET_FG - and a

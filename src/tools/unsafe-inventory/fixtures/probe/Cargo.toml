@@ -1,0 +1,11 @@
+[package]
+name = "inventory-fixture-probe"
+edition = "2024"
+description = "The completeness fixture: one site of every class the inventory must not lose"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+inventory-fixture-dep = { path = "../dep" }

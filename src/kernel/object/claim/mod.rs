@@ -40,6 +40,10 @@ pub struct Claim {
 	// Which binding of which device. Fixed at mint time and never edited: a claim object IS one
 	// binding, and the next binding of the same device is a different object.
 	key: abi::ClaimKey,
+	// The registry entry the binding was validated against and its declared DMA policy - the
+	// kernel's stamp, read back through `SYS_DEVICE_CLAIM_INFO`.
+	entry: [u8; abi::ENTRY_NAME_LEN],
+	policy: u8,
 	// The terminal state a release reached, or `LIVE`. This is the wait readiness.
 	settled: AtomicU32,
 	// Whether this object has already started the release. The forced release runs at most once
@@ -49,12 +53,20 @@ pub struct Claim {
 
 impl Claim {
 	// FALLIBLY: `SYS_DEVICE_CLAIM` reaches this, so a short heap is a refusal and not a halt.
-	pub fn create(key: abi::ClaimKey) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), key, settled: AtomicU32::new(LIVE), releasing: AtomicBool::new(false) })
+	pub fn create(key: abi::ClaimKey, entry: [u8; abi::ENTRY_NAME_LEN], policy: u8) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), key, entry, policy, settled: AtomicU32::new(LIVE), releasing: AtomicBool::new(false) })
 	}
 
 	pub fn key(&self) -> abi::ClaimKey {
 		self.key
+	}
+
+	pub fn entry(&self) -> [u8; abi::ENTRY_NAME_LEN] {
+		self.entry
+	}
+
+	pub fn policy(&self) -> u8 {
+		self.policy
 	}
 
 	// Whether the release has finished and the state will not change again. The wait readiness: a

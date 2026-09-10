@@ -1,0 +1,426 @@
+# THE AUDITOR'S DECISIONS over the unsafe-boundary inventory, keyed by group patterns (first match
+# wins, in this order) and by site id where a single site needs its own answer. Regenerating the
+# inventory re-applies this file; a site no rule matches is reported UNCLASSIFIED and the audit's
+# completeness claim fails while any is.
+#
+# Categories (closed): required-caller-enforced, contained-implementation, overly-broad,
+# abi-linkage, unclear-defect.
+
+# --- test-only sites, recorded apart from the production view --------------------------------
+
+[[group]]
+id = "test-only"
+invariant = "Compiled only under `cfg(test)` (the kernel test suite, host tests): not in any shipping row. Recorded so the count is visible, not judged as production."
+match = [{ test_only = true }]
+category = "contained-implementation"
+owner = "tests"
+disposition = "keep (test-only)"
+
+# --- the kernel, by trust boundary (M2) -----------------------------------------------------
+
+[[group]]
+id = "kernel-usercopy"
+invariant = "Every instruction that touches a user address is registered in `.extable` with a fixup; a faulting user page becomes a short count, never a kernel fault. The `unsafe fn` contract is on the KERNEL buffer (readable/writable for `len`), which the syscall layer's fixed-size callers uphold. SMAP is opened only inside `paging::user_access`."
+match = [{ file = "src/kernel/arch/*/usercopy.rs" }]
+category = "required-caller-enforced"
+owner = "kernel/arch"
+disposition = "keep"
+
+[[group]]
+id = "kernel-syscall-read-user"
+invariant = "`read_user<T>` is a SAFE generic function that builds a `T` from user bytes with `assume_init`. Sound for every instantiation in the tree (u64, [u8; 64], CapTransfer - all plain data), and the signature does not say so: a future `T` with invalid bit patterns would be undefined behaviour with no `unsafe` at the call site."
+match = [{ file = "src/kernel/syscall/mod.rs", item = "crate::syscall::read_user" }]
+category = "overly-broad"
+owner = "kernel/syscall"
+disposition = "narrow: bound T to plain-old-data (follow-up F2 in the report)"
+
+[[group]]
+id = "kernel-syscall-user-pointers"
+invariant = "User pointers are validated by `user_buf_ok`/`user_buf_writable` and copied through the faultable usercopy under `user_access`; the raw pointers are the kernel-side buffers of fixed-size ABI records. A short copy is an error, never a success."
+match = [{ file = "src/kernel/syscall/**" }]
+category = "contained-implementation"
+owner = "kernel/syscall"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-paging"
+invariant = "Page tables are reached through the physical direct map (`phys_to_virt`); an `unsafe fn` takes a table pointer that its SAFETY line requires to be a valid table at that level, owned by the address space being edited under its lock. TLB and control-register writes are the assembly the hardware requires. Falsified by a mapping visible after unmap (the shootdown tests) or a table freed while referenced (frame accounting tests)."
+match = [{ file = "src/kernel/arch/*/paging.rs", kind = ["unsafe-fn"] }]
+category = "required-caller-enforced"
+owner = "kernel/arch"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-paging-internals"
+invariant = "The blocks, raw pointers and assembly inside the page-table code: table walks over tables the caller vouched for, `invlpg`/`tlbi`/`sfence.vma`, and control-register reads. Contained behind the safe map/unmap API."
+match = [{ file = "src/kernel/arch/*/paging.rs" }]
+category = "contained-implementation"
+owner = "kernel/arch"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-usermode-and-context"
+invariant = "Ring transitions and context switches: `global_asm!` entry/exit stubs, `switch_context`, `write_cr3`/TTBR/SATP writes and the user-mode entry. Their contracts are the calling convention and the saved-frame layout the assembly defines; `enter` requires user-mapped entry and stack addresses that the loader established."
+match = [
+	{ file = "src/kernel/arch/*/context.rs" },
+	{ file = "src/kernel/arch/*/usermode.rs" },
+	{ file = "src/kernel/arch/*/exceptions.rs" },
+	{ file = "src/kernel/arch/*/traps/**" },
+	{ file = "src/kernel/arch/*/syscall_entry.rs" },
+	{ file = "src/kernel/arch/*/entry.rs" },
+]
+category = "required-caller-enforced"
+owner = "kernel/arch"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-interrupt-controllers"
+invariant = "MMIO to the interrupt controllers (LAPIC/IOAPIC, GIC/ITS, IMSIC/APLIC) at addresses from the device tree or firmware tables, volatile and behind the controller's own lock; the IDT/vector tables are `static mut` written before interrupts are enabled and read-only afterwards."
+match = [
+	{ file = "src/kernel/arch/*/gic.rs" },
+	{ file = "src/kernel/arch/*/its.rs" },
+	{ file = "src/kernel/arch/*/imsic.rs" },
+	{ file = "src/kernel/arch/*/aplic.rs" },
+	{ file = "src/kernel/arch/*/apic.rs" },
+	{ file = "src/kernel/arch/*/idt/**" },
+	{ file = "src/kernel/arch/*/interrupts/**" },
+	{ file = "src/kernel/arch/*/msi.rs" },
+	{ file = "src/kernel/arch/*/ioapic.rs" },
+	{ file = "src/kernel/arch/*/gicv2m.rs" },
+	{ file = "src/kernel/arch/*/timer.rs" },
+	{ file = "src/kernel/arch/*/plic.rs" },
+]
+category = "contained-implementation"
+owner = "kernel/arch"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-percpu-and-smp"
+invariant = "Per-CPU blocks are leaked once at boot, indexed by a CPU number below the online count the census established (the 64-CPU portable cap and the backend caps); the `unsafe impl Sync` on trap-stack pools holds because each CPU touches only its own slot. AP bring-up writes trampolines and stacks the BSP owns until the AP reports in. Falsified by a CPU index at or past the count, which the census refuses."
+match = [
+	{ file = "src/kernel/arch/*/percpu.rs" },
+	{ file = "src/kernel/smp/**" },
+	{ file = "src/kernel/arch/*/apboot.rs" },
+	{ file = "src/kernel/arch/*/psci.rs" },
+	{ file = "src/kernel/arch/*/smp.rs" },
+	{ file = "src/kernel/arch/x86_64/gdt.rs" },
+	{ file = "src/kernel/arch/*/cpu.rs" },
+]
+category = "contained-implementation"
+owner = "kernel/smp"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-early-virtio-blk-aarch64"
+invariant = "The AArch64 bring-up block driver programs PHYSICAL queue and buffer addresses into the device and enables bus mastering before the IOMMU and the device manager exist: untranslated DMA by construction, inside the ports' produced `no-iommu` mode. Not an unsoundness of the Rust code - the frames are its own - but the boundary P02M0173 M3 requires to move behind confirmed IOMMU initialisation or off the enforcing path."
+match = [{ file = "src/kernel/arch/aarch64/virtio_blk.rs" }]
+category = "contained-implementation"
+owner = "kernel/arch/aarch64"
+disposition = "family work: P02M0173 M3 (the early bootstrap access)"
+
+[[group]]
+id = "kernel-arch-boot"
+invariant = "Early boot before the allocator: BootInfo and firmware-handed memory read at the addresses the loader (or the device tree) gave, single-threaded on the boot CPU, `static mut` probes written once. Contained: nothing after `main` reaches these paths."
+match = [
+	{ file = "src/kernel/arch/*/boot.rs" },
+	{ file = "src/kernel/arch/*/mod.rs" },
+	{ file = "src/kernel/arch/*/early.rs" },
+	{ file = "src/kernel/arch/*/serial.rs" },
+	{ file = "src/kernel/arch/*/uart.rs" },
+]
+category = "contained-implementation"
+owner = "kernel/arch"
+disposition = "keep"
+
+[[group]]
+id = "kernel-arch-port-io-and-fwcfg"
+invariant = "x86_64 port I/O (`in`/`out`) to fixed legacy ports and the `fw_cfg` selector/data ports: the `unsafe fn` says which port is being driven and the callers are the kernel's own console, PCI configuration and the harness carrier read."
+match = [
+	{ file = "src/kernel/arch/x86_64/port.rs" },
+	{ file = "src/kernel/arch/x86_64/fwcfg.rs" },
+	{ file = "src/kernel/arch/*/pci.rs" },
+]
+category = "required-caller-enforced"
+owner = "kernel/arch/x86_64"
+disposition = "keep"
+
+[[group]]
+id = "kernel-dtb-parsing"
+invariant = "The device tree is parsed at a physical address the loader handed over; `Fdt::new` requires a valid tree there (its SAFETY contract) and every read inside is bounds-checked against the header's declared sizes (`Bounds`, `be32_in`, `prop_in`). Shared with the loader and host-tested in the `fdt` crate."
+match = [{ file = "src/kernel/arch/*/dtb.rs" }, { file = "src/fdt/**" }]
+category = "required-caller-enforced"
+owner = "fdt"
+disposition = "keep"
+
+[[group]]
+id = "kernel-iommu"
+invariant = "The virtio-IOMMU backend's request/event queues and DMA scratch live in frames the module owns and pins; every access carries a SAFETY line naming the frame and the bound; MMIO is to the controller's own configuration structures resolved from its PCI capabilities. Falsified by the hostile EDU gate and the fault-drain tests."
+match = [{ file = "src/kernel/iommu/**" }]
+category = "contained-implementation"
+owner = "kernel/iommu"
+disposition = "keep"
+
+[[group]]
+id = "kernel-mem"
+invariant = "The heap (`GlobalAlloc` over a free-region list of `&'static mut` nodes under a spin lock), the frame allocator (poisoning and accounting under `debug_assertions`, which IS the shipping profile) and the TLB shootdown. The contracts are the allocator's: a freed region was allocated here and is not referenced. `unsafe impl GlobalAlloc` is the ABI the language requires."
+match = [{ file = "src/kernel/mem/**" }]
+category = "contained-implementation"
+owner = "kernel/mem"
+disposition = "keep"
+
+[[group]]
+id = "kernel-sync"
+invariant = "`SpinLock<T>: Send + Sync` for `T: Send` and `Console: Send` - the standard exclusion argument: the lock hands out one `&mut T` at a time."
+match = [{ file = "src/kernel/sync.rs" }, { file = "src/kernel/console.rs" }]
+category = "contained-implementation"
+owner = "kernel"
+disposition = "keep"
+
+[[group]]
+id = "kernel-sched-and-objects"
+invariant = "The scheduler's per-CPU run queues (a leaked table indexed by the current CPU), the context-switch calls whose saved-frame contract is the arch's, thread stacks (frames owned by the stack for its life, guard-page checks by volatile read) and the idle hook stored as an integer and restored to the `fn()` it came from."
+match = [{ file = "src/kernel/sched/**" }, { file = "src/kernel/object/**" }]
+category = "contained-implementation"
+owner = "kernel/sched"
+disposition = "keep"
+
+[[group]]
+id = "kernel-main-loader-device"
+invariant = "Kernel entry (the `#[no_mangle]` entry point), user program loading (writes into a freshly created address space through kernel mappings the loader owns), PCI device enumeration and MMIO to configuration space and BARs the device census resolved. Contained behind the object layer."
+match = [
+	{ file = "src/kernel/main.rs" },
+	{ file = "src/kernel/loader.rs" },
+	{ file = "src/kernel/device.rs" },
+	{ file = "src/kernel/device/**" },
+	{ file = "src/kernel/pci/**" },
+	{ file = "src/kernel/dma_policy/**" },
+	{ file = "src/kernel/extable.rs" },
+	{ file = "src/kernel/perf/**" },
+	{ file = "src/kernel/product/**" },
+]
+category = "contained-implementation"
+owner = "kernel"
+disposition = "keep"
+
+[[group]]
+id = "kernel-remaining"
+invariant = "The remaining kernel sites: named in the report's kernel table by file; each reviewed as contained behind a safe API, with its invariant stated there."
+match = [{ file = "src/kernel/**" }]
+category = "contained-implementation"
+owner = "kernel"
+disposition = "keep"
+
+# --- userspace, by cohort (M3) ---------------------------------------------------------------
+
+[[group]]
+id = "rt-raw-syscall"
+invariant = "The raw `syscall` entry: inline assembly issuing the trap with the register convention the kernel expects. The caller contract is the whole syscall ABI - every argument that is a pointer must be valid for the kernel's copy - and it is genuinely the caller's."
+match = [{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::syscall" }]
+category = "required-caller-enforced"
+owner = "rt"
+disposition = "keep"
+
+[[group]]
+id = "rt-address-returning"
+invariant = "Wrappers that hand the caller a raw ADDRESS to dereference - a mapped MemoryObject, a DMA buffer, the framebuffer, the memory map: the returned address is valid for the object's length until unmapped, and that is the caller's obligation to respect, so `unsafe fn` is the honest signature."
+match = [
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::map_object" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::dma_buffer_map" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::framebuffer_map" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::memmap_get" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::dma_buffer_phys*" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::process_load_module" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::process_load_main" },
+	{ file = "src/user/runtime/rt/src/lib.rs", item = "crate::move_bytes" },
+]
+category = "required-caller-enforced"
+owner = "rt"
+disposition = "keep"
+
+[[group]]
+id = "rt-heap-stream-and-linkage"
+invariant = "The runtime's own allocator (`GlobalAlloc`, `Sync` for the locked heap), the stream frame reader over a mapped object, the process entry (`liber_rt_start`, `__user_main`) and the shared-image `memcpy`/`memset` forwarding stubs: the language's and the linker's ABI."
+match = [
+	{ file = "src/user/runtime/rt/src/heap.rs" },
+	{ file = "src/user/runtime/rt/src/stream.rs" },
+	{ file = "src/user/runtime/rt/src/lib.rs", kind = [
+		"linkage-attr",
+		"global-asm",
+		"extern-block",
+		"extern-abi-fn",
+		"unsafe-impl",
+	] },
+]
+category = "abi-linkage"
+owner = "rt"
+disposition = "keep"
+
+[[group]]
+id = "rt-propagated-wrappers"
+invariant = "One hundred and thirty typed syscall wrappers declared `unsafe fn` although their parameters are handles (`u64`), slices and values and their bodies uphold the raw call's contract themselves - `yield_now`, `close`, `clock`, `random_get(&mut [u8])`, `send_blocking`, `recv_blocking(&mut [u8])` and their kin. A caller cannot violate memory safety through them; the `unsafe` is propagation from `syscall`, and it is what every service, driver and tool then wraps in an `unsafe {}` of its own."
+match = [{ file = "src/user/runtime/rt/src/lib.rs" }]
+category = "overly-broad"
+owner = "rt"
+disposition = "narrow: safe signatures where the body upholds the contract (follow-up F1 in the report)"
+
+[[group]]
+id = "drivers-mmio-and-dma"
+invariant = "Device registers are reached through the MMIO span the kernel mapped for the claim, DMA rings and buffers through `DmaAddress`-backed buffers the kernel handed out; descriptor and ring writes are volatile and ordered by the barriers the virtio and xHCI specifications require. The raw pointers name those spans and nothing else. Falsified by the enforcing-IOMMU gate (a physical address in a descriptor faults) and the drivers' hostile-device host tests."
+match = [{ file = "src/user/drivers/**", kind = ["raw-pointer", "unsafe-block", "static-mut"] }]
+category = "contained-implementation"
+owner = "drivers"
+disposition = "keep"
+
+[[group]]
+id = "drivers-entry-linkage"
+invariant = "Each driver's `extern \"C\" fn __user_main` and its `#[unsafe(no_mangle)]`: the runtime's entry ABI."
+match = [{ file = "src/user/drivers/**", kind = ["extern-abi-fn", "linkage-attr", "extern-block"] }]
+category = "abi-linkage"
+owner = "drivers"
+disposition = "keep"
+
+[[group]]
+id = "drivers-propagated-wrappers"
+invariant = "The drivers' `unsafe fn` layer (`common.rs` handshake/offer/online/stand, per-device bring-up) is unsafe because it calls the runtime's propagated wrappers; its own contracts - a bootstrap handle, a bound - are values. Narrows together with the runtime."
+match = [{ file = "src/user/drivers/**", kind = ["unsafe-fn"] }]
+category = "overly-broad"
+owner = "drivers"
+disposition = "narrow with the runtime (follow-up F1)"
+
+[[group]]
+id = "services-mapped-views"
+invariant = "Raw pointers in services are views over MemoryObjects the kernel mapped whole (`map_object`) at the length the same service or the kernel reported, unmapped and closed after use; the display and audio engines additionally write into DMA-visible buffers the driver published for that purpose."
+match = [
+	{ file = "src/user/services/**", kind = [
+		"raw-pointer",
+	] },
+	{ file = "src/user/services/core/src/display_service.rs" },
+	{ file = "src/user/services/core/src/audio_engine.rs" },
+]
+category = "contained-implementation"
+owner = "services"
+disposition = "keep"
+
+[[group]]
+id = "services-entry-linkage"
+invariant = "Every service's `extern \"C\" fn __user_main` and `#[unsafe(no_mangle)]`: the runtime's entry ABI."
+match = [
+	{ file = "src/user/services/**", kind = [
+		"extern-abi-fn",
+		"linkage-attr",
+		"extern-block",
+	] },
+]
+category = "abi-linkage"
+owner = "services"
+disposition = "keep"
+
+[[group]]
+id = "services-wrapped-runtime-calls"
+invariant = "The services' `unsafe {}` blocks and `unsafe fn`s wrap calls into the runtime's propagated wrappers - `close`, `send_blocking`, `recv_*`, `wait_any`, `clock` - and pass handles and slices. Nothing in these blocks dereferences a raw pointer; they are the runtime's propagation counted once per call site."
+match = [{ file = "src/user/services/**" }]
+category = "overly-broad"
+owner = "services"
+disposition = "narrow with the runtime (follow-up F1)"
+
+[[group]]
+id = "apps-entry-linkage"
+invariant = "Each tool's `extern \"C\" fn __user_main` and `#[unsafe(no_mangle)]`: the runtime's entry ABI (seventy-five programs)."
+match = [{ file = "src/user/apps/**", kind = ["extern-abi-fn", "linkage-attr", "extern-block"] }]
+category = "abi-linkage"
+owner = "apps"
+disposition = "keep"
+
+[[group]]
+id = "apps-mapped-views"
+invariant = "The tools' raw pointers: `from_raw_parts` over a file the storage service mapped whole, read once and unmapped."
+match = [{ file = "src/user/apps/**", kind = ["raw-pointer"] }]
+category = "contained-implementation"
+owner = "apps"
+disposition = "keep"
+
+[[group]]
+id = "apps-wrapped-runtime-calls"
+invariant = "The tools' `unsafe {}` blocks and `unsafe fn`s wrap the runtime's propagated wrappers around handles and slices; no raw memory of their own."
+match = [{ file = "src/user/apps/**" }]
+category = "overly-broad"
+owner = "apps"
+disposition = "narrow with the runtime (follow-up F1)"
+
+[[group]]
+id = "libs-shared-image-exports"
+invariant = "The shared-image provider ABI: generated `#[unsafe(export_name)]` wrappers in the protocol crates, the `forward!` `global_asm!` templates that alias an exported symbol to its implementation per architecture, and the `extern` blocks a client crate declares for its provider's entry points. All of it is generated from the interface definitions and audited by the package identity and the export-owner checks."
+match = [
+	{ file = "src/user/libs/**", kind = [
+		"linkage-attr",
+		"global-asm",
+		"macro-template",
+		"extern-block",
+		"extern-abi-fn",
+	] },
+]
+category = "abi-linkage"
+owner = "libs (generated)"
+disposition = "keep"
+
+[[group]]
+id = "libs-ipc-and-driver-protocol"
+invariant = "The IPC client's `unsafe fn`s over runtime calls, and the driver protocol's raw pointers into DMA-visible frames it describes for the drivers."
+match = [{ file = "src/user/libs/ipc/**" }, { file = "src/user/libs/driver/**" }]
+category = "contained-implementation"
+owner = "libs"
+disposition = "keep"
+
+[[group]]
+id = "libs-wrapped-runtime-calls"
+invariant = "Client libraries' `unsafe {}` blocks around the runtime's propagated wrappers (send, receive, close on a handle)."
+match = [{ file = "src/user/libs/**" }]
+category = "overly-broad"
+owner = "libs"
+disposition = "narrow with the runtime (follow-up F1)"
+
+[[group]]
+id = "sdk-component-boundary"
+invariant = "The WASM component's side of the host contract: the host imports it declares (`unsafe extern \"C\"` in the SDK's world module, wrapped by the SDK's safe API) and the `#[unsafe(no_mangle)] extern \"C\"` exports the interpreter calls by name. The interpreter's side (`src/wasm`) contains no unsafe code: every import is dispatched by name and validated by the host."
+match = [{ file = "src/sdk/**" }]
+category = "abi-linkage"
+owner = "sdk"
+disposition = "keep"
+
+[[group]]
+id = "loader-firmware-and-handoff"
+invariant = "The UEFI loader: firmware tables and protocols are raw pointers the firmware handed the image entry (boot services, file and block protocols, variables), used while boot services are live and never after; the memory map, the ELF placement and the kernel hand-off write physical memory the firmware's map declared free; `static mut` state is single-threaded and reached only from the boot path (said at each one). The port hand-offs are inline assembly."
+match = [{ file = "src/boot/**" }]
+category = "required-caller-enforced"
+owner = "boot"
+disposition = "keep"
+
+[[group]]
+id = "term-raster"
+invariant = "The terminal raster draws into a framebuffer mapping through a raw address. `Raster::new` is `unsafe fn` with a written contract - a readable, writable, unaliased mapping of at least `pitch * height` bytes for the raster's life - and validates the geometry itself; every pixel write and read is bounds-checked against that geometry before the volatile access. Shared by the kernel console and the userspace display path."
+match = [{ file = "src/term/**", kind = ["unsafe-fn"] }]
+category = "required-caller-enforced"
+owner = "term"
+disposition = "keep"
+
+[[group]]
+id = "term-raster-internals"
+invariant = "The pixel accesses inside the raster: bounds-checked offsets into the mapping `Raster::new` vouched for, written and read volatile."
+match = [{ file = "src/term/**" }]
+category = "contained-implementation"
+owner = "term"
+disposition = "keep"
+
+[[group]]
+id = "shared-crates-misc"
+invariant = "The remaining shared crates: the DMA address contract's raw-pointer views, the wire codec's provider externs."
+match = [
+	{ file = "src/dma/**" },
+	{ file = "src/wire/**" },
+	{ file = "src/abi/**" },
+	{ file = "src/fs/**" },
+	{ file = "src/buddy/**" },
+]
+category = "contained-implementation"
+owner = "shared"
+disposition = "keep"

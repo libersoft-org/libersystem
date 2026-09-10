@@ -145,9 +145,18 @@ step_loader() {
 # Assemble the boot packages from an ALREADY-BUILT userspace. Deliberately without a `user`
 # dependency: a packaging step that quietly builds what it is missing cannot tell you something
 # was missing.
+# EVERY MEDIUM INPUT IS PUBLISHED UNDER THE ONE LOCK A CONSUMER'S SNAPSHOT TAKES. `mkpackages`
+# writes each output to a temporary name and, with this set, renames the whole set into place in one
+# `flock`-held step over `kernel-test-build.lock` - the lock the loader build and the harness staging
+# already take. `mkimage.sh` copies its inputs under the same lock, so it sees a complete generation
+# and never one file from before a publication and the next from after it. Held for the renames
+# only: never across a compile.
+export LIBER_PUBLISH_LOCK="$SRC_DIR/../.build/state/kernel-test-build.lock"
+
 step_packages() {
 	local arch="$1"
 	note "packages ($arch)"
+	mkdir -p "$SRC_DIR/../.build/state"
 	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "$arch")
 }
 
@@ -170,6 +179,7 @@ step_volume() {
 	fi
 	note "volume ($arch)"
 	local status=0
+	mkdir -p "$SRC_DIR/../.build/state"
 	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "${args[@]}") || status=$?
 	[[ -z "$staged_kernel" ]] || rm -f -- "$staged_kernel"
 	return "$status"
@@ -190,6 +200,12 @@ Builds the system. With no arguments: every part, for x86_64.
                 put the kernel on the system volume - what ./image.sh does for shipping media. A
                 test run needs it absent, because the suite boots its own kernel from the ESP and
                 the loader prefers the volume's. Off by default.
+  --dma-mode MODE
+                enforcing-required | no-iommu | harness: which DMA mode the volume's signed
+                manifest declares. A shipping medium is assembled around a volume signed for the
+                same value as the medium, which is why ./image.sh passes it here; $(harness) signs
+                a manifest that declares none, for the test and development media whose boots
+                take the mode from the harness carrier. Default: harness.
   --rebuild     ignore every build cache and produce each artifact again. The caches are keyed on
                 sources, tools and manifest, so this is for when the KEY is what you doubt - a
                 changed compiler that reports the same version, a half-written cache entry - and
@@ -243,6 +259,16 @@ while [[ $# -gt 0 ]]; do
 	--kernel-on-volume)
 		kernel_on_volume=1
 		shift
+		;;
+	--dma-mode)
+		[[ $# -ge 2 ]] || die "--dma-mode needs a value"
+		case "$2" in
+		enforcing-required | no-iommu | harness) ;;
+		*) die "--dma-mode takes enforcing-required, no-iommu or harness, got '$2'" ;;
+		esac
+		# EXPORTED for `mkpackages`, which signs the volume's manifest and reads it there.
+		export LIBER_DMA_MODE="$2"
+		shift 2
 		;;
 	--rebuild)
 		# EXPORTED rather than passed along: `build-shared.sh` and `build-exe-start.sh` both read

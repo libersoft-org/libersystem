@@ -11,6 +11,10 @@
 //! went without it at first, and a service that allocated and freed a large block
 //! on every request grew by a megabyte each time and never returned any of it.
 
+// UNREGISTERED UNDER THE HOST-TEST SEAM (see the crate features), so nothing here has a caller
+// there and the dead-code lint is answered once, for the module.
+#![cfg_attr(feature = "host-tests", allow(dead_code))]
+
 use crate::{SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, sys_is_err, syscall};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -27,7 +31,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const HEAP_SIZE: usize = 1024 * 1024; // 1 MB
 const PAGE_SIZE: usize = 4096;
 
-#[global_allocator]
+// NOT THE HOST'S ALLOCATOR UNDER `host-tests`: registered, the first `Vec` in a test would map its
+// heap through this system's syscalls on a kernel that has none of them.
+#[cfg_attr(not(feature = "host-tests"), global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::new();
 
 // A node in the free list, stored in-place at the start of each free block.

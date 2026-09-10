@@ -17,28 +17,25 @@ fn a_machine_without_a_controller_does_not_claim_enforcement() {
 	// about the bring-up. `PRESENT` used to be stored in the success arm only, so the two were the
 	// same question asked twice, and a controller that failed feature negotiation, queue creation or
 	// the bypass read-back left `present()` answering false. `dma_policy` reads exactly that to
-	// decide whether this machine was SUPPOSED to be isolated, so the one case a protected driver
-	// must refuse became indistinguishable from a machine that never had a controller.
+	// compare the machine with the boot's stated mode, so the one case a protected driver must
+	// refuse became indistinguishable from a machine that never had a controller.
 	match (present(), crate::dma_policy::enforcing()) {
 		// A controller on the bus, translating. `with` has one to hand out.
 		(true, true) => {
 			assert!(with(|controller| controller.still_enforcing()).unwrap_or(false), "a controller that came up reports bypass off");
 			assert!(translating(), "there is a controller to attach endpoints to");
-			assert!(crate::dma_policy::isolation_expected(), "a machine with a controller expects isolation");
 		}
 		// A controller on the bus that did not come up. Isolation was available and is not here,
 		// which is the case a protected driver refuses rather than degrades into.
 		(true, false) => {
 			assert!(with(|_| ()).is_none(), "a controller that failed bring-up is not handed out to callers");
 			assert!(!translating(), "and there is nothing to attach endpoints to or map buffers through");
-			assert!(crate::dma_policy::isolation_expected(), "the bus still has one, so this machine expected isolation and does not have it");
 		}
 		// No controller at all: the ordinary harness profile, and every machine whose firmware
 		// offers none. Untranslated DMA is the only DMA there is and nothing pretends otherwise.
 		(false, false) => {
 			assert!(with(|_| ()).is_none(), "and there is no controller to ask");
 			assert!(!translating(), "nor one to map through");
-			assert!(!crate::dma_policy::isolation_expected(), "a machine that never had one does not expect isolation");
 		}
 		(false, true) => panic!("enforcement without a controller on the bus is not a state this kernel has"),
 	}
@@ -48,35 +45,40 @@ crate::tagged_test!(a_controller_that_did_not_come_up_is_not_a_machine_without_o
 fn a_controller_that_did_not_come_up_is_not_a_machine_without_one() {
 	// THE CONSEQUENCE OF THE MIDDLE STATE, driven through the policy that reads it.
 	//
-	// The two facts are set here rather than taken from the machine this happens to run on, because
-	// the subject is what the policy DOES with them and that must be the same answer on every
-	// profile. `isolation_expected` is the fact about the bus; `enforcing` is the fact about the
-	// bring-up. Their four combinations are three real machines and one impossible one.
-	let was_expected = crate::dma_policy::isolation_expected();
+	// The three facts are set here rather than taken from the machine this happens to run on,
+	// because the subject is what the policy DOES with them and that must be the same answer on
+	// every profile: the boot's stated mode, whether a controller is on the bus, and whether the
+	// bring-up confirmed translation.
+	use bootproto::dma_mode::{Handoff, Mode};
+	let was_handoff = crate::dma_policy::handoff();
 	let was_enforcing = crate::dma_policy::enforcing();
-	const PROTECTED: u16 = abi::VIRTIO_TYPE_NET as u16;
+	let protected = crate::dma_policy::entry_field(b"synthetic-protected");
+	let device = driver_binding::Discovered { transport: abi::TRANSPORT_PLAIN_PCI, virtio_type: u16::MAX as u32, class: 0xff, subclass: 0xff, prog_if: 0xff, vendor: 0xffff, product: 0xffff, bus: 0xff, dev: 2, func: 0 };
 
-	// A controller on the bus that did not come up: the driver that declared it needs translation
-	// does not run. This is the state that used to be recorded as "no controller", and a protected
-	// driver then bound DEGRADED - untranslated DMA on a machine that was supposed to be isolated.
-	crate::dma_policy::set_isolation_expected(true);
+	// A controller on the bus that did not come up, on an enforcing boot: the driver that declared
+	// it needs translation does not run. This is the state that used to be recorded as "no
+	// controller", and a protected driver then bound DEGRADED - untranslated DMA on a machine that
+	// was supposed to be isolated.
+	crate::dma_policy::set_handoff_for_test(Some(Handoff::Signed(Mode::EnforcingRequired)));
+	crate::dma_policy::set_controller_present_for_test(Some(true));
 	crate::dma_policy::set_enforcing(false);
-	assert_eq!(crate::dma_policy::policy_for(PROTECTED), dma::Policy::IommuRequired);
-	assert_eq!(crate::dma_policy::admit(PROTECTED, 0, 2, 0), dma::BindDecision::Refused, "isolation was available and is not here - this driver does not run");
+	assert_eq!(crate::dma_policy::decide(&protected, &device), Err(crate::dma_policy::Refusal::EnforcementAbsent), "isolation was available and is not here - this driver does not run");
 
 	// The same machine once the controller is translating.
 	crate::dma_policy::set_enforcing(true);
-	assert_eq!(crate::dma_policy::admit(PROTECTED, 0, 2, 0), dma::BindDecision::Translated);
+	assert_eq!(crate::dma_policy::decide(&protected, &device).map(|(a, _)| a), Ok(crate::dma_policy::Admission::Translated));
 
-	// And a machine that never had one: untranslated is the only DMA there is, and networking is
-	// not withdrawn over isolation this machine never offered.
-	crate::dma_policy::set_isolation_expected(false);
+	// And a machine that never had one is not a machine where a protected driver silently runs
+	// untranslated either: its boot says `no-iommu`, and that value REFUSES the protected entry by
+	// name - the trusted exception is what runs there, loudly.
+	crate::dma_policy::set_handoff_for_test(Some(Handoff::Harness(Mode::NoIommu)));
+	crate::dma_policy::set_controller_present_for_test(Some(false));
 	crate::dma_policy::set_enforcing(false);
-	assert_eq!(crate::dma_policy::policy_for(PROTECTED), dma::Policy::TrustedUntranslated);
-	assert_eq!(crate::dma_policy::admit(PROTECTED, 0, 2, 0), dma::BindDecision::DegradedUntranslated);
+	assert_eq!(crate::dma_policy::decide(&protected, &device), Err(crate::dma_policy::Refusal::PolicyRefused));
+	assert_eq!(crate::dma_policy::decide(&crate::dma_policy::entry_field(b"synthetic-trusted"), &device).map(|(a, _)| a), Ok(crate::dma_policy::Admission::DegradedUntranslated));
 
-	crate::dma_policy::forget_degraded(0, 2, 0);
-	crate::dma_policy::set_isolation_expected(was_expected);
+	crate::dma_policy::set_controller_present_for_test(None);
+	crate::dma_policy::set_handoff_for_test(was_handoff);
 	crate::dma_policy::set_enforcing(was_enforcing);
 }
 
@@ -367,7 +369,7 @@ fn a_translated_address_stops_translating_when_its_claim_is_forced_to_end() {
 
 	// THE BINDING, TAKEN THE WAY DEVICEMANAGER TAKES ONE, so the generation below is a real claim's
 	// and the release is the production forced one rather than a detach called by hand.
-	let key = crate::device::claim(index).expect("the fixture's function is claimable");
+	let key = crate::device::claim(index, &crate::tests::entry_for_device(index as u64).unwrap_or([0; abi::ENTRY_NAME_LEN])).expect("the fixture's function is claimable");
 	assert!(attach_for(index, edu.bus, edu.dev, edu.func, key.generation), "the fixture's endpoint attaches under its claim");
 	let (mapping, iova) = map_device_buffer(index as u32, key.generation, sentinel.physical, 0x1000).expect("the binding's own generation maps").expect("the fixture is translated, so the map answers with an address");
 
@@ -387,7 +389,7 @@ fn a_translated_address_stops_translating_when_its_claim_is_forced_to_end() {
 	// the bus-master bit rather than the translation. The replacement puts the device back on the
 	// bus - under its own claim, its own generation and its own domain - and the OLD address must
 	// still reach nothing.
-	let next = crate::device::claim(index).expect("the function is claimable again once its release confirmed");
+	let next = crate::device::claim(index, &crate::tests::entry_for_device(index as u64).unwrap_or([0; abi::ENTRY_NAME_LEN])).expect("the function is claimable again once its release confirmed");
 	assert_ne!(next.generation, key.generation, "a replacement binding carries a generation of its own");
 	assert!(attach_for(index, edu.bus, edu.dev, edu.func, next.generation), "the replacement attaches");
 	sentinel.restore();

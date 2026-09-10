@@ -1779,3 +1779,170 @@ fn a_consumer_that_collides_with_the_builder_is_refused_rather_than_given_a_part
 	let after = permission_result_for_regression(cell, || Err("this builder must not run"));
 	assert!(after.is_ok(), "the cell is Ready afterwards, not stranded in Building");
 }
+
+tagged_test!(the_governed_kill_receives_its_session_client_and_signals_a_job, [Service, Process, PermissionService], id = "kernel.applications.the_governed_kill_receives_its_session_client_and_signals_a_job", covers = ["bin.permission_manager", "bin.kill", "kernel", "services"]);
+fn the_governed_kill_receives_its_session_client_and_signals_a_job() {
+	// `kill` is granted exactly `session` and reads it by name. The fixture plays the session: the
+	// job-signal request that arrives on the session's server end is the proof the grant was live
+	// and delivered under the right tag - a `kill` that received nothing there says "no session"
+	// and exits, and one that received the wrong client sends its request somewhere else.
+	declare_permission_cohort("kernel.applications.the_governed_kill_receives_its_session_client_and_signals_a_job", PermissionCohort::Base);
+	let result = permission_scenario_result(PermissionCohort::Base).expect("the governed tool scenario should run");
+	let request = &result.kill_request;
+	assert!(request.len() >= 11, "kill's job-signal request is a complete typed request, got {request:?}");
+	assert_eq!(u16::from_le_bytes([request[0], request[1]]), 12, "kill asked the session to SIGNAL a job (op 12), not something else");
+	assert_eq!(u32::from_le_bytes([request[6], request[7], request[8], request[9]]), 1, "kill named job 1, the one it was told to");
+	assert_eq!(request[10], 1, "kill asked for `kill` (the second signal kind), which is what `--kill` means");
+	let printed = alloc::string::String::from_utf8_lossy(&result.kill_read).into_owned();
+	assert!(printed.contains("killed job 1 sleep"), "kill reported the job the session answered with, got {printed:?}");
+	assert!(!printed.contains("no session"), "kill did not fall back to its no-session refusal, got {printed:?}");
+}
+
+tagged_test!(the_governed_lsdev_receives_the_policy_endpoint_and_its_config_read_stays_aligned, [Service, Process, PermissionService], id = "kernel.applications.the_governed_lsdev_receives_the_policy_endpoint_and_its_config_read_stays_aligned", covers = ["bin.permission_manager", "bin.lsdev", "kernel", "services"]);
+fn the_governed_lsdev_receives_the_policy_endpoint_and_its_config_read_stays_aligned() {
+	// `lsdev` reads DEVICE, DEVPOLICY and CONFIG by position. A manager that skipped the policy
+	// grant handed it the configuration client under the policy tag, and the read after it took
+	// the message that was actually next - which is how this defect presented. `--incident 0` asks
+	// the policy endpoint first and falls back to a configuration read when that endpoint goes
+	// away, so both the policy request and the config request have to arrive where the fixture
+	// serves them, in that order.
+	declare_permission_cohort("kernel.applications.the_governed_lsdev_receives_the_policy_endpoint_and_its_config_read_stays_aligned", PermissionCohort::Base);
+	let result = permission_scenario_result(PermissionCohort::Base).expect("the governed tool scenario should run");
+	let policy = &result.lsdev_policy_request;
+	assert!(policy.len() >= 10, "lsdev's policy request is a complete typed request, got {policy:?}");
+	assert_eq!(u16::from_le_bytes([policy[0], policy[1]]), 3, "lsdev asked its policy endpoint for the INCIDENT (op 3), so the grant under DEVPOLICY was the policy endpoint");
+	assert_eq!(u32::from_le_bytes([policy[6], policy[7], policy[8], policy[9]]), 0, "lsdev asked about row 0, the row it was given");
+	let config = &result.lsdev_config_request;
+	assert!(config.len() >= 6, "lsdev's configuration read is a complete typed request, got {config:?}");
+	assert_eq!(u16::from_le_bytes([config[0], config[1]]), 2, "lsdev LISTED the configuration (op 2) on the connection it received under CONFIG - the read downstream of the policy tag is still aligned");
+	let printed = alloc::string::String::from_utf8_lossy(&result.lsdev_read).into_owned();
+	assert!(printed.contains("no incident is stored for any device"), "lsdev reported the empty persisted store it read through its aligned config grant, got {printed:?}");
+	assert!(!printed.contains("no device-policy authority"), "lsdev did not report a missing policy grant, got {printed:?}");
+}
+
+tagged_test!(a_group_release_across_two_connections_is_refused_and_starts_nothing, [Service, Process, PermissionService, ProcessService], id = "kernel.applications.a_group_release_across_two_connections_is_refused_and_starts_nothing", covers = ["bin.permission_manager", "bin.process_service", "kernel", "services"]);
+fn a_group_release_across_two_connections_is_refused_and_starts_nothing() {
+	// The positive rule is that a pipeline is prepared, sealed and group-released on ONE connection.
+	// This is its negative against the real ProcessService: two connections are two owners, and a
+	// group release naming a launch prepared on the other one is refused with nothing started.
+	declare_permission_cohort("kernel.applications.a_group_release_across_two_connections_is_refused_and_starts_nothing", PermissionCohort::Base);
+	let result = permission_scenario_result(PermissionCohort::Base).expect("the governed tool scenario should run");
+	let reply = &result.cross_owner_release;
+	assert!(reply.len() >= 6, "ProcessService answered the cross-owner group release with a typed reply, got {reply:?}");
+	assert_eq!(reply[4], 1, "the cross-owner group release was ANSWERED rather than faulted: a refusal is a policy answer, got {reply:?}");
+	assert_eq!(reply[5], 0, "the cross-owner group release was REFUSED (false), because one koid belonged to the other connection");
+	assert_eq!(result.cross_owner_cancels, alloc::vec![true, true], "each owner could still cancel its own prepared launch afterwards - the refusal took nothing");
+	for name in ["echo", "readln"] {
+		assert!(!result.cross_owner_listed.iter().any(|listed| listed.starts_with(name)), "{name} never ran and its cancelled record is gone, but the process list still names it: {:?}", result.cross_owner_listed);
+	}
+}
+
+tagged_test!(a_launch_transaction_rolls_back_on_every_fault, [Service, Process, PermissionService, Slow], id = "kernel.applications.a_launch_transaction_rolls_back_on_every_fault", covers = ["bin.permission_manager", "kernel", "services"]);
+fn a_launch_transaction_rolls_back_on_every_fault() {
+	// Every way a launch transaction can end is driven here, with the fixture playing
+	// ProcessService, and what is asserted is the EFFECT: which requests the manager made
+	// afterwards, whether the process it had been handed was killed, and that every handle it took
+	// came back to the fixture's domain. The op numbers are ProcessService's: 6 prepare, 10
+	// bounded prepare, 7 release, 8 group release, 9 cancel, 2 list; the reserved CONNECT is
+	// `abi::CONNECT_OP` on the root, which is connection 0.
+	let report = run_permission_fault_scenario().expect("the fault scenario should run");
+	// THE GUARD'S BASELINE FIRST: a stdout capability without `send` is refused by the generated
+	// `@rights` dispatch, reported as the schema's own `denied`, and the handle it carried is closed
+	// - eight times over, because one leaked capability per refused request is the shape of the
+	// defect this asserts against.
+	assert_eq!(report.rights_denials.len(), 8, "every refused request was observed");
+	for (attempt, (reply, before, after)) in report.rights_denials.iter().enumerate() {
+		assert!(reply.len() >= 6 && reply[4] == 0 && reply[5] == 0, "attempt {attempt}: refused with `denied` by the generated guard, got {reply:?}");
+		assert_eq!(after, before, "attempt {attempt}: the refused request's capability was closed, so the domain's handle count is back at its baseline");
+	}
+	let cases = report.cases;
+	let connect = abi::CONNECT_OP;
+	let error_of = |reply: &[u8]| -> Option<u8> { if reply.len() >= 6 && reply[4] == 0 { Some(reply[5]) } else { None } };
+	let ops_on = |case: &FaultCase, connection: usize| -> alloc::vec::Vec<u16> { case.requests.iter().filter(|(index, _)| *index == connection).map(|(_, op)| *op).collect() };
+	let after = |case: &FaultCase, op: u16| -> alloc::vec::Vec<(usize, u16)> {
+		let at = case.requests.iter().position(|(_, seen)| *seen == op).map(|at| at + 1).unwrap_or(case.requests.len());
+		case.requests[at..].to_vec()
+	};
+	for case in &cases {
+		let label = case.label;
+		assert_eq!(case.handles_after, case.handles_before, "{label}: every handle the manager took for the transaction came back");
+		match label {
+			"mint refused" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: a mint that fails is a pre-start refusal, reported as not-found");
+				assert_eq!(case.requests, alloc::vec![(0, connect)], "{label}: nothing was asked beyond the refused CONNECT - there is no record anywhere to cancel");
+			}
+			"prepare refused" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: reported as not-found");
+				assert_eq!(ops_on(case, 1), alloc::vec![6], "{label}: a typed refusal prepared nothing, so nothing is cancelled on the connection");
+			}
+			"prepare reply lost" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: reported as a launch that did not happen");
+				assert_eq!(ops_on(case, 1), alloc::vec![6], "{label}: nothing more is asked on a connection whose peer went away - dropping it is the recovery");
+			}
+			"prepare reply garbled, then late" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: a reply the manager could not read is a launch that did not happen");
+				assert_eq!(ops_on(case, 1), alloc::vec![6], "{label}: nothing more is asked on the connection that answered garbage");
+				assert_eq!(case.late_reply_delivered, Some(false), "{label}: the late reply landed on a dead endpoint - the manager had closed the connection rather than waiting to take it as the next answer");
+			}
+			"grant fails after prepare" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: reported as a launch that did not happen");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 9], "{label}: the prepared launch was CANCELLED by name on its own connection before the connection closed");
+				assert_eq!(case.killed, alloc::vec![false], "{label}: a launch that never ran is not killed, it is cancelled");
+			}
+			"bounded prepare, then a grant fails" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: reported as a launch that did not happen");
+				assert_eq!(ops_on(case, 1), alloc::vec![10, 9], "{label}: the bounded tool is PREPARED under its limit (op 10, never the live bounded launch), and a grant that cannot be delivered - the prepared launch's bootstrap end is gone - cancels it; no release was ever asked for");
+				assert_eq!(case.killed, alloc::vec![false], "{label}: a launch that never ran is not killed, it is cancelled");
+			}
+			"selected-file grant fails after prepare" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: reported as a launch that did not happen");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 9], "{label}: the selected-file path cancels its prepared launch when the file cannot be minted");
+				assert_eq!(case.killed, alloc::vec![false], "{label}: nothing ran, nothing is killed");
+			}
+			"release refused" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: a pre-start refusal is reported as not-found");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 7, 9], "{label}: a refused release is followed by a cancel on the same connection, and nothing else");
+				assert_eq!(case.killed, alloc::vec![false], "{label}: nothing ran, nothing is killed");
+			}
+			"release start failed" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: a post-removal start failure ran nothing and is reported as not-found");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 7, 9], "{label}: the record the service forgot is cancelled anyway, which the service answers harmlessly");
+				assert_eq!(case.killed, alloc::vec![false], "{label}: a thread that failed to start never ran, so the process is not killed");
+			}
+			"release reply lost" => {
+				assert_eq!(error_of(&case.reply), Some(12), "{label}: a release whose reply was lost is reported as COMMIT-UNCERTAIN, not as a refusal");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 7], "{label}: nothing more is asked on the connection that lost the reply");
+				assert_eq!(case.killed, alloc::vec![true], "{label}: the program that may have been running was KILLED through the retained task");
+				assert!(after(case, 7).contains(&(0, 2)), "{label}: the manager asked for a reap (list on the root) after the recovery, got {:?}", case.requests);
+			}
+			"group release refused" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: a pre-commit group refusal is reported as not-found - no stage ran");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 6, 8, 9, 9], "{label}: both stages were prepared on ONE connection, released as a group there, and both cancelled there when the group was refused");
+				assert_eq!(case.killed, alloc::vec![false, false], "{label}: no stage ran, so no stage is killed");
+			}
+			"group release partial" => {
+				assert_eq!(error_of(&case.reply), Some(12), "{label}: a partial commit is reported as COMMIT-UNCERTAIN, never relabelled as a refusal");
+				assert!(ops_on(case, 1).starts_with(&[6, 6, 8]), "{label}: both stages prepared on one connection and group-released there, got {:?}", case.requests);
+				assert_eq!(case.killed, alloc::vec![true, true], "{label}: every member that may have started was killed through the group sealed before the release");
+				assert!(after(case, 8).contains(&(0, 2)), "{label}: the manager asked for a reap after the recovery, got {:?}", case.requests);
+			}
+			"group release reply lost" => {
+				assert_eq!(error_of(&case.reply), Some(12), "{label}: a lost group-release reply is COMMIT-UNCERTAIN");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 6, 8], "{label}: nothing more is asked on the connection that lost the reply");
+				assert_eq!(case.killed, alloc::vec![true, true], "{label}: every member was killed through the group handle minted over the PREPARED members");
+			}
+			"group creation fails" => {
+				assert_eq!(error_of(&case.reply), Some(1), "{label}: a group that cannot be created is an ordinary pre-commit refusal");
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 6, 9, 9], "{label}: no release was attempted - the seal comes first - and both prepared stages were cancelled");
+				assert_eq!(case.killed, alloc::vec![false, false], "{label}: no stage ran");
+				assert!(!crate::syscall::FAIL_NEXT_GROUP_CREATE.load(core::sync::atomic::Ordering::Acquire), "{label}: the one-shot kernel fault was consumed by the group creation it was armed for");
+			}
+			"pipeline committed" => {
+				assert!(case.reply.len() >= 5 && case.reply[4] == 1, "{label}: the healthy pipeline was answered with its group, got {:?}", case.reply);
+				assert_eq!(ops_on(case, 1), alloc::vec![6, 6, 8], "{label}: prepare, prepare, one group release - and no cancel on the success path");
+			}
+			other => panic!("an unasserted fault case: {other}"),
+		}
+	}
+	assert_eq!(cases.len(), 15, "every scripted case was run and asserted");
+}

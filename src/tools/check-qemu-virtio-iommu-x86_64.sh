@@ -22,6 +22,14 @@
 # to pass on enumeration: it requires the named cases to have RUN, by name, and fails if any of them
 # reports itself skipped.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
@@ -69,8 +77,11 @@ done
 # bootable volume and its pairing sidecar, the service manifest and its normalized layout, the
 # fallback bootstrap set, `product.conf` and the builders - and records the key each published image
 # was built from beside it. This asks the builder for today's key and compares the two.
-ISO="$BUILD/libersystem.iso"
+# THE IMAGE THIS RUN PRODUCED, when a run is collecting evidence; the tree's own otherwise. The
+# receipts travel with the stored artifact, so the freshness check below reads the run's copy.
+ISO="$(evidence_image libersystem.iso)" || fail "no libersystem.iso produced by this run"
 [[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso, which is what the ordinary-traffic half boots"
+echo "qemu-virtio-iommu: medium $ISO sha256=$(sha256sum "$ISO" | cut -d' ' -f1)"
 [[ -f "$ISO.build-key" ]] || fail "$ISO carries no build receipt, so nothing about it can be checked - rebuild it:  ./image.sh --format iso"
 KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
 [[ -f "$KERNEL_ELF" ]] || fail "no built kernel at $KERNEL_ELF, so this gate cannot tell whether $ISO carries this tree - build first:  ./build.sh --arch x86_64"
@@ -108,7 +119,7 @@ fi
 echo "qemu-virtio-iommu: the shipping image was built from this tree ($current_key)"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log; rm -rf "$work"' EXIT
 
 # 1. THE HOSTILE ENDPOINTS. Two `edu` functions, because the domain-locality case is about two of
 #    them: "the same number means different memory to different devices" is not a question one
@@ -163,6 +174,25 @@ grep -aq "iommu: virtio-iommu is translating - bypass is off and read back as of
 	exit 1
 }
 
+# 2b. AND IT RAN UNDER `gate`, WITH ITS OWN DECLARED MODE - not on the `test` row it shares its runner
+#     with. This is the exact collision the run-mode carrier exists for: the phase above invokes
+#     `test.sh`, which sets `test` only when unset, and the gate said `gate` first.
+#     THE ANNOUNCEMENT IS IN THE RUN LOG THE SUITE NAMED, not in the suite's own output: the runner's
+#     stderr goes to `test-kernel.sh`'s run log, which `$log` concatenates with the guest log
+#     (corrected 2026-09-09 - this read `$work/run.log`, where the line never appears, and the
+#     assertion had not been exercised before).
+grep -aq "qemu-run: run mode gate, DMA mode enforcing-required (harness provenance) via fw_cfg" "$log" || {
+	echo "qemu-virtio-iommu: the test-kernel phase did not run under the gate row with enforcing-required" >&2
+	grep -a "qemu-run: run mode" "$log" >&2 || echo "    (the runner announced no row)" >&2
+	exit 1
+}
+grep -aq "dma: boot DMA mode enforcing-required (harness provenance, the loader's BootInfo, fw_cfg relay checked)" "$log" || {
+	echo "qemu-virtio-iommu: the kernel did not adopt enforcing-required from the loader's relay" >&2
+	grep -a -m 5 "dma:" "$log" >&2 || true
+	exit 1
+}
+echo "qemu-virtio-iommu:   the test-kernel phase ran under the gate row, enforcing-required, relayed and revalidated"
+
 # 3. EVERY REQUIRED CASE RAN AND PASSED. Named individually: a case that silently stopped running is
 #    a case that stopped testing, and a count alone would not notice.
 #    `forced-release case PASSED` is here for the same reason and was missing (added 2026-09-02).
@@ -192,7 +222,18 @@ fi
 #    everything, including what should work, and satisfy every check above.
 # The image and the kernel were checked at the top of this gate, before any phase could move them.
 [[ -f "$OVMF_CODE" ]] || fail "no OVMF firmware at $OVMF_CODE"
-echo "qemu-virtio-iommu: booting the shipping image with an ordinary virtio-net endpoint behind the controller"
+# AND A BLOCK ENDPOINT BESIDE THE NIC, CARRYING THE SYSTEM VOLUME (added 2026-09-09). The traffic
+# phase used to put ONE endpoint behind the controller, `virtio-net-pci`, and its medium was a SATA
+# `-cdrom` read by firmware - so virtio-blk, the driver that masters the bus on every boot this
+# system makes, was never once exercised under translation by the gate whose name says translation
+# works. The bootable system volume - the one the medium's signed manifest names, so the loader
+# selects it - rides on a run-private copy behind `virtio-blk-pci` with `iommu_platform=on` like the
+# NIC beside it. The assertions below identify that provider by its binding address and require the
+# volume to have been READ through it: removing the endpoint, or breaking its read path, fails them.
+VOLUME="$(evidence_image system-volume-bootable-x86_64.img)" || fail "no bootable system volume produced by this run"
+[[ -f "$VOLUME" ]] || fail "no $VOLUME - build it with: ./build.sh --arch x86_64 --kernel-on-volume --part volume"
+cp "$VOLUME" "$work/volume-disk.img"
+echo "qemu-virtio-iommu: booting the shipping image with virtio-net and virtio-blk endpoints behind the controller"
 traffic="$work/traffic.log"
 cp "$OVMF_VARS" "$work/vars.fd"
 src/tools/guest-verdict.py iommu-traffic "$traffic" -- qemu-system-x86_64 \
@@ -204,6 +245,8 @@ src/tools/guest-verdict.py iommu-traffic "$traffic" -- qemu-system-x86_64 \
 	-device virtio-iommu-pci,boot-bypass=on \
 	-netdev user,id=n0 \
 	-device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on \
+	-drive "format=raw,file=$work/volume-disk.img,if=none,id=vol0" \
+	-device virtio-blk-pci,drive=vol0,disable-legacy=on,iommu_platform=on \
 	-serial "file:$traffic"
 
 grep -aq "iommu: virtio-iommu is translating" "$traffic" || fail "the shipping boot did not bring the controller up"
@@ -240,6 +283,24 @@ grep -aq "network: configured via DHCP" "$traffic" || {
 	exit 1
 }
 echo "qemu-virtio-iommu:   a DHCP lease was obtained through the enforcing controller - real packets both ways"
+# THE BLOCK PROVIDER, BY ITS ADDRESS, AND THE VOLUME READ THROUGH IT. The driver's own online line
+# names its bus address; the kernel's attach line names the same address behind a domain; and the
+# storage service says the partition table and superblocks came over that provider's channel - the
+# system volume is the one the medium names, so a mount is a read of expected bytes, not of any bytes.
+blk_line="$(grep -a -o 'driver.virtio-blk: online ([0-9a-f:.]*' "$traffic" | sed -n '1p' || true)"
+[[ -n "$blk_line" ]] || {
+	echo "qemu-virtio-iommu: no virtio-blk driver came up behind the enforcing controller" >&2
+	grep -a -m 10 "virtio-blk\|DeviceManager:\|iommu:" "$traffic" >&2 || true
+	exit 1
+}
+blk_bdf="${blk_line#*(}"
+grep -aq "iommu: $blk_bdf attached to domain" "$traffic" || fail "the block endpoint at $blk_bdf came up but was not attached to a translation domain"
+grep -aq "storage: vol://system mounted through its block provider" "$traffic" || {
+	echo "qemu-virtio-iommu: the system volume was not read through the block provider at $blk_bdf - the endpoint is behind the controller and nothing read it" >&2
+	grep -a -m 10 "storage:\|StorageService\|loader: .*volume" "$traffic" >&2 || true
+	exit 1
+}
+echo "qemu-virtio-iommu:   the system volume was read through virtio-blk at $blk_bdf, attached to a domain behind the controller"
 
 # 6. AND THE DEFAULT MACHINE IS THIS ONE. Every phase above builds its own QEMU command line, so all
 #    of them would keep passing on a day when `run.sh` quietly stopped putting a controller in the
@@ -296,6 +357,14 @@ grep -aq "dma: every bus-mastering device is translated" "$default_log" || {
 	grep -a "iommu:\|dma:" "$default_log" >&2 || echo "    (it printed no isolation lines at all)" >&2
 	exit 1
 }
+# AND THE MODE CAME FROM THE SIGNED FIELD. The shipping image carries its mode in every selected
+# manifest; the loader hands it over as `signed`, and no harness record is anywhere near it.
+grep -aq "dma: boot DMA mode enforcing-required (signed provenance" "$default_log" || {
+	echo "qemu-virtio-iommu: the default run did not take enforcing-required from the signed field" >&2
+	grep -a -m 5 "dma:\|loader: DMA" "$default_log" >&2 || true
+	exit 1
+}
+echo "qemu-virtio-iommu:   the shipping image's signed field is the mode, with signed provenance"
 # A degraded row names a device reaching memory untranslated. On the default machine there are none,
 # and asserting the ABSENCE is what keeps one from creeping back in unnoticed.
 if grep -aq "dma: DEGRADED ISOLATION" "$default_log"; then
@@ -371,6 +440,18 @@ echo "qemu-virtio-iommu:   the default machine is translated, nothing is degrade
 # AND `--no-iommu` STILL REACHES THE OTHER MACHINE, because a system that can only boot one of them
 # has not made isolation optional - it has made the machine without it unreachable, and that machine
 # is every one whose firmware offers no IOMMU.
+#
+# THE OTHER MACHINE BOOTS THE OTHER IMAGE. The signed DMA mode is frozen at assembly, so `--no-iommu`
+# selects `libersystem-no-iommu.iso`, signed `no-iommu`; this gate assembles it here - AFTER the
+# freshness check and the traffic phase, because assembling it rebuilds the bootable volume for the
+# degraded value - and restores the enforcing volume afterwards so the tree ends where `./image.sh`
+# leaves it. The degraded machine has NO NETWORK: virtio_net declares it requires translation, and
+# the refusal is by name and value.
+echo "qemu-virtio-iommu: assembling the degraded image for the machine without a controller"
+./image.sh --format iso --dma-mode no-iommu >"$work/image-degraded.log" 2>&1 || {
+	tail -20 "$work/image-degraded.log" >&2
+	fail "the degraded image could not be assembled"
+}
 echo "qemu-virtio-iommu: booting --no-iommu, the machine without one"
 plain_log="$work/plain.log"
 src/tools/guest-verdict.py iommu-plain "$plain_log" -- ./run.sh --no-iommu --smp 4 --serial "file:$plain_log"
@@ -378,6 +459,10 @@ src/tools/guest-verdict.py iommu-plain "$plain_log" -- ./run.sh --no-iommu --smp
 survived_the_boot "$plain_log" "--no-iommu"
 grep -aq "iommu: no virtio-iommu on this machine" "$plain_log" || fail "--no-iommu still put a controller in the machine"
 grep -aq "dma: DEGRADED ISOLATION" "$plain_log" || fail "--no-iommu did not report the degraded state it is for"
-echo "qemu-virtio-iommu:   --no-iommu boots the untranslated machine and says so"
+grep -aq "dma: boot DMA mode no-iommu (signed provenance" "$plain_log" || fail "the degraded image's signed field did not reach admission"
+grep -aq "under entry \`virtio_net\` REFUSED - the entry declares iommu-required and the boot mode is no-iommu" "$plain_log" || fail "virtio_net was not refused by name and value on the degraded machine"
+echo "qemu-virtio-iommu:   --no-iommu boots the degraded image on the untranslated machine, says so, and refuses virtio_net by name"
+# THE TREE, PUT BACK: the enforcing volume the shipping image was paired with.
+./build.sh --arch x86_64 --kernel-on-volume --dma-mode enforcing-required --part volume >"$work/restore.log" 2>&1 || fail "the enforcing volume could not be restored"
 
 echo "qemu-virtio-iommu: the controller transitioned out of bypass, five hostile cases were refused by the hardware, an ordinary endpoint passes real traffic, and the DEFAULT machine is the isolated one"

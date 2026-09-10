@@ -12,6 +12,14 @@
 # aarch64 and riscv64 loaders run the same MANIFEST verifier, and firmware Secure Boot on those two
 # is not a gate here and must not be documented as one.
 set -euo pipefail
+# THE PHASE LOGS OUTLIVE THIS SCRIPT when a run is collecting evidence: copied into the run from the
+# EXIT trap, before the directory is removed - on failure too, which is when they matter.
+# shellcheck source=evidence.sh
+source "$(dirname "${BASH_SOURCE[0]}")/evidence.sh"
+# THIS IS A NAMED GATE, AND IT SAYS SO BEFORE INVOKING ANYTHING. The run mode is the one carrier of
+# which matrix row a boot is on, set by the outermost entry point that knows and left alone by the
+# runners it invokes - so a gate's test-kernel phase runs under `gate` and not on the `test` row.
+export LIBER_RUN_MODE="${LIBER_RUN_MODE:-gate}"
 
 cd "$(dirname "$0")/../.."
 BUILD=".build/boot"
@@ -43,7 +51,7 @@ done
 [[ -f "$LOADER" ]] || fail "no loader at $LOADER - run ./build.sh --arch x86_64 --part loader"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'evidence_keep_gate "$work"/*.log "$work"/*/*.log; rm -rf "$work"' EXIT
 # signed-boot can rebuild this path with another trust profile. Acquire only while its
 # producer lock is held; signing and every later medium read use this run's immutable copy.
 mkdir -p .build/state
@@ -111,10 +119,13 @@ boot() {
 	rm -f "$store"
 }
 
-[[ -f "$BUILD/libersystem.iso" ]] || fail "no $BUILD/libersystem.iso - run ./image.sh --format iso"
+# THE IMAGE THIS RUN PRODUCED, when a run is collecting evidence; the tree's own otherwise.
+ISO="$(evidence_image libersystem.iso)" || fail "no libersystem.iso produced by this run"
+[[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso"
+echo "secure-boot: medium $ISO sha256=$(sha256sum "$ISO" | cut -d' ' -f1)"
 esp="$work/esp.img"
-xorriso -osirrox on -indev "$BUILD/libersystem.iso" -extract /boot/efiboot.img "$esp" >/dev/null 2>&1 || fail "could not read /boot/efiboot.img out of $BUILD/libersystem.iso"
-[[ -s "$esp" ]] || fail "the ESP extracted from $BUILD/libersystem.iso is empty"
+xorriso -osirrox on -indev "$ISO" -extract /boot/efiboot.img "$esp" >/dev/null 2>&1 || fail "could not read /boot/efiboot.img out of $ISO"
+[[ -s "$esp" ]] || fail "the ESP extracted from $ISO is empty"
 chmod u+w "$esp"
 
 signed_medium="$work/signed.img"

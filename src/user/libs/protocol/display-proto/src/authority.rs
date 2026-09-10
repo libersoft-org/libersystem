@@ -38,6 +38,8 @@ const TYPE_CHANNEL: u64 = 5;
 
 thread_local! {
 	static AUTHORITY: Cell<u64> = const { Cell::new(u64::MAX) };
+	// Every handle the generated dispatch released through the runtime's hook, in order.
+	static RELEASED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn packed(object_type: u64, rights: u32) -> u64 {
@@ -47,6 +49,17 @@ fn packed(object_type: u64, rights: u32) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn liber_handle_authority(_handle: u64) -> u64 {
 	AUTHORITY.with(|a| a.get())
+}
+
+// The runtime closes a refused handle through this; here it is recorded, because what the tests
+// below assert is that a denial CLOSED what it decoded rather than merely forgetting it.
+#[unsafe(no_mangle)]
+pub extern "C" fn liber_handle_release(handle: u64) {
+	RELEASED.with(|released| released.borrow_mut().push(handle));
+}
+
+fn released_handles() -> Vec<u64> {
+	RELEASED.with(|released| released.borrow_mut().drain(..).collect())
 }
 
 #[derive(Default)]
@@ -98,6 +111,29 @@ fn bind_with(authority: u64) -> (Recording, Result<u64, Error>) {
 	// will drain - which on a real system is a handle leaked once per refused request.
 	assert!(request_handles.as_slice().is_empty(), "the request's handles were taken, whatever the answer");
 	(service, outcome)
+}
+
+// AND A REFUSAL CLOSES THE HANDLE IT REFUSED. Taking it out of the list is not closing it: the
+// list is non-owning metadata, and a capability that is in nobody's list and nobody's hands is
+// still in the process's table. The generated denial path releases every handle the request
+// carried through the runtime hook, and the authorised path releases none - the service owns
+// them from then on.
+#[test]
+fn a_refusal_releases_the_handle_it_refused_and_an_acceptance_does_not() {
+	let _ = released_handles();
+	let (_, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_READ));
+	assert_eq!(outcome, Err(Error::Denied));
+	assert_eq!(released_handles(), vec![0x11], "the one handle the refused request carried was released");
+	let (_, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_MANAGE));
+	assert_eq!(outcome, Ok(0x5eed));
+	assert!(released_handles().is_empty(), "an accepted request's handle belongs to the service and is not released by the guard");
+	// Repeated refusals release one handle each - the shape of a caller retrying against a
+	// guard, which used to leak one capability per attempt.
+	for attempt in 0..8 {
+		let (_, outcome) = bind_with(packed(TYPE_CHANNEL, u32::MAX));
+		assert_eq!(outcome, Err(Error::Denied), "attempt {attempt}");
+		assert_eq!(released_handles(), vec![0x11], "attempt {attempt} released exactly its own handle");
+	}
 }
 
 #[test]

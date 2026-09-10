@@ -58,9 +58,10 @@ fn system_packages_use_canonical_executable_names() {
 // failed to report in there - which turned out to be the riscv trap-frame register clobber
 // (a trap could corrupt the interrupted thread's t0/x5), not an interrupt-timing issue;
 // with that fixed the chain settles deterministically on riscv64 too.
-// NetworkService cannot report online until a live NET publication opens a connection and the
-// real virtio-net driver supplies its MAC/MTU. This covers the driver's binding and connection
-// path; DHCP packet exchange is checked separately by the enforcing-controller traffic gate.
+// NetworkService reports online with a LINK only once a live NET publication opens a connection
+// and the real virtio-net driver supplies its MAC/MTU; on a boot whose DMA mode refuses that
+// driver it reports online without one. This covers the driver's launch and the claim's admission
+// or refusal; DHCP packet exchange is checked separately by the enforcing-controller traffic gate.
 // The routed-volume report requires real file bytes through the block drivers, including USB.
 tagged_test!(init_package_starts_system_manager, [Boot, Service, VolumeLayout], id = "kernel.boot.init_package_starts_system_manager", covers = ["kernel", "liberfs", "bin.device_manager", "bin.virtio_blk", "bin.virtio_net", "bin.xhci"]);
 fn init_package_starts_system_manager() {
@@ -113,6 +114,15 @@ fn init_package_starts_system_manager() {
 	// The separate lifecycle check below compares actual files from all four routed media.
 	const USB_VOLUME_REPORT: &[u8] = b"StorageService: online (vol://usb) routed";
 
+	// THE NETWORK SERVICE IS ONLINE ON EVERY BOOT, WITH OR WITHOUT A LINK. `virtio_net` declares
+	// `iommu-required`, so on a boot whose DMA mode is `no-iommu` - the test row, and every
+	// device-tree boot until those ports gain a controller - the kernel refuses the claim by name
+	// and NetworkService finds no provider. It comes up anyway, without a link, answering every
+	// link-bound operation with a typed refusal: the time service, PermissionManager,
+	// ConsoleService, SystemGraphService and the shell all depend on it by manifest, so a
+	// NetworkService that failed its bootstrap was a machine with no shell, not a machine with no
+	// network. On an enforcing boot the driver is admitted and the same report means a live link;
+	// which of the two this boot is, the console says beside the DHCP line.
 	let online_reports: [&[u8]; 23] = [
 		b"LogService: online",
 		b"DeviceManager: online",
@@ -182,6 +192,7 @@ fn init_package_starts_system_manager() {
 		}
 		arch::idle_halt();
 	}
+	crate::serial_println!("boot: this boot's DMA mode is {:?} - NetworkService reports online with a link only where virtio_net is admitted", crate::dma_policy::mode());
 	let missing_reports = online_reports.iter().filter(|expected| !actual_online_reports.iter().any(|actual| actual.as_slice() == **expected)).collect::<alloc::vec::Vec<_>>();
 	assert_eq!(actual_online_reports.len(), online_reports.len(), "every manifest service must report online; missing={missing_reports:?}");
 	actual_online_reports.sort();

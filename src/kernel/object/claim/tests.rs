@@ -22,9 +22,9 @@ fn a_second_claim_of_one_device_is_refused_by_name() {
 	// correctly, because the first is worth waiting on and the second never will be.
 	let index = device::add_synthetic_device();
 	assert_eq!(device::claim_state(index), Some(ClaimState::Free), "a fresh slot is free");
-	let key = device::claim(index).expect("the first claim succeeds");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("the first claim succeeds");
 	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed));
-	assert_eq!(device::claim(index), Err(ClaimError::AlreadyClaimed), "and the second one is refused");
+	assert_eq!(device::claim(index, &crate::dma_policy::synthetic_entry()), Err(ClaimError::AlreadyClaimed), "and the second one is refused");
 	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "a refused claim changes nothing");
 	assert_eq!(device::release_claim(key), Ok(ClaimState::Free));
 	assert_eq!(device::claim_state(index), Some(ClaimState::Free), "and after the release it is claimable again");
@@ -38,9 +38,9 @@ fn a_new_claim_is_a_new_binding_and_the_old_key_is_refused() {
 	// milestone rests on: a release naming a stale generation is REFUSED rather than applied to
 	// whoever holds the device now.
 	let index = device::add_synthetic_device();
-	let first = device::claim(index).expect("claimed");
+	let first = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	device::release_claim(first).expect("released");
-	let second = device::claim(index).expect("claimed again");
+	let second = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed again");
 	assert_ne!(first.generation, second.generation, "a new claim of one device is a new binding");
 	assert!(second.generation > first.generation, "and generations only ever advance");
 	assert_eq!(device::release_claim(first), Err(ClaimError::Stale), "the previous binding's key does not reach this one");
@@ -57,15 +57,15 @@ fn a_slot_that_runs_out_of_generations_is_retired_rather_than_wrapped() {
 	// about.
 	let index = device::add_synthetic_device();
 	device::exhaust_generations_of(index);
-	assert_eq!(device::claim(index), Err(ClaimError::Retired), "the slot has no generation left to mint");
-	assert_eq!(device::claim(index), Err(ClaimError::Retired), "and it stays retired for the life of the boot");
+	assert_eq!(device::claim(index, &crate::dma_policy::synthetic_entry()), Err(ClaimError::Retired), "the slot has no generation left to mint");
+	assert_eq!(device::claim(index, &crate::dma_policy::synthetic_entry()), Err(ClaimError::Retired), "and it stays retired for the life of the boot");
 }
 
 crate::tagged_test!(a_claim_handle_settles_once_and_reports_which_binding_it_was, [Object, Kernel, Pci], id = "kernel.object.claim.a_claim_handle_settles_once_and_reports_which_binding_it_was", covers = ["kernel"]);
 fn a_claim_handle_settles_once_and_reports_which_binding_it_was() {
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
-	let claim = Claim::create(key).expect("a claim object");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
+	let claim = Claim::create(key, crate::dma_policy::synthetic_entry(), abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8).expect("a claim object");
 	assert!(!claim.is_settled(), "a live claim has not settled");
 	assert_eq!(claim.outcome(), None);
 	assert_eq!(claim.key().device_index as usize, index);
@@ -85,10 +85,10 @@ fn the_last_close_of_a_claim_handle_is_a_forced_release() {
 	// handle carries neither TRANSFER nor DUPLICATE, so it can never be in a message, in a second
 	// table, or in two slots of one.
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed));
 	{
-		let _claim = Claim::create(key).expect("a claim object");
+		let _claim = Claim::create(key, crate::dma_policy::synthetic_entry(), abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8).expect("a claim object");
 		assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "still held while the object lives");
 	}
 	assert_eq!(device::claim_state(index), Some(ClaimState::Free), "and released the moment the last reference went");
@@ -105,7 +105,7 @@ fn ending_a_claim_takes_the_mapping_and_not_just_the_handle() {
 	use crate::object::KernelObject;
 	use crate::object::device_memory::DeviceMemory;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let memory = DeviceMemory::for_claim(key, 0xfeed_0000, 0x1000).expect("a device memory");
 	let before = memory.header().generation();
 	let rows = device::derived_rows();
@@ -159,7 +159,7 @@ fn a_claims_snapshot_names_what_it_still_holds() {
 	assert_eq!(free.irq_vectors, 0, "an unclaimed device holds no vector");
 	assert_eq!(free.iommu_grants, 0, "an unclaimed device holds no grant");
 
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let memory = DeviceMemory::for_claim(key, 0xfeed_2000, 0x1000).expect("a device memory");
 	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
 
@@ -183,10 +183,10 @@ fn a_capability_from_a_previous_binding_cannot_speak_for_this_one() {
 	// still using. Nothing forged it; it simply became a statement about a different machine.
 	use crate::object::device_memory::DeviceMemory;
 	let index = device::add_synthetic_device();
-	let first = device::claim(index).expect("claimed");
+	let first = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let stale = DeviceMemory::for_claim(first, 0xfeed_1000, 0x1000).expect("a device memory");
 	device::release_claim(first).expect("released");
-	let second = device::claim(index).expect("claimed again");
+	let second = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed again");
 	assert!(!device::claim_is_current(stale.claim().expect("it names a binding")), "the old binding is not the current one");
 	assert!(device::claim_is_current(second), "and the current one is");
 	device::release_claim(second).expect("released");
@@ -226,7 +226,7 @@ fn an_acquisition_that_cannot_answer_leaves_no_device_taken() {
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 	assert!(REFUSAL.load(Ordering::SeqCst) < 0, "an acquisition that cannot answer is a refusal");
 	assert_eq!(device::claim_state(index), Some(ClaimState::Free), "and the device was given back, not left claimed by nobody");
-	assert_eq!(device::claim(index).map(|key| key.device_index), Ok(index as u32), "so the next claimant can have it");
+	assert_eq!(device::claim(index, &crate::dma_policy::synthetic_entry()).map(|key| key.device_index), Ok(index as u32), "so the next claimant can have it");
 }
 
 crate::tagged_test!(a_claim_handle_cannot_leave_the_process_that_took_it, [Object, Kernel, Pci, Handle, Syscall], id = "kernel.object.claim.a_claim_handle_cannot_leave_the_process_that_took_it", covers = ["kernel"]);
@@ -281,7 +281,7 @@ fn a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releas
 	// reaching `Free` would put the frames and vectors back into circulation against a state a
 	// manager has already been told is final.
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("a fresh synthetic slot claims");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("a fresh synthetic slot claims");
 
 	// BEFORE THE DEADLINE: the snapshot reports what is happening and changes nothing.
 	let snapshot = device::snapshot(index).expect("a synthetic slot answers");
@@ -296,7 +296,7 @@ fn a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releas
 	assert_eq!(after.release_deadline, 0, "a settled claim carries no deadline");
 
 	// AND THE OTHER SIDE. A second binding, torn down past its deadline: the snapshot LATCHES it.
-	let second = device::claim(index).expect("free again, so claimable again");
+	let second = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("free again, so claimable again");
 	assert_ne!(second.generation, key.generation, "a new claim is a new binding");
 	device::begin_release_for_test(second).expect("the teardown starts");
 	let releasing = device::snapshot(index).expect("still a slot");
@@ -313,7 +313,7 @@ fn a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releas
 	// the teardown finishes, reports confirmed, and the claim must stay terminal anyway.
 	assert_eq!(device::finish_release_for_test(index, true), device::ClaimState::Quarantined, "a completion after the latch releases nothing");
 	assert_eq!(device::claim_state(index), Some(device::ClaimState::Quarantined));
-	assert_eq!(device::claim(index), Err(ClaimError::Quarantined), "and it is not claimed again this boot");
+	assert_eq!(device::claim(index, &crate::dma_policy::synthetic_entry()), Err(ClaimError::Quarantined), "and it is not claimed again this boot");
 }
 
 crate::tagged_test!(a_forced_release_takes_a_live_interrupt_away, [Object, Kernel, Pci, Interrupt], id = "kernel.object.claim.a_forced_release_takes_a_live_interrupt_away", covers = ["kernel"]);
@@ -345,7 +345,7 @@ fn a_forced_release_takes_a_live_interrupt_away() {
 	use crate::object::KernelObject;
 	use crate::object::interrupt::Interrupt;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
 	// NO SKIP HERE, AND THAT IS DELIBERATE (2026-09-01). This printed a line and returned
 	// SUCCESSFULLY when no vector was free, so the one test that proves a forced release takes a live
@@ -404,8 +404,8 @@ fn closing_the_last_claim_handle_releases_while_another_reference_is_alive() {
 	use crate::object::handle::{Capability, HandleTable};
 	use crate::object::rights::Rights;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
-	let claim = Claim::create(key).expect("a claim object");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
+	let claim = Claim::create(key, crate::dma_policy::synthetic_entry(), abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8).expect("a claim object");
 	let mut table = HandleTable::new();
 	let handle = table.insert(Capability::new(claim.clone() as alloc::sync::Arc<dyn crate::object::KernelObject>, Rights::WAIT | Rights::MANAGE));
 	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "held while the handle is open");
@@ -435,7 +435,7 @@ fn a_release_in_progress_refuses_a_late_derivation() {
 	use crate::object::KernelObject;
 	use crate::object::device_memory::DeviceMemory;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let memory = DeviceMemory::for_claim(key, 0xfeed_1000, 0x1000).expect("a device memory");
 	let weak = alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>));
 	assert!(device::register_derived(key, weak.clone()), "a live claim derives capabilities");
@@ -447,7 +447,7 @@ fn a_release_in_progress_refuses_a_late_derivation() {
 	// AND A STALE KEY IS REFUSED AFTER THE RELEASE HAS FINISHED, which is the same rule one step
 	// later: the generation has moved on and the row would belong to nobody.
 	assert!(!device::register_derived(key, weak), "a key whose claim has ended derives nothing at all");
-	let next = device::claim(index).expect("claimable again");
+	let next = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimable again");
 	device::release_claim(next).expect("released");
 }
 
@@ -469,7 +469,7 @@ fn a_capability_minted_before_its_row_dies_with_its_claim() {
 	use crate::object::handle::{Capability, HandleError, HandleTable};
 	use crate::object::rights::Rights;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let memory = DeviceMemory::for_claim(key, 0xfeed_3000, 0x1000).expect("a device memory");
 	// THE ORDER THE SYSCALL USES: the capability is minted while the claim is live and the object
 	// has never been revoked, so its snapshot is older than anything the row below can attract.
@@ -512,7 +512,7 @@ fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
 	use crate::object::KernelObject;
 	use crate::object::device_memory::DeviceMemory;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let memory = DeviceMemory::for_claim(key, 0xfeed_1000, 0x1000).expect("a device memory");
 	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
 
@@ -570,7 +570,7 @@ fn a_failure_this_binding_caused_is_not_read_as_an_earlier_ones() {
 	// The failure is injected rather than raced: a shootdown that cannot reach a core is a property
 	// of the machine, so what a test can drive is the fact it produces.
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	device::strand_mmio_for_test(index);
 	assert_eq!(device::release_claim(key), Ok(device::ClaimState::Quarantined), "a teardown this binding could not confirm is charged to this binding");
 
@@ -578,10 +578,10 @@ fn a_failure_this_binding_caused_is_not_read_as_an_earlier_ones() {
 	// every later claim of the device unreleasable - that is the whole reason the comparison is a
 	// difference rather than a total.
 	let other = device::add_synthetic_device();
-	let first = device::claim(other).expect("claimed");
+	let first = device::claim(other, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	assert_eq!(device::release_claim(first), Ok(device::ClaimState::Free), "a binding that stranded nothing is free");
 	device::strand_mmio_for_test(other);
-	let second = device::claim(other).expect("claimed again");
+	let second = device::claim(other, &crate::dma_policy::synthetic_entry()).expect("claimed again");
 	assert_eq!(device::release_claim(second), Ok(device::ClaimState::Free), "and the next binding is judged against what it inherited, not against zero");
 }
 
@@ -604,7 +604,7 @@ fn a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free() {
 	// work.
 	use crate::object::device_memory::DeviceMemory;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 	let memory = DeviceMemory::for_claim(key, 0xfeed_2000, 0x1000).expect("a device memory");
 
 	let space = crate::sched::kernel_as();
@@ -693,7 +693,7 @@ fn ending_a_claim_takes_the_dma_buffers_it_authorised() {
 	use crate::object::device_memory::DeviceMemory;
 	use crate::object::dma_buffer::DmaBuffer;
 	let index = device::add_synthetic_device();
-	let key = device::claim(index).expect("claimed");
+	let key = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("claimed");
 
 	// The buffer is created the way the syscall creates it - against the claim, in a Domain - and
 	// registered as derived the way the syscall registers it.
@@ -867,10 +867,10 @@ fn a_stale_faults_containment_does_not_reach_the_binding_that_replaced_it() {
 	// the generation the drain attributed it to, and that is what decides.
 	let index = device::add_synthetic_device();
 
-	let first = device::claim(index).expect("the synthetic device claims");
+	let first = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("the synthetic device claims");
 	assert_eq!(device::release_claim(first).expect("the first binding releases"), ClaimState::Free, "the synthetic device has nothing outstanding, so its teardown confirms");
 
-	let second = device::claim(index).expect("the same device is claimed again, which is the rebind this test is about");
+	let second = device::claim(index, &crate::dma_policy::synthetic_entry()).expect("the same device is claimed again, which is the rebind this test is about");
 	assert_ne!(second.generation, first.generation, "a rebind is a new generation - without that there is nothing here to tell apart");
 
 	let (bus, dev, func) = device::with(index, |entry| (entry.bus, entry.dev, entry.func)).expect("the synthetic entry is in the table");

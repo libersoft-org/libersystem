@@ -165,7 +165,13 @@ fi
 
 manifest_pattern='(read_to_string|join).*user/services/manifest[.]toml'
 manifest_readers="$(grep -RIlE "$manifest_pattern" src --include='*.rs' --include='*.sh' | sort || true)"
-allowed_manifest_readers="$(printf '%s\n' src/tools/system-manifest/src/lib.rs src/tools/system-manifest/src/main.rs src/user/services/core/build.rs | sort)"
+# THE KERNEL'S BUILD SCRIPT IS A CONSUMER THROUGH THE LIBRARY, NOT A SECOND PARSER. It generates the
+# trusted DMA registry from the same manifest DeviceManager selects from, through
+# `system_manifest::Manifest::load_workspace`, and names the file itself only in its
+# `rerun-if-changed` line - which is what makes a policy change rebuild the kernel rather than leave
+# it admitting yesterday's registry. Same shape as the services' build script, allowed for the same
+# reason.
+allowed_manifest_readers="$(printf '%s\n' src/kernel/build.rs src/tools/system-manifest/src/lib.rs src/tools/system-manifest/src/main.rs src/user/services/core/build.rs | sort)"
 if [[ "$manifest_readers" != "$allowed_manifest_readers" ]]; then
 	echo "source-hygiene: direct manifest readers differ from the ownership allowlist:" >&2
 	diff -u <(printf '%s\n' "$allowed_manifest_readers") <(printf '%s\n' "$manifest_readers") >&2 || true

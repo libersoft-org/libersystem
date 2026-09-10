@@ -359,15 +359,58 @@ PYEOF
 	#
 	# A per-run copy, made under the lock, is immutable for the life of this run by construction. It
 	# costs one file copy of a binary that is already on this disk.
-	cp "$built" "$STAGED_TEST_KERNEL"
+	#
+	# AND IT IS EVIDENCE, NOT ONLY A CONVENIENCE. Published atomically - written to a temporary name
+	# and renamed into place, so nothing ever sees a half-written executable - made read-only for
+	# the life of the run, and DIGESTED UNDER THE SAME LOCK, so the digest is of the bytes that were
+	# staged and not of whatever the path holds when somebody later asks. The digest travels: the
+	# runner prints it into the run log, the medium's input key is over these bytes, and the
+	# suite's result line names it, which is what lets a result be tied to the binary that produced
+	# it rather than to a path that may since have been reused.
+	cp "$built" "$STAGED_TEST_KERNEL.tmp.$$"
+	chmod 0444 "$STAGED_TEST_KERNEL.tmp.$$"
+	mv -f "$STAGED_TEST_KERNEL.tmp.$$" "$STAGED_TEST_KERNEL"
+	sha256sum "$STAGED_TEST_KERNEL" | awk '{print $1}' >"$STAGED_TEST_KERNEL.sha256"
 	rm -f "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"
 ) 8>"$REPO_ROOT/.build/state/kernel-test-build.lock" >>"$RUN_LOG" 2>&1 || {
 	echo "test-kernel: the selection-specific kernel did not build" >&2
 	tail -20 "$RUN_LOG" >&2
 	exit 1
 }
-# The staged copy is this run's, and it goes when the run does.
-trap 'rm -f "$STAGED_TEST_KERNEL" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
+STAGED_TEST_KERNEL_DIGEST="$(<"$STAGED_TEST_KERNEL.sha256")"
+[[ "$STAGED_TEST_KERNEL_DIGEST" =~ ^[0-9a-f]{64}$ ]] || {
+	echo "test-kernel: the staged kernel's digest was not recorded" >&2
+	exit 1
+}
+# Exported for the runner, which prints it beside the medium's digest so one run log names both.
+export LIBER_STAGED_KERNEL_DIGEST="$STAGED_TEST_KERNEL_DIGEST"
+echo "[test-$ARCH] STAGED-KERNEL sha256=$STAGED_TEST_KERNEL_DIGEST $STAGED_TEST_KERNEL"
+
+# THE SUITE'S EVIDENCE, published from the EXIT trap so every way out of this script - the verdict,
+# a timeout, a stalled guest, a guest that booted the wrong kernel - leaves an envelope behind when
+# a run is collecting them, and BEFORE the staged kernel is removed, so the envelope can name it by
+# path and digest. Only the WHOLE suite discharges the target's `suite.kernel` key: a run narrowed by
+# tags, by a selection or by a compile-time profile ran part of it and claims nothing here. The
+# envelope discharges every kernel test the guest reported `[ok]` beside its own key.
+# shellcheck source=../tools/evidence.sh
+source "$ROOT/tools/evidence.sh"
+SUITE_OUTCOME=failed
+publish_suite_evidence() {
+	evidence_active || return 0
+	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" ]] || return 0
+	local discharges medium
+	discharges="$(mktemp)"
+	grep -ahoE '^kernel\.[a-z_.0-9]+\.\.\.[[:space:]]*\[ok\]' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | sed -E 's/\.\.\..*$//' | sort -u | sed "s| *\$| / $ARCH / test-guest / test|" >"$discharges" || true
+	local -a inputs=(--input "$STAGED_TEST_KERNEL")
+	# The medium the runner bound, from the line it printed for exactly this.
+	medium="$(sed -n 's/^qemu-run: medium sha256=[0-9a-f]* (\(.*\), held as descriptor [0-9]*).*$/\1/p' "$RUN_LOG" 2>/dev/null | tail -1)"
+	[[ -n "$medium" && -f "$medium" ]] && inputs+=(--input "$medium")
+	evidence_publish "suite.kernel / $ARCH / test-guest / test" "test-kernel.sh" "$SUITE_OUTCOME" "$((SECONDS - START_SECONDS))" "${inputs[@]}" --log "$RUN_LOG" --log "$GUEST_LOG" --discharges-file "$discharges"
+	rm -f "$discharges"
+}
+# The staged copy is this run's, and it goes when the run does - read-only, so its own directory's
+# permissions are what allow the removal.
+trap 'publish_suite_evidence; rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KERNEL.tmp.$$" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
 
 # Inventory discovery needs only the descriptor-bearing executable in Cargo's target directory.
 # Build-only never starts the watchdog or runner: a cold inventory needs no volume or medium.
@@ -502,6 +545,7 @@ echo "[test-$ARCH] RESULT-LOGS $RUN_LOG $GUEST_LOG"
 if [[ "$status" -eq 0 ]]; then
 	result="$(grep -hE '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG" | tail -1 | tr -d '\r')"
 	echo "[test-$ARCH] PASS: $result (${elapsed}s); logs: $RUN_LOG $GUEST_LOG"
+	SUITE_OUTCOME=passed
 else
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	echo "[test-$ARCH] FAIL (exit $status, ${elapsed}s); logs: $RUN_LOG $GUEST_LOG" >&2

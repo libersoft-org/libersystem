@@ -1,0 +1,7 @@
+[package]
+name = "inventory-fixture-dep"
+edition = "2024"
+description = "An in-tree dependency of the probe fixture, with a boundary of its own"
+
+[lib]
+path = "src/lib.rs"

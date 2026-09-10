@@ -966,5 +966,17 @@ pub fn handle_carries(handle: u64, required_rights: u32, required_type: u64) -> 
 // type is not, and that is said here rather than left as a zero somebody reads as "Domain".
 pub const NO_REQUIRED_TYPE: u64 = u64::MAX;
 
+// THE OTHER HALF OF A REFUSAL: a handle the guard refused is a handle the service will never
+// close, so the generated dispatch closes it - through the runtime, for the same reason it asks the
+// runtime what the handle carries. `Handles` is non-owning transport metadata; clearing it drops
+// the numbers and not the capabilities behind them.
+unsafe extern "C" {
+	fn liber_handle_release(handle: u64);
+}
+
+pub fn release_handle(handle: u64) {
+	unsafe { liber_handle_release(handle) }
+}
+
 #[cfg(test)]
 mod tests;

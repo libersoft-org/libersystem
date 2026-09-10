@@ -4088,6 +4088,12 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		Ok(_) => {}
 	}
 	if let Ok(fs) = mounted {
+		// SAID OUT LOUD, because it is the one line that proves the block provider SERVED: the
+		// partition table and both superblocks were read over this provider's request channel to
+		// get here, and the enforcing-IOMMU gate's traffic phase asserts on exactly that.
+		unsafe {
+			print(b"storage: vol://system mounted through its block provider - the partition table and the superblocks were read over the provider's request channel\n");
+		}
 		if fs.num_blocks() != pool {
 			unsafe {
 				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");

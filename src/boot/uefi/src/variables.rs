@@ -16,7 +16,9 @@
 
 use core::ffi::c_void;
 
-use crate::{Handle, Status};
+use bootproto::rollback;
+
+use crate::{Handle, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUPPORTED, Status, high_bit};
 
 // EFI_GLOBAL_VARIABLE, the namespace these two live in. A variable name without its GUID names
 // nothing: two vendors may both define `SecureBoot`.
@@ -45,7 +47,9 @@ pub struct RuntimeServices {
 	pub convert_pointer: *const c_void,
 	pub get_variable: Option<unsafe extern "efiapi" fn(name: *const u16, guid: *const Guid, attributes: *mut u32, size: *mut usize, data: *mut c_void) -> Status>,
 	pub get_next_variable_name: *const c_void,
-	pub set_variable: *const c_void,
+	// TYPED FOR THE ROLLBACK FLOOR'S TWO SLOTS AND NOTHING ELSE - see `RollbackStore` below, which
+	// is the only caller and cannot be handed a name.
+	pub set_variable: Option<unsafe extern "efiapi" fn(name: *const u16, guid: *const Guid, attributes: u32, size: usize, data: *const c_void) -> Status>,
 }
 
 // What firmware says about its own verification state.
@@ -97,6 +101,69 @@ pub unsafe fn secure_boot_state(system_table: *const crate::SystemTable) -> Secu
 // The handle type is re-exported so a caller does not need two imports for one call.
 pub type ImageHandle = Handle;
 
+// THE ROLLBACK FLOOR'S THREE VARIABLES, and the one write path this crate has.
+//
+// THE ARGUMENT ABOVE IS ANSWERED, NOT DELETED. `SetVariable` was left untyped because a loader that
+// could set variables could enrol its own key. What is typed here cannot: the selector is a closed
+// enum of three names under this product's own vendor GUID, the write path takes a SLOT and a
+// sixty-four-byte record and nothing else, and the marker has no write path at all - the ceremony
+// writes it, from outside any booted system. A caller cannot name a variable, so it cannot name
+// `PK`, `db` or anything under another vendor's GUID. The reads report DISTINCT outcomes, because
+// "access denied" and "never written" are different machines and a floor that reads the first as
+// the second is defeated by a firmware fault.
+
+pub const STATUS_ACCESS_DENIED: Status = high_bit(15);
+pub const STATUS_DEVICE_ERROR: Status = high_bit(7);
+
+// The vendor namespace, in the firmware's layout.
+pub const ROLLBACK_GUID: Guid = Guid { data1: rollback::VENDOR_GUID_DATA1, data2: rollback::VENDOR_GUID_DATA2, data3: rollback::VENDOR_GUID_DATA3, data4: rollback::VENDOR_GUID_DATA4 };
+
+// The floor's firmware, as `bootproto::rollback::enforce` drives it.
+pub struct RollbackStore {
+	runtime: *const RuntimeServices,
+}
+
+impl RollbackStore {
+	// # Safety
+	// `system_table` must be the table the firmware handed the image entry point. `None` when the
+	// firmware offers no runtime services table, which is a firmware this loader cannot keep a
+	// floor on.
+	pub unsafe fn new(system_table: *const crate::SystemTable) -> Option<RollbackStore> {
+		let runtime = unsafe { (*system_table).runtime_services }.cast::<RuntimeServices>();
+		if runtime.is_null() { None } else { Some(RollbackStore { runtime }) }
+	}
+}
+
+impl rollback::Firmware for RollbackStore {
+	fn read(&mut self, which: rollback::Variable) -> rollback::Read {
+		// SAFETY: `runtime` was taken from the firmware's system table by `new`.
+		let Some(get) = (unsafe { (*self.runtime).get_variable }) else { return rollback::Read::Failed(STATUS_UNSUPPORTED) };
+		let name = which.name_utf16();
+		let mut attributes: u32 = 0;
+		// One byte more than a record, so a variable that is exactly one record fits and one that
+		// is longer is reported as such rather than silently truncated.
+		let mut buffer = [0u8; rollback::RECORD_LEN + 1];
+		let mut size: usize = buffer.len();
+		let status = unsafe { get(name.as_ptr(), &ROLLBACK_GUID, &mut attributes, &mut size, buffer.as_mut_ptr().cast()) };
+		match status {
+			STATUS_SUCCESS => rollback::Read::present(attributes, &buffer[..size.min(buffer.len())]),
+			STATUS_NOT_FOUND => rollback::Read::Absent,
+			STATUS_BUFFER_TOO_SMALL => rollback::Read::Oversized(size),
+			STATUS_ACCESS_DENIED => rollback::Read::AccessDenied,
+			STATUS_DEVICE_ERROR => rollback::Read::DeviceError,
+			other => rollback::Read::Failed(other),
+		}
+	}
+
+	fn write(&mut self, slot: rollback::Slot, record: &[u8; rollback::RECORD_LEN]) -> Result<(), rollback::WriteFault> {
+		// SAFETY: as above.
+		let Some(set) = (unsafe { (*self.runtime).set_variable }) else { return Err(rollback::WriteFault::NoWritePath) };
+		let name = slot.variable().name_utf16();
+		let status = unsafe { set(name.as_ptr(), &ROLLBACK_GUID, rollback::ATTRIBUTES, record.len(), record.as_ptr().cast()) };
+		if status == STATUS_SUCCESS { Ok(()) } else { Err(rollback::WriteFault::Refused(status)) }
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -126,6 +193,25 @@ mod tests {
 
 	// The table's shape is what makes `get_variable` land on the right entry, and the offset is the
 	// specification's rather than this file's opinion.
+	// AND `SetVariable` THE NINTH: header, then GetTime, SetTime, GetWakeupTime, SetWakeupTime,
+	// SetVirtualAddressMap, ConvertPointer, GetVariable, GetNextVariableName.
+	#[test]
+	fn set_variable_is_the_ninth_entry_of_runtime_services() {
+		let set = core::mem::offset_of!(RuntimeServices, set_variable);
+		let header = core::mem::size_of::<crate::TableHeader>();
+		assert_eq!(set, header + 8 * core::mem::size_of::<*const core::ffi::c_void>());
+	}
+
+	// The vendor GUID the store reads and writes under is the frozen one, in the firmware's layout.
+	#[test]
+	fn the_rollback_namespace_is_the_products_own() {
+		assert_eq!(ROLLBACK_GUID.data1, 0x4c69_6265);
+		assert_eq!(ROLLBACK_GUID.data2, 0x7253);
+		assert_eq!(ROLLBACK_GUID.data3, 0x7973);
+		assert_eq!(ROLLBACK_GUID.data4, [0x2d, 0x52, 0x6f, 0x6c, 0x6c, 0x62, 0x6b, 0x31]);
+		assert_ne!(ROLLBACK_GUID, GLOBAL_VARIABLE_GUID);
+	}
+
 	#[test]
 	fn get_variable_is_the_seventh_entry_of_runtime_services() {
 		let base = core::mem::offset_of!(RuntimeServices, header);

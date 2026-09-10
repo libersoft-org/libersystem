@@ -199,15 +199,106 @@ pub fn lower(kind: CheckKind, command: &str, configuration: &Configuration) -> S
 static DEFAULT_CONFIGURATION: std::sync::LazyLock<Configuration> = std::sync::LazyLock::new(|| Configuration { name: String::from("default"), default_features: true, features: Vec::new(), profile: String::from("dev"), build_mode: String::from("host-test"), description: String::from("the crate's own manifest") });
 
 pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, registry: &crate::registry::Registry) -> Vec<Step> {
+	steps_for_items(&plan.items, kernel_tests_per_target, registry)
+}
+
+// THE RELEASE PLAN: every release-required key at this revision, lowered into steps by the same code
+// an ordinary plan is lowered by, plus the three kinds of step an ordinary plan never contains.
+//
+//   PRODUCERS      the shipping images are BUILT WORK: one step per image row, before the gates
+//                    that read the image, which name it as their prerequisite in the catalog
+//   WHOLE SUITES   one `./test.sh --arch A` per target carrying the `suite.kernel` key; the guest
+//                    runner's envelope discharges every kernel test key of that target, so the
+//                    kernel tests are not steps of their own here
+//   THE LIFECYCLE  one step brings the development guest up, runs the four development checks
+//                    against it and tears it down; it carries the lifecycle key AND the four
+//                    development keys, because the checks cannot run against a guest that a
+//                    separate step has already torn down
+//
+// Everything else - builds, host suites, conformance suites, profile rows and the other gates -
+// is lowered exactly as an ordinary plan is, so a release step has the same id, the same command
+// and the same measured cost as the step a scoped run would have taken.
+pub fn release_steps(catalog: &crate::catalog::Catalog, registry: &crate::registry::Registry) -> Vec<Step> {
+	use crate::catalog::CheckClass;
+	use crate::plan::{PlanItem, PlanItemKey};
+	let item = |check: &crate::catalog::Check, variant: &crate::catalog::Variant| PlanItem { key: PlanItemKey { check: check.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() }, kind: check.kind, command: check.command.replace("{arch}", &variant.architecture), reason: String::from("release-required") };
+	let mut items: Vec<PlanItem> = Vec::new();
+	for check in catalog.checks.iter().filter(|check| check.release_required) {
+		if matches!(check.class, CheckClass::Producer | CheckClass::WholeSuite | CheckClass::DevCheck) {
+			continue;
+		}
+		for variant in &check.variants {
+			items.push(item(check, variant));
+		}
+	}
+	let mut steps = steps_for_items(&items, &BTreeMap::new(), registry);
+	// The last build step of each target: what every producer and every guest of that target
+	// cannot start before.
+	let mut build_last: BTreeMap<String, String> = BTreeMap::new();
+	for architecture in crate::registry::ARCHITECTURES {
+		for part in crate::catalog::BUILD_PARTS {
+			let id = scoped_id("build", architecture, &[part.to_string()]);
+			if steps.iter().any(|step| step.id == id) {
+				build_last.insert(architecture.to_string(), id);
+			}
+		}
+	}
+	let mut producer_ids: BTreeMap<String, String> = BTreeMap::new();
+	for check in catalog.checks.iter().filter(|check| check.release_required && check.class == CheckClass::Producer && check.id.starts_with("image.")) {
+		for variant in &check.variants {
+			let id = scoped_id("producer", &variant.architecture, &[check.id.clone()]);
+			producer_ids.insert(check.id.clone(), id.clone());
+			steps.push(Step { id, requires: build_last.get(&variant.architecture).cloned().into_iter().collect(), label: format!("{} (image producer)", check.id), command: item(check, variant).command, keys: vec![item(check, variant).key], note: Some(String::from("built work: the image the gates of this run boot, published into the run as an immutable artifact")), guests: 0 });
+		}
+	}
+	let mut suite_ids: Vec<String> = Vec::new();
+	for check in catalog.checks.iter().filter(|check| check.release_required && check.class == CheckClass::WholeSuite) {
+		for variant in &check.variants {
+			let id = scoped_id("guest", &variant.architecture, &[String::from("all")]);
+			suite_ids.push(id.clone());
+			steps.push(Step { id, requires: build_last.get(&variant.architecture).cloned().into_iter().collect(), label: format!("kernel suite {} (whole)", variant.architecture), command: item(check, variant).command, keys: vec![item(check, variant).key], note: Some(String::from("the whole suite: the guest runner's envelope discharges every kernel test key of this target")), guests: 1 });
+		}
+	}
+	if let Some(lifecycle) = catalog.checks.iter().find(|check| check.release_required && check.id == crate::catalog::DEV_LIFECYCLE_PRODUCER.0) {
+		for variant in &lifecycle.variants {
+			let mut keys = vec![item(lifecycle, variant).key];
+			for check in catalog.checks.iter().filter(|check| check.release_required && check.class == CheckClass::DevCheck) {
+				for dev_variant in &check.variants {
+					keys.push(item(check, dev_variant).key);
+				}
+			}
+			let mut requires: Vec<String> = build_last.get(&variant.architecture).cloned().into_iter().collect();
+			requires.extend(lifecycle.prerequisites.iter().filter_map(|id| producer_ids.get(id).cloned()));
+			steps.push(Step { id: scoped_id("dev", "lifecycle", &[]), requires, label: String::from("development lifecycle (image, boot, readiness, the development checks, teardown)"), command: item(lifecycle, variant).command, keys, note: Some(String::from("one self-contained step owns the development guest: the four development checks run against the instance it brought up and publish their own envelopes")), guests: 1 });
+		}
+	}
+	// The catalog's prerequisite edges - a gate that reads an image requires the step that built
+	// it - and the guest edges the appended steps introduced.
+	for step in &mut steps {
+		if let Some(key) = step.keys.first() {
+			if let Some(check) = catalog.get(&key.check) {
+				step.requires.extend(check.prerequisites.iter().filter_map(|id| producer_ids.get(id).cloned()));
+			}
+		}
+		if step.id.starts_with("gate-after-guest") {
+			step.requires.extend(suite_ids.iter().cloned());
+		}
+		step.requires.sort();
+		step.requires.dedup();
+	}
+	steps
+}
+
+pub fn steps_for_items(items: &[crate::plan::PlanItem], kernel_tests_per_target: &BTreeMap<String, usize>, registry: &crate::registry::Registry) -> Vec<Step> {
 	let mut steps = Vec::new();
 
 	// Each independently runnable build part gets its own duration and budget decision. Preserve
 	// build.sh's producer order within each target; Cargo reuses unchanged dependencies across calls.
 	let mut build_ids: BTreeMap<String, String> = BTreeMap::new();
-	let architectures: BTreeSet<&str> = plan.items.iter().filter(|item| item.kind == CheckKind::Build).map(|item| item.key.architecture.as_str()).collect();
+	let architectures: BTreeSet<&str> = items.iter().filter(|item| item.kind == CheckKind::Build).map(|item| item.key.architecture.as_str()).collect();
 	for architecture in architectures {
 		for part in crate::catalog::BUILD_PARTS {
-			let Some(item) = plan.items.iter().find(|item| item.kind == CheckKind::Build && item.key.architecture == architecture && item.key.check == format!("build.{part}")) else { continue };
+			let Some(item) = items.iter().find(|item| item.kind == CheckKind::Build && item.key.architecture == architecture && item.key.check == format!("build.{part}")) else { continue };
 			let id = scoped_id("build", architecture, &[part.to_string()]);
 			steps.push(Step { id: id.clone(), requires: build_ids.get(architecture).cloned().into_iter().collect(), label: format!("build {architecture} {part}"), command: item.command.clone(), keys: vec![item.key.clone()], note: None, guests: 0 });
 			build_ids.insert(architecture.to_string(), id);
@@ -217,7 +308,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// Host suites, one per crate per configuration. The configuration is in the command because it
 	// is in the key: for the sixteen crates declaring `shared-image`, the default configuration is
 	// the one that never ships, and running only that one is what this model exists to stop.
-	for item in plan.items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
+	for item in items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
 		let crate_name = item.key.check.strip_prefix("host.").unwrap_or(&item.key.check);
 		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None, guests: 0 });
 	}
@@ -232,7 +323,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// scheduling preference, it is the graph missing.
 	//
 	// The rest stay in front, where they are cheap and catch things early.
-	let gate_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Gate).collect();
+	let gate_items: Vec<&crate::plan::PlanItem> = items.iter().filter(|item| item.kind == CheckKind::Gate).collect();
 	let gate_name = |item: &crate::plan::PlanItem| item.key.check.strip_prefix("gate.").unwrap_or(&item.key.check).to_string();
 	// A GATE THAT STARTS GUESTS AT THE SAME TIME GETS ITS OWN STEP, and says how many.
 	//
@@ -290,7 +381,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		steps.push(Step { id: scoped_id("gate", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: None, guests: 0 });
 	}
 	let gates_after_guest: Vec<&crate::plan::PlanItem> = after_guest;
-	let conformance_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
+	let conformance_items: Vec<&crate::plan::PlanItem> = items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
 	// AND ONE STEP PER CONFORMANCE SUITE, for the reason above and with the same shape:
 	// `check.sh --conformance <one>` is a command, so a suite is a unit the scheduler can order,
 	// time and admit on its own.
@@ -304,7 +395,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// A target receives its exact selected IDs. The planner already accounts for the fixed boot
 	// cost and decides whether selecting the whole target suite is cheaper.
 	let mut kernel_by_arch: BTreeMap<&str, Vec<crate::plan::PlanItemKey>> = BTreeMap::new();
-	for item in plan.items.iter().filter(|item| item.kind == CheckKind::KernelTest) {
+	for item in items.iter().filter(|item| item.kind == CheckKind::KernelTest) {
 		kernel_by_arch.entry(&item.key.architecture).or_default().push(item.key.clone());
 	}
 	for (architecture, selected) in &kernel_by_arch {
@@ -342,7 +433,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// in a driver plan could never acquire a cost however many times it ran. Both states are catalog
 	// checks now, chosen by the planner, so `--plan` shows them, the estimator can price them and the
 	// recorder has a key to file against. What is left here is emitting what the plan decided.
-	for item in plan.items.iter().filter(|item| item.kind == CheckKind::GuestFallback) {
+	for item in items.iter().filter(|item| item.kind == CheckKind::GuestFallback) {
 		let architecture = item.key.architecture.as_str();
 		let (label, note) = if item.key.check == "guest.whole-suite" { (format!("kernel suite {architecture} (unenumerated)"), String::from("the model could not enumerate this target's tests, so the whole suite runs and is recorded against one aggregate key")) } else { (format!("boot check {architecture}"), String::from("this target is booted and no test selected it, so it runs a named boot check rather than everything or nothing")) };
 		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note), guests: 1 });
@@ -360,7 +451,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// Development checks mutate the same persistent instance, so each waits for its predecessor.
 	// They retain separate keys and timings while independent guest profiles may run in parallel.
 	let mut previous_dev: Option<String> = None;
-	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
+	for item in items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
 		let id = scoped_id("dev", &item.key.check, &[]);
 		steps.push(Step { id: id.clone(), requires: previous_dev.into_iter().collect(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1 });
 		previous_dev = Some(id);

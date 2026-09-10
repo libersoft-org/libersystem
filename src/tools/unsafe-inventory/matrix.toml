@@ -1,0 +1,409 @@
+# The artifact and configuration matrix the unsafe-boundary inventory is taken over.
+#
+# DERIVED FROM THE BUILD, NOT NAMED. Each row records what `build.sh`, `build-shared.sh` and the
+# cargo configurations actually do: the shipping kernel is Cargo's DEV profile (so
+# `debug_assertions` is on in it), static userspace is the dev profile with `development` on for
+# two crates only when LIBER_DEVELOPMENT=1, shared-image userspace is release with the custom
+# target spec, `-Z build-std` and `--no-default-features --features shared-image`, and the shipping
+# WASM component is a release build for `wasm32-unknown-unknown`. The loader rows are shipped code
+# too and are included although the audit's own list does not name them.
+#
+# `cfg` is the set of predicates a row answers true; anything not listed is false in that row, which
+# is the conservative reading and is where a missing predicate is added. `target_dir` is where a
+# build of the row leaves `OUT_DIR` files, read for generated code.
+
+exclude_crates = []
+
+# --- the kernel, one row per architecture ---------------------------------------------------
+
+[[row]]
+id = "kernel-x86_64"
+kind = "shipping"
+description = "the shipping kernel on x86_64: dev profile, build-std, static relocation model"
+roots = [{ manifest = "src/kernel/Cargo.toml", package = "kernel" }]
+target = "x86_64-unknown-none"
+profile = "dev"
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static"]
+cfg = [
+	'target_arch = "x86_64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+	'panic = "abort"',
+]
+target_dirs = [".build/cargo/kernel"]
+
+[[row]]
+id = "kernel-aarch64"
+kind = "shipping"
+description = "the shipping kernel on AArch64: dev profile, build-std, static, no-pie"
+roots = [{ manifest = "src/kernel/Cargo.toml", package = "kernel" }]
+target = "aarch64-unknown-none"
+profile = "dev"
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie"]
+cfg = [
+	'target_arch = "aarch64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+	'panic = "abort"',
+]
+target_dirs = [".build/cargo/kernel"]
+
+[[row]]
+id = "kernel-riscv64"
+kind = "shipping"
+description = "the shipping kernel on RISC-V: dev profile, build-std, static, medium code model"
+roots = [{ manifest = "src/kernel/Cargo.toml", package = "kernel" }]
+target = "riscv64gc-unknown-none-elf"
+profile = "dev"
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-no-pie", "-C", "code-model=medium"]
+cfg = [
+	'target_arch = "riscv64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+	'panic = "abort"',
+]
+target_dirs = [".build/cargo/kernel"]
+
+# --- static userspace: the eighteen statically linked programs' crates, dev profile -----------
+
+[[row]]
+id = "static-user-x86_64"
+kind = "shipping"
+description = "static userspace on x86_64: system_manager, services, storage, drivers - dev profile, default features"
+roots = [
+	{ manifest = "src/user/services/system_manager/Cargo.toml", package = "system_manager" },
+	{ manifest = "src/user/services/core/Cargo.toml", package = "services" },
+	{ manifest = "src/user/services/storage/Cargo.toml", package = "storage" },
+	{ manifest = "src/user/drivers/core/Cargo.toml", package = "drivers" },
+]
+target = "src/user/x86_64-unknown-none.json"
+profile = "dev"
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static"]
+cfg = [
+	'target_arch = "x86_64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+]
+target_dirs = [".build/cargo/user"]
+
+[[row]]
+id = "static-user-aarch64"
+kind = "shipping"
+description = "static userspace on AArch64"
+roots = [
+	{ manifest = "src/user/services/system_manager/Cargo.toml", package = "system_manager" },
+	{ manifest = "src/user/services/core/Cargo.toml", package = "services" },
+	{ manifest = "src/user/services/storage/Cargo.toml", package = "storage" },
+	{ manifest = "src/user/drivers/core/Cargo.toml", package = "drivers" },
+]
+target = "aarch64-unknown-none"
+profile = "dev"
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static"]
+cfg = [
+	'target_arch = "aarch64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+]
+target_dirs = [".build/cargo/user"]
+
+[[row]]
+id = "static-user-riscv64"
+kind = "shipping"
+description = "static userspace on RISC-V"
+roots = [
+	{ manifest = "src/user/services/system_manager/Cargo.toml", package = "system_manager" },
+	{ manifest = "src/user/services/core/Cargo.toml", package = "services" },
+	{ manifest = "src/user/services/storage/Cargo.toml", package = "storage" },
+	{ manifest = "src/user/drivers/core/Cargo.toml", package = "drivers" },
+]
+target = "riscv64gc-unknown-none-elf"
+profile = "dev"
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=medium"]
+cfg = [
+	'target_arch = "riscv64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+]
+target_dirs = [".build/cargo/user"]
+
+# --- the development-only closure: services and drivers with `development` on ----------------
+
+[[row]]
+id = "development-user-x86_64"
+kind = "development"
+description = "the development configuration of services and drivers (LIBER_DEVELOPMENT=1) on x86_64"
+roots = [
+	{ manifest = "src/user/services/core/Cargo.toml", package = "services" },
+	{ manifest = "src/user/drivers/core/Cargo.toml", package = "drivers" },
+]
+target = "src/user/x86_64-unknown-none.json"
+profile = "dev"
+features = ["development"]
+build_std = ["core", "compiler_builtins", "alloc"]
+rustflags = ["-C", "relocation-model=static"]
+env = { LIBER_DEVELOPMENT = "1" }
+cfg = [
+	'target_arch = "x86_64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+	'feature = "development"',
+]
+target_dirs = [".build/cargo/user"]
+
+# --- shared-image userspace: every staged library and every dynamically linked program --------
+
+[[row]]
+id = "shared-image-x86_64"
+kind = "shipping"
+description = "shared-image userspace on x86_64: release, custom target, build-std, PIC, no default features"
+manifest_roots = { manifest = "src/user/services/manifest.toml", libraries = true, programs = "dynamic" }
+target = "src/user/x86_64-unknown-none.json"
+profile = "release"
+# per-root features come from the manifest rows (libraries) and `shared-image` (dynamic programs)
+no_default_features = true
+build_std = ["core", "alloc", "compiler_builtins"]
+rustflags = ["-C", "relocation-model=pic"]
+cfg = [
+	'target_arch = "x86_64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'feature = "shared-image"',
+]
+target_dirs = [
+	".build/cargo/image-x86_64-unknown-none",
+	".build/cargo/provider-x86_64-unknown-none",
+]
+
+[[row]]
+id = "shared-image-aarch64"
+kind = "shipping"
+description = "shared-image userspace on AArch64"
+manifest_roots = { manifest = "src/user/services/manifest.toml", libraries = true, programs = "dynamic" }
+target = "aarch64-unknown-none"
+profile = "release"
+# per-root features come from the manifest rows (libraries) and `shared-image` (dynamic programs)
+no_default_features = true
+build_std = ["core", "alloc", "compiler_builtins"]
+rustflags = ["-C", "relocation-model=pic"]
+cfg = [
+	'target_arch = "aarch64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'feature = "shared-image"',
+]
+target_dirs = [
+	".build/cargo/image-aarch64-unknown-none",
+	".build/cargo/provider-aarch64-unknown-none",
+]
+
+[[row]]
+id = "shared-image-riscv64"
+kind = "shipping"
+description = "shared-image userspace on RISC-V"
+manifest_roots = { manifest = "src/user/services/manifest.toml", libraries = true, programs = "dynamic" }
+target = "riscv64gc-unknown-none-elf"
+profile = "release"
+# per-root features come from the manifest rows (libraries) and `shared-image` (dynamic programs)
+no_default_features = true
+build_std = ["core", "alloc", "compiler_builtins"]
+rustflags = ["-C", "relocation-model=pic", "-C", "code-model=medium"]
+cfg = [
+	'target_arch = "riscv64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'feature = "shared-image"',
+]
+target_dirs = [
+	".build/cargo/image-riscv64gc-unknown-none-elf",
+	".build/cargo/provider-riscv64gc-unknown-none-elf",
+]
+
+# --- the shipped WASM component and its SDK closure, and the development diagnostics build ----
+
+[[row]]
+id = "wasm-component"
+kind = "shipping"
+description = "the shipping WASM component (liber_component) with the SDK it links: release, wasm32-unknown-unknown, default features"
+roots = [{ manifest = "src/sdk/Cargo.toml", package = "liber_component" }]
+target = "wasm32-unknown-unknown"
+profile = "release"
+rustflags = ["-C", "link-arg=-zstack-size=65536"]
+cfg = [
+	'target_arch = "wasm32"',
+	'target_os = "unknown"',
+	'target_family = "wasm"',
+	'target_pointer_width = "32"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+]
+target_dirs = [".build/cargo/sdk"]
+
+[[row]]
+id = "wasm-component-dev-diagnostics"
+kind = "development"
+description = "the same component built with liber-sdk/dev-diagnostics - development evidence, a different row"
+roots = [{ manifest = "src/sdk/Cargo.toml", package = "liber_component" }]
+target = "wasm32-unknown-unknown"
+profile = "release"
+features = ["liber-sdk/dev-diagnostics"]
+rustflags = ["-C", "link-arg=-zstack-size=65536"]
+cfg = [
+	'target_arch = "wasm32"',
+	'target_os = "unknown"',
+	'target_family = "wasm"',
+	'target_pointer_width = "32"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'feature = "dev-diagnostics"',
+]
+target_dirs = [".build/cargo/sdk-dev"]
+
+# --- the boot loaders: shipped, and outside the audit's named list; included rather than left --
+
+[[row]]
+id = "loader-x86_64"
+kind = "shipping"
+description = "the UEFI loader on x86_64: dev profile, build-std, the test-trust profile by default"
+roots = [{ manifest = "src/boot/loader/Cargo.toml", package = "loader" }]
+target = "x86_64-unknown-uefi"
+profile = "dev"
+build_std = ["core", "alloc", "compiler_builtins"]
+rustflags = ["--cfg", "curve25519_dalek_backend=\"serial\""]
+cfg = [
+	'target_arch = "x86_64"',
+	'target_os = "uefi"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+]
+target_dirs = [".build/cargo/loader"]
+
+[[row]]
+id = "loader-aarch64"
+kind = "shipping"
+description = "the UEFI loader on AArch64"
+roots = [{ manifest = "src/boot/loader/Cargo.toml", package = "loader" }]
+target = "aarch64-unknown-uefi"
+profile = "dev"
+build_std = ["core", "alloc", "compiler_builtins"]
+cfg = [
+	'target_arch = "aarch64"',
+	'target_os = "uefi"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+]
+target_dirs = [".build/cargo/loader"]
+
+[[row]]
+id = "loader-riscv64"
+kind = "shipping"
+description = "the loader on RISC-V, assembled by build-loader-riscv64.sh from a static PIE for riscv64gc-unknown-none-elf"
+roots = [{ manifest = "src/boot/loader/Cargo.toml", package = "loader" }]
+target = "riscv64gc-unknown-none-elf"
+profile = "dev"
+build_std = ["core", "alloc", "compiler_builtins"]
+cfg = [
+	'target_arch = "riscv64"',
+	'target_os = "none"',
+	'target_pointer_width = "64"',
+	'target_endian = "little"',
+	'target_has_atomic = "64"',
+	'target_has_atomic = "32"',
+	'target_has_atomic = "8"',
+	'target_has_atomic = "16"',
+	'target_has_atomic = "ptr"',
+	'debug_assertions',
+]
+target_dirs = [".build/cargo/loader"]

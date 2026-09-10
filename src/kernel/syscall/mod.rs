@@ -518,7 +518,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		// having one, and answered with nothing the caller could later release the device by.
 		// `SYS_DEVICE_CLAIM` is what replaced it; a caller still issuing the old number gets
 		// `ERR_BAD_SYSCALL`, which is what a call that no longer exists should say.
-		SYS_DEVICE_CLAIM => sys_device_claim(a0, a1, a2),
+		SYS_DEVICE_CLAIM => sys_device_claim(a0, a1, a2, a3),
 		SYS_DEVICE_RELEASE => sys_device_release(a0),
 		SYS_DEVICE_CLAIM_INFO => sys_device_claim_info(a0, a1, a2),
 		SYS_DEVICE_CLAIM_SNAPSHOT => sys_device_claim_snapshot(a0, a1, a2, a3),
@@ -636,6 +636,15 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 			Err(e) => return e,
 		}
 	};
+	// A `none` CLAIM MINTS NO DMA BUFFER. The entry declared that its device never reaches memory on
+	// its own, bus mastering was left off on that word, and a buffer under that claim would be a
+	// DMA path the declaration says does not exist. Refused as a policy answer, not a malformed
+	// request: asking again or asking for less does not change what the entry declared.
+	if let Some(key) = claim
+		&& device::claim_stamp(key).is_some_and(|(_, policy)| u32::from(policy) == abi::DMA_POLICY_NONE)
+	{
+		return ERR_ACCESS_DENIED;
+	}
 	// Under the lifecycle guard, so the buffer joins the creating process's DMA registry before a
 	// teardown can take its snapshot. A buffer created after the orphan pass would never be marked,
 	// and an unmarked buffer's frames go back into circulation while a device may still name them.
@@ -1178,7 +1187,7 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 // ONE OPERATION OR NONE OF IT. Everything that can fail is listed in the order it is attempted, and
 // every refusal past the claim itself releases the claim before returning - a partial success would
 // leave a device nothing can release and nothing can rebind.
-fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
+fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64, entry_ptr: u64) -> i64 {
 	// `privilege` names a DeviceManager. Without it this minted a capability to any device's BAR for
 	// any caller that named an index - see `PrivilegeKind::DeviceManager` for why that is worse than
 	// it sounds on a machine with no IOMMU.
@@ -1192,6 +1201,12 @@ fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
 	if !user_buf_ok(grant_ptr, size) {
 		return ERR_INVALID;
 	}
+	// THE ENTRY THE MANAGER SELECTED, read before anything is taken. Sixty-four NUL-padded bytes,
+	// the manifest's own bound on a program name; what they name is validated by `device::claim`.
+	if !user_buf_ok(entry_ptr, abi::ENTRY_NAME_LEN as u64) {
+		return ERR_INVALID;
+	}
+	let entry: [u8; abi::ENTRY_NAME_LEN] = read_user(entry_ptr);
 	// BOTH HANDLES ARE BOOKED BEFORE EITHER OBJECT EXISTS. `insert_reserved` cannot fail, which is
 	// what makes "the second install fails after the first succeeded" - the case most likely to be
 	// got half right - not a state this code can reach. What CAN fail is the booking, and it fails
@@ -1203,13 +1218,15 @@ fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
 		thread.handles().lock().release_reservation(2);
 		return ERR_INVALID;
 	};
-	let key = match device::claim(index as usize) {
+	let key = match device::claim(index as usize, &entry) {
 		Ok(key) => key,
 		Err(error) => {
 			thread.handles().lock().release_reservation(2);
 			return claim_errno(error);
 		}
 	};
+	// The stamp the claim carries: the entry as validated, and its policy.
+	let (stamped_entry, policy) = device::claim_stamp(key).unwrap_or((entry, abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8));
 	// FROM HERE THE DEVICE IS TAKEN, so every refusal below gives it back.
 	let Some(memory) = DeviceMemory::for_claim(key, bar_phys, bar_len as usize) else {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
@@ -1226,7 +1243,7 @@ fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
 	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(memory as alloc::sync::Arc<dyn KernelObject>))) {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
 	}
-	let Some(claim) = Claim::create(key) else {
+	let Some(claim) = Claim::create(key, stamped_entry, policy) else {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
 	};
 	let memory_handle = thread.handles().lock().insert_reserved(memory_capability);
@@ -1235,7 +1252,7 @@ fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
 	// release off exactly when the machine most needs it. WAIT, because the terminal result of a
 	// release arrives on it; MANAGE, because ending the claim is what it is for.
 	let claim_handle = thread.handles().lock().insert_reserved(Capability::new(claim, Rights::READ | Rights::WAIT | Rights::MANAGE));
-	let grant = abi::ClaimGrant { key, memory: memory_handle.raw(), claim: claim_handle.raw() };
+	let grant = abi::ClaimGrant { key, memory: memory_handle.raw(), claim: claim_handle.raw(), entry: stamped_entry, policy: u32::from(policy), _pad: 0 };
 	if let Err(error) = write_user(grant_ptr, grant) {
 		// THE CALLER NEVER LEARNED THE NAME OF ANY OF THIS, so none of it may survive. Closing the
 		// claim handle is what releases the device - its `Drop` is the forced release - and the
@@ -1345,7 +1362,7 @@ fn sys_device_claim_info(claim_handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		Some(code) => code,
 		None => device::claim_state(key.device_index as usize).map_or(abi::CLAIM_STATE_FREE, |state| state.code()),
 	};
-	let info = abi::ClaimInfo { key, state, settled: u32::from(claim.is_settled()) };
+	let info = abi::ClaimInfo { key, state, settled: u32::from(claim.is_settled()), entry: claim.entry(), policy: u32::from(claim.policy()), _pad: 0 };
 	if let Err(error) = write_user(buf_ptr, info) {
 		return error;
 	}
@@ -2144,10 +2161,22 @@ fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
 // same right signalling one of them needs - so a group cannot be assembled out of processes
 // the caller could not already signal individually. Membership is sealed here: there is no
 // join, which is how "which processes does this reach" stays answerable from the handle.
+// A GROUP CREATION THE TEST KERNEL CAN MAKE FAIL ONCE, so the broker's rollback on that failure has
+// a way to be driven: the syscall refuses a group with `ERR_NO_MEMORY` for nothing a caller can
+// arrange from ring 3 - a heap that is short at exactly that moment - and a rollback nothing can
+// reach is a rollback nobody has watched. Armed by a test, consumed by the next call, absent from
+// the shipping kernel.
+#[cfg(test)]
+pub static FAIL_NEXT_GROUP_CREATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 	use crate::object::process_group::{MAX_GROUP_MEMBERS, ProcessGroup};
 	if count == 0 || count as usize > MAX_GROUP_MEMBERS {
 		return ERR_INVALID;
+	}
+	#[cfg(test)]
+	if FAIL_NEXT_GROUP_CREATE.swap(false, core::sync::atomic::Ordering::AcqRel) {
+		return ERR_NO_MEMORY;
 	}
 	let bytes = count * core::mem::size_of::<u64>() as u64;
 	if !user_buf_ok(handles_ptr, bytes) {

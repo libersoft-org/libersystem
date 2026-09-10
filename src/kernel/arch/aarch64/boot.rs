@@ -257,6 +257,25 @@ fn loader_root_selection(arg: u64) -> Option<bootproto::RootSelection> {
 	Some(unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).root)) })
 }
 
+// The loader's DMA-mode words, read the same way the root selection is: physically, before this
+// kernel publishes anything, and only when the boot argument really is a `BootInfo`.
+fn loader_dma_mode(arg: u64) -> Option<(u32, u32)> {
+	if arg == 0 {
+		return None;
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return None;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	let version = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).version)) };
+	if version != bootproto::VERSION {
+		crate::serial_println!("aarch64: the loader's BootInfo is version {version} and this kernel reads {} - its DMA mode is not read", bootproto::VERSION);
+		return Some((bootproto::dma_mode::MODE_ABSENT, bootproto::dma_mode::PROVENANCE_ABSENT));
+	}
+	Some(unsafe { (core::ptr::read_volatile(core::ptr::addr_of!((*bi).dma_mode)), core::ptr::read_volatile(core::ptr::addr_of!((*bi).dma_provenance))) })
+}
+
 // The boot argument, kept so a module can be looked up after the early boot has moved on.
 pub(super) static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -423,6 +442,10 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
 	crate::mem::set_direct_map_extent(BOOT_DIRECT_MAP_EXTENT);
 	super::remember_device_tree(dtb);
+	// THE DMA MODE, BEFORE ANYTHING IS ADMITTED - see `crate::adopt_dma_mode`. Read here, in the
+	// same pass that reads the memory map and the interrupt controller, because `device::init` and
+	// `dma_policy::init` both run long before this port constructs its own `BootInfo`.
+	crate::adopt_dma_mode(loader_dma_mode(arg), unsafe { super::dtb::dma_mode_carrier(dtb) }, unsafe { super::dtb::carries_boot_policy(dtb) });
 	let tree = unsafe { super::dtb::parse(dtb) };
 	let controller = tree.as_ref().map_or(GicProfile::MISSING, GicProfile::from_tree);
 	// A NO-DT BOOT GETS ONE NAMED DESCRIPTOR AND MAKES NO DISCOVERY CLAIM. The AAVMF/U-Boot path
@@ -739,22 +762,12 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", crate::arch::common::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.map_or(0, |cap| cap.offset));
 	}
 
-	// If a virtio-blk device is present, read sector 0 to confirm the driver works.
-	// The device is NOT written here: once userspace is up its virtio_blk driver +
-	// StorageService own the disk (the system volume), so the kernel must not touch
-	// its contents.
-	if let Some(blk) = virtio.iter().find(|v| v.virtio_type as u32 == abi::VIRTIO_TYPE_BLOCK) {
-		if let Some(mut disk) = super::virtio_blk::BlkDevice::init(blk) {
-			let mut buf = [0u8; 512];
-			if disk.read(0, &mut buf) {
-				crate::serial_println!("aarch64: virtio-blk sector 0 read - first16={:02x?}", &buf[..16]);
-			} else {
-				crate::serial_println!("aarch64: virtio-blk sector 0 read - FAILED");
-			}
-		} else {
-			crate::serial_println!("aarch64: virtio-blk init - FAILED");
-		}
-	}
+	// THE BRING-UP BLOCK PROBE IS GONE (P02M0173). This used to initialise the first virtio-blk
+	// function and read sector 0 as a diagnostic - before the device manager, before any IOMMU,
+	// with bus mastering enabled and physical queue addresses in the device. Nothing asserted the
+	// line it printed, and on an enforcing profile it is exactly the untranslated pre-transition
+	// DMA the transition gate refuses. The scan above is the diagnostic that stays: it reads
+	// configuration space and masters nothing.
 
 	// Clocks, and a sample of the seeded generator beside them.
 	//
@@ -1024,7 +1037,10 @@ fn publish_embedded_boot_info() {
 		None => (bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, 0u32),
 	};
 	// ALLOC-OK: boot, as above
-	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_HVC, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] } }));
+	// The adopted mode travels on for reporting; it is not where admission got it - see
+	// `crate::adopt_dma_mode`, which ran before the first device was admitted.
+	let (dma_mode, dma_provenance) = crate::adopted_dma_mode_words();
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_HVC, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] }, dma_mode, dma_provenance }));
 	crate::publish_boot_info(bi);
 }
 

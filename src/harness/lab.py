@@ -193,10 +193,10 @@ def stop_child_group(child, grace=5):
 			continue
 
 
-def run_command(displays):
+def run_command(displays, image=None):
 	if not os.path.exists(RUN_SH):
 		die(f'{RUN_SH} is missing - the lab boots the system through it')
-	command = [RUN_SH]
+	command = [RUN_SH, '--image', image or os.path.join(BUILD_ROOT, 'boot', 'libersystem-dev.iso')]
 	if displays:
 		command += ['--display', ','.join(displays)]
 	return command
@@ -218,19 +218,28 @@ def image_command(strip=None):
 	# The persistent and interactive lab guests boot only the ISO. image.sh performs the required
 	# x86_64 build first, so this is the complete pre-boot production step without also creating the
 	# raw and QCOW2 outputs that an interactive run does not use.
-	command = [IMAGE_SH, '--format', 'iso']
+	# THE DEVELOPMENT IMAGE IS SIGNED WITH NO DMA MODE (`harness`), so the same image boots the
+	# default translated machine and the `--no-iommu` one, taking the mode from the harness carrier
+	# each time. It is written as `libersystem-dev.iso`; the shipping images keep their names.
+	command = [IMAGE_SH, '--format', 'iso', '--dma-mode', 'harness']
 	if strip is not None:
 		command += ['--strip', strip]
 	return command
 
 
 BUILD = os.path.join(BUILD_ROOT, 'boot')
+# WHERE THE DEVELOPMENT INSTANCE'S STATE LIVES. The tree's `.build/boot` for a person's persistent
+# instance; a run-private directory when `LIBER_DEV_STATE` names one, which is how the lifecycle
+# gate brings up an instance of its own - lock, sockets, logs, boot record and the immutable copy of
+# the image it boots all under that directory - without depending on, or disturbing, a guest
+# somebody left running. The runner reads the same variable for its side of the boundary.
+DEV_STATE = os.environ.get('LIBER_DEV_STATE') or BUILD
 SERIAL_SOCK = os.path.join(BUILD, 'lab-serial.sock')
 CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
 SERIAL_LOG = os.path.join(BUILD, 'lab-serial.log')
 QEMU_LOG = os.path.join(BUILD, 'lab-qemu.log')
-MON_SOCK = os.path.join(BUILD, 'qemu-monitor.sock')
-QMP_SOCK = os.path.join(BUILD, 'qemu-qmp.sock')
+MON_SOCK = os.path.join(DEV_STATE, 'qemu-monitor.sock')
+QMP_SOCK = os.path.join(DEV_STATE, 'qemu-qmp.sock')
 
 # The monitor and QMP endpoints in use. The persistent instance's by default; a cold run points
 # them at the guest it started, alongside the control channel and the console log. All four move
@@ -259,16 +268,16 @@ USB_IMG = os.path.join(BUILD, 'usb-media.img')
 # The persistent development instance keeps its own serial socket, control socket and log
 # so an ad-hoc `lab boot` debugging session never steals its console. The monitor and QMP
 # sockets above stay shared, keeping their existing owners.
-DEV_LOCK = os.path.join(BUILD, 'dev-instance.lock')
-DEV_SERIAL_SOCK = os.path.join(BUILD, 'dev-serial.sock')
-DEV_CTL_SOCK = os.path.join(BUILD, 'dev-ctl.sock')
-DEV_SERIAL_LOG = os.path.join(BUILD, 'dev-serial.log')
-DEV_QEMU_LOG = os.path.join(BUILD, 'dev-qemu.log')
-DEV_CONSOLE_SOCK = os.path.join(BUILD, 'dev-console.sock')
+DEV_LOCK = os.path.join(DEV_STATE, 'dev-instance.lock')
+DEV_SERIAL_SOCK = os.path.join(DEV_STATE, 'dev-serial.sock')
+DEV_CTL_SOCK = os.path.join(DEV_STATE, 'dev-ctl.sock')
+DEV_SERIAL_LOG = os.path.join(DEV_STATE, 'dev-serial.log')
+DEV_QEMU_LOG = os.path.join(DEV_STATE, 'dev-qemu.log')
+DEV_CONSOLE_SOCK = os.path.join(DEV_STATE, 'dev-console.sock')
 # The control channel is the second virtio-serial device, not the console. QEMU listens
 # here and the guest's dev-channel driver holds the other end; nothing tees or logs it,
 # because it carries framed requests rather than terminal output.
-DEV_CHANNEL_SOCK = os.path.join(BUILD, 'dev-channel.sock')
+DEV_CHANNEL_SOCK = os.path.join(DEV_STATE, 'dev-channel.sock')
 
 # The development instance's sockets are its whole boundary: the control channel publishes
 # executable code into a running guest, and the console is a terminal on it. They are created
@@ -723,7 +732,7 @@ INSTANCE_INPUTS = (
 	('kernel', ['src/kernel'], ['.build/cargo/kernel/x86_64-unknown-none/debug/kernel']),
 	('loader', ['src/boot/loader'], ['.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi']),
 	('packages', [], ['.build/boot/init-x86_64.pkg', '.build/boot/volume-x86_64.pkg']),
-	('image', [], ['.build/boot/libersystem.iso', 'src/harness/mkimage.sh']),
+	('image', [], ['.build/boot/libersystem-dev.iso', 'src/harness/mkimage.sh']),
 	('topology', [], ['src/harness/qemu-run.sh']),
 	# THE CLASSES THAT WERE MISSING, and each of them can change what a guest is running while
 	# every fingerprint above stays equal.
@@ -782,6 +791,14 @@ def digest_tree(root, digest):
 
 # Content rather than timestamps: a rebuild that produces identical bytes must not read as
 # a change, or every status would claim the instance is stale.
+def file_sha256(path):
+	digest = hashlib.sha256()
+	with open(path, 'rb') as handle:
+		for chunk in iter(lambda: handle.read(1 << 20), b''):
+			digest.update(chunk)
+	return digest.hexdigest()
+
+
 def instance_inputs():
 	fingerprint = {}
 	for name, roots, files in INSTANCE_INPUTS:
@@ -861,7 +878,7 @@ def dev_identity_read():
 # either. KEYED TO THE LOCK'S INODE: the lock is created once per instance and unlinked by
 # `dev-down`, so a sidecar naming a different inode belongs to an instance that is gone, and reading
 # it would bind this session to a boot generation from a previous guest.
-DEV_BOOT_RECORD = os.path.join(BUILD, 'dev-instance.boot')
+DEV_BOOT_RECORD = os.path.join(DEV_STATE, 'dev-instance.boot')
 
 # ONE SCENARIO RUN AT A TIME, PER INSTANCE.
 #
@@ -875,7 +892,7 @@ DEV_BOOT_RECORD = os.path.join(BUILD, 'dev-instance.boot')
 # An flock, so it is released by the kernel when the holder dies: a killed run does not leave a
 # lease to break by hand, and "is somebody running scenarios" is answered by asking the lock rather
 # than by trusting a file to have been cleaned up.
-DEV_SCENARIO_LEASE = os.path.join(BUILD, 'dev-scenario.lease')
+DEV_SCENARIO_LEASE = os.path.join(DEV_STATE, 'dev-scenario.lease')
 
 
 @contextlib.contextmanager
@@ -1134,7 +1151,11 @@ def cmd_dev_up(args):
 	# the lock taken above is the one its ad-hoc-guest guard tests, and it is held across the runner
 	# started below - so without the marker the instance's own boot was refused by its own lock. See
 	# the guard for the reproduction.
-	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1', LIBER_DEV_INSTANCE_BRINGUP='1')
+	# `LIBER_RUN_MODE=development` is the development row of the DMA-mode matrix: the instance boots
+	# THROUGH `run.sh`, which sets `public` only when the mode is unset, so this is where the row is
+	# decided - the harness then writes `enforcing-required` on the default x86_64 machine, which
+	# has a controller, and `no-iommu` under `--no-iommu`.
+	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1', LIBER_DEV_INSTANCE_BRINGUP='1', LIBER_RUN_MODE='development')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
 	# THE IMAGE BUILD IS A STEP OF ITS OWN, because the runner no longer performs one.
 	#
@@ -1158,7 +1179,20 @@ def cmd_dev_up(args):
 	if build.returncode != 0:
 		os.close(lock_fd)
 		die(f'the development image build failed (see {DEV_QEMU_LOG})')
-	guest = subprocess.Popen(run_command(displays), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	# THE BOOT ARTIFACT, BY DIGEST. Every development result records which image its guest booted,
+	# and a run-private instance boots an IMMUTABLE COPY of it under its own state directory rather
+	# than the tree's `.build/boot` file, which the next image build replaces.
+	image = os.path.join(BUILD_ROOT, 'boot', 'libersystem-dev.iso')
+	if os.environ.get('LIBER_DEV_STATE'):
+		private = os.path.join(DEV_STATE, 'libersystem-dev.iso')
+		temporary = f'{private}.{os.getpid()}.tmp'
+		shutil.copyfile(image, temporary)
+		os.chmod(temporary, 0o444)
+		os.replace(temporary, private)
+		image = private
+	boot_artifact = {'path': image, 'sha256': file_sha256(image)}
+	print(f'lab: boot artifact sha256={boot_artifact["sha256"]} ({image})')
+	guest = subprocess.Popen(run_command(displays, image), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
 	record_lab_guest(guest)
 	qemu_deadline = time.time() + 60
 	while not dev_guest_qemu(guest.pid):
@@ -1200,6 +1234,7 @@ def cmd_dev_up(args):
 		# Taken after the guest booted, so it describes what this instance is actually
 		# running. A reattach deliberately keeps it: the broker changed, the guest did not.
 		'inputs': instance_inputs(),
+		'boot_artifact': boot_artifact,
 	})
 	os.close(lock_fd)
 	time.sleep(0.2)
@@ -1221,7 +1256,7 @@ def cmd_dev_up(args):
 	# The scenario runner reads it to tell a first run's first-touch residency, which is memory
 	# in use, from a repeat run's loss, which is not.
 	try:
-		os.remove(os.path.join(BUILD, 'dev-scenarios-seen'))
+		os.remove(os.path.join(DEV_STATE, 'dev-scenarios-seen'))
 	except OSError:
 		pass
 	profile = 'development' if b'boot profile: development' in strip_ansi(reply.data) or dev_profile_logged() else 'not reported'
@@ -2927,7 +2962,7 @@ def cmd_scenario_cold(args):
 	# frames out of circulation for good. The device-tree targets already cap themselves at 8; this is
 	# the same decision for the one that does not. Four, like the test profile: a driven guest is for
 	# scenarios, and a core count is not what they measure. An explicit SMP still wins.
-	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}', SMP=os.environ.get('SMP', '4'))
+	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}', SMP=os.environ.get('SMP', '4'), LIBER_RUN_MODE='development')
 	# UEFI ON THE DEVICE-TREE TARGETS, because a direct boot cannot carry what a driven guest needs.
 	#
 	# `-kernel` on `virt` has no module hand-off: the machine takes one blob, so a direct boot gets
@@ -3035,7 +3070,7 @@ def cmd_scenario_cold(args):
 # The lab starts its guest with `start_new_session=True`, so it has a process group of its own.
 # Recording that group at launch and killing it - after checking the group still holds a QEMU - is
 # precise, needs no QEMU flag, and cannot reach a process the lab did not start.
-LAB_PGIDFILE = os.path.join(BUILD, 'lab-guest.pgid')
+LAB_PGIDFILE = os.path.join(DEV_STATE, 'lab-guest.pgid')
 
 
 def record_lab_guest(process):

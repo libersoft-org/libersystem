@@ -172,11 +172,11 @@ or preventing further development of `v1`.
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [x] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
-- [~] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a NON-COMPLETABLE INDEX, never ticked from this list and counted in no phase's completion: a cross-phase umbrella of driver candidates plus prerequisites, not a Phase-2 gate. The `[~]` marker overstates it - this repository defines `[~]` as an ordinary open state - and the index owns the bounded tooling change that gives it a state of its own. Each item names its specification and a REFERENCE IMPLEMENTATION WITH ITS PERMITTED USE, which for GPL and LGPL rows is observation only and never adaptation; four items turn out to need an AML interpreter rather than hardware; the only start that creates no shared contract is virtio-rng
+- [i] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a NON-COMPLETABLE INDEX, never ticked from this list and counted in no phase's completion: a cross-phase umbrella of driver candidates plus prerequisites, not a Phase-2 gate. `[i]` is the index state the milestone-index gate now knows for exactly this kind of row - title-checked, never counted open, never tickable - and it replaced the `[~]` that this repository defines as an ordinary open state. Each item names its specification and a REFERENCE IMPLEMENTATION WITH ITS PERMITTED USE, which for GPL and LGPL rows is observation only and never adaptation; four items turn out to need an AML interpreter rather than hardware; the only start that creates no shared contract is virtio-rng
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
-- [~] [P02M0103 - The graphics rendering foundation](P02M0103.md) - PHASE-4 FUTURE VISION, not a Phase-2 gate and not completable from this list: activated part by part after the server phase and by explicit approval, with only `s`, `a-common` and `b`+`c` approvable as cross-phase foundations; renamed because text, pointer, touch, the compositor and the application platform are all elsewhere
+- [i] [P02M0103 - The graphics rendering foundation](P02M0103.md) - PHASE-4 FUTURE VISION, not a Phase-2 gate and not completable from this list, carried as an `[i]` reference row for the same reason as the driver index: activated part by part after the server phase and by explicit approval, with only `s`, `a-common` and `b`+`c` approvable as cross-phase foundations; renamed because text, pointer, touch, the compositor and the application platform are all elsewhere
 - [x] [P02M0104 - Incremental development and persistent QEMU test loop](P02M0104.md)
 - [ ] [P02M0105 - Locales: language, region, time zone, keyboard and formats](P02M0105.md)
 - [ ] [P02M0106 - Identity: accounts, authentication and per-user authority](P02M0106.md)
@@ -242,14 +242,15 @@ or preventing further development of `v1`.
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
 - [x] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md)
 - [x] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md)
-- [ ] [P02M0169 - Three bounded correctness debts: prepared launches, LSIDL rights and scheduler truth](P02M0169.md)
-- [ ] [P02M0170 - Verification evidence belongs to one revision and one immutable test artifact](P02M0170.md)
-- [ ] [P02M0171 - A signed release can still be old: enforce a monotonic boot floor](P02M0171.md)
+- [x] [P02M0169 - Three bounded correctness debts: prepared launches, LSIDL rights and scheduler truth](P02M0169.md) - complete 2026-09-09: the exhaustive grant vocabulary, one rollback and one recovery owner per launch, the pre-commit group seal, the effect-observing fault cohort, the LSIDL rights validation, and the scheduler prose
+- [x] [P02M0170 - Verification evidence belongs to one revision and one immutable test artifact](P02M0170.md)
+- [x] [P02M0171 - A signed release can still be old: enforce a monotonic boot floor](P02M0171.md) - complete 2026-09-09: the `rollback-enforcing` loader profile, the signed generation and purpose latched across a boot, the two-slot firmware floor with an ordered ceremony, and the persistent-store x86_64 OVMF gate
 - [ ] [P02M0172 - DMA isolation policy is registry data, not a kernel device-type list](P02M0172.md)
 - [ ] [P02M0173 - Virtio-IOMMU enforces the AArch64 and RISC-V QEMU profiles](P02M0173.md)
 - [ ] [P02M0174 - IPv6 at layer three: addressing, ICMPv6 and neighbour discovery](P02M0174.md)
 - [ ] [P02M0175 - Dual-stack transports, DNS and NetworkService](P02M0175.md)
-- [ ] [P02M0176 - Audit unsafe boundaries in the kernel and userspace before changing them](P02M0176.md)
+- [x] [P02M0176 - Audit unsafe boundaries in the kernel and userspace before changing them](P02M0176.md) - complete 2026-09-09: the derived fifteen-row matrix, the `unsafe-inventory` tool with completeness fixtures, 5732 classified sites, the report, and the corrective follow-up P02M0178
+- [ ] [P02M0178 - Narrow the userspace runtime's unsafe surface to the contracts callers actually hold](P02M0178.md) - the corrective follow-up the unsafe-boundary audit routed: safe signatures for the propagated syscall wrappers, the propagation removed downstream, and the kernel's `read_user` bounded
 - [x] [P02M0177 - A change is verified in proportion to itself, and integration bugs are catchable without a guest](P02M0177.md)
 
 ### Definition of done (phase 2)

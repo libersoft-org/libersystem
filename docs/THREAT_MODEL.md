@@ -129,6 +129,20 @@ kernel's own mappings bound where the DRIVER may reach; they do not bound where 
 DEVICE may reach. That state is not silent: every device running that way is listed
 by name in the boot report under `dma: DEGRADED ISOLATION`.
 
+**Which of the two a boot is in is STATED, not inferred from the bus.** The boot carries a
+DMA mode - `enforcing-required`, or the explicit degraded `no-iommu` - from exactly one
+producer per entry path: a signed field in every selected manifest on a public x86_64
+boot, and the named harness on every test, development and device-tree boot, with the
+provenance recorded beside the value. Admission compares the machine with the statement:
+an enforcing mode whose controller is absent or failed refuses every DMA-capable claim,
+a degraded mode with a controller on the bus is refused as a mismatch rather than
+reclassified, and a boot with no mode refuses every claim. Each driver's manifest row
+declares whether it masters the bus at all (`none`), requires translation
+(`iommu-required`) or is the explicit trusted exception (`trusted-untranslated`), and the
+kernel admits a claim only under an entry the image declares for that device. Removing
+the controller from a machine therefore cannot turn a protected driver into an
+untranslated one: the mode says the machine translates, and the driver is refused.
+
 So a driver holding a DMA-capable device is inside the memory-safety TCB exactly
 when its device is untranslated. Under an enforcing profile it leaves that TCB, and
 what remains trusted is named: the `virtio-iommu` device model, this kernel's backend
@@ -256,10 +270,22 @@ The following are out of scope here and are tracked in the Concept's
   before anything is placed. A source whose signed manifest is present and damaged stops the boot
   rather than falling back. On x86_64 the loader itself is authenticated first, by an OVMF firmware
   with a platform key enrolled, and the gate proves the negative: an unsigned or bit-modified loader
-  does not run at all. What is NOT covered: anti-rollback (a validly signed OLD image is accepted),
-  TPM measurement and attestation, physical firmware enrollment and NVRAM behaviour, and production
-  key custody, rotation and revocation - the format has a key-id boundary, the operations behind it
-  are not this repository's to prove;
+  does not run at all. FRESHNESS IS ENFORCED BY ONE NAMED BUILD: a loader built with the
+  `rollback-enforcing` trust profile keeps the highest security generation it has accepted in two
+  independently validated firmware variables under this product's own vendor GUID, refuses a
+  correctly signed release below it, and advances the floor - both slots written and read back -
+  only after the whole selected artifact set is verified. The generation and the purpose (ordinary
+  boot or recovery) are signed manifest fields, latched across every manifest of one boot, and a
+  root may sign only for the purposes it is scoped to. The enforcing loader is signed for the
+  firmware by a signer of its own, so replacement media cannot offer a current, correctly signed
+  loader that ignores the floor. The attacker this defends against controls persistent boot media
+  and NOT firmware NVRAM administration: deleting the provisioned marker costs the floor's
+  availability (the machine boots as unprovisioned and refuses to advance until the ceremony runs
+  again), never its integrity. What is NOT covered: the non-enforcing profiles (`test-trust` and the
+  plain external release, which keep the per-run fresh variables image), anti-rollback on AArch64 and
+  RISC-V firmware, TPM measurement and attestation, physical firmware enrollment, and production key
+  custody, rotation and revocation - the format has a key-id boundary, the operations behind it are
+  not this repository's to prove;
 - fine-grained portals (mic/camera/screenshot) and network policy granularity;
 - side-channel and timing attacks (Spectre-class microarchitectural leaks);
 - physical attacks (cold boot, bus probing) and encrypted user volumes;

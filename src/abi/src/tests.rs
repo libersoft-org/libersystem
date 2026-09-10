@@ -721,10 +721,13 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		generation => 8,
 	);
 	assert_layout!(
-		covered, ClaimInfo, 24, 8,
+		covered, ClaimInfo, 96, 8,
 		key => 0,
 		state => 16,
 		settled => 20,
+		entry => 24,
+		policy => 88,
+		_pad => 92,
 	);
 	// Read by device INDEX rather than through a claim handle, so it carries no key: a caller that
 	// had one would not need this call.
@@ -751,10 +754,13 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		iommu_faults => 40,
 	);
 	assert_layout!(
-		covered, ClaimGrant, 32, 8,
+		covered, ClaimGrant, 104, 8,
 		key => 0,
 		memory => 16,
 		claim => 24,
+		entry => 32,
+		policy => 96,
+		_pad => 100,
 	);
 	// The fourth argument of `SYS_CHANNEL_SEND_ATTENUATED`, read out of the caller's memory because
 	// the syscall ABI has no fifth register to put it in.

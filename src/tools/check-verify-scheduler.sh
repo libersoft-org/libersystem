@@ -168,6 +168,8 @@ learning="$work/learning"
 mkdir -p "$learning/src/tools" "$learning/bin"
 cp "$repo/verify.sh" "$repo/lib.sh" "$learning/"
 cp "$repo/src/tools/result-logs.sh" "$learning/src/tools/"
+# The evidence helper verify.sh sources; a no-op here, since no run is collecting.
+cp "$repo/src/tools/evidence.sh" "$learning/src/tools/"
 cat >"$learning/bin/cargo" <<'RECORDER'
 #!/usr/bin/env bash
 set -euo pipefail

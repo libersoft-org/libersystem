@@ -212,6 +212,14 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	arch::paging::remove_bootstrap_identity();
 	sched::init();
 	device::init();
+	// THE BOOT'S DMA MODE, FROM THE LOADER'S HAND-OFF, BEFORE POLICY INIT. UEFI admission consumes
+	// the validated `BootInfo` extension and nothing else; on this port the loader relayed the
+	// harness `fw_cfg` input, which reading does not consume, so the kernel revalidates all eight
+	// bytes and requires them to name the hand-off - and refuses a signed hand-off with a `fw_cfg`
+	// record beside it as an independent producer. An absent or invalid hand-off is ABSENT, and
+	// absent refuses every claim; nothing here recovers by reading the input as if this were a
+	// direct boot, because it is not one.
+	adopt_dma_mode_from_loader(bi);
 	// AFTER `device::init` RETURNS, not inside it. The bring-up reads the device table, and
 	// `device::init` is holding that table's lock while it fills it - a spin lock taken twice on one
 	// core is a boot that stops with no message at all, which is exactly what this did.
@@ -224,6 +232,67 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	boot_main();
 
 	arch::halt_loop()
+}
+
+// The x86_64 relay check: the loader's `BootInfo` words against the `fw_cfg` record it relayed.
+#[cfg(target_arch = "x86_64")]
+fn adopt_dma_mode_from_loader(bi: &BootInfo) {
+	let input = arch::dma_mode_carrier();
+	match bootproto::dma_mode::relay_check(bi.dma_mode, bi.dma_provenance, input) {
+		Ok(handoff) => dma_policy::adopt(Some(handoff), "the loader's BootInfo, fw_cfg relay checked"),
+		Err(refusal) => {
+			serial_println!("dma: the loader's hand-off is REFUSED - {}", refusal.message());
+			dma_policy::adopt(None, "the loader's BootInfo");
+		}
+	}
+}
+
+// THE DEVICE-TREE PORTS' ADOPTION, from whichever entry contract this boot arrived by.
+//
+// `loader` is the loader's hand-off when the boot argument was a `BootInfo` - the UEFI entry - and
+// `None` on a direct entry. The two are different producers and the entry path decides which one
+// admission listens to; neither falls back to the other:
+//
+//   UEFI    admission consumes the loader's validated extension. A tree carrying the boot-policy
+//           node beside it is an independent producer and refuses, even if its value agrees; a
+//           missing or invalid extension refuses without reading the tree as a direct boot.
+//   direct  admission consumes the tree's record, validated by the shared codec. There is no
+//           loader to have relayed anything.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) fn adopt_dma_mode(loader: Option<(u32, u32)>, tree: bootproto::dma_mode::Carrier, tree_has_record: bool) {
+	match loader {
+		Some((mode, provenance)) => {
+			if tree_has_record {
+				serial_println!("dma: the loader handed over a DMA mode AND the device tree carries the boot-policy node - two producers, REFUSED");
+				dma_policy::adopt(None, "the loader's BootInfo");
+				return;
+			}
+			match bootproto::dma_mode::Handoff::from_words(mode, provenance) {
+				Some(handoff) => dma_policy::adopt(Some(handoff), "the loader's BootInfo"),
+				None => {
+					serial_println!("dma: the loader's BootInfo carries no valid DMA mode - REFUSED, and the device tree is not consulted on a UEFI entry");
+					dma_policy::adopt(None, "the loader's BootInfo");
+				}
+			}
+		}
+		None => match tree {
+			bootproto::dma_mode::Carrier::Valid(mode) => dma_policy::adopt(Some(bootproto::dma_mode::Handoff::Harness(mode)), "the device tree's boot-policy record"),
+			bootproto::dma_mode::Carrier::Absent => {
+				serial_println!("dma: the device tree carries no boot-policy record - REFUSED");
+				dma_policy::adopt(None, "the device tree");
+			}
+			bootproto::dma_mode::Carrier::Malformed(reason) => {
+				serial_println!("dma: the device tree's boot-policy record is malformed ({reason:?}) - REFUSED, nothing in it is interpreted");
+				dma_policy::adopt(None, "the device tree");
+			}
+		},
+	}
+}
+
+// The DMA-mode words for a kernel-constructed `BootInfo`: what admission adopted, for reporting.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) fn adopted_dma_mode_words() -> (u32, u32) {
+	dma_policy::handoff().map_or((bootproto::dma_mode::MODE_ABSENT, bootproto::dma_mode::PROVENANCE_ABSENT), |handoff| handoff.words())
 }
 
 // Bring up physical frames, paging and the kernel heap from the loader's boot

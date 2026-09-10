@@ -75,6 +75,26 @@ fn validate_impl(file: &File, imports: Option<&HashMap<String, ResolvedSymbol>>)
 		define(&mut names, name, kind, span, &mut errs);
 	}
 
+	// THE ERROR ENUMS THAT CAN SAY `denied`, which is what a generated `@rights` refusal answers with.
+	// A method whose result cannot say it has no honest refusal, so an annotation on it is refused
+	// here rather than generated as the unguarded call it used to become. Local enums by their cases;
+	// imported ones by what the resolver read in the package that declares them.
+	let mut denied_enums: HashSet<String> = HashSet::new();
+	for item in &file.items {
+		if let Item::Enum(e) = item {
+			if e.cases.iter().any(|case| case.name == "denied") {
+				denied_enums.insert(e.name.clone());
+			}
+		}
+	}
+	if let Some(resolved) = imports {
+		for (local, symbol) in resolved {
+			if symbol.contains_denied {
+				denied_enums.insert(local.clone());
+			}
+		}
+	}
+
 	for item in &file.items {
 		match item {
 			Item::Alias(a) => {
@@ -100,7 +120,7 @@ fn validate_impl(file: &File, imports: Option<&HashMap<String, ResolvedSymbol>>)
 			Item::Resource(resource) => check_evolution(resource.evolution, file.package.version, resource.span, &mut errs),
 			Item::Interface(i) => {
 				check_evolution(i.evolution, file.package.version, i.span, &mut errs);
-				check_interface(i, file.package.version, &names, &mut errs);
+				check_interface(i, file.package.version, &names, &denied_enums, &mut errs);
 			}
 		}
 	}
@@ -203,7 +223,7 @@ fn check_flags(f: &Flags, package_version: u32, errs: &mut Vec<Error>) {
 	}
 }
 
-fn check_interface(i: &Interface, package_version: u32, names: &HashMap<String, Kind>, errs: &mut Vec<Error>) {
+fn check_interface(i: &Interface, package_version: u32, names: &HashMap<String, Kind>, denied_enums: &HashSet<String>, errs: &mut Vec<Error>) {
 	let mut seen_names = HashSet::new();
 	let mut used_ops: HashMap<u32, Span> = HashMap::new();
 	for m in &i.methods {
@@ -223,12 +243,7 @@ fn check_interface(i: &Interface, package_version: u32, names: &HashMap<String, 
 			if !seen_params.insert(p.name.as_str()) {
 				errs.push(Error::new(p.span, format!("duplicate parameter `{}` in `{}`", p.name, m.name)));
 			}
-			for r in &p.rights {
-				if !RIGHTS.contains(&r.as_str()) {
-					let suggestion = crate::resolve::suggest(r, RIGHTS.iter().copied());
-					errs.push(Error::new(p.span, format!("unknown right `{r}` in `@rights`{}", suggestion.map(|value| format!("; did you mean `{value}`?")).unwrap_or_default())));
-				}
-			}
+			check_rights(p, &m.ret, &m.name, names, denied_enums, errs);
 			check_type(&p.ty, p.span, names, errs);
 			check_bound(p.bound, &p.ty, p.span, &format!("parameter `{}`", p.name), errs);
 		}
@@ -239,6 +254,69 @@ fn check_interface(i: &Interface, package_version: u32, names: &HashMap<String, 
 		if used_ops.contains_key(r) {
 			errs.push(Error::new(i.span, format!("interface `{}` reserves opcode {r} that is also in use", i.name)));
 		}
+	}
+}
+
+// `@rights` IS A PROMISE THE GENERATOR KEEPS, SO EVERY SHAPE IT CANNOT KEEP IS REFUSED HERE.
+//
+// Generated dispatch guards exactly one shape: a parameter WRITTEN as `handle<resource>`, ahead of a
+// method whose result can answer `denied`, on the ordinary (non-stream) dispatch path. Everything
+// else used to compile and generate an UNGUARDED method while reading in the schema exactly like a
+// guarded one - which is worse than no annotation, because the reader believes the guard is there.
+// The rejected shapes, each for its own reason:
+//   - an option, list, result or record around the handle: the guard would have to recurse, and
+//     recursive authorization is a bigger language than this version has;
+//   - a NAMED ALIAS, local or imported, even where it resolves to a handle: the resolver attaches the
+//     kernel object type to resources and not to aliases, so an accepted alias would fall back to
+//     `NO_REQUIRED_TYPE` and weaken the object-type half of the guard silently;
+//   - a method whose result cannot say `denied`: there is no honest refusal to answer with;
+//   - a method that returns a stream: the ordinary dispatch loop skips those and the `<method>_open`
+//     path calls the service with no guard at all;
+//   - `@rights()`, `@rights(1)` and a repeated right: an annotation that was written and resolved to
+//     nothing is not "no annotation", it is a guard the schema asked for and did not spell.
+fn check_rights(p: &Param, ret: &Type, method: &str, names: &HashMap<String, Kind>, denied_enums: &HashSet<String>, errs: &mut Vec<Error>) {
+	if !p.rights_declared {
+		return;
+	}
+	if p.rights_non_names > 0 {
+		errs.push(Error::new(p.span, format!("`@rights` on parameter `{}` names a number; rights are names (`read`, `send`, `manage`, ...)", p.name)));
+	}
+	if p.rights.is_empty() && p.rights_non_names == 0 {
+		errs.push(Error::new(p.span, format!("`@rights()` on parameter `{}` names no right; a parameter that is not guarded carries no annotation", p.name)));
+	}
+	let mut seen_rights: HashSet<&str> = HashSet::new();
+	for r in &p.rights {
+		if !RIGHTS.contains(&r.as_str()) {
+			let suggestion = crate::resolve::suggest(r, RIGHTS.iter().copied());
+			errs.push(Error::new(p.span, format!("unknown right `{r}` in `@rights`{}", suggestion.map(|value| format!("; did you mean `{value}`?")).unwrap_or_default())));
+		}
+		if !seen_rights.insert(r.as_str()) {
+			errs.push(Error::new(p.span, format!("`@rights` on parameter `{}` names `{r}` twice", p.name)));
+		}
+	}
+	match &p.ty {
+		// The one accepted shape. Whether the resource exists is `check_type`'s complaint.
+		Type::Handle(_) => {}
+		Type::Named(named) => {
+			let what = match names.get(named) {
+				Some(Kind::Value) | Some(Kind::External) => "a named alias",
+				_ => "a name",
+			};
+			errs.push(Error::new(p.span, format!("`@rights` on parameter `{}`, whose type is {what} (`{named}`) rather than a parameter written as `handle<resource>`; an alias is refused even where it resolves to a handle, because the guard's object-type check comes from the resource and not from the alias", p.name)));
+		}
+		_ => errs.push(Error::new(p.span, format!("`@rights` on parameter `{}`, whose type is not written as `handle<resource>`; an option, a list, a result or a record around a handle is refused rather than left unguarded", p.name))),
+	}
+	// The method-level half, reported once per annotated parameter so the span points at the
+	// annotation that made the promise.
+	let denied_capable = match ret {
+		Type::Result(ok, err) => !matches!(ok.as_ref(), Type::Stream(_)) && matches!(err.as_ref(), Type::Named(n) if denied_enums.contains(n)),
+		_ => false,
+	};
+	let streams = matches!(ret, Type::Stream(_)) || matches!(ret, Type::Result(ok, _) if matches!(ok.as_ref(), Type::Stream(_)));
+	if streams {
+		errs.push(Error::new(p.span, format!("`@rights` on parameter `{}` of `{method}`, which returns a stream; the stream path dispatches out of band and carries no guard, so the annotation is refused rather than ignored", p.name)));
+	} else if !denied_capable {
+		errs.push(Error::new(p.span, format!("`@rights` on parameter `{}` of `{method}`, whose result cannot answer `denied`; a guarded method returns `result<T, E>` where `E` is an error enum with a `denied` case", p.name)));
 	}
 }
 

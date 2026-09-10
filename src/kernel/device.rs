@@ -350,6 +350,13 @@ struct ClaimSlot {
 	// that happens after it can move into it.
 	msi_quarantined_at_claim: usize,
 	mmio_unconfirmed_at_claim: u32,
+	// THE KERNEL'S STAMP ON THIS BINDING: the registry entry it was validated against and that
+	// entry's declared DMA policy. Written at `claim` and read back through the grant and the claim
+	// handle, so the identity the manager named, the one the kernel checked and the one the report
+	// shows are the same 64 bytes. `policy` also decides what the binding may mint: a `none` claim
+	// cannot create a DMA buffer.
+	entry: [u8; abi::ENTRY_NAME_LEN],
+	policy: u8,
 }
 
 // How long a teardown has to confirm before the device is quarantined.
@@ -369,7 +376,18 @@ fn reset_claims(len: usize) {
 	let mut claims = CLAIMS.lock();
 	claims.clear();
 	// ALLOC-OK: sized once at boot from the table just built.
-	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0 });
+	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+}
+
+// The stamp the CURRENT binding of `key`'s device carries: the entry it was validated against and
+// its policy. `None` for a key that is not the current binding.
+pub fn claim_stamp(key: abi::ClaimKey) -> Option<([u8; abi::ENTRY_NAME_LEN], u8)> {
+	let claims = CLAIMS.lock();
+	let slot = claims.get(key.device_index as usize)?;
+	if slot.generation != key.generation || slot.state == ClaimState::Free {
+		return None;
+	}
+	Some((slot.entry, slot.policy))
 }
 
 // What state the device at `index` is in, or None if the index names no device.
@@ -432,7 +450,8 @@ pub fn release_quiesced_if_current(key: abi::ClaimKey) -> Option<(usize, usize)>
 	Some((vectors, frames))
 }
 
-// Take the device at `index`. The FIRST claim succeeds and any other is refused.
+// Take the device at `index`, under the registry entry `entry_name` names. The FIRST claim succeeds
+// and any other is refused.
 //
 // The generation is minted here and it does not wrap: `checked_add` rather than `wrapping_add`, and
 // a slot that runs out is RETIRED for the life of the boot rather than wrapped onto a number a dead
@@ -440,7 +459,11 @@ pub fn release_quiesced_if_current(key: abi::ClaimKey) -> Option<(usize, usize)>
 // wrapped generation makes a stale key valid again, which is the one thing the key exists to
 // prevent. At one claim per microsecond a `u64` lasts about six hundred thousand years, so the
 // branch is unreachable in practice and cheap to be right about.
-pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
+//
+// `entry_name` is the manifest program name of the candidate the manager is attempting, NUL-padded
+// to the ABI field. The kernel validates it - exists, declared for this device, admissible under the
+// boot's DMA mode - and stamps it on the binding; it does not recompute the manager's priority.
+pub fn claim(index: usize, entry_name: &[u8; abi::ENTRY_NAME_LEN]) -> Result<abi::ClaimKey, ClaimError> {
 	let table = DEVICES.lock();
 	let mut claims = CLAIMS.lock();
 	let Some(entry) = table.get(index) else { return Err(ClaimError::NoSuchDevice) };
@@ -459,12 +482,15 @@ pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
 		return Err(ClaimError::Retired);
 	};
 	// THE DMA THREAT MODEL IS DECIDED HERE, at the one moment a device gains the ability to reach
-	// memory on its own. A driver that declared it needs translation does not master the bus without
-	// it - and a refusal is a refusal: there is no fall-back to untranslated DMA, because falling
+	// memory on its own. The entry the manager named is checked against this device and the boot's
+	// mode, and a refusal is a refusal: there is no fall-back to untranslated DMA, because falling
 	// back is the failure the isolation claim names in as many words.
-	if crate::dma_policy::admit(entry.device_type, entry.bus, entry.dev, entry.func) == dma::BindDecision::Refused {
-		return Err(ClaimError::Refused);
-	}
+	let discovered = driver_binding::Discovered { transport: entry.transport, virtio_type: entry.device_type as u32, class: entry.class, subclass: entry.subclass, prog_if: entry.prog_if, vendor: entry.vendor, product: entry.product, bus: entry.bus, dev: entry.dev, func: entry.func };
+	let (admission, policy) = match crate::dma_policy::admit(entry_name, &discovered, entry.device_type) {
+		Ok(admitted) => admitted,
+		Err(_) => return Err(ClaimError::Refused),
+	};
+	let masters = admission != crate::dma_policy::Admission::NonMastering;
 	// ATTACHED BEFORE IT CAN MASTER THE BUS, and refused if the attach does not confirm. The window
 	// between "this device can reach memory" and "this device is translated" is the one place
 	// untranslated DMA could happen under an enforcing profile, and the way to have no such window
@@ -482,7 +508,9 @@ pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
 	// Found by `check.sh --gate qemu-virtio-iommu-x86_64`, which is exactly the profile that can tell
 	// this apart from a device that is merely absent: `endpoint 0xffff could not be probed
 	// (NotMapped) - its reserved regions are unknown, so it is not attached`.
-	if entry.on_bus && crate::iommu::translating() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func, generation) {
+	// A NON-MASTERING CLAIM HAS NO ENDPOINT TO ATTACH: it never masters the bus, so there is nothing
+	// for the controller to translate and no domain to give it.
+	if masters && entry.on_bus && crate::iommu::translating() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func, generation) {
 		if crate::iommu::attachment_quarantined(index) {
 			// No handle was published, but an unanswered ATTACH may still own this endpoint.
 			// Keep the attempted generation visible and prevent a replacement claim.
@@ -492,9 +520,16 @@ pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
 		}
 		return Err(ClaimError::Refused);
 	}
-	bus_master(entry, true);
+	// BUS MASTERING GOES ON ONLY FOR A CLAIM THAT MASTERS. A `none` claim receives its registers and
+	// its interrupts and the bit stays off - which is what makes `none` an enforceable mode rather
+	// than a statement that the driver happens not to ask.
+	if masters {
+		bus_master(entry, true);
+	}
 	slot.state = ClaimState::Claimed;
 	slot.generation = generation;
+	slot.entry = *entry_name;
+	slot.policy = policy;
 	// THE BASELINES THIS BINDING WILL BE JUDGED AGAINST, taken here and not at the release. See
 	// `ClaimSlot::msi_quarantined_at_claim`. `CLAIMS` is held and the MSI registry is taken under it,
 	// which is the order `finish_release` already uses.
@@ -994,7 +1029,7 @@ pub fn add_synthetic_device() -> usize {
 	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
 	// itself - the two are one entry and a table with a device and no slot for it is worse than a
 	// test that could not allocate.
-	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0 });
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
 	index
 }
 

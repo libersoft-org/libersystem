@@ -11,6 +11,32 @@
 pub use fdt::BootInfo;
 use fdt::Fdt;
 
+// THE DIRECT-BOOT DMA-MODE CARRIER, read from the tree this port was handed - before `dma_policy::init`,
+// which is the requirement and not an implementation note: a mode parsed after admission is a mode
+// admission did not use. The record is the frozen eight bytes under this product's own node; the
+// shared codec decides what it says, and a property of any other length is malformed by that codec's
+// rule rather than by this reader's.
+//
+// # Safety
+// `hint` must be 0 or the device-tree pointer the boot path was given.
+pub unsafe fn dma_mode_carrier(hint: u64) -> bootproto::dma_mode::Carrier {
+	let Some(tree) = (unsafe { located(hint) }) else { return bootproto::dma_mode::Carrier::Absent };
+	match tree.boot_policy_record() {
+		None => bootproto::dma_mode::Carrier::Absent,
+		Some(property) if property.len == bootproto::dma_mode::RECORD_LEN => bootproto::dma_mode::Carrier::from_bytes(Some(&property.bytes)),
+		Some(property) => bootproto::dma_mode::Carrier::Malformed(bootproto::dma_mode::Malformed::Length(property.len)),
+	}
+}
+
+// Whether the tree carries the boot-policy node at all - which on a UEFI entry is an INDEPENDENT
+// producer beside the loader's hand-off, and refuses.
+//
+// # Safety
+// `hint` must be 0 or the device-tree pointer the boot path was given.
+pub unsafe fn carries_boot_policy(hint: u64) -> bool {
+	(unsafe { located(hint) }).is_some_and(|tree| tree.boot_policy_record().is_some())
+}
+
 // Fixed address the runner loads the dumped DTB at.
 const QEMU_DTB_ADDR: u64 = 0x4A00_0000;
 

@@ -3607,7 +3607,11 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			return BindStart::CandidateFailed;
 		}
 		let attempts_left = !node.retry_once && may_try_again(&node.incident, node.attempt);
-		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
+		// THE ENTRY THIS ATTEMPT IS ON, NAMED TO THE KERNEL. A fallback candidate carries its own name
+		// and therefore its own DMA policy, rather than inheriting the first matching row's; the
+		// kernel checks that the name is one the image declares for this device and refuses a stale
+		// or mismatched identity by name.
+		let grant: ClaimGrant = match device_claim(node.index, device_privilege, driver_name) {
 			Ok(grant) => grant,
 			Err(errno) => {
 				node.refund_unclaimed_attempt();

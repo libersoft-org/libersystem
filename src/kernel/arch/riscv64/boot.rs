@@ -133,6 +133,25 @@ fn loader_root_selection(arg: u64) -> Option<bootproto::RootSelection> {
 // The boot argument, kept so a module can be looked up after the early boot has moved on.
 static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// The loader's DMA-mode words, read the same way the root selection is: physically, before this
+// kernel publishes anything, and only when the boot argument really is a `BootInfo`.
+fn loader_dma_mode(arg: u64) -> Option<(u32, u32)> {
+	if arg == 0 {
+		return None;
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return None;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	let version = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).version)) };
+	if version != bootproto::VERSION {
+		crate::serial_println!("riscv64: the loader's BootInfo is version {version} and this kernel reads {} - its DMA mode is not read", bootproto::VERSION);
+		return Some((bootproto::dma_mode::MODE_ABSENT, bootproto::dma_mode::PROVENANCE_ABSENT));
+	}
+	Some(unsafe { (core::ptr::read_volatile(core::ptr::addr_of!((*bi).dma_mode)), core::ptr::read_volatile(core::ptr::addr_of!((*bi).dma_provenance))) })
+}
+
 // A named module from the loader's hand-off, translated into the kernel's map.
 //
 // The loader hands over PHYSICAL addresses, because it runs before this kernel builds its map -
@@ -240,6 +259,9 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// frame allocator, and bring up the kernel heap in the higher half.
 	use super::paging;
 	super::remember_device_tree(dtb);
+	// THE DMA MODE, BEFORE ANYTHING IS ADMITTED - see `crate::adopt_dma_mode` and the aarch64
+	// prologue, which does the same at the same point.
+	crate::adopt_dma_mode(loader_dma_mode(arg), unsafe { super::dtb::dma_mode_carrier(dtb) }, unsafe { super::dtb::carries_boot_policy(dtb) });
 	let boot_info = unsafe { super::dtb::parse(dtb) };
 	let mut ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, pcie_ecam, _plic_base, fwcfg_base) = match boot_info {
@@ -701,7 +723,10 @@ fn publish_embedded_boot_info() {
 		None => (bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, 0u32),
 	};
 	// ALLOC-OK: boot, as above
-	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] } }));
+	// The adopted mode travels on for reporting; it is not where admission got it - see
+	// `crate::adopt_dma_mode`, which ran before the first device was admitted.
+	let (dma_mode, dma_provenance) = crate::adopted_dma_mode_words();
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] }, dma_mode, dma_provenance }));
 	crate::publish_boot_info(bi);
 }
 

@@ -68,6 +68,70 @@ CASES = {
         (r"iommu: virtio-iommu is translating", r"iommu: .* attached to domain", r"driver\.virtio-net: online \(", r"network: configured via DHCP"),
         HEALTH_FAILURES, timeout=300, observe=300, health=True,
     ),
+    # THE DMA-MODE ROWS. An enforcing boot admits the driver that requires translation; a degraded
+    # boot refuses it BY NAME AND VALUE and admits the trusted rows into the visible degraded
+    # inventory; a loader that cannot state the mode halts before it loads a kernel; a kernel handed
+    # no mode refuses every claim. `dma-port-*` are the emulated ports' rows, with their own budget.
+    "dma-admits": Case(
+        (r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"driver\.virtio-net: online \(", r"network: configured via DHCP"),
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"REFUSED - the entry declares iommu-required"), timeout=300, observe=120, health=True,
+    ),
+    "dma-degraded": Case(
+        (r"dma: boot DMA mode no-iommu \(harness provenance", r"REFUSED - the entry declares iommu-required and the boot mode is no-iommu", r"dma: DEGRADED ISOLATION", r"driver\.virtio-blk: online \(", r"network: no network provider on this boot - NetworkService is up without a link"),
+        HEALTH_FAILURES + (r"driver\.virtio-net: online \(", r"dma: every bus-mastering device is translated"), timeout=300, observe=120, health=True,
+    ),
+    "dma-signed-admits": Case(
+        (r"loader: DMA mode enforcing-required \(signed", r"dma: boot DMA mode enforcing-required \(signed provenance", r"dma: every bus-mastering device is translated", r"network: configured via DHCP"),
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION",), timeout=300, observe=120, health=True,
+    ),
+    "dma-signed-degraded": Case(
+        (r"loader: DMA mode no-iommu \(signed", r"dma: boot DMA mode no-iommu \(signed provenance", r"REFUSED - the entry declares iommu-required and the boot mode is no-iommu", r"dma: DEGRADED ISOLATION", r"driver\.virtio-blk: online \(", r"network: no network provider on this boot - NetworkService is up without a link"),
+        HEALTH_FAILURES + (r"driver\.virtio-net: online \(",), timeout=300, observe=120, health=True,
+    ),
+    # THE ROLLBACK FLOOR'S ROWS. A boot the floor accepts prints its verdict before the hand-off;
+    # one it refuses halts before a kernel is loaded; an unprovisioned machine says so and boots. A
+    # loader the FIRMWARE refuses never prints its banner, which `secure-unsigned` already covers.
+    "rollback-accepted": Case((r"loader: rollback floor [0-9]+ - generation [0-9]+ accepted", LOADED), (r"loader: FATAL",), timeout=120),
+    "rollback-refused": Case((r"loader: FATAL - rollback floor",), (r"loader: rollback floor [0-9]+ - generation [0-9]+ accepted", STARTED), timeout=120),
+    "rollback-unprovisioned": Case((r"loader: rollback floor - this machine is UNPROVISIONED", LOADED), (r"loader: FATAL",), timeout=120),
+    "rollback-manifest-refused": Case((r"refusing to (boot from it|compose)",), (r"loader: rollback floor [0-9]+ - generation [0-9]+ accepted", STARTED), timeout=120),
+    "rollback-not-enforced": Case((r"loader: rollback floor - not enforced by this build", LOADED), (r"loader: FATAL", r"ROLLBACK FLOOR ENFORCED"), timeout=120),
+    "dma-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (LOADED, STARTED), timeout=300),
+    "dma-kernel-refused": Case((r"dma: NO DMA MODE reached this kernel|dma: the loader's hand-off is REFUSED",), (r"driver\.[a-z-]*: online \(",), timeout=300, observe=60),
+    # THE PORTS' ENFORCING PROFILES (P02M0173), and the two entry paths differ in what a boot can
+    # show. A DIRECT `-kernel` boot has no loader, so the kernel's boot code selects ROOT_NONE and no
+    # system volume is promoted: the service graph waits on a root that never comes, so there is no
+    # DHCP and no mounted volume, and the enforcing evidence is the kernel's own DMA audit - the
+    # controller translating with bypass read back off, every bus-mastering device translated, the
+    # endpoints attached to their domains, no fault, no degraded admission, and the block driver
+    # bound behind the controller. A UEFI boot runs the loader, which promotes a LiberFS volume as
+    # ROOT_BLOCK, so the services come up and traffic can be shown: a DHCP lease through virtio-net
+    # and the system volume read through virtio-blk, both through translated endpoints. That second
+    # case is where the network the degraded profile refuses is proved to have come back.
+    "iommu-port-ordinary-direct": Case(
+        (r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"iommu: [0-9]+ endpoint\(s\) attached, [0-9]+ mapping\(s\) live, 0 quarantined, 0 fault", r"driver\.virtio-blk: online \("),
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"dma: ADMITTED UNTRANSLATED", r"REFUSED - the entry declares iommu-required", r"did not confirm its reset", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=180, health=True,
+    ),
+    "iommu-port-ordinary-uefi": Case(
+        (r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"driver\.virtio-net: online \(", r"network: configured via DHCP", r"driver\.virtio-blk: online \(", r"storage: vol://system mounted through its block provider"),
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"dma: ADMITTED UNTRANSLATED", r"REFUSED - the entry declares iommu-required", r"did not confirm its reset", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=240, health=True,
+    ),
+    "iommu-port-transition": Case(
+        (r"iommu: the controller at [0-9a-f:.]* masters the bus", r"iommu: quiesced [a-z]* at [0-9a-f:.]* - ", r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: every bus-mastering device is translated"),
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"did not confirm", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=120, health=True,
+    ),
+    # THE PORTS' ORDINARY ROWS ADMIT (the flip P02M0173 M7 owes P02M0172): the produced record says
+    # enforcing-required, the machine is translated, and the driver the degraded row refuses by
+    # name comes online and passes traffic.
+    "dma-port-admits": Case(
+        (r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"driver\.virtio-net: online \(", r"network: configured via DHCP"),
+        (r"KERNEL PANIC", r"loader: FATAL", r"dma: DEGRADED ISOLATION", r"REFUSED - the entry declares iommu-required"), timeout=1500, observe=240, health=True,
+    ),
+    "dma-port-degraded": Case(
+        (r"dma: boot DMA mode no-iommu \(harness provenance", r"REFUSED - the entry declares iommu-required and the boot mode is no-iommu", r"dma: DEGRADED ISOLATION", r"driver\.virtio-blk: online \(", r"network: no network provider on this boot - NetworkService is up without a link"),
+        (r"KERNEL PANIC", r"loader: FATAL", r"driver\.virtio-net: online \("), timeout=1500, observe=240, health=True,
+    ),
+    "dma-port-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (LOADED, STARTED), timeout=1500),
 }
 
 

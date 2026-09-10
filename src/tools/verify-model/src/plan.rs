@@ -516,6 +516,13 @@ impl<'a> Planner<'a> {
 		if check.kind == CheckKind::GuestFallback {
 			return None;
 		}
+		// NOR A PRODUCER OR THE RELEASE'S WHOLE-SUITE ROW. They are obligations of the release run,
+		// which is flat and runs them by name before the rows that consume their artifacts; a
+		// change-driven plan runs the consuming gate, which assembles what it needs itself. Selecting
+		// them here would make every full plan build three images and boot every suite twice.
+		if matches!(check.class, crate::catalog::CheckClass::Producer | crate::catalog::CheckClass::WholeSuite) {
+			return None;
+		}
 		if full {
 			return Some(String::from("the plan is FULL"));
 		}

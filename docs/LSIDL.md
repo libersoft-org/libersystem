@@ -138,7 +138,7 @@ Annotations attach metadata to declarations. They begin with `@`:
 | `@op(n)` | method | the method's stable opcode (required) |
 | `@bound(n)` | field, param, return | the most elements a `list<T>` may carry, or bytes a `string` may hold |
 | `@reserved(n)` | interface, enum | a retired opcode or ordinal that must never be reused |
-| `@rights(r, ...)` | `handle<T>` param | validated contract metadata; runtime enforcement is not generated yet |
+| `@rights(r, ...)` | a param written as `handle<T>` | the minimum rights the handle must carry, and (through the resource's `@kernel`) the object it must be; enforced by generated dispatch before the service is called |
 | `@since(v)` | declaration/member | package version where it was added; stored, validated, and emitted |
 | `@deprecated(v)` | declaration/member | package version where it was deprecated; the adjacent doc comment carries the reason |
 
@@ -354,10 +354,29 @@ interface volume {
 }
 ```
 
-`@rights(...)` currently validates every named right and retains the requirement on
-the AST parameter, but generated dispatch does not inspect the received handle's
-rights. Kernel operations still enforce their own handle rights; generated
-pre-dispatch enforcement awaits a host-supplied `HandleInspector` boundary.
+`@rights(...)` is ENFORCED by generated dispatch: before the service is called, the
+dispatch asks the runtime what the received handle carries (`liber_handle_authority`)
+and refuses with the method's own `denied` case when it lacks a named right or is a
+kernel object of another kind than the resource's `@kernel(...)` declares. A refusal
+closes every capability the request carried (`liber_handle_release`) and the service
+is never reached. Kernel operations still enforce their own handle rights underneath.
+
+The accepted shape is exactly ONE, and the validator refuses every other before any
+code is generated, because an annotation the generator cannot guard used to compile
+into an UNGUARDED method that read like a guarded one:
+
+- the parameter is WRITTEN as `handle<resource>`. An `option<handle<T>>`, a
+  `list<handle<T>>`, a `result<..>` or a record around the handle is refused rather than
+  recursively authorized, and so is a NAMED ALIAS of a handle type - local or imported,
+  even where it resolves to a handle - because the resolver attaches the kernel object
+  type to resources and not to aliases, and an accepted alias would silently weaken the
+  object-type half of the guard;
+- the method returns `result<T, E>` where `E` is an error enum with a `denied` case;
+- the method does not return a stream, whose out-of-band `<method>_open` path carries no
+  guard;
+- the argument list names at least one right, names only rights (`@rights(1)` is
+  refused), and names none of them twice. `@rights()` is not "no annotation": it is a
+  guard the schema asked for and did not spell.
 
 **`buffer`** - a shared, zero-copy memory region backed by a transferable memory
 object. The bytes are never copied into the message. The current wire carries one

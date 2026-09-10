@@ -24,7 +24,7 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
-use sign_manifest::{TEST_KEY_ID, TEST_SIGNING_KEY};
+use sign_manifest::TestKey;
 
 fn die(message: &str) -> ! {
 	eprintln!("sign-manifest: {message}");
@@ -37,10 +37,23 @@ struct Args {
 	arch: u8,
 	source: u8,
 	release: String,
+	// The version-3 header fields. The generation is what the rollback floor compares; the purpose
+	// is what a root may sign for; the DMA mode is `None` for a tag-0 manifest - the test and
+	// development builders, whose boots take the mode from the harness carrier - and a mode for a
+	// shipping builder, which signs the value the medium is assembled for.
+	security_generation: u64,
+	purpose: u32,
+	dma_mode: Option<u32>,
+	dma_mode_given: bool,
 	volume_uuid: [u8; 16],
+	// Whether `--generation` was given: an external release must say its generation rather than
+	// take the default, because the default is what every test build carries.
+	generation_given: bool,
 	key_id: u32,
 	signer: Option<String>,
 	public_key: Option<[u8; 32]>,
+	// Which PUBLISHED key signs under `test-trust`; the boot key unless told otherwise.
+	test_key: TestKey,
 	rows: Vec<(u8, String, String)>,
 	out: String,
 }
@@ -52,13 +65,59 @@ fn hex(text: &str, want: usize) -> Option<Vec<u8>> {
 	(0..want).map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()).collect()
 }
 
-fn parse() -> Args {
-	let mut args = Args { profile: String::new(), product: String::new(), arch: 0, source: 0, release: String::new(), volume_uuid: [0; 16], key_id: 0, signer: None, public_key: None, rows: Vec::new(), out: String::new() };
+fn parse() -> (Args, Option<bootproto::rollback::Slot>, bool) {
+	let mut args = Args { profile: String::new(), product: String::new(), arch: 0, source: 0, release: String::new(), security_generation: 1, purpose: bootproto::manifest::PURPOSE_BOOT, dma_mode: None, dma_mode_given: false, volume_uuid: [0; 16], generation_given: false, key_id: 0, signer: None, public_key: None, test_key: TestKey::Boot, rows: Vec::new(), out: String::new() };
+	let mut rollback_record: Option<bootproto::rollback::Slot> = None;
+	let mut rollback_marker: bool = false;
 	let mut argv = std::env::args().skip(1);
 	while let Some(flag) = argv.next() {
 		let mut value = || argv.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
 		match flag.as_str() {
 			"--profile" => args.profile = value(),
+			"--generation" => {
+				let raw = value();
+				args.generation_given = true;
+				args.security_generation = raw.parse().unwrap_or_else(|_| die("--generation is an unsigned 64-bit number"));
+			}
+			"--purpose" => {
+				args.purpose = match value().as_str() {
+					"boot" => bootproto::manifest::PURPOSE_BOOT,
+					"recovery" => bootproto::manifest::PURPOSE_RECOVERY,
+					other => die(&format!("--purpose '{other}' is not one of boot or recovery")),
+				}
+			}
+			"--dma-mode" => {
+				// REQUIRED, AND `harness` IS A STATEMENT RATHER THAN A DEFAULT. A manifest that
+				// carries no mode is a manifest whose boot takes the mode from the harness carrier,
+				// and a builder that meant to sign one must say so - a tag-0 manifest produced by
+				// omission is exactly how a shipping medium would come to depend on a harness.
+				args.dma_mode = match value().as_str() {
+					"harness" => None,
+					"enforcing-required" => Some(bootproto::dma_mode::MODE_ENFORCING_REQUIRED),
+					"no-iommu" => Some(bootproto::dma_mode::MODE_NO_IOMMU),
+					other => die(&format!("--dma-mode '{other}' is not one of harness, enforcing-required or no-iommu")),
+				};
+				args.dma_mode_given = true;
+			}
+			"--inspect" => inspect(&value()),
+			// THE PROVISIONING TOOL'S HALF: one slot record, or the marker, as hex on stdout - the
+			// same codec the loader validates with, so the ceremony and the loader cannot disagree
+			// about a byte. Needs `--product` and `--generation`; nothing else is read.
+			"--rollback-record" => {
+				rollback_record = Some(match value().as_str() {
+					"a" | "A" => bootproto::rollback::Slot::A,
+					"b" | "B" => bootproto::rollback::Slot::B,
+					other => die(&format!("--rollback-record '{other}' is not one of a or b")),
+				})
+			}
+			"--rollback-marker" => rollback_marker = true,
+			"--signing-key" => {
+				args.test_key = match value().as_str() {
+					"boot" => TestKey::Boot,
+					"recovery" => TestKey::Recovery,
+					other => die(&format!("--signing-key '{other}' is not one of boot or recovery")),
+				}
+			}
 			"--product" => args.product = value(),
 			"--release" => args.release = value(),
 			"--out" => args.out = value(),
@@ -111,7 +170,7 @@ fn parse() -> Args {
 			other => die(&format!("unknown argument '{other}'")),
 		}
 	}
-	args
+	(args, rollback_record, rollback_marker)
 }
 
 // Ask the configured executable for a signature over exactly these bytes.
@@ -134,10 +193,61 @@ fn sign_externally(signer: &str, message: &[u8]) -> [u8; 64] {
 	signature.try_into().expect("64 bytes")
 }
 
+// PRINT WHAT A SIGNED MANIFEST SAYS, and exit. The parse is the loader's; no signature is checked,
+// because this answers "what does this record claim" for a host tool that decides which machine
+// to build around it - `run.sh` refusing to boot an enforcing image without a controller - and the
+// loader is what decides whether the claim is believed.
+fn inspect(path: &str) -> ! {
+	let bytes = std::fs::read(path).unwrap_or_else(|e| die(&format!("could not read {path}: {e}")));
+	let manifest = match bootproto::manifest::Manifest::decode(&bytes) {
+		Ok(manifest) => manifest,
+		Err(bootproto::manifest::Refusal::LegacyVersion) => {
+			println!("version: legacy");
+			std::process::exit(0)
+		}
+		Err(e) => die(&format!("{path} is not a manifest this tool reads: {e:?}")),
+	};
+	println!("version: 3");
+	println!("release: {}", String::from_utf8_lossy(manifest.release));
+	println!("generation: {}", manifest.security_generation);
+	println!(
+		"purpose: {}",
+		match manifest.purpose {
+			bootproto::manifest::PURPOSE_RECOVERY => "recovery",
+			_ => "boot",
+		}
+	);
+	println!(
+		"dma-mode: {}",
+		match manifest.dma_mode.and_then(bootproto::dma_mode::Mode::from_code) {
+			Some(mode) => mode.name(),
+			None => "harness",
+		}
+	);
+	println!("volume-uuid: {}", manifest.volume_uuid.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+	println!("rows: {}", manifest.row_count());
+	std::process::exit(0)
+}
+
 fn main() {
-	let args = parse();
+	let (args, rollback_record, rollback_marker) = parse();
+	if rollback_marker {
+		println!("{:02x}", bootproto::rollback::MARKER_VALUE);
+		return;
+	}
+	if let Some(slot) = rollback_record {
+		if args.product.is_empty() || !args.generation_given {
+			die("--rollback-record needs --product and --generation");
+		}
+		let record = bootproto::rollback::encode(args.security_generation, slot, &bootproto::rollback::product_identity(args.product.as_bytes()));
+		println!("{}", record.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+		return;
+	}
 	if args.out.is_empty() || args.product.is_empty() || args.release.is_empty() || args.arch == 0 || args.source == 0 {
 		die("--product, --arch, --source, --release and --out are all required");
+	}
+	if !args.dma_mode_given {
+		die("--dma-mode is required: harness for a manifest whose boot takes the mode from the harness carrier, or enforcing-required / no-iommu for a shipping medium");
 	}
 	if args.rows.is_empty() {
 		die("a manifest with no rows covers nothing");
@@ -148,14 +258,20 @@ fn main() {
 	// free.
 	let (key_id, public_key, signer) = match args.profile.as_str() {
 		"test-trust" => {
-			let signing = ed25519_dalek::SigningKey::from_bytes(&TEST_SIGNING_KEY);
-			(TEST_KEY_ID, signing.verifying_key().to_bytes(), None)
+			let signing = args.test_key.signing_key();
+			(args.test_key.key_id(), signing.verifying_key().to_bytes(), None)
 		}
 		"external-release" => {
 			let Some(public_key) = args.public_key else { die("external-release needs --public-key: the loader carries a public key and this must be that one") };
 			let Some(signer) = args.signer.clone() else { die("external-release needs --signer: one executable that holds the private key") };
 			if args.key_id == 0 {
 				die("external-release needs --key-id: the loader refuses a manifest whose key id it does not carry");
+			}
+			// THE GENERATION IS STATED, NEVER DEFAULTED, for a release: the default is the number every
+			// test build carries, and a release that took it by omission would be one the rollback
+			// floor compares against a value nobody chose.
+			if !args.generation_given {
+				die("external-release needs --generation: the security generation the rollback floor compares, stated rather than defaulted");
 			}
 			(args.key_id, public_key, Some(signer))
 		}
@@ -170,7 +286,7 @@ fn main() {
 	}
 	let mut rows: Vec<bootproto::manifest::Row<'_>> = contents.iter().map(|(kind, path, bytes)| bootproto::manifest::Row { kind: *kind, path: path.as_bytes(), length: bytes.len() as u64, digest: bootproto::sha256::digest(bytes) }).collect();
 
-	let header = bootproto::manifest::Header { key_id, product: args.product.as_bytes(), arch: args.arch, source_kind: args.source, release: args.release.as_bytes(), volume_uuid: args.volume_uuid };
+	let header = bootproto::manifest::Header { key_id, product: args.product.as_bytes(), arch: args.arch, source_kind: args.source, release: args.release.as_bytes(), security_generation: args.security_generation, purpose: args.purpose, volume_uuid: args.volume_uuid, dma_mode: args.dma_mode };
 	let mut record = vec![0u8; bootproto::manifest::MAX_MANIFEST_BYTES];
 	let payload_len = bootproto::manifest::encode_payload(&header, &mut rows, &mut record).unwrap_or_else(|e| die(&format!("the manifest will not encode: {e:?}")));
 
@@ -183,7 +299,7 @@ fn main() {
 		Some(signer) => sign_externally(signer, &message),
 		None => {
 			use ed25519_dalek::Signer;
-			ed25519_dalek::SigningKey::from_bytes(&TEST_SIGNING_KEY).sign(&message).to_bytes()
+			args.test_key.signing_key().sign(&message).to_bytes()
 		}
 	};
 	record[payload_len..payload_len + 64].copy_from_slice(&signature);
@@ -202,5 +318,16 @@ fn main() {
 	}
 
 	std::fs::write(&args.out, &record).unwrap_or_else(|e| die(&format!("could not write {}: {e}", args.out)));
-	println!("sign-manifest: {} - {} row(s), key {:#010x}, {} bytes, verified", args.out, read_back.row_count(), key_id, record.len());
+	println!(
+		"sign-manifest: {} - {} row(s), key {:#010x}, {} bytes, generation {}, dma-mode {}, verified",
+		args.out,
+		read_back.row_count(),
+		key_id,
+		record.len(),
+		read_back.security_generation,
+		match read_back.dma_mode.and_then(bootproto::dma_mode::Mode::from_code) {
+			Some(mode) => mode.name(),
+			None => "harness",
+		}
+	);
 }

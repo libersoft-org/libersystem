@@ -50,6 +50,7 @@ pub const STATUS_BUFFER_TOO_SMALL: Status = high_bit(5);
 // the memory map for. Anything else means something different went wrong - see `exit_boot_services`.
 pub const STATUS_INVALID_PARAMETER: Status = high_bit(2);
 pub const STATUS_NOT_FOUND: Status = high_bit(14);
+pub const STATUS_UNSUPPORTED: Status = high_bit(3);
 
 // Set the top bit (the UEFI error marker) on a small error number.
 const fn high_bit(n: usize) -> usize {

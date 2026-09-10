@@ -90,6 +90,8 @@ class ShadowLogPaths(unittest.TestCase):
             (root / "bin").mkdir()
             shutil.copy2(ROOT / "lib.sh", root / "lib.sh")
             shutil.copy2(ROOT / "src/tools/result-logs.sh", root / "src/tools/result-logs.sh")
+            # The evidence helper verify.sh sources: a no-op here, since no run is collecting.
+            shutil.copy2(ROOT / "src/tools/evidence.sh", root / "src/tools/evidence.sh")
             scripts = {
                 "verify.sh": source if source is not None else (ROOT / "verify.sh").read_text(),
                 "test.sh": GUEST,

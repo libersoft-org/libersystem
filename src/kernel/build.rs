@@ -15,8 +15,59 @@ fn main() {
 	// it stays here where the kernel's tests include it. Assembling the packages does read built
 	// artifacts, and that is `mkpackages`, a separate step.
 	let workspace = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set")).join("..");
+	// A POLICY CHANGE REBUILDS THIS KERNEL. The DMA registry below is generated from the manifest,
+	// so a one-line policy change cannot leave a kernel from the old decision beside a DeviceManager
+	// from the new one - cargo re-runs this script when the file moves.
+	println!("cargo:rerun-if-changed={}", workspace.join("user/services/manifest.toml").display());
 	let manifest = system_manifest::Manifest::load_workspace(&workspace).unwrap_or_else(|error| panic!("{error}"));
 	generate_test_volume_paths(&manifest);
+	generate_dma_registry(&manifest);
+}
+
+// THE TRUSTED DMA REGISTRY, from the same manifest DeviceManager selects from.
+//
+// One row per staged driver: its program name - the identity the claim boundary carries - its
+// declared DMA policy as the `abi::DMA_POLICY_*` code, and its match rules as `driver_binding::Match`
+// values, so the kernel checks a claim's entry against the concrete device with the predicate the
+// selector uses. The kernel does NOT carry priority: it validates membership, device, policy and
+// generation, and privileged DeviceManager's selection is authoritative.
+//
+// A DEVELOPMENT-ONLY DRIVER IS IN THE TABLE ONLY WHEN THE BUILD IS THE DEVELOPMENT ONE, exactly as
+// the userspace registry does it - a shipping kernel that admitted `dev_channel` by name would admit
+// a driver the image does not contain.
+fn generate_dma_registry(manifest: &system_manifest::Manifest) {
+	let mut entries = String::new();
+	let mut count = 0usize;
+	for program in manifest.programs.values() {
+		let Some(driver) = &program.driver else { continue };
+		if !included(program) {
+			continue;
+		}
+		let rules = driver
+			.rules
+			.iter()
+			.map(|rule| {
+				let address = match rule.pci_address {
+					Some(address) => format!("Some(({}, {}, {}))", address.bus, address.dev, address.func),
+					None => String::from("None"),
+				};
+				format!("driver_binding::Match {{ transport: {}, virtio_type: {}, class: {}, subclass: {}, prog_if: {}, vendor: {}, product: {}, address: {address} }}", option(rule.transport.map(u64::from)), option(rule.virtio_type.map(u64::from)), option(rule.pci_class.map(u64::from)), option(rule.pci_subclass.map(u64::from)), option(rule.pci_interface.map(u64::from)), option(rule.pci_vendor.map(u64::from)), option(rule.pci_product.map(u64::from)),)
+			})
+			.collect::<Vec<_>>()
+			.join(", ");
+		entries.push_str(&format!("\tDmaEntry {{ name: b\"{}\", policy: {} /* {} */, rules: &[{rules}] }},\n", program.name, driver.dma.wire(), driver.dma.name()));
+		count += 1;
+	}
+	let source = format!("// @generated from user/services/manifest.toml by build.rs - do not edit.\npub(crate) const DMA_REGISTRY: [DmaEntry; {count}] = [\n{entries}];\n");
+	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+	fs::write(out_dir.join("dma_registry.rs"), source).expect("write the DMA registry");
+}
+
+fn option(value: Option<u64>) -> String {
+	match value {
+		Some(value) => format!("Some({value})"),
+		None => String::from("None"),
+	}
 }
 
 fn select_linker_script() {

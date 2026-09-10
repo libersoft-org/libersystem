@@ -22,9 +22,17 @@ extern crate std;
 pub mod elf;
 
 pub mod boot_manifest;
-// The signed boot manifest, version 2: the same question the text one answers, plus who says so.
+// The signed boot manifest, version 3: the same question the text one answers, plus who says so -
+// and, since version 3, the boot's DMA mode, its security generation and its purpose.
 pub mod manifest;
 pub mod sha256;
+// The boot's DMA mode: the frozen harness record, the boot-wide latch over the signed set, and the
+// relay check the x86_64 kernel performs. Shared by the loader, the kernel and the host tools.
+pub mod dma_mode;
+// One value latched over every manifest of a boot - the generation and the purpose use it.
+pub mod latch;
+// The monotonic boot floor: the record, the state classification and the compare-and-advance.
+pub mod rollback;
 
 // The written rule for whether a candidate library may replace an installed provider in a
 // running system. It reads only the two images, so the guest, the build system and any
@@ -43,7 +51,10 @@ pub const MAGIC: u64 = 0x4c42_5350_524f_5432;
 // SEPARATELY: the loader lives on the ESP and the kernel on the volume, so a mismatched pair is
 // reachable. That mismatch is the one failure that happens before anything can report it, which is
 // why the guard exists and why appending a field is what it is for.
-pub const VERSION: u32 = 2;
+//
+// 3 since 2026-09-09: `BootInfo` gained `dma_mode` and `dma_provenance` - the boot's DMA mode as
+// the loader validated it, and where it came from. Appended for the reason `root` was.
+pub const VERSION: u32 = 3;
 
 // WHAT THE LOADER CHOSE AS THIS BOOT'S SYSTEM VOLUME.
 //
@@ -215,4 +226,19 @@ pub struct BootInfo {
 	// Appended, which is why `VERSION` is 2: the kernel reads these by offset and there is no size
 	// field, so an old loader's shorter struct would be read past its end.
 	pub root: RootSelection,
+
+	// THE BOOT'S DMA MODE AND WHERE IT CAME FROM - `dma_mode::MODE_*` and `dma_mode::PROVENANCE_*`.
+	//
+	// Written by a loader for a value it validated: `signed` only for a mode it verified in every
+	// selected manifest against a signature it checked, `harness` only for the named entry path's
+	// harness input, read and validated as the frozen eight-byte record. Zero in both is ABSENT,
+	// and absent refuses admission: a boot whose loader handed over no mode is a boot whose
+	// producer failed, whatever kind of boot it is.
+	//
+	// The kernel's admission decision is taken from HERE on every UEFI entry. On a direct
+	// device-tree entry the kernel constructs this struct itself, after it has already read the
+	// mode out of the tree - so there these two words are reporting, never the producer. Appended,
+	// which is why `VERSION` is 3.
+	pub dma_mode: u32,
+	pub dma_provenance: u32,
 }
