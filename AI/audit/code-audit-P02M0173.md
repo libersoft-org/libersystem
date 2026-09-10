@@ -410,3 +410,68 @@ design makes, which this job's rules forbid.
 Consequence for the two milestones: `dma-mode-aarch64` (and, by the same construction,
 `dma-mode-riscv64`) do not pass, so P02M0172 and P02M0173 both stay `- [ ]`. Everything else in
 P02M0173's matrix - all ten profile phases - is green.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0173 (2026-09-10T15:32:56Z):
+
+## The last failing row of this milestone's own evidence
+
+This milestone's definition of done requires all three of P02M0172's non-x86 rows to carry
+`enforcing-required`, which makes `dma-mode-aarch64` and `dma-mode-riscv64` this milestone's evidence
+as much as P02M0172's. The previous entry left both failing on the two-producer row and recorded that
+it was left failing rather than relaxed.
+
+It is closed now, and the finding is worth stating here too because it is about these ports'
+firmware. The UEFI firmware both enforcing port profiles run describes the machine with ACPI and
+publishes no device-tree configuration table. The loader is therefore handed no tree, and the kernel
+- which must have one, because these architectures describe their hardware with a tree - finds the
+machine's tree itself. So on these profiles the kernel is the component that reads the tree, and it
+is the component whose second-producer check fires. The full diagnosis, the measured firmware fault
+that ruled out teaching the loader to go looking, and the fixture change are recorded in
+`AI/audit/code-audit-P02M0172.md`, which owns that rule.
+
+Nothing in this milestone's own transition, quiesce or admission work changed. The two shared pieces
+that did change are behaviour-preserving: the two kernels' device-tree readers now call one shared
+page walk (`fdt::scan`) instead of each carrying a copy of it, and the loader's independent-producer
+check now validates a header before walking it.
+
+## Verification
+
+Every gate below was run from ONE tree, after the last source edit and after a full
+`./build.sh --arch aarch64` and `./build.sh --arch riscv64`, which is what the runner's digest check
+demands before it will believe a port suite. Each command is the whole command.
+
+    ./check.sh --gate iommu-ports          PASSED  10 phase(s) booted
+    ./check.sh --gate dma-mode-aarch64     PASSED   7 boots, 7 verdicts
+    ./check.sh --gate dma-mode-riscv64     PASSED   7 boots, 7 verdicts
+    ./check.sh --gate dma-mode-x86_64      PASSED  10 boots, 10 verdicts
+    ./build.sh --arch aarch64              PASSED  sdk libs user kernel loader packages volume
+    ./build.sh --arch riscv64              PASSED  sdk libs user kernel loader packages volume
+
+The ten phases, each with its own artifact, its own endpoint census and its own result log:
+
+    aarch64:direct-gicv2:hostile        transition confirmed; five hostile cases and the forced
+                                        release refused by the hardware; census 1 attachment
+    aarch64:direct-gicv2:ordinary       every bus master translated, the block driver bound behind
+                                        the controller, no untranslated admission, no fault
+    aarch64:direct-gicv3-its:transition transition confirmed, hostile cases refused; census 1
+    aarch64:direct-gicv3-its:ordinary   as above on the ITS interrupt path
+    aarch64:uefi-gicv2:transition       the firmware-touched endpoints quiesced by class and bypass
+                                        read back off before any driver mastered the bus;
+                                        census 12 attachments - this is the xHCI and NVMe evidence
+    aarch64:uefi-gicv2:ordinary         a DHCP lease and the system volume read through translated
+                                        endpoints, nothing degraded, no fault; census 3
+    riscv64:direct-aia:hostile          transition confirmed, hostile cases refused; census 1
+    riscv64:direct-aia:ordinary         every bus master translated, block driver bound, no fault
+    riscv64:uefi-aia:transition         quiesced by class, bypass read back off; census 10
+    riscv64:uefi-aia:ordinary           a DHCP lease and the system volume through translated
+                                        endpoints, nothing degraded, no fault; census 2
+
+The two UEFI transition phases run the FULL machine, not the reduced one, so the xHCI halt/reset and
+the NVMe `CC.EN`/`CSTS.RDY` procedures stay under test. The reduced machine is used only where the
+claim is about ordinary traffic, which is the boundary the previous entry recorded.
+
+Not performed, and named rather than implied: no run on physical hardware, no native IOMMU of any
+kind, no ATS/PRI/PASID/SR-IOV, and no QEMU other than the one this machine has - the topology refuses
+a QEMU that lacks the bypass property rather than silently omitting it, which is what makes that a
+gate rather than an assumption.

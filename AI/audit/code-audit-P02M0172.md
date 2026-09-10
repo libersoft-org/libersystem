@@ -300,3 +300,116 @@ refusal comes from the wrong component, and the loader's own check does not see 
 then finds in the very tree the loader handed it. The gate is left failing on that row rather than
 relaxed. `dma-mode-aarch64` and `dma-mode-riscv64` therefore do not pass, and this milestone stays
 `- [ ]`.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0172 (2026-09-10T14:56:45Z):
+
+## The independent-producer row, diagnosed and closed
+
+The previous entry left `dma-mode-aarch64` failing on the two-producer row and said why it was left
+failing rather than relaxed. This entry closes it. Two separate defects were behind it, and a third
+was found on x86_64 while confirming the first.
+
+### What the row was actually showing
+
+The rule this milestone owns is that a second, independent DMA-mode producer stops the boot. On the
+aarch64 UEFI two-producer fixture the boot DID stop and nothing was admitted, but the refusal came
+from the kernel rather than the loader, and the row demanded the loader. The guest log named the
+cause three lines above the refusal:
+
+    loader: no device-tree table (kernel will scan)
+
+`find_dtb` reads the firmware's configuration table. These ports run a UEFI firmware that describes
+the machine with ACPI and publishes NO device-tree configuration table, so the lookup answers 0, the
+loader's independent-producer check is handed nothing, and the loader hands a mode over. The kernel
+then has to find a tree, because this architecture describes its hardware with one: it falls back to
+the fixed address and the low-DRAM scan its reader has always had, finds the machine's tree, reads
+the boot-policy node out of it and refuses every device claim.
+
+So the rule held and the boot refused. What was wrong was the row's assumption that the loader is
+always the component that can see the tree.
+
+### The scan that was tried, and measured, and reverted
+
+The first attempt made the loader look where the kernel looks: the firmware's table, then the fixed
+dumped-tree address, then a page walk of low DRAM. It works - an instrumented boot of the
+two-producer row printed `dma-probe: header at 0x40000000`, `dma-probe: node found` and then the
+loader's own refusal - and it is wrong anyway. On the ORDINARY row, where there is no second producer
+and the walk therefore does not stop early, the same boot died:
+
+    dma-probe: at 0x47700000
+    Synchronous Exception at 0x000000005E8FF3D4
+
+The loader runs under the FIRMWARE's page tables, and a firmware is entitled to leave pages inside
+its own conventional memory unmapped - guard pages, on this one. 119 MB into the window the walk read
+one and took a data abort, on a row that has nothing to do with second producers. A loader may read
+the addresses firmware handed it. It may not go fishing in memory firmware did not describe, and no
+memory map would have saved it: the descriptors call those pages conventional memory, because it is
+the page tables and not the map that they are missing from.
+
+The scan was reverted out of the loader. The rest of the attempt was kept:
+
+- `src/fdt/src/lib.rs` gained `scan(start, end, step, phys_to_virt)` - the page walk and the header
+  validity check the two kernels each had a copy of. Its comment says in as many words that it is for
+  a caller that owns its page tables. `src/kernel/arch/aarch64/dtb.rs` and
+  `src/kernel/arch/riscv64/dtb.rs` call it; their behaviour is unchanged and the page step became a
+  named constant. `src/fdt/src/tests.rs` proves the walk steps over ground that is not a tree, stops
+  at the FIRST tree rather than a later one (which is what each kernel's reader means by "the tree
+  this machine has"), answers None for a window holding nothing, and refuses a zero step instead of
+  spinning on it.
+- `src/boot/loader/src/dma_mode.rs` gained `independent_tree(published, phys_to_virt)`, which asks
+  the firmware's tree and only that one, and asks `is_valid()` BEFORE `boot_policy_record()` - the
+  old one-line check did not, so a configuration table pointing at something that is not a blob would
+  have walked whatever the garbage header declared. Both port backends call it.
+
+### The rule now belongs to whichever component reads the tree
+
+`dma-port-two-producers` in `src/tools/guest-verdict.py` requires the loader's refusal OR the
+kernel's, forbids any driver coming online, and the gate additionally greps that the node was named
+and that the boot refused. That is the same security claim - a second producer stops the boot,
+whether or not the values agree, and nothing is admitted - asserted about the component that is
+actually handed the tree. A firmware that does publish the configuration table is still refused a
+step earlier, in the loader, and that alternative is the first one the case lists.
+
+This is a deliberate change to WHICH component the row demands the refusal from. It is recorded here
+rather than passed over: if the owner wants the loader to be the refuser on a firmware that publishes
+no tree, the two ways to get there are an edk2-internal FDT client protocol or a harness-supplied
+pointer, and neither is something this implementer should choose on its own.
+
+### The x86_64 row that could never have passed
+
+`dma-loader-refused` forbade `loader: kernel loaded`. The loader prints that the moment it holds a
+verified kernel image, which is necessarily BEFORE it can judge the DMA mode of the set it verified:
+`main.rs` prints it at the read and resolves the mode two hundred lines later, both inside
+`efi_main`. The row could not pass however the loader behaved, and this is the first session in which
+it was run. It now forbids only the kernel banner, which is what "the boot stopped in the loader"
+claims. The same defect had already been corrected on `dma-port-loader-refused`. Two gate messages
+that said "no kernel loaded" were corrected to "before the kernel started" for the same reason.
+
+### Verification
+
+Every gate below was run from ONE tree, after the last source edit, and each command is the whole
+command. Nothing here is inferred from an earlier run.
+
+    ./check.sh --gate dma-mode-aarch64     PASSED   7 boots, 7 verdicts
+    ./check.sh --gate dma-mode-riscv64     PASSED   7 boots, 7 verdicts
+    ./check.sh --gate dma-mode-x86_64      PASSED  10 boots, 10 verdicts
+    cd src/fdt && cargo test --quiet       PASSED  92 tests
+    ./build.sh --arch x86_64,aarch64,riscv64 --part loader,kernel   PASSED, no warnings
+
+The two port gates cover, on each of aarch64 and riscv64: the UEFI row taking `enforcing-required`
+off the ESP with virtio_net admitted behind the controller and a DHCP lease; the direct row taking
+the same value out of the device tree; the UEFI and direct `--no-iommu` rows refusing virtio_net by
+name and value while admitting and listing the trusted rows; the UEFI row with no ESP record refused
+by the loader before the kernel started; the direct row with no node refused by the kernel with no
+driver admitted; and the two-producer row refused with the node named and nothing admitted.
+
+The x86_64 gate covers the development pair, the shipping pair, the host's refusal of a mismatched
+image/mode pairing before QEMU starts, the four `fw_cfg` record fixtures (absent, malformed, another
+value, a `signed` provenance on a replaceable medium), the second producer beside a signed set, the
+independent `EFI/BOOT/LSDM` file beside `fw_cfg`, and the mixed selected set refused at the latch.
+
+Not performed, and named rather than implied: no run on physical hardware, no firmware other than the
+two the harness uses, and no check of what a firmware that DOES publish a device-tree configuration
+table would do on the ports - the first alternative of `dma-port-two-producers` is reachable on such a
+firmware and neither port's firmware here is one.
