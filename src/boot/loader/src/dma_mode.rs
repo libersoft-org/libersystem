@@ -122,3 +122,40 @@ fn malformed_name(reason: bootproto::dma_mode::Malformed) -> &'static str {
 pub(crate) fn mode_name(mode: Mode) -> &'static str {
 	mode.name()
 }
+
+// The name the refusal above prints for the ports' independent producer, spelled once.
+const BOOT_POLICY_NODE: &str = "the device tree's boot-policy node";
+
+// Does the device tree the FIRMWARE PUBLISHED carry the boot-policy node? The two device-tree ports
+// call this to fill `Inputs::independent`.
+//
+// THE COMPONENT THAT READS A TREE IS THE COMPONENT THAT CHECKS IT, and on these ports that is not
+// always this one. Measured on the two-producer fixture: the UEFI firmware these ports run describes
+// the machine with ACPI and publishes NO device-tree configuration table, so this check is handed
+// nothing and the loader hands a mode over - while the kernel, which has to have a tree because this
+// architecture describes its hardware with one, takes the machine's tree out of low DRAM, reads the
+// boot-policy node and refuses every device claim. Both refusals are the same rule, and each belongs
+// to whichever component actually reads the tree.
+//
+// AND THIS CHECK DOES NOT GO LOOKING FOR A TREE ITSELF. Making it walk low DRAM the way the kernel's
+// reader does was tried and measured: the loader runs under the FIRMWARE's page tables, and a
+// firmware is entitled to leave pages inside its own conventional memory unmapped - guard pages, on
+// this one - so the walk took a synchronous exception 119 MB into the window and killed the boot on
+// the ORDINARY row, where there is no second producer at all. A loader may read the addresses
+// firmware handed it. It may not go fishing in memory firmware did not describe.
+//
+// # Safety
+// `published` must be 0 or the address the firmware published for a device tree, and
+// `phys_to_virt` must reach it - `Fdt`'s methods dereference what this is handed (FDT-007).
+// Unused on x86_64, whose independent input is a file on the ESP rather than a node in a tree.
+#[allow(dead_code)]
+pub(crate) unsafe fn independent_tree(published: u64, phys_to_virt: fn(u64) -> u64) -> Option<&'static str> {
+	if published == 0 {
+		return None;
+	}
+	// SAFETY: the caller's contract covers this address.
+	let tree = unsafe { fdt::Fdt::new(published, phys_to_virt) };
+	// VALIDITY FIRST. Every other method on this type walks what the header declares, so asking one
+	// of them about an address that carries no header reads wherever that garbage points.
+	(tree.is_valid() && tree.boot_policy_record().is_some()).then_some(BOOT_POLICY_NODE)
+}

@@ -160,6 +160,16 @@ pub fn msi_doorbell() -> Option<(u64, u64)> {
 // boot's ESP - is admitted to the table without a BAR, so its registers are resolved here.
 pub fn function_bar(bus: u8, dev: u8, func: u8, index: usize) -> Option<(u64, u64)> {
 	let device = common::probe_function::<Access>(bus, dev, func)?;
+	// AND THIS PORT IS WHAT PLACES THE WINDOW, because nothing else does. There is no firmware here
+	// assigning BARs: `scan` places them for the functions it RESOLVES - the virtio and xHCI ones the
+	// device table admits - and a function outside that set is left with its BARs unprogrammed. So a
+	// caller that needs to reach one, which is the IOMMU fixture's `edu` device and the bypass
+	// transition's NVMe controller, read back a base of zero and concluded the device was absent.
+	// Placed here, once: a BAR that already has an address is left exactly where it is, so this is
+	// idempotent and never moves a window somebody is already decoding.
+	if common::bar_address::<Access>(&device, index).is_none_or(|base| base == 0) {
+		common::assign_bars_ecam::<Access>(&device);
+	}
 	let base = common::bar_address::<Access>(&device, index)?;
 	let size = common::bar_size::<Access>(&device, index)?;
 	if base == 0 || size == 0 { None } else { Some((base, size)) }

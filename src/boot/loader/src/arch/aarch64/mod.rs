@@ -43,10 +43,9 @@ pub fn dma_mode_inputs(bs: *mut BootServices, root: Option<*mut uefi::FileProtoc
 			crate::arch::halt();
 		}
 	};
-	let tree = find_dtb(system_table);
 	// SAFETY: the firmware published this table for exactly this reading, and the loader runs under
 	// the firmware's identity map - the same terms `psci_conduit` reads it on.
-	let independent = if tree != 0 && unsafe { fdt::Fdt::new(tree, crate::console::identity_map) }.boot_policy_record().is_some() { Some("the device tree's boot-policy node") } else { None };
+	let independent = unsafe { crate::dma_mode::independent_tree(find_dtb(system_table), crate::console::identity_map) };
 	crate::dma_mode::Inputs { carrier, independent }
 }
 

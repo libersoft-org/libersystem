@@ -96,7 +96,12 @@ CASES = {
     "rollback-unprovisioned": Case((r"loader: rollback floor - this machine is UNPROVISIONED", LOADED), (r"loader: FATAL",), timeout=120),
     "rollback-manifest-refused": Case((r"refusing to (boot from it|compose)",), (r"loader: rollback floor [0-9]+ - generation [0-9]+ accepted", STARTED), timeout=120),
     "rollback-not-enforced": Case((r"loader: rollback floor - not enforced by this build", LOADED), (r"loader: FATAL", r"ROLLBACK FLOOR ENFORCED"), timeout=120),
-    "dma-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (LOADED, STARTED), timeout=300),
+    # WHAT A LOADER REFUSAL CAN FORBID. `loader: kernel loaded` is printed the moment the kernel image
+    # has been read and verified, which is long BEFORE the selected set's DMA mode is resolved - the
+    # loader must hold a verified set before it can judge one. Forbidding that line demanded a refusal
+    # that no boot can produce, so this row could not pass however the loader behaved. What the
+    # refusal actually claims is that the boot stopped in the loader: the kernel never started.
+    "dma-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (STARTED,), timeout=300),
     "dma-kernel-refused": Case((r"dma: NO DMA MODE reached this kernel|dma: the loader's hand-off is REFUSED",), (r"driver\.[a-z-]*: online \(",), timeout=300, observe=60),
     # THE PORTS' ENFORCING PROFILES (P02M0173), and the two entry paths differ in what a boot can
     # show. A DIRECT `-kernel` boot has no loader, so the kernel's boot code selects ROOT_NONE and no
@@ -118,7 +123,7 @@ CASES = {
     ),
     "iommu-port-transition": Case(
         (r"iommu: the controller at [0-9a-f:.]* masters the bus", r"iommu: quiesced [a-z]* at [0-9a-f:.]* - ", r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: every bus-mastering device is translated"),
-        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"did not confirm", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=120, health=True,
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"did not confirm its reset", r"did not confirm CC.EN", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=120, health=True,
     ),
     # THE PORTS' ORDINARY ROWS ADMIT (the flip P02M0173 M7 owes P02M0172): the produced record says
     # enforcing-required, the machine is translated, and the driver the degraded row refuses by
@@ -127,11 +132,53 @@ CASES = {
         (r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"driver\.virtio-net: online \(", r"network: configured via DHCP"),
         (r"KERNEL PANIC", r"loader: FATAL", r"dma: DEGRADED ISOLATION", r"REFUSED - the entry declares iommu-required"), timeout=1500, observe=240, health=True,
     ),
+    # THE DIRECT ROWS OF A PORT HAVE NO ROOT, so they cannot assert on NetworkService at all. A
+    # direct `-kernel` boot runs no loader, the kernel selects ROOT_NONE, StorageService refuses to
+    # promote a volume nobody chose, and every service that waits on storage stays unstarted - so
+    # neither the DHCP line nor the no-link line is ever printed, whatever the DMA mode is. What the
+    # boot DOES show is the whole of the admission decision the carrier drives: the mode that
+    # reached admission with its provenance, the isolation summary, and the driver the mode admits
+    # or refuses BY NAME - and BY-NAME IS THE UEFI ROWS' JOB, because a rootless boot never claims
+    # the NIC at all. Its DeviceManager brings the block device up and then waits on a root that
+    # never comes, so it reaches neither an admission nor a refusal of `virtio_net`: the enforcing
+    # row would be requiring a driver this boot never launches, and the degraded row a refusal
+    # nothing ever triggers. What both direct rows DO show is the whole of the carrier's claim - the
+    # mode that reached admission with its provenance, the isolation state that mode produces, and
+    # the trusted row admitted and listed in the kernel's own inventory - with the NIC's absence
+    # from that inventory as the negative. `virtio_net` binding under enforcing-required, and being
+    # refused by name and value under no-iommu, are proved on the UEFI rows, which have a root, a
+    # service graph and a real DHCP lease.
+    "dma-port-admits-direct": Case(
+        (r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"driver\.virtio-blk: online \("),
+        (r"KERNEL PANIC", r"loader: FATAL", r"dma: DEGRADED ISOLATION", r"REFUSED - the entry declares iommu-required"), timeout=1500, observe=180, health=True,
+    ),
+    "dma-port-degraded-direct": Case(
+        (r"dma: boot DMA mode no-iommu \(harness provenance", r"dma: DEGRADED ISOLATION", r"dma: +virtio-blk at ", r"driver\.virtio-blk: online \("),
+        (r"KERNEL PANIC", r"loader: FATAL", r"driver\.virtio-net: online \("), timeout=1500, observe=180, health=True,
+    ),
     "dma-port-degraded": Case(
         (r"dma: boot DMA mode no-iommu \(harness provenance", r"REFUSED - the entry declares iommu-required and the boot mode is no-iommu", r"dma: DEGRADED ISOLATION", r"driver\.virtio-blk: online \(", r"network: no network provider on this boot - NetworkService is up without a link"),
         (r"KERNEL PANIC", r"loader: FATAL", r"driver\.virtio-net: online \("), timeout=1500, observe=240, health=True,
     ),
-    "dma-port-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (LOADED, STARTED), timeout=1500),
+    # THE KERNEL IMAGE IS LOADED BEFORE THE MODE IS RESOLVED, so `loader: kernel loaded` is not the
+    # forbidden signal here - the loader places the image, then reads this path's DMA-mode inputs,
+    # and refuses before ENTERING it. What must never appear is the kernel STARTING. Forbidding the
+    # load made this row unpassable on either port, which nothing had noticed because the ports' DMA
+    # gate had never been run.
+    "dma-port-loader-refused": Case((r"loader: FATAL - (no DMA mode can be handed to the kernel|.* is present beside this entry path's DMA-mode input)",), (STARTED,), timeout=1500),
+    # TWO PRODUCERS, REFUSED BY WHICHEVER COMPONENT READS THE TREE. The rule is one: a boot with a
+    # second, independent DMA-mode producer beside this entry path's own input stops, whether or not
+    # the two agree. Which component stops it depends on what the firmware hands over, and on these
+    # ports it hands over nothing: the UEFI firmware describes the machine with ACPI and publishes no
+    # device-tree configuration table, so the LOADER is given no tree to check, while the KERNEL -
+    # which must have a tree, because this architecture describes its hardware with one - finds the
+    # machine's tree in low DRAM, reads the boot-policy node there and refuses every device claim. A
+    # firmware that does publish the table is refused a step earlier, in the loader, and that is the
+    # first alternative below. Both name the node; neither admits anything.
+    "dma-port-two-producers": Case(
+        (r"loader: FATAL - the device tree's boot-policy node is present beside this entry path's DMA-mode input|dma: the loader handed over a DMA mode AND the device tree carries the boot-policy node - two producers, REFUSED",),
+        (r"driver\.[a-z-]*: online \(",), timeout=1500, observe=60,
+    ),
 }
 
 

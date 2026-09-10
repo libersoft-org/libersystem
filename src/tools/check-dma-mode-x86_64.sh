@@ -143,7 +143,7 @@ for fixture in absent malformed signed-provenance; do
 	malformed) grep -aq "harness carrier is malformed (not eight bytes)" "$work/refuse-$fixture.log" || fail "the malformed record was not named" ;;
 	signed-provenance) grep -aq "harness carrier is malformed (a provenance that is not \`harness\`" "$work/refuse-$fixture.log" || fail "the signed-provenance record was not refused as malformed" ;;
 	esac
-	echo "dma-mode-x86_64:   refused, no kernel loaded"
+	echo "dma-mode-x86_64:   refused before the kernel started"
 done
 
 # 5. A SECOND PRODUCER BESIDE A SIGNED SET: the enforcing image with a fw_cfg record that AGREES.

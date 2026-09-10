@@ -74,13 +74,28 @@ row_phases() {
 	*) return 1 ;;
 	esac
 }
-# The classes the transition must have quiesced on a row, from what its firmware touches.
+# THE CLASSES A PHASE'S TRANSITION MUST HAVE QUIESCED, which is a property of the machine THAT
+# PHASE BOOTS rather than of the row. The transition phases boot the full machine, so they are where
+# the xHCI halt-and-reset and the NVMe `CC.EN` clear are proved - the two procedures M0173 added and
+# the two device classes a port's firmware actually touches. The ordinary phases boot the reduced
+# machine, which has no xHCI at all, so requiring one there would be asserting about a device the
+# profile deliberately does not have.
 row_quiesced() {
-	case "$1:$2" in
-	aarch64:uefi-gicv2) printf 'virtio xhci' ;;
-	riscv64:uefi-aia) printf 'nvme xhci' ;;
-	*) printf 'virtio' ;;
-	esac
+	local arch="$1" profile="$2" phase="$3"
+	if [[ "$phase" == transition && "$profile" == uefi-* ]]; then
+		case "$arch" in
+		aarch64) printf 'virtio xhci' ;;
+		riscv64) printf 'virtio nvme xhci' ;;
+		esac
+		return
+	fi
+	# The reduced machines - the ordinary phases and the `DMA_FIXTURE` test-kernel phases. The
+	# riscv64 UEFI ESP is an NVMe namespace, and it is kept, because it is what the loader read.
+	if [[ "$arch" == riscv64 && "$profile" == uefi-* ]]; then
+		printf 'virtio nvme'
+	else
+		printf 'virtio'
+	fi
 }
 
 # THE CENSUS OF ONE PHASE: every bus master the kernel admitted, translated or refused, and every
@@ -95,14 +110,14 @@ census() {
 # before bypass goes off, every firmware-touched endpoint of the row's classes confirmed its reset,
 # the bypass byte read back off, and no refusal of the transition anywhere.
 assert_transition() {
-	local log="$1" arch="$2" profile="$3" class
+	local log="$1" arch="$2" profile="$3" phase="$4" class
 	grep -aq "iommu: the controller at [0-9a-f:.]* masters the bus" "$log" || fail "$arch:$profile: the controller never announced it masters the bus"
 	grep -aq "iommu: virtio-iommu is translating - bypass is off and read back as off" "$log" || {
 		grep -a -m 10 "iommu:" "$log" >&2 || true
 		fail "$arch:$profile: the kernel did not confirm the bypass-off transition"
 	}
 	! grep -aq "did not confirm its reset\|did not confirm CC.EN" "$log" || fail "$arch:$profile: an endpoint did not confirm its reset and the transition should have refused"
-	for class in $(row_quiesced "$arch" "$profile"); do
+	for class in $(row_quiesced "$arch" "$profile" "$phase"); do
 		grep -aq "iommu: quiesced $class at" "$log" || fail "$arch:$profile: no $class endpoint was quiesced before bypass-off, and this row has one"
 	done
 	# NOTHING MASTERED THE BUS BEFORE THE CONTROLLER: the first line that says a function masters
@@ -134,7 +149,7 @@ phase_test_kernel() {
 	local log="$work/$arch-$profile-$phase.log"
 	cat "${logs[@]}" >"$log"
 	grep -aq "qemu-run: run mode gate, DMA mode enforcing-required (harness provenance)" "$log" || fail "$arch:$profile:$phase: the runner did not announce the gate row with enforcing-required"
-	assert_transition "$log" "$arch" "$profile"
+	assert_transition "$log" "$arch" "$profile" "$phase"
 	local expected
 	for expected in "case 1 PASSED" "case 3 PASSED" "case 5 PASSED" "case 6 PASSED" "case 7 PASSED" "forced-release case PASSED"; do
 		grep -aq "iommu-fixture: $expected" "$log" || {
@@ -154,13 +169,21 @@ phase_test_kernel() {
 
 # A RUN.SH PHASE: the built system on the row's machine, the verdict tool watching its console.
 phase_run() {
-	local arch="$1" profile="$2" phase="$3" case_name="$4" row_environment
+	local arch="$1" profile="$2" phase="$3" case_name="$4" reduced="${5:-0}" row_environment
 	row_environment="$(row_env "$arch" "$profile")"
 	local log="$work/$arch-$profile-$phase.log"
 	echo "iommu-ports: $arch:$profile:$phase - the built system through run.sh (${row_environment})"
+	# THE REDUCED ORDINARY MACHINE (`DMA_ORDINARY=1`), which is what the x86_64 enforcing gate's
+	# traffic phase already boots and what these phases were missing. The full interactive machine
+	# puts about a dozen translated endpoints through attach-and-map inside DeviceManager's boot
+	# window; an emulated port does not finish that in time, so the drivers are torn down and the
+	# services never start - on a boot whose transition and translation were entirely correct. The
+	# reduced machine keeps every endpoint this phase's claim is about (the controller, the system
+	# volume, the NIC, and the ESP on a UEFI boot) and drops the fixture media, the USB controller
+	# and the interactive display, input and audio devices, which no assertion here reads.
 	# shellcheck disable=SC2086
-	env $row_environment SERIAL="file:$log" src/tools/guest-verdict.py "$case_name" "$log" -- ./run.sh --arch "$arch" --smp 4 || fail "$arch:$profile:$phase: the verdict tool refused the boot"
-	assert_transition "$log" "$arch" "$profile"
+	env $row_environment DMA_ORDINARY="$reduced" SERIAL="file:$log" src/tools/guest-verdict.py "$case_name" "$log" -- ./run.sh --arch "$arch" --smp 4 || fail "$arch:$profile:$phase: the verdict tool refused the boot"
+	assert_transition "$log" "$arch" "$profile" "$phase"
 	census "$log" "$work/$arch-$profile-$phase.census"
 	RAN=$((RAN + 1))
 }
@@ -175,14 +198,14 @@ phase_ordinary() {
 	# profile refuses is proved back with a real lease and a real volume read.
 	local log="$work/$arch-$profile-ordinary.log"
 	if [[ "$profile" == uefi-* ]]; then
-		phase_run "$arch" "$profile" ordinary iommu-port-ordinary-uefi
+		phase_run "$arch" "$profile" ordinary iommu-port-ordinary-uefi 1
 		local driver
 		for driver in virtio-net virtio-blk; do
 			grep -aq "driver\.$driver: online (" "$log" || fail "$arch:$profile:ordinary: $driver did not come online behind the controller"
 		done
 		echo "iommu-ports:   $arch:$profile:ordinary: a DHCP lease and the system volume through translated endpoints, nothing degraded, no fault"
 	else
-		phase_run "$arch" "$profile" ordinary iommu-port-ordinary-direct
+		phase_run "$arch" "$profile" ordinary iommu-port-ordinary-direct 1
 		grep -aq "driver\.virtio-blk: online (" "$log" || fail "$arch:$profile:ordinary: the block driver did not come online behind the controller"
 		echo "iommu-ports:   $arch:$profile:ordinary: every bus-mastering device translated, the block driver bound behind the controller, no untranslated admission, no fault (a direct boot promotes no root, so traffic is proved on the UEFI row)"
 	fi
@@ -191,7 +214,10 @@ phase_ordinary() {
 
 phase_transition_run() {
 	local arch="$1" profile="$2"
-	phase_run "$arch" "$profile" transition iommu-port-transition
+	# THE FULL MACHINE, deliberately: this phase's whole subject is that every firmware-touched
+	# endpoint is put through its class's procedure before it loses bus mastering, and the xHCI
+	# controller and the riscv64 NVMe ESP are exactly the endpoints that needs proving on.
+	phase_run "$arch" "$profile" transition iommu-port-transition 0
 	echo "iommu-ports:   $arch:$profile:transition: the firmware-touched endpoints were quiesced by class and bypass read back off before any driver mastered the bus"
 }
 

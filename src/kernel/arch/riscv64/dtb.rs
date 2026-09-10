@@ -40,6 +40,9 @@ pub unsafe fn carries_boot_policy(hint: u64) -> bool {
 const SCAN_START: u64 = 0x8000_0000;
 const SCAN_END: u64 = 0x9000_0000;
 
+// Page steps: a tree is published at a page boundary on every path this scan exists for.
+const SCAN_STEP: u64 = 0x1000;
+
 // An FDT view at `base`, reading physical memory through the riscv64 direct map.
 //
 // # Safety
@@ -82,14 +85,11 @@ unsafe fn locate(hint: u64) -> Option<u64> {
 		crate::serial_println!("dtb: the named no-device-tree profile is compiled in - this kernel does not go looking for a tree the loader withheld");
 		return None;
 	}
-	let mut base = SCAN_START;
-	while base < SCAN_END {
-		if unsafe { at(base) }.is_valid() {
-			return Some(base);
-		}
-		base += 0x1000;
-	}
-	None
+	// The walk and the header check belong to the shared reader; the window and the step are this
+	// machine's, which is why they stay here.
+	// SAFETY: the window is a compile-time constant inside the direct map, which is what
+	// `phys_to_virt` reads through.
+	unsafe { fdt::scan(SCAN_START, SCAN_END, SCAN_STEP, super::paging::phys_to_virt) }
 }
 
 // Parse the device tree reachable from `hint`, returning the RAM geometry, CPU count

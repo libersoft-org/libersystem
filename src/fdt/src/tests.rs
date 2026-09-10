@@ -2357,3 +2357,46 @@ fn the_fw_cfg_and_device_tree_carriers_share_one_record() {
 		assert_eq!(found.bytes.to_vec(), file.stdout, "{mode}: the tree carries the same eight bytes");
 	}
 }
+
+// Round `value` up to the next page boundary.
+fn page_up(value: u64) -> u64 {
+	(value + 0xFFF) & !0xFFF
+}
+
+// `scan` steps over ground that is not a tree and stops at the FIRST tree it finds.
+//
+// STOPPING AT THE FIRST ONE IS THE CONTRACT, not an implementation detail: it is what each kernel's
+// reader means by "the tree this machine has" when the boot path published no pointer, so a second
+// blob further up the window is not the one the boot will read.
+#[test]
+fn the_scan_steps_over_what_is_not_a_tree_and_stops_at_the_first_one() {
+	let plain = AARCH64;
+	let annotated = produced_tree(AARCH64, "enforcing-required", None);
+	// One page of alignment slack, one page of zeros for the walk to step over, then both trees.
+	let span = 0x1000 + page_up(plain.len() as u64) + page_up(annotated.len() as u64);
+	let mut memory = vec![0u8; (span + 0x1000) as usize];
+	let base = page_up(memory.as_ptr() as u64);
+	let offset = (base - memory.as_ptr() as u64) as usize;
+	let first = 0x1000u64;
+	let second = first + page_up(plain.len() as u64);
+	memory[offset + first as usize..offset + first as usize + plain.len()].copy_from_slice(plain);
+	memory[offset + second as usize..offset + second as usize + annotated.len()].copy_from_slice(annotated);
+	let end = base + second + page_up(annotated.len() as u64);
+
+	// SAFETY: the window is inside `memory`, which is alive for the whole test, and `identity` is
+	// the map that reaches it.
+	let found = unsafe { crate::scan(base, end, 0x1000, identity) };
+	assert_eq!(found, Some(base + first), "the zero page is stepped over and the first tree is the answer");
+	// The second tree carries the boot-policy node and the first does not, which is how a caller can
+	// tell that the answer is the first one rather than either one.
+	// SAFETY: as above.
+	assert_eq!(unsafe { Fdt::new(found.unwrap(), identity) }.boot_policy_record(), None, "the tree found is the plain one");
+
+	// A window with nothing in it answers None rather than its first address.
+	// SAFETY: as above.
+	assert_eq!(unsafe { crate::scan(base, base + 0x1000, 0x1000, identity) }, None, "a window holding no tree finds nothing");
+	// A zero step would never advance: it stops rather than spins.
+	// SAFETY: as above.
+	assert_eq!(unsafe { crate::scan(base, end, 0, identity) }, None, "a zero step is refused, not spun on");
+	drop(memory);
+}

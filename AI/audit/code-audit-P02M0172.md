@@ -274,3 +274,29 @@ The milestone's ticks wait for those results.
   provenance) via fw_cfg`) is present there.
 - Still owed at the end of the job: `dma-mode-x86_64`, `dma-mode-ports` (both ports, eight
   boots), the `arch-profile-*-no-dt-absent-1` rows, and the aarch64/riscv64 builds they need.
+
+## The ports' DMA-mode gate, run for the first time (2026-09-10T17:55:00Z)
+
+`check-dma-mode-ports.sh` was written by this milestone and deferred to the end-of-job sweep. Running
+it - after P02M0173 flipped its rows to the enforcing machine - found four defects in it, three fixed
+and one left open as a finding. They are recorded in full in this batch's P02M0173 record, because
+that is where the flip and the fixes live; in brief:
+
+- the four driver rows booted the full interactive machine, which an emulated port cannot bring up
+  inside DeviceManager's boot window; they boot the reduced machine now;
+- the two DIRECT rows asserted on NetworkService, which a rootless direct boot never starts, and on a
+  by-name refusal that such a boot never triggers because it never claims the NIC;
+- `dma-port-loader-refused` forbade `loader: kernel loaded`, which this loader always prints before it
+  resolves the DMA mode, so the row could not pass on either port.
+
+Six of the aarch64 row's seven boots now pass, including both refusal rows this milestone owns: the
+absent ESP record refused by the loader before a kernel was loaded, and the absent device-tree node
+refused by the kernel with no driver admitted.
+
+OPEN: the independent-producer row. This milestone's design has the LOADER refuse a second producer
+beside the path's own; on the aarch64 UEFI path the loader hands over and the KERNEL refuses instead.
+Nothing is admitted - the boot refuses every device claim, so the safety property holds - but the
+refusal comes from the wrong component, and the loader's own check does not see a node the kernel
+then finds in the very tree the loader handed it. The gate is left failing on that row rather than
+relaxed. `dma-mode-aarch64` and `dma-mode-riscv64` therefore do not pass, and this milestone stays
+`- [ ]`.

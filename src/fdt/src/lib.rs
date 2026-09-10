@@ -2337,6 +2337,39 @@ impl Fdt {
 	}
 }
 
+// The first device tree in `[start, end)`, for a boot path that published no pointer at one.
+//
+// WHERE to look stays with each backend - the module note above says so, and a DRAM window is a
+// machine fact rather than an FDT one. HOW to look does not: each caller walked its window in page
+// steps, built a view and asked the header whether it is a blob at all, and having that in two
+// places is two places to get the validity check wrong. The window and the step come from the
+// caller; the walk and the header check are here.
+//
+// THIS IS FOR A CALLER THAT OWNS ITS PAGE TABLES. It reads every candidate address blind, which is a
+// kernel's business and not a loader's: firmware may leave pages inside its own conventional memory
+// unmapped, and a walk over them takes a synchronous exception. The loader asks the addresses
+// firmware handed it and nothing else.
+//
+// # Safety
+// Every address in `[start, end)` must be readable through `phys_to_virt`: the walk dereferences
+// each candidate to read a header (FDT-007).
+pub unsafe fn scan(start: u64, end: u64, step: u64, phys_to_virt: fn(u64) -> u64) -> Option<u64> {
+	// A zero step never advances. A caller that computed one has a bug, and this is not the place to
+	// hang on it.
+	if step == 0 {
+		return None;
+	}
+	let mut base = start;
+	while base < end {
+		// SAFETY: the caller's contract covers every address in the window.
+		if unsafe { Fdt::new(base, phys_to_virt) }.is_valid() {
+			return Some(base);
+		}
+		base = base.checked_add(step)?;
+	}
+	None
+}
+
 #[cfg(test)]
 mod tests;
 

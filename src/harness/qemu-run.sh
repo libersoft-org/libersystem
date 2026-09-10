@@ -53,6 +53,16 @@
 #             aarch64/riscv64 UEFI: flip one byte of the signed manifest on the ESP this script
 #             assembles, so a gate can prove the loader refuses a tampered one on the two ports that
 #             have no shipping ISO to tamper with. Used by `check-signed-boot.sh` and nothing else.
+#   DMA_ORDINARY=1
+#             aarch64/riscv64: the REDUCED ORDINARY MACHINE of an enforcing profile - the
+#             controller, the system volume, the NIC and (on a UEFI boot) the ESP, and no other bus
+#             master. It is the ports' equivalent of what the x86_64 enforcing gate's traffic phase
+#             already boots, and it exists because the full interactive machine puts about a dozen
+#             translated endpoints through attach-and-map inside DeviceManager's boot window, which
+#             an emulated port does not finish in time - the drivers are then torn down and the
+#             services never start, on a boot whose isolation was perfectly correct. What it drops
+#             is the fixture media, the USB controller and the interactive display, input and audio
+#             devices; what it keeps is every endpoint the ordinary claim is about.
 #   LIBER_HARNESS_HOLD=FIFO
 #             A fixture hook: after every input is BOUND - the medium, the firmware image and the
 #             kernel opened once and hashed through their descriptors, the QEMU executable copied to
@@ -1804,6 +1814,12 @@ qemu_run_aarch64() {
 	PORT_IOMMU="$iommu"
 	local virtio_opts="disable-legacy=on"
 	local dma_fixture="${DMA_FIXTURE:-0}"
+	# THE REDUCED MACHINE, and the two switches that ask for it. `DMA_FIXTURE` is the hostile
+	# phase's machine; `DMA_ORDINARY` is the ordinary phase's, which keeps the system volume and the
+	# NIC because its whole claim is that they still work while translation is on. Both drop every
+	# bus master neither claim is about - see the header.
+	local reduced="$dma_fixture"
+	[[ "${DMA_ORDINARY:-0}" == "1" ]] && reduced=1
 	if [[ "$iommu" == "1" ]]; then
 		port_iommu_probe aarch64
 		machine="$machine,default-bus-bypass-iommu=off"
@@ -1830,7 +1846,7 @@ qemu_run_aarch64() {
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	if [[ "$dma_fixture" != "1" ]]; then
+	if [[ "$reduced" != "1" ]]; then
 		qemu_prepare_media_images "$media_suffix" -a64
 		[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "$virtio_opts" readonly
 		[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "$virtio_opts" readonly
@@ -1841,7 +1857,7 @@ qemu_run_aarch64() {
 	qemu_attach_virtio_net qemu_args vnet0 "" "$virtio_opts"
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
-	if [[ "$dma_fixture" != "1" ]]; then
+	if [[ "$reduced" != "1" ]]; then
 		qemu_prepare_usb_image "$media_suffix"
 		# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
 		#
@@ -1871,7 +1887,7 @@ qemu_run_aarch64() {
 		# The boot-chain test includes DisplayService and its Console/Shell dependents.
 		# Unlike x86, the virt machine has no default VGA device, so test mode supplies
 		# the same discoverable GPU path without enabling the interactive peripherals.
-		if [[ "$dma_fixture" != "1" ]]; then
+		if [[ "$reduced" != "1" ]]; then
 			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
 			qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.$$.sock" "$virtio_opts"
 			# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
@@ -1883,38 +1899,40 @@ qemu_run_aarch64() {
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,$virtio_opts")
 		fi
 	else
-		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
-		qemu_attach_virt_interactive qemu_args -aarch64 "$virtio_opts"
-		# The development profile is not x86_64's alone: a scenario has to be runnable against
-		# a cold boot of every target, and what that needs is a guest that names the profile
-		# (so DeviceManager starts an agent) and a channel for the agent to answer on.
-		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
-			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
-			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
-			# The same discoverable GPU the test configuration supplies, and for the same
-			# reason: the virt machine has no VGA device, the interactive set offers ramfb
-			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
-			# ConsoleService and the shell down with it. A driven guest needs all three.
-			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
-			# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
-			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
-			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
-			# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
-			#
-			# AND A COLD RUN TAKES THE COLD NAMES, which is what `scenario-cold` connects to. The x86
-			# block below has taken them since the run that destroyed a persistent instance's sockets;
-			# these two never did, so on these targets the guest listened on one path while the runner
-			# dialled another - and `key` steps failed with "no QEMU QMP socket" against a guest that
-			# was up and answering everything else.
-			local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
-			local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
-			if [[ "${COLD:-0}" == "1" ]]; then
-				dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
-				dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+		if [[ "$reduced" != "1" ]]; then
+			# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
+			qemu_attach_virt_interactive qemu_args -aarch64 "$virtio_opts"
+			# The development profile is not x86_64's alone: a scenario has to be runnable against
+			# a cold boot of every target, and what that needs is a guest that names the profile
+			# (so DeviceManager starts an agent) and a channel for the agent to answer on.
+			if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
+				qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
+				qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
+				# The same discoverable GPU the test configuration supplies, and for the same
+				# reason: the virt machine has no VGA device, the interactive set offers ramfb
+				# instead, and nothing drives ramfb - so DisplayService never comes up and takes
+				# ConsoleService and the shell down with it. A driven guest needs all three.
+				qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+				# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
+				# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
+				# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
+				# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
+				#
+				# AND A COLD RUN TAKES THE COLD NAMES, which is what `scenario-cold` connects to. The x86
+				# block below has taken them since the run that destroyed a persistent instance's sockets;
+				# these two never did, so on these targets the guest listened on one path while the runner
+				# dialled another - and `key` steps failed with "no QEMU QMP socket" against a guest that
+				# was up and answering everything else.
+				local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
+				local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+				if [[ "${COLD:-0}" == "1" ]]; then
+					dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
+					dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+				fi
+				rm -f "$dev_monitor" "$dev_qmp"
+				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
+				qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 			fi
-			rm -f "$dev_monitor" "$dev_qmp"
-			qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
-			qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 		fi
 	fi
 	qemu_append_debug_args qemu_args
@@ -2073,6 +2091,12 @@ qemu_run_riscv64() {
 	PORT_IOMMU="$iommu"
 	local virtio_opts="disable-legacy=on"
 	local dma_fixture="${DMA_FIXTURE:-0}"
+	# THE REDUCED MACHINE, and the two switches that ask for it. `DMA_FIXTURE` is the hostile
+	# phase's machine; `DMA_ORDINARY` is the ordinary phase's, which keeps the system volume and the
+	# NIC because its whole claim is that they still work while translation is on. Both drop every
+	# bus master neither claim is about - see the header.
+	local reduced="$dma_fixture"
+	[[ "${DMA_ORDINARY:-0}" == "1" ]] && reduced=1
 	local -a bridge_args=()
 	# THE CONTROLLER IS NOT IN `qemu_args`, and that is the riscv64 difference. The direct boot below
 	# hands the guest the DUMPED tree with `-dtb`, and `virtio-iommu-pci` is the one device that
@@ -2109,7 +2133,7 @@ qemu_run_riscv64() {
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	if [[ "$dma_fixture" != "1" ]]; then
+	if [[ "$reduced" != "1" ]]; then
 		qemu_prepare_media_images "$media_suffix" -rv64
 		[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "$virtio_opts" readonly
 		[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "$virtio_opts" readonly
@@ -2120,7 +2144,7 @@ qemu_run_riscv64() {
 	qemu_attach_virtio_net qemu_args vnet0 "" "$virtio_opts"
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
-	if [[ "$dma_fixture" != "1" ]]; then
+	if [[ "$reduced" != "1" ]]; then
 		qemu_prepare_usb_image "$media_suffix"
 		# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
 		#
@@ -2149,7 +2173,7 @@ qemu_run_riscv64() {
 		test_args+=(-semihosting)
 		# The RISC-V virt machine has no default VGA device, while the boot-chain test
 		# requires DisplayService and its Console/Shell dependents.
-		if [[ "$dma_fixture" != "1" ]]; then
+		if [[ "$reduced" != "1" ]]; then
 			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
 			qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.$$.sock" "$virtio_opts"
 			# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
@@ -2161,35 +2185,37 @@ qemu_run_riscv64() {
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,$virtio_opts")
 		fi
 	else
-		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
-		qemu_attach_virt_interactive qemu_args -riscv64 "$virtio_opts"
-		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
-			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
-			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
-			# The same discoverable GPU the test configuration supplies, and for the same
-			# reason: the virt machine has no VGA device, the interactive set offers ramfb
-			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
-			# ConsoleService and the shell down with it. A driven guest needs all three.
-			qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
-			# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
-			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
-			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
-			# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
-			#
-			# AND A COLD RUN TAKES THE COLD NAMES, which is what `scenario-cold` connects to. The x86
-			# block below has taken them since the run that destroyed a persistent instance's sockets;
-			# these two never did, so on these targets the guest listened on one path while the runner
-			# dialled another - and `key` steps failed with "no QEMU QMP socket" against a guest that
-			# was up and answering everything else.
-			local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
-			local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
-			if [[ "${COLD:-0}" == "1" ]]; then
-				dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
-				dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+		if [[ "$reduced" != "1" ]]; then
+			# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
+			qemu_attach_virt_interactive qemu_args -riscv64 "$virtio_opts"
+			if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
+				qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
+				qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
+				# The same discoverable GPU the test configuration supplies, and for the same
+				# reason: the virt machine has no VGA device, the interactive set offers ramfb
+				# instead, and nothing drives ramfb - so DisplayService never comes up and takes
+				# ConsoleService and the shell down with it. A driven guest needs all three.
+				qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+				# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
+				# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
+				# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
+				# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
+				#
+				# AND A COLD RUN TAKES THE COLD NAMES, which is what `scenario-cold` connects to. The x86
+				# block below has taken them since the run that destroyed a persistent instance's sockets;
+				# these two never did, so on these targets the guest listened on one path while the runner
+				# dialled another - and `key` steps failed with "no QEMU QMP socket" against a guest that
+				# was up and answering everything else.
+				local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
+				local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+				if [[ "${COLD:-0}" == "1" ]]; then
+					dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
+					dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+				fi
+				rm -f "$dev_monitor" "$dev_qmp"
+				qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
+				qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 			fi
-			rm -f "$dev_monitor" "$dev_qmp"
-			qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
-			qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 		fi
 	fi
 	qemu_append_debug_args qemu_args

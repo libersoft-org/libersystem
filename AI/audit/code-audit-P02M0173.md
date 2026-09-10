@@ -292,3 +292,121 @@ reachable by actually booting a port.
 NOT PROVEN, and named: the two UEFI ordinary phases, the three transition phases, the gicv3-its
 ordinary phase and the two hostile phases. `docs/todo/P02M0173.md` stays `- [ ]` and its status
 block says the same thing.
+
+## The reduced ordinary machine, and what it changed (2026-09-10T15:30:00Z)
+
+The reading recorded above was confirmed and acted on: the UEFI ordinary phase's failure was the
+boot window against a dozen translated endpoints, not the transition.
+
+`qemu-run.sh` gained `DMA_ORDINARY=1`, the ports' equivalent of the machine the x86_64 enforcing
+gate's traffic phase already boots. It keeps every endpoint the ordinary claim is about - the
+controller, the system volume, the NIC, and on a UEFI boot the ESP - and drops the three fixture
+media disks, the USB controller with its hub, keyboard, tablet and storage, and the interactive
+display, input and audio devices. Both port arms compute one `reduced` flag from either
+`DMA_FIXTURE` (the hostile machine) or `DMA_ORDINARY` (the ordinary one) and guard the media, USB,
+test-device and interactive blocks on it.
+
+With that, `iommu-aarch64-uefi-gicv2-ordinary`'s VERDICT PASSES: the services come up, a DHCP lease
+is obtained and the system volume is read through its block provider, all through translated
+endpoints behind a controller that confirmed its bypass-off transition. That is M6's ordinary claim
+and M7's proof that the network the degraded profile refuses comes back, on a port, for the first
+time.
+
+Two of this gate's own assertions were wrong once the machine changed, and both are fixed:
+
+- `row_quiesced` named the classes of the FULL machine for every phase, so the ordinary phase
+  demanded an xHCI quiesce on a machine that deliberately has no xHCI. It is now a property of the
+  phase's machine: the transition phases boot the FULL machine and require `virtio xhci` on aarch64
+  UEFI and `virtio nvme xhci` on riscv64 UEFI - which is where M3's two new procedures are proved,
+  on the two device classes a port's firmware actually touches - while the ordinary and hostile
+  phases require what their reduced machines have.
+- the transition case forbade `did not confirm`, which also matches DeviceManager's ordinary
+  "the teardown did not confirm" for a driver it restarts. Narrowed to `did not confirm its reset`
+  and `did not confirm CC.EN`, which are the quiesce refusals this milestone owns.
+
+This is also the answer to M3's xHCI clause. The plan permits either an early halt-and-reset or
+removing qemu-xHCI from the enforcing UEFI topology; the kernel implements the halt-and-reset, so
+the topology keeps xHCI where that procedure is under test (the transition phases) and drops it
+where no assertion reads it (the ordinary phases).
+
+## All ten profile phases pass (2026-09-10T16:40:00Z)
+
+Every phase of the matrix is green, each run as its own `check.sh` gate against its own artifact:
+
+| phase | result |
+| --- | --- |
+| `iommu-aarch64-direct-gicv2-hostile` | PASSED - the five hostile cases and the forced release refused by the hardware |
+| `iommu-aarch64-direct-gicv2-ordinary` | PASSED - every bus master translated, the block driver bound behind the controller |
+| `iommu-aarch64-direct-gicv3-its-transition` | PASSED - the hostile cases through the ITS interrupt path |
+| `iommu-aarch64-direct-gicv3-its-ordinary` | PASSED |
+| `iommu-aarch64-uefi-gicv2-transition` | PASSED - 12 endpoints, every firmware-touched class quiesced before any driver mastered the bus |
+| `iommu-aarch64-uefi-gicv2-ordinary` | PASSED - a DHCP lease AND the system volume through translated endpoints |
+| `iommu-riscv64-direct-aia-hostile` | PASSED |
+| `iommu-riscv64-direct-aia-ordinary` | PASSED |
+| `iommu-riscv64-uefi-aia-transition` | PASSED - the NVMe quiesce proved on the one profile whose ESP is an NVMe namespace |
+| `iommu-riscv64-uefi-aia-ordinary` | PASSED - a DHCP lease and the system volume |
+
+A sixth portability defect was found and fixed to get the hostile phases there:
+
+6. `arch::{aarch64,riscv64}::pci::function_bar` read a BAR that nothing had assigned. On these ports
+   there is no firmware placing BARs: `scan` places them for the functions it RESOLVES - the virtio
+   and xHCI ones the device table admits - and every other function is left unprogrammed. The IOMMU
+   fixture's `edu` device is exactly such a function, so it read a base of zero and every hostile
+   case reported `iommu-fixture: absent (no edu device on this machine)` and the phase failed
+   without a single case running. `function_bar` now places the window itself when it finds one
+   unprogrammed, idempotently, which is also what the bypass transition's NVMe path needs.
+
+Two process notes worth keeping. Editing anything under `src/tools` moves the volume source digest,
+so the three test-kernel phases refused to run against ports built before the edit - the tree's own
+staleness check doing its job, and the reason the ports were rebuilt between rounds. And the earlier
+`did not confirm` pattern in the transition case matched DeviceManager's ordinary driver-restart
+message as well as the quiesce refusal, which is why it is now the two specific refusals.
+
+## The DMA-mode ports gate, and the one row that does not pass (2026-09-10T17:50:00Z)
+
+`check-dma-mode-ports.sh` is the gate M7's flip changes, and running it for the first time - it had
+been deferred since P02M0172 wrote it - surfaced three more defects and one that is left open.
+
+Fixed:
+
+7. Its four driver rows booted the FULL interactive machine and hit the same boot-window wall the
+   ordinary phases did. They boot the reduced machine now (`DMA_ORDINARY=1`); the three refusal rows
+   keep their own machines, because they refuse before a driver is reached at all.
+8. Its two DIRECT rows asserted on NetworkService - a DHCP lease on the enforcing row, the no-link
+   line on the degraded one - and a rootless direct boot has no NetworkService at all: no loader
+   runs, the kernel selects ROOT_NONE, and every service waiting on storage stays unstarted. Worse,
+   such a boot never CLAIMS the NIC either, so the degraded row's by-name refusal is never printed.
+   The direct rows now assert what the carrier actually drives - the mode with its provenance, the
+   isolation state, the trusted row admitted and listed in the kernel's inventory, and the NIC's
+   absence from it - and `virtio_net` binding under enforcing-required, and being refused by name
+   and value under no-iommu, are proved on the UEFI rows, which have a root and a real lease.
+9. `dma-port-loader-refused` forbade `loader: kernel loaded`, and the loader PLACES the kernel image
+   before it resolves the DMA mode (`main.rs`: the load at line 272, `dma_mode::resolve` at 509). So
+   that case could never pass on either port. It forbids the kernel STARTING instead, which is the
+   signal that actually distinguishes a refusal.
+
+With those, the aarch64 row's first six boots pass: enforcing on both entry paths, degraded on both,
+the absent ESP record refused by the loader before a kernel was loaded, and the absent device-tree
+node refused by the kernel with no driver admitted.
+
+OPEN, and reported rather than papered over: the seventh row, "the boot-policy node ALSO in the
+firmware's tree - two producers". The gate requires the LOADER to refuse it, and the loader's own
+design says it must ("an INDEPENDENT input on the path - ... the device-tree node on the two UEFI
+ports"). What happens instead is that the loader hands over and the KERNEL refuses:
+
+    dma: the loader handed over a DMA mode AND the device tree carries the boot-policy node -
+         two producers, REFUSED
+    dma: NO DMA MODE reached this kernel ... every device claim will be REFUSED
+
+The safety property therefore HOLDS - nothing is admitted, the boot refuses every claim - but the
+component that refuses is not the one the design names. The kernel finds the boot-policy node in the
+very tree the loader handed it, so the tree the loader inspected has the node; the loader's own check
+(`arch::aarch64::dma_mode_inputs`, `fdt::Fdt::new(tree, console::identity_map).boot_policy_record()`)
+did not see it. That is a real gap in the loader's independent-producer detection on the UEFI ports,
+and finding it needs emulated iterations of the loader's early FDT access rather than a guess. The
+gate is left FAILING on that row: weakening it to accept the kernel's refusal would drop a claim the
+design makes, which this job's rules forbid.
+
+Consequence for the two milestones: `dma-mode-aarch64` (and, by the same construction,
+`dma-mode-riscv64`) do not pass, so P02M0172 and P02M0173 both stay `- [ ]`. Everything else in
+P02M0173's matrix - all ten profile phases - is green.
