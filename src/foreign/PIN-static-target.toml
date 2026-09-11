@@ -40,7 +40,7 @@ target_name = "libvulkan.a"
 # The build reads the option set rather than restating it, and archives deterministically - without
 # `llvm-ar`'s `D` modifier two archives of identical objects differ and "reproducibly" is unprovable.
 path = "src/tools/build-foreign-static.sh"
-sha256 = "a068d297d3311b750843f4c73bcf68ea1fd63056ff6d5bf8f13194c815e4badf"
+sha256 = "db698f587e259ef540aff91888b07ed2487c4ee416e1fe487ee1bc8aa29b3d70"
 option_deltas = "none beyond the bootstrap option set; the target is built from the loader's own sources under it"
 # THE BUILDER TAKES A SYSROOT AND THE ARCHIVES DO NOT DEPEND ON WHICH (2026-09-11). The profile
 # sysroot is sized by the inventory rather than by the option set, so building against it is how the
@@ -48,6 +48,11 @@ option_deltas = "none beyond the bootstrap option set; the target is built from 
 # under both sysroots, digest for digest. The digest above moved because the option was added; the
 # archives did not move at all, which is the finding.
 sysroots = ["bootstrap", "profile"]
+# AND IT BUILDS EITHER THE PINNED SOURCES OR THE PORTED ONES (2026-09-11). Pass 2 compiles the loader
+# with the platform port applied and this part froze the archives WITHOUT it, so the two trees live
+# side by side and the builder is told which to compile. The archives below are the pinned tree-s and
+# are unchanged; the ported tree-s are pass 2-s and are recorded in the derived part.
+trees = ["pinned", "ported"]
 
 [abi]
 # THE ABI DESCRIPTION BOTH BUILDS READ. It was written out inside the builder until the image build

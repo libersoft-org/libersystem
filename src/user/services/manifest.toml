@@ -63,6 +63,14 @@ owner = "icdprobe"
 path = "user/libs/foreign/icdprobe"
 producer = "foreign"
 
+# The lifecycle fixture. `__attribute__((constructor))` is how a C object reaches `.init_array`, and
+# the closure this milestone measured got there the same way - so the mechanism is observed with the
+# producer that has it rather than with an imitation of it.
+[[sources]]
+owner = "lifecycle"
+path = "user/libs/foreign/lifecycle"
+producer = "foreign"
+
 [[sources]]
 owner = "service-logic"
 path = "user/services/logic"
@@ -1056,6 +1064,17 @@ stage = "volume"
 destination = "libexec/icdcheck.lsexe"
 providers = ["lsrt"]
 selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+
+# The consumer half. It carries its own constructor and destructor, reads the record the provider's
+# constructor left, and prints what it finds - which is the only way any of this is observable.
+[[programs]]
+name = "lifecheck"
+owner = "tools"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/lifecheck.lsexe"
+providers = ["base-proto", "lifecycle", "lsrt"]
 
 [[programs]]
 name = "readln"
@@ -3054,6 +3073,15 @@ owner = "icdprobe"
 destination = "lib/foreign/icdprobe.lslib"
 providers = ["lsrt"]
 objects = ["icdprobe.c"]
+
+# The provider half of the lifecycle fixture: it RECORDS what ran, because a constructor runs before
+# the console is adopted and cannot say anything itself.
+[[libraries]]
+name = "lifecycle"
+owner = "lifecycle"
+destination = "lib/foreign/lifecycle.lslib"
+providers = ["lsrt"]
+objects = ["lifecycle.c"]
 
 [[libraries]]
 name = "flac"

@@ -1,0 +1,96 @@
+# THE DERIVED PART OF P02M0135's LOCKFILE. Frozen after the converging audit link, and before
+# anything is declared done.
+#
+# WHY IT COMES LAST. Everything here is an OUTPUT of this milestone's own measurements: the platform
+# port describes behaviour pass 1 could not see, the profile sysroot is sized by an inventory that
+# did not exist until something compiled, and the compiler-runtime component is a choice the link
+# made rather than one anybody declared. A part frozen before its inputs exist has pinned nothing.
+#
+# THE BUILD READS THESE VALUES RATHER THAN DUPLICATING THEM. A build that takes a pinned value from
+# anywhere but the part of the lockfile that owns it fails.
+
+[patches]
+# THE PLATFORM-PORT SERIES, IN ORDER, WITH A DIGEST PER PATCH. Order is part of the pin: a series
+# applied in another order is another source tree, and the archives below were built from this one.
+#
+# 0001 IS NOT A PLATFORM-PORT PATCH and is pinned in the static-target part instead. It declares the
+# platform surface and defines no behaviour at all, which is what makes the undefined references it
+# leaves the candidate surface pass 1 measures. It is listed here because the ported tree is built by
+# applying BOTH, and a reader needs to know which is already in the tree.
+applies_to = "vulkan-sdk-1.4.357.0"
+series = [
+	{ order = 1, path = "src/foreign/patches/0001-portable-static-target.patch", sha256 = "911e5bf3689624affccd6e7373409e251f6052af3a8eddcee0dc68e52a8ea45c", part = "static-target", describes = "the platform surface, declared and not defined" },
+	{ order = 2, path = "src/foreign/patches/0002-platform-port.patch", sha256 = "bb53f95588b4d0ecca82de990f7beb36e83621cecd3982b819775c1120756eaf", part = "derived", describes = "no environment, and no layers" },
+]
+
+[generated_sources]
+# NONE, AND THAT IS A MEASURED ANSWER RATHER THAN AN OMISSION. The bootstrap part froze the
+# generated-source POLICY: the pinned upstream vendors its generated sources, so code generation is
+# off and this build produces none. A digest list would be a list of files nothing wrote.
+count = 0
+policy = "vendored upstream; code generation is off in the pinned option set"
+
+[profile_sysroot]
+# THE FINAL PROFILE SYSROOT, sized by the converged inventory rather than by the option set. It is
+# bound into the image identity as well - a foreign artifact's record carries `sysroot-sha256` - so a
+# header edited after this freeze moves every artifact that was compiled against it.
+path = "src/foreign/profile-sysroot"
+digest = "3edb6533756fbe304b49c8b40f46499e940af93a9fae5e8f108230c8db3852ff"
+declares = 40
+
+[compiler_runtime]
+# WHAT THE CONVERGED LINK ACTUALLY SELECTED, which is two components and not one - and neither was
+# declared anywhere before the link chose them.
+#
+# For the C half, the four memory functions the code generator emits calls to come from the substrate
+# itself: `foreign-abi` defines `memcpy`, `memmove`, `memset` and `memcmp`, and the converged link
+# resolves all four from it. For the Rust half, `compiler_builtins` is built from source by
+# `build-std` with `compiler-builtins-mem`, which is the same component every other library in this
+# image links and is why the two halves cannot disagree about them.
+c_half = "foreign-abi: memcpy, memmove, memset, memcmp"
+rust_half = "compiler_builtins via build-std, with compiler-builtins-mem"
+# AND WHAT THE LINK LEFT FOR THE RUNTIME: the allocator shims and the panic paths, resolved from
+# `lsrt.lslib` exactly as they are for every other library staged in this image. They are the only
+# eight references the audit-linked ELF still carries.
+runtime_references = 8
+
+[audit_link]
+# THE CONVERGED RESULT, per target. The gate is the FIXED POINT - two consecutive links producing the
+# same resolved set - and not the first link's output.
+inventory = "src/foreign/INVENTORY-pass2.json"
+inventory_sha256 = "eaf0efc3ee34366ce2f27abef9949ae5733d0ec296dbdfd1ba464878ec188958"
+tool = "src/tools/foreign-audit-link.py"
+tool_sha256 = "2ec76d1a152fd08c48bbd8f3df2a7c17a192b2750447a1d0ec7bfa3cc4ed45f3"
+surface = 52
+x86_64 = { elf_bytes = 607496, converged = true }
+aarch64 = { elf_bytes = 629144, converged = true }
+riscv64 = { elf_bytes = 1005512, converged = true }
+
+[forbidden_mechanisms]
+# THE MECHANISMS THIS PROFILE REFUSES, with the flags that stop them being emitted and the gate that
+# catches them if they ever are. Neither answer may be "audit it", so both halves are recorded.
+#
+# THE RUST FLAG IS HERE BECAUSE THE CHECK FOUND IT NEEDED. Every C object was compiled without
+# exception tables and the aarch64 audit-linked ELF carried `.eh_frame` anyway: the Rust half emits
+# unwind tables by default on that target. A forbidden mechanism needs the flag on EVERY producer
+# that contributes to the closure, not on the one somebody thought of first.
+c_flags = ["-fno-exceptions", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables"]
+rust_flags = ["-C force-unwind-tables=no"]
+gate = "src/tools/check-foreign-cxx-abi.sh"
+mechanisms = ["exception tables and unwinding", "RTTI", "atexit registration"]
+# AND THE TWO THE CLOSURE DOES ADMIT, which get the supported-ABI answer instead: static
+# initialisation, measured as one constructor and one destructor, and `errno`, which is process-wide
+# because nothing in this closure creates a thread.
+admitted = ["static initialisers", "errno"]
+
+[measured]
+# THE FOUR ANSWERS ONLY THIS PASS COULD GIVE, recorded beside the link that gave them.
+tls_segments = 0
+thread_creation_symbols = 0
+cxx_abi_facilities = 0
+atexit_registrations = 0
+# AND THE ONE MECHANISM THE CLOSURE DOES ADMIT, named rather than counted: one constructor and one
+# destructor, the same two on all three targets. A measured `.init_array` makes the positive
+# lifecycle gates mandatory for exactly that mechanism.
+init_array = ["loader_init_library"]
+fini_array = ["loader_free_library"]

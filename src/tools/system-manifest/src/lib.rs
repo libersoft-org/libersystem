@@ -364,6 +364,17 @@ struct RawLibrary {
 	// two answers to it is how a staged artifact stops matching what the manifest says it is.
 	#[serde(default)]
 	objects: Vec<String>,
+	// THE PATCHES APPLIED TO THOSE SOURCES, IN ORDER, and empty when there are none. Order is part
+	// of the declaration for the same reason the object list-s is: a series applied in another order
+	// is another source tree. A foreign artifact whose sources were patched and whose identity did
+	// not say so would be an artifact whose record describes code that was never compiled.
+	#[serde(default)]
+	patches: Vec<String>,
+	// THE LICENCE THE ARTIFACT IS CARRIED UNDER. `project` for sources this tree wrote; an SPDX
+	// identifier for anything imported. It is in the identity record rather than only in the
+	// inventory because a licence obligation that travels with a binary has to travel INSIDE it.
+	#[serde(default)]
+	licence: Option<String>,
 }
 
 // One declared selection slot, as the manifest states it.
@@ -836,6 +847,11 @@ pub struct Library {
 	pub producer: Producer,
 	// The ordered object list, empty for every Rust library.
 	pub objects: Vec<RelativePath>,
+	// The ordered patch series applied to those objects' sources, empty for every Rust library and
+	// for a foreign one whose sources are this tree's own.
+	pub patches: Vec<RelativePath>,
+	// The licence the artifact is carried under: `project` unless the row says otherwise.
+	pub licence: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -997,13 +1013,33 @@ impl Manifest {
 				}
 				objects.push(object);
 			}
+			let mut patches: Vec<RelativePath> = Vec::new();
+			for (index, patch) in raw_library.patches.iter().enumerate() {
+				let Some(patch) = validate_relative_path(patch, &format!("{location}.patches.{index}"), &mut errors) else { continue };
+				if patches.contains(&patch) {
+					push_error(&mut errors, format!("{location}.patches.{index}"), format!("duplicate patch {}", patch.as_str()));
+					continue;
+				}
+				if !workspace_root.join(sources.get(&owner).map_or("", |source| source.path.as_str())).join(patch.as_str()).is_file() {
+					push_error(&mut errors, format!("{location}.patches.{index}"), format!("no patch at {}", patch.as_str()));
+				}
+				patches.push(patch);
+			}
+			// A LICENCE THAT IS NOT ONE. It reaches the identity record, and a record carrying a
+			// space or a newline where a licence belongs is a record a reader has to guess about.
+			let licence = raw_library.licence.clone().unwrap_or_else(|| String::from("project"));
+			if licence.is_empty() || !licence.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+' | b'_')) {
+				push_error(&mut errors, format!("{location}.licence"), format!("{licence} is not a licence identifier"));
+			}
 			match producer {
+				Producer::Rust if !patches.is_empty() => push_error(&mut errors, format!("{location}.patches"), "a Rust library's sources are this tree's own; a patch series here patches nothing"),
+				Producer::Rust if raw_library.licence.is_some() => push_error(&mut errors, format!("{location}.licence"), "a Rust library is carried under the project licence like every other crate"),
 				Producer::Foreign if objects.is_empty() => push_error(&mut errors, format!("{location}.objects"), "a foreign library builds from an ordered object list and this one names none"),
 				Producer::Rust if !objects.is_empty() => push_error(&mut errors, format!("{location}.objects"), "a Rust library's inputs come from Cargo; an object list here is a second answer to the same question"),
 				Producer::Foreign if !features.is_empty() => push_error(&mut errors, format!("{location}.features"), "Cargo features on a foreign library are features nothing reads"),
 				_ => {}
 			}
-			if libraries.insert(name.clone(), Library { name, owner, destination, features, providers, producer, objects }).is_some() {
+			if libraries.insert(name.clone(), Library { name, owner, destination, features, providers, producer, objects, patches, licence }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate library name");
 			}
 		}

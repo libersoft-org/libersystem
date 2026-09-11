@@ -67,20 +67,6 @@ fn atoi_saturates_rather_than_wrapping() {
 }
 
 #[test]
-fn strtoul_reports_where_it_stopped_and_reads_the_prefix() {
-	let hex = c("0x2aZ");
-	let mut end: *mut c_char = core::ptr::null_mut();
-	assert_eq!(unsafe { crate::strings::strtoul(hex.as_ptr(), &mut end, 0) }, 42);
-	assert_eq!(unsafe { *end } as u8, b'Z');
-
-	// `end` POINTS AT THE START WHEN NOTHING PARSED, which is the only way a caller can tell "zero"
-	// from "not a number".
-	let nothing = c("zz");
-	assert_eq!(unsafe { crate::strings::strtoul(nothing.as_ptr(), &mut end, 10) }, 0);
-	assert_eq!(end, nothing.as_ptr() as *mut c_char);
-}
-
-#[test]
 fn strtod_leaves_an_exponent_marker_with_no_digits_alone() {
 	// "1e" IS THE NUMBER 1 FOLLOWED BY A LETTER. Consuming the `e` would swallow a character the
 	// caller is about to read.

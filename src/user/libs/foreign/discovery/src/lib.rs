@@ -30,7 +30,6 @@ pub mod record;
 pub mod version;
 
 pub mod directory;
-pub mod environment;
 pub mod library;
 pub mod stream;
 

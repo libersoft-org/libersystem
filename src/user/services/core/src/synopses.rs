@@ -74,6 +74,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("ps", "ps [json] - list the running processes"),
 	("free", "free [-h] - print the memory totals"),
 	("icdcheck", "icdcheck - reach the provider bound into a selection slot and report what it agreed to"),
+	("lifecheck", "lifecheck - report what ran before this program started and what runs after it ends"),
 	("uname", "uname - print the system identity"),
 	("uptime", "uptime - print how long the system has been up"),
 	("date", "date - print the wall-clock date and time"),

@@ -4091,6 +4091,32 @@ fn invalidate_plt_relocation_size(volume: &mut [u8], artifact: &[u8]) {
 	replace_dynamic_value(volume, artifact, bootproto::elf::DT_PLTRELSZ, 47);
 }
 
+/// Rewrite the TYPE of the artifact's first relocation to `relocation`, leaving everything else.
+///
+/// WHY A TYPE AND NOT A WHOLE ENTRY. The relocation policy is an allowlist of FORMS, and what has to
+/// be shown refused is a form - a thread-local access - rather than a malformed table. Changing only
+/// the type field leaves a structurally perfect relocation whose only fault is being the one thing
+/// the policy does not admit, which is exactly the artifact a compiler emitting TLS would produce.
+fn replace_first_relocation_type(volume: &mut [u8], artifact: &[u8], relocation: u32) {
+	let volume_base = volume.as_ptr() as usize;
+	let (offset, info) = {
+		let archive = pkg::Package::parse(&*volume).expect("volume package parses");
+		let bytes = archive.lookup(artifact).expect("relocation test artifact is staged");
+		let elf = bootproto::elf::Elf::parse(bytes).expect("relocation test artifact is ELF");
+		let dynamic = elf.dynamic_info().expect("relocation test metadata parses").expect("relocation test artifact has PT_DYNAMIC");
+		let entries = elf.rela_entries(&dynamic).expect("relocation test entries parse");
+		let address = dynamic.rela.expect("relocation test artifact has DT_RELA");
+		let first = {
+			let mut entries = entries;
+			entries.next().expect("relocation test artifact has at least one relocation")
+		};
+		let data = elf.virtual_data(address, core::mem::size_of::<bootproto::elf::Rela>() as u64).expect("relocation test table is file-backed");
+		// The type is the low half of `info`; the symbol index is the high half and stays as it was.
+		(data.as_ptr() as usize - volume_base + core::mem::size_of::<u64>(), (first.info & !0xffff_ffffu64) | u64::from(relocation))
+	};
+	volume[offset..offset + core::mem::size_of::<u64>()].copy_from_slice(&info.to_le_bytes());
+}
+
 fn replace_volume_entry(volume: &mut [u8], destination: &[u8], source: &[u8]) {
 	let volume_base = volume.as_ptr() as usize;
 	let (destination_offset, destination_len, source_bytes) = {

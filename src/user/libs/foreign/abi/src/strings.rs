@@ -240,48 +240,6 @@ pub unsafe extern "C" fn atoi(text: *const c_char) -> i32 {
 	signed.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
-/// Parse an unsigned integer in `base`, with `0x` and `0` prefixes when the base allows.
-#[cfg_attr(not(test), unsafe(no_mangle))]
-pub unsafe extern "C" fn strtoul(text: *const c_char, end: *mut *mut c_char, base: i32) -> u64 {
-	let mut index = 0;
-	while matches!(unsafe { *text.add(index) as u8 }, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
-		index += 1;
-	}
-	let mut radix = match base {
-		0 => 10,
-		other => other as u32,
-	};
-	if (base == 0 || base == 16) && unsafe { *text.add(index) as u8 } == b'0' {
-		let next = unsafe { *text.add(index + 1) as u8 };
-		if next == b'x' || next == b'X' {
-			radix = 16;
-			index += 2;
-		} else if base == 0 {
-			radix = 8;
-		}
-	}
-	let start = index;
-	let mut value: u64 = 0;
-	loop {
-		let byte = unsafe { *text.add(index) as u8 };
-		let Some(digit) = (byte as char).to_digit(radix) else {
-			break;
-		};
-		value = value.saturating_mul(u64::from(radix)).saturating_add(u64::from(digit));
-		index += 1;
-	}
-	if !end.is_null() {
-		// `end` POINTS AT THE START WHEN NOTHING PARSED, which is how a caller tells "zero" from
-		// "not a number" - the return value cannot.
-		let stop = match index == start {
-			true => 0,
-			false => index,
-		};
-		unsafe { *end = text.add(stop) as *mut c_char };
-	}
-	value
-}
-
 /// Parse a decimal floating-point number. Enough of C's grammar for the pinned sources: an optional
 /// sign, digits, a fractional part and an exponent.
 #[cfg_attr(not(test), unsafe(no_mangle))]

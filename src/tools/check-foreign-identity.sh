@@ -53,7 +53,7 @@ base="$(sha256sum "$record" | cut -d' ' -f1)"
 
 # THE MUTATIONS. One line at a time, each a field that can change what the artifact IS without
 # changing a source byte.
-for field in compiler compiler-sha256 archiver archiver-sha256 linker linker-sha256 cflags sysroot-sha256 configure-sha256 objects-sha256; do
+for field in compiler compiler-sha256 archiver archiver-sha256 linker linker-sha256 cflags sysroot-sha256 configure-sha256 objects-sha256 patches-sha256 licence; do
 	grep -q "^$field=" "$record" || fail "the foreign record has no $field line"
 	sed "s|^$field=.*|$field=mutated|" "$record" >"$work/mutated"
 	cmp -s "$record" "$work/mutated" && fail "$field: the mutation changed nothing, so this proves nothing"

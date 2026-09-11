@@ -27,6 +27,12 @@ usage: build-foreign-static.sh --arch ARCH [--out DIR] [--sysroot WHICH]
   --arch ARCH      x86_64 | aarch64 | riscv64
   --out DIR        where the objects and the archive go (default: .build/foreign/ARCH)
   --sysroot WHICH  bootstrap (default) | profile
+  --ported         compile the PLATFORM-PORTED sources instead of the pinned ones
+
+THE PORTED TREE IS A COPY AND THE PINNED ONE IS NEVER EDITED. Pass 2 compiles the loader with this
+milestone's platform port applied; the static-target pin froze the archives WITHOUT it, and both have
+to stay reproducible - so the port lives in a copy under $(.build/foreign/src-loader-port) and this
+flag says which of the two is being built.
 
 THE TWO SYSROOTS ARE NOT ALTERNATIVES AND THE DEFAULT IS NOT A PREFERENCE. The BOOTSTRAP one is what
 the archives in the static-target pin were built against, so reproducing those digests has to name
@@ -43,6 +49,7 @@ EOF
 arch=""
 out=""
 sysroot="bootstrap"
+ported=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--arch)
@@ -60,12 +67,35 @@ while [[ $# -gt 0 ]]; do
 		sysroot="$2"
 		shift 2
 		;;
+	--ported)
+		ported=1
+		shift
+		;;
 	-h | --help) usage ;;
 	*) usage ;;
 	esac
 done
 [[ -n "$arch" ]] || usage
 out="${out:-$ROOT/.build/foreign/$arch}"
+
+# THE MECHANISMS THIS PROFILE FORBIDS, STATED AS FLAGS AND NOT ONLY AS A CHECK. The inventory names
+# no exception table, no unwind symbol and no RTTI, so the answer for each is FORBIDDEN - and a
+# forbidden mechanism gets the compiler flags that stop it being emitted as well as the artifact
+# check that catches it if it ever is. The flags are what makes the absence a decision; the check is
+# what makes it stay one.
+#
+# THEY APPLY TO THE PORTED TREE ONLY, and that is the freeze order rather than a hedge: the
+# static-target part froze three archive digests for the PINNED tree before pass 1, and a flag added
+# to that build now would move values a part that precedes this decision already holds. The ported
+# tree is the derived part's, which is where a derived decision belongs.
+#
+# `-fno-rtti` IS NOT HERE because clang refuses it for a C compile. The pinned production
+# configuration is C99; the RTTI answer is the artifact check, which is the half that would catch a
+# C++ object appearing.
+forbid=()
+if [[ "$ported" == 1 ]]; then
+	forbid=(-fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables)
+fi
 
 case "$sysroot" in
 bootstrap)
@@ -85,6 +115,9 @@ esac
 
 STORE="$ROOT/.build/foreign"
 LOADER="$STORE/src-loader"
+if [[ "$ported" == 1 ]]; then
+	LOADER="$STORE/src-loader-port"
+fi
 HEADERS="$STORE/src-headers"
 for dir in "$LOADER" "$HEADERS"; do
 	[[ -d "$dir" ]] || {
@@ -138,6 +171,7 @@ for name in "${sources[@]}"; do
 	clang \
 		--target="$target" \
 		-ffreestanding -nostdlibinc -fPIC -O2 \
+		"${forbid[@]}" \
 		"${abi[@]}" "${defines[@]}" \
 		"${include[@]}" \
 		-I "$LOADER/loader" -I "$LOADER/loader/generated" -I "$HEADERS/include" \

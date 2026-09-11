@@ -73,8 +73,89 @@ pub extern "C" fn liber_rt_start(bootstrap: u64, main: unsafe extern "C" fn(u64)
 			print(b"rt: refusing to run - built against a different kernel ABI revision\n");
 			exit();
 		}
+		run_initialisers();
 		main(bootstrap)
 	}
+}
+
+// THE LIFECYCLE ARRAYS, RUN. An image may carry a table of functions to call once before anything
+// else runs and once after everything else has, and until this existed nothing in this system ran
+// them: the ABI check passed and the entry point was called directly, so a constructor in a loaded
+// module was an initialisation that silently did not happen.
+//
+// THE ORDER IS THE LOAD ORDER AND THAT IS THE PROVIDER ORDER. The loader is given its modules in
+// dependency order and maps the main image last, so walking the table forwards runs a provider's
+// constructor before its consumer's - which is the only order in which a constructor can rely on
+// what it was built against. Destructors walk it backwards, for the same reason read the other way.
+//
+// THE TABLE IS READ ENTRY BY ENTRY rather than into a buffer this runtime sizes, because the number
+// of images is a property of the process and not of this code. The bound below is the loader's own
+// module limit; a table longer than that is a kernel that changed without this, and stopping is the
+// honest answer to it.
+const MAX_LIFECYCLE_IMAGES: u64 = 64;
+
+// SAFETY: every address in the table was written by the kernel out of an image it had already
+// mapped, biased by the bias it mapped it at. What this cannot check is that the image's own array
+// points at functions - that is the image's ABI contract, the same one a direct call to its entry
+// point relies on.
+unsafe fn run_lifecycle(entries: impl Iterator<Item = abi::ModuleLifecycle>, initialising: bool) {
+	for entry in entries {
+		let (address, count) = if initialising { (entry.init_array, entry.init_count) } else { (entry.fini_array, entry.fini_count) };
+		if address == 0 || count == 0 {
+			continue;
+		}
+		// DESTRUCTORS RUN IN REVERSE WITHIN AN IMAGE TOO. Construction order inside one array is
+		// first to last; unwinding it is last to first, and doing one and not the other would
+		// destroy in an order nothing constructed in.
+		for slot in 0..count {
+			let slot = if initialising { slot } else { count - 1 - slot };
+			let pointer = unsafe { core::ptr::read((address + slot * core::mem::size_of::<u64>() as u64) as *const u64) };
+			if pointer == 0 {
+				continue;
+			}
+			let function: extern "C" fn() = unsafe { core::mem::transmute::<u64, extern "C" fn()>(pointer) };
+			function();
+		}
+	}
+}
+
+fn lifecycle_entries() -> ([abi::ModuleLifecycle; MAX_LIFECYCLE_IMAGES as usize], usize) {
+	let mut table = [abi::ModuleLifecycle { init_array: 0, init_count: 0, fini_array: 0, fini_count: 0, is_main_image: 0 }; MAX_LIFECYCLE_IMAGES as usize];
+	let mut held = 0usize;
+	for index in 0..MAX_LIFECYCLE_IMAGES {
+		let mut entry = abi::ModuleLifecycle { init_array: 0, init_count: 0, fini_array: 0, fini_count: 0, is_main_image: 0 };
+		let result = unsafe { syscall(SYS_PROCESS_LIFECYCLE, index, &raw mut entry as u64, core::mem::size_of::<abi::ModuleLifecycle>() as u64, 0) };
+		if sys_is_err(result) {
+			break;
+		}
+		table[held] = entry;
+		held += 1;
+	}
+	(table, held)
+}
+
+fn run_initialisers() {
+	let (table, held) = lifecycle_entries();
+	unsafe { run_lifecycle(table[..held].iter().copied(), true) };
+}
+
+// Run every destructor, once, in reverse of the order the constructors ran in.
+//
+// ONCE IS ENFORCED HERE AND NOT ASSUMED. `exit_with` is reachable from anywhere, including from
+// inside a destructor, and running the table twice would destroy what was already destroyed.
+static mut FINALISED: bool = false;
+
+fn run_finalisers() {
+	// SAFETY: this process creates no threads - the whole substrate is pinned without thread
+	// creation - so there is no second reader of this flag to race with.
+	unsafe {
+		if FINALISED {
+			return;
+		}
+		FINALISED = true;
+	}
+	let (table, held) = lifecycle_entries();
+	unsafe { run_lifecycle(table[..held].iter().rev().copied(), false) };
 }
 
 #[cfg(not(any(feature = "shared-image", feature = "host-tests")))]
@@ -315,6 +396,11 @@ pub fn exit() -> ! {
 // tell a program that ran and refused from one that worked - which nothing could do before,
 // because the syscall took no argument and closure was the only signal.
 pub fn exit_with(status: u64) -> ! {
+	// A NORMAL EXIT RUNS THE DESTRUCTORS AND A CRASH DOES NOT, which is the whole of what a lifecycle
+	// contract says. Everything that reaches here asked to end; a process that faults or is killed
+	// never returns to this code, so the difference between the two paths is observable rather than
+	// documented.
+	run_finalisers();
 	unsafe {
 		syscall(SYS_USER_EXIT, status, 0, 0, 0);
 	}

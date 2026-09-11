@@ -410,6 +410,20 @@ pub const SYS_CHANNEL_SEND_ATTENUATED: u64 = 80;
 // deadline a teardown under way must confirm by - so "may I bind this?" and "how long is it
 // reasonable to wait?" are one read rather than two sources that can disagree.
 pub const SYS_DEVICE_CLAIM_SNAPSHOT: u64 = 81;
+// WHAT A PROCESS MUST RUN BEFORE ITS FIRST LINE AND AFTER ITS LAST.
+//
+// An image may carry a table of functions to call once before anything else runs and once after
+// everything else has. Nothing in this system ran them: `liber_rt_start` performed the ABI check and
+// called the entry point directly, so a constructor in a loaded module was an initialisation that
+// silently did not happen - and an image whose initialisation did not happen is not the image the
+// audit checked.
+//
+// THE CALLER READS ITS OWN TABLE AND NOBODY ELSE-S. The entries are in LOAD order, which is the
+// provider order the loader was given - so running them in order runs a provider-s constructor
+// before its consumer-s, and running them in reverse does the same for destructors. It takes no
+// handle because there is no other process it could name: a table of addresses in another process-s
+// address space would mean nothing here.
+pub const SYS_PROCESS_LIFECYCLE: u64 = 82;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -826,6 +840,25 @@ pub struct MemoryStats {
 	pub free_frames: u64,
 	pub heap_total: u64,
 	pub heap_free: u64,
+}
+
+// One module's lifecycle arrays, as `process_lifecycle` writes them into the caller's buffer: the
+// already-biased addresses and entry counts of its `.init_array` and `.fini_array`, and whether this
+// entry is the process's OWN image rather than one of its providers.
+//
+// WHY THE MAIN IMAGE IS MARKED RATHER THAN ORDERED. It is loaded FIRST and must be constructed LAST:
+// it is the consumer of everything else, so every provider's constructor has to have run before its
+// own does. Marking it says that in the record instead of asking every reader to remember that the
+// first entry is special - and a reader that ignored the flag would run the consumer first, which is
+// the one order that is wrong.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ModuleLifecycle {
+	pub init_array: u64,
+	pub init_count: u64,
+	pub fini_array: u64,
+	pub fini_count: u64,
+	pub is_main_image: u64,
 }
 
 // One boot memory-map region memmap_get writes into the caller's buffer: its physical

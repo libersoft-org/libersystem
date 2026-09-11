@@ -308,6 +308,33 @@ fn dynamic_relocation_policy_is_exact_for_every_supported_machine() {
 }
 
 #[test]
+// EVERY THREAD-LOCAL RELOCATION FORM IS REFUSED, BY NUMBER, ON EVERY MACHINE.
+//
+// WHY THIS IS ITS OWN TEST AND NOT A LINE IN THE ONE ABOVE. The policy is an ALLOWLIST, so every
+// form outside it is refused by construction and a test of one arbitrary outsider proves the
+// allowlist is an allowlist. This proves something narrower and load bearing: that the specific
+// forms a THREAD-LOCAL access is spelled with are outside it, on each architecture, by the number
+// the architecture uses. The foreign-substrate profile selects the no-TLS variant and its evidence
+// is an ABSENCE - a scan finding nothing - and an absence is only worth anything if the refusal it
+// relies on is real. Both readers of this policy, the packager and the runtime loader, refuse on
+// exactly this answer.
+fn every_thread_local_relocation_form_is_outside_the_policy() {
+	// x86_64: DTPMOD64, DTPOFF64, TLSGD, TLSLD, DTPOFF32, GOTTPOFF, TPOFF32, TPOFF64, TLSDESC_CALL,
+	// TLSDESC. aarch64: the TLS_DTPREL/DTPMOD/TPREL and TLSDESC group. riscv64: TLS_DTPMOD32 through
+	// TLS_TPREL64 and the descriptor forms.
+	let forms: &[(u16, &[u32])] = &[
+		(EM_X86_64, &[16, 17, 18, 19, 20, 21, 22, 23, 34, 35, 36]),
+		(EM_AARCH64, &[1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040]),
+		(EM_RISCV, &[8, 9, 10, 11, 12]),
+	];
+	for &(machine, relocations) in forms {
+		for &relocation in relocations {
+			assert_eq!(dynamic_relocation_kind(machine, relocation), None, "machine {machine} must refuse thread-local relocation {relocation}");
+		}
+	}
+}
+
+#[test]
 fn rela_metadata_uses_virtual_addresses_and_rejects_partial_tables() {
 	let header_len = core::mem::size_of::<Elf64Header>();
 	let table_len = core::mem::size_of::<[ProgramHeader; 2]>();

@@ -4,10 +4,12 @@
 name = "liber-profile-sysroot"
 version = "1"
 licence = "project"
-# WHAT SIZED IT. Not the option set - that is the bootstrap sysroot's rule - but the measured
-# inventory, which is why this file names the measurement it was derived from.
-derived_from = "src/foreign/INVENTORY-pass1.json"
-declares = 46
+# WHAT SIZED IT. Not the option set - that is the bootstrap sysroot-s rule - but the measured
+# inventory, which is why this file names the measurement it was derived from. PASS 2 AND NOT PASS 1:
+# the candidate surface over-states what a system must provide, and six of its symbols turned out to
+# be things only the unported loader asked for.
+derived_from = "src/foreign/INVENTORY-pass2.json"
+declares = 40
 # The twelve the loader's own patched headers declare, which is why 46 and not 58.
 declared_elsewhere = [
 	"loader_platform_close_library",

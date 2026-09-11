@@ -67,6 +67,10 @@ declare -A GATES=(
 	# before the first thread runs - none of which is observable from outside a launch, so this boots
 	# a guest and reads what the bound provider actually agreed to.
 	["icd-selection"]="tools/check-icd-selection.sh"
+	# Static initialisation is a mechanism the converged closure ADMITS, so it gets positive gates:
+	# order across the provider DAG, what a constructor that stopped half way leaves behind,
+	# destructors in reverse on a normal exit, and which of them a crash does not run.
+	["lifecycle"]="tools/check-lifecycle.sh"
 	["dma-mode-carrier"]="tools/check-dma-mode-carrier.sh"
 	["dma-mode-x86_64"]="tools/check-dma-mode-x86_64.sh"
 	["dma-mode-ports"]="tools/check-dma-mode-ports.sh"
@@ -187,6 +191,14 @@ declare -A GATES=(
 	# linker, the flags, the sysroot and the configure inputs each change what the artifact IS without
 	# changing a source byte, so each must move its digest, its consumer edges and its cache key.
 	["foreign-identity"]="tools/check-foreign-identity.sh"
+	# Pass 2: the converged audit link. An archive does not resolve its external symbols, so pass 1
+	# measures a CANDIDATE surface; what the substrate must provide is what a link actually resolved,
+	# and the gate is the fixed point rather than the first link.
+	["foreign-audit-link"]="tools/check-foreign-audit-link.sh"
+	# The C++ ABI decision matrix, on the artifact. Exception tables, RTTI and `atexit` registration
+	# are FORBIDDEN under this pin, which means flags that stop them being emitted AND a check that
+	# catches them if a flag, a compiler or a source ever changes that.
+	["foreign-cxx-abi"]="tools/check-foreign-cxx-abi.sh"
 	["source-hygiene"]="tools/check-source-hygiene.sh --current"
 	["source-history-hygiene"]="tools/check-source-hygiene.sh --history"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"

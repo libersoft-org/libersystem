@@ -22,7 +22,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-INVENTORY="src/foreign/INVENTORY-pass1.json"
+# PASS 2 IS THE AUTHORITY, NOT PASS 1. The candidate surface over-states what a system must provide -
+# a per-object undefined symbol may be satisfied by another upstream object - so the set a crate is
+# checked against is what the CONVERGED LINK resolved. Pass 1 is where the question was first asked
+# and is not where it is answered; when pass 2 has not run yet, this falls back to it and says so.
+INVENTORY="src/foreign/INVENTORY-pass2.json"
+INVENTORY_PASS="2"
+if [[ ! -f "$INVENTORY" ]]; then
+	INVENTORY="src/foreign/INVENTORY-pass1.json"
+	INVENTORY_PASS="1"
+fi
 FACILITIES="src/user/libs/foreign/abi"
 DISCOVERY="src/user/libs/foreign/discovery"
 
@@ -35,7 +44,7 @@ fail() {
 [[ -d "$FACILITIES" ]] || fail "$FACILITIES is missing"
 [[ -d "$DISCOVERY" ]] || fail "$DISCOVERY is missing"
 
-python3 - "$INVENTORY" "$FACILITIES" "$DISCOVERY" <<'PY' || exit 1
+python3 - "$INVENTORY" "$FACILITIES" "$DISCOVERY" "$INVENTORY_PASS" <<'PY' || exit 1
 import json
 import pathlib
 import re
@@ -47,7 +56,8 @@ discovery = pathlib.Path(sys.argv[3]) / "src"
 
 # THE THREE TARGETS MUST AGREE ABOUT WHAT THEY NEED. They do today - one C99 configuration with no
 # per-architecture sources - and if they ever stop, this crate cannot be one crate.
-surfaces = {arch: set(inventory[arch]["undefined"]) for arch in ("x86_64", "aarch64", "riscv64")}
+key = "undefined" if sys.argv[4] == "1" else "archive_surface"
+surfaces = {arch: set(inventory[arch][key]) for arch in ("x86_64", "aarch64", "riscv64")}
 named = set.union(*surfaces.values())
 if len(set(map(frozenset, surfaces.values()))) != 1:
 	print("foreign-facilities: the three targets name different symbols; one crate cannot serve them", file=sys.stderr)
@@ -55,9 +65,12 @@ if len(set(map(frozenset, surfaces.values()))) != 1:
 
 # THE DISCOVERY ITEM'S SHARE, written down. Each of these is a decision about what a provider or a
 # configuration directory IS on this system, which is that item's question and not a C translation.
+# THE ENVIRONMENT AND THE IDENTITY QUERIES ARE GONE, and that is the platform port showing through
+# rather than a trim: the ported loader never reads an environment, so `getenv` and the four id
+# queries `is_high_integrity` needed are symbols the converged link does not ask for - and a symbol
+# nothing requires is not built.
 DISCOVERY = {
-	"closedir", "opendir", "readdir", "fclose", "fileno", "fopen", "fread", "fstat",
-	"getegid", "getenv", "geteuid", "getgid", "getuid", "dladdr",
+	"closedir", "opendir", "readdir", "fclose", "fileno", "fopen", "fread", "fstat", "dladdr",
 	"loader_platform_close_library", "loader_platform_executable_path", "loader_platform_file_exists",
 	"loader_platform_get_proc_address", "loader_platform_is_path_absolute",
 	"loader_platform_open_library", "loader_platform_open_library_error",
@@ -104,5 +117,5 @@ if failed:
 total = sum(len(provided) for provided, _ in crates.values())
 for crate, (provided, owed) in sorted(crates.items()):
 	print(f"foreign-facilities: {crate}: {len(provided)} symbol(s), exactly its share of the inventory")
-print(f"foreign-facilities: {total} of the {len(named)} symbol(s) pass 1 derived are provided, and none beyond them")
+print(f"foreign-facilities: {total} of the {len(named)} symbol(s) pass {sys.argv[4]} derived are provided, and none beyond them")
 PY

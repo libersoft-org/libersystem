@@ -102,7 +102,7 @@ mean before it reads them:
 | `language=` | its fields |
 | --- | --- |
 | `rust` | `rustc-commit`, `rustflags`, `features` |
-| `foreign` | `compiler`, `compiler-sha256`, `archiver`, `archiver-sha256`, `linker`, `linker-sha256`, `cflags`, `sysroot-sha256`, `configure-sha256`, `objects-sha256` |
+| `foreign` | `compiler`, `compiler-sha256`, `archiver`, `archiver-sha256`, `linker`, `linker-sha256`, `cflags`, `sysroot-sha256`, `configure-sha256`, `objects-sha256`, `patches-sha256`, `licence` |
 
 Each foreign tool appears twice: the version line a person reads, and the digest of the
 binary that actually ran - two builds of one release are two different compilers, and the

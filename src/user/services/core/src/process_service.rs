@@ -195,10 +195,16 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 			// objects; this says what did, so a record cannot describe one compile while the
 			// artifact beside it is another.
 			let objects = identity_value(lines.next()?, b"objects-sha256=")?;
-			if compiler.is_empty() || archiver.is_empty() || linker.is_empty() || cflags.is_empty() {
+			// THE PATCH SERIES AND THE LICENCE. Both are definite answers even when there is nothing
+			// to say - an empty series hashes to the digest of an empty input, and a source this tree
+			// wrote is carried under `project` - because a field that may be ABSENT is a field an
+			// artifact can be silent about, and silence is what an obligation travels through.
+			let patches = identity_value(lines.next()?, b"patches-sha256=")?;
+			let licence = identity_value(lines.next()?, b"licence=")?;
+			if compiler.is_empty() || archiver.is_empty() || linker.is_empty() || cflags.is_empty() || licence.is_empty() {
 				return None;
 			}
-			if !valid_hex(compiler_digest, 64) || !valid_hex(archiver_digest, 64) || !valid_hex(linker_digest, 64) || !valid_hex(sysroot, 64) || !valid_hex(configure, 64) || !valid_hex(objects, 64) {
+			if !valid_hex(compiler_digest, 64) || !valid_hex(archiver_digest, 64) || !valid_hex(linker_digest, 64) || !valid_hex(sysroot, 64) || !valid_hex(configure, 64) || !valid_hex(objects, 64) || !valid_hex(patches, 64) {
 				return None;
 			}
 		}

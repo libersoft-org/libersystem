@@ -1,0 +1,192 @@
+THE PLATFORM PORT: no environment, and no layers.
+
+WHAT THIS PATCH IS FOR, AND WHY IT IS SEPARATE FROM 0001. The portable-static-target patch declares
+the platform surface and defines nothing; it is what makes the candidate surface measurable. This one
+describes BEHAVIOUR - what this platform answers when the loader asks it something - and it belongs
+to the derived half of the lockfile, after pass 1 has measured and before pass 2 links.
+
+IT IS APPLIED TO A COPY, NEVER TO THE PINNED TREE. The static-target pin froze three archives built
+WITHOUT it, and both builds have to stay reproducible, so the ported sources live beside the pinned
+ones and the builder is told which of the two to compile.
+
+WHAT IT CHANGES, IN TWO PLACES:
+
+  loader_environment.c  TWO CHANGES. LiberSystem takes upstream's own third shape - the one its `#else` branch
+                          already provides for a platform with no environment variables - rather than
+                          the common-unix one it joined for its file and thread facilities. Reading
+                          an environment is the ambient search this configuration exists to refuse:
+                          an overridable layer path, an overridable driver selection and an
+                          overridable log level are three ways for something outside the verified
+                          closure to decide what runs inside it. `loader_secure_getenv` is defined
+                          here too, which upstream's branch does not do, because its callers are
+                          compiled on this platform and are not on the ones that branch was for.
+                          And the id-filter override PARSER loses its body, which is not the same
+                          change twice: with the reader answering NULL the optimiser already deleted
+                          everything below its first branch, so the artifact was correct either way -
+                          but the SOURCE still called `strtoul`, and a sysroot that must declare a
+                          function the substrate does not provide is the general POSIX layer arriving
+                          through the include path. An empty filter is what an unset variable
+                          produced anyway, so no behaviour changes.
+  loader.c              the two layer-scan entry points answer an EMPTY list. That is legal under
+                          the specification and true here: there is no layer directory, no layer
+                          manifest and no way to load one. Everything downstream then follows from
+                          upstream's own code - `vkEnumerateInstanceLayerProperties` reports zero, and
+                          an instance or device creation that ENABLES a layer is refused with
+                          `VK_ERROR_LAYER_NOT_PRESENT` by the lookup that does not find it. These two
+                          functions are the ONLY entry points into the layer manifest search, so
+                          replacing them removes the filesystem walk, the settings-file override and
+                          the environment-steered layer paths in one place rather than in fifty.
+
+WHAT IT MEASURABLY REMOVES FROM THE SURFACE: `getenv`, the four identity queries `is_high_integrity`
+needed, and `strtoul`, which was reached only to parse a number an environment variable carried. Six
+symbols, 58 to 52, on all three targets - and six declarations out of the profile sysroot with them,
+because what the substrate does not provide is not declared.
+
+WHAT IT DOES NOT REMOVE, AND WHY IT CANNOT: the provider-open and manifest-read facilities the layer
+path SHARED with the ICD path stay, because they are the same symbols and the ICD path is what this
+substrate exists to serve. What they reach on this system is a bounded, package-owned record rather
+than an ambient directory - the discovery item's decision, not an accident of this port.
+
+--- a/loader/loader_environment.c
++++ b/loader/loader_environment.c
+@@ -36,7 +36,47 @@
+ #include <ctype.h>
+ 
+ // Environment variables
+-#if COMMON_UNIX_PLATFORMS
++#if defined(__LiberSystem__)
++
++// LIBERSYSTEM HAS NO ENVIRONMENT, AND THAT IS A DEFINITE ANSWER RATHER THAN A MISSING ONE.
++//
++// This is upstream's own third shape - the one its `#else` branch already provides for a platform
++// without environment variables - taken here rather than the common-unix one, because LiberSystem
++// joined that set for its FILE and THREAD facilities and not for this. Reading an environment is
++// the ambient search this configuration exists to refuse: an overridable layer path, an overridable
++// driver selection and an overridable log level are three ways for something outside the verified
++// closure to decide what runs inside it.
++//
++// TAKING THE BRANCH RATHER THAN STUBBING THE CALL is what removes `getenv` from the surface
++// entirely, along with the four identity queries `is_high_integrity` needs. A stub that still called
++// `getenv` would leave a symbol in the closure that the inventory would then have to explain, and
++// "it always answers unset" is an explanation about a body rather than about a surface.
++//
++// `loader_secure_getenv` is defined here as well, which upstream's `#else` branch does not do: its
++// callers are unconditional, and the branch is only reached on platforms whose builds do not compile
++// them. This one does.
++
++bool is_high_integrity(void) { return false; }
++
++char *loader_getenv(const char *name, const struct loader_instance *inst) {
++    (void)name;
++    (void)inst;
++    return NULL;
++}
++
++char *loader_secure_getenv(const char *name, const struct loader_instance *inst) {
++    (void)name;
++    (void)inst;
++    return NULL;
++}
++
++void loader_free_getenv(char *val, const struct loader_instance *inst) {
++    // Nothing was ever allocated, because nothing was ever read.
++    (void)val;
++    (void)inst;
++}
++
++#elif COMMON_UNIX_PLATFORMS
+ 
+ bool is_high_integrity(void) { return geteuid() != getuid() || getegid() != getgid(); }
+ 
+@@ -567,6 +607,26 @@
+     return res;
+ }
+ 
++#if defined(__LiberSystem__)
++
++// AN ENVIRONMENT OVERRIDE PARSER FOR AN ENVIRONMENT THAT DOES NOT EXIST.
++//
++// WHY THE BODY GOES RATHER THAN BEING LEFT UNREACHABLE. With `loader_secure_getenv` answering NULL in
++// this same translation unit the optimiser already deletes everything below the first branch, so the
++// linked artifact was correct either way. What it did NOT delete is the source's REQUIREMENT: the
++// call to `strtoul` still has to be declared for the compile, and a sysroot that declares a function
++// the substrate does not provide is the general POSIX layer arriving through the include path -
++// which is the one failure mode the profile sysroot exists to prevent. The empty filter is what the
++// caller gets from an unset variable anyway, so this changes no behaviour at all.
++void parse_id_filter_environment_var(const struct loader_instance *inst, const char *env_var_name,
++                                     struct loader_envvar_id_filter *filter_struct) {
++    (void)inst;
++    (void)env_var_name;
++    memset(filter_struct, 0, sizeof(struct loader_envvar_id_filter));
++}
++
++#else
++
+ void parse_id_filter_environment_var(const struct loader_instance *inst, const char *env_var_name,
+                                      struct loader_envvar_id_filter *filter_struct) {
+     memset(filter_struct, 0, sizeof(struct loader_envvar_id_filter));
+@@ -619,6 +679,8 @@
+     loader_free_getenv(env_var_value, inst);
+ }
+ 
++#endif  // defined(__LiberSystem__)
++
+ bool check_id_matches_filter_environment_var(const uint32_t id, const struct loader_envvar_id_filter *filter_struct) {
+     for (uint32_t i = 0; i < filter_struct->count; i++) {
+         if ((filter_struct->filters[i].begin <= id) && (id <= filter_struct->filters[i].end)) {
+--- a/loader/loader.c
++++ b/loader/loader.c
+@@ -4278,6 +4278,44 @@
+     }
+ }
+ 
++#if defined(__LiberSystem__)
++
++// THIS SYSTEM HAS NO LAYERS, AND SAYING SO IS THE HONEST ANSWER RATHER THAN A SIMPLIFICATION.
++//
++// Answering with an empty list is legal under the specification and it is TRUE here: there is no
++// layer directory, no layer manifest and no way to load one. What follows from it is the behaviour
++// an application already handles - `vkEnumerateInstanceLayerProperties` reports zero, and an
++// instance or device creation that ENABLES a layer is refused with `VK_ERROR_LAYER_NOT_PRESENT` by
++// the upstream code that looks the requested name up in this list and does not find it. Silently
++// dropping a requested layer is how a validation build reports success while validating nothing.
++//
++// THE MANIFEST SEARCH IS NOT REACHED FROM HERE, which is the point: these two functions are the only
++// entry points into it for layers, so replacing them removes the filesystem walk, the settings-file
++// override and the environment-steered layer paths in one place rather than in fifty.
++//
++// WHAT IS NOT REMOVED, AND WHY IT CANNOT BE: the provider-open and manifest-read facilities the
++// layer path shared with the ICD path stay in the surface, because the ICD path is what this
++// substrate exists to serve and they are the same symbols. What they reach on this system is a
++// bounded, package-owned record rather than an ambient directory - which is the discovery item's
++// decision, not an accident of this port.
++VkResult loader_scan_for_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
++                                const struct loader_envvar_all_filters *filters) {
++    (void)inst;
++    (void)filters;
++    memset(instance_layers, 0, sizeof(struct loader_layer_list));
++    return VK_SUCCESS;
++}
++
++VkResult loader_scan_for_implicit_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
++                                         const struct loader_envvar_all_filters *layer_filters) {
++    (void)inst;
++    (void)layer_filters;
++    memset(instance_layers, 0, sizeof(struct loader_layer_list));
++    return VK_SUCCESS;
++}
++
++#else
++
+ VkResult loader_scan_for_layers(struct loader_instance *inst, struct loader_layer_list *instance_layers,
+                                 const struct loader_envvar_all_filters *filters) {
+     VkResult res = VK_SUCCESS;
+@@ -4464,6 +4502,8 @@
+     return res;
+ }
+ 
++#endif  // defined(__LiberSystem__)
++
+ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL loader_gpdpa_instance_terminator(VkInstance inst, const char *pName) {
+     // inst is not wrapped
+     if (inst == VK_NULL_HANDLE) {

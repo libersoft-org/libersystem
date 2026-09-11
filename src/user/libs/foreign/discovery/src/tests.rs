@@ -79,17 +79,6 @@ fn a_record_at_the_wrong_version_is_refused_rather_than_interpreted() {
 }
 
 #[test]
-fn getenv_answers_nothing_for_every_name() {
-	// THE VARIABLES EXIST PRECISELY TO LET SOMETHING OUTSIDE THE PROCESS point it at a driver, which
-	// is the authority the selection slot holds instead.
-	install();
-	for name in [&b"VK_ICD_FILENAMES"[..], b"VK_DRIVER_FILES", b"VK_LAYER_PATH", b"PATH", b"HOME"] {
-		let name = c(name);
-		assert!(unsafe { crate::environment::getenv(name.as_ptr()) }.is_null(), "an environment search path is not a thing here");
-	}
-}
-
-#[test]
 fn a_directory_contains_exactly_what_the_record_names_under_it() {
 	install();
 	let real = c(b"vol://system/share/vulkan/icd.d");

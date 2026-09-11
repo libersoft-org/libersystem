@@ -184,6 +184,12 @@ pub struct Process {
 	// The biases dynamic modules are loaded at. `dynamic_modules` counts them; this says
 	// WHICH, which is what a second load at the same address has to be refused against.
 	dynamic_biases: SpinLock<Vec<u64>>,
+	// THE LIFECYCLE ARRAYS OF EVERY IMAGE IN THIS PROCESS, IN LOAD ORDER. The loader records one
+	// entry per image as it maps it, which is the provider order it was given - so the order this
+	// vector is in IS the construction order, and its reverse is the destruction order. Kept beside
+	// the biases rather than in them because a bias is a slot reservation that exists before the
+	// image is known to be good, and this is a fact about an image that loaded.
+	lifecycle: SpinLock<Vec<abi::ModuleLifecycle>>,
 }
 
 impl Process {
@@ -195,7 +201,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
+		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), lifecycle: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -409,6 +415,35 @@ impl Process {
 		let mut biases = self.dynamic_biases.lock();
 		biases.retain(|taken| *taken != bias);
 		self.dynamic_modules.store(biases.len(), Ordering::Release);
+	}
+
+	// Record what an image that has just finished loading must run, and when.
+	//
+	// REFUSED RATHER THAN DROPPED WHEN THE HEAP CANNOT HOLD IT. A process whose constructor list is
+	// incomplete would start and run some of its initialisers, which is a worse state than not
+	// starting: the caller turns `false` into a failed load and the process never runs at all.
+	pub fn record_lifecycle(&self, entry: abi::ModuleLifecycle) -> bool {
+		if entry.init_count == 0 && entry.fini_count == 0 {
+			// NOTHING TO RUN IS NOT AN ENTRY. Most images carry neither array, and a table full of
+			// empty rows would make every reader walk them to find that out.
+			return true;
+		}
+		let mut lifecycle = self.lifecycle.lock();
+		if lifecycle.try_reserve(1).is_err() {
+			return false;
+		}
+		lifecycle.push(entry);
+		true
+	}
+
+	// How many images in this process carry something to run.
+	pub fn lifecycle_count(&self) -> usize {
+		self.lifecycle.lock().len()
+	}
+
+	// The `index`-th entry, in load order.
+	pub fn lifecycle_entry(&self, index: usize) -> Option<abi::ModuleLifecycle> {
+		self.lifecycle.lock().get(index).copied()
 	}
 
 	pub fn has_dynamic_modules(&self) -> bool {

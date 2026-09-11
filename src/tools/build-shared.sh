@@ -189,14 +189,14 @@ declare -A library_rows=()
 declare -A library_destinations=()
 declare -A program_destinations=()
 declare -A program_owners=()
-while IFS=$'\t' read -r record_kind name owner destination features producer objects providers; do
+while IFS=$'\t' read -r record_kind name owner destination features producer objects patches licence providers; do
 	case "$record_kind" in
 	source)
 		source_owners[$name]="$owner"
 		source_paths[$owner]="$name"
 		;;
 	library)
-		library_rows[$name]="library"$'\t'"$name"$'\t'"$owner"$'\t'"volume"$'\t'"$destination"$'\t'"$features"$'\t'"$producer"$'\t'"$objects"$'\t'"$providers"
+		library_rows[$name]="library"$'\t'"$name"$'\t'"$owner"$'\t'"volume"$'\t'"$destination"$'\t'"$features"$'\t'"$producer"$'\t'"$objects"$'\t'"$patches"$'\t'"$licence"$'\t'"$providers"
 		library_destinations[$name]="$destination"
 		;;
 	program)
@@ -205,13 +205,15 @@ while IFS=$'\t' read -r record_kind name owner destination features producer obj
 		;;
 	esac
 done < <(jq -r '
-	(.sources[] | ["source", .owner, .path, "", "", "", "", ""]),
+	(.sources[] | ["source", .owner, .path, "", "", "", "", "", "", ""]),
 	(.libraries[] | ["library", .name, .owner, .destination,
 		(if (.features | length) == 0 then "-" else (.features | join(",")) end),
 		.producer,
 		(if (.objects | length) == 0 then "-" else (.objects | join(",")) end),
+		(if (.patches | length) == 0 then "-" else (.patches | join(",")) end),
+		.licence,
 		(.providers | join(" "))]),
-	(.programs[] | ["program", .name, .owner, .destination, "", "", "", ""]) |
+	(.programs[] | ["program", .name, .owner, .destination, "", "", "", "", "", ""]) |
 	@tsv
 ' <<<"$manifest_json")
 requested_arguments=("$@")
@@ -1382,7 +1384,11 @@ done <"$source_digest_roots"
 # The flags every foreign object in this image is compiled with, as one string. It is recorded in
 # the identity beside the tools, so a flag change moves every digest that names the artifact.
 foreign_cflags() {
-	printf '%s' "-ffreestanding -nostdlibinc -fPIC -O2 --target=$foreign_triple ${foreign_abi_flags[*]}"
+	# NO TRAILING SPACE WHEN THE ABI ARRAY IS EMPTY, which aarch64's is: the triple fixes that ABI
+	# completely. A trailing space in an identity record is a byte inside a digest that nothing means,
+	# and the difference between two records that read the same is exactly what a reader cannot see.
+	local flags="-ffreestanding -nostdlibinc -fPIC -O2 --target=$foreign_triple ${foreign_abi_flags[*]}"
+	printf '%s' "${flags% }"
 }
 
 # What SELECTED what was built: the target and the object list, in the order the manifest states it.
@@ -1407,6 +1413,8 @@ write_identity_record() {
 	local producer="${8:-rust}"
 	local objects="${9:--}"
 	local selection="${10:--}"
+	local patches="${11:-}"
+	local licence="${12:-project}"
 	local provider digest slot slot_kind slot_rest candidate first
 	{
 		# THE COMMON SECTION: what every artifact has, whatever produced it. A reader that only needs
@@ -1445,6 +1453,13 @@ write_identity_record() {
 			# what SHOULD produce them; this says what did, so a record cannot describe one compile
 			# and an artifact be another.
 			printf 'objects-sha256=%s\n' "$foreign_objects_digest"
+			# THE PATCH SERIES AND THE LICENCE. Both are empty or `project` for a source this tree
+			# wrote, and both are here because the FORMAT has to be able to carry them: an imported
+			# artifact whose sources were patched, or which is carried under somebody else-s licence,
+			# is one whose record must say so - and a field added later is a field every artifact
+			# built before it is silent about.
+			printf 'patches-sha256=%s\n' "$patches"
+			printf 'licence=%s\n' "$licence"
 			;;
 		*)
 			echo "build-shared: $artifact has unknown producer '$producer'" >&2
@@ -2240,8 +2255,8 @@ for spec in "$@"; do
 		echo "build-shared: $artifact has no unique library manifest row" >&2
 		exit 1
 	}
-	read -r row_kind row_artifact row_crate row_stage row_destination row_features row_producer row_objects row_providers <<<"$row"
-	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || ! "$row_destination" =~ ^lib/[a-z0-9][a-z0-9_-]*/$artifact\.lslib$ || -z "$row_features" || -z "$row_producer" || -z "$row_objects" ]]; then
+	read -r row_kind row_artifact row_crate row_stage row_destination row_features row_producer row_objects row_patches row_licence row_providers <<<"$row"
+	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || ! "$row_destination" =~ ^lib/[a-z0-9][a-z0-9_-]*/$artifact\.lslib$ || -z "$row_features" || -z "$row_producer" || -z "$row_objects" || -z "$row_patches" || -z "$row_licence" ]]; then
 		echo "build-shared: $artifact invocation differs from its library manifest row" >&2
 		exit 1
 	fi
@@ -2305,6 +2320,7 @@ for spec in "$@"; do
 	((artifact_state_misses += 1))
 	foreign_objects=()
 	foreign_objects_digest=""
+	foreign_patch_digest=""
 	if [[ "$row_producer" == foreign ]]; then
 		# THE PINNED C COMPILER, THE PROFILE SYSROOT, AND THE OBJECT LIST IN THE MANIFEST'S ORDER.
 		# Everything after this point - the link, the needed list, the import ownership audit, the
@@ -2332,6 +2348,23 @@ for spec in "$@"; do
 			echo "build-shared: $artifact is a foreign library and names no objects" >&2
 			exit 1
 		fi
+		# THE PATCH SERIES, AS ONE NUMBER, IN THE DECLARED ORDER. A series applied in another order is
+		# another source tree, so the order is hashed with the content rather than sorted away. An
+		# empty series hashes to the digest of an empty input, which is a definite answer and not a
+		# missing one.
+		foreign_patch_digest="$({
+			if [[ "$row_patches" != - ]]; then
+				while IFS= read -r patch; do
+					[[ -n "$patch" ]] || continue
+					if [[ ! -f "$root/$crate_dir/$patch" ]]; then
+						echo "build-shared: $artifact names patch $patch and $crate_dir does not have it" >&2
+						exit 1
+					fi
+					printf '%s\n' "$patch"
+					sha256sum "$root/$crate_dir/$patch"
+				done < <(tr ',' '\n' <<<"$row_patches")
+			fi
+		} | sha256sum | awk '{print $1}')"
 		deps=""
 		rlib="${foreign_objects[0]}"
 		foreign_objects_digest="$(sha256sum "${foreign_objects[@]}" | sha256sum | awk '{print $1}')"
@@ -2361,7 +2394,7 @@ for spec in "$@"; do
 	} | sha256sum | awk '{print $1}')"
 	provider_expected_identity="$(mktemp "$build_scratch/identity-record.XXXXXX")"
 	pending_identity_record="$provider_expected_identity"
-	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity" "$row_producer" "$row_objects"
+	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity" "$row_producer" "$row_objects" - "$foreign_patch_digest" "$row_licence"
 	provider_expected_needed="$(for provider in $row_providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
 	provider_cache_inputs="$provider_cache_prefix.inputs.$$.expected"

@@ -241,12 +241,54 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
+	// THE MAIN IMAGE IS RECORDED LAST AND IS MARKED AS ITSELF. It is loaded last by construction -
+	// providers go in first, in dependency order, and this remains the transaction-s final step - so
+	// the table is already in construction order. The mark is what says the last entry is the
+	// CONSUMER of every earlier one, which is a fact a reader would otherwise have to infer from the
+	// position it happens to be in.
+	// THE BIAS IS THE ONE THE IMAGE WAS ACTUALLY MAPPED AT, and for a PIE main image that is not
+	// zero: `elf::load_into` places an `ET_DYN` executable at `DYNAMIC_MAIN_BASE`. Recording zero
+	// here produced a lifecycle table of link-time addresses, and the first constructor call faulted
+	// reading the array - at exactly the address the section header names, which is what said the
+	// bias had been left out rather than the table being wrong.
+	let bias = if bootproto::elf::Elf::parse(elf_image).is_some_and(|image| image.image_type == bootproto::elf::ET_DYN) { elf::DYNAMIC_MAIN_BASE } else { 0 };
+	if !process.record_lifecycle(lifecycle_of(elf_image, bias, true)) {
+		return Err(LoadError::OutOfMemory);
+	}
 	Ok(entry)
 }
 
 // Map one ET_DYN dependency at the bias chosen by ProcessService. Unlike the main
 // image load this does not map a stack or create a thread; providers are loaded in
 // dependency order and the main SYS_PROCESS_LOAD remains the transaction's final step.
+
+// What an image must run before anything else and after everything else, as the caller's own table
+// will report it.
+//
+// THE ADDRESSES ARE BIASED HERE AND NOT BY THE READER. A module's dynamic table records where its
+// arrays are in its own link-time view; adding the load bias is what turns that into an address the
+// process can call. Doing it once, where the bias is known for certain, is what keeps a reader from
+// having to know there is a bias at all.
+//
+// AN IMAGE WITH NEITHER ARRAY RECORDS NOTHING - see `record_lifecycle`. An image whose dynamic table
+// cannot be read records nothing either: every caller here has already loaded it, and a table this
+// function cannot parse is one the loader parsed for relocation moments ago.
+fn lifecycle_of(elf_image: &[u8], bias: u64, is_main_image: bool) -> abi::ModuleLifecycle {
+	let mut entry = abi::ModuleLifecycle { is_main_image: u64::from(is_main_image), ..abi::ModuleLifecycle::default() };
+	let Some(elf) = bootproto::elf::Elf::parse(elf_image) else { return entry };
+	let Some(Some(dynamic)) = elf.dynamic_info() else { return entry };
+	let pointer = core::mem::size_of::<u64>() as u64;
+	if let (Some(address), Some(size)) = (dynamic.init_array, dynamic.init_arraysz) {
+		entry.init_array = address.wrapping_add(bias);
+		entry.init_count = size / pointer;
+	}
+	if let (Some(address), Some(size)) = (dynamic.fini_array, dynamic.fini_arraysz) {
+		entry.fini_array = address.wrapping_add(bias);
+		entry.fini_count = size / pointer;
+	}
+	entry
+}
+
 pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Result<(), LoadError> {
 	// The same guard, and this one is by definition an operation on a process that already exists
 	// and may already be dying. It also claims a module slot and registers dynamic symbols, both of
@@ -295,6 +337,12 @@ pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Resul
 	}
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
+	// AFTER THE POINT OF NO RETURN, because by here the module IS part of the process - and a
+	// process that cannot record what its module must initialise is one that would run some of its
+	// constructors and not others.
+	if !process.record_lifecycle(lifecycle_of(elf_image, bias, false)) {
+		return Err(LoadError::OutOfMemory);
+	}
 	Ok(())
 }
 

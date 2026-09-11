@@ -754,6 +754,9 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// evidence: `run` starts a detached process and forwards no console, so a probe launched that
 	// way proves it started and says nothing about what it found.
 	(b"icdcheck", Shape::Bare),
+	// `Rest` because the mode word decides which half of the contract is being observed: a normal
+	// exit and a crash are the same program and are the difference being measured.
+	(b"lifecheck", Shape::Rest),
 	(b"uname", Shape::Bare),
 	(b"uptime", Shape::Bare),
 	(b"dmesg", Shape::Bare),

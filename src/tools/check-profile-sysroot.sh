@@ -32,7 +32,10 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
 SYSROOT="src/foreign/profile-sysroot"
-INVENTORY="src/foreign/INVENTORY-pass1.json"
+# PASS 2 SIZES IT, NOT PASS 1. The candidate surface over-states what a system must provide, and the
+# platform port removed six of its symbols outright - so the sysroot that declares what the SUBSTRATE
+# backs has to be measured against what the converged link resolved.
+INVENTORY="src/foreign/INVENTORY-pass2.json"
 STATIC_PIN="src/foreign/PIN-static-target.toml"
 
 fail() {
@@ -58,7 +61,7 @@ failures = []
 
 # THE THREE TARGETS MUST AGREE, as they do for the facilities crates and for the same reason: one
 # sysroot cannot serve three different surfaces.
-surfaces = {arch: set(inventory[arch]["undefined"]) for arch in ("x86_64", "aarch64", "riscv64")}
+surfaces = {arch: set(inventory[arch]["archive_surface"]) for arch in ("x86_64", "aarch64", "riscv64")}
 if len({frozenset(surface) for surface in surfaces.values()}) != 1:
 	print("profile-sysroot: the three targets name different symbols; one sysroot cannot serve them", file=sys.stderr)
 	raise SystemExit(1)
@@ -123,21 +126,27 @@ echo "profile-sysroot: declarations and inventory agree"
 
 # THE THIRD CLAIM. It needs the audit-only upstream, and says so when it is absent rather than
 # passing quietly.
-if [[ ! -d "$ROOT/.build/foreign/src-loader" || ! -d "$ROOT/.build/foreign/src-headers" ]]; then
-	echo "profile-sysroot: NOT PERFORMED: the pinned sources are not unpacked under .build/foreign, so the archives were not rebuilt against this sysroot"
+if [[ ! -d "$ROOT/.build/foreign/src-loader-port" || ! -d "$ROOT/.build/foreign/src-headers" ]]; then
+	echo "profile-sysroot: NOT PERFORMED: the ported sources are not unpacked under .build/foreign, so the archives were not rebuilt against this sysroot"
 	exit 0
 fi
 
+# THE TRIM CHANGED NOTHING, PROVED ON THE TREE THAT MATTERS. The ported configuration is compiled
+# twice - once against the bootstrap sysroot, which declares everything the sources include, and once
+# against this one, which declares only what the substrate backs - and the two archives must be
+# identical. That is what proves the declarations dropped from here were surface nobody required; a
+# reading of the sources would prove nothing of the kind.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 for arch in x86_64 aarch64 riscv64; do
-	expected="$(sed -n "s/^$arch = { sha256 = \"\([0-9a-f]\{64\}\)\".*/\1/p" "$STATIC_PIN")"
-	[[ -n "$expected" ]] || fail "$STATIC_PIN records no archive digest for $arch"
-	"$HERE/build-foreign-static.sh" --arch "$arch" --sysroot profile --out "$work/$arch" >"$work/$arch.log" 2>&1 || {
-		cat "$work/$arch.log" >&2
-		fail "$arch: the pinned configuration does not compile against the profile sysroot"
-	}
-	actual="$(sha256sum "$work/$arch/libvulkan.a" | cut -d' ' -f1)"
-	[[ "$actual" == "$expected" ]] || fail "$arch: the profile sysroot produces $actual and the static-target pin froze $expected - the trim changed what was compiled"
-	echo "profile-sysroot: $arch: rebuilt against the profile sysroot, digest unchanged"
+	for which in bootstrap profile; do
+		"$HERE/build-foreign-static.sh" --arch "$arch" --sysroot "$which" --ported --out "$work/$arch-$which" >"$work/$arch-$which.log" 2>&1 || {
+			cat "$work/$arch-$which.log" >&2
+			fail "$arch: the ported configuration does not compile against the $which sysroot"
+		}
+	done
+	bootstrap_digest="$(sha256sum "$work/$arch-bootstrap/libvulkan.a" | cut -d' ' -f1)"
+	profile_digest="$(sha256sum "$work/$arch-profile/libvulkan.a" | cut -d' ' -f1)"
+	[[ "$bootstrap_digest" == "$profile_digest" ]] || fail "$arch: the two sysroots produce different archives ($profile_digest vs $bootstrap_digest) - the trim changed what was compiled"
+	echo "profile-sysroot: $arch: the ported archive is the same against both sysroots"
 done

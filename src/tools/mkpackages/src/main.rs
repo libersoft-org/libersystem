@@ -434,6 +434,9 @@ struct ManifestRow {
 	// What produced the artifact. Every program and every Rust library is `rust`; a foreign library
 	// is `foreign`, and the difference decides which language section its identity record carries.
 	producer: system_manifest::Producer,
+	// The licence the artifact is carried under, from the manifest - which is what the record is
+	// checked against, because a record checked against itself is not checked.
+	licence: String,
 }
 
 // Parse ../../product.conf (shell-style KEY="value") into key/value pairs (the
@@ -578,7 +581,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 	for library in model.libraries.values() {
 		let source = model.sources.get(&library.owner).expect("validated library owner");
 		let features = if library.features.is_empty() { String::from("-") } else { library.features.iter().map(|feature| feature.as_str()).collect::<Vec<_>>().join(",") };
-		rows.push(ManifestRow { kind: String::from("library"), name: library.name.as_str().to_string(), crate_dir: library.owner.as_str().to_string(), crate_path: source.path.as_str().to_string(), stage: String::from("volume"), destination: Some(library.destination.as_str().to_string()), features: Some(features), providers: library.providers.iter().map(|provider| provider.as_str().to_string()).collect(), producer: library.producer });
+		rows.push(ManifestRow { kind: String::from("library"), name: library.name.as_str().to_string(), crate_dir: library.owner.as_str().to_string(), crate_path: source.path.as_str().to_string(), stage: String::from("volume"), destination: Some(library.destination.as_str().to_string()), features: Some(features), providers: library.providers.iter().map(|provider| provider.as_str().to_string()).collect(), producer: library.producer, licence: library.licence.clone() });
 	}
 	for program in model.programs.values().filter(|program| included(program)) {
 		let source = model.sources.get(&program.owner).expect("validated program owner");
@@ -608,6 +611,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 			// a foreign library and this milestone answers only the second one; when the first is
 			// asked, this line is where the answer goes.
 			producer: system_manifest::Producer::Rust,
+			licence: String::from("project"),
 		});
 	}
 	rows
@@ -892,10 +896,10 @@ fn derive_dynamic_order(row: &ManifestRow, libraries: &[ManifestRow]) -> Vec<Str
 /// a field line - which fails as "a provider was replaced" and sends the reader to the wrong place.
 const IDENTITY_HEADER_LINES: usize = 11;
 
-/// The same count for a foreign artifact, whose language section carries eleven fields rather than
+/// The same count for a foreign artifact, whose language section carries thirteen fields rather than
 /// three. Two constants and not one expression, because the two sections have nothing in common
 /// beyond the seven lines above them.
-const FOREIGN_IDENTITY_HEADER_LINES: usize = 18;
+const FOREIGN_IDENTITY_HEADER_LINES: usize = 20;
 
 /// What the launch admits, mirrored from the `selection` module in `service-logic` so a package this
 /// tool accepts is not one ProcessService refuses.
@@ -933,9 +937,18 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 			for (index, key) in [(8, "compiler="), (10, "archiver="), (12, "linker="), (14, "cflags=")] {
 				assert!(lines[index].strip_prefix(key).is_some_and(|value| !value.is_empty()), "{} identity {key}", row.name);
 			}
-			for (index, key) in [(9, "compiler-sha256="), (11, "archiver-sha256="), (13, "linker-sha256="), (15, "sysroot-sha256="), (16, "configure-sha256="), (17, "objects-sha256=")] {
+			for (index, key) in [
+				(9, "compiler-sha256="),
+				(11, "archiver-sha256="),
+				(13, "linker-sha256="),
+				(15, "sysroot-sha256="),
+				(16, "configure-sha256="),
+				(17, "objects-sha256="),
+				(18, "patches-sha256="),
+			] {
 				assert!(lines[index].strip_prefix(key).is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())), "{} identity {key}", row.name);
 			}
+			assert_eq!(lines[19], format!("licence={}", row.licence), "{} identity licence", row.name);
 		}
 	}
 	let mut expected_providers: Vec<String> = row

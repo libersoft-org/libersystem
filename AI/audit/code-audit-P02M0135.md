@@ -410,3 +410,229 @@ dependency node BEFORE the equality check runs, and the guest gate that launches
 twice - at the lowest and highest admitted version - and asserts the four refusals. Until that
 exists, this substrate can LOAD an ICD and nothing can SELECT one, which is half of what the item
 claims.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0135 (2026-09-11T18:23:57Z):
+
+THREE ITEMS MOVED IN THIS STRETCH: the profile sysroot (built and gated, not ticked), foreign-artifact
+integration (ticked), and the authority half of the discovery model (built and gated; the item stays
+open for the loader port). One item's checkbox changed. The milestone is five of eleven.
+
+THE PROFILE SYSROOT. It is sized by the INVENTORY where the bootstrap one is sized by the option set,
+and the inversion is the whole of it: forty-six declarations - the fifty-eight symbols pass 1 names,
+less the twelve the loader's own patched headers declare for themselves. Measured against the
+bootstrap headers, that dropped 43 declarations the pinned configuration includes a header for and
+never calls: `open`, `read`, `close`, `exit`, `printf`, `qsort`, `strdup`, the whole `<ctype.h>`
+classification family, most of `<math.h>`. A function it does not declare is one the substrate has no
+symbol for, so a source that starts calling one fails to COMPILE rather than to link - which is the
+decision being made deliberately rather than discovered by a diagnostic nobody attributed.
+`arch/` carries one header per target - the triple, the data model, and static assertions over every
+width, alignment and struct layout the declarations depend on - force-included by the build rather
+than included by a source, so every translation unit carries the check. That found a wrong assumption
+of this milestone's own on its first run: plain `char` is UNSIGNED on riscv64, not signed, so x86_64
+is the odd target of the three. A comment would have carried that error indefinitely.
+THE TRIM IS PROVED AND NOT ARGUED. The pinned configuration compiled against the profile sysroot
+produces the archives the static-target pin froze - digest for digest, on all three targets. That is
+the only form of proof that does not rest on having read the sources correctly.
+ONE DESCRIPTION OF THE ABI. Adding the foreign path to the image build would have made a THIRD copy
+of the triple and flags, after the cross files and the portable static target. It is now
+`src/foreign/profile-abi.sh`, sourced by both builds and pinned in the lockfile, and the pin refuses
+a drift in it (watched).
+WHAT IS NOT DONE, AND WHY THE ITEM IS NOT TICKED: the item requires the sysroot bound into the
+lockfile, and this file's own freeze order puts the profile sysroot digest in the DERIVED pin, which
+is frozen after pass 2. Writing a derived pin now would be writing a part missing its own fields,
+which the pin gate is built to refuse. It is bound into the inventory, the cache key and the image
+identity today.
+
+FOREIGN ARTIFACTS AS A KIND. The manifest gained a `producer` on sources and libraries. A Rust source
+is a Cargo package whose closure Cargo answers; a foreign source is a directory of C sources with no
+Cargo manifest, and what it is built from is the ORDERED OBJECT LIST on its library row - order
+declared rather than sorted away, because link order decides which definition wins where two objects
+offer one. The rules that made a foreign artifact expressible only by forging Rust fields are gone in
+all three places that held them: the manifest's Cargo.toml requirement, the source-coverage walk that
+equated "physical" with "has a Cargo.toml", and the build's own manifest check.
+THE IDENTITY RECORD IS v2 IN TWO SECTIONS, image-wide and cold. A COMMON section every artifact has -
+format, kind, artifact, package, source digest, target, profile - and a LANGUAGE section keyed by
+producer. `rust` carries the compiler revision, the flags and the features; `foreign` carries each of
+the three tools BY VERSION AND BY DIGEST, the flags, the sysroot digest, the configure-input digest,
+the digest of the final objects, the patch-series digest and the licence. Each of those can change
+what an artifact IS without changing a source byte, which is why they are in the record rather than
+only in the build script.
+IDENTITY COVERS THE WHOLE RECORD. The split governs who must UNDERSTAND which fields, not what the
+digest is taken over: a consumer hashes the language section and does not parse it. The
+hot-replacement rule therefore compares the common fields BY NAME and the language section AS TEXT,
+line by line - strictly stronger than the three named Rust fields it replaced, because a producer
+field that rule has never heard of still cannot move under a compatible verdict.
+ALL FOUR READERS MOVED IN ONE CHANGE, which is what a cold transition means: `mkpackages`,
+ProcessService, the shared compatibility path and device publication, plus `build-shared.sh`, the
+staged-consistency check and the cache keys.
+THE FIRST FOREIGN ARTIFACT is a synthetic ICD, compiled by the pinned C compiler against the profile
+sysroot on all three targets, linked by the same linker into the same `.lslib` shape, and passing the
+same relocation, W^X, export-owner and provider-closure audits every Rust library passes. No parallel
+path, because a parallel audit is the thing that drifts.
+
+THE SELECTION SLOT, WHICH IS THE DISCOVERY ITEM'S AUTHORITY HALF. A consumer built against a SET of
+interchangeable providers names none of them. The manifest declares a slot as a KIND, the symbols
+that kind admits, and the closed candidate set; the build requires every candidate to export EXACTLY
+the kind's symbols and the consumer to import nothing else through the slot, and emits
+`selection=KIND:NAME=DIGEST,...` into the record after the providers. ProcessService resolves each
+slot into the dependency set and the recursive collection BEFORE the exact-equality check runs, so
+that check keeps the meaning it always had.
+THE KIND IS A CLOSED SET BECAUSE A FIXTURE PROVED IT HAD TO BE. A guest mutation corrupted
+`vulkan-icd` into `0ulkan-icd` - still a well-formed kind - and the launch SUCCEEDED, because nothing
+anywhere compared the kind against anything. It was documentation. It is now checked at the launch
+and mirrored in the manifest, and a well-spelled kind nothing admits is a different refusal from a
+malformed one.
+THE RULES LIVE IN `service-logic` AND THE SERVICE DELEGATES TO THEM. `services` links `rt` and cannot
+run a host test, and a launch-path rule with no test is a rule the next change does not know it broke.
+The service now carries no copy of the parsing, binding or accounting.
+
+VERIFICATION PERFORMED, AND WHAT EACH RUN ACTUALLY SHOWED:
+- `./build.sh` on x86_64, aarch64 and riscv64: the foreign artifact compiles and links on all three,
+  with the flags each target's single ABI description gives.
+- `./test.sh --arch x86_64`: 388 passed. The suite grew by the new dynamic test.
+- The new guest test binds the slot through the real ProcessService and then refuses fourteen
+  substitutions: each of the twelve foreign producer fields corrupted in a real volume, the
+  consumer's own slot line corrupted, and a candidate whose record no longer names the artifact it is
+  staged as. The whole-file substitution is the same refusal at the same check and is not repeated -
+  the helper needs the replacement to FIT the entry, and the synthetic ICD is the smallest artifact
+  in the image.
+- `check-icd-selection`: boots a guest, runs the consumer, and reads back that the admitted range
+  holds at BOTH ends - 2 and 6 - with the four refusals asserted: an ICD offering 0, one offering
+  only 1, one offering 7 brought down to 6, and the physical-device third export, which the build's
+  exact-symbol rule refuses so it cannot be staged at all.
+- `check-profile-sysroot`: declarations and inventory agree in both directions, and all three
+  archives rebuild against the profile sysroot to the frozen digests. Watched to fail by adding one
+  declaration the substrate does not provide.
+- `check-foreign-identity`: each of the twelve producer fields moves the identity digest; the
+  consumer edge carries exactly that digest; the cache key is the digest of a file the record is part
+  of.
+- `check-foreign-pin`: refuses a drift in the new ABI file (watched), and the two refrozen values -
+  the bootstrap sysroot's README and the builder - are recorded with the reason.
+- `build-shared.sh --verify-staged`: refuses a replaced selection candidate (watched), which the
+  provider-chain check could not see at all because a candidate is recorded by an EXECUTABLE.
+- `check.sh --gate` over dependency-policy, foreign-pin, foreign-facilities, profile-sysroot,
+  foreign-identity, artifact-metadata, source-hygiene, dynamic-report, build-order,
+  staged-consistency: all pass. The dynamic report was regenerated after all three targets were
+  built, because the new artifact is in every image.
+- Host tests: `bootproto` 87 passed including two new ones - the language section compared as text,
+  and a producer field this rule cannot name still deciding the verdict; `service-logic` selection
+  fixtures pass, now including the unknown-kind refusal.
+
+NOT PERFORMED: `./test.sh` on aarch64 and riscv64, and the full `./check.sh`. The three targets were
+BUILT and the foreign artifact was inspected on each; their guest suites were not run in this stretch.
+
+A CORRECTION THIS STRETCH MADE TO ITS OWN EARLIER WORK: a mechanical v1-to-v2 version bump had
+replaced the format string inside a compat fixture whose whole point was to carry a format the rule
+does NOT understand. The test then asserted that the format the rule implements is one it cannot
+read, and it had been failing since. It now names a version that does not exist.
+
+WHAT REMAINS OF THIS MILESTONE: pass 2's converging link, and behind it the profile sysroot's lockfile
+binding, the C++ ABI and TLS decisions, the no-threads gate on the FINALLY ADMITTED closure, and the
+discovery item's loader port with its guest gate against the audit-linked loader.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0135 (2026-09-11T19:10:21Z):
+
+PASS 2 CONVERGED, AND FOUR ITEMS CLOSED BEHIND IT. Nine of eleven. What was waiting on the audit link
+was not one item but four, because three of this milestone's answers are MEASUREMENTS over a closure
+that did not exist until something linked.
+
+THE LINK. The ported archive is admitted WHOLE against the loader's own exports, so member selection
+cannot narrow the closure below what the pinned configuration contains - a link rooted in whatever a
+fixture happens to call would prove something about the fixture. It is strict in three ways at once:
+nothing unresolved, nothing unresolved behind a shared library, and no default search path or default
+library anywhere. It resolves 52 of 52, the substrate builds NOTHING it does not ask for, and the
+eight references that remain are the Rust allocator shims and panic paths, taken from `lsrt.lslib`
+exactly as every other library in this image takes them. The gate is the FIXED POINT and not the
+first link: two consecutive links must resolve the same set, per target, because adjusting the
+substrate after one link can change what the next one resolves.
+
+THE PLATFORM PORT IS WHY THE SURFACE MOVED, and it is patch 0002 in the derived half. Two changes.
+The layer scan's two entry points answer an EMPTY list, which is legal and true - there is no layer
+directory on this system - and everything downstream then follows from upstream's own code:
+enumeration reports zero, and an enabled layer is refused with `VK_ERROR_LAYER_NOT_PRESENT` by the
+lookup that does not find it. Those two functions are the only entry points into the layer manifest
+search, so replacing them removes the filesystem walk, the settings override and the
+environment-steered paths in one place rather than in fifty. The environment reader takes upstream's
+own third shape - the one its `#else` branch already provides for a platform without environment
+variables - rather than the common-unix one LiberSystem joined for its FILE and THREAD facilities.
+Taking the branch rather than stubbing the call is what removes the symbol: a stub that still called
+`getenv` would leave it in the closure for the inventory to explain.
+MEASURED EFFECT: six symbols gone, 58 to 52, on all three targets - `getenv`, the four identity
+queries the elevation check needed, and the number parser only an environment value reached.
+WHAT THE PORT COULD NOT REMOVE, STATED RATHER THAN GLOSSED: the provider-open and manifest-read
+facilities the layer path SHARED with the ICD path. They are the same symbols, and the ICD path is
+what this substrate exists to serve. What they reach here is a bounded package-owned record and not
+an ambient directory, which is the discovery item's decision rather than an accident of this port.
+
+THE PORTED TREE IS A COPY. The static-target part froze three archive digests for the pinned tree
+before pass 1; editing that tree would move a value a part that PRECEDES this decision already holds.
+So the port lives beside it and the builder is told which of the two to compile.
+
+FOUR ANSWERS THAT ARE NOW MEASUREMENTS:
+- TLS: Variant B, and the proof is over all three things that variant names - no `PT_TLS` segment, no
+  `STT_TLS` symbol in any archive member or in the ELF, and no thread-local RELOCATION FORM anywhere.
+  The last is the one a symbol scan cannot see: an object can carry an access to a variable defined
+  elsewhere, and that is a relocation rather than a symbol.
+- THREADS: no thread-creation symbol in the finally admitted set - every `ET_REL` member, the
+  converged resolved set, and the audit-linked ELF - on any target. The stop condition is not hit.
+- C++ ABI: exception tables, RTTI and `atexit` registration are FORBIDDEN, which under this file's
+  own rule means the flags that stop them being emitted AND an artifact check. Static initialisation
+  and `errno` are ADMITTED, because the closure names them.
+- THE COMPILER-RUNTIME the link selected, which is two components and was declared by nobody: the
+  substrate's own four memory functions for the C half, and `compiler_builtins` via build-std for the
+  Rust half.
+
+TWO DEFECTS THE NEW GATES FOUND, NEITHER OF WHICH A READING WOULD HAVE:
+- The aarch64 audit-linked ELF carried `.eh_frame` after every C object had been compiled without
+  exception tables. The Rust half emits unwind tables by default on that target. A forbidden
+  mechanism needs the flag on EVERY producer that contributes to the closure, not on the one somebody
+  thought of first; `-C force-unwind-tables=no` is now in the derived pin beside the C flags.
+- Resizing the profile sysroot to pass 2 broke the compile, on a function the optimiser deletes. With
+  the environment reader answering NULL in the same translation unit, everything below its first
+  branch is dead - so the ARTIFACT never needed `strtoul`, and the SOURCE still called it. A sysroot
+  that has to declare a function the substrate does not provide is the POSIX layer arriving through
+  the include path, which is the one failure this sysroot exists to prevent, so the port removed that
+  call too.
+
+THE LOCKFILE IS COMPLETE. The derived part exists and holds what this file says it must: the ordered
+platform-port series with a digest per patch and the part that owns each, the generated-source answer
+(none, because the pinned upstream vendors them and codegen is off), the final profile sysroot
+digest, and the compiler-runtime the converged link selected - plus the forbidden-mechanism decision
+as both halves, flags and gate, because a decision with only one of them is a description. The pin
+gate reads all of it, including the freeze order between the parts.
+
+THE PROFILE SYSROOT IS NOW SIZED BY PASS 2, which is a correction the port forced: the candidate
+surface over-states what a system must provide, and six of its symbols were things only the UNPORTED
+loader asked for. Forty declarations. The proof moved with it and is stronger for the move - the
+PORTED configuration is compiled against both sysroots and the two archives must be identical, on all
+three targets, which is what says the dropped declarations were surface nobody required.
+
+VERIFICATION PERFORMED:
+- `foreign-audit-link`: converged on all three targets, twice each; the recorded inventory
+  reproduces byte for byte; and its scan is proved able to SEE an injected thread-local definition, an
+  injected thread-local ACCESS and an injected thread-creation reference before its zeroes are
+  believed.
+- `foreign-cxx-abi`: refuses a fixture carrying typeinfo, a vtable, an exception table and an
+  `__cxa_atexit` registration, then scans the real artifacts on all three targets and finds none.
+- `profile-sysroot`: declarations and the pass-2 inventory agree in both directions, and the ported
+  archive is identical against both sysroots on all three targets.
+- `foreign-pin`: all three parts intact, the freeze order holds, and drift in the new ABI file is
+  refused (watched).
+- `foreign-facilities`: 52 of 52 provided and none beyond them, now measured against pass 2 rather
+  than pass 1 - which is what this file says the authority is.
+- Host fixtures: `bootproto` 88 passed, including a new one asserting every thread-local relocation
+  form on all three architectures is outside the allowlist the packager and the loader share.
+- `./test.sh --arch x86_64`: 389 passed, including a new guest test that writes three thread-local
+  relocation forms into a staged provider and requires each to refuse the launch.
+- `check.sh --gate` over the ten gates this work touches: all pass.
+
+NOT PERFORMED: `./test.sh` on aarch64 and riscv64. The three targets were BUILT and every pass-2
+measurement was taken on each; their guest suites were not run in this stretch.
+
+WHAT REMAINS, AND BOTH ARE THE SAME SHAPE - a mechanism the measurement ADMITTED rather than one it
+refused. The C++ ABI item needs the supported-ABI answer for static initialisation: once-per-process
+init and fini ordering across the provider DAG, what a constructor failing part way leaves behind,
+normal exit versus crash - and the RUNNER that makes any of it observable, which this tree does not
+have, because `liber_rt_start` calls the entry point directly. The discovery item needs the ported
+loader ITSELF run in a guest against a synthetic ICD, reaching its entry points through the replaced
+provider lookup; the selection slot half is built and gated.

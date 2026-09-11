@@ -16,7 +16,10 @@ use crate::memlayout::{USER_MMAP_BASE, USER_STACK_PAGES, USER_STACK_TOP, USER_VA
 use crate::object::address_space::AddressSpace;
 use crate::sync::SpinLock;
 
-const DYNAMIC_MAIN_BASE: u64 = 0x1000_0000;
+// THE BASE A POSITION-INDEPENDENT MAIN IMAGE IS MAPPED AT. Public because the loader records each
+// image-s lifecycle arrays at the address they were mapped to, and an address recorded without this
+// is a link-time address the process will fault on the first time it is read.
+pub const DYNAMIC_MAIN_BASE: u64 = 0x1000_0000;
 const DYNAMIC_MAIN_SIZE: u64 = 0x1000_0000;
 const DYNAMIC_MODULE_BASE: u64 = 0x2000_0000;
 const DYNAMIC_MODULE_SLOT_SIZE: u64 = 0x0100_0000;

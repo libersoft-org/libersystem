@@ -238,6 +238,10 @@ reason = "inputs to the audit-only foreign build; nothing they produce enters an
 path = "src/user/libs/foreign/icdprobe"
 component = "icdprobe"
 
+[[ownership]]
+path = "src/user/libs/foreign/lifecycle"
+component = "lifecycle"
+
 [[non_code]]
 path = "third_party"
 # The recorded licence review. It is a record ABOUT the tree rather than a part of what is built, and

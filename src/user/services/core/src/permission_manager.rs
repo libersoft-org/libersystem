@@ -348,6 +348,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// it started and prints what that provider agreed to, so it reaches nothing this manifest
 		// could grant: an empty one is the whole of what it needs.
 		b"icdcheck" => Some(granted("icdcheck", alloc::vec![])),
+		// The lifecycle probe. It observes what ran inside its own process and reaches nothing this
+		// manifest could grant.
+		b"lifecheck" => Some(granted("lifecheck", alloc::vec![])),
 		_ => None,
 	}
 }

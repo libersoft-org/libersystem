@@ -101,6 +101,15 @@ pub const DT_STRSZ: i64 = 10;
 pub const DT_SYMENT: i64 = 11;
 pub const DT_SONAME: i64 = 14;
 pub const DT_RELACOUNT: i64 = 0x6fff_fff9;
+
+// THE LIFECYCLE ARRAYS. An image may carry a table of functions to call once before anything else
+// runs and once after everything else has, and the pinned foreign configuration turns out to carry
+// exactly one of each. They are parsed here rather than ignored because a constructor nobody runs is
+// an initialisation that silently did not happen - which is a worse failure than refusing the image.
+pub const DT_INIT_ARRAY: i64 = 25;
+pub const DT_FINI_ARRAY: i64 = 26;
+pub const DT_INIT_ARRAYSZ: i64 = 27;
+pub const DT_FINI_ARRAYSZ: i64 = 28;
 pub const MAX_DYNAMIC_MODULES: usize = 64;
 pub const MAX_DYNAMIC_DEPENDENCY_DEPTH: usize = 16;
 
@@ -224,6 +233,10 @@ pub struct DynamicInfo {
 	pub jmprel: Option<u64>,
 	pub pltrelsz: Option<u64>,
 	pub pltrel: Option<u64>,
+	pub init_array: Option<u64>,
+	pub init_arraysz: Option<u64>,
+	pub fini_array: Option<u64>,
+	pub fini_arraysz: Option<u64>,
 }
 
 // A parsed, validated ELF64 image over its in-memory bytes.
@@ -493,6 +506,10 @@ impl<'a> Elf<'a> {
 				DT_JMPREL => &mut info.jmprel,
 				DT_PLTRELSZ => &mut info.pltrelsz,
 				DT_PLTREL => &mut info.pltrel,
+				DT_INIT_ARRAY => &mut info.init_array,
+				DT_INIT_ARRAYSZ => &mut info.init_arraysz,
+				DT_FINI_ARRAY => &mut info.fini_array,
+				DT_FINI_ARRAYSZ => &mut info.fini_arraysz,
 				DT_NULL => break,
 				_ => continue,
 			};
@@ -506,6 +523,20 @@ impl<'a> Elf<'a> {
 				return None;
 			}
 			if info.relacount.is_some_and(|count| count > relasz / relaent) {
+				return None;
+			}
+		}
+		// EACH LIFECYCLE ARRAY IS AN ADDRESS AND A SIZE, AND BOTH OR NEITHER. A table whose size is
+		// missing is a table nothing can walk the end of, and one whose address is missing is a size
+		// describing nothing; either alone is a malformed image rather than an absent array. The
+		// size must be a whole number of pointers and the range must be file-backed, for the same
+		// reason the relocation table above must be: a walk off the end of an image is not a walk.
+		for (address, size) in [(info.init_array, info.init_arraysz), (info.fini_array, info.fini_arraysz)] {
+			if address.is_none() && size.is_none() {
+				continue;
+			}
+			let (Some(address), Some(size)) = (address, size) else { return None };
+			if size % core::mem::size_of::<u64>() as u64 != 0 || self.virtual_data(address, size).is_none() {
 				return None;
 			}
 		}

@@ -1103,6 +1103,39 @@ fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	assert!(reply.caps.is_empty(), "a corrupted embedded identity record creates no process capability");
 }
 
+tagged_test!(dynamic_process_service_refuses_a_thread_local_relocation, [Dynamic, DynamicReject, Service, Process, Storage], id = "kernel.dynamic.dynamic_process_service_refuses_a_thread_local_relocation", covers = ["kernel", "rt", "services"]);
+// THE RUNTIME HALF OF THE NO-TLS DECISION, watched to fail.
+//
+// WHY AN ABSENCE NEEDS A REFUSAL BEHIND IT. The foreign-substrate profile selects the variant that
+// AVOIDS thread-local storage, and its evidence is a scan that finds none - in every archive member,
+// in the converged resolved set, and in the audit-linked ELF. An absence is worth exactly as much as
+// the refusal it relies on: if a thread-local relocation could reach a running process anyway, the
+// scan would be measuring something that does not matter.
+//
+// THE POLICY IS ONE POLICY AND THIS IS ONE OF ITS TWO READERS. The packager refuses the same form
+// before an artifact reaches the volume, and `bootproto`'s host fixtures assert every thread-local
+// form on all three architectures is outside the allowlist. This is the other end: a form that got
+// past packaging - because somebody wrote the bytes, as here - must still not load.
+fn dynamic_process_service_refuses_a_thread_local_relocation() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	// The forms a thread-local access is spelled with on this machine. Each is a relocation the
+	// policy does not admit, applied to a relocation that is otherwise perfectly formed.
+	#[cfg(target_arch = "x86_64")]
+	let forms: &[(u32, u32)] = &[(90, 18), (91, 22), (92, 23)];
+	#[cfg(target_arch = "aarch64")]
+	let forms: &[(u32, u32)] = &[(90, 1028), (91, 1030), (92, 1031)];
+	#[cfg(target_arch = "riscv64")]
+	let forms: &[(u32, u32)] = &[(90, 8), (91, 10), (92, 11)];
+	for &(correlation, relocation) in forms {
+		let mut mutated = volume.to_vec();
+		replace_first_relocation_type(&mut mutated, test_library_path("lsrt.lslib").expect("lsrt destination").as_bytes(), relocation);
+		let reply = launch_from_volume(&mutated, b"echo", correlation);
+		assert_eq!(le_u32(&reply.bytes, 0), correlation);
+		assert_eq!(reply.bytes[4], 0, "ProcessService refuses a thread-local relocation form");
+		assert!(reply.caps.is_empty(), "a refused relocation form creates no process capability");
+	}
+}
+
 tagged_test!(dynamic_process_service_binds_a_selection_slot_and_refuses_every_substitution, [Dynamic, DynamicReject, Service, Process, Storage], id = "kernel.dynamic.dynamic_process_service_binds_a_selection_slot_and_refuses_every_substitution", covers = ["kernel", "rt", "services"]);
 // THE SELECTION SLOT, THROUGH THE REAL LAUNCH PATH, in both directions.
 //
@@ -1141,8 +1174,10 @@ fn dynamic_process_service_binds_a_selection_slot_and_refuses_every_substitution
 		(208, &b"sysroot-sha256="[..]),
 		(211, &b"configure-sha256="[..]),
 		(212, &b"objects-sha256="[..]),
-		(213, &b"language="[..]),
-		(214, &b"target="[..]),
+		(213, &b"patches-sha256="[..]),
+		(214, &b"licence="[..]),
+		(215, &b"language="[..]),
+		(216, &b"target="[..]),
 	] {
 		let mut mutated = volume.to_vec();
 		corrupt_identity_note(&mut mutated, candidate, field);
