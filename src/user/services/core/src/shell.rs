@@ -750,6 +750,10 @@ enum Shape {
 // separate `if` arm per tool, so adding a tool is one row and the routing stays short.
 const TOOLS: &[(&[u8], Shape)] = &[
 	(b"date", Shape::Bare),
+	// The selection-slot probe. It is here rather than behind `run` because what it prints IS the
+	// evidence: `run` starts a detached process and forwards no console, so a probe launched that
+	// way proves it started and says nothing about what it found.
+	(b"icdcheck", Shape::Bare),
 	(b"uname", Shape::Bare),
 	(b"uptime", Shape::Bare),
 	(b"dmesg", Shape::Bare),

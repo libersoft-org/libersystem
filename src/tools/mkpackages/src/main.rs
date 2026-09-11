@@ -431,6 +431,9 @@ struct ManifestRow {
 	destination: Option<String>,
 	features: Option<String>,
 	providers: Vec<String>,
+	// What produced the artifact. Every program and every Rust library is `rust`; a foreign library
+	// is `foreign`, and the difference decides which language section its identity record carries.
+	producer: system_manifest::Producer,
 }
 
 // Parse ../../product.conf (shell-style KEY="value") into key/value pairs (the
@@ -575,7 +578,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 	for library in model.libraries.values() {
 		let source = model.sources.get(&library.owner).expect("validated library owner");
 		let features = if library.features.is_empty() { String::from("-") } else { library.features.iter().map(|feature| feature.as_str()).collect::<Vec<_>>().join(",") };
-		rows.push(ManifestRow { kind: String::from("library"), name: library.name.as_str().to_string(), crate_dir: library.owner.as_str().to_string(), crate_path: source.path.as_str().to_string(), stage: String::from("volume"), destination: Some(library.destination.as_str().to_string()), features: Some(features), providers: library.providers.iter().map(|provider| provider.as_str().to_string()).collect() });
+		rows.push(ManifestRow { kind: String::from("library"), name: library.name.as_str().to_string(), crate_dir: library.owner.as_str().to_string(), crate_path: source.path.as_str().to_string(), stage: String::from("volume"), destination: Some(library.destination.as_str().to_string()), features: Some(features), providers: library.providers.iter().map(|provider| provider.as_str().to_string()).collect(), producer: library.producer });
 	}
 	for program in model.programs.values().filter(|program| included(program)) {
 		let source = model.sources.get(&program.owner).expect("validated program owner");
@@ -601,6 +604,10 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 			destination: Some(program.destination.as_str().to_string()),
 			features: None,
 			providers: program.providers.iter().map(|provider| provider.as_str().to_string()).collect(),
+			// Every program in this image is Rust. A foreign EXECUTABLE is a different question from
+			// a foreign library and this milestone answers only the second one; when the first is
+			// asked, this line is where the answer goes.
+			producer: system_manifest::Producer::Rust,
 		});
 	}
 	rows
@@ -885,6 +892,15 @@ fn derive_dynamic_order(row: &ManifestRow, libraries: &[ManifestRow]) -> Vec<Str
 /// a field line - which fails as "a provider was replaced" and sends the reader to the wrong place.
 const IDENTITY_HEADER_LINES: usize = 11;
 
+/// The same count for a foreign artifact, whose language section carries six fields rather than
+/// three. Two constants and not one expression, because the two sections have nothing in common
+/// beyond the seven lines above them.
+const FOREIGN_IDENTITY_HEADER_LINES: usize = 14;
+
+/// What the launch admits, mirrored from the `selection` module in `service-logic` so a package this
+/// tool accepts is not one ProcessService refuses.
+const MAX_SELECTION_SLOTS: usize = 4;
+
 fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow], expected_rustc_commit: &str) -> Vec<u8> {
 	let bytes = identity_record(artifact);
 	assert!(bytes.ends_with(b"\n"), "{} identity record is not newline terminated", row.name);
@@ -898,13 +914,30 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 	assert!(lines[4].strip_prefix("source-sha256=").is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())), "{} identity source digest", row.name);
 	assert_eq!(lines[5], format!("target={}", user_target()), "{} identity target", row.name);
 	assert_eq!(lines[6], "profile=release", "{} identity profile", row.name);
-	// THE LANGUAGE SECTION, AND ITS KEY IS CHECKED BEFORE ITS FIELDS. Everything produced by this
-	// build is Rust; a record claiming another producer here is one this packager has no rule for,
-	// and accepting it would be accepting fields it never validated.
-	assert_eq!(lines[7], "language=rust", "{} identity language", row.name);
-	assert_eq!(lines[8], format!("rustc-commit={expected_rustc_commit}"), "{} identity toolchain", row.name);
-	assert!(lines[9].starts_with("rustflags=-C relocation-model=pic"), "{} identity codegen flags", row.name);
-	assert!(lines[10].starts_with("features="), "{} identity features", row.name);
+	// THE LANGUAGE SECTION, AND ITS KEY IS CHECKED BEFORE ITS FIELDS - against what the MANIFEST
+	// says produced this artifact, not against whatever the record claims. A record is checked here
+	// precisely because it might be wrong, so letting it choose which rule it is checked by would be
+	// checking it against itself.
+	match row.producer {
+		system_manifest::Producer::Rust => {
+			assert_eq!(lines[7], "language=rust", "{} identity language", row.name);
+			assert_eq!(lines[8], format!("rustc-commit={expected_rustc_commit}"), "{} identity toolchain", row.name);
+			assert!(lines[9].starts_with("rustflags=-C relocation-model=pic"), "{} identity codegen flags", row.name);
+			assert!(lines[10].starts_with("features="), "{} identity features", row.name);
+		}
+		system_manifest::Producer::Foreign => {
+			// THE THREE TOOLS, THE FLAGS, THE SYSROOT AND THE CONFIGURE INPUTS. Each can change what
+			// the artifact IS without changing a source byte, which is why the record carries them
+			// and why a missing one is a malformed record rather than a cosmetic omission.
+			assert_eq!(lines[7], "language=foreign", "{} identity language", row.name);
+			for (index, key) in [(8, "compiler="), (9, "archiver="), (10, "linker="), (11, "cflags=")] {
+				assert!(lines[index].strip_prefix(key).is_some_and(|value| !value.is_empty()), "{} identity {key}", row.name);
+			}
+			for (index, key) in [(12, "sysroot-sha256="), (13, "configure-sha256=")] {
+				assert!(lines[index].strip_prefix(key).is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())), "{} identity {key}", row.name);
+			}
+		}
+	}
 	let mut expected_providers: Vec<String> = row
 		.providers
 		.iter()
@@ -923,8 +956,21 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 	// that out took reading file dates in the staged directory. The check is unchanged - a
 	// consumer's recorded chain must equal the providers staged beside it - and only the refusal is
 	// legible now.
-	if lines[IDENTITY_HEADER_LINES..] != *expected_providers.as_slice() {
-		let recorded: &[&str] = &lines[IDENTITY_HEADER_LINES..];
+	let header_lines = match row.producer {
+		system_manifest::Producer::Rust => IDENTITY_HEADER_LINES,
+		system_manifest::Producer::Foreign => FOREIGN_IDENTITY_HEADER_LINES,
+	};
+	// THE PROVIDER LIST ENDS WHERE THE SELECTION SLOTS BEGIN, and the two are compared differently
+	// because they mean different things: a provider is an edge this artifact HAS, a slot is a
+	// position it declared and the launch fills. Comparing the slots against the provider list would
+	// report a correctly built consumer as one built against providers that are not staged.
+	let recorded_tail: &[&str] = &lines[header_lines..];
+	let slot_start: usize = recorded_tail.iter().position(|line| line.starts_with("selection=")).unwrap_or(recorded_tail.len());
+	let (recorded_providers, recorded_slots) = recorded_tail.split_at(slot_start);
+	assert!(recorded_slots.iter().all(|line| line.starts_with("selection=")), "{} interleaves selection slots with providers", row.name);
+	assert!(recorded_slots.len() <= MAX_SELECTION_SLOTS, "{} declares more selection slots than the launch admits", row.name);
+	if recorded_providers != expected_providers.as_slice() {
+		let recorded: &[&str] = recorded_providers;
 		eprintln!("mkpackages: {} was built against providers that are not the ones staged beside it", row.name);
 		for provider in &row.providers {
 			let prefix = format!("provider={provider}:");

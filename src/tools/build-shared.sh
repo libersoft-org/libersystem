@@ -1336,7 +1336,8 @@ write_identity_record() {
 	local identity="$7"
 	local producer="${8:-rust}"
 	local objects="${9:--}"
-	local provider digest
+	local selection="${10:--}"
+	local provider digest slot slot_kind slot_rest candidate first
 	{
 		# THE COMMON SECTION: what every artifact has, whatever produced it. A reader that only needs
 		# to know WHICH artifact this is - the publication path, the compatibility rule's field
@@ -1382,6 +1383,37 @@ write_identity_record() {
 			digest="${provider_identity_digests[$provider]}"
 			printf 'provider=%s:%s\n' "$provider" "$digest"
 		done
+		# THE SLOTS COME LAST, AFTER THE PROVIDERS AND NEVER INTERLEAVED. The provider list is read
+		# as strictly ascending, which is what makes a duplicate impossible to express; a slot line
+		# in the middle of it would break that reading for no benefit.
+		#
+		# EACH CANDIDATE BY NAME AND BY DIGEST, IN THE CONSUMER-S OWN ORDER. The order is the
+		# preference order and is part of what is signed, so "which one runs" is a decision this
+		# build makes and a launch may narrow - never widen.
+		if [[ "$selection" != - ]]; then
+			while IFS= read -r slot; do
+				[[ -n "$slot" ]] || continue
+				slot_kind="${slot%%:*}"
+				slot_rest="${slot##*:}"
+				printf 'selection=%s:' "$slot_kind"
+				first=1
+				for candidate in $(tr ',' ' ' <<<"$slot_rest"); do
+					if [[ -z "${provider_identity_digests[$candidate]:-}" ]]; then
+						echo "build-shared: $artifact has no identity for selection candidate $candidate" >&2
+						return 1
+					fi
+					if [[ "$first" == 0 ]]; then printf ','; fi
+					# THE STAGED NAME, WITH ITS SUFFIX, AND A `provider=` LINE CARRIES THE BARE ONE.
+					# The two lines answer different questions: a provider is already in the
+					# dependency set, so its line names the provider a dependency RESOLVED TO, while
+					# a candidate has to be LOOKED UP before anything about it is known - and what a
+					# launch looks up is the staged artifact.
+					printf '%s.lslib=%s' "$candidate" "${provider_identity_digests[$candidate]}"
+					first=0
+				done
+				printf '\n'
+			done < <(tr ';' '\n' <<<"$selection")
+		fi
 	} >"$identity"
 }
 
@@ -1769,7 +1801,10 @@ dynamic_rows() {
 		select($artifact == "" or
 			($kind == "program" and .name == $artifact) or
 			($kind == "library" and any(.providers[]?; depends_on($root; .; $artifact)))) |
-		["dynamic", .name, .owner, "volume", .destination, (.providers | join(" "))] | @tsv
+		["dynamic", .name, .owner, "volume", .destination,
+			(if (.selection | length) == 0 then "-"
+			 else ([.selection[] | "\(.kind):\(.symbols | join("+")):\(.candidates | join(","))"] | join(";")) end),
+			(.providers | join(" "))] | @tsv
 	' <<<"$manifest_json" | sort -k2,2
 }
 
@@ -1783,7 +1818,7 @@ build_file_hash_inventory() {
 		file="$(library_file "$artifact")"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done
-	while read -r kind consumer crate stage destination providers; do
+	while read -r kind consumer crate stage destination selection providers; do
 		file="$artifact_output_root/${destination%.lsexe}"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done < <(dynamic_rows)
@@ -2585,7 +2620,7 @@ if [[ -n "$image_graph" ]]; then
 		echo "build-shared: duplicate dynamic executable $duplicate_consumer" >&2
 		exit 1
 	fi
-	while read -r kind consumer crate stage destination providers; do
+	while read -r kind consumer crate stage destination selection providers; do
 		if [[ "$kind" != dynamic || "$stage" != volume ]]; then
 			continue
 		fi
@@ -2599,6 +2634,45 @@ if [[ -n "$image_graph" ]]; then
 			echo "build-shared: dynamic $consumer repeats a direct provider" >&2
 			exit 1
 		fi
+		# THE SELECTION SLOTS, PARSED AND CHECKED BEFORE THEY ARE USED. Each is
+		# `KIND:SYM+SYM:CAND,CAND`, slots separated by `;`, or `-` when the consumer has none.
+		slot_symbols=""
+		slot_candidates=""
+		if [[ "$selection" != - ]]; then
+			while IFS= read -r slot; do
+				[[ -n "$slot" ]] || continue
+				slot_kind="${slot%%:*}"
+				slot_rest="${slot#*:}"
+				slot_symbol_list="${slot_rest%%:*}"
+				slot_candidate_list="${slot_rest##*:}"
+				if [[ -z "$slot_kind" || -z "$slot_symbol_list" || -z "$slot_candidate_list" ]]; then
+					echo "build-shared: $consumer has a malformed selection slot '$slot'" >&2
+					exit 1
+				fi
+				slot_symbols+="$(tr '+' '\n' <<<"$slot_symbol_list")"$'\n'
+				# EVERY CANDIDATE EXPORTS EXACTLY THE KIND-S SYMBOLS, and the check is both ways.
+				# A candidate missing one is a provider the consumer cannot call through the slot it
+				# was admitted into; a candidate exporting MORE is a wider surface reachable through
+				# a position whose whole point is that its surface is closed and the same for every
+				# occupant.
+				for candidate in $(tr ',' ' ' <<<"$slot_candidate_list"); do
+					if ! matches_line "$candidate" printf '%s\n' "${artifacts[@]}"; then
+						echo "build-shared: $consumer slot $slot_kind names unavailable candidate $candidate" >&2
+						exit 1
+					fi
+					candidate_exports="$(llvm-readelf --wide --dyn-syms "$(library_file "$candidate")" | awk '$7 != "UND" && $8 != "" && $8 != "Name" {print $8}' | sort -u)"
+					wanted_exports="$(tr '+' '\n' <<<"$slot_symbol_list" | sort -u)"
+					if [[ "$candidate_exports" != "$wanted_exports" ]]; then
+						echo "build-shared: $consumer slot $slot_kind candidate $candidate does not export exactly the kind-s symbols" >&2
+						diff -u <(printf '%s\n' "$wanted_exports") <(printf '%s\n' "$candidate_exports") >&2 || true
+						exit 1
+					fi
+					slot_candidates+="$slot_kind $candidate"$'\n'
+				done
+			done < <(tr ';' '\n' <<<"$selection")
+			slot_symbols="$(sort -u <<<"$slot_symbols" | sed '/^$/d')"
+			slot_candidates="$(sed '/^$/d' <<<"$slot_candidates")"
+		fi
 		consumer_dir="$root/$(source_path "$crate")"
 		out_dir="$(dirname "$artifact_output_root/${destination%.lsexe}")"
 		consumer_errors="$artifact_log_dir/$consumer.stderr"
@@ -2610,6 +2684,13 @@ if [[ -n "$image_graph" ]]; then
 		for provider in $providers; do
 			consumer_state_header+="provider=$provider:${provider_identity_digests[$provider]:-}:${provider_compile_digests[$provider]:-}"$'\n'
 		done
+		# A CANDIDATE IS AN INPUT EVEN THOUGH IT IS NOT A DEPENDENCY. Its digest is written into this
+		# consumer-s identity record, so a rebuilt candidate makes the record stale - and a state key
+		# that did not cover it would keep the stale record and refuse the launch.
+		while read -r slot_kind candidate; do
+			[[ -n "$candidate" ]] || continue
+			consumer_state_header+="selection=$slot_kind:$candidate:${provider_identity_digests[$candidate]:-}"$'\n'
+		done <<<"$slot_candidates"
 		if artifact_state_valid "$consumer_state_key" "$consumer_state_header" "$providers"; then
 			artifact_state_hit[$consumer]=1
 			((executable_cache_hits += 1))
@@ -2622,7 +2703,7 @@ if [[ -n "$image_graph" ]]; then
 		audit_provider_export_ownership "$providers"
 		consumer_expected_identity="$(mktemp "$build_scratch/identity-record.XXXXXX")"
 		pending_identity_record="$consumer_expected_identity"
-		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
+		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity" rust - "$selection"
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
 		consumer_cache_inputs="$consumer_cache_prefix.inputs.$$.expected"
@@ -2902,6 +2983,7 @@ if [[ -n "$image_graph" ]]; then
 			;;
 		esac
 		declare -A used_consumer_providers=()
+		declare -A reached_slot_symbols=()
 		for symbol in $consumer_imports; do
 			count=0
 			owner=""
@@ -2911,12 +2993,35 @@ if [[ -n "$image_graph" ]]; then
 					owner="$provider"
 				fi
 			done
+			# A SLOT SYMBOL HAS NO DECLARED PROVIDER AND THAT IS THE POINT. The consumer is built
+			# against a SET of candidates, so no `DT_NEEDED` edge names one; what stands behind the
+			# symbol is decided at launch, out of the closed set the identity record carries. It may
+			# not ALSO have a provider: two answers to "who defines this" is the duplicate the
+			# ordinary rule refuses, arriving by another route.
+			if [[ -n "$slot_symbols" ]] && grep -qx "$symbol" <<<"$slot_symbols"; then
+				if [[ "$count" != 0 ]]; then
+					echo "build-shared: $consumer slot symbol $symbol also has $count declared provider(s)" >&2
+					exit 1
+				fi
+				reached_slot_symbols[$symbol]=1
+				continue
+			fi
 			if [[ "$count" != 1 ]]; then
 				echo "build-shared: $consumer import $symbol has $count declared providers (expected 1)" >&2
 				exit 1
 			fi
 			used_consumer_providers[$owner]=1
 		done
+		# AND THE SLOT IS ACTUALLY USED. A declared slot whose symbols nothing imports is a provider
+		# position the launch will bind, load and verify for a consumer that never calls through it -
+		# which is an image carrying a provider for nobody, decided at build time and invisible after.
+		while IFS= read -r symbol; do
+			[[ -n "$symbol" ]] || continue
+			if [[ -z "${reached_slot_symbols[$symbol]:-}" ]]; then
+				echo "build-shared: $consumer declares a selection slot admitting $symbol and imports nothing through it" >&2
+				exit 1
+			fi
+		done <<<"$slot_symbols"
 		for provider in $providers; do
 			if [[ -z "${used_consumer_providers[$provider]:-}" ]]; then
 				echo "build-shared: dynamic $consumer provider $provider satisfies no direct import" >&2
@@ -2927,7 +3032,17 @@ if [[ -n "$image_graph" ]]; then
 		out="$published_out.$$.candidate"
 		rm -f "$out"
 		timing_event consumer link-start
-		"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "${provider_inputs[@]}" --no-allow-shlib-undefined -o "$out"
+		# `-z undefs` ONLY FOR A CONSUMER WITH SLOTS, and it is not a weakening: the audit above has
+		# already decided every undefined symbol individually - each is either defined by exactly one
+		# declared provider or admitted by a slot - so what this flag removes is the linker-s
+		# SECOND, coarser opinion about a question already answered exactly. Without it the link
+		# fails on the slot symbols, because the whole point is that no library on the command line
+		# defines them.
+		undefined_policy=(--no-allow-shlib-undefined)
+		if [[ -n "$slot_symbols" ]]; then
+			undefined_policy=(--no-allow-shlib-undefined -z undefs)
+		fi
+		"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "${provider_inputs[@]}" "${undefined_policy[@]}" -o "$out"
 		timing_event consumer link-end
 		if ! matches_output 'Type:.*DYN' llvm-readelf -h "$out"; then
 			echo "build-shared: $out is not ET_DYN" >&2

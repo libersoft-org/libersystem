@@ -63,6 +63,11 @@ struct RawProgram {
 	destination: String,
 	#[serde(default)]
 	providers: Vec<String>,
+	// THE SELECTION SLOTS this program was built against: a declared provider position it names by
+	// KIND and by a closed set of candidates rather than by one `DT_NEEDED` edge. Empty for every
+	// program that has none, which is all but one today.
+	#[serde(default)]
+	selection: Vec<RawSelectionSlot>,
 	// A development-only program: built and staged only when the development feature is on,
 	// and absent from a shipped image rather than present and refusing to work. Declaring it
 	// here keeps the manifest the single place that says what the system is made of, in both
@@ -361,6 +366,21 @@ struct RawLibrary {
 	objects: Vec<String>,
 }
 
+// One declared selection slot, as the manifest states it.
+//
+// THE SYMBOLS ARE PART OF THE DECLARATION AND NOT AN IMPLEMENTATION DETAIL. A slot is a position
+// several providers may occupy, so what the consumer may CALL through it has to be a property of the
+// KIND rather than of whichever candidate is staged - otherwise the consumer is built against one
+// candidate after all. Naming them here is what lets the build check both ends: that the consumer
+// imports nothing else through the slot, and that every candidate exports exactly this set.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawSelectionSlot {
+	kind: String,
+	symbols: Vec<String>,
+	candidates: Vec<String>,
+}
+
 // The pieces of the boot chain: the kernel and the UEFI loader. They are not userspace
 // programs - nothing stages them onto a volume and no service supervises them - but the
 // manifest is the final assembly of the whole system, so what goes into an ISO or IMG has to
@@ -526,6 +546,8 @@ pub struct Program {
 	pub stage: Stage,
 	pub destination: RelativePath,
 	pub providers: Vec<Name>,
+	// The declared selection slots, empty for a program that has none.
+	pub selection: Vec<SelectionSlot>,
 	// Built and staged only in the development configuration; see RawProgram.
 	pub development: bool,
 	// The binding rules, present exactly on drivers. `Some` for every `role = "driver"` entry that
@@ -534,6 +556,16 @@ pub struct Program {
 }
 
 // One driver registry entry: what it binds to, how it is supervised, and how specific its claim is.
+#[derive(Clone, Debug, Serialize)]
+pub struct SelectionSlot {
+	pub kind: Name,
+	pub symbols: Vec<String>,
+	// IN THE CONSUMER'S OWN PREFERENCE ORDER, which is why this is a list and not a set: the first
+	// candidate that is staged with the admitted bytes is the one that binds, and that order is part
+	// of the signed identity record rather than something the launch decides.
+	pub candidates: Vec<Name>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Driver {
 	pub lifecycle: DriverLifecycle,
@@ -1015,7 +1047,56 @@ impl Manifest {
 					})
 					.collect(),
 			});
-			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, development: raw_program.development, driver }).is_some() {
+			// THE SELECTION SLOTS, AND THEIR BOUNDS ARE THE LAUNCH'S BOUNDS. Four slots and sixteen
+			// candidates are what ProcessService admits, so a manifest able to express more would be
+			// a manifest able to describe an image that cannot start - and the failure would arrive
+			// at a launch rather than here.
+			let mut selection: Vec<SelectionSlot> = Vec::new();
+			if raw_program.selection.len() > MAX_SELECTION_SLOTS {
+				push_error(&mut errors, format!("{location}.selection"), format!("{} slots; the launch admits {MAX_SELECTION_SLOTS}", raw_program.selection.len()));
+			}
+			for (index, slot) in raw_program.selection.iter().enumerate() {
+				let where_ = format!("{location}.selection.{index}");
+				let Some(kind) = validate_name(&slot.kind, &format!("{where_}.kind"), &mut errors) else { continue };
+				if slot.symbols.is_empty() {
+					push_error(&mut errors, format!("{where_}.symbols"), "a slot whose kind admits no symbol is a position nothing can be called through");
+				}
+				for symbol in &slot.symbols {
+					if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+						push_error(&mut errors, format!("{where_}.symbols"), format!("{symbol} is not a symbol name"));
+					}
+				}
+				if slot.symbols.iter().collect::<BTreeSet<_>>().len() != slot.symbols.len() {
+					push_error(&mut errors, format!("{where_}.symbols"), "a repeated symbol");
+				}
+				if slot.candidates.is_empty() || slot.candidates.len() > MAX_SLOT_CANDIDATES {
+					push_error(&mut errors, format!("{where_}.candidates"), format!("{} candidates; a slot admits between one and {MAX_SLOT_CANDIDATES}", slot.candidates.len()));
+				}
+				let mut candidates: Vec<Name> = Vec::new();
+				for candidate in &slot.candidates {
+					let Some(candidate) = validate_name(candidate, &format!("{where_}.candidates"), &mut errors) else { continue };
+					if !libraries.contains_key(&candidate) {
+						push_error(&mut errors, format!("{where_}.candidates"), format!("unknown library {candidate}"));
+					}
+					// A CANDIDATE THAT IS ALSO A DIRECT PROVIDER would be accounted for twice: once
+					// by its `DT_NEEDED` edge and once by the slot it filled. The launch refuses
+					// that, by name; saying so here names the manifest as the fault.
+					if providers.contains(&candidate) {
+						push_error(&mut errors, format!("{where_}.candidates"), format!("{candidate} is already a direct provider; one edge cannot be counted twice"));
+					}
+					if candidates.contains(&candidate) {
+						push_error(&mut errors, format!("{where_}.candidates"), format!("duplicate candidate {candidate}"));
+						continue;
+					}
+					candidates.push(candidate);
+				}
+				if selection.iter().any(|held| held.kind == kind) {
+					push_error(&mut errors, format!("{where_}.kind"), format!("a second slot of kind {kind}; which one a candidate fills would have two answers"));
+					continue;
+				}
+				selection.push(SelectionSlot { kind, symbols: slot.symbols.clone(), candidates });
+			}
+			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, selection, development: raw_program.development, driver }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate program name");
 			}
 		}
@@ -1366,6 +1447,11 @@ fn validate_name_list(values: Vec<String>, location: &str, errors: &mut Vec<Vali
 	names.sort();
 	names
 }
+
+/// What the launch admits, mirrored here so the manifest cannot describe an image that cannot start.
+/// The authority is the `selection` module in `service-logic`; these are the same two numbers.
+const MAX_SELECTION_SLOTS: usize = 4;
+const MAX_SLOT_CANDIDATES: usize = 16;
 
 fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a str> {
 	if let Some(relative) = source.strip_prefix("user/libs/") {

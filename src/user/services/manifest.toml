@@ -1035,6 +1035,28 @@ stage = "pinned"
 destination = "holdopen.lsexe"
 providers = []
 
+# THE SELECTION-SLOT CONSUMER. It names NO provider for the ICD and no `DT_NEEDED` edge reaches one:
+# the slot declares a KIND and the closed set of candidates this program was built against, and
+# ProcessService binds one of them into the verified closure before the first thread runs. The
+# symbols are part of the slot rather than of a candidate, because a position several providers may
+# occupy cannot take its callable surface from whichever one is staged.
+#
+# STAGED IN EVERY IMAGE, like the synthetic provider it reaches. A development-only artifact would be
+# absent from exactly the image whose launch path this is meant to prove, and the gate that proves it
+# would then be proving a different image from the one that ships.
+[[programs]]
+name = "icdcheck"
+owner = "tools"
+# A PROBE AND NOT A TOOL. It answers a question about the system rather than doing anything for a
+# person, which is what `libexec` is for - and the tool WAVES in `lib.sh` are a grouping of the
+# user-facing command families, where this would be a seventh wave of one.
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/icdcheck.lsexe"
+providers = ["lsrt"]
+selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+
 [[programs]]
 name = "readln"
 owner = "tools"

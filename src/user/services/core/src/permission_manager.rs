@@ -344,6 +344,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"lsmem" => Some(granted("lsmem", alloc::vec![])),
 		b"lsirq" => Some(granted("lsirq", alloc::vec![])),
 		b"lspci" => Some(granted("lspci", alloc::vec![])),
+		// The selection-slot probe. It calls a provider ProcessService bound into its closure before
+		// it started and prints what that provider agreed to, so it reaches nothing this manifest
+		// could grant: an empty one is the whole of what it needs.
+		b"icdcheck" => Some(granted("icdcheck", alloc::vec![])),
 		_ => None,
 	}
 }

@@ -124,6 +124,10 @@ name = "hexdump"
 path = "src/hexdump.rs"
 
 [[bin]]
+name = "icdcheck"
+path = "src/icdcheck.rs"
+
+[[bin]]
 name = "truncate"
 path = "src/truncate.rs"
 

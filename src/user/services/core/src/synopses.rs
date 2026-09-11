@@ -73,6 +73,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	// system / status tools
 	("ps", "ps [json] - list the running processes"),
 	("free", "free [-h] - print the memory totals"),
+	("icdcheck", "icdcheck - reach the provider bound into a selection slot and report what it agreed to"),
 	("uname", "uname - print the system identity"),
 	("uptime", "uptime - print how long the system has been up"),
 	("date", "date - print the wall-clock date and time"),
