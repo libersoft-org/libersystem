@@ -633,10 +633,15 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 
 	// Build a DHCP server reply frame (Ethernet + IPv4 + UDP 67 -> 68 + BOOTP reply
 	// with the lease-clock options; the stack verifies no checksums).
-	let reply = |msg_type: u8, dst_ip: [u8; 4], dst_mac: [u8; 6]| -> Message {
+	let reply = |msg_type: u8, dst_ip: [u8; 4], dst_mac: [u8; 6], xid: [u8; 4], chaddr: [u8; 6]| -> Message {
 		let mut bootp = alloc::vec![0u8; 236];
 		bootp[0] = 2; // BOOTREPLY
+		// A SERVER ECHOES WHAT THE CLIENT SENT. The client draws a transaction identity per exchange
+		// and matches it, so a fixture that left these zero is answering a conversation nobody had -
+		// which is what a forged reply looks like, and is now refused.
+		bootp[4..8].copy_from_slice(&xid);
 		bootp[16..20].copy_from_slice(&leased); // yiaddr
+		bootp[28..34].copy_from_slice(&chaddr);
 		bootp.extend_from_slice(&0x6382_5363u32.to_be_bytes());
 		bootp.extend_from_slice(&[53, 1, msg_type]);
 		bootp.extend_from_slice(&[54, 4, server[0], server[1], server[2], server[3]]);
@@ -713,16 +718,15 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Net, frames_user).expect("the catalogue answered the subscription and the connection");
-	// Pre-queue the whole bind conversation (the kernel test thread cannot answer
-	// mid-wait): the MAC lead-in, the OFFER and the clock-carrying ACK the handshake
-	// will consume in order, and the ARP reply that teaches the service the server's
-	// MAC (its own gratuitous ARP pumps it in), so the T1 renewal can go unicast.
+	// The MAC lead-in and the ARP reply that teaches the service the server's MAC (its own gratuitous
+	// ARP pumps it in), so the T1 renewal can go unicast. The OFFER and the ACK are NOT pre-queued:
+	// a server echoes the client's transaction identity, and the client now draws one per exchange,
+	// so this fixture has to READ the DISCOVER before it can answer it. `run_until_idle` is what
+	// makes that possible - it runs the service until it blocks waiting for the reply.
 	let mut mac_msg = alloc::vec::Vec::new();
 	mac_msg.extend_from_slice(b"MAC");
 	mac_msg.extend_from_slice(&our_mac);
 	frames_kernel.send(Message::new(mac_msg, alloc::vec::Vec::new())).expect("MAC handoff");
-	frames_kernel.send(reply(2, [255; 4], [0xff; 6])).expect("the OFFER should queue");
-	frames_kernel.send(reply(5, [255; 4], [0xff; 6])).expect("the ACK should queue");
 	let mut arp_reply = alloc::vec::Vec::new();
 	arp_reply.extend_from_slice(&our_mac);
 	arp_reply.extend_from_slice(&srv_mac);
@@ -733,12 +737,22 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	arp_reply.extend_from_slice(&our_mac);
 	arp_reply.extend_from_slice(&leased);
 	frames_kernel.send(Message::new(arp_reply, alloc::vec::Vec::new())).expect("the ARP reply should queue");
-	sched::run_until_idle();
+	// STEPPED FROM HERE ON. An unbounded drain runs the client through its entire DHCP timeout before
+	// this thread sees a single frame, and this fixture has to answer that conversation while it is
+	// still open.
+	let mut online: Option<Message> = None;
+	let give_up = arch::apic::ticks() + 400;
+	while online.is_none() && arch::apic::ticks() < give_up {
+		sched::run_until_idle_until(arch::apic::ticks() + 2);
+		online = boot_kernel.recv().ok();
+	}
 
 	// The service binds and reports in; its side of the conversation arrives in
 	// order: the DISCOVER, the selecting REQUEST (ciaddr empty, server-id present),
 	// and the gratuitous ARP announcement.
-	let online = boot_kernel.recv().expect("NetworkService online report");
+	// ONLINE COMES BEFORE EITHER FAMILY IS STARTED NOW, so it arrives ahead of the DHCP conversation
+	// rather than after it.
+	let online = online.expect("NetworkService online report");
 	assert_eq!(&online.bytes[..], b"NetworkService: online", "the service binds and reports in");
 	// THE LINK NOW CARRIES IPv6 CONTROL TRAFFIC TOO. NetworkService stands an IPv6 host up on the
 	// same NIC, so router solicitations, detection probes and listener reports share this channel with
@@ -756,12 +770,33 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 			}
 		}};
 	}
-	let discover = next_ipv4!().expect("the DISCOVER should broadcast");
+	// STEPPED, NOT DRAINED. An unbounded drain runs the client through its entire DHCP timeout before
+	// this thread sees a single frame - which is why the conversation used to be pre-queued. It
+	// cannot be any more: the client draws a transaction identity per exchange and a server has to
+	// echo it, so this fixture must read the DISCOVER before it can answer it.
+	macro_rules! step_for {
+		($what:expr) => {{
+			let mut taken: Option<Message> = None;
+			let give_up = arch::apic::ticks() + 400;
+			while taken.is_none() && arch::apic::ticks() < give_up {
+				sched::run_until_idle_until(arch::apic::ticks() + 2);
+				taken = next_ipv4!().ok();
+			}
+			taken.expect($what)
+		}};
+	}
+	let discover = step_for!("the DISCOVER should broadcast");
 	assert_eq!(decode(&discover.bytes).map(|(t, _, _, _)| t), Some(1), "the first frame is the DISCOVER");
-	let request = next_ipv4!().expect("the REQUEST should follow the OFFER");
+	// The identity this client chose, which the answer has to carry.
+	let bootp = &discover.bytes[14 + 20 + 8..];
+	let xid: [u8; 4] = [bootp[4], bootp[5], bootp[6], bootp[7]];
+	let chaddr: [u8; 6] = [bootp[28], bootp[29], bootp[30], bootp[31], bootp[32], bootp[33]];
+	frames_kernel.send(reply(2, [255; 4], [0xff; 6], xid, chaddr)).expect("the OFFER should queue");
+	let request = step_for!("the REQUEST should follow the OFFER");
 	let (rtype, rciaddr, _, rsid) = decode(&request.bytes).expect("the second frame decodes");
 	assert!(rtype == 3 && rciaddr == [0; 4] && rsid, "the selecting REQUEST names the server, ciaddr empty");
-	let arp = next_ipv4!().expect("the gratuitous ARP should send");
+	frames_kernel.send(reply(5, [255; 4], [0xff; 6], xid, chaddr)).expect("the ACK should queue");
+	let arp = step_for!("the gratuitous ARP should send");
 	assert_eq!(&arp.bytes[12..14], &[0x08, 0x06], "the announcement is an ARP request");
 
 	// Let the clock tick to T1: the service must wake itself (the lease deadline is
@@ -774,6 +809,10 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 		renewal = next_ipv4!().ok();
 	}
 	let renewal = renewal.expect("the T1 renewal REQUEST should arrive unprompted");
+	// A RENEWAL IS ITS OWN EXCHANGE and carries its own identity, so the answer has to carry that one
+	// rather than the identity of the conversation that granted the lease.
+	let renewal_bootp = &renewal.bytes[14 + 20 + 8..];
+	let renewal_xid: [u8; 4] = [renewal_bootp[4], renewal_bootp[5], renewal_bootp[6], renewal_bootp[7]];
 	let (t, ciaddr, unicast, sid) = decode(&renewal.bytes).expect("the renewal decodes");
 	assert_eq!(t, 3, "the renewal is a REQUEST");
 	assert_eq!(ciaddr, leased, "the renewal carries the bound address in ciaddr");
@@ -784,7 +823,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	// the next renewal must arrive a full T1 (~100 ticks) later - an unanswered
 	// REQUEST would have retransmitted at half the time to T2 (~50 ticks) instead.
 	let acked_at = arch::apic::ticks();
-	frames_kernel.send(reply(5, leased, our_mac)).expect("the renewal ACK should send");
+	frames_kernel.send(reply(5, leased, our_mac, renewal_xid, chaddr)).expect("the renewal ACK should send");
 	let mut second: Option<Message> = None;
 	let give_up = acked_at + 500;
 	while second.is_none() && arch::apic::ticks() < give_up {

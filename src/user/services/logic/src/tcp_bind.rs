@@ -120,10 +120,14 @@ impl Binding {
 	}
 }
 
-/// The listeners a service is holding.
+/// The listeners a service is holding, each with the identity its accounting is keyed by.
+///
+/// AN IDENTITY AND NOT A PORT, because two listeners may legitimately hold the same port in two
+/// families - and a backlog keyed on the port would then be one budget for two claims.
 #[derive(Debug, Default)]
 pub struct BindTable {
-	entries: alloc::vec::Vec<Binding>,
+	entries: alloc::vec::Vec<(u32, Binding)>,
+	next_id: u32,
 }
 
 impl BindTable {
@@ -139,20 +143,27 @@ impl BindTable {
 		self.entries.is_empty()
 	}
 
-	/// Admit a claim, or say why not.
-	pub fn bind(&mut self, binding: Binding) -> Result<(), BindRefusal> {
+	/// Admit a claim, or say why not. The identity comes back so the caller can account against it.
+	pub fn bind(&mut self, binding: Binding) -> Result<u32, BindRefusal> {
 		binding.well_formed()?;
-		if self.entries.iter().any(|held| held.conflicts_with(&binding)) {
+		if self.entries.iter().any(|(_, held)| held.conflicts_with(&binding)) {
 			return Err(BindRefusal::InUse);
 		}
-		self.entries.push(binding);
-		Ok(())
+		self.next_id += 1;
+		let id: u32 = self.next_id;
+		self.entries.push((id, binding));
+		Ok(id)
 	}
 
-	pub fn unbind(&mut self, binding: &Binding) -> bool {
+	pub fn unbind(&mut self, id: u32) -> bool {
 		let before: usize = self.entries.len();
-		self.entries.retain(|held| held != binding);
+		self.entries.retain(|(held, _)| *held != id);
 		before != self.entries.len()
+	}
+
+	/// Every claim currently held, with its identity.
+	pub fn claims(&self) -> &[(u32, Binding)] {
+		&self.entries
 	}
 
 	/// Which listener a segment for `local`:`port` belongs to.
@@ -160,8 +171,8 @@ impl BindTable {
 	/// THE MOST SPECIFIC CLAIM WINS. With no reuse rule a wildcard and a specific address cannot both
 	/// be held, so at most one can match - but the order is written down rather than left to
 	/// insertion order, because insertion order is not a rule anybody can rely on.
-	pub fn lookup(&self, local: Local, port: u16) -> Option<&Binding> {
-		self.entries.iter().filter(|held| held.accepts(local, port)).min_by_key(|held| u8::from(held.address.is_unspecified()))
+	pub fn lookup(&self, local: Local, port: u16) -> Option<(u32, &Binding)> {
+		self.entries.iter().filter(|(_, held)| held.accepts(local, port)).min_by_key(|(_, held)| u8::from(held.address.is_unspecified())).map(|(id, held)| (*id, held))
 	}
 }
 

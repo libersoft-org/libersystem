@@ -20,6 +20,9 @@ fn only_denied_is_the_grant_saying_no() {
 	// The decision, not a lookup: the guest never names a path, so a granted file that is not there
 	// is the host's manifest being wrong. See the reasoning on `is_refusal`.
 	assert!(!is_refusal(Error::NotFound), "a granted path that is missing is the host's misconfiguration");
+	// A local address disappearing under a live operation is the machine's networking state, which
+	// the guest neither chose nor can see.
+	assert!(!is_refusal(Error::AddressUnavailable), "an address that went away is not a refused grant");
 }
 
 #[test]
@@ -31,7 +34,7 @@ fn all_three_operations_answer_one_error_the_same_way() {
 	// explicitly and `read_file` and `emit_log` used wildcards that happened to differ from it, so
 	// the same volume refusing a read and refusing a write reached the guest as two different
 	// statuses from within a single host.
-	let all: [Error; 5] = [Error::Denied, Error::NotFound, Error::Invalid, Error::Again, Error::Closed];
+	let all: [Error; 6] = [Error::Denied, Error::NotFound, Error::Invalid, Error::Again, Error::Closed, Error::AddressUnavailable];
 	for error in all {
 		let refused = is_refusal(error);
 		assert_eq!(read_failure(error) == ReadOutcome::Refused, refused, "read disagrees about {error:?}");

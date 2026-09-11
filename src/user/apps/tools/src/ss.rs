@@ -13,7 +13,7 @@
 extern crate alloc;
 
 use network_client::NetworkClient;
-use proto::system::SockState;
+use proto::system::{FamilyReadiness, SockState};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -80,6 +80,35 @@ fn show(netsvc: u64) {
 		line[pos] = b'\n';
 		pos += 1;
 		print(&line[..pos]);
+		// WHERE EACH FAMILY HAS GOT TO, which is the fact a caller acts on: the service answers as
+		// soon as it is listening, so "online" says nothing about whether either family can carry a
+		// packet yet.
+		let mut second: [u8; 96] = [0u8; 96];
+		let mut at: usize = 0;
+		at = put(&mut second, at, b"families: ipv4 ");
+		at = put(&mut second, at, readiness(&cap.ipv4));
+		at = put(&mut second, at, b", ipv6 ");
+		at = put(&mut second, at, readiness(&cap.ipv6));
+		at = put(&mut second, at, b"; diagnostic ");
+		at += write_u16(cap.diagnostic_used as u16, &mut second[at..]);
+		second[at] = b'/';
+		at += 1;
+		at += write_u16(cap.diagnostic_limit as u16, &mut second[at..]);
+		at = put(&mut second, at, b", refused ");
+		at += write_u16(cap.diagnostic_refusals as u16, &mut second[at..]);
+		second[at] = b'\n';
+		at += 1;
+		print(&second[..at]);
+	}
+}
+
+// The word for one family's readiness.
+fn readiness(state: &FamilyReadiness) -> &'static [u8] {
+	match state {
+		FamilyReadiness::Disabled => b"disabled",
+		FamilyReadiness::Configuring => b"configuring",
+		FamilyReadiness::Ready => b"ready",
+		FamilyReadiness::Failed => b"failed",
 	}
 }
 

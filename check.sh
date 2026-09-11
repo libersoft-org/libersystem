@@ -161,6 +161,15 @@ declare -A GATES=(
 	# Generated or compiled artifacts below src, in the working tree and anywhere in reachable
 	# history. Two Justfile recipes that nothing called; cheap enough to be part of "check it", and
 	# a tree that has committed a build output does not un-commit it by nobody looking.
+	# The dependency and licensing policy, which is three refusals rather than a description: an
+	# unreviewed licence, a source the build downloads, and a copied implementation whose attribution
+	# was lost. Each is a build failure, because a warning on a licence question is read once and the
+	# failure it prevents is found by somebody else in a distributed binary.
+	["dependency-policy"]="tools/check-dependency-policy.sh"
+	# The foreign-substrate lockfile against the tree it pins. A cross file or a sysroot header
+	# edited after the freeze changes the ABI every later measurement was taken under, silently -
+	# and the inventory would then describe a compile nobody can reproduce.
+	["foreign-pin"]="tools/check-foreign-pin.sh"
 	["source-hygiene"]="tools/check-source-hygiene.sh --current"
 	["source-history-hygiene"]="tools/check-source-hygiene.sh --history"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"

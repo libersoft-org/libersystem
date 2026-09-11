@@ -627,6 +627,46 @@ impl cli::ChunkSource for Source {
 	}
 }
 
+// Does this zone name the interface the service reported?
+//
+// BOTH SPELLINGS ARE ACCEPTED, because both are what this host writes: `%if0` is the short form a
+// person types and `%if0.1` is the one a rendered address carries, and the generation in the long
+// form has to MATCH rather than be ignored - a zone naming a replaced interface names something that
+// is gone.
+#[cfg(feature = "network-client")]
+#[inline]
+fn zone_names(zone: &[u8], scope: &proto::system::InterfaceId) -> bool {
+	let Some(rest) = zone.strip_prefix(b"if") else {
+		return false;
+	};
+	let (index, generation) = match rest.iter().position(|byte| *byte == b'.') {
+		Some(dot) => (&rest[..dot], Some(&rest[dot + 1..])),
+		None => (rest, None),
+	};
+	if parse_dec(index) != Some(u64::from(scope.index)) {
+		return false;
+	}
+	match generation {
+		Some(text) => parse_dec(text) == Some(scope.generation),
+		None => true,
+	}
+}
+
+// A decimal field with no sign, no leading zero and nothing else in it.
+#[cfg(feature = "network-client")]
+#[inline]
+fn parse_dec(text: &[u8]) -> Option<u64> {
+	if text.is_empty() || (text.len() > 1 && text[0] == b'0') {
+		return None;
+	}
+	let mut value: u64 = 0;
+	for byte in text {
+		let digit = byte.checked_sub(b'0').filter(|d| *d < 10)?;
+		value = value.checked_mul(10)?.checked_add(u64::from(digit))?;
+	}
+	Some(value)
+}
+
 // ONE TARGET, RESOLVED ONE WAY. Every net tool takes "a name or an address" and has to decide which
 // it was given; doing that per tool is how `ping` and `traceroute` come to disagree about whether a
 // bare `::1` is an address. The rule is in `IpAddress::parse`, and this is the one place a name is
@@ -638,6 +678,25 @@ impl cli::ChunkSource for Source {
 #[cfg(feature = "network-client")]
 #[inline(always)]
 pub fn resolve_target(client: &mut network_client::NetworkClient, target: &[u8]) -> Option<proto::system::ScopedAddress> {
+	// A TYPED ADDRESS WITH A ZONE IS THE ONE FORM A NAME CANNOT PRODUCE. `fe80::1%if0` names an
+	// address that means nothing without its link, and refusing it would leave a link-local peer
+	// unreachable from every tool - which is exactly the peer a person is diagnosing.
+	if let Some((addr, zone)) = proto::addr::parse_scoped_input(target) {
+		let Some(zone) = zone else {
+			return Some(proto::system::ScopedAddress::global(addr));
+		};
+		// THE SERVICE'S OWN IDENTITY, NOT THE TEXT'S. A zone is a local name for a link, and the
+		// only link this host has is the one the service reports; matching the text against it is
+		// what stops a typo silently selecting the interface it did not mean.
+		let info = match client.info() {
+			Some(Ok(info)) => info,
+			_ => return None,
+		};
+		if !zone_names(zone, &info.scope) {
+			return None;
+		}
+		return Some(proto::system::ScopedAddress { addr, scope: Some(info.scope) });
+	}
 	if let Some(addr) = proto::system::IpAddress::parse(target) {
 		return Some(proto::system::ScopedAddress::global(addr));
 	}

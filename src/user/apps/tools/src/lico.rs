@@ -1705,6 +1705,9 @@ fn volume_words(error: Error) -> &'static [u8] {
 		Error::Closed => b"the volume closed the connection",
 		Error::Cancelled => b"the volume cancelled it",
 		Error::Invalid | Error::Unsupported => b"the volume refused it",
+		// A volume is not reached over an address, so this cannot come from one - but the vocabulary
+		// is shared, and a reader is better served by the literal truth than by a guess.
+		Error::AddressUnavailable => b"a local address went away",
 	}
 }
 

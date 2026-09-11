@@ -407,6 +407,110 @@ impl MacAddr {
 	}
 }
 
+/// The largest zone identifier this UI convention accepts.
+///
+/// BOUNDED, because it is a UI convention and not a protocol field: an unbounded one is a place to
+/// put a megabyte and see what happens.
+pub const MAX_ZONE_LEN: usize = 16;
+
+/// Parse an address written for a HUMAN, with RFC 4007's optional `%zone` suffix.
+///
+/// THE ZONE IS LOCAL UI SCOPE AND IS NEVER TRANSMITTED. It names an interface on THIS machine, so it
+/// is meaningless anywhere else - which is why it is mapped to the stable interface identity here and
+/// why the other two grammars refuse it outright.
+///
+/// A ZONE ON AN ADDRESS THAT DOES NOT NEED ONE IS REFUSED. `2001:db8::1%if0` is over-specified in a
+/// way that hides a mistake: the writer believed the interface mattered, and it does not.
+pub fn parse_scoped_input(text: &[u8]) -> Option<(IpAddress, Option<&[u8]>)> {
+	match text.iter().position(|byte| *byte == b'%') {
+		None => IpAddress::parse(text).map(|addr| (addr, None)),
+		Some(at) => {
+			let zone: &[u8] = &text[at + 1..];
+			if zone.is_empty() || zone.len() > MAX_ZONE_LEN {
+				return None;
+			}
+			let addr: IpAddress = IpAddress::parse(&text[..at])?;
+			if !addr.needs_scope() {
+				return None;
+			}
+			Some((addr, Some(zone)))
+		}
+	}
+}
+
+/// Parse an RFC 3986 authority: `host:port`, with an IPv6 host in brackets.
+///
+/// THE BRACKETS ARE NOT DECORATION. `fe80::1:80` cannot be read - the colon before the port is
+/// indistinguishable from the colons inside the address - so an unbracketed IPv6 host with a port is
+/// AMBIGUOUS and is refused rather than guessed at.
+///
+/// AND A ZONE IS REFUSED HERE. RFC 6874's zone-in-URI extension is deprecated; following its `%25`
+/// advice would produce non-standard URLs, make two origins compare unequal that name the same
+/// service, and leak a local interface name into something meant to travel.
+pub fn parse_authority(text: &[u8]) -> Option<(IpAddress, u16)> {
+	if text.contains(&b'%') {
+		return None;
+	}
+	if text.first() == Some(&b'[') {
+		let close: usize = text.iter().position(|byte| *byte == b']')?;
+		let host: IpAddress = IpAddress::parse(&text[1..close])?;
+		if !host.is_v6() {
+			// BRACKETS ARE FOR THE FAMILY THAT NEEDS THEM. `[10.0.2.15]:80` is not a form RFC 3986
+			// defines, and accepting it would make one address have two spellings.
+			return None;
+		}
+		let rest: &[u8] = text.get(close + 1..)?;
+		return Some((host, parse_port(rest)?));
+	}
+	// Unbracketed: exactly one colon, and what is before it must be an IPv4 address.
+	let at: usize = text.iter().position(|byte| *byte == b':')?;
+	if text[at + 1..].contains(&b':') {
+		return None;
+	}
+	let host: IpAddress = IpAddress::parse(&text[..at])?;
+	if !host.is_v4() {
+		return None;
+	}
+	Some((host, parse_port(&text[at..])?))
+}
+
+fn parse_port(text: &[u8]) -> Option<u16> {
+	if text.first() != Some(&b':') {
+		return None;
+	}
+	let digits: &[u8] = &text[1..];
+	if digits.is_empty() || digits.len() > 5 || !digits.iter().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	// A LEADING ZERO IS REFUSED for the same reason it is in an address: two readings of one string.
+	if digits.len() > 1 && digits[0] == b'0' {
+		return None;
+	}
+	let mut value: u32 = 0;
+	for byte in digits {
+		value = value * 10 + u32::from(byte - b'0');
+	}
+	(value <= u32::from(u16::MAX)).then_some(value as u16)
+}
+
+/// Render an authority, bracketing the family that needs it.
+pub fn render_authority(addr: &IpAddress, port: u16, out: &mut [u8]) -> usize {
+	let mut pos: usize = 0;
+	let bracketed: bool = addr.is_v6();
+	if bracketed {
+		out[pos] = b'[';
+		pos += 1;
+	}
+	pos += addr.render(&mut out[pos..]);
+	if bracketed {
+		out[pos] = b']';
+		pos += 1;
+	}
+	out[pos] = b':';
+	pos += 1;
+	pos + write_dec_u64(u64::from(port), &mut out[pos..])
+}
+
 pub fn write_mac(mac: &[u8], out: &mut [u8]) -> usize {
 	let mut pos: usize = 0;
 	let mut i: usize = 0;

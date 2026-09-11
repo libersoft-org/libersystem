@@ -56,8 +56,8 @@ fn an_ipv4_mapped_address_is_refused_in_every_mode() {
 #[test]
 fn the_two_single_family_wildcards_share_a_port_and_a_dual_stack_bind_shares_it_with_nothing() {
 	let mut table = BindTable::new();
-	assert_eq!(table.bind(binding(BindMode::Ipv4Only, ANY4, 80)), Ok(()));
-	assert_eq!(table.bind(binding(BindMode::Ipv6Only, ANY6, 80)), Ok(()), "two families, two wildcards, no overlap");
+	assert!(table.bind(binding(BindMode::Ipv4Only, ANY4, 80)).is_ok());
+	assert!(table.bind(binding(BindMode::Ipv6Only, ANY6, 80)).is_ok(), "two families, two wildcards, no overlap");
 	assert_eq!(table.len(), 2);
 
 	// A DUAL-STACK BIND COVERS BOTH, so it conflicts with each of them.
@@ -65,7 +65,7 @@ fn the_two_single_family_wildcards_share_a_port_and_a_dual_stack_bind_shares_it_
 
 	// And in the other order, which is the half a rule written once per direction gets wrong.
 	let mut reverse = BindTable::new();
-	assert_eq!(reverse.bind(binding(BindMode::DualStack, ANY6, 80)), Ok(()));
+	assert!(reverse.bind(binding(BindMode::DualStack, ANY6, 80)).is_ok());
 	assert_eq!(reverse.bind(binding(BindMode::Ipv4Only, ANY4, 80)), Err(BindRefusal::InUse));
 	assert_eq!(reverse.bind(binding(BindMode::Ipv6Only, ANY6, 80)), Err(BindRefusal::InUse));
 	assert_eq!(reverse.bind(binding(BindMode::DualStack, ANY6, 80)), Err(BindRefusal::InUse), "and with another of itself");
@@ -81,7 +81,7 @@ fn the_same_mode_twice_and_a_wildcard_beside_a_specific_address_are_both_refused
 	assert_eq!(table.bind(binding(BindMode::Ipv4Only, v4(10, 0, 2, 15), 80)), Err(BindRefusal::InUse));
 
 	// A different port is a different claim entirely.
-	assert_eq!(table.bind(binding(BindMode::Ipv4Only, ANY4, 443)), Ok(()));
+	assert!(table.bind(binding(BindMode::Ipv4Only, ANY4, 443)).is_ok());
 }
 
 #[test]
@@ -90,8 +90,8 @@ fn a_segment_reaches_the_listener_whose_claim_covers_it_and_no_other() {
 	table.bind(binding(BindMode::Ipv4Only, ANY4, 80)).expect("v4");
 	table.bind(binding(BindMode::Ipv6Only, ANY6, 80)).expect("v6");
 
-	assert_eq!(table.lookup(v4(10, 0, 2, 15), 80).map(|held| held.mode), Some(BindMode::Ipv4Only));
-	assert_eq!(table.lookup(v6(1), 80).map(|held| held.mode), Some(BindMode::Ipv6Only));
+	assert_eq!(table.lookup(v4(10, 0, 2, 15), 80).map(|(_, held)| held.mode), Some(BindMode::Ipv4Only));
+	assert_eq!(table.lookup(v6(1), 80).map(|(_, held)| held.mode), Some(BindMode::Ipv6Only));
 	assert_eq!(table.lookup(v4(10, 0, 2, 15), 443), None, "a port nothing holds");
 
 	// A DUAL-STACK LISTENER TAKES BOTH, which is the whole reason the mode exists.
@@ -118,8 +118,8 @@ fn equal_ports_in_two_families_cannot_alias_each_other() {
 	let mut table = BindTable::new();
 	table.bind(binding(BindMode::Ipv4Only, v4(10, 0, 2, 15), 80)).expect("v4");
 	table.bind(binding(BindMode::Ipv6Only, v6(0x0f15), 80)).expect("v6");
-	assert_eq!(table.lookup(v4(10, 0, 2, 15), 80).map(|held| held.address), Some(v4(10, 0, 2, 15)));
-	assert_eq!(table.lookup(v6(0x0f15), 80).map(|held| held.address), Some(v6(0x0f15)));
+	assert_eq!(table.lookup(v4(10, 0, 2, 15), 80).map(|(_, held)| held.address), Some(v4(10, 0, 2, 15)));
+	assert_eq!(table.lookup(v6(0x0f15), 80).map(|(_, held)| held.address), Some(v6(0x0f15)));
 
 	// And a low address word that happens to match the other family's is still the other family's.
 	assert!(table.lookup(v6(1), 80).is_none());
@@ -129,10 +129,10 @@ fn equal_ports_in_two_families_cannot_alias_each_other() {
 fn unbinding_releases_the_claim_and_the_port_can_be_taken_again() {
 	let mut table = BindTable::new();
 	let held = binding(BindMode::DualStack, ANY6, 80);
-	table.bind(held).expect("the first");
+	let id: u32 = table.bind(held).expect("the first");
 	assert_eq!(table.bind(binding(BindMode::Ipv4Only, ANY4, 80)), Err(BindRefusal::InUse));
-	assert!(table.unbind(&held));
+	assert!(table.unbind(id));
 	assert!(table.is_empty());
-	assert_eq!(table.bind(binding(BindMode::Ipv4Only, ANY4, 80)), Ok(()));
-	assert!(!table.unbind(&held), "and releasing something nothing holds changes nothing");
+	assert!(table.bind(binding(BindMode::Ipv4Only, ANY4, 80)).is_ok());
+	assert!(!table.unbind(id), "and releasing something nothing holds changes nothing");
 }

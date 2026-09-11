@@ -142,3 +142,73 @@ fn a_hardware_address_round_trips() {
 	let len = mac.render(&mut out);
 	assert_eq!(text(&out, len), "52:54:00:12:34:56");
 }
+
+#[test]
+fn the_ui_grammar_takes_a_zone_and_only_where_one_means_something() {
+	// RFC 4007's `%zone` IS LOCAL UI SCOPE: it names an interface on THIS machine, so it is
+	// meaningless anywhere else - which is why it lives in the input grammar and nowhere else.
+	let (addr, zone) = parse_scoped_input(b"fe80::1%if0").expect("a scoped link-local");
+	assert!(addr.is_v6() && zone == Some(&b"if0"[..]));
+	let (addr, zone) = parse_scoped_input(b"2001:db8::1").expect("an unscoped global");
+	assert!(addr.is_v6() && zone.is_none());
+
+	// A ZONE ON AN ADDRESS THAT DOES NOT NEED ONE HIDES A MISTAKE: the writer believed the interface
+	// mattered, and it does not.
+	assert_eq!(parse_scoped_input(b"2001:db8::1%if0"), None);
+	assert_eq!(parse_scoped_input(b"10.0.2.15%if0"), None);
+	// And an empty or absurd zone is not a zone.
+	assert_eq!(parse_scoped_input(b"fe80::1%"), None);
+	assert_eq!(parse_scoped_input(b"fe80::1%0123456789abcdefg"), None);
+}
+
+#[test]
+fn the_authority_grammar_needs_brackets_where_the_address_has_colons() {
+	// `fe80::1:80` CANNOT BE READ: the colon before the port is indistinguishable from the ones
+	// inside the address, so the unbracketed form is ambiguous and is refused rather than guessed at.
+	let (addr, port) = parse_authority(b"[2001:db8::1]:443").expect("a bracketed authority");
+	assert!(addr.is_v6() && port == 443);
+	let (addr, port) = parse_authority(b"10.0.2.15:80").expect("an IPv4 authority");
+	assert!(addr.is_v4() && port == 80);
+	assert_eq!(parse_authority(b"2001:db8::1:443"), None, "ambiguous");
+	assert_eq!(parse_authority(b"fe80::1"), None, "an address is not an authority");
+
+	// BRACKETS ARE FOR THE FAMILY THAT NEEDS THEM: one address with two spellings is one too many.
+	assert_eq!(parse_authority(b"[10.0.2.15]:80"), None);
+}
+
+#[test]
+fn a_zone_is_refused_in_a_url_authority() {
+	// RFC 6874'S ZONE-IN-URI EXTENSION IS DEPRECATED. Following its `%25` advice would produce
+	// non-standard URLs, make two origins compare unequal that name the same service, and leak a
+	// local interface name into something meant to travel.
+	assert_eq!(parse_authority(b"[fe80::1%if0]:80"), None);
+	assert_eq!(parse_authority(b"[fe80::1%25if0]:80"), None);
+}
+
+#[test]
+fn a_port_is_refused_rather_than_wrapped_or_read_two_ways() {
+	assert_eq!(parse_authority(b"10.0.2.15:"), None);
+	assert_eq!(parse_authority(b"10.0.2.15:65536"), None);
+	assert_eq!(parse_authority(b"10.0.2.15:080"), None, "a leading zero is two readings of one string");
+	assert_eq!(parse_authority(b"10.0.2.15:8o"), None);
+	assert_eq!(parse_authority(b"10.0.2.15:80").map(|(_, port)| port), Some(80));
+	assert_eq!(parse_authority(b"10.0.2.15:65535").map(|(_, port)| port), Some(65535));
+}
+
+#[test]
+fn every_authority_this_host_writes_parses_back_to_what_wrote_it() {
+	// THE PROPERTY THAT MATTERS ACROSS ALL THREE GRAMMARS: a value this host renders is a value this
+	// host reads back unchanged, within the grammar it was rendered in.
+	for (text, port) in [("2001:db8::1", 443u16), ("fe80::1", 80), ("::1", 8080)] {
+		let addr = IpAddress::parse(text.as_bytes()).expect("an address");
+		let mut out = [0u8; 96];
+		let len = render_authority(&addr, port, &mut out);
+		let rendered = &out[..len];
+		assert_eq!(parse_authority(rendered), Some((addr, port)), "{}", core::str::from_utf8(rendered).expect("ascii"));
+	}
+	let v4 = IpAddress::parse(b"10.0.2.15").expect("an address");
+	let mut out = [0u8; 32];
+	let len = render_authority(&v4, 80, &mut out);
+	assert_eq!(&out[..len], b"10.0.2.15:80");
+	assert_eq!(parse_authority(&out[..len]), Some((v4, 80)));
+}

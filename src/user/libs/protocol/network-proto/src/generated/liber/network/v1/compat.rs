@@ -274,10 +274,18 @@ fn net_info_wire_is_stable() {
 	assert_eq!(NetInfo::decode(&bytes).unwrap(), sample);
 }
 #[test]
-fn net_capacity_wire_is_stable() {
-	let sample = NetCapacity { clients: 7, sockets: 7, listeners: 7, connections: 7 };
+fn family_readiness_wire_is_stable() {
+	let sample = FamilyReadiness::Disabled;
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FamilyReadiness::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn net_capacity_wire_is_stable() {
+	let sample = NetCapacity { clients: 7, sockets: 7, listeners: 7, connections: 7, ipv4: FamilyReadiness::Disabled, ipv6: FamilyReadiness::Disabled, diagnostic_used: 7, diagnostic_limit: 7, diagnostic_refusals: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(NetCapacity::decode(&bytes).unwrap(), sample);
 }

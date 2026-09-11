@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 100] = [
+const GATES: [(&str, &str); 102] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -500,6 +500,15 @@ const GATES: [(&str, &str); 100] = [
 	// target either.
 	("source-hygiene", "harness.tools"),
 	("source-history-hygiene", "harness.tools"),
+	// The dependency and licensing policy, and the foreign-substrate lockfile that the policy
+	// governs. Both read the SOURCE TREE and a checked-in record rather than any built artifact, so
+	// they belong to the harness for the same reason the two above do, and they cost milliseconds.
+	//
+	// ALWAYS SELECTED IS THE POINT FOR THESE TWO. A licence question and a frozen ABI are exactly
+	// the things a targeted selection would skip - the change that introduces an unreviewed import
+	// or edits a cross file need touch no crate the selector knows about.
+	("dependency-policy", "harness.tools"),
+	("foreign-pin", "harness.tools"),
 	// Every LSIDL interface a manifest role names must be one LSIDL
 	// defines. Its subject is the manifest and the IDL, neither of which is a crate, and it reads
 	// declarations rather than generated bindings - so it takes the always-selected label for the

@@ -10,8 +10,12 @@
 
 extern crate alloc;
 
+pub mod addr_select;
+pub mod dhcp;
+pub mod dns;
 pub mod executable;
 pub mod graph_limits;
+pub mod invalidation;
 pub mod ipv6;
 pub mod ipv6_budget;
 pub mod ipv6_events;
@@ -26,12 +30,17 @@ pub mod ipv6_router;
 pub mod ipv6_slaac;
 pub mod ipv6_solicit;
 pub mod ipv6_timers;
+pub mod net_profile;
+pub mod open_sequence;
 pub mod service_lifecycle;
 pub mod shell_language;
+pub mod sntp;
+pub mod tcp_admission;
 pub mod tcp_bind;
 pub mod tcp_close;
 pub mod tcp_flow;
 pub mod tcp_queue;
 pub mod tcp_rto;
+pub mod tcp_transmit;
 pub mod tcp_window;
 pub mod world_errors;

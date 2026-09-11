@@ -183,7 +183,7 @@ impl network::Service for Stub {
 		Err(crate::generated::liber::base::v1::Error::Unsupported)
 	}
 	fn capacity(&mut self) -> Result<NetCapacity, crate::generated::liber::base::v1::Error> {
-		Ok(NetCapacity { clients: 0, sockets: 0, listeners: 0, connections: 0 })
+		Ok(NetCapacity { clients: 0, sockets: 0, listeners: 0, connections: 0, ipv4: FamilyReadiness::Ready, ipv6: FamilyReadiness::Configuring, diagnostic_used: 0, diagnostic_limit: 16, diagnostic_refusals: 0 })
 	}
 	fn probe(&mut self, _addr: ScopedAddress, _ttl: u8) -> Result<TraceHop, crate::generated::liber::base::v1::Error> {
 		Err(crate::generated::liber::base::v1::Error::Unsupported)

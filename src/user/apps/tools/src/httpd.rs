@@ -42,11 +42,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Open the listening socket and accept connections forever, serving each one.
 fn serve(netsvc: u64) {
 	let mut net = NetworkClient::new(netsvc);
-	// EVERY IPv4 ADDRESS, WHICH IS WHAT THIS SERVICE CAN ACTUALLY BIND. The contract can express a
-	// dual-stack wildcard and NetworkService answers `unsupported` for it until its transports carry
-	// the other family; asking for one here would make this program fail to start rather than serve
-	// what there is.
-	let request: ListenRequest = ListenRequest { mode: BindMode::Ipv4Only, local: ScopedEndpoint { addr: ScopedAddress::global(IpAddress::unspecified_v4()), port: HTTP_PORT }, backlog: BACKLOG };
+	// EVERY ADDRESS OF EITHER FAMILY. A dual-stack wildcard is one claim on one port covering both
+	// transports, which is what a server on a dual-stack host means by "listen on port 80" - and it
+	// is the only bind that cannot be shadowed by a same-port claim in the other family.
+	let request: ListenRequest = ListenRequest { mode: BindMode::DualStack, local: ScopedEndpoint { addr: ScopedAddress::global(IpAddress::unspecified_v6()), port: HTTP_PORT }, backlog: BACKLOG };
 	let listen_chan: u64 = match net.listen(&request) {
 		Some(Ok(result)) => result.listener,
 		_ => {

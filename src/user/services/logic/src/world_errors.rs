@@ -47,6 +47,10 @@ pub fn is_refusal(error: Error) -> bool {
 		// `Unsupported` is the closest call - it can look like "you may not" - but it says the
 		// implementation does not do this, which is the host's shape and not the guest's authority.
 		Error::TimedOut | Error::Unsupported | Error::Exhausted | Error::NoSpace | Error::Io | Error::Corrupt | Error::Cancelled | Error::CommitUncertain => false,
+		// A LOCAL ADDRESS WENT AWAY UNDER A LIVE OPERATION. It is the machine's networking state,
+		// which the guest neither chose nor can see, so blaming its authority for it would be wrong
+		// in the same way `NotFound` would be.
+		Error::AddressUnavailable => false,
 	}
 }
 

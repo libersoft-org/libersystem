@@ -45,6 +45,22 @@ pub struct Delivery {
 }
 
 // One IPv6 interface and everything this host knows about it.
+/// What became of a transport packet handed to this host.
+///
+/// A PACKET WAITING ON ADDRESS RESOLUTION HAS NOT BEEN TRANSMITTED, and the consumer that owns the
+/// flow is the only layer that can act on the difference: its sequence space is not on the wire
+/// until the frame reaches the driver, so a router cannot have seen it and a quotation of it is a
+/// forgery. `Held` carries the token whose completion says when that changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Handoff {
+	/// The frame reached the driver.
+	Sent,
+	/// The frame is retained while the next hop resolves; this token's completion reports its fate.
+	Held(u64),
+	/// Nothing was queued: no route, no room, or a packet that could not be built.
+	Refused,
+}
+
 pub struct Ipv6Host {
 	interface: Interface,
 	mac: [u8; 6],
@@ -66,6 +82,11 @@ pub struct Ipv6Host {
 	invalidations: InvalidationQueue,
 	quoted_errors: QuotedErrorQueue,
 	pending: PendingQueue,
+	/// Handoff outcomes for retained packets, drained by the consumer that owns the flow.
+	completions: Vec<service_logic::ipv6_budget::Completion>,
+	/// How often RFC 8028's restriction found no advertiser of the source's prefix and the general
+	/// default-router rules were used instead. It is an ordinary state and worth saying.
+	router_fallbacks: u32,
 	solicitation: Solicitation,
 	limiter: RateLimiter,
 	outbound: Vec<Vec<u8>>,
@@ -96,7 +117,7 @@ pub struct Ipv6Host {
 
 impl Ipv6Host {
 	pub fn new(mac: [u8; 6], index: u16, generation: u32, mtu: u16, entropy: fn() -> [u8; 8], clock: fn() -> u64) -> Ipv6Host {
-		Ipv6Host { interface: Interface::new(index, generation), mac, mtu, hop_limit: DEFAULT_HOP_LIMIT, link_local: None, addresses: AddressSet::new(), neighbours: NeighbourCache::new(), routers: RouterList::new(), prefixes: PrefixTable::new(), routes: RouteTable::new(), path_mtu: PathMtuCache::new(), rdnss: RdnssSet::new(), listener: Listener::new(), timers: Timers::new(), invalidations: InvalidationQueue::new(), quoted_errors: QuotedErrorQueue::new(), pending: PendingQueue::new(), solicitation: Solicitation::new(), limiter: RateLimiter::new(ipv6_icmp::DEFAULT_ERROR_RATE), outbound: Vec::new(), outbound_dropped: 0, deliveries: Vec::new(), generation: 0, jitter: 0, entropy, clock }
+		Ipv6Host { interface: Interface::new(index, generation), mac, mtu, hop_limit: DEFAULT_HOP_LIMIT, link_local: None, addresses: AddressSet::new(), neighbours: NeighbourCache::new(), routers: RouterList::new(), prefixes: PrefixTable::new(), routes: RouteTable::new(), path_mtu: PathMtuCache::new(), rdnss: RdnssSet::new(), listener: Listener::new(), timers: Timers::new(), invalidations: InvalidationQueue::new(), quoted_errors: QuotedErrorQueue::new(), pending: PendingQueue::new(), completions: Vec::new(), router_fallbacks: 0, solicitation: Solicitation::new(), limiter: RateLimiter::new(ipv6_icmp::DEFAULT_ERROR_RATE), outbound: Vec::new(), outbound_dropped: 0, deliveries: Vec::new(), generation: 0, jitter: 0, entropy, clock }
 	}
 
 	// Set the rate the ICMPv6 error bucket refills at, read once from configuration.
@@ -358,19 +379,75 @@ impl Ipv6Host {
 	// NO ROUTE AT ALL LEAVES THE PEER ITSELF, which is what this host did before it had a route table
 	// and is still right for a link with no router: everything is either a neighbour or unreachable,
 	// and resolution is what says which.
-	fn next_hop_for(&self, peer: Address, now_ms: u64) -> Address {
-		match self.route_for(peer, now_ms) {
-			Some(route) => route.next_hop.unwrap_or(peer),
-			None => peer,
+	// Which neighbour a packet to `peer` is handed to, given the `source` it will carry.
+	//
+	// RFC 8028 SECTION 3: the default router is chosen from the routers that advertise the prefix
+	// THIS SOURCE was formed from, not from the whole list. Sending from an address one router
+	// delegated through a different router is what makes an ISP's source-address filter drop the
+	// packet - and the failure looks like a working connection that never gets a reply.
+	//
+	// THE ON-LINK DECISION COMES FIRST AND IS NOT FILTERED. RFC 4861 section 5.2 determines an
+	// on-link next hop before default-router selection; RFC 8028 extends only the later choice, so a
+	// direct route is never replaced by an advertising router.
+	fn next_hop_for(&mut self, peer: Address, source: Address, now_ms: u64) -> Address {
+		let Some(route) = self.route_for(peer, now_ms) else {
+			return peer;
+		};
+		let Some(next_hop) = route.next_hop else {
+			return peer;
+		};
+		let Some(advertisers) = self.prefixes.covering(self.interface, source, now_ms).map(|entry| entry.advertisers().to_vec()) else {
+			// The source was not formed from a learned prefix - a link-local source, or a statically
+			// configured address. There is no advertiser set to restrict to.
+			return next_hop;
+		};
+		match service_logic::addr_select::default_router_for_source(&self.routers.ordered(), &advertisers) {
+			Some(router) => router,
+			None => {
+				// EVERY ADVERTISER OF THAT PREFIX HAS GONE while the address is still valid on the
+				// prefix's own lifetime. The general rules apply, and the fallback is recorded.
+				self.router_fallbacks = self.router_fallbacks.saturating_add(1);
+				next_hop
+			}
 		}
 	}
 
+	/// Send an echo request to `peer`, and say whether it was queued.
+	///
+	/// THE SOURCE IS SELECTED LIKE ANY OTHER OUTBOUND PACKET'S, and the identity goes on the wire so
+	/// the reply can be matched to THIS probe rather than to whichever one was looked at first.
+	pub fn send_echo(&mut self, peer: Address, identifier: u16, sequence: u16, hop_limit: u8, payload: &[u8], now_ms: u64) -> bool {
+		let Some(source) = self.source_for(peer) else {
+			return false;
+		};
+		let message = ipv6_icmp::build_echo_request(source, peer, identifier, sequence, payload);
+		self.send_unicast_icmp_hops(peer, source, hop_limit, message, now_ms);
+		true
+	}
+
+	/// This interface's default hop limit, for a caller that is not tracing.
+	pub fn hop_limit(&self) -> u8 {
+		self.hop_limit
+	}
+
+	/// How often the general default-router rules were used because the source's prefix had no
+	/// advertiser left.
+	pub fn router_fallbacks(&self) -> u32 {
+		self.router_fallbacks
+	}
+
 	fn send_unicast_icmp(&mut self, peer: Address, source: Address, message: Vec<u8>, now_ms: u64) {
-		let next_hop = self.next_hop_for(peer, now_ms);
+		self.send_unicast_icmp_hops(peer, source, self.hop_limit, message, now_ms);
+	}
+
+	// The same, with the hop limit the caller chose. A traceroute probe IS its hop limit: the whole
+	// mechanism is sending one that expires and reading who said so.
+	fn send_unicast_icmp_hops(&mut self, peer: Address, source: Address, hop_limit: u8, message: Vec<u8>, now_ms: u64) {
+		let next_hop = self.next_hop_for(peer, source, now_ms);
 		let (lookup, action) = self.neighbours.resolve(self.interface, next_hop, now_ms);
 		self.perform(action, now_ms);
 		match lookup {
-			Lookup::Ready { link_layer } => self.send_icmp_to_mac(link_layer, source, peer, self.hop_limit, message),
+			Lookup::Ready { link_layer } => self.send_icmp_to_mac(link_layer, source, peer, hop_limit, message),
 			Lookup::Pending => {
 				// Build the frame with a placeholder destination and retain it: the neighbour's
 				// address is filled in when resolution completes, which is what the pending queue is
@@ -378,7 +455,7 @@ impl Ipv6Host {
 				let mut held = message;
 				let checksum = ipv6_packet::pseudo_header_checksum(source, peer, NEXT_ICMPV6, &held);
 				held[2..4].copy_from_slice(&checksum.to_be_bytes());
-				if let Ok(packet) = ipv6_packet::build_packet(source, peer, NEXT_ICMPV6, self.hop_limit, &held, self.mtu) {
+				if let Ok(packet) = ipv6_packet::build_packet(source, peer, NEXT_ICMPV6, hop_limit, &held, self.mtu) {
 					let mut frame = Vec::with_capacity(ipv6_packet::ETHERNET_HEADER_LEN + packet.len());
 					frame.extend_from_slice(&[0; 6]);
 					frame.extend_from_slice(&self.mac);
@@ -643,17 +720,21 @@ impl Ipv6Host {
 			}
 			Action::Retire { target } => {
 				self.timers.clear_identity(Identity::Neighbour { interface: self.interface, neighbour: target });
-				let completions = self.pending.fail_for(self.interface, target, service_logic::ipv6_budget::FailureCause::ResolutionFailed);
-				let _ = completions;
+				// THE OWNER OF EACH RETAINED PACKET IS TOLD IT NEVER WENT OUT. Discarding these left
+				// the consumer believing sequence space was transmitted that no router ever saw.
+				let failures = self.pending.fail_for(self.interface, target, service_logic::ipv6_budget::FailureCause::ResolutionFailed);
+				self.completions.extend(failures);
 				self.note(Identity::Neighbour { interface: self.interface, neighbour: target }, Change::Invalidated);
 				self.routers.set_reachability(self.interface, target, Reachability::Unusable);
 			}
 			Action::Resolved { target, link_layer } => {
 				self.timers.clear(TimerKind::NeighbourRetry, Identity::Neighbour { interface: self.interface, neighbour: target });
 				for held in self.pending.take_for(self.interface, target) {
+					let token = held.token;
 					let mut frame = held.frame;
 					frame[..6].copy_from_slice(&link_layer);
 					self.transmit(frame);
+					self.completions.push(service_logic::ipv6_budget::Completion::Sent { token, at: now_ms });
 				}
 				self.note(Identity::Neighbour { interface: self.interface, neighbour: target }, Change::Changed);
 				self.refresh_router_reachability(target);
@@ -767,6 +848,15 @@ impl Ipv6Host {
 	// Frames waiting to go out.
 	pub fn take_outbound(&mut self) -> Vec<Vec<u8>> {
 		core::mem::take(&mut self.outbound)
+	}
+
+	/// How many frames are waiting to go to the driver.
+	///
+	/// A CONSUMER DRIVING A TRANSPORT NEEDS THIS, because a segment handed to this host is not
+	/// written into the caller's frame buffer: "the buffer is empty" and "nothing was sent" are the
+	/// same answer for IPv4 and different answers here.
+	pub fn outbound_len(&self) -> usize {
+		self.outbound.len()
 	}
 
 	pub fn link_local(&self) -> Option<Address> {
@@ -918,14 +1008,14 @@ impl Ipv6Host {
 	/// is selected here - so the caller asks for one with `source_for`, builds its segment, and hands
 	/// the finished bytes over. The alternative is this layer reaching into a transport header to
 	/// patch a field, which is how a second checksum implementation appears.
-	pub fn send_transport(&mut self, peer: Address, source: Address, next_header: u8, payload: Vec<u8>, now_ms: u64) -> bool {
-		let next_hop: Address = self.next_hop_for(peer, now_ms);
+	pub fn send_transport(&mut self, peer: Address, source: Address, next_header: u8, payload: Vec<u8>, now_ms: u64) -> Handoff {
+		let next_hop: Address = self.next_hop_for(peer, source, now_ms);
 		let (lookup, action) = self.neighbours.resolve(self.interface, next_hop, now_ms);
 		self.perform(action, now_ms);
 		match lookup {
 			Lookup::Ready { link_layer } => {
 				let Ok(packet) = ipv6_packet::build_packet(source, peer, next_header, self.hop_limit, &payload, self.mtu) else {
-					return false;
+					return Handoff::Refused;
 				};
 				let mut frame = Vec::with_capacity(ipv6_packet::ETHERNET_HEADER_LEN + packet.len());
 				frame.extend_from_slice(&link_layer);
@@ -933,27 +1023,37 @@ impl Ipv6Host {
 				frame.extend_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
 				frame.extend_from_slice(&packet);
 				self.transmit(frame);
-				true
+				Handoff::Sent
 			}
 			Lookup::Pending => {
 				// RETAINED RATHER THAN DROPPED. The neighbour is being resolved; the packet waits in
 				// the bounded queue and goes out when it answers, which is what the queue is for.
 				let Ok(packet) = ipv6_packet::build_packet(source, peer, next_header, self.hop_limit, &payload, self.mtu) else {
-					return false;
+					return Handoff::Refused;
 				};
 				let mut frame = Vec::with_capacity(ipv6_packet::ETHERNET_HEADER_LEN + packet.len());
 				frame.extend_from_slice(&[0; 6]);
 				frame.extend_from_slice(&self.mac);
 				frame.extend_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
 				frame.extend_from_slice(&packet);
-				self.pending.admit(self.interface, next_hop, frame).is_ok()
+				match self.pending.admit(self.interface, next_hop, frame) {
+					Ok(token) => Handoff::Held(token.0),
+					Err(_) => Handoff::Refused,
+				}
 			}
-			Lookup::Capacity => false,
+			Lookup::Capacity => Handoff::Refused,
 		}
 	}
 
 	/// Record a lowering the consumer that owns the flow has validated.
 	///
+	/// Take every handoff outcome recorded since the last call.
+	///
+	/// THE CONSUMER DRAINS THEM, because it is the layer that knows which flow each token belongs to.
+	pub fn take_completions(&mut self) -> Vec<service_logic::ipv6_budget::Completion> {
+		core::mem::take(&mut self.completions)
+	}
+
 	/// THE ONLY WRITE TO THE PMTU CACHE, and it happens here because only the consumer could make the
 	/// check that justifies it. A full table answers `Capacity` rather than claiming it recorded the
 	/// lowering; the caller keeps the smaller limit it validated either way, which is what stops

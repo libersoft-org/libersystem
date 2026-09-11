@@ -13,6 +13,27 @@
 #   hostile  an advertisement whose preferred lifetime exceeds its valid one, an autonomous prefix
 #            that is not a /64, and a router that withdraws itself. The guest must refuse the first
 #            two, form no address from either, and start soliciting again when the list empties.
+#   flood    sixty-four packets whose extension chain is a lie, while the host is bringing itself
+#            up. It must come up anyway, and must not answer more of them than its error budget.
+#   echo     echo traffic in both directions and errors quoting it, including one quoting an
+#            address this interface does not hold.
+#   narrow   a link one byte below what IPv6 requires. The family is refused and IPv4 is untouched.
+#
+# AND THE ROWS THAT DRIVE THE GUEST AS WELL AS ANSWER IT. Everything above is the IPv6 HOST -
+# addresses, routers, neighbours, errors - all of which a peer can provoke. What the host EXISTS for
+# is guest-initiated and a peer cannot provoke any of it, so these rows type into the guest's shell
+# through `guest-console.py` and read the same log:
+#
+#   transport      a name resolved over the advertised resolver (AAAA, and a truncated answer
+#                  retried over TCP), an echo, a trace whose rows name the hop that complained, an
+#                  outbound connection carrying a request and reading a body - and IPv4 still there.
+#   fallback       a preferred IPv6 candidate that swallows the SYN and a working IPv4 one. The
+#                  handover is measured on the wire: without the cap the first candidate would run
+#                  its whole 183-second schedule first.
+#   budgets        ninety-six SYNs from ninety-six ports in each family against one dual-stack
+#                  listener. It must answer its backlog and DROP the rest, and still work after.
+#   hostile-quote  a connection reaching IN, and a transport error quoting a DIFFERENT live tuple.
+#                  The quoted flow must be untouched.
 #
 # THE ORACLE IS THE CAPTURE PLUS THE GUEST LOG. The capture says what went onto the wire and with
 # which hop limit and options; the guest log says what the host decided. A row asserts on both,
@@ -56,12 +77,18 @@ PY
 }
 
 # One row: start the peer, boot the guest against it, and hand both records back.
+#
+# WITH A SCRIPT, THE GUEST IS DRIVEN AS WELL AS ANSWERED. Half of what these rows prove is guest-
+# INITIATED - a name resolved, a connection opened, a probe sent - and a peer can only answer. The
+# console driver types those lines into the guest's shell and records the whole conversation in the
+# same shape `SERIAL=file:` produces, so every assertion below reads one file either way.
 row() {
-	local scenario="$1" seconds="$2" link_mtu="${3:-}" label="${4:-$1}"
-	local port capture guest
+	local scenario="$1" seconds="$2" link_mtu="${3:-}" label="${4:-$1}" script="${5:-}"
+	local port capture guest socket driver_pid=""
 	port="$(free_port)"
 	capture="$work/$label.capture"
 	guest="$work/$label.guest"
+	socket="$work/$label.console"
 	python3 src/harness/ipv6-peer.py --port "$port" --scenario "$scenario" --capture "$capture" --seconds "$seconds" >"$work/$label.peer" 2>&1 &
 	peer_pid=$!
 	# The peer prints its listening line before the port is usable, so waiting for it removes the
@@ -72,11 +99,27 @@ row() {
 		waited=$((waited + 1))
 		[[ "$waited" -lt 100 ]] || fail "$label: the peer never started listening"
 	done
-	NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="file:$guest" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 >"$work/$label.run" 2>&1 || true
+	if [[ -n "$script" ]]; then
+		rm -f "$socket"
+		python3 src/harness/guest-console.py --socket "$socket" --log "$guest" --script "$script" --seconds "$((seconds - 2))" >"$work/$label.driver" 2>&1 &
+		driver_pid=$!
+		NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="unix:$socket,server=on,wait=off" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 >"$work/$label.run" 2>&1 || true
+		wait "$driver_pid" 2>/dev/null || true
+	else
+		NET_PEER_PORT="$port" NET_LINK_MTU="$link_mtu" SERIAL="file:$guest" timeout "$((seconds + 60))" ./run.sh --arch x86_64 --smp 2 >"$work/$label.run" 2>&1 || true
+	fi
 	wait "$peer_pid" 2>/dev/null || true
 	peer_pid=""
 	[[ -s "$capture" ]] || fail "$label: the peer captured nothing - the guest never reached the wire"
 	printf '%s\n' "$capture" "$guest"
+}
+
+# A script for the console driver, written where the row can find it.
+script() {
+	local name="$1"
+	shift
+	printf '%s\n' "$@" >"$work/$name.script"
+	printf '%s' "$work/$name.script"
 }
 
 # 1. NOTHING ANSWERS.
@@ -265,5 +308,156 @@ grep -q "saw ipv4-echo-reply .*src4=10.0.2.15" "$capture" || fail "narrow link: 
 # different bug wearing the same message, and this is the number they were cut to at boot.
 grep -q "static config - 10.0.2.15/24 via 10.0.2.2 mtu=1279" "$guest" || fail "narrow link: the frame buffers are not the size the link reported"
 note "  IPv6 refused, IPv4 answering, and nothing of this host's on the wire"
+
+# 7. THE TRANSPORTS, OVER BOTH FAMILIES, IN ONE BOOT.
+#
+# Everything above is the IPv6 HOST: addresses, routers, neighbours, errors. This row is what the
+# host exists for - a name resolved over it, a connection opened across it, a probe sent through it -
+# and every line of it is guest-INITIATED, which is why the console is driven rather than only read.
+note "transport: a resolver, a web peer and a trace, all over the address the guest formed"
+mapfile -t records < <(
+	row transport 110 "" transport "$(script transport \
+		"nslookup ipv6.test" \
+		"nslookup big.test" \
+		"ping -c 2 2001:db8:a::99" \
+		"traceroute -m 2 2001:db8:a::99" \
+		"nc 2001:db8:a::99 80 GET /" \
+		"ping -c 1 10.0.2.99")"
+)
+capture="${records[0]}"
+guest="${records[1]}"
+
+# THE LOOKUP IS AAAA AND IT GOES TO THE ADVERTISED RESOLVER. A resolver that only ever asked for `A`
+# could never reach an IPv6-only host however well the rest of the stack worked, and one that only
+# ever asked over IPv4 would ignore the server the link advertised.
+grep -q "resolvers=1" "$guest" || fail "transport: the advertised recursive server was not installed"
+grep -q "saw udp6 .*dst=2001:db8:a::53 .*dport=53" "$capture" || fail "transport: no DNS query reached the advertised resolver over IPv6"
+grep -q "ipv6.test has address 2001:db8:a::99" "$guest" || fail "transport: the AAAA answer did not reach the caller"
+
+# TRUNCATION IS ANSWERED OVER TCP. The UDP answer carries the TC bit and NO records, so a resolver
+# that used what arrived would report nothing found; one that retried gets the whole answer.
+grep -q "saw tcp6 .*dst=2001:db8:a::53 .*dport=53 .*flags=S " "$capture" || fail "transport: a truncated answer was not retried over TCP"
+grep -q "big.test has address 2001:db8:a::99" "$guest" || fail "transport: the retried answer did not reach the caller"
+
+# `ping -6` AS A TYPED-ADDRESS INVOCATION, answered from the address that was asked.
+grep -q "sent echo-reply .*from 2001:db8:a::99" "$capture" || fail "transport: the peer never answered an echo request from the guest"
+grep -q "2 packets transmitted, 2 received" "$guest" || fail "transport: ping -6 did not complete"
+
+# A TRACE NAMES THE HOP THAT COMPLAINED. The first row is the router that reported the expiry and
+# NOT the destination the probe named; reporting the destination is how a trace draws a plausible
+# route that is not the route.
+grep -q "sent time-exceeded responder=fe80::a1" "$capture" || fail "transport: the peer never reported an expired probe"
+grep -qE "^ *1 fe80::a1" "$guest" || fail "transport: the trace did not name the hop that complained"
+grep -qE "^ *2 2001:db8:a::99" "$guest" || fail "transport: the trace did not reach the destination on its second hop"
+
+# AN OUTBOUND TCP CONNECTION ACROSS IPv6, with a request sent and a body read back.
+grep -q "received request bytes=[1-9]" "$capture" || fail "transport: the guest's outbound TCP request never arrived"
+grep -q "peer-body-" "$guest" || fail "transport: the peer's response body did not reach the caller"
+
+# AND THE OTHER FAMILY IS STILL THERE, in the same boot and on the same NIC.
+grep -q "saw ipv4-echo-reply .*src4=10.0.2.15" "$capture" || fail "transport: the guest stopped answering IPv4"
+grep -q "1 packets transmitted, 1 received" "$guest" || fail "transport: the guest could not ping over IPv4"
+note "  AAAA over the advertised resolver, truncation retried over TCP, an echo, a trace that names its hops, an outbound connection, and IPv4 untouched"
+
+# 8. THE DECLARED FALLBACK, WITH BOTH ENDS REAL.
+#
+# `fallback.test` resolves to a black-holed IPv6 address and a working IPv4 one. The service owns
+# the order and tries them ONE AT A TIME: the preferred family first, then - inside the cap, not
+# after the whole SYN schedule - the one that works. A caller's RPC deadline is not a fallback
+# mechanism, and this is the row that says so with a clock.
+note "fallback: a preferred IPv6 candidate that swallows the SYN, and a working IPv4 one"
+mapfile -t records < <(
+	row fallback 110 "" fallback "$(script fallback \
+		"nslookup fallback.test" \
+		"nc fallback.test 80 GET /")"
+)
+capture="${records[0]}"
+guest="${records[1]}"
+
+grep -q "black-holed tcp6 .*dport=80" "$capture" || fail "fallback: the guest never tried the preferred IPv6 candidate"
+grep -q "received request bytes=[1-9].* over ipv4" "$capture" || fail "fallback: the guest never fell back to the IPv4 candidate"
+grep -q "peer-body-v4-" "$guest" || fail "fallback: the caller did not get the second candidate's answer"
+
+# ONE SOCKET, NOT TWO. The first attempt is retired before the second starts, so the request bytes
+# reach exactly one peer - and the black hole, which never answered, saw no request at all.
+requests="$(grep -c "received request bytes=" "$capture" || true)"
+[[ "$requests" -eq 1 ]] || fail "fallback: the request was sent $requests times, and a sequential open sends it once"
+
+# AND THE HANDOVER IS AT THE CAP, measured on the wire. A service without the cap runs the first
+# candidate's whole SYN schedule - three minutes - before trying the second; one that raced them
+# would start the second immediately.
+python3 src/tools/check-fallback-timing.py "$capture" || fail "fallback: the handover was not at the declared cap"
+note "  the preferred candidate was tried and retired at the cap, the second connected, and the request went out once"
+
+# 9. A LISTENER UNDER A FLOOD, IN BOTH FAMILIES.
+note "budgets: SYNs from ninety-six ports in each family against one dual-stack listener"
+mapfile -t records < <(
+	row budgets 110 "" budgets "$(script budgets \
+		"httpd &" \
+		"ping -c 1 2001:db8:a::99" \
+		"ping -c 1 10.0.2.99")"
+)
+capture="${records[0]}"
+guest="${records[1]}"
+
+grep -q "httpd: listening on port 80" "$guest" || fail "budgets: the listener never started"
+[[ "$(grep -c "sent tcp6 .*dport=80 flags=S " "$capture")" -ge 32 ]] || fail "budgets: the peer did not flood over IPv6"
+[[ "$(grep -c "sent tcp4 .*dport=80 flags=S " "$capture")" -ge 32 ]] || fail "budgets: the peer did not flood over IPv4"
+
+# THE BUDGET IS A CEILING AND IT HOLDS. Ninety-six SYNs in each family is well past both the
+# listener's backlog and the sixty-four half-open slots, and the answer to the ones past it is a
+# DROP rather than a reset: a host that answered all of them would be holding state for every source
+# port a flood chooses to invent, and a reset would tell the flood its guesses were landing.
+#
+# BOUNDED ON BOTH SIDES. The upper bound fails a host that absorbed the flood; the lower one fails a
+# host that answered nothing at all, which a closed port does too and which would make this row pass
+# without a listener ever existing.
+answered="$(grep -c "saw tcp6 .*sport=80 .*flags=SA" "$capture" || true)"
+[[ "$answered" -ge 1 && "$answered" -le 64 ]] || fail "budgets: the guest answered $answered IPv6 SYNs, outside [1, 64]"
+answered4="$(grep -c "saw tcp4 .*sport=80 .*flags=SA" "$capture" || true)"
+[[ "$answered4" -ge 1 && "$answered4" -le 64 ]] || fail "budgets: the guest answered $answered4 IPv4 SYNs, outside [1, 64]"
+note "  it answered $answered of 96 over IPv6 and $answered4 of 96 over IPv4, and dropped the rest"
+
+# AND IT IS STILL ANSWERING WHEN THE FLOOD STOPS, in both families. A budget that held by wedging
+# the host would pass every line above.
+grep -q "sent echo-reply .*from 2001:db8:a::99" "$capture" || fail "budgets: the guest stopped sending IPv6 echoes under the flood"
+grep -q "sent ipv4-echo-reply" "$capture" || fail "budgets: the guest stopped pinging over IPv4 under the flood"
+note "  the flood was refused rather than absorbed, and both families still worked through it"
+
+# 10. A CONNECTION REACHING IN, AND AN ERROR ABOUT SOMEBODY ELSE.
+#
+# Every other row has the guest reaching out; a listener is only proven by somebody reaching in. And
+# while that connection is live the peer delivers a Packet Too Big whose quotation names a DIFFERENT
+# tuple - a flow of the guest's own that is also live. A validator matching on less than the full
+# tuple resizes or tears down the flow the error was never about, which is a correctness failure
+# rather than a diagnostic one.
+note "hostile-quote: a connection reaching in, and a transport error quoting a second live flow"
+# THE PING IN THE MIDDLE IS NOT FILLER. The console types as fast as prompts appear, so without
+# something that occupies the shell for twenty seconds every command would run before the error was
+# ever delivered - and a row that asserts a flow SURVIVED an error it never saw asserts nothing.
+mapfile -t records < <(
+	row hostile-quote 110 "" hostile-quote "$(script hostile-quote \
+		"httpd &" \
+		"nslookup ipv6.test" \
+		"ping -c 20 2001:db8:a::99" \
+		"nc 2001:db8:a::99 80 GET /" \
+		"nslookup dual.test")"
+)
+capture="${records[0]}"
+guest="${records[1]}"
+
+grep -q "httpd: listening on port 80" "$guest" || fail "hostile-quote: the listener never started"
+grep -q "inbound connection accepted by the guest" "$capture" || fail "hostile-quote: the guest never accepted the inbound connection"
+grep -q "sent packet-too-big mtu=1300 responder=fe80::a1" "$capture" || fail "hostile-quote: the peer never delivered the misquoting error"
+
+# THE QUOTED FLOW IS UNTOUCHED. The guest's own outbound connection to the web peer runs after the
+# error arrives and must still carry a full-sized request and read a full body back; a resolver
+# query after it must still work. Both would fail if the error had resized or retired a flow.
+grep -q "received request bytes=[1-9]" "$capture" || fail "hostile-quote: the guest's outbound connection did not survive the misquoting error"
+grep -q "peer-body-" "$guest" || fail "hostile-quote: the outbound connection's body did not reach the caller"
+grep -q "dual.test has address 2001:db8:a::99" "$guest" || fail "hostile-quote: resolution stopped working after the misquoting error"
+grep -q "20 packets transmitted, 20 received" "$guest" || fail "hostile-quote: the echo run did not survive the misquoting error"
+grep -q "saw ipv4-echo-reply .*src4=10.0.2.15" "$capture" || fail "hostile-quote: the guest stopped answering IPv4"
+note "  the listener accepted an inbound connection, and an error quoting another tuple changed nothing about it"
 
 note "the IPv6 layer answers a controllable peer: the ordering holds, a valid advertisement configures the host, and a lying one configures nothing"

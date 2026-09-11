@@ -1,0 +1,137 @@
+# THE BOOTSTRAP PART OF P02M0135's LOCKFILE. Frozen after the bootstrap inputs exist, and it gates
+# pass 1.
+#
+# WHAT BELONGS IN THIS PART AND WHAT DOES NOT. Everything here has its CONTENT decided independently
+# of this milestone's own measurements. The cross files and the bootstrap sysroot ARE output of this
+# milestone and are still safe here, because what creates a cycle is an input sized by a MEASUREMENT
+# this part gates - and these two are sized by the OPTION SET below, which needs nothing compiled to
+# be read.
+#
+# THE BUILD READS THESE VALUES RATHER THAN DUPLICATING THEM. A build that takes a pinned value from
+# anywhere but the part of the lockfile that owns it fails.
+
+[upstream.vulkan-loader]
+# AUDIT-ONLY. Compiled, audit-linked, inspected and quarantine-staged for the guest gate; nothing it
+# produces is imported into a shipping image or named by a production manifest. It is under the same
+# licence review as anything else that enters the tree - see docs/DEPENDENCY_POLICY.md.
+source = "https://github.com/KhronosGroup/Vulkan-Loader"
+revision = "vulkan-sdk-1.4.357.0"
+commit = "5f157b62e333c63260d05d81bf66faa216ab0fb8"
+archive_sha256 = "54f2537df22313768da0317dda2abdaaab7711b4081c48c869a79db343d0ae70"
+# THE ONE TERM THIS PROJECT TAKES IT UNDER, and the closure that term has to cover. Apache-2.0 is the
+# majority; the deviations upstream calls "more permissive" are enumerated rather than waved at,
+# because a licensing check that does not name them is a rubber stamp.
+licence = "Apache-2.0"
+licence_closure = ["Apache-2.0", "MIT", "HPND-Kevlin-Henney", "CC-BY-4.0"]
+# MIT covers cJSON.c/.h and loader_json.c/.h; HPND-Kevlin-Henney covers dirent_on_windows.c/.h, which
+# is outside this configuration's closure and is recorded because it is in the directory;
+# CC-BY-4.0 covers documentation only and is outside the build closure entirely.
+
+[upstream.vulkan-headers]
+# A SEPARATELY VERSIONED REPOSITORY AND A REQUIRED BUILD DEPENDENCY. A pin naming only the loader
+# does not identify a buildable configuration.
+source = "https://github.com/KhronosGroup/Vulkan-Headers"
+revision = "vulkan-sdk-1.4.357.0"
+commit = "e3b1eec08173d6b825cd3ac88c885a63b621504a"
+archive_sha256 = "e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3"
+licence = "Apache-2.0"
+# The compatibility statement this part exists to record: the loader revision above builds against
+# this header revision. Both carry the same SDK tag, which is what makes that statement checkable
+# rather than asserted.
+builds_against = true
+
+[options]
+# THE CMAKE OPTION SET IN FULL, WITH ITS VALUES. A configuration with some of its options chosen is
+# not one pinned configuration, and every later branch in this milestone - the ABI inventory, the
+# lifecycle set, the TLS variant, the symbol surface - is derived from this closure.
+BUILD_TESTS = "OFF"                  # the only reason C++17 would be required
+BUILD_WSI_XCB_SUPPORT = "OFF"        # LiberSystem is none of these window systems, and they
+BUILD_WSI_XLIB_SUPPORT = "OFF"       #   are what pull in X11/Wayland/XCB
+BUILD_WSI_WAYLAND_SUPPORT = "OFF"
+BUILD_WSI_DIRECTFB_SUPPORT = "OFF"
+BUILD_WSI_SCREEN_QNX_SUPPORT = "OFF"
+LOADER_ENABLE_ASSEMBLY = "OFF"       # per-architecture asm with its own relocation forms, in
+#   the one thing this milestone measures
+LOADER_ENABLE_ADDRESS_SANITIZER = "OFF"            # and every other sanitizer: they add a runtime this
+LOADER_ENABLE_THREAD_SANITIZER = "OFF"             #   system does not have
+LOADER_ENABLE_UNDEFINED_BEHAVIOR_SANITIZER = "OFF"
+BUILD_WERROR = "OFF"                               # upstream warnings are not this milestone's to fix
+ENABLE_WIN10_ONECORE = "OFF"                       # not this platform
+USE_GAS = "OFF"                                    # following the assembly choice above
+USE_MASM = "OFF"
+LOADER_USE_UNSAFE_FILE_SEARCH = "OFF"              # the ambient-file search the discovery item replaces
+LOADER_CODEGEN = "OFF"                             # see [generated_sources]: they are vendored upstream
+CMAKE_BUILD_TYPE_inventory = "Debug"               # a symbol surface is easier to read from it
+CMAKE_BUILD_TYPE_production = "Release"            # and where the two disagree, Release is authoritative
+CMAKE_INSTALL_PREFIX = "run-private"               # nothing is installed into a system location
+
+# THE STATIC LOADER IS NOT OBTAINED FROM `BUILD_STATIC_LOADER`, which is an Apple-only option
+# upstream and is made to fail elsewhere. A portable static target is its own deliverable and is
+# pinned by the STATIC-TARGET part, not here.
+[options.static_loader]
+mechanism = "portable-static-target"
+build_static_loader = "unusable: APPLE_STATIC_LOADER upstream, non-Apple use fails"
+
+[generated_sources]
+# THE POLICY, ANSWERED: the registry-generated sources are VENDORED in the upstream archive at
+# loader/generated/ rather than generated during the audit build. That is the more reproducible of
+# the two answers the policy allows - a generated source that is not pinned makes the inventory
+# unreproducible - and it is why LOADER_CODEGEN is OFF above.
+policy = "vendored-in-upstream-archive"
+path = "loader/generated"
+files = [
+	"vk_layer_dispatch_table.h",
+	"vk_loader_extensions.c",
+	"vk_loader_extensions.h",
+	"vk_object_types.h",
+]
+digest = "c7ed63a3a928518bfbf2ffe824a7649433fc123cee5872a856f215beeb225fba"
+
+[toolchain]
+# IDENTITIES, VERSIONS AND FLAGS. The flags themselves live in the cross files, which are digested
+# below; naming them twice is two descriptions of one ABI.
+c_compiler = "clang"
+cxx_compiler = "clang++"
+archiver = "llvm-ar"
+ranlib = "llvm-ranlib"
+linker = "ld.lld"
+version = "Debian clang version 19.1.7"
+
+[cross_files]
+# ONE PER TARGET, each with its digest. Without these CMake compiles for the HOST, and that failure
+# is silent: the build succeeds and the inventory describes a system this one is not.
+x86_64 = { path = "src/foreign/cross/x86_64.cmake", target = "x86_64-unknown-none-elf", sha256 = "1455edd9d7c907245db141a8ef9a9d17f2e654437350203fe9524e89cf3b3a24" }
+aarch64 = { path = "src/foreign/cross/aarch64.cmake", target = "aarch64-unknown-none", sha256 = "9692372a981dc63694b53ed1228c780f1eb60fa74db3ec6b40581ce610c23bc0" }
+riscv64 = { path = "src/foreign/cross/riscv64.cmake", target = "riscv64-unknown-none-elf", sha256 = "bbc9c2c7236f93b937d260558c115ede5f52199a38ebde7300569538b51b0f18" }
+
+[bootstrap_sysroot]
+# SIZED BY THE OPTION SET, NOT BY THE INVENTORY - which is what keeps this part free of a cycle. It
+# is NOT the profile sysroot, and it is NOT a libc: see its own README.
+path = "src/foreign/bootstrap-sysroot"
+digest = "87e931cb9d915807814eea3df691679d6c905089cf4ac87d766908f9b0c0ab07"
+headers = [
+	"assert.h",
+	"ctype.h",
+	"errno.h",
+	"inttypes.h",
+	"math.h",
+	"stdio.h",
+	"stdlib.h",
+	"string.h",
+	"sys/types.h",
+]
+# The compiler's own freestanding headers are deliberately NOT restated here; `-nostdlibinc` keeps
+# them reachable because they describe the TARGET rather than the host.
+
+[gate]
+# WHAT THIS PART CLAIMS, AND THE EVIDENCE FOR IT. The three files and the sysroot exist, each
+# digested above, and a compile of the pinned configuration reaches a diagnostic from the SOURCES
+# rather than a missing-header error, on all three targets.
+compile_probe = "loader/cJSON.c"
+missing_header_errors = 0
+source_diagnostic = "vk_loader_platform.h:248: use of undeclared identifier 'DIRECTORY_SYMBOL'"
+# THAT DIAGNOSTIC IS THE CORRECT RESULT AND NOT A FAILURE. It is the loader saying its platform port
+# is missing - which is a later deliverable of this milestone - and reaching it proves the headers
+# resolved, the target ABI was the cross file's rather than the host's, and the compile stopped in
+# the upstream sources.
+targets_proven = ["x86_64-unknown-none-elf", "aarch64-unknown-none", "riscv64-unknown-none-elf"]

@@ -281,6 +281,14 @@ pub enum Error {
 	/// which is the one answer a caller must not be forced to guess: `fs/core` grew
 	/// `CommitUncertain` for exactly this and the protocol could not express it.
 	CommitUncertain = 12,
+	/// A local address this operation was bound to is no longer held by the machine.
+	///
+	/// DISTINCT FROM `not-found` AND FROM `again`. The operation was well formed and was admitted;
+	/// what went away is the address underneath it, which is neither a bad argument nor a transient
+	/// condition the caller should retry into. A caller that NAMED its source gets this instead of a
+	/// silent re-selection - naming a source has a reason, and quietly using a different one is the
+	/// failure the override exists to prevent.
+	AddressUnavailable = 13,
 }
 
 impl Error {
@@ -336,6 +344,7 @@ impl Error {
 			10 => Some(Error::Corrupt),
 			11 => Some(Error::Cancelled),
 			12 => Some(Error::CommitUncertain),
+			13 => Some(Error::AddressUnavailable),
 			_ => None,
 		}
 	}
@@ -546,6 +555,7 @@ impl Error {
 			Error::Corrupt => out.push_str("\"corrupt\""),
 			Error::Cancelled => out.push_str("\"cancelled\""),
 			Error::CommitUncertain => out.push_str("\"commit-uncertain\""),
+			Error::AddressUnavailable => out.push_str("\"address-unavailable\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -563,6 +573,7 @@ impl Error {
 			Error::Corrupt => out.push_str("corrupt"),
 			Error::Cancelled => out.push_str("cancelled"),
 			Error::CommitUncertain => out.push_str("commit-uncertain"),
+			Error::AddressUnavailable => out.push_str("address-unavailable"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -580,6 +591,7 @@ impl Error {
 			Error::Corrupt => crate::codec::cbor::text(out, "corrupt"),
 			Error::Cancelled => crate::codec::cbor::text(out, "cancelled"),
 			Error::CommitUncertain => crate::codec::cbor::text(out, "commit-uncertain"),
+			Error::AddressUnavailable => crate::codec::cbor::text(out, "address-unavailable"),
 		}
 	}
 }

@@ -1220,16 +1220,96 @@ impl NetInfo {
 	}
 }
 
+/// Where one address family has got to.
+///
+/// READINESS IS AN OBSERVATION AND NOT A GATE. The service answers as soon as it is listening, with
+/// every configured family still `configuring`; a caller reads this and decides what to do, rather
+/// than being made to wait for a lease it may not need. Only `disabled` refuses a send outright -
+/// everything else is decided per destination against the current addresses and routes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FamilyReadiness {
+	/// The configured profile does not include this family.
+	Disabled = 0,
+	/// Included, and it has no usable address-and-route pair yet.
+	Configuring = 1,
+	/// A valid non-tentative unicast address and a usable route in that family. AN ON-LINK ROUTE IS
+	/// ENOUGH: a host that can reach its own link is working, and demanding a default route would
+	/// report a router-less link as broken.
+	Ready = 2,
+	/// No usable pair remains and configuration reported an explicit failure with nothing retrying.
+	/// A report, recomputed as state changes - never a terminal protocol state, and never what a
+	/// family that is merely still asking is called.
+	Failed = 3,
+}
+
+impl FamilyReadiness {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FamilyReadiness> {
+		let mut r = Reader::new(bytes);
+		let value = FamilyReadiness::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FamilyReadiness> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FamilyReadiness::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<FamilyReadiness> {
+		match r.u8()? {
+			0 => Some(FamilyReadiness::Disabled),
+			1 => Some(FamilyReadiness::Configuring),
+			2 => Some(FamilyReadiness::Ready),
+			3 => Some(FamilyReadiness::Failed),
+			_ => None,
+		}
+	}
+}
+
 /// The NetworkService pool utilization: how many client, socket and listener channels
-/// the serve loop currently stands on, and how many live TCP connections the stack holds.
+/// the serve loop currently stands on, how many live TCP connections the stack holds, where each
+/// family has got to, and what the diagnostic partition is holding.
 /// Every pool grows on demand (the domain's handle budget is the only ceiling), so these
-/// are the live counts `ss` reports and the graph folds in - observability, not a cap.
+/// are the live counts `ss` reports and the graph folds in - observability, not a cap. The
+/// diagnostic figures are the exception: that partition HAS a cap, and reporting used beside it is
+/// what lets an admission gate see the refusal coming.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetCapacity {
 	pub clients: u32,
 	pub sockets: u32,
 	pub listeners: u32,
 	pub connections: u32,
+	pub ipv4: FamilyReadiness,
+	pub ipv6: FamilyReadiness,
+	pub diagnostic_used: u32,
+	pub diagnostic_limit: u32,
+	pub diagnostic_refusals: u32,
 }
 
 impl NetCapacity {
@@ -1272,6 +1352,11 @@ impl NetCapacity {
 		w.u32(self.sockets)?;
 		w.u32(self.listeners)?;
 		w.u32(self.connections)?;
+		self.ipv4.write(w)?;
+		self.ipv6.write(w)?;
+		w.u32(self.diagnostic_used)?;
+		w.u32(self.diagnostic_limit)?;
+		w.u32(self.diagnostic_refusals)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<NetCapacity> {
@@ -1279,7 +1364,12 @@ impl NetCapacity {
 		let sockets = r.u32()?;
 		let listeners = r.u32()?;
 		let connections = r.u32()?;
-		Some(NetCapacity { clients, sockets, listeners, connections })
+		let ipv4 = FamilyReadiness::read(r)?;
+		let ipv6 = FamilyReadiness::read(r)?;
+		let diagnostic_used = r.u32()?;
+		let diagnostic_limit = r.u32()?;
+		let diagnostic_refusals = r.u32()?;
+		Some(NetCapacity { clients, sockets, listeners, connections, ipv4, ipv6, diagnostic_used, diagnostic_limit, diagnostic_refusals })
 	}
 }
 
@@ -5115,6 +5205,48 @@ impl NetInfo {
 	}
 }
 
+impl FamilyReadiness {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			FamilyReadiness::Disabled => out.push_str("\"disabled\""),
+			FamilyReadiness::Configuring => out.push_str("\"configuring\""),
+			FamilyReadiness::Ready => out.push_str("\"ready\""),
+			FamilyReadiness::Failed => out.push_str("\"failed\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			FamilyReadiness::Disabled => out.push_str("disabled"),
+			FamilyReadiness::Configuring => out.push_str("configuring"),
+			FamilyReadiness::Ready => out.push_str("ready"),
+			FamilyReadiness::Failed => out.push_str("failed"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			FamilyReadiness::Disabled => crate::codec::cbor::text(out, "disabled"),
+			FamilyReadiness::Configuring => crate::codec::cbor::text(out, "configuring"),
+			FamilyReadiness::Ready => crate::codec::cbor::text(out, "ready"),
+			FamilyReadiness::Failed => crate::codec::cbor::text(out, "failed"),
+		}
+	}
+}
+
 impl NetCapacity {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -5144,6 +5276,21 @@ impl NetCapacity {
 		out.push(',');
 		out.push_str("\"connections\":");
 		let _ = write!(out, "{}", self.connections);
+		out.push(',');
+		out.push_str("\"ipv4\":");
+		self.ipv4.to_json_into(out);
+		out.push(',');
+		out.push_str("\"ipv6\":");
+		self.ipv6.to_json_into(out);
+		out.push(',');
+		out.push_str("\"diagnostic-used\":");
+		let _ = write!(out, "{}", self.diagnostic_used);
+		out.push(',');
+		out.push_str("\"diagnostic-limit\":");
+		let _ = write!(out, "{}", self.diagnostic_limit);
+		out.push(',');
+		out.push_str("\"diagnostic-refusals\":");
+		let _ = write!(out, "{}", self.diagnostic_refusals);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -5159,10 +5306,25 @@ impl NetCapacity {
 		out.push_str(", ");
 		out.push_str("connections=");
 		let _ = write!(out, "{}", self.connections);
+		out.push_str(", ");
+		out.push_str("ipv4=");
+		self.ipv4.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("ipv6=");
+		self.ipv6.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("diagnostic-used=");
+		let _ = write!(out, "{}", self.diagnostic_used);
+		out.push_str(", ");
+		out.push_str("diagnostic-limit=");
+		let _ = write!(out, "{}", self.diagnostic_limit);
+		out.push_str(", ");
+		out.push_str("diagnostic-refusals=");
+		let _ = write!(out, "{}", self.diagnostic_refusals);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::map(out, 9);
 		crate::codec::cbor::text(out, "clients");
 		crate::codec::cbor::uint(out, self.clients as u64);
 		crate::codec::cbor::text(out, "sockets");
@@ -5171,6 +5333,16 @@ impl NetCapacity {
 		crate::codec::cbor::uint(out, self.listeners as u64);
 		crate::codec::cbor::text(out, "connections");
 		crate::codec::cbor::uint(out, self.connections as u64);
+		crate::codec::cbor::text(out, "ipv4");
+		self.ipv4.to_cbor_into(out);
+		crate::codec::cbor::text(out, "ipv6");
+		self.ipv6.to_cbor_into(out);
+		crate::codec::cbor::text(out, "diagnostic-used");
+		crate::codec::cbor::uint(out, self.diagnostic_used as u64);
+		crate::codec::cbor::text(out, "diagnostic-limit");
+		crate::codec::cbor::uint(out, self.diagnostic_limit as u64);
+		crate::codec::cbor::text(out, "diagnostic-refusals");
+		crate::codec::cbor::uint(out, self.diagnostic_refusals as u64);
 	}
 }
 

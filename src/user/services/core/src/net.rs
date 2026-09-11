@@ -11,10 +11,12 @@ use alloc::vec::Vec;
 // The IPv6 host this stack carries for the same link. Sibling module of this one, under the same
 // binary: the two protocols share a NIC and a frame channel and nothing else.
 use super::ipv6_host::Ipv6Host;
+use service_logic::tcp_admission::{Admission, RECEIVE_BASE_BYTES};
 use service_logic::tcp_bind::{BindRefusal, BindTable, Binding, Local};
 use service_logic::tcp_close::Closing;
 use service_logic::tcp_queue::{AckOutcome, SendQueue};
 use service_logic::tcp_rto::Rto;
+use service_logic::tcp_transmit::TransmitBound;
 use service_logic::tcp_window::{CongestionWindow, DuplicateAction, Persist};
 
 // EtherType values (the 2-byte type field of an Ethernet II frame).
@@ -48,12 +50,11 @@ const ICMP_FRAG_NEEDED: u8 = 4;
 const IPV4_MIN_MTU: u16 = 68;
 
 // The DNS server port (UDP).
-const DNS_PORT: u16 = 53;
+pub const DNS_PORT: u16 = 53;
 
 // The NTP / SNTP server port (UDP), and the offset between the NTP epoch (1900) and
 // the Unix epoch (1970) in seconds (70 years, 17 of them leap).
 pub const NTP_PORT: u16 = 123;
-const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
 
 // DHCP / BOOTP: a UDP client on port 68 talking to a server on port 67. The client
 // broadcasts a DISCOVER, the server OFFERs an address, the client REQUESTs it, and
@@ -66,10 +67,7 @@ const BOOTP_REPLY: u8 = 2;
 const BOOTP_HDR: usize = 236;
 const DHCP_MAGIC: u32 = 0x6382_5363;
 const DHCP_DISCOVER: u8 = 1;
-pub const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
-pub const DHCP_ACK: u8 = 5;
-pub const DHCP_NAK: u8 = 6;
 const DHCP_OPT_MASK: u8 = 1;
 const DHCP_OPT_ROUTER: u8 = 3;
 const DHCP_OPT_DNS: u8 = 6;
@@ -117,9 +115,11 @@ const TCP_ACK: u8 = 0x10;
 // lifts it - a connection whose peer offered the option grows its buffer to the
 // scaled size and advertises the free space shifted right by our scale. The
 // buffer lives inside the heap-pooled connection state.
-const TCP_RX_BASE: usize = 65535;
+// THE RECEIVE BUFFER EACH CONTROL BLOCK STARTS WITH, and it is the budget's number rather than the
+// window field's maximum. Sixty-four of the old 65535-byte buffers would have been 4 MB against a
+// 2 MB aggregate cap, so a base that size could not survive the accounting at all.
+const TCP_RX_BASE: usize = RECEIVE_BASE_BYTES;
 const TCP_WS_SHIFT: u8 = 2;
-const TCP_RX_SCALED: usize = TCP_RX_BASE << TCP_WS_SHIFT;
 
 // The initial TCP connection pool size: outbound `connect`s and inbound accepted
 // connections share the pool, which grows on demand - a size hint, never a cap.
@@ -320,7 +320,10 @@ impl DhcpLease {
 }
 
 // The notable thing a received frame did, for the driver to log or react to.
-#[derive(Clone, Copy)]
+//
+// NOT `Copy`, because one arm carries a DNS payload: correlating a response needs the bytes, and a
+// type that could be copied silently would be one a caller could act on twice.
+#[derive(Clone)]
 pub enum Event {
 	None,
 	// We learned a neighbor's MAC (from an ARP reply for an address we asked about). The pair
@@ -329,13 +332,27 @@ pub enum Event {
 	// An ICMP echo reply arrived (a `ping` we sent was answered): the responder's
 	// address, the reply packet's IP TTL, and the echoed sequence number.
 	EchoReply(Ipv4Addr, u8, u16),
-	// A DNS response resolved a name to this address.
-	DnsReply(Ipv4Addr),
+	// The same over IPv6: the responder, the Hop Limit the reply arrived with, and the echoed
+	// IDENTIFIER AND SEQUENCE. Both, because a trace is a run of probes under one identifier and the
+	// sequence is the only thing that tells its rows apart.
+	EchoReply6([u8; 16], u8, u16, u16),
+	// A datagram arrived from a DNS server's port. THE PAYLOAD AND NOT AN ADDRESS: correlating it
+	// needs the transaction, the question and the ports this host actually used, which is the
+	// resolver's state and not the stack's - and a stack that decided for itself would be accepting
+	// any datagram from port 53, which is what this replaces.
+	DnsReply(Vec<u8>),
 	// A DHCP reply arrived with this message type (OFFER or ACK); the learned lease is
 	// stored in the stack.
-	DhcpReply(u8),
+	// A DHCP reply, as far as the framing read it. THE WHOLE REPLY AND NOT A MESSAGE TYPE: deciding
+	// whether it is admissible needs the transaction, the client address, the server identifier, the
+	// address it names and the form it arrived in - and the type alone is what let a losing reply
+	// through.
+	DhcpReply(service_logic::dhcp::Reply),
 	// An SNTP reply arrived carrying this Unix timestamp (seconds since 1970, UTC).
-	SntpReply(u64),
+	// An SNTP reply, as the datagram carried it. THE PAYLOAD AND NOT A TIME: everything that decides
+	// whether this reply may move the wall clock is in the message, and the request it answers is the
+	// caller's state rather than the stack's.
+	SntpReply(Vec<u8>),
 	// A router discarded one of our datagrams because its TTL reached zero, and said so: the
 	// router's address and the sequence number of the echo it was carrying.
 	//
@@ -405,6 +422,34 @@ enum TcpState {
 	FinWait,
 }
 
+/// An ICMPv6 error that quoted one of this host's own echo probes.
+///
+/// RETAINED RATHER THAN ACTED ON HERE, because only the operation that sent the probe knows which
+/// probe is live: a traceroute is a run of echoes under one identifier, and an error quoting a
+/// sequence that has already retired must leave the current row untouched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProbeQuote {
+	pub quote: service_logic::tcp_flow::Quotation,
+	/// The ICMPv6 type: 3 is Time Exceeded, 1 is Destination Unreachable.
+	pub message_type: u8,
+}
+
+/// How many quoted echo errors are retained at once. A traceroute has one probe in flight, and the
+/// rest is what arrives while it is being read.
+pub const MAX_PROBE_QUOTES: usize = 8;
+
+/// What an address going away did to the operations bound to it.
+///
+/// COUNTED RATHER THAN INFERRED. "The listener is gone" and "the connection closed" look the same
+/// from outside if nobody says which happened, and the two have different consequences for a port.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AddressInvalidation {
+	pub listeners_withdrawn: usize,
+	pub listeners_kept: usize,
+	pub connections_closed: usize,
+	pub attempts_retired: usize,
+}
+
 // One TCP connection in the stack's pool. A slot is free when `in_use` is false; with
 // our IP fixed, the (local_port, remote_ip, remote_port) tuple demuxes inbound
 // segments to it.
@@ -426,6 +471,8 @@ struct TcpConn {
 	// segments to the other's control block.
 	local: Local,
 	remote: Local,
+	// Which listener's backlog funded this connection, or zero for an outbound one.
+	listener: u32,
 	remote_port: u16,
 	remote_mac: MacAddr,
 	// Send sequence: oldest unacknowledged, and the next sequence to use.
@@ -434,6 +481,9 @@ struct TcpConn {
 	// same fact and keeping them in two places is how they come to disagree.
 	snd_una: u32,
 	snd_nxt: u32,
+	/// How far this connection has actually TRANSMITTED, which a packet held for address
+	/// resolution has not. It is what a Packet Too Big is validated against.
+	sent: TransmitBound,
 	// The sender: what is owed the wire, how long to wait for an acknowledgement, how much may be in
 	// flight, what to do about a shut window, and where the closing handshake has got to.
 	tx: SendQueue,
@@ -453,6 +503,8 @@ struct TcpConn {
 	rto_deadline_ms: Option<u64>,
 	// The sender gave up: the retry limit expired with data or a FIN outstanding.
 	send_failed: bool,
+	// A SYN-ACK is owed again: the half-open timer fired and the final ACK has not arrived.
+	syn_ack_due: bool,
 	// Receive sequence: the next in-order byte we expect.
 	rcv_nxt: u32,
 	// Our window scale (RFC 7323): TCP_WS_SHIFT when the peer offered the WS option
@@ -467,7 +519,7 @@ struct TcpConn {
 
 impl TcpConn {
 	fn closed() -> TcpConn {
-		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, local: Local::V4([0; 4]), remote: Local::V4([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, tx: SendQueue::new(0), rto: Rto::new(), cwnd: CongestionWindow::new(u32::from(TCP_MSS)), persist: Persist::new(), closing: Closing::new(), peer_window: 0, peer_wscale: 0, peer_mss: TCP_MSS, path_mss: TCP_MSS, sent_at_ms: 0, rto_deadline_ms: None, send_failed: false, rcv_nxt: 0, rcv_wscale: 0, rx: alloc::vec![0; TCP_RX_BASE], rx_len: 0 }
+		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, local: Local::V4([0; 4]), remote: Local::V4([0; 4]), listener: 0, remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, sent: TransmitBound::new(0), tx: SendQueue::new(0), rto: Rto::new(), cwnd: CongestionWindow::new(u32::from(TCP_MSS)), persist: Persist::new(), closing: Closing::new(), peer_window: 0, peer_wscale: 0, peer_mss: TCP_MSS, path_mss: TCP_MSS, sent_at_ms: 0, rto_deadline_ms: None, send_failed: false, syn_ack_due: false, rcv_nxt: 0, rcv_wscale: 0, rx: Vec::new(), rx_len: 0 }
 	}
 }
 
@@ -497,6 +549,10 @@ pub enum SockEntryState {
 pub struct Stack {
 	// The monotonic clock in milliseconds, set by the serve loop before each pass. See `set_clock`.
 	clock_ms: u64,
+	// The lease the last parsed reply carried, held until a caller admits it.
+	pending_lease: DhcpLease,
+	// The transaction identity of the exchange currently in flight.
+	dhcp_xid: u32,
 	// THE IPv6 HOST, CARRIED RATHER THAN THREADED. Every blocking helper in the service pumps frames
 	// through this stack, and an IPv6 frame arriving during a DNS wait must be processed rather than
 	// dropped - which is exactly what M6's seam requires and what threading a second argument
@@ -518,6 +574,10 @@ pub struct Stack {
 	// Grows on demand.
 	// The listeners this host holds, and the rule for which claims may share a port.
 	listeners: BindTable,
+	/// ICMPv6 errors quoting this host's own echo probes, held for the operation that owns them.
+	probe_quotes: Vec<ProbeQuote>,
+	// What inbound state costs, charged before any of it is published.
+	admission: Admission,
 	// The next initial send sequence to hand a passively-opened connection (bumped per
 	// accept; predictability is not a concern for this stack).
 	next_iss: u32,
@@ -530,7 +590,7 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { ipv6: None, clock_ms: 0, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listeners: BindTable::new(), next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { ipv6: None, clock_ms: 0, pending_lease: DhcpLease::empty(), dhcp_xid: 0, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listeners: BindTable::new(), probe_quotes: Vec::new(), admission: Admission::new(), next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	// Stand the IPv6 host up on this link.
@@ -550,6 +610,40 @@ impl Stack {
 	// It is the same arrangement the IPv6 host beside it uses and for the same reason.
 	pub fn set_clock(&mut self, now_ms: u64) {
 		self.clock_ms = now_ms;
+	}
+
+	// Drop the IPv4 configuration entirely: no address, no gateway, no resolver.
+	//
+	// A FAMILY OUTSIDE THE PROFILE IS DISABLED, NOT QUIETLY CONFIGURED. Leaving the static fallback
+	// in place would leave an IPv6-only boot answering ARP and claiming an address nobody gave it.
+	pub fn clear_ipv4(&mut self) {
+		self.ip = Ipv4Addr([0; 4]);
+		self.mask = Ipv4Addr([0; 4]);
+		self.gateway = Ipv4Addr([0; 4]);
+		self.dns = Ipv4Addr([0; 4]);
+	}
+
+	// What each family has, for the readiness report.
+	pub fn family_state(&self) -> (service_logic::net_profile::FamilyState, service_logic::net_profile::FamilyState) {
+		let v4 = service_logic::net_profile::FamilyState {
+			has_address: self.ip.0 != [0; 4],
+			// An on-link route is enough, and an IPv4 host with an address and a mask has one.
+			has_route: self.ip.0 != [0; 4] && self.mask.0 != [0; 4],
+			failed: false,
+			recovering: false,
+		};
+		let v6 = match self.ipv6.as_ref() {
+			Some(host) => service_logic::net_profile::FamilyState {
+				has_address: !host.addresses().is_empty(),
+				has_route: !host.routes().is_empty(),
+				failed: false,
+				// SOLICITATION IS RECOVERY, NOT FAILURE: P02M0174 asks indefinitely, so a link with
+				// no router is one this host keeps asking rather than one it has given up on.
+				recovering: true,
+			},
+			None => service_logic::net_profile::FamilyState::default(),
+		};
+		(v4, v6)
 	}
 
 	pub fn ipv6_ref(&self) -> Option<&Ipv6Host> {
@@ -698,13 +792,6 @@ impl Stack {
 		))
 	}
 
-	// The count of live (in-use) TCP connections in the pool - what `network.capacity`
-	// reports as the connection utilization. The pool grows on demand, so this is a
-	// live count, never a fraction of a fixed cap.
-	pub fn conn_used(&self) -> usize {
-		self.conns.iter().filter(|c| c.in_use).count()
-	}
-
 	// Parse one received Ethernet frame, update the neighbor cache, and write an
 	// optional reply frame to `out`. Any malformed or unhandled frame yields no reply.
 	pub fn on_frame(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
@@ -791,9 +878,10 @@ impl Stack {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let src_ip: Ipv4Addr = Ipv4Addr([ip[12], ip[13], ip[14], ip[15]]);
+		let destination_is_broadcast: bool = dst_ip == IPV4_BROADCAST;
 		match proto {
 			IP_PROTO_ICMP => self.on_icmp(frame, ihl, src_ip, out),
-			IP_PROTO_UDP => self.on_udp(frame, ihl),
+			IP_PROTO_UDP => self.on_udp(frame, ihl, destination_is_broadcast, src_ip, dst_ip),
 			IP_PROTO_TCP => self.on_tcp(frame, ihl, src_ip, out),
 			_ => Outcome { reply_len: 0, event: Event::None },
 		}
@@ -801,24 +889,57 @@ impl Stack {
 
 	// Handle an inbound UDP datagram: a DNS response (source port 53) is parsed into
 	// the resolved address, a DHCP reply (source port 67) into the learned lease.
-	fn on_udp(&mut self, frame: &[u8], ihl: usize) -> Outcome {
+	fn on_udp(&mut self, frame: &[u8], ihl: usize, destination_is_broadcast: bool, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Outcome {
 		let udp: &[u8] = &frame[ETH_HDR + ihl..];
 		if udp.len() < UDP_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
-		let src_port: u16 = be16(udp, 0);
-		if src_port == DNS_PORT {
-			if let Some(addr) = parse_dns_response(&udp[UDP_HDR..]) {
-				return Outcome { reply_len: 0, event: Event::DnsReply(addr) };
+		// FULL FRAMING VALIDATION, NOT DISPATCH ON A SOURCE PORT. The declared length must match what
+		// arrived, and a checksum that is present must verify - over IPv4 a zero field legitimately
+		// means "not computed", which is the one exemption IPv6 does not have.
+		let declared: usize = be16(udp, 4) as usize;
+		if declared < UDP_HDR || declared > udp.len() {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		let udp: &[u8] = &udp[..declared];
+		let field: u16 = be16(udp, 6);
+		if field != 0 {
+			let mut copy: Vec<u8> = udp.to_vec();
+			put16(&mut copy, 6, 0);
+			if udp_checksum(src_ip, dst_ip, &copy) != field {
+				return Outcome { reply_len: 0, event: Event::None };
 			}
+		}
+		let src_port: u16 = be16(udp, 0);
+		let dst_port: u16 = be16(udp, 2);
+		// AND THE DESTINATION PORT IS PART OF THE TUPLE. A reply to one operation arriving on
+		// another's port is not that operation's answer.
+		if src_port == DHCP_SERVER_PORT && dst_port != DHCP_CLIENT_PORT {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
+		if src_port == DNS_PORT {
+			return Outcome { reply_len: 0, event: Event::DnsReply(udp[UDP_HDR..].to_vec()) };
 		} else if src_port == DHCP_SERVER_PORT {
 			if let Some(msg_type) = self.parse_dhcp(&udp[UDP_HDR..]) {
-				return Outcome { reply_len: 0, event: Event::DhcpReply(msg_type) };
+				let (server, yiaddr) = self.pending_lease();
+				let reply = service_logic::dhcp::Reply {
+					message_type: msg_type,
+					xid: be32(&udp[UDP_HDR..], 4),
+					chaddr: [udp[UDP_HDR + 28], udp[UDP_HDR + 29], udp[UDP_HDR + 30], udp[UDP_HDR + 31], udp[UDP_HDR + 32], udp[UDP_HDR + 33]],
+					server: (server != [0; 4]).then_some(server),
+					yiaddr,
+					// A DATAGRAM TO THE BROADCAST ADDRESS ON THE CLIENT PORT IS A LEGITIMATE REPLY:
+					// RFC 2131 section 4.1 requires a server to BROADCAST every DHCPNAK when `giaddr`
+					// is zero, a renewal whose request was unicast included.
+					destination: match destination_is_broadcast {
+						true => service_logic::dhcp::Destination::Broadcast,
+						false => service_logic::dhcp::Destination::Unicast,
+					},
+				};
+				return Outcome { reply_len: 0, event: Event::DhcpReply(reply) };
 			}
 		} else if src_port == NTP_PORT {
-			if let Some(unix) = parse_sntp(&udp[UDP_HDR..]) {
-				return Outcome { reply_len: 0, event: Event::SntpReply(unix) };
-			}
+			return Outcome { reply_len: 0, event: Event::SntpReply(udp[UDP_HDR..].to_vec()) };
 		}
 		Outcome { reply_len: 0, event: Event::None }
 	}
@@ -849,8 +970,8 @@ impl Stack {
 		let src_port: u16 = be16(datagram, 0);
 		let body: &[u8] = &datagram[UDP_HDR..];
 		match src_port {
-			DNS_PORT => parse_dns_response(body).map(Event::DnsReply).unwrap_or(Event::None),
-			NTP_PORT => parse_sntp(body).map(Event::SntpReply).unwrap_or(Event::None),
+			DNS_PORT => Event::DnsReply(body.to_vec()),
+			NTP_PORT => Event::SntpReply(body.to_vec()),
 			_ => Event::None,
 		}
 	}
@@ -870,7 +991,9 @@ impl Stack {
 		put16(&mut datagram, 6, checksum);
 		let now: u64 = self.clock_ms;
 		match self.ipv6.as_mut() {
-			Some(host) => host.send_transport(destination, source, service_logic::ipv6_packet::NEXT_UDP, datagram, now),
+			// A RETAINED DATAGRAM IS STILL QUEUED. UDP has no sequence space, so "waiting on the
+			// neighbour" and "handed to the driver" are the same answer to its caller.
+			Some(host) => !matches!(host.send_transport(destination, source, service_logic::ipv6_packet::NEXT_UDP, datagram, now), crate::ipv6_host::Handoff::Refused),
 			None => false,
 		}
 	}
@@ -907,11 +1030,14 @@ impl Stack {
 			None => {
 				// A SYN to a listening port opens a new inbound connection (passive open).
 				let flags: u8 = tcp[13];
-				if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 && self.listens_for(local, dst_port) {
+				if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+					let Some(listener) = self.listener_for(local, dst_port) else {
+						return Outcome { reply_len: 0, event: Event::None };
+					};
 					let seg_seq: u32 = be32(tcp, 4);
 					let peer_ws: bool = peer_offers_ws(tcp);
 					let peer_mss: u16 = peer_mss_option(tcp);
-					return self.passive_open(remote, local, src_port, dst_port, seg_seq, peer_ws, peer_mss, remote_mac, out);
+					return self.passive_open(listener, remote, local, src_port, dst_port, seg_seq, peer_ws, peer_mss, remote_mac, out);
 				}
 				return Outcome { reply_len: 0, event: Event::None };
 			}
@@ -940,7 +1066,6 @@ impl Stack {
 				self.conns[ci].state = TcpState::Established;
 				if peer_offers_ws(tcp) {
 					self.conns[ci].rcv_wscale = TCP_WS_SHIFT;
-					self.conns[ci].rx.resize(TCP_RX_SCALED, 0);
 				}
 				self.start_sender(ci, peer_mss_option(tcp), be16(tcp, 14));
 				let len: usize = self.emit_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], &[], out);
@@ -956,6 +1081,10 @@ impl Stack {
 				self.conns[ci].snd_una = seg_ack;
 				self.conns[ci].state = TcpState::Established;
 				self.conns[ci].pending_accept = true;
+				// THE SLOT DOES NOT MOVE, only what is in it: no second admission decision is made
+				// here, because the decision was made when the SYN was admitted.
+				let listener: u32 = self.conns[ci].listener;
+				self.admission.handshake_complete(listener);
 				self.start_sender(ci, self.conns[ci].peer_mss, be16(tcp, 14));
 			} else {
 				return Outcome { reply_len: 0, event: Event::None };
@@ -1113,9 +1242,42 @@ impl Stack {
 	// far as a layer holding no flow state can - the type, the code, and that the quoted source is an
 	// address this interface holds - and deliberately stopped. Whether this host actually SENT the
 	// quoted packet is a lookup in a send queue, and the send queue is this table.
+	/// Take the retained quotation belonging to THIS probe, if one arrived.
+	///
+	/// THE MATCH IS `probe_owns`, the same function the transports use: the full tuple, the family
+	/// and the interface generation, and then the quoted identifier AND sequence. An error from a
+	/// different router about a different hop of the same trace matches on everything but the
+	/// sequence, which is exactly why the sequence is part of it.
+	pub fn take_probe_quote(&mut self, flow: &service_logic::tcp_flow::FlowKey, identifier: u16, sequence: u16) -> Option<ProbeQuote> {
+		let position = self.probe_quotes.iter().position(|held| service_logic::tcp_flow::probe_owns(flow, identifier, sequence, &held.quote))?;
+		Some(self.probe_quotes.remove(position))
+	}
+
+	/// Forget every retained quotation. A diagnostic calls this before it sends, so a late error
+	/// from a retired operation cannot be read as an answer to the new one.
+	pub fn clear_probe_quotes(&mut self) {
+		self.probe_quotes.clear();
+	}
+
 	pub fn on_ipv6_error(&mut self, error: &service_logic::ipv6_events::QuotedError) -> bool {
 		use service_logic::ipv6_events::{ErrorClass, QuotedTransport};
 		use service_logic::tcp_flow::{FlowKey, PathMtu, Quotation, QuotedKind, path_mtu_for_tcp};
+		// AN ERROR ABOUT AN ECHO IS A DIAGNOSTIC'S ANSWER, not a transport event: a Time Exceeded IS
+		// what a traceroute row is made of. It is retained for the operation that owns it rather
+		// than matched here, because which sequence is live is the operation's state.
+		if let QuotedTransport::Icmpv6Echo { identifier, sequence } = error.transport {
+			let class: u8 = match error.class {
+				ErrorClass::DestinationUnreachable { .. } => service_logic::ipv6_icmp::DESTINATION_UNREACHABLE,
+				ErrorClass::TimeExceeded { .. } => service_logic::ipv6_icmp::TIME_EXCEEDED,
+				ErrorClass::PacketTooBig { .. } => service_logic::ipv6_icmp::PACKET_TOO_BIG,
+				ErrorClass::ParameterProblem { .. } => service_logic::ipv6_icmp::PARAMETER_PROBLEM,
+			};
+			let quote = Quotation { responder: Local::V6(error.reporter.octets()), local: Local::V6(error.quoted_source.octets()), local_port: 0, remote: Local::V6(error.quoted_destination.octets()), remote_port: 0, interface_generation: error.interface.generation, transport: QuotedKind::Echo { identifier, sequence } };
+			if self.probe_quotes.len() < MAX_PROBE_QUOTES {
+				self.probe_quotes.push(ProbeQuote { quote, message_type: class });
+			}
+			return true;
+		}
 		let ErrorClass::PacketTooBig { mtu } = error.class else {
 			return false;
 		};
@@ -1130,7 +1292,11 @@ impl Stack {
 			let flow = FlowKey { local: self.conns[index].local, local_port: self.conns[index].local_port, remote: self.conns[index].remote, remote_port: self.conns[index].remote_port, interface_generation: self.ipv6.as_ref().map(|host| host.interface().generation).unwrap_or(0) };
 			let current: u32 = u32::from(self.conns[index].path_mss) + (IPV6_HDR + TCP_HDR) as u32;
 			let snd_una: u32 = self.conns[index].tx.snd_una();
-			let snd_nxt: u32 = self.conns[index].tx.snd_nxt();
+			// THE TRANSMITTED BOUND, NOT `SND.NXT`. A segment the layer below still holds for address
+			// resolution has never been on the wire, so no router can have quoted it; and a
+			// Go-Back-N rewind lowers `SND.NXT` over bytes that HAVE been transmitted, which a
+			// second Packet Too Big about them is entitled to name.
+			let snd_nxt: u32 = self.conns[index].sent.transmitted();
 			// THE ROUTE MUST STILL BE THERE. A report about a path this flow no longer takes has
 			// nothing to lower.
 			let route_live: bool = match self.conns[index].remote {
@@ -1191,9 +1357,22 @@ impl Stack {
 	// IPv6 one is handed to the host that owns L3, which resolves the next hop and queues it. The
 	// return is the IPv4 frame's length, and zero for IPv6 - the caller sends what it was given and
 	// the host's queue carries the rest.
+	// EVERY SEGMENT THIS CONNECTION SENDS GOES THROUGH HERE, which is why the transmitted bound is
+	// maintained here: the send queue knows what it decided to send, and only this point knows
+	// whether the frame reached the driver or is waiting on an address resolution that may never
+	// finish.
 	fn emit_tcp(&mut self, ci: usize, flags: u8, seq: u32, ack: u32, opts: &[u8], payload: &[u8], out: &mut [u8]) -> usize {
+		// The sequence space this segment occupies: its bytes, and one each for a SYN and a FIN.
+		let end: u32 = seq.wrapping_add(payload.len() as u32).wrapping_add(u32::from(flags & TCP_SYN != 0)).wrapping_add(u32::from(flags & TCP_FIN != 0));
 		match self.conns[ci].local {
-			Local::V4(_) => self.build_tcp_opts(ci, flags, seq, ack, opts, payload, out),
+			Local::V4(_) => {
+				let len: usize = self.build_tcp_opts(ci, flags, seq, ack, opts, payload, out);
+				// A ZERO LENGTH IS A SEGMENT THAT WAS NOT BUILT, so nothing was transmitted.
+				if len > 0 {
+					self.conns[ci].sent.advance(end);
+				}
+				len
+			}
 			Local::V6(local) => {
 				let Local::V6(remote) = self.conns[ci].remote else {
 					return 0;
@@ -1202,10 +1381,52 @@ impl Stack {
 				let destination = service_logic::ipv6::Address::new(remote);
 				let segment: Vec<u8> = self.build_tcp_segment(ci, flags, seq, ack, opts, payload, source, destination);
 				let now: u64 = self.clock_ms;
-				if let Some(host) = self.ipv6.as_mut() {
-					host.send_transport(destination, source, IP_PROTO_TCP, segment, now);
+				let handoff = match self.ipv6.as_mut() {
+					Some(host) => host.send_transport(destination, source, IP_PROTO_TCP, segment, now),
+					None => crate::ipv6_host::Handoff::Refused,
+				};
+				match handoff {
+					crate::ipv6_host::Handoff::Sent => {
+						self.conns[ci].sent.advance(end);
+					}
+					crate::ipv6_host::Handoff::Held(token) => {
+						// A HOLD THE CONNECTION HAS NO ROOM FOR IS A SEND THAT DID NOT HAPPEN. The
+						// frame is still below and will go out, but this connection will not count
+						// its sequence space as transmitted, which only ever refuses more.
+						self.conns[ci].sent.hold(token, end);
+					}
+					crate::ipv6_host::Handoff::Refused => {}
 				}
 				0
+			}
+		}
+	}
+
+	/// Apply the IPv6 host's handoff outcomes to the connections that own them.
+	///
+	/// A `Sent` COMPLETION IS WHAT MAKES SEQUENCE SPACE ELIGIBLE for a Packet Too Big, and a failed
+	/// or cancelled one leaves it ineligible for ever. The token is unique across the host, so a
+	/// completion for a control block that has since been reused finds a stale entry and is refused
+	/// rather than advancing the new connection's bound.
+	pub fn apply_ipv6_completions(&mut self) {
+		use service_logic::ipv6_budget::Completion;
+		let completions = match self.ipv6.as_mut() {
+			Some(host) => host.take_completions(),
+			None => return,
+		};
+		for completion in completions {
+			let (token, sent) = match completion {
+				Completion::Sent { token, .. } => (token.0, true),
+				Completion::Failed { token, .. } | Completion::Cancelled { token } => (token.0, false),
+			};
+			for conn in self.conns.iter_mut() {
+				let moved = match sent {
+					true => conn.sent.on_sent(token),
+					false => conn.sent.on_retired(token),
+				};
+				if !matches!(moved, service_logic::tcp_transmit::Handoff::Unknown) {
+					break;
+				}
 			}
 		}
 	}
@@ -1258,11 +1479,24 @@ impl Stack {
 	// (carrying our MSS and, when the peer offered it, the WS option) into `out`. No
 	// reply if the pool is full.
 	#[allow(clippy::too_many_arguments)]
-	fn passive_open(&mut self, remote: Local, local: Local, src_port: u16, dst_port: u16, seg_seq: u32, peer_ws: bool, peer_mss: u16, remote_mac: Option<MacAddr>, out: &mut [u8]) -> Outcome {
+	#[allow(clippy::too_many_arguments)]
+	fn passive_open(&mut self, listener: u32, remote: Local, local: Local, src_port: u16, dst_port: u16, seg_seq: u32, peer_ws: bool, peer_mss: u16, remote_mac: Option<MacAddr>, out: &mut [u8]) -> Outcome {
+		// CHARGED BEFORE ANYTHING IS PUBLISHED, and refused HERE rather than after the handshake. A
+		// SYN that cannot be admitted gets NO SEGMENT BACK and creates no control block: a SYN is the
+		// segment a peer retransmits, so its next attempt finds the queue drained - which is the
+		// retry story a later refusal cannot have, because by then the peer is established and would
+		// have to be reset.
+		if self.admission.admit_syn(listener).is_err() {
+			return Outcome { reply_len: 0, event: Event::None };
+		}
 		let ci: usize = match self.tcp_alloc() {
 			Some(i) => i,
-			None => return Outcome { reply_len: 0, event: Event::None },
+			None => {
+				self.admission.release_half_open(listener);
+				return Outcome { reply_len: 0, event: Event::None };
+			}
 		};
+		self.conns[ci].listener = listener;
 		let iss: u32 = self.next_iss;
 		self.next_iss = self.next_iss.wrapping_add(0x1000);
 		let c: &mut TcpConn = &mut self.conns[ci];
@@ -1279,15 +1513,22 @@ impl Stack {
 		c.rcv_nxt = seg_seq.wrapping_add(1);
 		c.snd_una = iss;
 		c.snd_nxt = iss.wrapping_add(1);
+		c.sent.reset(iss);
 		c.rx_len = 0;
 		if peer_ws {
+			// THE SCALE IS RECORDED AND NOTHING IS GROWN. Growing on negotiation was an unfunded
+			// allocation made before a single byte had arrived; growth is now fallible, charged, and
+			// driven by actual receive demand.
 			c.rcv_wscale = TCP_WS_SHIFT;
-			c.rx.resize(TCP_RX_SCALED, 0);
 		}
 		let snd: u32 = self.conns[ci].snd_una;
 		let rcv: u32 = self.conns[ci].rcv_nxt;
 		let opts: [u8; 8] = self.syn_options();
 		let len: usize = self.emit_tcp(ci, TCP_SYN | TCP_ACK, snd, rcv, if peer_ws { &opts } else { &opts[..4] }, &[], out);
+		// The half-open schedule starts here; without it a peer that opens and walks away holds this
+		// slot until something else happens to free it.
+		let now: u64 = self.clock_ms;
+		self.conns[ci].rto_deadline_ms = Some(now + u64::from(self.conns[ci].rto.rto_ms()));
 		Outcome { reply_len: len, event: Event::None }
 	}
 
@@ -1362,6 +1603,44 @@ impl Stack {
 	// Allocate a free connection slot for a new open (outbound or accepted), marking it
 	// in use and reset to a clean Closed state. The pool grows on demand when every slot
 	// is in use, so an open never fails for lack of a slot.
+	// An outbound open: a control block and its receive storage, charged before either exists.
+	pub fn tcp_open_outbound(&mut self) -> Option<usize> {
+		if self.admission.open_outbound().is_err() {
+			return None;
+		}
+		match self.tcp_alloc() {
+			Some(ci) => {
+				self.conns[ci].listener = 0;
+				Some(ci)
+			}
+			None => {
+				self.admission.close(RECEIVE_BASE_BYTES);
+				None
+			}
+		}
+	}
+
+	// Retire an attempt without releasing its control block, so the next candidate starts clean.
+	//
+	// NOTHING OF THE FAILED ATTEMPT IS CARRIED FORWARD. A retained sequence number or a half-built
+	// sender would make the next candidate's first segment a continuation of a conversation the new
+	// peer never had.
+	pub fn tcp_reset(&mut self, ci: usize) {
+		let c: &mut TcpConn = &mut self.conns[ci];
+		c.state = TcpState::Closed;
+		c.aborted = false;
+		c.peer_fin = false;
+		c.pending_accept = false;
+		c.rx_len = 0;
+		c.rcv_wscale = 0;
+		c.tx = SendQueue::new(0);
+		c.sent.reset(0);
+		c.rto = Rto::new();
+		c.rto_deadline_ms = None;
+		c.send_failed = false;
+		c.syn_ack_due = false;
+	}
+
 	pub fn tcp_alloc(&mut self) -> Option<usize> {
 		for (i, c) in self.conns.iter_mut().enumerate() {
 			if !c.in_use {
@@ -1371,17 +1650,34 @@ impl Stack {
 				c.peer_fin = false;
 				c.pending_accept = false;
 				c.rx_len = 0;
+				// UNUSED SLOTS OWN NO RECEIVE BUFFER. It is allocated when the slot is taken and
+				// released when it is freed, so what the pool holds and what the budget says are the
+				// same thing.
+				c.rx = alloc::vec![0; TCP_RX_BASE];
 				return Some(i);
 			}
 		}
 		let mut fresh: TcpConn = TcpConn::closed();
 		fresh.in_use = true;
+		fresh.rx = alloc::vec![0; TCP_RX_BASE];
 		self.conns.push(fresh);
 		Some(self.conns.len() - 1)
 	}
 
 	// Release connection slot `ci` back to the pool (closed and free for reuse).
 	pub fn tcp_free(&mut self, ci: usize) {
+		if !self.conns[ci].in_use {
+			return;
+		}
+		// FREEING RELEASES THE ALLOCATION, and the release is the size that was actually charged. A
+		// pool that kept an uncharged base buffer in the reusable slot would be holding memory no
+		// budget knows about - and the budget would then permit more than it says.
+		let held: usize = self.conns[ci].rx.len();
+		self.admission.close(held);
+		let listener: u32 = self.conns[ci].listener;
+		if self.conns[ci].state == TcpState::SynRcvd {
+			self.admission.release_half_open(listener);
+		}
 		let c: &mut TcpConn = &mut self.conns[ci];
 		c.in_use = false;
 		c.state = TcpState::Closed;
@@ -1390,24 +1686,110 @@ impl Stack {
 		c.pending_accept = false;
 		c.rx_len = 0;
 		c.rcv_wscale = 0;
-		// a scaled buffer shrinks back to the base size so idle slots stay small.
-		if c.rx.len() > TCP_RX_BASE {
-			c.rx = alloc::vec![0; TCP_RX_BASE];
-		}
+		c.listener = 0;
+		c.rx = Vec::new();
 	}
 
 	// Start accepting inbound connections for `binding`, or say why not.
 	//
 	// THE MATRIX DECIDES, AND IT IS ONE FUNCTION. Which claims may share a port is a rule the
 	// admission and the demultiplexer are both written against; this is the admission half and
-	// `listens_for` is the other, and they read the same table.
-	pub fn listen(&mut self, binding: Binding) -> Result<(), BindRefusal> {
-		self.listeners.bind(binding)
+	// `listener_for` is the other, and they read the same table.
+	pub fn listen(&mut self, binding: Binding, effective: u16) -> Result<u32, BindRefusal> {
+		let id: u32 = self.listeners.bind(binding)?;
+		self.admission.register_listener(id, effective);
+		Ok(id)
 	}
 
-	// Stop accepting inbound connections for `binding`.
-	pub fn unlisten(&mut self, binding: &Binding) {
-		self.listeners.unbind(binding);
+	// Stop accepting inbound connections for a claim, aborting what it was holding.
+	//
+	// NO CALLER CAN ACCEPT THEM AFTERWARDS, so its half-open and unaccepted connections go with it
+	// rather than staying charged and unreachable. Sockets already handed off have their own
+	// lifecycles and are untouched.
+	/// An address this interface held has gone away.
+	///
+	/// THE TABLE IS APPLIED HERE because this is where the listeners and the connections are. Which
+	/// operations survive depends on what each of them has already put on the wire, and
+	/// `service-logic` owns that decision so both this and the guest run the same one.
+	pub fn on_address_invalidated(&mut self, address: [u8; 16]) -> AddressInvalidation {
+		use service_logic::invalidation::{OperationState, Outcome, on_invalidation};
+		let gone = Local::V6(address);
+		let mut result = AddressInvalidation::default();
+
+		// Listeners first: a withdrawal releases a port, and a connection closing does not.
+		let withdrawn: Vec<u32> = self
+			.listeners
+			.claims()
+			.iter()
+			.filter(|(_, held)| held.address == gone)
+			.filter(|(_, held)| {
+				let state = match held.address.is_unspecified() {
+					true => OperationState::WildcardListener,
+					false => OperationState::SpecificListener,
+				};
+				matches!(on_invalidation(state), Outcome::Withdraw)
+			})
+			.map(|(id, _)| *id)
+			.collect();
+		// A WILDCARD LISTENER IS NEVER IN THAT LIST: it is bound to the unspecified address, which is
+		// not an address any interface holds and so is never the one that went away.
+		result.listeners_kept = self.listeners.len() - withdrawn.len();
+		for id in withdrawn {
+			self.unlisten(id);
+			result.listeners_withdrawn += 1;
+		}
+
+		for index in 0..self.conns.len() {
+			if !self.conns[index].in_use || self.conns[index].local != gone {
+				continue;
+			}
+			let state = match self.conns[index].state {
+				TcpState::Established | TcpState::FinWait => OperationState::TcpEstablished,
+				TcpState::SynSent | TcpState::SynRcvd => OperationState::TcpConnecting { named_source: false, candidates_left: false },
+				TcpState::Closed => continue,
+			};
+			match on_invalidation(state) {
+				// THE PEER KNOWS NOTHING ABOUT A NEW SOURCE, so there is nothing to reselect to: what
+				// is already acknowledged has been flushed and the connection ends.
+				Outcome::Close => {
+					self.conns[index].aborted = true;
+					self.conns[index].send_failed = true;
+					result.connections_closed += 1;
+				}
+				Outcome::RetireAttempt { .. } => {
+					self.tcp_reset(index);
+					self.conns[index].in_use = false;
+					result.attempts_retired += 1;
+				}
+				_ => {}
+			}
+		}
+		result
+	}
+
+	pub fn unlisten(&mut self, id: u32) {
+		if !self.listeners.unbind(id) {
+			return;
+		}
+		self.admission.withdraw_listener(id);
+		for index in 0..self.conns.len() {
+			if self.conns[index].in_use && self.conns[index].listener == id && self.conns[index].pending_accept {
+				self.conns[index].in_use = false;
+				self.conns[index].state = TcpState::Closed;
+				self.conns[index].rx = Vec::new();
+			}
+		}
+	}
+
+	// What the inbound accounting is holding, and what it has refused.
+	pub fn admission(&self) -> (service_logic::tcp_admission::Occupancy, service_logic::tcp_admission::Refusals) {
+		(self.admission.occupancy(), self.admission.refusals())
+	}
+
+	// An accept handed the socket capability over successfully, so the backlog slot is released.
+	pub fn accepted(&mut self, ci: usize) {
+		let listener: u32 = self.conns[ci].listener;
+		self.admission.accepted(listener);
 	}
 
 	// Every port this host is listening on, whatever family or address the claim names.
@@ -1422,8 +1804,8 @@ impl Stack {
 	}
 
 	// Whether we accept inbound connections on `port`.
-	fn listens_for(&self, local: Local, port: u16) -> bool {
-		self.listeners.lookup(local, port).is_some()
+	fn listener_for(&self, local: Local, port: u16) -> Option<u32> {
+		self.listeners.lookup(local, port).map(|(id, _)| id)
 	}
 
 	// Take the next established-but-not-yet-handed-out connection accepted on `port`
@@ -1455,15 +1837,40 @@ impl Stack {
 		c.remote_mac = mac;
 		c.snd_una = iss;
 		c.snd_nxt = iss.wrapping_add(1); // the SYN consumes one sequence number
+		c.sent.reset(iss);
 		c.rcv_nxt = 0;
 		c.rx_len = 0;
 	}
 
-	// Open an outbound IPv6 connection. Returns false when this host has no address it may use to
-	// reach `peer`, which is the honest answer on a link whose IPv6 never came up.
-	pub fn tcp_open6(&mut self, ci: usize, peer: [u8; 16], port: u16, local_port: u16, iss: u32) -> bool {
+	/// Does this host currently hold `address`?
+	///
+	/// A NAMED SOURCE IS CHECKED BEFORE THE OPEN IS ADMITTED, not when the first segment goes out:
+	/// the caller is owed the refusal, not a connection that silently used something else.
+	pub fn holds_local(&self, address: Local) -> bool {
+		match address {
+			Local::V4(octets) => self.ip().0 == octets,
+			Local::V6(octets) => self.ipv6.as_ref().is_some_and(|host| host.addresses().contains(&service_logic::ipv6::Address::new(octets))),
+		}
+	}
+
+	/// Open an outbound IPv6 connection, optionally from the source the caller named.
+	///
+	/// `false` means this host has no address it may use to reach `peer`, which is the honest answer
+	/// on a link whose IPv6 never came up.
+	///
+	/// A NAMED SOURCE IS USED OR THE OPEN FAILS. Selecting a different one would hand the caller a
+	/// connection from the address it was avoiding while telling it the open succeeded, which is the
+	/// failure the field exists to prevent.
+	pub fn tcp_open6_from(&mut self, ci: usize, peer: [u8; 16], port: u16, local_port: u16, iss: u32, named: Option<[u8; 16]>) -> bool {
 		let destination = service_logic::ipv6::Address::new(peer);
-		let Some(source) = self.ipv6.as_ref().and_then(|host| host.source_address(destination)) else {
+		let selected = match named {
+			Some(octets) => {
+				let wanted = service_logic::ipv6::Address::new(octets);
+				self.ipv6.as_ref().filter(|host| host.addresses().contains(&wanted)).map(|_| wanted)
+			}
+			None => self.ipv6.as_ref().and_then(|host| host.source_address(destination)),
+		};
+		let Some(source) = selected else {
 			return false;
 		};
 		let c: &mut TcpConn = &mut self.conns[ci];
@@ -1481,6 +1888,7 @@ impl Stack {
 		c.remote_mac = MacAddr::ZERO;
 		c.snd_una = iss;
 		c.snd_nxt = iss.wrapping_add(1);
+		c.sent.reset(iss);
 		c.rcv_nxt = 0;
 		c.rx_len = 0;
 		true
@@ -1536,6 +1944,14 @@ impl Stack {
 			};
 			let ack: u32 = self.conns[ci].rcv_nxt;
 			return self.emit_tcp(ci, TCP_ACK, sequence, ack, &[], &[byte], out);
+		}
+		if self.conns[ci].syn_ack_due {
+			self.conns[ci].syn_ack_due = false;
+			let snd: u32 = self.conns[ci].snd_una;
+			let rcv: u32 = self.conns[ci].rcv_nxt;
+			let opts: [u8; 8] = self.syn_options();
+			let scaled: bool = self.conns[ci].rcv_wscale != 0;
+			return self.emit_tcp(ci, TCP_SYN | TCP_ACK, snd, rcv, if scaled { &opts } else { &opts[..4] }, &[], out);
 		}
 		let flight: u32 = self.conns[ci].tx.flight();
 		let usable: u32 = self.conns[ci].cwnd.usable(flight, self.conns[ci].peer_window);
@@ -1602,6 +2018,19 @@ impl Stack {
 		};
 		if now < deadline {
 			return self.conns[ci].persist.due_ms().is_some_and(|due| now >= due);
+		}
+		// A HALF-OPEN CONNECTION IS WAITING FOR A FINAL ACK, not for data to be acknowledged, so its
+		// timer retransmits the SYN-ACK and EXPIRES rather than retrying for ever. Expiry is what
+		// stops a peer that opens and walks away from holding a backlog slot until the machine fills.
+		if self.conns[ci].state == TcpState::SynRcvd {
+			let attempts: u8 = self.conns[ci].rto.back_off();
+			if usize::from(attempts) >= service_logic::tcp_rto::syn_attempts() {
+				self.tcp_free(ci);
+				return false;
+			}
+			self.conns[ci].rto_deadline_ms = Some(now + u64::from(self.conns[ci].rto.rto_ms()));
+			self.conns[ci].syn_ack_due = true;
+			return true;
 		}
 		if self.conns[ci].rto.back_off() >= service_logic::tcp_rto::MAX_DATA_RETRANSMISSIONS {
 			// The retry limit expired with data or a FIN outstanding. That is a typed failure, not a
@@ -1809,39 +2238,16 @@ impl Stack {
 	// if the name does not fit. `txn` is the DNS transaction id and `src_port` our UDP
 	// source port (echoed back by the response). The UDP checksum is left 0 (optional
 	// for IPv4).
-	pub fn build_dns_query(&self, server_mac: MacAddr, server_ip: Ipv4Addr, name: &[u8], txn: u16, src_port: u16, out: &mut [u8]) -> usize {
+	pub fn build_dns_query(&self, server_mac: MacAddr, server_ip: Ipv4Addr, message: &[u8], src_port: u16, out: &mut [u8]) -> usize {
+		// THE MESSAGE IS BUILT WHERE THE RULES ARE. This wraps it in UDP and IPv4 and nothing else:
+		// the header, the question encoding and the identity are `service-logic`'s, where a host test
+		// can drive them.
 		let dns_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
-		if dns_off + 12 + name.len() + 6 > out.len() {
+		if dns_off + message.len() > out.len() {
 			return 0;
 		}
-		// DNS header: id, flags (recursion desired), one question, no answers.
-		put16(out, dns_off, txn);
-		put16(out, dns_off + 2, 0x0100);
-		put16(out, dns_off + 4, 1);
-		put16(out, dns_off + 6, 0);
-		put16(out, dns_off + 8, 0);
-		put16(out, dns_off + 10, 0);
-		let mut p: usize = dns_off + 12;
-		// Question name, encoded as length-prefixed labels split on '.'.
-		let mut start: usize = 0;
-		for i in 0..=name.len() {
-			if i == name.len() || name[i] == b'.' {
-				let label: usize = i - start;
-				if label == 0 || label > 63 {
-					return 0;
-				}
-				out[p] = label as u8;
-				out[p + 1..p + 1 + label].copy_from_slice(&name[start..i]);
-				p += 1 + label;
-				start = i + 1;
-			}
-		}
-		out[p] = 0;
-		p += 1;
-		put16(out, p, 1); // qtype A
-		put16(out, p + 2, 1); // qclass IN
-		p += 4;
-		let dns_len: usize = p - dns_off;
+		out[dns_off..dns_off + message.len()].copy_from_slice(message);
+		let dns_len: usize = message.len();
 		// UDP header.
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, src_port);
@@ -1875,16 +2281,15 @@ impl Stack {
 	// Build an SNTP (NTP) client request to `server_ip` from `src_port` into `out`,
 	// returning its length: a 48-byte NTP payload (only the first byte set - LI 0,
 	// version 4, mode 3 = client; the rest zero) over UDP / IPv4 / Ethernet.
-	pub fn build_sntp_request(&self, server_mac: MacAddr, server_ip: Ipv4Addr, src_port: u16, out: &mut [u8]) -> usize {
+	pub fn build_sntp_request(&self, server_mac: MacAddr, server_ip: Ipv4Addr, src_port: u16, message: &[u8], out: &mut [u8]) -> usize {
+		// THE MESSAGE IS BUILT WHERE THE RULES ARE, as the DNS query is: this wraps it in UDP and IPv4
+		// and nothing else.
 		let ntp_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
-		let ntp_len: usize = 48;
+		let ntp_len: usize = message.len();
 		if ntp_off + ntp_len > out.len() {
 			return 0;
 		}
-		for b in out[ntp_off..ntp_off + ntp_len].iter_mut() {
-			*b = 0;
-		}
-		out[ntp_off] = 0x23; // LI 0, VN 4, Mode 3 (client)
+		out[ntp_off..ntp_off + ntp_len].copy_from_slice(message);
 		// UDP header.
 		let udp_off: usize = ETH_HDR + IPV4_HDR;
 		put16(out, udp_off, src_port);
@@ -1954,7 +2359,10 @@ impl Stack {
 		out[boot_off] = BOOTP_REQUEST;
 		out[boot_off + 1] = 1; // htype: Ethernet
 		out[boot_off + 2] = 6; // hlen
-		put32(out, boot_off + 4, 0x3903_f326); // xid (fixed; SLIRP is the only DHCP source)
+		// THE TRANSACTION IDENTITY, DRAWN PER EXCHANGE. It used to be a constant, on the reasoning
+		// that "SLIRP is the only DHCP source" - a statement about one deployment rather than about
+		// the protocol, and the only thing tying a reply to this client's own conversation.
+		put32(out, boot_off + 4, self.dhcp_xid);
 		if renew {
 			// ciaddr: the address whose lease this REQUEST extends (we can receive
 			// unicast on it, so the broadcast-reply flag stays clear).
@@ -2069,8 +2477,44 @@ impl Stack {
 		if msg_type == 0 {
 			return None;
 		}
-		self.dhcp = lease;
+		// PARSED, NOT COMMITTED. The old order wrote this lease into the stack HERE, before the
+		// caller had looked at the message type or the client's phase - so a late or losing reply
+		// mutated stored lease data even when the caller then ignored the event, and nothing
+		// downstream could undo it. The caller now admits the reply first and commits only what the
+		// phase allows.
+		self.pending_lease = lease;
 		Some(msg_type)
+	}
+
+	// The server that granted the held lease, and the address it granted.
+	pub fn lease_identity(&self) -> ([u8; 4], [u8; 4]) {
+		(self.dhcp.server.0, self.dhcp.yiaddr.0)
+	}
+
+	pub fn dhcp_xid(&self) -> u32 {
+		self.dhcp_xid
+	}
+
+	// Start a new exchange under this identity.
+	pub fn set_dhcp_xid(&mut self, xid: u32) {
+		self.dhcp_xid = xid;
+	}
+
+	// The lease the last parsed reply carried, for a caller deciding whether to commit it.
+	pub fn pending_lease(&self) -> ([u8; 4], [u8; 4]) {
+		(self.pending_lease.server.0, self.pending_lease.yiaddr.0)
+	}
+
+	// Commit the parsed lease. Called ONLY after the reply was admitted in the current phase.
+	pub fn commit_lease(&mut self) {
+		self.dhcp = self.pending_lease;
+	}
+
+	// The server rejected this client: discard the lease and the address it granted, which is what
+	// returns the client to INIT rather than leaving it using what was just refused.
+	pub fn clear_lease(&mut self) {
+		self.dhcp = DhcpLease::empty();
+		self.clear_ipv4();
 	}
 
 	// Apply the learned lease as our configuration: take the offered address, and the
@@ -2111,64 +2555,6 @@ impl Stack {
 
 // Skip a DNS name starting at `off` in `buf`, returning the offset just past it.
 // Handles both label sequences (terminated by a zero byte) and the 2-byte
-// compression pointer (top two bits set). None if it runs off the end.
-fn skip_name(buf: &[u8], mut off: usize) -> Option<usize> {
-	loop {
-		let b: u8 = *buf.get(off)?;
-		if b == 0 {
-			return Some(off + 1);
-		}
-		if b & 0xc0 == 0xc0 {
-			return Some(off + 2);
-		}
-		off += 1 + b as usize;
-	}
-}
-
-// Parse a DNS response message and return the first A record's address, if any.
-fn parse_dns_response(dns: &[u8]) -> Option<Ipv4Addr> {
-	if dns.len() < 12 {
-		return None;
-	}
-	let qdcount: u16 = be16(dns, 4);
-	let ancount: u16 = be16(dns, 6);
-	let mut off: usize = 12;
-	for _ in 0..qdcount {
-		off = skip_name(dns, off)?;
-		off += 4;
-		if off > dns.len() {
-			return None;
-		}
-	}
-	for _ in 0..ancount {
-		off = skip_name(dns, off)?;
-		if off + 10 > dns.len() {
-			return None;
-		}
-		let rtype: u16 = be16(dns, off);
-		let rdlen: usize = be16(dns, off + 8) as usize;
-		off += 10;
-		if rtype == 1 && rdlen == 4 && off + 4 <= dns.len() {
-			return Some(Ipv4Addr([dns[off], dns[off + 1], dns[off + 2], dns[off + 3]]));
-		}
-		off += rdlen;
-		if off > dns.len() {
-			return None;
-		}
-	}
-	None
-}
 
 // Parse an SNTP response payload and return the transmit timestamp as a Unix time
 // (seconds, UTC): the 64-bit transmit timestamp sits at offset 40, its integer-
-// seconds half (since the NTP 1900 epoch) in the first 4 bytes. None if too short.
-fn parse_sntp(ntp: &[u8]) -> Option<u64> {
-	if ntp.len() < 44 {
-		return None;
-	}
-	let ntp_secs: u32 = be32(ntp, 40);
-	if ntp_secs < NTP_UNIX_OFFSET {
-		return None;
-	}
-	Some((ntp_secs - NTP_UNIX_OFFSET) as u64)
-}

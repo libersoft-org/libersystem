@@ -151,6 +151,16 @@ impl PrefixTable {
 		self.entries.iter().find(|held| held.interface == interface && held.prefix == prefix)
 	}
 
+	/// The prefix an address was formed from, longest match first.
+	///
+	/// RFC 8028 RESTRICTS THE DEFAULT ROUTER TO THE ADVERTISERS OF THE SOURCE'S PREFIX, and this is
+	/// how a source address is turned back into that set. The longest match decides, for the same
+	/// reason it decides a route: a more specific prefix is a more specific statement about who is
+	/// on this link, and its advertisers are the ones that actually said so.
+	pub fn covering(&self, interface: Interface, address: Address, now_ms: u64) -> Option<&LearnedPrefix> {
+		self.entries.iter().filter(|entry| entry.interface == interface && !entry.valid.expired(now_ms) && entry.prefix.contains(address)).max_by_key(|entry| entry.prefix.len())
+	}
+
 	/// The size of the fullest advertiser set currently held.
 	///
 	/// A PER-PREFIX CEILING HAS NO SINGLE "USED" VALUE, and this is the one a consumer watching for

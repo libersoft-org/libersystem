@@ -48,10 +48,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(context) => context,
 		None => exit(),
 	};
-	let argument: &[u8] = context.arguments.as_bytes();
-	let len: usize = argument.len();
+	// THE ARGUMENTS ARE THE LAUNCH CONTEXT'S, NOT THE CAPABILITY BUFFER'S. `granted_capability`
+	// receives a tagged message into `buf`, so reading `buf` back as the argument reads whatever that
+	// left there - or nothing at all on the governed path, where the channel is already attached and
+	// `buf` is never written. Every target arrived empty.
+	let argument: alloc::vec::Vec<u8> = context.arguments.clone().into_bytes();
 	let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
-	ping(netsvc, &buf[..len]);
+	ping(netsvc, &argument);
 	// Drop our client channel (NetworkService reclaims the slot) and exit; the
 	// kernel closes the bootstrap with the process, which is what a waiting
 	// parent observes.

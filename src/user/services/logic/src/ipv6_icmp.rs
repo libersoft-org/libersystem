@@ -306,6 +306,25 @@ pub fn build_echo_reply(source: Address, destination: Address, request: &[u8]) -
 	Ok(message)
 }
 
+/// Build an echo REQUEST: type 128, with the identity the caller will match its reply against.
+///
+/// THE IDENTIFIER AND THE SEQUENCE ARE THE CORRELATION, and both of them are needed. A traceroute is
+/// a run of probes to one destination under one identifier, so the identifier alone matches every
+/// hop's answer to whichever probe was looked at first - which is how a trace comes to name the
+/// wrong router for every row.
+pub fn build_echo_request(source: Address, destination: Address, identifier: u16, sequence: u16, payload: &[u8]) -> Vec<u8> {
+	let mut message = Vec::with_capacity(MESSAGE_HEADER_LEN + 4 + payload.len());
+	message.push(ECHO_REQUEST);
+	message.push(0);
+	message.extend_from_slice(&[0, 0]);
+	message.extend_from_slice(&identifier.to_be_bytes());
+	message.extend_from_slice(&sequence.to_be_bytes());
+	message.extend_from_slice(payload);
+	let checksum = ipv6_packet::pseudo_header_checksum(source, destination, NEXT_ICMPV6, &message);
+	message[2..4].copy_from_slice(&checksum.to_be_bytes());
+	message
+}
+
 /// One path-MTU record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PathMtu {

@@ -32,15 +32,16 @@ fn show(netsvc: u64) {
 	let mut client = NetworkClient::new(netsvc);
 	match client.info() {
 		Some(Ok(info)) => {
-			if info.neighbors.is_empty() {
+			// THIS TOOL IS EXPLICITLY IPv4. The name is ARP's and the table it shows is ARP's; the
+			// other family's neighbours are shown by `ip`, which has a section for them. Putting them
+			// here would make one view of two tables under a name that means one of them.
+			if !info.neighbors.iter().any(|ngh| ngh.addr.is_v4()) {
 				eprint(b"arp: no neighbors\n");
 				return;
 			}
-			// WIDE ENOUGH FOR THE LONGEST ADDRESS THERE IS. An IPv6 address in full is 45 characters,
-			// and a buffer cut for a dotted quad would have silently truncated the other family's rows
-			// the moment this table held one.
+			// Wide enough for the longest address there is, so a shared buffer never truncates.
 			let mut tmp: [u8; 64] = [0u8; 64];
-			for ngh in &info.neighbors {
+			for ngh in info.neighbors.iter().filter(|ngh| ngh.addr.is_v4()) {
 				let n: usize = ngh.addr.render(&mut tmp);
 				print(&tmp[..n]);
 				print(b" at ");

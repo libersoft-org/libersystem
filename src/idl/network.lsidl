@@ -207,15 +207,44 @@ record net-info {
 	@bound(1088) neighbors: list<neighbor>,
 }
 
+/// Where one address family has got to.
+///
+/// READINESS IS AN OBSERVATION AND NOT A GATE. The service answers as soon as it is listening, with
+/// every configured family still `configuring`; a caller reads this and decides what to do, rather
+/// than being made to wait for a lease it may not need. Only `disabled` refuses a send outright -
+/// everything else is decided per destination against the current addresses and routes.
+enum family-readiness {
+	/// The configured profile does not include this family.
+	disabled,
+	/// Included, and it has no usable address-and-route pair yet.
+	configuring,
+	/// A valid non-tentative unicast address and a usable route in that family. AN ON-LINK ROUTE IS
+	/// ENOUGH: a host that can reach its own link is working, and demanding a default route would
+	/// report a router-less link as broken.
+	ready,
+	/// No usable pair remains and configuration reported an explicit failure with nothing retrying.
+	/// A report, recomputed as state changes - never a terminal protocol state, and never what a
+	/// family that is merely still asking is called.
+	failed,
+}
+
 /// The NetworkService pool utilization: how many client, socket and listener channels
-/// the serve loop currently stands on, and how many live TCP connections the stack holds.
+/// the serve loop currently stands on, how many live TCP connections the stack holds, where each
+/// family has got to, and what the diagnostic partition is holding.
 /// Every pool grows on demand (the domain's handle budget is the only ceiling), so these
-/// are the live counts `ss` reports and the graph folds in - observability, not a cap.
+/// are the live counts `ss` reports and the graph folds in - observability, not a cap. The
+/// diagnostic figures are the exception: that partition HAS a cap, and reporting used beside it is
+/// what lets an admission gate see the refusal coming.
 record net-capacity {
-	clients:     u32,
-	sockets:     u32,
-	listeners:   u32,
-	connections: u32,
+	clients:             u32,
+	sockets:             u32,
+	listeners:           u32,
+	connections:         u32,
+	ipv4:                family-readiness,
+	ipv6:                family-readiness,
+	diagnostic-used:     u32,
+	diagnostic-limit:    u32,
+	diagnostic-refusals: u32,
 }
 
 /// The outcome of a ping: a reply arrived, it timed out, or the target was

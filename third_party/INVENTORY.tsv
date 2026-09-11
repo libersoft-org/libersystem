@@ -1,0 +1,21 @@
+# The recorded licence review, one row per vendored upstream. `docs/DEPENDENCY_POLICY.md` is the
+# policy; `src/tools/check-dependency-policy.sh` enforces it.
+#
+# COLUMNS, TAB SEPARATED:
+#   name       what this tree calls it
+#   path       where it is vendored, relative to the repository root
+#   source     the upstream project URL, written down rather than remembered
+#   revision   the exact tag or commit - never a branch - or `unrecorded` (see below)
+#   digest     the SHA-256 of the source archive as fetched, or `unrecorded`
+#   licence    the ONE term this project takes it under, when the upstream offers several
+#   patches    the ordered patch series this tree applies, or `none`, or `adapted` when the files
+#              were adapted in place rather than patched
+#
+# `unrecorded` IS AN HONEST ANSWER AND NOT AN EXEMPTION. It means the import predates this policy and
+# its upstream revision was not captured at the time, so the tree cannot say which revision it holds.
+# Writing a plausible digest instead would make the inventory agree with nothing. The gate ACCEPTS
+# these and NAMES them on every run, so the gap stays visible until somebody establishes the
+# revision; a new import may not use it.
+#
+# name	path	source	revision	digest	licence	patches
+vorbis	src/user/libs/audio/vorbis	https://github.com/RustAudio/lewton	unrecorded	unrecorded	MIT	adapted
