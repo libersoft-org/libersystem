@@ -248,6 +248,7 @@ pub struct QuotedError {
 #[derive(Debug, Default)]
 pub struct QuotedErrorQueue {
 	entries: Vec<QuotedError>,
+	accepted: u32,
 	dropped: u32,
 }
 
@@ -263,15 +264,34 @@ impl QuotedErrorQueue {
 			return false;
 		}
 		self.entries.push(error);
+		self.accepted = self.accepted.saturating_add(1);
 		true
+	}
+
+	/// How many errors this queue has accepted since boot. Cumulative, because `len` is emptied by
+	/// every drain and a consumer asking "did anything arrive" cannot see a queue that was already
+	/// read.
+	pub fn accepted(&self) -> u32 {
+		self.accepted
 	}
 
 	pub fn drain(&mut self) -> Vec<QuotedError> {
 		core::mem::take(&mut self.entries)
 	}
 
-	/// How many errors were dropped for want of room. Aggregate, with no per-packet log: a flood
-	/// must not be able to make this host write one line per frame.
+	/// Count an error that never reached the queue because it could not be attributed - a quotation
+	/// too short for its transport identity, or one naming an address this interface does not hold.
+	///
+	/// ONE COUNTER FOR BOTH, deliberately. Both mean "an error arrived and no consumer will hear
+	/// about it", both are things a flood produces on purpose, and a counter split by cause is a
+	/// counter whose keys the flood chooses.
+	pub fn note_dropped(&mut self) {
+		self.dropped = self.dropped.saturating_add(1);
+	}
+
+	/// How many errors were dropped: for want of room, or because they could not be attributed.
+	/// Aggregate, with no per-packet log: a flood must not be able to make this host write one line
+	/// per frame.
 	pub fn dropped(&self) -> u32 {
 		self.dropped
 	}

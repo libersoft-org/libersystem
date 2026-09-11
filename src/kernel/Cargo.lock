@@ -204,6 +204,7 @@ dependencies = [
  "gif",
  "liberfs",
  "mp3",
+ "network-proto",
  "partition",
  "pcm",
  "pix",
@@ -260,6 +261,14 @@ name = "nanomp3"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541"
+
+[[package]]
+name = "network-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
 
 [[package]]
 name = "no_std_io"

@@ -37,24 +37,22 @@ fn show(netsvc: u64) {
 			if socks.is_empty() {
 				eprint(b"ss: no sockets\n");
 			} else {
-				print(b"State     Local            Peer\n");
+				print(b"State     Local                                Peer\n");
 				for s in &socks {
-					let mut line: [u8; 80] = [0u8; 80];
+					// A ROW HOLDS TWO FULL ADDRESSES NOW. Two scoped IPv6 endpoints with ports run to
+					// over a hundred characters, so a line cut for two dotted quads would truncate
+					// exactly the rows this milestone exists to show.
+					let mut line: [u8; 224] = [0u8; 224];
 					let mut pos: usize = 0;
 					pos = put(&mut line, pos, state_label(s.state));
 					pos = pad_col(&mut line, pos, 10);
-					line[pos] = b':';
-					pos += 1;
-					pos += write_u16(s.local_port, &mut line[pos..]);
-					pos = pad_col(&mut line, pos, 27);
+					pos += endpoint(&s.local, &mut line[pos..]);
+					pos = pad_col(&mut line, pos, 47);
+					// A LISTENER HAS NO PEER, and says so rather than printing the unspecified address it
+					// carries - `::` is a real address, and this is the absence of one.
 					match s.state {
 						SockState::Listen => pos = put(&mut line, pos, b"*"),
-						_ => {
-							pos += s.remote.addr.render(&mut line[pos..]);
-							line[pos] = b':';
-							pos += 1;
-							pos += write_u16(s.remote.port, &mut line[pos..]);
-						}
+						_ => pos += endpoint(&s.remote, &mut line[pos..]),
 					}
 					line[pos] = b'\n';
 					pos += 1;
@@ -83,6 +81,28 @@ fn show(netsvc: u64) {
 		pos += 1;
 		print(&line[..pos]);
 	}
+}
+
+// One endpoint: the address, and the port after a colon.
+//
+// AN IPv6 ADDRESS GOES IN BRACKETS. `fe80::1:80` cannot be read - the colon before the port is
+// indistinguishable from the colons inside the address, and every reader of this output would have
+// to guess where one ends.
+fn endpoint(value: &proto::generated::liber::network::v1::ScopedEndpoint, out: &mut [u8]) -> usize {
+	let mut pos: usize = 0;
+	let bracketed: bool = value.addr.addr.is_v6();
+	if bracketed {
+		out[pos] = b'[';
+		pos += 1;
+	}
+	pos += value.addr.render(&mut out[pos..]);
+	if bracketed {
+		out[pos] = b']';
+		pos += 1;
+	}
+	out[pos] = b':';
+	pos += 1;
+	pos + write_u16(value.port, &mut out[pos..])
 }
 
 // The human-readable label for a socket's TCP state.

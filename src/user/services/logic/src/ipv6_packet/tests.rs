@@ -342,3 +342,99 @@ fn the_pseudo_header_checksum_covers_the_addresses() {
 	let odd = [1u8, 2, 3];
 	assert_ne!(pseudo_header_checksum(host(), peer(), NEXT_UDP, &odd), 0);
 }
+
+#[test]
+fn the_walk_says_whether_a_router_alert_was_present_and_not_merely_that_a_header_was() {
+	// A LISTENER MESSAGE MUST CARRY IT. A receiver that inferred it from "some extension header was
+	// present" would accept a query behind a Destination Options header and nothing else, which is
+	// the check this flag exists to make honest.
+	let mut with_alert = ROUTER_ALERT_HEADER.to_vec();
+	with_alert.extend_from_slice(&[130, 0, 0, 0]);
+	let raw = packet(NEXT_HOP_BY_HOP, &with_alert);
+	let parsed = parse_packet(&raw).expect("accepted");
+	assert!(parsed.router_alert);
+	assert_eq!(parsed.upper, NEXT_ICMPV6);
+	assert_eq!(parsed.payload, &[130, 0, 0, 0]);
+
+	// A hop-by-hop header carrying only padding is a header without the option.
+	let mut padded = options_header(NEXT_ICMPV6, &[1, 2, 0, 0]);
+	padded.extend_from_slice(&[130, 0, 0, 0]);
+	let raw = packet(NEXT_HOP_BY_HOP, &padded);
+	assert!(!parse_packet(&raw).expect("accepted").router_alert);
+
+	// And the option in a DESTINATION options header is not a hop-by-hop Router Alert.
+	let mut wrong_header = options_header(NEXT_ICMPV6, &[OPTION_ROUTER_ALERT, 2, 0, 0]);
+	wrong_header.extend_from_slice(&[130, 0, 0, 0]);
+	let raw = packet(NEXT_DESTINATION, &wrong_header);
+	assert!(!parse_packet(&raw).expect("accepted").router_alert);
+
+	// A packet with no extension headers at all.
+	let raw = packet(NEXT_ICMPV6, &[128, 0, 0, 0]);
+	assert!(!parse_packet(&raw).expect("accepted").router_alert);
+}
+
+#[test]
+fn an_advertised_mtu_may_lower_the_link_and_never_raise_it_or_go_below_the_minimum() {
+	// LOWERING IS THE ONLY DIRECTION. The frame buffers were sized when the interface came up, and a
+	// router that asked for more would be asking this host to write past them.
+	assert_eq!(accept_link_mtu(1500, 1400), Some(1400));
+	assert_eq!(accept_link_mtu(1400, 1300), Some(1300));
+	assert_eq!(accept_link_mtu(1500, 9000), None, "above the ceiling the link reported");
+	assert_eq!(accept_link_mtu(1500, 1500), None, "equal is not a lowering");
+	assert_eq!(accept_link_mtu(1500, u32::from(u16::MAX) + 1), None, "and a value that is not even a u16");
+
+	// BELOW THE MINIMUM IS NOT A SMALLER LINK, it is one that cannot carry IPv6 at all. The option
+	// is ignored, which leaves a working interface; taking it would leave one that cannot send a
+	// legal packet.
+	assert_eq!(accept_link_mtu(1500, 1279), None);
+	assert_eq!(accept_link_mtu(1500, 576), None);
+	assert_eq!(accept_link_mtu(1500, 0), None);
+	assert_eq!(accept_link_mtu(1500, u32::from(MIN_MTU)), Some(MIN_MTU), "exactly the minimum is a legal link");
+}
+
+#[test]
+fn a_link_whose_effective_mtu_is_below_the_minimum_does_not_carry_ipv6_at_all() {
+	// THE EXACT BOUNDARY, from both sides. 1279 is the number an implementation writing `>` instead
+	// of `>=` gets wrong, and 576 is the smallest link IPv4 is willing to run on - a real link this
+	// host must keep IPv4 working over while refusing the other family.
+	assert!(!link_carries_ipv6(576));
+	assert!(!link_carries_ipv6(1279));
+	assert!(link_carries_ipv6(MIN_MTU));
+	assert!(link_carries_ipv6(1500));
+	assert!(!link_carries_ipv6(0));
+
+	// AND THE NUMBER IT JUDGES IS THE SMALLER OF THE TWO SOURCES, which is what makes either one able
+	// to refuse the family on its own: a 1500-byte link under a 576-byte policy carries no IPv6, and
+	// neither does a 576-byte link under a 1500-byte policy.
+	assert_eq!(effective_link_mtu(1500, 9000), 1500);
+	assert_eq!(effective_link_mtu(9000, 1500), 1500);
+	assert!(!link_carries_ipv6(effective_link_mtu(576, 1500)));
+	assert!(!link_carries_ipv6(effective_link_mtu(1500, 576)));
+	assert!(link_carries_ipv6(effective_link_mtu(1500, MIN_MTU)));
+
+	// An advertised option is a different question and cannot answer this one: it may only lower a
+	// link that already carries the family.
+	assert_eq!(accept_link_mtu(1500, 1279), None, "an option below the minimum is ignored");
+	assert_eq!(accept_link_mtu(1500, 1280), Some(1280));
+}
+
+#[test]
+fn a_udp_checksum_over_ipv6_is_mandatory_and_a_computed_zero_becomes_all_ones() {
+	// OVER IPv4 A ZERO FIELD MEANS "NOT COMPUTED" AND IS ACCEPTED. Over IPv6 there is no header
+	// checksum beneath the transport, so RFC 8200 section 8.1 removes the exemption - and this is the
+	// line an implementation that ported its IPv4 checksum across leaves out.
+	let source = address([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]);
+	let destination = address([0x2001, 0xdb8, 0, 0, 0, 0, 0, 2]);
+	let datagram = [0x30u8, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00];
+	let sum = udp_checksum(source, destination, &datagram);
+	assert_ne!(sum, 0, "a transmitted UDP checksum over IPv6 is never zero");
+
+	// A RECEIVER REFUSES A ZERO FIELD, because it means nothing checked this datagram.
+	assert!(!udp_checksum_present(0));
+	assert!(udp_checksum_present(0xffff));
+	assert!(udp_checksum_present(sum));
+
+	// The substitution is free: the two values are equal in ones-complement arithmetic, so a datagram
+	// whose real checksum is `0xffff` and one whose computed sum was zero verify identically.
+	assert_eq!(udp_checksum(source, destination, &datagram), sum);
+}

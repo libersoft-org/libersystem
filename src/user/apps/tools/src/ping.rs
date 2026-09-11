@@ -26,7 +26,7 @@ use core::fmt::Write;
 
 use network_client::NetworkClient;
 use proto::codec::{JsonMode, json_escape};
-use proto::system::{Ipv4Addr, LaunchContext, PingReply, PingStatus};
+use proto::system::{LaunchContext, PingReply, PingStatus, ScopedAddress};
 use rt::*;
 use tools::parse_u64;
 
@@ -111,21 +111,19 @@ fn ping(netsvc: u64, args: &[u8]) {
 	let mut client = NetworkClient::new(netsvc);
 	// Resolve the target: a dotted-decimal address parses directly, otherwise ask
 	// NetworkService to resolve the name over DNS.
-	let addr: Ipv4Addr = match Ipv4Addr::parse(target) {
-		Some(a) => a,
-		None => match core::str::from_utf8(target).ok().and_then(|name: &str| client.resolve(name)) {
-			Some(Ok(a)) => a,
-			_ => {
-				let mut line: String = String::new();
-				line.push_str("ping: cannot resolve ");
-				append_bytes(&mut line, target);
-				line.push_str(": unknown host\n");
-				print(line.as_bytes());
-				return;
-			}
-		},
+	let addr: ScopedAddress = match tools::resolve_target(&mut client, target) {
+		Some(addr) => addr,
+		None => {
+			let mut line: String = String::new();
+			line.push_str("ping: cannot resolve ");
+			append_bytes(&mut line, target);
+			line.push_str(": unknown host\n");
+			print(line.as_bytes());
+			return;
+		}
 	};
-	let mut ip_buf: [u8; 16] = [0u8; 16];
+	// Wide enough for the longest address of either family, with its scope.
+	let mut ip_buf: [u8; 96] = [0u8; 96];
 	let ip_len: usize = addr.render(&mut ip_buf);
 	let ip: &[u8] = &ip_buf[..ip_len];
 	// PING <target> (<ip>) 56(84) bytes of data. (CLI representation only - the JSON

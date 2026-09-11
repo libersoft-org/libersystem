@@ -32,6 +32,11 @@ driver-binding = { path = "../user/libs/driver/binding" }
 # features only: the channel client half is behind `channel-client-impl` and needs the userspace
 # runtime, which the kernel does not have.
 device-proto = { path = "../user/libs/protocol/device-proto" }
+# The network wire types, for the same reason and in the same way: the permission-manager scenario
+# stands in for NetworkService so a governed `ip` has something to query, and a hand-written copy of
+# `net-info` is how that harness and the service drift apart - which is exactly what happened when
+# the record grew from four fields to nine.
+network-proto = { path = "../user/libs/protocol/network-proto" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
 # can drive tens of millions of operations through - which is what the one unexplained
 # double allocation needed and could never get from a guest boot.

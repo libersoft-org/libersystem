@@ -15,11 +15,16 @@ extern crate alloc;
 
 use network_client::{ListenerClient, NetworkClient, SocketClient};
 use proto::codec::Buffer;
+use proto::system::{BindMode, IpAddress, ListenRequest, ScopedAddress, ScopedEndpoint};
 use rt::*;
 
 // The port we listen on, and the canned response - `Connection: close` so the client
 // reads the close-delimited body (no Content-Length needed).
 const HTTP_PORT: u16 = 80;
+
+// How many completed connections may wait to be accepted. One request at a time is served, so this is
+// the depth a burst may reach before the service refuses rather than queues without limit.
+const BACKLOG: u16 = 16;
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h1>Hello from LiberSystem httpd</h1></body></html>\n";
 
 #[unsafe(no_mangle)]
@@ -37,8 +42,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Open the listening socket and accept connections forever, serving each one.
 fn serve(netsvc: u64) {
 	let mut net = NetworkClient::new(netsvc);
-	let listen_chan: u64 = match net.listen(&HTTP_PORT) {
-		Some(Ok(h)) => h,
+	// EVERY IPv4 ADDRESS, WHICH IS WHAT THIS SERVICE CAN ACTUALLY BIND. The contract can express a
+	// dual-stack wildcard and NetworkService answers `unsupported` for it until its transports carry
+	// the other family; asking for one here would make this program fail to start rather than serve
+	// what there is.
+	let request: ListenRequest = ListenRequest { mode: BindMode::Ipv4Only, local: ScopedEndpoint { addr: ScopedAddress::global(IpAddress::unspecified_v4()), port: HTTP_PORT }, backlog: BACKLOG };
+	let listen_chan: u64 = match net.listen(&request) {
+		Some(Ok(result)) => result.listener,
 		_ => {
 			eprint(b"httpd: listen failed\n");
 			return;
@@ -50,7 +60,7 @@ fn serve(netsvc: u64) {
 	// listener channel closes (NetworkService gone).
 	loop {
 		let sockh: u64 = match lis.accept() {
-			Some(Ok(h)) => h,
+			Some(Ok(accepted)) => accepted.socket,
 			_ => break,
 		};
 		respond(sockh);

@@ -338,8 +338,12 @@ impl Snapshot {
 	}
 
 	/// Is any resource at its limit? A caller reporting health wants one answer, not seventeen.
+	///
+	/// THE INTERFACE COUNT IS NOT ONE OF THEM. Its limit is one and a working host uses one, so a
+	/// health signal that counted it would be on from the first second of every boot - which is a
+	/// signal nobody reads twice.
 	pub fn any_saturated(&self) -> bool {
-		self.usage.iter().any(|line| line.used >= line.limit)
+		self.usage.iter().filter(|line| line.resource != Resource::Interfaces).any(|line| line.used >= line.limit)
 	}
 }
 

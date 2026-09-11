@@ -102,6 +102,7 @@ keys = [
 	"gate.iommu-riscv64-direct-aia-ordinary / host / host / default",
 	"gate.iommu-riscv64-uefi-aia-ordinary / host / host / default",
 	"gate.iommu-riscv64-uefi-aia-transition / host / host / default",
+	"gate.ipv6-peer / host / host / default",
 	"gate.kernel-allocations / host / host / default",
 	"gate.malformed-dynamic / host / host / default",
 	"gate.malformed-symbol-relocation / host / host / default",

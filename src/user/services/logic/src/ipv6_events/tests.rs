@@ -183,3 +183,28 @@ fn a_quoted_error_carries_the_field_its_consumer_needs() {
 	let tcp = QuotedTransport::Tcp { source_port: 1234, destination_port: 80, sequence: 0x1000 };
 	assert_ne!(tcp, QuotedTransport::Tcp { source_port: 1234, destination_port: 80, sequence: 0x1001 });
 }
+
+#[test]
+fn a_dropped_advisory_error_never_asks_for_a_resync() {
+	// THE TWO QUEUES FAIL DIFFERENTLY, and this is the line between them. Losing a table
+	// invalidation leaves a consumer holding state that is no longer true, so the queue says so;
+	// losing an advisory error costs a diagnosis and nothing else, so it is counted and forgotten.
+	// A listener that raised the resync flag here would make every flood of errors cost a full table
+	// re-read.
+	let mut invalidations = InvalidationQueue::new();
+	let mut errors = QuotedErrorQueue::new();
+	for index in 0..QUOTED_ERROR_CAPACITY as u16 {
+		assert!(errors.offer(quoted(index)));
+	}
+	assert!(!errors.offer(quoted(9999)), "the thirty-third is dropped");
+	assert_eq!(errors.dropped(), 1);
+	assert!(!invalidations.resync_required(), "and the table queue is untouched by it");
+
+	// Meanwhile the invalidation queue's own overflow does raise it, which is what makes the
+	// difference visible rather than assumed.
+	for index in 0..=INVALIDATION_CAPACITY as u16 {
+		invalidations.record(event(index, Change::Changed, 1));
+	}
+	assert!(invalidations.resync_required());
+	assert_eq!(errors.dropped(), 1, "and the error counter is not touched by the table queue either");
+}

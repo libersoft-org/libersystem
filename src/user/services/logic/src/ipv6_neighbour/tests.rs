@@ -198,6 +198,21 @@ fn a_full_cache_refuses_rather_than_evicting_a_live_neighbour() {
 	assert_eq!(action, Action::Nothing);
 	assert_eq!(cache.len(), limit as usize);
 	assert_eq!(cache.refusals().get(Resource::Neighbours), 1);
+
+	// A CACHE HIT AT CAPACITY IS NOT AN ADMISSION, so it neither costs a slot nor refuses.
+	let (lookup, _) = cache.resolve(interface(), address(0), 0);
+	assert_eq!(lookup, Lookup::Pending, "the entry it already holds");
+	assert_eq!(cache.len(), limit as usize);
+	assert_eq!(cache.refusals().get(Resource::Neighbours), 1, "and nothing was refused");
+
+	// A RECLAIMED SLOT ADMITS A NEW NEIGHBOUR. Retirement is the normal way one comes back: three
+	// unanswered solicitations remove the entry, and the address behind it can then be resolved.
+	assert!(cache.remove(interface(), address(5)));
+	assert_eq!(cache.len(), limit as usize - 1);
+	let (lookup, action) = cache.resolve(interface(), address(9999), 0);
+	assert_eq!(lookup, Lookup::Pending, "the reclaimed slot admits it");
+	assert_eq!(action, Action::SolicitMulticast { target: address(9999) });
+	assert_eq!(cache.len(), limit as usize);
 }
 
 #[test]
@@ -226,4 +241,41 @@ fn due_reports_exactly_the_entries_whose_timer_has_expired() {
 	let due = cache.due(RETRANS_TIMER_MS);
 	assert_eq!(due, alloc::vec![(interface(), address(1))], "a stale entry has no timer to be due");
 	assert!(cache.due(0).is_empty());
+}
+
+#[test]
+fn a_full_neighbour_table_refuses_a_router_this_host_has_not_yet_resolved() {
+	// THE ADMISSION-REFUSAL CASE A HOST WITH NO ROUTER MEETS. Solicitation keeps running while the
+	// list is empty, and each answer needs a neighbour entry for the router that sent it. With the
+	// table full of live entries there is no slot, and the refusal must be a refusal rather than an
+	// eviction: throwing a live neighbour away to make room for an unsolicited advertisement is how
+	// a hostile link empties a cache.
+	let mut cache = NeighbourCache::new();
+	for index in 0..Resource::Neighbours.limit() as u16 {
+		cache.resolve(interface(), address(index), 0);
+	}
+	assert_eq!(cache.len(), Resource::Neighbours.limit() as usize);
+
+	let router = address(0xffff);
+	let (lookup, action) = cache.resolve(interface(), router, 0);
+	assert_eq!(lookup, Lookup::Capacity);
+	assert_eq!(action, Action::Nothing, "and nothing is put on the wire about it");
+	assert_eq!(cache.len(), Resource::Neighbours.limit() as usize);
+	assert_eq!(cache.refusals().get(Resource::Neighbours), 1);
+
+	// A solicitation FROM that router is refused the same way rather than growing the table.
+	assert_eq!(cache.on_solicitation(interface(), router, mac(9)), Action::Nothing);
+	assert_eq!(cache.len(), Resource::Neighbours.limit() as usize);
+	assert_eq!(cache.refusals().get(Resource::Neighbours), 2);
+
+	// RECLAIM, THEN ADMIT: an entry that probing retires releases its slot, and the router enters.
+	let mut now = RETRANS_TIMER_MS;
+	for _ in 0..=u64::from(MAX_MULTICAST_SOLICIT) {
+		cache.on_timeout(interface(), address(0), now);
+		now += RETRANS_TIMER_MS;
+	}
+	assert_eq!(cache.len(), Resource::Neighbours.limit() as usize - 1);
+	let (lookup, action) = cache.resolve(interface(), router, now);
+	assert_eq!(lookup, Lookup::Pending);
+	assert_eq!(action, Action::SolicitMulticast { target: router });
 }

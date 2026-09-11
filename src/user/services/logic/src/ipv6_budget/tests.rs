@@ -214,4 +214,60 @@ fn a_snapshot_reports_used_limit_and_refusals_for_every_resource() {
 
 	let full = Snapshot { usage: vec![Usage { resource: Resource::Rdnss, used: 4, limit: 4, refusals: 0 }], resolution_failures: 0, quoted_errors_dropped: 0, icmp_errors_rate_limited: 0, resync_required: false };
 	assert!(full.any_saturated(), "one answer, not seventeen");
+
+	// THE ONE INTERFACE IS NOT A WARNING. A host with its single NIC up is at that limit from the
+	// first second of every boot, and a health signal that said so would be permanently on.
+	let ordinary = Snapshot { usage: vec![Usage { resource: Resource::Interfaces, used: 1, limit: 1, refusals: 0 }], resolution_failures: 0, quoted_errors_dropped: 0, icmp_errors_rate_limited: 0, resync_required: false };
+	assert!(!ordinary.any_saturated());
+}
+
+#[test]
+fn the_byte_budget_admits_exactly_its_limit_and_refuses_one_byte_past_it() {
+	// THE EXACT-BOUND PAIR. A budget tested only with a value far past it passes with an off-by-one
+	// in either direction.
+	let mut exact = PendingQueue::new();
+	for peer in 0..4u16 {
+		for _ in 0..4 {
+			exact.admit(interface(), neighbour(peer), vec![0; 4096]).expect("within the budget");
+		}
+	}
+	assert_eq!(exact.bytes(), 65536, "exactly the limit is admitted");
+	assert_eq!(exact.len(), 16);
+
+	let mut over = PendingQueue::new();
+	for peer in 0..4u16 {
+		for _ in 0..3 {
+			over.admit(interface(), neighbour(peer), vec![0; 4096]).expect("within the budget");
+		}
+	}
+	over.admit(interface(), neighbour(9), vec![0; 16383]).expect("within the budget");
+	assert_eq!(over.bytes(), 65535);
+	// One byte more than the whole budget: refused, and nothing charged.
+	let refused = over.admit(interface(), neighbour(10), vec![0; 2]).expect_err("65537 does not fit");
+	assert_eq!(refused.resource, Resource::PendingBytes);
+	assert_eq!(over.bytes(), 65535, "no partial charge");
+	// And exactly the remaining byte does fit, which is what makes the refusal above about the bound
+	// rather than about the queue being unwilling.
+	over.admit(interface(), neighbour(10), vec![0; 1]).expect("the last byte fits");
+	assert_eq!(over.bytes(), 65536);
+}
+
+#[test]
+fn cancelling_one_operation_leaves_the_other_to_transmit_when_the_neighbour_resolves() {
+	let mut queue = PendingQueue::new();
+	let cancelled = queue.admit(interface(), neighbour(1), vec![1; 40]).expect("admitted");
+	let live = queue.admit(interface(), neighbour(1), vec![2; 40]).expect("admitted");
+	assert_eq!(queue.bytes(), 80);
+
+	assert_eq!(queue.cancel(cancelled), Some(Completion::Cancelled { token: cancelled }));
+	assert_eq!(queue.bytes(), 40, "released exactly once, and only its own charge");
+
+	// A CANCELLED PACKET CANNOT LATER TRANSMIT. Resolution hands back the live operation's packet
+	// and nothing else, which is the property a consumer that has given up depends on.
+	let taken = queue.take_for(interface(), neighbour(1));
+	assert_eq!(taken.len(), 1);
+	assert_eq!(taken[0].token, live);
+	assert_eq!(taken[0].frame[0], 2, "and it is the other operation's bytes, not the cancelled one's");
+	assert_eq!(queue.bytes(), 0);
+	assert!(queue.is_empty());
 }

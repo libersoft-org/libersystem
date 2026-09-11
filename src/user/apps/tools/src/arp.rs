@@ -12,7 +12,6 @@
 extern crate alloc;
 
 use network_client::NetworkClient;
-use proto::addr::write_mac;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -37,12 +36,15 @@ fn show(netsvc: u64) {
 				eprint(b"arp: no neighbors\n");
 				return;
 			}
-			let mut tmp: [u8; 18] = [0u8; 18];
+			// WIDE ENOUGH FOR THE LONGEST ADDRESS THERE IS. An IPv6 address in full is 45 characters,
+			// and a buffer cut for a dotted quad would have silently truncated the other family's rows
+			// the moment this table held one.
+			let mut tmp: [u8; 64] = [0u8; 64];
 			for ngh in &info.neighbors {
 				let n: usize = ngh.addr.render(&mut tmp);
 				print(&tmp[..n]);
 				print(b" at ");
-				let n: usize = write_mac(&ngh.mac, &mut tmp);
+				let n: usize = ngh.mac.render(&mut tmp);
 				print(&tmp[..n]);
 				print(b"\n");
 			}

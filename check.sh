@@ -59,6 +59,9 @@ declare -A GATES=(
 	# milliseconds; then every row of the x86_64 matrix booted - the development pair, the shipping
 	# pair, the host pairing check and every producible refusal; then the two device-tree ports on
 	# both entry paths, emulated and slow.
+	# THE IPv6 LAYER AGAINST A CONTROLLABLE PEER. Emulated and slow, so it is its own row rather than
+	# part of a sweep: it boots three guests, each against a scripted far end of the wire.
+	["ipv6-peer"]="tools/check-ipv6-peer.sh"
 	["dma-mode-carrier"]="tools/check-dma-mode-carrier.sh"
 	["dma-mode-x86_64"]="tools/check-dma-mode-x86_64.sh"
 	["dma-mode-ports"]="tools/check-dma-mode-ports.sh"

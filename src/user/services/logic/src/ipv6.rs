@@ -348,6 +348,11 @@ impl Prefix {
 	}
 
 	/// The link-local prefix `fe80::/10`.
+	/// `::/0`: the prefix that covers everything, which is the destination a default route has.
+	pub fn default_route() -> Prefix {
+		Prefix { base: UNSPECIFIED, len: 0 }
+	}
+
 	pub fn link_local() -> Prefix {
 		Prefix { base: Address([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), len: LINK_LOCAL_PREFIX_LEN }
 	}

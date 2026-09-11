@@ -2,9 +2,9 @@
 //
 // The shell mints a fresh NetworkService client channel (network.open), spawns this
 // program, and transfers that channel to it. ip asks NetworkService for the
-// interface state over its OWN channel and renders it - our address, MAC, gateway,
-// and the neighbor cache - then signals completion and exits. A standalone program,
-// not a shell built-in.
+// interface state over its OWN channel and renders it - every address the interface
+// holds, every route, router and resolver it knows, and its neighbor cache - then
+// signals completion and exits. A standalone program, not a shell built-in.
 
 #![no_std]
 #![no_main]
@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use network_client::NetworkClient;
-use proto::addr::write_mac;
+use proto::generated::liber::network::v1::{AddressState, NextHop, Reachability, RoutePreference};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -27,42 +27,115 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// Query and render the interface state: our address, MAC, MTU, gateway, and
-// neighbors.
+// Query and render the interface state.
+//
+// ONE SECTION PER TABLE, because they are separate tables and folding them into one line is what the
+// single-address, single-gateway view used to do - a shape that could not say "two routers" or "this
+// address is deprecated" at all.
 fn show(netsvc: u64) {
 	let mut client = NetworkClient::new(netsvc);
-	match client.info() {
-		Some(Ok(info)) => {
-			let mut tmp: [u8; 18] = [0u8; 18];
-			print(b"net0: ");
-			let n: usize = info.addr.render(&mut tmp);
-			print(&tmp[..n]);
-			print(b"  mac ");
-			let n: usize = write_mac(&info.mac, &mut tmp);
-			print(&tmp[..n]);
-			print(b"  mtu ");
-			let n: usize = write_dec(info.mtu as u64, &mut tmp);
-			print(&tmp[..n]);
-			print(b"  gateway ");
-			let n: usize = info.gateway.render(&mut tmp);
-			print(&tmp[..n]);
-			print(b"\n");
-			if !info.neighbors.is_empty() {
-				print(b"neighbors:\n");
-				for ngh in &info.neighbors {
-					print(b"  ");
-					let n: usize = ngh.addr.render(&mut tmp);
-					print(&tmp[..n]);
-					print(b"  ");
-					let n: usize = write_mac(&ngh.mac, &mut tmp);
-					print(&tmp[..n]);
-					print(b"\n");
-				}
+	let info = match client.info() {
+		Some(Ok(info)) => info,
+		Some(Err(_)) => return eprint(b"ip: network error\n"),
+		None => return eprint(b"ip: service unavailable\n"),
+	};
+	// Wide enough for the longest address there is, its prefix length and its scope.
+	let mut tmp: [u8; 96] = [0u8; 96];
+
+	print(info.name.as_bytes());
+	print(b" (if");
+	emit_dec(u64::from(info.scope.index), &mut tmp);
+	print(b".");
+	emit_dec(info.scope.generation, &mut tmp);
+	print(b"): mac ");
+	let n: usize = info.mac.render(&mut tmp);
+	print(&tmp[..n]);
+	print(b"  mtu ");
+	emit_dec(u64::from(info.mtu), &mut tmp);
+	print(b"\n");
+
+	for address in &info.addresses {
+		print(b"  address ");
+		let n: usize = address.addr.render(&mut tmp);
+		print(&tmp[..n]);
+		print(b"/");
+		emit_dec(u64::from(address.prefix_len), &mut tmp);
+		print(b" ");
+		print(match address.state {
+			AddressState::Tentative => b"tentative".as_slice(),
+			AddressState::Preferred => b"preferred".as_slice(),
+			AddressState::Deprecated => b"deprecated".as_slice(),
+			AddressState::Invalid => b"invalid".as_slice(),
+		});
+		print(b"\n");
+	}
+	for route in &info.routes {
+		print(b"  route ");
+		let n: usize = route.destination.render(&mut tmp);
+		print(&tmp[..n]);
+		print(b"/");
+		emit_dec(u64::from(route.prefix_len), &mut tmp);
+		match &route.hop {
+			// A DIRECT ROUTE HAS NO NEXT HOP AND SAYS SO. Printing an all-zeros address here is how
+			// a reader comes to believe there is a router at `::`.
+			NextHop::Direct => print(b" direct"),
+			NextHop::Via(addr) => {
+				print(b" via ");
+				let n: usize = addr.render(&mut tmp);
+				print(&tmp[..n]);
 			}
 		}
-		Some(Err(_)) => eprint(b"ip: network error\n"),
-		None => eprint(b"ip: service unavailable\n"),
+		print(b"\n");
 	}
+	for router in &info.routers {
+		print(b"  router ");
+		let n: usize = router.addr.render(&mut tmp);
+		print(&tmp[..n]);
+		print(b" ");
+		print(preference(&router.preference));
+		print(b" ");
+		print(reachability(&router.state));
+		print(b"\n");
+	}
+	for server in &info.dns {
+		print(b"  dns ");
+		let n: usize = server.addr.render(&mut tmp);
+		print(&tmp[..n]);
+		print(b"\n");
+	}
+	for ngh in &info.neighbors {
+		print(b"  neighbor ");
+		let n: usize = ngh.addr.render(&mut tmp);
+		print(&tmp[..n]);
+		print(b" at ");
+		let n: usize = ngh.mac.render(&mut tmp);
+		print(&tmp[..n]);
+		print(b"\n");
+	}
+}
+
+fn preference(value: &RoutePreference) -> &'static [u8] {
+	match value {
+		RoutePreference::Low => b"low",
+		RoutePreference::Medium => b"medium",
+		RoutePreference::High => b"high",
+	}
+}
+
+fn reachability(value: &Reachability) -> &'static [u8] {
+	match value {
+		Reachability::Incomplete => b"incomplete",
+		Reachability::Reachable => b"reachable",
+		Reachability::Stale => b"stale",
+		Reachability::Delay => b"delay",
+		Reachability::Probe => b"probe",
+		Reachability::Unreachable => b"unreachable",
+	}
+}
+
+fn emit_dec(value: u64, out: &mut [u8]) {
+	let n: usize = write_dec(value, out);
+	print(&out[..n]);
 }
 
 // Render a decimal number into `out`, returning the rendered length.

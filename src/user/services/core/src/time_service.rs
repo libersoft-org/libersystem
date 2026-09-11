@@ -98,11 +98,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // failure (no DNS, no route, no reply) leaves the RTC-seeded offset in place.
 fn discipline_sntp(netsvc: u64, time: &mut Time) {
 	let mut net = network::Client::new(ChannelTransport { chan: netsvc });
-	let server = match net.resolve(NTP_SERVER) {
-		Some(Ok(ip)) => ip,
-		_ => return,
+	// THE FIRST CANDIDATE, and only the first: this is one best-effort query against one server, and
+	// walking a name's whole address list to set a clock would turn a background refinement into a
+	// sequence of timeouts.
+	let Some(Ok(addresses)) = net.resolve(NTP_SERVER) else {
+		return;
 	};
-	if let Some(Ok(unix)) = net.sntp(&server) {
+	let Some(server) = addresses.into_iter().next() else {
+		return;
+	};
+	if let Some(Ok(unix)) = net.sntp(&proto::system::ScopedAddress::global(server)) {
 		time.set_now(unix);
 	}
 }

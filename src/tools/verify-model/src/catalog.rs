@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 99] = [
+const GATES: [(&str, &str); 100] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -316,6 +316,11 @@ const GATES: [(&str, &str); 99] = [
 	// consumer crates, so it belongs to the harness and every change selects it. The boot gates'
 	// subject is the kernel's admission decision and the loader's hand-off, so a kernel change
 	// selects them - and they boot guests, x86_64 under KVM and the two ports emulated.
+	// The IPv6 layer against a controllable peer. Its subject is the network service and the pure
+	// layer under it, so a userspace change selects it; it boots three guests, each with a scripted
+	// far end of the wire, which is the only way that layer's behaviour is an oracle rather than an
+	// assertion about a code path.
+	("ipv6-peer", "userspace.build"),
 	("dma-mode-carrier", "harness.tools"),
 	("dma-mode-x86_64", "kernel"),
 	// The ports umbrella and its two rows, exactly as `qemu-arch-profiles` and its profiles: the

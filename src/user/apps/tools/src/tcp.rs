@@ -16,7 +16,7 @@ extern crate alloc;
 
 use network_client::{NetworkClient, SocketClient};
 use proto::codec::Buffer;
-use proto::system::{Endpoint, Error, Ipv4Addr, LaunchContext, socket};
+use proto::system::{Error, LaunchContext, OpenTarget, socket};
 use rt::*;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -71,13 +71,7 @@ fn connect(netsvc: u64, args: &[u8]) {
 			}
 		};
 		let host: &[u8] = trim(&args[..sp]);
-		let addr: Ipv4Addr = match Ipv4Addr::parse(host) {
-			Some(a) => a,
-			None => {
-				eprint(b"tcp: invalid address\n");
-				return;
-			}
-		};
+
 		let port: u16 = match parse_port(trim(&args[sp + 1..])) {
 			Some(p) => p,
 			None => {
@@ -87,8 +81,15 @@ fn connect(netsvc: u64, args: &[u8]) {
 		};
 		// connect() returns the socket as a capability (the channel it is served on).
 		let mut net = NetworkClient::new(netsvc);
-		let ep: Endpoint = Endpoint { addr, port };
-		let sockh: u64 = match net.connect(&ep) {
+		// A NAME OR AN ADDRESS, AND EVERY ADDRESS THE NAME HAS. The service owns the order and tries
+		// the candidates in it; handing over only the first would make this tool decide, badly, what
+		// happens when a host's first address is unreachable.
+		let Some(destinations) = tools::resolve_all(&mut net, host) else {
+			eprint(b"tcp: cannot resolve the host\n");
+			return;
+		};
+		let target: OpenTarget = OpenTarget { destinations, port, source: None };
+		let sockh: u64 = match net.connect(&target) {
 			Some(Ok(h)) => h,
 			Some(Err(Error::NotFound)) => {
 				eprint(b"tcp: unreachable (no route)\n");

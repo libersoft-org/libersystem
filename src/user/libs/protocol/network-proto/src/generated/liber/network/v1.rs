@@ -72,14 +72,34 @@ impl Ipv4Addr {
 	}
 }
 
-/// A transport endpoint: an IPv4 address and a port.
+/// A 128-bit IPv6 address as sixteen octets.
+///
+/// FIXED AND POSITIONAL, LIKE ITS IPv4 COUNTERPART, and deliberately not `list<u8>` with a bound of
+/// sixteen. A bound says "at most", so a bounded list admits a twelve-octet value that is not an
+/// address at all, and every consumer would then have to check a length the wire should never have
+/// been able to express. Sixteen fields cost sixteen bytes and make the malformed case
+/// unrepresentable.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Endpoint {
-	pub addr: Ipv4Addr,
-	pub port: u16,
+pub struct Ipv6Addr {
+	pub o0: u8,
+	pub o1: u8,
+	pub o2: u8,
+	pub o3: u8,
+	pub o4: u8,
+	pub o5: u8,
+	pub o6: u8,
+	pub o7: u8,
+	pub o8: u8,
+	pub o9: u8,
+	pub o10: u8,
+	pub o11: u8,
+	pub o12: u8,
+	pub o13: u8,
+	pub o14: u8,
+	pub o15: u8,
 }
 
-impl Endpoint {
+impl Ipv6Addr {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
@@ -99,15 +119,358 @@ impl Endpoint {
 		self.write(&mut w)?;
 		Some(w.into_message())
 	}
-	pub fn decode(bytes: &[u8]) -> Option<Endpoint> {
+	pub fn decode(bytes: &[u8]) -> Option<Ipv6Addr> {
 		let mut r = Reader::new(bytes);
-		let value = Endpoint::read(&mut r)?;
+		let value = Ipv6Addr::read(&mut r)?;
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Endpoint> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Ipv6Addr> {
 		let mut r = Reader::with_handles(bytes, handles);
-		let value = Endpoint::read(&mut r)?;
+		let value = Ipv6Addr::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.o0)?;
+		w.u8(self.o1)?;
+		w.u8(self.o2)?;
+		w.u8(self.o3)?;
+		w.u8(self.o4)?;
+		w.u8(self.o5)?;
+		w.u8(self.o6)?;
+		w.u8(self.o7)?;
+		w.u8(self.o8)?;
+		w.u8(self.o9)?;
+		w.u8(self.o10)?;
+		w.u8(self.o11)?;
+		w.u8(self.o12)?;
+		w.u8(self.o13)?;
+		w.u8(self.o14)?;
+		w.u8(self.o15)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<Ipv6Addr> {
+		let o0 = r.u8()?;
+		let o1 = r.u8()?;
+		let o2 = r.u8()?;
+		let o3 = r.u8()?;
+		let o4 = r.u8()?;
+		let o5 = r.u8()?;
+		let o6 = r.u8()?;
+		let o7 = r.u8()?;
+		let o8 = r.u8()?;
+		let o9 = r.u8()?;
+		let o10 = r.u8()?;
+		let o11 = r.u8()?;
+		let o12 = r.u8()?;
+		let o13 = r.u8()?;
+		let o14 = r.u8()?;
+		let o15 = r.u8()?;
+		Some(Ipv6Addr { o0, o1, o2, o3, o4, o5, o6, o7, o8, o9, o10, o11, o12, o13, o14, o15 })
+	}
+}
+
+/// A hardware address: six octets, fixed for the same reason `ipv6-addr` is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MacAddr {
+	pub a: u8,
+	pub b: u8,
+	pub c: u8,
+	pub d: u8,
+	pub e: u8,
+	pub f: u8,
+}
+
+impl MacAddr {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MacAddr> {
+		let mut r = Reader::new(bytes);
+		let value = MacAddr::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MacAddr> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MacAddr::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.a)?;
+		w.u8(self.b)?;
+		w.u8(self.c)?;
+		w.u8(self.d)?;
+		w.u8(self.e)?;
+		w.u8(self.f)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<MacAddr> {
+		let a = r.u8()?;
+		let b = r.u8()?;
+		let c = r.u8()?;
+		let d = r.u8()?;
+		let e = r.u8()?;
+		let f = r.u8()?;
+		Some(MacAddr { a, b, c, d, e, f })
+	}
+}
+
+/// An address of either family, with the family IN the value.
+///
+/// A CLOSED VARIANT AND NOT TWO OPTIONAL FIELDS. A record carrying `option<ipv4-addr>` beside
+/// `option<ipv6-addr>` can say "both" and can say "neither", and a consumer must then decide what
+/// those mean - which two consumers will decide differently. The tag that says which family it is IS
+/// the thing that carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IpAddress {
+	V4(Ipv4Addr),
+	V6(Ipv6Addr),
+}
+
+impl IpAddress {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<IpAddress> {
+		let mut r = Reader::new(bytes);
+		let value = IpAddress::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<IpAddress> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = IpAddress::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			IpAddress::V4(v0) => {
+				w.u8(0)?;
+				v0.write(w)?;
+			}
+			IpAddress::V6(v1) => {
+				w.u8(1)?;
+				v1.write(w)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<IpAddress> {
+		match r.u8()? {
+			0 => Some(IpAddress::V4(Ipv4Addr::read(r)?)),
+			1 => Some(IpAddress::V6(Ipv6Addr::read(r)?)),
+			_ => None,
+		}
+	}
+}
+
+/// Which interface a value belongs to, and WHICH GENERATION of it.
+///
+/// THE GENERATION IS WHY THIS IS NOT JUST AN INDEX. A link-local address means nothing without the
+/// link it is on, and an index alone silently follows the link when the NIC behind it is replaced -
+/// so a value scoped before the replacement would quietly name something else afterwards. A scoped
+/// value carrying the generation refuses instead, which is the only answer that is true.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterfaceId {
+	pub index: u32,
+	pub generation: u64,
+}
+
+impl InterfaceId {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<InterfaceId> {
+		let mut r = Reader::new(bytes);
+		let value = InterfaceId::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<InterfaceId> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = InterfaceId::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.index)?;
+		w.u64(self.generation)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<InterfaceId> {
+		let index = r.u32()?;
+		let generation = r.u64()?;
+		Some(InterfaceId { index, generation })
+	}
+}
+
+/// An address and, where the address class needs one, the interface that gives it meaning.
+///
+/// SCOPE IS REQUIRED WHERE IT IS LOAD-BEARING AND REFUSED WHERE IT IS NOT. A link-local address
+/// without an interface is not an address: `fe80::1` names a different host on each link. A global
+/// address with an interface is over-specified but harmless, and a scoped IPv4 address is neither -
+/// this milestone's single interface makes it redundant, so it is refused rather than ignored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopedAddress {
+	pub addr: IpAddress,
+	pub scope: Option<InterfaceId>,
+}
+
+impl ScopedAddress {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ScopedAddress> {
+		let mut r = Reader::new(bytes);
+		let value = ScopedAddress::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ScopedAddress> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ScopedAddress::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		match &self.scope {
+			Some(v2) => {
+				w.u8(1)?;
+				v2.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ScopedAddress> {
+		let addr = IpAddress::read(r)?;
+		let scope = if r.tag()? { Some(InterfaceId::read(r)?) } else { None };
+		Some(ScopedAddress { addr, scope })
+	}
+}
+
+/// A transport endpoint of either family.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopedEndpoint {
+	pub addr: ScopedAddress,
+	pub port: u16,
+}
+
+impl ScopedEndpoint {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ScopedEndpoint> {
+		let mut r = Reader::new(bytes);
+		let value = ScopedEndpoint::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ScopedEndpoint> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ScopedEndpoint::read(&mut r)?;
 		r.finish()?;
 		// The frame is good, so the capabilities it carried are the value's now. A
 		// refusal above leaves them in the caller's list, which is the half that closes.
@@ -119,18 +482,527 @@ impl Endpoint {
 		w.u16(self.port)?;
 		Some(())
 	}
-	pub fn read(r: &mut Reader) -> Option<Endpoint> {
-		let addr = Ipv4Addr::read(r)?;
+	pub fn read(r: &mut Reader) -> Option<ScopedEndpoint> {
+		let addr = ScopedAddress::read(r)?;
 		let port = r.u16()?;
-		Some(Endpoint { addr, port })
+		Some(ScopedEndpoint { addr, port })
 	}
 }
 
-/// A neighbor-cache entry: an on-link address and the MAC (6 bytes) it resolved to.
+/// What an address of this host's own may be used for.
+///
+/// The four states are RFC 4862's and are not collapsible: a TENTATIVE address is not yet this
+/// host's and must not be a source; a DEPRECATED one still receives but must not start new
+/// conversations; an INVALID one is kept only long enough to be reported as gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AddressState {
+	Tentative = 0,
+	Preferred = 1,
+	Deprecated = 2,
+	Invalid = 3,
+}
+
+impl AddressState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AddressState> {
+		let mut r = Reader::new(bytes);
+		let value = AddressState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AddressState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AddressState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<AddressState> {
+		match r.u8()? {
+			0 => Some(AddressState::Tentative),
+			1 => Some(AddressState::Preferred),
+			2 => Some(AddressState::Deprecated),
+			3 => Some(AddressState::Invalid),
+			_ => None,
+		}
+	}
+}
+
+/// One address this interface holds, with the prefix it came from and what is left of its lifetimes.
+///
+/// LIFETIMES ARE SECONDS REMAINING, and `4294967295` is INFINITY rather than a very large number -
+/// the value the protocols themselves use, so a value read off the wire needs no translation and an
+/// infinite lifetime cannot be mistaken for one that expires in 136 years.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterfaceAddress {
+	pub addr: IpAddress,
+	pub prefix_len: u8,
+	pub state: AddressState,
+	pub preferred_seconds: u32,
+	pub valid_seconds: u32,
+}
+
+impl InterfaceAddress {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<InterfaceAddress> {
+		let mut r = Reader::new(bytes);
+		let value = InterfaceAddress::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<InterfaceAddress> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = InterfaceAddress::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		w.u8(self.prefix_len)?;
+		self.state.write(w)?;
+		w.u32(self.preferred_seconds)?;
+		w.u32(self.valid_seconds)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<InterfaceAddress> {
+		let addr = IpAddress::read(r)?;
+		let prefix_len = r.u8()?;
+		let state = AddressState::read(r)?;
+		let preferred_seconds = r.u32()?;
+		let valid_seconds = r.u32()?;
+		Some(InterfaceAddress { addr, prefix_len, state, preferred_seconds, valid_seconds })
+	}
+}
+
+/// Where a route sends a packet.
+///
+/// TWO FORMS AND NOT ONE ADDRESS FIELD. An on-link prefix route has no next hop: the packet's
+/// destination IS its own next hop, and neighbour resolution runs against it. A mandatory address
+/// field would force either a fabricated address or an all-zeros sentinel into a public contract,
+/// and a sentinel whose meaning is not written down is how two consumers come to disagree.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NextHop {
+	/// On-link: the destination is reached directly.
+	Direct,
+	/// Through a router, whose address must be a unicast address on the same interface - a router's
+	/// link-local in every case this host produces. The unspecified and multicast forms are refused
+	/// here rather than at use.
+	Via(IpAddress),
+}
+
+impl NextHop {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<NextHop> {
+		let mut r = Reader::new(bytes);
+		let value = NextHop::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<NextHop> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = NextHop::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			NextHop::Direct => {
+				w.u8(0)?;
+			}
+			NextHop::Via(v3) => {
+				w.u8(1)?;
+				v3.write(w)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<NextHop> {
+		match r.u8()? {
+			0 => Some(NextHop::Direct),
+			1 => Some(NextHop::Via(IpAddress::read(r)?)),
+			_ => None,
+		}
+	}
+}
+
+/// A router's advertised preference, RFC 4191's three usable values. The reserved fourth bit
+/// pattern reads as `medium`, which is what the standard requires of a receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RoutePreference {
+	Low = 0,
+	Medium = 1,
+	High = 2,
+}
+
+impl RoutePreference {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<RoutePreference> {
+		let mut r = Reader::new(bytes);
+		let value = RoutePreference::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<RoutePreference> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = RoutePreference::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<RoutePreference> {
+		match r.u8()? {
+			0 => Some(RoutePreference::Low),
+			1 => Some(RoutePreference::Medium),
+			2 => Some(RoutePreference::High),
+			_ => None,
+		}
+	}
+}
+
+/// A neighbour's reachability, RFC 4861's five states plus the terminal one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Reachability {
+	Incomplete = 0,
+	Reachable = 1,
+	Stale = 2,
+	Delay = 3,
+	Probe = 4,
+	Unreachable = 5,
+}
+
+impl Reachability {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<Reachability> {
+		let mut r = Reader::new(bytes);
+		let value = Reachability::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Reachability> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = Reachability::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<Reachability> {
+		match r.u8()? {
+			0 => Some(Reachability::Incomplete),
+			1 => Some(Reachability::Reachable),
+			2 => Some(Reachability::Stale),
+			3 => Some(Reachability::Delay),
+			4 => Some(Reachability::Probe),
+			5 => Some(Reachability::Unreachable),
+			_ => None,
+		}
+	}
+}
+
+/// One route: what it covers, on which interface, how it is reached, and for how long.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteEntry {
+	pub destination: IpAddress,
+	pub prefix_len: u8,
+	pub scope: InterfaceId,
+	pub preference: RoutePreference,
+	pub lifetime_seconds: u32,
+	pub hop: NextHop,
+}
+
+impl RouteEntry {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<RouteEntry> {
+		let mut r = Reader::new(bytes);
+		let value = RouteEntry::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<RouteEntry> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = RouteEntry::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.destination.write(w)?;
+		w.u8(self.prefix_len)?;
+		self.scope.write(w)?;
+		self.preference.write(w)?;
+		w.u32(self.lifetime_seconds)?;
+		self.hop.write(w)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<RouteEntry> {
+		let destination = IpAddress::read(r)?;
+		let prefix_len = r.u8()?;
+		let scope = InterfaceId::read(r)?;
+		let preference = RoutePreference::read(r)?;
+		let lifetime_seconds = r.u32()?;
+		let hop = NextHop::read(r)?;
+		Some(RouteEntry { destination, prefix_len, scope, preference, lifetime_seconds, hop })
+	}
+}
+
+/// One default router, with the two keys that order it and what is left of its lifetime.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouterEntry {
+	pub addr: IpAddress,
+	pub scope: InterfaceId,
+	pub preference: RoutePreference,
+	pub state: Reachability,
+	pub lifetime_seconds: u32,
+}
+
+impl RouterEntry {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<RouterEntry> {
+		let mut r = Reader::new(bytes);
+		let value = RouterEntry::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<RouterEntry> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = RouterEntry::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		self.scope.write(w)?;
+		self.preference.write(w)?;
+		self.state.write(w)?;
+		w.u32(self.lifetime_seconds)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<RouterEntry> {
+		let addr = IpAddress::read(r)?;
+		let scope = InterfaceId::read(r)?;
+		let preference = RoutePreference::read(r)?;
+		let state = Reachability::read(r)?;
+		let lifetime_seconds = r.u32()?;
+		Some(RouterEntry { addr, scope, preference, state, lifetime_seconds })
+	}
+}
+
+/// One recursive DNS server, and the interface that learned it - which is what makes an
+/// interface-qualified server expressible at all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DnsServer {
+	pub addr: IpAddress,
+	pub scope: InterfaceId,
+}
+
+impl DnsServer {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<DnsServer> {
+		let mut r = Reader::new(bytes);
+		let value = DnsServer::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<DnsServer> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = DnsServer::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.addr.write(w)?;
+		self.scope.write(w)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<DnsServer> {
+		let addr = IpAddress::read(r)?;
+		let scope = InterfaceId::read(r)?;
+		Some(DnsServer { addr, scope })
+	}
+}
+
+/// A neighbour-cache entry: an on-link address of either family, the hardware address it resolved
+/// to, and the interface it belongs to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Neighbor {
-	pub addr: Ipv4Addr,
-	pub mac: Vec<u8>,
+	pub addr: IpAddress,
+	pub mac: MacAddr,
+	pub scope: InterfaceId,
 }
 
 impl Neighbor {
@@ -170,39 +1042,42 @@ impl Neighbor {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.addr.write(w)?;
-		if self.mac.len() > u16::MAX as usize {
-			return None;
-		}
-		w.u16(self.mac.len() as u16)?;
-		for v0 in self.mac.iter() {
-			w.u8(*v0)?;
-		}
+		self.mac.write(w)?;
+		self.scope.write(w)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Neighbor> {
-		let addr = Ipv4Addr::read(r)?;
-		let mac = {
-			let v1 = r.u16()? as usize;
-			let mut v2 = Vec::new();
-			v2.try_reserve_exact(v1).ok()?;
-			for _ in 0..v1 {
-				v2.push(r.u8()?);
-			}
-			v2
-		};
-		Some(Neighbor { addr, mac })
+		let addr = IpAddress::read(r)?;
+		let mac = MacAddr::read(r)?;
+		let scope = InterfaceId::read(r)?;
+		Some(Neighbor { addr, mac, scope })
 	}
 }
 
-/// The interface's L3 state: our address, our MAC (6 bytes), the interface MTU,
-/// the gateway, and the neighbor cache - the typed form of what the `ip` / `net`
-/// command renders.
+/// The interface's L3 state: its identity and name, its hardware address and MTU, every address it
+/// holds, every route, router and recursive server it knows, and its neighbour cache - the typed
+/// form of what the `ip` / `net` command renders.
+///
+/// THE BOUNDS ARE A COMBINED DUAL-STACK SNAPSHOT of this milestone's single interface: each one adds
+/// the IPv4 values the stack already holds to the IPv6 maxima. Copying only the IPv6 maxima would
+/// overflow exactly when both families are full, which is the case worth reporting.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetInfo {
-	pub addr: Ipv4Addr,
-	pub mac: Vec<u8>,
+	pub scope: InterfaceId,
+	pub name: String,
+	pub mac: MacAddr,
 	pub mtu: u16,
-	pub gateway: Ipv4Addr,
+	/// 16 IPv6 addresses plus the current IPv4 address.
+	pub addresses: Vec<InterfaceAddress>,
+	/// 32 IPv6 routes plus the IPv4 on-link and default routes.
+	pub routes: Vec<RouteEntry>,
+	/// 8 IPv6 default routers plus the IPv4 gateway.
+	pub routers: Vec<RouterEntry>,
+	/// 4 RDNSS records plus the current IPv4 server.
+	pub dns: Vec<DnsServer>,
+	/// The default 1024-entry ARP cache plus all 64 IPv6 neighbours. A populated count above this
+	/// is a typed overflow rather than a truncated view: `net.arp-cache` stays configurable, and a
+	/// report that quietly dropped rows would be worse than one that says it cannot be made.
 	pub neighbors: Vec<Neighbor>,
 }
 
@@ -242,48 +1117,106 @@ impl NetInfo {
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
-		self.addr.write(w)?;
-		if self.mac.len() > u16::MAX as usize {
+		self.scope.write(w)?;
+		w.bytes_lp(self.name.as_bytes())?;
+		self.mac.write(w)?;
+		w.u16(self.mtu)?;
+		if self.addresses.len() > u16::MAX as usize {
 			return None;
 		}
-		w.u16(self.mac.len() as u16)?;
-		for v3 in self.mac.iter() {
-			w.u8(*v3)?;
+		w.u16(self.addresses.len() as u16)?;
+		for v4 in self.addresses.iter() {
+			v4.write(w)?;
 		}
-		w.u16(self.mtu)?;
-		self.gateway.write(w)?;
+		if self.routes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.routes.len() as u16)?;
+		for v5 in self.routes.iter() {
+			v5.write(w)?;
+		}
+		if self.routers.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.routers.len() as u16)?;
+		for v6 in self.routers.iter() {
+			v6.write(w)?;
+		}
+		if self.dns.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.dns.len() as u16)?;
+		for v7 in self.dns.iter() {
+			v7.write(w)?;
+		}
 		if self.neighbors.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.neighbors.len() as u16)?;
-		for v4 in self.neighbors.iter() {
-			v4.write(w)?;
+		for v8 in self.neighbors.iter() {
+			v8.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<NetInfo> {
-		let addr = Ipv4Addr::read(r)?;
-		let mac = {
-			let v5 = r.u16()? as usize;
-			let mut v6 = Vec::new();
-			v6.try_reserve_exact(v5).ok()?;
-			for _ in 0..v5 {
-				v6.push(r.u8()?);
-			}
-			v6
+		let scope = InterfaceId::read(r)?;
+		let name = {
+			let v9 = r.string_lp()?;
+			(v9.len() <= 16).then_some(v9)?
 		};
+		let mac = MacAddr::read(r)?;
 		let mtu = r.u16()?;
-		let gateway = Ipv4Addr::read(r)?;
-		let neighbors = {
-			let v7 = r.u16()? as usize;
-			let mut v8 = Vec::new();
-			v8.try_reserve_exact(v7).ok()?;
-			for _ in 0..v7 {
-				v8.push(Neighbor::read(r)?);
+		let addresses = {
+			let v10 = r.u16()? as usize;
+			let v10 = (v10 <= 17).then_some(v10)?;
+			let mut v11 = Vec::new();
+			v11.try_reserve_exact(v10).ok()?;
+			for _ in 0..v10 {
+				v11.push(InterfaceAddress::read(r)?);
 			}
-			v8
+			v11
 		};
-		Some(NetInfo { addr, mac, mtu, gateway, neighbors })
+		let routes = {
+			let v12 = r.u16()? as usize;
+			let v12 = (v12 <= 34).then_some(v12)?;
+			let mut v13 = Vec::new();
+			v13.try_reserve_exact(v12).ok()?;
+			for _ in 0..v12 {
+				v13.push(RouteEntry::read(r)?);
+			}
+			v13
+		};
+		let routers = {
+			let v14 = r.u16()? as usize;
+			let v14 = (v14 <= 9).then_some(v14)?;
+			let mut v15 = Vec::new();
+			v15.try_reserve_exact(v14).ok()?;
+			for _ in 0..v14 {
+				v15.push(RouterEntry::read(r)?);
+			}
+			v15
+		};
+		let dns = {
+			let v16 = r.u16()? as usize;
+			let v16 = (v16 <= 5).then_some(v16)?;
+			let mut v17 = Vec::new();
+			v17.try_reserve_exact(v16).ok()?;
+			for _ in 0..v16 {
+				v17.push(DnsServer::read(r)?);
+			}
+			v17
+		};
+		let neighbors = {
+			let v18 = r.u16()? as usize;
+			let v18 = (v18 <= 1088).then_some(v18)?;
+			let mut v19 = Vec::new();
+			v19.try_reserve_exact(v18).ok()?;
+			for _ in 0..v18 {
+				v19.push(Neighbor::read(r)?);
+			}
+			v19
+		};
+		Some(NetInfo { scope, name, mac, mtu, addresses, routes, routers, dns, neighbors })
 	}
 }
 
@@ -351,7 +1284,7 @@ impl NetCapacity {
 }
 
 /// The outcome of a ping: a reply arrived, it timed out, or the target was
-/// unreachable (no route / no ARP).
+/// unreachable (no route / no neighbour).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PingStatus {
@@ -408,7 +1341,7 @@ impl PingStatus {
 	}
 }
 
-/// The result of one ping echo: the outcome, the reply packet's IP TTL, and the
+/// The result of one ping echo: the outcome, the reply packet's IP TTL or IPv6 hop limit, and the
 /// measured round-trip time in microseconds. `ttl` and `rtt-us` are meaningful only
 /// when `status` is `reply` (zero otherwise).
 #[derive(Clone, Debug, PartialEq)]
@@ -471,8 +1404,8 @@ impl PingReply {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HopStatus {
-	/// A router discarded the datagram because its TTL ran out, and reported itself. This is the
-	/// ordinary answer for every hop before the destination.
+	/// A router discarded the datagram because its TTL or hop limit ran out, and reported itself.
+	/// This is the ordinary answer for every hop before the destination.
 	TimeExceeded = 0,
 	/// The destination itself answered the echo: the trace has arrived.
 	Reply = 1,
@@ -539,7 +1472,7 @@ impl HopStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TraceHop {
 	pub status: HopStatus,
-	pub addr: Ipv4Addr,
+	pub addr: IpAddress,
 	pub rtt_us: u32,
 }
 
@@ -586,16 +1519,109 @@ impl TraceHop {
 	}
 	pub fn read(r: &mut Reader) -> Option<TraceHop> {
 		let status = HopStatus::read(r)?;
-		let addr = Ipv4Addr::read(r)?;
+		let addr = IpAddress::read(r)?;
 		let rtt_us = r.u32()?;
 		Some(TraceHop { status, addr, rtt_us })
 	}
 }
 
-/// A one-shot TCP exchange: connect to `ep`, send `request`, and read the response.
+/// Where to open a connection to, shared by `connect` and `fetch`.
+///
+/// A LIST, BECAUSE A NAME RESOLVES TO SEVERAL ADDRESSES AND THE SERVICE OWNS THE ORDER. A literal is
+/// a singleton; a resolved name supplies what `resolve` returned, already ordered. The service tries
+/// them in order, sequentially - a caller's RPC deadline is not a fallback mechanism and neither is a
+/// second concurrent request. An empty list, a list over the bound or a malformed scope is refused
+/// before any open is admitted; caller input is never truncated to fit, and duplicate scoped
+/// addresses collapse to their first occurrence.
+///
+/// `source` is the caller's OPTIONAL choice of source address. Absent means "select for me", which
+/// is every ordinary call. A source that is not a usable candidate for a destination fails THAT
+/// destination - another may be tried with the same source - and a source that becomes invalid fails
+/// the whole open. Naming one and quietly getting another is the failure this field exists to
+/// prevent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenTarget {
+	pub destinations: Vec<ScopedAddress>,
+	pub port: u16,
+	pub source: Option<ScopedAddress>,
+}
+
+impl OpenTarget {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<OpenTarget> {
+		let mut r = Reader::new(bytes);
+		let value = OpenTarget::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<OpenTarget> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = OpenTarget::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		if self.destinations.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.destinations.len() as u16)?;
+		for v20 in self.destinations.iter() {
+			v20.write(w)?;
+		}
+		w.u16(self.port)?;
+		match &self.source {
+			Some(v21) => {
+				w.u8(1)?;
+				v21.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<OpenTarget> {
+		let destinations = {
+			let v22 = r.u16()? as usize;
+			let v22 = (v22 <= 8).then_some(v22)?;
+			let mut v23 = Vec::new();
+			v23.try_reserve_exact(v22).ok()?;
+			for _ in 0..v22 {
+				v23.push(ScopedAddress::read(r)?);
+			}
+			v23
+		};
+		let port = r.u16()?;
+		let source = if r.tag()? { Some(ScopedAddress::read(r)?) } else { None };
+		Some(OpenTarget { destinations, port, source })
+	}
+}
+
+/// A one-shot TCP exchange: open to `target`, send `request`, and read the response as a stream.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TcpRequest {
-	pub ep: Endpoint,
+	pub target: OpenTarget,
 	pub request: Vec<u8>,
 }
 
@@ -635,28 +1661,362 @@ impl TcpRequest {
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
-		self.ep.write(w)?;
+		self.target.write(w)?;
 		if self.request.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.request.len() as u16)?;
-		for v9 in self.request.iter() {
-			w.u8(*v9)?;
+		for v24 in self.request.iter() {
+			w.u8(*v24)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<TcpRequest> {
-		let ep = Endpoint::read(r)?;
+		let target = OpenTarget::read(r)?;
 		let request = {
-			let v10 = r.u16()? as usize;
-			let mut v11 = Vec::new();
-			v11.try_reserve_exact(v10).ok()?;
-			for _ in 0..v10 {
-				v11.push(r.u8()?);
+			let v25 = r.u16()? as usize;
+			let v25 = (v25 <= 1024).then_some(v25)?;
+			let mut v26 = Vec::new();
+			v26.try_reserve_exact(v25).ok()?;
+			for _ in 0..v25 {
+				v26.push(r.u8()?);
 			}
-			v11
+			v26
 		};
-		Some(TcpRequest { ep, request })
+		Some(TcpRequest { target, request })
+	}
+}
+
+/// How a fetch ended. A caller that cannot tell these apart cannot know whether it holds the whole
+/// resource, which is why the stream carries the answer rather than leaving it to be inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FetchOutcome {
+	/// Orderly TCP end of stream, after at most the cumulative body cap.
+	Complete = 0,
+	/// An in-order response byte beyond the cumulative cap was observed. That byte proves truncation
+	/// and is never delivered.
+	Truncated = 1,
+	/// A reset, a receive timeout or another transport failure before either terminal above. Never
+	/// inferred completion.
+	Failed = 2,
+}
+
+impl FetchOutcome {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FetchOutcome> {
+		let mut r = Reader::new(bytes);
+		let value = FetchOutcome::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FetchOutcome> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FetchOutcome::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<FetchOutcome> {
+		match r.u8()? {
+			0 => Some(FetchOutcome::Complete),
+			1 => Some(FetchOutcome::Truncated),
+			2 => Some(FetchOutcome::Failed),
+			_ => None,
+		}
+	}
+}
+
+/// One chunk of a fetch response. The final element carries the outcome; every earlier one carries
+/// body bytes and no outcome.
+///
+/// Reaching the cumulative cap does not by itself end the stream: a body of exactly the cap followed
+/// by an orderly end is COMPLETE, and truncation requires evidence of a further byte.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetchChunk {
+	pub data: Vec<u8>,
+	pub outcome: Option<FetchOutcome>,
+}
+
+impl FetchChunk {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FetchChunk> {
+		let mut r = Reader::new(bytes);
+		let value = FetchChunk::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FetchChunk> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FetchChunk::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		if self.data.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.data.len() as u16)?;
+		for v27 in self.data.iter() {
+			w.u8(*v27)?;
+		}
+		match &self.outcome {
+			Some(v28) => {
+				w.u8(1)?;
+				v28.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<FetchChunk> {
+		let data = {
+			let v29 = r.u16()? as usize;
+			let v29 = (v29 <= 4096).then_some(v29)?;
+			let mut v30 = Vec::new();
+			v30.try_reserve_exact(v29).ok()?;
+			for _ in 0..v29 {
+				v30.push(r.u8()?);
+			}
+			v30
+		};
+		let outcome = if r.tag()? { Some(FetchOutcome::read(r)?) } else { None };
+		Some(FetchChunk { data, outcome })
+	}
+}
+
+/// Which address families a listener binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BindMode {
+	Ipv4Only = 0,
+	Ipv6Only = 1,
+	/// Both families at once, and only ever on the unspecified IPv6 address.
+	DualStack = 2,
+}
+
+impl BindMode {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BindMode> {
+		let mut r = Reader::new(bytes);
+		let value = BindMode::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BindMode> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BindMode::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<BindMode> {
+		match r.u8()? {
+			0 => Some(BindMode::Ipv4Only),
+			1 => Some(BindMode::Ipv6Only),
+			2 => Some(BindMode::DualStack),
+			_ => None,
+		}
+	}
+}
+
+/// A request to listen: the families, where, and how deep the accept queue is.
+///
+/// WHICH ENDPOINTS ARE LEGAL WITH WHICH MODE:
+///
+///   ipv4-only    `0.0.0.0` binds every IPv4 address; a specific IPv4 address binds that one
+///   ipv6-only    `::` binds every IPv6 address; a specific IPv6 address binds that one
+///   dual-stack   `::` and NOTHING else
+///
+/// THE WILDCARD IS THE UNSPECIFIED ADDRESS AND NOT AN ABSENT ONE. An optional endpoint would be a
+/// second way to say the same thing and a first way to say something undefined; the unspecified
+/// address is what these protocols already mean by "any", and it makes "is this a wildcard" one
+/// comparison rather than a convention. A dual-stack bind naming a specific address is refused, so
+/// is an address whose family disagrees with a single-family mode, and so is an IPv4-mapped IPv6
+/// address in every mode.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListenRequest {
+	pub mode: BindMode,
+	pub local: ScopedEndpoint,
+	pub backlog: u16,
+}
+
+impl ListenRequest {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ListenRequest> {
+		let mut r = Reader::new(bytes);
+		let value = ListenRequest::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ListenRequest> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ListenRequest::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.mode.write(w)?;
+		self.local.write(w)?;
+		w.u16(self.backlog)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ListenRequest> {
+		let mode = BindMode::read(r)?;
+		let local = ScopedEndpoint::read(r)?;
+		let backlog = r.u16()?;
+		Some(ListenRequest { mode, local, backlog })
+	}
+}
+
+/// A listener and the backlog it actually got, which is not always the one that was asked for.
+///
+/// The handle travels out of band as a capability, beside inline metadata, exactly as
+/// `process.start-result` does; an error publishes neither a listener nor a handle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListenResult {
+	pub listener: u64,
+	pub backlog: u16,
+}
+
+impl ListenResult {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ListenResult> {
+		let mut r = Reader::new(bytes);
+		let value = ListenResult::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ListenResult> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ListenResult::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.set_handle(self.listener)?;
+		w.u32(0)?;
+		w.u16(self.backlog)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ListenResult> {
+		let listener = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
+		let backlog = r.u16()?;
+		Some(ListenResult { listener, backlog })
 	}
 }
 
@@ -723,13 +2083,13 @@ impl SockState {
 	}
 }
 
-/// A live socket in the NetworkService table: its local port, the remote endpoint it
-/// talks to (zeros for a listening socket), and its TCP state - the typed form of one
-/// row `ss` lists.
+/// A live socket in the NetworkService table: both of its endpoints and its TCP state, which is what
+/// lets `ss` report what a socket IS rather than only that it exists. A listening socket's remote
+/// endpoint is the unspecified address of its own family on port zero.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SockInfo {
-	pub local_port: u16,
-	pub remote: Endpoint,
+	pub local: ScopedEndpoint,
+	pub remote: ScopedEndpoint,
 	pub state: SockState,
 }
 
@@ -769,16 +2129,77 @@ impl SockInfo {
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
-		w.u16(self.local_port)?;
+		self.local.write(w)?;
 		self.remote.write(w)?;
 		self.state.write(w)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<SockInfo> {
-		let local_port = r.u16()?;
-		let remote = Endpoint::read(r)?;
+		let local = ScopedEndpoint::read(r)?;
+		let remote = ScopedEndpoint::read(r)?;
 		let state = SockState::read(r)?;
-		Some(SockInfo { local_port, remote, state })
+		Some(SockInfo { local, remote, state })
+	}
+}
+
+/// An accepted connection: the socket capability and both endpoints it runs between.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AcceptResult {
+	pub socket: u64,
+	pub local: ScopedEndpoint,
+	pub remote: ScopedEndpoint,
+}
+
+impl AcceptResult {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<AcceptResult> {
+		let mut r = Reader::new(bytes);
+		let value = AcceptResult::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AcceptResult> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = AcceptResult::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.set_handle(self.socket)?;
+		w.u32(0)?;
+		self.local.write(w)?;
+		self.remote.write(w)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<AcceptResult> {
+		let socket = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
+		let local = ScopedEndpoint::read(r)?;
+		let remote = ScopedEndpoint::read(r)?;
+		Some(AcceptResult { socket, local, remote })
 	}
 }
 
@@ -809,17 +2230,29 @@ pub mod network {
 
 	pub trait Service {
 		fn info(&mut self) -> Result<NetInfo, Error>;
-		fn resolve(&mut self, name: String) -> Result<Ipv4Addr, Error>;
-		fn ping(&mut self, addr: Ipv4Addr) -> Result<PingReply, Error>;
-		fn fetch(&mut self, req: TcpRequest) -> Result<Vec<u8>, Error>;
-		fn connect(&mut self, ep: Endpoint) -> Result<u64, Error>;
+		/// Resolve a name to an ORDERED list of addresses of either family, at most eight.
+		///
+		/// A NAME WITH MORE THAN EIGHT ADDRESSES IS NOT AN ERROR. The list is already ordered by the
+		/// selection rules, so the eight kept are the eight that would have been tried first; refusing
+		/// the name instead would make a well-provisioned service unreachable.
+		fn resolve(&mut self, name: String) -> Result<Vec<IpAddress>, Error>;
+		fn ping(&mut self, addr: ScopedAddress) -> Result<PingReply, Error>;
+		/// Open to one of `req`'s destinations, send its request bytes, and stream the response.
+		///
+		/// THE OPEN IS GUARDED AND THE BODY IS A STREAM. A refusal before any body exists - an
+		/// unresolvable name, a spent budget, a refused connection - is the typed error every other
+		/// operation here uses, and not a zero-length stream a caller has to interpret. Only the opening
+		/// phase may try another destination: once a handshake succeeds the request is never replayed
+		/// elsewhere.
+		fn fetch(&mut self, req: TcpRequest) -> Result<Vec<FetchChunk>, Error>;
+		fn connect(&mut self, target: OpenTarget) -> Result<u64, Error>;
 		fn open(&mut self) -> Result<u64, Error>;
-		fn listen(&mut self, port: u16) -> Result<u64, Error>;
+		fn listen(&mut self, req: ListenRequest) -> Result<ListenResult, Error>;
 		fn sockets(&mut self) -> Result<Vec<SockInfo>, Error>;
-		fn sntp(&mut self, server: Ipv4Addr) -> Result<u64, Error>;
+		fn sntp(&mut self, server: ScopedAddress) -> Result<u64, Error>;
 		fn capacity(&mut self) -> Result<NetCapacity, Error>;
-		/// One traceroute probe: send an echo to `addr` with the IP TTL set to `ttl` and report what
-		/// answered.
+		/// One traceroute probe: send an echo to `addr` with the IP TTL or IPv6 hop limit set to `ttl`
+		/// and report what answered.
 		///
 		/// THE TOOL NEVER TOUCHES THE NIC. A traceroute is conventionally a program with a raw socket,
 		/// which is ambient authority over every packet the machine sends and receives - to discover a
@@ -830,7 +2263,7 @@ pub mod network {
 		/// answered (`time-exceeded`), the destination itself answered (`reply`, so the trace is over),
 		/// or nothing came back (`timeout`, a hop that does not report itself) - and `unreachable`,
 		/// which is an answer saying the path is refused rather than silence saying nothing about it.
-		fn probe(&mut self, addr: Ipv4Addr, ttl: u8) -> Result<TraceHop, Error>;
+		fn probe(&mut self, addr: ScopedAddress, ttl: u8) -> Result<TraceHop, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -861,13 +2294,13 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v12) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							v12.write(w)?;
+							v31.write(w)?;
 						}
-						Err(v13) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v13.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -890,7 +2323,10 @@ pub mod network {
 				}
 			}
 			OP_RESOLVE => {
-				let name = r.string_lp()?;
+				let name = {
+					let v33 = r.string_lp()?;
+					(v33.len() <= 253).then_some(v33)?
+				};
 				r.finish()?;
 				request_handles.clear();
 				let result = service.resolve(name);
@@ -898,13 +2334,19 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v14) => {
+						Ok(v34) => {
 							w.u8(1)?;
-							v14.write(w)?;
+							if v34.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v34.len() as u16)?;
+							for v36 in v34.iter() {
+								v36.write(w)?;
+							}
 						}
-						Err(v15) => {
+						Err(v35) => {
 							w.u8(0)?;
-							v15.write(w)?;
+							v35.write(w)?;
 						}
 					}
 					Some(())
@@ -927,7 +2369,7 @@ pub mod network {
 				}
 			}
 			OP_PING => {
-				let addr = Ipv4Addr::read(r)?;
+				let addr = ScopedAddress::read(r)?;
 				r.finish()?;
 				request_handles.clear();
 				let result = service.ping(addr);
@@ -935,56 +2377,13 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v16) => {
+						Ok(v37) => {
 							w.u8(1)?;
-							v16.write(w)?;
+							v37.write(w)?;
 						}
-						Err(v17) => {
+						Err(v38) => {
 							w.u8(0)?;
-							v17.write(w)?;
-						}
-					}
-					Some(())
-				})();
-				if encoded.is_none() {
-					if writer.has_handle() {
-						match Handles::try_from_slice(writer.handles()) {
-							Some(taken) => *reply_handles = taken,
-							None => {}
-						}
-						return None;
-					}
-					// the reply outgrew the caller's buffer: replace it with a typed
-					// error, so the client sees a failure instead of hanging.
-					writer.reset();
-					let w = &mut writer;
-					w.u32(corr)?;
-					w.u8(0)?;
-					Error::Again.write(w)?;
-				}
-			}
-			OP_FETCH => {
-				let req = TcpRequest::read(r)?;
-				r.finish()?;
-				request_handles.clear();
-				let result = service.fetch(req);
-				let encoded: Option<()> = (|| {
-					let w = &mut writer;
-					w.u32(corr)?;
-					match &result {
-						Ok(v18) => {
-							w.u8(1)?;
-							if v18.len() > u16::MAX as usize {
-								return None;
-							}
-							w.u16(v18.len() as u16)?;
-							for v20 in v18.iter() {
-								w.u8(*v20)?;
-							}
-						}
-						Err(v19) => {
-							w.u8(0)?;
-							v19.write(w)?;
+							v38.write(w)?;
 						}
 					}
 					Some(())
@@ -1007,22 +2406,22 @@ pub mod network {
 				}
 			}
 			OP_CONNECT => {
-				let ep = Endpoint::read(r)?;
+				let target = OpenTarget::read(r)?;
 				r.finish()?;
 				request_handles.clear();
-				let result = service.connect(ep);
+				let result = service.connect(target);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v21) => {
+						Ok(v39) => {
 							w.u8(1)?;
-							w.set_handle(*v21)?;
+							w.set_handle(*v39)?;
 							w.u32(0)?;
 						}
-						Err(v22) => {
+						Err(v40) => {
 							w.u8(0)?;
-							v22.write(w)?;
+							v40.write(w)?;
 						}
 					}
 					Some(())
@@ -1052,14 +2451,14 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v23) => {
+						Ok(v41) => {
 							w.u8(1)?;
-							w.set_handle(*v23)?;
+							w.set_handle(*v41)?;
 							w.u32(0)?;
 						}
-						Err(v24) => {
+						Err(v42) => {
 							w.u8(0)?;
-							v24.write(w)?;
+							v42.write(w)?;
 						}
 					}
 					Some(())
@@ -1082,22 +2481,21 @@ pub mod network {
 				}
 			}
 			OP_LISTEN => {
-				let port = r.u16()?;
+				let req = ListenRequest::read(r)?;
 				r.finish()?;
 				request_handles.clear();
-				let result = service.listen(port);
+				let result = service.listen(req);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v25) => {
+						Ok(v43) => {
 							w.u8(1)?;
-							w.set_handle(*v25)?;
-							w.u32(0)?;
+							v43.write(w)?;
 						}
-						Err(v26) => {
+						Err(v44) => {
 							w.u8(0)?;
-							v26.write(w)?;
+							v44.write(w)?;
 						}
 					}
 					Some(())
@@ -1127,19 +2525,19 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v27) => {
+						Ok(v45) => {
 							w.u8(1)?;
-							if v27.len() > u16::MAX as usize {
+							if v45.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v27.len() as u16)?;
-							for v29 in v27.iter() {
-								v29.write(w)?;
+							w.u16(v45.len() as u16)?;
+							for v47 in v45.iter() {
+								v47.write(w)?;
 							}
 						}
-						Err(v28) => {
+						Err(v46) => {
 							w.u8(0)?;
-							v28.write(w)?;
+							v46.write(w)?;
 						}
 					}
 					Some(())
@@ -1162,7 +2560,7 @@ pub mod network {
 				}
 			}
 			OP_SNTP => {
-				let server = Ipv4Addr::read(r)?;
+				let server = ScopedAddress::read(r)?;
 				r.finish()?;
 				request_handles.clear();
 				let result = service.sntp(server);
@@ -1170,13 +2568,13 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v30) => {
+						Ok(v48) => {
 							w.u8(1)?;
-							w.u64(*v30)?;
+							w.u64(*v48)?;
 						}
-						Err(v31) => {
+						Err(v49) => {
 							w.u8(0)?;
-							v31.write(w)?;
+							v49.write(w)?;
 						}
 					}
 					Some(())
@@ -1206,13 +2604,13 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v32) => {
+						Ok(v50) => {
 							w.u8(1)?;
-							v32.write(w)?;
+							v50.write(w)?;
 						}
-						Err(v33) => {
+						Err(v51) => {
 							w.u8(0)?;
-							v33.write(w)?;
+							v51.write(w)?;
 						}
 					}
 					Some(())
@@ -1235,7 +2633,7 @@ pub mod network {
 				}
 			}
 			OP_PROBE => {
-				let addr = Ipv4Addr::read(r)?;
+				let addr = ScopedAddress::read(r)?;
 				let ttl = r.u8()?;
 				r.finish()?;
 				request_handles.clear();
@@ -1244,13 +2642,13 @@ pub mod network {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v34) => {
+						Ok(v52) => {
 							w.u8(1)?;
-							v34.write(w)?;
+							v52.write(w)?;
 						}
-						Err(v35) => {
+						Err(v53) => {
 							w.u8(0)?;
-							v35.write(w)?;
+							v53.write(w)?;
 						}
 					}
 					Some(())
@@ -1279,6 +2677,60 @@ pub mod network {
 			None => return None,
 		}
 		Some(writer.pos())
+	}
+
+	pub fn fetch_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<FetchChunk>, Error>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let req = TcpRequest::read(r)?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.fetch(req);
+		Some((corr, items))
+	}
+	pub fn fetch_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(1)?;
+		w.u32(0)?;
+		writer.finish()
+	}
+	pub fn fetch_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let w = &mut writer;
+		w.u32(corr)?;
+		w.u8(0)?;
+		error.write(w)?;
+		writer.finish()
+	}
+	pub fn fetch_frame(seq: u32, item: &FetchChunk, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn fetch_read(msg: &[u8], frame_handles: &mut Handles) -> Option<FetchChunk> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = FetchChunk::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
 	}
 
 	fn transport_outcome(error: TransportError) -> Error {
@@ -1388,7 +2840,7 @@ pub mod network {
 			}
 			decoded
 		}
-		pub fn resolve(&mut self, name: &str) -> Option<Result<Ipv4Addr, Error>> {
+		pub fn resolve(&mut self, name: &str) -> Option<Result<Vec<IpAddress>, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1411,7 +2863,20 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				let value = if r.tag()? { Ok(Ipv4Addr::read(r)?) } else { Err(Error::read(r)?) };
+				let value = if r.tag()? {
+					Ok({
+						let v54 = r.u16()? as usize;
+						let v54 = (v54 <= 8).then_some(v54)?;
+						let mut v55 = Vec::new();
+						v55.try_reserve_exact(v54).ok()?;
+						for _ in 0..v54 {
+							v55.push(IpAddress::read(r)?);
+						}
+						v55
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
 				r.finish()?;
 				Some(value)
 			})();
@@ -1421,7 +2886,7 @@ pub mod network {
 			}
 			decoded
 		}
-		pub fn ping(&mut self, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>> {
+		pub fn ping(&mut self, addr: &ScopedAddress) -> Option<Result<PingReply, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1454,7 +2919,7 @@ pub mod network {
 			}
 			decoded
 		}
-		pub fn fetch(&mut self, req: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {
+		pub fn fetch(&mut self, req: &TcpRequest) -> Option<Result<u64, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1471,41 +2936,39 @@ pub mod network {
 					return Some(Err(transport_outcome(e)));
 				}
 			};
-			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
 			let decoded = (|| {
-				let r = &mut reader;
 				if r.u32()? != corr {
 					return None;
 				}
-				let value = if r.tag()? {
-					Ok({
-						let v36 = r.u16()? as usize;
-						let mut v37 = Vec::new();
-						v37.try_reserve_exact(v36).ok()?;
-						for _ in 0..v36 {
-							v37.push(r.u8()?);
-						}
-						v37
-					})
-				} else {
-					Err(Error::read(r)?)
-				};
+				if r.tag()? {
+					let _ = r.u32()?;
+					r.finish()?;
+					if reply_handles.len() != 1 {
+						return None;
+					}
+					return Some(Ok(reply_handles.first()));
+				}
+				if !reply_handles.is_empty() {
+					return None;
+				}
+				let error = Error::read(r)?;
 				r.finish()?;
-				Some(value)
+				Some(Err(error))
 			})();
-			if decoded.is_none() {
+			if !matches!(decoded, Some(Ok(_))) {
 				self.transport.discard_handles(reply_handles.as_slice());
-				return None;
 			}
 			decoded
 		}
-		pub fn connect(&mut self, ep: &Endpoint) -> Option<Result<u64, Error>> {
+		pub fn connect(&mut self, target: &OpenTarget) -> Option<Result<u64, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_CONNECT)?;
 			w.u32(corr)?;
-			ep.write(w)?;
+			target.write(w)?;
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -1578,13 +3041,13 @@ pub mod network {
 			}
 			decoded
 		}
-		pub fn listen(&mut self, port: &u16) -> Option<Result<u64, Error>> {
+		pub fn listen(&mut self, req: &ListenRequest) -> Option<Result<ListenResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_LISTEN)?;
 			w.u32(corr)?;
-			w.u16(*port)?;
+			req.write(w)?;
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -1601,14 +3064,7 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				let value = if r.tag()? {
-					Ok({
-						let _ = r.u32()?;
-						r.take_handle()?
-					})
-				} else {
-					Err(Error::read(r)?)
-				};
+				let value = if r.tag()? { Ok(ListenResult::read(r)?) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -1642,13 +3098,14 @@ pub mod network {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v38 = r.u16()? as usize;
-						let mut v39 = Vec::new();
-						v39.try_reserve_exact(v38).ok()?;
-						for _ in 0..v38 {
-							v39.push(SockInfo::read(r)?);
+						let v56 = r.u16()? as usize;
+						let v56 = (v56 <= 256).then_some(v56)?;
+						let mut v57 = Vec::new();
+						v57.try_reserve_exact(v56).ok()?;
+						for _ in 0..v56 {
+							v57.push(SockInfo::read(r)?);
 						}
-						v39
+						v57
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1662,7 +3119,7 @@ pub mod network {
 			}
 			decoded
 		}
-		pub fn sntp(&mut self, server: &Ipv4Addr) -> Option<Result<u64, Error>> {
+		pub fn sntp(&mut self, server: &ScopedAddress) -> Option<Result<u64, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1727,7 +3184,7 @@ pub mod network {
 			}
 			decoded
 		}
-		pub fn probe(&mut self, addr: &Ipv4Addr, ttl: &u8) -> Option<Result<TraceHop, Error>> {
+		pub fn probe(&mut self, addr: &ScopedAddress, ttl: &u8) -> Option<Result<TraceHop, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1774,7 +3231,7 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_resolve")]
-	fn channel_invoke_resolve(chan: u64, name: &str) -> Option<Result<Ipv4Addr, Error>> {
+	fn channel_invoke_resolve(chan: u64, name: &str) -> Option<Result<Vec<IpAddress>, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.resolve(name)
 	}
@@ -1782,7 +3239,7 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_ping")]
-	fn channel_invoke_ping(chan: u64, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>> {
+	fn channel_invoke_ping(chan: u64, addr: &ScopedAddress) -> Option<Result<PingReply, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.ping(addr)
 	}
@@ -1790,7 +3247,7 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_fetch")]
-	fn channel_invoke_fetch(chan: u64, req: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {
+	fn channel_invoke_fetch(chan: u64, req: &TcpRequest) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.fetch(req)
 	}
@@ -1798,9 +3255,9 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_connect")]
-	fn channel_invoke_connect(chan: u64, ep: &Endpoint) -> Option<Result<u64, Error>> {
+	fn channel_invoke_connect(chan: u64, target: &OpenTarget) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.connect(ep)
+		client.connect(target)
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1814,9 +3271,9 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_listen")]
-	fn channel_invoke_listen(chan: u64, port: &u16) -> Option<Result<u64, Error>> {
+	fn channel_invoke_listen(chan: u64, req: &ListenRequest) -> Option<Result<ListenResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.listen(port)
+		client.listen(req)
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1830,7 +3287,7 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_sntp")]
-	fn channel_invoke_sntp(chan: u64, server: &Ipv4Addr) -> Option<Result<u64, Error>> {
+	fn channel_invoke_sntp(chan: u64, server: &ScopedAddress) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.sntp(server)
 	}
@@ -1846,7 +3303,7 @@ pub mod network {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_network_probe")]
-	fn channel_invoke_probe(chan: u64, addr: &Ipv4Addr, ttl: &u8) -> Option<Result<TraceHop, Error>> {
+	fn channel_invoke_probe(chan: u64, addr: &ScopedAddress, ttl: &u8) -> Option<Result<TraceHop, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.probe(addr, ttl)
 	}
@@ -1907,13 +3364,13 @@ pub mod socket {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v40) => {
+						Ok(v58) => {
 							w.u8(1)?;
-							w.u32(*v40)?;
+							w.u32(*v58)?;
 						}
-						Err(v41) => {
+						Err(v59) => {
 							w.u8(0)?;
-							v41.write(w)?;
+							v59.write(w)?;
 						}
 					}
 					Some(())
@@ -1943,12 +3400,12 @@ pub mod socket {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v42) => {
+						Ok(v60) => {
 							w.u8(1)?;
 						}
-						Err(v43) => {
+						Err(v61) => {
 							w.u8(0)?;
-							v43.write(w)?;
+							v61.write(w)?;
 						}
 					}
 					Some(())
@@ -2255,20 +3712,21 @@ impl Chunk {
 			return None;
 		}
 		w.u16(self.data.len() as u16)?;
-		for v44 in self.data.iter() {
-			w.u8(*v44)?;
+		for v62 in self.data.iter() {
+			w.u8(*v62)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Chunk> {
 		let data = {
-			let v45 = r.u16()? as usize;
-			let mut v46 = Vec::new();
-			v46.try_reserve_exact(v45).ok()?;
-			for _ in 0..v45 {
-				v46.push(r.u8()?);
+			let v63 = r.u16()? as usize;
+			let v63 = (v63 <= 4096).then_some(v63)?;
+			let mut v64 = Vec::new();
+			v64.try_reserve_exact(v63).ok()?;
+			for _ in 0..v63 {
+				v64.push(r.u8()?);
 			}
-			v46
+			v64
 		};
 		Some(Chunk { data })
 	}
@@ -2276,9 +3734,9 @@ impl Chunk {
 
 /// A listening socket from `network.listen`, served on the channel it hands back.
 /// `accept` waits until an inbound connection completes its handshake, then hands it
-/// back as a `socket` capability (the channel a `socket` interface is served on) - the
-/// passive-open counterpart to `network.connect`. The server calls `accept` in a loop,
-/// each call yielding the next connection.
+/// back as a `socket` capability together with both endpoints - the passive-open
+/// counterpart to `network.connect`. The server calls `accept` in a loop, each call
+/// yielding the next connection.
 // interface `listener` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod listener {
 	use super::*;
@@ -2288,7 +3746,7 @@ pub mod listener {
 	pub const OP_ACCEPT: u16 = 1;
 
 	pub trait Service {
-		fn accept(&mut self) -> Result<u64, Error>;
+		fn accept(&mut self) -> Result<AcceptResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -2319,14 +3777,13 @@ pub mod listener {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v47) => {
+						Ok(v65) => {
 							w.u8(1)?;
-							w.set_handle(*v47)?;
-							w.u32(0)?;
+							v65.write(w)?;
 						}
-						Err(v48) => {
+						Err(v66) => {
 							w.u8(0)?;
-							v48.write(w)?;
+							v66.write(w)?;
 						}
 					}
 					Some(())
@@ -2432,7 +3889,7 @@ pub mod listener {
 			r.finish()?;
 			Some((package, version))
 		}
-		pub fn accept(&mut self) -> Option<Result<u64, Error>> {
+		pub fn accept(&mut self) -> Option<Result<AcceptResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -2454,14 +3911,7 @@ pub mod listener {
 				if r.u32()? != corr {
 					return None;
 				}
-				let value = if r.tag()? {
-					Ok({
-						let _ = r.u32()?;
-						r.take_handle()?
-					})
-				} else {
-					Err(Error::read(r)?)
-				};
+				let value = if r.tag()? { Ok(AcceptResult::read(r)?) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -2476,7 +3926,7 @@ pub mod listener {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_network_listener_accept")]
-	fn channel_invoke_accept(chan: u64) -> Option<Result<u64, Error>> {
+	fn channel_invoke_accept(chan: u64) -> Option<Result<AcceptResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.accept()
 	}
@@ -2541,7 +3991,404 @@ impl Ipv4Addr {
 	}
 }
 
-impl Endpoint {
+impl Ipv6Addr {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"o0\":");
+		let _ = write!(out, "{}", self.o0);
+		out.push(',');
+		out.push_str("\"o1\":");
+		let _ = write!(out, "{}", self.o1);
+		out.push(',');
+		out.push_str("\"o2\":");
+		let _ = write!(out, "{}", self.o2);
+		out.push(',');
+		out.push_str("\"o3\":");
+		let _ = write!(out, "{}", self.o3);
+		out.push(',');
+		out.push_str("\"o4\":");
+		let _ = write!(out, "{}", self.o4);
+		out.push(',');
+		out.push_str("\"o5\":");
+		let _ = write!(out, "{}", self.o5);
+		out.push(',');
+		out.push_str("\"o6\":");
+		let _ = write!(out, "{}", self.o6);
+		out.push(',');
+		out.push_str("\"o7\":");
+		let _ = write!(out, "{}", self.o7);
+		out.push(',');
+		out.push_str("\"o8\":");
+		let _ = write!(out, "{}", self.o8);
+		out.push(',');
+		out.push_str("\"o9\":");
+		let _ = write!(out, "{}", self.o9);
+		out.push(',');
+		out.push_str("\"o10\":");
+		let _ = write!(out, "{}", self.o10);
+		out.push(',');
+		out.push_str("\"o11\":");
+		let _ = write!(out, "{}", self.o11);
+		out.push(',');
+		out.push_str("\"o12\":");
+		let _ = write!(out, "{}", self.o12);
+		out.push(',');
+		out.push_str("\"o13\":");
+		let _ = write!(out, "{}", self.o13);
+		out.push(',');
+		out.push_str("\"o14\":");
+		let _ = write!(out, "{}", self.o14);
+		out.push(',');
+		out.push_str("\"o15\":");
+		let _ = write!(out, "{}", self.o15);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("o0=");
+		let _ = write!(out, "{}", self.o0);
+		out.push_str(", ");
+		out.push_str("o1=");
+		let _ = write!(out, "{}", self.o1);
+		out.push_str(", ");
+		out.push_str("o2=");
+		let _ = write!(out, "{}", self.o2);
+		out.push_str(", ");
+		out.push_str("o3=");
+		let _ = write!(out, "{}", self.o3);
+		out.push_str(", ");
+		out.push_str("o4=");
+		let _ = write!(out, "{}", self.o4);
+		out.push_str(", ");
+		out.push_str("o5=");
+		let _ = write!(out, "{}", self.o5);
+		out.push_str(", ");
+		out.push_str("o6=");
+		let _ = write!(out, "{}", self.o6);
+		out.push_str(", ");
+		out.push_str("o7=");
+		let _ = write!(out, "{}", self.o7);
+		out.push_str(", ");
+		out.push_str("o8=");
+		let _ = write!(out, "{}", self.o8);
+		out.push_str(", ");
+		out.push_str("o9=");
+		let _ = write!(out, "{}", self.o9);
+		out.push_str(", ");
+		out.push_str("o10=");
+		let _ = write!(out, "{}", self.o10);
+		out.push_str(", ");
+		out.push_str("o11=");
+		let _ = write!(out, "{}", self.o11);
+		out.push_str(", ");
+		out.push_str("o12=");
+		let _ = write!(out, "{}", self.o12);
+		out.push_str(", ");
+		out.push_str("o13=");
+		let _ = write!(out, "{}", self.o13);
+		out.push_str(", ");
+		out.push_str("o14=");
+		let _ = write!(out, "{}", self.o14);
+		out.push_str(", ");
+		out.push_str("o15=");
+		let _ = write!(out, "{}", self.o15);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 16);
+		crate::codec::cbor::text(out, "o0");
+		crate::codec::cbor::uint(out, self.o0 as u64);
+		crate::codec::cbor::text(out, "o1");
+		crate::codec::cbor::uint(out, self.o1 as u64);
+		crate::codec::cbor::text(out, "o2");
+		crate::codec::cbor::uint(out, self.o2 as u64);
+		crate::codec::cbor::text(out, "o3");
+		crate::codec::cbor::uint(out, self.o3 as u64);
+		crate::codec::cbor::text(out, "o4");
+		crate::codec::cbor::uint(out, self.o4 as u64);
+		crate::codec::cbor::text(out, "o5");
+		crate::codec::cbor::uint(out, self.o5 as u64);
+		crate::codec::cbor::text(out, "o6");
+		crate::codec::cbor::uint(out, self.o6 as u64);
+		crate::codec::cbor::text(out, "o7");
+		crate::codec::cbor::uint(out, self.o7 as u64);
+		crate::codec::cbor::text(out, "o8");
+		crate::codec::cbor::uint(out, self.o8 as u64);
+		crate::codec::cbor::text(out, "o9");
+		crate::codec::cbor::uint(out, self.o9 as u64);
+		crate::codec::cbor::text(out, "o10");
+		crate::codec::cbor::uint(out, self.o10 as u64);
+		crate::codec::cbor::text(out, "o11");
+		crate::codec::cbor::uint(out, self.o11 as u64);
+		crate::codec::cbor::text(out, "o12");
+		crate::codec::cbor::uint(out, self.o12 as u64);
+		crate::codec::cbor::text(out, "o13");
+		crate::codec::cbor::uint(out, self.o13 as u64);
+		crate::codec::cbor::text(out, "o14");
+		crate::codec::cbor::uint(out, self.o14 as u64);
+		crate::codec::cbor::text(out, "o15");
+		crate::codec::cbor::uint(out, self.o15 as u64);
+	}
+}
+
+impl MacAddr {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"a\":");
+		let _ = write!(out, "{}", self.a);
+		out.push(',');
+		out.push_str("\"b\":");
+		let _ = write!(out, "{}", self.b);
+		out.push(',');
+		out.push_str("\"c\":");
+		let _ = write!(out, "{}", self.c);
+		out.push(',');
+		out.push_str("\"d\":");
+		let _ = write!(out, "{}", self.d);
+		out.push(',');
+		out.push_str("\"e\":");
+		let _ = write!(out, "{}", self.e);
+		out.push(',');
+		out.push_str("\"f\":");
+		let _ = write!(out, "{}", self.f);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("a=");
+		let _ = write!(out, "{}", self.a);
+		out.push_str(", ");
+		out.push_str("b=");
+		let _ = write!(out, "{}", self.b);
+		out.push_str(", ");
+		out.push_str("c=");
+		let _ = write!(out, "{}", self.c);
+		out.push_str(", ");
+		out.push_str("d=");
+		let _ = write!(out, "{}", self.d);
+		out.push_str(", ");
+		out.push_str("e=");
+		let _ = write!(out, "{}", self.e);
+		out.push_str(", ");
+		out.push_str("f=");
+		let _ = write!(out, "{}", self.f);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "a");
+		crate::codec::cbor::uint(out, self.a as u64);
+		crate::codec::cbor::text(out, "b");
+		crate::codec::cbor::uint(out, self.b as u64);
+		crate::codec::cbor::text(out, "c");
+		crate::codec::cbor::uint(out, self.c as u64);
+		crate::codec::cbor::text(out, "d");
+		crate::codec::cbor::uint(out, self.d as u64);
+		crate::codec::cbor::text(out, "e");
+		crate::codec::cbor::uint(out, self.e as u64);
+		crate::codec::cbor::text(out, "f");
+		crate::codec::cbor::uint(out, self.f as u64);
+	}
+}
+
+impl IpAddress {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			IpAddress::V4(v67) => {
+				out.push_str("{\"v4\":");
+				v67.to_json_into(out);
+				out.push('}');
+			}
+			IpAddress::V6(v68) => {
+				out.push_str("{\"v6\":");
+				v68.to_json_into(out);
+				out.push('}');
+			}
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			IpAddress::V4(v69) => {
+				out.push_str("v4(");
+				v69.to_text_into(out);
+				out.push(')');
+			}
+			IpAddress::V6(v70) => {
+				out.push_str("v6(");
+				v70.to_text_into(out);
+				out.push(')');
+			}
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			IpAddress::V4(v71) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "v4");
+				v71.to_cbor_into(out);
+			}
+			IpAddress::V6(v72) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "v6");
+				v72.to_cbor_into(out);
+			}
+		}
+	}
+}
+
+impl InterfaceId {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"index\":");
+		let _ = write!(out, "{}", self.index);
+		out.push(',');
+		out.push_str("\"generation\":");
+		let _ = write!(out, "{}", self.generation);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("index=");
+		let _ = write!(out, "{}", self.index);
+		out.push_str(", ");
+		out.push_str("generation=");
+		let _ = write!(out, "{}", self.generation);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "index");
+		crate::codec::cbor::uint(out, self.index as u64);
+		crate::codec::cbor::text(out, "generation");
+		crate::codec::cbor::uint(out, self.generation as u64);
+	}
+}
+
+impl ScopedAddress {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"scope\":");
+		match &self.scope {
+			Some(v73) => {
+				v73.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("scope=");
+		match &self.scope {
+			Some(v74) => {
+				v74.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "scope");
+		match &self.scope {
+			Some(v75) => {
+				v75.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
+impl ScopedEndpoint {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
 		self.to_json_into(&mut s);
@@ -2584,6 +4431,435 @@ impl Endpoint {
 	}
 }
 
+impl AddressState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			AddressState::Tentative => out.push_str("\"tentative\""),
+			AddressState::Preferred => out.push_str("\"preferred\""),
+			AddressState::Deprecated => out.push_str("\"deprecated\""),
+			AddressState::Invalid => out.push_str("\"invalid\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			AddressState::Tentative => out.push_str("tentative"),
+			AddressState::Preferred => out.push_str("preferred"),
+			AddressState::Deprecated => out.push_str("deprecated"),
+			AddressState::Invalid => out.push_str("invalid"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			AddressState::Tentative => crate::codec::cbor::text(out, "tentative"),
+			AddressState::Preferred => crate::codec::cbor::text(out, "preferred"),
+			AddressState::Deprecated => crate::codec::cbor::text(out, "deprecated"),
+			AddressState::Invalid => crate::codec::cbor::text(out, "invalid"),
+		}
+	}
+}
+
+impl InterfaceAddress {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"prefix-len\":");
+		let _ = write!(out, "{}", self.prefix_len);
+		out.push(',');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"preferred-seconds\":");
+		let _ = write!(out, "{}", self.preferred_seconds);
+		out.push(',');
+		out.push_str("\"valid-seconds\":");
+		let _ = write!(out, "{}", self.valid_seconds);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("prefix-len=");
+		let _ = write!(out, "{}", self.prefix_len);
+		out.push_str(", ");
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("preferred-seconds=");
+		let _ = write!(out, "{}", self.preferred_seconds);
+		out.push_str(", ");
+		out.push_str("valid-seconds=");
+		let _ = write!(out, "{}", self.valid_seconds);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "prefix-len");
+		crate::codec::cbor::uint(out, self.prefix_len as u64);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "preferred-seconds");
+		crate::codec::cbor::uint(out, self.preferred_seconds as u64);
+		crate::codec::cbor::text(out, "valid-seconds");
+		crate::codec::cbor::uint(out, self.valid_seconds as u64);
+	}
+}
+
+impl NextHop {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			NextHop::Direct => out.push_str("\"direct\""),
+			NextHop::Via(v76) => {
+				out.push_str("{\"via\":");
+				v76.to_json_into(out);
+				out.push('}');
+			}
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			NextHop::Direct => out.push_str("direct"),
+			NextHop::Via(v77) => {
+				out.push_str("via(");
+				v77.to_text_into(out);
+				out.push(')');
+			}
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			NextHop::Direct => crate::codec::cbor::text(out, "direct"),
+			NextHop::Via(v78) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "via");
+				v78.to_cbor_into(out);
+			}
+		}
+	}
+}
+
+impl RoutePreference {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			RoutePreference::Low => out.push_str("\"low\""),
+			RoutePreference::Medium => out.push_str("\"medium\""),
+			RoutePreference::High => out.push_str("\"high\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			RoutePreference::Low => out.push_str("low"),
+			RoutePreference::Medium => out.push_str("medium"),
+			RoutePreference::High => out.push_str("high"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			RoutePreference::Low => crate::codec::cbor::text(out, "low"),
+			RoutePreference::Medium => crate::codec::cbor::text(out, "medium"),
+			RoutePreference::High => crate::codec::cbor::text(out, "high"),
+		}
+	}
+}
+
+impl Reachability {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			Reachability::Incomplete => out.push_str("\"incomplete\""),
+			Reachability::Reachable => out.push_str("\"reachable\""),
+			Reachability::Stale => out.push_str("\"stale\""),
+			Reachability::Delay => out.push_str("\"delay\""),
+			Reachability::Probe => out.push_str("\"probe\""),
+			Reachability::Unreachable => out.push_str("\"unreachable\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			Reachability::Incomplete => out.push_str("incomplete"),
+			Reachability::Reachable => out.push_str("reachable"),
+			Reachability::Stale => out.push_str("stale"),
+			Reachability::Delay => out.push_str("delay"),
+			Reachability::Probe => out.push_str("probe"),
+			Reachability::Unreachable => out.push_str("unreachable"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			Reachability::Incomplete => crate::codec::cbor::text(out, "incomplete"),
+			Reachability::Reachable => crate::codec::cbor::text(out, "reachable"),
+			Reachability::Stale => crate::codec::cbor::text(out, "stale"),
+			Reachability::Delay => crate::codec::cbor::text(out, "delay"),
+			Reachability::Probe => crate::codec::cbor::text(out, "probe"),
+			Reachability::Unreachable => crate::codec::cbor::text(out, "unreachable"),
+		}
+	}
+}
+
+impl RouteEntry {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"destination\":");
+		self.destination.to_json_into(out);
+		out.push(',');
+		out.push_str("\"prefix-len\":");
+		let _ = write!(out, "{}", self.prefix_len);
+		out.push(',');
+		out.push_str("\"scope\":");
+		self.scope.to_json_into(out);
+		out.push(',');
+		out.push_str("\"preference\":");
+		self.preference.to_json_into(out);
+		out.push(',');
+		out.push_str("\"lifetime-seconds\":");
+		let _ = write!(out, "{}", self.lifetime_seconds);
+		out.push(',');
+		out.push_str("\"hop\":");
+		self.hop.to_json_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("destination=");
+		self.destination.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("prefix-len=");
+		let _ = write!(out, "{}", self.prefix_len);
+		out.push_str(", ");
+		out.push_str("scope=");
+		self.scope.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("preference=");
+		self.preference.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("lifetime-seconds=");
+		let _ = write!(out, "{}", self.lifetime_seconds);
+		out.push_str(", ");
+		out.push_str("hop=");
+		self.hop.to_text_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "destination");
+		self.destination.to_cbor_into(out);
+		crate::codec::cbor::text(out, "prefix-len");
+		crate::codec::cbor::uint(out, self.prefix_len as u64);
+		crate::codec::cbor::text(out, "scope");
+		self.scope.to_cbor_into(out);
+		crate::codec::cbor::text(out, "preference");
+		self.preference.to_cbor_into(out);
+		crate::codec::cbor::text(out, "lifetime-seconds");
+		crate::codec::cbor::uint(out, self.lifetime_seconds as u64);
+		crate::codec::cbor::text(out, "hop");
+		self.hop.to_cbor_into(out);
+	}
+}
+
+impl RouterEntry {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"scope\":");
+		self.scope.to_json_into(out);
+		out.push(',');
+		out.push_str("\"preference\":");
+		self.preference.to_json_into(out);
+		out.push(',');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"lifetime-seconds\":");
+		let _ = write!(out, "{}", self.lifetime_seconds);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("scope=");
+		self.scope.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("preference=");
+		self.preference.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("lifetime-seconds=");
+		let _ = write!(out, "{}", self.lifetime_seconds);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "scope");
+		self.scope.to_cbor_into(out);
+		crate::codec::cbor::text(out, "preference");
+		self.preference.to_cbor_into(out);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "lifetime-seconds");
+		crate::codec::cbor::uint(out, self.lifetime_seconds as u64);
+	}
+}
+
+impl DnsServer {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"scope\":");
+		self.scope.to_json_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("scope=");
+		self.scope.to_text_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "scope");
+		self.scope.to_cbor_into(out);
+	}
+}
+
 impl Neighbor {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -2606,16 +4882,10 @@ impl Neighbor {
 		self.addr.to_json_into(out);
 		out.push(',');
 		out.push_str("\"mac\":");
-		out.push('[');
-		let mut v50 = true;
-		for v49 in self.mac.iter() {
-			if !v50 {
-				out.push(',');
-			}
-			v50 = false;
-			let _ = write!(out, "{}", v49);
-		}
-		out.push(']');
+		self.mac.to_json_into(out);
+		out.push(',');
+		out.push_str("\"scope\":");
+		self.scope.to_json_into(out);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -2624,27 +4894,20 @@ impl Neighbor {
 		self.addr.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("mac=");
-		out.push('[');
-		let mut v52 = true;
-		for v51 in self.mac.iter() {
-			if !v52 {
-				out.push_str(", ");
-			}
-			v52 = false;
-			let _ = write!(out, "{}", v51);
-		}
-		out.push(']');
+		self.mac.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("scope=");
+		self.scope.to_text_into(out);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
-		crate::codec::cbor::array(out, self.mac.len());
-		for v53 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v53 as u64);
-		}
+		self.mac.to_cbor_into(out);
+		crate::codec::cbor::text(out, "scope");
+		self.scope.to_cbor_into(out);
 	}
 }
 
@@ -2666,93 +4929,188 @@ impl NetInfo {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("\"addr\":");
-		self.addr.to_json_into(out);
+		out.push_str("\"scope\":");
+		self.scope.to_json_into(out);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
 		out.push(',');
 		out.push_str("\"mac\":");
-		out.push('[');
-		let mut v55 = true;
-		for v54 in self.mac.iter() {
-			if !v55 {
-				out.push(',');
-			}
-			v55 = false;
-			let _ = write!(out, "{}", v54);
-		}
-		out.push(']');
+		self.mac.to_json_into(out);
 		out.push(',');
 		out.push_str("\"mtu\":");
 		let _ = write!(out, "{}", self.mtu);
 		out.push(',');
-		out.push_str("\"gateway\":");
-		self.gateway.to_json_into(out);
+		out.push_str("\"addresses\":");
+		out.push('[');
+		let mut v80 = true;
+		for v79 in self.addresses.iter() {
+			if !v80 {
+				out.push(',');
+			}
+			v80 = false;
+			v79.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"routes\":");
+		out.push('[');
+		let mut v82 = true;
+		for v81 in self.routes.iter() {
+			if !v82 {
+				out.push(',');
+			}
+			v82 = false;
+			v81.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"routers\":");
+		out.push('[');
+		let mut v84 = true;
+		for v83 in self.routers.iter() {
+			if !v84 {
+				out.push(',');
+			}
+			v84 = false;
+			v83.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"dns\":");
+		out.push('[');
+		let mut v86 = true;
+		for v85 in self.dns.iter() {
+			if !v86 {
+				out.push(',');
+			}
+			v86 = false;
+			v85.to_json_into(out);
+		}
+		out.push(']');
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v57 = true;
-		for v56 in self.neighbors.iter() {
-			if !v57 {
+		let mut v88 = true;
+		for v87 in self.neighbors.iter() {
+			if !v88 {
 				out.push(',');
 			}
-			v57 = false;
-			v56.to_json_into(out);
+			v88 = false;
+			v87.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("addr=");
-		self.addr.to_text_into(out);
+		out.push_str("scope=");
+		self.scope.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
 		out.push_str(", ");
 		out.push_str("mac=");
-		out.push('[');
-		let mut v59 = true;
-		for v58 in self.mac.iter() {
-			if !v59 {
-				out.push_str(", ");
-			}
-			v59 = false;
-			let _ = write!(out, "{}", v58);
-		}
-		out.push(']');
+		self.mac.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("mtu=");
 		let _ = write!(out, "{}", self.mtu);
 		out.push_str(", ");
-		out.push_str("gateway=");
-		self.gateway.to_text_into(out);
+		out.push_str("addresses=");
+		out.push('[');
+		let mut v90 = true;
+		for v89 in self.addresses.iter() {
+			if !v90 {
+				out.push_str(", ");
+			}
+			v90 = false;
+			v89.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("routes=");
+		out.push('[');
+		let mut v92 = true;
+		for v91 in self.routes.iter() {
+			if !v92 {
+				out.push_str(", ");
+			}
+			v92 = false;
+			v91.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("routers=");
+		out.push('[');
+		let mut v94 = true;
+		for v93 in self.routers.iter() {
+			if !v94 {
+				out.push_str(", ");
+			}
+			v94 = false;
+			v93.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("dns=");
+		out.push('[');
+		let mut v96 = true;
+		for v95 in self.dns.iter() {
+			if !v96 {
+				out.push_str(", ");
+			}
+			v96 = false;
+			v95.to_text_into(out);
+		}
+		out.push(']');
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v61 = true;
-		for v60 in self.neighbors.iter() {
-			if !v61 {
+		let mut v98 = true;
+		for v97 in self.neighbors.iter() {
+			if !v98 {
 				out.push_str(", ");
 			}
-			v61 = false;
-			v60.to_text_into(out);
+			v98 = false;
+			v97.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 5);
-		crate::codec::cbor::text(out, "addr");
-		self.addr.to_cbor_into(out);
+		crate::codec::cbor::map(out, 9);
+		crate::codec::cbor::text(out, "scope");
+		self.scope.to_cbor_into(out);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "mac");
-		crate::codec::cbor::array(out, self.mac.len());
-		for v62 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v62 as u64);
-		}
+		self.mac.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mtu");
 		crate::codec::cbor::uint(out, self.mtu as u64);
-		crate::codec::cbor::text(out, "gateway");
-		self.gateway.to_cbor_into(out);
+		crate::codec::cbor::text(out, "addresses");
+		crate::codec::cbor::array(out, self.addresses.len());
+		for v99 in self.addresses.iter() {
+			v99.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "routes");
+		crate::codec::cbor::array(out, self.routes.len());
+		for v100 in self.routes.iter() {
+			v100.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "routers");
+		crate::codec::cbor::array(out, self.routers.len());
+		for v101 in self.routers.iter() {
+			v101.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "dns");
+		crate::codec::cbor::array(out, self.dns.len());
+		for v102 in self.dns.iter() {
+			v102.to_cbor_into(out);
+		}
 		crate::codec::cbor::text(out, "neighbors");
 		crate::codec::cbor::array(out, self.neighbors.len());
-		for v63 in self.neighbors.iter() {
-			v63.to_cbor_into(out);
+		for v103 in self.neighbors.iter() {
+			v103.to_cbor_into(out);
 		}
 	}
 }
@@ -2999,6 +5357,99 @@ impl TraceHop {
 	}
 }
 
+impl OpenTarget {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"destinations\":");
+		out.push('[');
+		let mut v105 = true;
+		for v104 in self.destinations.iter() {
+			if !v105 {
+				out.push(',');
+			}
+			v105 = false;
+			v104.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"port\":");
+		let _ = write!(out, "{}", self.port);
+		out.push(',');
+		out.push_str("\"source\":");
+		match &self.source {
+			Some(v106) => {
+				v106.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("destinations=");
+		out.push('[');
+		let mut v108 = true;
+		for v107 in self.destinations.iter() {
+			if !v108 {
+				out.push_str(", ");
+			}
+			v108 = false;
+			v107.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("port=");
+		let _ = write!(out, "{}", self.port);
+		out.push_str(", ");
+		out.push_str("source=");
+		match &self.source {
+			Some(v109) => {
+				v109.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "destinations");
+		crate::codec::cbor::array(out, self.destinations.len());
+		for v110 in self.destinations.iter() {
+			v110.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "port");
+		crate::codec::cbor::uint(out, self.port as u64);
+		crate::codec::cbor::text(out, "source");
+		match &self.source {
+			Some(v111) => {
+				v111.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
 impl TcpRequest {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3017,49 +5468,306 @@ impl TcpRequest {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("\"ep\":");
-		self.ep.to_json_into(out);
+		out.push_str("\"target\":");
+		self.target.to_json_into(out);
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v65 = true;
-		for v64 in self.request.iter() {
-			if !v65 {
+		let mut v113 = true;
+		for v112 in self.request.iter() {
+			if !v113 {
 				out.push(',');
 			}
-			v65 = false;
-			let _ = write!(out, "{}", v64);
+			v113 = false;
+			let _ = write!(out, "{}", v112);
 		}
 		out.push(']');
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("ep=");
-		self.ep.to_text_into(out);
+		out.push_str("target=");
+		self.target.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v67 = true;
-		for v66 in self.request.iter() {
-			if !v67 {
+		let mut v115 = true;
+		for v114 in self.request.iter() {
+			if !v115 {
 				out.push_str(", ");
 			}
-			v67 = false;
-			let _ = write!(out, "{}", v66);
+			v115 = false;
+			let _ = write!(out, "{}", v114);
 		}
 		out.push(']');
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
-		crate::codec::cbor::text(out, "ep");
-		self.ep.to_cbor_into(out);
+		crate::codec::cbor::text(out, "target");
+		self.target.to_cbor_into(out);
 		crate::codec::cbor::text(out, "request");
 		crate::codec::cbor::array(out, self.request.len());
-		for v68 in self.request.iter() {
-			crate::codec::cbor::uint(out, *v68 as u64);
+		for v116 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v116 as u64);
 		}
+	}
+}
+
+impl FetchOutcome {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			FetchOutcome::Complete => out.push_str("\"complete\""),
+			FetchOutcome::Truncated => out.push_str("\"truncated\""),
+			FetchOutcome::Failed => out.push_str("\"failed\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			FetchOutcome::Complete => out.push_str("complete"),
+			FetchOutcome::Truncated => out.push_str("truncated"),
+			FetchOutcome::Failed => out.push_str("failed"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			FetchOutcome::Complete => crate::codec::cbor::text(out, "complete"),
+			FetchOutcome::Truncated => crate::codec::cbor::text(out, "truncated"),
+			FetchOutcome::Failed => crate::codec::cbor::text(out, "failed"),
+		}
+	}
+}
+
+impl FetchChunk {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"data\":");
+		out.push('[');
+		let mut v118 = true;
+		for v117 in self.data.iter() {
+			if !v118 {
+				out.push(',');
+			}
+			v118 = false;
+			let _ = write!(out, "{}", v117);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"outcome\":");
+		match &self.outcome {
+			Some(v119) => {
+				v119.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("data=");
+		out.push('[');
+		let mut v121 = true;
+		for v120 in self.data.iter() {
+			if !v121 {
+				out.push_str(", ");
+			}
+			v121 = false;
+			let _ = write!(out, "{}", v120);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("outcome=");
+		match &self.outcome {
+			Some(v122) => {
+				v122.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "data");
+		crate::codec::cbor::array(out, self.data.len());
+		for v123 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v123 as u64);
+		}
+		crate::codec::cbor::text(out, "outcome");
+		match &self.outcome {
+			Some(v124) => {
+				v124.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
+impl BindMode {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			BindMode::Ipv4Only => out.push_str("\"ipv4-only\""),
+			BindMode::Ipv6Only => out.push_str("\"ipv6-only\""),
+			BindMode::DualStack => out.push_str("\"dual-stack\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			BindMode::Ipv4Only => out.push_str("ipv4-only"),
+			BindMode::Ipv6Only => out.push_str("ipv6-only"),
+			BindMode::DualStack => out.push_str("dual-stack"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BindMode::Ipv4Only => crate::codec::cbor::text(out, "ipv4-only"),
+			BindMode::Ipv6Only => crate::codec::cbor::text(out, "ipv6-only"),
+			BindMode::DualStack => crate::codec::cbor::text(out, "dual-stack"),
+		}
+	}
+}
+
+impl ListenRequest {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"mode\":");
+		self.mode.to_json_into(out);
+		out.push(',');
+		out.push_str("\"local\":");
+		self.local.to_json_into(out);
+		out.push(',');
+		out.push_str("\"backlog\":");
+		let _ = write!(out, "{}", self.backlog);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("mode=");
+		self.mode.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("local=");
+		self.local.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("backlog=");
+		let _ = write!(out, "{}", self.backlog);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "mode");
+		self.mode.to_cbor_into(out);
+		crate::codec::cbor::text(out, "local");
+		self.local.to_cbor_into(out);
+		crate::codec::cbor::text(out, "backlog");
+		crate::codec::cbor::uint(out, self.backlog as u64);
+	}
+}
+
+impl ListenResult {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"listener\":");
+		let _ = write!(out, "{}", self.listener);
+		out.push(',');
+		out.push_str("\"backlog\":");
+		let _ = write!(out, "{}", self.backlog);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("listener=");
+		let _ = write!(out, "{}", self.listener);
+		out.push_str(", ");
+		out.push_str("backlog=");
+		let _ = write!(out, "{}", self.backlog);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "listener");
+		crate::codec::cbor::uint(out, self.listener as u64);
+		crate::codec::cbor::text(out, "backlog");
+		crate::codec::cbor::uint(out, self.backlog as u64);
 	}
 }
 
@@ -3129,8 +5837,8 @@ impl SockInfo {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("\"local-port\":");
-		let _ = write!(out, "{}", self.local_port);
+		out.push_str("\"local\":");
+		self.local.to_json_into(out);
 		out.push(',');
 		out.push_str("\"remote\":");
 		self.remote.to_json_into(out);
@@ -3141,8 +5849,8 @@ impl SockInfo {
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		out.push('{');
-		out.push_str("local-port=");
-		let _ = write!(out, "{}", self.local_port);
+		out.push_str("local=");
+		self.local.to_text_into(out);
 		out.push_str(", ");
 		out.push_str("remote=");
 		self.remote.to_text_into(out);
@@ -3153,12 +5861,63 @@ impl SockInfo {
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
-		crate::codec::cbor::text(out, "local-port");
-		crate::codec::cbor::uint(out, self.local_port as u64);
+		crate::codec::cbor::text(out, "local");
+		self.local.to_cbor_into(out);
 		crate::codec::cbor::text(out, "remote");
 		self.remote.to_cbor_into(out);
 		crate::codec::cbor::text(out, "state");
 		self.state.to_cbor_into(out);
+	}
+}
+
+impl AcceptResult {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"socket\":");
+		let _ = write!(out, "{}", self.socket);
+		out.push(',');
+		out.push_str("\"local\":");
+		self.local.to_json_into(out);
+		out.push(',');
+		out.push_str("\"remote\":");
+		self.remote.to_json_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("socket=");
+		let _ = write!(out, "{}", self.socket);
+		out.push_str(", ");
+		out.push_str("local=");
+		self.local.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("remote=");
+		self.remote.to_text_into(out);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "socket");
+		crate::codec::cbor::uint(out, self.socket as u64);
+		crate::codec::cbor::text(out, "local");
+		self.local.to_cbor_into(out);
+		crate::codec::cbor::text(out, "remote");
+		self.remote.to_cbor_into(out);
 	}
 }
 
@@ -3182,13 +5941,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v70 = true;
-		for v69 in self.data.iter() {
-			if !v70 {
+		let mut v126 = true;
+		for v125 in self.data.iter() {
+			if !v126 {
 				out.push(',');
 			}
-			v70 = false;
-			let _ = write!(out, "{}", v69);
+			v126 = false;
+			let _ = write!(out, "{}", v125);
 		}
 		out.push(']');
 		out.push('}');
@@ -3197,13 +5956,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v72 = true;
-		for v71 in self.data.iter() {
-			if !v72 {
+		let mut v128 = true;
+		for v127 in self.data.iter() {
+			if !v128 {
 				out.push_str(", ");
 			}
-			v72 = false;
-			let _ = write!(out, "{}", v71);
+			v128 = false;
+			let _ = write!(out, "{}", v127);
 		}
 		out.push(']');
 		out.push('}');
@@ -3212,8 +5971,8 @@ impl Chunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v73 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v73 as u64);
+		for v129 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v129 as u64);
 		}
 	}
 }

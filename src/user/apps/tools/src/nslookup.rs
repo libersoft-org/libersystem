@@ -50,13 +50,25 @@ fn resolve(netsvc: u64, name: &[u8]) {
 	};
 	let mut client = NetworkClient::new(netsvc);
 	match client.resolve(name_str) {
-		Some(Ok(addr)) => {
-			print(name);
-			print(b" has address ");
-			let mut tmp: [u8; 16] = [0u8; 16];
-			let n: usize = addr.render(&mut tmp);
-			print(&tmp[..n]);
-			print(b"\n");
+		Some(Ok(addresses)) => {
+			// EVERY ADDRESS, IN THE ORDER THE SERVICE CHOSE. A name with four addresses had three of
+			// them thrown away by a contract that returned one, and the one kept was whichever the
+			// resolver happened to put first - so a caller could not prefer, retry or even see the
+			// rest.
+			if addresses.is_empty() {
+				eprint(b"nslookup: no addresses for ");
+				eprint(name);
+				eprint(b"\n");
+				return;
+			}
+			let mut tmp: [u8; 64] = [0u8; 64];
+			for addr in &addresses {
+				print(name);
+				print(b" has address ");
+				let n: usize = addr.render(&mut tmp);
+				print(&tmp[..n]);
+				print(b"\n");
+			}
 		}
 		Some(Err(_)) => {
 			eprint(b"nslookup: could not resolve ");

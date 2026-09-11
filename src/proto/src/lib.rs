@@ -16,6 +16,7 @@ pub mod generated;
 pub mod system;
 
 pub use network_proto::addr;
+pub use network_proto::limits as net_limits;
 pub use time_proto::clock;
 
 pub use storage_proto::path;

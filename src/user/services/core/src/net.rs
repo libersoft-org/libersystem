@@ -11,6 +11,10 @@ use alloc::vec::Vec;
 // The IPv6 host this stack carries for the same link. Sibling module of this one, under the same
 // binary: the two protocols share a NIC and a frame channel and nothing else.
 use super::ipv6_host::Ipv6Host;
+use service_logic::tcp_close::Closing;
+use service_logic::tcp_queue::{AckOutcome, SendQueue};
+use service_logic::tcp_rto::Rto;
+use service_logic::tcp_window::{CongestionWindow, DuplicateAction, Persist};
 
 // EtherType values (the 2-byte type field of an Ethernet II frame).
 const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -34,6 +38,11 @@ const ICMP_ECHO_REPLY: u8 = 0;
 // so with type 11; a host or router that will not forward it at all says so with type 3.
 const ICMP_DEST_UNREACHABLE: u8 = 3;
 const ICMP_TIME_EXCEEDED: u8 = 11;
+// Destination Unreachable, code 4: the datagram was too large for the next hop and carried
+// don't-fragment. RFC 1191 puts the hop's MTU in the header's otherwise unused field.
+const ICMP_FRAG_NEEDED: u8 = 4;
+// The smallest MTU an IPv4 path is required to carry. A report below it is not a path.
+const IPV4_MIN_MTU: u16 = 68;
 
 // The DNS server port (UDP).
 const DNS_PORT: u16 = 53;
@@ -86,7 +95,6 @@ const UDP_HDR: usize = 8;
 const TCP_HDR: usize = 20;
 // What the Ethernet + IPv4 + TCP headers take out of a frame - what remains of the
 // frame buffer is the largest single TCP segment payload.
-pub const TCP_SEGMENT_OVERHEAD: usize = ETH_HDR + IPV4_HDR + TCP_HDR;
 
 // ICMP echo payload size (bytes). 56 matches the ping default, so the on-wire
 // packet is 84 bytes (20 IP + 8 ICMP + 56) and a reply reports the familiar 64
@@ -113,6 +121,17 @@ const TCP_RX_SCALED: usize = TCP_RX_BASE << TCP_WS_SHIFT;
 // The initial TCP connection pool size: outbound `connect`s and inbound accepted
 // connections share the pool, which grows on demand - a size hint, never a cap.
 const TCP_CONN_MAX: usize = 4;
+
+// The segment size assumed before a peer says otherwise: RFC 9293's default for a peer that sends no
+// MSS option. Both sides raise it from the option and from the interface, and the sender uses the
+// smaller of what the peer will accept and what the path will carry.
+const TCP_MSS: u16 = 536;
+
+// The smallest segment size this sender will use however small a peer's option is. A peer offering
+// a handful of bytes per segment would otherwise turn every transfer into a header flood, and RFC
+// 9293 section 3.7.1 permits a receiver's advertised MSS to be treated as a lower bound of this
+// order rather than obeyed to the byte.
+const TCP_MSS_FLOOR: u16 = 88;
 
 // The initial listen-table size (passive open); the table grows on demand.
 const LISTEN_MAX: usize = 2;
@@ -152,16 +171,6 @@ fn put32(b: &mut [u8], off: usize, v: u32) {
 	b[off + 1] = (v >> 16) as u8;
 	b[off + 2] = (v >> 8) as u8;
 	b[off + 3] = v as u8;
-}
-
-// TCP serial-number comparisons (RFC 793 modular arithmetic): `a` is after `b`, or
-// `a` is at or before `b`, accounting for 32-bit wraparound.
-fn seq_gt(a: u32, b: u32) -> bool {
-	(a.wrapping_sub(b) as i32) > 0
-}
-
-fn seq_le(a: u32, b: u32) -> bool {
-	(a.wrapping_sub(b) as i32) <= 0
 }
 
 // The internet checksum (ones-complement sum of 16-bit words) of `data`.
@@ -224,6 +233,33 @@ fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, seg: &[u8]) -> u16 {
 // option (kind 3, RFC 7323). We ignore the peer's shift value itself - the stack
 // tracks no send window - so the option's presence is all that matters: it licenses
 // scaling our own advertised window.
+// The largest segment the peer said it will accept, from its SYN's MSS option.
+//
+// ABSENT MEANS 536, which is RFC 9293's default and not "as large as we like": a peer that sends no
+// option has told us nothing about its path, and assuming the interface's own MTU is how a sender
+// discovers the answer by having every segment dropped.
+fn peer_mss_option(tcp: &[u8]) -> u16 {
+	let data_off: usize = ((tcp[12] >> 4) as usize) * 4;
+	if data_off < TCP_HDR || data_off > tcp.len() {
+		return TCP_MSS;
+	}
+	let mut i: usize = TCP_HDR;
+	while i < data_off {
+		match tcp[i] {
+			0 => return TCP_MSS,
+			1 => i += 1,
+			2 if i + 3 < data_off && tcp[i + 1] == 4 => return u16::from_be_bytes([tcp[i + 2], tcp[i + 3]]).max(TCP_MSS_FLOOR),
+			_ => {
+				if i + 1 >= data_off || tcp[i + 1] < 2 {
+					return TCP_MSS;
+				}
+				i += tcp[i + 1] as usize;
+			}
+		}
+	}
+	TCP_MSS
+}
+
 fn peer_offers_ws(tcp: &[u8]) -> bool {
 	let data_off: usize = ((tcp[12] >> 4) as usize) * 4;
 	if data_off < TCP_HDR || data_off > tcp.len() {
@@ -389,8 +425,30 @@ struct TcpConn {
 	remote_port: u16,
 	remote_mac: MacAddr,
 	// Send sequence: oldest unacknowledged, and the next sequence to use.
+	// THE HANDSHAKE'S SEQUENCE, and only the handshake's: once the connection is established the
+	// transmit queue owns the sequence space, because the bytes and the sequence they occupy are the
+	// same fact and keeping them in two places is how they come to disagree.
 	snd_una: u32,
 	snd_nxt: u32,
+	// The sender: what is owed the wire, how long to wait for an acknowledgement, how much may be in
+	// flight, what to do about a shut window, and where the closing handshake has got to.
+	tx: SendQueue,
+	rto: Rto,
+	cwnd: CongestionWindow,
+	persist: Persist,
+	closing: Closing,
+	// What the peer said it will hold, already unshifted by its window scale.
+	peer_window: u32,
+	peer_wscale: u8,
+	// The largest segment the peer will accept, and the largest this path will carry. The sender
+	// uses the smaller.
+	peer_mss: u16,
+	path_mss: u16,
+	// When the oldest outstanding segment was sent, and when its timer expires.
+	sent_at_ms: u64,
+	rto_deadline_ms: Option<u64>,
+	// The sender gave up: the retry limit expired with data or a FIN outstanding.
+	send_failed: bool,
 	// Receive sequence: the next in-order byte we expect.
 	rcv_nxt: u32,
 	// Our window scale (RFC 7323): TCP_WS_SHIFT when the peer offered the WS option
@@ -405,7 +463,7 @@ struct TcpConn {
 
 impl TcpConn {
 	fn closed() -> TcpConn {
-		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, rcv_nxt: 0, rcv_wscale: 0, rx: alloc::vec![0; TCP_RX_BASE], rx_len: 0 }
+		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, tx: SendQueue::new(0), rto: Rto::new(), cwnd: CongestionWindow::new(u32::from(TCP_MSS)), persist: Persist::new(), closing: Closing::new(), peer_window: 0, peer_wscale: 0, peer_mss: TCP_MSS, path_mss: TCP_MSS, sent_at_ms: 0, rto_deadline_ms: None, send_failed: false, rcv_nxt: 0, rcv_wscale: 0, rx: alloc::vec![0; TCP_RX_BASE], rx_len: 0 }
 	}
 }
 
@@ -433,6 +491,8 @@ pub enum SockEntryState {
 // connections (on the heap - each carries a kilobyte receive buffer, too large for the
 // 16 kB user stack).
 pub struct Stack {
+	// The monotonic clock in milliseconds, set by the serve loop before each pass. See `set_clock`.
+	clock_ms: u64,
 	// THE IPv6 HOST, CARRIED RATHER THAN THREADED. Every blocking helper in the service pumps frames
 	// through this stack, and an IPv6 frame arriving during a DNS wait must be processed rather than
 	// dropped - which is exactly what M6's seam requires and what threading a second argument
@@ -465,7 +525,7 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { ipv6: None, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { ipv6: None, clock_ms: 0, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	// Stand the IPv6 host up on this link.
@@ -476,6 +536,28 @@ impl Stack {
 	// The IPv6 host, if one was attached.
 	pub fn ipv6(&mut self) -> Option<&mut Ipv6Host> {
 		self.ipv6.as_mut()
+	}
+
+	// The IPv6 host, read-only, for a report that must not disturb it.
+	// THE MONOTONIC CLOCK, SUPPLIED RATHER THAN READ. A retransmission timer needs the time on every
+	// path that touches it - an arriving acknowledgement, a segment going out, a timer firing - and a
+	// stack that read the clock itself would be a stack no host test could drive through a schedule.
+	// It is the same arrangement the IPv6 host beside it uses and for the same reason.
+	pub fn set_clock(&mut self, now_ms: u64) {
+		self.clock_ms = now_ms;
+	}
+
+	pub fn ipv6_ref(&self) -> Option<&Ipv6Host> {
+		self.ipv6.as_ref()
+	}
+
+	// This interface's identity, as the public contract carries it. Absent only on a boot with no
+	// IPv6 host at all, which is a link that refused the family.
+	pub fn ipv6_identity(&self) -> Option<(u32, u64)> {
+		self.ipv6.as_ref().map(|host| {
+			let interface = host.interface();
+			(u32::from(interface.index), u64::from(interface.generation))
+		})
 	}
 
 	// The IPv6 layer's next deadline, in milliseconds, or None when it has nothing pending.
@@ -588,6 +670,14 @@ impl Stack {
 			out.push(SockEntry { local_port: c.local_port, remote_ip: c.remote_ip, remote_port: c.remote_port, state });
 		}
 		out
+	}
+
+	// One connection's endpoints: the local port, and the peer it runs to. An accepted connection is
+	// handed to its owner with both, which is what lets a server say which of this host's addresses
+	// a client reached it on rather than only that somebody connected.
+	pub fn conn_endpoints(&self, ci: usize) -> Option<(u16, Ipv4Addr, u16)> {
+		let conn = self.conns.get(ci)?;
+		conn.in_use.then_some((conn.local_port, conn.remote_ip, conn.remote_port))
 	}
 
 	// The count of live (in-use) TCP connections in the pool - what `network.capacity`
@@ -765,6 +855,7 @@ impl Stack {
 					self.conns[ci].rcv_wscale = TCP_WS_SHIFT;
 					self.conns[ci].rx.resize(TCP_RX_SCALED, 0);
 				}
+				self.start_sender(ci, peer_mss_option(tcp), be16(tcp, 14));
 				let len: usize = self.build_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], out);
 				return Outcome { reply_len: len, event: Event::None };
 			}
@@ -778,13 +869,15 @@ impl Stack {
 				self.conns[ci].snd_una = seg_ack;
 				self.conns[ci].state = TcpState::Established;
 				self.conns[ci].pending_accept = true;
+				self.start_sender(ci, self.conns[ci].peer_mss, be16(tcp, 14));
 			} else {
 				return Outcome { reply_len: 0, event: Event::None };
 			}
 		}
-		// Established (or tearing down): advance our send window from the ack.
-		if flags & TCP_ACK != 0 && seq_gt(seg_ack, self.conns[ci].snd_una) && seq_le(seg_ack, self.conns[ci].snd_nxt) {
-			self.conns[ci].snd_una = seg_ack;
+		// Established (or tearing down): the acknowledgement retires what it covers, and the peer's
+		// window says how much more may go out.
+		if flags & TCP_ACK != 0 {
+			self.on_tcp_ack(ci, seg_ack, be16(tcp, 14));
 		}
 		// Accept in-order data into the receive buffer (bounded by the window). Data
 		// at the expected sequence is acknowledged even when the buffer is full and
@@ -811,6 +904,132 @@ impl Stack {
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		Outcome { reply_len: 0, event: Event::None }
+	}
+
+	// Stand the sender up once the handshake completes.
+	//
+	// THE QUEUE STARTS WHERE THE HANDSHAKE LEFT OFF. `snd_nxt` is the sequence after the SYN, which
+	// is the first byte of data this connection will ever send - so the queue owns the sequence space
+	// from here and the handshake's two fields stop being consulted.
+	fn start_sender(&mut self, ci: usize, peer_mss: u16, raw_window: u16) {
+		let path_mss: u16 = self.mtu.saturating_sub((IPV4_HDR + TCP_HDR) as u16).max(TCP_MSS_FLOOR);
+		let first: u32 = self.conns[ci].snd_nxt;
+		let c: &mut TcpConn = &mut self.conns[ci];
+		c.tx = SendQueue::new(first);
+		c.rto = Rto::new();
+		c.peer_mss = peer_mss;
+		c.path_mss = path_mss;
+		// THE SMALLER OF THE TWO, because the peer's option says what it will accept and the
+		// interface says what this link will carry; exceeding either drops the segment.
+		c.cwnd = CongestionWindow::new(u32::from(peer_mss.min(path_mss)));
+		c.persist = Persist::new();
+		c.closing = Closing::new();
+		// A SYN's window field is never scaled, whatever scale was negotiated.
+		c.peer_window = u32::from(raw_window);
+		c.peer_wscale = if c.rcv_wscale != 0 { TCP_WS_SHIFT } else { 0 };
+		c.rto_deadline_ms = None;
+		c.send_failed = false;
+	}
+
+	// The segment size in force: the smaller of what the peer accepts and what the path carries.
+	fn effective_mss(&self, ci: usize) -> usize {
+		usize::from(self.conns[ci].peer_mss.min(self.conns[ci].path_mss))
+	}
+
+	// An acknowledgement arrived. Retire what it covers, move the congestion window, and record the
+	// peer's advertised window.
+	fn on_tcp_ack(&mut self, ci: usize, seg_ack: u32, raw_window: u16) {
+		let window: u32 = u32::from(raw_window) << self.conns[ci].peer_wscale;
+		self.conns[ci].peer_window = window;
+		let flight: u32 = self.conns[ci].tx.flight();
+		let snd_nxt: u32 = self.conns[ci].tx.snd_nxt();
+		let was_retransmitted: bool = self.conns[ci].tx.outstanding_was_retransmitted();
+		match self.conns[ci].tx.on_ack(seg_ack) {
+			AckOutcome::Advanced { bytes, covered_fin } => {
+				// KARN'S RULE IS APPLIED HERE, where the queue knows whether these bytes had been on
+				// the wire before.
+				let now: u64 = self.clock_ms;
+				let rtt: u32 = now.saturating_sub(self.conns[ci].sent_at_ms).min(u64::from(u32::MAX)) as u32;
+				self.conns[ci].rto.sample(rtt, was_retransmitted);
+				self.conns[ci].cwnd.on_new_ack(bytes, seg_ack);
+				if covered_fin {
+					self.conns[ci].closing.on_fin_acknowledged(now);
+				}
+				// The timer follows what is still outstanding: re-armed for the next segment, or
+				// disarmed when nothing is owed.
+				if self.conns[ci].tx.flight() == 0 {
+					self.conns[ci].rto_deadline_ms = None;
+					self.conns[ci].rto.restart();
+				} else {
+					self.conns[ci].rto_deadline_ms = Some(now + u64::from(self.conns[ci].rto.rto_ms()));
+				}
+			}
+			AckOutcome::Duplicate => {
+				let duplicates: u8 = self.conns[ci].tx.duplicates();
+				if let DuplicateAction::FastRetransmit = self.conns[ci].cwnd.on_duplicate_ack(flight, snd_nxt) {
+					// THE MISSING SEGMENT GOES BACK ON THE WIRE NOW rather than waiting for the
+					// timer: three duplicates are three segments that arrived, which is evidence a
+					// timeout would take a whole RTO to reach.
+					self.conns[ci].tx.rewind();
+				}
+				let _ = duplicates;
+			}
+			AckOutcome::Old | AckOutcome::Invalid => {}
+		}
+		// A window that shut with something still owed starts the probe schedule; one that reopened
+		// ends it.
+		let waiting: usize = self.conns[ci].tx.pending().len();
+		let rto_ms: u32 = self.conns[ci].rto.rto_ms();
+		let now: u64 = self.clock_ms;
+		self.conns[ci].persist.on_window(window, waiting, now, rto_ms);
+	}
+
+	// The soonest any live connection needs waking, across the whole pool.
+	//
+	// ONE DEADLINE FOR THE WHOLE STACK, because the serve loop waits once: a per-connection timer
+	// that the loop did not know about would fire only when some other event happened to wake it,
+	// which is a retransmission schedule decided by unrelated traffic.
+	pub fn tcp_deadline_any(&self) -> Option<u64> {
+		let mut soonest: Option<u64> = None;
+		for index in 0..self.conns.len() {
+			if let Some(deadline) = self.tcp_deadline(index) {
+				soonest = Some(match soonest {
+					Some(held) => held.min(deadline),
+					None => deadline,
+				});
+			}
+		}
+		soonest
+	}
+
+	// Every connection whose timer has expired.
+	pub fn tcp_due(&mut self, now_ms: u64) -> Vec<usize> {
+		self.clock_ms = now_ms;
+		let mut due: Vec<usize> = Vec::new();
+		for index in 0..self.conns.len() {
+			if self.conns[index].in_use && self.tcp_deadline(index).is_some_and(|deadline| now_ms >= deadline) {
+				due.push(index);
+			}
+		}
+		due
+	}
+
+	// The unacknowledged bytes every connection is holding together, which is what the service-wide
+	// budget is measured against.
+	pub fn tcp_outstanding_total(&self) -> usize {
+		self.conns.iter().filter(|c| c.in_use).map(|c| c.tx.pending().len()).sum()
+	}
+
+	// A validated Packet Too Big for `ip`: lower the segment size of every connection to it and put
+	// their outstanding bytes back on the wire cut to fit.
+	pub fn tcp_on_path_mtu(&mut self, ip: Ipv4Addr, mtu: u16) -> bool {
+		let mut changed: bool = false;
+		for index in 0..self.conns.len() {
+			if self.conns[index].in_use && self.conns[index].remote_ip == ip {
+				changed |= self.tcp_path_mtu(index, mtu);
+			}
+		}
+		changed
 	}
 
 	// Find the live connection an inbound segment belongs to (matched by its 4-tuple;
@@ -1029,25 +1248,155 @@ impl Stack {
 		self.build_tcp_opts(ci, TCP_SYN, self.conns[ci].snd_una, 0, &opts, &[], out)
 	}
 
-	// Build a data segment carrying `data` (PSH|ACK) on connection `ci` into `out` and
-	// advance its send sequence past it.
-	pub fn tcp_build_data(&mut self, ci: usize, data: &[u8], out: &mut [u8]) -> usize {
-		let seq: u32 = self.conns[ci].snd_nxt;
+	// Hand `data` to connection `ci`'s transmit queue, and say how much was taken.
+	//
+	// THE COUNT IS BYTES ACCEPTED, NOT BYTES ACKNOWLEDGED, and they are COPIED before this returns -
+	// so a caller may reuse its buffer immediately. Fewer than offered is the backpressure; zero is
+	// what a caller turns into `Again`. The old path built ONE segment from the caller's buffer,
+	// sent it once and reported the whole length as sent, which was a data-loss bug wearing a
+	// success.
+	pub fn tcp_send(&mut self, ci: usize, data: &[u8], aggregate_remaining: usize) -> usize {
+		if self.conns[ci].send_failed || self.conns[ci].tx.fin_queued() {
+			return 0;
+		}
+		self.conns[ci].tx.accept(data, aggregate_remaining)
+	}
+
+	// Queue the FIN behind everything already accepted.
+	pub fn tcp_close_half(&mut self, ci: usize) {
+		if self.conns[ci].tx.queue_fin() {
+			self.conns[ci].state = TcpState::FinWait;
+		}
+	}
+
+	// Build the next segment connection `ci` owes the wire into `out`, or 0 when it owes nothing
+	// right now.
+	//
+	// ONE SEGMENT PER CALL, because the caller owns the transmit buffer and the frame channel; it
+	// calls again until this returns nothing. What comes out is decided here: a zero-window probe if
+	// the persist timer is due, otherwise as much queued data as the congestion window and the
+	// peer's window jointly allow, cut to the segment size in force.
+	pub fn tcp_pump(&mut self, ci: usize, out: &mut [u8]) -> usize {
+		if !self.conns[ci].in_use || self.conns[ci].send_failed {
+			return 0;
+		}
+		let now: u64 = self.clock_ms;
+		// A ZERO-WINDOW PROBE IS ONE BYTE PAST THE WINDOW, deliberately: it is the segment the peer
+		// must acknowledge, and its acknowledgement carries the window update that was lost.
+		if self.conns[ci].persist.fire(now) {
+			let sequence: u32 = self.conns[ci].tx.snd_nxt();
+			let offset: usize = self.conns[ci].tx.flight() as usize;
+			let Some(byte) = self.conns[ci].tx.pending().get(offset).copied() else {
+				return 0;
+			};
+			let ack: u32 = self.conns[ci].rcv_nxt;
+			return self.build_tcp(ci, TCP_ACK, sequence, ack, &[byte], out);
+		}
+		let flight: u32 = self.conns[ci].tx.flight();
+		let usable: u32 = self.conns[ci].cwnd.usable(flight, self.conns[ci].peer_window);
+		let mss: usize = self.effective_mss(ci);
+		let Some(segment) = self.conns[ci].tx.next_segment(mss, usable) else {
+			return 0;
+		};
+		let flags: u8 = if segment.fin { TCP_FIN | TCP_ACK } else { TCP_PSH | TCP_ACK };
 		let ack: u32 = self.conns[ci].rcv_nxt;
-		let len: usize = self.build_tcp(ci, TCP_PSH | TCP_ACK, seq, ack, data, out);
-		self.conns[ci].snd_nxt = self.conns[ci].snd_nxt.wrapping_add(data.len() as u32);
+		let payload: Vec<u8> = self.conns[ci].tx.pending()[segment.offset..segment.offset + segment.len].to_vec();
+		let len: usize = self.build_tcp(ci, flags, segment.sequence, ack, &payload, out);
+		if len == 0 {
+			return 0;
+		}
+		if segment.fin {
+			self.conns[ci].closing.on_fin_sent(now);
+		}
+		// THE TIMER IS ARMED FROM THE FIRST SEGMENT OUTSTANDING, not from the last: what it is
+		// waiting for is the oldest unacknowledged byte, and re-arming on every send would let a
+		// steady stream of new data postpone a retransmission for ever.
+		if flight == 0 {
+			self.conns[ci].sent_at_ms = now;
+			self.conns[ci].rto_deadline_ms = Some(now + u64::from(self.conns[ci].rto.rto_ms()));
+		}
 		len
 	}
 
-	// Build a FIN|ACK to close our half of connection `ci` into `out`, advancing its
-	// send sequence and entering FinWait.
-	pub fn tcp_build_fin(&mut self, ci: usize, out: &mut [u8]) -> usize {
-		let seq: u32 = self.conns[ci].snd_nxt;
-		let ack: u32 = self.conns[ci].rcv_nxt;
-		let len: usize = self.build_tcp(ci, TCP_FIN | TCP_ACK, seq, ack, &[], out);
-		self.conns[ci].snd_nxt = self.conns[ci].snd_nxt.wrapping_add(1);
-		self.conns[ci].state = TcpState::FinWait;
-		len
+	// When connection `ci` next needs waking, if it does.
+	pub fn tcp_deadline(&self, ci: usize) -> Option<u64> {
+		let c: &TcpConn = &self.conns[ci];
+		if !c.in_use {
+			return None;
+		}
+		let mut deadline: Option<u64> = c.rto_deadline_ms;
+		for candidate in [c.persist.due_ms(), c.closing.deadline_ms()] {
+			deadline = match (deadline, candidate) {
+				(Some(held), Some(next)) => Some(held.min(next)),
+				(held, None) => held,
+				(None, next) => next,
+			};
+		}
+		deadline
+	}
+
+	// A timer fired on connection `ci`. Returns whether it has anything to put on the wire.
+	//
+	// A RETRANSMISSION TIMEOUT SAYS NOTHING IS GETTING THROUGH: the congestion window drops to one
+	// segment, the timeout doubles, and everything outstanding is sent again from the oldest byte.
+	// Past the retry limit the connection fails with a typed error rather than retrying for ever.
+	pub fn tcp_on_timer(&mut self, ci: usize) -> bool {
+		if !self.conns[ci].in_use {
+			return false;
+		}
+		let now: u64 = self.clock_ms;
+		// A control block in TIME-WAIT is released by its own timer and nothing else.
+		if self.conns[ci].closing.tick(now) && self.conns[ci].state == TcpState::FinWait {
+			self.conns[ci].state = TcpState::Closed;
+			return false;
+		}
+		let Some(deadline) = self.conns[ci].rto_deadline_ms else {
+			return self.conns[ci].persist.due_ms().is_some_and(|due| now >= due);
+		};
+		if now < deadline {
+			return self.conns[ci].persist.due_ms().is_some_and(|due| now >= due);
+		}
+		if self.conns[ci].rto.back_off() >= service_logic::tcp_rto::MAX_DATA_RETRANSMISSIONS {
+			// The retry limit expired with data or a FIN outstanding. That is a typed failure, not a
+			// quiet close: the caller asked for bytes to arrive and they did not.
+			self.conns[ci].send_failed = true;
+			self.conns[ci].state = TcpState::Closed;
+			self.conns[ci].rto_deadline_ms = None;
+			return false;
+		}
+		let flight: u32 = self.conns[ci].tx.flight();
+		self.conns[ci].cwnd.on_timeout(flight);
+		self.conns[ci].tx.rewind();
+		self.conns[ci].rto_deadline_ms = Some(now + u64::from(self.conns[ci].rto.rto_ms()));
+		self.conns[ci].sent_at_ms = now;
+		true
+	}
+
+	// Did the sender give up on connection `ci`?
+	pub fn tcp_send_failed(&self, ci: usize) -> bool {
+		self.conns[ci].send_failed
+	}
+
+	// Has everything this side owes been acknowledged, FIN included?
+	pub fn tcp_fully_acknowledged(&self, ci: usize) -> bool {
+		self.conns[ci].tx.fully_acknowledged()
+	}
+
+	// Lower the segment size after a validated Packet Too Big and put the outstanding bytes back on
+	// the wire cut to fit.
+	//
+	// RESEGMENTATION IS THE REWIND. There is no separate mechanism: the unsent boundary goes back to
+	// the oldest unacknowledged byte and the queue is cut at whatever size is in force now.
+	pub fn tcp_path_mtu(&mut self, ci: usize, mtu: u16) -> bool {
+		let mss: u16 = mtu.saturating_sub((IPV4_HDR + TCP_HDR) as u16).max(TCP_MSS_FLOOR);
+		if mss >= self.conns[ci].path_mss {
+			return false;
+		}
+		self.conns[ci].path_mss = mss;
+		let effective: u32 = u32::from(mss.min(self.conns[ci].peer_mss));
+		self.conns[ci].cwnd.set_smss(effective);
+		self.conns[ci].tx.rewind();
+		true
 	}
 
 	// Whether connection `ci`'s handshake completed.
@@ -1106,6 +1455,23 @@ impl Stack {
 		}
 		// THE TWO ERRORS A TRACEROUTE IS MADE OF. Each quotes the datagram that caused it, and the
 		// quote is what attributes the answer to a probe - see `Event::TimeExceeded`.
+		// FRAGMENTATION NEEDED IS A PATH MTU REPORT, and it is the one ICMP message a TCP sender must
+		// act on rather than merely report: the segments it is sending are too large for a hop, and
+		// nothing else will tell it so. The quoted packet's destination names the flow it is about,
+		// which is the correlation this host can make without keeping a flow table.
+		if icmp[0] == ICMP_DEST_UNREACHABLE && icmp.len() >= ICMP_HDR && icmp[1] == ICMP_FRAG_NEEDED {
+			let reported: u16 = be16(icmp, 6);
+			if let Some(quoted) = icmp.get(8..)
+				&& quoted.len() >= IPV4_HDR
+			{
+				let destination: Ipv4Addr = Ipv4Addr([quoted[16], quoted[17], quoted[18], quoted[19]]);
+				// A ZERO NEXT-HOP MTU IS AN OLD ROUTER that predates RFC 1191's field. There is
+				// nothing to act on, and guessing a number would be inventing the report.
+				if reported >= IPV4_MIN_MTU {
+					self.tcp_on_path_mtu(destination, reported);
+				}
+			}
+		}
 		if icmp[0] == ICMP_TIME_EXCEEDED || icmp[0] == ICMP_DEST_UNREACHABLE {
 			let Some(seq) = quoted_echo_sequence(icmp) else {
 				return Outcome { reply_len: 0, event: Event::None };

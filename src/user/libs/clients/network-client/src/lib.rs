@@ -4,29 +4,29 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use base_proto::generated::liber::base::v1::Error;
-use network_proto::generated::liber::network::v1::{Endpoint, Ipv4Addr, NetCapacity, NetInfo, PingReply, SockInfo, TcpRequest, TraceHop};
+use network_proto::generated::liber::network::v1::{AcceptResult, IpAddress, ListenRequest, ListenResult, NetCapacity, NetInfo, OpenTarget, PingReply, ScopedAddress, SockInfo, TcpRequest, TraceHop};
 use wire::Buffer;
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_network_network_info"]
 	fn network_info(chan: u64) -> Option<Result<NetInfo, Error>>;
 	#[link_name = "liber_channel_liber_network_network_resolve"]
-	fn network_resolve(chan: u64, name: &str) -> Option<Result<Ipv4Addr, Error>>;
+	fn network_resolve(chan: u64, name: &str) -> Option<Result<Vec<IpAddress>, Error>>;
 	#[link_name = "liber_channel_liber_network_network_ping"]
-	fn network_ping(chan: u64, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>>;
+	fn network_ping(chan: u64, addr: &ScopedAddress) -> Option<Result<PingReply, Error>>;
 	#[link_name = "liber_channel_liber_network_network_probe"]
-	fn network_probe(chan: u64, addr: &Ipv4Addr, ttl: &u8) -> Option<Result<TraceHop, Error>>;
-	fn network_fetch(chan: u64, request: &TcpRequest) -> Option<Result<Vec<u8>, Error>>;
+	fn network_probe(chan: u64, addr: &ScopedAddress, ttl: &u8) -> Option<Result<TraceHop, Error>>;
+	fn network_fetch(chan: u64, request: &TcpRequest) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_network_network_connect"]
-	fn network_connect(chan: u64, endpoint: &Endpoint) -> Option<Result<u64, Error>>;
+	fn network_connect(chan: u64, target: &OpenTarget) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_network_network_open"]
 	fn network_open(chan: u64) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_network_network_listen"]
-	fn network_listen(chan: u64, port: &u16) -> Option<Result<u64, Error>>;
+	fn network_listen(chan: u64, req: &ListenRequest) -> Option<Result<ListenResult, Error>>;
 	#[link_name = "liber_channel_liber_network_network_sockets"]
 	fn network_sockets(chan: u64) -> Option<Result<Vec<SockInfo>, Error>>;
 	#[link_name = "liber_channel_liber_network_network_sntp"]
-	fn network_sntp(chan: u64, server: &Ipv4Addr) -> Option<Result<u64, Error>>;
+	fn network_sntp(chan: u64, server: &ScopedAddress) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_network_network_capacity"]
 	fn network_capacity(chan: u64) -> Option<Result<NetCapacity, Error>>;
 	#[link_name = "liber_channel_liber_network_socket_send"]
@@ -36,7 +36,7 @@ unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_network_socket_close"]
 	fn socket_close(chan: u64) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_network_listener_accept"]
-	fn listener_accept(chan: u64) -> Option<Result<u64, Error>>;
+	fn listener_accept(chan: u64) -> Option<Result<AcceptResult, Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -55,40 +55,46 @@ impl NetworkClient {
 		unsafe { network_info(self.chan) }
 	}
 	#[inline(always)]
-	pub fn resolve(&mut self, name: &str) -> Option<Result<Ipv4Addr, Error>> {
+	/// Resolve a name to the ordered candidate list the service chose, at most eight.
+	pub fn resolve(&mut self, name: &str) -> Option<Result<Vec<IpAddress>, Error>> {
 		unsafe { network_resolve(self.chan, name) }
 	}
 	#[inline(always)]
-	pub fn ping(&mut self, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>> {
+	pub fn ping(&mut self, addr: &ScopedAddress) -> Option<Result<PingReply, Error>> {
 		unsafe { network_ping(self.chan, addr) }
 	}
-	/// One traceroute probe: an echo with the IP TTL set to `ttl`, and whatever answered it.
+	/// One traceroute probe: an echo with the IP TTL or hop limit set to `ttl`, and whatever
+	/// answered it.
 	#[inline(always)]
-	pub fn probe(&mut self, addr: &Ipv4Addr, ttl: u8) -> Option<Result<TraceHop, Error>> {
+	pub fn probe(&mut self, addr: &ScopedAddress, ttl: u8) -> Option<Result<TraceHop, Error>> {
 		unsafe { network_probe(self.chan, addr, &ttl) }
 	}
 	#[inline(always)]
-	pub fn fetch(&mut self, request: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {
+	/// Open a fetch and get the STREAM the body arrives on, not the body: the response is read
+	/// chunk by chunk, and the last chunk says whether it was complete, truncated or failed.
+	pub fn fetch(&mut self, request: &TcpRequest) -> Option<Result<u64, Error>> {
 		unsafe { network_fetch(self.chan, request) }
 	}
 	#[inline(always)]
-	pub fn connect(&mut self, endpoint: &Endpoint) -> Option<Result<u64, Error>> {
-		unsafe { network_connect(self.chan, endpoint) }
+	pub fn connect(&mut self, target: &OpenTarget) -> Option<Result<u64, Error>> {
+		unsafe { network_connect(self.chan, target) }
 	}
 	#[inline(always)]
 	pub fn open(&mut self) -> Option<Result<u64, Error>> {
 		unsafe { network_open(self.chan) }
 	}
 	#[inline(always)]
-	pub fn listen(&mut self, port: &u16) -> Option<Result<u64, Error>> {
-		unsafe { network_listen(self.chan, port) }
+	/// Bind a listener. The reply carries the listener channel AND the backlog it actually got,
+	/// which is not always the one that was asked for.
+	pub fn listen(&mut self, req: &ListenRequest) -> Option<Result<ListenResult, Error>> {
+		unsafe { network_listen(self.chan, req) }
 	}
 	#[inline(always)]
 	pub fn sockets(&mut self) -> Option<Result<Vec<SockInfo>, Error>> {
 		unsafe { network_sockets(self.chan) }
 	}
 	#[inline(always)]
-	pub fn sntp(&mut self, server: &Ipv4Addr) -> Option<Result<u64, Error>> {
+	pub fn sntp(&mut self, server: &ScopedAddress) -> Option<Result<u64, Error>> {
 		unsafe { network_sntp(self.chan, server) }
 	}
 	#[inline(always)]
@@ -138,7 +144,8 @@ impl ListenerClient {
 	}
 
 	#[inline(always)]
-	pub fn accept(&mut self) -> Option<Result<u64, Error>> {
+	/// Wait for the next inbound connection: the socket capability and both of its endpoints.
+	pub fn accept(&mut self) -> Option<Result<AcceptResult, Error>> {
 		unsafe { listener_accept(self.chan) }
 	}
 }

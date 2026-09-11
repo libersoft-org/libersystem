@@ -740,12 +740,28 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	// and the gratuitous ARP announcement.
 	let online = boot_kernel.recv().expect("NetworkService online report");
 	assert_eq!(&online.bytes[..], b"NetworkService: online", "the service binds and reports in");
-	let discover = frames_kernel.recv().expect("the DISCOVER should broadcast");
+	// THE LINK NOW CARRIES IPv6 CONTROL TRAFFIC TOO. NetworkService stands an IPv6 host up on the
+	// same NIC, so router solicitations, detection probes and listener reports share this channel with
+	// the DHCP conversation this test is about. "The next frame" stopped meaning "the next frame this
+	// test is about", so every read below takes the next NON-IPv6 one. What is asserted is unchanged;
+	// what is skipped is another protocol's traffic, which has tests of its own.
+	macro_rules! next_ipv4 {
+		() => {{
+			loop {
+				let taken = frames_kernel.recv();
+				match &taken {
+					Ok(frame) if frame.bytes.len() >= 14 && frame.bytes[12] == 0x86 && frame.bytes[13] == 0xdd => continue,
+					_ => break taken,
+				}
+			}
+		}};
+	}
+	let discover = next_ipv4!().expect("the DISCOVER should broadcast");
 	assert_eq!(decode(&discover.bytes).map(|(t, _, _, _)| t), Some(1), "the first frame is the DISCOVER");
-	let request = frames_kernel.recv().expect("the REQUEST should follow the OFFER");
+	let request = next_ipv4!().expect("the REQUEST should follow the OFFER");
 	let (rtype, rciaddr, _, rsid) = decode(&request.bytes).expect("the second frame decodes");
 	assert!(rtype == 3 && rciaddr == [0; 4] && rsid, "the selecting REQUEST names the server, ciaddr empty");
-	let arp = frames_kernel.recv().expect("the gratuitous ARP should send");
+	let arp = next_ipv4!().expect("the gratuitous ARP should send");
 	assert_eq!(&arp.bytes[12..14], &[0x08, 0x06], "the announcement is an ARP request");
 
 	// Let the clock tick to T1: the service must wake itself (the lease deadline is
@@ -755,7 +771,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	while renewal.is_none() && arch::apic::ticks() < give_up {
 		sched::run_until_idle();
 		arch::idle_halt();
-		renewal = frames_kernel.recv().ok();
+		renewal = next_ipv4!().ok();
 	}
 	let renewal = renewal.expect("the T1 renewal REQUEST should arrive unprompted");
 	let (t, ciaddr, unicast, sid) = decode(&renewal.bytes).expect("the renewal decodes");
@@ -774,7 +790,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	while second.is_none() && arch::apic::ticks() < give_up {
 		sched::run_until_idle();
 		arch::idle_halt();
-		second = frames_kernel.recv().ok();
+		second = next_ipv4!().ok();
 	}
 	let second = second.expect("the next T1 renewal should arrive");
 	let (t2, ciaddr2, _, _) = decode(&second.bytes).expect("the second renewal decodes");

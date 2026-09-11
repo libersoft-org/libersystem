@@ -14,27 +14,197 @@ record ipv4-addr {
 	d: u8,
 }
 
-/// A transport endpoint: an IPv4 address and a port.
-record endpoint {
-	addr: ipv4-addr,
+/// A 128-bit IPv6 address as sixteen octets.
+///
+/// FIXED AND POSITIONAL, LIKE ITS IPv4 COUNTERPART, and deliberately not `list<u8>` with a bound of
+/// sixteen. A bound says "at most", so a bounded list admits a twelve-octet value that is not an
+/// address at all, and every consumer would then have to check a length the wire should never have
+/// been able to express. Sixteen fields cost sixteen bytes and make the malformed case
+/// unrepresentable.
+record ipv6-addr {
+	o0:  u8,
+	o1:  u8,
+	o2:  u8,
+	o3:  u8,
+	o4:  u8,
+	o5:  u8,
+	o6:  u8,
+	o7:  u8,
+	o8:  u8,
+	o9:  u8,
+	o10: u8,
+	o11: u8,
+	o12: u8,
+	o13: u8,
+	o14: u8,
+	o15: u8,
+}
+
+/// A hardware address: six octets, fixed for the same reason `ipv6-addr` is.
+record mac-addr {
+	a: u8,
+	b: u8,
+	c: u8,
+	d: u8,
+	e: u8,
+	f: u8,
+}
+
+/// An address of either family, with the family IN the value.
+///
+/// A CLOSED VARIANT AND NOT TWO OPTIONAL FIELDS. A record carrying `option<ipv4-addr>` beside
+/// `option<ipv6-addr>` can say "both" and can say "neither", and a consumer must then decide what
+/// those mean - which two consumers will decide differently. The tag that says which family it is IS
+/// the thing that carries it.
+variant ip-address {
+	v4(ipv4-addr),
+	v6(ipv6-addr),
+}
+
+/// Which interface a value belongs to, and WHICH GENERATION of it.
+///
+/// THE GENERATION IS WHY THIS IS NOT JUST AN INDEX. A link-local address means nothing without the
+/// link it is on, and an index alone silently follows the link when the NIC behind it is replaced -
+/// so a value scoped before the replacement would quietly name something else afterwards. A scoped
+/// value carrying the generation refuses instead, which is the only answer that is true.
+record interface-id {
+	index:      u32,
+	generation: u64,
+}
+
+/// An address and, where the address class needs one, the interface that gives it meaning.
+///
+/// SCOPE IS REQUIRED WHERE IT IS LOAD-BEARING AND REFUSED WHERE IT IS NOT. A link-local address
+/// without an interface is not an address: `fe80::1` names a different host on each link. A global
+/// address with an interface is over-specified but harmless, and a scoped IPv4 address is neither -
+/// this milestone's single interface makes it redundant, so it is refused rather than ignored.
+record scoped-address {
+	addr:  ip-address,
+	scope: option<interface-id>,
+}
+
+/// A transport endpoint of either family.
+record scoped-endpoint {
+	addr: scoped-address,
 	port: u16,
 }
 
-/// A neighbor-cache entry: an on-link address and the MAC (6 bytes) it resolved to.
-record neighbor {
-	addr: ipv4-addr,
-	mac:  list<u8>,
+/// What an address of this host's own may be used for.
+///
+/// The four states are RFC 4862's and are not collapsible: a TENTATIVE address is not yet this
+/// host's and must not be a source; a DEPRECATED one still receives but must not start new
+/// conversations; an INVALID one is kept only long enough to be reported as gone.
+enum address-state {
+	tentative,
+	preferred,
+	deprecated,
+	invalid,
 }
 
-/// The interface's L3 state: our address, our MAC (6 bytes), the interface MTU,
-/// the gateway, and the neighbor cache - the typed form of what the `ip` / `net`
-/// command renders.
+/// One address this interface holds, with the prefix it came from and what is left of its lifetimes.
+///
+/// LIFETIMES ARE SECONDS REMAINING, and `4294967295` is INFINITY rather than a very large number -
+/// the value the protocols themselves use, so a value read off the wire needs no translation and an
+/// infinite lifetime cannot be mistaken for one that expires in 136 years.
+record interface-address {
+	addr:              ip-address,
+	prefix-len:        u8,
+	state:             address-state,
+	preferred-seconds: u32,
+	valid-seconds:     u32,
+}
+
+/// Where a route sends a packet.
+///
+/// TWO FORMS AND NOT ONE ADDRESS FIELD. An on-link prefix route has no next hop: the packet's
+/// destination IS its own next hop, and neighbour resolution runs against it. A mandatory address
+/// field would force either a fabricated address or an all-zeros sentinel into a public contract,
+/// and a sentinel whose meaning is not written down is how two consumers come to disagree.
+variant next-hop {
+	/// On-link: the destination is reached directly.
+	direct,
+	/// Through a router, whose address must be a unicast address on the same interface - a router's
+	/// link-local in every case this host produces. The unspecified and multicast forms are refused
+	/// here rather than at use.
+	via(ip-address),
+}
+
+/// A router's advertised preference, RFC 4191's three usable values. The reserved fourth bit
+/// pattern reads as `medium`, which is what the standard requires of a receiver.
+enum route-preference {
+	low,
+	medium,
+	high,
+}
+
+/// A neighbour's reachability, RFC 4861's five states plus the terminal one.
+enum reachability {
+	incomplete,
+	reachable,
+	stale,
+	delay,
+	probe,
+	unreachable,
+}
+
+/// One route: what it covers, on which interface, how it is reached, and for how long.
+record route-entry {
+	destination:      ip-address,
+	prefix-len:       u8,
+	scope:            interface-id,
+	preference:       route-preference,
+	lifetime-seconds: u32,
+	hop:              next-hop,
+}
+
+/// One default router, with the two keys that order it and what is left of its lifetime.
+record router-entry {
+	addr:             ip-address,
+	scope:            interface-id,
+	preference:       route-preference,
+	state:            reachability,
+	lifetime-seconds: u32,
+}
+
+/// One recursive DNS server, and the interface that learned it - which is what makes an
+/// interface-qualified server expressible at all.
+record dns-server {
+	addr:  ip-address,
+	scope: interface-id,
+}
+
+/// A neighbour-cache entry: an on-link address of either family, the hardware address it resolved
+/// to, and the interface it belongs to.
+record neighbor {
+	addr:  ip-address,
+	mac:   mac-addr,
+	scope: interface-id,
+}
+
+/// The interface's L3 state: its identity and name, its hardware address and MTU, every address it
+/// holds, every route, router and recursive server it knows, and its neighbour cache - the typed
+/// form of what the `ip` / `net` command renders.
+///
+/// THE BOUNDS ARE A COMBINED DUAL-STACK SNAPSHOT of this milestone's single interface: each one adds
+/// the IPv4 values the stack already holds to the IPv6 maxima. Copying only the IPv6 maxima would
+/// overflow exactly when both families are full, which is the case worth reporting.
 record net-info {
-    addr:      ipv4-addr,
-    mac:       list<u8>,
-    mtu:       u16,
-	gateway:   ipv4-addr,
-	neighbors: list<neighbor>,
+	scope:                 interface-id,
+	@bound(16)   name:      string,
+	mac:                   mac-addr,
+	mtu:                   u16,
+	/// 16 IPv6 addresses plus the current IPv4 address.
+	@bound(17)   addresses: list<interface-address>,
+	/// 32 IPv6 routes plus the IPv4 on-link and default routes.
+	@bound(34)   routes:    list<route-entry>,
+	/// 8 IPv6 default routers plus the IPv4 gateway.
+	@bound(9)    routers:   list<router-entry>,
+	/// 4 RDNSS records plus the current IPv4 server.
+	@bound(5)    dns:       list<dns-server>,
+	/// The default 1024-entry ARP cache plus all 64 IPv6 neighbours. A populated count above this
+	/// is a typed overflow rather than a truncated view: `net.arp-cache` stays configurable, and a
+	/// report that quietly dropped rows would be worse than one that says it cannot be made.
+	@bound(1088) neighbors: list<neighbor>,
 }
 
 /// The NetworkService pool utilization: how many client, socket and listener channels
@@ -49,14 +219,14 @@ record net-capacity {
 }
 
 /// The outcome of a ping: a reply arrived, it timed out, or the target was
-/// unreachable (no route / no ARP).
+/// unreachable (no route / no neighbour).
 enum ping-status {
 	reply,
 	timeout,
 	unreachable,
 }
 
-/// The result of one ping echo: the outcome, the reply packet's IP TTL, and the
+/// The result of one ping echo: the outcome, the reply packet's IP TTL or IPv6 hop limit, and the
 /// measured round-trip time in microseconds. `ttl` and `rtt-us` are meaningful only
 /// when `status` is `reply` (zero otherwise).
 record ping-reply {
@@ -67,8 +237,8 @@ record ping-reply {
 
 /// What answered one traceroute probe.
 enum hop-status {
-	/// A router discarded the datagram because its TTL ran out, and reported itself. This is the
-	/// ordinary answer for every hop before the destination.
+	/// A router discarded the datagram because its TTL or hop limit ran out, and reported itself.
+	/// This is the ordinary answer for every hop before the destination.
 	time-exceeded,
 	/// The destination itself answered the echo: the trace has arrived.
 	reply,
@@ -85,14 +255,94 @@ enum hop-status {
 /// because there is no address to report and inventing one would be worse than an empty row.
 record trace-hop {
 	status: hop-status,
-	addr:   ipv4-addr,
+	addr:   ip-address,
 	rtt-us: u32,
 }
 
-/// A one-shot TCP exchange: connect to `ep`, send `request`, and read the response.
+/// Where to open a connection to, shared by `connect` and `fetch`.
+///
+/// A LIST, BECAUSE A NAME RESOLVES TO SEVERAL ADDRESSES AND THE SERVICE OWNS THE ORDER. A literal is
+/// a singleton; a resolved name supplies what `resolve` returned, already ordered. The service tries
+/// them in order, sequentially - a caller's RPC deadline is not a fallback mechanism and neither is a
+/// second concurrent request. An empty list, a list over the bound or a malformed scope is refused
+/// before any open is admitted; caller input is never truncated to fit, and duplicate scoped
+/// addresses collapse to their first occurrence.
+///
+/// `source` is the caller's OPTIONAL choice of source address. Absent means "select for me", which
+/// is every ordinary call. A source that is not a usable candidate for a destination fails THAT
+/// destination - another may be tried with the same source - and a source that becomes invalid fails
+/// the whole open. Naming one and quietly getting another is the failure this field exists to
+/// prevent.
+record open-target {
+	@bound(8) destinations: list<scoped-address>,
+	port:                   u16,
+	source:                 option<scoped-address>,
+}
+
+/// A one-shot TCP exchange: open to `target`, send `request`, and read the response as a stream.
 record tcp-request {
-	ep:      endpoint,
-	request: list<u8>,
+	target:                open-target,
+	@bound(1024) request:  list<u8>,
+}
+
+/// How a fetch ended. A caller that cannot tell these apart cannot know whether it holds the whole
+/// resource, which is why the stream carries the answer rather than leaving it to be inferred.
+enum fetch-outcome {
+	/// Orderly TCP end of stream, after at most the cumulative body cap.
+	complete,
+	/// An in-order response byte beyond the cumulative cap was observed. That byte proves truncation
+	/// and is never delivered.
+	truncated,
+	/// A reset, a receive timeout or another transport failure before either terminal above. Never
+	/// inferred completion.
+	failed,
+}
+
+/// One chunk of a fetch response. The final element carries the outcome; every earlier one carries
+/// body bytes and no outcome.
+///
+/// Reaching the cumulative cap does not by itself end the stream: a body of exactly the cap followed
+/// by an orderly end is COMPLETE, and truncation requires evidence of a further byte.
+record fetch-chunk {
+	@bound(4096) data: list<u8>,
+	outcome:           option<fetch-outcome>,
+}
+
+/// Which address families a listener binds.
+enum bind-mode {
+	ipv4-only,
+	ipv6-only,
+	/// Both families at once, and only ever on the unspecified IPv6 address.
+	dual-stack,
+}
+
+/// A request to listen: the families, where, and how deep the accept queue is.
+///
+/// WHICH ENDPOINTS ARE LEGAL WITH WHICH MODE:
+///
+///   ipv4-only    `0.0.0.0` binds every IPv4 address; a specific IPv4 address binds that one
+///   ipv6-only    `::` binds every IPv6 address; a specific IPv6 address binds that one
+///   dual-stack   `::` and NOTHING else
+///
+/// THE WILDCARD IS THE UNSPECIFIED ADDRESS AND NOT AN ABSENT ONE. An optional endpoint would be a
+/// second way to say the same thing and a first way to say something undefined; the unspecified
+/// address is what these protocols already mean by "any", and it makes "is this a wildcard" one
+/// comparison rather than a convention. A dual-stack bind naming a specific address is refused, so
+/// is an address whose family disagrees with a single-family mode, and so is an IPv4-mapped IPv6
+/// address in every mode.
+record listen-request {
+	mode:    bind-mode,
+	local:   scoped-endpoint,
+	backlog: u16,
+}
+
+/// A listener and the backlog it actually got, which is not always the one that was asked for.
+///
+/// The handle travels out of band as a capability, beside inline metadata, exactly as
+/// `process.start-result` does; an error publishes neither a listener nor a handle.
+record listen-result {
+	listener: handle<channel>,
+	backlog:  u16,
 }
 
 /// A live socket's TCP state - the typed form of the state column `ss` prints.
@@ -105,13 +355,20 @@ enum sock-state {
 	listen,
 }
 
-/// A live socket in the NetworkService table: its local port, the remote endpoint it
-/// talks to (zeros for a listening socket), and its TCP state - the typed form of one
-/// row `ss` lists.
+/// A live socket in the NetworkService table: both of its endpoints and its TCP state, which is what
+/// lets `ss` report what a socket IS rather than only that it exists. A listening socket's remote
+/// endpoint is the unspecified address of its own family on port zero.
 record sock-info {
-	local-port: u16,
-	remote:     endpoint,
-	state:      sock-state,
+	local:  scoped-endpoint,
+	remote: scoped-endpoint,
+	state:  sock-state,
+}
+
+/// An accepted connection: the socket capability and both endpoints it runs between.
+record accept-result {
+	socket: handle<channel>,
+	local:  scoped-endpoint,
+	remote: scoped-endpoint,
 }
 
 /// The NetworkService contract: the interface state, name resolution, ping, a
@@ -123,17 +380,29 @@ record sock-info {
 /// API like every other service.
 interface network {
 	@op(1) info:    func() -> result<net-info, error>;
-	@op(2) resolve: func(name: string) -> result<ipv4-addr, error>;
-	@op(3) ping:    func(addr: ipv4-addr) -> result<ping-reply, error>;
-	@op(4) fetch:   func(req: tcp-request) -> result<list<u8>, error>;
-	@op(5) connect: func(ep: endpoint) -> result<handle<channel>, error>;
+	/// Resolve a name to an ORDERED list of addresses of either family, at most eight.
+	///
+	/// A NAME WITH MORE THAN EIGHT ADDRESSES IS NOT AN ERROR. The list is already ordered by the
+	/// selection rules, so the eight kept are the eight that would have been tried first; refusing
+	/// the name instead would make a well-provisioned service unreachable.
+	@op(2) @bound(8) resolve: func(@bound(253) name: string) -> result<list<ip-address>, error>;
+	@op(3) ping:    func(addr: scoped-address) -> result<ping-reply, error>;
+	/// Open to one of `req`'s destinations, send its request bytes, and stream the response.
+	///
+	/// THE OPEN IS GUARDED AND THE BODY IS A STREAM. A refusal before any body exists - an
+	/// unresolvable name, a spent budget, a refused connection - is the typed error every other
+	/// operation here uses, and not a zero-length stream a caller has to interpret. Only the opening
+	/// phase may try another destination: once a handshake succeeds the request is never replayed
+	/// elsewhere.
+	@op(4) fetch:   func(req: tcp-request) -> result<stream<fetch-chunk>, error>;
+	@op(5) connect: func(target: open-target) -> result<handle<channel>, error>;
 	@op(6) open:    func() -> result<handle<channel>, error>;
-	@op(7) listen:  func(port: u16) -> result<handle<channel>, error>;
-	@op(8) sockets: func() -> result<list<sock-info>, error>;
-	@op(9) sntp:    func(server: ipv4-addr) -> result<u64, error>;
+	@op(7) listen:  func(req: listen-request) -> result<listen-result, error>;
+	@op(8) @bound(256) sockets: func() -> result<list<sock-info>, error>;
+	@op(9) sntp:    func(server: scoped-address) -> result<u64, error>;
 	@op(10) capacity: func() -> result<net-capacity, error>;
-	/// One traceroute probe: send an echo to `addr` with the IP TTL set to `ttl` and report what
-	/// answered.
+	/// One traceroute probe: send an echo to `addr` with the IP TTL or IPv6 hop limit set to `ttl`
+	/// and report what answered.
 	///
 	/// THE TOOL NEVER TOUCHES THE NIC. A traceroute is conventionally a program with a raw socket,
 	/// which is ambient authority over every packet the machine sends and receives - to discover a
@@ -144,7 +413,7 @@ interface network {
 	/// answered (`time-exceeded`), the destination itself answered (`reply`, so the trace is over),
 	/// or nothing came back (`timeout`, a hop that does not report itself) - and `unreachable`,
 	/// which is an answer saying the path is refused rather than silence saying nothing about it.
-	@op(11) probe: func(addr: ipv4-addr, ttl: u8) -> result<trace-hop, error>;
+	@op(11) probe: func(addr: scoped-address, ttl: u8) -> result<trace-hop, error>;
 }
 
 /// A connected TCP socket, served on the channel `network.connect` hands back as a
@@ -161,14 +430,14 @@ interface socket {
 
 /// One chunk of received socket data, the element of the `socket.recv` stream.
 record chunk {
-	data: list<u8>,
+	@bound(4096) data: list<u8>,
 }
 
 /// A listening socket from `network.listen`, served on the channel it hands back.
 /// `accept` waits until an inbound connection completes its handshake, then hands it
-/// back as a `socket` capability (the channel a `socket` interface is served on) - the
-/// passive-open counterpart to `network.connect`. The server calls `accept` in a loop,
-/// each call yielding the next connection.
+/// back as a `socket` capability together with both endpoints - the passive-open
+/// counterpart to `network.connect`. The server calls `accept` in a loop, each call
+/// yielding the next connection.
 interface listener {
-	@op(1) accept: func() -> result<handle<channel>, error>;
+	@op(1) accept: func() -> result<accept-result, error>;
 }

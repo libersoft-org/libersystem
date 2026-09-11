@@ -213,6 +213,26 @@ fn the_address_set_is_bounded_and_refuses_rather_than_evicting() {
 
 	// Adding one that is already there is not an admission and costs no slot.
 	assert_eq!(set.add_tentative(interface(), address(0), Lifetime::Infinite, Lifetime::Infinite), Ok(DadOutcome::Nothing));
+
+	// A REFRESH AT CAPACITY COSTS NO SLOT, and a slot released by removal admits a new address. The
+	// pair matters together: a table that refused for ever once full would leave a renumbered host
+	// unable to take the prefix that replaced the one it just let go.
+	assert!(set.refresh(interface(), address(0), Lifetime::Finite(1_000), Lifetime::Finite(2_000), 0));
+	assert_eq!(set.len(), 16);
+	assert_eq!(set.add_tentative(interface(), address(999), Lifetime::Infinite, Lifetime::Infinite), Err(Resource::UnicastAddresses));
+
+	assert!(set.remove(interface(), address(3)));
+	assert_eq!(set.len(), 15);
+	assert_eq!(set.add_tentative(interface(), address(999), Lifetime::Infinite, Lifetime::Infinite), Ok(DadOutcome::Probe { address: address(999) }), "the reclaimed slot admits it");
+	assert_eq!(set.len(), 16);
+
+	// And expiry is the other way a slot comes back: it releases exactly the one that ran out. The
+	// deadline is the two-hour rule's and not the advertised one - the refresh above tried to cut an
+	// infinite lifetime to two seconds, which is the shortening that rule refuses.
+	assert!(set.tick(TWO_HOURS_MS - 1).is_empty(), "still inside the floor the rule imposed");
+	assert_eq!(set.tick(TWO_HOURS_MS), alloc::vec![address(0)]);
+	assert_eq!(set.len(), 15);
+	assert_eq!(set.add_tentative(interface(), address(998), Lifetime::Infinite, Lifetime::Infinite), Ok(DadOutcome::Probe { address: address(998) }));
 }
 
 #[test]
@@ -226,4 +246,86 @@ fn addresses_belong_to_one_interface_generation() {
 	assert_eq!(set.len(), 1);
 	assert!(set.remove(replaced, address(1)));
 	assert!(!set.remove(replaced, address(1)));
+}
+
+fn router(low: u16) -> Address {
+	let mut bytes = [0u8; 16];
+	bytes[0] = 0xfe;
+	bytes[1] = 0x80;
+	bytes[14..16].copy_from_slice(&low.to_be_bytes());
+	Address::new(bytes)
+}
+
+#[test]
+fn a_recursive_server_is_keyed_on_the_pair_so_one_router_cannot_withdraw_anothers_offer() {
+	let mut set = RdnssSet::new();
+	assert!(set.advertise(interface(), router(1), address(0x53), 600, 0));
+	assert!(set.advertise(interface(), router(2), address(0x53), 600, 0));
+	assert_eq!(set.len(), 2, "two records");
+	assert_eq!(set.servers(), alloc::vec![address(0x53)], "one server: a resolver list, not a record list");
+
+	// ONE ROUTER WITHDRAWS. The server is still offered by the other, so nothing is taken away.
+	assert!(set.advertise(interface(), router(1), address(0x53), 0, 1_000));
+	assert_eq!(set.len(), 1);
+	assert_eq!(set.servers(), alloc::vec![address(0x53)]);
+
+	// The second withdrawal is the one that removes it.
+	assert!(set.advertise(interface(), router(2), address(0x53), 0, 2_000));
+	assert!(set.is_empty());
+	assert!(set.servers().is_empty());
+	assert!(!set.advertise(interface(), router(2), address(0x53), 0, 3_000), "withdrawing what is not there changes nothing");
+}
+
+#[test]
+fn expiry_reports_only_the_servers_that_are_no_longer_offered_at_all() {
+	let mut set = RdnssSet::new();
+	set.advertise(interface(), router(1), address(0x53), 10, 0);
+	set.advertise(interface(), router(2), address(0x53), 60, 0);
+	set.advertise(interface(), router(1), address(0x54), 10, 0);
+
+	// The first router's records run out. `0x53` is still offered by the second, so only `0x54` is
+	// reported gone - a consumer told to stop using `0x53` would stop for no reason.
+	assert_eq!(set.expire(10_000), alloc::vec![address(0x54)]);
+	assert_eq!(set.servers(), alloc::vec![address(0x53)]);
+	assert_eq!(set.expire(60_000), alloc::vec![address(0x53)]);
+	assert!(set.is_empty());
+}
+
+#[test]
+fn a_refreshed_record_outlives_its_original_lifetime_and_an_infinite_one_never_expires() {
+	let mut set = RdnssSet::new();
+	set.advertise(interface(), router(1), address(0x53), 10, 0);
+	set.advertise(interface(), router(1), address(0x53), 60, 5_000);
+	assert!(set.expire(10_000).is_empty(), "the refresh moved its deadline");
+	assert_eq!(set.expire(65_001), alloc::vec![address(0x53)]);
+
+	let mut forever = RdnssSet::new();
+	forever.advertise(interface(), router(1), address(0x53), INFINITE_LIFETIME, 0);
+	assert!(forever.expire(u64::MAX - 1).is_empty(), "an infinite lifetime is not a large number");
+}
+
+#[test]
+fn the_recursive_server_set_is_bounded_and_refuses_rather_than_evicting() {
+	let mut set = RdnssSet::new();
+	for index in 0..Resource::Rdnss.limit() as u16 {
+		assert!(set.advertise(interface(), router(index), address(0x53 + index), 600, 0), "record {index}");
+	}
+	assert_eq!(set.len(), 4);
+	assert!(!set.advertise(interface(), router(99), address(0x99), 600, 0), "the fifth is refused");
+	assert_eq!(set.len(), 4, "and no live record was thrown away");
+	assert_eq!(set.refusals().get(Resource::Rdnss), 1);
+
+	// A refresh at capacity costs no slot; a released slot admits a new record.
+	assert!(set.advertise(interface(), router(0), address(0x53), 1200, 0));
+	set.advertise(interface(), router(0), address(0x53), 0, 0);
+	assert!(set.advertise(interface(), router(99), address(0x99), 600, 0), "the reclaimed slot admits it");
+
+	// AND THE BOUND IS THE WHOLE SET'S, not one interface's: a replaced NIC cannot use a slot the
+	// full table does not have.
+	let replaced = Interface::new(0, 2);
+	assert!(!set.advertise(replaced, router(1), address(0x53), 600, 0), "the table is full again");
+	assert_eq!(set.clear_interface(interface()), 4, "teardown takes its own link's records");
+	assert!(set.is_empty());
+	assert!(set.advertise(replaced, router(1), address(0x53), 600, 0), "and the new generation can then learn");
+	assert_eq!(set.clear_interface(interface()), 0, "which the old link's teardown does not touch");
 }

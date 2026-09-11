@@ -565,11 +565,32 @@ qemu_attach_virtio_net() {
 	local legacy="${4:-}"
 	local net_user="user,id=$net_id"
 	[[ -n "$hostfwd" ]] && net_user="$net_user,$hostfwd"
+	# A CONTROLLABLE PEER INSTEAD OF SLIRP, when one is asked for.
+	#
+	# User-mode networking is convenient and is not an oracle: it answers what it likes, it will not
+	# emit the router advertisement a test wrote, and it cannot be made to send a malformed one. With
+	# `NET_PEER_PORT` set, the NIC is attached to a socket netdev instead and QEMU connects to
+	# `harness/ipv6-peer.py`, which emits exactly what its scenario names and writes down exactly what
+	# came back. Nothing else about the machine changes, so a peer run and an ordinary run differ in
+	# the far end of the wire and in nothing else.
+	if [[ -n "${NET_PEER_PORT:-}" ]]; then
+		net_user="socket,id=$net_id,connect=127.0.0.1:$NET_PEER_PORT"
+		echo "qemu-run: the NIC is attached to the controllable peer on port $NET_PEER_PORT, not to user-mode networking" >&2
+	fi
 	arr+=(-netdev "$net_user")
+	# THE LINK'S OWN MTU, when a test needs one the guest cannot choose.
+	#
+	# `NET_LINK_MTU` sets what the DEVICE reports, which is the number the driver hands the service
+	# and the service sizes its frame buffers by. It exists for one case that has no other oracle: a
+	# link whose effective MTU is below the 1280 bytes IPv6 requires must leave that family refused
+	# while IPv4 keeps working, and nothing a router advertises can produce that - an RA option is
+	# ignored on a normal link, which is a different branch proving a different thing.
+	local mtu_option=""
+	[[ -n "${NET_LINK_MTU:-}" ]] && mtu_option=",host_mtu=$NET_LINK_MTU"
 	if [[ -n "$legacy" ]]; then
-		arr+=(-device "virtio-net-pci,netdev=$net_id,$legacy")
+		arr+=(-device "virtio-net-pci,netdev=$net_id,$legacy$mtu_option")
 	else
-		arr+=(-device "virtio-net-pci,netdev=$net_id")
+		arr+=(-device "virtio-net-pci,netdev=$net_id$mtu_option")
 	fi
 }
 

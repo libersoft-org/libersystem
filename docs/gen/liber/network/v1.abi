@@ -1,32 +1,52 @@
 package liber:network@1
 record ipv4-addr(a:u8,b:u8,c:u8,d:u8)
-record endpoint(addr:ipv4-addr,port:u16)
-record neighbor(addr:ipv4-addr,mac:list<u8>)
-record net-info(addr:ipv4-addr,mac:list<u8>,mtu:u16,gateway:ipv4-addr,neighbors:list<neighbor>)
+record ipv6-addr(o0:u8,o1:u8,o2:u8,o3:u8,o4:u8,o5:u8,o6:u8,o7:u8,o8:u8,o9:u8,o10:u8,o11:u8,o12:u8,o13:u8,o14:u8,o15:u8)
+record mac-addr(a:u8,b:u8,c:u8,d:u8,e:u8,f:u8)
+variant ip-address(v4=0:ipv4-addr,v6=1:ipv6-addr)
+record interface-id(index:u32,generation:u64)
+record scoped-address(addr:ip-address,scope:option<interface-id>)
+record scoped-endpoint(addr:scoped-address,port:u16)
+enum address-state(tentative=0,preferred=1,deprecated=2,invalid=3)
+record interface-address(addr:ip-address,prefix-len:u8,state:address-state,preferred-seconds:u32,valid-seconds:u32)
+variant next-hop(direct=0:unit,via=1:ip-address)
+enum route-preference(low=0,medium=1,high=2)
+enum reachability(incomplete=0,reachable=1,stale=2,delay=3,probe=4,unreachable=5)
+record route-entry(destination:ip-address,prefix-len:u8,scope:interface-id,preference:route-preference,lifetime-seconds:u32,hop:next-hop)
+record router-entry(addr:ip-address,scope:interface-id,preference:route-preference,state:reachability,lifetime-seconds:u32)
+record dns-server(addr:ip-address,scope:interface-id)
+record neighbor(addr:ip-address,mac:mac-addr,scope:interface-id)
+record net-info(scope:interface-id,name:string:bound=16,mac:mac-addr,mtu:u16,addresses:list<interface-address>:bound=17,routes:list<route-entry>:bound=34,routers:list<router-entry>:bound=9,dns:list<dns-server>:bound=5,neighbors:list<neighbor>:bound=1088)
 record net-capacity(clients:u32,sockets:u32,listeners:u32,connections:u32)
 enum ping-status(reply=0,timeout=1,unreachable=2)
 record ping-reply(status:ping-status,ttl:u8,rtt-us:u32)
 enum hop-status(time-exceeded=0,reply=1,unreachable=2,timeout=3)
-record trace-hop(status:hop-status,addr:ipv4-addr,rtt-us:u32)
-record tcp-request(ep:endpoint,request:list<u8>)
+record trace-hop(status:hop-status,addr:ip-address,rtt-us:u32)
+record open-target(destinations:list<scoped-address>:bound=8,port:u16,source:option<scoped-address>)
+record tcp-request(target:open-target,request:list<u8>:bound=1024)
+enum fetch-outcome(complete=0,truncated=1,failed=2)
+record fetch-chunk(data:list<u8>:bound=4096,outcome:option<fetch-outcome>)
+enum bind-mode(ipv4-only=0,ipv6-only=1,dual-stack=2)
+record listen-request(mode:bind-mode,local:scoped-endpoint,backlog:u16)
+record listen-result(listener:handle<channel>,backlog:u16)
 enum sock-state(closed=0,syn-sent=1,syn-rcvd=2,established=3,fin-wait=4,listen=5)
-record sock-info(local-port:u16,remote:endpoint,state:sock-state)
+record sock-info(local:scoped-endpoint,remote:scoped-endpoint,state:sock-state)
+record accept-result(socket:handle<channel>,local:scoped-endpoint,remote:scoped-endpoint)
 interface network
 method network.info op=1 () -> result<net-info, liber:base@1::error>
-method network.resolve op=2 (name:string:rights=) -> result<ipv4-addr, liber:base@1::error>
-method network.ping op=3 (addr:ipv4-addr:rights=) -> result<ping-reply, liber:base@1::error>
-method network.fetch op=4 (req:tcp-request:rights=) -> result<list<u8>, liber:base@1::error>
-method network.connect op=5 (ep:endpoint:rights=) -> result<handle<channel>, liber:base@1::error>
+method network.resolve op=2 (name:string:bound=253:rights=) -> result<list<ip-address>, liber:base@1::error>:bound=8
+method network.ping op=3 (addr:scoped-address:rights=) -> result<ping-reply, liber:base@1::error>
+method network.fetch op=4 (req:tcp-request:rights=) -> result<stream<fetch-chunk>, liber:base@1::error>
+method network.connect op=5 (target:open-target:rights=) -> result<handle<channel>, liber:base@1::error>
 method network.open op=6 () -> result<handle<channel>, liber:base@1::error>
-method network.listen op=7 (port:u16:rights=) -> result<handle<channel>, liber:base@1::error>
-method network.sockets op=8 () -> result<list<sock-info>, liber:base@1::error>
-method network.sntp op=9 (server:ipv4-addr:rights=) -> result<u64, liber:base@1::error>
+method network.listen op=7 (req:listen-request:rights=) -> result<listen-result, liber:base@1::error>
+method network.sockets op=8 () -> result<list<sock-info>, liber:base@1::error>:bound=256
+method network.sntp op=9 (server:scoped-address:rights=) -> result<u64, liber:base@1::error>
 method network.capacity op=10 () -> result<net-capacity, liber:base@1::error>
-method network.probe op=11 (addr:ipv4-addr:rights=,ttl:u8:rights=) -> result<trace-hop, liber:base@1::error>
+method network.probe op=11 (addr:scoped-address:rights=,ttl:u8:rights=) -> result<trace-hop, liber:base@1::error>
 interface socket
 method socket.send op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
 method socket.recv op=2 () -> stream<chunk>
 method socket.close op=3 () -> result<unit, liber:base@1::error>
-record chunk(data:list<u8>)
+record chunk(data:list<u8>:bound=4096)
 interface listener
-method listener.accept op=1 () -> result<handle<channel>, liber:base@1::error>
+method listener.accept op=1 () -> result<accept-result, liber:base@1::error>

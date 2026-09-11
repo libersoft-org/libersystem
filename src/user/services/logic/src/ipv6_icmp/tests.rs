@@ -267,3 +267,59 @@ fn a_record_belongs_to_one_interface_generation() {
 	assert_eq!(cache.record(replaced, address(2), 1350, 0), MtuOutcome::Lowered { mtu: 1350 });
 	assert_eq!(cache.get(interface(), address(2), 0), Some(1400), "and the old one is untouched");
 }
+
+#[test]
+fn under_a_flood_the_emission_in_elapsed_time_is_bounded_by_the_burst_plus_the_rate() {
+	// THE BOUND WRITTEN AS A FORMULA rather than as "not too many". In elapsed time T at rate R,
+	// what may leave is at most `20 + floor(R * T)`, and a limiter that refilled per call or that
+	// let the bucket grow past the burst breaks exactly this.
+	for rate in [1u32, 10, 100] {
+		for elapsed_ms in [0u64, 250, 1_000, 5_000] {
+			let mut limiter = RateLimiter::new(rate);
+			let attempt = origination(ErrorClass::DestinationUnreachable { code: 3 }, address(2), address(1));
+			let mut emitted = 0u64;
+			// A flood: ask far more often than the bucket can answer, across the whole interval.
+			for step in 0..2000u64 {
+				let now = elapsed_ms * step / 2000;
+				if may_originate(&attempt, &mut limiter, now).is_ok() {
+					emitted += 1;
+				}
+			}
+			let permitted = u64::from(ERROR_BURST) + u64::from(rate) * elapsed_ms / 1000;
+			assert!(emitted <= permitted, "rate {rate} over {elapsed_ms}ms emitted {emitted}, past {permitted}");
+			// And the counter saw every one it refused, with no per-packet log to grow.
+			assert_eq!(u64::from(limiter.limited()), 2000 - emitted);
+		}
+	}
+}
+
+#[test]
+fn a_full_path_mtu_table_refuses_the_next_key_and_the_flow_keeps_its_own_smaller_limit() {
+	let mut cache = PathMtuCache::new();
+	let limit = crate::ipv6_budget::Resource::PathMtu.limit();
+	for index in 0..limit as u16 {
+		assert_eq!(cache.record(interface(), address(index), 1400, 0), MtuOutcome::Lowered { mtu: 1400 });
+	}
+	assert_eq!(cache.len(), limit as usize);
+
+	// THE SIXTY-FIFTH KEY IS REFUSED, and the answer says `Capacity` rather than claiming the write
+	// happened. The consumer that asked keeps the smaller limit it validated for its own flow - the
+	// cache is where the durable record lives, not where the decision was made - and can retry once
+	// a slot is released.
+	assert_eq!(cache.record(interface(), address(9999), 1300, 0), MtuOutcome::Capacity);
+	assert_eq!(cache.get(interface(), address(9999), 0), None, "nothing was written for it");
+	assert_eq!(cache.len(), limit as usize, "and no live record was evicted to make room");
+	// Every other flow still reads what it had.
+	assert_eq!(cache.get(interface(), address(0), 0), Some(1400));
+
+	// A REFRESH AT CAPACITY still works, because it costs no slot.
+	assert_eq!(cache.record(interface(), address(0), 1350, 0), MtuOutcome::Lowered { mtu: 1350 });
+	assert_eq!(cache.len(), limit as usize);
+
+	// AND A SLOT RELEASED BY EXPIRY ADMITS THE KEY THAT WAS REFUSED, which is what makes `Capacity`
+	// a retryable answer rather than a permanent one.
+	assert_eq!(cache.expire(PATH_MTU_LIFETIME_MS + 1), limit as usize, "every record aged out together");
+	assert!(cache.is_empty());
+	assert_eq!(cache.record(interface(), address(9999), 1300, PATH_MTU_LIFETIME_MS + 1), MtuOutcome::Lowered { mtu: 1300 });
+	assert_eq!(cache.get(interface(), address(9999), PATH_MTU_LIFETIME_MS + 1), Some(1300));
+}

@@ -313,6 +313,11 @@ impl AddressSet {
 		self.entries.iter().filter(|entry| entry.interface == interface && entry.assigned()).map(|entry| entry.address).collect()
 	}
 
+	/// Every record this interface holds, tentative and deprecated included.
+	pub fn configured(&self, interface: Interface) -> Vec<ConfiguredAddress> {
+		self.entries.iter().filter(|entry| entry.interface == interface).copied().collect()
+	}
+
 	pub fn get(&self, interface: Interface, address: Address) -> Option<ConfiguredAddress> {
 		self.entries.iter().copied().find(|entry| entry.interface == interface && entry.address == address)
 	}
@@ -344,3 +349,101 @@ impl AddressSet {
 
 #[cfg(test)]
 mod tests;
+
+/// One recursive DNS server learned from a router advertisement, and who advertised it.
+///
+/// THE PAIR IS THE IDENTITY, not the server. Two routers may advertise the same server with
+/// different lifetimes, and a table keyed on the server alone would let one router's withdrawal take
+/// away a server the other is still offering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RdnssRecord {
+	pub interface: Interface,
+	pub router: Address,
+	pub server: Address,
+	pub lifetime: Lifetime,
+}
+
+/// The bounded set of recursive DNS servers.
+#[derive(Debug, Default)]
+pub struct RdnssSet {
+	entries: Vec<RdnssRecord>,
+	refusals: Refusals,
+}
+
+impl RdnssSet {
+	pub fn new() -> RdnssSet {
+		RdnssSet::default()
+	}
+
+	/// Learn or refresh a server from `router`.
+	///
+	/// A LIFETIME OF ZERO IS A WITHDRAWAL, and it withdraws only that router's offer. Returns
+	/// whether anything changed, so a caller knows when to tell its consumers.
+	pub fn advertise(&mut self, interface: Interface, router: Address, server: Address, lifetime_seconds: u32, now_ms: u64) -> bool {
+		let existing = self.entries.iter().position(|held| held.interface == interface && held.router == router && held.server == server);
+		if lifetime_seconds == 0 {
+			return match existing {
+				Some(index) => {
+					self.entries.remove(index);
+					true
+				}
+				None => false,
+			};
+		}
+		let lifetime = Lifetime::from_wire(lifetime_seconds, now_ms);
+		if let Some(index) = existing {
+			self.entries[index].lifetime = lifetime;
+			return true;
+		}
+		if self.entries.len() as u32 >= Resource::Rdnss.limit() {
+			self.refusals.record(Resource::Rdnss);
+			return false;
+		}
+		self.entries.push(RdnssRecord { interface, router, server, lifetime });
+		true
+	}
+
+	/// Drop records whose lifetime ran out, returning the servers that are no longer offered AT ALL.
+	///
+	/// A record expiring is not the same as a server going away: another router may still be
+	/// offering it, and a consumer told to stop using it would stop for no reason.
+	pub fn expire(&mut self, now_ms: u64) -> Vec<Address> {
+		let before: Vec<Address> = self.servers();
+		self.entries.retain(|record| !record.lifetime.expired(now_ms));
+		let after = self.servers();
+		before.into_iter().filter(|server| !after.contains(server)).collect()
+	}
+
+	/// Every server offered, once each, in the order they were learned.
+	///
+	/// EXPORTED UNIQUE, because a consumer wants a resolver list rather than a record list: two
+	/// routers offering the same server is one server to ask.
+	pub fn servers(&self) -> Vec<Address> {
+		let mut out: Vec<Address> = Vec::new();
+		for record in &self.entries {
+			if !out.contains(&record.server) {
+				out.push(record.server);
+			}
+		}
+		out
+	}
+
+	/// Remove everything an interface learned, for teardown or a generation change.
+	pub fn clear_interface(&mut self, interface: Interface) -> usize {
+		let before = self.entries.len();
+		self.entries.retain(|record| record.interface != interface);
+		before - self.entries.len()
+	}
+
+	pub fn len(&self) -> usize {
+		self.entries.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.entries.is_empty()
+	}
+
+	pub fn refusals(&self) -> Refusals {
+		self.refusals
+	}
+}

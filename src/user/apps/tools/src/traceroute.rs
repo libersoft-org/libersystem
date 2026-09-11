@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use cli::{Arg, classify, parse_u64};
 use network_client::NetworkClient;
 use proto::codec::{JsonMode, json_escape};
-use proto::system::{HopStatus, Ipv4Addr, LaunchContext};
+use proto::system::{HopStatus, LaunchContext, ScopedAddress};
 use rt::*;
 use tools::{push_decimal, split_args};
 
@@ -101,23 +101,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// A NAME OR A NUMBER, resolved the same way `ping` resolves one - through the service's own
 	// DNS, so the tool needs no resolver and no configuration of its own.
 	let mut client = NetworkClient::new(netsvc);
-	let destination: Ipv4Addr = match Ipv4Addr::parse(target) {
-		Some(addr) => addr,
-		None => {
-			let Ok(name) = core::str::from_utf8(target) else {
-				eprint(b"traceroute: the destination is neither an address nor a name\n");
-				exit();
-			};
-			match client.resolve(name) {
-				Some(Ok(addr)) => addr,
-				_ => {
-					eprint(b"traceroute: cannot resolve ");
-					eprint(target);
-					eprint(b"\n");
-					exit();
-				}
-			}
-		}
+	let Some(destination) = tools::resolve_target(&mut client, target) else {
+		eprint(b"traceroute: cannot resolve ");
+		eprint(target);
+		eprint(b"\n");
+		exit();
 	};
 	catch_interrupt();
 	trace(&mut client, &destination, target, max_hops, probes, json);
@@ -126,9 +114,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 // Walk the path: one row per TTL, several probes each, stopping at the destination.
-fn trace(client: &mut NetworkClient, destination: &Ipv4Addr, shown: &[u8], max_hops: u64, probes: u64, json: Option<JsonMode>) {
+fn trace(client: &mut NetworkClient, destination: &ScopedAddress, shown: &[u8], max_hops: u64, probes: u64, json: Option<JsonMode>) {
 	let mut document = String::from("{\"target\":");
-	let mut rendered: [u8; 16] = [0u8; 16];
+	// Wide enough for the longest address of either family, with its scope.
+	let mut rendered: [u8; 96] = [0u8; 96];
 	let length: usize = destination.render(&mut rendered);
 	json_escape(&String::from_utf8_lossy(shown), &mut document);
 	document.push_str(",\"address\":\"");
@@ -163,7 +152,7 @@ fn trace(client: &mut NetworkClient, destination: &Ipv4Addr, shown: &[u8], max_h
 		line.push(b' ');
 		// The address this hop reported, so the row names it once rather than after every
 		// probe - which is what makes three probes of one router read as one hop.
-		let mut named: Option<Ipv4Addr> = None;
+		let mut named: Option<proto::system::IpAddress> = None;
 		let mut arrived = false;
 		let mut refused = false;
 		let mut times: Vec<u32> = Vec::new();

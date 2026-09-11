@@ -56,6 +56,15 @@ const OPTION_JUMBO_PAYLOAD: u8 = 0xc2;
 /// Pad1, which is one byte and has no length field.
 const OPTION_PAD1: u8 = 0;
 
+/// The IPv6 Router Alert option, which every multicast listener message carries.
+pub const OPTION_ROUTER_ALERT: u8 = 5;
+
+/// A Hop-by-Hop header carrying nothing but Router Alert, ready to sit before an MLD message.
+///
+/// Next Header, a length of one eight-byte unit minus one, the option with its two-byte value, and a
+/// PadN to fill the unit. Spelled once here because every emitted listener message needs exactly it.
+pub const ROUTER_ALERT_HEADER: [u8; 8] = [NEXT_ICMPV6, 0, OPTION_ROUTER_ALERT, 2, 0, 0, 1, 0];
+
 /// What the top two bits of an unknown option type tell a host to do.
 ///
 /// The two bits are the whole reason a blanket "no ICMP error for a multicast destination" rule is
@@ -160,6 +169,12 @@ pub struct Parsed<'a> {
 	/// Whether an atomic fragment header was stripped on the way. A Neighbour Discovery consumer
 	/// refuses the message when this is set, which is RFC 6980.
 	pub atomic_fragment: bool,
+	/// Whether a Hop-by-Hop header carried the IPv6 Router Alert option.
+	///
+	/// MULTICAST LISTENER DISCOVERY REQUIRES IT ON EVERY MESSAGE, and a receiver that inferred it
+	/// from "some extension header was present" would accept a query carrying a Destination Options
+	/// header and nothing else. The walk knows; this is the walk saying so.
+	pub router_alert: bool,
 }
 
 /// Read the fixed header out of an L3 packet, without walking the chain.
@@ -219,6 +234,7 @@ fn walk(header: Header, body: &[u8]) -> Result<Parsed<'_>, Refusal> {
 	let mut offset = 0usize;
 	let mut headers = 0usize;
 	let mut atomic_fragment = false;
+	let mut router_alert = false;
 	loop {
 		match next {
 			NEXT_HOP_BY_HOP | NEXT_DESTINATION => {
@@ -226,6 +242,9 @@ fn walk(header: Header, body: &[u8]) -> Result<Parsed<'_>, Refusal> {
 				// with a Jumbo option means the real length is in the option, and a host that walked
 				// past the option would then treat a jumbogram as an empty packet.
 				let (length, options) = extension_slice(body, offset)?;
+				if next == NEXT_HOP_BY_HOP && carries_router_alert(options) {
+					router_alert = true;
+				}
 				step_options(options, HEADER_LEN + offset)?;
 				// The first byte of an extension header is the NEXT one's number. Read it before
 				// stepping over the header, not by arithmetic afterwards.
@@ -278,7 +297,7 @@ fn walk(header: Header, body: &[u8]) -> Result<Parsed<'_>, Refusal> {
 	if atomic_fragment && next == NEXT_ICMPV6 && is_neighbour_discovery(&body[offset..]) {
 		return Err(Refusal::FragmentedNeighbourDiscovery);
 	}
-	Ok(Parsed { header, upper: next, payload: &body[offset..], extension_bytes: offset, atomic_fragment })
+	Ok(Parsed { header, upper: next, payload: &body[offset..], extension_bytes: offset, atomic_fragment, router_alert })
 }
 
 /// The ICMPv6 types Neighbour Discovery uses.
@@ -338,7 +357,26 @@ fn step_options(header_bytes: &[u8], header_offset: usize) -> Result<(), Refusal
 /// The options this host implements. Router Alert is the one a Multicast Listener Discovery message
 /// carries, and refusing it would refuse this host's own group reports coming back.
 fn known_option(option_type: u8) -> bool {
-	option_type == 5
+	option_type == OPTION_ROUTER_ALERT
+}
+
+/// Does this Hop-by-Hop header carry the Router Alert option?
+fn carries_router_alert(header_bytes: &[u8]) -> bool {
+	let mut index = 2usize;
+	while index < header_bytes.len() {
+		if header_bytes[index] == OPTION_PAD1 {
+			index += 1;
+			continue;
+		}
+		if index + 1 >= header_bytes.len() {
+			return false;
+		}
+		if header_bytes[index] == OPTION_ROUTER_ALERT {
+			return true;
+		}
+		index += 2 + usize::from(header_bytes[index + 1]);
+	}
+	false
 }
 
 /// Is this packet addressed to us?
@@ -404,11 +442,70 @@ pub fn build_frame(destination_mac: [u8; 6], source_mac: [u8; 6], source: Addres
 	Ok(frame)
 }
 
+/// The link MTU to use after a router advertised `advertised`, or `None` to keep what we have.
+///
+/// AN ADVERTISEMENT MAY LOWER THE MTU AND NEVER RAISE IT. The frame buffers were sized when the
+/// interface came up, from the driver's report and the configured knob; a router that asked for more
+/// than that would be asking this host to write past them, and a host that obliged would have a
+/// buffer overflow reachable from one packet on the link.
+///
+/// AND IT MAY NOT GO BELOW THE MINIMUM. An option naming less than 1280 does not describe a link
+/// this host can run IPv6 on at all, so it is ignored rather than acted on: refusing the option
+/// leaves a working interface, while taking it would leave one that cannot send a legal packet.
+/// The MTU this host will actually use on a link: the smaller of what the configuration asks for and
+/// what the device reports the link carries.
+///
+/// BOTH, NOT EITHER. A configured value larger than the link is a configuration error the link wins;
+/// a link larger than the configured value is a policy the configuration wins. The number that
+/// decides whether IPv6 runs at all is this one - not an advertised MTU option, which arrives later,
+/// is ignored on a link that already carries less, and says nothing about what the interface can do.
+pub fn effective_link_mtu(configured: u16, reported: u16) -> u16 {
+	configured.min(reported)
+}
+
+/// Will IPv6 run on a link of this effective MTU at all?
+///
+/// A LINK BELOW 1280 BYTES LEAVES THE FAMILY REFUSED, which is the only honest answer. RFC 8200 puts
+/// the floor there and gives no fragmentation this host may use to get under it, so the two
+/// alternatives are both worse: raising the number leaves a host writing frames the link will not
+/// take, and running anyway leaves one that cannot send a legal packet. Nothing else on the
+/// interface is affected - IPv4 keeps working and the frame buffers stay the size the link reported.
+pub fn link_carries_ipv6(effective_mtu: u16) -> bool {
+	effective_mtu >= MIN_MTU
+}
+
+pub fn accept_link_mtu(current: u16, advertised: u32) -> Option<u16> {
+	if advertised < u32::from(MIN_MTU) || advertised >= u32::from(current) {
+		return None;
+	}
+	Some(advertised as u16)
+}
+
 /// The checksum over the IPv6 pseudo-header and an upper-layer message.
 ///
 /// IPv6 has no header checksum of its own, so the upper layer's is the only integrity check on the
 /// addresses: a UDP or ICMPv6 message whose checksum was computed over different addresses does not
 /// verify here, which is what stops a packet delivered to the wrong host from being processed.
+/// The checksum a UDP datagram carries over IPv6.
+///
+/// MANDATORY, AND A COMPUTED ZERO IS TRANSMITTED AS `0xFFFF`. Over IPv4 a zero in the field means
+/// "not computed" and a receiver accepts it; over IPv6 there is no header checksum beneath it, so
+/// RFC 8200 section 8.1 makes the transport checksum the only integrity check the datagram has and
+/// forbids the exemption. The two values are numerically equal in ones-complement arithmetic, which
+/// is why the substitution is free - and it is the one line an implementation that ported its IPv4
+/// checksum across leaves out.
+pub fn udp_checksum(source: Address, destination: Address, datagram: &[u8]) -> u16 {
+	pseudo_header_checksum(source, destination, NEXT_UDP, datagram)
+}
+
+/// Is a received UDP datagram's checksum field acceptable over IPv6?
+///
+/// A ZERO FIELD IS NOT. It means "no checksum" and IPv6 has no header checksum to fall back on, so a
+/// receiver that accepted it would be accepting a datagram nothing has checked.
+pub fn udp_checksum_present(field: u16) -> bool {
+	field != 0
+}
+
 pub fn pseudo_header_checksum(source: Address, destination: Address, next_header: u8, message: &[u8]) -> u16 {
 	let mut sum: u32 = 0;
 	for chunk in source.octets().chunks(2).chain(destination.octets().chunks(2)) {

@@ -626,3 +626,41 @@ impl cli::ChunkSource for Source {
 		}
 	}
 }
+
+// ONE TARGET, RESOLVED ONE WAY. Every net tool takes "a name or an address" and has to decide which
+// it was given; doing that per tool is how `ping` and `traceroute` come to disagree about whether a
+// bare `::1` is an address. The rule is in `IpAddress::parse`, and this is the one place a name is
+// handed to the service instead.
+//
+// THE FIRST CANDIDATE, because these tools ask one question of one host. `resolve` returns the
+// service's ORDERED list; a tool that needs to try the rest hands the whole list to `connect` and
+// lets the service do it, which is the point of the list being on the wire at all.
+#[cfg(feature = "network-client")]
+#[inline(always)]
+pub fn resolve_target(client: &mut network_client::NetworkClient, target: &[u8]) -> Option<proto::system::ScopedAddress> {
+	if let Some(addr) = proto::system::IpAddress::parse(target) {
+		return Some(proto::system::ScopedAddress::global(addr));
+	}
+	let name: &str = core::str::from_utf8(target).ok()?;
+	let addresses = match client.resolve(name) {
+		Some(Ok(addresses)) => addresses,
+		_ => return None,
+	};
+	addresses.into_iter().next().map(proto::system::ScopedAddress::global)
+}
+
+// Every address a name has, in the order the service chose - for a tool that opens a connection and
+// can therefore hand the whole list over.
+#[cfg(feature = "network-client")]
+#[inline(always)]
+pub fn resolve_all(client: &mut network_client::NetworkClient, target: &[u8]) -> Option<alloc::vec::Vec<proto::system::ScopedAddress>> {
+	if let Some(addr) = proto::system::IpAddress::parse(target) {
+		return Some(alloc::vec![proto::system::ScopedAddress::global(addr)]);
+	}
+	let name: &str = core::str::from_utf8(target).ok()?;
+	let addresses = match client.resolve(name) {
+		Some(Ok(addresses)) if !addresses.is_empty() => addresses,
+		_ => return None,
+	};
+	Some(addresses.into_iter().map(proto::system::ScopedAddress::global).collect())
+}

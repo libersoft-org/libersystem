@@ -152,3 +152,66 @@ fn a_router_belongs_to_one_interface_generation() {
 	assert_eq!(list.clear_interface(interface()), 1);
 	assert_eq!(list.len(), 1);
 }
+
+#[test]
+fn the_winner_is_the_same_whatever_the_usable_state_the_insertion_order_or_the_addresses() {
+	// THE SAME DECISION, ARRIVED AT FOUR WAYS. Each variant below breaks a different plausible
+	// implementation: one that ranks inside the usable class, one that keeps insertion order, and
+	// one whose tie-break is not total.
+	for state in [NeighbourState::Stale, NeighbourState::Delay, NeighbourState::Probe] {
+		let mut list = RouterList::new();
+		list.advertise(interface(), router(1), Preference::High, 1800, 0);
+		list.advertise(interface(), router(2), Preference::Low, 1800, 0);
+		list.set_reachability(interface(), router(1), Reachability::of(state));
+		list.set_reachability(interface(), router(2), Reachability::of(NeighbourState::Reachable));
+		assert_eq!(list.ordered()[0].address, router(1), "a high-preference {state:?} router still comes first");
+
+		// REVERSE INSERTION ORDER, same answer.
+		let mut reversed = RouterList::new();
+		reversed.advertise(interface(), router(2), Preference::Low, 1800, 0);
+		reversed.advertise(interface(), router(1), Preference::High, 1800, 0);
+		reversed.set_reachability(interface(), router(1), Reachability::of(state));
+		reversed.set_reachability(interface(), router(2), Reachability::of(NeighbourState::Reachable));
+		assert_eq!(reversed.ordered()[0].address, router(1), "insertion order does not decide");
+
+		// SWAPPED ADDRESSES, same answer: preference outranks the tie-break.
+		let mut swapped = RouterList::new();
+		swapped.advertise(interface(), router(9), Preference::High, 1800, 0);
+		swapped.advertise(interface(), router(1), Preference::Low, 1800, 0);
+		swapped.set_reachability(interface(), router(9), Reachability::of(state));
+		swapped.set_reachability(interface(), router(1), Reachability::of(NeighbourState::Reachable));
+		assert_eq!(swapped.ordered()[0].address, router(9), "the address is the last key, not the first");
+	}
+}
+
+#[test]
+fn routers_expire_independently_of_one_another() {
+	let mut list = RouterList::new();
+	list.advertise(interface(), router(1), Preference::Medium, 10, 0);
+	list.advertise(interface(), router(2), Preference::Medium, 30, 0);
+	list.advertise(interface(), router(3), Preference::Medium, 20, 0);
+	assert_eq!(list.len(), 3);
+
+	assert_eq!(list.expire(10_000), alloc::vec![router(1)], "only the one whose lifetime ran out");
+	assert_eq!(list.len(), 2);
+	assert_eq!(list.expire(20_000), alloc::vec![router(3)]);
+	assert_eq!(list.len(), 1, "the longest-lived is untouched by the others going");
+	// AND A REFRESH MOVES ONLY ITS OWN DEADLINE.
+	list.advertise(interface(), router(2), Preference::Medium, 60, 20_000);
+	assert!(list.expire(30_000).is_empty(), "the refreshed router outlives its original lifetime");
+	assert_eq!(list.expire(80_001), alloc::vec![router(2)]);
+	assert!(list.is_empty());
+}
+
+#[test]
+fn a_slot_released_by_expiry_admits_a_new_router() {
+	let mut list = RouterList::new();
+	for index in 0..Resource::DefaultRouters.limit() as u16 {
+		list.advertise(interface(), router(index), Preference::Medium, 10, 0);
+	}
+	assert_eq!(list.advertise(interface(), router(99), Preference::Medium, 1800, 0), RouterOutcome::Capacity);
+	// RECLAIM, THEN ADMIT. A live record is never removed to make room; a dead one is.
+	assert_eq!(list.expire(10_000).len(), 8);
+	assert_eq!(list.advertise(interface(), router(99), Preference::Medium, 1800, 10_000), RouterOutcome::Added);
+	assert_eq!(list.len(), 1);
+}

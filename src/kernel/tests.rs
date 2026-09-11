@@ -1114,6 +1114,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 
 	sched::run_until_idle();
 	let open_request = net_server.recv().map_err(|_| "PermissionManager did not request a fresh NetworkService client")?;
+
 	if open_request.bytes.len() != 6 || le_u16(&open_request.bytes, 0) != 6 {
 		return Err("PermissionManager sent an invalid NetworkService open request");
 	}
@@ -1128,15 +1129,14 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	if info_request.bytes.len() != 6 || le_u16(&info_request.bytes, 0) != 1 {
 		return Err("governed ip sent an invalid NetworkService info request");
 	}
+	// THE GENERATED ENCODER, NOT A HAND-WRITTEN COPY OF THE WIRE FORMAT. This stands in for
+	// NetworkService so a governed `ip` has something to query, and the bytes it answers with are
+	// the same bytes the real service would produce - which is the only way this harness cannot
+	// drift from the contract it is imitating.
 	let mut info_reply = alloc::vec::Vec::new();
 	info_reply.extend_from_slice(&info_request.bytes[2..6]);
 	info_reply.push(1);
-	info_reply.extend_from_slice(&[10, 0, 2, 15]);
-	info_reply.extend_from_slice(&6u16.to_le_bytes());
-	info_reply.extend_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
-	info_reply.extend_from_slice(&1500u16.to_le_bytes());
-	info_reply.extend_from_slice(&[10, 0, 2, 2]);
-	info_reply.extend_from_slice(&0u16.to_le_bytes());
+	info_reply.extend_from_slice(&network_info_reply());
 	tool_net_server.send(Message::new(info_reply, alloc::vec::Vec::new())).map_err(|_| "could not answer governed ip NetworkService request")?;
 	sched::run_until_idle();
 
@@ -3417,6 +3417,30 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 }
 
 // Little-endian field readers for decoding the proto reply bytes in the tests.
+// The interface snapshot this harness answers `network.info` with: one IPv4 address, the on-link
+// route it implies, a default route through the gateway, that gateway as a router, the resolver, and
+// no neighbours - the shape an ordinary boot produces before anything has been resolved.
+fn network_info_reply() -> alloc::vec::Vec<u8> {
+	use network_proto::generated::liber::network::v1 as net;
+	let scope = net::InterfaceId { index: 0, generation: 1 };
+	let v4 = |a: u8, b: u8, c: u8, d: u8| net::IpAddress::V4(net::Ipv4Addr { a, b, c, d });
+	let info = net::NetInfo {
+		scope: scope.clone(),
+		name: alloc::string::String::from("net0"),
+		mac: net::MacAddr::from_octets([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]),
+		mtu: 1500,
+		addresses: alloc::vec![net::InterfaceAddress { addr: v4(10, 0, 2, 15), prefix_len: 24, state: net::AddressState::Preferred, preferred_seconds: u32::MAX, valid_seconds: u32::MAX }],
+		routes: alloc::vec![
+			net::RouteEntry { destination: v4(10, 0, 2, 0), prefix_len: 24, scope: scope.clone(), preference: net::RoutePreference::Medium, lifetime_seconds: u32::MAX, hop: net::NextHop::Direct },
+			net::RouteEntry { destination: v4(0, 0, 0, 0), prefix_len: 0, scope: scope.clone(), preference: net::RoutePreference::Medium, lifetime_seconds: u32::MAX, hop: net::NextHop::Via(v4(10, 0, 2, 2)) },
+		],
+		routers: alloc::vec![net::RouterEntry { addr: v4(10, 0, 2, 2), scope: scope.clone(), preference: net::RoutePreference::Medium, state: net::Reachability::Reachable, lifetime_seconds: u32::MAX }],
+		dns: alloc::vec![net::DnsServer { addr: v4(10, 0, 2, 3), scope: scope.clone() }],
+		neighbors: alloc::vec::Vec::new(),
+	};
+	info.encode_vec().expect("the interface snapshot encodes")
+}
+
 fn le_u16(b: &[u8], off: usize) -> u16 {
 	u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
 }

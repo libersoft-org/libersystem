@@ -925,7 +925,20 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 	assert_eq!(result.date_read[20], b'\n', "date ended its stdout line");
 	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny device-policy=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "date received only its time grant");
 	assert_eq!(result.cat_read, result.expected, "cat printed its file through the storage grant");
-	assert_eq!(result.ip_read.as_slice(), b"net0: 10.0.2.15  mac 52:54:00:12:34:56  mtu 1500  gateway 10.0.2.2\n", "ip rendered state from its typed NetworkService grant");
+	// THE SHAPE AND THE FACTS, NOT ONE FROZEN LINE. `ip` now renders a section per table - addresses,
+	// routes, routers, resolvers, neighbours - and how many rows each has depends on what the link
+	// offered this boot. What must be true every time is that it spoke to the service at all and that
+	// the interface it described is this one.
+	let rendered: &[u8] = result.ip_read.as_slice();
+	let contains = |needle: &[u8]| rendered.windows(needle.len()).any(|window| window == needle);
+	// THE FAILURE CARRIES WHAT IT JUDGED. A tool's output assertion that says only "did not match"
+	// leaves the next reader to boot the system again before they can see what it printed.
+	let shown: &str = core::str::from_utf8(rendered).unwrap_or("<not utf-8>");
+	assert!(rendered.starts_with(b"net0 (if"), "ip named the interface and its generation, and printed: {shown}");
+	assert!(contains(b"mac 52:54:00:12:34:56"), "ip rendered the hardware address from its typed NetworkService grant, and printed: {shown}");
+	assert!(contains(b"mtu 1500"), "ip rendered the interface MTU");
+	assert!(contains(b"address 10.0.2.15/24 preferred"), "ip rendered the IPv4 address with its prefix and state");
+	assert!(contains(b"route 0.0.0.0/0 via 10.0.2.2"), "ip rendered the default route and the router it goes through");
 	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "ip received only its network grant");
 }
 

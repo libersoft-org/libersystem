@@ -39,3 +39,32 @@ the order the file fixes.
 
 Verification: not applicable - no change was made. Commands run: read of `docs/todo/P02M0136.md`,
 `docs/todo/P02M0103.md`, `docs/todo/TODO.md`.
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-10T20:43:15Z):
+
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-10T20:43:20Z):
+
+Scope: `docs/todo/P02M0136.md`. Nothing was implemented.
+
+## The dependency, and why it is a real one
+
+This milestone's own ordering puts the font package and catalogue FIRST so that the shaping, layout
+and rendering work can follow it. Its output is a `GlyphRun` that `render2d` consumes, and `render2d`
+is `P02M0103b`. Building the font destination and the catalogue service on their own would deliver a
+place to put fonts and a service to list them, with no shaping to use them and no renderer to draw
+what shaping produced - the partial layer this job's rules forbid, and the reason the plan orders the
+item first rather than shipping it alone.
+
+`P02M0103` is `PHASE-4 FUTURE VISION` and was not started, so the consumer this milestone's pipeline
+ends at does not exist.
+
+## What is separable
+
+The two host-testable halves that need no renderer: the CLOSED OpenType profile - what this system
+parses and what it refuses - and the normative Unicode conformance harness the plan names, run
+against the pinned version's own files. Both are checks rather than pipeline, and both would still be
+true when the pipeline arrives. A dedicated run should take them first.
+
+Verification: not applicable - no change was made.
