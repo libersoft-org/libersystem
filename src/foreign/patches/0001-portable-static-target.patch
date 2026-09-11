@@ -1,0 +1,163 @@
+--- a/loader/vk_loader_platform.h
++++ b/loader/vk_loader_platform.h
+@@ -44,13 +44,33 @@
+ 
+ // Set of platforms with a common set of functionality which is queried throughout the program
+ #if defined(__linux__) || defined(__APPLE__) || defined(__Fuchsia__) || defined(__QNX__) || defined(__FreeBSD__) || \
+-    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__GNU__) || defined(__CYGWIN__)
++    defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__GNU__) || defined(__CYGWIN__) || \
++    defined(__LiberSystem__)
+ #define COMMON_UNIX_PLATFORMS 1
+ #else
+ #define COMMON_UNIX_PLATFORMS 0
+ #endif
+ 
+-#if COMMON_UNIX_PLATFORMS
++#if defined(__LiberSystem__)
++// LIBERSYSTEM HAS NO AMBIENT FILE NAMESPACE AND NO PTHREADS, so none of the headers the other
++// common-unix platforms include here exist. What this platform needs in their place is DECLARED in
++// this file's own block below; what BACKS those declarations is the substrate, which is a later
++// deliverable of this milestone. A header pulled in from elsewhere to satisfy the compiler would be
++// the POSIX layer arriving through the include path, which is what this port exists to avoid.
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++// DECLARATIONS, NOT A POSIX LAYER. The bootstrap sysroot's own <unistd.h> and <dirent.h> declare the
++// ambient-file and user-identity interfaces the pinned sources call; whether the substrate provides
++// a symbol for any of them is the discovery item's decision, and including them here is what lets
++// pass 1 SEE the call rather than hiding it behind a compile error.
++#include <unistd.h>
++#include <dirent.h>
++#include <libgen.h>
++#include <dlfcn.h>
++#include <stdlib.h>
++#elif COMMON_UNIX_PLATFORMS
+ #include <unistd.h>
+ // Note: The following file is for dynamic loading:
+ #include <dlfcn.h>
+@@ -143,7 +163,64 @@
+ #define LAYERS_PATH_ENV "VK_LAYER_PATH"
+ #define ENABLED_LAYERS_ENV "VK_INSTANCE_LAYERS"
+ 
+-#if COMMON_UNIX_PLATFORMS
++#if defined(__LiberSystem__)
++/* LiberSystem-specific common code.
++ *
++ * THIS BLOCK IS DECLARATIONS, NOT BEHAVIOUR. Every type here names something the substrate will
++ * provide and every macro is a constant the sources compare against; nothing in it implements
++ * anything. That split is deliberate and it is what lets this patch exist before the platform port:
++ * the declarations are sized by the pinned SOURCES, which can be read, while the implementations are
++ * sized by the inventory, which cannot be measured until something has compiled.
++ */
++
++// VK Library Filenames, Paths, etc.
++#define PATH_SEPARATOR ':'
++#define DIRECTORY_SYMBOL '/'
++
++#define VULKAN_DIR "vulkan/"
++#define VULKAN_ICDCONF_DIR "icd.d"
++#define VULKAN_ICD_DIR "icd"
++#define VULKAN_SETTINGSCONF_DIR "settings.d"
++#define VULKAN_ELAYERCONF_DIR "explicit_layer.d"
++#define VULKAN_ILAYERCONF_DIR "implicit_layer.d"
++#define VULKAN_LAYER_DIR "layer"
++
++#define VK_DRIVERS_INFO_RELATIVE_DIR VULKAN_DIR VULKAN_ICDCONF_DIR
++#define VK_SETTINGS_INFO_RELATIVE_DIR VULKAN_DIR VULKAN_SETTINGSCONF_DIR
++#define VK_ELAYERS_INFO_RELATIVE_DIR VULKAN_DIR VULKAN_ELAYERCONF_DIR
++#define VK_ILAYERS_INFO_RELATIVE_DIR VULKAN_DIR VULKAN_ILAYERCONF_DIR
++
++// EMPTY, AND THAT IS THE ANSWER RATHER THAN A PLACEHOLDER. These name a Windows registry and this
++// platform has none; the other common-unix platforms define them empty for the same reason.
++#define VK_DRIVERS_INFO_REGISTRY_LOC ""
++#define VK_ELAYERS_INFO_REGISTRY_LOC ""
++#define VK_ILAYERS_INFO_REGISTRY_LOC ""
++#define VK_SETTINGS_INFO_REGISTRY_LOC ""
++
++// C99:
++#define PRINTF_SIZE_T_SPECIFIER "%zu"
++
++// DYNAMIC LOADING. The handle is opaque here on purpose: what a provider actually is, and how one is
++// found, is the DISCOVERY item's decision and not this file's. A `void *` would have quietly said
++// "whatever dlopen returns", which is the ambient search this milestone exists to replace.
++typedef struct loader_liber_provider *loader_platform_dl_handle;
++
++// THREADS. The pinned configuration CREATES NO THREADS - that is a measured property of this
++// configuration rather than an assumption - so these name the identity and the mutual exclusion the
++// sources still take, and nothing that starts anything. The single-threaded contract is what makes
++// the primitives below expressible without a thread runtime underneath them.
++typedef uintptr_t loader_platform_thread;
++typedef uintptr_t loader_platform_thread_id;
++
++typedef struct loader_liber_mutex {
++    uintptr_t state;
++} loader_platform_thread_mutex;
++
++typedef struct loader_liber_cond {
++    uintptr_t state;
++} loader_platform_thread_cond;
++
++#elif COMMON_UNIX_PLATFORMS
+ /* Linux-specific common code: */
+ 
+ // VK Library Filenames, Paths, etc.:
+@@ -279,7 +356,57 @@
+ 
+ #endif
+ 
+-#if COMMON_UNIX_PLATFORMS
++#if defined(__LiberSystem__)
++/* LiberSystem's platform functions are DECLARED here and DEFINED by the substrate.
++ *
++ * WHY EXTERN RATHER THAN `static inline`. Every other platform in this file writes its bodies here
++ * because its bodies are one call into a libc that already exists. LiberSystem's do not exist yet -
++ * they are the foreign ABI facilities, a later deliverable of this milestone - and writing bodies
++ * against a substrate that has not been designed would be inventing the substrate from the shape of
++ * this header rather than from the measured inventory.
++ *
++ * AND THE UNDEFINED SYMBOLS ARE THE POINT, not a shortcoming. An archive does not resolve its
++ * external symbols, so this compiles and archives exactly as the pre-pass-1 gate requires; and what
++ * pass 1 then measures - the candidate surface - IS this set of undefined references. A header full
++ * of inline bodies would have hidden that surface inside the objects instead of declaring it.
++ *
++ * THE NAMES AND SIGNATURES ARE UPSTREAM'S, not this port's invention: each one matches the
++ * common-unix definition it replaces, so a caller compiled against either sees the same interface.
++ */
++bool loader_platform_file_exists(const char *path);
++bool loader_platform_is_path_absolute(const char *path);
++char *loader_platform_dirname(char *path);
++char *loader_platform_executable_path(char *buffer, size_t size);
++loader_platform_dl_handle loader_platform_open_library(const char *libPath);
++const char *loader_platform_open_library_error(const char *libPath);
++void loader_platform_close_library(loader_platform_dl_handle library);
++void *loader_platform_get_proc_address(loader_platform_dl_handle library, const char *name);
++const char *loader_platform_get_proc_address_error(const char *name);
++loader_platform_thread_id loader_platform_get_thread_id(void);
++void loader_platform_thread_create_mutex(loader_platform_thread_mutex *pMutex);
++void loader_platform_thread_lock_mutex(loader_platform_thread_mutex *pMutex);
++void loader_platform_thread_unlock_mutex(loader_platform_thread_mutex *pMutex);
++void loader_platform_thread_delete_mutex(loader_platform_thread_mutex *pMutex);
++void loader_platform_thread_init_cond(loader_platform_thread_cond *pCond);
++void loader_platform_thread_cond_wait(loader_platform_thread_cond *pCond, loader_platform_thread_mutex *pMutex);
++void loader_platform_thread_cond_broadcast(loader_platform_thread_cond *pCond);
++
++// THESE FOUR ARE NOT PLATFORM BEHAVIOUR, and they sit here only because upstream keeps them beside
++// the functions that are. Three are portable C over <string.h> and the fourth is one call; defining
++// them rather than declaring them keeps the extern set above exactly the platform surface pass 1 is
++// meant to measure, instead of padding it with string functions.
++void *thread_safe_strtok(char *str, const char *delim, char **saveptr);
++FILE *loader_fopen(const char *fileName, const char *mode);
++static inline char *loader_strncat(char *dest, size_t dest_sz, const char *src, size_t count) {
++    (void)dest_sz;
++    return strncat(dest, src, count);
++}
++static inline char *loader_strncpy(char *dest, size_t dest_sz, const char *src, size_t count) {
++    (void)dest_sz;
++    return strncpy(dest, src, count);
++}
++
++#elif COMMON_UNIX_PLATFORMS
+ 
+ // File IO
+ static inline bool loader_platform_file_exists(const char *path) {

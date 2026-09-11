@@ -41,10 +41,12 @@ set(LIBERSYSTEM_C_ABI_FLAGS
 	"-ffreestanding"
 	"-nostdlibinc"
 	"-isystem" "${LIBERSYSTEM_SYSROOT}/include"
-	# NO FLOATING POINT AND NO ADVANCED SIMD in code this system may run with the FPU state not
-	# saved. The Rust half is built the same way; a C object that used NEON where the other half
-	# assumes it is untouched is a corruption nobody traces back to a compiler flag.
-	"-mgeneral-regs-only"
+	# FLOATING POINT AND NEON ARE ON, because the Rust half has them on: `aarch64-unknown-none`
+	# reports `target_feature="neon"`, which is the hardfloat AAPCS variant. An earlier version of
+	# this file set `-mgeneral-regs-only` here on the assumption that a freestanding target must be
+	# soft-float, and that was a SECOND description of the ABI - exactly the failure the paragraph
+	# above warns about. It surfaced as `cJSON` refusing to compile: the pinned sources use `double`
+	# and the ABI this file had declared could not pass one.
 	"-fPIC"
 )
 string(JOIN " " LIBERSYSTEM_C_ABI_FLAGS_STR ${LIBERSYSTEM_C_ABI_FLAGS})

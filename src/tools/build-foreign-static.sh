@@ -74,7 +74,11 @@ x86_64)
 	;;
 aarch64)
 	target="aarch64-unknown-none"
-	abi=(-mgeneral-regs-only)
+	# NO ABI FLAGS BEYOND THE TRIPLE. `aarch64-unknown-none` is the hardfloat AAPCS variant and the
+	# Rust half reports `target_feature="neon"` under it, so clang's defaults for this triple already
+	# match. Adding `-mgeneral-regs-only` here would be a second description of that ABI - and it
+	# was: the pinned sources use `double`, which such an ABI cannot pass.
+	abi=()
 	;;
 riscv64)
 	target="riscv64-unknown-none-elf"

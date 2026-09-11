@@ -1,0 +1,57 @@
+# THE STATIC-TARGET PART OF P02M0135's LOCKFILE. Frozen when the portable static target builds
+# reproducibly on all three targets, and it gates PASS 1.
+#
+# WHY IT IS ITS OWN PART. It is milestone OUTPUT, so it cannot sit in the bootstrap half, which holds
+# only what is decided independently of this milestone's work; and pass 1 configures against it, so
+# it cannot wait for the derived half, which is frozen after pass 2. A value needs the part that can
+# precede its consumer.
+#
+# WHAT IS PROVEN HERE, AND WHAT IS DELIBERATELY NOT. The three targets COMPILE AND ARCHIVE this
+# target, twice, to the same digest. Nothing here claims it LINKS: an archive does not resolve its
+# external symbols, and the providers a link needs - the profile sysroot, the foreign-ABI substrate
+# and the platform port - are all assigned after pass 1. The strict converging link is pass 2's, and
+# the derived pin records it.
+
+[patch]
+# CARRIED AS A DERIVED PATCH AGAINST THE PINNED REVISION, like every other upstream change this
+# milestone makes. It applies to vulkan-sdk-1.4.357.0 as frozen in PIN-bootstrap.toml.
+#
+# AND IT IS NOT ONE OF THE PLATFORM-PORT PATCHES. Those are the derived half's and describe OS
+# BEHAVIOUR; this one adds no behaviour at all - it declares the platform surface and defines nothing
+# that touches the system.
+path = "src/foreign/patches/0001-portable-static-target.patch"
+sha256 = "911e5bf3689624affccd6e7373409e251f6052af3a8eddcee0dc68e52a8ea45c"
+applies_to = "vulkan-sdk-1.4.357.0"
+target_name = "libvulkan.a"
+
+# WHAT THE PATCH DOES, IN THREE PARTS:
+#
+#   1. `__LiberSystem__` joins the common-unix functionality set, so the shared declarations apply.
+#   2. A LiberSystem block supplies the macros and types that section needs - path separators, the
+#      manifest directory names, the opaque provider handle, and the thread identity and mutual
+#      exclusion types under the single-threaded contract.
+#   3. The platform FUNCTIONS are declared EXTERN rather than defined `static inline`. Every other
+#      platform writes bodies here because its bodies are one call into a libc that exists; this
+#      one's do not exist yet. Writing them now would invent the substrate from the shape of a header
+#      instead of from the measured inventory - and the undefined references those declarations
+#      leave in the archive ARE the candidate surface pass 1 is meant to measure.
+
+[builder]
+# The build reads the option set rather than restating it, and archives deterministically - without
+# `llvm-ar`'s `D` modifier two archives of identical objects differ and "reproducibly" is unprovable.
+path = "src/tools/build-foreign-static.sh"
+sha256 = "33e06330dbddc3c4c47b8f09458d51b168fd57319d25ec50dc0c704f8063a076"
+option_deltas = "none beyond the bootstrap option set; the target is built from the loader's own sources under it"
+
+[archives]
+# THE THREE PER-TARGET ARCHIVE RESULTS: evidence the deliverable is done rather than attempted. Each
+# was built twice from a clean output directory and produced the same digest.
+x86_64 = { sha256 = "d88098c03d65ecfb1fe5590de27c3ff7876b66363a1dbe2d35795dc65ad53a39", objects = 14, reproduced = true }
+aarch64 = { sha256 = "df4912ed7a9d682ea3f18ceb80256b8d99b4579993155bb95aea9f37f9df2e78", objects = 14, reproduced = true }
+riscv64 = { sha256 = "9ecb584294088639d9e86e64f660c3c03350f0bdda200f45dde1d58d3322692c", objects = 14, reproduced = true }
+
+[diagnostics]
+# THE BUILD DIAGNOSTICS THAT PRODUCED THEM. Clean on all three: no errors and no warnings escalated,
+# with BUILD_WERROR off as the bootstrap option set freezes it.
+errors = 0
+note = "aarch64 initially failed because this milestone's own cross file declared -mgeneral-regs-only, which is a SECOND description of an ABI the Rust half already fixes; the Rust target reports target_feature=\"neon\", and the pinned sources use double. Corrected in the cross file and here."

@@ -1,0 +1,1114 @@
+{
+	"_differences": {
+		"common_undefined": [
+			"__liber_assert_failed",
+			"__liber_errno_location",
+			"abort",
+			"atoi",
+			"calloc",
+			"closedir",
+			"dladdr",
+			"fabs",
+			"fclose",
+			"fileno",
+			"fopen",
+			"fputc",
+			"fputs",
+			"fread",
+			"free",
+			"fstat",
+			"getegid",
+			"getenv",
+			"geteuid",
+			"getgid",
+			"getuid",
+			"linux_read_sorted_physical_devices",
+			"linux_sort_physical_device_groups",
+			"loader_platform_close_library",
+			"loader_platform_executable_path",
+			"loader_platform_file_exists",
+			"loader_platform_get_proc_address",
+			"loader_platform_is_path_absolute",
+			"loader_platform_open_library",
+			"loader_platform_open_library_error",
+			"loader_platform_thread_create_mutex",
+			"loader_platform_thread_delete_mutex",
+			"loader_platform_thread_lock_mutex",
+			"loader_platform_thread_unlock_mutex",
+			"malloc",
+			"memcmp",
+			"memcpy",
+			"memmove",
+			"memset",
+			"opendir",
+			"readdir",
+			"realloc",
+			"snprintf",
+			"sscanf",
+			"stderr",
+			"strchr",
+			"strcmp",
+			"strcpy",
+			"strerror",
+			"strlen",
+			"strncat",
+			"strncmp",
+			"strncpy",
+			"strrchr",
+			"strstr",
+			"strtod",
+			"strtoul",
+			"thread_safe_strtok",
+			"tolower",
+			"vsnprintf"
+		],
+		"note": "identical undefined sets are expected for a configuration with no per-architecture sources; the relocation forms are where three builds are visible, and they differ",
+		"per_target_only": {
+			"aarch64": [],
+			"riscv64": [],
+			"x86_64": []
+		},
+		"relocation_form_counts": {
+			"aarch64": 8,
+			"riscv64": 12,
+			"x86_64": 5
+		},
+		"relocation_forms_identical": false
+	},
+	"aarch64": {
+		"archive": ".build/foreign/aarch64/libvulkan.a",
+		"archive_sha256": "df4912ed7a9d682ea3f18ceb80256b8d99b4579993155bb95aea9f37f9df2e78",
+		"classified": {
+			"compiler_runtime": [
+				"memcmp",
+				"memcpy",
+				"memmove",
+				"memset"
+			],
+			"cxx_abi": {
+				"atexit": [],
+				"cxa": [],
+				"errno": [
+					"__liber_errno_location"
+				],
+				"rtti": [],
+				"unwind": []
+			},
+			"platform_and_libc": [
+				"__liber_assert_failed",
+				"abort",
+				"atoi",
+				"calloc",
+				"closedir",
+				"dladdr",
+				"fabs",
+				"fclose",
+				"fileno",
+				"fopen",
+				"fputc",
+				"fputs",
+				"fread",
+				"free",
+				"fstat",
+				"getegid",
+				"getenv",
+				"geteuid",
+				"getgid",
+				"getuid",
+				"linux_read_sorted_physical_devices",
+				"linux_sort_physical_device_groups",
+				"loader_platform_close_library",
+				"loader_platform_executable_path",
+				"loader_platform_file_exists",
+				"loader_platform_get_proc_address",
+				"loader_platform_is_path_absolute",
+				"loader_platform_open_library",
+				"loader_platform_open_library_error",
+				"loader_platform_thread_create_mutex",
+				"loader_platform_thread_delete_mutex",
+				"loader_platform_thread_lock_mutex",
+				"loader_platform_thread_unlock_mutex",
+				"malloc",
+				"opendir",
+				"readdir",
+				"realloc",
+				"snprintf",
+				"sscanf",
+				"stderr",
+				"strchr",
+				"strcmp",
+				"strcpy",
+				"strerror",
+				"strlen",
+				"strncat",
+				"strncmp",
+				"strncpy",
+				"strrchr",
+				"strstr",
+				"strtod",
+				"strtoul",
+				"thread_safe_strtok",
+				"tolower",
+				"vsnprintf"
+			]
+		},
+		"defined_count": 1173,
+		"relocation_forms": {
+			"R_AARCH64_ABS64": 132,
+			"R_AARCH64_ADD_ABS_LO12_NC": 4166,
+			"R_AARCH64_ADR_GOT_PAGE": 944,
+			"R_AARCH64_ADR_PREL_PG_HI21": 4169,
+			"R_AARCH64_CALL26": 5151,
+			"R_AARCH64_JUMP26": 84,
+			"R_AARCH64_LD64_GOT_LO12_NC": 944,
+			"R_AARCH64_LDST64_ABS_LO12_NC": 3
+		},
+		"static_initialisers": {
+			"fini_array": [
+				"loader_free_library"
+			],
+			"init_array": [
+				"loader_init_library"
+			]
+		},
+		"tls": {
+			"pt_tls": "not observable in a relocatable archive; the absence of TLS symbols and TLS relocations is what rules one out at link time",
+			"relocation_forms": {},
+			"symbols": []
+		},
+		"undefined": {
+			"__liber_assert_failed": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"__liber_errno_location": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"abort": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"atoi": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"calloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"closedir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"dladdr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fabs": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fclose": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fileno": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fopen": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fputc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fputs": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fread": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"free": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fstat": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getegid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getenv": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"geteuid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getgid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getuid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"linux_read_sorted_physical_devices": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"linux_sort_physical_device_groups": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_close_library": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_executable_path": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_file_exists": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_get_proc_address": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_is_path_absolute": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_open_library": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_open_library_error": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_create_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_delete_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_lock_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_unlock_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"malloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memcmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memcpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memmove": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memset": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"opendir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"readdir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"realloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"snprintf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"sscanf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"stderr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strchr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strcmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strcpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strerror": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strlen": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncat": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strrchr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strstr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strtod": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strtoul": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"thread_safe_strtok": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"tolower": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"vsnprintf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			}
+		},
+		"undefined_count": 60
+	},
+	"riscv64": {
+		"archive": ".build/foreign/riscv64/libvulkan.a",
+		"archive_sha256": "9ecb584294088639d9e86e64f660c3c03350f0bdda200f45dde1d58d3322692c",
+		"classified": {
+			"compiler_runtime": [
+				"memcmp",
+				"memcpy",
+				"memmove",
+				"memset"
+			],
+			"cxx_abi": {
+				"atexit": [],
+				"cxa": [],
+				"errno": [
+					"__liber_errno_location"
+				],
+				"rtti": [],
+				"unwind": []
+			},
+			"platform_and_libc": [
+				"__liber_assert_failed",
+				"abort",
+				"atoi",
+				"calloc",
+				"closedir",
+				"dladdr",
+				"fabs",
+				"fclose",
+				"fileno",
+				"fopen",
+				"fputc",
+				"fputs",
+				"fread",
+				"free",
+				"fstat",
+				"getegid",
+				"getenv",
+				"geteuid",
+				"getgid",
+				"getuid",
+				"linux_read_sorted_physical_devices",
+				"linux_sort_physical_device_groups",
+				"loader_platform_close_library",
+				"loader_platform_executable_path",
+				"loader_platform_file_exists",
+				"loader_platform_get_proc_address",
+				"loader_platform_is_path_absolute",
+				"loader_platform_open_library",
+				"loader_platform_open_library_error",
+				"loader_platform_thread_create_mutex",
+				"loader_platform_thread_delete_mutex",
+				"loader_platform_thread_lock_mutex",
+				"loader_platform_thread_unlock_mutex",
+				"malloc",
+				"opendir",
+				"readdir",
+				"realloc",
+				"snprintf",
+				"sscanf",
+				"stderr",
+				"strchr",
+				"strcmp",
+				"strcpy",
+				"strerror",
+				"strlen",
+				"strncat",
+				"strncmp",
+				"strncpy",
+				"strrchr",
+				"strstr",
+				"strtod",
+				"strtoul",
+				"thread_safe_strtok",
+				"tolower",
+				"vsnprintf"
+			]
+		},
+		"defined_count": 1173,
+		"relocation_forms": {
+			"R_RISCV_64": 132,
+			"R_RISCV_ADD32": 375,
+			"R_RISCV_BRANCH": 2943,
+			"R_RISCV_CALL_PLT": 5274,
+			"R_RISCV_GOT_HI20": 945,
+			"R_RISCV_JAL": 2367,
+			"R_RISCV_PCREL_HI20": 4949,
+			"R_RISCV_PCREL_LO12_I": 5894,
+			"R_RISCV_RELAX": 16117,
+			"R_RISCV_RVC_BRANCH": 5083,
+			"R_RISCV_RVC_JUMP": 2017,
+			"R_RISCV_SUB32": 375
+		},
+		"static_initialisers": {
+			"fini_array": [
+				"loader_free_library"
+			],
+			"init_array": [
+				"loader_init_library"
+			]
+		},
+		"tls": {
+			"pt_tls": "not observable in a relocatable archive; the absence of TLS symbols and TLS relocations is what rules one out at link time",
+			"relocation_forms": {},
+			"symbols": []
+		},
+		"undefined": {
+			"__liber_assert_failed": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"__liber_errno_location": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"abort": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"atoi": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"calloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"closedir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"dladdr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fabs": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fclose": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fileno": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fopen": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fputc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fputs": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fread": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"free": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fstat": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getegid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getenv": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"geteuid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getgid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getuid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"linux_read_sorted_physical_devices": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"linux_sort_physical_device_groups": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_close_library": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_executable_path": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_file_exists": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_get_proc_address": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_is_path_absolute": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_open_library": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_open_library_error": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_create_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_delete_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_lock_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_unlock_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"malloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memcmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memcpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memmove": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memset": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"opendir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"readdir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"realloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"snprintf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"sscanf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"stderr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strchr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strcmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strcpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strerror": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strlen": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncat": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strrchr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strstr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strtod": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strtoul": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"thread_safe_strtok": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"tolower": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"vsnprintf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			}
+		},
+		"undefined_count": 60
+	},
+	"x86_64": {
+		"archive": ".build/foreign/x86_64/libvulkan.a",
+		"archive_sha256": "d88098c03d65ecfb1fe5590de27c3ff7876b66363a1dbe2d35795dc65ad53a39",
+		"classified": {
+			"compiler_runtime": [
+				"memcmp",
+				"memcpy",
+				"memmove",
+				"memset"
+			],
+			"cxx_abi": {
+				"atexit": [],
+				"cxa": [],
+				"errno": [
+					"__liber_errno_location"
+				],
+				"rtti": [],
+				"unwind": []
+			},
+			"platform_and_libc": [
+				"__liber_assert_failed",
+				"abort",
+				"atoi",
+				"calloc",
+				"closedir",
+				"dladdr",
+				"fabs",
+				"fclose",
+				"fileno",
+				"fopen",
+				"fputc",
+				"fputs",
+				"fread",
+				"free",
+				"fstat",
+				"getegid",
+				"getenv",
+				"geteuid",
+				"getgid",
+				"getuid",
+				"linux_read_sorted_physical_devices",
+				"linux_sort_physical_device_groups",
+				"loader_platform_close_library",
+				"loader_platform_executable_path",
+				"loader_platform_file_exists",
+				"loader_platform_get_proc_address",
+				"loader_platform_is_path_absolute",
+				"loader_platform_open_library",
+				"loader_platform_open_library_error",
+				"loader_platform_thread_create_mutex",
+				"loader_platform_thread_delete_mutex",
+				"loader_platform_thread_lock_mutex",
+				"loader_platform_thread_unlock_mutex",
+				"malloc",
+				"opendir",
+				"readdir",
+				"realloc",
+				"snprintf",
+				"sscanf",
+				"stderr",
+				"strchr",
+				"strcmp",
+				"strcpy",
+				"strerror",
+				"strlen",
+				"strncat",
+				"strncmp",
+				"strncpy",
+				"strrchr",
+				"strstr",
+				"strtod",
+				"strtoul",
+				"thread_safe_strtok",
+				"tolower",
+				"vsnprintf"
+			]
+		},
+		"defined_count": 1173,
+		"relocation_forms": {
+			"R_X86_64_64": 132,
+			"R_X86_64_GOTPCREL": 1,
+			"R_X86_64_PC32": 4575,
+			"R_X86_64_PLT32": 5241,
+			"R_X86_64_REX_GOTPCRELX": 952
+		},
+		"static_initialisers": {
+			"fini_array": [
+				"loader_free_library"
+			],
+			"init_array": [
+				"loader_init_library"
+			]
+		},
+		"tls": {
+			"pt_tls": "not observable in a relocatable archive; the absence of TLS symbols and TLS relocations is what rules one out at link time",
+			"relocation_forms": {},
+			"symbols": []
+		},
+		"undefined": {
+			"__liber_assert_failed": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"__liber_errno_location": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"abort": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"atoi": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"calloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"closedir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"dladdr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fabs": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fclose": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fileno": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fopen": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fputc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fputs": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fread": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"free": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"fstat": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getegid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getenv": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"geteuid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getgid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"getuid": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"linux_read_sorted_physical_devices": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"linux_sort_physical_device_groups": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_close_library": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_executable_path": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_file_exists": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_get_proc_address": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_is_path_absolute": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_open_library": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_open_library_error": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_create_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_delete_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_lock_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"loader_platform_thread_unlock_mutex": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"malloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memcmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memcpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memmove": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"memset": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"opendir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"readdir": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"realloc": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"snprintf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"sscanf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"stderr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strchr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strcmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strcpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strerror": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strlen": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncat": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncmp": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strncpy": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strrchr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strstr": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strtod": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"strtoul": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"thread_safe_strtok": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"tolower": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			},
+			"vsnprintf": {
+				"binding": "GLOBAL",
+				"type": "NOTYPE"
+			}
+		},
+		"undefined_count": 60
+	}
+}

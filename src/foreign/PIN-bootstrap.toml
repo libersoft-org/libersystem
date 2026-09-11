@@ -101,24 +101,37 @@ version = "Debian clang version 19.1.7"
 # ONE PER TARGET, each with its digest. Without these CMake compiles for the HOST, and that failure
 # is silent: the build succeeds and the inventory describes a system this one is not.
 x86_64 = { path = "src/foreign/cross/x86_64.cmake", target = "x86_64-unknown-none-elf", sha256 = "1455edd9d7c907245db141a8ef9a9d17f2e654437350203fe9524e89cf3b3a24" }
-aarch64 = { path = "src/foreign/cross/aarch64.cmake", target = "aarch64-unknown-none", sha256 = "9692372a981dc63694b53ed1228c780f1eb60fa74db3ec6b40581ce610c23bc0" }
+# REFROZEN 2026-09-11, and the reason is recorded rather than left as a changed number. The first
+# version of this file declared `-mgeneral-regs-only`, on the assumption that a freestanding aarch64
+# target must be soft-float. That was a SECOND description of an ABI the Rust half already fixes -
+# `aarch64-unknown-none` reports `target_feature="neon"` - and it is exactly the failure the cross
+# file's own header warns about. It surfaced as the pinned sources refusing to compile: cJSON uses
+# `double`, which the ABI this file had declared cannot pass.
+aarch64 = { path = "src/foreign/cross/aarch64.cmake", target = "aarch64-unknown-none", sha256 = "10fc6e0cb90aa5c5ad01fde6bb6a09ece3de77cb752fb1d4e98a1dc7f692c551" }
 riscv64 = { path = "src/foreign/cross/riscv64.cmake", target = "riscv64-unknown-none-elf", sha256 = "bbc9c2c7236f93b937d260558c115ede5f52199a38ebde7300569538b51b0f18" }
 
 [bootstrap_sysroot]
 # SIZED BY THE OPTION SET, NOT BY THE INVENTORY - which is what keeps this part free of a cycle. It
 # is NOT the profile sysroot, and it is NOT a libc: see its own README.
 path = "src/foreign/bootstrap-sysroot"
-digest = "87e931cb9d915807814eea3df691679d6c905089cf4ac87d766908f9b0c0ab07"
+digest = "e4b3d843284226a47d723bf40362c45392dc2a202ffcd08f7c9cbb68eebd3e55"
 headers = [
+	"alloca.h",
 	"assert.h",
 	"ctype.h",
+	"dirent.h",
+	"dlfcn.h",
 	"errno.h",
+	"fcntl.h",
 	"inttypes.h",
+	"libgen.h",
 	"math.h",
 	"stdio.h",
 	"stdlib.h",
 	"string.h",
+	"sys/stat.h",
 	"sys/types.h",
+	"unistd.h",
 ]
 # The compiler's own freestanding headers are deliberately NOT restated here; `-nostdlibinc` keeps
 # them reachable because they describe the TARGET rather than the host.
