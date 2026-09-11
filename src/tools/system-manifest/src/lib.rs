@@ -48,6 +48,8 @@ struct RawManifest {
 struct RawSource {
 	owner: String,
 	path: String,
+	#[serde(default)]
+	producer: Producer,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -350,6 +352,13 @@ struct RawLibrary {
 	features: Vec<String>,
 	#[serde(default)]
 	providers: Vec<String>,
+	// THE OBJECT LIST, ORDERED, AND ONLY FOR A FOREIGN LIBRARY. Order is part of the declaration
+	// rather than incidental: link order decides which definition wins where two objects offer one,
+	// and a build that sorted the list would answer a different question on a different filesystem.
+	// A Rust library declaring one is refused - Cargo answers that question for Cargo packages, and
+	// two answers to it is how a staged artifact stops matching what the manifest says it is.
+	#[serde(default)]
+	objects: Vec<String>,
 }
 
 // The pieces of the boot chain: the kernel and the UEFI loader. They are not userspace
@@ -433,6 +442,20 @@ pub enum MatchPriority {
 	Quirk,
 }
 
+// WHAT TURNS A SOURCE INTO AN ARTIFACT. Every row in this manifest was Rust until a foreign
+// artifact had to enter the image as a first-class kind rather than as an exception, and the
+// difference is not cosmetic: a Rust source is a Cargo package whose dependency closure Cargo
+// answers, and a foreign source is an ORDERED LIST OF OBJECTS this manifest states, because nothing
+// else can answer it deterministically. The field is defaulted, so every existing row means what it
+// always meant.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Producer {
+	#[default]
+	Rust,
+	Foreign,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Linkage {
@@ -491,6 +514,7 @@ impl RelativePath {
 pub struct Source {
 	pub owner: Name,
 	pub path: RelativePath,
+	pub producer: Producer,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -775,6 +799,11 @@ pub struct Library {
 	pub destination: RelativePath,
 	pub features: Vec<Name>,
 	pub providers: Vec<Name>,
+	// The producer this library's owner declared, carried here so a consumer of the projection does
+	// not have to join the two tables to know how a library is built.
+	pub producer: Producer,
+	// The ordered object list, empty for every Rust library.
+	pub objects: Vec<RelativePath>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -875,13 +904,25 @@ impl Manifest {
 			let location = format!("sources.{}", raw_source.owner);
 			let Some(owner) = validate_name(&raw_source.owner, &format!("{location}.owner"), &mut errors) else { continue };
 			let Some(path) = validate_relative_path(&raw_source.path, &format!("{location}.path"), &mut errors) else { continue };
-			if !workspace_root.join(path.as_str()).join("Cargo.toml").is_file() {
-				push_error(&mut errors, format!("{location}.path"), format!("no Cargo.toml at {}", path.as_str()));
+			// A RUST SOURCE IS A CARGO PACKAGE AND A FOREIGN ONE IS A DIRECTORY OF SOURCES. Requiring
+			// a manifest of both was the rule that made a foreign artifact expressible only by
+			// forging one, which is what this producer field replaces.
+			match raw_source.producer {
+				Producer::Rust if !workspace_root.join(path.as_str()).join("Cargo.toml").is_file() => {
+					push_error(&mut errors, format!("{location}.path"), format!("no Cargo.toml at {}", path.as_str()));
+				}
+				Producer::Foreign if !workspace_root.join(path.as_str()).is_dir() => {
+					push_error(&mut errors, format!("{location}.path"), format!("no directory at {}", path.as_str()));
+				}
+				Producer::Foreign if workspace_root.join(path.as_str()).join("Cargo.toml").is_file() => {
+					push_error(&mut errors, format!("{location}.path"), "a foreign source must not be a Cargo package; the producer decides who answers for the closure and two answers is one too many");
+				}
+				_ => {}
 			}
 			if !source_paths.insert(path.clone()) {
 				push_error(&mut errors, format!("{location}.path"), format!("duplicate source path {}", path.as_str()));
 			}
-			if sources.insert(owner.clone(), Source { owner, path }).is_some() {
+			if sources.insert(owner.clone(), Source { owner, path, producer: raw_source.producer }).is_some() {
 				push_error(&mut errors, format!("{location}.owner"), "duplicate source owner");
 			}
 		}
@@ -907,7 +948,30 @@ impl Manifest {
 			if !destinations.insert(destination.clone()) {
 				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
 			}
-			if libraries.insert(name.clone(), Library { name, owner, destination, features, providers }).is_some() {
+			// THE OBJECT LIST BELONGS TO THE PRODUCER, BOTH WAYS. A foreign library with no objects
+			// builds nothing and would stage an empty artifact; a Rust library with objects has two
+			// answers to what it is built from, and the one the build follows is whichever the
+			// script happened to read first.
+			let producer = sources.get(&owner).map_or(Producer::Rust, |source| source.producer);
+			let mut objects: Vec<RelativePath> = Vec::new();
+			for (index, object) in raw_library.objects.iter().enumerate() {
+				let Some(object) = validate_relative_path(object, &format!("{location}.objects.{index}"), &mut errors) else { continue };
+				if objects.contains(&object) {
+					push_error(&mut errors, format!("{location}.objects.{index}"), format!("duplicate object {}", object.as_str()));
+					continue;
+				}
+				if !workspace_root.join(sources.get(&owner).map_or("", |source| source.path.as_str())).join(object.as_str()).is_file() {
+					push_error(&mut errors, format!("{location}.objects.{index}"), format!("no source at {}", object.as_str()));
+				}
+				objects.push(object);
+			}
+			match producer {
+				Producer::Foreign if objects.is_empty() => push_error(&mut errors, format!("{location}.objects"), "a foreign library builds from an ordered object list and this one names none"),
+				Producer::Rust if !objects.is_empty() => push_error(&mut errors, format!("{location}.objects"), "a Rust library's inputs come from Cargo; an object list here is a second answer to the same question"),
+				Producer::Foreign if !features.is_empty() => push_error(&mut errors, format!("{location}.features"), "Cargo features on a foreign library are features nothing reads"),
+				_ => {}
+			}
+			if libraries.insert(name.clone(), Library { name, owner, destination, features, providers, producer, objects }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate library name");
 			}
 		}
@@ -1684,6 +1748,17 @@ fn validate_user_source_coverage(workspace_root: &Path, sources: &BTreeMap<Name,
 	}
 	let mut physical = BTreeSet::new();
 	collect(&workspace_root.join("user"), workspace_root, &mut physical);
+	// A FOREIGN SOURCE IS PHYSICAL WITHOUT BEING A CARGO PACKAGE, and the two directions of this
+	// rule need it for different reasons. Declared-and-not-physical would refuse every foreign row,
+	// because the walk above finds a crate by its `Cargo.toml`; physical-and-unowned would be unable
+	// to see a foreign directory at all, so nothing would ever notice one that was never declared.
+	// Both are answered by adding the foreign sources to the physical set here, where the producer
+	// is known - the walk itself cannot tell a foreign source from an ordinary directory.
+	for source in sources.values().filter(|source| source.producer == Producer::Foreign && source.path.as_str().starts_with("user/")) {
+		if workspace_root.join(source.path.as_str()).is_dir() {
+			physical.insert(source.path.as_str().to_string());
+		}
+	}
 	let declared = sources.values().filter(|source| source.path.as_str().starts_with("user/")).map(|source| source.path.as_str().to_string()).collect::<BTreeSet<_>>();
 	for missing in physical.difference(&declared) {
 		push_error(errors, "sources", format!("physical userspace crate {missing} has no source owner"));

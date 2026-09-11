@@ -189,14 +189,14 @@ declare -A library_rows=()
 declare -A library_destinations=()
 declare -A program_destinations=()
 declare -A program_owners=()
-while IFS=$'\t' read -r record_kind name owner destination features providers; do
+while IFS=$'\t' read -r record_kind name owner destination features producer objects providers; do
 	case "$record_kind" in
 	source)
 		source_owners[$name]="$owner"
 		source_paths[$owner]="$name"
 		;;
 	library)
-		library_rows[$name]="library"$'\t'"$name"$'\t'"$owner"$'\t'"volume"$'\t'"$destination"$'\t'"$features"$'\t'"$providers"
+		library_rows[$name]="library"$'\t'"$name"$'\t'"$owner"$'\t'"volume"$'\t'"$destination"$'\t'"$features"$'\t'"$producer"$'\t'"$objects"$'\t'"$providers"
 		library_destinations[$name]="$destination"
 		;;
 	program)
@@ -205,11 +205,13 @@ while IFS=$'\t' read -r record_kind name owner destination features providers; d
 		;;
 	esac
 done < <(jq -r '
-	(.sources[] | ["source", .owner, .path, "", "", ""]),
+	(.sources[] | ["source", .owner, .path, "", "", "", "", ""]),
 	(.libraries[] | ["library", .name, .owner, .destination,
 		(if (.features | length) == 0 then "-" else (.features | join(",")) end),
+		.producer,
+		(if (.objects | length) == 0 then "-" else (.objects | join(",")) end),
 		(.providers | join(" "))]),
-	(.programs[] | ["program", .name, .owner, .destination, "", ""]) |
+	(.programs[] | ["program", .name, .owner, .destination, "", "", "", ""]) |
 	@tsv
 ' <<<"$manifest_json")
 requested_arguments=("$@")
@@ -770,20 +772,20 @@ targeted_state_paths() {
 			closure_dirs="$source_metadata_dir/$(closure_key "$source_dir").dirs"
 			if [[ -n "$source_metadata_dir" && -f "$closure_dirs" ]]; then
 				while read -r package_dir; do
-					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 				done <"$closure_dirs"
 			else
-				find "$root/$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+				find "$root/$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 			fi
 			if [[ "$owner" == *-client-provider ]]; then
 				source_dir="$(source_path "${owner%-provider}")"
 				closure_dirs="$source_metadata_dir/$(closure_key "$source_dir").dirs"
 				if [[ -n "$source_metadata_dir" && -f "$closure_dirs" ]]; then
 					while read -r package_dir; do
-						find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+						find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 					done <"$closure_dirs"
 				else
-					find "$root/$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+					find "$root/$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 				fi
 			fi
 			printf '%s\n' "$(library_file "$artifact")"
@@ -797,7 +799,7 @@ targeted_state_paths() {
 				printf '%s\n' "$source_dir/src/lib.rs" "$source_dir/src/$program.rs"
 			elif [[ -f "$source_metadata_dir/$package.dirs" ]]; then
 				while read -r package_dir; do
-					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 				done <"$source_metadata_dir/$package.dirs"
 			fi
 			printf '%s\n' "$(program_file "$program")"
@@ -998,6 +1000,15 @@ closure_key() {
 library_closure_file() {
 	local dir="$1"
 	local out="$source_metadata_dir/$(closure_key "$dir").dirs"
+	# A FOREIGN SOURCE IS ITS OWN CLOSURE. Cargo is what answers "what else does this compile
+	# against" for a Cargo package, and a directory of C sources has no such answer to ask for - what
+	# it is built from is the ordered object list on its library row. Writing the directory itself
+	# keeps every reader below unchanged: the closure digest is then a digest of this source alone,
+	# which is the true one rather than a constant.
+	if [[ ! -f "$root/$dir/Cargo.toml" ]]; then
+		printf '%s\n' "$dir" >"$out"
+		return 0
+	fi
 	(cd "$root" && cargo metadata --format-version 1 --all-features --manifest-path "$root/$dir/Cargo.toml") |
 		jq -r --arg root "$root" '.packages[] | select(.source == null) | .manifest_path | sub("/Cargo.toml$"; "") | sub("^" + $root + "/"; "")' |
 		sort -u >"$out"
@@ -1079,7 +1090,7 @@ done < <(
 	cd "$root"
 	{
 		mapfile -t source_roots <"$source_roots_file"
-		find "${source_roots[@]}" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) -print0
+		find "${source_roots[@]}" -path '*/target' -prune -o -path '*/shared' -prune -o -type f \( -name '*.rs' -o -name '*.c' -o -name '*.h' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) -print0
 		printf 'user/build.rs\0user/user.ld\0user/user-aarch64.ld\0user/user-riscv64.ld\0'
 		printf '../product.conf\0'
 	} | sort -z | xargs -0 sha256sum --zero
@@ -1107,6 +1118,36 @@ build_file_digest() {
 		sha256sum "$file" | awk '{print $1}'
 	fi
 }
+
+# THE FOREIGN PRODUCER'S IDENTITY, COMPUTED ONCE. Three tools, the flags they are given and the
+# sysroot they compile against - each able to change the ABI of an artifact without changing a single
+# source byte, which is why they are in the identity record rather than only in this script.
+#
+# THE VERSION LINES ARE TAKEN WITHOUT A PIPE. `clang --version | head -1` closes the pipe on the
+# first line, the writer takes SIGPIPE, and `pipefail` turns that into the status of the build. The
+# whole output is captured and the first line taken with parameter expansion, which reads nothing
+# early and cannot fail that way.
+first_line() {
+	local text="$1"
+	printf '%s\n' "${text%%$'\n'*}"
+}
+# The ABI, from the one file that describes it - the cross files and the portable static target's
+# build read the same one.
+# shellcheck source=../foreign/profile-abi.sh
+source "$root/foreign/profile-abi.sh"
+foreign_profile_abi "$target" || exit 2
+foreign_compiler="$(first_line "$(clang --version)")"
+foreign_archiver="$(first_line "$(llvm-ar --version)")"
+# `-flavor gnu` BECAUSE `rust-lld` IS THE GENERIC DRIVER. Asked for its version without a flavour it
+# prints "lld is a generic driver" to stderr and exits 1, which under `set -e` would either kill the
+# build or - as it first did here - leave the field EMPTY. An empty linker identity is worse than a
+# failure: the launch path refuses the artifact, and the reason it gives is about a record rather
+# than about this line.
+foreign_linker="$(first_line "$("$lld" -flavor gnu --version)")"
+# THE SYSROOT AS ONE NUMBER: every file under it, by path and by content, in sorted order. A header
+# edited after an artifact was built has to change this, or the artifact's identity would claim a
+# compile nobody can reproduce.
+foreign_sysroot_digest="$( (cd "$root/foreign/profile-sysroot" && find . -type f -print0 | sort -z | xargs -0 sha256sum) | sha256sum | awk '{print $1}')"
 
 rustc_commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
 if [[ ! "$rustc_commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -1151,7 +1192,11 @@ compute_source_digest() {
 	fi
 	awk -F '\t' -v crate="$crate_dir/" -v api="${api_dir:+$api_dir/}" '
 		function source_file(path) {
-			return path ~ /\.rs$/ || path ~ /(^|\/)Cargo\.toml$/ || path ~ /(^|\/)Cargo\.lock$/ || path ~ /(^|\/)rust-toolchain\.toml$/
+			# `.c` AND `.h` BESIDE THE RUST ONES: the files of a foreign source are what its
+			# artifact is built from, and a digest that could not see them would be a cache key
+			# that never moves. No apostrophe in this comment - it sits inside a single-quoted awk
+			# program, where one would end the string.
+			return path ~ /\.rs$/ || path ~ /\.c$/ || path ~ /\.h$/ || path ~ /(^|\/)Cargo\.toml$/ || path ~ /(^|\/)Cargo\.lock$/ || path ~ /(^|\/)rust-toolchain\.toml$/
 		}
 		source_file($1) && (index($1, crate) == 1 || (api != "" && index($1, api) == 1)) {
 			print $1
@@ -1264,6 +1309,23 @@ while IFS= read -r crate_dir; do
 	fi
 done <"$source_digest_roots"
 
+# The flags every foreign object in this image is compiled with, as one string. It is recorded in
+# the identity beside the tools, so a flag change moves every digest that names the artifact.
+foreign_cflags() {
+	printf '%s' "-ffreestanding -nostdlibinc -fPIC -O2 --target=$foreign_triple ${foreign_abi_flags[*]}"
+}
+
+# What SELECTED what was built: the target and the object list, in the order the manifest states it.
+# Order is part of the answer - link order decides which definition wins where two objects offer one
+# - so a reordered list is a different configuration and gets a different digest.
+foreign_configure_digest() {
+	local objects="$1"
+	{
+		printf 'target=%s\n' "$target"
+		printf 'objects=%s\n' "$objects"
+	} | sha256sum | awk '{print $1}'
+}
+
 write_identity_record() {
 	local kind="$1"
 	local artifact="$2"
@@ -1272,6 +1334,8 @@ write_identity_record() {
 	local feature_set="$5"
 	local providers="$6"
 	local identity="$7"
+	local producer="${8:-rust}"
+	local objects="${9:--}"
 	local provider digest
 	{
 		# THE COMMON SECTION: what every artifact has, whatever produced it. A reader that only needs
@@ -1288,10 +1352,27 @@ write_identity_record() {
 		# lines under it mean before it reads them. Identity still covers the whole record - a
 		# consumer HASHES this section, it does not parse it - so a provider that changed its
 		# compiler or its flags changes every digest that names it.
-		printf 'language=rust\n'
-		printf 'rustc-commit=%s\n' "$rustc_commit"
-		printf 'rustflags=%s\n' "$rustflags"
-		printf 'features=%s\n' "$feature_set"
+		case "$producer" in
+		rust)
+			printf 'language=rust\n'
+			printf 'rustc-commit=%s\n' "$rustc_commit"
+			printf 'rustflags=%s\n' "$rustflags"
+			printf 'features=%s\n' "$feature_set"
+			;;
+		foreign)
+			printf 'language=foreign\n'
+			printf 'compiler=%s\n' "$foreign_compiler"
+			printf 'archiver=%s\n' "$foreign_archiver"
+			printf 'linker=%s\n' "$foreign_linker"
+			printf 'cflags=%s\n' "$(foreign_cflags)"
+			printf 'sysroot-sha256=%s\n' "$foreign_sysroot_digest"
+			printf 'configure-sha256=%s\n' "$(foreign_configure_digest "$objects")"
+			;;
+		*)
+			echo "build-shared: $artifact has unknown producer '$producer'" >&2
+			return 1
+			;;
+		esac
 		for provider in $(tr ' ' '\n' <<<"$providers" | sort); do
 			[[ -n "$provider" ]] || continue
 			if [[ -z "${provider_identity_digests[$provider]:-}" ]]; then
@@ -2047,16 +2128,21 @@ for spec in "$@"; do
 		echo "build-shared: $artifact has no unique library manifest row" >&2
 		exit 1
 	}
-	read -r row_kind row_artifact row_crate row_stage row_destination row_features row_providers <<<"$row"
-	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || ! "$row_destination" =~ ^lib/[a-z0-9][a-z0-9_-]*/$artifact\.lslib$ || -z "$row_features" ]]; then
+	read -r row_kind row_artifact row_crate row_stage row_destination row_features row_producer row_objects row_providers <<<"$row"
+	if [[ "$row_kind" != library || "$row_artifact" != "$artifact" || "$row_crate" != "$crate" || "$row_stage" != volume || ! "$row_destination" =~ ^lib/[a-z0-9][a-z0-9_-]*/$artifact\.lslib$ || -z "$row_features" || -z "$row_producer" || -z "$row_objects" ]]; then
 		echo "build-shared: $artifact invocation differs from its library manifest row" >&2
 		exit 1
 	fi
 	crate_dir="$(source_path "$crate")"
-	manifest="$crate_dir/Cargo.toml"
-	if [[ ! -f "$manifest" ]]; then
-		echo "build-shared: missing $manifest" >&2
-		exit 1
+	# A RUST SOURCE IS A CARGO PACKAGE AND A FOREIGN ONE IS NOT. Requiring a manifest of both is the
+	# rule the manifest side already dropped; keeping it here would have made a foreign artifact
+	# expressible in the manifest and unbuildable by the build.
+	if [[ "$row_producer" != foreign ]]; then
+		manifest="$crate_dir/Cargo.toml"
+		if [[ ! -f "$manifest" ]]; then
+			echo "build-shared: missing $manifest" >&2
+			exit 1
+		fi
 	fi
 	out="$(library_file "$artifact")"
 	out_dir="$(dirname "$out")"
@@ -2105,7 +2191,37 @@ for spec in "$@"; do
 		continue
 	fi
 	((artifact_state_misses += 1))
-	if [[ -n "$image_graph" ]]; then
+	foreign_objects=()
+	if [[ "$row_producer" == foreign ]]; then
+		# THE PINNED C COMPILER, THE PROFILE SYSROOT, AND THE OBJECT LIST IN THE MANIFEST'S ORDER.
+		# Everything after this point - the link, the needed list, the import ownership audit, the
+		# identity note, the cache and the staging - is the path every Rust library takes, which is
+		# what "a first-class kind and not an exception" has to mean to be worth saying.
+		foreign_object_dir="$build_scratch/foreign-$artifact-$target"
+		rm -rf "$foreign_object_dir"
+		mkdir -p "$foreign_object_dir"
+		while IFS= read -r object; do
+			[[ -n "$object" ]] || continue
+			if [[ ! -f "$root/$crate_dir/$object" ]]; then
+				echo "build-shared: $artifact names object $object and $crate_dir does not have it" >&2
+				exit 1
+			fi
+			compiled="$foreign_object_dir/$(printf '%s' "$object" | tr '/' '_').o"
+			# shellcheck disable=SC2046
+			clang --target="$foreign_triple" -ffreestanding -nostdlibinc -fPIC -O2 \
+				${foreign_abi_flags[@]+"${foreign_abi_flags[@]}"} \
+				-isystem "$root/foreign/profile-sysroot/include" \
+				-include "$root/foreign/profile-sysroot/arch/$foreign_arch.h" \
+				-c "$root/$crate_dir/$object" -o "$compiled"
+			foreign_objects+=("$compiled")
+		done < <(tr ',' '\n' <<<"$row_objects")
+		if [[ "${#foreign_objects[@]}" == 0 ]]; then
+			echo "build-shared: $artifact is a foreign library and names no objects" >&2
+			exit 1
+		fi
+		deps=""
+		rlib="${foreign_objects[0]}"
+	elif [[ -n "$image_graph" ]]; then
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
 	else
@@ -2131,11 +2247,20 @@ for spec in "$@"; do
 	} | sha256sum | awk '{print $1}')"
 	provider_expected_identity="$(mktemp "$build_scratch/identity-record.XXXXXX")"
 	pending_identity_record="$provider_expected_identity"
-	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity"
+	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity" "$row_producer" "$row_objects"
 	provider_expected_needed="$(for provider in $row_providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
 	provider_cache_inputs="$provider_cache_prefix.inputs.$$.expected"
-	artifact_cache_record library "$row" "$provider_expected_identity" "cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')" >"$provider_cache_inputs"
+	# WHAT THE COMPILE PRODUCED, as one number. For a Rust library that is the rlib; for a foreign
+	# one it is EVERY object, not the first - `$rlib` holds the first only, so that a foreign library
+	# has one path through the code below, and a cache key over it would miss a change in any other
+	# object the manifest lists.
+	if [[ "$row_producer" == foreign ]]; then
+		provider_compile_inputs="objects=$(sha256sum "${foreign_objects[@]}" | sha256sum | awk '{print $1}')"
+	else
+		provider_compile_inputs="cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')"
+	fi
+	artifact_cache_record library "$row" "$provider_expected_identity" "$provider_compile_inputs" >"$provider_cache_inputs"
 	provider_cache_key="$(sha256sum "$provider_cache_inputs" | awk '{print $1}')"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_expected_identity" "$provider_expected_needed"; then
 		verbose_log "build-shared: provider cache hit $artifact"
@@ -2192,6 +2317,11 @@ for spec in "$@"; do
 			llvm-objcopy --set-symbol-visibility=memcpy=default --set-symbol-visibility=memmove=default --set-symbol-visibility=memset=default --set-symbol-visibility=memcmp=default --set-symbol-visibility=__udivti3=default --set-symbol-visibility=__umodti3=default "$object"
 			link_inputs+=("$object")
 		done < <(find "$object_root" -name '*.o' -print0)
+	elif [[ "$row_producer" == foreign ]]; then
+		# OBJECT FILES AND NOT AN ARCHIVE. `--whole-archive` is how a Rust rlib is kept whole through
+		# member selection; objects are already whole, and wrapping them in that pair would say
+		# nothing while looking like it said something.
+		link_inputs=("${foreign_objects[@]}")
 	else
 		link_inputs=(--whole-archive "${archives[@]}" --no-whole-archive)
 	fi

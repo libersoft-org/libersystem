@@ -879,12 +879,18 @@ fn derive_dynamic_order(row: &ManifestRow, libraries: &[ManifestRow]) -> Vec<Str
 	expected
 }
 
+/// How many lines precede the provider list: the seven common fields and the four the `rust`
+/// language section adds. Named rather than written at each use, because the two uses below index
+/// past it and a record that grows a field turns a wrong constant into a provider comparison against
+/// a field line - which fails as "a provider was replaced" and sends the reader to the wrong place.
+const IDENTITY_HEADER_LINES: usize = 11;
+
 fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow], expected_rustc_commit: &str) -> Vec<u8> {
 	let bytes = identity_record(artifact);
 	assert!(bytes.ends_with(b"\n"), "{} identity record is not newline terminated", row.name);
 	let text = core::str::from_utf8(&bytes).unwrap_or_else(|_| panic!("identity for {} is not UTF-8", row.name));
 	let lines: Vec<&str> = text.lines().collect();
-	assert!(lines.len() >= 11 && lines[0] == "format=liber-image-identity-v2", "{} has malformed identity record", row.name);
+	assert!(lines.len() >= IDENTITY_HEADER_LINES && lines[0] == "format=liber-image-identity-v2", "{} has malformed identity record", row.name);
 	let expected_kind = if row.kind == "library" { "library" } else { "executable" };
 	assert_eq!(lines[1], format!("kind={expected_kind}"), "{} identity kind", row.name);
 	assert_eq!(lines[2], format!("artifact={}", row.name), "{} identity artifact", row.name);
@@ -917,8 +923,8 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 	// that out took reading file dates in the staged directory. The check is unchanged - a
 	// consumer's recorded chain must equal the providers staged beside it - and only the refusal is
 	// legible now.
-	if lines[10..] != *expected_providers.as_slice() {
-		let recorded: &[&str] = &lines[10..];
+	if lines[IDENTITY_HEADER_LINES..] != *expected_providers.as_slice() {
+		let recorded: &[&str] = &lines[IDENTITY_HEADER_LINES..];
 		eprintln!("mkpackages: {} was built against providers that are not the ones staged beside it", row.name);
 		for provider in &row.providers {
 			let prefix = format!("provider={provider}:");

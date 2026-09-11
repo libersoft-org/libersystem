@@ -54,6 +54,15 @@ path = "user/libs/foreign/abi"
 owner = "foreign-discovery"
 path = "user/libs/foreign/discovery"
 
+# THE FIRST FOREIGN SOURCE. Not a Cargo package and not meant to become one: its producer is the
+# pinned C compiler, and what it is built from is the ORDERED OBJECT LIST on its library row rather
+# than a dependency closure Cargo answers. Declaring the producer is what lets a foreign artifact
+# enter this manifest as a kind rather than as an exception.
+[[sources]]
+owner = "icdprobe"
+path = "user/libs/foreign/icdprobe"
+producer = "foreign"
+
 [[sources]]
 owner = "service-logic"
 path = "user/services/logic"
@@ -3013,6 +3022,16 @@ owner = "display-proto"
 destination = "lib/protocol/display-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+# The synthetic ICD. It carries no Vulkan entry point: what it implements is the Loader/Driver
+# INTERFACE - two exports and the version negotiation between them - which is what a selection slot
+# of kind `vulkan-icd` binds and what the packaging path has to carry.
+[[libraries]]
+name = "icdprobe"
+owner = "icdprobe"
+destination = "lib/foreign/icdprobe.lslib"
+providers = ["lsrt"]
+objects = ["icdprobe.c"]
 
 [[libraries]]
 name = "flac"

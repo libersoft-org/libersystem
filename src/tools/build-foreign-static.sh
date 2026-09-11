@@ -94,30 +94,14 @@ for dir in "$LOADER" "$HEADERS"; do
 	}
 done
 
-# THE ABI COMES FROM THE SAME PLACE THE RUST SIDE'S DOES. Two descriptions of one ABI is how a C
-# object and a Rust object come to disagree about a type, so these mirror the cross files exactly.
-case "$arch" in
-x86_64)
-	target="x86_64-unknown-none-elf"
-	abi=(-mno-mmx -msse -msse2 -mno-sse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -mfxsr -mno-red-zone)
-	;;
-aarch64)
-	target="aarch64-unknown-none"
-	# NO ABI FLAGS BEYOND THE TRIPLE. `aarch64-unknown-none` is the hardfloat AAPCS variant and the
-	# Rust half reports `target_feature="neon"` under it, so clang's defaults for this triple already
-	# match. Adding `-mgeneral-regs-only` here would be a second description of that ABI - and it
-	# was: the pinned sources use `double`, which such an ABI cannot pass.
-	abi=()
-	;;
-riscv64)
-	target="riscv64-unknown-none-elf"
-	abi=(-march=rv64gc -mabi=lp64d -mcmodel=medany)
-	;;
-*)
-	echo "build-foreign-static: unsupported arch '$arch'" >&2
-	exit 2
-	;;
-esac
+# THE ABI COMES FROM THE SAME PLACE THE RUST SIDE'S DOES, and from the same place the image build's
+# does. It was written out here until the image build needed it too; a third copy of one ABI is how a
+# C object and a Rust object come to disagree about a type, so it moved to one file both read.
+# shellcheck source=../foreign/profile-abi.sh
+source "$ROOT/src/foreign/profile-abi.sh"
+foreign_profile_abi "$arch" || exit 2
+target="$foreign_triple"
+abi=("${foreign_abi_flags[@]}")
 
 # THE OPTION SET, AS THE BOOTSTRAP PIN FREEZES IT. Every WSI backend off because LiberSystem is none
 # of those window systems; assembly off because per-architecture dispatch stubs are exactly the
