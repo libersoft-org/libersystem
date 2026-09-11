@@ -25,9 +25,10 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use rt::*;
 
-use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack};
+use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Addr, MacAddr, NEIGH_MAX, NTP_PORT, SockEntry, SockEntryState, Stack};
 use proto::codec::{Buffer, Handles};
 use proto::system::{AcceptResult, AddressState, BindMode, Chunk, DnsServer, Error, FetchChunk, FetchOutcome, HopStatus, InterfaceAddress, InterfaceId, IpAddress, Ipv4Addr as WireIp, Ipv6Addr as WireIpv6, ListenRequest, ListenResult, MacAddr as WireMac, Neighbor, NetCapacity, NetInfo, NextHop, OpenTarget, PingReply, PingStatus, ProviderKind, Reachability, RouteEntry, RoutePreference, RouterEntry, ScopedAddress, ScopedEndpoint, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, provider_catalogue, socket};
+use service_logic::tcp_bind::Binding;
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -309,8 +310,12 @@ fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Event {
 					host.receive(&rx[..len], now_ms());
 				}
 				drain_ipv6(frames, stack);
+				// A TRANSPORT EVENT CAN ARRIVE OVER EITHER FAMILY, and every caller of `pump` reads
+				// one from here - so an IPv6 answer must come back the same way an IPv4 one does or
+				// the waiting operation never learns it arrived.
+				let events: Vec<Event> = deliver_ipv6(frames, stack);
 				report_ipv6(stack);
-				return Event::None;
+				return events.into_iter().next().unwrap_or(Event::None);
 			}
 			let outcome: net::Outcome = stack.on_frame(&rx[..len], tx);
 			send_frame(frames, &tx[..outcome.reply_len]);
@@ -359,6 +364,15 @@ fn report_ipv6(stack: &mut Stack) {
 	};
 	let invalidations = host.drain_invalidations();
 	let errors = host.drain_quoted_errors();
+	// EVERY ERROR REACHES THE FLOW THAT OWNS IT BEFORE IT IS COUNTED. The layer below validated the
+	// quotation as far as a layer holding no flow state can; the consumer that owns the send queue
+	// makes the second check and is the only thing that may act.
+	for error in &errors {
+		stack.on_ipv6_error(error);
+	}
+	let Some(host) = stack.ipv6() else {
+		return;
+	};
 	for delivery in host.take_deliveries() {
 		print(b"ipv6: delivered ");
 		print_u64(u64::from(delivery.next_header));
@@ -452,6 +466,7 @@ fn wait_frames(frames: u64, stack: &mut Stack, deadline: u64) -> i64 {
 			host.on_timer(now_ms());
 		}
 		drain_ipv6(frames, stack);
+		let _ipv6_events: Vec<Event> = deliver_ipv6(frames, stack);
 		drive_tcp_timers(frames, stack);
 		// REPORTED WHERE IT CHANGES. The line is written only when something is actually pending, so
 		// this costs nothing on a quiet link - and without it the layer's state was said once, at
@@ -479,6 +494,42 @@ fn drive_tcp_timers(frames: u64, stack: &mut Stack) {
 			drain_tx(frames, ci, stack, &mut frame);
 		}
 	}
+}
+
+// Route what the IPv6 host delivered into the transports that own it.
+//
+// THE HOST OWNS L3 AND STOPS THERE. Everything above the IPv6 header - a TCP segment, a UDP datagram -
+// belongs to the same machinery the other family uses, keyed by an address wide enough to tell the
+// two apart. Anything this host has no transport for is reported and dropped rather than queued.
+fn deliver_ipv6(frames: u64, stack: &mut Stack) -> Vec<Event> {
+	let deliveries: Vec<crate::ipv6_host::Delivery> = match stack.ipv6() {
+		Some(host) => host.take_deliveries(),
+		None => return Vec::new(),
+	};
+	if deliveries.is_empty() {
+		return Vec::new();
+	}
+	let mut out: Vec<u8> = alloc::vec![0u8; usize::from(stack.mtu()) + 14];
+	let mut pending: Vec<Event> = Vec::new();
+	for delivery in deliveries {
+		stack.set_clock(now_ms());
+		match delivery.next_header {
+			IP_PROTO_TCP => {
+				stack.on_tcp6(delivery.source.octets(), delivery.destination.octets(), &delivery.payload, &mut out);
+			}
+			IP_PROTO_UDP => {
+				let event = stack.on_udp6(delivery.source.octets(), delivery.destination.octets(), &delivery.payload);
+				if !matches!(event, Event::None) {
+					pending.push(event);
+				}
+			}
+			_ => {}
+		}
+	}
+	// The replies an IPv6 segment provokes are queued on the host, not written here, so they leave
+	// with everything else it has pending.
+	drain_ipv6(frames, stack);
+	pending
 }
 
 // Send everything the IPv6 host has queued.
@@ -779,7 +830,7 @@ fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, fra
 			let mut li: usize = 0;
 			while li < listeners.len() {
 				if listeners[li].chan != 0 && listeners[li].pending {
-					if let Some(ci) = stack.take_accepted(listeners[li].port) {
+					if let Some(ci) = stack.take_accepted(listeners[li].binding.port) {
 						if accept_handoff(listeners[li].chan, listeners[li].pending_corr, ci, &mut socks, stack) {
 							listeners[li].pending = false;
 						}
@@ -835,7 +886,7 @@ fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, fra
 					let mut new_sock_ci: usize = 0;
 					let mut new_client: u64 = 0;
 					let mut new_listener: u64 = 0;
-					let mut new_listener_port: u16 = 0;
+					let mut new_listener_binding: Binding = Binding { mode: service_logic::tcp_bind::BindMode::Ipv4Only, address: service_logic::tcp_bind::Local::V4([0; 4]), port: 0 };
 					// every set grows on demand, so there is always room.
 					let client_room: bool = true;
 					let sock_room: bool = true;
@@ -845,7 +896,7 @@ fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, fra
 					let sockets_used: u32 = socks.iter().filter(|s| s.chan != 0).count() as u32;
 					let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
 					{
-						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
+						let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_binding: &mut new_listener_binding, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
 						let mut reply_handle = proto::codec::Handles::new();
 						if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
 							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
@@ -862,7 +913,7 @@ fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, fra
 						place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
 					}
 					if new_listener != 0 {
-						place_listener(&mut listeners, Listener { chan: new_listener, port: new_listener_port, pending_corr: 0, pending: false });
+						place_listener(&mut listeners, Listener { chan: new_listener, binding: new_listener_binding, pending_corr: 0, pending: false });
 					}
 					if new_client != 0 {
 						place_client(&mut clients, new_client);
@@ -989,7 +1040,9 @@ fn teardown_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: &mut
 #[derive(Clone, Copy)]
 struct Listener {
 	chan: u64,
-	port: u16,
+	// WHAT IT CLAIMED, not only which port: releasing a claim needs the mode and the address too,
+	// because two listeners may legitimately hold the same port in two families.
+	binding: Binding,
 	pending_corr: u32,
 	pending: bool,
 }
@@ -1016,7 +1069,7 @@ fn serve_listener(listener: &mut Listener, socks: &mut Vec<SockSlot>, stack: &mu
 				let op: u16 = u16::from_le_bytes([req[0], req[1]]);
 				let corr: u32 = u32::from_le_bytes([req[2], req[3], req[4], req[5]]);
 				if op == listener::OP_ACCEPT {
-					match stack.take_accepted(listener.port) {
+					match stack.take_accepted(listener.binding.port) {
 						Some(ci) if accept_handoff(listener.chan, corr, ci, socks, stack) => {}
 						_ => {
 							listener.pending_corr = corr;
@@ -1027,7 +1080,7 @@ fn serve_listener(listener: &mut Listener, socks: &mut Vec<SockSlot>, stack: &mu
 			}
 		}
 		Received::Closed => {
-			stack.unlisten(listener.port);
+			stack.unlisten(&listener.binding);
 			close(listener.chan);
 			listener.chan = 0;
 		}
@@ -1087,7 +1140,7 @@ struct Net<'a> {
 	// up; plus whether the client / socket / listener sets have room.
 	new_client: &'a mut u64,
 	new_listener: &'a mut u64,
-	new_listener_port: &'a mut u16,
+	new_listener_binding: &'a mut Binding,
 	sock_room: bool,
 	client_room: bool,
 	listener_room: bool,
@@ -1159,7 +1212,14 @@ use proto::net_limits::{FETCH_CHUNK_BYTES, MAX_FETCH_BODY_BYTES, MAX_OPEN_DESTIN
 // VALIDATION BEFORE ADMISSION, not as the attempts go along: an empty list, a list past the bound or
 // a malformed scope is a request that was wrong when it arrived, and finding that out halfway
 // through a sequence of attempts would mean some of them already happened.
-fn first_destination(target: &OpenTarget) -> Result<Ipv4Addr, Error> {
+// Where an open is going, in whichever family the caller named.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Destination {
+	V4(Ipv4Addr),
+	V6([u8; 16]),
+}
+
+fn first_destination(target: &OpenTarget) -> Result<Destination, Error> {
 	if target.destinations.is_empty() || target.destinations.len() > MAX_OPEN_DESTINATIONS {
 		return Err(Error::Invalid);
 	}
@@ -1178,10 +1238,10 @@ fn first_destination(target: &OpenTarget) -> Result<Ipv4Addr, Error> {
 	}
 	// Every candidate is checked, so a malformed one refuses the request even when an earlier
 	// candidate would have been usable.
-	let mut first: Option<Ipv4Addr> = None;
+	let mut first: Option<Destination> = None;
 	let mut carried: Option<Error> = None;
 	for candidate in &seen {
-		match ipv4_destination(candidate) {
+		match open_destination(candidate) {
 			Ok(addr) if first.is_none() => first = Some(addr),
 			Ok(_) => {}
 			Err(Error::Invalid) => return Err(Error::Invalid),
@@ -1190,34 +1250,46 @@ fn first_destination(target: &OpenTarget) -> Result<Ipv4Addr, Error> {
 	}
 	match first {
 		Some(addr) => Ok(addr),
-		// Nothing usable, and the reason is the one the candidates gave: a list of v6 addresses is
-		// `unsupported`, not `not-found`.
 		None => Err(carried.unwrap_or(Error::Invalid)),
+	}
+}
+
+// One candidate, validated into the form the transports open with.
+fn open_destination(addr: &ScopedAddress) -> Result<Destination, Error> {
+	match &addr.addr {
+		// A SCOPE ON AN IPv4 ADDRESS IS REFUSED RATHER THAN IGNORED. There is one interface, so the
+		// scope selects nothing, and ignoring it would let a caller believe it had.
+		IpAddress::V4(_) if addr.scope.is_some() => Err(Error::Invalid),
+		IpAddress::V4(v4) => Ok(Destination::V4(Ipv4Addr([v4.a, v4.b, v4.c, v4.d]))),
+		// AN IPv4-MAPPED ADDRESS IS NOT AN IPv4 DESTINATION, by the same rule that refuses it as a
+		// listen address: the direct spelling exists, and a second one is a check every consumer has
+		// to remember.
+		IpAddress::V6(v6) if v6.is_ipv4_mapped() => Err(Error::Invalid),
+		IpAddress::V6(v6) => Ok(Destination::V6(v6.octets())),
 	}
 }
 
 // THE BIND MATRIX, IN ONE PLACE. Which mode may name which address is a frozen contract, and a
 // listener that validated it anywhere else would let two callers disagree about what `::` means.
-fn validate_bind(req: &ListenRequest) -> Result<u16, Error> {
+fn validate_bind(req: &ListenRequest) -> Result<Binding, Error> {
 	// A scope on a listen address is refused: this service has one interface, so it selects nothing.
 	if req.local.addr.scope.is_some() {
 		return Err(Error::Invalid);
 	}
-	match (&req.mode, &req.local.addr.addr) {
-		// AN IPv4-MAPPED ADDRESS IS NOT A WAY TO EXPRESS AN IPv4 BIND, in any mode. An IPv4 endpoint
-		// is expressible directly, so a second spelling buys nothing and costs every consumer a check
-		// it will sometimes forget.
-		(_, IpAddress::V6(addr)) if addr.is_ipv4_mapped() => Err(Error::Invalid),
-		(BindMode::Ipv4Only, IpAddress::V4(_)) => Ok(req.local.port),
-		// A DUAL-STACK BIND MAY NAME NOTHING BUT THE UNSPECIFIED IPv6 ADDRESS: a bind covering two
-		// families cannot name one address in one of them.
-		(BindMode::DualStack, IpAddress::V6(addr)) if !addr.is_unspecified() => Err(Error::Invalid),
-		// The two modes whose family this service does not yet carry. `unsupported` rather than
-		// `invalid`: the request is well formed and this implementation does not serve it.
-		(BindMode::Ipv6Only, IpAddress::V6(_)) | (BindMode::DualStack, IpAddress::V6(_)) => Err(Error::Unsupported),
-		// Anything else is a mode and an address whose families disagree.
-		_ => Err(Error::Invalid),
-	}
+	let address: service_logic::tcp_bind::Local = match &req.local.addr.addr {
+		IpAddress::V4(addr) => service_logic::tcp_bind::Local::V4([addr.a, addr.b, addr.c, addr.d]),
+		IpAddress::V6(addr) => service_logic::tcp_bind::Local::V6(addr.octets()),
+	};
+	let mode = match req.mode {
+		BindMode::Ipv4Only => service_logic::tcp_bind::BindMode::Ipv4Only,
+		BindMode::Ipv6Only => service_logic::tcp_bind::BindMode::Ipv6Only,
+		BindMode::DualStack => service_logic::tcp_bind::BindMode::DualStack,
+	};
+	let binding = Binding { mode, address, port: req.local.port };
+	// THE MATRIX IS ONE FUNCTION AND IT LIVES IN `service-logic`, where a host test can drive every
+	// row of it. This is the translation into it, not a second copy of it.
+	binding.well_formed().map_err(|_| Error::Invalid)?;
+	Ok(binding)
 }
 
 // Cut a fetched body into the stream's chunks, with the outcome on the last one.
@@ -1427,7 +1499,7 @@ impl network::Service for Net<'_> {
 		// THE OPEN IS GUARDED: everything that can refuse before a body exists refuses here, as the
 		// typed error every other operation uses, rather than as an empty stream a caller would have
 		// to interpret.
-		let destination: Ipv4Addr = first_destination(&req.target)?;
+		let destination: Destination = first_destination(&req.target)?;
 		let ci: usize = match self.stack.tcp_alloc() {
 			Some(i) => i,
 			None => return Err(Error::Again),
@@ -1449,7 +1521,7 @@ impl network::Service for Net<'_> {
 	// for the serve loop to start waiting on. Refused with `Again` when the socket pool
 	// or the connection pool is full.
 	fn connect(&mut self, target: OpenTarget) -> Result<u64, Error> {
-		let destination: Ipv4Addr = first_destination(&target)?;
+		let destination: Destination = first_destination(&target)?;
 		if !self.sock_room {
 			return Err(Error::Again);
 		}
@@ -1504,25 +1576,33 @@ impl network::Service for Net<'_> {
 
 	// Open a listening socket on `port` (passive open) and hand the caller a `listener`
 	// capability: the client end of a fresh channel on which we serve `accept`. The
-	// server end (and its port) are parked in `new_listener`/`new_listener_port` for the
+	// server end (and its claim) are parked in `new_listener`/`new_listener_binding` for the
 	// serve loop to start waiting on, and the stack starts accepting inbound connections
 	// on the port. Refused with `Again` when the listener set or the listen table is
 	// full.
 	fn listen(&mut self, req: ListenRequest) -> Result<ListenResult, Error> {
-		let port: u16 = validate_bind(&req)?;
-		if !self.listener_room || !self.stack.listen(port) {
+		let binding: Binding = validate_bind(&req)?;
+		if !self.listener_room {
 			return Err(Error::Again);
+		}
+		// THE MATRIX REFUSES BEFORE ANYTHING IS PUBLISHED. A port already held in a way that overlaps
+		// is `denied` rather than `again`: retrying will not make the conflict go away.
+		if let Err(refusal) = self.stack.listen(binding) {
+			return Err(match refusal {
+				service_logic::tcp_bind::BindRefusal::InUse => Error::Denied,
+				_ => Error::Invalid,
+			});
 		}
 		match channel() {
 			Some((server, peer)) => {
 				*self.new_listener = server;
-				*self.new_listener_port = port;
+				*self.new_listener_binding = binding;
 				// THE BACKLOG IT ACTUALLY GOT. The accept queue this stack keeps is the listen table's
 				// own, so what a caller asked for is reported back rather than assumed granted.
 				Ok(ListenResult { listener: peer, backlog: req.backlog.min(LISTEN_BACKLOG_MAX) })
 			}
 			None => {
-				self.stack.unlisten(port);
+				self.stack.unlisten(&binding);
 				Err(Error::Again)
 			}
 		}
@@ -1538,7 +1618,7 @@ impl network::Service for Net<'_> {
 	// Query an NTP server for the wall-clock time, returning the Unix epoch seconds from
 	// its reply. The TimeService combines this with the monotonic clock and the RTC.
 	fn sntp(&mut self, server: ScopedAddress) -> Result<u64, Error> {
-		let target: Ipv4Addr = ipv4_destination(&server)?;
+		let target: Destination = open_destination(&server)?;
 		match do_sntp(target, self.frames, self.stack, self.rx, self.tx) {
 			Some(unix) => Ok(unix),
 			None => Err(Error::Again),
@@ -1978,17 +2058,38 @@ fn do_dns(name: &[u8], frames: u64, stack: &mut Stack, txn: &mut u16, rx: &mut [
 
 // Send an SNTP request to `server` and return the Unix epoch seconds from its reply,
 // or None on timeout / no route. A one-shot UDP query/response, mirroring do_dns.
-fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<u64> {
-	let hop: Ipv4Addr = stack.next_hop(server);
-	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-		Some(m) => m,
-		None => return None,
-	};
-	let query: usize = stack.build_sntp_request(mac, server, NTP_SRC_PORT, tx);
-	if query == 0 {
-		return None;
+// The 48-byte SNTP client request, which is the same on either family.
+//
+// ONE DEFINITION, because it is the message and not the framing: `build_sntp_request` writes these
+// bytes into an IPv4 frame and the IPv6 path hands them to the host, and a second copy of "LI 0, VN
+// 4, Mode 3 and forty-seven zeros" is a second thing to get wrong.
+fn sntp_request_body() -> Vec<u8> {
+	let mut body: Vec<u8> = alloc::vec![0u8; 48];
+	body[0] = 0x23;
+	body
+}
+
+fn do_sntp(server: Destination, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Option<u64> {
+	match server {
+		Destination::V4(ip) => {
+			let hop: Ipv4Addr = stack.next_hop(ip);
+			let mac: MacAddr = resolve(hop, frames, stack, rx, tx)?;
+			let query: usize = stack.build_sntp_request(mac, ip, NTP_SRC_PORT, tx);
+			if query == 0 {
+				return None;
+			}
+			send_frame(frames, &tx[..query]);
+		}
+		// THE SAME REQUEST OVER THE OTHER FAMILY. The datagram is identical; what differs is the
+		// pseudo-header its mandatory checksum covers and who resolves the next hop.
+		Destination::V6(octets) => {
+			stack.set_clock(now_ms());
+			if !stack.send_udp6(octets, NTP_SRC_PORT, NTP_PORT, &sntp_request_body()) {
+				return None;
+			}
+			drain_ipv6(frames, stack);
+		}
 	}
-	send_frame(frames, &tx[..query]);
 	let deadline: u64 = clock() + NTP_TIMEOUT_TICKS;
 	while clock() < deadline {
 		if wait_frames(frames, stack, deadline) != 0 {
@@ -2010,10 +2111,10 @@ fn do_sntp(server: Ipv4Addr, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: 
 // accumulate the response into `reply` until the peer closes or it falls quiet.
 // Returns the establish status (1 = ok, 2 = unreachable, 3 = refused, 0 = timeout).
 #[allow(clippy::too_many_arguments)]
-fn do_tcp(ci: usize, ip: Ipv4Addr, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut Vec<u8>) -> u8 {
+fn do_tcp(ci: usize, destination: Destination, port: u16, request: &[u8], frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8], reply: &mut Vec<u8>) -> u8 {
 	// Establish the connection; on failure report the status and stop (the
 	// establish status bytes 2 / 3 / 0 map straight onto the fetch errors).
-	match tcp_establish(ci, ip, port, frames, stack, rx, tx) {
+	match tcp_establish(ci, destination, port, frames, stack, rx, tx) {
 		1 => {}
 		other => return other,
 	}
@@ -2092,15 +2193,28 @@ fn drain_tx(frames: u64, ci: usize, stack: &mut Stack, tx: &mut [u8]) {
 // resolve the next hop, open the connection, and send the SYN, retransmitting it
 // until the handshake completes. Returns 1 = established, 2 = unreachable (no ARP),
 // 3 = refused (reset), 0 = timed out. Shared by `fetch` (do_tcp) and `connect`.
-fn tcp_establish(ci: usize, ip: Ipv4Addr, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
-	let hop: Ipv4Addr = stack.next_hop(ip);
-	let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
-		Some(m) => m,
-		None => return 2,
-	};
+fn tcp_establish(ci: usize, destination: Destination, port: u16, frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> u8 {
 	let iss: u32 = clock() as u32;
 	let local_port: u16 = TCP_LOCAL_PORT_BASE | (clock() as u16 & 0x0fff);
-	stack.tcp_open(ci, ip, port, mac, local_port, iss);
+	match destination {
+		Destination::V4(ip) => {
+			// IPv4 RESOLVES ITS OWN NEXT HOP HERE, because the IPv4 stack owns its ARP cache.
+			let hop: Ipv4Addr = stack.next_hop(ip);
+			let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+				Some(m) => m,
+				None => return 2,
+			};
+			stack.tcp_open(ci, ip, port, mac, local_port, iss);
+		}
+		// IPv6 DOES NOT, because the host below owns the route and the neighbour cache: the segment
+		// is handed down and resolution happens when it goes out, which is what keeps an off-link
+		// connection following the route rather than a MAC frozen at open time.
+		Destination::V6(octets) => {
+			if !stack.tcp_open6(ci, octets, port, local_port, iss) {
+				return 2;
+			}
+		}
+	}
 	let syn: usize = stack.tcp_build_syn(ci, tx);
 	send_frame(frames, &tx[..syn]);
 	// THE SYN SCHEDULE IS THE PROFILE'S, NOT A FIXED INTERVAL REPEATED. RFC 9293 section 3.8.3

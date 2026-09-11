@@ -932,7 +932,7 @@ impl Ipv6Host {
 				frame.extend_from_slice(&self.mac);
 				frame.extend_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
 				frame.extend_from_slice(&packet);
-				self.queue(frame);
+				self.transmit(frame);
 				true
 			}
 			Lookup::Pending => {
@@ -950,6 +950,16 @@ impl Ipv6Host {
 			}
 			Lookup::Capacity => false,
 		}
+	}
+
+	/// Record a lowering the consumer that owns the flow has validated.
+	///
+	/// THE ONLY WRITE TO THE PMTU CACHE, and it happens here because only the consumer could make the
+	/// check that justifies it. A full table answers `Capacity` rather than claiming it recorded the
+	/// lowering; the caller keeps the smaller limit it validated either way, which is what stops
+	/// cache exhaustion from restoring a limit the path has already refused.
+	pub fn record_path_mtu(&mut self, destination: Address, mtu: u32, now_ms: u64) -> service_logic::ipv6_icmp::MtuOutcome {
+		self.path_mtu.record(self.interface, destination, mtu, now_ms)
 	}
 
 	/// The address this host would send to `peer` from, or `None` when it has none it may use.

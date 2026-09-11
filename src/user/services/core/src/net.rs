@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 // The IPv6 host this stack carries for the same link. Sibling module of this one, under the same
 // binary: the two protocols share a NIC and a frame channel and nothing else.
 use super::ipv6_host::Ipv6Host;
+use service_logic::tcp_bind::{BindRefusal, BindTable, Binding, Local};
 use service_logic::tcp_close::Closing;
 use service_logic::tcp_queue::{AckOutcome, SendQueue};
 use service_logic::tcp_rto::Rto;
@@ -28,8 +29,10 @@ const ARP_OP_REPLY: u16 = 2;
 
 // IPv4 protocol numbers.
 const IP_PROTO_ICMP: u8 = 1;
-const IP_PROTO_UDP: u8 = 17;
-const IP_PROTO_TCP: u8 = 6;
+pub const IP_PROTO_UDP: u8 = 17;
+pub const IP_PROTO_TCP: u8 = 6;
+// The fixed IPv6 header, which a segment size for that family is measured under.
+const IPV6_HDR: usize = 40;
 
 // ICMP message types.
 const ICMP_ECHO_REQUEST: u8 = 8;
@@ -49,7 +52,7 @@ const DNS_PORT: u16 = 53;
 
 // The NTP / SNTP server port (UDP), and the offset between the NTP epoch (1900) and
 // the Unix epoch (1970) in seconds (70 years, 17 of them leap).
-const NTP_PORT: u16 = 123;
+pub const NTP_PORT: u16 = 123;
 const NTP_UNIX_OFFSET: u32 = 2_208_988_800;
 
 // DHCP / BOOTP: a UDP client on port 68 talking to a server on port 67. The client
@@ -132,9 +135,6 @@ const TCP_MSS: u16 = 536;
 // 9293 section 3.7.1 permits a receiver's advertised MSS to be treated as a lower bound of this
 // order rather than obeyed to the byte.
 const TCP_MSS_FLOOR: u16 = 88;
-
-// The initial listen-table size (passive open); the table grows on demand.
-const LISTEN_MAX: usize = 2;
 
 // A 48-bit Ethernet MAC address.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -421,7 +421,11 @@ struct TcpConn {
 	// socket - awaiting the listener's `accept`.
 	pending_accept: bool,
 	local_port: u16,
-	remote_ip: Ipv4Addr,
+	// THE FULL KEY, FAMILY INCLUDED. Port 80 in one family and port 80 in the other are different
+	// connections, and a table keyed on the port and the low address words would hand one family's
+	// segments to the other's control block.
+	local: Local,
+	remote: Local,
 	remote_port: u16,
 	remote_mac: MacAddr,
 	// Send sequence: oldest unacknowledged, and the next sequence to use.
@@ -463,7 +467,7 @@ struct TcpConn {
 
 impl TcpConn {
 	fn closed() -> TcpConn {
-		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, tx: SendQueue::new(0), rto: Rto::new(), cwnd: CongestionWindow::new(u32::from(TCP_MSS)), persist: Persist::new(), closing: Closing::new(), peer_window: 0, peer_wscale: 0, peer_mss: TCP_MSS, path_mss: TCP_MSS, sent_at_ms: 0, rto_deadline_ms: None, send_failed: false, rcv_nxt: 0, rcv_wscale: 0, rx: alloc::vec![0; TCP_RX_BASE], rx_len: 0 }
+		TcpConn { in_use: false, state: TcpState::Closed, aborted: false, peer_fin: false, pending_accept: false, local_port: 0, local: Local::V4([0; 4]), remote: Local::V4([0; 4]), remote_port: 0, remote_mac: MacAddr::ZERO, snd_una: 0, snd_nxt: 0, tx: SendQueue::new(0), rto: Rto::new(), cwnd: CongestionWindow::new(u32::from(TCP_MSS)), persist: Persist::new(), closing: Closing::new(), peer_window: 0, peer_wscale: 0, peer_mss: TCP_MSS, path_mss: TCP_MSS, sent_at_ms: 0, rto_deadline_ms: None, send_failed: false, rcv_nxt: 0, rcv_wscale: 0, rx: alloc::vec![0; TCP_RX_BASE], rx_len: 0 }
 	}
 }
 
@@ -512,7 +516,8 @@ pub struct Stack {
 	conns: Vec<TcpConn>,
 	// The ports we accept inbound connections on (passive open); 0 = unused slot.
 	// Grows on demand.
-	listen_ports: Vec<u16>,
+	// The listeners this host holds, and the rule for which claims may share a port.
+	listeners: BindTable,
 	// The next initial send sequence to hand a passively-opened connection (bumped per
 	// accept; predictability is not a concern for this stack).
 	next_iss: u32,
@@ -525,7 +530,7 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { ipv6: None, clock_ms: 0, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listen_ports: alloc::vec![0; LISTEN_MAX], next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { ipv6: None, clock_ms: 0, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listeners: BindTable::new(), next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
 	}
 
 	// Stand the IPv6 host up on this link.
@@ -651,10 +656,8 @@ impl Stack {
 	// state. NetworkService maps these to the typed `sock-info` the tool renders.
 	pub fn sockets(&self) -> Vec<SockEntry> {
 		let mut out: Vec<SockEntry> = Vec::new();
-		for &p in self.listen_ports.iter() {
-			if p != 0 {
-				out.push(SockEntry { local_port: p, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, state: SockEntryState::Listen });
-			}
+		for port in self.listening_ports() {
+			out.push(SockEntry { local_port: port, remote_ip: Ipv4Addr([0; 4]), remote_port: 0, state: SockEntryState::Listen });
 		}
 		for c in self.conns.iter() {
 			if !c.in_use {
@@ -667,7 +670,15 @@ impl Stack {
 				TcpState::Established => SockEntryState::Established,
 				TcpState::FinWait => SockEntryState::FinWait,
 			};
-			out.push(SockEntry { local_port: c.local_port, remote_ip: c.remote_ip, remote_port: c.remote_port, state });
+			out.push(SockEntry {
+				local_port: c.local_port,
+				remote_ip: match c.remote {
+					Local::V4(octets) => Ipv4Addr(octets),
+					Local::V6(_) => Ipv4Addr([0; 4]),
+				},
+				remote_port: c.remote_port,
+				state,
+			});
 		}
 		out
 	}
@@ -677,7 +688,14 @@ impl Stack {
 	// a client reached it on rather than only that somebody connected.
 	pub fn conn_endpoints(&self, ci: usize) -> Option<(u16, Ipv4Addr, u16)> {
 		let conn = self.conns.get(ci)?;
-		conn.in_use.then_some((conn.local_port, conn.remote_ip, conn.remote_port))
+		conn.in_use.then_some((
+			conn.local_port,
+			match conn.remote {
+				Local::V4(octets) => Ipv4Addr(octets),
+				Local::V6(_) => Ipv4Addr([0; 4]),
+			},
+			conn.remote_port,
+		))
 	}
 
 	// The count of live (in-use) TCP connections in the pool - what `network.capacity`
@@ -805,26 +823,95 @@ impl Stack {
 		Outcome { reply_len: 0, event: Event::None }
 	}
 
+	// An IPv6 UDP datagram, delivered by the host that owns L3.
+	//
+	// THE CHECKSUM IS MANDATORY HERE AND A ZERO FIELD IS REFUSED. Over IPv4 a zero means "not
+	// computed" and a receiver accepts it; IPv6 has no header checksum beneath the transport, so
+	// RFC 8200 section 8.1 removes the exemption - and accepting a zero would be accepting a datagram
+	// nothing has checked.
+	pub fn on_udp6(&mut self, source: [u8; 16], destination: [u8; 16], datagram: &[u8]) -> Event {
+		if datagram.len() < UDP_HDR {
+			return Event::None;
+		}
+		let field: u16 = be16(datagram, 6);
+		if !service_logic::ipv6_packet::udp_checksum_present(field) {
+			return Event::None;
+		}
+		let from = service_logic::ipv6::Address::new(source);
+		let to = service_logic::ipv6::Address::new(destination);
+		// The checksum covers the whole datagram with the field zeroed; a copy is the honest way to
+		// verify one rather than reaching into the caller's bytes.
+		let mut copy: Vec<u8> = datagram.to_vec();
+		put16(&mut copy, 6, 0);
+		if service_logic::ipv6_packet::udp_checksum(from, to, &copy) != field {
+			return Event::None;
+		}
+		let src_port: u16 = be16(datagram, 0);
+		let body: &[u8] = &datagram[UDP_HDR..];
+		match src_port {
+			DNS_PORT => parse_dns_response(body).map(Event::DnsReply).unwrap_or(Event::None),
+			NTP_PORT => parse_sntp(body).map(Event::SntpReply).unwrap_or(Event::None),
+			_ => Event::None,
+		}
+	}
+
+	// Send a UDP datagram over IPv6. Returns false when this host has no address it may use.
+	pub fn send_udp6(&mut self, peer: [u8; 16], src_port: u16, dst_port: u16, body: &[u8]) -> bool {
+		let destination = service_logic::ipv6::Address::new(peer);
+		let Some(source) = self.ipv6.as_ref().and_then(|host| host.source_address(destination)) else {
+			return false;
+		};
+		let mut datagram: Vec<u8> = alloc::vec![0u8; UDP_HDR + body.len()];
+		put16(&mut datagram, 0, src_port);
+		put16(&mut datagram, 2, dst_port);
+		put16(&mut datagram, 4, (UDP_HDR + body.len()) as u16);
+		datagram[UDP_HDR..].copy_from_slice(body);
+		let checksum: u16 = service_logic::ipv6_packet::udp_checksum(source, destination, &datagram);
+		put16(&mut datagram, 6, checksum);
+		let now: u64 = self.clock_ms;
+		match self.ipv6.as_mut() {
+			Some(host) => host.send_transport(destination, source, service_logic::ipv6_packet::NEXT_UDP, datagram, now),
+			None => false,
+		}
+	}
+
 	// Handle an inbound TCP segment: demux it to the live connection it belongs to (by
 	// its 4-tuple), complete the handshake (SYN-ACK -> ACK), accept in-order data and
 	// acknowledge it, note a peer FIN, and abort on RST. Segments for no live
 	// connection are ignored.
 	fn on_tcp(&mut self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> Outcome {
 		let tcp: &[u8] = &frame[ETH_HDR + ihl..];
+		let remote_mac: MacAddr = MacAddr([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]);
+		let local: Local = Local::V4(self.ip.0);
+		self.on_tcp_segment(Local::V4(src_ip.0), local, tcp, Some(remote_mac), out)
+	}
+
+	// An IPv6 TCP segment, delivered by the host that owns L3.
+	//
+	// THE SAME MACHINERY, KEYED BY A WIDER ADDRESS. Nothing about sequence numbers, windows or the
+	// closing handshake is family-specific; what differs is the pseudo-header underneath and who
+	// resolves the next hop, and both of those are below this.
+	pub fn on_tcp6(&mut self, source: [u8; 16], destination: [u8; 16], segment: &[u8], out: &mut [u8]) -> usize {
+		self.on_tcp_segment(Local::V6(source), Local::V6(destination), segment, None, out).reply_len
+	}
+
+	// The family-neutral half: everything from the four-tuple lookup onwards.
+	fn on_tcp_segment(&mut self, remote: Local, local: Local, tcp: &[u8], remote_mac: Option<MacAddr>, out: &mut [u8]) -> Outcome {
 		if tcp.len() < TCP_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
 		let src_port: u16 = be16(tcp, 0);
 		let dst_port: u16 = be16(tcp, 2);
-		let ci: usize = match self.find_conn(src_ip, src_port, dst_port) {
+		let ci: usize = match self.find_conn(remote, src_port, local, dst_port) {
 			Some(i) => i,
 			None => {
 				// A SYN to a listening port opens a new inbound connection (passive open).
 				let flags: u8 = tcp[13];
-				if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 && self.is_listening(dst_port) {
+				if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 && self.listens_for(local, dst_port) {
 					let seg_seq: u32 = be32(tcp, 4);
 					let peer_ws: bool = peer_offers_ws(tcp);
-					return self.passive_open(frame, src_ip, src_port, dst_port, seg_seq, peer_ws, out);
+					let peer_mss: u16 = peer_mss_option(tcp);
+					return self.passive_open(remote, local, src_port, dst_port, seg_seq, peer_ws, peer_mss, remote_mac, out);
 				}
 				return Outcome { reply_len: 0, event: Event::None };
 			}
@@ -856,7 +943,7 @@ impl Stack {
 					self.conns[ci].rx.resize(TCP_RX_SCALED, 0);
 				}
 				self.start_sender(ci, peer_mss_option(tcp), be16(tcp, 14));
-				let len: usize = self.build_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], out);
+				let len: usize = self.emit_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], &[], out);
 				return Outcome { reply_len: len, event: Event::None };
 			}
 			return Outcome { reply_len: 0, event: Event::None };
@@ -900,7 +987,7 @@ impl Stack {
 		}
 		// Acknowledge any data or FIN we consumed.
 		if progressed {
-			let len: usize = self.build_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], out);
+			let len: usize = self.emit_tcp(ci, TCP_ACK, self.conns[ci].snd_nxt, self.conns[ci].rcv_nxt, &[], &[], out);
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		Outcome { reply_len: 0, event: Event::None }
@@ -1020,23 +1107,146 @@ impl Stack {
 		self.conns.iter().filter(|c| c.in_use).map(|c| c.tx.pending().len()).sum()
 	}
 
+	// A validated ICMPv6 error the IPv6 host handed up. Returns whether it changed anything.
+	//
+	// THE CONSUMER IS HERE BECAUSE THE FLOW STATE IS HERE. The layer below validated the quotation as
+	// far as a layer holding no flow state can - the type, the code, and that the quoted source is an
+	// address this interface holds - and deliberately stopped. Whether this host actually SENT the
+	// quoted packet is a lookup in a send queue, and the send queue is this table.
+	pub fn on_ipv6_error(&mut self, error: &service_logic::ipv6_events::QuotedError) -> bool {
+		use service_logic::ipv6_events::{ErrorClass, QuotedTransport};
+		use service_logic::tcp_flow::{FlowKey, PathMtu, Quotation, QuotedKind, path_mtu_for_tcp};
+		let ErrorClass::PacketTooBig { mtu } = error.class else {
+			return false;
+		};
+		let QuotedTransport::Tcp { source_port, destination_port, sequence } = error.transport else {
+			return false;
+		};
+		let quote = Quotation { responder: Local::V6(error.reporter.octets()), local: Local::V6(error.quoted_source.octets()), local_port: source_port, remote: Local::V6(error.quoted_destination.octets()), remote_port: destination_port, interface_generation: error.interface.generation, transport: QuotedKind::Tcp { sequence } };
+		for index in 0..self.conns.len() {
+			if !self.conns[index].in_use {
+				continue;
+			}
+			let flow = FlowKey { local: self.conns[index].local, local_port: self.conns[index].local_port, remote: self.conns[index].remote, remote_port: self.conns[index].remote_port, interface_generation: self.ipv6.as_ref().map(|host| host.interface().generation).unwrap_or(0) };
+			let current: u32 = u32::from(self.conns[index].path_mss) + (IPV6_HDR + TCP_HDR) as u32;
+			let snd_una: u32 = self.conns[index].tx.snd_una();
+			let snd_nxt: u32 = self.conns[index].tx.snd_nxt();
+			// THE ROUTE MUST STILL BE THERE. A report about a path this flow no longer takes has
+			// nothing to lower.
+			let route_live: bool = match self.conns[index].remote {
+				Local::V6(peer) => self.ipv6.as_ref().is_some_and(|host| host.route_for(service_logic::ipv6::Address::new(peer), self.clock_ms).is_some()),
+				Local::V4(_) => false,
+			};
+			if let PathMtu::Apply(limit) = path_mtu_for_tcp(&flow, &quote, snd_una, snd_nxt, route_live, mtu, current) {
+				// THE FLOW KEEPS WHAT IT VALIDATED WHATEVER THE CACHE SAYS. The bounded path-MTU
+				// cache may refuse the write; cache exhaustion must never restore a larger limit the
+				// path has already refused to carry.
+				let now: u64 = self.clock_ms;
+				if let Some(host) = self.ipv6.as_mut() {
+					host.record_path_mtu(
+						service_logic::ipv6::Address::new(match flow.remote {
+							Local::V6(peer) => peer,
+							Local::V4(_) => [0; 16],
+						}),
+						limit,
+						now,
+					);
+				}
+				return self.tcp_path_mtu6(index, limit);
+			}
+		}
+		false
+	}
+
+	// Lower an IPv6 connection's segment size and resegment what is outstanding.
+	fn tcp_path_mtu6(&mut self, ci: usize, mtu: u32) -> bool {
+		let mss: u16 = (mtu.saturating_sub((IPV6_HDR + TCP_HDR) as u32).max(u32::from(TCP_MSS_FLOOR))).min(u32::from(u16::MAX)) as u16;
+		if mss >= self.conns[ci].path_mss {
+			return false;
+		}
+		self.conns[ci].path_mss = mss;
+		let effective: u32 = u32::from(mss.min(self.conns[ci].peer_mss));
+		self.conns[ci].cwnd.set_smss(effective);
+		self.conns[ci].tx.rewind();
+		true
+	}
+
 	// A validated Packet Too Big for `ip`: lower the segment size of every connection to it and put
 	// their outstanding bytes back on the wire cut to fit.
 	pub fn tcp_on_path_mtu(&mut self, ip: Ipv4Addr, mtu: u16) -> bool {
 		let mut changed: bool = false;
 		for index in 0..self.conns.len() {
-			if self.conns[index].in_use && self.conns[index].remote_ip == ip {
+			if self.conns[index].in_use && self.conns[index].remote == Local::V4(ip.0) {
 				changed |= self.tcp_path_mtu(index, mtu);
 			}
 		}
 		changed
 	}
 
+	// Put one TCP segment for connection `ci` on the wire, whichever family it is.
+	//
+	// THE FAMILIES DIFFER BELOW THE SEGMENT AND NOWHERE ABOVE IT. The sequence numbers, the flags and
+	// the payload are the same; what changes is the pseudo-header the checksum covers and who builds
+	// the frame around it. An IPv4 segment is written into the caller's transmit buffer as before; an
+	// IPv6 one is handed to the host that owns L3, which resolves the next hop and queues it. The
+	// return is the IPv4 frame's length, and zero for IPv6 - the caller sends what it was given and
+	// the host's queue carries the rest.
+	fn emit_tcp(&mut self, ci: usize, flags: u8, seq: u32, ack: u32, opts: &[u8], payload: &[u8], out: &mut [u8]) -> usize {
+		match self.conns[ci].local {
+			Local::V4(_) => self.build_tcp_opts(ci, flags, seq, ack, opts, payload, out),
+			Local::V6(local) => {
+				let Local::V6(remote) = self.conns[ci].remote else {
+					return 0;
+				};
+				let source = service_logic::ipv6::Address::new(local);
+				let destination = service_logic::ipv6::Address::new(remote);
+				let segment: Vec<u8> = self.build_tcp_segment(ci, flags, seq, ack, opts, payload, source, destination);
+				let now: u64 = self.clock_ms;
+				if let Some(host) = self.ipv6.as_mut() {
+					host.send_transport(destination, source, IP_PROTO_TCP, segment, now);
+				}
+				0
+			}
+		}
+	}
+
+	// The TCP segment itself - header, options, payload - with the checksum its family's
+	// pseudo-header produces.
+	#[allow(clippy::too_many_arguments)]
+	fn build_tcp_segment(&self, ci: usize, flags: u8, seq: u32, ack: u32, opts: &[u8], payload: &[u8], source: service_logic::ipv6::Address, destination: service_logic::ipv6::Address) -> Vec<u8> {
+		let hdr: usize = TCP_HDR + opts.len();
+		let mut segment: Vec<u8> = alloc::vec![0u8; hdr + payload.len()];
+		put16(&mut segment, 0, self.conns[ci].local_port);
+		put16(&mut segment, 2, self.conns[ci].remote_port);
+		put32(&mut segment, 4, seq);
+		put32(&mut segment, 8, ack);
+		segment[12] = ((hdr / 4) as u8) << 4;
+		segment[13] = flags;
+		let free: usize = self.conns[ci].rx.len() - self.conns[ci].rx_len;
+		// A SYN'S WINDOW FIELD IS NEVER SCALED, whatever scale is being negotiated in it.
+		let advertised: usize = if flags & TCP_SYN != 0 { free.min(0xffff) } else { free >> self.conns[ci].rcv_wscale };
+		put16(&mut segment, 14, advertised.min(0xffff) as u16);
+		segment[hdr - opts.len()..hdr].copy_from_slice(opts);
+		segment[hdr..].copy_from_slice(payload);
+		let checksum: u16 = service_logic::ipv6_packet::pseudo_header_checksum(source, destination, IP_PROTO_TCP, &segment);
+		put16(&mut segment, 16, checksum);
+		segment
+	}
+
+	// The IPv4 peer of a connection that has one. The v4 frame builder needs an `Ipv4Addr`, and a
+	// connection of the other family never reaches it.
+	fn remote_v4(&self, ci: usize) -> Ipv4Addr {
+		match self.conns[ci].remote {
+			Local::V4(octets) => Ipv4Addr(octets),
+			Local::V6(_) => Ipv4Addr([0; 4]),
+		}
+	}
+
 	// Find the live connection an inbound segment belongs to (matched by its 4-tuple;
 	// our address is fixed, so local_port plus the remote address/port), or None.
-	fn find_conn(&self, remote_ip: Ipv4Addr, remote_port: u16, local_port: u16) -> Option<usize> {
+	fn find_conn(&self, remote: Local, remote_port: u16, local: Local, local_port: u16) -> Option<usize> {
 		for (i, c) in self.conns.iter().enumerate() {
-			if c.in_use && c.state != TcpState::Closed && c.remote_ip == remote_ip && c.remote_port == remote_port && c.local_port == local_port {
+			if c.in_use && c.state != TcpState::Closed && c.remote == remote && c.remote_port == remote_port && c.local == local && c.local_port == local_port {
 				return Some(i);
 			}
 		}
@@ -1048,20 +1258,24 @@ impl Stack {
 	// (carrying our MSS and, when the peer offered it, the WS option) into `out`. No
 	// reply if the pool is full.
 	#[allow(clippy::too_many_arguments)]
-	fn passive_open(&mut self, frame: &[u8], src_ip: Ipv4Addr, src_port: u16, dst_port: u16, seg_seq: u32, peer_ws: bool, out: &mut [u8]) -> Outcome {
+	fn passive_open(&mut self, remote: Local, local: Local, src_port: u16, dst_port: u16, seg_seq: u32, peer_ws: bool, peer_mss: u16, remote_mac: Option<MacAddr>, out: &mut [u8]) -> Outcome {
 		let ci: usize = match self.tcp_alloc() {
 			Some(i) => i,
 			None => return Outcome { reply_len: 0, event: Event::None },
 		};
-		let remote_mac: MacAddr = MacAddr([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]);
 		let iss: u32 = self.next_iss;
 		self.next_iss = self.next_iss.wrapping_add(0x1000);
 		let c: &mut TcpConn = &mut self.conns[ci];
 		c.state = TcpState::SynRcvd;
 		c.local_port = dst_port;
-		c.remote_ip = src_ip;
+		c.remote = remote;
+		c.local = local;
 		c.remote_port = src_port;
-		c.remote_mac = remote_mac;
+		// AN IPv6 PEER HAS NO LEARNED MAC HERE. Its next hop is the IPv6 host's to resolve, and a
+		// MAC copied off the arriving frame would be the ROUTER's on an off-link connection - which
+		// is right only until the route changes.
+		c.remote_mac = remote_mac.unwrap_or(MacAddr::ZERO);
+		c.peer_mss = peer_mss;
 		c.rcv_nxt = seg_seq.wrapping_add(1);
 		c.snd_una = iss;
 		c.snd_nxt = iss.wrapping_add(1);
@@ -1073,7 +1287,7 @@ impl Stack {
 		let snd: u32 = self.conns[ci].snd_una;
 		let rcv: u32 = self.conns[ci].rcv_nxt;
 		let opts: [u8; 8] = self.syn_options();
-		let len: usize = self.build_tcp_opts(ci, TCP_SYN | TCP_ACK, snd, rcv, if peer_ws { &opts } else { &opts[..4] }, &[], out);
+		let len: usize = self.emit_tcp(ci, TCP_SYN | TCP_ACK, snd, rcv, if peer_ws { &opts } else { &opts[..4] }, &[], out);
 		Outcome { reply_len: len, event: Event::None }
 	}
 
@@ -1122,7 +1336,11 @@ impl Stack {
 		put16(out, t + 18, 0);
 		out[t + TCP_HDR..t + hdr].copy_from_slice(opts);
 		out[t + hdr..t + hdr + payload.len()].copy_from_slice(payload);
-		let tcp_csum: u16 = tcp_checksum(self.ip, c.remote_ip, &out[t..t + hdr + payload.len()]);
+		let peer: Ipv4Addr = match c.remote {
+			Local::V4(octets) => Ipv4Addr(octets),
+			Local::V6(_) => Ipv4Addr([0; 4]),
+		};
+		let tcp_csum: u16 = tcp_checksum(self.ip, peer, &out[t..t + hdr + payload.len()]);
 		put16(out, t + 16, tcp_csum);
 		// IPv4 header.
 		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
@@ -1135,7 +1353,7 @@ impl Stack {
 		ip[9] = IP_PROTO_TCP;
 		put16(ip, 10, 0);
 		ip[12..16].copy_from_slice(&self.ip.0);
-		ip[16..20].copy_from_slice(&self.conns[ci].remote_ip.0);
+		ip[16..20].copy_from_slice(&self.remote_v4(ci).0);
 		let csum: u16 = checksum(&ip[..IPV4_HDR]);
 		put16(ip, 10, csum);
 		ETH_HDR + total
@@ -1178,36 +1396,34 @@ impl Stack {
 		}
 	}
 
-	// Start accepting inbound connections on `port` (passive open). Idempotent; the
-	// listen table grows on demand, so this always succeeds.
-	pub fn listen(&mut self, port: u16) -> bool {
-		for p in self.listen_ports.iter() {
-			if *p == port {
-				return true;
-			}
-		}
-		for p in self.listen_ports.iter_mut() {
-			if *p == 0 {
-				*p = port;
-				return true;
-			}
-		}
-		self.listen_ports.push(port);
-		true
+	// Start accepting inbound connections for `binding`, or say why not.
+	//
+	// THE MATRIX DECIDES, AND IT IS ONE FUNCTION. Which claims may share a port is a rule the
+	// admission and the demultiplexer are both written against; this is the admission half and
+	// `listens_for` is the other, and they read the same table.
+	pub fn listen(&mut self, binding: Binding) -> Result<(), BindRefusal> {
+		self.listeners.bind(binding)
 	}
 
-	// Stop accepting inbound connections on `port`.
-	pub fn unlisten(&mut self, port: u16) {
-		for p in self.listen_ports.iter_mut() {
-			if *p == port {
-				*p = 0;
+	// Stop accepting inbound connections for `binding`.
+	pub fn unlisten(&mut self, binding: &Binding) {
+		self.listeners.unbind(binding);
+	}
+
+	// Every port this host is listening on, whatever family or address the claim names.
+	pub fn listening_ports(&self) -> Vec<u16> {
+		let mut ports: Vec<u16> = Vec::new();
+		for port in 0..=u16::MAX {
+			if self.listeners.lookup(Local::V4([0; 4]), port).is_some() || self.listeners.lookup(Local::V6([0; 16]), port).is_some() {
+				ports.push(port);
 			}
 		}
+		ports
 	}
 
 	// Whether we accept inbound connections on `port`.
-	fn is_listening(&self, port: u16) -> bool {
-		self.listen_ports.iter().any(|&p: &u16| p == port)
+	fn listens_for(&self, local: Local, port: u16) -> bool {
+		self.listeners.lookup(local, port).is_some()
 	}
 
 	// Take the next established-but-not-yet-handed-out connection accepted on `port`
@@ -1233,7 +1449,8 @@ impl Stack {
 		c.peer_fin = false;
 		c.pending_accept = false;
 		c.local_port = local_port;
-		c.remote_ip = ip;
+		c.remote = Local::V4(ip.0);
+		c.local = Local::V4(self.ip.0);
 		c.remote_port = port;
 		c.remote_mac = mac;
 		c.snd_una = iss;
@@ -1242,10 +1459,38 @@ impl Stack {
 		c.rx_len = 0;
 	}
 
+	// Open an outbound IPv6 connection. Returns false when this host has no address it may use to
+	// reach `peer`, which is the honest answer on a link whose IPv6 never came up.
+	pub fn tcp_open6(&mut self, ci: usize, peer: [u8; 16], port: u16, local_port: u16, iss: u32) -> bool {
+		let destination = service_logic::ipv6::Address::new(peer);
+		let Some(source) = self.ipv6.as_ref().and_then(|host| host.source_address(destination)) else {
+			return false;
+		};
+		let c: &mut TcpConn = &mut self.conns[ci];
+		c.in_use = true;
+		c.state = TcpState::SynSent;
+		c.aborted = false;
+		c.peer_fin = false;
+		c.pending_accept = false;
+		c.local_port = local_port;
+		c.remote = Local::V6(peer);
+		c.local = Local::V6(source.octets());
+		c.remote_port = port;
+		// NO MAC. The IPv6 host resolves the next hop when the segment goes out, which is what keeps
+		// an off-link connection following the route rather than a MAC copied at open time.
+		c.remote_mac = MacAddr::ZERO;
+		c.snd_una = iss;
+		c.snd_nxt = iss.wrapping_add(1);
+		c.rcv_nxt = 0;
+		c.rx_len = 0;
+		true
+	}
+
 	// Build connection `ci`'s SYN (seq = the initial send sequence) into `out`.
-	pub fn tcp_build_syn(&self, ci: usize, out: &mut [u8]) -> usize {
+	pub fn tcp_build_syn(&mut self, ci: usize, out: &mut [u8]) -> usize {
 		let opts: [u8; 8] = self.syn_options();
-		self.build_tcp_opts(ci, TCP_SYN, self.conns[ci].snd_una, 0, &opts, &[], out)
+		let seq: u32 = self.conns[ci].snd_una;
+		self.emit_tcp(ci, TCP_SYN, seq, 0, &opts, &[], out)
 	}
 
 	// Hand `data` to connection `ci`'s transmit queue, and say how much was taken.
@@ -1290,7 +1535,7 @@ impl Stack {
 				return 0;
 			};
 			let ack: u32 = self.conns[ci].rcv_nxt;
-			return self.build_tcp(ci, TCP_ACK, sequence, ack, &[byte], out);
+			return self.emit_tcp(ci, TCP_ACK, sequence, ack, &[], &[byte], out);
 		}
 		let flight: u32 = self.conns[ci].tx.flight();
 		let usable: u32 = self.conns[ci].cwnd.usable(flight, self.conns[ci].peer_window);
@@ -1301,8 +1546,10 @@ impl Stack {
 		let flags: u8 = if segment.fin { TCP_FIN | TCP_ACK } else { TCP_PSH | TCP_ACK };
 		let ack: u32 = self.conns[ci].rcv_nxt;
 		let payload: Vec<u8> = self.conns[ci].tx.pending()[segment.offset..segment.offset + segment.len].to_vec();
-		let len: usize = self.build_tcp(ci, flags, segment.sequence, ack, &payload, out);
-		if len == 0 {
+		let len: usize = self.emit_tcp(ci, flags, segment.sequence, ack, &[], &payload, out);
+		// A LENGTH OF ZERO IS NOT ALWAYS "NOTHING WENT OUT": an IPv6 segment is queued on the host
+		// rather than written here, so only an IPv4 connection can report failure this way.
+		if len == 0 && matches!(self.conns[ci].local, Local::V4(_)) {
 			return 0;
 		}
 		if segment.fin {
