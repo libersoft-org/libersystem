@@ -34,6 +34,13 @@ fn a_well_formed_slot_keeps_the_consumers_own_order() {
 fn each_malformation_is_refused_for_its_own_reason() {
 	assert_eq!(parse_slot(b"novulkanicd", valid_name), Err(Refusal::NoKind));
 	assert_eq!(parse_slot(&line("VULKAN", &[("a.lslib", 1)]), valid_name), Err(Refusal::BadKind), "a kind is lower case");
+	// A KIND NOTHING ADMITS IS NOT A KIND. This is a different refusal from a badly spelled one, and
+	// the difference is what a reader needs: the first says the record is malformed, the second says
+	// it is well formed and names a position this system has never defined. Without it the field was
+	// documentation - a guest fixture corrupted `vulkan-icd` into `0ulkan-icd` and the launch
+	// succeeded, because nothing anywhere compared the kind against anything.
+	assert_eq!(parse_slot(&line("0ulkan-icd", &[("a.lslib", 1)]), valid_name), Err(Refusal::UnknownKind), "a well-spelled kind no launch admits is refused");
+	assert_eq!(parse_slot(&line("vulkan", &[("a.lslib", 1)]), valid_name), Err(Refusal::UnknownKind), "and so is one that merely looks close");
 	assert_eq!(parse_slot(&line("", &[("a.lslib", 1)]), valid_name), Err(Refusal::BadKind), "and is not empty");
 	assert_eq!(parse_slot(b"vulkan-icd:a.lslib", valid_name), Err(Refusal::NoDigest));
 	assert_eq!(parse_slot(&line("vulkan-icd", &[("libbad.lslib", 1)]), valid_name), Err(Refusal::BadName), "a provider name may not start with lib");

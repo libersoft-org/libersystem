@@ -62,6 +62,11 @@ declare -A GATES=(
 	# THE IPv6 LAYER AGAINST A CONTROLLABLE PEER. Emulated and slow, so it is its own row rather than
 	# part of a sweep: it boots three guests, each against a scripted far end of the wire.
 	["ipv6-peer"]="tools/check-ipv6-peer.sh"
+	# THE SELECTION SLOT, through the real launch path. A consumer with no `DT_NEEDED` edge to its
+	# provider, the candidate carried by digest in the authenticated record, and the binding done
+	# before the first thread runs - none of which is observable from outside a launch, so this boots
+	# a guest and reads what the bound provider actually agreed to.
+	["icd-selection"]="tools/check-icd-selection.sh"
 	["dma-mode-carrier"]="tools/check-dma-mode-carrier.sh"
 	["dma-mode-x86_64"]="tools/check-dma-mode-x86_64.sh"
 	["dma-mode-ports"]="tools/check-dma-mode-ports.sh"
@@ -178,6 +183,10 @@ declare -A GATES=(
 	# sysroot's rule, which is sized by the option set. An inversion nobody checks decays back into
 	# what it inverted, one declaration at a time, and the link failure arrives weeks later.
 	["profile-sysroot"]="tools/check-profile-sysroot.sh"
+	# A foreign artifact's identity is load bearing field by field: the compiler, the archiver, the
+	# linker, the flags, the sysroot and the configure inputs each change what the artifact IS without
+	# changing a source byte, so each must move its digest, its consumer edges and its cache key.
+	["foreign-identity"]="tools/check-foreign-identity.sh"
 	["source-hygiene"]="tools/check-source-hygiene.sh --current"
 	["source-history-hygiene"]="tools/check-source-hygiene.sh --history"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"

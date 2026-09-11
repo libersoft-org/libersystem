@@ -1103,6 +1103,82 @@ fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	assert!(reply.caps.is_empty(), "a corrupted embedded identity record creates no process capability");
 }
 
+tagged_test!(dynamic_process_service_binds_a_selection_slot_and_refuses_every_substitution, [Dynamic, DynamicReject, Service, Process, Storage], id = "kernel.dynamic.dynamic_process_service_binds_a_selection_slot_and_refuses_every_substitution", covers = ["kernel", "rt", "services"]);
+// THE SELECTION SLOT, THROUGH THE REAL LAUNCH PATH, in both directions.
+//
+// WHAT A SLOT IS. `icdcheck` has NO `DT_NEEDED` edge to the provider it calls: the candidates are
+// carried by name and digest inside its authenticated identity record, and ProcessService chooses
+// one, resolves it into the dependency set and binds it BEFORE the exact-equality check runs. So the
+// positive case is not "a program started" - it is a program that could not have started unless a
+// provider nothing named had been found, verified and loaded.
+//
+// AND EVERY WAY OF SUBSTITUTING ONE IS REFUSED, which is what makes the mechanism worth having. A
+// slot that bound whatever was staged under an admitted NAME would be an ambient search with extra
+// steps; what closes that is the digest beside the name, and the only way to show a digest is load
+// bearing is to change what it covers and watch the launch refuse.
+fn dynamic_process_service_binds_a_selection_slot_and_refuses_every_substitution() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let candidate: &[u8] = test_library_path("icdprobe.lslib").expect("icdprobe destination").as_bytes();
+
+	// THE POSITIVE CASE. Nothing in this program-s dynamic table names the provider it is about to
+	// call; the slot is the only thing that can put it in the closure.
+	let reply = launch_from_volume(&volume, b"icdcheck", 200);
+	assert_eq!(le_u32(&reply.bytes, 0), 200);
+	assert_eq!(reply.bytes[4], 1, "the slot consumer loaded with the provider its record admits");
+	assert_eq!(reply.caps.len(), 1, "a bound selection slot produces one process capability");
+
+	// THE CANDIDATE-S OWN RECORD, FIELD BY FIELD. Each of these is a field only a FOREIGN artifact
+	// has, and each can change what the artifact is without changing a source byte - which is the
+	// whole reason the language section is inside the digest rather than beside it.
+	for (correlation, field) in [
+		(201u32, &b"compiler="[..]),
+		(202, &b"compiler-sha256="[..]),
+		(203, &b"archiver="[..]),
+		(204, &b"archiver-sha256="[..]),
+		(205, &b"linker="[..]),
+		(206, &b"linker-sha256="[..]),
+		(207, &b"cflags="[..]),
+		(208, &b"sysroot-sha256="[..]),
+		(211, &b"configure-sha256="[..]),
+		(212, &b"objects-sha256="[..]),
+		(213, &b"language="[..]),
+		(214, &b"target="[..]),
+	] {
+		let mut mutated = volume.to_vec();
+		corrupt_identity_note(&mut mutated, candidate, field);
+		let reply = launch_from_volume(&mutated, b"icdcheck", correlation);
+		assert_eq!(le_u32(&reply.bytes, 0), correlation);
+		assert_eq!(reply.bytes[4], 0, "a candidate whose foreign identity record moved is not the one the slot admits");
+		assert!(reply.caps.is_empty(), "a refused slot creates no process capability");
+	}
+
+	// THE CONSUMER-S OWN SLOT LINE. A record whose slot cannot be read is a record the launch cannot
+	// act on, and reading it as "no slot" would start a program with nothing behind the symbols it
+	// calls.
+	let mut corrupted_slot = volume.to_vec();
+	corrupt_identity_note(&mut corrupted_slot, test_program_path("icdcheck").expect("icdcheck destination").as_bytes(), b"selection=");
+	let reply = launch_from_volume(&corrupted_slot, b"icdcheck", 209);
+	assert_eq!(le_u32(&reply.bytes, 0), 209);
+	assert_eq!(reply.bytes[4], 0, "ProcessService refuses a consumer whose selection slot is malformed");
+	assert!(reply.caps.is_empty(), "a malformed selection slot creates no process capability");
+
+	// AND A RECORD THAT NO LONGER CLAIMS TO BE THIS ARTIFACT. The name a candidate is staged under
+	// and the name its own record carries have to be the same name, or an admitted name is a place to
+	// put any verified artifact at all.
+	//
+	// THE WHOLE-FILE SUBSTITUTION IS THE SAME REFUSAL AT THE SAME CHECK, and is not repeated here for
+	// a reason worth writing down: `replace_volume_entry` requires the replacement to FIT inside the
+	// entry it overwrites, and the synthetic ICD is the smallest artifact in the image - there is
+	// nothing to substitute into it. What that case tests is a digest that no longer matches the
+	// admitted one, which is exactly what each field mutation above produces.
+	let mut renamed = volume.to_vec();
+	corrupt_identity_note(&mut renamed, candidate, b"artifact=");
+	let reply = launch_from_volume(&renamed, b"icdcheck", 210);
+	assert_eq!(le_u32(&reply.bytes, 0), 210);
+	assert_eq!(reply.bytes[4], 0, "a candidate whose record names a different artifact is refused");
+	assert!(reply.caps.is_empty(), "a substituted candidate creates no process capability");
+}
+
 tagged_test!(dynamic_process_service_rejects_duplicate_provider_export, [Dynamic, DynamicReject, Service, Process, Storage], id = "kernel.dynamic.dynamic_process_service_rejects_duplicate_provider_export", covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_duplicate_provider_export() {
 	let (volume, _) = scenario_packages().expect("scenario packages");

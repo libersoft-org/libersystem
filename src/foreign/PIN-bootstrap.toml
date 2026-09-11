@@ -113,8 +113,12 @@ riscv64 = { path = "src/foreign/cross/riscv64.cmake", target = "riscv64-unknown-
 [bootstrap_sysroot]
 # SIZED BY THE OPTION SET, NOT BY THE INVENTORY - which is what keeps this part free of a cycle. It
 # is NOT the profile sysroot, and it is NOT a libc: see its own README.
+#
+# REFROZEN 2026-09-11, for a README change and nothing else. The profile sysroot now exists, so this
+# one-s README says where it is and what the difference between them is; no header moved, which is
+# what the archives prove independently - they reproduce bit for bit under both sysroots.
 path = "src/foreign/bootstrap-sysroot"
-digest = "e4b3d843284226a47d723bf40362c45392dc2a202ffcd08f7c9cbb68eebd3e55"
+digest = "7dfc0825994fa2843d444dbde830e7b35ad776a40f05b82ed62d20d570cc31fd"
 headers = [
 	"alloca.h",
 	"assert.h",

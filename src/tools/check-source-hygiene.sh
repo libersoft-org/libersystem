@@ -220,7 +220,7 @@ source_rows="$(mktemp)"
 physical_user_crates="$(mktemp)"
 declared_user_crates="$(mktemp)"
 trap 'rm -f "$source_rows" "$physical_user_crates" "$declared_user_crates"' EXIT
-jq -r '.sources[] | [.owner, .path] | @tsv' <<<"$manifest_json" | sort >"$source_rows"
+jq -r '.sources[] | [.owner, .path, .producer] | @tsv' <<<"$manifest_json" | sort >"$source_rows"
 # captured whole, then first-lined - `head` closing the pipe on `uniq` is the hazard this
 # very script refuses everywhere else.
 duplicate_owners="$(cut -f1 "$source_rows" | uniq -d)"
@@ -232,22 +232,40 @@ if [[ -n "$duplicate_owner" || -n "$duplicate_path" ]]; then
 	exit 1
 fi
 
-while IFS=$'\t' read -r owner path; do
-	if [[ -z "$owner" || -z "$path" || "$path" == /* || "$path" == *".."* || ! -f "src/$path/Cargo.toml" ]]; then
-		echo "source-hygiene: invalid or missing manifest source path for $owner: $path" >&2
+while IFS=$'\t' read -r owner path producer; do
+	if [[ -z "$owner" || -z "$path" || "$path" == /* || "$path" == *".."* ]]; then
+		echo "source-hygiene: invalid manifest source path for $owner: $path" >&2
 		exit 1
 	fi
+	# A RUST SOURCE IS A CARGO PACKAGE AND A FOREIGN ONE IS A DIRECTORY OF SOURCES. Requiring a
+	# manifest of both is the rule that made a foreign artifact expressible only by forging one.
+	case "$producer" in
+	foreign)
+		if [[ ! -d "src/$path" || -f "src/$path/Cargo.toml" ]]; then
+			echo "source-hygiene: $owner is a foreign source and src/$path is not a Cargo-free directory" >&2
+			exit 1
+		fi
+		;;
+	*)
+		if [[ ! -f "src/$path/Cargo.toml" ]]; then
+			echo "source-hygiene: invalid or missing manifest source path for $owner: $path" >&2
+			exit 1
+		fi
+		;;
+	esac
 done <"$source_rows"
 
 find src/user -mindepth 2 -name Cargo.toml -printf '%h\n' | sed 's#^src/##' | sort >"$physical_user_crates"
-cut -f2 "$source_rows" | grep '^user/' | sort >"$declared_user_crates"
+# THE CARGO ROOTS ONLY. A foreign source has none, so comparing it against the physical Cargo walk
+# would report it missing from a set it was never in.
+awk -F '\t' '$3 != "foreign" {print $2}' "$source_rows" | grep '^user/' | sort >"$declared_user_crates"
 if ! cmp -s "$physical_user_crates" "$declared_user_crates"; then
 	echo "source-hygiene: physical userspace Cargo roots differ from manifest ownership:" >&2
 	diff -u "$declared_user_crates" "$physical_user_crates" >&2 || true
 	exit 1
 fi
 
-while IFS=$'\t' read -r owner path; do
+while IFS=$'\t' read -r owner path producer; do
 	[[ "$path" == user/*/* ]] || continue
 	if [[ "$path" == "user/$owner/"* ]]; then
 		for suffix in Cargo.toml Cargo.lock rust-toolchain.toml src/; do

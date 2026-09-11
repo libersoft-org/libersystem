@@ -892,10 +892,10 @@ fn derive_dynamic_order(row: &ManifestRow, libraries: &[ManifestRow]) -> Vec<Str
 /// a field line - which fails as "a provider was replaced" and sends the reader to the wrong place.
 const IDENTITY_HEADER_LINES: usize = 11;
 
-/// The same count for a foreign artifact, whose language section carries six fields rather than
+/// The same count for a foreign artifact, whose language section carries eleven fields rather than
 /// three. Two constants and not one expression, because the two sections have nothing in common
 /// beyond the seven lines above them.
-const FOREIGN_IDENTITY_HEADER_LINES: usize = 14;
+const FOREIGN_IDENTITY_HEADER_LINES: usize = 18;
 
 /// What the launch admits, mirrored from the `selection` module in `service-logic` so a package this
 /// tool accepts is not one ProcessService refuses.
@@ -930,10 +930,10 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 			// the artifact IS without changing a source byte, which is why the record carries them
 			// and why a missing one is a malformed record rather than a cosmetic omission.
 			assert_eq!(lines[7], "language=foreign", "{} identity language", row.name);
-			for (index, key) in [(8, "compiler="), (9, "archiver="), (10, "linker="), (11, "cflags=")] {
+			for (index, key) in [(8, "compiler="), (10, "archiver="), (12, "linker="), (14, "cflags=")] {
 				assert!(lines[index].strip_prefix(key).is_some_and(|value| !value.is_empty()), "{} identity {key}", row.name);
 			}
-			for (index, key) in [(12, "sysroot-sha256="), (13, "configure-sha256=")] {
+			for (index, key) in [(9, "compiler-sha256="), (11, "archiver-sha256="), (13, "linker-sha256="), (15, "sysroot-sha256="), (16, "configure-sha256="), (17, "objects-sha256=")] {
 				assert!(lines[index].strip_prefix(key).is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())), "{} identity {key}", row.name);
 			}
 		}

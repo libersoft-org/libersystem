@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 104] = [
+const GATES: [(&str, &str); 106] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -321,6 +321,10 @@ const GATES: [(&str, &str); 104] = [
 	// far end of the wire, which is the only way that layer's behaviour is an oracle rather than an
 	// assertion about a code path.
 	("ipv6-peer", "userspace.build"),
+	// The selection slot, end to end. Its subject is ProcessService's launch path, the identity
+	// record that carries the candidates and the foreign artifact that fills the slot - a userspace
+	// change selects it, and it boots a guest because a bound slot is only visible from inside one.
+	("icd-selection", "userspace.build"),
 	("dma-mode-carrier", "harness.tools"),
 	("dma-mode-x86_64", "kernel"),
 	// The ports umbrella and its two rows, exactly as `qemu-arch-profiles` and its profiles: the
@@ -511,6 +515,7 @@ const GATES: [(&str, &str); 104] = [
 	("foreign-pin", "harness.tools"),
 	("foreign-facilities", "harness.tools"),
 	("profile-sysroot", "harness.tools"),
+	("foreign-identity", "harness.tools"),
 	// Every LSIDL interface a manifest role names must be one LSIDL
 	// defines. Its subject is the manifest and the IDL, neither of which is a crate, and it reads
 	// declarations rather than generated bindings - so it takes the always-selected label for the

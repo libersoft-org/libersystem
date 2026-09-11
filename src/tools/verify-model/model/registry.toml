@@ -230,6 +230,14 @@ path = "src/foreign"
 # and `dependency-policy` governs what may be there at all; both are release-required.
 reason = "inputs to the audit-only foreign build; nothing they produce enters an image, and the foreign-pin gate holds them to their frozen digests"
 
+# THE FOREIGN LIBRARY SOURCES. They are CODE - compiled by the pinned C compiler and staged into
+# every image - so they are owned rather than declared non-code, and they are not Cargo crates, so
+# the crate walk cannot find them. One component per foreign source, named as the manifest names it,
+# which is what the provider graph resolves a candidate to.
+[[ownership]]
+path = "src/user/libs/foreign/icdprobe"
+component = "icdprobe"
+
 [[non_code]]
 path = "third_party"
 # The recorded licence review. It is a record ABOUT the tree rather than a part of what is built, and

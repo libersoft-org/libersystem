@@ -83,12 +83,51 @@ worker stack; smaller stacks have crashed the pinned compiler while elaborating 
 `core`.
 
 Every dynamic executable and provider carries one allocated `.note.liber.identity` ELF
-note. Its bounded `liber-image-identity-v2` payload records the kind, logical artifact
-name, package, source digest, Rust compiler revision, target, profile, Rust flags,
-features, and direct-provider record digests. The builder emits the canonical record
-directly into the note, validates the exact note bytes on cache hits, and uses the
-SHA-256 of those bytes as the provider-chain identity. There are no separate identity
-files in the image, cache, or system volume.
+note. The builder emits the canonical record directly into the note, validates the exact
+note bytes on cache hits, and uses the SHA-256 of those bytes as the provider-chain
+identity. There are no separate identity files in the image, cache, or system volume.
+
+### The record has a common section and a language section
+
+The bounded `liber-image-identity-v2` payload is in two parts.
+
+The COMMON section is what every artifact has, whatever produced it: `format`, `kind`,
+`artifact`, `package`, `source-sha256`, `target` and `profile`. A reader that only needs
+to know WHICH artifact this is - the publication path, the hot-replacement rule's field
+comparison - reads those seven lines and stops.
+
+The LANGUAGE section follows, keyed by producer so a reader knows what the lines under it
+mean before it reads them:
+
+| `language=` | its fields |
+| --- | --- |
+| `rust` | `rustc-commit`, `rustflags`, `features` |
+| `foreign` | `compiler`, `compiler-sha256`, `archiver`, `archiver-sha256`, `linker`, `linker-sha256`, `cflags`, `sysroot-sha256`, `configure-sha256`, `objects-sha256` |
+
+Each foreign tool appears twice: the version line a person reads, and the digest of the
+binary that actually ran - two builds of one release are two different compilers, and the
+difference between them changes code generation without changing a source byte.
+`objects-sha256` is what actually went into the link, so a record cannot describe one
+compile while the artifact beside it is another.
+
+Then the direct-provider digests, and then the selection slots below.
+
+IDENTITY STILL COVERS THE WHOLE RECORD. The common/language split governs who must
+UNDERSTAND which fields, not what the digest is taken over: a consumer HASHES the language
+section, it does not parse it, and hashing bytes needs no knowledge of their producer. A
+provider that changed its compiler, its linker, its flags, its sysroot or its configure
+inputs - every one of them able to change ABI and code generation - therefore changes the
+digest its consumers embed and the cache key that decides whether to rebuild it.
+
+The hot-replacement rule compares the common fields BY NAME and the language section AS
+TEXT, line by line. Naming the language fields there would force that rule to learn every
+producer's vocabulary, and the failure that causes is silent: a field nobody added to the
+list is a field that may change freely under a compatible verdict.
+
+The version moved to `v2` for the split and for the selection slots below, and for nothing
+else. A `v1` reader cannot decline either politely - it would reject the record and refuse
+the launch - so the two are different languages and the format says which one it is
+speaking. The transition is COLD: every artifact in an image is v2, and no boot mixes them.
 
 ### Selection slots
 
@@ -96,12 +135,16 @@ A consumer may be built against a SET of interchangeable providers rather than a
 one of them, and then it names none of them: there is no `DT_NEEDED` edge to name. For
 that case the record may carry `selection=KIND:NAME=DIGEST,NAME=DIGEST,...` lines after
 its providers - a declared provider position with the closed set of candidates the
-consumer accepts in it, signed into the record like every other provider digest.
+consumer accepts in it, signed into the record like every other provider digest. The
+candidate is named as it is STAGED, with its `.lslib` suffix, because it has to be looked
+up before anything about it is known; a `provider=` line names a provider a dependency
+already resolved to, and carries the bare name.
 
-The version moved to `v2` because of those lines and for no other reason. A record with a
-slot is not a record a `v1` reader can decline politely - it would reject the line and
-refuse the launch - so the two are different languages and the format says which one it
-is speaking.
+THE KIND IS A CLOSED SET, not a free string. What a consumer may CALL through a slot is
+decided at build time from the kind - the build requires every candidate to export exactly
+the kind's symbols - so a launch that accepted any kind at all would leave that field as
+documentation. `vulkan-icd` is the first and currently the only one, and adding another is
+a deliberate change in `service-logic`'s `selection` module rather than a manifest edit.
 
 AT LAUNCH ProcessService binds each slot before the closure is built: it takes the first
 candidate in the consumer's own order that is staged and whose bytes are the admitted

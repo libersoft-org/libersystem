@@ -314,7 +314,7 @@ staged_identity_digest() {
 # the map was skipped. Delete a provider a consumer records and this exited zero saying every library
 # matched the providers staged beside it. Every one of them is now a refusal that names the artifact.
 verify_staged_provider_chains() {
-	local note file artifact provider recorded expected inconsistent=0
+	local note file artifact provider recorded expected inconsistent=0 slot_kind entry
 	local -A staged_digests=()
 	local -A recorded_providers=()
 	# AND THE FOURTH ONE, WHICH WAS THE WHOLE INPUT. Both loops below read from
@@ -445,6 +445,68 @@ verify_staged_provider_chains() {
 		return 1
 	fi
 }
+# THE SELECTION CANDIDATES, which `verify_staged_provider_chains` cannot see at all.
+#
+# A slot candidate is recorded by an EXECUTABLE and is not an edge of any library, so a candidate
+# replaced after its consumer was built left every check in that function passing - and the consumer
+# would then be refused at launch, by a digest comparison, with nothing in the build having said why.
+#
+# IT IS ITS OWN FUNCTION BECAUSE OF WHEN IT CAN RUN. The provider chains are checked when the library
+# phase ends; the executables that record these candidates are built after that, so folding this in
+# there refused every build that rebuilt a candidate - correctly describing a tree that was about to
+# be finished.
+verify_staged_selection_candidates() {
+	local note file artifact program candidate recorded expected slot_line slot_kind entry inconsistent=0
+	local -A staged_digests=()
+	local -A manifest_candidates=()
+	[[ -d "$provider_output_dir/lib" ]] || return 0
+	while IFS= read -r edge; do
+		[[ -n "$edge" ]] || continue
+		manifest_candidates[$edge]=1
+	done < <(jq -r '.programs | to_entries[] | .key as $program | (.value.selection[]? | .kind as $kind | .candidates[] | "\($program):\($kind):\(.)")' <<<"$manifest_json")
+	((${#manifest_candidates[@]} > 0)) || return 0
+	note="$(mktemp "$build_scratch/staged-selection.XXXXXX")"
+	while IFS= read -r file; do
+		artifact="$(basename "$file" .lslib)"
+		staged_digests[$artifact]="$(staged_identity_digest "$file" "$note")" || staged_digests[$artifact]=""
+	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
+	while IFS= read -r file; do
+		program="$(basename "$file")"
+		llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null || continue
+		while IFS= read -r slot_line; do
+			[[ -n "$slot_line" ]] || continue
+			slot_kind="${slot_line#selection=}"
+			slot_kind="${slot_kind%%:*}"
+			for entry in $(tr ',' ' ' <<<"${slot_line#selection=*:}"); do
+				candidate="${entry%%=*}"
+				recorded="${entry##*=}"
+				artifact="${candidate%.lslib}"
+				if [[ -z "${manifest_candidates[$program:$slot_kind:$artifact]:-}" ]]; then
+					echo "build-shared: $program admits $artifact in its $slot_kind slot and the manifest declares no such candidate" >&2
+					inconsistent=1
+					continue
+				fi
+				expected="${staged_digests[$artifact]:-}"
+				if [[ -z "$expected" ]]; then
+					echo "build-shared: $program admits $artifact in its $slot_kind slot, and no readable $artifact is staged" >&2
+					inconsistent=1
+					continue
+				fi
+				if [[ "$recorded" != "$expected" ]]; then
+					echo "build-shared: $program admits $artifact at $recorded, and the staged $artifact is $expected" >&2
+					inconsistent=1
+				fi
+			done
+		done < <(grep -a -o 'selection=[a-z0-9-]*:[a-zA-Z0-9_.,=-]*' "$note" || true)
+	done < <(find "$artifact_output_root/bin" "$artifact_output_root/libexec" -type f 2>/dev/null | sort)
+	rm -f "$note"
+	if ((inconsistent)); then
+		echo "build-shared: the staged tree for $target holds a selection candidate no consumer was built against" >&2
+		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch $(public_arch "$target")" >&2
+		return 1
+	fi
+}
+
 # THE MAPPING, ASKABLE. `check-staged-consistency.sh` asserts all three triples through this, so the
 # public name printed by a failed build's advice and the one the gate checks are the same answer
 # rather than two copies of it.
@@ -456,6 +518,7 @@ fi
 if [[ -n "${verify_staged_only:-}" ]]; then
 	mkdir -p "$build_scratch"
 	verify_staged_provider_chains || exit 1
+	verify_staged_selection_candidates || exit 1
 	echo "build-shared: every staged library in $target names the providers staged beside it"
 	exit 0
 fi
@@ -1137,6 +1200,13 @@ first_line() {
 source "$root/foreign/profile-abi.sh"
 foreign_profile_abi "$target" || exit 2
 foreign_compiler="$(first_line "$(clang --version)")"
+# AND THE TOOLS THEMSELVES, BY CONTENT. A version line names a release; two builds of one release
+# are two different compilers, and the difference between them is exactly the kind of thing that
+# changes code generation without changing a source byte. The record carries both: the version
+# because it is what a person reads, the digest because it is what actually compiled.
+foreign_compiler_digest="$(sha256sum "$(command -v clang)" | awk '{print $1}')"
+foreign_archiver_digest="$(sha256sum "$(command -v llvm-ar)" | awk '{print $1}')"
+foreign_linker_digest="$(sha256sum "$lld" | awk '{print $1}')"
 foreign_archiver="$(first_line "$(llvm-ar --version)")"
 # `-flavor gnu` BECAUSE `rust-lld` IS THE GENERIC DRIVER. Asked for its version without a flavour it
 # prints "lld is a generic driver" to stderr and exits 1, which under `set -e` would either kill the
@@ -1363,11 +1433,18 @@ write_identity_record() {
 		foreign)
 			printf 'language=foreign\n'
 			printf 'compiler=%s\n' "$foreign_compiler"
+			printf 'compiler-sha256=%s\n' "$foreign_compiler_digest"
 			printf 'archiver=%s\n' "$foreign_archiver"
+			printf 'archiver-sha256=%s\n' "$foreign_archiver_digest"
 			printf 'linker=%s\n' "$foreign_linker"
+			printf 'linker-sha256=%s\n' "$foreign_linker_digest"
 			printf 'cflags=%s\n' "$(foreign_cflags)"
 			printf 'sysroot-sha256=%s\n' "$foreign_sysroot_digest"
 			printf 'configure-sha256=%s\n' "$(foreign_configure_digest "$objects")"
+			# THE FINAL OBJECTS, which are what actually went into the link. Everything above says
+			# what SHOULD produce them; this says what did, so a record cannot describe one compile
+			# and an artifact be another.
+			printf 'objects-sha256=%s\n' "$foreign_objects_digest"
 			;;
 		*)
 			echo "build-shared: $artifact has unknown producer '$producer'" >&2
@@ -2227,6 +2304,7 @@ for spec in "$@"; do
 	fi
 	((artifact_state_misses += 1))
 	foreign_objects=()
+	foreign_objects_digest=""
 	if [[ "$row_producer" == foreign ]]; then
 		# THE PINNED C COMPILER, THE PROFILE SYSROOT, AND THE OBJECT LIST IN THE MANIFEST'S ORDER.
 		# Everything after this point - the link, the needed list, the import ownership audit, the
@@ -2256,6 +2334,7 @@ for spec in "$@"; do
 		fi
 		deps=""
 		rlib="${foreign_objects[0]}"
+		foreign_objects_digest="$(sha256sum "${foreign_objects[@]}" | sha256sum | awk '{print $1}')"
 	elif [[ -n "$image_graph" ]]; then
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
@@ -3083,6 +3162,8 @@ if [[ -n "$image_graph" ]]; then
 			"$object_cache_prefix.build-key" "$object_cache_prefix.sha256" "$start_obj"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
+	# THE CANDIDATES, NOW THAT THE EXECUTABLES THAT RECORD THEM EXIST.
+	verify_staged_selection_candidates || exit 1
 	consumer_seconds=$((SECONDS - consumer_started))
 	timing_event consumers end
 fi

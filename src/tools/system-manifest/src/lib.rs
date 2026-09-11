@@ -1058,6 +1058,9 @@ impl Manifest {
 			for (index, slot) in raw_program.selection.iter().enumerate() {
 				let where_ = format!("{location}.selection.{index}");
 				let Some(kind) = validate_name(&slot.kind, &format!("{where_}.kind"), &mut errors) else { continue };
+				if !ADMITTED_SLOT_KINDS.contains(&kind.as_str()) {
+					push_error(&mut errors, format!("{where_}.kind"), format!("{kind} is not a slot kind any launch admits"));
+				}
 				if slot.symbols.is_empty() {
 					push_error(&mut errors, format!("{where_}.symbols"), "a slot whose kind admits no symbol is a position nothing can be called through");
 				}
@@ -1452,6 +1455,10 @@ fn validate_name_list(values: Vec<String>, location: &str, errors: &mut Vec<Vali
 /// The authority is the `selection` module in `service-logic`; these are the same two numbers.
 const MAX_SELECTION_SLOTS: usize = 4;
 const MAX_SLOT_CANDIDATES: usize = 16;
+
+/// And the kinds a launch admits, from the same module. A manifest able to declare a kind the launch
+/// refuses is a manifest able to describe an image that cannot start.
+const ADMITTED_SLOT_KINDS: [&str; 1] = ["vulkan-icd"];
 
 fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a str> {
 	if let Some(relative) = source.strip_prefix("user/libs/") {

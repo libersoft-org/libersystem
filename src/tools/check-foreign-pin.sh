@@ -123,7 +123,10 @@ static_state = "absent"
 if static_path.is_file():
 	static = tomllib.load(static_path.open("rb"))
 	static_state = "present"
-	for section in ("patch", "builder"):
+	# THE ABI DESCRIPTION IS PINNED LIKE THE OTHER TWO. It was inside the builder until the image
+	# build needed the same values; a file two builds read is a file that can move under both at
+	# once, which is exactly what a pin is for.
+	for section in ("patch", "builder", "abi"):
 		entry = static[section]
 		path = root / entry["path"]
 		if not path.is_file():

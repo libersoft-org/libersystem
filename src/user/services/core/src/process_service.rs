@@ -179,13 +179,26 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 			// INTO CODE - the three tools, the flags they were given, the sysroot they compiled
 			// against and the configure inputs that selected what was built. Each of those can
 			// change the ABI without changing a single source byte.
+			// EACH TOOL TWICE: the version line a person reads, and the digest of the binary that
+			// actually ran. Two builds of one release are two different compilers, and the
+			// difference between them changes code generation without changing a source byte.
 			let compiler = identity_value(lines.next()?, b"compiler=")?;
+			let compiler_digest = identity_value(lines.next()?, b"compiler-sha256=")?;
 			let archiver = identity_value(lines.next()?, b"archiver=")?;
+			let archiver_digest = identity_value(lines.next()?, b"archiver-sha256=")?;
 			let linker = identity_value(lines.next()?, b"linker=")?;
+			let linker_digest = identity_value(lines.next()?, b"linker-sha256=")?;
 			let cflags = identity_value(lines.next()?, b"cflags=")?;
 			let sysroot = identity_value(lines.next()?, b"sysroot-sha256=")?;
 			let configure = identity_value(lines.next()?, b"configure-sha256=")?;
-			if compiler.is_empty() || archiver.is_empty() || linker.is_empty() || cflags.is_empty() || !valid_hex(sysroot, 64) || !valid_hex(configure, 64) {
+			// WHAT ACTUALLY WENT INTO THE LINK. Everything above says what should produce the
+			// objects; this says what did, so a record cannot describe one compile while the
+			// artifact beside it is another.
+			let objects = identity_value(lines.next()?, b"objects-sha256=")?;
+			if compiler.is_empty() || archiver.is_empty() || linker.is_empty() || cflags.is_empty() {
+				return None;
+			}
+			if !valid_hex(compiler_digest, 64) || !valid_hex(archiver_digest, 64) || !valid_hex(linker_digest, 64) || !valid_hex(sysroot, 64) || !valid_hex(configure, 64) || !valid_hex(objects, 64) {
 				return None;
 			}
 		}
