@@ -219,6 +219,24 @@ reason = "documentation; changes no byte of any artifact"
 # rather than left unowned, because an unowned path SELECTS EVERYTHING: without this, appending a
 # paragraph to an audit scheduled a full three-architecture sweep.
 [[non_code]]
+path = "src/foreign"
+# THE AUDIT-ONLY FOREIGN SUBSTRATE: cross files, a bootstrap sysroot, the lockfile parts, the derived
+# inventory and the patch series. They ARE build inputs - but to a build whose output is compiled,
+# inspected and quarantine-staged rather than imported, so no byte of any LiberSystem artifact
+# depends on them and no test selection can reach them.
+#
+# THEY ARE NOT UNGUARDED, which is the question a reader of this rule should ask. The `foreign-pin`
+# gate verifies every one of them against its frozen digest and regenerates the inventory to compare,
+# and `dependency-policy` governs what may be there at all; both are release-required.
+reason = "inputs to the audit-only foreign build; nothing they produce enters an image, and the foreign-pin gate holds them to their frozen digests"
+
+[[non_code]]
+path = "third_party"
+# The recorded licence review. It is a record ABOUT the tree rather than a part of what is built, and
+# the `dependency-policy` gate is what holds the tree and the record to each other.
+reason = "the recorded licence review; a record about the tree rather than an input to any artifact, enforced by the dependency-policy gate"
+
+[[non_code]]
 path = "AI"
 reason = "working notes and audit files; no build step reads them and they change no byte of any artifact"
 

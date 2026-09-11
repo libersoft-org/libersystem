@@ -884,17 +884,21 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 	assert!(bytes.ends_with(b"\n"), "{} identity record is not newline terminated", row.name);
 	let text = core::str::from_utf8(&bytes).unwrap_or_else(|_| panic!("identity for {} is not UTF-8", row.name));
 	let lines: Vec<&str> = text.lines().collect();
-	assert!(lines.len() >= 10 && lines[0] == "format=liber-image-identity-v1", "{} has malformed identity record", row.name);
+	assert!(lines.len() >= 11 && lines[0] == "format=liber-image-identity-v2", "{} has malformed identity record", row.name);
 	let expected_kind = if row.kind == "library" { "library" } else { "executable" };
 	assert_eq!(lines[1], format!("kind={expected_kind}"), "{} identity kind", row.name);
 	assert_eq!(lines[2], format!("artifact={}", row.name), "{} identity artifact", row.name);
 	assert_eq!(lines[3], format!("package={}", row.crate_dir), "{} identity package", row.name);
 	assert!(lines[4].strip_prefix("source-sha256=").is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())), "{} identity source digest", row.name);
-	assert_eq!(lines[5], format!("rustc-commit={expected_rustc_commit}"), "{} identity toolchain", row.name);
-	assert_eq!(lines[6], format!("target={}", user_target()), "{} identity target", row.name);
-	assert_eq!(lines[7], "profile=release", "{} identity profile", row.name);
-	assert!(lines[8].starts_with("rustflags=-C relocation-model=pic"), "{} identity codegen flags", row.name);
-	assert!(lines[9].starts_with("features="), "{} identity features", row.name);
+	assert_eq!(lines[5], format!("target={}", user_target()), "{} identity target", row.name);
+	assert_eq!(lines[6], "profile=release", "{} identity profile", row.name);
+	// THE LANGUAGE SECTION, AND ITS KEY IS CHECKED BEFORE ITS FIELDS. Everything produced by this
+	// build is Rust; a record claiming another producer here is one this packager has no rule for,
+	// and accepting it would be accepting fields it never validated.
+	assert_eq!(lines[7], "language=rust", "{} identity language", row.name);
+	assert_eq!(lines[8], format!("rustc-commit={expected_rustc_commit}"), "{} identity toolchain", row.name);
+	assert!(lines[9].starts_with("rustflags=-C relocation-model=pic"), "{} identity codegen flags", row.name);
+	assert!(lines[10].starts_with("features="), "{} identity features", row.name);
 	let mut expected_providers: Vec<String> = row
 		.providers
 		.iter()

@@ -42,13 +42,25 @@ use crate::elf::{Elf, Symbol};
 // It is the only field a candidate may change.
 pub const CONTENT_DIGEST_FIELD: &str = "source-sha256";
 
-// Every identity field that must match, in the order they are checked. `format` is first so
+// Every COMMON identity field that must match, in the order they are checked. `format` is first so
 // a record this rule does not understand is rejected as a field mismatch rather than
 // silently compared field by field against a layout that may not mean the same thing.
-pub const REQUIRED_FIELDS: [&str; 9] = ["format", "kind", "artifact", "package", "rustc-commit", "target", "profile", "rustflags", "features"];
+//
+// THE LANGUAGE FIELDS ARE NOT HERE AND ARE NOT EXEMPT. `rustc-commit`, `rustflags` and `features`
+// stood in this list until the record grew a language section, and naming them here would have made
+// this rule refuse every artifact a different producer built - it would report a MissingField for a
+// field that producer has no concept of. They are compared instead by `compare_language_section`,
+// which requires the whole section to be IDENTICAL without knowing what any of it means. That is
+// strictly stronger than the three named fields were: a producer field this rule has never heard of
+// still cannot change under a compatible verdict.
+pub const REQUIRED_FIELDS: [&str; 7] = ["format", "kind", "artifact", "package", "target", "profile", "language"];
+
+// Where the language section starts. Everything from this line to the end of the record belongs to
+// the producer the `language=` value names, except the two lists the closure rules read.
+const LANGUAGE_KEY: &str = "language=";
 
 // The identity record layout this rule understands.
-pub const IDENTITY_FORMAT: &str = "liber-image-identity-v1";
+pub const IDENTITY_FORMAT: &str = "liber-image-identity-v2";
 
 // How many candidate symbols the export comparison may visit in total before giving up.
 //
@@ -91,6 +103,9 @@ pub enum Reason<'a> {
 	MissingField { field: &'static str, installed: bool },
 	// A required identity field differs.
 	IdentityField { field: &'static str, installed: &'a str, candidate: &'a str },
+	// The language section differs at this position; `None` means the section ended. The line is
+	// carried whole because this rule does not know the producer's field names.
+	LanguageSection { position: usize, installed: Option<&'a str>, candidate: Option<&'a str> },
 	// The declared provider closure differs at this position; `None` means the list ended.
 	ProviderList { position: usize, installed: Option<&'a str>, candidate: Option<&'a str> },
 	// The image's own DT_NEEDED entries differ at this position.
@@ -146,6 +161,16 @@ impl<'a> Identity<'a> {
 	// The value of the first line with this key, or None when the record has no such line.
 	pub fn field(&self, key: &str) -> Option<&'a str> {
 		self.text.lines().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
+	}
+
+	// The producer's own lines: from `language=` to the end of the record, less the two closure
+	// lists this rule reads by meaning rather than by text.
+	//
+	// THE KEY LINE IS PART OF THE SECTION. Comparing the fields and not the key would let a record
+	// change producer while every line under it happened to match, which is a different artifact
+	// reported as the same one.
+	pub fn language_section(&self) -> impl Iterator<Item = &'a str> {
+		self.text.lines().skip_while(|line| !line.starts_with(LANGUAGE_KEY)).filter(|line| !line.starts_with("provider=") && !line.starts_with("selection="))
 	}
 
 	// The declared provider entries, in the record's order, WITH their identity digests. The order
@@ -228,6 +253,29 @@ pub fn declared_machine(bytes: &[u8]) -> Option<u16> {
 
 // Rule 2: every required identity field matches, and the record is the layout this rule
 // understands. The content digest is skipped by construction - it is not in REQUIRED_FIELDS.
+// The producer's own fields, compared as lines rather than as fields.
+//
+// A CONSUMER HASHES THIS SECTION, IT DOES NOT PARSE IT, and comparing it is the same operation: two
+// records are interchangeable only if every line a producer wrote is the same line. The alternative
+// - naming the fields - forces this crate to learn every producer's vocabulary, and the failure that
+// causes is silent: a field nobody added to the list is a field that may change freely under a
+// compatible verdict, which is exactly the stale-consumer case identity exists to prevent.
+//
+// The section runs from `language=` to the first line of the closure lists, which are compared
+// separately because their MEANING is this rule's business and the producer's fields are not.
+fn compare_language_section<'a>(installed: &Identity<'a>, candidate: &Identity<'a>) -> Verdict<'a> {
+	let mut left = installed.language_section();
+	let mut right = candidate.language_section();
+	let mut position = 0usize;
+	loop {
+		match (left.next(), right.next()) {
+			(None, None) => return Verdict::Compatible,
+			(one, other) if one != other => return Verdict::Incompatible(Reason::LanguageSection { position, installed: one, candidate: other }),
+			_ => position += 1,
+		}
+	}
+}
+
 fn compare_identity<'a>(installed: &Identity<'a>, candidate: &Identity<'a>) -> Verdict<'a> {
 	for field in REQUIRED_FIELDS {
 		let (left, right) = match (installed.field(field), candidate.field(field)) {
@@ -242,7 +290,7 @@ fn compare_identity<'a>(installed: &Identity<'a>, candidate: &Identity<'a>) -> V
 			return Verdict::Incompatible(Reason::UnknownIdentityFormat { format: left });
 		}
 	}
-	Verdict::Compatible
+	compare_language_section(installed, candidate)
 }
 
 // Rules 3 and 4: two ordered name lists must be identical, and the first position that is

@@ -77,7 +77,7 @@ identity_record() {
 	out="$(mktemp)"
 	llvm-objcopy --dump-section .note.liber.identity="$out" "$image" /dev/null 2>/dev/null || true
 	# The note carries an 8-byte header before the record's own text.
-	tr -d '\0' <"$out" | sed -n 's/.*\(format=liber-image-identity-v1\)/\1/p;/^[a-z-]*=/p'
+	tr -d '\0' <"$out" | sed -n 's/.*\(format=liber-image-identity-v2\)/\1/p;/^[a-z-]*=/p'
 	rm -f "$out"
 }
 

@@ -1274,14 +1274,22 @@ write_identity_record() {
 	local identity="$7"
 	local provider digest
 	{
-		printf 'format=liber-image-identity-v1\n'
+		# THE COMMON SECTION: what every artifact has, whatever produced it. A reader that only needs
+		# to know WHICH artifact this is - the publication path, the compatibility rule's field
+		# comparison - reads these seven lines and stops.
+		printf 'format=liber-image-identity-v2\n'
 		printf 'kind=%s\n' "$kind"
 		printf 'artifact=%s\n' "$artifact"
 		printf 'package=%s\n' "$package"
 		printf 'source-sha256=%s\n' "$source_sha"
-		printf 'rustc-commit=%s\n' "$rustc_commit"
 		printf 'target=%s\n' "$target"
 		printf 'profile=release\n'
+		# THE LANGUAGE SECTION: keyed by producer, and the key comes first so a reader knows what the
+		# lines under it mean before it reads them. Identity still covers the whole record - a
+		# consumer HASHES this section, it does not parse it - so a provider that changed its
+		# compiler or its flags changes every digest that names it.
+		printf 'language=rust\n'
+		printf 'rustc-commit=%s\n' "$rustc_commit"
 		printf 'rustflags=%s\n' "$rustflags"
 		printf 'features=%s\n' "$feature_set"
 		for provider in $(tr ' ' '\n' <<<"$providers" | sort); do

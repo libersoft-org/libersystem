@@ -83,12 +83,42 @@ worker stack; smaller stacks have crashed the pinned compiler while elaborating 
 `core`.
 
 Every dynamic executable and provider carries one allocated `.note.liber.identity` ELF
-note. Its bounded `liber-image-identity-v1` payload records the kind, logical artifact
+note. Its bounded `liber-image-identity-v2` payload records the kind, logical artifact
 name, package, source digest, Rust compiler revision, target, profile, Rust flags,
 features, and direct-provider record digests. The builder emits the canonical record
 directly into the note, validates the exact note bytes on cache hits, and uses the
 SHA-256 of those bytes as the provider-chain identity. There are no separate identity
 files in the image, cache, or system volume.
+
+### Selection slots
+
+A consumer may be built against a SET of interchangeable providers rather than against
+one of them, and then it names none of them: there is no `DT_NEEDED` edge to name. For
+that case the record may carry `selection=KIND:NAME=DIGEST,NAME=DIGEST,...` lines after
+its providers - a declared provider position with the closed set of candidates the
+consumer accepts in it, signed into the record like every other provider digest.
+
+The version moved to `v2` because of those lines and for no other reason. A record with a
+slot is not a record a `v1` reader can decline politely - it would reject the line and
+refuse the launch - so the two are different languages and the format says which one it
+is speaking.
+
+AT LAUNCH ProcessService binds each slot before the closure is built: it takes the first
+candidate in the consumer's own order that is staged and whose bytes are the admitted
+ones, adds it to the effective dependency set and to the recursive collection that walks
+it, and only then compares the set with the record. The exact-equality check is unchanged
+and means exactly what it meant - the bound provider was named, by name and by digest, in
+the authenticated record before the launch.
+
+A candidate staged under an admitted name whose bytes are NOT the admitted ones is
+refused rather than skipped: moving on would let a replaced provider hide behind the next
+name in the list. A slot no admitted candidate fills refuses the launch, because a
+consumer that declared one cannot run without it. And nothing is loaded after the first
+thread starts, so no selection can happen later.
+
+This is what makes discovery a policy input rather than an authority: which admitted
+provider runs may be narrowed from outside, and a provider the consumer was not built
+against cannot be introduced at all.
 
 Because Cargo cannot consume a Rust dylib on these targets, consumers cross a generated
 image-internal export boundary. A small explicit unmangled smoke ABI currently pins this

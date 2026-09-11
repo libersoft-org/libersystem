@@ -270,7 +270,7 @@ fn explicit_machine_parser_supports_cross_target_audits() {
 
 #[test]
 fn liber_identity_note_is_exact_and_unique() {
-	let record = b"format=liber-image-identity-v1\n";
+	let record = b"format=liber-image-identity-v2\n";
 	let (bytes, note_offset, section_offset) = identity_note_image(record);
 	assert_eq!(Elf::parse(&bytes).unwrap().liber_identity_note(), Some(&record[..]));
 

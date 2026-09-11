@@ -1,0 +1,12 @@
+[package]
+name = "foreign-discovery"
+edition = "2024"
+description = "The pinned configuration's discovery surface, answered from a bounded record rather than a filesystem"
+
+# NO DEPENDENCIES, for the same reason `foreign-abi` has none: a crate that reaches the runtime
+# cannot be tested on the host, because `rt` and `std` both define `panic_impl`. Everything this
+# crate needs is handed to it by the substrate at install time.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

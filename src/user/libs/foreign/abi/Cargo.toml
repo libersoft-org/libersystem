@@ -1,0 +1,17 @@
+[package]
+name = "foreign-abi"
+edition = "2024"
+description = "Exactly the C-ABI facilities the pinned foreign configuration's derived inventory names"
+
+# NO DEPENDENCIES AT ALL, AND THAT IS THE CONTRACT. A crate that reached `rt` could not be tested on
+# the host - `rt` and `std` both define `panic_impl`, so `cargo test` fails with a duplicate lang item
+# before a test runs, which is exactly why `service-logic` exists separately. Every function here
+# implements a C contract whose violations are silent, so host fixtures are worth more here than
+# almost anywhere. The substrate installs a diagnostic sink instead; see `sink`.
+[dependencies]
+
+# A WARNING IS AN ERROR HERE, and it matters more in this crate than in most: every function below is
+# `extern "C"` and unmangled, so a mistake here is a symbol the linker happily resolves to the wrong
+# thing rather than a type error somebody sees.
+[lints.rust]
+warnings = "deny"

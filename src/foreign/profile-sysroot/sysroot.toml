@@ -1,0 +1,25 @@
+# THE PROFILE SYSROOT'S IDENTITY, carried with the thing it describes rather than only in the
+# lockfile, so a copy of this directory says what it is. The lockfile holds the DIGEST, which is what
+# binds a build to one version of it; this file holds what the digest is a digest OF.
+name = "liber-profile-sysroot"
+version = "1"
+licence = "project"
+# WHAT SIZED IT. Not the option set - that is the bootstrap sysroot's rule - but the measured
+# inventory, which is why this file names the measurement it was derived from.
+derived_from = "src/foreign/INVENTORY-pass1.json"
+declares = 46
+# The twelve the loader's own patched headers declare, which is why 46 and not 58.
+declared_elsewhere = [
+	"loader_platform_close_library",
+	"loader_platform_executable_path",
+	"loader_platform_file_exists",
+	"loader_platform_get_proc_address",
+	"loader_platform_is_path_absolute",
+	"loader_platform_open_library",
+	"loader_platform_open_library_error",
+	"loader_platform_thread_create_mutex",
+	"loader_platform_thread_delete_mutex",
+	"loader_platform_thread_lock_mutex",
+	"loader_platform_thread_unlock_mutex",
+	"thread_safe_strtok",
+]

@@ -38,7 +38,7 @@ use services::graph_limits;
 
 const LIBRARY_BASE: u64 = 0x2000_0000;
 const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
-const IDENTITY_FORMAT: &[u8] = b"format=liber-image-identity-v1";
+const IDENTITY_FORMAT: &[u8] = b"format=liber-image-identity-v2";
 #[cfg(target_arch = "x86_64")]
 const IMAGE_TARGET: &str = "x86_64-unknown-none";
 #[cfg(target_arch = "aarch64")]
@@ -96,6 +96,18 @@ impl Drop for MappedFile {
 struct Identity {
 	digest: [u8; 32],
 	providers: Vec<(String, [u8; 32])>,
+	/// The declared selection slots, in record order.
+	///
+	/// A SLOT IS A PROVIDER POSITION THIS CONSUMER WAS BUILT AGAINST WITHOUT NAMING ONE. It carries
+	/// a KIND and the CLOSED SET OF DIGESTS the consumer accepts in it, signed into the record like
+	/// every other provider digest. At launch one of those digests is chosen from what is staged and
+	/// bound into the slot, and the exact-equality check below then holds unchanged - because the
+	/// chosen provider was named, by digest, in the authenticated record before the launch.
+	///
+	/// THAT IS WHAT MAKES DISCOVERY A POLICY INPUT RATHER THAN AN AUTHORITY. An operator or a
+	/// registry may choose which admitted provider runs; it cannot introduce one the consumer was not
+	/// built against, because a digest outside the set is not in the record and the check refuses it.
+	slots: Vec<service_logic::selection::Slot>,
 }
 
 fn valid_identity_name(name: &str) -> bool {
@@ -144,17 +156,63 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 	}
 	let package = identity_value(lines.next()?, b"package=")?;
 	let source = identity_value(lines.next()?, b"source-sha256=")?;
-	let rustc = identity_value(lines.next()?, b"rustc-commit=")?;
-	if package.is_empty() || !valid_hex(source, 64) || !valid_hex(rustc, 40) || !identity_field_matches(lines.next()?, b"target=", IMAGE_TARGET.as_bytes()) || !identity_field_matches(lines.next()?, b"profile=", b"release") {
+	if package.is_empty() || !valid_hex(source, 64) || !identity_field_matches(lines.next()?, b"target=", IMAGE_TARGET.as_bytes()) || !identity_field_matches(lines.next()?, b"profile=", b"release") {
 		return None;
 	}
-	let rustflags = identity_value(lines.next()?, b"rustflags=")?;
-	let features = identity_value(lines.next()?, b"features=")?;
-	if !rustflags.starts_with(b"-C relocation-model=pic") || features.is_empty() {
-		return None;
+	// THE LANGUAGE SECTION, AND ITS KEY DECIDES WHAT THE LINES UNDER IT MEAN. The common section
+	// above is what every artifact has whatever produced it; below this point the fields belong to
+	// one producer, and a record naming a producer this service has no rule for is refused rather
+	// than skipped past. Identity still covers the whole record: the digest is over these bytes too,
+	// so a provider that changed its compiler or its flags changes every digest that names it.
+	match identity_value(lines.next()?, b"language=")? {
+		b"rust" => {
+			let rustc = identity_value(lines.next()?, b"rustc-commit=")?;
+			let rustflags = identity_value(lines.next()?, b"rustflags=")?;
+			let features = identity_value(lines.next()?, b"features=")?;
+			if !valid_hex(rustc, 40) || !rustflags.starts_with(b"-C relocation-model=pic") || features.is_empty() {
+				return None;
+			}
+		}
+		b"foreign" => {
+			// THE PRODUCER'S IDENTITY, NOT ITS SOURCES. A foreign artifact's sources are covered by
+			// the common section's digest like any other; what these lines add is WHAT TURNED THEM
+			// INTO CODE - the three tools, the flags they were given, the sysroot they compiled
+			// against and the configure inputs that selected what was built. Each of those can
+			// change the ABI without changing a single source byte.
+			let compiler = identity_value(lines.next()?, b"compiler=")?;
+			let archiver = identity_value(lines.next()?, b"archiver=")?;
+			let linker = identity_value(lines.next()?, b"linker=")?;
+			let cflags = identity_value(lines.next()?, b"cflags=")?;
+			let sysroot = identity_value(lines.next()?, b"sysroot-sha256=")?;
+			let configure = identity_value(lines.next()?, b"configure-sha256=")?;
+			if compiler.is_empty() || archiver.is_empty() || linker.is_empty() || cflags.is_empty() || !valid_hex(sysroot, 64) || !valid_hex(configure, 64) {
+				return None;
+			}
+		}
+		_ => return None,
 	}
 	let mut providers: Vec<(String, [u8; 32])> = Vec::new();
+	let mut slots: Vec<service_logic::selection::Slot> = Vec::new();
 	for line in lines {
+		// THE SLOTS FOLLOW THE PROVIDERS AND MAY NOT BE INTERLEAVED. The provider list is checked for
+		// strict ascending order, which is what makes a duplicate impossible to express; a slot line
+		// in the middle of it would break that reading with no benefit at all.
+		if let Some(value) = identity_value(line, b"selection=") {
+			if slots.len() >= service_logic::selection::MAX_SLOTS {
+				return None;
+			}
+			// THE RULE ITSELF IS IN `service-logic` and not here, because `services` builds against the
+			// freestanding runtime and cannot run a host test: a launch-path rule with no test is a rule
+			// the next change does not know it broke. What stays here is the record's shape - where the
+			// line sits and what the service does with the result.
+			let Ok(slot) = service_logic::selection::parse_slot(value, valid_library_name) else { return None };
+			slots.push(slot);
+			continue;
+		}
+		if !slots.is_empty() {
+			// A `provider=` line after a slot: see above.
+			return None;
+		}
 		let value = identity_value(line, b"provider=")?;
 		let separator = value.iter().position(|byte| *byte == b':')?;
 		let provider = core::str::from_utf8(&value[..separator]).ok()?;
@@ -163,7 +221,7 @@ fn parse_identity(bytes: &[u8], kind: &str, artifact: &str) -> Option<Identity> 
 		}
 		providers.push((String::from(provider), parse_digest(&value[separator + 1..])?));
 	}
-	Some(Identity { digest: bootproto::sha256::digest(bytes), providers })
+	Some(Identity { digest: bootproto::sha256::digest(bytes), providers, slots })
 }
 
 fn verify_identity(elf: &bootproto::elf::Elf<'_>, kind: &str, artifact: &str) -> Option<Identity> {
@@ -201,19 +259,22 @@ struct Module {
 	baseline: [u8; 32],
 }
 
-fn identity_matches_dependencies(identity: &Identity, dependencies: &[String], modules: &[Module]) -> bool {
-	if identity.providers.len() != dependencies.len() {
-		return false;
-	}
+/// Does the authenticated record account for exactly this dependency set?
+///
+/// EXACT EQUALITY, AND THE SLOTS DO NOT WEAKEN IT. A bound slot is not an append to the record: the
+/// provider occupying it was named, by name and by digest, in the record before the launch. So the
+/// arithmetic is the same as it always was - the record accounts for every dependency and every
+/// dependency is accounted for - with each bound slot consumed exactly once so two dependencies
+/// cannot both claim the same declared position.
+fn identity_matches_dependencies(identity: &Identity, dependencies: &[String], modules: &[Module], bound: &[(String, usize)]) -> bool {
+	// The arithmetic is `service-logic`'s, for the reason the module says; the service's part is to
+	// supply what only it can, which is the baseline digest each staged dependency was loaded with.
+	let mut staged: Vec<(String, [u8; 32])> = Vec::with_capacity(dependencies.len());
 	for dependency in dependencies {
-		let Some(name) = dependency.strip_suffix(".lslib") else { return false };
 		let Some(module) = modules.iter().find(|module| module.name.as_str() == dependency.as_str()) else { return false };
-		let Some((_, digest)) = identity.providers.iter().find(|(provider, _)| provider.as_str() == name) else { return false };
-		if *digest != module.baseline {
-			return false;
-		}
+		staged.push((dependency.clone(), module.baseline));
 	}
-	true
+	service_logic::selection::accounts_for(&identity.providers, bound, &staged)
 }
 
 struct Resolver {
@@ -285,13 +346,23 @@ impl Resolver {
 				}
 				let identity = verify_identity(&elf, "library", stem)?;
 				let dynamic = elf.dynamic_info()??;
-				let dependencies = dependencies(&elf, &dynamic)?;
+				let mut dependencies = dependencies(&elf, &dynamic)?;
 				for dependency in &dependencies {
 					if !self.collect(dependency, depth + 1) {
 						return None;
 					}
 				}
-				if !identity_matches_dependencies(&identity, &dependencies, &self.modules) {
+				// RESOLUTION HAPPENS BEFORE THE EQUALITY CHECK, which is the whole of the new
+				// mechanism. A digest occupying a slot enters none of the ordinary dependency
+				// machinery by itself - it would simply make the two sets differ in length and fail
+				// the launch - so the slot is bound first, the bound provider joins the effective
+				// dependency set and the recursive collection that walks it, and only then are the
+				// sets compared.
+				//
+				// THE CONSUMER NEEDS NO `DT_NEEDED` ENTRY FOR IT, which is the point: it was built
+				// against a SET of candidates and not against one of them.
+				let bound = self.bind_slots(&identity, &mut dependencies, depth + 1)?;
+				if !identity_matches_dependencies(&identity, &dependencies, &self.modules, &bound) {
 					return None;
 				}
 				Some(Module { name: String::from(name), image, dependencies, baseline })
@@ -304,6 +375,40 @@ impl Resolver {
 				false
 			}
 		}
+	}
+
+	/// Bind every declared selection slot, adding each bound provider to `dependencies`.
+	///
+	/// THE FIRST ADMITTED CANDIDATE THAT IS STAGED AND HAS THE ADMITTED BYTES WINS, and the order is
+	/// the consumer's own - it is part of the signed record, so "which one runs" is a decision the
+	/// consumer made at build time and an operator may later narrow, never widen. A candidate that is
+	/// staged under an admitted name but is NOT the admitted bytes is refused rather than skipped:
+	/// silently moving on would let a replaced provider hide behind the next name in the list.
+	fn bind_slots(&mut self, identity: &Identity, dependencies: &mut Vec<String>, depth: usize) -> Option<Vec<(String, usize)>> {
+		let mut bound: Vec<(String, usize)> = Vec::new();
+		for (index, slot) in identity.slots.iter().enumerate() {
+			// STAGE IN THE CONSUMER'S OWN ORDER AND STOP AT THE FIRST CANDIDATE THAT IS PRESENT. The
+			// decision is `selection::bind`'s; this loop only answers the one question that needs the
+			// image, which is whether a name is staged and with what bytes. Staging past the point the
+			// decision is made would pull provider images into the closure the launch has no use for.
+			let mut staged: Vec<(String, [u8; 32])> = Vec::new();
+			for (name, _) in &slot.admitted {
+				if dependencies.iter().any(|held| held.as_str() == name.as_str()) {
+					break;
+				}
+				if !self.collect(name, depth) {
+					continue;
+				}
+				let module = self.modules.iter().find(|module| module.name.as_str() == name.as_str())?;
+				staged.push((name.clone(), module.baseline));
+				break;
+			}
+			let decision = service_logic::selection::bind(slot, dependencies, |name| staged.iter().find(|(held, _)| held.as_str() == name).map(|(_, digest)| *digest));
+			let service_logic::selection::Binding::Bind(name) = decision else { return None };
+			dependencies.push(name.clone());
+			bound.push((name, index));
+		}
+		Some(bound)
 	}
 
 	fn order(&self) -> Option<Vec<String>> {
@@ -681,9 +786,13 @@ fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_ident
 		};
 		let Some(artifact) = expected_identity else { return None };
 		let Some(identity) = verify_identity(&elf, "executable", artifact) else { return None };
-		let Some(dependencies) = dependencies(&elf, &dynamic) else { return None };
-		if dependencies.is_empty() {
-			if !identity_matches_dependencies(&identity, &dependencies, &[]) {
+		let Some(mut dependencies) = dependencies(&elf, &dynamic) else { return None };
+		// A CONSUMER WITH NO `DT_NEEDED` EDGES MAY STILL DECLARE A SLOT, and that is the whole shape
+		// of this mechanism: it was built against a SET of candidates rather than against one of
+		// them, so it names none of them. Taking the static fast path for it would start it with an
+		// empty closure and no provider at all.
+		if dependencies.is_empty() && identity.slots.is_empty() {
+			if !identity_matches_dependencies(&identity, &dependencies, &[], &[]) {
 				return None;
 			}
 			let (process, thread) = spawn_prepared_in(bytes, bootstrap, 0)?;
@@ -698,7 +807,8 @@ fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_ident
 				return None;
 			}
 		}
-		if !identity_matches_dependencies(&identity, &dependencies, &resolver.modules) {
+		let Some(bound) = resolver.bind_slots(&identity, &mut dependencies, 0) else { return None };
+		if !identity_matches_dependencies(&identity, &dependencies, &resolver.modules, &bound) {
 			return None;
 		}
 		let Some(order) = resolver.order() else { return None };

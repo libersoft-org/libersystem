@@ -1,5 +1,6 @@
 use super::*;
 use crate::elf::{DT_HASH, DT_NEEDED, DT_NULL, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DynamicEntry, ET_DYN, PF_R, PT_DYNAMIC, PT_LOAD, ProgramHeader};
+use std::format;
 use std::string::{String, ToString};
 use std::vec;
 use std::vec::Vec;
@@ -160,9 +161,12 @@ fn record(providers: &[&str], overrides: &[(&str, &str)]) -> String {
 		("artifact".to_string(), "png".to_string()),
 		("package".to_string(), "png".to_string()),
 		("source-sha256".to_string(), "a".repeat(64)),
-		("rustc-commit".to_string(), "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf".to_string()),
 		("target".to_string(), "x86_64-unknown-none".to_string()),
 		("profile".to_string(), "release".to_string()),
+		// The language section, in the order the build writes it. The key line first, because a
+		// reader has to know what the lines under it mean before it reads them.
+		("language".to_string(), "rust".to_string()),
+		("rustc-commit".to_string(), "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf".to_string()),
 		("rustflags".to_string(), "-C relocation-model=pic".to_string()),
 		("features".to_string(), "-".to_string()),
 	];
@@ -259,20 +263,36 @@ fn every_retained_symbol_attribute_is_checked_and_names_itself() {
 #[test]
 fn every_required_identity_field_is_checked_and_names_itself() {
 	let installed = baseline();
-	for (field, value) in [
-		("kind", "executable"),
-		("artifact", "apng"),
-		("package", "apng"),
-		("rustc-commit", "0000000000000000000000000000000000000000"),
-		("target", "aarch64-unknown-none"),
-		("profile", "debug"),
-		("rustflags", "-C relocation-model=static"),
-		("features", "wide"),
-	] {
+	// THE COMMON SECTION, field by field: each is compared by NAME, so the refusal names it.
+	for (field, value) in [("kind", "executable"), ("artifact", "apng"), ("package", "apng"), ("target", "aarch64-unknown-none"), ("profile", "debug"), ("language", "foreign")] {
 		let candidate = library(&record(&["lsrt", "pix"], &[(field, value)]), &["lsrt.lslib", "pix.lslib"], &[Export::function("decode"), Export::function("encode")]);
 		let expected = Verdict::Incompatible(Reason::IdentityField { field, installed: Identity::read(&Elf::parse(&installed).unwrap()).unwrap().field(field).unwrap(), candidate: value });
 		assert_eq!(decide(&installed, &candidate), expected, "a changed {field} must decide the verdict and name itself");
 	}
+
+	// THE LANGUAGE SECTION, line by line: this rule does not know these field names, so the refusal
+	// carries the whole line and the position it differed at. The position is what says WHICH of a
+	// producer's lines moved when several of them look alike.
+	for (field, value, position) in [("rustc-commit", "0000000000000000000000000000000000000000", 1), ("rustflags", "-C relocation-model=static", 2), ("features", "wide", 3)] {
+		let candidate = library(&record(&["lsrt", "pix"], &[(field, value)]), &["lsrt.lslib", "pix.lslib"], &[Export::function("decode"), Export::function("encode")]);
+		let held = format!("{field}={}", Identity::read(&Elf::parse(&installed).unwrap()).unwrap().field(field).unwrap());
+		let offered = format!("{field}={value}");
+		let expected = Verdict::Incompatible(Reason::LanguageSection { position, installed: Some(&held), candidate: Some(&offered) });
+		assert_eq!(decide(&installed, &candidate), expected, "a changed {field} must decide the verdict and carry its line");
+	}
+}
+
+#[test]
+// A PRODUCER FIELD THIS RULE HAS NEVER HEARD OF STILL CANNOT MOVE. That is the whole reason the
+// language section is compared as text: the three Rust fields above were once named in
+// REQUIRED_FIELDS, and under that scheme a field added by any other producer - or a fourth Rust one
+// - would have changed freely under a compatible verdict.
+fn a_producer_field_this_rule_cannot_name_still_decides_the_verdict() {
+	let installed = library(&record(&["lsrt"], &[("language", "foreign")]), &["lsrt.lslib"], &[Export::function("decode")]);
+	let mut text = record(&["lsrt"], &[("language", "foreign")]);
+	text = text.replace("features=-\n", "features=-\nsysroot-sha256=beef\n");
+	let candidate = library(&text, &["lsrt.lslib"], &[Export::function("decode")]);
+	assert_eq!(decide(&installed, &candidate), Verdict::Incompatible(Reason::LanguageSection { position: 4, installed: None, candidate: Some("sysroot-sha256=beef") }));
 }
 
 #[test]
@@ -318,8 +338,12 @@ fn an_unreadable_or_unidentified_image_is_refused_rather_than_assumed() {
 	assert_eq!(decide(b"not an elf at all", &installed), Verdict::Incompatible(Reason::NotAnElf { installed: true }));
 	assert_eq!(decide(&installed, b"not an elf at all"), Verdict::Incompatible(Reason::NotAnElf { installed: false }));
 
-	let unknown = library(&record(&["lsrt", "pix"], &[("format", "liber-image-identity-v2")]), &["lsrt.lslib", "pix.lslib"], &[Export::function("decode"), Export::function("encode")]);
-	assert_eq!(decide(&unknown, &unknown), Verdict::Incompatible(Reason::UnknownIdentityFormat { format: "liber-image-identity-v2" }));
+	// A FORMAT THIS RULE DOES NOT UNDERSTAND, which is a version it has never seen rather than the
+	// one it was written for. This line named the CURRENT format for a while - a mechanical version
+	// bump replaced the unknown one along with every real occurrence - and the test then asserted
+	// that the format this rule implements is one it cannot read.
+	let unknown = library(&record(&["lsrt", "pix"], &[("format", "liber-image-identity-v3")]), &["lsrt.lslib", "pix.lslib"], &[Export::function("decode"), Export::function("encode")]);
+	assert_eq!(decide(&unknown, &unknown), Verdict::Incompatible(Reason::UnknownIdentityFormat { format: "liber-image-identity-v3" }));
 }
 
 #[test]

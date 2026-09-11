@@ -22,10 +22,17 @@ cd "$ROOT"
 
 usage() {
 	cat >&2 <<EOF
-usage: build-foreign-static.sh --arch ARCH [--out DIR]
+usage: build-foreign-static.sh --arch ARCH [--out DIR] [--sysroot WHICH]
 
-  --arch ARCH   x86_64 | aarch64 | riscv64
-  --out DIR     where the objects and the archive go (default: .build/foreign/ARCH)
+  --arch ARCH      x86_64 | aarch64 | riscv64
+  --out DIR        where the objects and the archive go (default: .build/foreign/ARCH)
+  --sysroot WHICH  bootstrap (default) | profile
+
+THE TWO SYSROOTS ARE NOT ALTERNATIVES AND THE DEFAULT IS NOT A PREFERENCE. The BOOTSTRAP one is what
+the archives in the static-target pin were built against, so reproducing those digests has to name
+it. The PROFILE one is sized by the inventory instead of by the option set, and building against it
+is how the trim is PROVED to have removed only surface nobody required: the objects are the same
+objects, or a declaration that was removed was one the configuration actually needed.
 
 Needs the pinned sources unpacked under .build/foreign/src-loader and .build/foreign/src-headers.
 The build FETCHES NOTHING: see docs/DEPENDENCY_POLICY.md.
@@ -35,6 +42,7 @@ EOF
 
 arch=""
 out=""
+sysroot="bootstrap"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--arch)
@@ -47,12 +55,33 @@ while [[ $# -gt 0 ]]; do
 		out="$2"
 		shift 2
 		;;
+	--sysroot)
+		[[ $# -ge 2 ]] || usage
+		sysroot="$2"
+		shift 2
+		;;
 	-h | --help) usage ;;
 	*) usage ;;
 	esac
 done
 [[ -n "$arch" ]] || usage
 out="${out:-$ROOT/.build/foreign/$arch}"
+
+case "$sysroot" in
+bootstrap)
+	include=("-isystem" "$ROOT/src/foreign/bootstrap-sysroot/include")
+	;;
+profile)
+	# THE TARGET HEADER IS FORCE-INCLUDED AND NOT LEFT TO A SOURCE TO INCLUDE. Its static assertions
+	# are the data model, and a model asserted in one translation unit describes one translation
+	# unit; this way every object carries the check.
+	include=("-isystem" "$ROOT/src/foreign/profile-sysroot/include" "-include" "$ROOT/src/foreign/profile-sysroot/arch/$arch.h")
+	;;
+*)
+	echo "build-foreign-static: unknown sysroot '$sysroot' - bootstrap or profile" >&2
+	exit 2
+	;;
+esac
 
 STORE="$ROOT/.build/foreign"
 LOADER="$STORE/src-loader"
@@ -105,7 +134,11 @@ defines=(
 	-DFALLBACK_CONFIG_DIRS='"/etc/xdg"'
 	-DFALLBACK_DATA_DIRS='"/usr/local/share:/usr/share"'
 	-DSYSCONFDIR='"/etc"'
-	-DLOADER_ENABLE_LINUX_SORT=0
+	# LOADER_ENABLE_LINUX_SORT IS NOT DEFINED AT ALL, and `=0` was wrong: the source guards it with
+	# `#if defined(...)`, so defining it to zero switched it ON. The inventory is what caught it - it
+	# named `linux_read_sorted_physical_devices` and `linux_sort_physical_device_groups`, which live
+	# in `loader_linux.c`, a source this configuration does not compile. A candidate surface holding
+	# two symbols no object can ever provide is the inventory describing a build nobody made.
 )
 
 sources=(
@@ -122,7 +155,7 @@ for name in "${sources[@]}"; do
 		--target="$target" \
 		-ffreestanding -nostdlibinc -fPIC -O2 \
 		"${abi[@]}" "${defines[@]}" \
-		-isystem "$ROOT/src/foreign/bootstrap-sysroot/include" \
+		"${include[@]}" \
 		-I "$LOADER/loader" -I "$LOADER/loader/generated" -I "$HEADERS/include" \
 		-c "$LOADER/loader/$name.c" -o "$object"
 	objects+=("$object")
@@ -134,5 +167,5 @@ rm -f "$archive"
 # archives of identical objects differ, and "builds reproducibly" becomes unprovable.
 llvm-ar crsD "$archive" "${objects[@]}"
 
-echo "build-foreign-static: $arch: ${#objects[@]} object(s) -> $archive"
+echo "build-foreign-static: $arch: ${#objects[@]} object(s), $sysroot sysroot -> $archive"
 echo "build-foreign-static: $arch: $(sha256sum "$archive" | cut -d' ' -f1)"

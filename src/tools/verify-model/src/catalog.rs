@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 102] = [
+const GATES: [(&str, &str); 104] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -509,6 +509,8 @@ const GATES: [(&str, &str); 102] = [
 	// or edits a cross file need touch no crate the selector knows about.
 	("dependency-policy", "harness.tools"),
 	("foreign-pin", "harness.tools"),
+	("foreign-facilities", "harness.tools"),
+	("profile-sysroot", "harness.tools"),
 	// Every LSIDL interface a manifest role names must be one LSIDL
 	// defines. Its subject is the manifest and the IDL, neither of which is a crate, and it reads
 	// declarations rather than generated bindings - so it takes the always-selected label for the

@@ -13,8 +13,12 @@ include path instead of through the symbol list, one declaration at a time, and 
 lives in; whether the substrate will PROVIDE it is decided later, by the derived inventory, and a
 declaration here is not a promise that it will.
 
-THE PROFILE SYSROOT IS A DIFFERENT THING AND COMES LATER. That one is sized by what the inventory
-names. This one exists so the inventory can be measured at all.
+THE PROFILE SYSROOT IS A DIFFERENT THING AND IT EXISTS NOW, in `src/foreign/profile-sysroot`. That
+one is sized by what the inventory NAMES, so a function it does not declare is one the substrate has
+no symbol for and a source calling it fails to compile. This one exists so the inventory could be
+measured at all, and the two are not alternatives: the archives in the static-target pin were built
+against THIS sysroot, and they reproduce bit for bit against that one - which is what proves the
+forty-three declarations the profile sysroot dropped were surface nobody required.
 
 THE COMPILER'S OWN FREESTANDING HEADERS ARE NOT DUPLICATED HERE. `stddef.h`, `stdint.h`, `stdarg.h`,
 `float.h`, `limits.h` and `stdbool.h` describe the TARGET and come from clang; a second copy in this

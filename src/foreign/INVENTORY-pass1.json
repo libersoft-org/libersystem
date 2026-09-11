@@ -22,8 +22,6 @@
 			"geteuid",
 			"getgid",
 			"getuid",
-			"linux_read_sorted_physical_devices",
-			"linux_sort_physical_device_groups",
 			"loader_platform_close_library",
 			"loader_platform_executable_path",
 			"loader_platform_file_exists",
@@ -77,7 +75,7 @@
 	},
 	"aarch64": {
 		"archive": ".build/foreign/aarch64/libvulkan.a",
-		"archive_sha256": "df4912ed7a9d682ea3f18ceb80256b8d99b4579993155bb95aea9f37f9df2e78",
+		"archive_sha256": "2b1efc7ace666e0355b32ef74f765496db24a1307c7d79db93e3ef8e3e422a29",
 		"classified": {
 			"compiler_runtime": [
 				"memcmp",
@@ -115,8 +113,6 @@
 				"geteuid",
 				"getgid",
 				"getuid",
-				"linux_read_sorted_physical_devices",
-				"linux_sort_physical_device_groups",
 				"loader_platform_close_library",
 				"loader_platform_executable_path",
 				"loader_platform_file_exists",
@@ -152,13 +148,13 @@
 				"vsnprintf"
 			]
 		},
-		"defined_count": 1173,
+		"defined_count": 1172,
 		"relocation_forms": {
 			"R_AARCH64_ABS64": 132,
-			"R_AARCH64_ADD_ABS_LO12_NC": 4166,
+			"R_AARCH64_ADD_ABS_LO12_NC": 4159,
 			"R_AARCH64_ADR_GOT_PAGE": 944,
-			"R_AARCH64_ADR_PREL_PG_HI21": 4169,
-			"R_AARCH64_CALL26": 5151,
+			"R_AARCH64_ADR_PREL_PG_HI21": 4162,
+			"R_AARCH64_CALL26": 5135,
 			"R_AARCH64_JUMP26": 84,
 			"R_AARCH64_LD64_GOT_LO12_NC": 944,
 			"R_AARCH64_LDST64_ABS_LO12_NC": 3
@@ -261,14 +257,6 @@
 				"binding": "GLOBAL",
 				"type": "NOTYPE"
 			},
-			"linux_read_sorted_physical_devices": {
-				"binding": "GLOBAL",
-				"type": "NOTYPE"
-			},
-			"linux_sort_physical_device_groups": {
-				"binding": "GLOBAL",
-				"type": "NOTYPE"
-			},
 			"loader_platform_close_library": {
 				"binding": "GLOBAL",
 				"type": "NOTYPE"
@@ -418,11 +406,11 @@
 				"type": "NOTYPE"
 			}
 		},
-		"undefined_count": 60
+		"undefined_count": 58
 	},
 	"riscv64": {
 		"archive": ".build/foreign/riscv64/libvulkan.a",
-		"archive_sha256": "9ecb584294088639d9e86e64f660c3c03350f0bdda200f45dde1d58d3322692c",
+		"archive_sha256": "4c7c9cb0b8ac9f5b77ab311b6db4d36787a1bd74fd5413c501ad9c54ee8ab3c9",
 		"classified": {
 			"compiler_runtime": [
 				"memcmp",
@@ -460,8 +448,6 @@
 				"geteuid",
 				"getgid",
 				"getuid",
-				"linux_read_sorted_physical_devices",
-				"linux_sort_physical_device_groups",
 				"loader_platform_close_library",
 				"loader_platform_executable_path",
 				"loader_platform_file_exists",
@@ -497,19 +483,19 @@
 				"vsnprintf"
 			]
 		},
-		"defined_count": 1173,
+		"defined_count": 1172,
 		"relocation_forms": {
 			"R_RISCV_64": 132,
 			"R_RISCV_ADD32": 375,
-			"R_RISCV_BRANCH": 2943,
-			"R_RISCV_CALL_PLT": 5274,
+			"R_RISCV_BRANCH": 2925,
+			"R_RISCV_CALL_PLT": 5258,
 			"R_RISCV_GOT_HI20": 945,
 			"R_RISCV_JAL": 2367,
-			"R_RISCV_PCREL_HI20": 4949,
-			"R_RISCV_PCREL_LO12_I": 5894,
-			"R_RISCV_RELAX": 16117,
-			"R_RISCV_RVC_BRANCH": 5083,
-			"R_RISCV_RVC_JUMP": 2017,
+			"R_RISCV_PCREL_HI20": 4943,
+			"R_RISCV_PCREL_LO12_I": 5888,
+			"R_RISCV_RELAX": 16089,
+			"R_RISCV_RVC_BRANCH": 5077,
+			"R_RISCV_RVC_JUMP": 2013,
 			"R_RISCV_SUB32": 375
 		},
 		"static_initialisers": {
@@ -610,14 +596,6 @@
 				"binding": "GLOBAL",
 				"type": "NOTYPE"
 			},
-			"linux_read_sorted_physical_devices": {
-				"binding": "GLOBAL",
-				"type": "NOTYPE"
-			},
-			"linux_sort_physical_device_groups": {
-				"binding": "GLOBAL",
-				"type": "NOTYPE"
-			},
 			"loader_platform_close_library": {
 				"binding": "GLOBAL",
 				"type": "NOTYPE"
@@ -767,11 +745,11 @@
 				"type": "NOTYPE"
 			}
 		},
-		"undefined_count": 60
+		"undefined_count": 58
 	},
 	"x86_64": {
 		"archive": ".build/foreign/x86_64/libvulkan.a",
-		"archive_sha256": "d88098c03d65ecfb1fe5590de27c3ff7876b66363a1dbe2d35795dc65ad53a39",
+		"archive_sha256": "e8f22a8db18f1e40a1363c1aeb3094341b49839171c5f23b4abffb7d769d83e4",
 		"classified": {
 			"compiler_runtime": [
 				"memcmp",
@@ -809,8 +787,6 @@
 				"geteuid",
 				"getgid",
 				"getuid",
-				"linux_read_sorted_physical_devices",
-				"linux_sort_physical_device_groups",
 				"loader_platform_close_library",
 				"loader_platform_executable_path",
 				"loader_platform_file_exists",
@@ -846,12 +822,12 @@
 				"vsnprintf"
 			]
 		},
-		"defined_count": 1173,
+		"defined_count": 1172,
 		"relocation_forms": {
 			"R_X86_64_64": 132,
 			"R_X86_64_GOTPCREL": 1,
-			"R_X86_64_PC32": 4575,
-			"R_X86_64_PLT32": 5241,
+			"R_X86_64_PC32": 4568,
+			"R_X86_64_PLT32": 5225,
 			"R_X86_64_REX_GOTPCRELX": 952
 		},
 		"static_initialisers": {
@@ -952,14 +928,6 @@
 				"binding": "GLOBAL",
 				"type": "NOTYPE"
 			},
-			"linux_read_sorted_physical_devices": {
-				"binding": "GLOBAL",
-				"type": "NOTYPE"
-			},
-			"linux_sort_physical_device_groups": {
-				"binding": "GLOBAL",
-				"type": "NOTYPE"
-			},
 			"loader_platform_close_library": {
 				"binding": "GLOBAL",
 				"type": "NOTYPE"
@@ -1109,6 +1077,6 @@
 				"type": "NOTYPE"
 			}
 		},
-		"undefined_count": 60
+		"undefined_count": 58
 	}
 }

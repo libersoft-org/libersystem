@@ -1,0 +1,212 @@
+//! Selection slots: a declared provider position a consumer was built against without naming one.
+//!
+//! WHY A CONSUMER WOULD HAVE ONE. Some providers are interchangeable - a graphics driver is the case
+//! this exists for - and a consumer built against a SET of them names none of them, because there is
+//! no `DT_NEEDED` edge to name. Its identity record therefore has to say which set it accepts, or
+//! the launch has nothing to check a chosen provider against.
+//!
+//! THE SET IS CLOSED AND SIGNED, AND THAT IS THE WHOLE SECURITY ARGUMENT. The slot carries every
+//! candidate by NAME and by DIGEST, inside the record the launch already authenticates. So binding
+//! one is not an append to that record - the provider was named in it, by digest, before the launch -
+//! and the exact-equality check the loader performs keeps the meaning it always had. What an operator
+//! or a registry may do is NARROW the choice; what nothing can do is widen it.
+//!
+//! NAME AND DIGEST TOGETHER. A set of bare digests would leave the launch with nothing to look a
+//! provider up BY: it would have to enumerate everything staged and match on content, which is a scan
+//! of the image at every launch and a different authority from the one this mechanism is for.
+//! Carrying the name makes resolution an ordinary lookup, and carrying the digest beside it means a
+//! provider staged under an admitted name whose bytes are not the admitted ones is refused.
+//!
+//! THESE ARE HERE AND NOT IN THE SERVICE for the reason this crate exists: `services` builds against
+//! the freestanding runtime and cannot run a host test, and a launch-path rule with no test is a rule
+//! the next change does not know it broke.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// The most slots one consumer may declare.
+///
+/// A CONSUMER WITH MANY SELECTABLE PROVIDERS is one whose closure is decided at launch rather than at
+/// build, which is what this mechanism is bounded to avoid.
+pub const MAX_SLOTS: usize = 4;
+
+/// The most candidates one slot may admit. The set is closed and signed, so its size is a property of
+/// the consumer's build; the bound keeps a malformed record from making the launch path walk a list
+/// somebody else chose the length of.
+pub const MAX_CANDIDATES: usize = 16;
+
+/// One declared slot.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Slot {
+	/// What kind of provider may occupy it. `vulkan-icd` is the first and currently the only one.
+	pub kind: String,
+	/// The candidates this consumer accepts, in its own preference order.
+	pub admitted: Vec<(String, [u8; 32])>,
+}
+
+/// Why a slot line was refused. Each is a different malformation, and collapsing them would leave
+/// whoever hits one guessing which part of the record to look at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refusal {
+	/// No `kind:` separator at all.
+	NoKind,
+	/// A kind that is not spelled like one.
+	BadKind,
+	/// A candidate with no `name=digest` separator.
+	NoDigest,
+	/// A name that is not a library name.
+	BadName,
+	/// A digest that is not sixty-four hex characters.
+	BadDigest,
+	/// The same name twice: "which bytes does this consumer accept under that name" would have two
+	/// answers.
+	DuplicateName,
+	/// A slot that admits nothing can never be filled, so the consumer can never start. Refused when
+	/// the record is READ, which names the record as the fault rather than the launch.
+	EmptySet,
+	/// More candidates than one slot may hold.
+	TooManyCandidates,
+}
+
+fn hex(byte: u8) -> Option<u8> {
+	match byte {
+		b'0'..=b'9' => Some(byte - b'0'),
+		b'a'..=b'f' => Some(byte - b'a' + 10),
+		b'A'..=b'F' => Some(byte - b'A' + 10),
+		_ => None,
+	}
+}
+
+/// Sixty-four hex characters, as thirty-two bytes.
+pub fn parse_digest(bytes: &[u8]) -> Option<[u8; 32]> {
+	if bytes.len() != 64 {
+		return None;
+	}
+	let mut digest = [0u8; 32];
+	for (index, pair) in bytes.chunks_exact(2).enumerate() {
+		digest[index] = (hex(pair[0])? << 4) | hex(pair[1])?;
+	}
+	Some(digest)
+}
+
+/// A slot kind is lower-case, digits and hyphens, and is not empty.
+pub fn valid_kind(kind: &str) -> bool {
+	!kind.is_empty() && kind.len() <= 32 && kind.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// Parse the value of one `selection=` line: `KIND:NAME=DIGEST,NAME=DIGEST,...`.
+pub fn parse_slot(value: &[u8], valid_name: impl Fn(&str) -> bool) -> Result<Slot, Refusal> {
+	let Some(separator) = value.iter().position(|byte| *byte == b':') else {
+		return Err(Refusal::NoKind);
+	};
+	let Ok(kind) = core::str::from_utf8(&value[..separator]) else {
+		return Err(Refusal::BadKind);
+	};
+	if !valid_kind(kind) {
+		return Err(Refusal::BadKind);
+	}
+	let mut admitted: Vec<(String, [u8; 32])> = Vec::new();
+	for candidate in value[separator + 1..].split(|byte| *byte == b',') {
+		if admitted.len() >= MAX_CANDIDATES {
+			return Err(Refusal::TooManyCandidates);
+		}
+		let Some(equals) = candidate.iter().position(|byte| *byte == b'=') else {
+			return Err(Refusal::NoDigest);
+		};
+		let Ok(name) = core::str::from_utf8(&candidate[..equals]) else {
+			return Err(Refusal::BadName);
+		};
+		if !valid_name(name) {
+			return Err(Refusal::BadName);
+		}
+		let Some(digest) = parse_digest(&candidate[equals + 1..]) else {
+			return Err(Refusal::BadDigest);
+		};
+		if admitted.iter().any(|(held, _)| held.as_str() == name) {
+			return Err(Refusal::DuplicateName);
+		}
+		admitted.push((String::from(name), digest));
+	}
+	if admitted.is_empty() {
+		return Err(Refusal::EmptySet);
+	}
+	Ok(Slot { kind: String::from(kind), admitted })
+}
+
+/// Which candidate a slot binds to, given what is staged.
+///
+/// THE FIRST ADMITTED CANDIDATE THAT IS STAGED AND HAS THE ADMITTED BYTES WINS, and the order is the
+/// consumer's own - part of the signed record - so "which one runs" is a decision the consumer made
+/// at build time.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Binding {
+	/// Bind this name.
+	Bind(String),
+	/// A candidate is staged under an admitted name and its bytes are NOT the admitted ones.
+	///
+	/// REFUSED RATHER THAN SKIPPED, and the difference matters: moving on to the next name would let
+	/// a REPLACED provider hide behind it, which is precisely the substitution the digest is in the
+	/// record to prevent.
+	Replaced { name: String },
+	/// This name is already a `DT_NEEDED` dependency. Binding it into a slot as well would have one
+	/// provider accounted for twice; saying so names the record as the fault rather than the count.
+	AlreadyADependency { name: String },
+	/// No admitted candidate is staged. The launch is refused: a consumer that declared a slot cannot
+	/// run without one, and starting it to fail later would leave a process alive that cannot do what
+	/// it was started for.
+	Unfilled,
+}
+
+/// Decide a slot against what is staged.
+///
+/// `staged` answers "is this name staged, and with what digest" - the caller's lookup, because only
+/// it can reach the image.
+pub fn bind(slot: &Slot, dependencies: &[String], staged: impl Fn(&str) -> Option<[u8; 32]>) -> Binding {
+	for (name, digest) in &slot.admitted {
+		if dependencies.iter().any(|held| held.as_str() == name.as_str()) {
+			return Binding::AlreadyADependency { name: name.clone() };
+		}
+		let Some(actual) = staged(name) else {
+			continue;
+		};
+		if actual != *digest {
+			return Binding::Replaced { name: name.clone() };
+		}
+		return Binding::Bind(name.clone());
+	}
+	Binding::Unfilled
+}
+
+/// Does the record account for exactly this dependency set?
+///
+/// EXACT EQUALITY, AND THE SLOTS DO NOT WEAKEN IT. Every dependency is either a named provider whose
+/// digest matches what is staged, or a bound slot - and each slot is consumed exactly once, so two
+/// dependencies cannot both claim one declared position.
+pub fn accounts_for(providers: &[(String, [u8; 32])], bound: &[(String, usize)], dependencies: &[(String, [u8; 32])]) -> bool {
+	if providers.len() + bound.len() != dependencies.len() {
+		return false;
+	}
+	let mut consumed = [false; MAX_SLOTS];
+	for (dependency, baseline) in dependencies {
+		if let Some((_, slot)) = bound.iter().find(|(held, _)| held == dependency) {
+			if *slot >= MAX_SLOTS || consumed[*slot] {
+				return false;
+			}
+			consumed[*slot] = true;
+			continue;
+		}
+		let Some(name) = dependency.strip_suffix(".lslib") else {
+			return false;
+		};
+		let Some((_, digest)) = providers.iter().find(|(provider, _)| provider.as_str() == name) else {
+			return false;
+		};
+		if digest != baseline {
+			return false;
+		}
+	}
+	true
+}
+
+#[cfg(test)]
+mod tests;

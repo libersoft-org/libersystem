@@ -40,18 +40,25 @@ target_name = "libvulkan.a"
 # The build reads the option set rather than restating it, and archives deterministically - without
 # `llvm-ar`'s `D` modifier two archives of identical objects differ and "reproducibly" is unprovable.
 path = "src/tools/build-foreign-static.sh"
-sha256 = "33e06330dbddc3c4c47b8f09458d51b168fd57319d25ec50dc0c704f8063a076"
+sha256 = "7da5ba6d9d5803f5471eaa15aa091c22999af066b73aeed979ab72850df059e3"
 option_deltas = "none beyond the bootstrap option set; the target is built from the loader's own sources under it"
+# THE BUILDER TAKES A SYSROOT AND THE ARCHIVES DO NOT DEPEND ON WHICH (2026-09-11). The profile
+# sysroot is sized by the inventory rather than by the option set, so building against it is how the
+# trim is PROVED to have removed only surface nobody required: all three archives below reproduce
+# under both sysroots, digest for digest. The digest above moved because the option was added; the
+# archives did not move at all, which is the finding.
+sysroots = ["bootstrap", "profile"]
 
 [archives]
 # THE THREE PER-TARGET ARCHIVE RESULTS: evidence the deliverable is done rather than attempted. Each
 # was built twice from a clean output directory and produced the same digest.
-x86_64 = { sha256 = "d88098c03d65ecfb1fe5590de27c3ff7876b66363a1dbe2d35795dc65ad53a39", objects = 14, reproduced = true }
-aarch64 = { sha256 = "df4912ed7a9d682ea3f18ceb80256b8d99b4579993155bb95aea9f37f9df2e78", objects = 14, reproduced = true }
-riscv64 = { sha256 = "9ecb584294088639d9e86e64f660c3c03350f0bdda200f45dde1d58d3322692c", objects = 14, reproduced = true }
+x86_64 = { sha256 = "e8f22a8db18f1e40a1363c1aeb3094341b49839171c5f23b4abffb7d769d83e4", objects = 14, reproduced = true }
+aarch64 = { sha256 = "2b1efc7ace666e0355b32ef74f765496db24a1307c7d79db93e3ef8e3e422a29", objects = 14, reproduced = true }
+riscv64 = { sha256 = "4c7c9cb0b8ac9f5b77ab311b6db4d36787a1bd74fd5413c501ad9c54ee8ab3c9", objects = 14, reproduced = true }
 
 [diagnostics]
 # THE BUILD DIAGNOSTICS THAT PRODUCED THEM. Clean on all three: no errors and no warnings escalated,
 # with BUILD_WERROR off as the bootstrap option set freezes it.
 errors = 0
+note_linux_sort = "REFROZEN 2026-09-11: the option set says the Linux physical-device sort is off, and the first freeze passed -DLOADER_ENABLE_LINUX_SORT=0 - which the source guards with `#if defined(...)`, so zero switched it ON. Pass 1's inventory is what caught it, by naming two symbols from a source this configuration does not compile. The define is gone and the archives are the ones without it."
 note = "aarch64 initially failed because this milestone's own cross file declared -mgeneral-regs-only, which is a SECOND description of an ABI the Rust half already fixes; the Rust target reports target_feature=\"neon\", and the pinned sources use double. Corrected in the cross file and here."

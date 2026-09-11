@@ -170,6 +170,14 @@ declare -A GATES=(
 	# edited after the freeze changes the ABI every later measurement was taken under, silently -
 	# and the inventory would then describe a compile nobody can reproduce.
 	["foreign-pin"]="tools/check-foreign-pin.sh"
+	# The foreign ABI facilities are EXACTLY what the derived inventory names. "Do not grow a general
+	# POSIX layer" is a rule about a direction of travel and every step along it looks reasonable;
+	# it holds only if adding a symbol the inventory does not name fails.
+	["foreign-facilities"]="tools/check-foreign-facilities.sh"
+	# The profile sysroot declares exactly what the substrate provides - the inverse of the bootstrap
+	# sysroot's rule, which is sized by the option set. An inversion nobody checks decays back into
+	# what it inverted, one declaration at a time, and the link failure arrives weeks later.
+	["profile-sysroot"]="tools/check-profile-sysroot.sh"
 	["source-hygiene"]="tools/check-source-hygiene.sh --current"
 	["source-history-hygiene"]="tools/check-source-hygiene.sh --history"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"

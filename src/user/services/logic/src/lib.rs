@@ -32,6 +32,7 @@ pub mod ipv6_solicit;
 pub mod ipv6_timers;
 pub mod net_profile;
 pub mod open_sequence;
+pub mod selection;
 pub mod service_lifecycle;
 pub mod shell_language;
 pub mod sntp;

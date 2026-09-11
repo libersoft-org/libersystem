@@ -47,6 +47,14 @@ owner = "kernel"
 path = "kernel"
 
 [[sources]]
+owner = "foreign-abi"
+path = "user/libs/foreign/abi"
+
+[[sources]]
+owner = "foreign-discovery"
+path = "user/libs/foreign/discovery"
+
+[[sources]]
 owner = "service-logic"
 path = "user/services/logic"
 
