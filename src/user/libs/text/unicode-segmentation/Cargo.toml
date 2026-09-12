@@ -1,0 +1,13 @@
+[package]
+name = "unicode-segmentation"
+edition = "2024"
+description = "Grapheme cluster, word and line break boundaries, over the generated Unicode tables"
+
+[dependencies]
+# THE GENERATED TABLES, and nothing else. The rules below are written in terms of the properties the
+# UCD defines, so the one dependency is the thing that says what those properties are - and it has no
+# dependencies of its own, which is what keeps this linkable by a shaper and testable on a host.
+unicode-tables = { path = "../unicode-tables" }
+
+[lints.rust]
+warnings = "deny"

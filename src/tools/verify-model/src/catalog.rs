@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 113] = [
+const GATES: [(&str, &str); 115] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -540,6 +540,15 @@ const GATES: [(&str, &str); 113] = [
 	// have, and a selection narrowed to one crate would skip exactly that change. Always selected for
 	// the same reason `dependency-policy` is, and it costs seconds on the host.
 	("graphics-profile", "harness.tools"),
+	// The OpenType profile: the closed list of what a font may contain and this system will read.
+	// It reads the profile crate and the generated document beside it and nothing else, so it costs
+	// seconds; always selected for the same reason the graphics one is - the thing it guards against
+	// is a list growing somewhere a narrowed selection would not look.
+	("opentype-profile", "harness.tools"),
+	// Unicode segmentation against the normative conformance files. It reads the generated tables,
+	// the algorithms over them and the pinned UCD in the cache - never the network - so it costs
+	// seconds and belongs to the harness like every other source-reading gate.
+	("unicode-segmentation", "harness.tools"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:

@@ -199,6 +199,24 @@ path = "user/libs/graphics/profile"
 owner = "font-contract"
 path = "user/libs/text/font-contract"
 
+# THE OPENTYPE PROFILE, which stages nothing either: the closed list of what a font may contain and
+# this system will read. The parser it bounds is not written yet, which is the point - its
+# publication is that parser's start gate.
+[[sources]]
+owner = "opentype-profile"
+path = "user/libs/text/opentype-profile"
+
+# THE UNICODE TABLES AND THE ALGORITHMS OVER THEM. Generated from the release `toolchain.lock` pins
+# by SHA-256, and measured against Unicode's own conformance files; neither stages anything yet,
+# because the shaping stack that will read them is not written.
+[[sources]]
+owner = "unicode-tables"
+path = "user/libs/text/unicode-tables"
+
+[[sources]]
+owner = "unicode-segmentation"
+path = "user/libs/text/unicode-segmentation"
+
 # THE FONT CATALOGUE'S PROTOCOL. Generated from `idl/font.lsidl` like every other package. It has no
 # consumer yet - the catalogue service it describes is not built - so it carries a source row and no
 # library row: a package that is generated and checked but staged nowhere.
@@ -1110,7 +1128,14 @@ linkage = "dynamic"
 stage = "volume"
 destination = "libexec/icdcheck.lsexe"
 providers = ["lsrt"]
-selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+selection = [
+	{ kind = "vulkan-icd", symbols = [
+		"vk_icdNegotiateLoaderICDInterfaceVersion",
+		"vk_icdGetInstanceProcAddr",
+	], candidates = [
+		"icdprobe",
+	] },
+]
 
 # The consumer half. It carries its own constructor and destructor, reads the record the provider's
 # constructor left, and prints what it finds - which is the only way any of this is observable.
@@ -1145,7 +1170,14 @@ destination = "libexec/abiprobe.lsexe"
 providers = ["lsrt"]
 producer = "audit"
 development = true
-selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+selection = [
+	{ kind = "vulkan-icd", symbols = [
+		"vk_icdNegotiateLoaderICDInterfaceVersion",
+		"vk_icdGetInstanceProcAddr",
+	], candidates = [
+		"icdprobe",
+	] },
+]
 
 [[programs]]
 name = "vkprobe"
@@ -1160,7 +1192,14 @@ producer = "audit"
 # travels with a binary has to travel INSIDE it, which is why the identity record carries it too.
 licence = "Apache-2.0"
 development = true
-selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+selection = [
+	{ kind = "vulkan-icd", symbols = [
+		"vk_icdNegotiateLoaderICDInterfaceVersion",
+		"vk_icdGetInstanceProcAddr",
+	], candidates = [
+		"icdprobe",
+	] },
+]
 
 [[programs]]
 name = "readln"

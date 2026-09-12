@@ -22,3 +22,135 @@ cache = ".build/tools/tla2tools.jar"
 # demanded because a model checker's answer does not depend on which one ran it.
 java_min_major = 11
 java_measured = "25.0.4.1"
+
+# ------------------------------------------------------------------ the Unicode Character Database
+#
+# THE TABLES ARE GENERATED FROM THESE AND NOT WRITTEN BY HAND, which is what the text milestone
+# requires and what a hand-written range list cannot be: a property table copied out of a document is
+# a snapshot nobody can re-derive, and the first correction to it is a patch rather than a
+# regeneration. `src/tools/ucd-gen` reads the files below out of the cache and writes
+# `user/libs/text/unicode-tables/src/generated.rs`; the gate regenerates and compares.
+#
+# THE VERSION IS PART OF THE PIN. Segmentation changes between Unicode versions - a break that moves
+# is a boundary a user sees move - so the tables state which version they came from and every file
+# here is from that one release. Mixing two releases is the failure this block exists to prevent.
+#
+# LICENCE: the UCD is published under the Unicode License v3, which is permissive in the sense
+# `docs/DEPENDENCY_POLICY.md` requires: use, modification and redistribution in source and binary
+# form, with the notice kept. The GENERATED tables carry that notice and name the version they came
+# from; the files themselves are fetched rather than vendored, which is what the cache is for.
+
+[ucd_grapheme_break]
+purpose = "UAX #29 grapheme cluster break property"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakProperty.txt"
+sha256 = "d6b51d1d2ae5c33b451b7ed994b48f1f4dc62b2272a5831e7fd418514a6bae89"
+cache = ".build/ucd/17.0.0/GraphemeBreakProperty.txt"
+[ucd_word_break]
+purpose = "UAX #29 word break property"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/WordBreakProperty.txt"
+sha256 = "72274cac1e6b919507db35655c3e175aa27274668a1ece95c28d2069f2ad9852"
+cache = ".build/ucd/17.0.0/WordBreakProperty.txt"
+[ucd_line_break]
+purpose = "UAX #14 line break class"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/LineBreak.txt"
+sha256 = "e6a18fa91f8f6a6f8e534b1d3f128c21ada45bfe152eb6b1bcc5e15fd8ac92e6"
+cache = ".build/ucd/17.0.0/LineBreak.txt"
+[ucd_emoji_data]
+purpose = "UTS #51 Extended_Pictographic, which GB11 is written in terms of"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-data.txt"
+sha256 = "2cb2bb9455cda83e8481541ecf5b6dfda66a3bb89efa3fa7c5297eccf607b72b"
+cache = ".build/ucd/17.0.0/emoji-data.txt"
+[ucd_indic_syllabic]
+purpose = "the syllable categories Indic reordering is written in terms of"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/IndicSyllabicCategory.txt"
+sha256 = "3fc122f4cf58b0c19268d5f810263b04ab4e1e67743386ec0e0ada9c76aec5be"
+cache = ".build/ucd/17.0.0/IndicSyllabicCategory.txt"
+[ucd_indic_positional]
+purpose = "where a matra sits relative to its base"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/IndicPositionalCategory.txt"
+sha256 = "68cedc29a7e57f984d90fe2c7712f2e6d0c717e253db219607daea8997d6c480"
+cache = ".build/ucd/17.0.0/IndicPositionalCategory.txt"
+[ucd_arabic_shaping]
+purpose = "joining type and joining group, which cursive shaping needs before any lookup runs"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/ArabicShaping.txt"
+sha256 = "39afa01e680e27d0fd10b67a9b27be13fbaa3d0efecfb5be45991de9a0d267d0"
+cache = ".build/ucd/17.0.0/ArabicShaping.txt"
+[ucd_scripts]
+purpose = "the script of a character, which selects the shaper and the GSUB/GPOS script table"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/Scripts.txt"
+sha256 = "9f5e50d3abaee7d6ce09480f325c706f485ae3240912527e651954d2d6b035bf"
+cache = ".build/ucd/17.0.0/Scripts.txt"
+[ucd_general_category]
+purpose = "the general category, which mark handling and default ignorables are written in terms of"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt"
+sha256 = "d62e5bab70ca74f099343f71224fa051cb1fdd61a1ab45c0488c44cfc0b6102e"
+cache = ".build/ucd/17.0.0/DerivedGeneralCategory.txt"
+[ucd_east_asian_width]
+purpose = "East_Asian_Width, which LB30 turns on - a bracket beside a wide character breaks where one beside a narrow character does not"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/EastAsianWidth.txt"
+sha256 = "ea7ce50f3444a050333448dffef1cadd9325af55cbb764b4a2280faf52170a33"
+cache = ".build/ucd/17.0.0/EastAsianWidth.txt"
+
+[ucd_derived_core]
+purpose = "Indic_Conjunct_Break, which GB9c is written in terms of - grapheme clustering is wrong without it from Unicode 15.1 onward"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt"
+sha256 = "24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da22c08"
+cache = ".build/ucd/17.0.0/DerivedCoreProperties.txt"
+
+[ucd_bidi_class]
+purpose = "Bidi_Class, which the bidirectional algorithm is written in terms of - half a BiDi implementation renders Arabic and Hebrew that looks plausible and is wrong"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedBidiClass.txt"
+sha256 = "4867b4b7f0731ed1bfcd34cc6251211ff1542541fce0734b6fbda139ee80b3a4"
+cache = ".build/ucd/17.0.0/DerivedBidiClass.txt"
+
+[ucd_bidi_brackets]
+purpose = "the paired brackets rule N0 reads: which brackets pair, and which are canonically equivalent to which"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/BidiBrackets.txt"
+sha256 = "dadbaf38a0d0246e5b805bf8725cb81b7c621f93d030595635f5ba2c2f179428"
+cache = ".build/ucd/17.0.0/BidiBrackets.txt"
+
+[ucd_bidi_test]
+purpose = "the NORMATIVE bidi conformance file, by class sequence - every ordering the algorithm must produce"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/BidiTest.txt"
+sha256 = "888bdfc8090652272d1f859cdb00ae659e2dc6c26740be61ef1d03998a687620"
+cache = ".build/ucd/17.0.0/BidiTest.txt"
+
+[ucd_bidi_character_test]
+purpose = "the NORMATIVE bidi conformance file, by actual code points - the half that exercises the paired brackets"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/BidiCharacterTest.txt"
+sha256 = "a3e6e905ab5afbe318a96df5401d0372a04cd73ef139ab5e3cf0ae241c255488"
+cache = ".build/ucd/17.0.0/BidiCharacterTest.txt"
+
+[ucd_grapheme_break_test]
+purpose = "the NORMATIVE grapheme cluster conformance file"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/GraphemeBreakTest.txt"
+sha256 = "e2d134d2c52919bace503ebb6a551c1855fe1a1faec18478c78fff254a1793ec"
+cache = ".build/ucd/17.0.0/GraphemeBreakTest.txt"
+[ucd_word_break_test]
+purpose = "the NORMATIVE word boundary conformance file"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/WordBreakTest.txt"
+sha256 = "1de23a75f37904abc7d206239ee8d34f8fdf0fb4ab32a7174dfbabbde25419b2"
+cache = ".build/ucd/17.0.0/WordBreakTest.txt"
+[ucd_line_break_test]
+purpose = "the NORMATIVE line break conformance file"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/auxiliary/LineBreakTest.txt"
+sha256 = "e69884e0dde6a8724873f885d68c52dc14518abf9ae4ca9e2283b8773db3b752"
+cache = ".build/ucd/17.0.0/LineBreakTest.txt"

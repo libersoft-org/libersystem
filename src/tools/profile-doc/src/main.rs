@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use graphics_profile::capability::{Coverage, Range};
 use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MINIMA, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS};
 
+mod opentype;
 mod scan;
 mod selftest;
 
@@ -402,6 +403,45 @@ fn main() -> std::process::ExitCode {
 		}
 	}
 
+	// THE OPENTYPE PROFILE, which is a document rather than a checklist: there is no backend handler
+	// for `HVAR`, so it has the generation and the hash and none of the coverage checks. Its own
+	// fixtures are what hold the list closed, and the gate runs them.
+	{
+		let canonical = opentype::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		let directory = root.join("docs/gen/opentype");
+		for (path, contents) in [(directory.join("profile-1.canonical"), canonical.clone()), (directory.join("profile-1.md"), opentype::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the profile", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("opentype: {} tables, {} exclusions, {} scripts and {} languages, hashed", opentype_profile::tables::TABLES.len(), opentype_profile::tables::EXCLUDED.len(), opentype_profile::scripts::SCRIPTS.len(), opentype_profile::scripts::LANGUAGES.len());
+		}
+	}
+
 	if !ok {
 		if check {
 			eprintln!("profile-doc: regenerate with `cargo run --manifest-path src/tools/profile-doc/Cargo.toml`");
@@ -409,7 +449,7 @@ fn main() -> std::process::ExitCode {
 		return std::process::ExitCode::FAILURE;
 	}
 	if check {
-		println!("profile-doc: the generated documents match both profiles");
+		println!("profile-doc: the generated documents match every profile");
 	}
 	std::process::ExitCode::SUCCESS
 }

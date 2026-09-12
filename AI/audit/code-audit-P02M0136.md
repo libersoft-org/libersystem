@@ -433,3 +433,141 @@ NOT PERFORMED:
     `system-manifest` 19. `check-source-hygiene.sh` clean.
 
 Still NOT PERFORMED: no guest has booted any of this. The service has never served a request.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T13:54:09Z):
+
+## What was delivered
+
+`OpenType Profile 1`, published and closed: `src/user/libs/text/opentype-profile`, with
+`docs/gen/opentype/profile-1.md` generated from it and hashed.
+
+This item is the START GATE for the parser that reads untrusted font bytes, so publishing it before
+the parser is the whole point: a profile written afterwards describes what was built rather than
+stating what was required.
+
+  - 29 TABLES, each with the major versions it is admitted at and one line saying why it is in the
+    profile. A table with no version field of its own admits any, and says so, rather than carrying a
+    check that always passes while looking like one that does something.
+  - BOTH HALVES OF "CORRECT AT ANY COORDINATE", which is the sentence this item was written about.
+    The outline half is the Type 2 and CFF2 charstring interpreters with subroutines and `blend`; the
+    metric half is `HVAR`, `VVAR`, `MVAR`, the item variation store and the delta-set index map.
+    A font instanced without the second has correct outlines at the wrong advances - text that is
+    subtly mis-spaced at every non-default coordinate.
+  - ALL EIGHT `GSUB` AND ALL NINE `GPOS` LOOKUP TYPES with their subtable formats, the six lookup
+    flags including the two that are a class rather than a bit, and the shared structure formats.
+    `cmap` format 14 is in it: without Unicode variation sequences a document asking for one form of
+    a character gets the default one.
+  - THE CONDITIONAL MECHANISMS, which a table list forgets: `FeatureVariations` decides WHICH
+    lookups apply at a coordinate, and `Device`/`VariationIndex` are how a `GPOS` value varies. With
+    the variation tables and neither of these, positioning is right at the default instance only.
+  - THE `COLR` v1 PAINT GRAPH enumerated by paint, with the 28 composite modes - the same set the 2D
+    profile carries, deliberately, because a profile naming a mode the renderer does not have is a
+    promise nothing can keep.
+  - 32 SCRIPTS, EACH NAMED, with the shaping class it needs. "Indic" is not an entry: Devanagari and
+    Malayalam are both "Indic" and their reordering differs, so a category would make a missing
+    script and a wrong one look the same from outside.
+  - 19 LANGUAGES, each with what selecting it CHANGES. An unknown `LangSys` falls back to `dflt`
+    rather than refusing - the one fallback in the profile, stated so the difference is deliberate.
+  - THE EXCLUSIONS, with their reasons and the tags each refuses.
+
+## Verification
+
+PERFORMED and passing:
+
+  - `cargo test` in `opentype-profile` - 9 fixtures, 9 passed.
+  - `./check.sh --gate opentype-profile` - the fixtures, then the generated document and its hash.
+  - `./gen.sh --check` - no drift; every profile regenerates to what is on disk.
+  - `./check.sh --gate verify-model` - model consistent, 629 checks, the new gate in the catalog and
+    its key in `release-required.toml`. `--gate milestone-index` and `check-source-hygiene.sh` clean.
+  - `system-manifest check` - exit 0 with the new source row.
+
+WHAT THE FIXTURES FOUND, which is the part worth recording: three defects in the LIST, before any
+gate existed to run over it.
+
+  - A paint rule that admitted `format + 1` for every paint admitted a format 33 above
+    `PaintComposite` at 32. Not every paint has a variable counterpart - a layer list carries no
+    numbers of its own to vary - so `varies` is now a field of the entry rather than an assumption.
+  - The "nothing is both supported and excluded" check scraped a tag out of the exclusion's prose,
+    and read "`avar` version 2" as excluding `avar`, which IS supported. An exclusion now names the
+    tags it refuses in a field, and a narrow exclusion names none - which is what makes the check
+    exact instead of a heuristic that would also have missed a real contradiction.
+  - A language entry said "Sindhi letter forms", which does not say what selecting it changes. The
+    rule that every language must state its effect is what caught it.
+
+In each case the model was corrected and the test left alone, which is the direction that matters.
+
+NOT PERFORMED:
+
+  - nothing reads this profile yet. The parser it bounds is the next item and is not written; until
+    it is, what is checked is that the list is closed, consistent and unchanged - not that anything
+    obeys it.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T14:15:36Z):
+
+## What was delivered
+
+Unicode segmentation at 17.0.0: the tables, the three algorithms over them, and the normative
+conformance run that measures them.
+
+`toolchain.lock` gains sixteen `[ucd_*]` blocks - each with the upstream URL, the version and the
+SHA-256 of the file as fetched. `./bootstrap.sh` fetches them once, deliberately, verifying the
+digest BEFORE the file is where anything reads it; every tool and gate below reads the cache and
+never the network, which is the tree's existing rule for pinned external artifacts.
+
+`src/tools/ucd-gen` writes the whole of `unicode-tables/src/generated.rs` - nine property tables with
+their enums and `Extended_Pictographic`. Two decisions worth naming:
+
+  - THE ENUMS ARE GENERATED BESIDE THE TABLES. A hand-written enum indexing a generated table is two
+    lists that must agree with nothing checking that they do, and the day they stop agreeing every
+    character in one range quietly takes another category's rules.
+  - IT REFUSES TO DEFAULT A VALUE IT DOES NOT KNOW. A property value the release has and the
+    generator's list does not is an error, not an `Other`. That is how `HH` - the unambiguous hyphen
+    class this release added - was found rather than filed under `XX` and never breaking.
+
+`unicode-tables` also carries the classes SHAPING needs, which a segmentation-only table set misses:
+`Joining_Type`, `Indic_Syllabic_Category`, `Indic_Positional_Category`, `Script`, `General_Category`
+and `Indic_Conjunct_Break`.
+
+`unicode-segmentation` implements UAX #29 grapheme cluster and word boundaries and UAX #14 line
+break opportunities, as the documents' numbered rules in the documents' order, with each rule named
+at the line that implements it. No tailoring.
+
+`src/tools/unicode-conformance` runs the three normative files IN FULL and prints the code points and
+both boundary sets for a failure, because "1273 of 9836 passed" is a number nobody can act on.
+
+## Verification
+
+PERFORMED and passing:
+
+  - THE NORMATIVE CONFORMANCE FILES, every case: `GraphemeBreakTest` 766 of 766, `WordBreakTest` 1944
+    of 1944, `LineBreakTest` 19338 of 19338.
+  - `cargo test` in `unicode-tables` - 4 fixtures: every table sorted, disjoint, non-empty and
+    carrying no run of the default value; spot values a person can check by hand; the UCD spelling
+    recoverable from each variant; and the binary search at its edges.
+  - `cargo test` in `unicode-segmentation` - 6 fixtures, written so a reader can see what each
+    algorithm is FOR without opening a conformance file.
+  - `ucd-gen --check` - the tables regenerate to what is on disk. The generator formats its own
+    output, so generating and checking answer the same thing after `./format.sh` has run.
+  - `./check.sh --gate unicode-segmentation`, `--gate verify-model` (model consistent),
+    `--gate dependency-policy`, `check-source-hygiene.sh`, `system-manifest check` - all pass.
+
+WHAT THE CONFORMANCE RUN CORRECTED, which is the part worth recording, because none of it would have
+been found by a test written by the same person who wrote the code:
+
+  - WORD BOUNDARIES: the rules that ignore combining marks are numbered AFTER the ones about spaces
+    and joiners, and I had applied the filtering first. A space, a combining mark and a space came
+    out as one word instead of two. 9 cases.
+  - LINE BREAKING: 1077 of 19338 failed against my first implementation, which was written from the
+    shape of the rules rather than from their exact 17.0 text. Rewriting them from the numbered rule
+    set - including the six sub-rules of LB19, the fifteen of LB25 and the east-asian width LB30
+    turns on - took it to 22.
+  - THE LAST 22 were a zero-width joiner at the start of a text: the rule prohibiting a break after
+    one is numbered before the rule that turns an unattached mark into a letter, and my resolution
+    order lost it. The fix also had to distinguish "this run contained a joiner" from "this run ENDS
+    with one", which a joiner followed by a combining mark is the only case to show.
+
+NOT PERFORMED:
+
+  - nothing consumes these yet. The shaping stack that will read the joining types and the Indic
+    categories is the next items and is not written; what is checked here is that the boundaries are
+    Unicode's, not that anything downstream uses them.

@@ -1,0 +1,10 @@
+[package]
+name = "unicode-bidi"
+edition = "2024"
+description = "The Unicode bidirectional algorithm: paragraph levels, embeddings, isolates, overrides, mirroring and reordering"
+
+[dependencies]
+unicode-tables = { path = "../unicode-tables" }
+
+[lints.rust]
+warnings = "deny"

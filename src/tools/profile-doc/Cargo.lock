@@ -11,9 +11,14 @@ name = "graphics-profile"
 version = "0.0.0"
 
 [[package]]
+name = "opentype-profile"
+version = "0.0.0"
+
+[[package]]
 name = "profile-doc"
 version = "0.0.0"
 dependencies = [
  "bootproto",
  "graphics-profile",
+ "opentype-profile",
 ]

@@ -74,6 +74,14 @@ declare -A GATES=(
 	# test for every feature, and no test claiming a feature the profile does not have. Host-only and
 	# seconds; the two coverage halves report NOT PERFORMED until a backend and a suite exist.
 	["graphics-profile"]="tools/check-graphics-profile.sh"
+	# THE OPENTYPE PROFILE, which bounds what a FONT may contain rather than what a backend must
+	# draw. Its publication is a START GATE for the parser that reads untrusted font bytes, and a
+	# start gate that drifts before the work begins has bounded nothing. Host-only and seconds.
+	["opentype-profile"]="tools/check-opentype-profile.sh"
+	# Unicode segmentation, measured against Unicode's OWN answers rather than against a sample: the
+	# three normative conformance files in full, plus the tables regenerated from the pinned release
+	# and compared. Host-only; the line break file alone is nineteen thousand cases and still seconds.
+	["unicode-segmentation"]="tools/check-unicode-segmentation.sh"
 	# Static initialisation is a mechanism the converged closure ADMITS, so it gets positive gates:
 	# order across the provider DAG, what a constructor that stopped half way leaves behind,
 	# destructors in reverse on a normal exit, and which of them a crash does not run.

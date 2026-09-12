@@ -1,0 +1,12 @@
+[package]
+name = "opentype-profile"
+edition = "2024"
+description = "OpenType Profile 1 as code: the closed list of tables, lookups, colour, variation, scripts and languages"
+
+# NO DEPENDENCIES, for the reason every profile in this tree has none: the parser is checked against
+# this list, the conformance suite is checked against this list, and the document is generated from
+# it - so it must be linkable by each of them and testable on the host.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

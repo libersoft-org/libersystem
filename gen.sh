@@ -144,9 +144,9 @@ done
 args+=(--docs-dir ../../../docs/gen)
 generate "$out" "${args[@]}"
 
-# THE GRAPHICS PROFILES, WHICH ARE ALSO CODE AND ALSO WRITE UNDER docs/gen. Not LSIDL and not a
-# package above: `Render2D Core Profile 1` and `Render3D Core Profile 1` are closed enumerations in
-# `user/libs/graphics/profile`, and the table, the backend checklist, the conformance matrix and the
+# THE PROFILES THAT ARE CODE, AND ALSO WRITE UNDER docs/gen. Not LSIDL and not a package above:
+# `Render2D Core Profile 1`, `Render3D Core Profile 1` and `OpenType Profile 1` are closed
+# enumerations in `user/libs/graphics/profile` and `user/libs/text/opentype-profile`, and the table, the backend checklist, the conformance matrix and the
 # capability report are generated from them with a hash over the canonical form. They are here
 # because a reader who has just edited a profile runs the command the generated file names, and
 # every generated file under docs/gen names this one.
@@ -172,6 +172,6 @@ if [[ "$mode" != check ]]; then
 fi
 
 case "$mode" in
-check) note "no drift: ${#PACKAGES[@]} packages, the aggregate and both graphics profiles regenerate to what is on disk" ;;
-*) note "${#PACKAGES[@]} packages and the aggregate regenerated and formatted, and both graphics profiles written" ;;
+check) note "no drift: ${#PACKAGES[@]} packages, the aggregate and every profile regenerates to what is on disk" ;;
+*) note "${#PACKAGES[@]} packages and the aggregate regenerated and formatted, and every profile written" ;;
 esac

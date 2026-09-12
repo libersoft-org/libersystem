@@ -1,0 +1,13 @@
+[package]
+name = "unicode-conformance"
+edition = "2024"
+description = "Run the NORMATIVE Unicode segmentation conformance files against this tree's implementation"
+
+[dependencies]
+# THE IMPLEMENTATION UNDER TEST, and the tables it reads. Nothing else: what makes this a conformance
+# run rather than a self-consistency check is that the ANSWERS come from a file Unicode publishes.
+unicode-segmentation = { path = "../../user/libs/text/unicode-segmentation" }
+unicode-tables = { path = "../../user/libs/text/unicode-tables" }
+
+[lints.rust]
+warnings = "deny"

@@ -1,0 +1,9 @@
+[package]
+name = "ucd-gen"
+edition = "2024"
+description = "Generate the Unicode property tables from the pinned UCD files, and refuse to guess at anything else"
+
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

@@ -1,0 +1,188 @@
+profile=opentype version=1
+table=head majors=1
+table=hhea majors=1
+table=hmtx majors=any
+table=maxp majors=0,1
+table=cmap majors=0
+table=name majors=0,1
+table=OS/2 majors=1,2,3,4,5
+table=post majors=2,3
+table=loca majors=any
+table=glyf majors=any
+table=CFF  majors=1
+table=CFF2 majors=2
+table=vhea majors=1
+table=vmtx majors=any
+table=VORG majors=1
+table=GDEF majors=1
+table=GSUB majors=1
+table=GPOS majors=1
+table=fvar majors=1
+table=gvar majors=1
+table=avar majors=1
+table=HVAR majors=1
+table=VVAR majors=1
+table=MVAR majors=1
+table=COLR majors=0,1
+table=CPAL majors=0,1
+table=sbix majors=1
+table=CBDT majors=2,3
+table=CBLC majors=2,3
+excluded=SVG glyph outlines tags=SVG 
+excluded=the legacy kern table tags=kern
+excluded=Apple Advanced Typography tags=morx,mort,kerx,feat
+excluded=monochrome bitmap strikes as a glyph source tags=EBDT,EBLC,EBSC
+excluded=avar version 2 tags=-
+excluded=hinting programs, and the instructions inside glyf tags=fpgm,prep,cvt 
+gsub=1 name=Single formats=1,2
+gsub=2 name=Multiple formats=1
+gsub=3 name=Alternate formats=1
+gsub=4 name=Ligature formats=1
+gsub=5 name=Contextual formats=1,2,3
+gsub=6 name=ChainedContextual formats=1,2,3
+gsub=7 name=Extension formats=1
+gsub=8 name=ReverseChainedContextualSingle formats=1
+gpos=1 name=SingleAdjustment formats=1,2
+gpos=2 name=PairAdjustment formats=1,2
+gpos=3 name=CursiveAttachment formats=1
+gpos=4 name=MarkToBase formats=1
+gpos=5 name=MarkToLigature formats=1
+gpos=6 name=MarkToMark formats=1
+gpos=7 name=Contextual formats=1,2,3
+gpos=8 name=ChainedContextual formats=1,2,3
+gpos=9 name=Extension formats=1
+lookup-flag=0x0001 name=rightToLeft
+lookup-flag=0x0002 name=ignoreBaseGlyphs
+lookup-flag=0x0004 name=ignoreLigatures
+lookup-flag=0x0008 name=ignoreMarks
+lookup-flag=0x0010 name=useMarkFilteringSet
+lookup-flag=0xff00 name=markAttachmentType
+subtable=cmap format=4
+subtable=cmap format=6
+subtable=cmap format=12
+subtable=cmap format=14
+subtable=Coverage format=1
+subtable=Coverage format=2
+subtable=ClassDef format=1
+subtable=ClassDef format=2
+conditional=FeatureVariations format=1
+conditional=ConditionSet format=1
+conditional=Device format=1
+conditional=Device format=2
+conditional=Device format=3
+conditional=VariationIndex format=32768
+variation=fvar axes
+variation=fvar named instances
+variation=avar normalisation
+variation=gvar outline deltas
+variation=CFF2 blend
+variation=item variation store
+variation=delta-set index map
+variation=HVAR advances
+variation=VVAR advances
+variation=MVAR font metrics
+variation=GDEF variation store
+variation=FeatureVariations
+paint=1 name=PaintColrLayers varies=false
+paint=2 name=PaintSolid varies=true
+paint=4 name=PaintLinearGradient varies=true
+paint=6 name=PaintRadialGradient varies=true
+paint=8 name=PaintSweepGradient varies=true
+paint=10 name=PaintGlyph varies=false
+paint=11 name=PaintColrGlyph varies=false
+paint=12 name=PaintTransform varies=true
+paint=14 name=PaintTranslate varies=true
+paint=16 name=PaintScale varies=true
+paint=18 name=PaintScaleAroundCenter varies=true
+paint=20 name=PaintScaleUniform varies=true
+paint=22 name=PaintScaleUniformAroundCenter varies=true
+paint=24 name=PaintRotate varies=true
+paint=26 name=PaintRotateAroundCenter varies=true
+paint=28 name=PaintSkew varies=true
+paint=30 name=PaintSkewAroundCenter varies=true
+paint=32 name=PaintComposite varies=false
+composite=0 name=Clear
+composite=1 name=Source
+composite=2 name=Destination
+composite=3 name=SourceOver
+composite=4 name=DestinationOver
+composite=5 name=SourceIn
+composite=6 name=DestinationIn
+composite=7 name=SourceOut
+composite=8 name=DestinationOut
+composite=9 name=SourceAtop
+composite=10 name=DestinationAtop
+composite=11 name=Xor
+composite=12 name=Plus
+composite=13 name=Screen
+composite=14 name=Overlay
+composite=15 name=Darken
+composite=16 name=Lighten
+composite=17 name=ColorDodge
+composite=18 name=ColorBurn
+composite=19 name=HardLight
+composite=20 name=SoftLight
+composite=21 name=Difference
+composite=22 name=Exclusion
+composite=23 name=Multiply
+composite=24 name=HslHue
+composite=25 name=HslSaturation
+composite=26 name=HslColor
+composite=27 name=HslLuminosity
+bitmap=sbix name=png
+bitmap=sbix name=tiff
+bitmap=sbix name=jpg
+bitmap=CBDT name=format 17
+bitmap=CBDT name=format 18
+bitmap=CBDT name=format 19
+script=latn name=Latin class=default rtl=false
+script=grek name=Greek class=default rtl=false
+script=cyrl name=Cyrillic class=default rtl=false
+script=armn name=Armenian class=default rtl=false
+script=geor name=Georgian class=default rtl=false
+script=ethi name=Ethiopic class=default rtl=false
+script=hebr name=Hebrew class=default rtl=true
+script=thaa name=Thaana class=default rtl=true
+script=arab name=Arabic class=cursive-joining rtl=true
+script=syrc name=Syriac class=cursive-joining rtl=true
+script=nko  name=N'Ko class=cursive-joining rtl=true
+script=dev2 name=Devanagari class=indic-reordering rtl=false
+script=bng2 name=Bengali class=indic-reordering rtl=false
+script=gur2 name=Gurmukhi class=indic-reordering rtl=false
+script=gjr2 name=Gujarati class=indic-reordering rtl=false
+script=ory2 name=Oriya class=indic-reordering rtl=false
+script=tml2 name=Tamil class=indic-reordering rtl=false
+script=tel2 name=Telugu class=indic-reordering rtl=false
+script=knd2 name=Kannada class=indic-reordering rtl=false
+script=mlm2 name=Malayalam class=indic-reordering rtl=false
+script=sinh name=Sinhala class=indic-reordering rtl=false
+script=khmr name=Khmer class=khmer rtl=false
+script=mym2 name=Myanmar class=myanmar rtl=false
+script=thai name=Thai class=universal rtl=false
+script=lao  name=Lao class=universal rtl=false
+script=tibt name=Tibetan class=universal rtl=false
+script=hani name=Han class=default rtl=false
+script=kana name=Kana class=default rtl=false
+script=bopo name=Bopomofo class=default rtl=false
+script=hang name=Hangul class=hangul rtl=false
+script=DFLT name=Default class=default rtl=false
+script=zyyy name=Common class=default rtl=false
+language=dflt name=Default
+language=TRK  name=Turkish
+language=AZE  name=Azerbaijani
+language=CRT  name=Crimean Tatar
+language=DEU  name=German
+language=NLD  name=Dutch
+language=CAT  name=Catalan
+language=ROM  name=Romanian
+language=MOL  name=Moldavian
+language=SRB  name=Serbian
+language=MKD  name=Macedonian
+language=ARA  name=Arabic
+language=FAR  name=Persian
+language=URD  name=Urdu
+language=SND  name=Sindhi
+language=ZHS  name=Chinese, simplified
+language=ZHT  name=Chinese, traditional
+language=JAN  name=Japanese
+language=KOR  name=Korean

@@ -1,0 +1,11 @@
+[package]
+name = "unicode-tables"
+edition = "2024"
+description = "The Unicode character property tables, generated from the pinned UCD and never written by hand"
+
+# NO DEPENDENCIES. The tables are read by the segmentation algorithms, by the shaper and by a host
+# gate, so they must be linkable by each and testable without any of them.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"
