@@ -1,0 +1,11 @@
+[package]
+name = "text-layout"
+edition = "2024"
+description = "Line layout above shaping: composition, alignment, justification, tabs, truncation, and caret and selection geometry"
+
+[dependencies]
+# The seam this layer arranges: runs, cluster maps and the one numeric form.
+font-contract = { path = "../font-contract" }
+
+[lints.rust]
+warnings = "deny"

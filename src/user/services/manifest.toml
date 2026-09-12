@@ -237,6 +237,13 @@ path = "user/libs/text/font-shape"
 owner = "font-run"
 path = "user/libs/text/font-run"
 
+# LINE LAYOUT ABOVE SHAPING: where the runs of a line sit, and where a caret lands. Separate from
+# the pipeline below because it decides GEOMETRY over the frozen run seam and reads no text at all,
+# which is what makes its decisions checkable on numbers a fixture states.
+[[sources]]
+owner = "text-layout"
+path = "user/libs/text/text-layout"
+
 # THE PIPELINE OVER ALL OF THEM: one ordered sequence of typed stages, so that bidi reordering cannot
 # be applied before line breaking - which is the mistake that is invisible until a line happens to
 # break inside a right-to-left run.

@@ -225,6 +225,7 @@ keys = [
 	"host.storage-proto / host / host / default",
 	"host.system-manifest / host / host / default",
 	"host.term / host / host / default",
+	"host.text-layout / host / host / default",
 	"host.text-pipeline / host / host / default",
 	"host.tga / host / host / default",
 	"host.time-proto / host / host / default",

@@ -1325,3 +1325,207 @@ two paint-graph ones to the `COLR` decoder - both named as remaining work under 
 and the three pass and retry ceilings belong to the line layout item, which is where a layout loop
 will first exist to be iterated. I am not ticking a box that says "bound the recursive work" while
 the two recursive structures with the deepest recursion in the format have no bound in code.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T16:19:52Z):
+
+`name`, `OS/2` AND `post`: WHAT A FACE SAYS IT IS.
+
+WHY THESE THREE, AND WHY NOW
+
+They are what the catalogue's TRUTH ORACLE compares a declaration against. A staged face arrives with
+a declared record - family, style, axes, face index, format - trusted by review until something can
+check it, and checking it means recovering the same fields from the file. The oracle itself is still
+blocked on the licensed last-resort face, because nothing is staged for it to check; the reader it
+will use is not, and is now built.
+
+THE DECISIONS IN IT
+
+A STYLE IS A NUMBER AND A SET OF BITS, NOT A WORD. "Bold Italic" is a string a designer chose, in a
+language they chose it in; matching on it is how a face called `Fett` or `Gras` stops being bold.
+`OS/2` states the weight as a number from 1 to 1000, the width as a number from 1 to 9 and the slope
+as a bit, and those are what a style is compared on. Two bits mean slanted - a face that sets only
+the oblique one is still not upright - and the `USE_TYPO_METRICS` bit changes the leading of every
+line, so a layout that ignored it sets the face too tight or too loose everywhere and it looks like a
+layout bug.
+
+`OS/2` VERSION 0 IS REFUSED, and by the PROFILE's decision rather than this reader's: the version
+list is read out of the profile table, so a reader cannot admit a version the published list does not
+carry. Version 0 predates the selection bits and the typographic metrics that a style and a line
+height are decided from. The VERSION says what is present rather than the length - a version 1 table
+padded out to a later version's size still has no x-height, and reading past what the version
+promises gives two metrics out of somebody's padding.
+
+A NAME TABLE HAS MANY RECORDS FOR ONE NAME. Taking the first makes the answer depend on the order a
+font tool happened to write them in, so two files with identical names could disagree about their own
+family - and the difference would be invisible to whoever reported it. The preference is stated and
+total: Windows English, then Windows in any language, then Macintosh English, then anything; ties
+keep the earlier record so a font with two identical records answers the same way whichever order
+they are in.
+
+THE UPPER HALF OF MAC ROMAN IS NOT LATIN-1. `0xA5` is a bullet, not a yen sign; `0xD5` is a right
+single quote, not a capital O with a tilde. Reading an older face's name as Latin-1 gives a family
+name that is wrong in a way that looks like a corrupt font rather than a wrong decoder, so the
+128-entry table is written out. A UTF-16 name outside the basic plane is a PAIR of units, and a
+decoder taking each unit as a character turns an emoji or a rarer ideograph into two replacement
+characters.
+
+NO ALLOCATION, SO A NAME IS A DECODER AND NOT A STRING. The stored form is UTF-16 big-endian or Mac
+Roman, neither of which is a `str`, and returning an owned string would allocate on a path that must
+not allocate. The caller owns the buffer, and a name too long for it is a REFUSAL: truncating a
+family name is how two different families become one, and the caller cannot tell it happened. The
+equality comparison a truth oracle makes is provided here so it is written once, rather than at each
+caller that would have to decide what a too-long name means.
+
+`post` carries the italic angle - NEGATIVE for the ordinary forward slant, which is the sign that
+gets reversed - the underline position and thickness, whether the face is monospaced, which no other
+table states, and version 2.0's glyph names. A glyph name is what a PDF exporter writes, what an
+accessibility layer reads back and what a subsetter matches on; a face that carries them and a reader
+that ignores them produce a document nothing else can get the text out of. The 258 standard
+Macintosh names are carried because in the FILE they cost nothing - a face whose glyphs are the
+ordinary Latin ones names all of them without storing a string - so a reader without that table could
+not answer for any of those glyphs. The custom names are Pascal strings one after another with no
+index into them, so reaching the nth means walking the n before it; assuming a fixed length would
+read a name out of the middle of another. Version 3.0 carries no names, which is what almost every
+modern face states and is not an error.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p font-parse`: 26 passed, 0 failed. Five are new:
+
+  - the record preference, on a table whose Macintosh record is written FIRST and whose Windows
+    English one is written LAST, so a reader taking the first would answer with the wrong one; and a
+    name the face does not carry answering `None` rather than an empty string, which are different
+    answers;
+  - the two encodings, including an emoji counted as ONE character rather than two and a buffer too
+    small refused rather than truncated, and a Mac Roman record whose bytes are exactly the two that
+    Latin-1 would get wrong;
+  - the style read as numbers and bits, an oblique-only face still slanted, a version 1 table with no
+    x-height, and version 0 refused by name;
+  - `post`'s angle, underline, pitch and names - two standard ones costing no storage, one custom
+    Pascal string, one past the count answering `None` - and version 3.0 carrying none without that
+    being a fault;
+  - all three tables through the exhaustive corruption sweep: every byte, four patterns, every
+    accessor, asserting only that they ANSWER.
+
+`./src/tools/check-opentype-profile.sh` passes. `./format.sh` was run and the suite re-run after it.
+`cargo clippy -D warnings` reports nothing in the new file.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHAT REMAINS FOR THE ITEM
+
+`CFF`/`CFF2` charstrings, the `COLR` paint graph and the bitmap strike DATA - the indices are read
+and the contents are not - and the truth oracle, which cannot exist until a face is staged for it to
+check.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T16:37:36Z):
+
+LINE LAYOUT: `text-layout`.
+
+WHY A CRATE, AND WHY IT READS NO TEXT
+
+Shaping answers "what glyphs" and this answers "where". A shaped run knows its own advances and
+nothing about the line it is on - not how wide the line is, not what else is on it, not which end of
+it is the beginning - and those are the questions between a correct run and a correct paragraph.
+
+Every input is already in the seam's 26.6, so this layer never measures a font. That is what makes
+its decisions CHECKABLE rather than merely reviewable: a fixture states advances and the answers are
+arithmetic. A layer that had to shape first would be testing the shaper.
+
+THE DECISIONS
+
+DIRECTION BELONGS TO THE PARAGRAPH. "Start" is the left in a left-to-right paragraph and the RIGHT in
+a right-to-left one. A layout spelled left and right makes every right-to-left document ragged on the
+wrong side - a defect a reader of that script sees immediately and a developer of it never does.
+`Left` and `Right` exist beside them for a column of numbers, where the glyphs and not the language
+decide. A centred line's odd half-unit goes to the START side, because rounding toward zero drifts a
+centred right-to-left line left, which is the one direction it must not move.
+
+THE RUNS ARRIVE IN VISUAL ORDER AND ARE NOT REORDERED AGAIN. Rule L2 has already decided which run is
+drawn first; applying it a second time is the identity for one embedding level and wrong for three.
+What moves in a right-to-left paragraph is the starting pen, not the order.
+
+JUSTIFICATION HAS A POLICY AND NOT A FORMULA, and the seam is stated in the type: WHICH points may
+absorb space is a property of the text - an inter-word space, a Thai word boundary, an Arabic kashida
+position and a CJK inter-character gap are four different answers in four scripts, and none of them
+is visible from a run of advances - so the caller names them, with weights. HOW MUCH each gets, what
+happens when there are none, and whether the last line is stretched are decided here. Splitting it
+the other way is how two callers justify the same paragraph differently.
+
+A LINE WITH NOTHING TO STRETCH IS LEFT RAGGED AND NEVER LETTER-SPACED. Spreading the slack between
+every pair of glyphs is what a layout does when it refuses to admit it cannot justify a line; it
+changes the rhythm of the word itself, and on a line with one long word it is unreadable. The
+remainder is given away one 26.6 unit at a time so the line reaches its box EXACTLY - a few
+sixty-fourths short shows as a ragged right edge on justified text, which is precisely what
+justification was asked to remove. The space is added to the elastic glyph's ADVANCE rather than to
+the positions after it: moving the glyphs after each space would mean moving them again for every
+later space, and the two would disagree by a rounding unit.
+
+A TAB IS NOT A WIDE SPACE. Its advance depends on where the pen already is, which makes it the only
+thing on a line whose width is not a property of the font - and a layout that gave it a fixed advance
+produces columns that do not line up, which is the entire reason anybody typed a tab. It lands
+STRICTLY past the pen: a tab landing on a stop would advance by nothing, so two tabs in a row would
+columnise as one. Past the stated stops the interval continues from the LAST STATED ONE, so a stop
+that is not a multiple of the interval does not shift every column after it. An interval of zero
+advances by nothing rather than searching forever.
+
+THE ELLIPSIS GOES AT THE PARAGRAPH'S END, which in a right-to-left paragraph is the LEFT. Always
+putting it on the right truncates an Arabic line at its beginning and marks it at its end: a sentence
+with its first word missing and a mark claiming the last one is. Truncation stops at a CLUSTER
+boundary and never inside one - cutting inside a cluster drops half a combining sequence or half a
+ligature, which is not a shorter string but a different one - and the clusters are walked in LOGICAL
+order, because keeping whichever happen to be drawn first is not the beginning of the sentence in
+mixed-direction text.
+
+THE CARET AND SELECTION GEOMETRY IS WHAT THE CLUSTER MAPPING WAS CARRIED FOR:
+
+  - ONE CONTIGUOUS RANGE OF TEXT IS NOT ONE RECTANGLE. A selection across a direction boundary is
+    separate pieces with a gap, and a layer that assumed one rectangle draws a highlight over text
+    the user did not select. That is not an edge case; it is what selecting across a boundary always
+    looks like.
+  - PIECES THAT TOUCH ARE MERGED. Ten adjacent rectangles over ten Latin clusters leave a seam at
+    every boundary on a surface that blends, so merging matters as much as splitting.
+  - A CARET INSIDE A LIGATURE lands on the face's own divider rather than at a fraction of its width,
+    because `fi` is not two equal halves. A cluster a ligature swallowed owns no pixels of its own,
+    so every answer about it is taken from the glyph that owns it.
+  - A CARET AT A LINE'S EDGE IS OWNED BY ONE LINE, and affinity says which. Answering from both is how
+    a caret is drawn twice; answering from neither is how it disappears at a wrap.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p text-layout`: 10 passed, 0 failed, over fixtures that state advances rather than
+shape them:
+
+  - alignment in both directions for all six values, with Start and End swapping and Left and Right
+    not;
+  - a centred line whose slack does not halve, checked in both directions so the odd unit is seen to
+    move;
+  - justification filling the box exactly over a slack that does not divide by its two points;
+  - a line with no elastic points, and one with a point of weight zero, both left at their natural
+    width; the last line of a paragraph not stretched, and the same line not last being filled;
+  - tabs at zero, mid-column, EXACTLY on a stop, past the last stated stop, and with a zero interval;
+  - a caret inside a ligature landing on the declared divider at 70 rather than the 60 an equal split
+    would give, and at the ligature's trailing edge at its far end;
+  - a three-run line whose middle run is right to left: the whole line selected as ONE merged piece,
+    and a range across the direction boundary as two pieces with a gap between them;
+  - a caret at each edge of a line, owned by this line under one affinity and not the other;
+  - truncation that fits untouched, that cuts at a cluster boundary, and that puts its mark on the
+    other side in a right-to-left paragraph;
+  - a cluster map naming glyphs its run does not have, refused rather than laid out around.
+
+`cargo clippy -D warnings` over the crate and its tests: clean. `./format.sh` was run and the suite
+re-run after it. `verify-model host-suites` discovers it: 91 runnable suites, `text-layout` among
+them, and it is registered in the manifest and the release-required host list.
+
+A DEAD VARIANT WAS REMOVED RATHER THAN LEFT IN. The crate first carried an `Exceeded` refusal and a
+dependency on the profile for the layout-pass ceilings. Nothing raised it: this layer's layout is
+SINGLE-PASS by construction, so there is no loop for those ceilings to bound. A variant nothing
+raises is a promise nothing keeps, so both it and the dependency are gone, and the three pass
+ceilings are still recorded as unenforced under the ceilings item - with this as the reason.
+
+WHAT THIS DELIBERATELY IS NOT
+
+The line breaking is GREEDY over the UAX #14 opportunities rather than an optimal paragraph fit. That
+is a typographic refinement over the same opportunities and the same measurement, not a correctness
+gap, and it is named in the plan so a later reader does not have to work out whether it was decided
+or forgotten.

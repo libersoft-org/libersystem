@@ -795,3 +795,28 @@ VERIFICATION PERFORMED:
 
 NOT PERFORMED: the full `./check.sh`, and `./test.sh` in full on the two ports - only the dynamic tag
 ran there.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0135 (2026-09-12T16:27:10Z):
+
+A GATE THIS MILESTONE LEFT RED, FOUND AND CLOSED.
+
+`./src/tools/check-host-tests.sh` was failing on `abi`, and it was this milestone's doing: the
+loader work added `SYS_PROCESS_LIFECYCLE = 82` and the `ModuleLifecycle` record to `src/abi`
+without registering either in the two snapshots that exist to notice exactly that. Both guards
+worked - one said the crate declares 82 syscalls and the snapshot names 81, the other said the crate
+declares 15 `repr(C)` structs and 14 have layout assertions - and both had been red since the
+commit that added them.
+
+WHY IT MATTERS RATHER THAN BEING A LIST TO TOP UP. The syscall snapshot is what makes an added
+syscall a deliberate decision; the layout assertions are what stop a marshalled struct changing shape
+under a kernel and a userspace that must agree byte for byte. A snapshot that is behind is not a
+weaker check, it is an absent one - and both of these guards were themselves rewritten earlier
+BECAUSE a previous version of them compared a list against its own length and stayed green over a
+syscall the kernel dispatches.
+
+FIXED: the syscall is named in `SYSCALLS` with its number, and `ModuleLifecycle` has the same
+size, alignment and per-field offset assertion every other marshalled struct has - 40 bytes, aligned
+to 8, five `u64` fields at 0, 8, 16, 24 and 32.
+
+VERIFIED: `cargo test -p abi` 28 passed, 0 failed. `./src/tools/check-host-tests.sh`: 90 suites,
+all passing, exit 0 - where it was 1 of 90 failing before.

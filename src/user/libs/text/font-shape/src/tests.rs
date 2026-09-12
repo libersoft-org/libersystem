@@ -660,3 +660,69 @@ fn more_features_than_the_profile_freezes_are_refused_rather_than_dropped() {
 	let mut buffer = glyphs(&[1, 2]);
 	assert_eq!(crate::shape::shape_with_masks(&face, &mut buffer, *b"latn", *b"dflt", &features).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "features", ceiling: opentype_profile::limits::FEATURES, asked: ceiling as u64 + 1 })));
 }
+
+#[test]
+// THE SHAPER IS FUZZED THE WAY THE PARSER IS: exhaustively rather than randomly. A shaper walks a
+// font's layout tables - a script list into a feature list into a lookup list into subtables, each
+// one an offset into the next - and every one of those is a place a crafted font can point somewhere
+// else. Random bytes would find the shallow ones and miss the deep ones; every byte of a font this
+// tree built, flipped four ways, reaches all of them.
+//
+// WHAT IS ASSERTED IS THAT IT ANSWERS. Whether a mutated font still shapes is not the question, and
+// a test that demanded a particular answer would be worthless: some mutations produce a font that is
+// perfectly valid and shapes differently. What must never happen is a panic, an out-of-bounds read,
+// or a walk that does not come back.
+fn a_layout_table_corrupted_anywhere_is_refused_rather_than_read_past() {
+	let bytes = build::sample(Some(build::gsub_ligature(1, 2, 4)), Some(build::gpos_kern(1, 2, -40)), Some(build::gdef(&[3])));
+	// The three layout tables, which is where every offset this fixture is about lives.
+	for tag in [b"GSUB", b"GPOS", b"GDEF"] {
+		let at = find_table(&bytes, tag);
+		let entry = find_entry(&bytes, tag);
+		let length = u32::from_be_bytes([bytes[entry + 12], bytes[entry + 13], bytes[entry + 14], bytes[entry + 15]]) as usize;
+		for index in 0..length {
+			for pattern in [0x01u8, 0x7F, 0x80, 0xFF] {
+				let mut mutated = bytes.clone();
+				mutated[at + index] ^= pattern;
+				let Ok(face) = Face::open(&mutated, 0) else { continue };
+				let mut buffer = glyphs(&[1, 2, 3]);
+				let _ = crate::shape::shape(&face, &mut buffer, *b"latn", *b"dflt", &[*b"liga", *b"kern", *b"mark"]);
+				// And through the script path too, which runs a shaper's own pass before any lookup.
+				let mut buffer = Buffer::new();
+				for (index, _) in ['a', 'b', 'c'].iter().enumerate() {
+					buffer.push(index as u16 + 1, index as u32);
+				}
+				let _ = crate::shape::shape_run(&face, &mut buffer, &['a', 'b', 'c'], *b"dflt");
+			}
+		}
+	}
+}
+
+#[test]
+// AND A TRUNCATION AT EVERY LENGTH, which is the other half: a table cut short is not the same input
+// as a table with a wrong byte in it, and the offsets that fail are different ones.
+fn a_font_truncated_anywhere_is_refused_rather_than_shaped_past() {
+	let bytes = build::sample(Some(build::gsub_ligature(1, 2, 4)), Some(build::gpos_kern(1, 2, -40)), Some(build::gdef(&[3])));
+	for length in 0..bytes.len() {
+		let Ok(face) = Face::open(&bytes[..length], 0) else { continue };
+		let mut buffer = glyphs(&[1, 2, 3]);
+		let _ = crate::shape::shape(&face, &mut buffer, *b"latn", *b"dflt", &[*b"liga", *b"kern", *b"mark"]);
+	}
+}
+
+/// Where a table's DIRECTORY ENTRY is in a font this tree built.
+fn find_entry(bytes: &[u8], tag: &[u8; 4]) -> usize {
+	let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+	for index in 0..count {
+		let entry = 12 + index * 16;
+		if &bytes[entry..entry + 4] == tag {
+			return entry;
+		}
+	}
+	panic!("the fixture's own font has no {} table", core::str::from_utf8(tag).unwrap_or("????"));
+}
+
+/// Where a table's bytes start in a font this tree built.
+fn find_table(bytes: &[u8], tag: &[u8; 4]) -> usize {
+	let entry = find_entry(bytes, tag);
+	u32::from_be_bytes([bytes[entry + 8], bytes[entry + 9], bytes[entry + 10], bytes[entry + 11]]) as usize
+}

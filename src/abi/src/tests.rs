@@ -149,6 +149,10 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// What a manager holding no claim handle may read about a device - the reconstruction path,
 	// where the handle died with the Domain of the manager that held it.
 	(SYS_DEVICE_CLAIM_SNAPSHOT, 81),
+	// The caller's OWN initialisation and finalisation tables, in load order. It takes no handle
+	// because there is no other process it could name: a table of addresses in another address space
+	// would mean nothing here.
+	(SYS_PROCESS_LIFECYCLE, 82),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -696,6 +700,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 
 	assert_layout!(covered, MemoryStats, 32, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24);
 	assert_layout!(covered, MemmapRegion, 24, 8, base => 0, length => 8, kind => 16, _pad => 20);
+	assert_layout!(covered, ModuleLifecycle, 40, 8, init_array => 0, init_count => 8, fini_array => 16, fini_count => 24, is_main_image => 32);
 	assert_layout!(covered, IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);
 	assert_layout!(
 		covered, PciInfo, 12, 2,
