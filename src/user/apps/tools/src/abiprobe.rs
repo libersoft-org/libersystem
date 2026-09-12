@@ -202,10 +202,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut small = [0u8; 4];
 		let would = snprintf(small.as_mut_ptr(), small.len(), b"%s=%d\0".as_ptr(), b"n\0".as_ptr(), 123);
 		check(b"snprintf", would == 5 && small[..3] == *b"n=1");
-		// `vsnprintf` IS REACHED THROUGH `snprintf`'s OWN PATH in this substrate; calling it here
-		// with a null argument list would be calling it wrongly. What is checked is that the symbol
-		// is the substrate's rather than absent, which a null-format call answers without UB.
-		check(b"vsnprintf", vsnprintf(core::ptr::null_mut(), 0, core::ptr::null(), core::ptr::null_mut()) <= 0);
+		// `vsnprintf` IS RESOLVED AND DELIBERATELY NOT CALLED. Rust cannot construct a `va_list`
+		// portably, and the first version of this line called it with a null format to prove the
+		// symbol was there - which is not a test, it is undefined behaviour, and the guest faulted
+		// on it immediately. What the two share in this substrate is the rendering path `snprintf`
+		// above just exercised; what differs is only how the arguments arrive, and the host fixtures
+		// cover that.
+		let _ = vsnprintf;
 	}
 
 	print(b"abiprobe: group diagnostics\n");
@@ -290,7 +293,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// contracts the host fixtures cover.
 	let _ = abort;
 	let _ = __liber_assert_failed;
-	print(b"abiprobe: abort and __liber_assert_failed are resolved and deliberately not called\n");
+	print(b"abiprobe: abort, __liber_assert_failed and vsnprintf are resolved and deliberately not called\n");
 
 	number(b"abiprobe: checks=", CHECKED.load(core::sync::atomic::Ordering::Relaxed));
 	number(b"abiprobe: failures=", FAILURES.load(core::sync::atomic::Ordering::Relaxed));
