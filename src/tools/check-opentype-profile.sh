@@ -13,14 +13,16 @@
 # forgotten one by looking at what IS supported, so the refused structures are enumerated with their
 # reasons, and the fixtures hold nothing to being both supported and excluded.
 #
-# WHY A GATE RATHER THAN A DOCUMENT NOBODY RUNS. The parser this profile bounds is not written yet;
-# the profile's publication is a START GATE for it, and a start gate that drifts before the work
-# begins has bounded nothing. The hash over the canonical form is what makes a change to the list a
-# line in a diff.
+# WHY A GATE RATHER THAN A DOCUMENT NOBODY RUNS. The profile's publication is a START GATE for the
+# parser, and a start gate that drifts is one that bounded nothing. The hash over the canonical form
+# is what makes a change to the list a line in a diff - and the parser's own fixtures run here so the
+# two cannot drift apart in the other direction either.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 PROFILE="src/user/libs/text/opentype-profile/Cargo.toml"
+PARSER="src/user/libs/text/font-parse/Cargo.toml"
+SHAPER="src/user/libs/text/font-shape/Cargo.toml"
 TOOL="src/tools/profile-doc/Cargo.toml"
 
 # THE PROFILE'S OWN FIXTURES FIRST: both halves of "correct at any coordinate", every lookup type the
@@ -28,6 +30,18 @@ TOOL="src/tools/profile-doc/Cargo.toml"
 # named with its shaping class, and nothing both supported and excluded. The document below is
 # written from that list, so a broken list would be checked against itself.
 cargo test --quiet --offline --manifest-path "$PROFILE" || exit 1
+
+# AND THE PARSER THE PROFILE BOUNDS, whose fixtures are the other half of this gate: a font this tree
+# BUILT is read, and then every truncation of it and every single byte of it flipped four ways is put
+# through every path the parser has. What is asserted there is that it ANSWERS - no panic, no
+# out-of-bounds read, no walk that does not come back - because whether a mutated font is readable is
+# not the question and a test that demanded a particular answer would be worthless.
+cargo test --quiet --offline --manifest-path "$PARSER" || exit 1
+
+# AND THE SHAPER OVER IT, whose fixtures are fonts built here carrying exactly one ligature, one
+# kerning pair and one mark attachment - which no real font does, and which is what makes an
+# assertion about the result readable.
+cargo test --quiet --offline --manifest-path "$SHAPER" || exit 1
 
 # Then the generated document and its hash. `--check` covers every profile this tool writes; the
 # graphics gate runs the same command for its own half, and running it twice costs a second.

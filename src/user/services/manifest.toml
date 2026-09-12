@@ -221,6 +221,29 @@ path = "user/libs/text/unicode-segmentation"
 owner = "unicode-bidi"
 path = "user/libs/text/unicode-bidi"
 
+# THE FONT PARSER, which reads a font as hostile input. Bounded by the profile above and staged
+# nowhere yet: the catalogue does not read fonts and the shaping stack that will is not written.
+[[sources]]
+owner = "font-parse"
+path = "user/libs/text/font-parse"
+
+[[sources]]
+owner = "font-shape"
+path = "user/libs/text/font-shape"
+
+# THE PRODUCER OF THE SHARED RUN. It is where a shaped buffer in font units becomes the 26.6 run the
+# renderer consumes, which is the one place that conversion is allowed to happen.
+[[sources]]
+owner = "font-run"
+path = "user/libs/text/font-run"
+
+# THE PIPELINE OVER ALL OF THEM: one ordered sequence of typed stages, so that bidi reordering cannot
+# be applied before line breaking - which is the mistake that is invisible until a line happens to
+# break inside a right-to-left run.
+[[sources]]
+owner = "text-pipeline"
+path = "user/libs/text/text-pipeline"
+
 # THE FONT CATALOGUE'S PROTOCOL. Generated from `idl/font.lsidl` like every other package. It has no
 # consumer yet - the catalogue service it describes is not built - so it carries a source row and no
 # library row: a package that is generated and checked but staged nowhere.

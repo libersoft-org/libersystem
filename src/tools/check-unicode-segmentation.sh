@@ -22,6 +22,7 @@ cd "$(dirname "$0")/../.."
 TABLES="src/user/libs/text/unicode-tables/Cargo.toml"
 SEGMENTATION="src/user/libs/text/unicode-segmentation/Cargo.toml"
 BIDI="src/user/libs/text/unicode-bidi/Cargo.toml"
+PIPELINE="src/user/libs/text/text-pipeline/Cargo.toml"
 GENERATOR="src/tools/ucd-gen/Cargo.toml"
 CONFORMANCE="src/tools/unicode-conformance/Cargo.toml"
 
@@ -36,6 +37,12 @@ fi
 cargo test --quiet --offline --manifest-path "$TABLES" || exit 1
 cargo test --quiet --offline --manifest-path "$SEGMENTATION" || exit 1
 cargo test --quiet --offline --manifest-path "$BIDI" || exit 1
+
+# AND THE PIPELINE OVER THEM, whose fixtures pin the canonical-equivalence policy: the composed and
+# decomposed spellings of one string take the SAME fallback decision, and every offset reported is
+# into the caller's own bytes. Run here rather than beside the font gates because what it rests on is
+# the Unicode data above - the decompositions, the cluster boundaries and the bidi levels.
+cargo test --quiet --offline --manifest-path "$PIPELINE" || exit 1
 
 # Then that they are what the pinned release generates, rather than what somebody edited them into.
 cargo run --quiet --offline --manifest-path "$GENERATOR" -- --check || exit 1

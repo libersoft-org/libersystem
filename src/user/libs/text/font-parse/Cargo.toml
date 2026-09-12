@@ -1,0 +1,12 @@
+[package]
+name = "font-parse"
+edition = "2024"
+description = "Read an OpenType or TrueType font as HOSTILE INPUT: every length, offset and index checked before use"
+
+[dependencies]
+# THE PROFILE, which says what may be read at all. A parser that decided for itself which tables it
+# would accept would be a second profile, and the one thing this milestone's ordering forbids.
+opentype-profile = { path = "../opentype-profile" }
+
+[lints.rust]
+warnings = "deny"

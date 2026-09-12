@@ -23,12 +23,14 @@
 
 pub mod colour;
 pub mod layout;
+pub mod limits;
 pub mod scripts;
 pub mod tables;
 pub mod variations;
 
 pub use colour::{BitmapFormat, CompositeMode, ExtendMode, PaintKind};
 pub use layout::{GposLookup, GsubLookup, LookupFlag, SubtableFormat};
+pub use limits::{Limit, limit};
 pub use scripts::{LanguageSupport, ScriptSupport, ShapingClass};
 pub use tables::{Excluded, TableSupport};
 pub use variations::VariationMechanism;
@@ -62,6 +64,12 @@ pub enum Unsupported {
 	Variation(&'static str),
 	/// A structure the profile EXCLUDES by name - see `tables::EXCLUDED`.
 	ExcludedByProfile(&'static str),
+	/// A NUMERIC CEILING the profile freezes, met by a font or a document.
+	///
+	/// IT NAMES WHICH ONE AND BY HOW MUCH. "Too complex" is not something a report, a staging tool or
+	/// a person can act on; "composite depth, ceiling 5, asked 41" is - and a conformance suite can
+	/// assert on it.
+	Exceeded { limit: &'static str, ceiling: u32, asked: u64 },
 }
 
 /// A four-character OpenType tag, as the format stores it.

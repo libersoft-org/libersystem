@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 
-use opentype_profile::{colour, layout, scripts, tables, variations};
+use opentype_profile::{colour, layout, limits, scripts, tables, variations};
 
 /// The canonical machine-readable form the hash is taken over.
 ///
@@ -64,6 +64,11 @@ pub fn canonical() -> String {
 	for language in scripts::LANGUAGES {
 		let _ = writeln!(out, "language={} name={}", core::str::from_utf8(&language.tag).unwrap_or("????"), language.name);
 	}
+	// THE CEILINGS ARE PART OF THE PROFILE AND THEREFORE PART OF THE HASH. A limit raised quietly is
+	// exactly the change this hash exists to turn into a line in a diff.
+	for limit in limits::LIMITS {
+		let _ = writeln!(out, "limit={} value={} unit={} kind={}", limit.name, limit.value, limit.unit, limit.kind.name());
+	}
 	out
 }
 
@@ -95,6 +100,22 @@ pub fn document(hash: &str) -> String {
 	for excluded in tables::EXCLUDED {
 		let tags: Vec<String> = excluded.tags.iter().map(|tag| format!("`{}`", core::str::from_utf8(tag).unwrap_or("????"))).collect();
 		let _ = writeln!(out, "| {} | {} | {} |", excluded.what, if tags.is_empty() { String::from("-") } else { tags.join(", ") }, excluded.reason);
+	}
+
+	let _ = writeln!(out, "\n## Numeric ceilings\n");
+	let _ = writeln!(out, "Checked offsets stop a crafted font reading somebody else's memory. They stop none of the other");
+	let _ = writeln!(out, "thing a font can do: a STRUCTURALLY VALID face can ask for work that exhausts time, stack or the");
+	let _ = writeln!(out, "caller's memory, and none of it is a parse error at any single read. Exceeding a ceiling is a");
+	let _ = writeln!(out, "typed refusal naming which one and by how much - never a truncation, which is a document silently");
+	let _ = writeln!(out, "rendered wrong.\n");
+	let _ = writeln!(out, "An `internal` ceiling is a property of the face; a `proportional` one caps a multiplier and not a");
+	let _ = writeln!(out, "product; an `absolute` one caps a document, and is what makes the proportional ones bound anything");
+	let _ = writeln!(out, "at all. The proportional rules continue to apply INSIDE the absolute ones rather than being");
+	let _ = writeln!(out, "replaced by them.\n");
+	let _ = writeln!(out, "| ceiling | value | unit | kind | why |");
+	let _ = writeln!(out, "| --- | ---: | --- | --- | --- |");
+	for limit in limits::LIMITS {
+		let _ = writeln!(out, "| {} | {} | {} | {} | {} |", limit.name, limit.value, limit.unit, limit.kind.name(), limit.why);
 	}
 
 	let _ = writeln!(out, "\n## Shaping: `GSUB`\n");

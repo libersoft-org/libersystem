@@ -186,3 +186,25 @@ language=ZHS  name=Chinese, simplified
 language=ZHT  name=Chinese, traditional
 language=JAN  name=Japanese
 language=KOR  name=Korean
+limit=font bytes value=16777216 unit=bytes per face kind=internal
+limit=table bytes value=4194304 unit=bytes per table kind=internal
+limit=composite depth value=5 unit=nested components kind=internal
+limit=composite points value=10000 unit=points after expansion kind=internal
+limit=charstring depth value=10 unit=nested subroutine calls kind=internal
+limit=charstring stack value=48 unit=operands kind=internal
+limit=paint depth value=64 unit=nested paints kind=internal
+limit=paint nodes value=8192 unit=nodes per glyph kind=internal
+limit=context depth value=64 unit=nested lookups kind=internal
+limit=output expansion value=64 unit=x the input run kind=proportional
+limit=variation axes value=64 unit=axes per face kind=internal
+limit=variation regions value=4096 unit=regions per store kind=internal
+limit=features value=256 unit=features per run kind=internal
+limit=bidi depth value=125 unit=nested controls kind=absolute
+limit=fallback faces value=16 unit=faces per cluster kind=proportional
+limit=shaping retries value=4 unit=retries per run kind=proportional
+limit=line passes value=8 unit=passes per line kind=proportional
+limit=paragraph passes value=2 unit=passes per paragraph kind=proportional
+limit=run input value=4096 unit=code points per run kind=absolute
+limit=paragraph input value=65536 unit=code points per paragraph kind=absolute
+limit=run output value=16384 unit=glyphs per run kind=absolute
+limit=paragraph output value=262144 unit=glyphs per paragraph kind=absolute

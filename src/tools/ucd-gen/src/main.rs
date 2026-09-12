@@ -367,6 +367,43 @@ fn generate(cache: &Path) -> Result<String, String> {
 		let _ = writeln!(out, "];\n");
 	}
 
+	// THE CANONICAL DECOMPOSITIONS, and the combining classes that order them.
+	//
+	// WHAT THEY ARE FOR HERE is one question and not normalisation: does a face cover this cluster?
+	// A face may have a glyph for precomposed U+00E9 and no combining acute, or the reverse, so the
+	// question has to be asked of BOTH spellings - and answering it needs the mapping between them.
+	// The buffer itself is never rewritten; see the pipeline's canonical-equivalence policy.
+	{
+		let path = cache.join("UnicodeData.txt");
+		let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+		let exclusions_path = cache.join("CompositionExclusions.txt");
+		let exclusions_text = std::fs::read_to_string(&exclusions_path).map_err(|error| format!("{}: {error}", exclusions_path.display()))?;
+		let (decompositions, classes, composites) = parse_canonical(&text, &exclusions_text)?;
+		let _ = writeln!(out, "/// The CANONICAL decomposition of a character, as `(code point, first, second)` - a canonical");
+		let _ = writeln!(out, "/// decomposition is one or two characters and never more, which is what lets this be a flat");
+		let _ = writeln!(out, "/// table. A second of `0` is a singleton decomposition.");
+		let _ = writeln!(out, "pub const CANONICAL_DECOMPOSITION: &[(u32, u32, u32)] = &[");
+		for (code, first, second) in &decompositions {
+			let _ = writeln!(out, "\t({code:#x}, {first:#x}, {second:#x}),");
+		}
+		let _ = writeln!(out, "];\n");
+		let _ = writeln!(out, "/// The canonical COMBINING CLASS, which orders the marks of a decomposition. Zero for the");
+		let _ = writeln!(out, "/// characters the UCD does not give one, which is most of them.");
+		let _ = writeln!(out, "pub const COMBINING_CLASS: &[(u32, u32, u8)] = &[");
+		for (first, last, class) in &classes {
+			let _ = writeln!(out, "\t({first:#x}, {last:#x}, {class}),");
+		}
+		let _ = writeln!(out, "];\n");
+		let _ = writeln!(out, "/// The primary composites: `(first, second, composed)`, sorted, with the composition");
+		let _ = writeln!(out, "/// exclusions REMOVED - without that a canonical view invents spellings Unicode says do not");
+		let _ = writeln!(out, "/// exist, and then asks a font to cover them.");
+		let _ = writeln!(out, "pub const CANONICAL_COMPOSITION: &[(u32, u32, u32)] = &[");
+		for (first, second, composed) in &composites {
+			let _ = writeln!(out, "\t({first:#x}, {second:#x}, {composed:#x}),");
+		}
+		let _ = writeln!(out, "];\n");
+	}
+
 	// Extended_Pictographic is a single boolean property out of the emoji file rather than one of the
 	// enumerated ones above, and GB11 - the emoji ZWJ sequence rule - is written in terms of it.
 	let path = cache.join("emoji-data.txt");
@@ -475,6 +512,68 @@ fn parse_missing(text: &str) -> Result<Ranges, String> {
 		}
 	}
 	Ok(coalesce(ranges))
+}
+
+/// `UnicodeData.txt`: the canonical decompositions, the combining classes, and the composites those
+/// two imply once the exclusions are taken out.
+///
+/// A COMPATIBILITY DECOMPOSITION IS NOT A CANONICAL ONE and is deliberately dropped: `<font> 0066`
+/// says a character LOOKS like an `f`, not that it IS one, and treating the two alike is how a text
+/// engine decides a font covers a character it has no glyph for.
+#[allow(clippy::type_complexity)]
+fn parse_canonical(text: &str, exclusions_text: &str) -> Result<(Vec<(u32, u32, u32)>, Ranges, Vec<(u32, u32, u32)>), String> {
+	let mut exclusions: Vec<u32> = Vec::new();
+	for line in exclusions_text.lines() {
+		let line = line.split('#').next().unwrap_or("").trim();
+		if line.is_empty() {
+			continue;
+		}
+		let field = line.split(';').next().unwrap_or("").trim();
+		if let Ok(code) = u32::from_str_radix(field, 16) {
+			exclusions.push(code);
+		}
+	}
+	let mut decompositions: Vec<(u32, u32, u32)> = Vec::new();
+	let mut classes: Ranges = Vec::new();
+	for line in text.lines() {
+		let fields: Vec<&str> = line.split(';').collect();
+		if fields.len() < 6 {
+			continue;
+		}
+		let Ok(code) = u32::from_str_radix(fields[0], 16) else { continue };
+		// Field 3 is the canonical combining class, as a decimal number.
+		if let Ok(class) = fields[3].trim().parse::<u8>()
+			&& class != 0
+		{
+			classes.push((code, code, class));
+		}
+		// Field 5 is the decomposition mapping. A leading `<tag>` marks it as COMPATIBILITY, which
+		// this profile does not read.
+		let mapping = fields[5].trim();
+		if mapping.is_empty() || mapping.starts_with('<') {
+			continue;
+		}
+		let parts: Vec<u32> = mapping.split_whitespace().filter_map(|part| u32::from_str_radix(part, 16).ok()).collect();
+		match parts.len() {
+			1 => decompositions.push((code, parts[0], 0)),
+			2 => decompositions.push((code, parts[0], parts[1])),
+			other => return Err(format!("a canonical decomposition of {other} characters at {code:#x}, which the standard does not have")),
+		}
+	}
+	decompositions.sort_by_key(|(code, _, _)| *code);
+	// The composites are the two-character decompositions read backwards, minus the exclusions and
+	// minus anything whose first character has a non-zero combining class - a "non-starter", which
+	// the standard forbids composing onto.
+	let class_of = |code: u32| classes.iter().find(|(first, last, _)| code >= *first && code <= *last).map(|(_, _, class)| *class).unwrap_or(0);
+	let mut composites: Vec<(u32, u32, u32)> = Vec::new();
+	for (code, first, second) in &decompositions {
+		if *second == 0 || exclusions.contains(code) || class_of(*first) != 0 {
+			continue;
+		}
+		composites.push((*first, *second, *code));
+	}
+	composites.sort_by_key(|(first, second, _)| (*first, *second));
+	Ok((decompositions, coalesce(classes), composites))
 }
 
 /// The short `Bidi_Class` alias a long `@missing` name stands for.
@@ -602,7 +701,20 @@ fn emit(out: &mut String, name: &str, values: &[String], ranges: &Ranges) {
 	let _ = writeln!(out, "];\n");
 	let _ = writeln!(out, "/// The `{name}` of a character.");
 	let _ = writeln!(out, "pub fn {}(character: char) -> {name} {{", function_name(name));
-	if name == "BidiClass" {
+	if name == "JoiningType" {
+		// THE FILE'S OWN DERIVED DEFAULT, stated in its header rather than in its records: a code
+		// point it does not list is `T` when its general category is `Mn`, `Me` or `Cf`, and `U`
+		// otherwise. Without this every Arabic vowel mark is non-joining rather than TRANSPARENT,
+		// and a mark between two letters breaks the join - which in Arabic is most places, so the
+		// whole script renders as disconnected shapes.
+		let _ = writeln!(out, "\tmatch crate::lookup_run({table}, character as u32) {{");
+		let _ = writeln!(out, "\t\tSome(ordinal) => {name}::from_ordinal(ordinal),");
+		let _ = writeln!(out, "\t\tNone => match general_category(character) {{");
+		let _ = writeln!(out, "\t\t\tGeneralCategory::Mn | GeneralCategory::Me | GeneralCategory::Cf => {name}::T,");
+		let _ = writeln!(out, "\t\t\t_ => {name}::U,");
+		let _ = writeln!(out, "\t\t}},");
+		let _ = writeln!(out, "\t}}");
+	} else if name == "BidiClass" {
 		let _ = writeln!(out, "\t// A code point the records do not mention takes its BLOCK's default, which is `R` or `AL`");
 		let _ = writeln!(out, "\t// in the right-to-left blocks and `L` elsewhere - see `BIDI_CLASS_DEFAULTS`.");
 		let _ = writeln!(out, "\tmatch crate::lookup_run({table}, character as u32) {{");

@@ -35,6 +35,13 @@ pub const MAX_PARAGRAPH: usize = 65536;
 const MAX_BRACKET_PAIRS: usize = 63;
 
 /// The explicit level limit UAX #9 states.
+/// THE ALGORITHM'S OWN MAXIMUM DEPTH, and it is written here rather than read from a font profile.
+///
+/// STATED IN TWO PLACES ON PURPOSE. The text stack's numeric ceilings are frozen with the OpenType
+/// profile, and this number appears in that list too - but it is UAX #9's number and not that
+/// profile's choice, and a Unicode implementation that had to link an OpenType profile to know its
+/// own algorithm's depth would have the dependency the wrong way round. The profile records it; this
+/// is where it comes from.
 const MAX_DEPTH: u8 = 125;
 
 /// Which way a paragraph runs when the text does not say.

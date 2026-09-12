@@ -81,6 +81,14 @@ fn the_tables_answer_what_the_ucd_says() {
 	assert_eq!(joining_type('\u{0628}'), JoiningType::D, "ARABIC LETTER BEH joins both ways");
 	assert_eq!(joining_type('\u{0627}'), JoiningType::R, "ARABIC LETTER ALEF joins only to its right");
 	assert_eq!(joining_type('a'), JoiningType::U);
+	// THE FILE'S OWN DERIVED DEFAULT: a code point `ArabicShaping.txt` does not list is `T` when its
+	// general category is a mark or a format character, and `U` otherwise. Without it every Arabic
+	// vowel mark is non-joining rather than transparent, and a mark between two letters breaks the
+	// join - which in Arabic is most places.
+	assert_eq!(joining_type('\u{064E}'), JoiningType::T, "ARABIC FATHA is transparent, and the file does not list it");
+	assert_eq!(joining_type('\u{0301}'), JoiningType::T, "so is any other non-spacing mark");
+	assert_eq!(joining_type('\u{200B}'), JoiningType::T, "ZERO WIDTH SPACE is a FORMAT character despite its name, so it is transparent too");
+	assert_eq!(joining_type(' '), JoiningType::U, "an ordinary space is non-joining, which is what breaks a word");
 	assert_eq!(script('a'), Script::Latin);
 	assert_eq!(script('\u{0905}'), Script::Devanagari);
 	assert_eq!(script('\u{0628}'), Script::Arabic);
@@ -138,4 +146,34 @@ fn the_lookup_answers_at_the_edges() {
 	assert_eq!(lookup(table, 0x1000), 3);
 	assert_eq!(lookup(table, 0x1001), 0);
 	assert_eq!(lookup(&[], 0x41), 0, "an empty table answers the default rather than reading past it");
+}
+
+#[test]
+// THE CANONICAL MAPPING BETWEEN THE TWO SPELLINGS OF ONE STRING, which is what the text pipeline's
+// coverage question is asked in terms of - not normalisation, and never a rewrite of the caller's
+// bytes.
+fn the_canonical_decompositions_and_compositions_agree_with_each_other() {
+	// é is a letter and a mark, either way round.
+	assert_eq!(canonical_decomposition('\u{00E9}'), Some(('e', Some('\u{0301}'))));
+	assert_eq!(canonical_composition('e', '\u{0301}'), Some('\u{00E9}'));
+	// A character with no decomposition has none, which is not an error.
+	assert_eq!(canonical_decomposition('a'), None);
+	assert_eq!(canonical_composition('a', 'b'), None);
+	// RECURSION IS THE CALLER'S: U+1E17 decomposes to a character that decomposes further, and this
+	// answers one step so the caller can stop where its own cluster ends.
+	let (first, second) = canonical_decomposition('\u{1E17}').expect("a recursive decomposition");
+	assert_eq!(first, '\u{0113}');
+	assert!(second.is_some());
+	assert!(canonical_decomposition(first).is_some(), "and the first half decomposes again");
+	// A COMPATIBILITY DECOMPOSITION IS NOT A CANONICAL ONE. U+FB01 is the `fi` ligature and says it
+	// LOOKS like `f` `i`, not that it is - and treating the two alike is how a text engine decides a
+	// font covers a character it has no glyph for.
+	assert_eq!(canonical_decomposition('\u{FB01}'), None);
+	// AND THE COMPOSITION EXCLUSIONS ARE OUT: U+0344 decomposes but must never be recomposed.
+	assert!(canonical_decomposition('\u{0344}').is_some());
+	assert_eq!(canonical_composition('\u{0308}', '\u{0301}'), None, "a composition exclusion is not a composition");
+	// The combining classes that order a decomposition's marks.
+	assert_eq!(combining_class('\u{0301}'), 230, "a mark above");
+	assert_eq!(combining_class('\u{0327}'), 202, "a mark below");
+	assert_eq!(combining_class('a'), 0);
 }

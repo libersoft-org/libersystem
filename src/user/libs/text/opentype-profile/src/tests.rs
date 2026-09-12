@@ -185,3 +185,82 @@ fn a_refusal_names_what_it_refused() {
 	assert_eq!(PROFILE_VERSION, 1);
 	assert_eq!(Tag::new(b"GSUB").as_str(), "GSUB");
 }
+
+#[test]
+// THE TABLE AND THE CONSTANTS ARE ONE LIST. A call site uses the constant and the document is written
+// from the table, so a table that drifted from the constants would publish a ceiling nothing
+// enforces - which is the exact failure a written-down limit is supposed to prevent.
+fn every_published_ceiling_is_the_constant_the_code_uses() {
+	use crate::limits;
+	let pairs: &[(&str, u32)] = &[
+		("font bytes", limits::FONT_BYTES),
+		("table bytes", limits::TABLE_BYTES),
+		("composite depth", limits::COMPOSITE_DEPTH),
+		("composite points", limits::COMPOSITE_POINTS),
+		("charstring depth", limits::CHARSTRING_DEPTH),
+		("charstring stack", limits::CHARSTRING_STACK),
+		("paint depth", limits::PAINT_DEPTH),
+		("paint nodes", limits::PAINT_NODES),
+		("context depth", limits::CONTEXT_DEPTH),
+		("output expansion", limits::OUTPUT_EXPANSION),
+		("variation axes", limits::VARIATION_AXES),
+		("variation regions", limits::VARIATION_REGIONS),
+		("features", limits::FEATURES),
+		("bidi depth", limits::BIDI_DEPTH),
+		("fallback faces", limits::FALLBACK_FACES),
+		("shaping retries", limits::SHAPING_RETRIES),
+		("line passes", limits::LINE_PASSES),
+		("paragraph passes", limits::PARAGRAPH_PASSES),
+		("run input", limits::RUN_INPUT),
+		("paragraph input", limits::PARAGRAPH_INPUT),
+		("run output", limits::RUN_OUTPUT),
+		("paragraph output", limits::PARAGRAPH_OUTPUT),
+	];
+	assert_eq!(pairs.len(), limits::LIMITS.len(), "a ceiling in the table with no constant beside it is a number nothing can enforce");
+	for (name, value) in pairs {
+		let entry = limits::limit(name).unwrap_or_else(|| panic!("the profile publishes no ceiling called {name}"));
+		assert_eq!(entry.value, *value, "the published value of {name} is not the constant the code uses");
+	}
+}
+
+#[test]
+// A LIMIT NOBODY DECLARED IS NOT A LIMIT, and answering a default for an unknown name would let a
+// call site enforce a ceiling the profile never froze.
+fn a_ceiling_the_profile_does_not_carry_is_none_rather_than_a_default() {
+	assert!(crate::limits::limit("composite depth").is_some());
+	assert!(crate::limits::limit("glyph budget").is_none());
+	assert!(crate::limits::limit("").is_none());
+}
+
+#[test]
+// WITHOUT THE ABSOLUTE CEILINGS THE REST BOUND NOTHING. A proportional rule is a ratio against an
+// input, so an unbounded input still demands unbounded work however small the ratio is - and the
+// earlier form of this list had no absolute row in it at all.
+fn the_absolute_ceilings_are_present_in_both_directions() {
+	use crate::limits::{self, Kind};
+	let absolute: std::vec::Vec<&str> = limits::LIMITS.iter().filter(|limit| limit.kind == Kind::Absolute).map(|limit| limit.name).collect();
+	for required in ["run input", "paragraph input", "run output", "paragraph output"] {
+		assert!(absolute.contains(&required), "{required} must be an ABSOLUTE ceiling: a proportional rule with no absolute one under it is a ratio, not a bound");
+	}
+	// BOTH DIRECTIONS, because either alone leaves a hole: an input cap without an output cap admits
+	// a run a pathological face expands sixty-four fold, and an output cap without an input cap admits
+	// a source whose refusal is discovered only after it has been read.
+	assert!(limits::RUN_OUTPUT > limits::RUN_INPUT, "an output ceiling below the input one would refuse ordinary text");
+	assert!(limits::PARAGRAPH_OUTPUT > limits::PARAGRAPH_INPUT);
+	// And the proportional rule continues to apply INSIDE them rather than being replaced by them.
+	assert!(limits::OUTPUT_EXPANSION >= 1);
+	assert!(limits::RUN_INPUT.saturating_mul(limits::OUTPUT_EXPANSION) >= limits::RUN_OUTPUT, "the run output ceiling must be reachable within the expansion rule, or one of the two is unreachable and says nothing");
+}
+
+#[test]
+// EVERY CEILING SAYS WHAT IT IS FOR. A number with no reason beside it is one a later reader raises
+// because it was in the way, which is how a bound becomes a formality.
+fn every_ceiling_names_its_kind_its_unit_and_its_reason() {
+	for limit in crate::limits::LIMITS {
+		assert!(!limit.name.is_empty());
+		assert!(!limit.unit.is_empty(), "{} publishes no unit, so its number means nothing on its own", limit.name);
+		assert!(limit.why.len() > 20, "{} publishes no reason", limit.name);
+		assert!(limit.value > 0, "{} is zero, which refuses everything rather than bounding anything", limit.name);
+		assert!(!limit.kind.name().is_empty());
+	}
+}

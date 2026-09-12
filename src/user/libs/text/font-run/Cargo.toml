@@ -1,0 +1,19 @@
+[package]
+name = "font-run"
+edition = "2024"
+description = "Produces the frozen `GlyphRun` and cluster mapping from a shaped buffer: the one conversion from font units to 26.6"
+
+[dependencies]
+# The SEAM this crate produces. It is the definition of what a run is; nothing here restates it.
+font-contract = { path = "../font-contract" }
+# The face, for the metrics, the glyph forms it offers and the ligature carets it declares.
+font-parse = { path = "../font-parse" }
+# The shaped buffer this turns into a run, and the coverage reader every layout table is found through.
+font-shape = { path = "../font-shape" }
+# The frozen numeric ceilings. A run past one of them is refused by name rather than produced.
+opentype-profile = { path = "../opentype-profile" }
+# Cluster boundaries are GRAPHEME boundaries, which is where a caret may stand.
+unicode-segmentation = { path = "../unicode-segmentation" }
+
+[lints.rust]
+warnings = "deny"

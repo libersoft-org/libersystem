@@ -94,6 +94,20 @@ version = "17.0.0"
 url = "https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt"
 sha256 = "d62e5bab70ca74f099343f71224fa051cb1fdd61a1ab45c0488c44cfc0b6102e"
 cache = ".build/ucd/17.0.0/DerivedGeneralCategory.txt"
+[ucd_unicode_data]
+purpose = "the canonical decomposition mappings and the combining classes the canonical-equivalence policy is asked in terms of"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt"
+sha256 = "2e1efc1dcb59c575eedf5ccae60f95229f706ee6d031835247d843c11d96470c"
+cache = ".build/ucd/17.0.0/UnicodeData.txt"
+
+[ucd_composition_exclusions]
+purpose = "the composites that must NOT be recomposed - without them a canonical view invents spellings Unicode says do not exist"
+version = "17.0.0"
+url = "https://www.unicode.org/Public/17.0.0/ucd/CompositionExclusions.txt"
+sha256 = "2f239196ef3b5b61db5cc476e9bd80f534d15aa1b74e1be1dea5d042a344c85f"
+cache = ".build/ucd/17.0.0/CompositionExclusions.txt"
+
 [ucd_east_asian_width]
 purpose = "East_Asian_Width, which LB30 turns on - a bracket beside a wide character breaks where one beside a narrow character does not"
 version = "17.0.0"

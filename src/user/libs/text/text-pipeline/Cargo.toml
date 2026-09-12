@@ -1,0 +1,17 @@
+[package]
+name = "text-pipeline"
+edition = "2024"
+description = "The ordered text pipeline: one sequence of typed stages, with the canonical-equivalence policy"
+
+[dependencies]
+font-contract = { path = "../font-contract" }
+# THE FROZEN CEILINGS. They live with the profile because that is where they were frozen; this layer
+# reads them rather than restating them, because a ceiling each layer chose for itself is a ceiling
+# nobody froze.
+opentype-profile = { path = "../opentype-profile" }
+unicode-bidi = { path = "../unicode-bidi" }
+unicode-segmentation = { path = "../unicode-segmentation" }
+unicode-tables = { path = "../unicode-tables" }
+
+[lints.rust]
+warnings = "deny"

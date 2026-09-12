@@ -1,0 +1,15 @@
+[package]
+name = "font-shape"
+edition = "2024"
+description = "Complex-script shaping over GSUB and GPOS: feature selection, substitution and positioning"
+
+[dependencies]
+# The font, read as hostile input, and the profile that says which lookups exist at all.
+font-parse = { path = "../font-parse" }
+opentype-profile = { path = "../opentype-profile" }
+# The properties the per-script shapers are written in terms of: joining type, syllabic category,
+# and the script itself.
+unicode-tables = { path = "../unicode-tables" }
+
+[lints.rust]
+warnings = "deny"
