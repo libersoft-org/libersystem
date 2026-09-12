@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::glyf::{Outline, Point};
+use crate::glyf::{Outline, Point, PointKind};
 
 /// A TrueType font this tree BUILT, so the parser has valid input to be measured against.
 ///
@@ -382,7 +382,7 @@ fn a_well_formed_font_is_read() {
 	crate::glyf::walk(&face, 1, &mut counter).expect("a square");
 	assert_eq!(counter.points, 4);
 	assert_eq!(counter.contours, 1);
-	assert_eq!(counter.first, Some(Point { x: 100, y: 100, on_curve: true, ends_contour: false }));
+	assert_eq!(counter.first, Some(Point { x: 100, y: 100, kind: PointKind::OnCurve, ends_contour: false }));
 
 	let mut counter = Counter::default();
 	crate::glyf::walk(&face, 2, &mut counter).expect("a triangle");
@@ -404,7 +404,7 @@ fn a_composite_glyph_is_resolved_through_its_component() {
 	let mut counter = Counter::default();
 	crate::glyf::walk(&face, 3, &mut counter).expect("a composite");
 	assert_eq!(counter.points, 4, "the component's four points");
-	assert_eq!(counter.first, Some(Point { x: 150, y: 160, on_curve: true, ends_contour: false }), "moved by the composite's offset");
+	assert_eq!(counter.first, Some(Point { x: 150, y: 160, kind: PointKind::OnCurve, ends_contour: false }), "moved by the composite's offset");
 }
 
 #[test]
@@ -1077,7 +1077,7 @@ fn varying_sample() -> std::vec::Vec<u8> {
 
 /// Walk one glyph at a coordinate, with buffers this fixture owns - which is how the parser is used.
 fn varied_points(face: &Face<'_>, glyph: u16, coordinate: i16) -> std::vec::Vec<Point> {
-	let mut points = [Point { x: 0, y: 0, on_curve: false, ends_contour: false }; 64];
+	let mut points = [Point { x: 0, y: 0, kind: PointKind::OnCurve, ends_contour: false }; 64];
 	let mut deltas = [(0i16, 0i16); 64];
 	let mut touched = [false; 64];
 	let mut recorder = Recorder::default();
@@ -1169,7 +1169,7 @@ fn an_advance_varies_through_the_phantom_points_when_there_is_no_hvar() {
 	let bytes = varying_sample();
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	assert!(face.table(b"HVAR").expect("readable").is_none(), "this fixture states its widths through gvar alone");
-	let mut points = [Point { x: 0, y: 0, on_curve: false, ends_contour: false }; 64];
+	let mut points = [Point { x: 0, y: 0, kind: PointKind::OnCurve, ends_contour: false }; 64];
 	let mut deltas = [(0i16, 0i16); 64];
 	let mut touched = [false; 64];
 	let advance = |coordinate: i16, points: &mut [Point], deltas: &mut [(i16, i16)], touched: &mut [bool]| {
@@ -1192,7 +1192,7 @@ fn an_advance_varies_through_the_phantom_points_when_there_is_no_hvar() {
 fn a_glyph_larger_than_the_buffer_it_was_given_is_refused() {
 	let bytes = varying_sample();
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
-	let mut points = [Point { x: 0, y: 0, on_curve: false, ends_contour: false }; 2];
+	let mut points = [Point { x: 0, y: 0, kind: PointKind::OnCurve, ends_contour: false }; 2];
 	let mut deltas = [(0i16, 0i16); 64];
 	let mut touched = [false; 64];
 	let mut recorder = Recorder::default();
@@ -1200,7 +1200,7 @@ fn a_glyph_larger_than_the_buffer_it_was_given_is_refused() {
 	assert!(crate::gvar::walk_varied(&face, 1, &[16384], scratch, &mut recorder).is_err(), "four points do not fit in two");
 
 	// And so is a delta buffer that cannot hold the phantom points, which are part of the count.
-	let mut points = [Point { x: 0, y: 0, on_curve: false, ends_contour: false }; 64];
+	let mut points = [Point { x: 0, y: 0, kind: PointKind::OnCurve, ends_contour: false }; 64];
 	let mut deltas = [(0i16, 0i16); 4];
 	let mut touched = [false; 4];
 	let mut recorder = Recorder::default();
@@ -1227,7 +1227,7 @@ fn a_gvar_font_corrupted_anywhere_is_refused_rather_than_read_past() {
 			let Ok(face) = Face::open(&mutated, 0) else { continue };
 			for glyph in 0..4u16 {
 				for coordinate in [-16384i16, 0, 8192, 16384] {
-					let mut points = [Point { x: 0, y: 0, on_curve: false, ends_contour: false }; 64];
+					let mut points = [Point { x: 0, y: 0, kind: PointKind::OnCurve, ends_contour: false }; 64];
 					let mut deltas = [(0i16, 0i16); 64];
 					let mut touched = [false; 64];
 					let mut recorder = Recorder::default();
@@ -1319,6 +1319,28 @@ fn a_table_larger_than_the_frozen_ceiling_is_refused_by_name() {
 	bytes[entry + 12..entry + 16].copy_from_slice(&asked.to_be_bytes());
 	let face = Face::open(&bytes, 0).expect("a directory entry is not read until the table is asked for");
 	assert_eq!(face.table(b"glyf").err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "table bytes", ceiling: opentype_profile::limits::TABLE_BYTES, asked: asked as u64 })));
+
+	// AND EXACTLY AT THE CEILING IT IS NOT THE CEILING THAT REFUSES IT - which is what makes the
+	// published number the number. The range still has to be inside the file, so what is asserted
+	// here is that the refusal is the FILE's.
+	let mut bytes = build::sample();
+	let entry = find_entry(&bytes, b"glyf");
+	bytes[entry + 12..entry + 16].copy_from_slice(&opentype_profile::limits::TABLE_BYTES.to_be_bytes());
+	let face = Face::open(&bytes, 0).expect("a directory entry is not read until the table is asked for");
+	assert_eq!(face.table(b"glyf").err(), Some(Error::Malformed(Malformed::TableOutOfBounds { table: *b"glyf" })));
+}
+
+#[test]
+// A FACE LARGER THAN ANY REAL ONE IS A DOCUMENT TRYING TO EXHAUST MEMORY BEFORE IT IS PARSED, and it
+// is refused before a single byte of it is read - the only point at which refusing it costs nothing.
+fn a_file_larger_than_the_frozen_ceiling_is_refused_before_anything_is_read() {
+	let ceiling = opentype_profile::limits::FONT_BYTES as usize;
+	let bytes = std::vec![0u8; ceiling + 1];
+	assert_eq!(Face::open(&bytes, 0).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "font bytes", ceiling: opentype_profile::limits::FONT_BYTES, asked: ceiling as u64 + 1 })));
+	// Exactly at the ceiling the size is not what refuses it: the file is still not a font, and THAT
+	// is what it is refused for.
+	let bytes = std::vec![0u8; ceiling];
+	assert_eq!(Face::open(&bytes, 0).err(), Some(Error::Malformed(Malformed::NotAFont)));
 }
 
 #[test]
@@ -1357,6 +1379,86 @@ fn the_points_a_composite_expands_to_are_counted_across_the_whole_walk() {
 	// The composite that draws it twice is REFUSED, and the refusal names the ceiling and the ask.
 	let mut counter = Counter::default();
 	assert_eq!(crate::glyf::walk(&face, 0, &mut counter), Err(Error::Unsupported(crate::Unsupported::Exceeded { limit: "composite points", ceiling: opentype_profile::limits::COMPOSITE_POINTS, asked: 12000 })));
+
+	// AND EXACTLY AT THE CEILING IT IS DRAWN. Two leaves of five thousand points each are ten
+	// thousand, which is the number - and a ceiling that refused at its own value would be a
+	// different number than the one published.
+	let ceiling = opentype_profile::limits::COMPOSITE_POINTS as usize;
+	let leaf: std::vec::Vec<(i16, i16)> = (0..ceiling / 2).map(|index| ((index % 900) as i16 + 50, (index / 900) as i16 + 50)).collect();
+	let leaf = build::simple_glyph(&leaf);
+	let pair = build::composite_glyphs(&[(1, 0, 0), (1, 10, 10)]);
+	let mut glyf = std::vec::Vec::new();
+	let mut loca = std::vec::Vec::new();
+	u16_at(&mut loca, 0);
+	for glyph in [&pair, &leaf] {
+		glyf.extend_from_slice(glyph);
+		while glyf.len() % 2 != 0 {
+			glyf.push(0);
+		}
+		u16_at(&mut loca, (glyf.len() / 2) as u16);
+	}
+	let mut hhea = table_bytes(&sample, b"hhea");
+	hhea[34..36].copy_from_slice(&2u16.to_be_bytes());
+	let mut maxp = table_bytes(&sample, b"maxp");
+	maxp[4..6].copy_from_slice(&2u16.to_be_bytes());
+	let bytes = build::font(&[(*b"glyf", glyf), (*b"head", table_bytes(&sample, b"head")), (*b"hhea", hhea), (*b"hmtx", std::vec![0u8; 8]), (*b"loca", loca), (*b"maxp", maxp)]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut counter = Counter::default();
+	crate::glyf::walk(&face, 0, &mut counter).expect("exactly ten thousand points is within the ceiling");
+	assert_eq!(counter.points, ceiling);
+}
+
+#[test]
+// A COMPOSITE THAT REFERS TO A COMPOSITE IS ORDINARY, and the ceiling is on how far that goes. At the
+// ceiling it is drawn and one past it is refused by name, which is what makes the published number
+// the number rather than an approximation of it.
+fn a_composite_is_nested_to_the_frozen_depth_and_no_further() {
+	let build_chain = |links: usize| {
+		let leaf = build::simple_glyph(&[(100, 100), (900, 100), (900, 900)]);
+		let mut glyf = std::vec::Vec::new();
+		let mut loca = std::vec::Vec::new();
+		u16_at(&mut loca, 0);
+		for index in 0..links {
+			let link = build::composite_glyphs(&[(index as u16 + 1, 1, 1)]);
+			glyf.extend_from_slice(&link);
+			while glyf.len() % 2 != 0 {
+				glyf.push(0);
+			}
+			u16_at(&mut loca, (glyf.len() / 2) as u16);
+		}
+		glyf.extend_from_slice(&leaf);
+		while glyf.len() % 2 != 0 {
+			glyf.push(0);
+		}
+		u16_at(&mut loca, (glyf.len() / 2) as u16);
+		let count = links as u16 + 1;
+		let sample = build::sample();
+		let mut hhea = table_bytes(&sample, b"hhea");
+		hhea[34..36].copy_from_slice(&count.to_be_bytes());
+		let mut maxp = table_bytes(&sample, b"maxp");
+		maxp[4..6].copy_from_slice(&count.to_be_bytes());
+		build::font(&[
+			(*b"glyf", glyf),
+			(*b"head", table_bytes(&sample, b"head")),
+			(*b"hhea", hhea),
+			(*b"hmtx", std::vec![0u8; count as usize * 4]),
+			(*b"loca", loca),
+			(*b"maxp", maxp),
+		])
+	};
+
+	// A chain of `COMPOSITE_DEPTH` links reaches its leaf at exactly the ceiling.
+	let depth = opentype_profile::limits::COMPOSITE_DEPTH as usize;
+	let bytes = build_chain(depth);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut counter = Counter::default();
+	crate::glyf::walk(&face, 0, &mut counter).expect("a chain exactly as deep as the ceiling is drawn");
+	assert_eq!(counter.points, 3);
+
+	let bytes = build_chain(depth + 1);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let mut counter = Counter::default();
+	assert_eq!(crate::glyf::walk(&face, 0, &mut counter), Err(Error::Unsupported(crate::Unsupported::Exceeded { limit: "composite depth", ceiling: opentype_profile::limits::COMPOSITE_DEPTH, asked: opentype_profile::limits::COMPOSITE_DEPTH as u64 + 1 })));
 }
 
 #[test]
@@ -1378,6 +1480,27 @@ fn a_face_declaring_more_axes_than_the_profile_freezes_is_refused_by_name() {
 	]);
 	let face = Face::open(&bytes, 0).expect("a font this tree built");
 	assert_eq!(Variations::of(&face).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "variation axes", ceiling: opentype_profile::limits::VARIATION_AXES, asked: asked as u64 })));
+
+	// AND EXACTLY AT THE CEILING IT IS READ, with the bytes for every axis it declares - so what is
+	// exercised is the reader rather than the refusal.
+	let ceiling = opentype_profile::limits::VARIATION_AXES as u16;
+	let mut fvar = variable::fvar();
+	fvar[8..10].copy_from_slice(&ceiling.to_be_bytes());
+	fvar[12..14].copy_from_slice(&0u16.to_be_bytes()); // no named instances, which the axes displace
+	let first = fvar[16..36].to_vec();
+	for _ in 1..ceiling {
+		fvar.extend_from_slice(&first);
+	}
+	let bytes = build::font(&[
+		(*b"fvar", fvar),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let variations = Variations::of(&face).expect("readable").expect("a variable font");
+	assert_eq!(variations.axis_count, ceiling as usize);
 }
 
 /// A big-endian `u16`, for the fixtures above that assemble a `loca` by hand.
@@ -1581,6 +1704,1235 @@ fn the_metadata_tables_corrupted_anywhere_are_refused_rather_than_read_past() {
 					let mut buffer = [0u8; MAX_GLYPH_NAME];
 					for glyph in 0..8u16 {
 						let _ = names.get(glyph, &mut buffer);
+					}
+				}
+			}
+		}
+	}
+}
+
+#[test]
+// EACH REGION IS READ FOR EVERY DELTA, so a store's WIDTH is work per glyph rather than a size - and
+// the ceiling is checked at its exact bound and one past it, because a ceiling tested only past its
+// value could be off by one in either direction and nothing would say so.
+fn an_item_variation_store_holds_regions_to_the_frozen_ceiling_and_no_further() {
+	// An `HVAR` whose region LIST declares `regions` of them, with one delta over the first.
+	let hvar = |regions: u16| {
+		let mut list = std::vec::Vec::new();
+		variable::u16(&mut list, 1); // one axis
+		variable::u16(&mut list, regions);
+		for _ in 0..regions {
+			variable::i16(&mut list, 0);
+			variable::i16(&mut list, 16384);
+			variable::i16(&mut list, 16384);
+		}
+		let mut data = std::vec::Vec::new();
+		variable::u16(&mut data, 2); // two items
+		variable::u16(&mut data, 1); // one short delta each
+		variable::u16(&mut data, 1); // over one region
+		variable::u16(&mut data, 0); // region index 0
+		variable::i16(&mut data, 0);
+		variable::i16(&mut data, 100);
+
+		let regions_at = 12usize;
+		let data_at = regions_at + list.len();
+		let mut store = std::vec::Vec::new();
+		variable::u16(&mut store, 1);
+		variable::u32(&mut store, regions_at as u32);
+		variable::u16(&mut store, 1);
+		variable::u32(&mut store, data_at as u32);
+		store.extend_from_slice(&list);
+		store.extend_from_slice(&data);
+
+		let mut out = std::vec::Vec::new();
+		variable::u16(&mut out, 1);
+		variable::u16(&mut out, 0);
+		variable::u32(&mut out, 20);
+		variable::u32(&mut out, 0);
+		variable::u32(&mut out, 0);
+		variable::u32(&mut out, 0);
+		out.extend_from_slice(&store);
+		out
+	};
+	let face_with = |regions: u16| {
+		let sample = build::sample();
+		build::font(&[
+			(*b"HVAR", hvar(regions)),
+			(*b"fvar", variable::fvar()),
+			(*b"head", table_bytes(&sample, b"head")),
+			(*b"hhea", table_bytes(&sample, b"hhea")),
+			(*b"hmtx", table_bytes(&sample, b"hmtx")),
+			(*b"maxp", table_bytes(&sample, b"maxp")),
+		])
+	};
+
+	let ceiling = opentype_profile::limits::VARIATION_REGIONS as u16;
+	// At the ceiling the delta is read, which is what makes the published number the number.
+	let bytes = face_with(ceiling);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	assert_eq!(crate::variations::advance_delta(&face, 1, &[16384]).expect("readable"), 100);
+
+	// One past it the store is refused BY NAME rather than read: a report saying "variation regions,
+	// ceiling 4096, asked 4097" is something a staging tool and a person can act on.
+	let bytes = face_with(ceiling + 1);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	assert_eq!(crate::variations::advance_delta(&face, 1, &[16384]).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "variation regions", ceiling: opentype_profile::limits::VARIATION_REGIONS, asked: ceiling as u64 + 1 })));
+}
+
+/// A `CFF` table this tree builds, because a charstring is a PROGRAM and a fixture has to be able to
+/// write one.
+mod charstrings {
+	/// A DICT integer, always in the five-byte form - so every offset in the fixture has a length
+	/// that does not depend on its value, and the layout below is arithmetic rather than a search.
+	pub fn integer(out: &mut std::vec::Vec<u8>, value: i32) {
+		out.push(29);
+		out.extend_from_slice(&value.to_be_bytes());
+	}
+
+	/// An INDEX with one-byte offsets over the entries given.
+	pub fn index(entries: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+		let mut out = std::vec::Vec::new();
+		if entries.is_empty() {
+			out.extend_from_slice(&0u16.to_be_bytes());
+			return out;
+		}
+		out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+		out.push(1); // one-byte offsets
+		let mut at = 1u8;
+		out.push(at);
+		for entry in entries {
+			at += entry.len() as u8;
+			out.push(at);
+		}
+		for entry in entries {
+			out.extend_from_slice(entry);
+		}
+		out
+	}
+
+	/// A charstring number, in the CHARSTRING encoding - which is not the DICT's.
+	pub fn number(out: &mut std::vec::Vec<u8>, value: i32) {
+		if (-107..=107).contains(&value) {
+			out.push((value + 139) as u8);
+		} else if (108..=1131).contains(&value) {
+			let value = value - 108;
+			out.push((value / 256) as u8 + 247);
+			out.push((value % 256) as u8);
+		} else if (-1131..=-108).contains(&value) {
+			let value = -value - 108;
+			out.push((value / 256) as u8 + 251);
+			out.push((value % 256) as u8);
+		} else {
+			out.push(28);
+			out.extend_from_slice(&(value as i16).to_be_bytes());
+		}
+	}
+
+	/// An INDEX with CFF2's THIRTY-TWO-BIT count, which CFF's sixteen-bit one is not - and reading one
+	/// as the other puts every offset in the table two bytes out.
+	pub fn index_wide(entries: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+		let mut out = std::vec::Vec::new();
+		out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+		if entries.is_empty() {
+			return out;
+		}
+		out.push(1);
+		let mut at = 1u8;
+		out.push(at);
+		for entry in entries {
+			at += entry.len() as u8;
+			out.push(at);
+		}
+		for entry in entries {
+			out.extend_from_slice(entry);
+		}
+		out
+	}
+
+	/// A whole `CFF2` table: the header with its stated top-DICT length, an `FDArray` because CFF2
+	/// requires one, and an item variation store for `blend` to read through.
+	pub fn cff2(glyphs: &[std::vec::Vec<u8>], store: &[u8]) -> std::vec::Vec<u8> {
+		let charstrings = index_wide(glyphs);
+		// The top DICT is a fixed nineteen bytes: three five-byte integers with a one-, two- and
+		// one-byte operator after them.
+		let top_length = 6 + 7 + 6;
+		let charstrings_at = 5 + top_length + 4;
+		let mut font = std::vec::Vec::new();
+		integer(&mut font, 0); // the private DICT's size
+		let font_placeholder = font.len();
+		integer(&mut font, 0); // ... and its offset, filled in below
+		font.push(18);
+		let fdarray = index_wide(&[font.clone()]);
+		let fdarray_at = charstrings_at + charstrings.len();
+		let private_at = fdarray_at + fdarray.len();
+		let vstore_at = private_at;
+
+		// The private DICT's offset, now that the layout is known.
+		let mut font = font;
+		font[font_placeholder..font_placeholder + 5].copy_from_slice(&{
+			let mut bytes = std::vec::Vec::new();
+			integer(&mut bytes, private_at as i32);
+			bytes
+		});
+		let fdarray = index_wide(&[font]);
+
+		let mut top = std::vec::Vec::new();
+		integer(&mut top, charstrings_at as i32);
+		top.push(17); // CharStrings
+		integer(&mut top, fdarray_at as i32);
+		top.extend_from_slice(&[12, 36]); // FDArray
+		integer(&mut top, vstore_at as i32);
+		top.push(24); // vstore
+		assert_eq!(top.len(), top_length, "the fixture's own layout arithmetic must match the bytes it writes");
+
+		let mut out = std::vec::Vec::new();
+		out.push(2); // major
+		out.push(0); // minor
+		out.push(5); // header size
+		out.extend_from_slice(&(top_length as u16).to_be_bytes());
+		out.extend_from_slice(&top);
+		out.extend_from_slice(&index_wide(&[])); // no global subroutines
+		out.extend_from_slice(&charstrings);
+		out.extend_from_slice(&fdarray);
+		// The variation store, whose own length precedes it.
+		out.extend_from_slice(&(store.len() as u16).to_be_bytes());
+		out.extend_from_slice(store);
+		out
+	}
+
+	/// A whole `CFF` table: the header, the four INDEXes, the charstrings and a private DICT with the
+	/// local subroutines given.
+	pub fn cff(glyphs: &[std::vec::Vec<u8>], local_subrs: &[std::vec::Vec<u8>], global_subrs: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+		let names = index(&[b"Test".to_vec()]);
+		let strings = index(&[]);
+		let globals = index(global_subrs);
+		let charstrings = index(glyphs);
+		let subrs = index(local_subrs);
+
+		// The top DICT is a fixed seventeen bytes: two five-byte integers and an operator for the
+		// private DICT, and one of each for the charstrings.
+		let top_length = 5 + 5 + 1 + 5 + 1;
+		let top_index_length = 2 + 1 + 2 + top_length;
+		let header = 4usize;
+		let charstrings_at = header + names.len() + top_index_length + strings.len() + globals.len();
+		let private_at = charstrings_at + charstrings.len();
+		// The private DICT: one five-byte offset and the `Subrs` operator, whose offset is relative
+		// to the private DICT's own start.
+		let private_length = 6usize;
+
+		let mut top = std::vec::Vec::new();
+		integer(&mut top, private_length as i32);
+		integer(&mut top, private_at as i32);
+		top.push(18); // Private
+		integer(&mut top, charstrings_at as i32);
+		top.push(17); // CharStrings
+		assert_eq!(top.len(), top_length, "the fixture's own layout arithmetic must match the bytes it writes");
+
+		let mut private = std::vec::Vec::new();
+		integer(&mut private, private_length as i32);
+		private.push(19); // Subrs
+		assert_eq!(private.len(), private_length);
+
+		let mut out = std::vec::Vec::new();
+		out.push(1); // major
+		out.push(0); // minor
+		out.push(4); // header size
+		out.push(1); // absolute offset size, which nothing below reads
+		out.extend_from_slice(&names);
+		out.extend_from_slice(&index(&[top]));
+		out.extend_from_slice(&strings);
+		out.extend_from_slice(&globals);
+		out.extend_from_slice(&charstrings);
+		out.extend_from_slice(&private);
+		out.extend_from_slice(&subrs);
+		out
+	}
+}
+
+/// A face whose outlines are charstrings rather than `glyf`.
+fn charstring_font(glyphs: &[std::vec::Vec<u8>], local: &[std::vec::Vec<u8>], global: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+	let sample = build::sample();
+	build::font(&[
+		(*b"CFF ", charstrings::cff(glyphs, local, global)),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	])
+}
+
+/// An outline walk that keeps the points AND what kind each one is, which is the whole difference
+/// between the two outline formats.
+#[derive(Default)]
+struct Shape {
+	points: std::vec::Vec<(i16, i16, PointKind, bool)>,
+}
+
+impl Outline for Shape {
+	fn point(&mut self, point: Point) -> bool {
+		self.points.push((point.x, point.y, point.kind, point.ends_contour));
+		true
+	}
+}
+
+#[test]
+// `glyf` IS DATA AND A CHARSTRING IS CODE. Drawing one means RUNNING it - a stack machine with
+// subroutine calls - which is why the operand stack, the call depth and the operator set are the
+// profile's frozen numbers rather than whatever the font asks for.
+fn a_charstring_is_run_and_its_outline_is_drawn() {
+	let mut triangle = std::vec::Vec::new();
+	charstrings::number(&mut triangle, 100);
+	charstrings::number(&mut triangle, 100);
+	triangle.push(21); // rmoveto
+	charstrings::number(&mut triangle, 800);
+	charstrings::number(&mut triangle, 0);
+	triangle.push(5); // rlineto
+	charstrings::number(&mut triangle, -400);
+	charstrings::number(&mut triangle, 800);
+	triangle.push(5); // rlineto
+	triangle.push(14); // endchar
+
+	let bytes = charstring_font(&[std::vec![14u8], triangle], &[], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("a face with charstrings");
+	assert_eq!(cff.glyph_count(), 2);
+
+	let mut shape = Shape::default();
+	cff.walk(1, &[], &mut shape).expect("a charstring this tree wrote");
+	assert_eq!(shape.points, std::vec![(100i16, 100i16, PointKind::OnCurve, false), (900, 100, PointKind::OnCurve, false), (500, 900, PointKind::OnCurve, true)], "three on-curve points, and the LAST one closes the contour");
+
+	// A glyph that is nothing but `endchar` draws nothing, which is what a notdef with no outline is.
+	let mut shape = Shape::default();
+	cff.walk(0, &[], &mut shape).expect("a charstring this tree wrote");
+	assert!(shape.points.is_empty());
+}
+
+#[test]
+// THE CURVES ARE CUBIC AND `glyf`'S ARE QUADRATIC, which is why the point kind is an enum. Two
+// quadratic controls in a row imply an on-curve point half way between them and the two controls of
+// a cubic do not; a consumer that read one as the other draws a different shape and nothing in the
+// data says so.
+fn a_charstring_curve_is_cubic_and_says_so() {
+	let mut glyph = std::vec::Vec::new();
+	charstrings::number(&mut glyph, 100);
+	charstrings::number(&mut glyph, 100);
+	glyph.push(21); // rmoveto
+	for value in [200, 300, 200, -300, 200, 0] {
+		charstrings::number(&mut glyph, value);
+	}
+	glyph.push(8); // rrcurveto
+	glyph.push(14);
+
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+	let mut shape = Shape::default();
+	cff.walk(1, &[], &mut shape).expect("a charstring this tree wrote");
+	assert_eq!(shape.points, std::vec![(100i16, 100i16, PointKind::OnCurve, false), (300, 400, PointKind::Cubic, false), (500, 100, PointKind::Cubic, false), (700, 100, PointKind::OnCurve, true),], "one on-curve point, TWO cubic controls, and the on-curve point the curve ends at");
+}
+
+#[test]
+// THE SUBROUTINE BIAS IS PART OF THE ENCODING AND NOT AN OPTIMISATION. A subroutine is named by a
+// number that may be NEGATIVE, and the bias turns it into an index so the commonest subroutines get
+// the shortest numbers. Getting it wrong calls a different subroutine, which draws a different glyph
+// and reports nothing.
+fn a_charstring_calls_local_and_global_subroutines_through_the_bias() {
+	// One local subroutine that draws the base of a triangle, and one global that draws its side.
+	let mut base = std::vec::Vec::new();
+	charstrings::number(&mut base, 800);
+	charstrings::number(&mut base, 0);
+	base.push(5); // rlineto
+	base.push(11); // return
+
+	let mut side = std::vec::Vec::new();
+	charstrings::number(&mut side, -400);
+	charstrings::number(&mut side, 800);
+	side.push(5);
+	side.push(11);
+
+	// With one subroutine the bias is 107, so index 0 is called as -107.
+	let mut glyph = std::vec::Vec::new();
+	charstrings::number(&mut glyph, 100);
+	charstrings::number(&mut glyph, 100);
+	glyph.push(21);
+	charstrings::number(&mut glyph, -107);
+	glyph.push(10); // callsubr
+	charstrings::number(&mut glyph, -107);
+	glyph.push(29); // callgsubr
+	glyph.push(14);
+
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[base], &[side]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+	let mut shape = Shape::default();
+	cff.walk(1, &[], &mut shape).expect("a charstring this tree wrote");
+	assert_eq!(shape.points, std::vec![(100i16, 100i16, PointKind::OnCurve, false), (900, 100, PointKind::OnCurve, false), (500, 900, PointKind::OnCurve, true)], "the same triangle, drawn out of two subroutines");
+}
+
+#[test]
+// A SUBROUTINE THAT CALLS ITSELF IS A CHARSTRING THAT NEVER RETURNS, and a stack that is pushed and
+// never popped is the cheapest way to ask a parser for unbounded memory. Both ceilings are the
+// profile's, and both refuse by name.
+fn a_charstring_past_the_frozen_depth_or_stack_is_refused_by_name() {
+	// A subroutine that calls itself: with one subroutine the bias is 107, so it calls -107.
+	let mut loop_subr = std::vec::Vec::new();
+	charstrings::number(&mut loop_subr, -107);
+	loop_subr.push(10);
+	loop_subr.push(11);
+	let mut glyph = std::vec::Vec::new();
+	charstrings::number(&mut glyph, -107);
+	glyph.push(10);
+	glyph.push(14);
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[loop_subr], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+	let mut shape = Shape::default();
+	assert_eq!(cff.walk(1, &[], &mut shape).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "charstring depth", ceiling: opentype_profile::limits::CHARSTRING_DEPTH, asked: opentype_profile::limits::CHARSTRING_DEPTH as u64 + 1 })));
+
+	// And a charstring that pushes one operand past the stack.
+	let ceiling = opentype_profile::limits::CHARSTRING_STACK as usize;
+	let mut glyph = std::vec::Vec::new();
+	for _ in 0..=ceiling {
+		charstrings::number(&mut glyph, 1);
+	}
+	glyph.push(14);
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+	let mut shape = Shape::default();
+	assert_eq!(cff.walk(1, &[], &mut shape).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "charstring stack", ceiling: opentype_profile::limits::CHARSTRING_STACK, asked: opentype_profile::limits::CHARSTRING_STACK as u64 + 1 })));
+
+	// AND EXACTLY AT THE STACK'S CEILING IT RUNS, which is what makes the published number the number.
+	// The operands are given to `rlineto`, which takes any even number of them - `endchar` takes at
+	// most five, and a charstring that hands it forty-eight is refused for contradicting itself
+	// rather than for the stack.
+	let mut glyph = std::vec::Vec::new();
+	for _ in 0..ceiling {
+		charstrings::number(&mut glyph, 1);
+	}
+	glyph.push(5);
+	glyph.push(14);
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+	let mut shape = Shape::default();
+	assert!(cff.walk(1, &[], &mut shape).is_ok());
+}
+
+#[test]
+// THE DEPRECATED HALF OF TYPE 2 IS A STACK MACHINE INSIDE THE STACK MACHINE - arithmetic, storage, a
+// random number - and no font written this century uses it. It is refused BY NUMBER, which a report
+// and a conformance suite can act on; implementing an interpreter for untrusted input in exchange for
+// nothing is a trade this profile does not make.
+fn the_deprecated_charstring_operators_are_refused_by_number() {
+	for (operator, encoded) in [(1223u16, std::vec![12u8, 23]), (1220, std::vec![12u8, 20]), (1226, std::vec![12u8, 26])] {
+		let mut glyph = std::vec::Vec::new();
+		charstrings::number(&mut glyph, 1);
+		charstrings::number(&mut glyph, 2);
+		glyph.extend_from_slice(&encoded);
+		glyph.push(14);
+		let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+		let face = Face::open(&bytes, 0).expect("a font this tree built");
+		let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+		let mut shape = Shape::default();
+		assert_eq!(cff.walk(1, &[], &mut shape).err(), Some(Error::Unsupported(crate::Unsupported::CharstringOperator(operator))));
+	}
+
+	// `seac` - an accented character built out of two others by their standard encoding codes - is a
+	// Type 1 mechanism, and it is refused rather than drawn as a bare letter without its accent.
+	let mut glyph = std::vec::Vec::new();
+	for value in [0, 0, 65, 200] {
+		charstrings::number(&mut glyph, value);
+	}
+	glyph.push(14);
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+	let mut shape = Shape::default();
+	assert_eq!(cff.walk(1, &[], &mut shape).err(), Some(Error::Unsupported(crate::Unsupported::CharstringOperator(14))));
+}
+
+#[test]
+// THE SAME BOUND AS EVERY OTHER TABLE, over the one that is a program. A charstring is offsets into
+// INDEXes into offsets, and every one of them is a place a crafted font can point somewhere else -
+// and unlike every other table, reading it means RUNNING what it says.
+fn a_charstring_table_corrupted_anywhere_is_refused_rather_than_run_past() {
+	let mut triangle = std::vec::Vec::new();
+	charstrings::number(&mut triangle, 100);
+	charstrings::number(&mut triangle, 100);
+	triangle.push(21);
+	for value in [200, 300, 200, -300, 200, 0] {
+		charstrings::number(&mut triangle, value);
+	}
+	triangle.push(8);
+	triangle.push(14);
+	let mut subr = std::vec::Vec::new();
+	charstrings::number(&mut subr, 50);
+	charstrings::number(&mut subr, 50);
+	subr.push(5);
+	subr.push(11);
+
+	let bytes = charstring_font(&[std::vec![14u8], triangle], &[subr.clone()], &[subr]);
+	let at = find_table(&bytes, b"CFF ");
+	let entry = find_entry(&bytes, b"CFF ");
+	let length = u32::from_be_bytes([bytes[entry + 12], bytes[entry + 13], bytes[entry + 14], bytes[entry + 15]]) as usize;
+	for index in 0..length {
+		for pattern in [0x01u8, 0x7F, 0x80, 0xFF] {
+			let mut mutated = bytes.clone();
+			mutated[at + index] ^= pattern;
+			let Ok(face) = Face::open(&mutated, 0) else { continue };
+			let Ok(Some(cff)) = crate::cff::Cff::of(&face) else { continue };
+			for glyph in 0..4u16 {
+				let mut shape = Shape::default();
+				let _ = cff.walk(glyph, &[0, 0], &mut shape);
+			}
+		}
+	}
+}
+
+#[test]
+// CFF2 IS THE SAME MACHINE WITH THE WIDTH REMOVED AND `blend` ADDED. A width in a charstring was
+// always a duplicate of `hmtx`; `blend` takes a value and the deltas for every region and leaves the
+// value AT THIS INSTANCE. Reading a CFF2 charstring as a Type 2 one silently takes the first blend
+// delta for the value itself, which draws a glyph out of the difference between two masters rather
+// than the glyph.
+fn a_cff2_charstring_blends_its_values_at_the_instance() {
+	// A value and one delta, blended: `value delta 1 blend`.
+	let blended = |out: &mut std::vec::Vec<u8>, value: i32, delta: i32| {
+		charstrings::number(out, value);
+		charstrings::number(out, delta);
+		charstrings::number(out, 1);
+		out.push(16); // blend
+	};
+	let mut glyph = std::vec::Vec::new();
+	blended(&mut glyph, 100, 50);
+	charstrings::number(&mut glyph, 100);
+	glyph.push(21); // rmoveto
+	charstrings::number(&mut glyph, 800);
+	charstrings::number(&mut glyph, 0);
+	glyph.push(5); // rlineto
+	// A CFF2 CHARSTRING HAS NO `endchar`: it ends where its bytes end, and a reader that waited for
+	// one would run off the end of every glyph in the font.
+
+	let store = variable::item_store(&[0]);
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"CFF2", charstrings::cff2(&[std::vec![], glyph], &store)),
+		(*b"fvar", variable::fvar()),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let cff = crate::cff::Cff::of(&face).expect("readable").expect("a face with charstrings");
+	assert_eq!(cff.glyph_count(), 2);
+
+	// At the default coordinate the one region does not apply, so the blend leaves the value alone.
+	let mut shape = Shape::default();
+	cff.walk(1, &[0], &mut shape).expect("a charstring this tree wrote");
+	assert_eq!(shape.points, std::vec![(100i16, 100i16, PointKind::OnCurve, false), (900, 100, PointKind::OnCurve, true)]);
+
+	// At the top of the axis the whole delta applies.
+	let mut shape = Shape::default();
+	cff.walk(1, &[16384], &mut shape).expect("a charstring this tree wrote");
+	assert_eq!(shape.points, std::vec![(150i16, 100i16, PointKind::OnCurve, false), (950, 100, PointKind::OnCurve, true)]);
+
+	// Half way up, half of it - which is the whole point of blending rather than picking a master.
+	let mut shape = Shape::default();
+	cff.walk(1, &[8192], &mut shape).expect("a charstring this tree wrote");
+	assert_eq!(shape.points, std::vec![(125i16, 100i16, PointKind::OnCurve, false), (925, 100, PointKind::OnCurve, true)]);
+}
+
+#[test]
+// `blend` AND `vsindex` BELONG TO CFF2 AND ARE NOT TYPE 2 OPERATORS. A `CFF` charstring that uses one
+// is refused by number rather than run, because in Type 2 those numbers mean nothing at all and
+// running them would be inventing an instruction set.
+fn the_cff2_operators_are_refused_inside_a_plain_cff_charstring() {
+	for operator in [15u16, 16] {
+		let mut glyph = std::vec::Vec::new();
+		charstrings::number(&mut glyph, 0);
+		glyph.push(operator as u8);
+		glyph.push(14);
+		let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+		let face = Face::open(&bytes, 0).expect("a font this tree built");
+		let cff = crate::cff::Cff::of(&face).expect("readable").expect("charstrings");
+		let mut shape = Shape::default();
+		assert_eq!(cff.walk(1, &[], &mut shape).err(), Some(Error::Unsupported(crate::Unsupported::CharstringOperator(operator))));
+	}
+}
+
+#[test]
+// A FACE HAS `glyf` OR CHARSTRINGS AND NEVER BOTH, and which one decides whether its curves are
+// quadratic or cubic, whether a glyph is data or a program, and how it varies. None of that is the
+// business of a layer that wants a glyph drawn - and a caller asking each face which format it is
+// would ask once per glyph and get it wrong for the faces nobody tested against.
+fn one_call_draws_a_glyph_whichever_outline_format_the_face_is_in() {
+	use crate::outline::{Format, format};
+	let mut points = [Point { x: 0, y: 0, kind: PointKind::OnCurve, ends_contour: false }; 64];
+	let mut deltas = [(0i16, 0i16); 64];
+	let mut touched = [false; 64];
+
+	// The quadratic face: `glyf`, whose square is four on-curve points.
+	let bytes = build::sample();
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	assert_eq!(format(&face).expect("readable"), Some(Format::Quadratic));
+	let mut shape = Shape::default();
+	let scratch = crate::gvar::Scratch { points: &mut points, deltas: &mut deltas, touched: &mut touched };
+	crate::outline::walk(&face, 1, &[], scratch, &mut shape).expect("a font this tree built");
+	assert_eq!(shape.points.len(), 4);
+	assert!(shape.points.iter().all(|(_, _, kind, _)| *kind == PointKind::OnCurve));
+
+	// The cubic face: a charstring, whose curve is two control points and an end point.
+	let mut glyph = std::vec::Vec::new();
+	charstrings::number(&mut glyph, 100);
+	charstrings::number(&mut glyph, 100);
+	glyph.push(21);
+	for value in [200, 300, 200, -300, 200, 0] {
+		charstrings::number(&mut glyph, value);
+	}
+	glyph.push(8);
+	glyph.push(14);
+	let bytes = charstring_font(&[std::vec![14u8], glyph], &[], &[]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	assert_eq!(format(&face).expect("readable"), Some(Format::Cubic));
+	let mut shape = Shape::default();
+	let scratch = crate::gvar::Scratch { points: &mut points, deltas: &mut deltas, touched: &mut touched };
+	crate::outline::walk(&face, 1, &[], scratch, &mut shape).expect("a font this tree built");
+	assert_eq!(shape.points.iter().filter(|(_, _, kind, _)| *kind == PointKind::Cubic).count(), 2);
+
+	// AND A FACE WITH NEITHER IS NOT A FACE THIS SYSTEM DRAWS, said by naming the missing table:
+	// "no outlines" is not something a staging report can act on.
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	assert_eq!(format(&face).expect("readable"), None);
+	let mut shape = Shape::default();
+	let scratch = crate::gvar::Scratch { points: &mut points, deltas: &mut deltas, touched: &mut touched };
+	assert_eq!(crate::outline::walk(&face, 1, &[], scratch, &mut shape).err(), Some(Error::Malformed(Malformed::MissingTable { table: *b"glyf" })));
+}
+
+/// A `COLR` table this tree builds: version 0's layer list, and version 1's paint graph.
+mod colour {
+	pub fn u16(out: &mut std::vec::Vec<u8>, value: u16) {
+		out.extend_from_slice(&value.to_be_bytes());
+	}
+
+	pub fn u32(out: &mut std::vec::Vec<u8>, value: u32) {
+		out.extend_from_slice(&value.to_be_bytes());
+	}
+
+	/// A twenty-four bit offset, which is what almost every offset inside a paint is - and reading one
+	/// as two or four bytes is the mistake this fixture exists to catch.
+	pub fn u24(out: &mut std::vec::Vec<u8>, value: u32) {
+		out.extend_from_slice(&value.to_be_bytes()[1..]);
+	}
+
+	/// A version 1 `COLR` with one colour glyph whose graph is: two layers, the first a glyph clipping
+	/// a solid colour and the second a translation of a glyph clipping a linear gradient.
+	pub fn colr_v1(glyph: u16) -> std::vec::Vec<u8> {
+		// THE BASE GLYPH LIST: its record's paint offset is from the LIST's start, and the root paint
+		// sits just after the one record.
+		let mut base_list = std::vec::Vec::new();
+		u32(&mut base_list, 1); // one record
+		u16(&mut base_list, glyph);
+		u32(&mut base_list, 10); // the root paint follows the record
+		base_list.push(1); // PaintColrLayers
+		base_list.push(2); // two layers
+		u32(&mut base_list, 0); // starting at the first
+
+		// THE LAYER LIST, whose paints are in ITS space and not the base list's.
+		let (first_paint, second_paint) = (12usize, 18usize);
+		let (solid_at, second_glyph_at, gradient_at, line_at) = (26usize, 31usize, 37usize, 53usize);
+		let mut layers = std::vec::Vec::new();
+		u32(&mut layers, 2);
+		u32(&mut layers, first_paint as u32);
+		u32(&mut layers, second_paint as u32);
+		// PaintGlyph, clipping a solid.
+		layers.push(10);
+		u24(&mut layers, (solid_at - first_paint) as u32);
+		u16(&mut layers, 3);
+		// PaintTranslate, over the second glyph.
+		layers.push(14);
+		u24(&mut layers, (second_glyph_at - second_paint) as u32);
+		u16(&mut layers, 10);
+		u16(&mut layers, 20);
+		// PaintSolid.
+		layers.push(2);
+		u16(&mut layers, 1); // palette entry
+		u16(&mut layers, 0x4000); // alpha, in 2.14: one half
+		// PaintGlyph, clipping the gradient.
+		layers.push(10);
+		u24(&mut layers, (gradient_at - second_glyph_at) as u32);
+		u16(&mut layers, 4);
+		// PaintLinearGradient.
+		layers.push(4);
+		u24(&mut layers, (line_at - gradient_at) as u32);
+		for value in [0i16, 0, 100, 0, 0, 100] {
+			u16(&mut layers, value as u16);
+		}
+		// The colour line: two stops, repeating past its ends.
+		layers.push(1); // repeat
+		u16(&mut layers, 2);
+		u16(&mut layers, 0);
+		u16(&mut layers, 5);
+		u16(&mut layers, 0x4000);
+		u16(&mut layers, 0x4000);
+		u16(&mut layers, 6);
+		u16(&mut layers, 0x4000);
+		assert_eq!(layers.len(), 68, "the fixture's own layout arithmetic must match the bytes it writes");
+
+		let header = 34usize;
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 1); // version
+		u16(&mut out, 0); // no version 0 base glyph records
+		u32(&mut out, 0);
+		u32(&mut out, 0);
+		u16(&mut out, 0);
+		u32(&mut out, header as u32);
+		u32(&mut out, (header + base_list.len()) as u32);
+		u32(&mut out, 0); // no clip list
+		u32(&mut out, 0); // no variation index map
+		u32(&mut out, 0); // no variation store
+		out.extend_from_slice(&base_list);
+		out.extend_from_slice(&layers);
+		out
+	}
+
+	/// A version 0 `COLR`: the glyph given is drawn out of the layers listed.
+	pub fn colr_v0(glyph: u16, layers: &[(u16, u16)]) -> std::vec::Vec<u8> {
+		let header = 14usize;
+		let mut records = std::vec::Vec::new();
+		u16(&mut records, glyph);
+		u16(&mut records, 0);
+		u16(&mut records, layers.len() as u16);
+		let mut layer_records = std::vec::Vec::new();
+		for (glyph, palette) in layers {
+			u16(&mut layer_records, *glyph);
+			u16(&mut layer_records, *palette);
+		}
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 0);
+		u16(&mut out, 1);
+		u32(&mut out, header as u32);
+		u32(&mut out, (header + records.len()) as u32);
+		u16(&mut out, layers.len() as u16);
+		out.extend_from_slice(&records);
+		out.extend_from_slice(&layer_records);
+		out
+	}
+}
+
+/// A paint walk that records the graph as it is handed over.
+#[derive(Default)]
+struct Graph {
+	nodes: std::vec::Vec<(u8, std::string::String)>,
+}
+
+impl crate::colr::Paints for Graph {
+	fn paint(&mut self, paint: crate::colr::Paint<'_>, depth: u8) -> bool {
+		use crate::colr::Paint;
+		let name = match paint {
+			Paint::Layers { count, .. } => std::format!("layers({count})"),
+			Paint::Solid { palette, alpha } => std::format!("solid({palette},{alpha})"),
+			Paint::LinearGradient { x1, y2, .. } => std::format!("linear({x1},{y2})"),
+			Paint::RadialGradient { .. } => std::string::String::from("radial"),
+			Paint::SweepGradient { .. } => std::string::String::from("sweep"),
+			Paint::Glyph { glyph } => std::format!("glyph({glyph})"),
+			Paint::ColrGlyph { glyph } => std::format!("colrglyph({glyph})"),
+			Paint::Transform { .. } => std::string::String::from("transform"),
+			Paint::Translate { dx, dy } => std::format!("translate({dx},{dy})"),
+			Paint::Scale { x, y, centre_x, centre_y } => std::format!("scale({x},{y},{centre_x},{centre_y})"),
+			Paint::Rotate { angle, .. } => std::format!("rotate({angle})"),
+			Paint::Skew { .. } => std::string::String::from("skew"),
+			Paint::Composite { mode } => std::format!("composite({mode})"),
+		};
+		self.nodes.push((depth, name));
+		true
+	}
+}
+
+#[test]
+// VERSION 0 IS A LIST AND VERSION 1 IS A TREE, and that is the whole difference. A version 0 glyph is
+// layers of ordinary outlines each with a palette colour; a version 1 glyph is a paint graph, and a
+// consumer that read one as the other draws a flat approximation of a gradient.
+fn a_colour_glyph_is_read_as_the_layers_or_the_graph_the_face_states() {
+	use crate::colr::{Colr, Layer};
+	let sample = build::sample();
+	let face_with = |colr: std::vec::Vec<u8>| {
+		build::font(&[
+			(*b"COLR", colr),
+			(*b"head", table_bytes(&sample, b"head")),
+			(*b"hhea", table_bytes(&sample, b"hhea")),
+			(*b"hmtx", table_bytes(&sample, b"hmtx")),
+			(*b"maxp", table_bytes(&sample, b"maxp")),
+		])
+	};
+
+	// VERSION 0: a list.
+	let bytes = face_with(colour::colr_v0(2, &[(3, 0), (4, 1)]));
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let colr = Colr::of(&face).expect("readable").expect("a face with COLR");
+	assert_eq!(colr.version(), 0);
+	let mut layers = [Layer { glyph: 0, palette: 0 }; 8];
+	assert_eq!(colr.layers(2, &mut layers).expect("readable"), Some(2));
+	assert_eq!(layers[0], Layer { glyph: 3, palette: 0 });
+	assert_eq!(layers[1], Layer { glyph: 4, palette: 1 });
+	// A glyph the table does not carry is `None` rather than an empty list: a glyph with no colour
+	// form is not a colour glyph with no layers.
+	assert!(colr.layers(9, &mut layers).expect("readable").is_none());
+	// AND A BUFFER TOO SMALL IS A REFUSAL: half a colour glyph drawn is a shape the font does not
+	// contain.
+	let mut one = [Layer { glyph: 0, palette: 0 }; 1];
+	assert!(colr.layers(2, &mut one).is_err());
+
+	// VERSION 1: a graph.
+	let bytes = face_with(colour::colr_v1(2));
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let colr = Colr::of(&face).expect("readable").expect("a face with COLR");
+	assert_eq!(colr.version(), 1);
+	let mut graph = Graph::default();
+	assert!(colr.walk(2, &mut graph).expect("readable"));
+	let shape: std::vec::Vec<(u8, &str)> = graph.nodes.iter().map(|(depth, name)| (*depth, name.as_str())).collect();
+	assert_eq!(shape, std::vec![(0u8, "layers(2)"), (1, "glyph(3)"), (2, "solid(1,16384)"), (1, "translate(10,20)"), (2, "glyph(4)"), (3, "linear(100,100)"),], "the depth is what a consumer rebuilds the tree from");
+	// A glyph with no graph answers false rather than an empty one.
+	let mut graph = Graph::default();
+	assert!(!colr.walk(9, &mut graph).expect("readable"));
+}
+
+#[test]
+// A GRADIENT IS ITS STOPS, and a gradient missing its last colours is a different picture rather than
+// a smaller one - so a buffer too small is a refusal. How it continues past its ends is part of it
+// too: a repeating gradient read as a padded one is flat where the font meant it to band.
+fn a_gradient_carries_its_stops_and_how_it_continues_past_them() {
+	use crate::colr::{Colr, Extend, Paint, Paints, Stop};
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"COLR", colour::colr_v1(2)),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let colr = Colr::of(&face).expect("readable").expect("a face with COLR");
+
+	// A visitor that reads the stops as it meets the gradient, which is the only point at which the
+	// colour line's own space is known.
+	struct Collect<'c, 'a> {
+		colr: &'c Colr<'a>,
+		read: Option<(Extend, std::vec::Vec<Stop>)>,
+	}
+	impl Paints for Collect<'_, '_> {
+		fn paint(&mut self, paint: Paint<'_>, _depth: u8) -> bool {
+			if let Paint::LinearGradient { stops, .. } = paint {
+				let mut into = [Stop { offset: 0, palette: 0, alpha: 0 }; 8];
+				if let Ok((extend, count)) = self.colr.stops(stops, &mut into) {
+					self.read = Some((extend, into[..count].to_vec()));
+				}
+			}
+			true
+		}
+	}
+	let mut collect = Collect { colr: &colr, read: None };
+	colr.walk(2, &mut collect).expect("readable");
+	let (extend, stops) = collect.read.expect("the fixture's gradient");
+	assert_eq!(extend, Extend::Repeat, "a repeating gradient read as a padded one is flat where the font meant it to band");
+	assert_eq!(stops, std::vec![Stop { offset: 0, palette: 5, alpha: 0x4000 }, Stop { offset: 0x4000, palette: 6, alpha: 0x4000 }]);
+}
+
+#[test]
+// A GRAPH OVER UNTRUSTED INPUT IS A CYCLE WAITING TO BE FOLLOWED, and a bounded depth over an
+// unbounded breadth is still unbounded work - which is why there are two ceilings and both refuse by
+// name.
+fn a_paint_graph_past_the_frozen_depth_is_refused_by_name() {
+	use crate::colr::{Colr, Paint, Paints};
+	// A translate that points at ITSELF: every step is a valid paint and the graph never ends.
+	let base_list = {
+		let mut out = std::vec::Vec::new();
+		colour::u32(&mut out, 1);
+		colour::u16(&mut out, 2);
+		colour::u32(&mut out, 10);
+		out.push(14); // PaintTranslate
+		colour::u24(&mut out, 0); // ... whose child is itself
+		colour::u16(&mut out, 1);
+		colour::u16(&mut out, 1);
+		out
+	};
+	let header = 34usize;
+	let mut colr = std::vec::Vec::new();
+	colour::u16(&mut colr, 1);
+	colour::u16(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u16(&mut colr, 0);
+	colour::u32(&mut colr, header as u32);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colr.extend_from_slice(&base_list);
+
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"COLR", colr),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let colr = Colr::of(&face).expect("readable").expect("a face with COLR");
+	struct Count(usize);
+	impl Paints for Count {
+		fn paint(&mut self, _paint: Paint<'_>, _depth: u8) -> bool {
+			self.0 += 1;
+			true
+		}
+	}
+	let mut count = Count(0);
+	assert_eq!(colr.walk(2, &mut count).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "paint depth", ceiling: opentype_profile::limits::PAINT_DEPTH, asked: opentype_profile::limits::PAINT_DEPTH as u64 + 1 })));
+	assert_eq!(count.0 as u32, opentype_profile::limits::PAINT_DEPTH, "the walk stops AT the ceiling rather than somewhere near it");
+}
+
+#[test]
+// THE SAME BOUND AS EVERY OTHER TABLE, over the one whose offsets are twenty-four bits. A parser
+// written from the shape of the other tables reads them as two or four and lands in the middle of
+// somebody else's paint.
+fn a_colr_table_corrupted_anywhere_is_refused_rather_than_walked_past() {
+	use crate::colr::{Colr, Layer, Paint, Paints};
+	struct Walk;
+	impl Paints for Walk {
+		fn paint(&mut self, _paint: Paint<'_>, _depth: u8) -> bool {
+			true
+		}
+	}
+	let sample = build::sample();
+	for table in [colour::colr_v1(2), colour::colr_v0(2, &[(3, 0), (4, 1)])] {
+		let bytes = build::font(&[
+			(*b"COLR", table),
+			(*b"head", table_bytes(&sample, b"head")),
+			(*b"hhea", table_bytes(&sample, b"hhea")),
+			(*b"hmtx", table_bytes(&sample, b"hmtx")),
+			(*b"maxp", table_bytes(&sample, b"maxp")),
+		]);
+		let at = find_table(&bytes, b"COLR");
+		let entry = find_entry(&bytes, b"COLR");
+		let length = u32::from_be_bytes([bytes[entry + 12], bytes[entry + 13], bytes[entry + 14], bytes[entry + 15]]) as usize;
+		for index in 0..length {
+			for pattern in [0x01u8, 0x7F, 0x80, 0xFF] {
+				let mut mutated = bytes.clone();
+				mutated[at + index] ^= pattern;
+				let Ok(face) = Face::open(&mutated, 0) else { continue };
+				let Ok(Some(colr)) = Colr::of(&face) else { continue };
+				let mut layers = [Layer { glyph: 0, palette: 0 }; 16];
+				for glyph in 0..5u16 {
+					let _ = colr.layers(glyph, &mut layers);
+					let _ = colr.walk(glyph, &mut Walk);
+				}
+			}
+		}
+	}
+}
+
+#[test]
+// A BOUNDED DEPTH OVER AN UNBOUNDED BREADTH IS STILL UNBOUNDED WORK, which is why the node count
+// exists beside the depth. A graph three levels deep whose every node has two hundred and fifty-five
+// children is sixty-five thousand paints, and every offset in it is in range.
+fn a_paint_graph_past_the_frozen_node_count_is_refused_by_name() {
+	use crate::colr::{Colr, Paint, Paints};
+	// The layer list: the first 255 entries are a `PaintColrLayers` over the SECOND 255, and those
+	// are solids. Two paints, five hundred and ten entries pointing at them.
+	let entries = 510usize;
+	let offsets_end = 4 + entries * 4;
+	let branch_at = offsets_end;
+	let leaf_at = branch_at + 6;
+	let mut layers = std::vec::Vec::new();
+	colour::u32(&mut layers, entries as u32);
+	for index in 0..entries {
+		colour::u32(&mut layers, if index < 255 { branch_at as u32 } else { leaf_at as u32 });
+	}
+	layers.push(1); // PaintColrLayers
+	layers.push(255);
+	colour::u32(&mut layers, 255); // ... over the second half of the list
+	layers.push(2); // PaintSolid
+	colour::u16(&mut layers, 1);
+	colour::u16(&mut layers, 0x4000);
+
+	let mut base_list = std::vec::Vec::new();
+	colour::u32(&mut base_list, 1);
+	colour::u16(&mut base_list, 2);
+	colour::u32(&mut base_list, 10);
+	base_list.push(1); // PaintColrLayers
+	base_list.push(255);
+	colour::u32(&mut base_list, 0); // ... over the first half
+
+	let header = 34usize;
+	let mut colr = std::vec::Vec::new();
+	colour::u16(&mut colr, 1);
+	colour::u16(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u16(&mut colr, 0);
+	colour::u32(&mut colr, header as u32);
+	colour::u32(&mut colr, (header + base_list.len()) as u32);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colour::u32(&mut colr, 0);
+	colr.extend_from_slice(&base_list);
+	colr.extend_from_slice(&layers);
+
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"COLR", colr),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let colr = Colr::of(&face).expect("readable").expect("a face with COLR");
+	struct Count(usize);
+	impl Paints for Count {
+		fn paint(&mut self, _paint: Paint<'_>, _depth: u8) -> bool {
+			self.0 += 1;
+			true
+		}
+	}
+	let mut count = Count(0);
+	assert_eq!(colr.walk(2, &mut count).err(), Some(Error::Unsupported(crate::Unsupported::Exceeded { limit: "paint nodes", ceiling: opentype_profile::limits::PAINT_NODES, asked: opentype_profile::limits::PAINT_NODES as u64 + 1 })));
+	assert_eq!(count.0 as u32, opentype_profile::limits::PAINT_NODES, "the walk stops AT the ceiling rather than somewhere near it");
+}
+
+/// The two bitmap mechanisms, which share nothing but the idea.
+mod strikes {
+	pub fn u16(out: &mut std::vec::Vec<u8>, value: u16) {
+		out.extend_from_slice(&value.to_be_bytes());
+	}
+
+	pub fn u32(out: &mut std::vec::Vec<u8>, value: u32) {
+		out.extend_from_slice(&value.to_be_bytes());
+	}
+
+	/// An `sbix` with one strike: glyph 1 is a PNG, glyph 2 is a `dupe` of it, and glyph 3 is absent.
+	pub fn sbix(glyph_count: u16, ppem: u16, png: &[u8]) -> std::vec::Vec<u8> {
+		// One glyph record: two origins, a type and the data.
+		let mut records: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+		for glyph in 0..glyph_count {
+			let mut record = std::vec::Vec::new();
+			match glyph {
+				1 => {
+					u16(&mut record, 4);
+					u16(&mut record, (-2i16) as u16);
+					record.extend_from_slice(b"png ");
+					record.extend_from_slice(png);
+				}
+				2 => {
+					u16(&mut record, 0);
+					u16(&mut record, 0);
+					record.extend_from_slice(b"dupe");
+					u16(&mut record, 1);
+				}
+				_ => {}
+			}
+			records.push(record);
+		}
+		let mut body = std::vec::Vec::new();
+		u16(&mut body, ppem);
+		u16(&mut body, 72);
+		let data_at = 4 + (glyph_count as usize + 1) * 4;
+		let mut offset = data_at;
+		let mut data = std::vec::Vec::new();
+		for record in &records {
+			u32(&mut body, offset as u32);
+			offset += record.len();
+			data.extend_from_slice(record);
+		}
+		u32(&mut body, offset as u32);
+		body.extend_from_slice(&data);
+
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 1);
+		u16(&mut out, 0);
+		u32(&mut out, 1); // one strike
+		u32(&mut out, 12); // which follows this header
+		out.extend_from_slice(&body);
+		out
+	}
+
+	/// A `CBLC` and its `CBDT`, with one strike whose index subtable is format 1 over glyphs 1 and 2,
+	/// and whose image records are format 17.
+	pub fn cblc_and_cbdt(ppem: u8, png: &[u8]) -> (std::vec::Vec<u8>, std::vec::Vec<u8>) {
+		// `CBDT`: a version, then one record per glyph.
+		let mut cbdt = std::vec::Vec::new();
+		u32(&mut cbdt, 0x0003_0000);
+		let first_at = cbdt.len();
+		for _ in 0..2 {
+			cbdt.push(10); // height
+			cbdt.push(12); // width
+			cbdt.push(3); // bearing x
+			cbdt.push((-1i8) as u8); // bearing y
+			cbdt.push(14); // advance
+			u32(&mut cbdt, png.len() as u32);
+			cbdt.extend_from_slice(png);
+		}
+		let record_length = 5 + 4 + png.len();
+
+		// The index subtable: format 1, image format 17, and three offsets for two glyphs - the array
+		// has one entry MORE than the glyphs it covers, which is where the last glyph's length is.
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1); // index format
+		u16(&mut subtable, 17); // image format
+		u32(&mut subtable, first_at as u32);
+		u32(&mut subtable, 0);
+		u32(&mut subtable, record_length as u32);
+		u32(&mut subtable, (record_length * 2) as u32);
+
+		// The index subtable ARRAY, which the subtable's offset is measured from.
+		let mut array = std::vec::Vec::new();
+		u16(&mut array, 1); // first glyph
+		u16(&mut array, 2); // last glyph
+		u32(&mut array, 8); // the subtable follows this one entry
+		array.extend_from_slice(&subtable);
+
+		let header = 8usize;
+		let array_at = header + 48;
+		let mut cblc = std::vec::Vec::new();
+		u16(&mut cblc, 3);
+		u16(&mut cblc, 0);
+		u32(&mut cblc, 1); // one size
+		// The `BitmapSize` record: forty-eight bytes, whose ends are what this reader uses.
+		u32(&mut cblc, array_at as u32);
+		u32(&mut cblc, array.len() as u32);
+		u32(&mut cblc, 1); // one index subtable
+		u32(&mut cblc, 0); // colour reference
+		cblc.extend_from_slice(&[0u8; 24]); // the horizontal and vertical line metrics
+		u16(&mut cblc, 1); // first glyph
+		u16(&mut cblc, 2); // last glyph
+		cblc.push(ppem);
+		cblc.push(ppem);
+		cblc.push(32); // bit depth
+		cblc.push(1); // flags
+		assert_eq!(cblc.len(), array_at, "the fixture's own layout arithmetic must match the bytes it writes");
+		cblc.extend_from_slice(&array);
+		(cblc, cbdt)
+	}
+}
+
+#[test]
+// A STRIKE IS A PHOTOGRAPH OF A GLYPH AT ONE PIXEL SIZE, and this hands back its bytes UNDECODED. A
+// strike's contents are PNG, TIFF or JPEG - whole image formats with their own decoders and their own
+// history of vulnerabilities - and a font parser that decoded them would be an image decoder reached
+// through a document.
+fn an_sbix_strike_hands_back_its_image_without_decoding_it() {
+	use crate::bitmap::{Bitmaps, ImageFormat};
+	let png = b"\x89PNG\r\n\x1a\n-not-really-a-png";
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+		(*b"sbix", strikes::sbix(4, 64, png)),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let bitmaps = Bitmaps::of(&face).expect("readable").expect("a face with strikes");
+	assert_eq!(bitmaps.strike_count().expect("readable"), 1);
+
+	let image = bitmaps.image(1, 0).expect("readable").expect("a glyph this strike draws");
+	assert_eq!(image.format, ImageFormat::Png);
+	assert_eq!(image.bytes, png, "the bytes are handed over whole, and this layer does not look inside them");
+	assert_eq!(image.origin, (4, -2), "the origin is in PIXELS of this strike and not in font units");
+	assert_eq!(image.ppem, 64);
+
+	// `dupe` IS NOT AN IMAGE FORMAT: it is a glyph id saying "this glyph is drawn as that one", which
+	// is how a face stores one picture for several code points.
+	let image = bitmaps.image(2, 0).expect("readable").expect("a glyph drawn as another");
+	assert_eq!(image.bytes, png);
+
+	// A GLYPH THIS STRIKE DOES NOT DRAW IS `None` and not an error: a colour-emoji face has a strike
+	// for its emoji and nothing for its letters.
+	assert!(bitmaps.image(3, 0).expect("readable").is_none());
+	assert!(bitmaps.image(1, 9).expect("readable").is_none());
+}
+
+#[test]
+// `CBLC` IS AN INDEX OF INDEX SUBTABLES pointing into a second table, and `sbix` is a blob per glyph.
+// They share nothing but the idea, which is why they are read separately and answer the same type.
+fn a_cblc_strike_finds_its_image_through_the_index_subtable() {
+	use crate::bitmap::{Bitmaps, ImageFormat};
+	let png = b"\x89PNG\r\n\x1a\n-second";
+	let (cblc, cbdt) = strikes::cblc_and_cbdt(48, png);
+	let sample = build::sample();
+	let bytes = build::font(&[
+		(*b"CBDT", cbdt),
+		(*b"CBLC", cblc),
+		(*b"head", table_bytes(&sample, b"head")),
+		(*b"hhea", table_bytes(&sample, b"hhea")),
+		(*b"hmtx", table_bytes(&sample, b"hmtx")),
+		(*b"maxp", table_bytes(&sample, b"maxp")),
+	]);
+	let face = Face::open(&bytes, 0).expect("a font this tree built");
+	let bitmaps = Bitmaps::of(&face).expect("readable").expect("a face with strikes");
+	assert_eq!(bitmaps.strike_count().expect("readable"), 1);
+
+	for glyph in [1u16, 2] {
+		let image = bitmaps.image(glyph, 0).expect("readable").expect("a glyph this strike draws");
+		assert_eq!(image.format, ImageFormat::Png);
+		assert_eq!(image.bytes, png, "the record's leading metrics are stepped over, not taken for picture");
+		assert_eq!(image.origin, (3, -1));
+		assert_eq!(image.ppem, 48);
+	}
+	// Outside the strike's own range there is nothing, which the record states rather than the
+	// subtable.
+	assert!(bitmaps.image(3, 0).expect("readable").is_none());
+	assert!(bitmaps.image(0, 0).expect("readable").is_none());
+}
+
+#[test]
+// THE SAME BOUND AS EVERY OTHER TABLE. A strike is an offset array into an offset array into a second
+// table, and a `dupe` chain is a cycle waiting to be followed.
+fn a_strike_corrupted_anywhere_is_refused_rather_than_read_past() {
+	use crate::bitmap::Bitmaps;
+	let png = b"\x89PNG\r\n\x1a\n-x";
+	let sample = build::sample();
+	let (cblc, cbdt) = strikes::cblc_and_cbdt(48, png);
+	let fonts = [
+		build::font(&[
+			(*b"head", table_bytes(&sample, b"head")),
+			(*b"hhea", table_bytes(&sample, b"hhea")),
+			(*b"hmtx", table_bytes(&sample, b"hmtx")),
+			(*b"maxp", table_bytes(&sample, b"maxp")),
+			(*b"sbix", strikes::sbix(4, 64, png)),
+		]),
+		build::font(&[
+			(*b"CBDT", cbdt),
+			(*b"CBLC", cblc),
+			(*b"head", table_bytes(&sample, b"head")),
+			(*b"hhea", table_bytes(&sample, b"hhea")),
+			(*b"hmtx", table_bytes(&sample, b"hmtx")),
+			(*b"maxp", table_bytes(&sample, b"maxp")),
+		]),
+	];
+	for (font, tag) in fonts.iter().zip([b"sbix", b"CBLC"]) {
+		let at = find_table(font, tag);
+		let entry = find_entry(font, tag);
+		let length = u32::from_be_bytes([font[entry + 12], font[entry + 13], font[entry + 14], font[entry + 15]]) as usize;
+		for index in 0..length {
+			for pattern in [0x01u8, 0x7F, 0x80, 0xFF] {
+				let mut mutated = font.clone();
+				mutated[at + index] ^= pattern;
+				let Ok(face) = Face::open(&mutated, 0) else { continue };
+				let Ok(Some(bitmaps)) = Bitmaps::of(&face) else { continue };
+				let _ = bitmaps.strike_count();
+				for glyph in 0..5u16 {
+					for strike in 0..3u16 {
+						let _ = bitmaps.image(glyph, strike);
 					}
 				}
 			}

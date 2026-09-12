@@ -1,0 +1,17 @@
+[package]
+name = "font-oracle"
+edition = "2024"
+description = "The catalogue's truth oracle: every staged face is parsed and required to equal its declared record"
+
+[[bin]]
+name = "font-oracle"
+path = "src/main.rs"
+
+[dependencies]
+# The only component allowed to read a font.
+font-parse = { path = "../../user/libs/text/font-parse" }
+# The declaration vocabulary, which is the catalogue's own and is not restated here.
+service-logic = { path = "../../user/services/logic" }
+
+[lints.rust]
+warnings = "deny"

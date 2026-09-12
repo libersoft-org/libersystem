@@ -18,12 +18,9 @@ use font_parse::tables::Face;
 use crate::Error;
 
 /// What forms a face offers, read once per run rather than once per glyph.
-#[derive(Clone, Copy)]
 pub struct Forms<'a> {
-	/// `COLR` version 1's base glyph list: the paint graphs.
-	paint_graphs: Option<Reader<'a>>,
-	/// `COLR` version 0's base glyph records: the layer lists.
-	layer_lists: Option<(Reader<'a>, u16)>,
+	/// The face's `COLR`, read by the parser that owns that table.
+	colour: Option<font_parse::colr::Colr<'a>>,
 	/// The palette a colour glyph is drawn with, when the face declares any.
 	palette: Option<u16>,
 	/// `sbix`, with its strike table.
@@ -41,32 +38,11 @@ impl<'a> Forms<'a> {
 	/// Read what the face declares. A face with none of these tables offers outlines alone, which is
 	/// most faces and is not a special case.
 	pub fn of(face: &Face<'a>) -> Result<Self, Error> {
-		let mut forms = Forms { paint_graphs: None, layer_lists: None, palette: None, sbix: None, cblc: None, glyph_count: face.metrics.glyph_count };
-		if let Some(colr) = face.table(b"COLR")? {
-			let mut reader = colr;
-			let version = reader.u16().ok_or_else(|| bad(b"COLR"))?;
-			let base_count = reader.u16().ok_or_else(|| bad(b"COLR"))?;
-			let base_at = reader.u32().ok_or_else(|| bad(b"COLR"))? as usize;
-			let _layers_at = reader.u32().ok_or_else(|| bad(b"COLR"))?;
-			let _layer_count = reader.u16().ok_or_else(|| bad(b"COLR"))?;
-			if base_at != 0 && base_count != 0 {
-				let records = colr.slice(base_at, (base_count as usize).checked_mul(6).ok_or_else(|| bad(b"COLR"))?).ok_or_else(|| bad(b"COLR"))?;
-				forms.layer_lists = Some((records, base_count));
-			}
-			// VERSION 1 ADDS A SECOND, RICHER LIST and does not replace the first: a face carries both
-			// so that a consumer which only understands version 0 still draws something. The richer
-			// one is preferred, and a version this profile does not know is refused by NAME rather
-			// than read as the version it resembles.
-			if version == 1 {
-				let list_at = reader.u32().ok_or_else(|| bad(b"COLR"))? as usize;
-				if list_at != 0 {
-					let list = colr.slice(list_at, colr.len().checked_sub(list_at).ok_or_else(|| bad(b"COLR"))?).ok_or_else(|| bad(b"COLR"))?;
-					forms.paint_graphs = Some(list);
-				}
-			} else if version != 0 {
-				return Err(Error::Font(font_parse::Error::Unsupported(font_parse::Unsupported::TableVersion { tag: *b"COLR", major: version, minor: 0 })));
-			}
-		}
+		let mut forms = Forms { colour: None, palette: None, sbix: None, cblc: None, glyph_count: face.metrics.glyph_count };
+		// ONE READER FOR `COLR` AND NOT TWO. Which colour form a glyph has is a lookup in a sorted
+		// record list, and answering it with a second, smaller reader beside the parser's own is how
+		// the two come to disagree about a font.
+		forms.colour = font_parse::colr::Colr::of(face)?;
 		if let Some(cpal) = face.table(b"CPAL")? {
 			let mut reader = cpal;
 			let _version = reader.u16().ok_or_else(|| bad(b"CPAL"))?;
@@ -88,15 +64,12 @@ impl<'a> Forms<'a> {
 	/// that cannot paint. `size_pixels` selects among the bitmap strikes, because a strike is made at
 	/// a size and picking the wrong one is a blurred glyph rather than a wrong one.
 	pub fn kind_of(&self, glyph: u16, size_pixels: u16) -> Result<(GlyphKind, KindSelection), Error> {
-		if let Some(list) = self.paint_graphs
-			&& base_paint_record(list, glyph)?
-		{
-			return Ok((GlyphKind::ColrPaintGraph, KindSelection { strike: None, palette: self.palette }));
-		}
-		if let Some((records, count)) = self.layer_lists
-			&& base_glyph_record(records, count, glyph)?
-		{
-			return Ok((GlyphKind::ColrLayers, KindSelection { strike: None, palette: self.palette }));
+		if let Some(colour) = self.colour.as_ref() {
+			match colour.form_of(glyph)? {
+				Some(font_parse::colr::Form::PaintGraph) => return Ok((GlyphKind::ColrPaintGraph, KindSelection { strike: None, palette: self.palette })),
+				Some(font_parse::colr::Form::Layers) => return Ok((GlyphKind::ColrLayers, KindSelection { strike: None, palette: self.palette })),
+				None => {}
+			}
 		}
 		if let Some(sbix) = self.sbix
 			&& let Some(strike) = sbix_strike(sbix, glyph, self.glyph_count, size_pixels)?
@@ -110,44 +83,6 @@ impl<'a> Forms<'a> {
 		}
 		Ok((GlyphKind::Outline, KindSelection::default()))
 	}
-}
-
-/// Is this glyph in `COLR` version 1's base glyph list?
-///
-/// BINARY SEARCH, because the format states the list is sorted by glyph id and a face with several
-/// thousand colour glyphs is ordinary. A list that is NOT sorted answers "no" for some glyphs rather
-/// than reading out of bounds - the search is bounded by the record count either way.
-fn base_paint_record(list: Reader<'_>, glyph: u16) -> Result<bool, Error> {
-	let mut reader = list;
-	let count = reader.u32().ok_or_else(|| bad(b"COLR"))? as usize;
-	let records_at = reader.position();
-	let records = list.slice(records_at, count.checked_mul(6).ok_or_else(|| bad(b"COLR"))?).ok_or_else(|| bad(b"COLR"))?;
-	search_u16(&records, count, 3, glyph)
-}
-
-/// Is this glyph in `COLR` version 0's base glyph records?
-fn base_glyph_record(records: Reader<'_>, count: u16, glyph: u16) -> Result<bool, Error> {
-	search_u16(&records, count as usize, 3, glyph)
-}
-
-/// A binary search over a sorted array of records whose FIRST field is a `u16` glyph id.
-///
-/// `stride` is the record's length in `u16`s, which is how a `u16_at` index reaches the next record.
-/// A list that is NOT sorted answers "no" for some glyphs rather than reading out of bounds: the
-/// search is bounded by the record count either way, which is the property that matters here.
-fn search_u16(records: &Reader<'_>, count: usize, stride: usize, glyph: u16) -> Result<bool, Error> {
-	let mut low = 0usize;
-	let mut high = count;
-	while low < high {
-		let middle = low + (high - low) / 2;
-		let value = records.u16_at(middle * stride).ok_or_else(|| bad(b"COLR"))?;
-		match value.cmp(&glyph) {
-			core::cmp::Ordering::Equal => return Ok(true),
-			core::cmp::Ordering::Less => low = middle + 1,
-			core::cmp::Ordering::Greater => high = middle,
-		}
-	}
-	Ok(false)
 }
 
 /// Which `sbix` strike holds this glyph, if any.

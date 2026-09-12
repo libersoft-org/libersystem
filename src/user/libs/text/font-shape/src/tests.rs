@@ -82,6 +82,115 @@ mod build {
 
 	/// The script, feature and lookup lists every layout table begins with, assembled around one
 	/// feature naming one lookup.
+	/// A `GSUB` whose lookup list holds SEVERAL lookups, with the feature naming the first.
+	///
+	/// THE ONE-LOOKUP HELPER BELOW CANNOT EXPRESS A CHAIN, and a chain is exactly what a contextual
+	/// rule builds: lookup 0 invokes lookup 1, which invokes lookup 2. Without a list a fixture can
+	/// only ever reach depth one, which is the depth nothing interesting happens at.
+	pub fn layout_many(tag: &[u8; 4], lookups: &[std::vec::Vec<u8>]) -> std::vec::Vec<u8> {
+		let mut lang_sys = std::vec::Vec::new();
+		u16(&mut lang_sys, 0);
+		u16(&mut lang_sys, 0xFFFF);
+		u16(&mut lang_sys, 1);
+		u16(&mut lang_sys, 0);
+
+		let mut script = std::vec::Vec::new();
+		u16(&mut script, 4);
+		u16(&mut script, 0);
+		script.extend_from_slice(&lang_sys);
+
+		let mut script_list = std::vec::Vec::new();
+		u16(&mut script_list, 1);
+		script_list.extend_from_slice(b"DFLT");
+		u16(&mut script_list, 8);
+		script_list.extend_from_slice(&script);
+
+		let mut feature = std::vec::Vec::new();
+		u16(&mut feature, 0);
+		u16(&mut feature, 1);
+		u16(&mut feature, 0); // the feature names the FIRST lookup, and the chain reaches the rest
+
+		let mut feature_list = std::vec::Vec::new();
+		u16(&mut feature_list, 1);
+		feature_list.extend_from_slice(tag);
+		u16(&mut feature_list, 8);
+		feature_list.extend_from_slice(&feature);
+
+		let mut lookup_list = std::vec::Vec::new();
+		u16(&mut lookup_list, lookups.len() as u16);
+		let mut at = 2 + lookups.len() * 2;
+		for lookup in lookups {
+			u16(&mut lookup_list, at as u16);
+			at += lookup.len();
+		}
+		for lookup in lookups {
+			lookup_list.extend_from_slice(lookup);
+		}
+
+		let header = 10usize;
+		let script_at = header;
+		let feature_at = script_at + script_list.len();
+		let lookup_at = feature_at + feature_list.len();
+		let mut out = std::vec::Vec::new();
+		u16(&mut out, 1);
+		u16(&mut out, 0);
+		u16(&mut out, script_at as u16);
+		u16(&mut out, feature_at as u16);
+		u16(&mut out, lookup_at as u16);
+		out.extend_from_slice(&script_list);
+		out.extend_from_slice(&feature_list);
+		out.extend_from_slice(&lookup_list);
+		out
+	}
+
+	/// A contextual substitution, format 1: the covered glyph, matched alone, invoking one lookup.
+	pub fn gsub_context(glyph: u16, invokes: u16) -> std::vec::Vec<u8> {
+		// One rule: a one-glyph sequence (so no further input after the covered glyph) and one
+		// substitution record naming the lookup to run at sequence index 0.
+		let mut rule = std::vec::Vec::new();
+		u16(&mut rule, 1); // glyph count, the covered one included
+		u16(&mut rule, 1); // one substitution record
+		u16(&mut rule, 0); // at sequence index 0
+		u16(&mut rule, invokes);
+
+		let mut set = std::vec::Vec::new();
+		u16(&mut set, 1); // one rule
+		u16(&mut set, 4); // which follows the header and the one offset
+		set.extend_from_slice(&rule);
+
+		let coverage = coverage(&[glyph]);
+		let coverage_at = 6usize + 2; // format, coverage offset, set count, one set offset
+		let set_at = coverage_at + coverage.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1); // format 1
+		u16(&mut subtable, coverage_at as u16);
+		u16(&mut subtable, 1); // one rule set
+		u16(&mut subtable, set_at as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&set);
+		lookup(5, 0, subtable)
+	}
+
+	/// A multiple substitution: the covered glyph becomes the sequence given.
+	pub fn gsub_multiple(from: u16, into: &[u16]) -> std::vec::Vec<u8> {
+		let mut sequence = std::vec::Vec::new();
+		u16(&mut sequence, into.len() as u16);
+		for glyph in into {
+			u16(&mut sequence, *glyph);
+		}
+		let coverage = coverage(&[from]);
+		let coverage_at = 8usize; // format, coverage offset, sequence count, one sequence offset
+		let sequence_at = coverage_at + coverage.len();
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 1);
+		u16(&mut subtable, coverage_at as u16);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, sequence_at as u16);
+		subtable.extend_from_slice(&coverage);
+		subtable.extend_from_slice(&sequence);
+		layout(b"liga", lookup(2, 0, subtable))
+	}
+
 	fn layout(tag: &[u8; 4], lookup: std::vec::Vec<u8>) -> std::vec::Vec<u8> {
 		// The three lists are laid out one after another, and every offset is from the table start.
 		let mut lang_sys = std::vec::Vec::new();
@@ -295,6 +404,40 @@ mod build {
 	}
 
 	/// Five glyphs: notdef, `f`, `i`, the `fi` ligature, and a mark.
+	/// A bare single-substitution LOOKUP, for a fixture that assembles its own lookup list.
+	pub fn single_lookup(from: u16, to: u16) -> std::vec::Vec<u8> {
+		let coverage = coverage(&[from]);
+		let coverage_at = 8usize;
+		let mut subtable = std::vec::Vec::new();
+		u16(&mut subtable, 2);
+		u16(&mut subtable, coverage_at as u16);
+		u16(&mut subtable, 1);
+		u16(&mut subtable, to);
+		subtable.extend_from_slice(&coverage);
+		lookup(1, 0, subtable)
+	}
+
+	/// The sample font with a stated glyph count, for a fixture whose substitutions produce more
+	/// glyphs than the five the ordinary one declares.
+	pub fn sample_many(gsub: Option<std::vec::Vec<u8>>, gpos: Option<std::vec::Vec<u8>>, gdef: Option<std::vec::Vec<u8>>, glyphs: u16) -> std::vec::Vec<u8> {
+		let mut tables: std::vec::Vec<([u8; 4], std::vec::Vec<u8>)> = std::vec::Vec::new();
+		if let Some(gdef) = gdef {
+			tables.push((*b"GDEF", gdef));
+		}
+		if let Some(gpos) = gpos {
+			tables.push((*b"GPOS", gpos));
+		}
+		if let Some(gsub) = gsub {
+			tables.push((*b"GSUB", gsub));
+		}
+		tables.push((*b"head", head()));
+		tables.push((*b"hhea", hhea(glyphs)));
+		let advances: std::vec::Vec<u16> = (0..glyphs).map(|index| 200 + index * 3).collect();
+		tables.push((*b"hmtx", hmtx(&advances)));
+		tables.push((*b"maxp", maxp(glyphs)));
+		font(&tables)
+	}
+
 	pub fn sample(gsub: Option<std::vec::Vec<u8>>, gpos: Option<std::vec::Vec<u8>>, gdef: Option<std::vec::Vec<u8>>) -> std::vec::Vec<u8> {
 		let mut tables: std::vec::Vec<([u8; 4], std::vec::Vec<u8>)> = std::vec::Vec::new();
 		if let Some(gdef) = gdef {
@@ -659,6 +802,11 @@ fn more_features_than_the_profile_freezes_are_refused_rather_than_dropped() {
 	let features: std::vec::Vec<([u8; 4], u32)> = (0..=ceiling).map(|index| ([b'a', b'a', (index / 26) as u8 + b'a', (index % 26) as u8 + b'a'], crate::buffer::GLOBAL)).collect();
 	let mut buffer = glyphs(&[1, 2]);
 	assert_eq!(crate::shape::shape_with_masks(&face, &mut buffer, *b"latn", *b"dflt", &features).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "features", ceiling: opentype_profile::limits::FEATURES, asked: ceiling as u64 + 1 })));
+	// AND EXACTLY AT THE CEILING THE RUN IS SHAPED, which is what makes the published number the
+	// number rather than one short of it.
+	let features: std::vec::Vec<([u8; 4], u32)> = features.into_iter().take(ceiling).collect();
+	let mut buffer = glyphs(&[1, 2]);
+	assert!(crate::shape::shape_with_masks(&face, &mut buffer, *b"latn", *b"dflt", &features).is_ok());
 }
 
 #[test]
@@ -725,4 +873,56 @@ fn find_entry(bytes: &[u8], tag: &[u8; 4]) -> usize {
 fn find_table(bytes: &[u8], tag: &[u8; 4]) -> usize {
 	let entry = find_entry(bytes, tag);
 	u32::from_be_bytes([bytes[entry + 8], bytes[entry + 9], bytes[entry + 10], bytes[entry + 11]]) as usize
+}
+
+#[test]
+// A ONE-TO-MANY SUBSTITUTION APPLIED REPEATEDLY TURNS A WORD INTO A PAGE, which is what the expansion
+// rule caps - and it caps the MULTIPLIER rather than the product, which is why the absolute input
+// ceiling exists under it. Both are checked here at the exact bound and one past it.
+fn a_run_expanded_past_the_frozen_ratio_is_refused_by_name() {
+	let ceiling = opentype_profile::limits::OUTPUT_EXPANSION as usize;
+	let shaped = |into: &[u16]| {
+		let bytes = build::sample_many(Some(build::gsub_multiple(1, into)), None, None, into.len() as u16 + 2);
+		let face = Face::open(&bytes, 0).expect("a font this tree built");
+		let mut buffer = glyphs(&[1]);
+		crate::shape::shape(&face, &mut buffer, *b"latn", *b"dflt", &[*b"liga"]).map(|()| buffer.len())
+	};
+	// EXACTLY THE RATIO IS DRAWN: one glyph becoming sixty-four is sixty-four times its input, which
+	// is the number - and a rule that refused at its own value would be a different number than the
+	// one published.
+	let into: std::vec::Vec<u16> = (0..ceiling as u16).map(|index| index + 2).collect();
+	assert_eq!(shaped(&into).expect("a run exactly at the ratio"), ceiling);
+
+	// One more is refused by name, with the ratio it reached.
+	let into: std::vec::Vec<u16> = (0..ceiling as u16 + 1).map(|index| index + 2).collect();
+	assert_eq!(shaped(&into).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "output expansion", ceiling: opentype_profile::limits::OUTPUT_EXPANSION, asked: ceiling as u64 + 1 })));
+}
+
+#[test]
+// A CONTEXTUAL RULE INVOKES ANOTHER LOOKUP, WHICH MAY INVOKE IT AGAIN, and a font arranging that
+// sixty-four deep is arranging for a shaper to recurse until the stack ends. At the ceiling the chain
+// runs and one past it is refused by name - and the refusal matters as much as the bound: declining
+// to apply the lookup silently would leave the run shaped as though the font had not asked.
+fn a_contextual_chain_runs_to_the_frozen_depth_and_no_further() {
+	let ceiling = opentype_profile::limits::CONTEXT_DEPTH as usize;
+	let chain = |links: usize| {
+		// Lookups 0..links-1 are contextual and each invokes the next; the last is a single
+		// substitution, so the chain has something to do when it arrives.
+		let mut lookups: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+		for index in 0..links {
+			lookups.push(build::gsub_context(1, index as u16 + 1));
+		}
+		lookups.push(build::single_lookup(1, 2));
+		let gsub = build::layout_many(b"liga", &lookups);
+		let bytes = build::sample_many(Some(gsub), None, None, 4);
+		let face = Face::open(&bytes, 0).expect("a font this tree built");
+		let mut buffer = glyphs(&[1]);
+		crate::shape::shape(&face, &mut buffer, *b"latn", *b"dflt", &[*b"liga"]).map(|()| buffer.infos[0].glyph)
+	};
+
+	// A chain of `CONTEXT_DEPTH` contextual lookups reaches its substitution at exactly the ceiling.
+	assert_eq!(chain(ceiling).expect("a chain exactly as deep as the ceiling"), 2, "the chain must actually reach its substitution, or this fixture measures nothing");
+
+	// One more link is refused by name.
+	assert_eq!(chain(ceiling + 1).err(), Some(font_parse::Error::Unsupported(font_parse::Unsupported::Exceeded { limit: "context depth", ceiling: opentype_profile::limits::CONTEXT_DEPTH, asked: opentype_profile::limits::CONTEXT_DEPTH as u64 + 1 })));
 }

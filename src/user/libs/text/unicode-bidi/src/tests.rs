@@ -100,3 +100,55 @@ fn the_empty_paragraph_and_the_bound_are_answered() {
 	let long: std::string::String = core::iter::repeat_n('a', MAX_PARAGRAPH + 10).collect();
 	assert_eq!(levels(&long, ParagraphDirection::Auto).levels.len(), MAX_PARAGRAPH);
 }
+
+#[test]
+// THE ALGORITHM'S OWN MAXIMUM DEPTH, AT ITS EXACT BOUND AND ONE PAST IT.
+//
+// TWO DIFFERENT MAXIMA, AND CONFUSING THEM IS THE MISTAKE. 125 is the greatest EXPLICIT level an
+// embedding may push; 126 is the greatest RESOLVED level a character may end at, because the implicit
+// rules raise a left-to-right character sitting at an odd level by one. A bound written as "no level
+// above 125" refuses correct text, and one written as "no level above 126" lets an embedding push a
+// level it should have overflowed on.
+//
+// PAST THE BOUND THE EMBEDDING OVERFLOWS AND IS IGNORED, and - this is the part that is got wrong -
+// its matching terminator must be ignored too. A terminator matched to an embedding that was never
+// pushed pops a level that was never there, and every character after it is laid out one level off.
+fn embeddings_nest_to_the_algorithms_own_depth_and_overflow_past_it() {
+	use crate::ParagraphDirection;
+	// Right-to-left embeddings, one per level, around a single strong left-to-right letter.
+	let nest = |count: usize| {
+		let mut text = std::string::String::new();
+		for _ in 0..count {
+			text.push('\u{202B}'); // RIGHT-TO-LEFT EMBEDDING
+		}
+		text.push('a');
+		for _ in 0..count {
+			text.push('\u{202C}'); // POP DIRECTIONAL FORMATTING
+		}
+		text
+	};
+	let deepest = |text: &str| crate::levels(text, ParagraphDirection::LeftToRight).levels.iter().copied().max().unwrap_or(0);
+	let resolved_maximum = crate::MAX_DEPTH + 1;
+
+	// Each right-to-left embedding takes the least ODD level above the last, so `MAX_DEPTH / 2 + 1`
+	// of them reach exactly `MAX_DEPTH`. The letter inside is left to right at an odd level, which
+	// the implicit rules raise by one.
+	let at_bound = crate::MAX_DEPTH as usize / 2 + 1;
+	assert_eq!(deepest(&nest(at_bound)), resolved_maximum, "at the bound the nesting must actually reach it, or this fixture measures nothing");
+
+	// ONE MORE EMBEDDING CANNOT RAISE IT. The next odd level would be above the maximum, so the
+	// embedding overflows and is ignored - and the answer is the same as at the bound rather than one
+	// level higher.
+	assert_eq!(deepest(&nest(at_bound + 1)), resolved_maximum, "an overflowing embedding must not raise the level past the maximum");
+	assert_eq!(deepest(&nest(at_bound + 40)), resolved_maximum, "and neither must forty of them");
+
+	// AND THE TEXT AFTER EVERY EMBEDDING IS CLOSED IS BACK AT THE PARAGRAPH'S OWN LEVEL. This is what
+	// says the overflowed embeddings' terminators were ignored rather than popping levels that were
+	// never pushed: a terminator that popped one would leave everything after it one level off, and
+	// with forty of them the rest of the paragraph would be laid out right to left.
+	for count in [at_bound, at_bound + 1, at_bound + 40] {
+		let text = alloc::format!("{}b", nest(count));
+		let levels = crate::levels(&text, ParagraphDirection::LeftToRight);
+		assert_eq!(levels.levels.last().copied(), Some(0), "the text after every embedding is closed must be at the paragraph's own level, and it was not at {count}");
+	}
+}

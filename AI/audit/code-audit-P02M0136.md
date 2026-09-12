@@ -1529,3 +1529,483 @@ The line breaking is GREEDY over the UAX #14 opportunities rather than an optima
 is a typographic refinement over the same opportunities and the same measurement, not a correctness
 gap, and it is named in the plan so a later reader does not have to work out whether it was decided
 or forgotten.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T16:53:39Z):
+
+MAKING "EVERY NUMERIC LIMIT IS TESTED" INTO SOMETHING THAT CAN FAIL.
+
+THE PROBLEM
+
+The milestone asks for each frozen ceiling to be exercised AT ITS EXACT BOUND AND ONE PAST IT. That
+is a sentence in a plan, and nothing enforced it. A ceiling tested only past its value could be off
+by one in either direction and nothing would say so - which, for a limit that decides whether a
+document is refused, is precisely the difference between "long" and "too long". A ceiling with no
+fixture at all is worse: a number in a published table that no code has ever been shown to respect.
+
+WHAT WAS BUILT
+
+`src/tools/text-limits` holds one entry per ceiling the profile publishes and refuses in both
+directions: a ceiling with nothing claiming to exercise it, a claim naming a ceiling the profile does
+not publish, and a claim naming a fixture that is not in the file it says it is in - so a renamed or
+deleted test is caught rather than quietly stopping. `--self-test` hands it four broken tables and
+requires it to reject each, because a checker exercised only over a currently-valid tree is not a
+checker. `check-text-limits.sh` runs the fixtures the table points at before checking the table,
+since a gate that verified only that a test EXISTS would pass over one that fails.
+
+THREE STATES AND NOT TWO. A ceiling is exercised at its bound, or ENFORCED IN CODE WITHOUT A BOUND
+FIXTURE, or has NO SITE because the code it bounds is not written. Folding the last two into the
+first would approve the absence of the thing the gate exists to check; folding them into each other
+would hide which of two quite different pieces of work is outstanding. All three are printed. Today:
+13 exercised, 2 enforced without a bound fixture, 7 with no site.
+
+THE FIXTURES ADDED TO REACH THIRTEEN
+
+  - the file ceiling, at 16 MiB and one byte past, with the refusal at the bound being the FILE's
+    ("not a font") rather than the ceiling's - which is what shows the ceiling admits its own value;
+  - the table ceiling, the same way;
+  - the composite DEPTH, over a chain built to exactly the depth and then one link longer;
+  - the composite POINT COUNT, over two five-thousand-point leaves that are exactly ten thousand, and
+    two six-thousand-point ones that are not;
+  - the variation AXIS count, with a fixture that carries the bytes for all sixty-four axes so what
+    is exercised at the bound is the reader rather than the refusal;
+  - the variation REGION count, over a store built with 4096 regions and one with 4097;
+  - the feature count, at the ceiling and one past;
+  - the run input ceiling, at and past;
+  - the paragraph input and output ceilings, at and past;
+  - the run output ceiling, at and past;
+  - the fallback face count, with the covering face placed at the last position the ceiling admits
+    and then one past it;
+  - THE BIDI DEPTH, which found a fixture defect of my own and is the most interesting of them.
+
+THE BIDI DEPTH, AND THE TWO MAXIMA
+
+My first fixture asserted that no level exceeds 125 and it failed at 126. The code was right and the
+fixture was wrong, and the distinction is worth writing down: 125 is the greatest EXPLICIT level an
+embedding may push, and 126 is the greatest RESOLVED level a character may end at, because the
+implicit rules raise a left-to-right character sitting at an odd level by one. A bound written as "no
+level above 125" refuses correct text; one written as "no level above 126" lets an embedding push a
+level it should have overflowed on. The fixture now pins both, and pins the consequence that matters:
+text after every embedding is closed is back at the paragraph's own level, in the at-bound case and
+with one and with forty overflowing embeddings - which is what says an overflowed embedding's
+TERMINATOR was ignored too, rather than popping a level that was never pushed and laying out the rest
+of the paragraph one level off.
+
+THE SHAPER IS NOW FUZZED
+
+It was not. A shaper walks a script list into a feature list into a lookup list into subtables, each
+an offset into the next, and every one is a place a crafted font can point elsewhere. Random bytes
+find the shallow ones and miss the deep ones; every byte of a font this tree built, XORed with four
+patterns, and every truncation of that font, reach all of them - through both the feature path and
+the script path, which runs a per-script pass before any lookup. What is asserted is that it ANSWERS.
+
+WHAT WAS VERIFIED, AND HOW
+
+  font-parse       29 passed (was 26)        font-shape     19 passed (was 17)
+  text-pipeline    13 passed (was 11)        unicode-bidi    9 passed (was 8)
+  font-run         11 passed                 text-layout    10 passed
+  opentype-profile 13 passed
+
+`./src/tools/check-text-limits.sh`: the self-test passes, and the table reports 22 ceilings with the
+three states above. `verify-model`: 157 passed, 0 failed, after the new gate was added to the
+catalog (116 gates) and to the release-required set - the model's own fixture caught that it was
+missing from the frozen set, which is what that fixture is for. `check-gate-oracles`,
+`check-milestone-index` and `check-source-hygiene` all pass. `./format.sh` was run and every suite
+re-run after it.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHAT THE HOST GATES ITEM STILL NEEDS
+
+The pinned FONT CORPUS with expected glyph indices and positions - Latin with ligatures and kerning,
+Arabic in four joining forms, Hebrew with marks, Devanagari, Thai, Khmer, mixed-direction paragraphs,
+emoji sequences, variable instances - needs faces this tree may not author, and nothing is staged
+until the licensed last-resort face is imported. The two enforced-without-a-bound ceilings need fonts
+built to reach them: sixty-five nested contextual lookups, and a substitution set that expands a run
+sixty-four fold. Those are fixtures, not blockers, and the gate now names them so they cannot be
+forgotten.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T17:08:46Z):
+
+`CFF` AND `CFF2`: THE OUTLINE FORMAT THAT IS A PROGRAM.
+
+THE DIFFERENCE THAT DECIDES HOW THIS FILE IS WRITTEN
+
+`glyf` is DATA - a list of points - and a charstring is CODE. Drawing one means RUNNING it: a stack
+machine with subroutine calls, over bytes that arrived in a document. That is the whole reason the
+operand stack, the call depth and the operator set here are the profile's FROZEN numbers rather than
+whatever the font asks for. "Run what the file says" with no bound is the shape of every font-parser
+exploit there has ever been.
+
+THE POINT KIND IS NOW AN ENUM, AND THAT IS A CHANGE TO A SHARED TYPE
+
+CFF curves are CUBIC and `glyf`'s are QUADRATIC. A boolean `on_curve` cannot tell two quadratic
+control points in a row - which imply an on-curve point half way between them - from the two control
+points of one cubic. A consumer that read one as the other draws a different shape and nothing in the
+data says so. `PointKind` is `OnCurve`, `Quadratic` or `Cubic`, so a consumer that handles only
+one of the two formats REFUSES rather than drawing the wrong curve. Every caller in the tree moved to
+it in the same edit.
+
+WHAT IS IMPLEMENTED
+
+The INDEX (both the 16-bit CFF count and the 32-bit CFF2 one), the DICT scanner, the top DICT, the
+private DICT, local and global subroutines, `FDArray` and `FDSelect` for CID-keyed fonts in both
+their formats, and the Type 2 operator set: the stem hints and both masks, the three moves, the three
+line forms, the six curve forms, `rcurveline` and `rlinecurve`, all four flex operators, both calls
+and `return`, and `endchar`. CFF2 adds `vsindex` and `blend`, and removes the width.
+
+THE THINGS THAT ARE SILENTLY WRONG IF READ CARELESSLY, each with a fixture over it:
+
+  - THE SUBROUTINE BIAS is part of the encoding and not an optimisation. A subroutine is named by a
+    number that may be negative, and the bias turns it into an index so the commonest ones get the
+    shortest numbers. Getting it wrong calls a DIFFERENT subroutine, which draws a different glyph
+    and reports nothing.
+  - THE WIDTH is the first operand of the FIRST stack-clearing operator and only then. It duplicates
+    `hmtx`, so it is dropped - but it must be RECOGNISED, because leaving it on the stack shifts
+    every operand of that operator by one and draws the glyph somewhere else.
+  - BYTE 255 is a 32-bit integer in a DICT and 16.16 in a charstring. A reader using the DICT rule in
+    a charstring scales every value by sixty-five thousand.
+  - THE DICT OPERATOR RANGE RUNS TO 27, not to 21. CFF's own operators stop at 21, and a reader
+    written against CFF alone reads CFF2's variation-store operator 24 as a malformed byte and
+    refuses every CFF2 font. This one I got wrong first and the CFF2 fixture caught it.
+  - `endchar` WITH FOUR OPERANDS IS `seac` and with any other count above one it is a charstring
+    contradicting itself. My first version treated every count of four or more as `seac`, which the
+    stack-ceiling fixture caught by handing it forty-eight.
+  - THE `Subrs` OFFSET is relative to its own private DICT, the one offset in the format that is not
+    from the table's start.
+  - `vvcurveto` and `hhcurveto` take an ODD first operand as a one-off displacement on the other
+    axis, FOR THE FIRST CURVE ONLY; applying it to every curve bends the whole stroke.
+  - `hlineto` and `vlineto` ALTERNATE; taking them as all-horizontal draws a staircase as a line.
+
+CFF2 `blend`, WHICH IS WHAT THE VARIABLE-FONT ITEM WAS WAITING FOR
+
+It takes `n` values followed by `n` deltas per region and leaves the `n` values at THIS instance,
+with `vsindex` choosing the subtable of the variation store the regions come from. Without it a CFF2
+charstring is read as a Type 2 one and the deltas are taken as coordinates - a glyph drawn out of the
+DIFFERENCE between two masters rather than the glyph, which is not a subtly wrong weight but a shape
+nobody designed. `variations::blend_regions` was added beside the existing delta lookup, because
+`blend` needs the region SCALARS alone rather than a summed row.
+
+ONE CALL FOR BOTH FORMATS
+
+`outline::walk` draws a glyph whichever format the face is in, and `outline::format` answers for the
+one caller that must know - a rasteriser choosing between a quadratic and a cubic path builder. A
+face with neither is refused by naming the missing table, because "no outlines" is not something a
+staging report can act on.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p font-parse`: 38 passed, 0 failed. Seven are new:
+
+  - a charstring run and its outline drawn, with the LAST point of the contour marked as closing it -
+    which a charstring never states and only the next `moveto` or the end of the glyph reveals;
+  - a curve drawn as two CUBIC controls and an on-curve end;
+  - local and global subroutines called through the bias;
+  - the call depth and the operand stack, each one past the ceiling refused by name, and the stack
+    exactly at its ceiling accepted;
+  - the deprecated operators refused by number, and `seac` with them;
+  - the whole `CFF` table through the exhaustive corruption sweep - every byte, four patterns, every
+    glyph - where, unlike every other table, reading it means RUNNING what it says;
+  - a CFF2 charstring blended at the default coordinate, at the top of the axis and half way up,
+    which is what makes it a blend rather than a choice between two masters;
+  - the CFF2 operators refused inside a plain `CFF` charstring, where those numbers mean nothing and
+    running them would be inventing an instruction set;
+  - one call drawing a glyph from each format, and a face with neither refused by name.
+
+Every other text crate re-run after the shared point type changed: font-shape 19, font-run 11,
+text-layout 10, text-pipeline 13, all passing. `cargo clippy -D warnings` reports nothing in the new
+files, and the one arity warning my earlier change introduced in `glyf` is fixed.
+`./src/tools/check-text-limits.sh` now reports 15 ceilings exercised at bound and one past, up from
+13: the two charstring ceilings moved out of "no site" because the code they bound now exists.
+`./format.sh` was run and every suite re-run after it.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHAT THIS CLOSES AND WHAT IT DOES NOT
+
+It closes the VARIABLE FONT item, which was open on `blend` alone: both outline formats now vary,
+and the metrics did already. It does NOT close the parser item, which still owes the `COLR` paint
+graph and the bitmap strike DATA - the indices are read, so a run says which form a glyph is, and the
+contents are not - and the truth oracle, which needs a staged face.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T17:19:42Z):
+
+`COLR`: A COLOUR GLYPH IS A GRAPH RATHER THAN A SHAPE.
+
+VERSION 0 IS A LIST AND VERSION 1 IS A TREE
+
+A version 0 glyph is layers of ordinary outlines, each with a palette colour. A version 1 glyph is a
+paint graph - gradients, transforms, clips and composites - with paints referring to other paints and
+to other colour glyphs. A consumer that read one as the other draws a flat approximation of a
+gradient, which looks like a font that was designed that way.
+
+THE OFFSETS ARE TWENTY-FOUR BITS, AND THAT IS THE TRAP
+
+Almost every offset inside a paint is three bytes rather than two or four. Reading one as a `u16`
+lands two-thirds of the way into the table and reading it as a `u32` swallows the byte after it, so a
+parser written from the shape of every other OpenType table gets EVERY paint wrong. The base glyph
+record's own paint offset is a `u32` two bytes into a six-byte record, which is read by seeking
+rather than by an index that would assume a four-byte stride.
+
+A COLOUR LINE'S OFFSET IS FROM ITS PAINT, AND A PAINT HAS TWO POSSIBLE HOMES
+
+A paint lives either in the base glyph list or in the layer list, and every offset inside it is
+measured from the paint's own start - so resolving a colour line against the TABLE lands the reader in
+whichever of the two the font happened not to use. The handle a gradient hands back carries the space
+its offset is in, rather than assuming one. I wrote it the wrong way first; the fixture's gradient
+lives in the layer list, which is what caught it.
+
+THE BOUNDS
+
+The depth and the node count are both the profile's, and both refuse by name. Two of them, because a
+bounded depth over an unbounded breadth is still unbounded work: a graph three levels deep whose every
+node has two hundred and fifty-five children is sixty-five thousand paints with every offset in range.
+A composite mode outside the profile is refused rather than falling back to source-over, which would
+draw the glyph with the wrong blend and look like a designer's choice rather than a mode nobody
+implemented.
+
+WHAT IS AND IS NOT DECIDED HERE
+
+The values stay in the format's own fixed point - 2.14 for an angle and a scale, 16.16 for a
+transform, font units for a coordinate - because converting them here would put a rounding decision in
+the layer with the least idea what the result is for. A uniform scale is folded into the general one,
+because keeping a separate variant would make every consumer handle two spellings of one thing. And
+this READS the graph; it does not draw it. Rasterising a gradient is the renderer's work, and a parser
+that tried would be deciding what a colour space is.
+
+ONE READER FOR THE TABLE AND NOT TWO
+
+The run producer had its own smaller reader for "which colour form is this glyph", written before this
+one existed. Two readers of one table is how they come to disagree about a font, so it now asks this
+one. The duplicate is gone.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p font-parse`: 43 passed, 0 failed. Four are new:
+
+  - version 0's layers read as a list, a glyph with no colour form answering `None` rather than an
+    empty list - which are different answers - and a buffer too small refused;
+  - version 1's graph walked and reported with its depth, over a fixture whose tree is layers, a
+    glyph clip, a solid, a translate, a second glyph clip and a linear gradient;
+  - a gradient's stops and its extend mode, read in the paint's own space - a repeating gradient read
+    as a padded one is flat where the font meant it to band;
+  - the DEPTH ceiling, over a translate that points at itself, stopping AT the ceiling rather than
+    near it;
+  - the NODE ceiling, over a three-level graph of sixty-five thousand paints, likewise;
+  - both versions through the exhaustive corruption sweep: every byte, four patterns, every glyph.
+
+`cargo clippy -D warnings`: nothing in the new file, and nothing in the run producer after the
+duplicate reader was removed. Every text crate re-run: font-parse 43, font-shape 19, font-run 11,
+text-pipeline 13, text-layout 10, opentype-profile 13, all passing.
+`./src/tools/check-text-limits.sh` now reports 17 ceilings exercised at bound and one past, up from
+15 - the two paint ceilings moved out of "no site" - leaving 2 enforced without a bound fixture and 3
+with no site at all. `./format.sh` was run and every suite re-run after it.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHAT REMAINS FOR THE PARSER ITEM
+
+The bitmap strike DATA - the indices are read, so a run already says which form a glyph is and which
+strike it comes from, and the image bytes are not - and the truth oracle, which needs a staged face.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T17:25:23Z):
+
+THE BITMAP STRIKES: `sbix` AND `CBLC`/`CBDT`.
+
+WHAT A STRIKE IS, AND WHY THAT DECIDES THE INTERFACE
+
+A strike is a photograph of a glyph at ONE pixel size. Every other thing a face carries is one
+description drawn at any size; a strike is not, and a face has several. Choosing the wrong one is a
+blurred glyph rather than a wrong one - the kind of defect that is never filed and never fixed - which
+is why the run producer already chooses by size and why the image carries the size it was drawn at.
+
+THE BYTES ARE HANDED BACK UNDECODED, AND THAT IS THE POINT
+
+A strike's contents are PNG, TIFF or JPEG: whole image formats, with their own decoders and their own
+history of vulnerabilities. A font parser that decoded them would be an image decoder reached through
+a document, which is a much larger attack surface than the one this parser was written to bound. What
+kind of image it is, where it sits and at what pixel size are this layer's; the pixels belong to the
+image decoder this system already has, and it is reached deliberately rather than from inside a font
+parser. The format is taken from what the face STATES rather than sniffed from a magic number, because
+sniffing is how a mislabelled blob reaches the wrong decoder.
+
+THE TWO MECHANISMS ARE NOT VARIANTS OF ONE
+
+`sbix` is a strike per size with one blob per glyph. `CBLC` is an index of index subtables - five
+formats - pointing into a second table, `CBDT`. They share nothing but the idea, so they are read
+separately and answer the same type.
+
+THE THINGS THAT ARE SILENTLY WRONG IF READ CARELESSLY:
+
+  - `dupe` IS NOT AN IMAGE FORMAT. It is a glyph id saying "this glyph is drawn as that one", which
+    is how a face stores one picture for several code points. Its chain is bounded and a glyph that
+    names itself is refused, because a chain that comes back is a loop.
+  - AN OFFSET ARRAY HAS ONE ENTRY MORE THAN THE GLYPHS IT COVERS, because a glyph's image is the range
+    between its offset and the NEXT one. A reader that sized the array at `last - first` reads the
+    last glyph's length out of whatever follows it.
+  - INDEX FORMATS 4 AND 5 ARE SPARSE: a list of the glyphs actually drawn. Taking the size record's
+    own first-to-last range as the coverage claims images that are not there, which is a missing glyph
+    rather than a fallback to the outline the face does have.
+  - A `CBDT` RECORD'S LEADING METRICS DEPEND ON THE IMAGE FORMAT the index subtable declared. Format
+    17 has five bytes of them, format 18 has eight, and FORMAT 19 HAS NONE - its metrics come from
+    `CBLC` - so a reader that expected metrics there takes the first five bytes of the PNG for them
+    and hands the decoder a file that begins in the middle.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p font-parse`: 46 passed, 0 failed. Three are new:
+
+  - an `sbix` strike handing back its image whole, with its origin in PIXELS of that strike rather
+    than in font units; a `dupe` resolved to the picture it names; a glyph the strike does not draw
+    answering `None` rather than an error, which is what a colour-emoji face's letters are; and a
+    strike index past the count likewise;
+  - a `CBLC` strike found through its index subtable, with the record's leading metrics stepped over
+    rather than taken for picture, and both glyphs of the run reaching their own image;
+  - both mechanisms through the exhaustive corruption sweep - every byte, four patterns, every glyph,
+    three strikes.
+
+`cargo clippy -D warnings`: nothing in the new file. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHAT THE PARSER ITEM NOW OWES, AND IT IS ONE THING
+
+THE TRUTH ORACLE. It parses every STAGED face and requires the family, style, axes, face index and
+format it recovers to equal the declared record, with a disagreement failing the gate and naming the
+face and the field. Everything it reads is now built - `name`, `OS/2`, `fvar`, the face index and
+the outline format - and nothing is staged for it to check until the licensed last-resort face is
+imported. That is the whole of what is left, and it is not something this session can decide.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T17:36:00Z):
+
+THE CATALOGUE'S TRUTH ORACLE.
+
+THE PROBLEM IT EXISTS FOR
+
+The catalogue publishes DECLARED metadata and never derives it, and that is a deliberate decision
+rather than a shortcut: deriving the family, the style and the axes from the face would put a second,
+unprofiled font parser inside a service, when the whole point of the closed OpenType profile is that
+exactly ONE component in this tree reads a font. The cost of that decision is that the declaration
+beside each staged face is TRUSTED - and a declaration nobody checks is a claim rather than a fact.
+
+WHAT WAS BUILT
+
+`src/tools/font-oracle` parses every staged face with the one component allowed to read a font and
+requires eight things to agree with the record: the family, the style, the format, the face index, the
+weight, the width, the slope and the axes. A disagreement names the FACE and the FIELD, and EVERY
+disagreement is reported rather than the first - whoever staged the face has to fix all of them, and a
+gate that stopped at the first makes that as many rounds as there are wrong fields.
+`check-font-declarations.sh` runs the declaration vocabulary's own fixtures, then the self-test, then
+the check, and is registered in `check.sh`, the model catalog (117 gates) and the release-required
+set.
+
+THE DECISIONS IN THE COMPARISON
+
+  - A STYLE IS COMPARED AS NUMBERS AND BITS and never against the style STRING. "Bold" is a word in a
+    language a designer chose; 700 is not, and matching on the word is how a face called `Fett`
+    stops being bold.
+  - THE FAMILY AND STYLE PREFER THE TYPOGRAPHIC NAMES, falling back to the legacy pair. A family with
+    more than four styles states its real family in the typographic names, and the legacy pair splits
+    it into groups of four so that a twenty-year-old menu could show it.
+  - A COLLECTION IS A PROPERTY OF THE FILE AND NOT OF THE FACE - every face inside one has its own
+    outline format - so the declared format is checked against the file's own signature, and a
+    non-zero face index in a file that is not a collection is named as such.
+  - THE AXIS RANGES ARE COMPARED IN THE FACE'S 16.16 rather than truncated into the declaration's
+    whole design units. An axis whose range has a fractional end cannot be expressed by the
+    declaration at all, and a comparison that truncated would call it equal to the whole number below
+    it. I wrote it the other way first and the self-test caught it.
+
+ITS STAGED SET IS EMPTY, AND THAT IS WHY IT PROVES IT REFUSES
+
+There is no face to check until the licensed last-resort face is imported, which is the catalogue
+item's and is the one thing in this milestone blocked on a DECISION rather than on work. Over an empty
+set the gate reports NOT PERFORMED with the reason, rather than printing a pass a reader would take
+for one - which is this tree's own convention for a check that ranged over nothing.
+
+A validator exercised only against a valid input is not exercised, and one exercised against NO input
+could pass for months while its comparison quietly stopped comparing. So the tool BUILDS a face -
+`name`, `OS/2` version 4, `fvar`, `glyf` and the rest - agrees with a matching declaration, and is
+then required to DISAGREE with the same face under each of eight fields made wrong in turn: the
+family, the style, the format, the weight, the width, the slope, an axis range, and a declaration that
+states NO axes at all for a variable face. That last one is the omission a comparison written as
+"check what is declared" would miss entirely. When a real face arrives the gate already covers it.
+
+THE SHA-256 IS WRITTEN OUT HERE, and the reason is recorded in `font_record` itself: the tree's one
+implementation is `bootproto`'s, and wrapping it in `service-logic` would put that symbol into the
+`service-util` library that every consumer of those modules then has to find a provider for. The two
+callers that need it link it themselves. This tool is a host tool outside the image, so it carries its
+own rather than adding an edge to the image graph for one use.
+
+WHAT WAS VERIFIED, AND HOW
+
+`./src/tools/check-font-declarations.sh`: the vocabulary's fixtures pass, the self-test passes over
+eight altered declarations, and the check reports NOT PERFORMED over the empty staged set.
+`cargo clippy -D warnings` over the tool: clean. `verify-model`: 157 passed, after the gate was
+added to the catalog and to the frozen release set - its own fixture is what told me the second was
+missing. `check-gate-oracles` and `check-source-hygiene` pass. `./format.sh` was run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHY THE PARSER ITEM IS NOW TICKED
+
+Everything it names is built and gated: the bounded parser over hostile input, the tables the profile
+lists, the exhaustive fuzzing, and the truth oracle with its self-test. The oracle's set is empty and
+it SAYS so rather than passing; filling it is the licensed face's, which the catalogue item owns and
+which is the one thing here blocked on a decision this session cannot make. I am not ticking it on the
+strength of an empty set - I am ticking it because the check exists, refuses, and is registered, which
+is what the item asked for.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T17:42:37Z):
+
+THE LAST TWO CEILING FIXTURES, AND A CAP ON THE ONES THAT HAVE NONE.
+
+THE TWO FIXTURES
+
+The contextual-depth and output-expansion ceilings were enforced in code with nothing reaching their
+bounds, and the gate said so every run. Both now have fixtures.
+
+THE CONTEXTUAL CHAIN needed something the fixtures did not have: a `GSUB` whose lookup list holds
+SEVERAL lookups. Every existing builder makes a table with one, and a chain is exactly what a
+contextual rule builds - lookup 0 invokes lookup 1, which invokes lookup 2 - so a fixture with one
+lookup can only ever reach depth one, which is the depth nothing interesting happens at. With a list
+builder and a format 1 contextual subtable, a chain of sixty-four runs to its substitution and one of
+sixty-five is refused by name.
+
+THE EXPANSION is a multiple substitution turning one glyph into sixty-four, which is exactly the
+ratio, and into sixty-five, which is one past it. That also exercises the rule the ceiling is FOR: it
+caps the multiplier and not the product, and a one-glyph run is where that distinction is visible.
+
+Both needed a sample font with a stated glyph count, because the ordinary one declares five and these
+produce sixty-five.
+
+THE CAP, WHICH IS WHAT KEEPS THE REMAINING THREE HONEST
+
+Three ceilings still have no enforcement site, and all three bound an ITERATION this tree does not
+perform: nothing re-shapes a run, and the line layout is single-pass by construction. A ceiling with
+no code bounds nothing, and a refusal type nothing raises is a promise nothing keeps, so none was
+invented for them - the same reasoning that removed the dead `Exceeded` variant from `text-layout`
+earlier today, and that has now removed the `Enforced` state from this gate, which became dead the
+moment its last two entries got fixtures.
+
+But "no site" is also the answer somebody reaches for when a ceiling is in the way. So the number of
+them is CAPPED at three, and a fourth fails the gate until the cap comes down in the same edit - a
+decision with a reviewer rather than a drift. The self-test proves that refusal too, by demoting one
+covered ceiling and requiring rejection.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p font-shape`: 21 passed, 0 failed, both new fixtures passing first time.
+`./src/tools/check-text-limits.sh`: 19 ceilings exercised at bound and one past, 3 with no site, and
+the self-test passes over five broken tables - a missing ceiling, a missing fixture, an invented
+ceiling, a reasonless entry, and one ceiling too many demoted. `cargo clippy -D warnings` over the
+gate: clean. `./format.sh` was run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHY THE CEILINGS ITEM IS NOW TICKED
+
+Everything it asks for is built: the values frozen with the profile and hashed with it, the typed
+refusal naming which ceiling and by how much, fallible allocation on the run path, and nineteen of
+twenty-two ceilings exercised at their exact bound and one past it. The three that are not bound work
+that does not exist, the gate names them on every run, and the cap means a fourth cannot be added
+quietly. I am not ticking it over an absence - I am ticking it because the bounds that have work
+behind them all refuse, and the ones that do not are named and counted.

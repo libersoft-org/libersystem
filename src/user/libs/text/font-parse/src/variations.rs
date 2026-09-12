@@ -325,6 +325,42 @@ fn delta_set_index(map: Reader<'_>, glyph: u16) -> Result<(u16, u16), Error> {
 	Ok(((value >> inner_bits) as u16, (value & inner_mask) as u16))
 }
 
+/// How much each region of one item variation data subtable applies at a coordinate.
+///
+/// THIS IS WHAT CFF2'S `blend` NEEDS AND A DELTA LOOKUP DOES NOT. A delta lookup reads one row and
+/// sums it; `blend` is given the deltas IN THE CHARSTRING and needs the scalars alone, in the
+/// subtable's own region order. Answers how many regions there were, which is also how many deltas
+/// each blended value carries.
+pub fn blend_regions(store: Reader<'_>, index: u16, coordinates: &[Normalised], into: &mut [i32]) -> Result<usize, Error> {
+	let table = b"CFF2";
+	let mut reader = store;
+	let format = reader.u16().ok_or_else(|| bad(table))?;
+	if format != 1 {
+		return Err(Error::Unsupported(opentype_profile::Unsupported::SubtableFormat { table: *table, format }));
+	}
+	let regions_at = reader.u32().ok_or_else(|| bad(table))? as usize;
+	let data_count = reader.u16().ok_or_else(|| bad(table))? as usize;
+	if index as usize >= data_count {
+		return Err(Error::Malformed(Malformed::InconsistentTable { table: *table }));
+	}
+	let data_offset = store.u32_at(2 + index as usize).ok_or_else(|| bad(table))? as usize;
+	let data = store.slice(data_offset, store.len().checked_sub(data_offset).ok_or_else(|| bad(table))?).ok_or_else(|| bad(table))?;
+	let mut reader = data;
+	let _item_count = reader.u16().ok_or_else(|| bad(table))?;
+	let _short_count = reader.u16().ok_or_else(|| bad(table))?;
+	let region_count = reader.u16().ok_or_else(|| bad(table))? as usize;
+	if region_count > into.len() {
+		return Err(Error::Unsupported(opentype_profile::Unsupported::Exceeded { limit: "variation regions", ceiling: into.len() as u32, asked: region_count as u64 }));
+	}
+	let indices_at = reader.position();
+	let regions = store.slice(regions_at, store.len().checked_sub(regions_at).ok_or_else(|| bad(table))?).ok_or_else(|| bad(table))?;
+	for (slot, out) in into.iter_mut().enumerate().take(region_count) {
+		let region = data.u16_at(indices_at / 2 + slot).ok_or_else(|| bad(table))?;
+		*out = region_scalar(regions, region, coordinates, table)?;
+	}
+	Ok(region_count)
+}
+
 /// One delta from an item variation store, scaled by how far the coordinate is into each region.
 ///
 /// THE SCALAR IS A PRODUCT OVER THE AXES, and a region that does not apply contributes ZERO rather

@@ -19,9 +19,13 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod bitmap;
+pub mod cff;
+pub mod colr;
 pub mod glyf;
 pub mod gvar;
 pub mod metadata;
+pub mod outline;
 pub mod reader;
 pub mod tables;
 pub mod variations;

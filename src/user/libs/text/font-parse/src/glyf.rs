@@ -15,15 +15,39 @@ use crate::reader::Reader;
 use crate::tables::Face;
 use crate::{Error, MAX_COMPOSITE_DEPTH, Malformed};
 
+/// WHAT A POINT IS ON THE CURVE, and which curve.
+///
+/// AN ENUM AND NOT A BOOLEAN, because this system has TWO outline formats and they draw different
+/// curves. `glyf` is quadratic - one control point between two on-curve ones - and `CFF`/`CFF2` are
+/// CUBIC, with two. A boolean `on_curve` cannot tell two quadratic controls in a row, which imply an
+/// on-curve point half way between them, from the two controls of one cubic; a consumer that read a
+/// cubic as a pair of quadratics draws a different shape, and nothing in the data says so. An enum
+/// makes a consumer that handles only one of them REFUSE rather than draw the wrong curve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PointKind {
+	/// A point the curve passes through.
+	OnCurve,
+	/// The single control point of a quadratic segment, as `glyf` draws.
+	Quadratic,
+	/// One of the two control points of a cubic segment, as `CFF` and `CFF2` draw.
+	Cubic,
+}
+
 /// One point of an outline, in font units.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Point {
 	pub x: i16,
 	pub y: i16,
-	/// A point the curve passes through, as opposed to a control point.
-	pub on_curve: bool,
+	pub kind: PointKind,
 	/// The last point of a contour, which is where it closes back to its first.
 	pub ends_contour: bool,
+}
+
+impl Point {
+	/// Whether the curve passes through this point, for a caller that only needs to know that much.
+	pub const fn on_curve(&self) -> bool {
+		matches!(self.kind, PointKind::OnCurve)
+	}
 }
 
 /// What a glyph's outline is made of, as it is walked.
@@ -63,7 +87,7 @@ fn walk_at(face: &Face<'_>, glyph: u16, depth: u8, dx: i16, dy: i16, points: &mu
 	let mut reader = description;
 	let contours = reader.i16().ok_or(Error::Malformed(Malformed::BadGlyph { glyph }))?;
 	reader.skip(8).ok_or(Error::Malformed(Malformed::BadGlyph { glyph }))?;
-	if contours >= 0 { simple(description, contours as usize, glyph, dx, dy, points, outline) } else { composite(face, description, glyph, depth, dx, dy, points, outline) }
+	if contours >= 0 { simple(description, contours as usize, glyph, dx, dy, points, outline) } else { composite(face, description, glyph, depth, (dx, dy), points, outline) }
 }
 
 /// A simple glyph: contours, flags, and delta-encoded coordinates.
@@ -170,7 +194,7 @@ fn simple(description: Reader<'_>, contours: usize, glyph: u16, dx: i16, dy: i16
 		x = x.checked_add(delta_x).ok_or_else(bad)?;
 		y = y.checked_add(delta_y).ok_or_else(bad)?;
 		let ends_contour = contour_end == Some(index);
-		let point = Point { x: i16::try_from(x).map_err(|_| bad())?.saturating_add(dx), y: i16::try_from(y).map_err(|_| bad())?.saturating_add(dy), on_curve: current_flag & 0x01 != 0, ends_contour };
+		let point = Point { x: i16::try_from(x).map_err(|_| bad())?.saturating_add(dx), y: i16::try_from(y).map_err(|_| bad())?.saturating_add(dy), kind: if current_flag & 0x01 != 0 { PointKind::OnCurve } else { PointKind::Quadratic }, ends_contour };
 		if !outline.point(point) {
 			return Ok(());
 		}
@@ -228,7 +252,8 @@ pub fn components(face: &Face<'_>, glyph: u16, each: &mut dyn FnMut(usize, Compo
 }
 
 /// A composite glyph: other glyphs, each with a placement.
-fn composite(face: &Face<'_>, description: Reader<'_>, glyph: u16, depth: u8, dx: i16, dy: i16, points: &mut usize, outline: &mut impl Outline) -> Result<(), Error> {
+fn composite(face: &Face<'_>, description: Reader<'_>, glyph: u16, depth: u8, at: (i16, i16), points: &mut usize, outline: &mut impl Outline) -> Result<(), Error> {
+	let (dx, dy) = at;
 	components_of(description, glyph, &mut |_, component| {
 		walk_at(face, component.glyph, depth + 1, dx.saturating_add(component.dx), dy.saturating_add(component.dy), points, outline)?;
 		Ok(true)

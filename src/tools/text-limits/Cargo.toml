@@ -1,0 +1,14 @@
+[package]
+name = "text-limits"
+edition = "2024"
+description = "Checks that every numeric ceiling the OpenType profile freezes is exercised at its exact bound and one past it"
+
+[[bin]]
+name = "text-limits"
+path = "src/main.rs"
+
+[dependencies]
+opentype-profile = { path = "../../user/libs/text/opentype-profile" }
+
+[lints.rust]
+warnings = "deny"

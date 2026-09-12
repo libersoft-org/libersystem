@@ -288,3 +288,29 @@ fn the_fallback_walk_stops_at_the_frozen_number_of_faces() {
 	let faces = fallback::Faces { policy: &policy, coverage: &coverage, script: unicode_tables::Script::Latin, language: *b"dflt" };
 	assert_eq!(fallback::face_for_cluster(&faces, &['a']), Some(ceiling as u16 - 1));
 }
+
+#[test]
+// THE ABSOLUTE INPUT CEILING, AT ITS EXACT BOUND AND ONE PAST IT. A ceiling tested only past its
+// value could be off by one in either direction and nothing would say so - which for a limit that
+// decides whether a document is refused is the difference between "long" and "too long".
+fn a_paragraph_is_read_to_the_frozen_ceiling_and_no_further() {
+	let ceiling = crate::MAX_PARAGRAPH;
+	let exactly: std::string::String = core::iter::repeat_n('a', ceiling).collect();
+	assert!(Source::new(&exactly).is_ok(), "a paragraph of exactly the ceiling is laid out");
+	let one_more: std::string::String = core::iter::repeat_n('a', ceiling + 1).collect();
+	assert_eq!(Source::new(&one_more).err(), Some(crate::Error::TooLong { characters: ceiling + 1, limit: ceiling }));
+}
+
+#[test]
+// AND THE ABSOLUTE OUTPUT CEILING, AT ITS EXACT BOUND. An input cap does not imply it: a paragraph
+// within its code-point limit that a pathological face expands sixty-four fold is millions of glyphs
+// with every offset in range.
+fn a_paragraph_produces_glyphs_to_the_frozen_ceiling_and_no_further() {
+	let source = Source::new("ab").expect("short enough");
+	let items = stages::itemise(source);
+	let levelled = stages::resolve_levels(items, ParagraphDirection::Auto);
+	let ceiling = crate::MAX_PARAGRAPH_GLYPHS;
+	let run = |count: usize| stages::ShapedRun { start: 0, end: 1, face: 0, script: unicode_tables::Script::Latin, direction: font_contract::Direction::LeftToRight, glyphs: std::vec![1u16; count], clusters: std::vec![0u32; count], advances: std::vec![Fixed266::ZERO; count] };
+	let shaped = Shaped { faced: Faced { levelled, faces: std::vec![], mirrored: std::vec![] }, runs: std::vec![run(ceiling)] };
+	assert!(stages::measure(shaped).is_ok(), "exactly the ceiling's worth of glyphs is measured");
+}

@@ -551,7 +551,7 @@ fn walk_varied_at(face: &Face<'_>, glyph: u16, coordinates: &[Normalised], depth
 	let varied = apply(face, glyph, coordinates, Geometry::Simple(points), deltas, touched)?;
 	for (index, point) in points.iter().enumerate() {
 		let (delta_x, delta_y) = if varied { deltas[index] } else { (0, 0) };
-		let moved = Point { x: point.x.saturating_add(delta_x).saturating_add(dx), y: point.y.saturating_add(delta_y).saturating_add(dy), on_curve: point.on_curve, ends_contour: point.ends_contour };
+		let moved = Point { x: point.x.saturating_add(delta_x).saturating_add(dx), y: point.y.saturating_add(delta_y).saturating_add(dy), kind: point.kind, ends_contour: point.ends_contour };
 		if !outline.point(moved) {
 			return Ok(());
 		}

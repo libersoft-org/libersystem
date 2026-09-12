@@ -64,6 +64,13 @@ pub enum Unsupported {
 	Variation(&'static str),
 	/// A structure the profile EXCLUDES by name - see `tables::EXCLUDED`.
 	ExcludedByProfile(&'static str),
+	/// A charstring operator outside the profile.
+	///
+	/// THE DEPRECATED HALF OF TYPE 2 IS A STACK MACHINE - arithmetic, storage, a random number - and
+	/// no font written this century uses it. Refusing it by NUMBER says which operator a font asked
+	/// for, which is what a report and a conformance suite can act on; implementing it would add an
+	/// interpreter for untrusted input in exchange for nothing.
+	CharstringOperator(u16),
 	/// A NUMERIC CEILING the profile freezes, met by a font or a document.
 	///
 	/// IT NAMES WHICH ONE AND BY HOW MUCH. "Too complex" is not something a report, a staging tool or

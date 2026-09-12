@@ -78,6 +78,8 @@ declare -A GATES=(
 	# draw. Its publication is a START GATE for the parser that reads untrusted font bytes, and a
 	# start gate that drifts before the work begins has bounded nothing. Host-only and seconds.
 	["opentype-profile"]="tools/check-opentype-profile.sh"
+	["text-limits"]="tools/check-text-limits.sh"
+	["font-declarations"]="tools/check-font-declarations.sh"
 	# Unicode segmentation AND the bidirectional algorithm, measured against Unicode's OWN answers
 	# rather than against a sample: five normative conformance files in full - and `BidiTest` alone is
 	# seven hundred thousand cases - plus the tables regenerated from the pinned release and compared.

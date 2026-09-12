@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 115] = [
+const GATES: [(&str, &str); 117] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -545,6 +545,8 @@ const GATES: [(&str, &str); 115] = [
 	// seconds; always selected for the same reason the graphics one is - the thing it guards against
 	// is a list growing somewhere a narrowed selection would not look.
 	("opentype-profile", "harness.tools"),
+	("text-limits", "harness.tools"),
+	("font-declarations", "harness.tools"),
 	// Unicode segmentation and the bidirectional algorithm against the normative conformance files. It reads the generated tables,
 	// the algorithms over them and the pinned UCD in the cache - never the network - so it costs
 	// seconds and belongs to the harness like every other source-reading gate.
