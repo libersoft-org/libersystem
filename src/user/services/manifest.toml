@@ -1076,6 +1076,45 @@ stage = "volume"
 destination = "libexec/lifecheck.lsexe"
 providers = ["base-proto", "lifecycle", "lsrt"]
 
+# THE QUARANTINE CONSUMER. Its object is this tree's own and its LINK is the audit substrate's: the
+# audit-linked Vulkan loader, the foreign ABI and discovery crates, and the runtime. The upstream it
+# links against is audit-only and is not in this tree, so this row is DEVELOPMENT-ONLY - it is staged
+# into the image the gate builds and into no other, which is what quarantine staging means here.
+#
+# ITS ICD COMES THROUGH A SELECTION SLOT, the same one `icdcheck` uses: the loader is handed the two
+# exports of a provider ProcessService bound into the closure before the first thread ran.
+# THE FACILITY PROBE. It calls every admitted foreign ABI facility once and CHECKS the answer: the
+# gates that hold the substrate to its exact surface are static, and none of them shows that a
+# facility works. It is a quarantine artifact for a plainer reason than `vkprobe`: the substrate
+# defines `malloc`, `strlen` and the rest under their C names, which every staged library would
+# collide with - so it is linked into the consumer that uses it.
+[[programs]]
+name = "abiprobe"
+owner = "tools"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/abiprobe.lsexe"
+providers = ["lsrt"]
+producer = "audit"
+development = true
+selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+
+[[programs]]
+name = "vkprobe"
+owner = "tools"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/vkprobe.lsexe"
+providers = ["lsrt"]
+producer = "audit"
+# THE UPSTREAM'S TERM, because this program links code taken under it. A licence obligation that
+# travels with a binary has to travel INSIDE it, which is why the identity record carries it too.
+licence = "Apache-2.0"
+development = true
+selection = [{ kind = "vulkan-icd", symbols = ["vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"], candidates = ["icdprobe"] }]
+
 [[programs]]
 name = "readln"
 owner = "tools"

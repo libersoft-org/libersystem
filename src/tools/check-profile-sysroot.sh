@@ -61,6 +61,9 @@ failures = []
 
 # THE THREE TARGETS MUST AGREE, as they do for the facilities crates and for the same reason: one
 # sysroot cannot serve three different surfaces.
+# THE WHOLE SURFACE, because a header declares what a SOURCE may call and the closure is what backs
+# it - and four of those names are backed by the runtime rather than by the substrate crates. A
+# sysroot sized to the substrate alone would drop `memcpy`, which every C compiler emits calls to.
 surfaces = {arch: set(inventory[arch]["archive_surface"]) for arch in ("x86_64", "aarch64", "riscv64")}
 if len({frozenset(surface) for surface in surfaces.values()}) != 1:
 	print("profile-sysroot: the three targets name different symbols; one sysroot cannot serve them", file=sys.stderr)
@@ -90,6 +93,11 @@ provided = set()
 for crate in ("src/user/libs/foreign/abi/src", "src/user/libs/foreign/discovery/src"):
 	for source in sorted(pathlib.Path(crate).glob("*.rs")):
 		provided |= set(export.findall(source.read_text()))
+# AND WHAT THE RUNTIME OWNS. `lsrt.lslib` publishes the four memory functions on purpose, so that
+# every library in this image imports them rather than carrying a copy; the converged link resolves
+# the C references to them from there. They are as provided as anything in the crates above - by a
+# different owner, which is what the audit artifact's export-collision check exists to keep true.
+provided |= {"memcpy", "memmove", "memset", "memcmp"}
 
 for symbol in sorted(declared - provided):
 	failures.append(f"<{symbol}> is declared by the profile sysroot and no substrate crate provides it - a compile that succeeds and a link that fails")

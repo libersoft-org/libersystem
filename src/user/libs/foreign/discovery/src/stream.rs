@@ -48,6 +48,9 @@ pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut
 		return ptr::null_mut();
 	};
 	let Some(icd) = record.icd_by_manifest(unsafe { as_bytes(path) }) else {
+		// SAYS WHICH PATH, for the reason `opendir` does: a loader whose search path and a record's
+		// paths never meet gets "nothing here" from every call, succeeds, and reaches no driver.
+		crate::report(b"no manifest at ", unsafe { as_bytes(path) });
 		return ptr::null_mut();
 	};
 	let opens = &raw mut OPEN;

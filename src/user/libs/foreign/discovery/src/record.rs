@@ -98,3 +98,72 @@ impl Record {
 		self.icds().find(|icd| icd.library_path == path)
 	}
 }
+
+/// Install a record holding ONE ICD, from outside Rust.
+///
+/// WHY THERE IS A C ENTRY POINT. The substrate that installs a record is not always a Rust crate
+/// that can name `install`: the quarantine consumer this milestone's guest gate launches is an
+/// ordinary program in this image, and it reaches the audit-linked artifact the only way anything
+/// reaches anything here - as unmangled provider exports. What it hands over is what a launch knows
+/// and this crate cannot: which provider was bound into the closure, and the two entry points that
+/// provider exports.
+///
+/// IT IS NOT INVENTORY SURFACE, and the gate that holds this crate to the inventory knows it by
+/// name. Nothing in the pinned configuration references it; it is how a LAUNCH hands the substrate
+/// its record, which is the opposite direction from every other symbol here.
+///
+/// ONE ICD AND NOT A LIST, because one selection slot resolves to one provider. A caller with two
+/// would be a caller whose consumer declared two slots, which is a record this entry point would
+/// have to grow a shape for rather than guess one.
+///
+/// # Safety
+/// Every pointer must be valid and NUL-terminated for the life of the process, and the two function
+/// pointers must be the provider's own exports.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn liber_foreign_install_icd(manifest_path: *const u8, manifest: *const u8, library_path: *const u8, self_path: *const u8, negotiate: NegotiateFn, get_instance_proc_addr: GetInstanceProcAddrFn) -> i32 {
+	// THE STRINGS ARE BORROWED AND NOT COPIED. A record outlives every foreign call, and the caller
+	// is a program whose own image holds these literals for as long as it runs; copying them would
+	// need an allocator this crate does not have and must not acquire.
+	unsafe fn borrow(pointer: *const u8) -> Option<&'static [u8]> {
+		if pointer.is_null() {
+			return None;
+		}
+		let mut len = 0usize;
+		// A BOUND, because a missing terminator is a walk with no end. Every path this substrate
+		// answers is a package-owned name, and 4096 is past anything one can be.
+		while len < 4096 && unsafe { *pointer.add(len) } != 0 {
+			len += 1;
+		}
+		if len == 4096 {
+			return None;
+		}
+		Some(unsafe { core::slice::from_raw_parts(pointer, len) })
+	}
+	let (Some(manifest_path), Some(manifest), Some(library_path), Some(self_path)) = (unsafe { borrow(manifest_path) }, unsafe { borrow(manifest) }, unsafe { borrow(library_path) }, unsafe { borrow(self_path) }) else {
+		return -1;
+	};
+	// THE RECORD AND THE ICD ARE PROCESS-WIDE STATICS, written once. There is no allocator here and
+	// nothing to free: a record that could be replaced would be a discovery that happens after the
+	// closure was verified, which is the thing this whole design refuses.
+	static mut ICD: Option<Icd> = None;
+	static mut RECORD: Option<Record> = None;
+	// ONCE, AND THE FLAG IS WHAT SAYS SO. Reading the statics to find out would be a shared reference
+	// to a mutable static, which is the thing this process has no second thread to race over and
+	// still must not write: a raw-pointer write and an atomic flag say the same thing without
+	// claiming a reference that does not hold.
+	static INSTALLED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+	if INSTALLED_ONCE.swap(true, Ordering::Relaxed) {
+		// A second install is a caller that thinks it is the first one.
+		return -2;
+	}
+	unsafe {
+		(&raw mut ICD).write(Some(Icd { manifest_path, manifest, library_path, negotiate, get_instance_proc_addr }));
+		let icd: &'static Icd = (*(&raw const ICD)).as_ref().unwrap_unchecked();
+		(&raw mut RECORD).write(Some(Record { version: RECORD_VERSION, icds: [Some(icd), None, None, None], self_path }));
+		let record: &'static Record = (*(&raw const RECORD)).as_ref().unwrap_unchecked();
+		match install(record) {
+			Ok(()) => 0,
+			Err(_) => -3,
+		}
+	}
+}

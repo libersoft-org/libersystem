@@ -296,13 +296,11 @@ struct Launch {
 // reset, and neither is a place to leak the process handle and the channel it wrote to.
 impl Drop for Launch {
 	fn drop(&mut self) {
-		unsafe {
-			if self.output != 0 {
-				close(self.output);
-			}
-			if self.task != 0 {
-				close(self.task);
-			}
+		if self.output != 0 {
+			close(self.output);
+		}
+		if self.task != 0 {
+			close(self.task);
 		}
 	}
 }
@@ -386,7 +384,7 @@ pub struct Session {
 impl Session {
 	pub fn new(storage: u64, boot_nonce: [u8; 8]) -> Session {
 		let mut profile: [u8; 32] = [0u8; 32];
-		let len: usize = unsafe { boot_profile(&mut profile) };
+		let len: usize = boot_profile(&mut profile);
 		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, registry: 0, restart: false, candidate: None, artifacts: Vec::new(), registry_bytes: 0, fixtures: Vec::new(), fixture_bytes: 0 }
 	}
 
@@ -411,7 +409,7 @@ impl Session {
 	// may never arrive.
 	pub fn set_registry(&mut self, registry: u64) {
 		self.registry = registry;
-		unsafe { send_blocking(registry, services::REGISTRY_ANNOUNCEMENT, 0) };
+		send_blocking(registry, services::REGISTRY_ANNOUNCEMENT, 0);
 	}
 
 	pub fn registry_channel(&self) -> u64 {
@@ -427,7 +425,7 @@ impl Session {
 	// is shadowing what it resolved.
 	pub fn answer_resolution(&mut self) {
 		let mut buf: [u8; 64] = [0u8; 64];
-		let (len, _) = match unsafe { recv_blocking(self.registry, &mut buf) } {
+		let (len, _) = match recv_blocking(self.registry, &mut buf) {
 			Received::Message { len, handle } => (len, handle),
 			Received::Closed => {
 				self.registry = 0;
@@ -440,7 +438,7 @@ impl Session {
 			Some(generation) if self.registry_allowed => &generation.bytes,
 			_ => &[],
 		};
-		unsafe { send_blocking(self.registry, bytes, 0) };
+		send_blocking(self.registry, bytes, 0);
 	}
 
 	// The channel a launched program's output arrives on, so the serve loop can wait on it
@@ -466,7 +464,7 @@ impl Session {
 			// second is how a launched program reports that it finished - its end of this
 			// channel goes with it - so treating both as "no work" would leave every launch
 			// looking like it never ended.
-			let pending: i64 = unsafe { channel_peek(launch.output) };
+			let pending: i64 = channel_peek(launch.output);
 			if pending == ERR_PEER_CLOSED {
 				launch.exited = true;
 				return;
@@ -474,7 +472,7 @@ impl Session {
 			if pending < 0 {
 				return;
 			}
-			match unsafe { recv_vec_blocking(launch.output) } {
+			match recv_vec_blocking(launch.output) {
 				ReceivedVec::Message { bytes, .. } => {
 					launch.buffered.extend_from_slice(&bytes);
 					// The newest output is what a scenario is waiting on, so an overrun drops
@@ -682,7 +680,7 @@ impl Session {
 		self.next_generation += 1;
 		let mut bytes: Vec<u8> = Vec::new();
 		bytes.reserve_exact(total as usize);
-		self.candidate = Some(Candidate { generation, name: payload[37..37 + name_len].to_vec(), total, digest, bytes, deadline: unsafe { clock() } + PUBLICATION_IDLE_TICKS });
+		self.candidate = Some(Candidate { generation, name: payload[37..37 + name_len].to_vec(), total, digest, bytes, deadline: clock() + PUBLICATION_IDLE_TICKS });
 		sink.send(OP_PUB_ACK, request, generation, ST_OK, &0u32.to_le_bytes())
 	}
 
@@ -706,7 +704,7 @@ impl Session {
 			return live;
 		}
 		candidate.bytes.extend_from_slice(payload);
-		candidate.deadline = unsafe { clock() } + PUBLICATION_IDLE_TICKS;
+		candidate.deadline = clock() + PUBLICATION_IDLE_TICKS;
 		let received: u32 = candidate.bytes.len() as u32;
 		sink.send(OP_PUB_ACK, request, generation, ST_OK, &received.to_le_bytes())
 	}
@@ -762,7 +760,7 @@ impl Session {
 			},
 			None => (VERDICT_UNKNOWN, b"the installed artifact could not be read".to_vec()),
 		};
-		let entry = Generation { generation: candidate.generation, digest: candidate.digest, published_at: unsafe { clock_rtc() }, verdict, detail, bytes: candidate.bytes };
+		let entry = Generation { generation: candidate.generation, digest: candidate.digest, published_at: clock_rtc(), verdict, detail, bytes: candidate.bytes };
 		let added: usize = entry.bytes.len();
 		let at: usize = match index {
 			Some(at) => at,
@@ -880,7 +878,7 @@ impl Session {
 		}
 		let mut path: String = String::from(FIXTURE_PREFIX);
 		path.push_str(name);
-		if !unsafe { write_volume_file(self.storage, &path, body) } {
+		if !write_volume_file(self.storage, &path, body) {
 			return sink.send(OP_ERROR, request, 0, ST_NO_SPACE, &[]);
 		}
 		if !known {
@@ -904,7 +902,7 @@ impl Session {
 		for name in core::mem::take(&mut self.fixtures) {
 			let mut path: String = String::from(FIXTURE_PREFIX);
 			path.push_str(&name);
-			if unsafe { remove_volume_file(self.storage, &path) } {
+			if remove_volume_file(self.storage, &path) {
 				removed += 1;
 			} else {
 				stuck.push(name);
@@ -1005,7 +1003,7 @@ impl Session {
 // Reply payload: free_frames u64, total_frames u64, heap_free u64, heap_total u64.
 fn memory_stats(request: u32, sink: &mut impl Sink) -> bool {
 	let mut stats: MemoryStats = MemoryStats::default();
-	if unsafe { rt::memory_stats(&mut stats) } < 0 {
+	if rt::memory_stats(&mut stats) < 0 {
 		return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
 	}
 	let mut reply: Vec<u8> = Vec::with_capacity(32);
@@ -1036,7 +1034,7 @@ fn terminal_input(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
 	let mut accepted: u16 = 0;
 	let privilege = CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed);
 	for &byte in payload {
-		if unsafe { console_feed_serial(privilege, byte) } != 0 {
+		if console_feed_serial(privilege, byte) != 0 {
 			break;
 		}
 		accepted += 1;
@@ -1115,6 +1113,17 @@ fn explain(reason: &compat::Reason) -> Vec<u8> {
 			out.extend_from_slice(installed.as_bytes());
 			out.extend_from_slice(b" -> ");
 			out.extend_from_slice(candidate.as_bytes());
+		}
+		compat::Reason::LanguageSection { position, installed, candidate } => {
+			// THE LINE WHOLE, because this rule does not know the producer's field names - which is
+			// exactly why it compares the section as text. Naming a field here would be this
+			// renderer claiming knowledge the comparison deliberately does not have.
+			out.extend_from_slice(b"producer field at ");
+			push_number(&mut out, *position);
+			out.extend_from_slice(b": ");
+			out.extend_from_slice(entry_or_end(*installed));
+			out.extend_from_slice(b" -> ");
+			out.extend_from_slice(entry_or_end(*candidate));
 		}
 		compat::Reason::ProviderList { position, installed, candidate } => {
 			out.extend_from_slice(b"provider closure at ");
@@ -1334,7 +1343,7 @@ impl Session {
 		// A previous launch is replaced, and its channel released with it: one at a time is
 		// the rule, and a scenario that starts another has finished with the first.
 		self.launch = None;
-		let (ours, theirs): (u64, u64) = match unsafe { channel() } {
+		let (ours, theirs): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]),
 		};
@@ -1346,7 +1355,7 @@ impl Session {
 		let (koid, task): (u64, u64) = match started {
 			Some(Ok(result)) => (result.info.koid, result.task),
 			_ => {
-				unsafe { close(ours) };
+				close(ours);
 				return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]);
 			}
 		};
@@ -1364,7 +1373,7 @@ impl Session {
 		let Some(launch) = &mut self.launch else {
 			return sink.send(OP_ERROR, request, 0, ST_NO_LAUNCH, &[]);
 		};
-		let signalled: bool = !launch.exited && launch.task != 0 && unsafe { signal(launch.task, SIG_KILL) } >= 0;
+		let signalled: bool = !launch.exited && launch.task != 0 && signal(launch.task, SIG_KILL) >= 0;
 		if signalled {
 			launch.exited = true;
 		}

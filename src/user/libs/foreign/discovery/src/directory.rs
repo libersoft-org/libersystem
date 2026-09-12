@@ -93,6 +93,12 @@ pub unsafe extern "C" fn opendir(path: *const c_char) -> *mut c_void {
 		// AN EMPTY DIRECTORY IS NOT AN OPEN ONE. The loader treats a NULL from `opendir` as "this
 		// search-path element has nothing", which is exactly what a directory outside the record
 		// means here - and it is the branch upstream already handles.
+		//
+		// AND IT SAYS WHICH DIRECTORY, because the quietest way a discovery model can be wrong is
+		// for the loader's search path and the record's paths never to meet: every call returns
+		// "nothing here", the enumeration succeeds, and no driver is reached. That is exactly what
+		// happened the first time this ran, and nothing said so.
+		crate::report(b"no manifest under ", directory);
 		return ptr::null_mut();
 	}
 	let walks = &raw mut WALKS;

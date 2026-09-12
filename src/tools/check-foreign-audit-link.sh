@@ -55,6 +55,12 @@ for crate in ("src/user/libs/foreign/abi/src", "src/user/libs/foreign/discovery/
 	for source in sorted(pathlib.Path(crate).glob("*.rs")):
 		declared |= set(export.findall(source.read_text()))
 declared.discard("__liber_stderr_stream")
+# THE SUBSTRATE'S OWN CONTROL SURFACE IS NOT SOMETHING THE LINK RESOLVES. These two are how a LAUNCH
+# hands the substrate what only a launch knows - its diagnostic sink, and which provider was bound
+# into the closure - so nothing upstream references them, and the exact-surface rule below would
+# report them as declared-and-unresolved in both directions. Named here, as they are in the
+# facilities gate, so the exemption is one list and not two readings of the same fact.
+declared -= {"liber_foreign_install_sink", "liber_foreign_install_icd"}
 
 for target in targets:
 	entry = inventory.get(target)
@@ -63,8 +69,13 @@ for target in targets:
 		continue
 	asked = set(entry["archive_surface"])
 	resolved = set(entry["resolved_from_substrate"])
-	for symbol in sorted(asked - resolved):
-		failures.append(f"{target}: <{symbol}> is asked for and was not resolved from the substrate")
+	# THE CLOSURE IS THE SUBSTRATE AND THE RUNTIME, and the split between them is a measurement rather
+	# than a preference: `lsrt.lslib` owns the four memory functions in this image, so the link takes
+	# them from there and a second definition in the substrate would be an export with two owners.
+	# What must hold is that EVERY symbol the archive asks for came from somewhere in the closure.
+	from_runtime = set(entry["resolved_from_runtime"])
+	for symbol in sorted(asked - resolved - from_runtime):
+		failures.append(f"{target}: <{symbol}> is asked for and was resolved by nothing in the closure")
 	if entry["substrate_built_and_unrequired"]:
 		failures.append(f"{target}: the substrate builds {entry['substrate_built_and_unrequired']} and the converged link asks for none of them")
 	# THE DECLARED SURFACE IS THE ONE IN THE TREE, not the one the inventory remembers. A crate that

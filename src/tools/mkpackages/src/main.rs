@@ -32,6 +32,14 @@ fn verify_artifacts() {
 			("driver" | "service", "volume") => user_elf_path(&manifest, &row.crate_path, &row.name),
 			_ => continue,
 		};
+		// A QUARANTINE ARTIFACT IS ABSENT WHEN ITS UPSTREAM IS. Its link comes from the audit
+		// substrate, whose sources are deliberately not in this tree, so a build on a machine that
+		// has not fetched them stages nothing for it - and requiring it here would make the
+		// development build fail for everyone who is not running the gate that needs it.
+		if row.producer == system_manifest::Producer::Audit && !path.exists() {
+			println!("mkpackages: {} is audit-produced and was not staged - the image is built without it", row.name);
+			continue;
+		}
 		if !path.exists() {
 			missing.push(format!("  {} ({})", row.name, path.display()));
 		}
@@ -607,11 +615,12 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 			destination: Some(program.destination.as_str().to_string()),
 			features: None,
 			providers: program.providers.iter().map(|provider| provider.as_str().to_string()).collect(),
-			// Every program in this image is Rust. A foreign EXECUTABLE is a different question from
-			// a foreign library and this milestone answers only the second one; when the first is
-			// asked, this line is where the answer goes.
-			producer: system_manifest::Producer::Rust,
-			licence: String::from("project"),
+			// FROM THE MANIFEST, because one program in this image is not built by this build: the
+			// quarantine consumer's link comes from the audit substrate. This line read
+			// `Producer::Rust` unconditionally, which made the packager check that artifact against
+			// the Rust rules and require it to be staged in a tree that cannot produce it.
+			producer: program.producer,
+			licence: program.licence.clone(),
 		});
 	}
 	rows
@@ -929,7 +938,10 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 			assert!(lines[9].starts_with("rustflags=-C relocation-model=pic"), "{} identity codegen flags", row.name);
 			assert!(lines[10].starts_with("features="), "{} identity features", row.name);
 		}
-		system_manifest::Producer::Foreign => {
+		// A QUARANTINE ARTIFACT IS FOREIGN-PRODUCED TOO, and is held to exactly the same record. Its
+		// LINK comes from the audit substrate rather than from this build, which changes who made the
+		// bytes and changes nothing about what their record must say.
+		system_manifest::Producer::Audit | system_manifest::Producer::Foreign => {
 			// THE THREE TOOLS, THE FLAGS, THE SYSROOT AND THE CONFIGURE INPUTS. Each can change what
 			// the artifact IS without changing a source byte, which is why the record carries them
 			// and why a missing one is a malformed record rather than a cosmetic omission.
@@ -971,7 +983,7 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 	// legible now.
 	let header_lines = match row.producer {
 		system_manifest::Producer::Rust => IDENTITY_HEADER_LINES,
-		system_manifest::Producer::Foreign => FOREIGN_IDENTITY_HEADER_LINES,
+		system_manifest::Producer::Audit | system_manifest::Producer::Foreign => FOREIGN_IDENTITY_HEADER_LINES,
 	};
 	// THE PROVIDER LIST ENDS WHERE THE SELECTION SLOTS BEGIN, and the two are compared differently
 	// because they mean different things: a provider is an edge this artifact HAS, a slot is a
@@ -1204,6 +1216,13 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, row.destination.as_deref().expect("program destination")),
 			_ => user_elf_path(&manifest, &row.crate_path, &row.name),
 		};
+		// A QUARANTINE ARTIFACT THAT WAS NOT STAGED IS NOT PACKAGED, and that is the only place its
+		// absence is admitted: its link comes from an upstream this tree does not carry, so a build
+		// without that upstream has nothing to put in the image. Every artifact that IS there goes
+		// through the same audits, this one included.
+		if row.producer == system_manifest::Producer::Audit && !path.exists() {
+			continue;
+		}
 		let identity = if row.kind == "dynamic" || row.kind == "dynamic-service" || row.kind == "library" { Some(audit_identity(&row, &path, &library_rows, &expected_rustc_commit)) } else { None };
 		// Strip the ELF to its loadable image; fall back to the raw ELF when no
 		// `strip` supports the target (the host binutils cannot strip aarch64), so
@@ -1230,7 +1249,7 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
 	assert!(!files.windows(2).any(|pair| pair[0].0 == pair[1].0), "duplicate volume package destination");
-	let expected_entries = factory_manifest.volume_destinations(development_configuration());
+	let expected_entries = factory_manifest.volume_destinations(development_configuration(), |name| user_dynamic_path(&manifest, &format!("libexec/{name}.lsexe")).exists());
 	let actual_entries = files.iter().map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
 	assert_eq!(actual_entries, expected_entries, "system volume entries differ from the manifest");
 	for (name, bytes) in &files {

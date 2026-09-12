@@ -351,6 +351,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// The lifecycle probe. It observes what ran inside its own process and reaches nothing this
 		// manifest could grant.
 		b"lifecheck" => Some(granted("lifecheck", alloc::vec![])),
+		// The quarantine consumer. It runs the audit-linked loader against a provider the launch
+		// bound into its own closure and reaches nothing this manifest could grant.
+		b"vkprobe" => Some(granted("vkprobe", alloc::vec![])),
+		// The facility probe. It calls the substrate linked into its own image and reaches nothing
+		// this manifest could grant.
+		b"abiprobe" => Some(granted("abiprobe", alloc::vec![])),
 		_ => None,
 	}
 }

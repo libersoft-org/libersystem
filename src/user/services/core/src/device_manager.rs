@@ -280,63 +280,55 @@ impl DevAgent {
 	// itself: this program has to be able to give the same capability to the next agent, and
 	// only one agent is ever alive to use it.
 	fn deliver(&self, tag: &[u8], held: u64) {
-		unsafe {
-			if self.bootstrap == 0 || held == 0 {
-				return;
+		if self.bootstrap == 0 || held == 0 {
+			return;
+		}
+		let Some(info) = object_info(held) else { return };
+		let copy: i64 = duplicate(held, info.rights);
+		if copy < 0 || !send_blocking(self.bootstrap, tag, copy as u64) {
+			if copy >= 0 {
+				close(copy as u64);
 			}
-			let Some(info) = object_info(held) else { return };
-			let copy: i64 = duplicate(held, info.rights);
-			if copy < 0 || !send_blocking(self.bootstrap, tag, copy as u64) {
-				if copy >= 0 {
-					close(copy as u64);
-				}
-				print(b"DeviceManager: the development agent did not take ");
-				print(tag);
-				print(b"\n");
-			}
+			print(b"DeviceManager: the development agent did not take ");
+			print(tag);
+			print(b"\n");
 		}
 	}
 
 	fn hold_launcher(&mut self, handle: u64) {
-		unsafe {
-			if handle == 0 {
-				return;
-			}
-			if self.bootstrap == 0 {
-				close(handle);
-				return;
-			}
-			self.launcher = handle;
-			self.deliver(b"PERM", handle);
+		if handle == 0 {
+			return;
 		}
+		if self.bootstrap == 0 {
+			close(handle);
+			return;
+		}
+		self.launcher = handle;
+		self.deliver(b"PERM", handle);
 	}
 
 	fn hold_registry(&mut self, handle: u64) {
-		unsafe {
-			if handle == 0 {
-				return;
-			}
-			if self.bootstrap == 0 {
-				close(handle);
-				return;
-			}
-			self.registry = handle;
-			self.deliver(b"REG", handle);
+		if handle == 0 {
+			return;
 		}
+		if self.bootstrap == 0 {
+			close(handle);
+			return;
+		}
+		self.registry = handle;
+		self.deliver(b"REG", handle);
 	}
 
 	// The agent's bootstrap became readable. Anything it says is passed through to the console;
 	// its closing means the process ended, and a fresh one takes its place.
 	#[cfg(feature = "development")]
 	fn supervise(&mut self, buf: &mut [u8]) {
-		unsafe {
-			match recv_blocking(self.bootstrap, buf) {
-				Received::Message { len, .. } => {
-					print(&buf[..len]);
-					print(b"\n");
-				}
-				Received::Closed => self.restart(),
+		match recv_blocking(self.bootstrap, buf) {
+			Received::Message { len, .. } => {
+				print(&buf[..len]);
+				print(b"\n");
 			}
+			Received::Closed => self.restart(),
 		}
 	}
 
@@ -1396,7 +1388,10 @@ fn route_offers(node: &mut Node, #[cfg(feature = "development")] catalogue: &mut
 			// for a number that never needed to be unguessable.
 			random_insecure(&mut dev.nonce);
 			dev.console_input = console_input;
-			dev.bootstrap = start_dev_agent(dev.storage, dev_bytes, console_input, &dev.nonce);
+			// SAFETY: `start_dev_agent` maps the agent's ELF and reads it as a slice, which is the
+			// one genuinely unsafe thing left on this path - the wrappers around it became safe and
+			// took the enclosing block with them, which is what left this call bare.
+			dev.bootstrap = unsafe { start_dev_agent(dev.storage, dev_bytes, console_input, &dev.nonce) };
 			if dev.bootstrap == 0 {
 				print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
 			}

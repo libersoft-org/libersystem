@@ -132,6 +132,14 @@ name = "lifecheck"
 path = "src/lifecheck.rs"
 
 [[bin]]
+name = "abiprobe"
+path = "src/abiprobe.rs"
+
+[[bin]]
+name = "vkprobe"
+path = "src/vkprobe.rs"
+
+[[bin]]
 name = "truncate"
 path = "src/truncate.rs"
 

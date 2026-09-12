@@ -35,3 +35,33 @@ pub mod stream;
 
 #[cfg(test)]
 mod tests;
+
+/// Say something about a path this substrate refused, through the sink the launch installed.
+///
+/// THE SUBSTRATE'S DIAGNOSTICS GO WHERE THE SUBSTRATE'S DO. `foreign-abi` owns the sink because it
+/// owns `fputs`; this crate reaches it the same way anything else does, through the C entry point,
+/// so there is one place a foreign diagnostic comes out and not two.
+pub(crate) fn report(prefix: &[u8], value: &[u8]) {
+	// A FIXED BUFFER AND A TRUNCATION, because this runs on a path that must not allocate: it is
+	// reached from inside a directory walk the loader is in the middle of.
+	let mut line = [0u8; 256];
+	let mut len = 0usize;
+	for source in [prefix, value, b"\n"] {
+		for byte in source {
+			if len == line.len() {
+				break;
+			}
+			line[len] = *byte;
+			len += 1;
+		}
+	}
+	unsafe extern "C" {
+		fn fputs(text: *const core::ffi::c_char, stream: *mut core::ffi::c_void) -> i32;
+		static mut stderr: *mut core::ffi::c_void;
+	}
+	if len < line.len() {
+		// SAFETY: the buffer is NUL-terminated by construction above, and `stderr` is the sentinel
+		// the facilities crate publishes for exactly this.
+		unsafe { fputs(line.as_ptr() as *const core::ffi::c_char, stderr) };
+	}
+}

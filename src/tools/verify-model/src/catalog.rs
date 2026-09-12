@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 109] = [
+const GATES: [(&str, &str); 111] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -330,6 +330,10 @@ const GATES: [(&str, &str); 109] = [
 	// change selects it, and it boots a guest because a constructor is only observable from inside
 	// the process it runs in.
 	("lifecycle", "userspace.build"),
+	// The ported loader in a guest. Its subject is the audit link, the substrate and the quarantine
+	// staging path, and it boots a development image because that is the only image the quarantine
+	// artifact is in.
+	("foreign-loader-guest", "userspace.build"),
 	("dma-mode-carrier", "harness.tools"),
 	("dma-mode-x86_64", "kernel"),
 	// The ports umbrella and its two rows, exactly as `qemu-arch-profiles` and its profiles: the
@@ -523,6 +527,7 @@ const GATES: [(&str, &str); 109] = [
 	("foreign-identity", "harness.tools"),
 	("foreign-audit-link", "harness.tools"),
 	("foreign-cxx-abi", "harness.tools"),
+	("foreign-audit-artifact", "harness.tools"),
 	// Every LSIDL interface a manifest role names must be one LSIDL
 	// defines. Its subject is the manifest and the IDL, neither of which is a crate, and it reads
 	// declarations rather than generated bindings - so it takes the always-selected label for the

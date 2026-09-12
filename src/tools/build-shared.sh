@@ -963,6 +963,17 @@ warm_input_inventory() {
 		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
 			printf 'env-%s=%s\n' "$variable" "${!variable-}"
 		done
+		# THE CONFIGURATION IS AN INPUT, and leaving it out made the warm path answer for the wrong
+		# image: a development build after a shipping one found every input unchanged and skipped the
+		# phase that stages the quarantine artifact, so the development image came out without it.
+		printf 'env-LIBER_DEVELOPMENT=%s\n' "${LIBER_DEVELOPMENT:-0}"
+		# AND SO IS THE QUARANTINE ARTIFACT ITSELF, which this build does not produce: it is staged
+		# from the audit link's output, so a new link is a new input even though nothing in `src/`
+		# moved.
+		for quarantine in "$build_root/foreign/pass2/$(public_arch "$target")"/*.lsexe; do
+			[[ -f "$quarantine" ]] || continue
+			stat -c 'input\t%n\t%s\t%y' "$quarantine"
+		done
 		find "$root/user" "$root/abi" "$root/boot/protocol" "$root/fs" "$root/proto" "$root/term" "$root/wasm" "$root/wire" "$root/tools/system-manifest" -type f -printf 'input\t%p\t%s\t%T@\n'
 		for input in "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$root/tools/system-manifest.sh" "$root/../product.conf"; do
 			stat -c 'input\t%n\t%s\t%y' "$input"
@@ -1866,8 +1877,18 @@ audit_library_destinations() {
 }
 
 audit_program_destinations() {
-	local expected actual
+	local expected actual quarantine
+	# A QUARANTINE PROGRAM IS EXPECTED ONLY WHERE IT CAN EXIST: in the development configuration, and
+	# only when the audit link has produced it. Its link comes from an upstream this tree does not
+	# carry, so a shipping image is RIGHT not to have it and a tree without the upstream has nothing
+	# to stage - requiring it in either case would fail a build that is behaving correctly.
 	expected="$(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .destination | sub("\\.lsexe$"; "")' <<<"$manifest_json" | sort)"
+	while IFS= read -r quarantine; do
+		[[ -n "$quarantine" ]] || continue
+		if [[ "${LIBER_DEVELOPMENT:-0}" != 1 || ! -f "$build_root/foreign/pass2/$(public_arch "$target")/$quarantine.lsexe" ]]; then
+			expected="$(grep -vx "libexec/$quarantine" <<<"$expected" || true)"
+		fi
+	done < <(jq -r '.programs[] | select(.producer == "audit") | .name' <<<"$manifest_json")
 	actual="$(find "$artifact_output_root" -type f \( -path "$artifact_output_root/bin/*" -o -path "$artifact_output_root/libexec/*" \) -printf '%P\n' 2>/dev/null | sort)"
 	if [[ "$actual" != "$expected" ]]; then
 		echo "build-shared: staged program paths differ from the manifest" >&2
@@ -1893,7 +1914,7 @@ dynamic_rows() {
 		select($artifact == "" or
 			($kind == "program" and .name == $artifact) or
 			($kind == "library" and any(.providers[]?; depends_on($root; .; $artifact)))) |
-		["dynamic", .name, .owner, "volume", .destination,
+		["dynamic", .name, .owner, "volume", .destination, .producer,
 			(if (.selection | length) == 0 then "-"
 			 else ([.selection[] | "\(.kind):\(.symbols | join("+")):\(.candidates | join(","))"] | join(";")) end),
 			(.providers | join(" "))] | @tsv
@@ -1910,7 +1931,7 @@ build_file_hash_inventory() {
 		file="$(library_file "$artifact")"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done
-	while read -r kind consumer crate stage destination selection providers; do
+	while read -r kind consumer crate stage destination producer selection providers; do
 		file="$artifact_output_root/${destination%.lsexe}"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done < <(dynamic_rows)
@@ -2732,8 +2753,51 @@ if [[ -n "$image_graph" ]]; then
 		echo "build-shared: duplicate dynamic executable $duplicate_consumer" >&2
 		exit 1
 	fi
-	while read -r kind consumer crate stage destination selection providers; do
+	while read -r kind consumer crate stage destination producer selection providers; do
 		if [[ "$kind" != dynamic || "$stage" != volume ]]; then
+			continue
+		fi
+		# THE QUARANTINE PRODUCER. Its object is this tree's own and its LINK is the audit
+		# substrate's - the pinned upstream, which is audit-only and is deliberately not in this
+		# tree. Nothing this build can do produces it, so it is STAGED from the audit link's output
+		# when that output exists and is absent otherwise, which is what "the gate's own test-only
+		# image" means: the gate runs where the upstream is, and a tree without it builds and tests
+		# exactly as before.
+		if [[ "$producer" == audit ]]; then
+			quarantine="$build_root/foreign/pass2/$(public_arch "$target")/$consumer.lsexe"
+			out="$artifact_output_root/${destination%.lsexe}"
+			# NOT IN A SHIPPING IMAGE, EVER. The manifest already says development-only; this is the
+			# build honouring it, and removing a copy an earlier development build left behind.
+			if [[ "${LIBER_DEVELOPMENT:-0}" != 1 ]]; then
+				rm -f "$out"
+				continue
+			fi
+			if [[ ! -f "$quarantine" ]]; then
+				# AND A STALE ONE IS REMOVED. The staged tree is shared between configurations, so a
+				# development build that staged this artifact would otherwise leave it behind for the
+				# next shipping build to carry - which is the one thing a quarantine artifact must
+				# never do.
+				rm -f "$out"
+				echo "build-shared: $consumer is audit-produced and $quarantine does not exist - not staged"
+				continue
+			fi
+			mkdir -p "$(dirname "$out")"
+			cp "$quarantine" "$out"
+			# THE SAME AUDITS AS ANY OTHER ARTIFACT, on the bytes that were staged. A quarantine
+			# artifact gets no parallel audit, because a parallel audit is the thing that drifts.
+			if ! matches_output 'Type:.*DYN' llvm-readelf -h "$out"; then
+				echo "build-shared: $out is not ET_DYN" >&2
+				exit 1
+			fi
+			if ! llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ { bad = 1 } END { exit bad }'; then
+				echo "build-shared: $out contains a writable executable segment" >&2
+				exit 1
+			fi
+			if ! llvm-objcopy --dump-section .note.liber.identity=/dev/null "$out" /dev/null 2>/dev/null; then
+				echo "build-shared: $out carries no identity note" >&2
+				exit 1
+			fi
+			echo "build-shared: $out ($(stat -c %s "$out") bytes, quarantine)"
 			continue
 		fi
 		if [[ -z "$providers" ]]; then

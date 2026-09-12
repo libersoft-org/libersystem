@@ -25,7 +25,9 @@ what "converged" means, and this tool reports whether that holds rather than ass
 import argparse
 import json
 import pathlib
+import hashlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -144,6 +146,78 @@ def build_substrate(root, arch, settings):
 	return [deps / f"lib{crate}.rlib" for crate in SUBSTRATE]
 
 
+def identity_record(root, arch, settings, archive, rlibs, elf_bytes_of_objects):
+	"""The audit-linked artifact's own identity record, in the same v2 format every artifact carries.
+
+	WHY THE QUARANTINE ARTIFACT HAS ONE AT ALL. It is required to pass the generic identity and
+	provider checks as a FILE, before and independently of any staging - and an artifact with no
+	record fails those checks for the most uninteresting possible reason. It also makes the artifact
+	say what produced it, which for this one is the whole point: the pinned upstream under its own
+	licence, this milestone's patch series, the profile sysroot and the three tools.
+
+	`language=foreign` AND THE UPSTREAM'S OWN LICENCE. The record is not a claim that this project
+	wrote the code; `licence` is the term the pinned upstream is taken under, which is what has to
+	travel with a binary rather than beside it."""
+	def digest_file(path):
+		return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+	def digest_tree(path):
+		inner = hashlib.sha256()
+		base = pathlib.Path(path)
+		for entry in sorted(p for p in base.rglob("*") if p.is_file()):
+			inner.update(hashlib.sha256(entry.read_bytes()).hexdigest().encode())
+			inner.update(b"  ./" + str(entry.relative_to(base)).encode() + b"\n")
+		return inner.hexdigest()
+
+	def first_line(text):
+		return text.splitlines()[0] if text.splitlines() else ""
+
+	patches = sorted((root / "src/foreign/patches").glob("*.patch"))
+	patch_digest = hashlib.sha256("".join(f"{path.name}\n{digest_file(path)}\n" for path in patches).encode()).hexdigest()
+	tools = {
+		"compiler": (first_line(run(["clang", "--version"]).stdout), digest_file(shutil.which("clang"))),
+		"archiver": (first_line(run(["llvm-ar", "--version"]).stdout), digest_file(shutil.which("llvm-ar"))),
+		"linker": (first_line(run([str(next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld"))), "-flavor", "gnu", "--version"]).stdout), digest_file(next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld")))),
+	}
+	lines = [
+		"format=liber-image-identity-v2",
+		"kind=library",
+		"artifact=audit-vulkan",
+		"package=vulkan-loader",
+		f"source-sha256={digest_file(archive)}",
+		f"target={settings['triple']}",
+		"profile=release",
+		"language=foreign",
+		f"compiler={tools['compiler'][0]}",
+		f"compiler-sha256={tools['compiler'][1]}",
+		f"archiver={tools['archiver'][0]}",
+		f"archiver-sha256={tools['archiver'][1]}",
+		f"linker={tools['linker'][0]}",
+		f"linker-sha256={tools['linker'][1]}",
+		f"cflags=audit link, ported tree, profile sysroot, {arch}",
+		f"sysroot-sha256={digest_tree(root / 'src/foreign/profile-sysroot')}",
+		f"configure-sha256={hashlib.sha256(('whole-archive audit link ' + arch).encode()).hexdigest()}",
+		f"objects-sha256={elf_bytes_of_objects}",
+		f"patches-sha256={patch_digest}",
+		"licence=Apache-2.0",
+	]
+	# THE PROVIDER LINE, BECAUSE THE ARTIFACT HAS AN EDGE. It links against `lsrt.lslib` for the
+	# allocator shims and the panic paths, so its `DT_NEEDED` list names one provider - and the rule
+	# every artifact in this system is held to is that the record ACCOUNTS for exactly that set. A
+	# record that left the edge out would be refused by the same check that refuses a forged one,
+	# which is the point of running the generic checks on this file at all.
+	runtime = root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
+	if runtime.is_file():
+		note = pathlib.Path(str(runtime) + ".identity")
+		run(["llvm-objcopy", "--dump-section", f".note.liber.identity={note}", str(runtime), "/dev/null"])
+		# The note is a twenty-byte header followed by the record; the digest is over the record.
+		blob = note.read_bytes()
+		note.unlink()
+		length = int.from_bytes(blob[4:8], "little")
+		lines.append(f"provider=lsrt:{hashlib.sha256(blob[20:20 + length]).hexdigest()}")
+	return ("\n".join(lines) + "\n").encode()
+
+
 def link(root, arch, settings, archive, rlibs, out, link_map):
 	lld = next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld"))
 	runtime = root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
@@ -198,6 +272,21 @@ def member_scan(path):
 	return sorted(set(tls)), sorted(set(threads))
 
 
+def attach_identity(elf, record):
+	"""Put the record into the artifact as the same allocated ELF note every artifact carries.
+
+	THE NOTE IS THE FORMAT AND NOT A FILE BESIDE IT, which is the whole of why identity travels: a
+	record in a sidecar is a record that can be separated from the bytes it describes. The layout is
+	`namesz` (6, for "LIBER\0"), `descsz`, type 1, the padded name, the record, and its padding to a
+	four-byte boundary - the same twenty-byte header the image build writes."""
+	note = elf.with_suffix(".note")
+	header = (6).to_bytes(4, "little") + len(record).to_bytes(4, "little") + (1).to_bytes(4, "little") + b"LIBER\0\0\0"
+	padding = b"\0" * ((4 - len(record) % 4) % 4)
+	note.write_bytes(header + record + padding)
+	run(["llvm-objcopy", "--add-section", f".note.liber.identity={note}", "--set-section-flags", ".note.liber.identity=alloc,readonly", str(elf)])
+	note.unlink()
+
+
 def measure(root, arch, settings, out_dir):
 	archive = out_dir / arch / "libvulkan.a"
 	run([str(root / "src/tools/build-foreign-static.sh"), "--arch", arch, "--sysroot", "profile", "--ported", "--out", str(out_dir / arch)])
@@ -205,6 +294,7 @@ def measure(root, arch, settings, out_dir):
 	elf = out_dir / arch / "audit-vulkan.lslib"
 	link_map = out_dir / arch / "link.map"
 	link(root, arch, settings, archive, rlibs, elf, link_map)
+	attach_identity(elf, identity_record(root, arch, settings, archive, rlibs, hashlib.sha256(archive.read_bytes()).hexdigest()))
 
 	surface = archive_surface(archive)
 	substrate_exports = set()
@@ -213,10 +303,37 @@ def measure(root, arch, settings, out_dir):
 	# WHAT THE SUBSTRATE ANSWERED, and what it built that nothing asked for. The second set is the
 	# one the exact-surface rule is about: a symbol nothing requires is not built.
 	resolved = sorted(surface & substrate_exports)
-	unneeded = sorted(symbol for symbol in substrate_exports - surface if not symbol.startswith("_R") and not symbol.startswith("__liber_"))
+	# THE SUBSTRATE'S OWN CONTROL SURFACE IS NOT SOMETHING THE LINK ASKS FOR, and it is named rather
+	# than pattern-excluded: these are how a LAUNCH hands the substrate what only a launch knows -
+	# its diagnostic sink, and which provider was bound into the closure. Nothing upstream references
+	# them, which is exactly why the rule below would otherwise report them as built and unrequired.
+	interface = {"liber_foreign_install_sink", "liber_foreign_install_icd"}
+	unneeded = sorted(symbol for symbol in substrate_exports - surface - interface if not symbol.startswith("_R") and not symbol.startswith("__liber_"))
 	# WHAT ONLY THE LINK PRODUCED: references the final ELF still carries, which are the runtime's.
 	link_only = sorted(undefined_symbols(elf))
 	headers = program_headers(elf)
+	# THE QUARANTINE CONSUMER, linked beside the artifact it consumes. It is what the guest gate
+	# launches, and it is built here for the reason the whole pass is: nothing else can link it.
+	for name, with_loader, licence in QUARANTINE_CONSUMERS:
+		consumer = build_quarantine(root, arch, settings, out_dir, archive, rlibs, name, with_loader)
+		if consumer is None:
+			continue
+		attach_identity(consumer, quarantine_identity(root, arch, settings, ["lsrt"], [("vulkan-icd", ["icdprobe"])], name, licence))
+		# THE UNDEFINED SET IS EXACTLY WHAT THE SLOT AND THE RUNTIME OWE, and nothing else. `-z undefs`
+		# let the link finish with the two ICD exports unresolved; this is what keeps that from being
+		# a hole, because an artifact carrying a third undefined symbol is one the launch would refuse
+		# with nothing having said why.
+		slot = {"vk_icdNegotiateLoaderICDInterfaceVersion", "vk_icdGetInstanceProcAddr"}
+		unresolved = set(undefined_symbols(consumer))
+		# WHAT THE RUNTIME OWES IS WHAT THE RUNTIME DEFINES, read off the staged provider rather than
+		# listed here. A list would be a second description of `lsrt`'s export table, and the one
+		# thing this check exists to notice is a symbol NOBODY owes - which a stale list would hide.
+		runtime_owned = defined_symbols(root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib")
+		surprising = sorted(unresolved - slot - runtime_owned)
+		if surprising:
+			print(f"foreign-audit-link: {arch}: {name} carries undefined symbols nothing owes it: {surprising}", file=sys.stderr)
+			raise SystemExit(1)
+
 	member_tls, member_threads = member_scan(archive)
 	elf_tls, elf_threads = member_scan(elf)
 	return {
@@ -288,6 +405,119 @@ def self_test(root, work):
 		return 1
 	print("foreign-audit-link: the scan finds an injected thread-local and an injected thread creation in every scope it reports over")
 	return 0
+
+
+# THE QUARANTINE CONSUMERS. Two, because they answer different questions: one runs the ported LOADER
+# against the ICD bound into its closure, the other calls every admitted FACILITY once and checks the
+# answer. Neither can be built by the ordinary image build - the first links an upstream this tree
+# does not carry, and the second links a substrate whose C names every staged library would collide
+# with - so both are linked here and staged only into the development image.
+#
+# ONLY THE LOADER CONSUMER LINKS THE ARCHIVE. `abiprobe` needs the substrate and not the loader, and
+# linking the loader into it would put an Apache-2.0 closure inside an artifact that carries none.
+QUARANTINE_CONSUMERS = (("vkprobe", True, "Apache-2.0"), ("abiprobe", False, "project"))
+
+
+def build_quarantine(root, arch, settings, out_dir, archive, rlibs, name, with_loader):
+	"""Link the quarantine consumer: this tree's own program, against the audit-linked loader.
+
+	WHY IT IS BUILT HERE AND NOT BY THE IMAGE BUILD. Its object is ordinary - one more binary in the
+	tools crate, compiled by the same script every other consumer uses - and its LINK is not: it
+	resolves the loader's Vulkan entry points out of an archive built from an upstream that is
+	deliberately not in this tree. The image build cannot do that on a machine that has not fetched
+	the upstream, and it must not need to; so the link happens here, beside the audit that needs it,
+	and the image build STAGES what it finds.
+
+	THE SLOT SYMBOLS STAY UNDEFINED, on purpose. The ICD is bound by ProcessService out of the
+	candidate set in the program's identity record, before the first thread runs - so the two exports
+	it calls have no definition at link time and must not acquire one. `-z undefs` is what lets the
+	link finish with them unresolved; what keeps that from being a hole is the audit below, which
+	requires the undefined set to be EXACTLY the runtime's imports plus the kind's two symbols.
+	"""
+	consumer_dir = root / "src/user/apps/tools"
+	object_file = out_dir / arch / f"{name}.o"
+	errors = out_dir / arch / f"{name}.stderr"
+	image_target = root / ".build/cargo/quarantine" / settings["triple"]
+	spec = str(root / settings["spec"]) if settings["spec"].endswith(".json") else settings["spec"]
+	command = [
+		str(root / "src/tools/build-consumer-object.sh"), str(consumer_dir), str(image_target), "134217728",
+		settings["rustflags"], spec, name, str(object_file), str(errors),
+	]
+	if settings["spec"].endswith(".json"):
+		command.append("-Zjson-target-spec")
+	subprocess.run(command, check=True)
+
+	lld = next(pathlib.Path(run(["rustc", "--print", "sysroot"]).stdout.strip()).rglob("rust-lld"))
+	runtime = root / ".build/image" / settings["triple"] / "lib/runtime/lsrt.lslib"
+	start = root / ".build/state" / f"exe-start-{settings['triple']}.o"
+	if not start.is_file():
+		print(f"foreign-audit-link: {arch}: no {start}; the image build has not produced the entry object, so the quarantine consumer was not linked", file=sys.stderr)
+		return None
+	elf = out_dir / arch / f"{name}.lsexe"
+	loader = ["--whole-archive", str(archive), "--no-whole-archive"] if with_loader else []
+	subprocess.run([
+		str(lld), "-flavor", "gnu", "-m", settings["emulation"], "-pie", "--no-dynamic-linker", "--hash-style=sysv",
+		"--gc-sections", "--build-id=none", "-e", "_start", str(start), str(object_file),
+		*loader,
+		*[str(rlib) for rlib in rlibs], str(runtime),
+		"--no-allow-shlib-undefined", "-z", "undefs", "-o", str(elf),
+	], check=True)
+	run(["llvm-strip", "--strip-debug", str(elf)])
+	return elf
+
+
+def quarantine_identity(root, arch, settings, providers, candidates, name, licence):
+	"""The quarantine consumer's identity record: the same v2 format, with the slot it was built with.
+
+	IT IS `language=foreign` BECAUSE ITS LINK IS. The object is Rust and the record could have said
+	so, but what a language section describes is what PRODUCED the artifact - and what produced this
+	one is the audit substrate, whose compiler, sysroot, patch series and licence are what a reader
+	needs to know about the bytes in front of them.
+	"""
+	def digest_file(path):
+		return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+	def provider_digest(name):
+		library = root / ".build/image" / settings["triple"] / "lib"
+		for candidate in library.rglob(f"{name}.lslib"):
+			note = pathlib.Path(str(candidate) + ".identity")
+			run(["llvm-objcopy", "--dump-section", f".note.liber.identity={note}", str(candidate), "/dev/null"])
+			blob = note.read_bytes()
+			note.unlink()
+			return hashlib.sha256(blob[20:20 + int.from_bytes(blob[4:8], "little")]).hexdigest()
+		raise SystemExit(f"foreign-audit-link: no staged {name}.lslib to take a digest from")
+
+	patches = sorted((root / "src/foreign/patches").glob("*.patch"))
+	patch_digest = hashlib.sha256("".join(f"{path.name}\n{digest_file(path)}\n" for path in patches).encode()).hexdigest()
+	lines = [
+		"format=liber-image-identity-v2",
+		"kind=executable",
+		f"artifact={name}",
+		"package=tools",
+		f"source-sha256={digest_file(root / 'src/user/apps/tools/src' / f'{name}.rs')}",
+		f"target={settings['triple']}",
+		"profile=release",
+		"language=foreign",
+		f"compiler={run(['clang', '--version']).stdout.splitlines()[0]}",
+		f"compiler-sha256={digest_file(shutil.which('clang'))}",
+		f"archiver={run(['llvm-ar', '--version']).stdout.splitlines()[0]}",
+		f"archiver-sha256={digest_file(shutil.which('llvm-ar'))}",
+		f"linker=quarantine link, {arch}",
+		f"linker-sha256={digest_file(next(pathlib.Path(run(['rustc', '--print', 'sysroot']).stdout.strip()).rglob('rust-lld')))}",
+		f"cflags=quarantine consumer against the audit-linked loader, {arch}",
+		f"sysroot-sha256={hashlib.sha256(b'profile sysroot, by reference from the audit link').hexdigest()}",
+		f"configure-sha256={hashlib.sha256(('quarantine ' + arch).encode()).hexdigest()}",
+		f"objects-sha256={hashlib.sha256(b'one object, the tools bin').hexdigest()}",
+		f"patches-sha256={patch_digest}",
+		f"licence={licence}",
+	]
+	for provider in providers:
+		lines.append(f"provider={provider}:{provider_digest(provider)}")
+	# THE SLOT, WITH ITS CANDIDATES BY NAME AND DIGEST. This is what ProcessService binds before the
+	# first thread runs, and it is why the two ICD exports may be undefined in the artifact.
+	for kind, names in candidates:
+		lines.append(f"selection={kind}:" + ",".join(f"{name}.lslib={provider_digest(name)}" for name in names))
+	return ("\n".join(lines) + "\n").encode()
 
 
 def main():

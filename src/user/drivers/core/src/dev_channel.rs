@@ -148,10 +148,8 @@ impl Port<'_> {
 	// Reap every transmit completion the device has posted, which is what releases the
 	// buffer for the next write.
 	fn reclaim(&mut self) {
-		unsafe {
-			while self.tx.take_used().is_some() {
-				self.busy = false;
-			}
+		while self.tx.take_used().is_some() {
+			self.busy = false;
 		}
 	}
 
@@ -199,60 +197,58 @@ impl Port<'_> {
 // A replacement byte channel remains owned until `adopt` discards the old session's receive pool.
 // Other frames must be PING or STOP for this generation; unexpected handles are closed.
 fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64, pending_bytes: &mut u64) -> bool {
-	unsafe {
-		let mut buf: [u8; 64] = [0u8; 64];
-		loop {
-			match try_recv(bootstrap, &mut buf) {
-				Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => {
-					if *pending_bytes != 0 {
-						close(*pending_bytes);
-					}
-					*pending_bytes = handle;
+	let mut buf: [u8; 64] = [0u8; 64];
+	loop {
+		match try_recv(bootstrap, &mut buf) {
+			Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => {
+				if *pending_bytes != 0 {
+					close(*pending_bytes);
 				}
-				Polled::Message { len, handle } => {
-					if handle != 0 {
-						close(handle);
-					}
-					if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
-						&& header.generation == bind.generation
-					{
-						match header.opcode {
-							driver_protocol::Opcode::Ping => {
-								if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
-									&& !common::pong(bootstrap, bind, sequence)
-								{
-									return false;
-								}
-							}
-							// AND A STOP IS ANSWERED. This driver read its bootstrap for pings alone,
-							// so a manager asking it to stop waited out the forced-teardown deadline
-							// for a driver that had nothing to drain.
-							// AND THE DEVICE IS STOPPED BEFORE THE STOP IS CERTIFIED. This answered
-							// `stopped` directly while its queues and its device were still live -
-							// and `STOPPED` is the claim on which the kernel gives back DMA frames
-							// and masked vectors, which it cannot itself verify. Routed through
-							// `finish_stop` like every other planned stop, so the reset happens
-							// first and a device that does not confirm gets no certificate.
-							driver_protocol::Opcode::Stop => {
-								// LATCHED FIRST, AND THIS IS WHY `STOPPED` WAS NEVER SENT.
-								//
-								// `finish_stop` acknowledges a stop only when the flag says one was
-								// asked for - the wait helpers in `common` set it as they read the
-								// frame, and this driver reads its own bootstrap and did not. So the
-								// device was quiesced, the driver exited, and DeviceManager saw no
-								// clean-stop acknowledgement: a planned stop classified as a driver
-								// that went away, waiting out the forced-teardown deadline.
-								common::latch_stop();
-								common::finish_stop(bootstrap, bind, device_capability, common::quiesce_virtio());
+				*pending_bytes = handle;
+			}
+			Polled::Message { len, handle } => {
+				if handle != 0 {
+					close(handle);
+				}
+				if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
+					&& header.generation == bind.generation
+				{
+					match header.opcode {
+						driver_protocol::Opcode::Ping => {
+							if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
+								&& !common::pong(bootstrap, bind, sequence)
+							{
 								return false;
 							}
-							_ => {}
 						}
+						// AND A STOP IS ANSWERED. This driver read its bootstrap for pings alone,
+						// so a manager asking it to stop waited out the forced-teardown deadline
+						// for a driver that had nothing to drain.
+						// AND THE DEVICE IS STOPPED BEFORE THE STOP IS CERTIFIED. This answered
+						// `stopped` directly while its queues and its device were still live -
+						// and `STOPPED` is the claim on which the kernel gives back DMA frames
+						// and masked vectors, which it cannot itself verify. Routed through
+						// `finish_stop` like every other planned stop, so the reset happens
+						// first and a device that does not confirm gets no certificate.
+						driver_protocol::Opcode::Stop => {
+							// LATCHED FIRST, AND THIS IS WHY `STOPPED` WAS NEVER SENT.
+							//
+							// `finish_stop` acknowledges a stop only when the flag says one was
+							// asked for - the wait helpers in `common` set it as they read the
+							// frame, and this driver reads its own bootstrap and did not. So the
+							// device was quiesced, the driver exited, and DeviceManager saw no
+							// clean-stop acknowledgement: a planned stop classified as a driver
+							// that went away, waiting out the forced-teardown deadline.
+							common::latch_stop();
+							common::finish_stop(bootstrap, bind, device_capability, common::quiesce_virtio());
+							return false;
+						}
+						_ => {}
 					}
 				}
-				Polled::Empty => return true,
-				Polled::Closed => return false,
 			}
+			Polled::Empty => return true,
+			Polled::Closed => return false,
 		}
 	}
 }
@@ -260,22 +256,20 @@ fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64, pendin
 // Backpressure retains the current payload while control remains live. SYS_WAIT_ANY observes
 // readability, so wait on bootstrap and retry capacity on the next periodic clock tick.
 fn send_to_agent(bind: &common::Bind, bootstrap: u64, capability: u64, pending_bytes: &mut u64, bytes: u64, payload: &[u8]) -> bool {
-	unsafe {
-		loop {
-			if !heartbeat(bind, bootstrap, capability, pending_bytes) {
-				exit();
-			}
-			if *pending_bytes != 0 {
-				return false;
-			}
-			match try_send_outcome(bytes, payload, 0) {
-				SendOutcome::Delivered => return true,
-				SendOutcome::Failed => return false,
-				SendOutcome::Stalled => {
-					let ready = wait_any_periodic(&[bootstrap], clock().saturating_add(1));
-					if ready < 0 && ready != ERR_TIMED_OUT {
-						exit();
-					}
+	loop {
+		if !heartbeat(bind, bootstrap, capability, pending_bytes) {
+			exit();
+		}
+		if *pending_bytes != 0 {
+			return false;
+		}
+		match try_send_outcome(bytes, payload, 0) {
+			SendOutcome::Delivered => return true,
+			SendOutcome::Failed => return false,
+			SendOutcome::Stalled => {
+				let ready = wait_any_periodic(&[bootstrap], clock().saturating_add(1));
+				if ready < 0 && ready != ERR_TIMED_OUT {
+					exit();
 				}
 			}
 		}
@@ -365,69 +359,67 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 // has: stopping here would leave it with nowhere to put what a host is still writing, and the
 // port would still be stalled once the new agent arrived.
 fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, dead: u64, pending_bytes: &mut u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
-	unsafe {
-		close(dead);
-		// BIG ENOUGH FOR THE FRAME IT IS MEANT TO READ. This was 16 bytes - smaller than the 20-byte
-		// header alone, so the PING branch below could never decode one even once `bind` was in
-		// scope. A PING is 24 bytes: the header and a four-byte sequence.
-		let mut buf: [u8; 64] = [0u8; 64];
+	close(dead);
+	// BIG ENOUGH FOR THE FRAME IT IS MEANT TO READ. This was 16 bytes - smaller than the 20-byte
+	// header alone, so the PING branch below could never decode one even once `bind` was in
+	// scope. A PING is 24 bytes: the header and a four-byte sequence.
+	let mut buf: [u8; 64] = [0u8; 64];
+	loop {
+		let mut recycled: bool = false;
+		for _ in 0..RX_SLOTS {
+			let Some((id, _)) = rx.take_used() else { break };
+			if id < RX_SLOTS {
+				rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);
+				recycled = true;
+			}
+		}
+		if recycled {
+			rx.notify();
+		}
+		// Discard the old session's queued receive pool before accepting its replacement.
+		if *pending_bytes != 0 {
+			return core::mem::take(pending_bytes);
+		}
 		loop {
-			let mut recycled: bool = false;
-			for _ in 0..RX_SLOTS {
-				let Some((id, _)) = rx.take_used() else { break };
-				if id < RX_SLOTS {
-					rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);
-					recycled = true;
-				}
-			}
-			if recycled {
-				rx.notify();
-			}
-			// Discard the old session's queued receive pool before accepting its replacement.
-			if *pending_bytes != 0 {
-				return core::mem::take(pending_bytes);
-			}
-			loop {
-				match try_recv(bootstrap, &mut buf) {
-					Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => return handle,
-					// THE MANAGER'S PING LANDS HERE, in the branch that used to close whatever
-					// arrived and say nothing. This driver already reads its bootstrap without
-					// blocking, so the ping is answered by the loop that was already looking.
-					Polled::Message { len, handle } => {
-						if handle != 0 {
-							close(handle);
-						}
-						if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
-							&& header.generation == bind.generation
-						{
-							match header.opcode {
-								driver_protocol::Opcode::Ping => {
-									if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
-										&& !common::pong(bootstrap, bind, sequence)
-									{
-										exit();
-									}
-								}
-								driver_protocol::Opcode::Stop => {
-									common::latch_stop();
-									common::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());
+			match try_recv(bootstrap, &mut buf) {
+				Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => return handle,
+				// THE MANAGER'S PING LANDS HERE, in the branch that used to close whatever
+				// arrived and say nothing. This driver already reads its bootstrap without
+				// blocking, so the ping is answered by the loop that was already looking.
+				Polled::Message { len, handle } => {
+					if handle != 0 {
+						close(handle);
+					}
+					if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
+						&& header.generation == bind.generation
+					{
+						match header.opcode {
+							driver_protocol::Opcode::Ping => {
+								if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
+									&& !common::pong(bootstrap, bind, sequence)
+								{
 									exit();
 								}
-								_ => {}
 							}
+							driver_protocol::Opcode::Stop => {
+								common::latch_stop();
+								common::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());
+								exit();
+							}
+							_ => {}
 						}
 					}
-					Polled::Empty => break,
-					// The supervisor dropped this driver's bootstrap, which is how it is told to
-					// shut down - and with it goes any prospect of a replacement.
-					Polled::Closed => exit(),
 				}
+				Polled::Empty => break,
+				// The supervisor dropped this driver's bootstrap, which is how it is told to
+				// shut down - and with it goes any prospect of a replacement.
+				Polled::Closed => exit(),
 			}
-			let ready: i64 = wait_any(&[irq, bootstrap], 0);
-			if ready == 0 {
-				let _ = device.read_isr();
-				interrupt_ack(irq);
-			}
+		}
+		let ready: i64 = wait_any(&[irq, bootstrap], 0);
+		if ready == 0 {
+			let _ = device.read_isr();
+			interrupt_ack(irq);
 		}
 	}
 }

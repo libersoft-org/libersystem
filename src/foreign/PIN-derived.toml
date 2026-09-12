@@ -47,24 +47,42 @@ declares = 40
 # resolves all four from it. For the Rust half, `compiler_builtins` is built from source by
 # `build-std` with `compiler-builtins-mem`, which is the same component every other library in this
 # image links and is why the two halves cannot disagree about them.
-c_half = "foreign-abi: memcpy, memmove, memset, memcmp"
+# CORRECTED 2026-09-11 BY THE GENERIC ARTIFACT CHECK. This first recorded `foreign-abi` as the C
+# half's owner, because it defined the four names and the link resolved them there. The
+# export-collision check on the audit-linked artifact refused that: `lsrt.lslib` already owns those
+# four in this image - it publishes them so every library can import them - and the artifact links
+# against it. Two owners for one symbol is the defect, and the answer is the one every other library
+# in this image already gives.
+c_half = "lsrt.lslib: memcpy, memmove, memset, memcmp"
+c_half_owner = "this project"
+c_half_licence = "project"
 rust_half = "compiler_builtins via build-std, with compiler-builtins-mem"
+rust_half_owner = "the Rust project, as part of the pinned toolchain"
+rust_half_licence = "MIT OR Apache-2.0"
+# THERE IS NO C++ ABI COMPONENT AND NO UNWIND COMPONENT TO OWN. Both mechanisms are forbidden under
+# this pin and the converged closure names neither, so naming an owner for them would be naming the
+# owner of something that is not in the image.
+cxx_abi_component = "none; the mechanism is forbidden"
+unwind_component = "none; the mechanism is forbidden"
 # AND WHAT THE LINK LEFT FOR THE RUNTIME: the allocator shims and the panic paths, resolved from
 # `lsrt.lslib` exactly as they are for every other library staged in this image. They are the only
 # eight references the audit-linked ELF still carries.
-runtime_references = 8
+runtime_references = 12
 
 [audit_link]
 # THE CONVERGED RESULT, per target. The gate is the FIXED POINT - two consecutive links producing the
 # same resolved set - and not the first link's output.
 inventory = "src/foreign/INVENTORY-pass2.json"
-inventory_sha256 = "eaf0efc3ee34366ce2f27abef9949ae5733d0ec296dbdfd1ba464878ec188958"
+inventory_sha256 = "3f5fcdb3a6a8ff6f11768e2003720331f1bfa9e9084994671b518c56ee7c3054"
 tool = "src/tools/foreign-audit-link.py"
-tool_sha256 = "2ec76d1a152fd08c48bbd8f3df2a7c17a192b2750447a1d0ec7bfa3cc4ed45f3"
+tool_sha256 = "32c24205315e36643c4f13f260640ced3ccda6dcc9ff1f521c6674d6917a6338"
 surface = 52
-x86_64 = { elf_bytes = 607496, converged = true }
-aarch64 = { elf_bytes = 629144, converged = true }
-riscv64 = { elf_bytes = 1005512, converged = true }
+# Of which forty-eight come from the substrate crates and four from the runtime; see the
+# compiler-runtime section, which the artifact check corrected.
+resolved_from_substrate = 48
+x86_64 = { elf_bytes = 610416, converged = true }
+aarch64 = { elf_bytes = 632408, converged = true }
+riscv64 = { elf_bytes = 950208, converged = true }
 
 [forbidden_mechanisms]
 # THE MECHANISMS THIS PROFILE REFUSES, with the flags that stop them being emitted and the gate that
@@ -82,6 +100,21 @@ mechanisms = ["exception tables and unwinding", "RTTI", "atexit registration"]
 # initialisation, measured as one constructor and one destructor, and `errno`, which is process-wide
 # because nothing in this closure creates a thread.
 admitted = ["static initialisers", "errno"]
+
+[quarantine]
+# WHAT THE GUEST GATE LAUNCHES, and where it comes from. The consumer's object is this tree's own -
+# one more binary in the tools crate, compiled by the same script every other consumer uses - and its
+# LINK resolves the loader's Vulkan entry points out of an archive built from an upstream that is
+# deliberately not in this tree. The image build cannot produce it and must not need to, so the link
+# happens beside the audit that needs it and the image build STAGES what it finds.
+#
+# IT IS DEVELOPMENT-ONLY, which is the whole of what keeps it out of a shipped image, and it carries
+# the upstream's licence in its own identity record because it links code taken under that term.
+consumer = "vkprobe"
+source = "src/user/apps/tools/src/vkprobe.rs"
+staged_only_in = "the development configuration"
+licence = "Apache-2.0"
+gate = "src/tools/check-foreign-loader-guest.sh"
 
 [measured]
 # THE FOUR ANSWERS ONLY THIS PASS COULD GIVE, recorded beside the link that gave them.

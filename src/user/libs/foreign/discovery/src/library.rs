@@ -164,7 +164,11 @@ pub unsafe extern "C" fn loader_platform_file_exists(path: *const c_char) -> boo
 	// "EXISTS" MEANS "IS IN THIS RECORD". There is nothing else for it to mean: a path that names
 	// something outside the launch's closure does not exist as far as this process is concerned,
 	// whatever some other process can see.
-	record.icd_by_manifest(path).is_some() || record.icd_by_library(path).is_some()
+	let known = record.icd_by_manifest(path).is_some() || record.icd_by_library(path).is_some();
+	if !known {
+		crate::report(b"no such path ", path);
+	}
+	known
 }
 
 // `loader_platform_dirname` AND `loader_platform_get_proc_address_error` ARE NOT HERE, and their

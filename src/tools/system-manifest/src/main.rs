@@ -141,8 +141,12 @@ fn run() -> Result<(), String> {
 			// exactly the development-only programs. Accept whichever it is rather than
 			// demanding one, and say which was recognised, so this never becomes a reason to
 			// avoid checking the configuration that is actually being built.
-			let shipping = manifest.volume_destinations(false);
-			let development = manifest.volume_destinations(true);
+			// EVERY ROW COUNTED, INCLUDING THE QUARANTINE ONE. This command answers what the manifest
+			// DECLARES rather than what a particular build produced, so the staging question is
+			// answered `true` here: a reader asking what a development image is made of wants the
+			// artifact named whether or not this machine can build it.
+			let shipping = manifest.volume_destinations(false, |_| true);
+			let development = manifest.volume_destinations(true, |_| true);
 			if actual != shipping && actual != development {
 				let expected = if actual.len() > shipping.len() { &development } else { &shipping };
 				let missing = expected.difference(&actual).cloned().collect::<Vec<_>>().join(", ");

@@ -202,6 +202,17 @@ if derived_path.is_file():
 		if not gate.is_file():
 			failures.append(f"derived: the forbidden-mechanism gate {forbidden.get('gate')} does not exist, so the decision is a description")
 
+	# THE QUARANTINE HALF IS A CONSUMER AND A GATE. A part recording the artifact without the gate
+	# that launches it would be recording a file nobody runs, which is the state this milestone was
+	# in before the carrier existed.
+	quarantine = derived.get("quarantine")
+	if not quarantine:
+		failures.append("derived: no quarantine consumer is recorded, and the guest gate is what the audit link exists for")
+	else:
+		for key in ("source", "gate"):
+			if not (root / quarantine.get(key, "")).is_file():
+				failures.append(f"derived: the quarantine {key} {quarantine.get(key)} does not exist")
+
 	# AND THE FREEZE ORDER: nothing derived may exist before the part it is derived from.
 	if static_state != "present":
 		failures.append("derived: the derived part exists and the static-target part does not - it has frozen values derived from something unfrozen")

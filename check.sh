@@ -71,6 +71,10 @@ declare -A GATES=(
 	# order across the provider DAG, what a constructor that stopped half way leaves behind,
 	# destructors in reverse on a normal exit, and which of them a crash does not run.
 	["lifecycle"]="tools/check-lifecycle.sh"
+	# The ported loader ITSELF, in a guest, against a synthetic ICD. A substrate that satisfies every
+	# undefined symbol and still cannot load an ICD has prepared nothing, and a gate that never runs
+	# the thing being ported proves the wrong half.
+	["foreign-loader-guest"]="tools/check-foreign-loader-guest.sh"
 	["dma-mode-carrier"]="tools/check-dma-mode-carrier.sh"
 	["dma-mode-x86_64"]="tools/check-dma-mode-x86_64.sh"
 	["dma-mode-ports"]="tools/check-dma-mode-ports.sh"
@@ -199,6 +203,10 @@ declare -A GATES=(
 	# are FORBIDDEN under this pin, which means flags that stop them being emitted AND a check that
 	# catches them if a flag, a compiler or a source ever changes that.
 	["foreign-cxx-abi"]="tools/check-foreign-cxx-abi.sh"
+	# The audit-linked artifact itself, through the generic checks, as a file. This milestone
+	# previously exempted the one artifact whose surface it claims - only a synthetic one was checked
+	# - which would have let it close with a substrate derived from an ELF the importer rejects.
+	["foreign-audit-artifact"]="tools/check-foreign-audit-artifact.sh"
 	["source-hygiene"]="tools/check-source-hygiene.sh --current"
 	["source-history-hygiene"]="tools/check-source-hygiene.sh --history"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"

@@ -57,14 +57,17 @@ int liber_lifecycle_partial(void) { return partial; }
    Under this one it returns the same address for the life of the process, which is what the
    no-thread-creation pin makes correct.
 
-   THIS IS THE FIXTURE'S OWN AND NOT THE SUBSTRATE'S. `foreign-abi` defines the same accessor for the
-   audit-linked artifact, which is not staged in this image - so there is exactly one owner of this
-   name in anything that ships, and the contract being observed is the same contract. */
+   THE NAME IS THE FIXTURE'S OWN, AND THAT IS A CORRECTION. It was `__liber_errno_location` - the
+   substrate's own name - until the export-collision check on the audit-linked artifact found that
+   the artifact and this fixture both defined it. They are never staged together today, but "never
+   together today" is not a property anybody is holding fixed, and a symbol with two owners is the
+   defect that check exists to find. What is being observed is the SHAPE - an accessor two images
+   share - and the shape does not depend on the name. */
 static int errno_storage;
 
-int *__liber_errno_location(void) { return &errno_storage; }
+int *liber_lifecycle_errno_location(void) { return &errno_storage; }
 
-const void *liber_lifecycle_errno_slot(void) { return (const void *)__liber_errno_location(); }
+const void *liber_lifecycle_errno_slot(void) { return (const void *)liber_lifecycle_errno_location(); }
 
 /* WHERE A DESTRUCTOR CAN SAY SOMETHING. A constructor runs before the console is adopted and can
    only write; a DESTRUCTOR runs while the program is still alive and its console still attached, so

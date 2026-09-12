@@ -28,7 +28,7 @@ unsafe extern "C" {
 	fn liber_lifecycle_partial() -> i32;
 	fn liber_lifecycle_set_reporter(report: extern "C" fn(*const u8));
 	fn liber_lifecycle_errno_slot() -> *const core::ffi::c_void;
-	fn __liber_errno_location() -> *mut i32;
+	fn liber_lifecycle_errno_location() -> *mut i32;
 }
 
 // THE CONSUMER'S OWN CONSTRUCTOR, placed in `.init_array` the way a C object's would be.
@@ -110,7 +110,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe { liber_lifecycle_set_reporter(report) };
 
 	// SAFETY: both are calls into already-relocated images; neither dereferences what it returns.
-	let (provider_slot, own_slot) = unsafe { (liber_lifecycle_errno_slot(), __liber_errno_location() as *const core::ffi::c_void) };
+	let (provider_slot, own_slot) = unsafe { (liber_lifecycle_errno_slot(), liber_lifecycle_errno_location() as *const core::ffi::c_void) };
 	print(if provider_slot == own_slot { b"lifecheck: errno is process-wide\n" } else { b"lifecheck: errno differs between images\n" });
 
 	if mode == b"crash" {

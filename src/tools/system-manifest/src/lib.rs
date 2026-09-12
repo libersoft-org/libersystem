@@ -63,6 +63,17 @@ struct RawProgram {
 	destination: String,
 	#[serde(default)]
 	providers: Vec<String>,
+	// THE LICENCE THE PROGRAM IS CARRIED UNDER. `project` for everything this tree wrote; an SPDX
+	// identifier for anything that links code taken under another term - which a quarantine artifact
+	// does, and which has to travel INSIDE the binary rather than beside it.
+	#[serde(default)]
+	licence: Option<String>,
+	// WHAT PRODUCES THIS PROGRAM'S BYTES. `rust` is the ordinary consumer build. `audit` is the
+	// quarantine one: its object comes from this tree and its LINK comes from the audit substrate,
+	// whose upstream is deliberately not in the tree - so the ordinary build cannot produce it, and
+	// it is staged only into the development image the gate builds.
+	#[serde(default)]
+	producer: Producer,
 	// THE SELECTION SLOTS this program was built against: a declared provider position it names by
 	// KIND and by a closed set of candidates rather than by one `DT_NEEDED` edge. Empty for every
 	// program that has none, which is all but one today.
@@ -485,6 +496,12 @@ pub enum Producer {
 	#[default]
 	Rust,
 	Foreign,
+	// THE QUARANTINE PRODUCER. The artifact's object comes from this tree and its LINK comes from the
+	// audit substrate - the pinned upstream, which is audit-only and content-addressed and is
+	// deliberately NOT in this tree. Nothing the ordinary build can do produces it, so a row carrying
+	// this producer is staged from the audit link's output when that output exists, and is absent
+	// otherwise. It is admitted on programs only, and only development-only ones.
+	Audit,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -557,6 +574,10 @@ pub struct Program {
 	pub stage: Stage,
 	pub destination: RelativePath,
 	pub providers: Vec<Name>,
+	// What produces this program's bytes; see RawProgram.
+	pub producer: Producer,
+	// The licence it is carried under: `project` unless the row says otherwise.
+	pub licence: String,
 	// The declared selection slots, empty for a program that has none.
 	pub selection: Vec<SelectionSlot>,
 	// Built and staged only in the development configuration; see RawProgram.
@@ -1083,6 +1104,26 @@ impl Manifest {
 					})
 					.collect(),
 			});
+			// A QUARANTINE PROGRAM IS DEVELOPMENT-ONLY, AND THAT IS THE WHOLE OF WHAT KEEPS IT OUT OF
+			// A SHIPPED IMAGE. Its bytes are produced by the audit link against an upstream that is
+			// not in this tree; a shipping row for it would be the production import this system
+			// defers by name, and a build without the upstream would have no bytes to stage.
+			if raw_program.producer == Producer::Foreign {
+				push_error(&mut errors, format!("{location}.producer"), "a program is produced by `rust` or by `audit`; `foreign` describes a library's object list");
+			}
+			let program_licence = raw_program.licence.clone().unwrap_or_else(|| String::from("project"));
+			if program_licence.is_empty() || !program_licence.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+' | b'_')) {
+				push_error(&mut errors, format!("{location}.licence"), format!("{program_licence} is not a licence identifier"));
+			}
+			// A LICENCE OTHER THAN THE PROJECT'S MEANS THIS PROGRAM CARRIES SOMEBODY ELSE'S CODE, and
+			// the only producer here that can is the quarantine one. A Rust program naming one would
+			// be a row claiming an obligation its build cannot have taken on.
+			if raw_program.producer != Producer::Audit && raw_program.licence.is_some() {
+				push_error(&mut errors, format!("{location}.licence"), "a program built from this tree is carried under the project licence like every other artifact");
+			}
+			if raw_program.producer == Producer::Audit && !raw_program.development {
+				push_error(&mut errors, format!("{location}.producer"), "an audit-produced program must be development-only: its bytes come from an upstream this tree does not carry");
+			}
 			// THE SELECTION SLOTS, AND THEIR BOUNDS ARE THE LAUNCH'S BOUNDS. Four slots and sixteen
 			// candidates are what ProcessService admits, so a manifest able to express more would be
 			// a manifest able to describe an image that cannot start - and the failure would arrive
@@ -1135,7 +1176,7 @@ impl Manifest {
 				}
 				selection.push(SelectionSlot { kind, symbols: slot.symbols.clone(), candidates });
 			}
-			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, selection, development: raw_program.development, driver }).is_some() {
+			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, producer: raw_program.producer, licence: program_licence, selection, development: raw_program.development, driver }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate program name");
 			}
 		}
@@ -1436,8 +1477,16 @@ impl Manifest {
 	// configuration: false is the shipping volume, which omits the development-only programs
 	// entirely, and the two answers must not be conflated - a build that stages one set and
 	// checks against the other is exactly the mistake this returns a parameter to prevent.
-	pub fn volume_destinations(&self, development: bool) -> BTreeSet<String> {
-		self.libraries.values().map(|library| library.destination.as_str().to_string()).chain(self.programs.values().filter(|program| program.stage == Stage::Volume && (development || !program.development)).map(|program| program.destination.as_str().to_string())).chain(self.factory_files.values().map(|file| file.destination.as_str().to_string())).collect()
+	/// What a system volume holds, given the configuration and what is actually staged.
+	///
+	/// `staged` ANSWERS FOR THE ONE KIND OF ARTIFACT THIS MANIFEST CANNOT PRODUCE. A quarantine
+	/// program's link comes from the audit substrate, whose upstream is deliberately not in this
+	/// tree, so a build that has not fetched it has nothing to put in the image - and a declared
+	/// destination that nothing can produce would make the ordinary development build fail for
+	/// everyone who is not running the gate that needs it. Every other row is expected
+	/// unconditionally, which is what keeps this from becoming "whatever happens to be there".
+	pub fn volume_destinations(&self, development: bool, staged: impl Fn(&str) -> bool) -> BTreeSet<String> {
+		self.libraries.values().map(|library| library.destination.as_str().to_string()).chain(self.programs.values().filter(|program| program.stage == Stage::Volume && (development || !program.development)).filter(|program| program.producer != Producer::Audit || staged(program.name.as_str())).map(|program| program.destination.as_str().to_string())).chain(self.factory_files.values().map(|file| file.destination.as_str().to_string())).collect()
 	}
 }
 

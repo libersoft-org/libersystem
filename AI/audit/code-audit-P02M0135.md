@@ -636,3 +636,91 @@ normal exit versus crash - and the RUNNER that makes any of it observable, which
 have, because `liber_rt_start` calls the entry point directly. The discovery item needs the ported
 loader ITSELF run in a guest against a synthetic ICD, reaching its entry points through the replaced
 provider lookup; the selection slot half is built and gated.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0135 (2026-09-11T20:46:17Z):
+
+TEN OF ELEVEN. This stretch built the one thing three items were waiting on - the init/fini runner -
+and then ran the audit-linked artifact through the generic checks, which found two real defects.
+
+THE RUNNER, BECAUSE THE MEASUREMENT ADMITTED THE MECHANISM. Pass 2 named exactly one constructor and
+one destructor on all three targets, and under this file's own rule that makes static initialisation
+ADMITTED and its runner a deliverable rather than an assumption. Nothing in this system ran them:
+`liber_rt_start` performed the ABI check and called the entry point directly, so a constructor in a
+loaded module was an initialisation that silently did not happen.
+WHERE IT LIVES AND WHY. The kernel records each image's `.init_array` and `.fini_array` as it maps
+it, biased to the address it was mapped at, in LOAD order - which is the provider order the loader
+was given, so walking it forwards runs a provider's constructor before its consumer's and walking it
+backwards does the same for destructors. A new syscall hands a process its own table, entry by entry;
+it takes no handle because there is no other process it could sensibly name - the entries are
+addresses in an address space, and an address from another one means nothing. Appending a syscall
+needs no ABI bump, which this tree's own rule says in as many words.
+ONE DEFECT ON THE WAY, and the fixture found it immediately: the main image was recorded at bias
+zero, and a position-independent executable is mapped at `DYNAMIC_MAIN_BASE`. The first constructor
+call faulted reading the array at exactly the address the section header names, which is what said
+the bias had been left out rather than the table being wrong.
+
+THE FOUR POSITIVE GATES, OBSERVED IN A GUEST. The fixture is a foreign provider that RECORDS - a
+constructor runs before the console is adopted and cannot speak - and a consumer that reads the
+record and prints it. The provider carries TWO constructors, the second of which returns without
+reaching the step that would clear its marker, because a mechanism that only ever succeeds has no
+observable failure. What the gate reads back: `sequence=PQC`, so both provider constructors ran in
+priority order and before the consumer's; the completing one completed AND a partial initialisation
+was left behind, which are two different questions and would be one flag if this were careless; on a
+normal exit the consumer's destructor runs and then its provider's, in reverse of construction across
+the DAG; and the same program crashing runs neither. `errno` is observed process-wide by two images
+asking for it and getting one address.
+THE PROVIDER PRINTS THROUGH A REPORTER THE CONSUMER INSTALLS, which is what makes the destruction
+ORDER visible rather than merely recorded: both destructors say something, and the positions of their
+two lines are the assertion.
+
+THE AUDIT-LINKED ARTIFACT, THROUGH THE GENERIC CHECKS, AS A FILE. This milestone previously exempted
+the one artifact whose surface it claims. It now carries a v2 foreign identity record - each tool by
+version and digest, the sysroot, the configure inputs, the objects, the patch series, and the
+UPSTREAM'S OWN LICENCE - and passes, per target: relocation forms inside the allowlist, no writable
+executable segment, readable dynamic metadata with no `RPATH`/`RUNPATH`/`TEXTREL`, a record
+accounting for exactly its `DT_NEEDED` set, and no export a staged provider already owns.
+THE ALLOWLIST IS READ FROM THE ONE PLACE THAT DEFINES IT. A table of numbers in the gate would be a
+second policy that agrees until it does not, so the gate parses `dynamic_relocation_kind` and fails
+out loud on a shape it cannot read.
+
+TWO REAL DEFECTS THE EXPORT-COLLISION CHECK FOUND, both of which would have been invisible until
+something was staged:
+- The lifecycle fixture had taken `__liber_errno_location` - the substrate's own name. They are never
+  staged together today, but "never together today" is not a property anybody is holding fixed. The
+  fixture's accessor is now its own name; what is being observed is the SHAPE, and the shape does not
+  depend on the name.
+- The substrate was defining `memcpy`, `memmove`, `memset` and `memcmp`, which `lsrt.lslib` already
+  publishes so that every library in this image can import them - and the audit artifact links
+  against it. The substrate no longer exports them, the converged link resolves them from the runtime
+  like every other library does, and the derived pin's compiler-runtime answer was corrected: the C
+  half's owner is the runtime, not the substrate. The measured split moved with it, 52 asked as 48
+  from the substrate and 12 from the runtime, and three gates followed.
+
+THE ONE ITEM THAT REMAINS, AND IT IS BLOCKED ON A MECHANISM RATHER THAN ON WORK. The discovery item's
+last requirement is the audit-linked LOADER run in a guest against a synthetic ICD. The artifact
+exists, is checked and is reproducible; what does not exist is a way to get it into a guest. Three
+routes, each needing something this milestone forbids or has not defined:
+- A MANIFEST ROW needs a source row, and the manifest requires a physical source directory. The
+  pinned upstream is deliberately not in the tree, and naming it in a manifest is the production
+  import this file defers by name.
+- A BUILD-TIME INCLUDE into the test kernel would make the test build depend on untracked audit-only
+  bytes: the suite would stop building for anyone who has not fetched the upstream, and a test kernel
+  whose content varies with a directory outside `src/` is not reproducible.
+- A RUNTIME CARRIER - a second disk or a ramdisk the harness supplies - needs no build coupling and
+  is the shape that fits, but it is undefined here: what reads it in the guest, how the artifact is
+  launched without a manifest path, and how the consumer that calls the loader is built and
+  delivered.
+I have not invented one. The item records the three routes and says the carrier is the next decision
+it needs.
+
+VERIFICATION PERFORMED:
+- `./build.sh --arch x86_64` and `./test.sh --arch x86_64`: 389 passed, with the runner walking the
+  lifecycle table on every launch in the suite.
+- `check-lifecycle`: the four positive gates plus `errno`, in a booted guest.
+- `check-foreign-audit-artifact`: all five generic checks on all three targets.
+- `check-foreign-audit-link`, `check-foreign-facilities`, `check-profile-sysroot`,
+  `check-foreign-cxx-abi`, `check-foreign-pin`, `check-foreign-identity`, `dependency-policy`,
+  `artifact-metadata`, `source-hygiene`: all pass after the compiler-runtime correction.
+- `check-icd-selection`: still passes; the slot binds and the admitted range holds at both ends.
+
+NOT PERFORMED: `./test.sh` on aarch64 and riscv64, and the full `./check.sh`.

@@ -757,6 +757,8 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// `Rest` because the mode word decides which half of the contract is being observed: a normal
 	// exit and a crash are the same program and are the difference being measured.
 	(b"lifecheck", Shape::Rest),
+	(b"vkprobe", Shape::Bare),
+	(b"abiprobe", Shape::Bare),
 	(b"uname", Shape::Bare),
 	(b"uptime", Shape::Bare),
 	(b"dmesg", Shape::Bare),

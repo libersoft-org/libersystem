@@ -65,7 +65,11 @@ check_target() {
 	local expected
 	expected="$(
 		jq -r '.libraries[] | "library-\(.name)\t\(.destination)"' <<<"$manifest_json"
-		jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | "executable-\(.name)\t\(.destination | sub("\\.lsexe$"; ""))"' <<<"$manifest_json"
+		# A QUARANTINE PROGRAM IS EXPECTED ONLY WHERE IT CAN EXIST. Its link comes from an upstream
+		# this tree does not carry, and it is staged only in the development configuration - so a
+		# shipping image is RIGHT not to have it, and requiring it here would make every shipping
+		# build report a missing artifact it must not contain.
+		jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .producer != "audit") | "executable-\(.name)\t\(.destination | sub("\\.lsexe$"; ""))"' <<<"$manifest_json"
 	)"
 
 	# Every staged file is hashed by one `sha256sum` invocation rather than one per file.

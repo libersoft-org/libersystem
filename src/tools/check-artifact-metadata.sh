@@ -94,7 +94,10 @@ while IFS= read -r artifact; do
 		exit 1
 	fi
 done < <(
-	jq -r --arg root "$image_root" '(.libraries[].destination | "\($root)/\(.)"), (.programs[] | select(.linkage == "dynamic" and .stage == "volume") | "\($root)/\(.destination | sub("\\.lsexe$"; ""))")' <<<"$manifest_json" | sort
+	# A QUARANTINE PROGRAM IS NOT IN A SHIPPING IMAGE AND IS NOT MISSING FROM ONE. Its link comes from
+	# an upstream this tree does not carry and it is staged only in the development configuration, so
+	# a shipping image is right not to have it - and this gate reads the shipping image.
+	jq -r --arg root "$image_root" '(.libraries[].destination | "\($root)/\(.)"), (.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .producer != "audit") | "\($root)/\(.destination | sub("\\.lsexe$"; ""))")' <<<"$manifest_json" | sort
 )
 
 echo "artifact-metadata: clean"

@@ -118,7 +118,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 629144,
+		"elf_bytes": 632424,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -141,7 +141,11 @@
 			"_RNvNtCs8o4BPvVgMqJ_4core9panicking18panic_bounds_check",
 			"_RNvNtCs8o4BPvVgMqJ_4core9panicking9panic_fmt",
 			"_RNvNtNtCs8o4BPvVgMqJ_4core5slice5index16slice_index_fail",
-			"_RNvNtNtCs8o4BPvVgMqJ_4core9panicking11panic_const23panic_const_rem_by_zero"
+			"_RNvNtNtCs8o4BPvVgMqJ_4core9panicking11panic_const23panic_const_rem_by_zero",
+			"memcmp",
+			"memcpy",
+			"memmove",
+			"memset"
 		],
 		"resolved_from_substrate": [
 			"__liber_assert_failed",
@@ -172,10 +176,6 @@
 			"loader_platform_thread_lock_mutex",
 			"loader_platform_thread_unlock_mutex",
 			"malloc",
-			"memcmp",
-			"memcpy",
-			"memmove",
-			"memset",
 			"opendir",
 			"readdir",
 			"realloc",
@@ -267,7 +267,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 1005512,
+		"elf_bytes": 950272,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -291,7 +291,11 @@
 			"_RNvNtCs1xi9M9H9dsQ_4core9panicking18panic_bounds_check",
 			"_RNvNtCs1xi9M9H9dsQ_4core9panicking9panic_fmt",
 			"_RNvNtNtCs1xi9M9H9dsQ_4core5slice5index16slice_index_fail",
-			"_RNvNtNtCs1xi9M9H9dsQ_4core9panicking11panic_const23panic_const_rem_by_zero"
+			"_RNvNtNtCs1xi9M9H9dsQ_4core9panicking11panic_const23panic_const_rem_by_zero",
+			"memcmp",
+			"memcpy",
+			"memmove",
+			"memset"
 		],
 		"resolved_from_substrate": [
 			"__liber_assert_failed",
@@ -322,10 +326,6 @@
 			"loader_platform_thread_lock_mutex",
 			"loader_platform_thread_unlock_mutex",
 			"malloc",
-			"memcmp",
-			"memcpy",
-			"memmove",
-			"memset",
 			"opendir",
 			"readdir",
 			"realloc",
@@ -417,7 +417,7 @@
 			"vsnprintf"
 		],
 		"converged": true,
-		"elf_bytes": 607496,
+		"elf_bytes": 610432,
 		"fini_array": [
 			"loader_free_library"
 		],
@@ -440,7 +440,11 @@
 			"_RNvNtCscxNVyFYGLI2_4core9panicking18panic_bounds_check",
 			"_RNvNtCscxNVyFYGLI2_4core9panicking9panic_fmt",
 			"_RNvNtNtCscxNVyFYGLI2_4core5slice5index16slice_index_fail",
-			"_RNvNtNtCscxNVyFYGLI2_4core9panicking11panic_const23panic_const_rem_by_zero"
+			"_RNvNtNtCscxNVyFYGLI2_4core9panicking11panic_const23panic_const_rem_by_zero",
+			"memcmp",
+			"memcpy",
+			"memmove",
+			"memset"
 		],
 		"resolved_from_substrate": [
 			"__liber_assert_failed",
@@ -471,10 +475,6 @@
 			"loader_platform_thread_lock_mutex",
 			"loader_platform_thread_unlock_mutex",
 			"malloc",
-			"memcmp",
-			"memcpy",
-			"memmove",
-			"memset",
 			"opendir",
 			"readdir",
 			"realloc",

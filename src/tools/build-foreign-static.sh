@@ -145,9 +145,11 @@ defines=(
 	-DHAVE_ALLOCA_H
 	-DVK_ENABLE_BETA_EXTENSIONS
 	# THE QUOTES HAVE TO SURVIVE INTO THE COMPILER, which bare shell quoting does not do: the shell
-	# strips them and the source then sees a bare path where it expects a string literal. These
-	# values are only here because the upstream CMake would set them; what a configuration directory
-	# means on this system is the discovery item's answer, not this script's.
+	# strips them and the source then sees a bare path where it expects a string literal.
+	#
+	# THESE ARE THE PINNED TREE'S VALUES AND THEY ARE WHAT UPSTREAM'S CMAKE WOULD SET. The ported
+	# tree overrides them below: what a configuration directory MEANS on this system is the discovery
+	# item's answer, and giving it is part of the port rather than of the option set pass 1 measured.
 	-DFALLBACK_CONFIG_DIRS='"/etc/xdg"'
 	-DFALLBACK_DATA_DIRS='"/usr/local/share:/usr/share"'
 	-DSYSCONFDIR='"/etc"'
@@ -157,6 +159,26 @@ defines=(
 	# in `loader_linux.c`, a source this configuration does not compile. A candidate surface holding
 	# two symbols no object can ever provide is the inventory describing a build nobody made.
 )
+
+# WHERE A DRIVER MANIFEST LIVES ON THIS SYSTEM, which is the discovery item's answer and is given
+# here because the loader reads it as a compiled-in string. The pinned tree keeps upstream's own
+# values; the ported tree gets this system's, so the paths the loader composes are the paths the
+# substrate's bounded record answers for. Without this the loader searched `/usr/share/vulkan/icd.d`,
+# the record held `vol://system/share/vulkan/icd.d`, and the two never met - the enumeration
+# succeeded and reached no driver at all, which is the quietest way a discovery model can be wrong.
+#
+# AND THEY CARRY NO SCHEME, WHICH IS NOT COSMETIC. These values are SEARCH LISTS and the loader
+# splits them on `:`, so `vol://system/share` becomes `vol` and `//system/share` - two directories
+# that exist nowhere. The record's paths reach no file system either way; what they have to be is
+# spellings the loader can compose and compare, and an absolute one with no colon is that.
+if [[ "$ported" == 1 ]]; then
+	defines+=(
+		-U FALLBACK_CONFIG_DIRS -U FALLBACK_DATA_DIRS -U SYSCONFDIR
+		-DFALLBACK_CONFIG_DIRS='"/system/etc/xdg"'
+		-DFALLBACK_DATA_DIRS='"/system/share"'
+		-DSYSCONFDIR='"/system/etc"'
+	)
+fi
 
 sources=(
 	allocation cJSON debug_utils extension_manual loader_environment gpa_helper
