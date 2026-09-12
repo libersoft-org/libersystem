@@ -25,6 +25,10 @@ driver-protocol = { path = "../user/libs/driver/protocol" }
 # with the SAME host-tested predicate DeviceManager selects with. A second copy of the rule here is
 # a second thing to keep in step, and the one that is not tested is the one that drifts.
 driver-binding = { path = "../user/libs/driver/binding" }
+# THE VOLUME OPCODE TABLE, for the same reason the two above are here: a scope test that wrote the
+# numbers out would be a second description of the op table, and the copy nobody regenerates is the
+# one that drifts. Only the constants are used.
+storage-proto = { path = "../user/libs/protocol/storage-proto" }
 # THE DEVICE INTERFACES, for the same reason and the same suites. AudioService no longer receives its
 # device over the bootstrap: it holds a provider-catalogue connection and SUBSCRIBES, so a suite
 # standing in for the supervisor has to answer that conversation - and answering it from a

@@ -1,0 +1,126 @@
+profile=render2d
+feature=PathConstruction group=geometry owner=render2d
+feature=FillNonZero group=geometry owner=backend
+feature=FillEvenOdd group=geometry owner=backend
+feature=ShapeRect group=geometry owner=render2d
+feature=ShapeRoundedRect group=geometry owner=render2d
+feature=ShapeCircle group=geometry owner=render2d
+feature=ShapeEllipse group=geometry owner=render2d
+feature=ShapeArc group=geometry owner=render2d
+feature=ShapeLine group=geometry owner=render2d
+feature=ShapePolyline group=geometry owner=render2d
+feature=ShapePolygon group=geometry owner=render2d
+feature=StrokeWidth group=strokes owner=backend
+feature=CapButt group=strokes owner=backend
+feature=CapRound group=strokes owner=backend
+feature=CapSquare group=strokes owner=backend
+feature=JoinMiter group=strokes owner=backend
+feature=JoinBevel group=strokes owner=backend
+feature=JoinRound group=strokes owner=backend
+feature=MiterLimit group=strokes owner=backend
+feature=StrokeDash group=strokes owner=backend
+feature=AnalyticCoverageFill group=antialiasing owner=backend
+feature=AnalyticCoverageStroke group=antialiasing owner=backend
+feature=AnalyticCoverageGlyph group=antialiasing owner=backend
+feature=TransformAffine group=transforms owner=render2d
+feature=TransformProjective group=transforms owner=render2d
+feature=PaintSolid group=paints owner=backend
+feature=PaintLinearGradient group=paints owner=backend
+feature=PaintRadialGradient group=paints owner=backend
+feature=PaintConicGradient group=paints owner=backend
+feature=PaintImagePattern group=paints owner=backend
+feature=GradientMultiStop group=paints owner=backend
+feature=SpreadClamp group=paints owner=backend
+feature=SpreadRepeat group=paints owner=backend
+feature=SpreadMirror group=paints owner=backend
+feature=PaintTransform group=paints owner=backend
+feature=LinearLightStops group=paints owner=graphics-core
+feature=ClipRect group=clipping owner=backend
+feature=ClipRoundedRect group=clipping owner=backend
+feature=ClipPath group=clipping owner=backend
+feature=ClipNested group=clipping owner=backend
+feature=ClipAlphaMask group=clipping owner=backend
+feature=ClipInverse group=clipping owner=backend
+feature=LayerGroupOpacity group=layers owner=backend
+feature=LayerBlendMode group=layers owner=backend
+feature=LayerNesting group=layers owner=render2d
+feature=CompositeClear group=compositing owner=backend
+feature=CompositeSource group=compositing owner=backend
+feature=CompositeDestination group=compositing owner=backend
+feature=CompositeSourceOver group=compositing owner=backend
+feature=CompositeDestinationOver group=compositing owner=backend
+feature=CompositeSourceIn group=compositing owner=backend
+feature=CompositeDestinationIn group=compositing owner=backend
+feature=CompositeSourceOut group=compositing owner=backend
+feature=CompositeDestinationOut group=compositing owner=backend
+feature=CompositeSourceAtop group=compositing owner=backend
+feature=CompositeDestinationAtop group=compositing owner=backend
+feature=CompositeXor group=compositing owner=backend
+feature=CompositePlus group=compositing owner=backend
+feature=BlendMultiply group=compositing owner=backend
+feature=BlendScreen group=compositing owner=backend
+feature=BlendOverlay group=compositing owner=backend
+feature=BlendDarken group=compositing owner=backend
+feature=BlendLighten group=compositing owner=backend
+feature=BlendColorDodge group=compositing owner=backend
+feature=BlendColorBurn group=compositing owner=backend
+feature=BlendHardLight group=compositing owner=backend
+feature=BlendSoftLight group=compositing owner=backend
+feature=BlendDifference group=compositing owner=backend
+feature=BlendExclusion group=compositing owner=backend
+feature=BlendHue group=compositing owner=backend
+feature=BlendSaturation group=compositing owner=backend
+feature=BlendColor group=compositing owner=backend
+feature=BlendLuminosity group=compositing owner=backend
+feature=ImageSourceDestRect group=images owner=backend
+feature=ImageProjective group=images owner=backend
+feature=ImageNearest group=images owner=backend
+feature=ImageBilinear group=images owner=backend
+feature=ImageBicubic group=images owner=backend
+feature=ImageMipmappedMinification group=images owner=backend
+feature=ImageWrapClamp group=images owner=backend
+feature=ImageWrapRepeat group=images owner=backend
+feature=ImageWrapMirror group=images owner=backend
+feature=ImageOpacity group=images owner=backend
+feature=ImageColorSpaceConversion group=images owner=graphics-core
+feature=FilterGaussianBlur group=filters owner=backend
+feature=FilterDropShadow group=filters owner=backend
+feature=FilterColorMatrix group=filters owner=backend
+feature=FilterComposite group=filters owner=backend
+feature=FilterBlend group=filters owner=backend
+feature=FilterConvolution group=filters owner=backend
+feature=FilterMorphologyDilate group=filters owner=backend
+feature=FilterMorphologyErode group=filters owner=backend
+feature=FilterDisplacementMap group=filters owner=backend
+feature=FilterCrop group=filters owner=backend
+feature=FilterTile group=filters owner=backend
+feature=FilterBackdrop group=filters owner=backend
+feature=GlyphOutlines group=text owner=backend
+feature=GlyphGrayscaleMask group=text owner=backend
+feature=GlyphBitmapStrike group=text owner=backend
+feature=GlyphColorLayers group=text owner=backend
+feature=GlyphEmbeddedColorBitmap group=text owner=backend
+feature=GlyphTransform group=text owner=backend
+feature=GlyphSubpixelPositioning group=text owner=backend
+feature=QueryPathBoolean group=queries owner=render2d
+feature=QueryHitTest group=queries owner=render2d
+feature=QueryTightBounds group=queries owner=render2d
+feature=QueryStrokeBounds group=queries owner=render2d
+feature=QueryPathLength group=queries owner=render2d
+feature=QueryPointAtDistance group=queries owner=render2d
+feature=QueryTangentAtDistance group=queries owner=render2d
+limit=max_commands value=65536
+limit=max_resources value=4096
+limit=max_path_verbs value=65536
+limit=max_path_points value=262144
+limit=max_subpaths value=8192
+limit=max_clip_depth value=32
+limit=max_layer_depth value=16
+limit=max_filter_nodes value=64
+limit=max_filter_radius value=256
+limit=max_glyphs_per_run value=4096
+limit=max_image_extent value=16384
+limit=max_layer_pixels value=67108864
+limit=max_prepared_scratch_bytes value=67108864
+limit=max_cache_bytes value=268435456
+limit=max_display_list_bytes value=33554432

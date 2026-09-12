@@ -208,7 +208,7 @@ or preventing further development of `v1`.
 - [x] [P02M0132 - The gap between what fsck can see and what a writable mount will accept](P02M0132.md)
 - [x] [P02M0133 - The parts are right; the transactions between them are not](P02M0133.md)
 - [x] [P02M0134 - The Wasm engine runs modules it has never validated](P02M0134.md)
-- [ ] [P02M0135 - Foreign graphics-stack prerequisites](P02M0135.md)
+- [x] [P02M0135 - Foreign graphics-stack prerequisites](P02M0135.md)
 - [ ] [P02M0136 - Text foundation: shaping, fallback and layout](P02M0136.md)
 - [x] [P02M0137 - Remove redundant dynamic-report work from warm builds](P02M0137.md)
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)

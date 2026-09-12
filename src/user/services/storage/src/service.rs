@@ -436,7 +436,18 @@ fn storage_bootstrap_report(name: &[u8], routed: bool, formats: &[u8]) -> Result
 #[derive(Clone)]
 enum Scope {
 	Full,
-	Directory(String),
+	/// EVERY PATH UNDER ONE DIRECTORY, and `writable` decides whether any of them may CHANGE.
+	///
+	/// THE FLAG IS AN ALLOWLIST HERE AND NOT A DENIAL LIST, which is the difference between this and
+	/// the file scope below. Reusing the file rule would mint a "read-only" client that can still
+	/// `mkdir` and `rmdir`: that rule consults `writable` for file scopes only, and its denial list
+	/// omits both opcodes, which the op table then admits for any path inside the scope. So a
+	/// read-only directory admits exactly the four read operations by name, and everything else -
+	/// including an opcode added to `volume` later - is refused until somebody classifies it.
+	Directory {
+		path: String,
+		writable: bool,
+	},
 	/// EXACTLY ONE PATH, and nothing beside it - not the directory it sits in, not a sibling.
 	///
 	/// This is what a selected-file grant is made of: a program handed one file to open must not be
@@ -614,8 +625,8 @@ impl volume_admin::Service for AdminCall<'_> {
 		self.mint(scope)
 	}
 
-	fn open_directory(&mut self, path: String) -> Result<u64, Error> {
-		let scope: Scope = Scope::directory(self.volume, &path)?;
+	fn open_directory(&mut self, path: String, writable: bool) -> Result<u64, Error> {
+		let scope: Scope = Scope::directory(self.volume, &path, writable)?;
 		self.mint(scope)
 	}
 }
@@ -806,7 +817,7 @@ fn to_string(from: &str) -> Result<String, Error> {
 }
 
 impl Scope {
-	fn directory(volume: &Volume, path: &str) -> Result<Scope, Error> {
+	fn directory(volume: &Volume, path: &str, writable: bool) -> Result<Scope, Error> {
 		if volume.name() != SYSTEM_VOLUME {
 			return Err(Error::Denied);
 		}
@@ -815,7 +826,7 @@ impl Scope {
 			return Err(Error::NotFound);
 		}
 		let directory: &str = core::str::from_utf8(target.path.as_bytes()).map_err(|_| Error::Invalid)?;
-		Ok(Scope::Directory(String::from(directory)))
+		Ok(Scope::Directory { path: String::from(directory), writable })
 	}
 
 	fn file(volume: &Volume, path: &str, writable: bool) -> Result<Scope, Error> {
@@ -830,7 +841,7 @@ impl Scope {
 	fn allows_path(&self, volume: &[u8], path: &str) -> bool {
 		match self {
 			Self::Full => true,
-			Self::Directory(directory) => {
+			Self::Directory { path: directory, .. } => {
 				let Some(target) = VolumePath::parse(path.as_bytes()) else { return false };
 				target.volume == volume && (target.path.as_bytes() == directory.as_bytes() || target.path.as_bytes().strip_prefix(directory.as_bytes()).is_some_and(|rest| rest.starts_with(b"/")))
 			}
@@ -853,6 +864,15 @@ impl Scope {
 		// answers nothing and listing anything else is refused anyway - and a READ-ONLY one may not
 		// reach any op that changes the file, which is the whole difference between handing a
 		// program a file to show and handing it one to edit.
+		// A READ-ONLY DIRECTORY ADMITS FOUR OPS BY NAME. Everything else is refused, which is the
+		// only shape that survives a new opcode: a denial list would admit whatever nobody had
+		// thought to add to it, and `mkdir` and `rmdir` are the two that were already in that gap.
+		if let Self::Directory { writable: false, .. } = self {
+			let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+			if !matches!(op, volume::OP_OPEN | volume::OP_LIST | volume::OP_READ | volume::OP_WATCH) {
+				return false;
+			}
+		}
 		if let Self::File { writable, .. } = self {
 			let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 			if op == volume::OP_LIST {

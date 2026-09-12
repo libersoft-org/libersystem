@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 111] = [
+const GATES: [(&str, &str); 113] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -334,6 +334,7 @@ const GATES: [(&str, &str); 111] = [
 	// staging path, and it boots a development image because that is the only image the quarantine
 	// artifact is in.
 	("foreign-loader-guest", "userspace.build"),
+	("foreign-facilities-guest", "userspace.build"),
 	("dma-mode-carrier", "harness.tools"),
 	("dma-mode-x86_64", "kernel"),
 	// The ports umbrella and its two rows, exactly as `qemu-arch-profiles` and its profiles: the
@@ -533,6 +534,12 @@ const GATES: [(&str, &str); 111] = [
 	// declarations rather than generated bindings - so it takes the always-selected label for the
 	// same reason `milestone-index` and `forwarded-abi` do, and costs milliseconds.
 	("declared-interfaces", "harness.tools"),
+	// The two graphics profiles, and what claims to implement or test them. It reads the profile
+	// enumerations, the generated documents beside them and every `@handles:` and `@covers:` marker
+	// in the tree - so a change ANYWHERE can make it fail, by claiming a feature the profile does not
+	// have, and a selection narrowed to one crate would skip exactly that change. Always selected for
+	// the same reason `dependency-policy` is, and it costs seconds on the host.
+	("graphics-profile", "harness.tools"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:

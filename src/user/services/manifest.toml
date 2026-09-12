@@ -183,6 +183,41 @@ path = "user/libs/audio/flac"
 owner = "gif"
 path = "user/libs/image/gif"
 
+# THE GRAPHICS PROFILES, WHICH STAGE NOTHING. `Render2D Core Profile 1` and `Render3D Core Profile 1`
+# as code: the closed lists every generated document, checklist and conformance matrix is written
+# from. It builds no userspace program and reaches no volume, but it is a Cargo package under
+# `user/`, so its source has to resolve like any other owner.
+[[sources]]
+owner = "graphics-profile"
+path = "user/libs/graphics/profile"
+
+# THE FONT SEAM, WHICH ALSO STAGES NOTHING. The one shared font-resource contract: what a face is,
+# who issues its identity, who owns the validated bytes, what a shaped run carries and in what units,
+# and the glyph cache key both sides of the seam use. Like the profiles above it is a Cargo package
+# under `user/` that builds no program, so its source has to resolve like any other owner.
+[[sources]]
+owner = "font-contract"
+path = "user/libs/text/font-contract"
+
+# THE FONT CATALOGUE'S PROTOCOL. Generated from `idl/font.lsidl` like every other package. It has no
+# consumer yet - the catalogue service it describes is not built - so it carries a source row and no
+# library row: a package that is generated and checked but staged nowhere.
+[[sources]]
+owner = "font-proto"
+path = "user/libs/protocol/font-proto"
+
+# THE CONCRETE FONT CLIENTS, and the trampolines that publish them by name. A dynamic consumer may
+# not instantiate the generic transport itself - that monomorphises the whole codec into the
+# consumer, which the shared-image inventory refuses - so the instantiation lives in `font-proto`
+# and reaches a tool through these two.
+[[sources]]
+owner = "font-client"
+path = "user/libs/clients/font-client"
+
+[[sources]]
+owner = "font-client-provider"
+path = "user/libs/clients/font-client-provider"
+
 [[sources]]
 owner = "icns"
 path = "user/libs/image/icns"
@@ -769,6 +804,18 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsdev.lsexe"
 providers = ["base-proto", "config-client", "device-client", "device-proto", "wire", "lsrt"]
+
+# THE FONT OPERATOR COMMAND. It holds the READ every text client holds, and the RESCAN nothing else
+# in the system holds - the same separation `lsdev` has between rendering a device list and changing
+# a binding.
+[[programs]]
+name = "lsfont"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lsfont.lsexe"
+providers = ["base-proto", "font-client", "lsrt"]
 
 [[programs]]
 name = "lsirq"
@@ -1487,6 +1534,22 @@ stage = "volume"
 destination = "bin/tcp.lsexe"
 providers = ["base-proto", "network-client", "network-proto", "lsrt"]
 
+# STATIC, AND THE REASON IS ONE SYMBOL. This service DIGESTS every face it publishes and every face
+# it serves - the identity is the digest, and a resolve checks the bytes it read against the identity
+# they are served under - so it needs SHA-256, which is `bootproto`'s and is linked by whoever uses
+# it. No staged library publishes it, and making the BOOT protocol a userspace shared library to
+# export one function is a change to the image graph out of all proportion to the need. Static is
+# what `process_service` does for the same reason and what every driver does; the cost is this
+# binary's own copy of the codecs it uses.
+[[programs]]
+name = "font_catalogue"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/font_catalogue.lsexe"
+providers = []
+
 [[programs]]
 name = "time_service"
 owner = "services"
@@ -1888,6 +1951,49 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:config@1/config"
+
+# THE INSTALLED-FACE CATALOGUE. It holds metadata and identities and never decoded faces, so what it
+# holds is bounded by the installation ceilings; parsing and every cache live in the calling
+# application, where the allocations are charged to the Domain that asked for them.
+[[services]]
+name = "font_catalogue"
+program = "font_catalogue"
+restart = "transparent"
+# EVERYTHING IT HOLDS IS DERIVED FROM THE FONT DIRECTORY, which is what makes it restartable: a fresh
+# instance re-reads the directory and is in the same place. It persists nothing of its own.
+state_class = "ephemeral"
+state_scope = "service"
+dependencies = ["log_service", "storage_service"]
+
+# THE ONE READ-ONLY DIRECTORY THIS SERVICE MAY READ, minted from StorageService's ADMIN root rather
+# than duplicated from its ordinary one - a `client` row would hand over the whole volume, which is
+# the ambient authority this service refuses on behalf of its own clients. The PATH is not here
+# because a `Role` has nowhere to put one; it is `font_record::FONT_DIRECTORY`, which the supervisor
+# reads when it mints and the catalogue reads when it lists.
+[[services.roles]]
+tag = "FONTDIR"
+kind = "factory"
+provider = "storage_service"
+source = "ADMIN"
+interface = "liber:storage@1/volume"
+
+# THE OPERATOR'S ROOT, minted at start beside the client one and SEEDED into the serve set so its
+# channel value is knowable - which is the identity `rescan` compares against. A connection minted on
+# demand from the ordinary root is indistinguishable from every other, so an opcode could not tell
+# them apart.
+#
+# BEFORE `SERVE`, like every role this program reads: the bootstrap is positional.
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:font@1/font-catalogue-admin"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:font@1/font-catalogue"
 
 [[services]]
 name = "console_service"
@@ -2389,6 +2495,7 @@ dependencies = [
 	"ram_storage",
 	"tmp_storage",
 	"device_manager",
+	"font_catalogue",
 ]
 
 [[services.roles]]
@@ -2450,6 +2557,25 @@ kind = "client"
 provider = "device_manager"
 source = "SERVE"
 interface = "liber:device@1/device-policy-admin"
+presence = "optional"
+
+# THE INSTALLED FACES, and the operator's scan held apart from them - the same separation
+# `DEVPOLICY` has from `DEVICE`. A text client reads faces; forcing a full directory read, digest
+# and metadata pass is work no ordinary client may demand.
+[[services.roles]]
+tag = "FONT"
+kind = "client"
+provider = "font_catalogue"
+source = "SERVE"
+interface = "liber:font@1/font-catalogue"
+presence = "optional"
+
+[[services.roles]]
+tag = "FONTADMIN"
+kind = "client"
+provider = "font_catalogue"
+source = "ADMIN"
+interface = "liber:font@1/font-catalogue-admin"
 presence = "optional"
 
 [[services.roles]]
@@ -3178,6 +3304,20 @@ owner = "inflate"
 destination = "lib/compression/inflate.lslib"
 features = []
 providers = ["lsrt"]
+
+[[libraries]]
+name = "font-client"
+owner = "font-client-provider"
+destination = "lib/clients/font-client.lslib"
+features = ["shared-image"]
+providers = ["font-proto"]
+
+[[libraries]]
+name = "font-proto"
+owner = "font-proto"
+destination = "lib/protocol/font-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 
 [[libraries]]
 name = "input-proto"

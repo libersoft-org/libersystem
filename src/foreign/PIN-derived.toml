@@ -73,16 +73,16 @@ runtime_references = 12
 # THE CONVERGED RESULT, per target. The gate is the FIXED POINT - two consecutive links producing the
 # same resolved set - and not the first link's output.
 inventory = "src/foreign/INVENTORY-pass2.json"
-inventory_sha256 = "3f5fcdb3a6a8ff6f11768e2003720331f1bfa9e9084994671b518c56ee7c3054"
+inventory_sha256 = "6bd124215feac2d9c122e4e41c24bfe7a488b6da9d90843814099e06641bbfe4"
 tool = "src/tools/foreign-audit-link.py"
-tool_sha256 = "32c24205315e36643c4f13f260640ced3ccda6dcc9ff1f521c6674d6917a6338"
+tool_sha256 = "4261629fa350e73090ddf2041d5f6bb3f64aa84e67ebc6cc56801080e4186310"
 surface = 52
 # Of which forty-eight come from the substrate crates and four from the runtime; see the
 # compiler-runtime section, which the artifact check corrected.
 resolved_from_substrate = 48
-x86_64 = { elf_bytes = 610416, converged = true }
-aarch64 = { elf_bytes = 632408, converged = true }
-riscv64 = { elf_bytes = 950208, converged = true }
+x86_64 = { elf_bytes = 610432, converged = true }
+aarch64 = { elf_bytes = 632424, converged = true }
+riscv64 = { elf_bytes = 950272, converged = true }
 
 [forbidden_mechanisms]
 # THE MECHANISMS THIS PROFILE REFUSES, with the flags that stop them being emitted and the gate that
@@ -110,8 +110,10 @@ admitted = ["static initialisers", "errno"]
 #
 # IT IS DEVELOPMENT-ONLY, which is the whole of what keeps it out of a shipped image, and it carries
 # the upstream's licence in its own identity record because it links code taken under that term.
-consumer = "vkprobe"
+consumers = ["vkprobe", "abiprobe"]
 source = "src/user/apps/tools/src/vkprobe.rs"
+facility_source = "src/user/apps/tools/src/abiprobe.rs"
+facility_gate = "src/tools/check-foreign-facilities-guest.sh"
 staged_only_in = "the development configuration"
 licence = "Apache-2.0"
 gate = "src/tools/check-foreign-loader-guest.sh"

@@ -295,8 +295,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let _ = __liber_assert_failed;
 	print(b"abiprobe: abort, __liber_assert_failed and vsnprintf are resolved and deliberately not called\n");
 
-	number(b"abiprobe: checks=", CHECKED.load(core::sync::atomic::Ordering::Relaxed));
-	number(b"abiprobe: failures=", FAILURES.load(core::sync::atomic::Ordering::Relaxed));
+	let checks = CHECKED.load(core::sync::atomic::Ordering::Relaxed);
+	let failures = FAILURES.load(core::sync::atomic::Ordering::Relaxed);
+	number(b"abiprobe: checks=", checks);
+	number(b"abiprobe: failures=", failures);
 	print(b"abiprobe: done\n");
-	exit();
+	// THE EXIT STATUS CARRIES THE ANSWER, so a caller that cannot read a console can still tell. The
+	// ports boot under emulation and, in this tree, do not reach a shell at all - their device
+	// bring-up quarantines the network endpoint and the service graph never starts - so the gate that
+	// proves this program LAUNCHES on all three architectures is a kernel test, and a kernel test
+	// reads a status rather than a log.
+	//
+	// A RUN THAT CHECKED NOTHING IS A FAILURE TOO. Zero failures out of zero checks is what a probe
+	// that stopped before its first group reports, and it is exactly the shape the status must not
+	// call success.
+	exit_with(if checks >= 40 { u64::from(failures) } else { u64::from(checks) + 1000 });
 }

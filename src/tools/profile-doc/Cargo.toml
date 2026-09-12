@@ -1,0 +1,15 @@
+[package]
+name = "profile-doc"
+edition = "2024"
+description = "Generate the graphics profile documents from the profiles, and check what claims to implement them"
+
+[dependencies]
+# THE PROFILES THEMSELVES, because this tool must not carry a second copy of them. A generator with
+# its own list is the drift the machine-readable profile exists to prevent.
+graphics-profile = { path = "../../user/libs/graphics/profile" }
+# THE HASH THE REST OF THE SYSTEM ALREADY USES. A generator with its own SHA-256 is a second
+# implementation to be wrong in a way nothing else is.
+bootproto = { path = "../../boot/protocol" }
+
+[lints.rust]
+warnings = "deny"

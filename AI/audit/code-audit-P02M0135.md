@@ -724,3 +724,74 @@ VERIFICATION PERFORMED:
 - `check-icd-selection`: still passes; the slot binds and the admitted range holds at both ends.
 
 NOT PERFORMED: `./test.sh` on aarch64 and riscv64, and the full `./check.sh`.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0135 (2026-09-12T02:42:48Z):
+
+ALL ELEVEN ITEMS. What closed the last one was the QUARANTINE CARRIER, and the carrier turned out to
+be one this system already had rather than one that needed inventing: the DEVELOPMENT configuration
+is "the gate's own test-only image", which is what this file already called it.
+
+HOW IT WORKS, AND WHY IT BREAKS NOTHING. A program row marked `producer = "audit"` is staged from the
+audit link's output when that output exists and is absent otherwise, and is development-only. So: no
+production manifest names the artifact; nothing in the ordinary build depends on audit-only bytes; a
+tree that has never fetched the upstream builds and tests exactly as before, and the gates that need
+the artifact say NOT PERFORMED; and a shipping build actively REMOVES a copy an earlier development
+build left behind, because the staged tree is shared between the two. The consumer's own source is in
+this tree - one more binary in the tools crate, compiled by the same script every other consumer uses
+- and only its LINK is not.
+
+THE PORTED LOADER RUNS. In a guest, against the synthetic ICD bound into its closure through a
+selection slot, it answers zero layers, refuses an enabled layer by name both ways, answers out of
+its own table, and REACHES THE DRIVER: three negotiations and three entry-point lookups through the
+substrate's replaced provider lookup, counted by shims the consumer hands it because the ICD cannot
+report it itself - its export surface is exactly two symbols by the kind's own rule, and a counter
+would be a third. The instance ends as `VK_ERROR_INCOMPATIBLE_DRIVER`, which is the honest outcome:
+the synthetic ICD implements no Vulkan entry point, because this milestone exports no Vulkan ABI.
+
+THE DEFECT THAT GATE FOUND, AND NOTHING ELSE COULD. The loader's search path and the record's paths
+never met. The ported build gave the loader `vol://system/share`, and the loader SPLITS a search list
+on `:` - so it looked in `vol` and `//system/share`, found nothing, and reported SUCCESS from every
+call. Every behavioural assertion passed while no driver was reached at all. The paths carry no
+scheme now, and the substrate says which path it refused, so the next time the two do not meet it is
+a line in the log rather than a silence. That is the whole argument for running the thing being
+ported rather than a selector that stands in for it.
+
+EVERY ADMITTED FACILITY, CALLED AND CHECKED. `abiprobe` calls all of them once and checks each
+ANSWER - `strncpy` pads to the full count, `snprintf` returns what it WOULD have written, `fputs` to
+anything but the diagnostic stream is refused rather than discarded, an `opendir` outside the record
+answers nothing, an uncontended mutex taken twice does not deadlock a process with one thread - and
+exits with the number that were wrong. Forty-six checks, zero failures.
+THREE ARE RESOLVED AND DELIBERATELY NOT CALLED, said out loud rather than hidden: `abort` and
+`__liber_assert_failed` diverge, so a probe that ended in one would report nothing about what it had
+already checked, and `vsnprintf` needs a `va_list` Rust cannot construct. The first version of that
+line called it with a null format to prove the symbol was there, which is not a test but undefined
+behaviour, and the guest faulted on it immediately.
+
+ON ALL THREE ARCHITECTURES, AND THE EVIDENCE IS SPLIT BECAUSE THE PORTS HAVE NO SHELL. aarch64 and
+riscv64 boot under emulation and, in this tree, do not reach a shell at all: device bring-up
+quarantines the network endpoint and the service graph never starts. That is outside this milestone,
+so the LAUNCH is asserted by a kernel test instead, which needs no console - it launches the consumer
+through ProcessService, requires the provider closure to verify, and reads the exit status the probe
+reports its facility verdict in. The probe's own output is in all three guest logs.
+
+TWO MORE DEFECTS FOUND ON THE WAY, both pre-existing and both invisible until something used the
+configuration they were in:
+- The DEVELOPMENT build did not compile. Fourteen `unnecessary unsafe` blocks and one genuinely
+  missing one, left behind when the runtime's wrappers became safe: the shipping build never
+  compiles those files, so nothing had noticed.
+- The warm image snapshot did not treat the configuration as an input, so a development build after
+  a shipping one found every input unchanged and skipped the phase that stages the quarantine
+  artifact - producing a development image without it, silently.
+
+VERIFICATION PERFORMED:
+- `./test.sh --arch x86_64`: 389 passed in the shipping configuration.
+- `LIBER_DEVELOPMENT=1 ./test.sh --tags dynamic` on x86_64, aarch64 and riscv64: 30 passed on each,
+  including the foreign-consumer launch, which ran the probe on every one of them.
+- `check-foreign-loader-guest`, `check-foreign-facilities-guest`, `check-icd-selection`,
+  `check-lifecycle`: all pass on x86_64.
+- The host gate set - dependency-policy, foreign-pin, foreign-facilities, profile-sysroot,
+  foreign-identity, foreign-audit-link, foreign-cxx-abi, foreign-audit-artifact, artifact-metadata,
+  source-hygiene, milestone-index, staged-consistency: all pass.
+
+NOT PERFORMED: the full `./check.sh`, and `./test.sh` in full on the two ports - only the dynamic tag
+ran there.

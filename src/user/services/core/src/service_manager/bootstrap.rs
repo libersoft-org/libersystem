@@ -590,6 +590,23 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 					let scoped: u64 = open_storage_directory(storage_adm, "vol://system/libexec/config_service");
 					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
 				}
+				// THE FONT CATALOGUE GETS THE ONE READ-ONLY SCOPED CLIENT IN THIS SUPERVISOR, and it
+				// is the case `Role` cannot express: a role carries a tag, a kind, a provider, a
+				// presence, an interface and a source, and NO path and NO scope - so a manifest
+				// `client` row would duplicate StorageService's whole root, and the one confined
+				// thing, `open-directory`, takes only a path. Confined AND read-only is minted here,
+				// beside the path, which is where the rest of the bootstrap wiring keeps its paths.
+				//
+				// A MINT THAT FAILS IS A START-UP REFUSAL for this service rather than a zero handle
+				// it could run without: a catalogue that cannot read a face would answer "nothing
+				// installed" to every client, which is a truthful sentence about a broken boot.
+				if name == b"font_catalogue" && role.tag == b"FONTDIR" {
+					if storage_root == 0 {
+						return Some((role.tag.to_vec(), 0));
+					}
+					let scoped: u64 = open_storage_directory_read_only(storage_adm, service_logic::font_record::FONT_DIRECTORY);
+					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
+				}
 				// THE INIT PACKAGE, under the rights a launcher needs: read it, map it, pass it on.
 				// The message carries its length behind the tag because a memory object does not
 				// say how much of itself is the archive.
@@ -737,7 +754,14 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), graph_client, stats_server) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", CAP_SERVE), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
+		// THE FONT ENDPOINTS, read from what this supervisor KEPT rather than threaded through the
+		// parameter list: the catalogue's ordinary root, which the manager mints per-grant
+		// connections from, and its ADMIN root ITSELF, which is TAKEN because the catalogue
+		// recognises an operator request by the channel it arrives on - a connection minted from
+		// that root would reach it on a channel it does not know, and one end cannot be owned twice.
+		let font_root: u64 = kept.end_of(b"font_catalogue", CAP_SERVE);
+		let font_admin_root: u64 = kept.take_end_of(b"font_catalogue", CAP_ADMIN);
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", CAP_SERVE), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		let report_buf: &mut [u8] = if name == b"storage_service" { &mut system_report } else { buf };
@@ -1051,7 +1075,7 @@ pub(super) fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N]
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, catalogue_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root: u64, font_admin_root: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, catalogue_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	// A fresh StorageService connection for the manager (independent of the shell's),
 	// duplicable so the manager can grant a narrowed copy to a sandboxed component.
 	let storage: u64 = match service_connect(storage_client) {
@@ -1162,6 +1186,23 @@ fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, storage_ad
 	// simply has no operator path rather than a half-built one.
 	let policy_conn: u64 = if policy_admin != 0 { service_connect(policy_admin).unwrap_or(0) } else { 0 };
 	if !send_blocking(manager_side, CAP_DEVPOLICY, policy_conn) {
+		return false;
+	}
+	// THE FONT CATALOGUE, in the two shapes the two capabilities need.
+	//
+	// The ordinary one is a CONNECTION minted from the catalogue's serve root, like every other
+	// service client here; the manager mints a fresh sub-connection from it per grant, because a
+	// duplicate would share this connection's reply queue between two applications.
+	//
+	// The operator's one is the ADMIN ROOT ITSELF. The catalogue tells an operator request from an
+	// ordinary one by the channel it arrived on - a connection minted on demand is indistinguishable
+	// from every other - so minting here would produce an endpoint the service refuses. This is the
+	// same shape ConfigService's `POLICYOWNER` has and for the same reason.
+	let font_conn: u64 = if font_root != 0 { service_connect(font_root).unwrap_or(0) } else { 0 };
+	if !send_blocking(manager_side, CAP_FONT, font_conn) {
+		return false;
+	}
+	if !send_blocking(manager_side, CAP_FONTADMIN, font_admin_root) {
 		return false;
 	}
 	// A fresh AudioService connection the manager grants to the governed `beep` command
@@ -1345,10 +1386,24 @@ pub(super) fn serve_root(manager_side: u64, tag: &[u8], handed_on: bool, client:
 // private admin endpoint; ordinary volume clients never receive it and can only mint
 // another client with their existing scope.
 pub(super) fn open_storage_directory(storage_admin: u64, path: &str) -> u64 {
+	open_storage_directory_with(storage_admin, path, true)
+}
+
+// The same mint, READ-ONLY, for a consumer that must not be able to change what it reads.
+//
+// A SEPARATE ENTRY POINT RATHER THAN A BOOLEAN AT EVERY CALL SITE: three of the four scoped clients
+// this supervisor mints are a service's own persistence directory and are writable by definition,
+// and one is not. Naming the exception is what keeps a future call from taking the default because
+// the default is what the line above it did.
+pub(super) fn open_storage_directory_read_only(storage_admin: u64, path: &str) -> u64 {
+	open_storage_directory_with(storage_admin, path, false)
+}
+
+fn open_storage_directory_with(storage_admin: u64, path: &str, writable: bool) -> u64 {
 	if storage_admin == 0 {
 		return 0;
 	}
-	match volume_admin::Client::new(ChannelTransport { chan: storage_admin }).open_directory(path) {
+	match volume_admin::Client::new(ChannelTransport { chan: storage_admin }).open_directory(path, &writable) {
 		Some(Ok(client)) => client,
 		_ => 0,
 	}

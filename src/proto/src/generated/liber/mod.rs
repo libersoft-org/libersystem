@@ -4,6 +4,7 @@ pub use base_proto::generated::liber::base;
 pub use config_proto::generated::liber::config;
 pub use device_proto::generated::liber::device;
 pub use display_proto::generated::liber::display;
+pub use font_proto::generated::liber::font;
 pub use input_proto::generated::liber::input;
 pub use log_proto::generated::liber::log;
 pub use network_proto::generated::liber::network;

@@ -230,6 +230,64 @@ fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 	assert!(!storage.can_open_writer(&writable, hello_uri.as_bytes(), 0xd118), "and still only over the file it names");
 }
 
+tagged_test!(a_read_only_directory_scope_refuses_every_opcode_that_can_change_the_volume, [Filesystem, Storage, VolumeLayout, VolumeScope], id = "kernel.volume_layout.a_read_only_directory_scope_refuses_every_opcode_that_can_change_the_volume", covers = ["liberfs", "storage"]);
+// A READ-ONLY DIRECTORY CLIENT, AND THE COMPLETE SET IT REFUSES.
+//
+// WHY THIS EXISTS AND WHY IT IS NOT "THE SAME FILTER". The obvious way to build a read-only
+// directory is to reuse the read-only FILE rule, and it does not work: that rule consults `writable`
+// for file scopes only, and its denial list omits `mkdir` and `rmdir` - which the op table then
+// admits for any path inside the scope. A "read-only" client built that way could create and remove
+// directories under its grant. So the directory rule is an ALLOWLIST of four read operations, and
+// this test is what says so: every opcode that can change the volume is attempted individually, and
+// `mkdir` and `rmdir` are named because they are the two the other rule lets through - a test that
+// tried "a write, a create and a delete" and stopped there would have passed over the actual hole.
+//
+// AND IT IS WATCHED TO FAIL: the same client minted `writable: true` accepts what the read-only one
+// refuses, so the assertions below are measuring the flag rather than an operation nothing supports.
+fn a_read_only_directory_scope_refuses_every_opcode_that_can_change_the_volume() {
+	// The opcode numbers, from the same place the service reads them: one table, so a renumbering
+	// moves both sides together.
+	use storage_proto::generated::liber::storage::v1::volume;
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume_bytes, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let hello = test_factory_path("hello").expect("hello factory path");
+	let directory = alloc::format!("vol://system/{}", hello.rsplit_once('/').map_or("", |(parent, _)| parent));
+	let directory = if directory.ends_with("system/") { alloc::string::String::from("vol://system/wallpapers") } else { directory };
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume_bytes, SYSTEM_CAPACITY);
+
+	// THE COMPLETE DENIAL SET, named rather than inherited: every opcode that can change the volume.
+	let mutating: &[(u16, &str)] = &[
+		(volume::OP_WRITE, "write"),
+		(volume::OP_REMOVE, "remove"),
+		(volume::OP_TRUNCATE, "truncate"),
+		(volume::OP_TOUCH, "touch"),
+		(volume::OP_WRITE_STREAM, "write-stream"),
+		(volume::OP_OPEN_WRITER, "open-writer"),
+		(volume::OP_MKDIR, "mkdir"),
+		(volume::OP_RMDIR, "rmdir"),
+		(volume::OP_RENAME, "rename"),
+	];
+	let target = alloc::format!("{directory}/liber-read-only-probe");
+	let read_only = storage.open_directory_scope(directory.as_bytes(), false);
+	for (index, (op, name)) in mutating.iter().enumerate() {
+		assert!(!storage.attempt_op(&read_only, *op, target.as_bytes(), 0xd200 + index as u32), "a read-only directory scope must refuse {name}");
+	}
+	// AND AN OPCODE NOBODY HAS CLASSIFIED IS REFUSED TOO, which is the direction a default must fail
+	// in: the rule admits four operations by name, so one added to `volume` later is refused until
+	// somebody decides it is a read.
+	assert!(!storage.attempt_op(&read_only, volume::OP_STAT, target.as_bytes(), 0xd220), "a read-only directory scope refuses what it has not admitted by name");
+	// WHAT IT DOES ADMIT. A scope that refused everything would pass every assertion above and be
+	// useless, which is the failure this line exists to catch.
+	assert!(storage.attempt_op(&read_only, volume::OP_LIST, directory.as_bytes(), 0xd221), "a read-only directory scope lists its own directory");
+
+	// WATCHED TO FAIL. The same grant, writable, accepts what the read-only one refused - so the
+	// refusals above are the flag's doing and not an operation the service does not support.
+	let writable = storage.open_directory_scope(directory.as_bytes(), true);
+	assert!(storage.attempt_op(&writable, volume::OP_MKDIR, target.as_bytes(), 0xd230), "a writable directory scope creates a directory under its grant");
+	assert!(storage.attempt_op(&writable, volume::OP_RMDIR, target.as_bytes(), 0xd231), "and removes it again");
+}
+
 tagged_test!(existing_system_volume_preserves_owned_state_across_a_restart, [Filesystem, Storage, VolumeLayout, VolumeScope], id = "kernel.volume_layout.existing_system_volume_preserves_owned_state_across_a_restart", covers = ["liberfs", "storage"]);
 // This used to corrupt the factory archive between the two runs and assert that an existing
 // volume mounted as-is rather than being reformatted from the changed seed. There is no seed any

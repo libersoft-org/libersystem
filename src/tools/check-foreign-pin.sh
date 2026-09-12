@@ -209,7 +209,7 @@ if derived_path.is_file():
 	if not quarantine:
 		failures.append("derived: no quarantine consumer is recorded, and the guest gate is what the audit link exists for")
 	else:
-		for key in ("source", "gate"):
+		for key in ("source", "gate", "facility_source", "facility_gate"):
 			if not (root / quarantine.get(key, "")).is_file():
 				failures.append(f"derived: the quarantine {key} {quarantine.get(key)} does not exist")
 

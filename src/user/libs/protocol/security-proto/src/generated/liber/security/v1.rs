@@ -71,6 +71,22 @@ pub enum Capability {
 	/// a manifest that hands the microphone to anything that beeps, so the two are named apart and
 	/// the connection each mints refuses the other's operations.
 	AudioCapture = 22,
+	/// The INSTALLED FACES: enumerate them, and get one face's bytes into a buffer the caller
+	/// created and owns.
+	///
+	/// It carries no StorageService authority and no directory scan. A text client that could only
+	/// be given `volumes` in order to find a font would be handed every file on every mounted
+	/// volume to draw a word, which is the over-granting a capability system exists to make
+	/// unnecessary - and a per-process directory scan is not a SET, which is why the catalogue is a
+	/// service at all.
+	FontCatalogue = 23,
+	/// THE OPERATOR'S FONT ENDPOINT: re-read the font directory after a dropped watch hint.
+	///
+	/// Separate from `font-catalogue` for the reason `device-policy` is separate from `device`.
+	/// Reading a face is what every text client does; forcing a full directory read, digest and
+	/// metadata pass is work an ordinary client must not be able to demand, because authority to
+	/// READ a font must not become authority to make the machine work.
+	FontAdmin = 24,
 }
 
 impl Capability {
@@ -136,6 +152,8 @@ impl Capability {
 			20 => Some(Capability::DevicePolicy),
 			21 => Some(Capability::AppAssets),
 			22 => Some(Capability::AudioCapture),
+			23 => Some(Capability::FontCatalogue),
+			24 => Some(Capability::FontAdmin),
 			_ => None,
 		}
 	}
@@ -1271,6 +1289,8 @@ impl Capability {
 			Capability::DevicePolicy => out.push_str("\"device-policy\""),
 			Capability::AppAssets => out.push_str("\"app-assets\""),
 			Capability::AudioCapture => out.push_str("\"audio-capture\""),
+			Capability::FontCatalogue => out.push_str("\"font-catalogue\""),
+			Capability::FontAdmin => out.push_str("\"font-admin\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -1298,6 +1318,8 @@ impl Capability {
 			Capability::DevicePolicy => out.push_str("device-policy"),
 			Capability::AppAssets => out.push_str("app-assets"),
 			Capability::AudioCapture => out.push_str("audio-capture"),
+			Capability::FontCatalogue => out.push_str("font-catalogue"),
+			Capability::FontAdmin => out.push_str("font-admin"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1325,6 +1347,8 @@ impl Capability {
 			Capability::DevicePolicy => crate::codec::cbor::text(out, "device-policy"),
 			Capability::AppAssets => crate::codec::cbor::text(out, "app-assets"),
 			Capability::AudioCapture => crate::codec::cbor::text(out, "audio-capture"),
+			Capability::FontCatalogue => crate::codec::cbor::text(out, "font-catalogue"),
+			Capability::FontAdmin => crate::codec::cbor::text(out, "font-admin"),
 		}
 	}
 }

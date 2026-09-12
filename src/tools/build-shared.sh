@@ -2797,6 +2797,11 @@ if [[ -n "$image_graph" ]]; then
 				echo "build-shared: $out carries no identity note" >&2
 				exit 1
 			fi
+			# THE SAME DIGEST RECORD EVERY OTHER STAGED ARTIFACT HAS. Without it the staged-image
+			# check reports a file it cannot verify, which is the same answer it gives for one that
+			# was tampered with - and a quarantine artifact is exactly the kind that should be
+			# verifiable rather than exempt.
+			sha256sum "$out" | awk '{print $1}' >"$artifact_cache_dir/executable-$consumer.sha256"
 			echo "build-shared: $out ($(stat -c %s "$out") bytes, quarantine)"
 			continue
 		fi

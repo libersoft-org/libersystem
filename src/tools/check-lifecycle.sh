@@ -25,20 +25,17 @@
 #                             no-thread-creation pin makes correct.
 
 set -euo pipefail
+GUEST_GATE_NAME="lifecycle"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root/.."
+source "$root/tools/guest-gate.sh"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"; [[ -n "${driver_pid:-}" ]] && kill "$driver_pid" 2>/dev/null || true' EXIT
-driver_pid=""
+guest_gate_arch "$@"
 
-fail() {
-	echo "lifecycle: $*" >&2
-	exit 1
-}
+fail() { guest_gate_fail "$@"; }
 
-provider="$root/../.build/image/x86_64-unknown-none/lib/foreign/lifecycle.lslib"
-consumer="$root/../.build/image/x86_64-unknown-none/libexec/lifecheck"
+provider="$root/../.build/image/$(guest_gate_triple)/lib/foreign/lifecycle.lslib"
+consumer="$root/../.build/image/$(guest_gate_triple)/libexec/lifecheck"
 [[ -f "$provider" && -f "$consumer" ]] || fail "the lifecycle fixture is not staged - build the image first"
 
 # BOTH IMAGES ACTUALLY CARRY THE ARRAYS. Everything below observes what RAN; this observes that there
@@ -53,26 +50,12 @@ for artifact in "$provider" "$consumer"; do
 	done
 done
 
-script="$work/script"
-cat >"$script" <<'EOF'
-lifecheck
+# THREE RUNS IN ONE BOOT: a normal exit, the same program crashing, and a normal exit again. The
+# difference between the first and the second is what a lifecycle contract says.
+guest_gate_run 'lifecheck
 lifecheck crash
-lifecheck
-EOF
-guest="$work/guest"
-socket="$work/console"
-rm -f "$socket"
-python3 src/harness/guest-console.py --socket "$socket" --log "$guest" --script "$script" --seconds 70 >"$work/driver" 2>&1 &
-driver_pid=$!
-SERIAL="unix:$socket,server=on,wait=off" timeout 200 ./run.sh --arch x86_64 --smp 2 >"$work/run" 2>&1 || true
-wait "$driver_pid" 2>/dev/null || true
-driver_pid=""
-[[ -s "$guest" ]] || fail "the guest produced no console output"
-
-# The console log carries escape sequences and the shell's own echo, so every assertion below reads
-# the lifecheck lines only, in the order they were printed.
-lines="$work/lines"
-grep -a -o 'lifecheck: [a-zA-Z0-9 =-]*' "$guest" >"$lines" || fail "the probe printed nothing at all"
+lifecheck' lifecheck
+lines="$GUEST_LINES"
 
 expect() {
 	grep -qxF "lifecheck: $1" "$lines" || {

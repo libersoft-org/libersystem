@@ -1,0 +1,13 @@
+[package]
+name = "font-contract"
+edition = "2024"
+description = "The one shared font-resource contract: face identity, glyph runs, cluster mapping and the glyph cache key"
+
+# NO DEPENDENCIES, AND THAT IS THE CONTRACT. This is the seam between the text stack that PRODUCES
+# glyph runs and the 2D renderer that CONSUMES them, and a seam that pulled either side in would be
+# a seam only one of them could link. It is also why it is host-testable: a crate that reached the
+# runtime could not be, because `rt` and `std` both define `panic_impl`.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

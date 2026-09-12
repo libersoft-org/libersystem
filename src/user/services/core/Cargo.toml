@@ -69,6 +69,10 @@ name = "display_service"
 path = "src/display_service.rs"
 
 [[bin]]
+name = "font_catalogue"
+path = "src/font_catalogue.rs"
+
+[[bin]]
 name = "time_service"
 path = "src/time_service.rs"
 

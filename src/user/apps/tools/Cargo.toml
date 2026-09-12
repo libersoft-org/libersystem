@@ -184,6 +184,10 @@ name = "lsdev"
 path = "src/lsdev.rs"
 
 [[bin]]
+name = "lsfont"
+path = "src/lsfont.rs"
+
+[[bin]]
 name = "config"
 path = "src/config.rs"
 
@@ -357,6 +361,8 @@ shared-image = [
 	"config-client-provider/shared-image",
 	"device-client/shared-image",
 	"device-client-provider/shared-image",
+	"font-client/shared-image",
+	"font-client-provider/shared-image",
 	"log-client/shared-image",
 	"log-client-provider/shared-image",
 	"network-client/shared-image",
@@ -409,6 +415,8 @@ config-client = { path = "../../libs/clients/config-client", optional = true }
 config-client-provider = { path = "../../libs/clients/config-client-provider", optional = true }
 device-client = { path = "../../libs/clients/device-client", optional = true }
 device-client-provider = { path = "../../libs/clients/device-client-provider", optional = true }
+font-client = { path = "../../libs/clients/font-client", optional = true }
+font-client-provider = { path = "../../libs/clients/font-client-provider", optional = true }
 log-client = { path = "../../libs/clients/log-client", optional = true }
 log-client-provider = { path = "../../libs/clients/log-client-provider", optional = true }
 observability-client = { path = "../../libs/clients/observability-client", optional = true }

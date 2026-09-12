@@ -66,6 +66,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "font-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "input-proto"
 version = "0.0.0"
 dependencies = [
@@ -123,6 +131,7 @@ dependencies = [
  "config-proto",
  "device-proto",
  "display-proto",
+ "font-proto",
  "input-proto",
  "log-proto",
  "network-proto",

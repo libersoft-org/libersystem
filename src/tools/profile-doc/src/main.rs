@@ -1,0 +1,415 @@
+//! Generate what the graphics profiles are READ from, out of the profiles they ARE - and check what
+//! claims to implement or to test them.
+//!
+//! WHAT IS GENERATED AND WHY EACH. The documentation table is what a person reads; the backend
+//! checklist is what an implementer works through; the conformance matrix is what a test suite is
+//! measured against; the capability report is what an implementation says about itself. All four are
+//! the same list seen from four sides, and four hand-maintained copies of one list is four chances
+//! for a feature to exist in three of them.
+//!
+//! AND A HASH, so a change to a profile is VISIBLE. A closed list that quietly grows is not closed;
+//! the hash is what turns "somebody added a feature" from a thing a reviewer might notice into a
+//! line in a diff.
+//!
+//! THE THREE CHECKS NO REVIEWER RELIABLY CATCHES, run by `--check` over the claims in the tree:
+//! every `Backend`-owned feature has a handler, every feature has at least one conformance test, and
+//! no test claims a feature outside the profile. Where nothing claims anything yet the check is
+//! reported as NOT PERFORMED with the count it ranged over, because a check over an empty set
+//! passing is not the same as a check passing.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use graphics_profile::capability::{Coverage, Range};
+use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MINIMA, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS};
+
+mod scan;
+mod selftest;
+
+use scan::{Claim, Marker};
+
+/// The generated form of one profile: the directory it is written under, and what it contains.
+struct Profile {
+	/// The directory under `docs/gen`, which is also what the gate calls this profile.
+	slug: &'static str,
+	title: &'static str,
+	groups: &'static [&'static str],
+	entries: Entries,
+}
+
+/// The entries, type-erased to what every generated document needs: a name, a group and an owner.
+///
+/// THE FEATURE ITSELF IS NOT NEEDED HERE. A document is written from names, and erasing the type is
+/// what lets one generator write both profiles instead of one generator written twice.
+struct Entries(Vec<(&'static str, &'static str, FeatureOwner)>);
+
+impl Entries {
+	fn of<F: 'static>(profile: &'static [ProfileEntry<F>]) -> Self {
+		Self(profile.iter().map(|entry| (entry.name, entry.group, entry.owner)).collect())
+	}
+}
+
+fn owner_name(owner: FeatureOwner) -> &'static str {
+	match owner {
+		FeatureOwner::GraphicsCore => "graphics-core",
+		FeatureOwner::Render2D => "render2d",
+		FeatureOwner::Render3D => "render3d",
+		FeatureOwner::Scene3D => "scene3d",
+		FeatureOwner::Backend => "backend",
+	}
+}
+
+/// The digest as it is written into the document: lower-case hexadecimal, because the profile hash
+/// is something a person compares by eye against a diff.
+fn hex(digest: &[u8; 32]) -> String {
+	let mut out = String::with_capacity(64);
+	for byte in digest {
+		let _ = write!(out, "{byte:02x}");
+	}
+	out
+}
+
+/// The canonical machine-readable form the hash is taken over and the documents are generated from.
+///
+/// ONE LINE PER FEATURE, IN PROFILE ORDER, naming the group, the owner and the feature. Order is
+/// part of it: a reordering is a different document, and a hash that ignored order would call two
+/// different tables the same profile.
+fn canonical(profile: &Profile) -> String {
+	let mut out = String::new();
+	let _ = writeln!(out, "profile={}", profile.slug);
+	for (name, group, owner) in &profile.entries.0 {
+		let _ = writeln!(out, "feature={name} group={group} owner={}", owner_name(*owner));
+	}
+	if profile.slug == "render2d" {
+		for (name, value) in minima() {
+			let _ = writeln!(out, "limit={name} value={value}");
+		}
+	}
+	out
+}
+
+/// The 2D guaranteed minima, named and in one order, because they are hashed with the profile: a
+/// list that could be lowered without changing the hash is a list that can be lowered quietly.
+fn minima() -> Vec<(&'static str, u64)> {
+	let limits = RENDER2D_PROFILE_1_MINIMA;
+	vec![
+		("max_commands", u64::from(limits.max_commands)),
+		("max_resources", u64::from(limits.max_resources)),
+		("max_path_verbs", u64::from(limits.max_path_verbs)),
+		("max_path_points", u64::from(limits.max_path_points)),
+		("max_subpaths", u64::from(limits.max_subpaths)),
+		("max_clip_depth", u64::from(limits.max_clip_depth)),
+		("max_layer_depth", u64::from(limits.max_layer_depth)),
+		("max_filter_nodes", u64::from(limits.max_filter_nodes)),
+		("max_filter_radius", u64::from(limits.max_filter_radius)),
+		("max_glyphs_per_run", u64::from(limits.max_glyphs_per_run)),
+		("max_image_extent", u64::from(limits.max_image_extent)),
+		("max_layer_pixels", limits.max_layer_pixels),
+		("max_prepared_scratch_bytes", limits.max_prepared_scratch_bytes),
+		("max_cache_bytes", limits.max_cache_bytes),
+		("max_display_list_bytes", limits.max_display_list_bytes),
+	]
+}
+
+fn generated_by(what: &str) -> String {
+	format!("<!-- @generated by profile-doc from the {what} profile. Do not edit; run `./gen.sh`. -->\n")
+}
+
+fn table(profile: &Profile) -> String {
+	let mut grouped: BTreeMap<&str, Vec<&(&str, &str, FeatureOwner)>> = BTreeMap::new();
+	for entry in &profile.entries.0 {
+		grouped.entry(entry.1).or_default().push(entry);
+	}
+	let mut out = generated_by(profile.slug);
+	let _ = writeln!(out, "# {}\n", profile.title);
+	let _ = writeln!(out, "Profile hash: `{}`\n", hex(&bootproto::sha256::digest(canonical(profile).as_bytes())));
+	let _ = writeln!(out, "A conforming backend implements every entry below. `Unsupported` is reserved for extensions");
+	let _ = writeln!(out, "added after Profile 1 and may never be returned for anything in it.\n");
+	let _ = writeln!(out, "The OWNER decides which checks apply: `backend` features need a handler in every backend, and");
+	let _ = writeln!(out, "the rest are implemented once above a backend and a rasteriser never sees them.\n");
+	let _ = writeln!(out, "| feature | group | owner |");
+	let _ = writeln!(out, "| --- | --- | --- |");
+	for group in profile.groups {
+		for (name, group, owner) in grouped.get(group).map(Vec::as_slice).unwrap_or_default() {
+			let _ = writeln!(out, "| `{name}` | {group} | {} |", owner_name(*owner));
+		}
+	}
+	let backend = profile.entries.0.iter().filter(|entry| entry.2 == FeatureOwner::Backend).count();
+	let _ = writeln!(out, "\n{} features, of which {backend} need a handler in every backend.", profile.entries.0.len());
+	if profile.slug == "render2d" {
+		let _ = writeln!(out, "\n## Guaranteed minima\n");
+		let _ = writeln!(out, "A conforming implementation accepts at least these and may declare more. They are what");
+		let _ = writeln!(out, "\"supports Profile 1\" promises, so that it cannot mean \"accepts ten path points\".\n");
+		let _ = writeln!(out, "| limit | minimum |");
+		let _ = writeln!(out, "| --- | ---: |");
+		for (name, value) in minima() {
+			let _ = writeln!(out, "| `{name}` | {value} |");
+		}
+	}
+	out
+}
+
+fn checklist(profile: &Profile, handled: &[Claim]) -> String {
+	let mut out = generated_by(profile.slug);
+	let _ = writeln!(out, "# {} - backend checklist\n", profile.title);
+	let _ = writeln!(out, "What a backend has to implement, and nothing else: the entries the profile says a backend");
+	let _ = writeln!(out, "owns. A backend declares one by writing `@handles: <feature>` in a comment on the code that");
+	let _ = writeln!(out, "does it, which is what makes a deleted handler stop claiming coverage.\n");
+	let _ = writeln!(out, "| feature | group | handled by |");
+	let _ = writeln!(out, "| --- | --- | --- |");
+	let mut done = 0;
+	let mut total = 0;
+	for group in profile.groups {
+		for (name, entry_group, owner) in &profile.entries.0 {
+			if entry_group != group || *owner != FeatureOwner::Backend {
+				continue;
+			}
+			total += 1;
+			let sites: Vec<String> = handled.iter().filter(|claim| claim.feature == *name).map(|claim| format!("`{}:{}`", claim.file, claim.line)).collect();
+			if !sites.is_empty() {
+				done += 1;
+			}
+			let _ = writeln!(out, "| `{name}` | {group} | {} |", if sites.is_empty() { "-".to_owned() } else { sites.join(", ") });
+		}
+	}
+	let _ = writeln!(out, "\n{done} of {total} implemented.");
+	out
+}
+
+fn matrix(profile: &Profile, covered: &[Claim]) -> String {
+	let mut out = generated_by(profile.slug);
+	let _ = writeln!(out, "# {} - conformance matrix\n", profile.title);
+	let _ = writeln!(out, "Every feature and the tests that measure it. A test declares what it measures by writing");
+	let _ = writeln!(out, "`@covers: <feature>` in a comment; a name this profile does not have is refused by the gate");
+	let _ = writeln!(out, "rather than counted, because a test measuring an extension must not report Profile 1 coverage.\n");
+	let _ = writeln!(out, "| feature | group | owner | tests |");
+	let _ = writeln!(out, "| --- | --- | --- | --- |");
+	let mut done = 0;
+	for group in profile.groups {
+		for (name, entry_group, owner) in &profile.entries.0 {
+			if entry_group != group {
+				continue;
+			}
+			let sites: Vec<String> = covered.iter().filter(|claim| claim.feature == *name).map(|claim| format!("`{}:{}`", claim.file, claim.line)).collect();
+			if !sites.is_empty() {
+				done += 1;
+			}
+			let _ = writeln!(out, "| `{name}` | {group} | {} | {} |", owner_name(*owner), if sites.is_empty() { "-".to_owned() } else { sites.join(", ") });
+		}
+	}
+	let _ = writeln!(out, "\n{done} of {} features have at least one conformance test.", profile.entries.0.len());
+	out
+}
+
+fn capability_report(profile: &Profile, handled: &[Claim]) -> String {
+	let mut by_crate: BTreeMap<String, Vec<&Claim>> = BTreeMap::new();
+	for claim in handled {
+		by_crate.entry(crate_of(&claim.file)).or_default().push(claim);
+	}
+	let mut out = generated_by(profile.slug);
+	let _ = writeln!(out, "# {} - capability report\n", profile.title);
+	let _ = writeln!(out, "What each implementation in this tree says about itself, measured against the profile. An");
+	let _ = writeln!(out, "implementation conforms when nothing backend-owned is missing: `Unsupported` for a profile");
+	let _ = writeln!(out, "feature is not a gap, it is a failure to conform.\n");
+	if by_crate.is_empty() {
+		let _ = writeln!(out, "No implementation declares a handler yet, so there is nothing to report. This is the state");
+		let _ = writeln!(out, "the profile was written in, on purpose: the checklist above is what the first backend works");
+		let _ = writeln!(out, "through, and a checklist written after a backend is a description rather than a requirement.");
+		return out;
+	}
+	let backend_total = profile.entries.0.iter().filter(|entry| entry.2 == FeatureOwner::Backend).count();
+	for (name, claims) in by_crate {
+		let declared: Vec<&str> = claims.iter().map(|claim| claim.feature.as_str()).collect();
+		let missing = profile.entries.0.iter().filter(|entry| entry.2 == FeatureOwner::Backend).filter(|entry| !declared.contains(&entry.0)).count();
+		let _ = writeln!(out, "## `{name}`\n");
+		let _ = writeln!(out, "{} of {backend_total} backend-owned features handled.\n", backend_total - missing);
+		if missing > 0 {
+			let _ = writeln!(out, "Missing:\n");
+			for entry in profile.entries.0.iter().filter(|entry| entry.2 == FeatureOwner::Backend).filter(|entry| !declared.contains(&entry.0)) {
+				let _ = writeln!(out, "- `{}` ({})", entry.0, entry.1);
+			}
+			let _ = writeln!(out);
+		}
+	}
+	out
+}
+
+/// The crate a claim was made in: the path up to `/src/`, which is what a reader calls it.
+fn crate_of(file: &str) -> String {
+	match file.split_once("/src/") {
+		Some((crate_path, _)) => crate_path.to_owned(),
+		None => file.to_owned(),
+	}
+}
+
+/// One generated file: where it goes and what is in it.
+struct Output {
+	path: PathBuf,
+	contents: String,
+}
+
+fn outputs(root: &Path, profile: &Profile, handled: &[Claim], covered: &[Claim]) -> Vec<Output> {
+	let directory = root.join("docs/gen").join(profile.slug);
+	vec![
+		Output { path: directory.join("profile-1.canonical"), contents: canonical(profile) },
+		Output { path: directory.join("profile-1.md"), contents: table(profile) },
+		Output { path: directory.join("backend-checklist.md"), contents: checklist(profile, handled) },
+		Output { path: directory.join("conformance-matrix.md"), contents: matrix(profile, covered) },
+		Output { path: directory.join("capability-report.md"), contents: capability_report(profile, handled) },
+	]
+}
+
+/// The three checks, reported one line each.
+///
+/// A CHECK OVER AN EMPTY SET IS NOT A PASS, and this says so in as many words rather than printing
+/// "0 missing" and letting a reader take it for one.
+fn checks<F: 'static>(slug: &str, entries: &'static [ProfileEntry<F>], handled: &[Claim], covered: &[Claim]) -> bool {
+	let mut ok = true;
+	let handled_names: Vec<&str> = handled.iter().map(|claim| claim.feature.as_str()).collect();
+	let covered_names: Vec<&str> = covered.iter().map(|claim| claim.feature.as_str()).collect();
+	let handlers = Coverage::new(entries, &handled_names, Range::OwnedBy(FeatureOwner::Backend));
+	let coverage = Coverage::new(entries, &covered_names, Range::EveryFeature);
+
+	// A CLAIMED NAME THE PROFILE DOES NOT HAVE IS ALWAYS AN ERROR, whether anything else is claimed
+	// or not: a typo and an extension look the same from here, and both must be refused.
+	for name in handlers.outside_profile() {
+		let site = handled.iter().find(|claim| claim.feature == name).map(|claim| format!("{}:{}", claim.file, claim.line)).unwrap_or_default();
+		eprintln!("{slug}: {site} handles `{name}`, which is not in the profile");
+		ok = false;
+	}
+	for name in coverage.outside_profile() {
+		let site = covered.iter().find(|claim| claim.feature == name).map(|claim| format!("{}:{}", claim.file, claim.line)).unwrap_or_default();
+		eprintln!("{slug}: {site} covers `{name}`, which is not in the profile");
+		ok = false;
+	}
+	for name in handlers.outside_range() {
+		eprintln!("{slug}: `{name}` is handled by a backend, and the profile says no backend owns it");
+		ok = false;
+	}
+
+	if handled.is_empty() {
+		println!("{slug}: backend handlers NOT PERFORMED - nothing declares `@handles:`, {} features await one", handlers.required());
+	} else if handlers.complete() {
+		println!("{slug}: every one of the {} backend-owned features has a handler", handlers.required());
+	} else {
+		for entry in handlers.missing() {
+			eprintln!("{slug}: `{}` ({}) has no backend handler", entry.name, entry.group);
+			ok = false;
+		}
+	}
+
+	if covered.is_empty() {
+		println!("{slug}: conformance coverage NOT PERFORMED - nothing declares `@covers:`, {} features await a test", coverage.required());
+	} else if coverage.complete() {
+		println!("{slug}: every one of the {} features has at least one conformance test", coverage.required());
+	} else {
+		for entry in coverage.missing() {
+			eprintln!("{slug}: `{}` ({}) has no conformance test", entry.name, entry.group);
+			ok = false;
+		}
+	}
+	ok
+}
+
+fn main() -> std::process::ExitCode {
+	let arguments: Vec<String> = std::env::args().skip(1).collect();
+	let check = arguments.iter().any(|argument| argument == "--check");
+	let self_test = arguments.iter().any(|argument| argument == "--self-test");
+	if let Some(unexpected) = arguments.iter().find(|argument| *argument != "--check" && *argument != "--self-test") {
+		eprintln!("profile-doc: unexpected argument '{unexpected}' (usage: profile-doc [--check] [--self-test])");
+		return std::process::ExitCode::FAILURE;
+	}
+	if self_test {
+		// A TEMPORARY TREE, REMOVED AFTERWARDS. The self-test's fixtures claim features on purpose,
+		// and fixtures left in the tree would be claims the real scan then found.
+		let directory = std::env::temp_dir().join(format!("profile-doc-self-test-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&directory);
+		let passed = selftest::run(&directory);
+		let _ = std::fs::remove_dir_all(&directory);
+		if !passed {
+			return std::process::ExitCode::FAILURE;
+		}
+		if !check {
+			return std::process::ExitCode::SUCCESS;
+		}
+	}
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+	let root = root.canonicalize().unwrap_or(root);
+	let profiles = [
+		Profile { slug: "render2d", title: "Render2D Core Profile 1", groups: RENDER2D_GROUPS, entries: Entries::of(RENDER2D_CORE_PROFILE_1) },
+		Profile { slug: "render3d", title: "Render3D Core Profile 1", groups: RENDER3D_GROUPS, entries: Entries::of(RENDER3D_CORE_PROFILE_1) },
+	];
+
+	let source = root.join("src");
+	let handled = match scan::claims(&source, Marker::Handles) {
+		Ok(claims) => claims,
+		Err(error) => {
+			eprintln!("profile-doc: {error}");
+			return std::process::ExitCode::FAILURE;
+		}
+	};
+	let covered = match scan::claims(&source, Marker::Covers) {
+		Ok(claims) => claims,
+		Err(error) => {
+			eprintln!("profile-doc: {error}");
+			return std::process::ExitCode::FAILURE;
+		}
+	};
+
+	let mut ok = true;
+	for profile in &profiles {
+		// EACH PROFILE SEES ONLY ITS OWN CLAIMS. The two name sets are disjoint - the crate has a
+		// fixture for it - so a claim belongs to exactly one profile, and a claim in neither is
+		// reported by both as outside the profile, which is what it is.
+		let mine = |claims: &[Claim], known: &dyn Fn(&str) -> bool, other: &dyn Fn(&str) -> bool| -> Vec<Claim> { claims.iter().filter(|claim| known(&claim.feature) || !other(&claim.feature)).cloned().collect() };
+		let in_2d = |name: &str| graphics_profile::render2d::entry_by_name(name).is_some();
+		let in_3d = |name: &str| graphics_profile::render3d::entry_by_name(name).is_some();
+		let (known, other): (&dyn Fn(&str) -> bool, &dyn Fn(&str) -> bool) = if profile.slug == "render2d" { (&in_2d, &in_3d) } else { (&in_3d, &in_2d) };
+		let handled = mine(&handled, known, other);
+		let covered = mine(&covered, known, other);
+
+		for output in outputs(&root, profile, &handled, &covered) {
+			if check {
+				match std::fs::read_to_string(&output.path) {
+					Ok(existing) if existing == output.contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the profile", output.path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", output.path.display());
+						ok = false;
+					}
+				}
+			} else {
+				if let Some(parent) = output.path.parent()
+					&& let Err(error) = std::fs::create_dir_all(parent)
+				{
+					eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+					return std::process::ExitCode::FAILURE;
+				}
+				if let Err(error) = std::fs::write(&output.path, &output.contents) {
+					eprintln!("profile-doc: cannot write {}: {error}", output.path.display());
+					return std::process::ExitCode::FAILURE;
+				}
+				println!("profile-doc: wrote {}", output.path.display());
+			}
+		}
+		let passed = if profile.slug == "render2d" { checks(profile.slug, RENDER2D_CORE_PROFILE_1, &handled, &covered) } else { checks(profile.slug, RENDER3D_CORE_PROFILE_1, &handled, &covered) };
+		if !passed {
+			ok = false;
+		}
+	}
+
+	if !ok {
+		if check {
+			eprintln!("profile-doc: regenerate with `cargo run --manifest-path src/tools/profile-doc/Cargo.toml`");
+		}
+		return std::process::ExitCode::FAILURE;
+	}
+	if check {
+		println!("profile-doc: the generated documents match both profiles");
+	}
+	std::process::ExitCode::SUCCESS
+}

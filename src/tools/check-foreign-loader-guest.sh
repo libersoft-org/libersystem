@@ -37,26 +37,17 @@
 #                               should report.
 
 set -euo pipefail
+GUEST_GATE_NAME="foreign-loader-guest"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root/.."
+source "$root/tools/guest-gate.sh"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"; [[ -n "${driver_pid:-}" ]] && kill "$driver_pid" 2>/dev/null || true' EXIT
-driver_pid=""
+fail() { guest_gate_fail "$@"; }
 
-fail() {
-	echo "foreign-loader-guest: $*" >&2
-	exit 1
-}
+guest_gate_arch "$@"
+guest_gate_require_quarantine vkprobe
 
-artifact="$root/../.build/foreign/pass2/x86_64/vkprobe.lsexe"
-if [[ ! -f "$artifact" ]]; then
-	echo "foreign-loader-guest: NOT PERFORMED: there is no quarantine consumer at $artifact, so the audit-linked loader was not run"
-	exit 0
-fi
-
-staged="$root/../.build/image/x86_64-unknown-none/libexec/vkprobe"
-[[ -f "$staged" ]] || fail "the quarantine consumer is not staged - build the development image first:  LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64"
+staged="$root/../.build/image/$(guest_gate_triple)/libexec/vkprobe"
 
 # IT CARRIES THE LOADER, checked on the artifact rather than assumed from its name. A consumer that
 # had lost its link to the audit archive would pass every behavioural assertion below by answering
@@ -78,19 +69,8 @@ grep -q "^selection=vulkan-icd:icdprobe\.lslib=[0-9a-f]\{64\}$" <<<"$record" || 
 grep -qx "licence=Apache-2.0" <<<"$record" || fail "the consumer record does not carry the upstream licence it links"
 echo "foreign-loader-guest: the staged consumer carries the loader and binds its ICD through a slot"
 
-script="$work/script"
-printf 'vkprobe\n' >"$script"
-guest="$work/guest"
-socket="$work/console"
-rm -f "$socket"
-python3 src/harness/guest-console.py --socket "$socket" --log "$guest" --script "$script" --seconds 70 >"$work/driver" 2>&1 &
-driver_pid=$!
-SERIAL="unix:$socket,server=on,wait=off" timeout 200 ./run.sh --arch x86_64 --smp 2 >"$work/run" 2>&1 || true
-wait "$driver_pid" 2>/dev/null || true
-driver_pid=""
-[[ -s "$guest" ]] || fail "the guest produced no console output"
-lines="$work/lines"
-grep -a -o 'vkprobe: [a-zA-Z0-9 =-]*' "$guest" >"$lines" || fail "the quarantine consumer printed nothing at all"
+guest_gate_run vkprobe vkprobe
+lines="$GUEST_LINES"
 
 expect() {
 	grep -qxF "vkprobe: $1" "$lines" || {
@@ -115,4 +95,4 @@ lookups="$(sed -n 's/^vkprobe: icd lookups=\([0-9]*\)$/\1/p' "$lines" | tail -n 
 [[ -n "$negotiations" && -n "$lookups" ]] || fail "the consumer reported no call counts"
 ((negotiations > 0)) || fail "the loader never negotiated with the ICD - it reached no driver at all"
 ((lookups > 0)) || fail "the loader never asked the ICD for an entry point"
-echo "foreign-loader-guest: the loader reached the ICD through the replaced lookup: $negotiations negotiation(s), $lookups entry-point lookup(s)"
+echo "foreign-loader-guest: $GUEST_ARCH: the loader reached the ICD through the replaced lookup: $negotiations negotiation(s), $lookups entry-point lookup(s)"

@@ -1,0 +1,23 @@
+package liber:font@1
+resource buffer-object
+enum face-format(truetype-glyf=0,opentype-cff=1,opentype-cff2=2,collection=3)
+enum face-width(ultra-condensed=0,extra-condensed=1,condensed=2,semi-condensed=3,normal=4,semi-expanded=5,expanded=6,extra-expanded=7,ultra-expanded=8)
+enum face-slant(upright=0,italic=1,oblique=2)
+record face-identity(digest:list<u8>:bound=32,index:u32)
+record variation-axis(tag:u32,minimum:i32,default:i32,maximum:i32)
+record face-record(identity:face-identity,family:string:bound=64,style:string:bound=32,format:face-format,weight:u16,width:face-width,slant:face-slant,axes:list<variation-axis>:bound=8)
+record face-bytes(identity:face-identity,generation:u64,length:u64)
+variant resolve-outcome(filled=0:u64,stale=1:u64,too-small=2:u64)
+record generation-event(generation:u64)
+enum ceiling(none=0,installed-faces=1,face-metadata-bytes=2,list-reply-bytes=3)
+enum rejection-reason(declaration=0,relabelled=1,past-ceiling=2)
+record rejection(name:string:bound=64,reason:rejection-reason)
+record scan-report(generation:u64,advanced:bool,published-faces:u32,withdrawn:list<string>:bound=64,rejected:list<rejection>:bound=64,breach:ceiling)
+variant rescan-outcome(completed=0:scan-report,try-again-at=1:u64,in-flight=2:unit)
+interface font-catalogue
+method font-catalogue.list op=1 () -> result<list<face-record>, liber:base@1::error>:bound=64
+method font-catalogue.resolve-info op=2 (identity:face-identity:rights=) -> result<face-bytes, liber:base@1::error>
+method font-catalogue.resolve-into op=3 (identity:face-identity:rights=,generation:u64:rights=,target:handle<buffer-object>:rights=map+write) -> result<resolve-outcome, liber:base@1::error>
+method font-catalogue.subscribe op=4 () -> stream<generation-event>
+interface font-catalogue-admin
+method font-catalogue-admin.rescan op=1 () -> result<rescan-outcome, liber:base@1::error>

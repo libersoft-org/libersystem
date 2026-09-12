@@ -1,0 +1,13 @@
+[package]
+name = "graphics-profile"
+edition = "2024"
+description = "The graphics profiles as code: the closed 2D and 3D feature lists, their owners and the 2D limits"
+
+# NO DEPENDENCIES, AND THAT IS THE CONTRACT. This crate is the thing a backend, a conformance suite
+# and a documentation table are all checked against, so it must be readable by each of them and
+# testable on the host. A crate that reached the runtime could not be host-tested at all - `rt` and
+# `std` both define `panic_impl` - which is why `service-logic` and `foreign-abi` exist as they do.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

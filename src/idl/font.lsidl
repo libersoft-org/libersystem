@@ -1,0 +1,235 @@
+//! LiberSystem font package - the installed-face catalogue.
+//!
+//! WHAT THIS SERVICE IS FOR, AND WHAT IT DELIBERATELY IS NOT. Deterministic fallback has to
+//! enumerate the same set for every client, and a per-process view of "what is installed" is not a
+//! set - so the CATALOGUE is service-owned. Parsing, shaping and every glyph and shaping cache are
+//! IN-PROCESS, in the calling application, where their allocations are charged to the caller's own
+//! Domain and a pathological document harms only the process that asked for it.
+//!
+//! SO THIS SERVICE SERVES METADATA AND IDENTITIES, NOT DECODED FACES AND NOT CACHES. What it holds
+//! is bounded by the installed-face ceilings, and what it hands over is bytes into a buffer THE
+//! CALLER CREATED AND OWNS.
+
+package liber:font@1;
+
+use liber:base@1.{error};
+
+/// A memory object the CALLER created, for the catalogue to fill.
+///
+/// `@kernel(memory-object)` is what makes the `@rights` guard on `resolve-into` refuse a handle of
+/// any other kernel object rather than checking rights on whatever it was handed.
+@kernel(memory-object)
+resource buffer-object;
+
+/// The formats a face may be declared as. CLOSED: a declaration outside this vocabulary is refused
+/// at staging and refused again at runtime, because fallback and resolution are steered by it.
+enum face-format {
+	/// Outlines in `glyf`.
+	truetype-glyf = 0,
+	/// Outlines in `CFF `.
+	opentype-cff = 1,
+	/// Outlines in `CFF2`, the variable one.
+	opentype-cff2 = 2,
+	/// A collection: several faces in one file, selected by the face index.
+	collection = 3,
+}
+
+/// The width axis, as its nine values.
+enum face-width {
+	ultra-condensed = 0,
+	extra-condensed = 1,
+	condensed       = 2,
+	semi-condensed  = 3,
+	normal          = 4,
+	semi-expanded   = 5,
+	expanded        = 6,
+	extra-expanded  = 7,
+	ultra-expanded  = 8,
+}
+
+/// The slant axis. `italic` and `oblique` are different designs and not two words for one.
+enum face-slant {
+	upright = 0,
+	italic  = 1,
+	oblique = 2,
+}
+
+/// A face: the content-derived identity of its FILE, and which face within that file.
+///
+/// A COLLECTION IS ONE FILE WITH SEVERAL FACES, so every face in it shares the digest and the index
+/// is what tells them apart. The identity is ISSUED BY THE CATALOGUE from the file it read; a client
+/// never derives one from a buffer it can write, because a client that rewrote its own buffer would
+/// otherwise have changed what an identity names.
+record face-identity {
+	@bound(32) digest: list<u8>,
+	index:              u32,
+}
+
+/// One variation axis as the declaration states it: the OpenType tag and its design range.
+record variation-axis {
+	/// The four-character tag packed big-endian - `wght`, `wdth`, `slnt`.
+	tag:     u32,
+	minimum: i32,
+	default: i32,
+	maximum: i32,
+}
+
+/// What the catalogue publishes about a face: its identity and its DECLARED metadata.
+///
+/// DECLARED AND NOT DERIVED. Getting family, style, axes, face index and format out of OpenType
+/// bytes is PARSING, and a parser inside the catalogue would be a second, unprofiled, hostile-input
+/// parser written before the item that authorises one. The record is a checked-in declaration
+/// staged beside the face, validated and digested by the staging tool; whether it is TRUE is
+/// checked by the profiled parser, which is the only component allowed to read a font.
+///
+/// ITS ENCODED SIZE IS BOUNDED at 256 bytes, which is what makes a full `list` reply arithmetic
+/// rather than hope: 64 faces at 256 bytes plus a reserved 4096-byte envelope for the list count,
+/// the result tag, the correlation id and whatever framing a reply grows later.
+record face-record {
+	identity:              face-identity,
+	@bound(64) family:     string,
+	@bound(32) style:      string,
+	format:                face-format,
+	/// The OpenType weight, 1..=1000.
+	weight:                u16,
+	width:                 face-width,
+	slant:                 face-slant,
+	@bound(8) axes:        list<variation-axis>,
+}
+
+/// What `resolve-info` answers: how big the face is, and which publication that answer is about.
+///
+/// IT ALLOCATES NOTHING, which is the whole reason resolve is two operations: in this kernel a
+/// memory object is charged to the Domain that CREATED it and stays charged after the handle moves,
+/// so a catalogue that created the buffer would grow without bound under a client that kept asking.
+/// The caller must be told the size before it can create the object.
+record face-bytes {
+	identity:   face-identity,
+	generation: u64,
+	length:     u64,
+}
+
+/// What `resolve-into` did.
+///
+/// THE REFUSALS ARE TYPED AND CARRY WHAT THE CALLER NEEDS TO RETRY, because "invalid" would leave a
+/// caller unable to tell a stale generation from a buffer one byte too small.
+variant resolve-outcome {
+	/// The bytes are in the caller's object; the value is how many were written.
+	filled(u64),
+	/// The publication moved, or the bytes under the published identity are not the bytes that
+	/// identity names. The value is the generation that is current now: re-ask.
+	///
+	/// THE SECOND CASE IS NOT THE GENERATION'S. The generation moves only once the catalogue has
+	/// PROCESSED a watch hint, and a hint can be dropped - so an admitted read under a still-current
+	/// old generation could return a REPLACEMENT's bytes under the previous identity. `resolve-into`
+	/// digests what it actually read and compares it with the published identity; different is this
+	/// same refusal, and the catalogue rescans immediately rather than waiting for a hint that may
+	/// never arrive.
+	stale(u64),
+	/// The object is smaller than the face. The value is the length required.
+	too-small(u64),
+}
+
+/// A change to the published set.
+record generation-event {
+	generation: u64,
+}
+
+/// Which installation ceiling a scan would have exceeded. `none` is what a scan that exceeded none
+/// answers, so a report carries one field rather than an absent one every reader has to guess about.
+enum ceiling {
+	none                = 0,
+	installed-faces     = 1,
+	face-metadata-bytes = 2,
+	list-reply-bytes    = 3,
+}
+
+/// Why one face was not published.
+enum rejection-reason {
+	/// Malformed, incomplete, outside a vocabulary, or not matching the bytes beside it.
+	declaration = 0,
+	/// Well formed, and declaring a DIFFERENT face than the one already published under this name.
+	/// A replacement is a new version of the same face; a different identity arrives under its own
+	/// name. This is the capture case, and it is refused.
+	relabelled = 1,
+	/// The record is past its own ceiling.
+	past-ceiling = 2,
+}
+
+/// One rejected face, as the report names it.
+record rejection {
+	@bound(64) name: string,
+	reason:          rejection-reason,
+}
+
+/// What a scan did.
+record scan-report {
+	/// The generation current AFTER the scan.
+	generation:                  u64,
+	/// Whether the scan advanced it.
+	advanced:                    bool,
+	/// How many faces are published now.
+	published-faces:             u32,
+	/// The published faces this catalogue can no longer serve, withdrawn by this scan.
+	@bound(64) withdrawn:        list<string>,
+	@bound(64) rejected:         list<rejection>,
+	/// The ceiling the admissible set would have exceeded, or `none`.
+	breach:                      ceiling,
+}
+
+/// What a recovery scan answered.
+variant rescan-outcome {
+	/// A scan ran and its report is here - published or not, the report says which.
+	completed(scan-report),
+	/// Inside the delay a completed scan re-armed. The value is when the next scan may start, so a
+	/// caller waits rather than polls.
+	try-again-at(u64),
+	/// A scan is already in flight. At most one is.
+	in-flight(unit),
+}
+
+/// What an application holds: enumerate the installed faces, and get a face's bytes into a buffer of
+/// its own.
+///
+/// IT NEVER HOLDS StorageService AUTHORITY and never scans a directory. A client without this
+/// capability reaches no face at all.
+interface font-catalogue {
+	/// Every installed face, as bounded metadata records. One message: the reply bound is arithmetic
+	/// from the two ceilings above it.
+	@op(1) @bound(64) list: func() -> result<list<face-record>, error>;
+
+	/// How long a face is, and which publication that answer is about. Allocates nothing.
+	@op(2) resolve-info: func(identity: face-identity) -> result<face-bytes, error>;
+
+	/// Fill a memory object the CALLER created with the face's bytes.
+	///
+	/// THE HANDLE IS ATTENUATED AT THE CALLER, before the send: `SYS_HANDLE_DUPLICATE` narrows and
+	/// never widens, so the caller creates the object, duplicates a handle down to map, write and
+	/// transfer, and passes the COPY - keeping the original, so the send consuming the copy costs it
+	/// nothing. Without `duplicate` the catalogue cannot make a second handle and keep it after
+	/// closing the one it was given, which is the property the retained-face gates rest on.
+	///
+	/// `transfer` IS present and cannot be otherwise: the typed transport consumes request handles
+	/// that way. That the catalogue must not pass the object on is a code obligation with a gate,
+	/// not a right it lacks - said plainly, because a plan that claims a rights bit it cannot obtain
+	/// has a security argument that is decoration.
+	///
+	/// The generation is the one `resolve-info` answered about, and it is what closes the race
+	/// between the two calls.
+	@op(3) resolve-into: func(identity: face-identity, generation: u64, @rights(map, write) target: handle<buffer-object>) -> result<resolve-outcome, error>;
+
+	/// Learn that the published set changed, without polling.
+	@op(4) subscribe: func() -> stream<generation-event>;
+}
+
+/// The operator's interface: recovery after a dropped watch hint.
+///
+/// A SECOND SERVE ROOT ON THE CATALOGUE ITSELF, tagged `ADMIN`, minted at its start beside the
+/// client one - the shape StorageService's `ADMIN` root already has. `rescan` is NOT on the client
+/// interface: authority to READ a font must not become authority to make the machine work, and the
+/// live-endpoint ceiling bounds endpoints rather than requests on one.
+interface font-catalogue-admin {
+	/// Re-read the directory now. At most one in flight; every completed scan re-arms a delay,
+	/// whatever it found.
+	@op(1) rescan: func() -> result<rescan-outcome, error>;
+}

@@ -1103,6 +1103,62 @@ fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	assert!(reply.caps.is_empty(), "a corrupted embedded identity record creates no process capability");
 }
 
+tagged_test!(dynamic_foreign_consumer_launches_and_exercises_every_admitted_facility, [Dynamic, Service, Process, Storage], id = "kernel.dynamic.dynamic_foreign_consumer_launches_and_exercises_every_admitted_facility", covers = ["kernel", "rt", "services"]);
+// THE FOREIGN CONSUMER LAUNCHES, ON WHATEVER ARCHITECTURE THIS SUITE IS RUNNING ON.
+//
+// WHY A KERNEL TEST AND NOT A CONSOLE GATE. The completion condition says the synthetic foreign
+// consumer launches on ALL THREE architectures, and the console gates cannot say that: the two ports
+// boot under emulation and, in this tree, do not reach a shell at all - their device bring-up
+// quarantines the network endpoint and the service graph never starts. A launch through
+// ProcessService needs none of that, and this suite already runs on all three.
+//
+// THE STATUS CARRIES THE ANSWER. The probe calls every admitted facility, checks each answer, and
+// exits with the number that were wrong - so "it launched" and "every facility answered" are one
+// assertion here, and the console gate on x86_64 is what says WHICH facility failed when one does.
+//
+// IT IS A DEVELOPMENT-ONLY ARTIFACT and is absent from a shipping build by construction, so this
+// asserts nothing when it is not staged. That is not a silent skip: the probe is quarantine-staged
+// precisely because its substrate cannot be in a shipping image, and the configuration that has it
+// is the one the gate runs in.
+fn dynamic_foreign_consumer_launches_and_exercises_every_admitted_facility() {
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let Some(path) = test_program_path("abiprobe") else {
+		// NOT STAGED: a shipping build, where the quarantine artifact must not exist. Said out loud
+		// rather than returned silently, because "the probe is absent" and "the probe passed" are
+		// the same outcome from outside and only one of them is evidence.
+		crate::serial_println!("    (abiprobe is not staged in this configuration; the launch was not exercised)");
+		return;
+	};
+	// AND IT IS ACTUALLY IN THE VOLUME. The path table is generated from the manifest, so a program
+	// can be NAMED there and still be missing from the image - which is exactly what a quarantine
+	// artifact is when its upstream was never fetched, and is not something to launch into.
+	if pkg::Package::parse(&volume).and_then(|archive| archive.lookup(path.as_bytes())).is_none() {
+		crate::serial_println!("    (abiprobe is declared and not in this volume; the launch was not exercised)");
+		return;
+	}
+	let reply = launch_from_volume(&volume, b"abiprobe", 220);
+	assert_eq!(le_u32(&reply.bytes, 0), 220);
+	assert_eq!(reply.bytes[4], 1, "the foreign consumer must launch with its provider closure verified");
+	assert_eq!(reply.caps.len(), 1, "a launched consumer produces one process capability");
+
+	// AND IT EXITS CLEANLY, WHICH IS WHERE THE FACILITY ANSWERS ARE. The probe calls every admitted
+	// facility, checks each answer, and exits with the number that were wrong - so the status is the
+	// whole verdict on this architecture. Reading it is what makes this a bounded LIFECYCLE rather
+	// than a launch: allocate, use, exit, and a number that says whether any of it was wrong.
+	//
+	// BOUNDED RATHER THAN UNBOUNDED: a regression here is a failure, not a hang.
+	let process = reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("the launch reply carries a Process");
+	let mut status = None;
+	for _ in 0..64 {
+		sched::run_until_idle();
+		status = process.exit_status();
+		if status.is_some() {
+			break;
+		}
+	}
+	assert_eq!(status, Some(0), "the foreign consumer must exit reporting no facility answered wrongly");
+}
+
 tagged_test!(dynamic_process_service_refuses_a_thread_local_relocation, [Dynamic, DynamicReject, Service, Process, Storage], id = "kernel.dynamic.dynamic_process_service_refuses_a_thread_local_relocation", covers = ["kernel", "rt", "services"]);
 // THE RUNTIME HALF OF THE NO-TLS DECISION, watched to fail.
 //

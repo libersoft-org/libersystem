@@ -1533,6 +1533,9 @@ pub const CAP_LOG: &[u8] = b"LOG";
 pub const CAP_DEVICE: &[u8] = b"DEVICE";
 // The operator's device-policy endpoint, held apart from the read above.
 pub const CAP_DEVPOLICY: &[u8] = b"DEVPOLICY";
+// The installed faces, and the operator's scan held apart from them for the same reason.
+pub const CAP_FONT: &[u8] = b"FONT";
+pub const CAP_FONTADMIN: &[u8] = b"FONTADMIN";
 pub const CAP_PROCESS: &[u8] = b"PROCESS";
 pub const CAP_CONFIG: &[u8] = b"CONFIG";
 pub const CAP_NET: &[u8] = b"NET";

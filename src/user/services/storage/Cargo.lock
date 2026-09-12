@@ -59,6 +59,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "font-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "fscore"
 version = "0.0.0"
 
@@ -150,6 +159,7 @@ dependencies = [
  "config-proto",
  "device-proto",
  "display-proto",
+ "font-proto",
  "input-proto",
  "ipc-client",
  "log-proto",

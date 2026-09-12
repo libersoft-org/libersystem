@@ -210,6 +210,7 @@ dependencies = [
  "pix",
  "png",
  "smpboot",
+ "storage-proto",
  "system-manifest",
  "term",
  "tga",
@@ -385,6 +386,14 @@ dependencies = [
 [[package]]
 name = "smpboot"
 version = "0.0.0"
+
+[[package]]
+name = "storage-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
 
 [[package]]
 name = "syn"

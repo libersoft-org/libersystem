@@ -33,20 +33,17 @@
 # it cannot be staged at all.
 
 set -euo pipefail
+GUEST_GATE_NAME="icd-selection"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root/.."
+source "$root/tools/guest-gate.sh"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"; [[ -n "${driver_pid:-}" ]] && kill "$driver_pid" 2>/dev/null || true' EXIT
-driver_pid=""
+guest_gate_arch "$@"
 
-fail() {
-	echo "icd-selection: $*" >&2
-	exit 1
-}
+fail() { guest_gate_fail "$@"; }
 
-probe="$root/../.build/image/x86_64-unknown-none/lib/foreign/icdprobe.lslib"
-consumer="$root/../.build/image/x86_64-unknown-none/libexec/icdcheck"
+probe="$root/../.build/image/$(guest_gate_triple)/lib/foreign/icdprobe.lslib"
+consumer="$root/../.build/image/$(guest_gate_triple)/libexec/icdcheck"
 [[ -f "$probe" ]] || fail "the synthetic ICD is not staged at $probe - build the image first"
 [[ -f "$consumer" ]] || fail "the slot consumer is not staged at $consumer - build the image first"
 
@@ -69,26 +66,15 @@ record="$(llvm-objcopy --dump-section .note.liber.identity=/dev/stdout "$consume
 grep -q "^selection=vulkan-icd:icdprobe.lslib=[0-9a-f]\{64\}$" <<<"$record" || fail "the consumer record carries no selection slot naming the candidate by digest"
 
 # THE LAUNCH ITSELF. The guest console types the probe into the shell and reads back what it said.
-script="$work/script"
-cat >"$script" <<'EOF'
-icdcheck
-EOF
-guest="$work/guest"
-socket="$work/console"
-rm -f "$socket"
-python3 src/harness/guest-console.py --socket "$socket" --log "$guest" --script "$script" --seconds 60 >"$work/driver" 2>&1 &
-driver_pid=$!
-SERIAL="unix:$socket,server=on,wait=off" timeout 180 ./run.sh --arch x86_64 --smp 2 >"$work/run" 2>&1 || true
-wait "$driver_pid" 2>/dev/null || true
-driver_pid=""
-[[ -s "$guest" ]] || fail "the guest produced no console output"
+guest_gate_run icdcheck ""
+lines="$GUEST_LINES"
 
 expect() {
 	local line="$1" why="$2"
-	grep -qF "$line" "$guest" || {
+	grep -qF "$line" "$lines" || {
 		echo "icd-selection: expected \"$line\" - $why" >&2
 		echo "--- guest log ---" >&2
-		cat "$guest" >&2
+		cat "$lines" >&2
 		exit 1
 	}
 	echo "icd-selection: $line"

@@ -67,6 +67,13 @@ declare -A GATES=(
 	# before the first thread runs - none of which is observable from outside a launch, so this boots
 	# a guest and reads what the bound provider actually agreed to.
 	["icd-selection"]="tools/check-icd-selection.sh"
+	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
+	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
+	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three
+	# checks no reviewer reliably catches: a handler for every backend-owned feature, a conformance
+	# test for every feature, and no test claiming a feature the profile does not have. Host-only and
+	# seconds; the two coverage halves report NOT PERFORMED until a backend and a suite exist.
+	["graphics-profile"]="tools/check-graphics-profile.sh"
 	# Static initialisation is a mechanism the converged closure ADMITS, so it gets positive gates:
 	# order across the provider DAG, what a constructor that stopped half way leaves behind,
 	# destructors in reverse on a normal exit, and which of them a crash does not run.
@@ -75,6 +82,10 @@ declare -A GATES=(
 	# undefined symbol and still cannot load an ICD has prepared nothing, and a gate that never runs
 	# the thing being ported proves the wrong half.
 	["foreign-loader-guest"]="tools/check-foreign-loader-guest.sh"
+	# Every admitted foreign ABI facility, called once in a guest with its answer CHECKED. The static
+	# gates hold the substrate to its exact surface and none of them shows that a facility works - a
+	# symbol that is present and wrong is a link that succeeds and a driver that misbehaves later.
+	["foreign-facilities-guest"]="tools/check-foreign-facilities-guest.sh"
 	["dma-mode-carrier"]="tools/check-dma-mode-carrier.sh"
 	["dma-mode-x86_64"]="tools/check-dma-mode-x86_64.sh"
 	["dma-mode-ports"]="tools/check-dma-mode-ports.sh"

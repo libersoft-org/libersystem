@@ -130,7 +130,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 23] = [
+const VOCABULARY: [Capability; 25] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -172,6 +172,10 @@ const VOCABULARY: [Capability; 23] = [
 	Capability::AudioStream,
 	Capability::AudioCapture,
 	Capability::AppAssets,
+	// THE INSTALLED FACES, and the operator's scan after them. Position is free for both: no tool
+	// granted either is granted anything between them, and the two are read by tag.
+	Capability::FontCatalogue,
+	Capability::FontAdmin,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -271,6 +275,11 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// what makes the snapshot visible after both deaths. A read of one key prefix rather than a
 		// second write authority: `lsdev` already holds `DevicePolicy` for its four verbs.
 		b"lsdev" => Some(granted("lsdev", alloc::vec![Capability::Device, Capability::DevicePolicy, Capability::Config])),
+		// THE FONT OPERATOR COMMAND, and the two halves for the reason `lsdev` has two: listing the
+		// installed faces is what every text client does, and forcing a full directory read, digest
+		// and metadata pass is not. A build without this row is a build in which the catalogue's
+		// recovery scan cannot be issued at all.
+		b"lsfont" => Some(granted("lsfont", alloc::vec![Capability::FontCatalogue, Capability::FontAdmin])),
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
@@ -410,6 +419,8 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::AudioCapture => b"AUDIO_CAPTURE",
 		Capability::Session => b"SESSION",
 		Capability::AppAssets => b"APP_ASSETS",
+		Capability::FontCatalogue => b"FONT",
+		Capability::FontAdmin => b"FONTADMIN",
 	}
 }
 
@@ -465,6 +476,17 @@ struct Clients {
 	// VT 1's SessionService client, granted to the governed `kill` command so it can ask the
 	// session to signal a job without ever holding the job's Process handle.
 	session: u64,
+	// The font catalogue's ordinary client, from which every granted one is MINTED FRESH - see
+	// `grant_handle`. A duplicate would share this connection's reply queue, and two applications
+	// each issuing a list and a resolve would answer each other's calls.
+	font: u64,
+	// THE OPERATOR'S SCAN, and it is the catalogue's ADMIN ROOT ITSELF rather than a connection
+	// minted from it. The catalogue tells an admin request from an ordinary one by the CHANNEL it
+	// arrived on - a connection minted on demand is indistinguishable from every other - so a
+	// sub-connection would reach the service on a channel it does not recognise and be refused. One
+	// holder, `lsfont`, which is what makes sharing this connection's reply queue acceptable here
+	// and not for the capability above.
+	font_admin: u64,
 }
 
 impl Clients {
@@ -496,6 +518,8 @@ impl Clients {
 			// Minted per launch rather than held, so `for_capability` has nothing to answer with.
 			// See `grant_handle`.
 			Capability::AppAssets => 0,
+			Capability::FontCatalogue => self.font,
+			Capability::FontAdmin => self.font_admin,
 		}
 	}
 }
@@ -606,7 +630,7 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		}
 		let mut path = String::from("vol://system/bin/");
 		path.push_str(asset_bundle(component));
-		let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_directory(&path) {
+		let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_directory(&path, &true) {
 			Some(Ok(client)) => client,
 			_ => return 0,
 		};
@@ -643,6 +667,13 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 	let (held, name): (&mut u64, &'static [u8]) = match cap {
 		Capability::Config => (&mut clients.config, CAP_CONFIG),
 		Capability::Device => (&mut clients.device, CAP_DEVICE),
+		// A FRESH SUB-CONNECTION AND NOT A DUPLICATE. Every generated client starts its correlation
+		// counter at zero and the transport consumes exactly the next reply, so two applications
+		// granted a duplicate of one connection would answer each other's calls. This capability
+		// joins `config`, `device` and `network` in being minted rather than copied - and the case
+		// that discriminates it is two applications holding it at once, each issuing a list and a
+		// resolve.
+		Capability::FontCatalogue => (&mut clients.font, CAP_FONT),
 		_ => {
 			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
 			return if dup >= 0 { dup as u64 } else { 0 };
@@ -1856,6 +1887,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The operator's WRITE. Optional: a boot that granted none has no operator path rather than a
 	// half-built one, and `for_capability` answering 0 refuses the grant by itself.
 	let device_policy: u64 = caps.take(CAP_DEVPOLICY);
+	// THE INSTALLED FACES, and the operator's scan held apart from them. Both optional for the same
+	// reason as the policy endpoint above: a boot that granted neither has no font path rather than
+	// a half-built one, and `for_capability` answering 0 refuses the grant by itself.
+	let font: u64 = caps.take(CAP_FONT);
+	let font_admin: u64 = caps.take(CAP_FONTADMIN);
 	let audio: u64 = caps.take(CAP_AUDIO);
 	let display_admin: u64 = caps.take(CAP_DISPLAY_ADMIN);
 	let input_admin: u64 = caps.take(CAP_INPUT_ADMIN);
@@ -1897,7 +1933,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

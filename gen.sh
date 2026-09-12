@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Regenerate the protocol bindings from the LSIDL interface definitions in src/idl.
 #
-# Sixteen packages, each generated from the WHOLE schema set and each keeping only its own - which
-# is why every invocation ends in `idl/*.lsidl` and differs only in `--rust-package` and which other
-# packages it is told to reach by name rather than regenerate. That was three Justfile recipes of
-# sixteen near-identical lines each, forty-eight lines differing in two words, and a package added
-# to one and not the others is a drift nothing would have reported.
+# A package per schema, each generated from the WHOLE schema set and each keeping only its own -
+# which is why every invocation ends in `idl/*.lsidl` and differs only in `--rust-package` and which
+# other packages it is told to reach by name rather than regenerate. That was three Justfile recipes
+# of sixteen near-identical lines each, forty-eight lines differing in two words, and a package added
+# to one and not the others is a drift nothing would have reported. The count is printed from the
+# list rather than written in the prose, for the same reason.
 #
 # The three modes are the same table with one flag changed:
 #
@@ -21,7 +22,7 @@ SCRIPT_NAME=gen.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display security session input storage)
+PACKAGES=(base audio device log network observability resources time config process display security session input storage font)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -41,18 +42,20 @@ declare -A EXTERNAL=(
 	[session]="base process"
 	[input]="base"
 	[storage]="base"
+	[font]="base"
 )
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(audio base config device display input log network observability process resources security session storage time)
+AGGREGATE_EXTERNAL=(audio base config device display font input log network observability process resources security session storage time)
 
 help() {
 	usage_and_exit <<EOF
 usage: gen.sh [--check | --accept-breaking] [--list] [--dry-run]
 
 Regenerates the protocol bindings in src/user/libs/protocol/*, the aggregate crate src/proto, and
-the ABI manifests and reference pages under docs/gen, from src/idl/*.lsidl.
+the ABI manifests and reference pages under docs/gen, from src/idl/*.lsidl - and the graphics
+profile documents under docs/gen/render2d and docs/gen/render3d, from the profiles themselves.
 
   --check             regenerate in memory and fail on Rust, docs, ABI or stale-output drift
   --accept-breaking   write, accepting an intentional pre-release ABI-manifest break
@@ -141,6 +144,20 @@ done
 args+=(--docs-dir ../../../docs/gen)
 generate "$out" "${args[@]}"
 
+# THE GRAPHICS PROFILES, WHICH ARE ALSO CODE AND ALSO WRITE UNDER docs/gen. Not LSIDL and not a
+# package above: `Render2D Core Profile 1` and `Render3D Core Profile 1` are closed enumerations in
+# `user/libs/graphics/profile`, and the table, the backend checklist, the conformance matrix and the
+# capability report are generated from them with a hash over the canonical form. They are here
+# because a reader who has just edited a profile runs the command the generated file names, and
+# every generated file under docs/gen names this one.
+profile_doc=(cargo run --quiet --offline --manifest-path tools/profile-doc/Cargo.toml --)
+[[ "$mode" == check ]] && profile_doc+=(--check)
+if ((dry_run)); then
+	printf '%s\n' "${profile_doc[*]}"
+else
+	(cd "$SRC_DIR" && "${profile_doc[@]}")
+fi
+
 # FORMAT ONLY WHAT WAS WRITTEN. `--check` writes nothing, so formatting after it would reformat
 # whatever is on disk and report that as part of a check that is supposed to change nothing.
 if [[ "$mode" != check ]]; then
@@ -155,6 +172,6 @@ if [[ "$mode" != check ]]; then
 fi
 
 case "$mode" in
-check) note "no drift: sixteen packages regenerate to what is on disk" ;;
-*) note "sixteen packages regenerated and formatted" ;;
+check) note "no drift: ${#PACKAGES[@]} packages, the aggregate and both graphics profiles regenerate to what is on disk" ;;
+*) note "${#PACKAGES[@]} packages and the aggregate regenerated and formatted, and both graphics profiles written" ;;
 esac

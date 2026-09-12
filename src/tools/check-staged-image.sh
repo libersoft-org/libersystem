@@ -65,11 +65,16 @@ check_target() {
 	local expected
 	expected="$(
 		jq -r '.libraries[] | "library-\(.name)\t\(.destination)"' <<<"$manifest_json"
-		# A QUARANTINE PROGRAM IS EXPECTED ONLY WHERE IT CAN EXIST. Its link comes from an upstream
-		# this tree does not carry, and it is staged only in the development configuration - so a
-		# shipping image is RIGHT not to have it, and requiring it here would make every shipping
-		# build report a missing artifact it must not contain.
+		# A QUARANTINE PROGRAM IS EXPECTED EXACTLY WHERE IT EXISTS. Its link comes from an upstream
+		# this tree does not carry and it is staged only in the development configuration, so a
+		# shipping image is RIGHT not to have it - and a development one that has it must still be
+		# able to verify it, which is why it is not simply excluded. Both halves matter: excluded, a
+		# staged copy would be reported as undeclared; required, every shipping build would report it
+		# missing.
 		jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .producer != "audit") | "executable-\(.name)\t\(.destination | sub("\\.lsexe$"; ""))"' <<<"$manifest_json"
+		while IFS=$'\t' read -r record relative; do
+			[[ -n "$record" && -f "$image/$relative" ]] && printf '%s\t%s\n' "$record" "$relative"
+		done < <(jq -r '.programs[] | select(.producer == "audit") | "executable-\(.name)\t\(.destination | sub("\\.lsexe$"; ""))"' <<<"$manifest_json")
 	)"
 
 	# Every staged file is hashed by one `sha256sum` invocation rather than one per file.

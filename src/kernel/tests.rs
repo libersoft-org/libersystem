@@ -4807,6 +4807,14 @@ impl StorageHarness {
 	}
 
 	fn open_directory(&mut self, path: &[u8]) -> alloc::sync::Arc<object::channel::Channel> {
+		self.open_directory_scope(path, true)
+	}
+
+	// `writable` decides whether the minted client may CHANGE anything under the directory. A
+	// read-only one admits four read operations by name and refuses everything else, which is the
+	// shape the font catalogue's least-authority claim rests on - and the shape the obvious
+	// alternative would not have given, because the file rule lets `mkdir` and `rmdir` through.
+	fn open_directory_scope(&mut self, path: &[u8], writable: bool) -> alloc::sync::Arc<object::channel::Channel> {
 		use object::channel::{Channel, Message};
 		let corr: u32 = 0xd1ec_7000;
 		let mut request = alloc::vec::Vec::new();
@@ -4814,6 +4822,7 @@ impl StorageHarness {
 		request.extend_from_slice(&corr.to_le_bytes());
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
+		request.push(u8::from(writable));
 		self.admin.send(Message::new(request, alloc::vec::Vec::new())).expect("storage directory request");
 		for _ in 0..100_000 {
 			self.pump();
@@ -4875,6 +4884,58 @@ impl StorageHarness {
 	fn open(&mut self, path: &[u8], corr: u32) -> Option<alloc::vec::Vec<u8>> {
 		let client = self.client.clone();
 		self.open_from(&client, path, corr)
+	}
+
+	// Issue ONE opcode against a scoped client and answer whether the service accepted it.
+	//
+	// THE REQUEST IS THE SHORTEST ONE THAT CARRIES A PATH, which is all a scope check reads: the
+	// opcode, the correlation, and the path. An operation refused by the scope never reaches its
+	// own decoder, so a body it would have needed is a body that does not change the answer - and
+	// one that IS accepted answers something, which is the case a least-authority claim has to fail
+	// on rather than pass over.
+	fn attempt_op(&mut self, client: &alloc::sync::Arc<object::channel::Channel>, op: u16, path: &[u8], corr: u32) -> bool {
+		use object::channel::{Channel, Message};
+		use object::handle::Capability;
+		use object::rights::Rights;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&op.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		// A WRITE STREAM CARRIES A CHANNEL, and one sent without it never reaches the scope check at
+		// all: the service requires a readable, waitable channel before it looks at the path, so a
+		// handle-less attempt tests the handle check rather than the scope. The stream end is
+		// dropped immediately - what is being measured is whether the scope let the request start.
+		let mut caps = alloc::vec::Vec::new();
+		if op == 16 {
+			// THE WHOLE REQUEST OR NONE OF IT. A write stream carries a byte count and a channel
+			// after its path, and a request short of either fails to PARSE - which answers with a
+			// correlation of zero and never reaches the scope check at all. That is what the first
+			// version of this helper measured: not whether the scope refused the stream, but whether
+			// the decoder liked the request.
+			request.extend_from_slice(&0u32.to_le_bytes());
+			let (ours, theirs) = Channel::create();
+			core::mem::drop(ours);
+			caps.push(Capability::new(theirs, Rights::ALL));
+		}
+		client.send(Message::new(request, caps)).expect("storage scoped request");
+		// SILENCE IS AN ANSWER FOR ONE OPCODE AND ONLY ONE. A write stream that is ACCEPTED gets no
+		// immediate reply - the service answers when the stream ends - so for that op "nothing came
+		// back" means admitted, and a refusal is the case that DOES reply. Every other op answers
+		// either way, so a silence there is a service that stopped rather than a decision.
+		for _ in 0..20_000 {
+			self.pump();
+			if let Ok(reply) = client.recv() {
+				if le_u32(&reply.bytes, 0) != corr {
+					continue;
+				}
+				return reply.bytes.get(4) == Some(&1);
+			}
+		}
+		if op == 16 {
+			return true;
+		}
+		panic!("StorageService did not answer opcode {op}");
 	}
 
 	fn open_from(&mut self, client: &alloc::sync::Arc<object::channel::Channel>, path: &[u8], corr: u32) -> Option<alloc::vec::Vec<u8>> {

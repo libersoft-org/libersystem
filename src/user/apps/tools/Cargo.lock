@@ -224,6 +224,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "font-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "font-proto",
+]
+
+[[package]]
+name = "font-client-provider"
+version = "0.0.0"
+dependencies = [
+ "font-proto",
+]
+
+[[package]]
+name = "font-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "gif"
 version = "0.0.0"
 dependencies = [
@@ -514,6 +538,7 @@ dependencies = [
  "config-proto",
  "device-proto",
  "display-proto",
+ "font-proto",
  "input-proto",
  "ipc-client",
  "log-proto",
@@ -728,6 +753,8 @@ dependencies = [
  "device-client",
  "device-client-provider",
  "flac",
+ "font-client",
+ "font-client-provider",
  "imgconv",
  "ipc-client",
  "keys",

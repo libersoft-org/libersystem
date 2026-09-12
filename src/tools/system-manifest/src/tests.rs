@@ -572,3 +572,35 @@ fn the_production_manifest_classifies_every_staged_driver() {
 	}
 	assert!(drivers.iter().any(|(name, _)| *name == "virtio_net"), "the network driver is staged");
 }
+
+#[test]
+// THE CANONICAL FONT DESTINATION IS ADMITTED, AND NOTHING ELSE UNDER IT IS.
+//
+// `share/fonts` is where the font catalogue reads. What may be staged there is a FACE and the
+// DECLARATION beside it, and bounding it by shape is what keeps "install another face" from becoming
+// "install anything anywhere under share" - the same rule the syntax descriptors are bounded by, and
+// checked here because a validator that admits everything is indistinguishable from no validator.
+fn the_font_destination_admits_a_face_and_its_declaration_and_nothing_else() {
+	let root = fixture_workspace();
+	fs::create_dir_all(root.join("volume/share/fonts")).unwrap();
+	let staged = |destination: &str| {
+		let source = format!("volume/{destination}");
+		format!("[[factory_files]]\nname = \"a-face\"\nkind = \"source\"\nsource = \"{source}\"\ndestination = \"{destination}\"\n")
+	};
+	for admitted in ["share/fonts/sans.ttf", "share/fonts/sans.ttf.face", "share/fonts/serif.otf", "share/fonts/family.ttc"] {
+		let text = format!("{}{}", valid_fixture(), staged(admitted));
+		fs::write(root.join(format!("volume/{admitted}")), b"x").unwrap();
+		let parsed = Manifest::parse(&text, &root);
+		assert!(parsed.is_ok(), "{admitted} is what this destination is for: {:?}", parsed.err().map(|error| error.to_string()));
+		fs::remove_file(root.join(format!("volume/{admitted}"))).unwrap();
+	}
+	for refused in ["share/fonts/notes.txt", "share/fonts/vendor/sans.ttf", "share/anything.ttf", "share/fonts/.face"] {
+		let text = format!("{}{}", valid_fixture(), staged(refused));
+		let _ = fs::create_dir_all(root.join(format!("volume/{refused}")).parent().unwrap());
+		fs::write(root.join(format!("volume/{refused}")), b"x").unwrap();
+		let error = Manifest::parse(&text, &root).unwrap_err().to_string();
+		assert!(error.contains("factory source files must be"), "{refused} must be refused, got: {error}");
+		let _ = fs::remove_file(root.join(format!("volume/{refused}")));
+	}
+	fs::remove_dir_all(root).unwrap();
+}

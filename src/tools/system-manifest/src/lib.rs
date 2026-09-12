@@ -1683,6 +1683,25 @@ fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativeP
 	}
 }
 
+// A file name the font destination admits: a FACE, or the DECLARATION for one.
+//
+// THE DECLARATION IS THE FACE'S WHOLE NAME PLUS `.face` - `sans.ttf.face` - and checking that here is
+// what makes the convention a rule rather than a habit. A stem-keyed sidecar would be one
+// declaration claiming both `sans.ttf` and `sans.otf`, and a file called `.face` declares nothing at
+// all: both are admitted by "ends with .face" and refused by this.
+fn admitted_font_file(name: &str) -> bool {
+	fn is_face(name: &str) -> bool {
+		[".ttf", ".otf", ".ttc"].iter().any(|extension| name.len() > extension.len() && name.ends_with(extension))
+	}
+	if name.contains('/') {
+		return false;
+	}
+	match name.strip_suffix(".face") {
+		Some(declared) => is_face(declared),
+		None => is_face(name),
+	}
+}
+
 fn validate_factory_file_shape(kind: FactoryFileKind, source: Option<&RelativePath>, destination: &RelativePath, location: &str, errors: &mut Vec<ValidationError>) {
 	match kind {
 		FactoryFileKind::Source => {
@@ -1700,9 +1719,22 @@ fn validate_factory_file_shape(kind: FactoryFileKind, source: Option<&RelativePa
 			// `bin/lico/syntax/*.syntax` with no deeper nesting is what keeps "install another
 			// descriptor" from becoming "install anything anywhere under bin".
 			let descriptor = destination.as_str().strip_prefix("bin/lico/syntax/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".syntax"));
-			let valid = matches!(destination.as_str(), "hello.txt" | "motd.txt" | "audio/test.mp3") || descriptor || destination.as_str().strip_prefix("wallpapers/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".webp"));
+			// THE CANONICAL FONT DESTINATION, ADMITTED HERE AND NOWHERE ELSE. `share/fonts` is where
+			// the font catalogue reads, and the only thing that may be staged into it is a FACE and
+			// the DECLARATION beside it - `sans.ttf` and `sans.ttf.face`. Bounding it to those
+			// extensions with no deeper nesting is what keeps "install another face" from becoming
+			// "install anything anywhere under share", and it is the same shape the syntax
+			// descriptors above are bounded by.
+			//
+			// THE DECLARATION IS ADMITTED AS A STAGED FILE, not derived at build time: it is a
+			// checked-in statement about the face beside it, authored in the review that added the
+			// face, because deriving family, style, axes, face index and format from OpenType bytes
+			// is PARSING and nothing may parse a font before the profile that bounds a parser is
+			// frozen.
+			let face = destination.as_str().strip_prefix("share/fonts/").is_some_and(admitted_font_file);
+			let valid = matches!(destination.as_str(), "hello.txt" | "motd.txt" | "audio/test.mp3") || descriptor || face || destination.as_str().strip_prefix("wallpapers/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".webp"));
 			if !valid {
-				push_error(errors, format!("{location}.destination"), "factory source files must be hello.txt, motd.txt, audio/test.mp3, or a wallpapers/*.webp file");
+				push_error(errors, format!("{location}.destination"), "factory source files must be hello.txt, motd.txt, audio/test.mp3, a wallpapers/*.webp file, a bin/lico/syntax/*.syntax descriptor, or a share/fonts face or .face declaration");
 			}
 		}
 		FactoryFileKind::SdkComponent => {

@@ -356,7 +356,16 @@ interface writer {
 /// below a system volume. The returned channel preserves normal `volume` operations,
 /// but rejects paths outside the granted directory and cannot mint a broader client.
 interface volume-admin {
-	@op(1) open-directory: func(path: string) -> result<handle<channel>, error>;
+	/// `writable` decides whether the minted client may CHANGE anything under that directory.
+	///
+	/// A READ-ONLY DIRECTORY IS AN ALLOWLIST AND NOT A DENIAL LIST, which is the correction that
+	/// made this flag worth having. The obvious shape - reuse the read-only FILE filter - mints a
+	/// client that can still `mkdir` and `rmdir`: that filter consults `writable` for file scopes
+	/// only, and its denial list omits both opcodes, which the op table then admits for any path
+	/// inside the scope. So a read-only directory admits exactly `open`, `list`, `read` and `watch`,
+	/// and every other opcode - including one added to `volume` later - is refused until somebody
+	/// classifies it. That is the direction a default has to fail in.
+	@op(1) open-directory: func(path: string, writable: bool) -> result<handle<channel>, error>;
 
 	/// Mint a client restricted to EXACTLY ONE PATH - not the directory it sits in, not a sibling.
 	///
