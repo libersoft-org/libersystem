@@ -1,0 +1,26 @@
+profile=graphics-layers version=1
+layer=FRAMEBUFFER owner=the loader, until the display driver takes the device what=the LEGACY LINEAR BOOT SURFACE and nothing else: what firmware hands over, described by `bootproto::Framebuffer` as a base, a pitch and six shift/size fields
+layer=SCANOUT owner=the display driver what=what the display controller is SHOWING. One per connected output, and its format is the controller's rather than an application's choice
+layer=IMAGE owner=whoever allocated it what=any 2D region of pixels with a layout and a meaning. A glyph mask, a decoded photograph, a filter intermediate and a depth buffer are all images
+layer=SURFACE owner=the application, with DisplayService holding the presentation half what=a PRESENTABLE application object: an image plus the presentation state that makes it something a compositor can show
+layer=RENDER TARGET owner=the renderer, for the duration of a frame what=an image a renderer is drawing INTO. A surface's image becomes one while a frame is being drawn and stops being one when it is presented
+edge=application->render2d carries=a `DrawList`: paths, paints, clips, layers, filters and glyph runs
+edge=application->scene3d carries=a retained hierarchy: cameras, lights, materials, culling and animation
+edge=scene3d->render3d carries=a pass graph and the resources it names
+edge=render2d->soft2d carries=the backend interface: `prepare` then `render`
+edge=render3d->soft3d carries=the same, for three dimensions
+edge=soft2d->graphics-core carries=images, colour, sampling and compositing
+edge=soft3d->graphics-core carries=the same
+edge=graphics-core->surface carries=a presentable image and its present queue
+edge=surface->DisplayService carries=presentation: what is shown, when, and with what damage
+edge=DisplayService->display driver carries=the device transport: scanout configuration and the pages it reads
+route=OpenGL and OpenGL ES through=EGL, onto a Mesa state tracker over this stack's own surfaces refused=a hand-written GL front end in this tree: a second implementation of a thirty-year-old specification is not something this project can keep correct
+route=Vulkan through=the Khronos loader and an ICD, with Venus the likely transport to a host refused=a common GL/Vulkan command language invented here, which would be a third API that neither upstream tests
+route=presentation through=DisplayService, which owns the WSI and the present queue refused=an application reaching a scanout directly
+route=the device through=the display driver, which owns the transport refused=virtqueue descriptors exposed to applications, at any layer
+boundary=the loader, over firmware's hand-off untrusted=the framebuffer base, pitch, and the six shift and size fields of a `PIXEL_BIT_MASK` mode checks=contiguous, disjoint channel masks whose ELEMENT SIZE comes from the masks rather than from an assumed thirty-two bits
+boundary=the image view constructor untrusted=a caller's extent, pitch, format and byte slice checks=a known format, a non-zero extent, a pitch at least the minimum row, and a slice at least the minimum visible bytes - all in checked arithmetic
+boundary=`render2d`'s draw-list builder untrusted=an application's paths, paints, clips, filter graphs and resource indices checks=every resource index against the list's own table, every count against the profile's ceilings, and every recursive structure against its depth bound
+boundary=the backend's `prepare` untrusted=a draw list that was built elsewhere and may have crossed a process boundary checks=the resource table again, because a list that arrived over a channel is not the list this process built - and the scratch it will need, which is refused up front rather than halfway through a filter chain
+boundary=DisplayService, over a client's surface untrusted=a surface configuration, a damage region and a presented image's identity checks=the configuration against the output's own modes, damage against the surface extent, and the image against what the client actually owns
+boundary=the display driver, over a device's replies untrusted=everything the device writes back, including lengths and resource identifiers it echoes checks=every length against the buffer it was given and every identifier against what this driver issued; a device is not trusted merely because it is a device

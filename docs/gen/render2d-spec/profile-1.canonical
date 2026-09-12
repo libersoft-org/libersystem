@@ -1,0 +1,57 @@
+profile=render2d-spec version=1
+compositing-equation=co = as*Fa*Cs + ab*Fb*Cb ; ao = as*Fa + ab*Fb, with colours premultiplied and linear
+operator=Clear fa=0 fb=0
+operator=Src fa=1 fb=0
+operator=Dst fa=0 fb=1
+operator=SrcOver fa=1 fb=1 - as
+operator=DstOver fa=1 - ab fb=1
+operator=SrcIn fa=ab fb=0
+operator=DstIn fa=0 fb=as
+operator=SrcOut fa=1 - ab fb=0
+operator=DstOut fa=0 fb=1 - as
+operator=SrcAtop fa=ab fb=1 - as
+operator=DstAtop fa=1 - ab fb=as
+operator=Xor fa=1 - ab fb=1 - as
+operator=Plus fa=1 fb=1
+blend=Normal b=Cs
+blend=Multiply b=Cb * Cs
+blend=Screen b=Cb + Cs - Cb * Cs
+blend=Overlay b=HardLight(Cs, Cb): the operands swapped
+blend=Darken b=min(Cb, Cs)
+blend=Lighten b=max(Cb, Cs)
+blend=ColorDodge b=Cb == 0 -> 0 ; Cs == 1 -> 1 ; otherwise min(1, Cb / (1 - Cs))
+blend=ColorBurn b=Cb == 1 -> 1 ; Cs == 0 -> 0 ; otherwise 1 - min(1, (1 - Cb) / Cs)
+blend=HardLight b=Cs <= 0.5 -> Multiply(Cb, 2*Cs) ; otherwise Screen(Cb, 2*Cs - 1)
+blend=SoftLight b=Cs <= 0.5 -> Cb - (1 - 2*Cs) * Cb * (1 - Cb) ; otherwise Cb + (2*Cs - 1) * (D(Cb) - Cb), where D(Cb) = Cb <= 0.25 ? ((16*Cb - 12) * Cb + 4) * Cb : sqrt(Cb)
+blend=Difference b=abs(Cb - Cs)
+blend=Exclusion b=Cb + Cs - 2 * Cb * Cs
+non-separable=Hue b=SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb))
+non-separable=Saturation b=SetLum(SetSat(Cb, Sat(Cs)), Lum(Cb))
+non-separable=Color b=SetLum(Cs, Lum(Cb))
+non-separable=Luminosity b=SetLum(Cb, Lum(Cs))
+model luminance=0.3,0.59,0.11 saturation=max(R, G, B) - min(R, G, B) set-luminance=add l - Lum(C) to every channel, then ClipColor set-saturation=order the channels; the smallest becomes 0, the largest s, the middle (Cmid - Cmin) * s / (Cmax - Cmin); if Cmax == Cmin every channel becomes 0 clip=with l = Lum(C), n = min channel and x = max channel: if n < 0, C = l + (C - l) * l / (l - n); if x > 1, C = l + (C - l) * (1 - l) / (x - l). Luminance is preserved and the chroma is reduced
+lcd filter-ninths=1,2,3,2,1 coverage-gamma=2.2
+flattening tolerance-pixels=0.25 max-depth=16 at-max-depth=the remaining segment is emitted as a line; the primitive is not refused
+projective w-epsilon=0.00000095367431640625 horizon=clip the segment against w = epsilon in homogeneous space before dividing; a segment entirely beyond it is dropped, and the primitive is refused only if nothing survives
+coincidence-epsilon-pixels=0.00390625
+boolean=how self-intersections are resolved answer=each operand is rewritten FIRST into non-self-intersecting contours under its own fill rule; operating on a self-intersecting operand makes the result depend on the algorithm's traversal order
+boolean=what an OPEN subpath means as an operand answer=it is closed with a straight segment from its last point to its first. A boolean operation is defined on REGIONS and an open subpath is not one - and refusing it would fail the commonest use, the union of two stroke outlines
+boolean=how two operands with different fill rules combine answer=each is resolved to regions under ITS OWN rule first, so the operation is on regions and the two rules never have to agree. The result is non-zero
+boolean=whether the result preserves curves or is polygonised answer=POLYGONISED at the flattening tolerance, and the profile says so: preserving curves needs exact curve-curve intersection, whose answer is approximate anyway - so the honest form is the polygon, at a tolerance the caller knows
+boolean=the tolerance used answer=the one flattening tolerance, with points within a coincidence epsilon of each other treated as one
+boolean=the canonical ordering and winding of the output contours answer=contours sorted by their bounding box's minimum y then minimum x then their first point; an outer contour is wound so its signed area is POSITIVE in the device's y-down space and a hole negative
+boolean=what happens to degenerate and zero-length edges answer=dropped before the operation. A contour left with fewer than three distinct points contributes nothing, and a result with no contours is an EMPTY path rather than a refusal
+boolean=determinism answer=the output is a function of the input bytes and the tolerance alone: no reduction whose order depends on threading, and no iteration over a container whose order is not stated
+prepared-dependency=profile version and hash why=a list prepared against a different profile may contain a command this one does not have, or the same command with a different meaning
+prepared-dependency=backend identity and version why=the scratch layout and the prepared form are the backend's own; another backend's bytes are not a prepared list, they are bytes
+prepared-dependency=target format why=quantisation, dithering and the final conversion are all chosen for the target's own format
+prepared-dependency=target colour space why=every paint was converted into the target's space during preparation
+prepared-dependency=physical extent and scale why=curves were flattened in DEVICE space, so a different scale is a different flattening
+prepared-dependency=immutable resource identity and layout generation why=a replaced path, gradient or immutable image is a different drawing under the same index
+prepared-dependency=glyph-cache generation why=a rasterised glyph the list refers to may have been evicted or re-rasterised at another size
+prepared-dependency=filter parameters why=a filter's radius decides the scratch reserved for it, which was reserved during preparation
+prepared on-mismatch=a typed re-prepare requirement naming the dependency that changed content-refresh=a new frame in a mutable image refreshes that image's upload and sampling cache alone; paths are not re-flattened, scratch is not re-reserved, and the prepared list stays valid
+builder within=no allocation beyond=a typed limit or reservation outcome, returned before any replay begins snapshots=one mutated or replaced at a time; a live prepared snapshot retains its own resources scratch=reuse the reservation when it suffices; report the larger requirement explicitly when it does not
+filter shape=a directed acyclic graph; a cycle is refused during preparation bounds=each node maps an output rectangle to the input rectangle it needs, and produces no pixel outside its declared output working=the canonical premultiplied linear intermediate, for every node edge=transparent black, unless the node states another and the graph records which scratch=computed for the whole graph during preparation, and refused up front
+minima commands=65536 resources=4096 path-verbs=65536 path-points=262144 subpaths=8192 clip-depth=32 layer-depth=16 filter-nodes=64 filter-radius=256 glyphs-per-run=4096 image-extent=16384 layer-pixels=67108864 prepared-scratch=67108864 cache=268435456 display-list=33554432
+features=110

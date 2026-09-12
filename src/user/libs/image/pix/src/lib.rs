@@ -4,6 +4,12 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use graphics_core::composite::{BlendMode, Operator, composite};
+use graphics_core::format::{PackedChannel, PackedRgbLayout};
+use graphics_core::pixel::{Decoder, Rgba as Colour, Working, quantise, write_packed};
+use graphics_core::semantics::ImageSemantics;
+use graphics_core::{AlphaMode, ColorSpace};
+
 #[cfg(test)]
 extern crate std;
 
@@ -190,19 +196,30 @@ impl Compositor {
 	}
 }
 
+/// Source-over, through the ONE compositing implementation.
+///
+/// THE WORKING SPACE IS STATED AND NOT ASSUMED. This blends ENCODED sRGB bytes with STRAIGHT alpha,
+/// which is what an animated image's frames are and what this crate has always done - it is cheap,
+/// it is wrong in the darks, and for a decoder handing frames to a viewer it is the answer the format
+/// itself specifies. Saying so is what stops it being the silent default in a compositor that needs
+/// light instead; the same function, told `LinearPremultiplied`, is what `soft2d` composites with.
 fn blend_over(destination: &mut [u8], source: [u8; 4]) {
-	let source_alpha = source[3] as u32;
-	let destination_alpha = destination[3] as u32;
-	let out_alpha = source_alpha + (destination_alpha * (255 - source_alpha) + 127) / 255;
-	if out_alpha == 0 {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
+	let Ok(decoder) = Decoder::new(&semantics, Working::EncodedStraight(ColorSpace::Srgb)) else { return };
+	// THE DECODER IS WHAT APPLIES THE WORKING SPACE. Told `EncodedStraight` it premultiplies and
+	// leaves the transfer function alone, which is this crate's contract; told `LinearPremultiplied`
+	// the same function decodes to light, which is what a compositor wants. Neither is written here.
+	let bytes_to_colour = |bytes: [u8; 4]| decoder.decode(Colour::new(bytes[0] as f32 / 255.0, bytes[1] as f32 / 255.0, bytes[2] as f32 / 255.0, bytes[3] as f32 / 255.0));
+	let backdrop = bytes_to_colour([destination[0], destination[1], destination[2], destination[3]]);
+	let result = composite(Operator::SrcOver, BlendMode::Normal, bytes_to_colour(source), backdrop);
+	if result.alpha <= 0.0 {
 		destination.fill(0);
 		return;
 	}
-	for channel in 0..3 {
-		let numerator = source[channel] as u32 * source_alpha * 255 + destination[channel] as u32 * destination_alpha * (255 - source_alpha);
-		destination[channel] = ((numerator + out_alpha * 127) / (out_alpha * 255)) as u8;
+	for (index, channel) in [result.red, result.green, result.blue].into_iter().enumerate() {
+		destination[index] = quantise(channel / result.alpha, 255.0) as u8;
 	}
-	destination[3] = out_alpha as u8;
+	destination[3] = quantise(result.alpha, 255.0) as u8;
 }
 
 fn validate_geometry(width: u32, height: u32) -> Result<(), Error> {
@@ -388,24 +405,30 @@ fn validate(source: &Image<'_>, target: &Target<'_>, damage: Rect) -> Option<()>
 	Some(())
 }
 
+/// One pixel into a firmware-described packed layout, through the ONE packer.
+///
+/// A LITERAL 32 HERE ONCE GAVE A DIAGONAL SMEAR, which is what a private packer in every consumer
+/// eventually produces: the element size, the shifts and the widths have to come from the layout the
+/// firmware described, and there is one implementation of that arithmetic in `graphics-core`.
 fn write_pixel(target: &mut Target<'_>, x: u32, y: u32, bgrx: u32) {
-	let red = (bgrx >> 16) & 0xff;
-	let green = (bgrx >> 8) & 0xff;
-	let blue = bgrx & 0xff;
-	let packed = scale_channel(red, target.red_size) << target.red_shift | scale_channel(green, target.green_size) << target.green_shift | scale_channel(blue, target.blue_size) << target.blue_shift;
+	let layout = packed_layout(target);
 	let offset = y as usize * target.pitch as usize + x as usize * target.bytes_per_pixel as usize;
-	for byte in 0..target.bytes_per_pixel as usize {
-		target.data[offset + byte] = (packed >> (byte * 8)) as u8;
-	}
+	let width = target.bytes_per_pixel as usize;
+	let Some(pixel) = target.data.get_mut(offset..offset + width) else { return };
+	let value = Colour::new(((bgrx >> 16) & 0xff) as f32 / 255.0, ((bgrx >> 8) & 0xff) as f32 / 255.0, (bgrx & 0xff) as f32 / 255.0, 1.0);
+	write_packed(layout, pixel, value);
 }
 
-fn scale_channel(value: u32, bits: u8) -> u32 {
-	if bits == 0 {
-		0
-	} else if bits >= 8 {
-		value
-	} else {
-		value >> (8 - bits)
+/// This target's channel masks, as the shared model describes them.
+fn packed_layout(target: &Target<'_>) -> PackedRgbLayout {
+	PackedRgbLayout {
+		bytes_per_pixel: target.bytes_per_pixel.min(8) as u8,
+		red: PackedChannel { shift: target.red_shift, bits: target.red_size },
+		green: PackedChannel { shift: target.green_shift, bits: target.green_size },
+		blue: PackedChannel { shift: target.blue_shift, bits: target.blue_size },
+		// THE RESERVED BITS ARE NOT THIS BLITTER'S TO SET. A scanout target's unused lane is written
+		// by whoever owns the format; here the three channels are the whole contract.
+		reserved: PackedChannel { shift: 0, bits: 0 },
 	}
 }
 

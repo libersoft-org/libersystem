@@ -1,0 +1,15 @@
+[package]
+name = "render2d"
+edition = "2024"
+description = "The 2D drawing API: a Canvas that records a bounded, validated, immutable DrawList, and the backend interface that replays it"
+
+[dependencies]
+# The image model every layer shares, and the frozen profile it implements.
+graphics-core = { path = "../core" }
+graphics-profile = { path = "../profile" }
+# The frozen glyph-run seam. Text enters this API as a run and never as a string: a drawing API that
+# took a string would be a text layout engine with a rasteriser attached.
+font-contract = { path = "../../text/font-contract" }
+
+[lints.rust]
+warnings = "deny"

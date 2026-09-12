@@ -1,0 +1,15 @@
+[package]
+name = "graphics-core"
+edition = "2024"
+description = "The canonical image model: layouts, views, owned images, formats, colour spaces and the two coordinate spaces"
+
+[dependencies]
+# THE FROZEN REGISTRY THIS IMPLEMENTS. Every format, colour constant and byte-span rule comes from
+# there rather than being restated here - a second copy of a matrix is a second answer.
+graphics-profile = { path = "../profile" }
+# The transcendentals the transfer functions need. `core` has none, and a hand-rolled `powf` in a
+# colour pipeline is a different colour pipeline.
+libm = "0.2"
+
+[lints.rust]
+warnings = "deny"

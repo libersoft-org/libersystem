@@ -1,0 +1,15 @@
+[package]
+name = "soft2d-bench"
+edition = "2024"
+description = "The headless soft2d performance floor: four frozen scenes recorded once and replayed into an OwnedImage"
+
+[dependencies]
+graphics-core = { path = "../../user/libs/graphics/core" }
+graphics-profile = { path = "../../user/libs/graphics/profile" }
+render2d = { path = "../../user/libs/graphics/render2d" }
+soft2d = { path = "../../user/libs/graphics/soft2d" }
+font-contract = { path = "../../user/libs/text/font-contract" }
+
+# A WARNING IS AN ERROR HERE, as everywhere in this tree.
+[lints.rust]
+warnings = "deny"

@@ -158,3 +158,505 @@ stands in for them today - a clean tree proves nothing about a scan that has sto
 The remaining fifteen items of `P02M0103b` - stroke scaling under a transform, the `render2d`
 library itself, `Canvas`, `DrawList`, the resource table, validation, damage, caching and the rest.
 The profile is what they are all measured against and it exists now; none of them is started.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T18:08:42Z):
+
+`IMAGE_COLOR_PROFILE_1.md`: THE FIRST OF THE NORMATIVE DOCUMENTS, AND IT IS GENERATED.
+
+WHY GENERATED AND NOT WRITTEN
+
+This document carries the matrices, the transfer constants and the rounding rules that decide whether
+two implementations produce the same pixels. That makes it the worst thing in this tree to let drift
+from the code, and a hand-written normative document drifts the first time somebody changes a
+constant without opening it. So the REGISTRY is the source, the document is written from it, and a
+SHA-256 over the canonical form makes a change to any value a line in a diff. It is written to
+`docs/graphics/` rather than `docs/gen/` because other documents cite it by name and a citation into
+a generated directory reads as a build artefact; its banner says where it comes from.
+
+WHAT IS FROZEN
+
+  - THE TWELVE STORAGE FORMATS, with channel order defined by the format NAME and never by host
+    endianness, their widths, encoding and byte count - and the canonical intermediate NAMED:
+    premultiplied linear `R16G16B16A16_FLOAT` for every layer, filter intermediate and offscreen
+    composite. Repeated compositing through eight-bit sRGB bands, and a blur over an eight-bit
+    intermediate is where it shows first.
+  - THE ALPHA MODES EACH FORMAT ADMITS, and they FALL OUT of what its channels are rather than being
+    listed per format and getting out of step. An `X8` format is opaque only; an ALPHA-ONLY format
+    admits `straight` alone, because premultiplication is a relation between colour and alpha and
+    there is no colour to have been multiplied. I had it as two booleans first and the alpha-only
+    case came out wrong; it is one enumeration now and the modes are derived.
+  - THE SIX IMAGE SEMANTICS AND THE OPERATIONS EACH ADMITS. A colour-managed pipeline that cannot
+    tell a colour from a measurement will transform the measurement, and the artefact looks like a
+    lighting bug. Filtering an IDENTITY image averages two object ids into a third that names a
+    different object, and the bug that follows is a click landing on the wrong thing.
+  - THREE PRIMARY SETS AND EIGHT COLOUR SPACES; sRGB WITH ITS LINEAR SEGMENT, which is the part that
+    gets dropped - a 2.2 power law is close enough to look right and wrong enough that two
+    implementations disagree in the darks, which is where banding lives.
+  - PQ'S CONSTANTS AS THE TWELVE-BIT FRACTIONS THE STANDARD STATES, not as rounded decimals. HLG's
+    three, with `b` and `c` written out beside their derivations from `a`.
+  - BRADFORD AND ITS INVERSE, named and written down, because "adapts between white points" is
+    satisfied by three different matrices in common use and they do not agree.
+  - DIFFUSE WHITE AT 203 cd/m²; EXTENDED REINHARD ON LUMINANCE as the one tone-mapping operator, with
+    its single parameter - chosen over a filmic curve because it has one parameter, is exactly
+    reproducible, and is defined on luminance so it does not shift hue, where a filmic curve is
+    prettier and is five constants two implementations copy from different sources; and
+    HUE-PRESERVING DESATURATION BY BISECTION in a FIXED sixteen steps as the gamut-mapping rule,
+    because clipping each channel shifts hue most on exactly the saturated colours a wide-gamut image
+    was made for, and a fixed step count is what makes two implementations agree rather than "until
+    it converges".
+  - THE BAYER 8x8 DITHER MATRIX, with its phase anchored to the TARGET's origin. Error diffusion
+    carries state ACROSS pixels, which makes a tile-parallel renderer's output depend on how it
+    decomposed the image - not merely vague here but incompatible with the architecture - and a
+    tile-relative phase makes the pattern restart at every tile boundary, which is the artefact that
+    looks like a seam.
+  - THE ROUNDING AT EVERY BOUNDARY: clamp-then-round-half-away-from-zero into an integer channel,
+    NaN to zero, infinity clamped, round-to-nearest-ties-to-even into a half, subnormals PRESERVED,
+    one canonical quiet NaN, and reserved bits ignored on read and written all-set so a producer
+    cannot leak stale bytes.
+  - THE THREE YUV LAYOUTS with plane order, PER-PLANE PITCH, bit placement - P010's ten bits are the
+    HIGH ten of a little-endian word, which is the half a reader assumes is the low ten - the
+    odd-extent rule, the three matrices, both ranges at both depths, chroma siting and
+    reconstruction; and THE ORDER OF OPERATIONS, which is the part an RGB recipe gets wrong: the
+    matrix produces ENCODED RGB, and only then does transfer decoding happen. Applying an RGB
+    sampling recipe to YUV bytes decodes the transfer function of a signal that is not yet a colour.
+  - ALLOCATION AND PADDING, the HDR metadata each transfer function needs, and the THREE BYTE SPANS,
+    which are three different numbers: confusing them is how a buffer is accepted that cannot hold
+    the image, or how one that is exactly big enough is refused.
+
+THE FIXTURES CHECK THE VALUES, NOT THEIR PRESENCE
+
+That is the difference that matters for a transcribed constant. sRGB's two segments must MEET at
+their thresholds; PQ's `c1 = c3 - c2 + 1` identity must hold; HLG's `b` and `c` must be the
+derivations of `a`; the Bradford pair must actually multiply to the identity; the dither matrix must
+be a permutation of its own range; the ten-bit YUV ranges must be the eight-bit ones scaled rather
+than re-derived; and the YUV order must place the matrix before the transfer function. Each of those
+catches a paste from the wrong source, which is how these numbers actually go wrong.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p graphics-profile`: 15 passed, 0 failed - 6 of them new.
+`./src/tools/check-graphics-profile.sh`: passes, regenerating and comparing every profile document
+including this one. `cargo clippy -D warnings` over the profile crate: clean, after a first version
+of one fixture turned out to be a vacuous assertion over a constant and was rewritten to check the
+colour-space list instead. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep. This is an enumeration crate with no
+architecture-specific code.
+
+WHAT `s-common` STILL NEEDS
+
+`docs/GRAPHICS.md`, the other half of this freeze point. `s-common` releases `a-common`, which
+releases `b`, which releases `c` - soft2d - so this is the first of four documents on the path the
+text milestone's guest gate is waiting for.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T18:19:44Z):
+
+`docs/GRAPHICS.md`, AND THE CORRECTION TO THE THREE BYTE SPANS.
+
+THE NAMING DECISION, WHICH IS WHAT THIS DOCUMENT IS FOR
+
+`framebuffer` meant five things in this tree: the UEFI boot surface in `bootproto`, the virtio-gpu
+resource's DMA backing, the DisplayService scanout, an application's surface, and `pix::Target`. A
+word that means five things is one every conversation has to disambiguate and every interface
+eventually gets wrong - and the way it gets wrong is that somebody passes one of the five where
+another was meant, which type-checks whenever both are a pointer and a length.
+
+Each has its own name now, and `FRAMEBUFFER` is the NARROW one: the legacy linear boot surface and
+nothing else. It was the word that meant everything.
+
+GENERATED, FOR THE SAME REASON AS THE COLOUR PROFILE
+
+A naming decision written in prose drifts the first time somebody adds a sixth meaning. The five
+names, the ten ownership edges, the four integration routes and the six validation boundaries are a
+registry; the document is written from it, with a SHA-256 over its canonical form.
+
+THE OWNERSHIP IS AN ENUMERATION RATHER THAN A DIAGRAM. A diagram is checked by whoever reads it; a
+list of edges is checked by a fixture, which holds the graph acyclic - a cycle is the failure that
+turns a stack into a knot, and it is the one a picture never shows. Every edge states what CROSSES
+it, because an edge with no payload is a dependency nobody has thought about.
+
+THE ROUTES ARE FROZEN BEFORE ANY OF THEM EXISTS, because a provisional `gl*` or `vk*` API introduced
+to draw a demo is the API the tree then has. Each names what it REFUSES, since the absence is the
+decision, and the two the plan names by name - a common GL/Vulkan command language invented here, and
+virtqueue descriptors reaching applications - are refused in the registry where a fixture can see
+them rather than in a sentence.
+
+THE BOUNDARIES ARE WHERE UNTRUSTED INPUT IS VALIDATED, and the point of naming one is that the layer
+below may then ASSUME. A stack where every layer re-checks is one where the check that matters is the
+one nobody wrote because everybody assumed somebody else had; a stack where none does is the other
+failure. Six of them, including the one a driver is most likely to skip: what a DEVICE writes back is
+untrusted input too, and a reply is not trustworthy because it came from hardware.
+
+THE CORRECTION
+
+The image and colour profile I published earlier today froze the wrong THREE BYTE SPANS: the minimum
+row, the pitch and the visible bytes. Reading `a-common` for this item showed the three it names are
+`minimum_visible_bytes`, `backend_access_span` and `allocation_len` - three different QUESTIONS
+about one image rather than three sizes:
+
+  - what a borrowed CPU view needs, which EXCLUDES the final row's padding, so a legal final row with
+    no padding after it is accepted and a validator demanding `pitch * height` refuses buffers that
+    are exactly big enough;
+  - what the selected display or DMA backend may touch, which INCLUDES that padding where a scanout
+    engine fetching whole rows reads it, and which a presentable or DMA image must OWN;
+  - what the allocation actually is, which is a fact about memory and not a second answer to "how big
+    is the image".
+
+An implementation that stores one number answers all three with it and is wrong about two. The row
+quantities are stated beside them as what the spans are computed FROM. My own fixture had not caught
+it because it only checked that the three differed from each other, which they did.
+
+AND THE FIVE FREEZE REQUIREMENTS
+
+Reading the per-part Done clause also showed two of the five were not met by the colour profile as
+first written. Added: the GUARANTEED MINIMA - a profile with no minima promises nothing, because
+"supports large images" is satisfied by an implementation that refuses at 513 pixels and an
+application written against it discovers the real limit in front of a user - and the CONFORMANCE
+TOLERANCES, so "passes conformance" has a boundary rather than a judgement. The dither's tolerance is
+EXACT, because its matrix and its phase are both stated: two implementations that disagree by
+anything disagree about the rule rather than about arithmetic. The initialisation contract went in
+with them, where the uninitialised case is a DISCLOSURE rather than an aesthetic problem.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p graphics-profile`: 22 passed, 0 failed - 7 more than this morning. The new ones hold
+the five names distinct, the ownership graph acyclic in both the two-node and the long-path sense,
+every route to naming its refusal, every boundary to naming what it checks, the pitch minimum to
+actually reaching the extent minimum at the widest format (or the two minima contradict each other
+and an application obeying both is still refused), and the dither tolerance to being the one exact
+comparison.
+
+`./src/tools/check-graphics-profile.sh` passes, regenerating and comparing every profile document.
+`cargo clippy -D warnings`: clean, after two assertions over pairs of constants were moved into
+`const` blocks - a runtime assertion over two literals is a test that cannot fail at a moment when
+it could still matter. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+`s-common` NOW HAS BOTH ITS DOCUMENTS, its registry, its gate, its minima and its tolerances. It
+releases `a-common`, which releases `b`, which releases `c` - soft2d - which is what the text
+milestone's guest gate is waiting for.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T18:29:04Z):
+
+`RENDER2D_PROFILE_1.md`: THE HALF A FEATURE LIST CANNOT CARRY.
+
+THE LIST WAS ALREADY THERE
+
+`docs/gen/render2d/profile-1.md` names every entry the profile carries. Two implementations can
+agree on that list entirely and produce different pixels from the same draw list, because a name does
+not say what `ColorBurn` does at zero, what `SoftLight` does below a quarter, what a boolean union
+does with an open subpath, or how far a curve may deviate from its flattening. This document is those
+answers, generated from three registries.
+
+WHAT IS FROZEN
+
+  - THIRTEEN COMPOSITING OPERATORS, each as its `Fa`/`Fb` pair under one equation. The factors ARE
+    the operator, which makes them checkable against one another rather than thirteen paragraphs -
+    and a fixture holds every pair distinct, because two operators with the same factors are one
+    operator under two names. `Plus` is not among Porter and Duff's twelve and is there anyway:
+    additive light is what a glow and an emissive overlay are, and an implementation without it grows
+    a private one.
+  - TWELVE SEPARABLE BLEND MODES. The two with a division state their ENDPOINTS rather than leaving
+    them to whatever the division produces, and `SoftLight`'s `D(Cb)` is a piecewise function of the
+    BACKDROP with its threshold on the backdrop - the part that is got wrong.
+  - FOUR NON-SEPARABLE MODES WITH THEIR WHOLE COLOUR MODEL: `Lum`, `Sat`, `SetLum`, `SetSat` and
+    `ClipColor`. The clip is the step the mode's name does not imply, and it PRESERVES LUMINANCE
+    while reducing chroma rather than clamping each channel - which is what every implementation that
+    omits it gets wrong on saturated colours. `Lum`'s coefficients are the compositing
+    specification's own fixed triple and stay fixed in every colour space: using the destination's
+    luminance would make `Luminosity` give a different result for the same two colours depending on
+    which space they were tagged with, and the mode is defined on the numbers rather than on the
+    light.
+  - THE GEOMETRY NUMBERS. A quarter of a PHYSICAL pixel, because flattening in logical pixels makes a
+    curve twice as coarse on a two-times display - facets on exactly the screens that show them best.
+    A maximum depth of sixteen with a stated outcome that is NOT a refusal, because a legal drawing
+    must not fail for a reason nobody can act on. A projective `w` epsilon, with the horizon clipped
+    in homogeneous space BEFORE the divide: dividing first produces a vertex at ten million pixels and
+    a rasteriser that spends a second on one triangle. And a point-coincidence epsilon that is a
+    SEPARATE, smaller number, because merging vertices a quarter of a pixel apart collapses thin
+    features that were meant to be there.
+  - ALL EIGHT BOOLEAN ANSWERS. The result is POLYGONISED and the document says so: preserving curves
+    needs exact curve-curve intersection, whose answer is approximate anyway, so the honest form is
+    the polygon at a tolerance the caller knows.
+  - THE LCD NUMBERS the word "LCD" does not carry: the five-tap FIR, and the gamma coverage is blended
+    through. Blending it linearly makes light-on-dark text look bolder than dark-on-light at the same
+    weight, which is the artefact reported as "the font renders too thin" - a gamma question rather
+    than a font question.
+  - THE CONTRACTS A RECORDING API HAS THAT A DRAWING API DOES NOT. Eight prepared-list dependencies,
+    each with the reason a change invalidates it, so `is_compatible` is a list rather than a
+    judgement and a test can change one ALONE. A mismatch as a TYPED requirement and never a silent
+    re-prepare, because a caller getting a full preparation sixty times a second has a performance bug
+    it cannot see. CONTENT IS NOT STRUCTURE, so a new video frame refreshes one cache and re-flattens
+    nothing. The reusable builder allocating nothing within its reservation and refusing BEFORE any
+    replay begins, because a list that half-drew and then refused has already put pixels on screen.
+    And the per-node filter contract, whose bounds map is the whole reason a blur over a small dirty
+    region does not cost a full-screen blur.
+  - THE GUARANTEED MINIMA, which already existed in `Render2DLimits` and are now published in the
+    document that promises them.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p graphics-profile`: 28 passed, 0 failed - 6 more, each checking a VALUE rather than a
+presence: every operator pair distinct and the four that define the rest exactly right; `ColorDodge`
+and `ColorBurn` stating their endpoints and `SoftLight`'s threshold being on the backdrop; the
+luminance coefficients summing to one and the clip preserving luminance; the coincidence epsilon
+strictly below the flattening tolerance; every one of the plan's eight boolean questions having an
+answer, and no answer short enough to be a restatement; and every prepared-list dependency the plan
+names being present with a reason.
+
+`./src/tools/check-graphics-profile.sh` passes: 13 operators, 12 separable and 4 non-separable blend
+modes, 8 boolean answers and 8 prepared dependencies, hashed, and every generated document matching.
+`cargo clippy -D warnings`: clean, after four more assertions over pairs of constants were moved into
+`const` blocks. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHERE THIS SITS
+
+`s-2d` releases `b`, and `b` releases `c` - soft2d. `s-common` and `s-2d` now both have their
+documents, their registries and their gate. The remaining specification on that path is none: the
+next work is `a-common`, the code the two freezes release.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T18:47:18Z):
+
+`graphics-core`: THE CANONICAL IMAGE MODEL.
+
+NINE ITEMS, ONE CRATE
+
+The plan lists the image model, the two coordinate spaces, the format set, the alpha rules, the
+colour model, the semantics, the borrowed views, owned images and their zeroing as nine items. They
+are one crate, because a layout without a format set, an alpha rule, a colour model and a meaning is
+a struct nobody can validate - the constructor that makes the type worth having needs all of them.
+
+THE PROFILE IS THE LIST AND THE CRATE IS THE CODE
+
+Neither restates the other. Every format name, byte count, alpha rule, colour constant, byte-span
+definition and operation table comes from `graphics-profile`'s frozen registry, and a fixture holds
+the enumeration and the registry to describing the same twelve formats IN THE SAME ORDER with the
+same widths and the same alpha rules. A second copy of a list is a second answer, and the second
+answer is the one that is out of date.
+
+THE THREE SPANS, IMPLEMENTED AS THREE
+
+  - `minimum_visible_bytes` EXCLUDES the final row's padding. A buffer that is exactly big enough for
+    the image it holds is accepted; a validator demanding `pitch * height` refuses it, and that is
+    the ordinary case for a tightly packed last row.
+  - `backend_access_span` takes whether the backend reads that padding as an ARGUMENT rather than
+    assuming. Assuming it always does makes every presentable image own bytes it does not need;
+    assuming it never does is the out-of-bounds read.
+  - `OwnedImage` allocates the backend span, because an allocation one row-padding short is an
+    out-of-bounds read BY HARDWARE - which no bounds check in this process can catch.
+
+TWO COORDINATE SPACES, TWO TYPES
+
+The drawing space is `f32` and SIGNED: an unsigned parameter makes "half a pixel to the left of the
+origin" unrepresentable, and geometry has to clip off the left edge as naturally as off the right.
+The pixel space is what damage, a scissor, a surface extent and everything on the wire is in. Both
+HALF-OPEN, so adjacent rectangles tile - a closed rectangle is why two adjacent damage regions redraw
+a shared column twice, which is invisible until it flickers.
+
+A NaN EXTENT IS EMPTY, and saying so needs the comparison written out rather than a plain `<= 0.0`:
+every comparison with NaN is false, so the plain form answers "not empty" for a rectangle nobody can
+place, and the rectangle is then drawn. Clippy pushed back on the negated comparison, which was the
+right prompt to write the reason down rather than the right prompt to change the behaviour.
+
+THE COLOUR MATRICES ARE DERIVED AND NOT TABULATED
+
+A tabulated matrix is a fourth place the primaries live and the first one somebody updates without
+the others. The derivation is arithmetic over the chromaticities the profile already froze, and the
+fixture checks it by the property every correct derivation has - THE PRIMARIES MUST REPRODUCE THEIR
+OWN WHITE POINT - and by a round trip, which is what catches a TRANSPOSED matrix, since a
+transposition is still invertible and passes every other check.
+
+Bradford adaptation is skipped when the white points match, and that is not an optimisation: every
+space in the profile is D65, so the common case would otherwise pay a matrix pair that changes
+nothing except in the last bits. `libm` supplies the transcendentals; `core` has none, and a
+hand-rolled `powf` in a colour pipeline is a different colour pipeline.
+
+WHAT THE CONSTRUCTORS REPLACE
+
+An application computing a length and building an aliasing mutable slice out of a raw pointer -
+`from_raw_parts_mut(surface.addr() as *mut u8, target_len)` - which is unsound whenever the length is
+wrong and is exactly as easy to write when it is. A view that cannot be constructed from a short
+buffer cannot be used over one.
+
+AND AN OWNED IMAGE IS ZEROED, WHICH IS A SECURITY PROPERTY
+
+A buffer recycled between Domains holds whatever the last one put in it. An image whose bytes were
+never written shows that, and the bug reads as a flicker rather than as a disclosure - so it is not
+reported. Export ZEROES the padding rather than trusting it to have stayed zero, because a drawing
+routine that wrote a whole pitch is not a bug and its padding is still not content; two exports of one
+image are then the same bytes, which is what makes it hashable and a golden comparison meaningful.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p graphics-core`: 9 passed, 0 failed, over the enumeration-against-registry check, the
+three spans as three numbers with a buffer of exactly the visible bytes accepted and one byte fewer
+refused, every way a layout has been wrong, a 5:6:5 firmware mode accepted and an overlapping one
+refused, the operation table keyed by meaning, a zeroed allocation that owns the backend span, both
+coordinate spaces half-open with a signed origin, the colour matrices against their white points and
+their round trip, and every transfer function through its own inverse at sixty-five points.
+
+A FIXTURE OF MINE WAS WRONG AND THE CODE WAS RIGHT: I asserted that Display P3's green is outside Rec.
+2020, and it is the other way round - P3 is a SUBSET. The fixture now checks both directions, which
+is the stronger statement.
+
+`cargo clippy -D warnings`: clean. `verify-model`: 157 passed, with the crate in the
+release-required host list and discovered by `host-suites` - 92 runnable suites. `./build.sh --part
+user` for x86_64: built. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHERE THIS SITS
+
+`a-common` was 23 items and is now 13. What remains there is the multi-plane model, converging and
+migrating `pix`, and the surface, present-queue, timing, damage and completion work that belongs with
+the WSI. `b` - `render2d` itself - is what `c`, soft2d, is waiting for.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T19:04:14Z):
+
+`render2d`: THE DRAWING API, AND THE BOUNDARY A GPU BACKEND LATER ARRIVES AT.
+
+TWELVE ITEMS, ONE CRATE
+
+A canvas without paints, paths, layers, filters, glyph runs, a list, a prepared key and an error type
+is a struct with no calls on it. They went in together.
+
+WHAT A CANVAS PRODUCES IS A LIST AND NOT PIXELS
+
+That indirection is the design, and it pays for itself before the GPU backend it was also chosen for
+exists: the same list is cacheable per component, analysable for damage, replayable, and TESTABLE
+WITHOUT ANY BACKEND AT ALL. Every fixture in this crate is a host test for that reason.
+
+THE DECISIONS, AND WHY EACH IS THE WAY IT IS
+
+  - THE STATE AT THE TIME OF THE CALL IS RECORDED WITH IT. A list whose commands referred to a
+    mutable state object would draw differently depending on when it was replayed.
+  - `restore` WITHOUT A `save` IS AN ERROR AND NOT A NO-OP. Treating it as one is how a component
+    that restores once too often silently inherits its parent's clip - and the drawing that results
+    is wrong somewhere else, in a component that did nothing. An UNCLOSED LAYER is refused rather
+    than replayed, because its contents went into an offscreen nothing composites: a drawing that is
+    simply missing, with nothing to say why.
+  - DEDUPLICATION IS NOT AN OPTIMISATION. A component drawing one rounded rectangle forty times
+    records it once, which is what keeps the resource ceiling meaningful - a list storing forty
+    copies would exceed it for a drawing that has one shape in it.
+  - STROKE SCALING IS A CHOICE AND BOTH ARMS ARE WANTED. A shape scaled up should usually get a
+    thicker outline; a hairline, a selection rectangle and a diagram's grid should stay one pixel at
+    any zoom. An API with only the first makes the second a caller dividing by its own zoom, which is
+    wrong under rotation and meaningless under perspective.
+  - THE TRANSFORM IS PROJECTIVE, because the affine version is the one that has to be replaced later.
+    A point at or beyond the horizon has NO image and answers `None`: dividing by a `w` near zero
+    produces a vertex at ten million pixels and a rasteriser that spends a second on one triangle. A
+    rotated rectangle's bounds take all FOUR corners, because a bound from two is smaller than the
+    drawing - which is how a damage rectangle comes to clip the thing it was computed for.
+  - A PATH ANSWERS A HIT TEST, under both fill rules, flattened at the profile's ONE tolerance. That
+    is why a point can never be inside for a hit test and outside for the fill that drew it, and an
+    application that cannot ask implements its own geometry. Tight bounds are separate from loose
+    ones because a control point is often well outside the curve, and a layer sized by the loose
+    bound allocates a bigger offscreen every frame.
+  - A FILTER GRAPH IS ACYCLIC BY CONSTRUCTION - a node may only read nodes before it - rather than by
+    a check a later edit can defeat. Its bounds map runs BACKWARDS from the output, which is the
+    direction the question runs.
+  - EVERY HANDLE IS TYPED. A single integer index shared by paths, images, fonts and filters is an
+    index a validator cannot check: index seven is a valid path and a valid image, and the drawing
+    that confused them still replays.
+  - THE ERROR TYPE DISTINGUISHES WHOSE FAULT IT IS. An out-of-range handle is a defect in the
+    recorder; a limit exceeded is a drawing that has to be split or simplified, with the ceiling
+    NAMED so the caller knows which way; an unbalanced save is a control-flow bug three functions
+    away. A single "invalid" would leave every one of them to be found by reading drawing code.
+
+THE CANONICAL ENCODING, AND THE CONTENT-VERSUS-STRUCTURE RULE
+
+A cache key is a hash of bytes, so the list has a byte form whether or not anything sends it
+anywhere - and it is explicitly NOT a wire ABI: not stable across releases, not endian-defined, not
+rights-bearing, not safe to accept from another process. A fixture requires every field the encoding
+carries to CHANGE the digest, because a field the encoding loses is a field a cache HIT loses.
+
+The content generation is in the ENCODING and not in the PREPARED KEY, and that difference is the
+whole rule: two frames of a video are different DRAWINGS, so they must not share a cached raster, and
+they are the same STRUCTURE, so the prepared list stays valid. A fixture checks both halves at once.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test -p render2d`: 12 passed, 0 failed, all without a backend - recording, deduplication, the
+save stack in both directions, the unclosed layer, an unknown handle refused by name, a ceiling
+refused while building, the acyclic graph and its backwards bounds map, the projective horizon, a hit
+test under both fill rules with the two rules actually differing, the encoding distinguishing every
+field it carries, each prepared dependency changed ALONE, and the operator and blend enumerations held
+to the frozen registry.
+
+`cargo clippy -D warnings`: clean, after three NaN comparisons were written out with `partial_cmp` -
+which was the right prompt to write the reason down rather than to change the behaviour: every
+comparison with NaN is false, so a plain `<= 0.0` lets a NaN through and divides by it.
+`verify-model`: 157 passed, with the crate in the release-required host list and discovered by
+`host-suites` - 93 runnable suites. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: aarch64 and riscv64, and the full sweep.
+
+WHERE THIS SITS
+
+`b` was 19 items and is now 4: what remains there is boolean path operations, the shared flattening
+implementation, the remaining query surface, and the backend-free host-test roster. `c` - soft2d, the
+CPU implementation - is what the text milestone's guest gate is ultimately waiting for, and it now has
+an API to implement.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T19:29:42Z):
+
+P02M0103b IS COMPLETE. The four items that were open are closed: path OPERATIONS and QUERIES, the ONE
+flattening with the horizon rule answered, the backend-free host-test roster, and the prepared/backend
+split that the previous section already carried.
+
+WHAT WAS DELIVERED
+
+`render2d::flatten` is now the single flattening for the whole crate and it clips against the horizon
+the way the profile froze it: `HORIZON_RULE` says "clip the segment against w = epsilon in homogeneous
+space before dividing; a segment entirely beyond it is dropped, and the primitive is refused only if
+nothing survives", and that is now what the code does rather than what the document said. Curves are
+subdivided by de Casteljau ON THE HOMOGENEOUS CONTROL POINTS, which is the correct split for a
+projected curve: the image of a Bezier under a projective transform is a rational Bezier carrying its
+own `w`, so splitting before the divide splits the curve that is actually drawn. The convex hull
+decides a drop without subdividing - every point of the curve is a convex combination of its control
+points, so a curve whose control points are all beyond the horizon is beyond it everywhere. The
+flatness test is device-space distance from the CHORD's line, bounded by the profile's
+`MAX_SUBDIVISION_DEPTH`, and a non-finite deviation counts as flat so an overflowed curve stops
+recursing instead of subdividing into more overflow.
+
+`Error::BeyondHorizon` existed in the enumeration and nothing produced it. It is now produced by
+`flatten_checked`, and the `Canvas` calls that take geometry - `fill_path`, `stroke_path`, `set_clip` -
+refuse at the call that made the mistake rather than at replay. The check costs nothing on an affine
+transform, because an affine transform has no horizon and every point of it has an image.
+
+`Transform::inverse` is the full 3x3 adjugate and not the affine shortcut, because a projective
+transform is exactly the case where the shortcut is wrong. A singular transform returns `None` rather
+than one of the many points that map to each image. `map_homogeneous` exposes the pre-divide map that
+the clipping needs.
+
+The boolean output order gained its third key. The frozen answer is "sorted by their bounding box's
+minimum y then minimum x then their first point"; the implementation stopped at the box, which leaves
+two contours sharing a box corner - a shape and the hole that touches it there - in whatever order the
+traversal found them.
+
+One square root now serves the crate. There were two private copies, in `transform.rs` and in
+`query.rs`, and a third was about to be written in `flatten.rs`.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test` for the crate: 21 passed, 0 failed, every one of them WITHOUT a backend. The three new
+fixtures are the horizon (a square straddling it keeps the half that has an image and comes back OPEN,
+because a fill that closed it would close it across the gap the horizon made; a square entirely beyond
+it is a REFUSAL and not an empty drawing; the refusal arrives at `fill_path`, `stroke_path` and
+`set_clip`; an affine transform refuses nothing), the four boolean answers the overlapping-squares
+fixture did not reach (an open subpath closed with a straight segment, XOR, the canonical order, and
+determinism asserted as byte equality of verbs and points), and projective composition plus inversion
+inside the transform fixture.
+
+`cargo clippy --all-targets` with `-D warnings`: clean. `./format.sh` was run and the suite re-run.
+
+NOT PERFORMED: the full gate sweep, aarch64 and riscv64. They are deferred to the end of the next
+chunk rather than run twice.
+
+WHERE THIS SITS
+
+`b` is 0 open items. `c` - soft2d, the CPU implementation of the whole profile - is next, and it is
+what the text milestone's guest gate is waiting for. The milestone as a whole is 95 open items.

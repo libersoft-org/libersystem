@@ -4,6 +4,10 @@ edition = "2024"
 description = "Shared pixel vocabulary and bounded direct/scaled blitters"
 
 [dependencies]
+# THE ONE PIXEL PIPELINE. This crate's blending and packing are CALLS into it rather than private
+# copies of it: a compositor that rounds differently from the renderer above it is a seam between the
+# pixels one drew and the pixels the other did, and that is what two copies eventually become.
+graphics-core = { path = "../../graphics/core" }
 
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to

@@ -1,0 +1,87 @@
+profile=image-color version=1
+format=A8_UNORM channels=A bits=8 encoding=unorm bytes=1 carries=alpha alpha=straight
+format=R8_UNORM channels=R bits=8 encoding=unorm bytes=1 carries=data alpha=opaque
+format=R8G8_UNORM channels=RG bits=8,8 encoding=unorm bytes=2 carries=data alpha=opaque
+format=B8G8R8X8_UNORM channels=BGRX bits=8,8,8,8 encoding=unorm bytes=4 carries=colour alpha=opaque
+format=R8G8B8X8_UNORM channels=RGBX bits=8,8,8,8 encoding=unorm bytes=4 carries=colour alpha=opaque
+format=B8G8R8A8_UNORM channels=BGRA bits=8,8,8,8 encoding=unorm bytes=4 carries=colour+alpha alpha=opaque,straight,premultiplied
+format=R8G8B8A8_UNORM channels=RGBA bits=8,8,8,8 encoding=unorm bytes=4 carries=colour+alpha alpha=opaque,straight,premultiplied
+format=R10G10B10A2_UNORM channels=RGBA bits=10,10,10,2 encoding=unorm bytes=4 carries=colour+alpha alpha=opaque,straight,premultiplied
+format=R16G16B16A16_UNORM channels=RGBA bits=16,16,16,16 encoding=unorm bytes=8 carries=colour+alpha alpha=opaque,straight,premultiplied
+format=R16G16B16A16_FLOAT channels=RGBA bits=16,16,16,16 encoding=float bytes=8 carries=colour+alpha alpha=opaque,straight,premultiplied
+format=R32_UINT channels=R bits=32 encoding=uint bytes=4 carries=data alpha=opaque
+format=R32G32B32A32_FLOAT channels=RGBA bits=32,32,32,32 encoding=float bytes=16 carries=colour+alpha alpha=opaque,straight,premultiplied
+intermediate=R16G16B16A16_FLOAT
+semantics=color transfer-applies=true
+semantics=mask transfer-applies=false
+semantics=normal transfer-applies=false
+semantics=data transfer-applies=false
+semantics=depth transfer-applies=false
+semantics=identity transfer-applies=false
+operations=color allowed=sample,filter,transfer,blend,convert-primaries,premultiply,dither
+operations=mask allowed=sample,filter,blend
+operations=normal allowed=sample,filter
+operations=data allowed=sample,filter
+operations=depth allowed=sample
+operations=identity allowed=sample
+storage=known use=any image: sampled, filtered, drawn into, presented
+storage=packed-rgb-unorm use=a boot or scanout adapter's destination only: never sampled, never a texture, never a presentable application surface
+allocation row-alignment=16 exported-padding=zero short=a typed refusal, from checked arithmetic zero-extent=a typed refusal
+hdr-metadata=pq value=mastering display minimum and maximum luminance in cd/m², plus maximum content light level and maximum frame-average light level; absent metadata is a refusal to tone-map rather than an assumed peak
+hdr-metadata=hlg value=the nominal peak luminance in cd/m² the relative signal is referred to; its system gamma follows from that peak
+hdr-metadata=sdr value=none: an SDR signal is relative to diffuse white, which the profile states
+primaries=sRGB r=0.64,0.33 g=0.3,0.6 b=0.15,0.06 w=0.3127,0.329
+primaries=Display P3 r=0.68,0.32 g=0.265,0.69 b=0.15,0.06 w=0.3127,0.329
+primaries=Rec. 2020 r=0.708,0.292 g=0.17,0.797 b=0.131,0.046 w=0.3127,0.329
+space=srgb primaries=sRGB transfer=srgb
+space=srgb-linear primaries=sRGB transfer=linear
+space=display-p3 primaries=Display P3 transfer=srgb
+space=display-p3-linear primaries=Display P3 transfer=linear
+space=rec2020 primaries=Rec. 2020 transfer=srgb
+space=rec2020-linear primaries=Rec. 2020 transfer=linear
+space=rec2020-pq primaries=Rec. 2020 transfer=pq
+space=rec2020-hlg primaries=Rec. 2020 transfer=hlg
+srgb threshold=0.04045 linear-threshold=0.0031308 slope=12.92 offset=0.055 exponent=2.4
+pq m1=0.1593017578125 m2=78.84375 c1=0.8359375 c2=18.8515625 c3=18.6875 peak=10000
+hlg a=0.17883277 b=0.28466892 c=0.55991073 split=0.08333333333333333
+bradford=forward 0.8951,0.2664,-0.1614,-0.7502,1.7135,0.0367,0.0389,-0.0685,1.0296
+bradford=inverse 0.9869929,-0.1470543,0.1599627,0.4323053,0.5183603,0.0492912,-0.0085287,0.0400428,0.9684867
+reference diffuse-white-nits=203 pq-absolute=true
+tone-map=extended Reinhard, on luminance white=4
+gamut-map=hue-preserving desaturation toward equal luminance, by bisection steps=16 tolerance=0.000244140625
+dither=ordered, Bayer 8x8 phase=the target's origin matrix=0,32,8,40,2,34,10,42;48,16,56,24,50,18,58,26;12,44,4,36,14,46,6,38;60,28,52,20,62,30,54,22;3,35,11,43,1,33,9,41;51,19,59,27,49,17,57,25;15,47,7,39,13,45,5,37;63,31,55,23,61,29,53,21
+rounding=float-to-integer rule=clamp, then round half away from zero
+rounding=nan-to-integer rule=zero
+rounding=infinity-to-integer rule=clamp to the channel extreme
+rounding=float-to-half rule=round to nearest, ties to even
+rounding=half-subnormals rule=preserved
+rounding=half-nan rule=one canonical quiet NaN
+rounding=reserved-bits rule=ignored on read, all bits set on write
+yuv=NV12 planes=2 order=Y, then interleaved CbCr subsampling=2x2 bits=8 placement=the whole byte pitch=luma at least the width; chroma at least the width rounded up to an even number, because its two samples are interleaved
+yuv=I420 planes=3 order=Y, then Cb, then Cr subsampling=2x2 bits=8 placement=the whole byte pitch=luma at least the width; each chroma plane at least half the width rounded up
+yuv=P010 planes=2 order=Y, then interleaved CbCr subsampling=2x2 bits=10 placement=the HIGH ten bits of a little-endian 16-bit word; the low six are zero on write and ignored on read pitch=luma at least twice the width; chroma at least twice the width rounded up to an even number
+yuv-matrix=BT.601 kr=0.299 kb=0.114
+yuv-matrix=BT.709 kr=0.2126 kb=0.0722
+yuv-matrix=BT.2020 kr=0.2627 kb=0.0593
+yuv-range limited-luma-8=16,235 limited-chroma-8=16,240 full-8=0,255
+yuv-range limited-luma-10=64,940 limited-chroma-10=64,960 full-10=0,1023
+yuv-rule=siting value=left-sited horizontally, centre-sited vertically, as MPEG-2 and every codec in this tree produce
+yuv-rule=reconstruction value=bilinear, with the siting above, edge samples replicated
+yuv-rule=order value=reconstruct planes, apply the matrix to encoded RGB, then decode the transfer function, then convert primaries, then premultiply
+yuv-rule=odd-extent value=chroma extent is the ceiling of half the luma extent; the final sample is replicated
+yuv-rule=crop-alignment value=a crop origin and extent are multiples of the subsampling factor
+minima image-extent=16384 pitch-bytes=262208 planes=3 gradient-stops=256
+tolerance=transfer-round-trip value=0.0000152587890625
+tolerance=primary-round-trip value=0.000244140625
+tolerance=tone-map value=0.000244140625
+tolerance=yuv-code-values value=1
+tolerance=dither value=0
+tolerance=filtered-sample value=0.0009765625
+initialisation=new-image value=undefined; a reader before a writer is a defect in the reader
+initialisation=before-first-present value=fully written or cleared; presenting an unwritten surface is refused
+initialisation=padding value=not content; never read, zeroed on export
+row=minimum-row-bytes value=width * bytes_per_pixel
+row=pitch value=the layout's own, at least the minimum row
+span=minimum-visible-bytes value=(height - 1) * pitch + minimum_row_bytes
+span=backend-access-span value=every byte the selected display or DMA backend may touch, including the final row's pitch padding where it reads that
+span=allocation-len value=the owned allocation's own length, at least the backend access span for a presentable or DMA image

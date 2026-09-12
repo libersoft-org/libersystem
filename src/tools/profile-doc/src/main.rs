@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 use graphics_profile::capability::{Coverage, Range};
 use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MINIMA, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS};
 
+mod graphics;
+mod image;
 mod opentype;
+mod render2d_spec;
 mod scan;
 mod selftest;
 
@@ -439,6 +442,121 @@ fn main() -> std::process::ExitCode {
 		}
 		if check {
 			println!("opentype: {} tables, {} exclusions, {} scripts and {} languages, hashed", opentype_profile::tables::TABLES.len(), opentype_profile::tables::EXCLUDED.len(), opentype_profile::scripts::SCRIPTS.len(), opentype_profile::scripts::LANGUAGES.len());
+		}
+	}
+
+	// THE IMAGE AND COLOUR REGISTRY, whose document is normative rather than generated-and-filed: it
+	// carries the matrices, the transfer constants and the rounding rules that decide whether two
+	// implementations produce the same pixels, so it goes to `docs/graphics/` where other documents
+	// cite it - with its generated banner saying where it comes from.
+	{
+		let canonical = image::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/image-color/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/IMAGE_COLOR_PROFILE_1.md"), image::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("image-color: {} formats, {} colour spaces, {} YUV layouts and {} matrices, hashed", graphics_profile::image::FORMATS.len(), graphics_profile::image::COLOR_SPACES.len(), graphics_profile::image::YUV_LAYOUTS.len(), graphics_profile::image::YUV_MATRICES.len());
+		}
+	}
+
+	// THE LAYER REGISTRY, whose document is the naming decision the rest of the stack is written
+	// against. `framebuffer` meant five things; each has its own name, and the names are generated so
+	// that a sixth meaning cannot appear in prose without appearing in the registry.
+	{
+		let canonical = graphics::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/graphics-layers/profile-1.canonical"), canonical.clone()), (root.join("docs/GRAPHICS.md"), graphics::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("graphics-layers: {} names, {} ownership edges, {} routes and {} validation boundaries, hashed", graphics_profile::layers::LAYERS.len(), graphics_profile::layers::OWNERSHIP.len(), graphics_profile::layers::ROUTES.len(), graphics_profile::layers::BOUNDARIES.len());
+		}
+	}
+
+	// THE RENDER2D SPECIFICATION. The feature list says what the profile carries; this says what each
+	// entry MEANS numerically, which is the half two implementations can agree on in name and differ
+	// on in pixels.
+	{
+		let canonical = render2d_spec::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/render2d-spec/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/RENDER2D_PROFILE_1.md"), render2d_spec::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("render2d-spec: {} operators, {} separable and {} non-separable blend modes, {} boolean answers and {} prepared dependencies, hashed", graphics_profile::compositing::OPERATORS.len(), graphics_profile::compositing::BLENDS.len(), graphics_profile::compositing::NON_SEPARABLE_BLENDS.len(), graphics_profile::geometry::BOOLEAN_RULES.len(), graphics_profile::contracts::PREPARED_DEPENDENCIES.len());
 		}
 	}
 

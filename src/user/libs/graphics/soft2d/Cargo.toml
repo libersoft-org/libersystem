@@ -1,0 +1,20 @@
+[package]
+name = "soft2d"
+edition = "2024"
+description = "The complete CPU implementation of Render2D Core Profile 1: a tiled coverage rasteriser behind the render2d backend interface"
+
+[dependencies]
+# The image model, the shared pixel pipeline, the compositing arithmetic and the one sampler.
+graphics-core = { path = "../core" }
+# The frozen profile: every limit, tolerance and equation this backend implements.
+graphics-profile = { path = "../profile" }
+# The API this is a backend for. A command in Profile 1 that this cannot execute is a defect here.
+render2d = { path = "../render2d" }
+# The glyph cache key, which is ONE definition shared with the text stack rather than two that agree.
+font-contract = { path = "../../text/font-contract" }
+# The transcendentals a rasteriser needs. `core` has none, and a hand-rolled `floor` in a coverage
+# calculation is a coverage calculation that is wrong at negative coordinates.
+libm = "0.2"
+
+[lints.rust]
+warnings = "deny"

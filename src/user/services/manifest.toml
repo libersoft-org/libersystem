@@ -237,6 +237,28 @@ path = "user/libs/text/font-shape"
 owner = "font-run"
 path = "user/libs/text/font-run"
 
+# THE CANONICAL IMAGE MODEL every graphics layer shares: layouts, views, owned images, formats,
+# colour spaces and the two coordinate spaces. It implements the frozen registry above rather than
+# restating it, which is why the two are separate packages.
+[[sources]]
+owner = "graphics-core"
+path = "user/libs/graphics/core"
+
+# THE 2D DRAWING API, separate from any rasteriser - which is the boundary a GPU backend later
+# arrives at. What a `Canvas` produces is a bounded, validated, immutable display list; what draws it
+# is a backend, of which `soft2d` is the first.
+[[sources]]
+owner = "render2d"
+path = "user/libs/graphics/render2d"
+
+# THE COMPLETE CPU IMPLEMENTATION OF PROFILE 1. It implements the whole 2D profile behind the backend
+# trait above: a tiled coverage rasteriser, stroking by conversion to a fill, clipping as a mask,
+# every paint, layers, filters and glyphs. A command in Profile 1 that it cannot execute is a defect,
+# not an `Unsupported` - which is what a closed profile is for.
+[[sources]]
+owner = "soft2d"
+path = "user/libs/graphics/soft2d"
+
 # LINE LAYOUT ABOVE SHAPING: where the runs of a line sit, and where a caret lands. Separate from
 # the pipeline below because it decides GEOMETRY over the frozen run seam and reads no text at all,
 # which is what makes its decisions checkable on numbers a fixture states.

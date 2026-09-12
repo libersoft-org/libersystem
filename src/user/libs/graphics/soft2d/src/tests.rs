@@ -1,0 +1,990 @@
+use super::*;
+
+use graphics_core::geom::{Extent2D, PointF, RectF};
+use graphics_core::layout::{ImageLayout, RowOrigin};
+use graphics_core::semantics::ImageSemantics;
+use graphics_core::{AlphaMode, ColorSpace, OwnedImage, PixelFormat, PixelStorage};
+use render2d::backend::{Backend, TargetDescription};
+use render2d::blend::{Antialias, BlendMode, Operator};
+use render2d::paint::{Color, Paint};
+use render2d::path::{FillRule, PathBuilder};
+use render2d::{Canvas, DrawList};
+
+/// A target in the commonest surface format: eight-bit sRGB with straight alpha.
+fn target(width: u32, height: u32) -> OwnedImage {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
+	let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
+	let layout = ImageLayout::new(Extent2D::new(width, height), width * 4, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+	OwnedImage::new(layout).expect("an image")
+}
+
+fn description(image: &OwnedImage) -> TargetDescription {
+	TargetDescription { extent: image.layout().extent, format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 }
+}
+
+/// The stored bytes of one pixel, which is what a fixture states its expectations in.
+fn pixel(image: &OwnedImage, x: u32, y: u32) -> [u8; 4] {
+	let view = image.view();
+	let row = view.row(y).expect("a row");
+	let start = x as usize * 4;
+	[row[start], row[start + 1], row[start + 2], row[start + 3]]
+}
+
+fn red() -> Paint {
+	Paint::Solid(Color::new(1.0, 0.0, 0.0, 1.0, ColorSpace::Srgb))
+}
+
+fn draw(list: &DrawList, image: &mut OwnedImage) {
+	let mut backend = Soft2d::new();
+	let description = description(image);
+	let prepared = backend.prepare(list, &description).expect("a preparation");
+	let mut view = image.view_mut();
+	backend.render(&prepared, &mut view).expect("a frame");
+}
+
+fn rect_path(rect: RectF) -> render2d::path::Path {
+	let mut builder = PathBuilder::new();
+	builder.add_rect(rect).expect("a rectangle");
+	builder.finish()
+}
+
+#[test]
+// THE FIRST THING A RASTERISER HAS TO GET RIGHT IS A RECTANGLE. `Rect` is half-open, a fill covers
+// every sample point inside it, and a zero-width rectangle draws nothing and is not an error.
+fn a_filled_rectangle_is_exact_and_half_open() {
+	let mut image = target(8, 8);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(2.0, 2.0, 4.0, 4.0)), red(), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut image);
+
+	assert_eq!(pixel(&image, 3, 3), [255, 0, 0, 255], "inside is the paint");
+	assert_eq!(pixel(&image, 0, 0), [0, 0, 0, 0], "outside is untouched");
+	// HALF-OPEN: the pixel at the right edge is OUTSIDE a rectangle that ends there.
+	assert_eq!(pixel(&image, 5, 3), [255, 0, 0, 255], "the last covered pixel");
+	assert_eq!(pixel(&image, 6, 3), [0, 0, 0, 0], "and the first one past it is not covered");
+
+	// A ZERO-WIDTH RECTANGLE DRAWS NOTHING AND IS NOT AN ERROR.
+	let mut empty = target(4, 4);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(1.0, 1.0, 0.0, 2.0)), red(), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut empty);
+	assert_eq!(pixel(&empty, 1, 1), [0, 0, 0, 0]);
+}
+
+#[test]
+// COVERAGE ALONG A KNOWN EDGE. A rectangle covering half of a column of pixels must composite at half
+// alpha - not at none, not at all of it, and not at a value that depends on which sub-scanline the
+// edge happened to land on.
+fn coverage_is_analytic_along_a_known_edge() {
+	let mut image = target(8, 4);
+	let mut canvas = Canvas::new();
+	// From 2.5 to 6.0: the pixel at x = 2 is half covered, and 3 to 5 are whole.
+	canvas.fill_path(rect_path(RectF::new(2.5, 0.0, 3.5, 4.0)), red(), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut image);
+
+	let half = pixel(&image, 2, 1);
+	assert!((half[3] as i32 - 128).abs() <= 2, "a half-covered pixel is half-covered: {half:?}");
+	assert_eq!(pixel(&image, 3, 1)[3], 255);
+	assert_eq!(pixel(&image, 6, 1)[3], 0);
+
+	// AND THE ALIASED PATH IS A PIXEL IN OR OUT, which a diagram's grid and a screenshot comparison
+	// both need. The pixel whose centre the edge passes is decided by its centre.
+	let mut aliased = target(8, 4);
+	let mut canvas = Canvas::new();
+	canvas.set_antialias(Antialias::Off);
+	canvas.fill_path(rect_path(RectF::new(2.5, 0.0, 3.5, 4.0)), red(), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut aliased);
+	for x in 0..8 {
+		let alpha = pixel(&aliased, x, 1)[3];
+		assert!(alpha == 0 || alpha == 255, "an aliased edge has no partial coverage: {x} is {alpha}");
+	}
+}
+
+#[test]
+// THE TWO FILL RULES ARE DIFFERENT SHAPES, and a backend that implements one of them has implemented
+// half of the profile: a ring drawn as two rectangles wound the same way is solid under non-zero and
+// hollow under even-odd.
+fn both_fill_rules_are_implemented_and_differ() {
+	let mut builder = PathBuilder::new();
+	builder.add_rect(RectF::new(0.0, 0.0, 8.0, 8.0)).expect("the outside");
+	builder.add_rect(RectF::new(2.0, 2.0, 4.0, 4.0)).expect("the inside, wound the same way");
+	let path = builder.finish();
+
+	let mut solid = target(8, 8);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(path.clone(), red(), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut solid);
+	assert_eq!(pixel(&solid, 4, 4)[3], 255, "under non-zero the middle is filled");
+
+	let mut hollow = target(8, 8);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(path, red(), FillRule::EvenOdd).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut hollow);
+	assert_eq!(pixel(&hollow, 4, 4)[3], 0, "under even-odd it is a hole");
+	assert_eq!(pixel(&hollow, 1, 4)[3], 255, "and the ring around it is filled");
+}
+
+#[test]
+// A STROKE IS A FILL OF ITS OUTLINE, and the caps and joins are what make the outline. A butt cap
+// stops at the endpoint, a square cap reaches half a width past it, and a round one reaches the same
+// distance with a curve - so the three differ at exactly the pixels past the end.
+fn caps_and_joins_reach_where_they_should() {
+	let line = || {
+		let mut builder = PathBuilder::new();
+		builder.move_to(PointF { x: 4.0, y: 8.0 }).expect("a start");
+		builder.line_to(PointF { x: 12.0, y: 8.0 }).expect("a line");
+		builder.finish()
+	};
+	let stroke = |cap: render2d::path::Cap| {
+		let mut image = target(20, 16);
+		let mut canvas = Canvas::new();
+		let style = render2d::path::StrokeStyle { width: 4.0, cap, ..render2d::path::StrokeStyle::default() };
+		canvas.stroke_path(line(), red(), style).expect("a stroke");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		image
+	};
+	let butt = stroke(render2d::path::Cap::Butt);
+	let square = stroke(render2d::path::Cap::Square);
+	let round = stroke(render2d::path::Cap::Round);
+
+	// The stroke's body is drawn by all three.
+	for image in [&butt, &square, &round] {
+		assert_eq!(pixel(image, 8, 8)[3], 255, "the body of the stroke");
+		assert_eq!(pixel(image, 8, 4)[3], 0, "and not two widths away");
+	}
+	// PAST THE ENDPOINT is where they differ: a butt cap stops, the other two reach.
+	assert_eq!(pixel(&butt, 13, 8)[3], 0, "a butt cap stops at the endpoint");
+	assert_eq!(pixel(&square, 13, 8)[3], 255, "a square cap reaches half a width past it");
+	// A ROUND CAP REACHES THE SAME DISTANCE ON THE AXIS, and the pixel there is partly outside the
+	// circle - which is the coverage a round cap is for.
+	assert!(pixel(&round, 13, 8)[3] > 128, "a round cap reaches past the endpoint on the axis: {:?}", pixel(&round, 13, 8));
+	// A ROUND CAP IS ROUND: its corner is not filled, and a square cap's is.
+	assert_eq!(pixel(&square, 13, 6)[3], 255, "the square cap's corner");
+	assert!(pixel(&round, 13, 6)[3] < 128, "the round cap's corner is outside the circle: {:?}", pixel(&round, 13, 6));
+
+	// A MITER JOIN REACHES PAST A SHARP CORNER and a bevel does not, which is what the miter limit is
+	// a limit on.
+	let corner = || {
+		let mut builder = PathBuilder::new();
+		builder.move_to(PointF { x: 4.0, y: 14.0 }).expect("a start");
+		builder.line_to(PointF { x: 10.0, y: 4.0 }).expect("up");
+		builder.line_to(PointF { x: 16.0, y: 14.0 }).expect("down");
+		builder.finish()
+	};
+	let joined = |join: render2d::path::Join| {
+		let mut image = target(20, 20);
+		let mut canvas = Canvas::new();
+		let style = render2d::path::StrokeStyle { width: 3.0, join, miter_limit: 8.0, ..render2d::path::StrokeStyle::default() };
+		canvas.stroke_path(corner(), red(), style).expect("a stroke");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		image
+	};
+	let miter = joined(render2d::path::Join::Miter);
+	let bevel = joined(render2d::path::Join::Bevel);
+	let tip = pixel(&miter, 10, 2);
+	assert!(tip[3] > pixel(&bevel, 10, 2)[3], "a miter reaches past the corner and a bevel cuts it off: {tip:?}");
+}
+
+#[test]
+// A DASH PATTERN IS WALKED BY ARC LENGTH, so the gaps are where the pattern says and the phase moves
+// them - which is what makes a marching-ants selection an animation of one number.
+fn a_dash_pattern_leaves_the_gaps_it_states() {
+	let mut canvas = Canvas::new();
+	let pattern = canvas.resources().add_dashes(alloc::vec![4.0, 4.0]).expect("a pattern");
+	let mut builder = PathBuilder::new();
+	builder.move_to(PointF { x: 0.0, y: 4.0 }).expect("a start");
+	builder.line_to(PointF { x: 16.0, y: 4.0 }).expect("a line");
+	let style = render2d::path::StrokeStyle { width: 4.0, dash: Some(render2d::path::DashHandleRange { pattern, phase: 0.0 }), ..render2d::path::StrokeStyle::default() };
+	canvas.stroke_path(builder.finish(), red(), style).expect("a stroke");
+	let mut image = target(16, 8);
+	draw(&canvas.finish().expect("a list"), &mut image);
+
+	assert_eq!(pixel(&image, 1, 4)[3], 255, "the first dash is drawn");
+	assert_eq!(pixel(&image, 6, 4)[3], 0, "the first gap is not");
+	assert_eq!(pixel(&image, 9, 4)[3], 255, "and the second dash is");
+
+	// A PATTERN WITH NO POSITIVE LENGTH IS REFUSED WHERE IT IS RECORDED, because a dasher walking it
+	// never advances.
+	let mut canvas = Canvas::new();
+	assert_eq!(canvas.resources().add_dashes(alloc::vec![0.0, 0.0]).err(), Some(render2d::Error::DegenerateDash));
+}
+
+#[test]
+// CLIPPING IS A COVERAGE MASK, so a rounded clip, a path clip and a nested pair cost the same
+// machinery as a rectangle - and nesting is the PRODUCT of the masks, which is what makes two
+// antialiased edges crossing at a corner let through the product of their coverages.
+fn clips_nest_intersect_and_invert() {
+	let mut image = target(16, 16);
+	let mut canvas = Canvas::new();
+	canvas.save().expect("a state");
+	canvas.set_clip(rect_path(RectF::new(0.0, 0.0, 8.0, 16.0)), FillRule::NonZero).expect("the first clip");
+	canvas.set_clip(rect_path(RectF::new(4.0, 0.0, 12.0, 16.0)), FillRule::NonZero).expect("the second");
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), red(), FillRule::NonZero).expect("a fill");
+	canvas.restore().expect("both clips popped");
+	draw(&canvas.finish().expect("a list"), &mut image);
+
+	assert_eq!(pixel(&image, 5, 8)[3], 255, "the intersection of the two clips is drawn");
+	assert_eq!(pixel(&image, 2, 8)[3], 0, "outside the second clip is not");
+	assert_eq!(pixel(&image, 12, 8)[3], 0, "and neither is outside the first: clips INTERSECT");
+
+	// AN INVERSE CLIP KEEPS EVERYTHING THE SHAPE MISSES, which is what a knockout and a spotlight are.
+	let mut knockout = target(16, 16);
+	let mut canvas = Canvas::new();
+	canvas.save().expect("a state");
+	canvas.set_clip_inverse(rect_path(RectF::new(4.0, 4.0, 8.0, 8.0)), FillRule::NonZero).expect("an inverse clip");
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), red(), FillRule::NonZero).expect("a fill");
+	canvas.restore().expect("the clip popped");
+	draw(&canvas.finish().expect("a list"), &mut knockout);
+	assert_eq!(pixel(&knockout, 8, 8)[3], 0, "inside the inverse clip's shape nothing is drawn");
+	assert_eq!(pixel(&knockout, 1, 1)[3], 255, "and outside it everything is");
+
+	// A ROUNDED CLIP IS THE SAME MACHINERY: its corner is partially covered rather than square.
+	let mut rounded = target(16, 16);
+	let mut builder = PathBuilder::new();
+	builder.move_to(PointF { x: 8.0, y: 0.0 }).expect("a start");
+	builder.cubic_to(PointF { x: 16.0, y: 0.0 }, PointF { x: 16.0, y: 16.0 }, PointF { x: 8.0, y: 16.0 }).expect("a curve");
+	builder.cubic_to(PointF { x: 0.0, y: 16.0 }, PointF { x: 0.0, y: 0.0 }, PointF { x: 8.0, y: 0.0 }).expect("and back");
+	builder.close().expect("closed");
+	let mut canvas = Canvas::new();
+	canvas.save().expect("a state");
+	canvas.set_clip(builder.finish(), FillRule::NonZero).expect("a rounded clip");
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), red(), FillRule::NonZero).expect("a fill");
+	canvas.restore().expect("the clip popped");
+	draw(&canvas.finish().expect("a list"), &mut rounded);
+	assert_eq!(pixel(&rounded, 8, 8)[3], 255, "the middle of a rounded clip is open");
+	assert_eq!(pixel(&rounded, 0, 0)[3], 0, "and its corner is not");
+}
+
+#[test]
+// GROUP OPACITY CANNOT BE DONE BY MULTIPLYING EACH DRAWING'S ALPHA. Two overlapping shapes at half
+// opacity each show the seam between them; the same two shapes in a layer at half opacity do not -
+// and the reference value is worked out by hand here rather than taken from the implementation.
+fn a_layer_composites_as_one_thing_at_its_opacity() {
+	let overlapping = |layered: bool| {
+		let mut image = target(16, 16);
+		let mut canvas = Canvas::new();
+		if layered {
+			canvas.begin_layer(None, 0.5, BlendMode::Normal, None).expect("a layer");
+		} else {
+			canvas.set_opacity(0.5);
+		}
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 10.0, 16.0)), red(), FillRule::NonZero).expect("one");
+		canvas.fill_path(rect_path(RectF::new(6.0, 0.0, 10.0, 16.0)), red(), FillRule::NonZero).expect("the other");
+		if layered {
+			canvas.end_layer().expect("closed");
+		}
+		draw(&canvas.finish().expect("a list"), &mut image);
+		image
+	};
+	let separate = overlapping(false);
+	let grouped = overlapping(true);
+
+	// WHERE THEY DO NOT OVERLAP the two agree: one shape at half alpha.
+	assert!((separate_alpha(&separate, 2, 8) as i32 - 128).abs() <= 2, "{:?}", pixel(&separate, 2, 8));
+	assert!((separate_alpha(&grouped, 2, 8) as i32 - 128).abs() <= 2, "{:?}", pixel(&grouped, 2, 8));
+	// WHERE THEY DO, the separate drawings composite twice - a half over a half is three quarters -
+	// and the layer composites once.
+	assert!((separate_alpha(&separate, 8, 8) as i32 - 191).abs() <= 3, "half over half is three quarters: {:?}", pixel(&separate, 8, 8));
+	assert!((separate_alpha(&grouped, 8, 8) as i32 - 128).abs() <= 3, "a group is composited ONCE: {:?}", pixel(&grouped, 8, 8));
+}
+
+fn separate_alpha(image: &OwnedImage, x: u32, y: u32) -> u8 {
+	pixel(image, x, y)[3]
+}
+
+#[test]
+// EVERY PORTER-DUFF OPERATOR AND EVERY BLEND MODE, through the backend and against the value the
+// algebra gives. The arithmetic is checked in `graphics-core`; what this checks is that the backend
+// actually reaches it - an operator recorded and silently composited as source-over is the failure a
+// per-operator fixture exists to catch.
+fn the_operators_and_blends_reach_the_pixels() {
+	let draw_with = |operator: Operator, blend: BlendMode| {
+		let mut image = target(8, 8);
+		let mut canvas = Canvas::new();
+		// A GREEN BACKDROP AND NOT A WHITE ONE. White is the identity for Multiply, the annihilator
+		// for Screen and the fixed point of half the list: over white, most of the sixteen modes
+		// produce the source unchanged, and a fixture that used it would pass with every one of them
+		// unimplemented.
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 8.0, 8.0)), Paint::Solid(Color::new(0.0, 1.0, 0.25, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a backdrop");
+		canvas.set_operator(operator);
+		canvas.set_blend_mode(blend);
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 8.0, 8.0)), Paint::Solid(Color::new(1.0, 0.0, 0.0, 0.5, ColorSpace::Srgb)), FillRule::NonZero).expect("a source");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		pixel(&image, 4, 4)
+	};
+
+	// `Clear` leaves nothing, `Dst` leaves the backdrop, `Src` replaces it.
+	assert_eq!(draw_with(Operator::Clear, BlendMode::Normal)[3], 0);
+	assert_eq!(draw_with(Operator::Dst, BlendMode::Normal)[1], 255, "Dst leaves the green backdrop");
+	assert!((draw_with(Operator::Src, BlendMode::Normal)[3] as i32 - 128).abs() <= 2);
+	// `SrcOver` of a half-transparent red over green is half of each, at full alpha.
+	let over = draw_with(Operator::SrcOver, BlendMode::Normal);
+	assert_eq!(over[3], 255);
+	assert!(over[0] > 100 && over[1] > 100, "half red over green is both: {over:?}");
+	// A BLEND MODE CHANGES THE COLOUR AND NOT THE COVERAGE: red times green is black, so the blended
+	// result is darker than the plain one and its alpha is the same.
+	let multiplied = draw_with(Operator::SrcOver, BlendMode::Multiply);
+	assert_eq!(multiplied[3], 255);
+	assert!(multiplied[0] < over[0], "red multiplied by green keeps neither: {multiplied:?} against {over:?}");
+	// AND EVERY ONE OF THEM RUNS. A mode the backend silently treated as Normal would be found here.
+	let mut distinct = alloc::vec::Vec::new();
+	for mode in graphics_core::composite::ALL_BLEND_MODES {
+		distinct.push(draw_with(Operator::SrcOver, mode));
+	}
+	assert_eq!(distinct.len(), 16);
+	let normal = distinct[0];
+	assert!(distinct.iter().filter(|value| **value != normal).count() >= 8, "most blend modes must differ from Normal over this pair");
+}
+
+#[test]
+// DAMAGE IS CONSERVATIVE AND NOT EXACT. Exact damage would mean comparing old and new pixels - a
+// source-over with alpha zero changes nothing while covering a rectangle - and that cost defeats the
+// purpose. What it must never be is too SMALL.
+fn damage_is_conservative_and_clipped_to_the_target() {
+	let mut image = target(64, 64);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(8.0, 8.0, 16.0, 16.0)), red(), FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	let mut backend = Soft2d::new();
+	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+	let damage = prepared.damage().expect("something was drawn");
+	assert!(damage.x <= 8 && damage.y <= 8, "{damage:?}");
+	assert!(damage.x + damage.width >= 24 && damage.y + damage.height >= 24, "{damage:?}");
+	assert!(damage.fits(image.layout().extent), "damage is clipped to the target: {damage:?}");
+	assert_eq!(prepared.commands(), 1);
+	assert_eq!(prepared.command_damage(0), Some(damage), "one command's damage is the frame's");
+
+	// A DRAWING ENTIRELY OFF THE TARGET DAMAGES NOTHING, which is an empty answer and not a refusal.
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(500.0, 500.0, 4.0, 4.0)), red(), FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+	assert_eq!(prepared.damage(), None);
+	let mut view = image.view_mut();
+	backend.render(&prepared, &mut view).expect("a frame that draws nothing");
+}
+
+#[test]
+// A RENDERER THAT WRITES PAST ITS TARGET IS A SECURITY BUG AND NOT A DRAWING BUG. The canaries are the
+// pitch padding inside every row and the bytes after the last visible one: a drawing that reaches
+// either has written outside the image it was given.
+fn nothing_is_written_outside_the_target() {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
+	let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
+	// A pitch eight bytes wider than the rows need, and sixty-four bytes of tail.
+	let (width, height, pitch) = (16u32, 16u32, 16 * 4 + 8);
+	let layout = ImageLayout::new(Extent2D::new(width, height), pitch, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+	let mut bytes = alloc::vec![0xA5u8; pitch as usize * height as usize + 64];
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(-8.0, -8.0, 64.0, 64.0)), red(), FillRule::NonZero).expect("a fill reaching past every edge");
+	let list = canvas.finish().expect("a list");
+	let mut backend = Soft2d::new();
+	let description = TargetDescription { extent: Extent2D::new(width, height), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 };
+	let prepared = backend.prepare(&list, &description).expect("a preparation");
+	{
+		let mut view = graphics_core::ImageViewMut::new(layout, &mut bytes).expect("a view");
+		backend.render(&prepared, &mut view).expect("a frame");
+	}
+	for row in 0..height {
+		let padding_start = row as usize * pitch as usize + width as usize * 4;
+		for byte in &bytes[padding_start..padding_start + 8] {
+			assert_eq!(*byte, 0xA5, "the pitch padding of row {row} was written");
+		}
+	}
+	let tail = pitch as usize * height as usize;
+	for byte in &bytes[tail..] {
+		assert_eq!(*byte, 0xA5, "the bytes after the image were written");
+	}
+	// And the drawing itself did happen.
+	assert_eq!(bytes[3], 255);
+}
+
+/// An image source for a fixture: one image, under one identity.
+struct OneImage {
+	identity: u64,
+	image: OwnedImage,
+}
+
+impl ImageSource for OneImage {
+	fn image(&self, identity: u64) -> Option<graphics_core::ImageView<'_>> {
+		(identity == self.identity).then(|| self.image.view())
+	}
+}
+
+/// A checkerboard, which is the pattern that shows minification: it averages to a flat grey and
+/// aliases to noise.
+fn checkerboard(size: u32) -> OwnedImage {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Opaque };
+	let storage = PixelStorage::Known(PixelFormat::R8G8B8X8Unorm);
+	let layout = ImageLayout::new(Extent2D::new(size, size), size * 4, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+	let mut image = OwnedImage::new(layout).expect("an image");
+	{
+		let mut view = image.view_mut();
+		for y in 0..size {
+			for x in 0..size {
+				let value = if (x + y) % 2 == 0 { 1.0 } else { 0.0 };
+				graphics_core::pixel::write(&mut view, x, y, graphics_core::pixel::Rgba::new(value, value, value, 1.0));
+			}
+		}
+	}
+	image
+}
+
+#[test]
+// EVERY PAINT, INCLUDING CONIC. A pie chart, a colour wheel and a loading spinner are conic
+// gradients, and a backend that typed them and refused them makes each of those an image somebody
+// generated somewhere else.
+fn every_gradient_paints_and_every_spread_mode_differs() {
+	let stops = |canvas: &mut Canvas| {
+		canvas
+			.resources()
+			.add_stops(alloc::vec![
+				render2d::paint::GradientStop { offset: 0.0, color: Color::new(1.0, 0.0, 0.0, 1.0, ColorSpace::Srgb) },
+				render2d::paint::GradientStop { offset: 1.0, color: Color::new(0.0, 0.0, 1.0, 1.0, ColorSpace::Srgb) },
+			])
+			.expect("stops")
+	};
+
+	// A LINEAR GRADIENT ACROSS THE MIDDLE EIGHT PIXELS, clamped at both ends.
+	let mut image = target(16, 4);
+	let mut canvas = Canvas::new();
+	let handle = stops(&mut canvas);
+	let paint = Paint::Linear { from: PointF { x: 4.0, y: 0.0 }, to: PointF { x: 12.0, y: 0.0 }, stops: handle, spread: graphics_core::sample::Spread::Clamp, transform: render2d::transform::Transform::IDENTITY };
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 4.0)), paint, FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut image);
+	assert_eq!(pixel(&image, 1, 2)[0], 255, "clamped before the start is the first stop");
+	assert_eq!(pixel(&image, 14, 2)[2], 255, "and after the end is the last");
+	let middle = pixel(&image, 8, 2);
+	assert!(middle[0] > 100 && middle[2] > 100, "the middle is a mix of both: {middle:?}");
+
+	// THE THREE SPREAD MODES ARE THREE DIFFERENT PICTURES past the gradient's own span.
+	let spread_pixel = |spread: graphics_core::sample::Spread| {
+		let mut image = target(16, 4);
+		let mut canvas = Canvas::new();
+		let handle = stops(&mut canvas);
+		let paint = Paint::Linear { from: PointF { x: 0.0, y: 0.0 }, to: PointF { x: 4.0, y: 0.0 }, stops: handle, spread, transform: render2d::transform::Transform::IDENTITY };
+		canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 4.0)), paint, FillRule::NonZero).expect("a fill");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		pixel(&image, 5, 2)
+	};
+	let clamped = spread_pixel(graphics_core::sample::Spread::Clamp);
+	let repeated = spread_pixel(graphics_core::sample::Spread::Repeat);
+	let mirrored = spread_pixel(graphics_core::sample::Spread::Mirror);
+	assert_eq!(clamped[2], 255, "clamp holds the last stop: {clamped:?}");
+	assert!(repeated[0] > repeated[2], "repeat starts the ramp again: {repeated:?}");
+	assert!(mirrored[2] > mirrored[0], "mirror runs it backwards: {mirrored:?}");
+
+	// A RADIAL GRADIENT IS ROUND: its centre is the first stop and its rim the last.
+	let mut radial = target(16, 16);
+	let mut canvas = Canvas::new();
+	let handle = stops(&mut canvas);
+	let paint = Paint::Radial { from: PointF { x: 8.0, y: 8.0 }, from_radius: 0.0, to: PointF { x: 8.0, y: 8.0 }, to_radius: 8.0, stops: handle, spread: graphics_core::sample::Spread::Clamp, transform: render2d::transform::Transform::IDENTITY };
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), paint, FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut radial);
+	assert!(pixel(&radial, 8, 8)[0] > 200, "the centre: {:?}", pixel(&radial, 8, 8));
+	assert!(pixel(&radial, 0, 8)[2] > 200, "the rim: {:?}", pixel(&radial, 0, 8));
+
+	// AND A CONIC GRADIENT SWEEPS AROUND ITS CENTRE: two points at different angles and the same
+	// radius are different colours, which is the property that distinguishes it from a radial.
+	let mut conic = target(16, 16);
+	let mut canvas = Canvas::new();
+	let handle = stops(&mut canvas);
+	let paint = Paint::Conic { centre: PointF { x: 8.0, y: 8.0 }, start_angle: 0.0, end_angle: core::f32::consts::TAU, stops: handle, spread: graphics_core::sample::Spread::Clamp, transform: render2d::transform::Transform::IDENTITY };
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), paint, FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut conic);
+	let right = pixel(&conic, 14, 8);
+	let below = pixel(&conic, 8, 14);
+	assert!(right != below, "a conic gradient's colour depends on the ANGLE: {right:?} against {below:?}");
+	assert!(right[0] > below[0], "and it sweeps from the start angle: {right:?} against {below:?}");
+}
+
+#[test]
+// A GENERAL IMAGE RENDERER THAT ONLY HAS BILINEAR PRODUCES SHIMMERING THUMBNAILS. A checkerboard
+// scaled down to a few pixels must average to a flat grey; sampled without a pyramid it comes out as
+// whichever texels the sample points happened to land on.
+fn images_are_drawn_at_quality_and_minified_without_aliasing() {
+	let source = OneImage { identity: 7, image: checkerboard(32) };
+	let record = render2d::list::ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 };
+
+	let draw_scaled = |quality: render2d::paint::ImageQuality| {
+		let mut image = target(4, 4);
+		let mut canvas = Canvas::new();
+		canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 4.0, 4.0), quality).expect("an image");
+		let list = canvas.finish().expect("a list");
+		let mut backend = Soft2d::new().with_images(&source);
+		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+		{
+			let mut view = image.view_mut();
+			backend.render(&prepared, &mut view).expect("a frame");
+		}
+		image
+	};
+
+	let mipmapped = draw_scaled(render2d::paint::ImageQuality::Mipmapped);
+	// EIGHT TIMES DOWN, so every output pixel covers sixty-four texels of which half are white: the
+	// answer is the average and not one of them.
+	for (x, y) in [(0u32, 0u32), (1, 2), (3, 3)] {
+		let value = pixel(&mipmapped, x, y);
+		assert!(value[0] > 60 && value[0] < 220, "a minified checkerboard is grey and not noise: {value:?}");
+	}
+	// NEAREST IS THE OTHER ANSWER, and it is a real one: pixel art must not be softened.
+	let nearest = draw_scaled(render2d::paint::ImageQuality::Nearest);
+	let extremes = (0..4).flat_map(|y| (0..4).map(move |x| (x, y))).filter(|(x, y)| pixel(&nearest, *x, *y)[0] == 0 || pixel(&nearest, *x, *y)[0] == 255).count();
+	assert!(extremes > 8, "nearest keeps the texels it lands on: {extremes} of sixteen are black or white");
+
+	// A PROJECTIVE TRANSFORM IS IN THE PROFILE, and an image under one is drawn rather than refused:
+	// the near edge is larger than the far one, which is what perspective means.
+	let mut perspective = target(32, 32);
+	let mut canvas = Canvas::new();
+	canvas.set_transform(render2d::transform::Transform { m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -0.01, 1.0]] });
+	canvas.draw_image(record, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(0.0, 0.0, 32.0, 32.0), render2d::paint::ImageQuality::Mipmapped).expect("an image");
+	let list = canvas.finish().expect("a list");
+	let mut backend = Soft2d::new().with_images(&source);
+	let prepared = backend.prepare(&list, &description(&perspective)).expect("a preparation");
+	{
+		let mut view = perspective.view_mut();
+		backend.render(&prepared, &mut view).expect("a frame");
+	}
+	let drawn = (0..32).flat_map(|y| (0..32).map(move |x| (x, y))).filter(|(x, y)| pixel(&perspective, *x, *y)[3] > 0).count();
+	assert!(drawn > 100, "a projectively transformed image is drawn: {drawn} pixels");
+}
+
+#[test]
+// THE COLOUR IS CONVERTED, TONE MAPPED AND DITHERED on the way to the target, which is the end of the
+// one pipeline: a paint in a wide-gamut space is not the same numbers in a narrow one, a value above
+// diffuse white is compressed rather than clipped, and a value between two levels is dithered rather
+// than banded.
+fn colour_conversion_tone_mapping_and_dithering_reach_the_target() {
+	// A Display P3 green is OUTSIDE sRGB, so writing its numbers through unchanged would be a
+	// different colour presented as the right one.
+	let mut image = target(4, 4);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 4.0, 4.0)), Paint::Solid(Color::new(0.0, 0.8, 0.2, 1.0, ColorSpace::DisplayP3)), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut image);
+	let converted = pixel(&image, 1, 1);
+	let mut plain = target(4, 4);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 4.0, 4.0)), Paint::Solid(Color::new(0.0, 0.8, 0.2, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut plain);
+	assert!(converted != pixel(&plain, 1, 1), "the same numbers in two spaces are two colours: {converted:?}");
+
+	// ADDITIVE LIGHT GOES ABOVE ONE and the narrow target TONE MAPS it rather than clipping: the
+	// result is brighter than either input and is not saturated white.
+	let mut bright = target(4, 4);
+	let mut canvas = Canvas::new();
+	let grey = Paint::Solid(Color::new(0.7, 0.7, 0.7, 1.0, ColorSpace::Srgb));
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 4.0, 4.0)), grey, FillRule::NonZero).expect("a backdrop");
+	canvas.set_operator(Operator::Plus);
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 4.0, 4.0)), grey, FillRule::NonZero).expect("and again, additively");
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 4.0, 4.0)), grey, FillRule::NonZero).expect("and a third time");
+	draw(&canvas.finish().expect("a list"), &mut bright);
+	let added = pixel(&bright, 1, 1);
+	assert!(added[0] > pixel(&plain, 1, 1)[1], "additive light is brighter: {added:?}");
+	assert!(added[0] < 255, "and a narrow target compresses it rather than clipping it to white: {added:?}");
+
+	// THE DITHER IS ORDERED AND ITS PHASE IS THE TARGET'S ORIGIN, so a colour that falls between two
+	// levels is a pattern rather than a band - and the pattern repeats every eight pixels.
+	let mut dithered = target(16, 16);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), Paint::Solid(Color::new(0.5019, 0.5019, 0.5019, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut dithered);
+	let values: alloc::vec::Vec<u8> = (0..8).map(|x| pixel(&dithered, x, 0)[0]).collect();
+	let distinct = values.iter().filter(|value| **value != values[0]).count();
+	assert!(distinct > 0, "a value between two levels is dithered: {values:?}");
+	for x in 0..8 {
+		assert_eq!(pixel(&dithered, x, 0)[0], pixel(&dithered, x + 8, 0)[0], "the Bayer pattern repeats every eight pixels");
+	}
+}
+
+#[test]
+// EVERY FILTER NODE, ONE AT A TIME. A graph whose nodes were tested only in composition hides the one
+// that does nothing: a blur that returns its input looks correct behind an offset and a flood.
+fn every_filter_node_does_its_own_work() {
+	let with_graph = |build: &dyn Fn(&mut render2d::filter::FilterGraph)| {
+		let mut graph = render2d::filter::FilterGraph::default();
+		build(&mut graph);
+		let mut image = target(32, 32);
+		let mut canvas = Canvas::new();
+		let handle = canvas.resources().add_filter(graph).expect("a graph");
+		canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a filtered layer");
+		canvas.fill_path(rect_path(RectF::new(12.0, 12.0, 8.0, 8.0)), red(), FillRule::NonZero).expect("a fill");
+		canvas.end_layer().expect("closed");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		image
+	};
+	use render2d::filter::FilterNode;
+
+	// SOURCE alone is the drawing itself.
+	let plain = with_graph(&|graph| {
+		graph.push(FilterNode::Source).expect("a node");
+	});
+	assert_eq!(pixel(&plain, 16, 16)[3], 255);
+	assert_eq!(pixel(&plain, 4, 16)[3], 0);
+
+	// A BLUR SPREADS PAST THE SHAPE'S OWN BOUNDS, which is what the graph's bounds map grows the
+	// layer by - a blur clipped to its input is the defect that gives every shadow a straight edge.
+	let blurred = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+	});
+	assert!(pixel(&blurred, 16, 16)[3] > 128, "the middle survives a blur: {:?}", pixel(&blurred, 16, 16));
+	assert!(pixel(&blurred, 10, 16)[3] > 0, "and it reaches past the shape: {:?}", pixel(&blurred, 10, 16));
+
+	// AN OFFSET MOVES IT, in the direction it says.
+	let offset = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		graph.push(FilterNode::Offset { input: source, dx: 6.0, dy: 0.0 }).expect("an offset");
+	});
+	assert_eq!(pixel(&offset, 16, 16)[3], 0, "what was here has moved");
+	assert_eq!(pixel(&offset, 22, 16)[3], 255, "to six pixels along");
+
+	// A COLOUR MATRIX REPLACES THE COLOUR: red through a matrix that swaps red and blue is blue.
+	let swapped = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let matrix = [[0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0]];
+		graph.push(FilterNode::ColorMatrix { input: source, matrix }).expect("a matrix");
+	});
+	let value = pixel(&swapped, 16, 16);
+	assert!(value[2] > 200 && value[0] < 60, "red with its channels swapped is blue: {value:?}");
+
+	// A FLOOD FILLS THE WHOLE OUTPUT, which is what makes a tint and a shadow's colour.
+	let flooded = with_graph(&|graph| {
+		graph.push(FilterNode::Flood { color: Color::new(0.0, 0.0, 1.0, 1.0, ColorSpace::Srgb) }).expect("a flood");
+	});
+	assert!(pixel(&flooded, 2, 2)[2] > 200, "a flood covers the layer: {:?}", pixel(&flooded, 2, 2));
+
+	// `In` KEEPS ONLY WHERE THE MASK HAS ALPHA, which is what every clip-shaped effect is built on -
+	// a flood kept inside the drawing's own alpha is a tint of the drawing.
+	let tinted = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let flood = graph.push(FilterNode::Flood { color: Color::new(0.0, 0.0, 1.0, 1.0, ColorSpace::Srgb) }).expect("a flood");
+		graph.push(FilterNode::In { input: flood, mask: source }).expect("kept inside");
+	});
+	assert!(pixel(&tinted, 16, 16)[2] > 200, "inside the shape the flood survives: {:?}", pixel(&tinted, 16, 16));
+	assert_eq!(pixel(&tinted, 2, 2)[3], 0, "and outside it is gone");
+
+	// COMPOSITE AND BLEND TAKE TWO INPUTS, which is what makes a shadow a shadow: the blurred,
+	// offset, flooded copy UNDER the thing that cast it.
+	let shadow = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let blur = graph.push(FilterNode::Blur { input: source, x: 2.0, y: 2.0 }).expect("a blur");
+		let offset = graph.push(FilterNode::Offset { input: blur, dx: 4.0, dy: 4.0 }).expect("an offset");
+		let flood = graph.push(FilterNode::Flood { color: Color::new(0.0, 0.0, 0.0, 1.0, ColorSpace::Srgb) }).expect("a flood");
+		let tint = graph.push(FilterNode::In { input: flood, mask: offset }).expect("kept inside the blur");
+		graph.push(FilterNode::Composite { source, backdrop: tint, operator: Operator::SrcOver }).expect("the thing over its shadow");
+	});
+	assert!(pixel(&shadow, 16, 16)[0] > 200, "the shape is still red: {:?}", pixel(&shadow, 16, 16));
+	let under = pixel(&shadow, 23, 23);
+	assert!(under[3] > 0 && under[0] < 60, "and its shadow is dark and below-right of it: {under:?}");
+
+	// AND THE BACKDROP NODE READS WHAT IS UNDER THE LAYER, which is what a frosted panel is. Without
+	// it the whole class of backdrop effects has to be built by drawing the scene twice.
+	let mut image = target(32, 32);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 32.0, 16.0)), Paint::Solid(Color::new(0.0, 0.0, 1.0, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("something underneath");
+	let mut graph = render2d::filter::FilterGraph::default();
+	let backdrop = graph.push(FilterNode::Backdrop).expect("a node");
+	graph.push(FilterNode::Blur { input: backdrop, x: 3.0, y: 3.0 }).expect("a blur of it");
+	assert!(graph.reads_backdrop(), "a graph that reads the backdrop says so, which is what a compositor asks before it reorders anything");
+	let handle = canvas.resources().add_filter(graph).expect("a graph");
+	canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a filtered layer");
+	canvas.fill_path(rect_path(RectF::new(8.0, 8.0, 16.0, 16.0)), Paint::Solid(Color::new(1.0, 1.0, 1.0, 0.1, ColorSpace::Srgb)), FillRule::NonZero).expect("a pane");
+	canvas.end_layer().expect("closed");
+	draw(&canvas.finish().expect("a list"), &mut image);
+	// The blue under the panel has been blurred across the boundary it had.
+	let blurred_edge = pixel(&image, 16, 17);
+	assert!(blurred_edge[2] > 0, "the backdrop's blue is blurred past the edge it had: {blurred_edge:?}");
+}
+
+/// A provider that answers with one form per kind, so every kind the profile lists is drawn.
+struct EveryKind;
+
+impl GlyphProvider for EveryKind {
+	fn glyph(&self, key: &font_contract::cache::GlyphCacheKey) -> GlyphImage {
+		use font_contract::glyph::{GlyphKind, RasterisationMode};
+		match key.kind {
+			GlyphKind::Outline => {
+				let mut builder = PathBuilder::new();
+				builder.add_rect(RectF::new(0.0, -4.0, 4.0, 4.0)).expect("a box");
+				GlyphImage::Outline(builder.finish())
+			}
+			GlyphKind::GrayscaleMask => GlyphImage::Mask { left: 0, top: -4, width: 4, height: 4, coverage: alloc::vec![255u8; 16], mode: RasterisationMode::Grayscale },
+			GlyphKind::SubpixelMask => GlyphImage::Mask { left: 0, top: -4, width: 4, height: 4, coverage: alloc::vec![255u8; 48], mode: key.mode },
+			GlyphKind::BitmapStrike => {
+				let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
+				let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
+				let layout = ImageLayout::new(Extent2D::new(4, 4), 16, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+				let mut image = OwnedImage::new(layout).expect("an image");
+				{
+					let mut view = image.view_mut();
+					for y in 0..4 {
+						for x in 0..4 {
+							graphics_core::pixel::write(&mut view, x, y, graphics_core::pixel::Rgba::new(0.0, 0.0, 1.0, 1.0));
+						}
+					}
+				}
+				GlyphImage::Bitmap { left: 0, top: -4, image }
+			}
+			GlyphKind::ColrLayers | GlyphKind::ColrPaintGraph => {
+				let mut builder = PathBuilder::new();
+				builder.add_rect(RectF::new(0.0, -4.0, 4.0, 4.0)).expect("a box");
+				GlyphImage::Layers(alloc::vec![(builder.finish(), Color::new(0.0, 1.0, 0.0, 1.0, ColorSpace::Srgb))])
+			}
+		}
+	}
+}
+
+#[test]
+// EVERY GLYPH KIND THE PROFILE LISTS. An outline, a grayscale mask, a subpixel mask, a bitmap strike
+// and a colour-layer glyph are five different things to composite, and a renderer that only has the
+// first draws a page of text and no emoji.
+fn every_glyph_kind_is_drawn_and_the_cache_keys_them_apart() {
+	use font_contract::glyph::{GlyphKind, RasterisationMode, SubpixelLayout};
+	let run = |kind: GlyphKind, mode: RasterisationMode| render2d::list::RecordedGlyphRun { face: font_contract::FaceRef { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity([7u8; 32]), index: 0 }, generation: font_contract::face::Generation(1) }, size: font_contract::Fixed266::from_pixels(8), variation: font_contract::VariationCoordinates::default(), script: font_contract::ScriptTag::from_bytes(*b"latn"), direction: font_contract::Direction::LeftToRight, mode, origin_x: font_contract::Fixed266::from_pixels(4), origin_y: font_contract::Fixed266::from_pixels(12), glyphs: alloc::vec![font_contract::PositionedGlyph { glyph: 42, x_offset: font_contract::Fixed266::ZERO, y_offset: font_contract::Fixed266::ZERO, x_advance: font_contract::Fixed266::from_pixels(8), y_advance: font_contract::Fixed266::ZERO, kind, selection: font_contract::cache::KindSelection { strike: None, palette: None } }], clusters: alloc::vec![] };
+
+	let provider = EveryKind;
+	let drawn = |kind: GlyphKind, mode: RasterisationMode| {
+		let mut image = target(24, 24);
+		let mut canvas = Canvas::new();
+		canvas.draw_glyph_run(run(kind, mode), red()).expect("a run");
+		let list = canvas.finish().expect("a list");
+		let mut backend = Soft2d::new().with_glyphs(&provider);
+		let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+		{
+			let mut view = image.view_mut();
+			backend.render(&prepared, &mut view).expect("a frame");
+		}
+		(image, backend.glyph_cache().len())
+	};
+
+	let (outline, _) = drawn(GlyphKind::Outline, RasterisationMode::Grayscale);
+	assert_eq!(pixel(&outline, 5, 9)[3], 255, "an outline glyph is filled with the run's paint");
+	assert_eq!(pixel(&outline, 5, 9)[0], 255, "in the paint's own colour");
+
+	let (grayscale, _) = drawn(GlyphKind::GrayscaleMask, RasterisationMode::Grayscale);
+	assert!(grayscale.view().row(9).expect("a row")[4 * 4 + 3] > 0, "a grayscale mask composites its coverage");
+
+	let (subpixel, _) = drawn(GlyphKind::SubpixelMask, RasterisationMode::Subpixel(SubpixelLayout::RgbHorizontal));
+	assert!(pixel(&subpixel, 5, 9)[3] > 0, "a subpixel mask is composited per channel");
+
+	let (bitmap, _) = drawn(GlyphKind::BitmapStrike, RasterisationMode::Grayscale);
+	assert!(pixel(&bitmap, 5, 9)[2] > 200, "a bitmap strike brings its OWN colour, not the paint's: {:?}", pixel(&bitmap, 5, 9));
+
+	let (layers, _) = drawn(GlyphKind::ColrLayers, RasterisationMode::Grayscale);
+	assert!(pixel(&layers, 5, 9)[1] > 200, "a colour-layer glyph uses its palette colour: {:?}", pixel(&layers, 5, 9));
+
+	// AND THE CACHE KEYS THEM APART. Two glyphs differing only in KIND, or only in rasterisation
+	// MODE, must not share an entry - which is the stale-pixel case the eleven-field key exists for.
+	let mut cache = GlyphRaster::default();
+	let key = |kind: GlyphKind, mode: RasterisationMode| font_contract::cache::GlyphCacheKey { face: font_contract::FaceIdentity { file: font_contract::face::FileIdentity([7u8; 32]), index: 0 }, generation: font_contract::face::Generation(1), glyph: 42, size: font_contract::Fixed266::from_pixels(8), variation: font_contract::VariationCoordinates::default(), transform: font_contract::glyph::TransformKey::IDENTITY, phase: font_contract::glyph::SubpixelPhase { x: 0, y: 0 }, kind, selection: font_contract::cache::KindSelection { strike: None, palette: None }, mode };
+	assert_eq!(cache.get(&key(GlyphKind::Outline, RasterisationMode::Grayscale), &provider).kind(), Some(GlyphKind::Outline));
+	assert_eq!(cache.get(&key(GlyphKind::GrayscaleMask, RasterisationMode::Grayscale), &provider).kind(), Some(GlyphKind::GrayscaleMask));
+	assert_eq!(cache.len(), 2, "two kinds are two entries");
+	cache.get(&key(GlyphKind::SubpixelMask, RasterisationMode::Subpixel(SubpixelLayout::RgbHorizontal)), &provider);
+	cache.get(&key(GlyphKind::SubpixelMask, RasterisationMode::Subpixel(SubpixelLayout::BgrVertical)), &provider);
+	assert_eq!(cache.len(), 4, "one glyph rasterised for two subpixel geometries is two entries");
+	// A CLEARED CACHE IS A NEW GENERATION, which is what makes every prepared list bound to the old
+	// one refuse by name rather than replay against entries that are gone.
+	let before = cache.generation();
+	cache.clear();
+	assert!(cache.is_empty() && cache.generation() != before);
+}
+
+#[test]
+// THE WIDE PATH AND THE SCALAR REFERENCE ARE ONE ALGORITHM, so they agree BIT FOR BIT and not within
+// a tolerance. A tolerance between them would let the fast path drift until the difference showed up
+// as a seam between the pixels one covered and the pixels the other did.
+fn the_wide_span_path_agrees_with_the_scalar_reference_exactly() {
+	use graphics_core::pixel::Rgba;
+	let value = |seed: u32| {
+		let part = |shift: u32| ((seed >> shift) & 0xff) as f32 / 255.0;
+		let alpha = part(24);
+		// Premultiplied, which is what a span carries: the colour may not exceed the alpha.
+		Rgba::new(part(0) * alpha, part(8) * alpha, part(16) * alpha, alpha)
+	};
+	// LENGTHS AROUND THE LANE WIDTH, because the tail is where a wide loop goes wrong and every
+	// length that is a multiple of four would hide it.
+	for length in [0usize, 1, 3, 4, 5, 7, 8, 9, 16, 17, 64, 129] {
+		let source: alloc::vec::Vec<Rgba> = (0..length).map(|index| value((index as u32).wrapping_mul(2_654_435_761))).collect();
+		let start: alloc::vec::Vec<Rgba> = (0..length).map(|index| value((index as u32).wrapping_mul(40_503).wrapping_add(7))).collect();
+		let mut wide = start.clone();
+		let mut reference = start.clone();
+		crate::span::composite_span(&mut wide, &source, Operator::SrcOver, BlendMode::Normal);
+		crate::span::composite_span_scalar(&mut reference, &source, Operator::SrcOver, BlendMode::Normal);
+		for (index, (fast, slow)) in wide.iter().zip(reference.iter()).enumerate() {
+			assert_eq!(fast.red.to_bits(), slow.red.to_bits(), "length {length}, pixel {index}: {fast:?} against {slow:?}");
+			assert_eq!(fast.alpha.to_bits(), slow.alpha.to_bits(), "length {length}, pixel {index}");
+		}
+
+		// AND THE SAME FOR THE COVERAGE MULTIPLY, which is the other loop that was widened.
+		let coverage: alloc::vec::Vec<f32> = (0..length).map(|index| (index % 17) as f32 / 16.0).collect();
+		let mut wide = start.clone();
+		let mut reference = start.clone();
+		crate::span::scale_span(&mut wide, &coverage);
+		crate::span::scale_span_scalar(&mut reference, &coverage);
+		assert!(wide.iter().zip(reference.iter()).all(|(fast, slow)| fast.red.to_bits() == slow.red.to_bits() && fast.alpha.to_bits() == slow.alpha.to_bits()), "length {length}");
+	}
+	assert_eq!(crate::span::LANES, 4);
+}
+
+/// A cancellation that fires after a stated number of questions.
+struct StopAfter {
+	limit: core::cell::Cell<u32>,
+}
+
+impl backend::Cancellation for StopAfter {
+	fn cancelled(&self) -> bool {
+		let left = self.limit.get();
+		if left == 0 {
+			return true;
+		}
+		self.limit.set(left - 1);
+		false
+	}
+}
+
+#[test]
+// A SURFACE THAT WAS CLOSED OR RESIZED MID-FRAME IS A FRAME NOBODY WILL SEE. Finishing it costs the
+// whole drawing for nothing, and on a resize it costs it at the WRONG SIZE - so the loop asks between
+// tiles and says plainly that it stopped.
+fn a_cancelled_frame_stops_and_says_so() {
+	let mut image = target(256, 256);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 256.0, 256.0)), red(), FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	let stop = StopAfter { limit: core::cell::Cell::new(2) };
+	let mut backend = Soft2d::new().with_cancellation(&stop);
+	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+	{
+		let mut view = image.view_mut();
+		assert_eq!(backend.render(&prepared, &mut view).err(), Some(render2d::Error::Cancelled));
+	}
+	// WHAT WAS DRAWN STAYS DRAWN, in whole tiles: the first two tiles are complete and the rest are
+	// untouched, which is a stop at a boundary rather than a shape cut in half.
+	assert_eq!(pixel(&image, 4, 4)[3], 255, "the first tile was finished");
+	assert_eq!(pixel(&image, 200, 200)[3], 0, "and the last was never started");
+}
+
+#[test]
+// A PREPARED LIST IS A CACHE, and a cache whose validity conditions are not enumerated eventually
+// replays a drawing that is not the one recorded. Each dependency is changed ALONE here, and each
+// refusal names the one that changed.
+fn a_prepared_list_is_bound_to_what_it_was_prepared_against() {
+	let mut image = target(32, 32);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 8.0, 8.0)), red(), FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	let mut backend = Soft2d::new();
+	let description = description(&image);
+	let prepared = backend.prepare(&list, &description).expect("a preparation");
+	let key = render2d::backend::Prepared::key(&prepared);
+	assert_eq!(key.backend, BACKEND_NAME);
+
+	let against = |changed: TargetDescription| render2d::prepared::PreparedKey::of(&list, &changed, (BACKEND_NAME, BACKEND_VERSION), backend.glyph_cache().generation());
+	assert_eq!(key.compatible_with(&against(description)), Ok(()));
+	assert_eq!(key.compatible_with(&against(TargetDescription { extent: Extent2D::new(64, 32), ..description })), Err(render2d::prepared::RePrepare::Extent));
+	assert_eq!(key.compatible_with(&against(TargetDescription { scale: 2.0, ..description })), Err(render2d::prepared::RePrepare::Scale));
+	assert_eq!(key.compatible_with(&against(TargetDescription { format: PixelFormat::B8G8R8A8Unorm, ..description })), Err(render2d::prepared::RePrepare::Format));
+	assert_eq!(key.compatible_with(&against(TargetDescription { color_space: ColorSpace::DisplayP3, ..description })), Err(render2d::prepared::RePrepare::ColorSpace));
+
+	// AND A RENDER AGAINST A TARGET OF THE WRONG SIZE IS REFUSED rather than drawing off the end of
+	// it: the preparation's tiling is the target's, and a different target is a different tiling.
+	let mut wider = target(64, 32);
+	let mut view = wider.view_mut();
+	assert!(backend.render(&prepared, &mut view).is_err());
+	let mut view = image.view_mut();
+	backend.render(&prepared, &mut view).expect("the target it was prepared for");
+}
+
+#[test]
+// HOSTILE INPUT IS ANSWERED AND NEVER CRASHED ON. Coordinates at the edges of the type, degenerate
+// curves, singular and projective transforms, a pitch with padding, a deep filter graph and a clip
+// stack at its ceiling: none of them may panic, and none may write outside the target - which the
+// canary around this one checks on every iteration.
+fn hostile_input_is_answered_rather_than_crashed_on() {
+	let hostile = [0.0f32, -0.0, 1.0, -1.0, f32::MAX, f32::MIN, f32::EPSILON, 1e30, -1e30, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+	for value in hostile {
+		let mut builder = PathBuilder::new();
+		let _ = builder.move_to(PointF { x: value, y: value });
+		let _ = builder.line_to(PointF { x: -value, y: value });
+		let _ = builder.quad_to(PointF { x: value, y: -value }, PointF { x: 0.0, y: 0.0 });
+		let _ = builder.cubic_to(PointF { x: value, y: 0.0 }, PointF { x: 0.0, y: value }, PointF { x: 4.0, y: 4.0 });
+		let _ = builder.close();
+		let path = builder.finish();
+
+		let transforms = [
+			render2d::transform::Transform::IDENTITY,
+			render2d::transform::Transform::scale(value, value),
+			render2d::transform::Transform { m: [[value, 0.0, 0.0], [0.0, value, 0.0], [value, value, 0.0]] },
+			render2d::transform::Transform { m: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]] },
+		];
+		for transform in transforms {
+			let mut canvas = Canvas::new();
+			canvas.set_transform(transform);
+			let _ = canvas.fill_path(path.clone(), red(), FillRule::EvenOdd);
+			let _ = canvas.stroke_path(path.clone(), red(), render2d::path::StrokeStyle { width: value, miter_limit: value, ..render2d::path::StrokeStyle::default() });
+			let Ok(list) = canvas.finish() else { continue };
+			// A PITCH WITH PADDING AND A CANARY AFTER THE IMAGE, so a write outside either is caught.
+			let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
+			let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
+			let layout = ImageLayout::new(Extent2D::new(9, 7), 9 * 4 + 5, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+			let mut bytes = alloc::vec![0xC3u8; (9 * 4 + 5) * 7 + 32];
+			let mut backend = Soft2d::new();
+			let description = TargetDescription { extent: Extent2D::new(9, 7), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 };
+			if let Ok(prepared) = backend.prepare(&list, &description) {
+				let mut view = graphics_core::ImageViewMut::new(layout, &mut bytes).expect("a view");
+				let _ = backend.render(&prepared, &mut view);
+			}
+			let tail = (9 * 4 + 5) * 7;
+			assert!(bytes[tail..].iter().all(|byte| *byte == 0xC3), "a hostile drawing wrote past the image: {value}");
+		}
+	}
+
+	// A DEEP FILTER GRAPH, to the profile's own ceiling: every node reads the one before it, which is
+	// the deepest chain the type allows.
+	// SIXTEEN DEEP AND NOT THE PROFILE'S SIXTY-FOUR. Each node of a chain of blurs grows the layer's
+	// scratch by its own reach, so a chain at the ceiling is a quarter of a megabyte per node over a
+	// surface a quarter of a megapixel - twenty seconds of work to learn what sixteen already show.
+	// That the BUILDER refuses past the ceiling is the profile's own fixture, in `render2d`.
+	let mut graph = render2d::filter::FilterGraph::default();
+	let mut previous = graph.push(render2d::filter::FilterNode::Source).expect("a source");
+	for _ in 0..15 {
+		previous = graph.push(render2d::filter::FilterNode::Blur { input: previous, x: 0.5, y: 0.5 }).expect("a blur");
+	}
+	assert_eq!(graph.nodes().len(), 16);
+	let mut canvas = Canvas::new();
+	let handle = canvas.resources().add_filter(graph).expect("a graph");
+	canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a filtered layer");
+	canvas.fill_path(rect_path(RectF::new(1.0, 1.0, 4.0, 4.0)), red(), FillRule::NonZero).expect("a fill");
+	canvas.end_layer().expect("closed");
+	let list = canvas.finish().expect("a list");
+	let mut image = target(16, 16);
+	let mut backend = Soft2d::new();
+	match backend.prepare(&list, &description(&image)) {
+		// EITHER IT FITS AND DRAWS, OR IT IS REFUSED BY NAME. What it must not be is a partial frame.
+		Ok(prepared) => {
+			let mut view = image.view_mut();
+			let _ = backend.render(&prepared, &mut view);
+		}
+		Err(error) => assert!(matches!(error, render2d::Error::LimitExceeded { .. }), "{error:?}"),
+	}
+
+	// AND A CLIP STACK AT ITS CEILING, which is the other bound a drawing can reach.
+	let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+	let mut canvas = Canvas::new();
+	for index in 0..limits.max_clip_depth.min(16) {
+		canvas.save().expect("a state");
+		canvas.set_clip(rect_path(RectF::new(index as f32 * 0.25, 0.0, 16.0, 16.0)), FillRule::NonZero).expect("a clip");
+	}
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, 16.0, 16.0)), red(), FillRule::NonZero).expect("a fill");
+	for _ in 0..limits.max_clip_depth.min(16) {
+		canvas.restore().expect("popped");
+	}
+	let list = canvas.finish().expect("a list");
+	let mut image = target(16, 16);
+	let mut backend = Soft2d::new();
+	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+	let mut view = image.view_mut();
+	backend.render(&prepared, &mut view).expect("a frame under sixteen nested clips");
+	assert!(pixel(&image, 8, 8)[3] > 0, "the drawing survives the nesting");
+}

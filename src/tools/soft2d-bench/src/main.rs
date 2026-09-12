@@ -1,0 +1,312 @@
+//! THE SOFT2D PERFORMANCE FLOOR, measured headlessly.
+//!
+//! IT NEEDS NO SURFACE, NO DisplayService, NO GUEST AND NO APPLICATION. Four bounded `DrawList`
+//! fixtures are recorded once and replayed into an `OwnedImage`, which is what makes this a number a
+//! person can get in a second on a host rather than a boot away - and what stops the live application
+//! becoming a prerequisite of the backend's own floor.
+//!
+//! THE FIXTURES ARE FROZEN AND THIS PROGRAM CHECKS THAT THEY ARE. Each one's command count, resource
+//! count and extent are asserted against the numbers recorded here, so a later simplification cannot
+//! quietly lower the workload and report the same milliseconds against an easier scene. A benchmark
+//! whose workload can drift measures the workload and not the renderer.
+//!
+//! PREPARATION AND REPLAY ARE REPORTED SEPARATELY, because they are different claims: `prepare`
+//! flattens, strokes, bins and reserves once, and `render` is what a repeated frame costs. The floor
+//! is on the REPLAY, which is the frame.
+
+use std::time::Instant;
+
+use graphics_core::geom::{Extent2D, PointF, RectF};
+use graphics_core::layout::{ImageLayout, RowOrigin};
+use graphics_core::semantics::ImageSemantics;
+use graphics_core::{AlphaMode, ColorSpace, ImageView, OwnedImage, PixelFormat, PixelStorage};
+use render2d::backend::{Backend, TargetDescription};
+use render2d::blend::{BlendMode, Operator};
+use render2d::filter::{FilterGraph, FilterNode};
+use render2d::list::{DrawList, ImageRecord};
+use render2d::paint::{Color, GradientStop, ImageQuality, Paint};
+use render2d::path::{Cap, FillRule, Join, PathBuilder, StrokeStyle};
+use render2d::transform::Transform;
+use render2d::{Canvas, Error};
+use soft2d::{ImageSource, Soft2d};
+
+/// THE MEASURED EXTENT. The profile's own benchmark size, so two measurements are comparable.
+const WIDTH: u32 = 640;
+const HEIGHT: u32 = 480;
+
+/// How many frames are thrown away before measuring, and how many are kept.
+///
+/// THE WARMUP IS NOT A COURTESY. The first replay of a list touches every page of the reservation and
+/// pulls the target into cache; including it would measure the allocator's first-touch cost once and
+/// divide it into every sample.
+const WARMUP: usize = 5;
+const SAMPLES: usize = 30;
+
+/// One scene's frozen shape and its budget.
+struct Scene {
+	name: &'static str,
+	/// The ceiling, in milliseconds. FIXED INDEPENDENTLY OF THE IMPLEMENTATION: sixty and fifteen
+	/// frames a second are what a user interface and a heavy scene respectively have to hold.
+	ceiling_ms: f64,
+	/// The frozen budget: the first accepted measurement or the ceiling, whichever is lower. IT MAY
+	/// ONLY EVER BE LOWERED - raising it is how a regression becomes the new normal.
+	budget_ms: f64,
+	commands: usize,
+	resources: usize,
+}
+
+/// The four scenes, with the frozen counts a fixture is checked against.
+const SCENES: [Scene; 4] = [
+	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 16.7, commands: 252, resources: 153 },
+	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 66.7, commands: 45, resources: 34 },
+	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 66.7, commands: 240, resources: 241 },
+	Scene { name: "image-stress", ceiling_ms: 16.7, budget_ms: 16.7, commands: 24, resources: 2 },
+];
+
+/// The images the scenes reference, under their recorded identities.
+struct Images {
+	photo: OwnedImage,
+	icon: OwnedImage,
+	wide: OwnedImage,
+}
+
+impl ImageSource for Images {
+	fn image(&self, identity: u64) -> Option<ImageView<'_>> {
+		match identity {
+			1 => Some(self.photo.view()),
+			2 => Some(self.icon.view()),
+			3 => Some(self.wide.view()),
+			_ => None,
+		}
+	}
+}
+
+fn main() {
+	let check = std::env::args().any(|argument| argument == "--check");
+	let images = build_images();
+	println!("scene\tcommands\tresources\tprepare_ms\treplay_median_ms\treplay_p99_ms\tbudget_ms\tceiling_ms\tverdict");
+	let mut failed = false;
+	for scene in SCENES.iter() {
+		let list = match scene.name {
+			"UI-basic" => ui_basic(),
+			"UI-effects" => ui_effects(),
+			"vector-stress" => vector_stress(),
+			_ => image_stress(),
+		}
+		.expect("a fixture this program records");
+		// THE FROZEN SHAPE IS CHECKED BEFORE THE CLOCK STARTS. A fixture that lost half its commands
+		// would otherwise report a comfortable number against a scene nobody agreed to.
+		if std::env::var("SOFT2D_BENCH_FREEZE").is_ok() {
+			// FREEZING IS AN EXPLICIT ACT. The counts below are what the scenes are, and this prints
+			// them so the constants above can be written from a run rather than guessed - it never
+			// rewrites them itself, because a benchmark that updates its own workload has none.
+			eprintln!("freeze: {} commands={} resources={}", scene.name, list.commands().len(), resource_count(&list));
+		} else {
+			assert_eq!(list.commands().len(), scene.commands, "{}: the frozen command count changed", scene.name);
+			assert_eq!(resource_count(&list), scene.resources, "{}: the frozen resource count changed", scene.name);
+		}
+
+		let mut target = target();
+		let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 };
+		let mut backend = Soft2d::new().with_images(&images);
+		let started = Instant::now();
+		let prepared = backend.prepare(&list, &description).expect("a preparation");
+		let prepare_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+		let mut samples = Vec::with_capacity(SAMPLES);
+		for index in 0..WARMUP + SAMPLES {
+			let started = Instant::now();
+			{
+				let mut view = target.view_mut();
+				backend.render(&prepared, &mut view).expect("a frame");
+			}
+			let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+			if index >= WARMUP {
+				samples.push(elapsed);
+			}
+		}
+		samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+		let median = samples[samples.len() / 2];
+		// THE NINETY-NINTH PERCENTILE AND NOT THE MAXIMUM. One sample interrupted by the scheduler is
+		// not the renderer's cost, and a floor set on a maximum is a floor set on the busiest machine
+		// that ever ran it.
+		let percentile = samples[((samples.len() as f64 * 0.99) as usize).min(samples.len() - 1)];
+		let allowed = scene.budget_ms.min(scene.ceiling_ms);
+		let met = median <= allowed;
+		failed |= check && !met;
+		println!("{}\t{}\t{}\t{prepare_ms:.3}\t{median:.3}\t{percentile:.3}\t{:.1}\t{:.1}\t{}", scene.name, scene.commands, scene.resources, scene.budget_ms, scene.ceiling_ms, if met { "met" } else { "OVER" });
+	}
+	if failed {
+		eprintln!("soft2d-bench: a scene is over its frozen budget");
+		std::process::exit(1);
+	}
+}
+
+fn resource_count(list: &DrawList) -> usize {
+	let resources = list.resources();
+	resources.paths.len() + resources.images.len() + resources.stops.len() + resources.dashes.len() + resources.glyph_runs.len() + resources.filters.len()
+}
+
+fn target() -> OwnedImage {
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Premultiplied };
+	let storage = PixelStorage::Known(PixelFormat::B8G8R8A8Unorm);
+	let layout = ImageLayout::new(Extent2D::new(WIDTH, HEIGHT), WIDTH * 4, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+	OwnedImage::new(layout).expect("a target")
+}
+
+/// DETERMINISTIC CONTENT. Every image is generated from its coordinates, so the scene is the same on
+/// every machine and in every run - a benchmark whose input is random measures the input.
+fn build_images() -> Images {
+	let make = |extent: Extent2D, space: ColorSpace, pattern: &dyn Fn(u32, u32) -> [f32; 4]| {
+		let semantics = ImageSemantics::Color { color_space: space, alpha_mode: AlphaMode::Straight };
+		let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
+		let layout = ImageLayout::new(extent, extent.width * 4, storage, RowOrigin::TopLeft, semantics).expect("a layout");
+		let mut image = OwnedImage::new(layout).expect("an image");
+		{
+			let mut view = image.view_mut();
+			for y in 0..extent.height {
+				for x in 0..extent.width {
+					let [red, green, blue, alpha] = pattern(x, y);
+					graphics_core::pixel::write(&mut view, x, y, graphics_core::pixel::Rgba::new(red, green, blue, alpha));
+				}
+			}
+		}
+		image
+	};
+	Images {
+		photo: make(Extent2D::new(512, 512), ColorSpace::Srgb, &|x, y| [(x % 256) as f32 / 255.0, (y % 256) as f32 / 255.0, ((x ^ y) % 256) as f32 / 255.0, 1.0]),
+		icon: make(Extent2D::new(32, 32), ColorSpace::Srgb, &|x, y| [1.0, (x + y) as f32 / 64.0, 0.25, if (x / 4 + y / 4) % 2 == 0 { 1.0 } else { 0.5 }]),
+		// A WIDE-GAMUT SOURCE, which is the colour-conversion half of the image scene. The YUV source
+		// the plan also names needs the multi-plane image model, which `P02M0103a-common` still owes.
+		wide: make(Extent2D::new(256, 256), ColorSpace::DisplayP3, &|x, y| [(x % 128) as f32 / 127.0, 0.5, (y % 128) as f32 / 127.0, 1.0]),
+	}
+}
+
+fn rect(canvas: &mut Canvas, rect: RectF, paint: Paint) -> Result<(), Error> {
+	let mut builder = PathBuilder::new();
+	builder.add_rect(rect)?;
+	canvas.fill_path(builder.finish(), paint, FillRule::NonZero)
+}
+
+/// RECTANGLES, GLYPHS, IMAGES AND CLIPS: the shape of a user interface, which is what most drawings
+/// actually are.
+fn ui_basic() -> Result<DrawList, Error> {
+	let mut canvas = Canvas::new();
+	let icon = canvas.resources().add_image(ImageRecord { identity: 2, layout_generation: 1, content_generation: 1 })?;
+	let _ = icon;
+	let panel = Color::new(0.16, 0.18, 0.22, 1.0, ColorSpace::Srgb);
+	let text = Color::new(0.9, 0.92, 0.95, 1.0, ColorSpace::Srgb);
+	rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(panel))?;
+	for row in 0..50 {
+		let y = 8.0 + row as f32 * 9.0;
+		canvas.save()?;
+		canvas.set_clip(
+			{
+				let mut builder = PathBuilder::new();
+				builder.add_rect(RectF::new(4.0, y, 632.0, 8.0))?;
+				builder.finish()
+			},
+			FillRule::NonZero,
+		)?;
+		rect(&mut canvas, RectF::new(6.0, y + 1.0, 120.0, 6.0), Paint::Solid(text))?;
+		rect(&mut canvas, RectF::new(140.0, y + 1.0, 400.0, 6.0), Paint::Solid(Color::new(0.4, 0.5, 0.7, 0.8, ColorSpace::Srgb)))?;
+		canvas.draw_image(ImageRecord { identity: 2, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 32.0, 32.0), RectF::new(560.0, y - 2.0, 12.0, 12.0), ImageQuality::Bilinear)?;
+		canvas.restore()?;
+	}
+	rect(&mut canvas, RectF::new(0.0, 460.0, WIDTH as f32, 20.0), Paint::Solid(Color::new(0.1, 0.11, 0.13, 1.0, ColorSpace::Srgb)))?;
+	canvas.finish()
+}
+
+/// LAYERS, SHADOWS AND A BACKDROP BLUR: the scene whose cost is the filter graph rather than the
+/// geometry.
+fn ui_effects() -> Result<DrawList, Error> {
+	let mut canvas = Canvas::new();
+	rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.5, 1.0, ColorSpace::Srgb)))?;
+	canvas.draw_image(ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 512.0, 512.0), RectF::new(0.0, 0.0, 640.0, 480.0), ImageQuality::Bilinear)?;
+	for index in 0..10 {
+		let x = 20.0 + (index % 5) as f32 * 120.0;
+		let y = 40.0 + (index / 5) as f32 * 200.0;
+		// A SHADOW IS A BLUR OF AN ALPHA CHANNEL, offset, tinted and composited UNDER the thing that
+		// cast it - five nodes, which is what an API with a `drop_shadow` call cannot express.
+		let mut graph = FilterGraph::default();
+		let source = graph.push(FilterNode::Source)?;
+		let blur = graph.push(FilterNode::Blur { input: source, x: 4.0, y: 4.0 })?;
+		let offset = graph.push(FilterNode::Offset { input: blur, dx: 3.0, dy: 5.0 })?;
+		let flood = graph.push(FilterNode::Flood { color: Color::new(0.0, 0.0, 0.0, 0.6, ColorSpace::Srgb) })?;
+		let shadow = graph.push(FilterNode::In { input: flood, mask: offset })?;
+		graph.push(FilterNode::Composite { source, backdrop: shadow, operator: Operator::SrcOver })?;
+		let handle = canvas.resources().add_filter(graph)?;
+		canvas.begin_layer(Some(RectF::new(x - 12.0, y - 12.0, 124.0, 174.0)), 0.95, BlendMode::Normal, Some(handle))?;
+		rect(&mut canvas, RectF::new(x, y, 100.0, 150.0), Paint::Solid(Color::new(0.95, 0.95, 0.98, 1.0, ColorSpace::Srgb)))?;
+		rect(&mut canvas, RectF::new(x + 8.0, y + 8.0, 84.0, 40.0), Paint::Solid(Color::new(0.3, 0.6, 0.9, 1.0, ColorSpace::Srgb)))?;
+		canvas.end_layer()?;
+	}
+	// AND ONE BACKDROP BLUR, which is the frosted panel: a blur of what is UNDER the layer.
+	let mut graph = FilterGraph::default();
+	let backdrop = graph.push(FilterNode::Backdrop)?;
+	graph.push(FilterNode::Blur { input: backdrop, x: 6.0, y: 6.0 })?;
+	let handle = canvas.resources().add_filter(graph)?;
+	canvas.begin_layer(Some(RectF::new(80.0, 180.0, 480.0, 120.0)), 1.0, BlendMode::Normal, Some(handle))?;
+	rect(&mut canvas, RectF::new(80.0, 180.0, 480.0, 120.0), Paint::Solid(Color::new(1.0, 1.0, 1.0, 0.15, ColorSpace::Srgb)))?;
+	canvas.end_layer()?;
+	canvas.finish()
+}
+
+/// PATHS AND CURVES AT A FIXED STROKE WIDTH AND JOIN SET, which is the scene whose cost is the
+/// rasteriser itself.
+fn vector_stress() -> Result<DrawList, Error> {
+	let mut canvas = Canvas::new();
+	let stops = canvas.resources().add_stops(vec![
+		GradientStop { offset: 0.0, color: Color::new(0.9, 0.2, 0.1, 1.0, ColorSpace::Srgb) },
+		GradientStop { offset: 0.5, color: Color::new(0.95, 0.8, 0.1, 1.0, ColorSpace::Srgb) },
+		GradientStop { offset: 1.0, color: Color::new(0.1, 0.4, 0.9, 1.0, ColorSpace::Srgb) },
+	])?;
+	let gradient = Paint::Linear { from: PointF { x: 0.0, y: 0.0 }, to: PointF { x: 640.0, y: 480.0 }, stops, spread: graphics_core::sample::Spread::Clamp, transform: Transform::IDENTITY };
+	let style = StrokeStyle { width: 2.5, cap: Cap::Round, join: Join::Miter, miter_limit: 4.0, ..StrokeStyle::default() };
+	for index in 0..120 {
+		let phase = index as f32 * 0.11;
+		let mut builder = PathBuilder::new();
+		builder.move_to(PointF { x: 10.0 + phase * 4.0, y: 20.0 + (index % 20) as f32 * 22.0 })?;
+		for segment in 0..6 {
+			let x = 10.0 + phase * 4.0 + segment as f32 * 100.0;
+			let y = 20.0 + (index % 20) as f32 * 22.0;
+			builder.cubic_to(PointF { x: x + 30.0, y: y - 40.0 }, PointF { x: x + 70.0, y: y + 40.0 }, PointF { x: x + 100.0, y })?;
+		}
+		canvas.stroke_path(builder.finish(), gradient, style)?;
+
+		let mut fill = PathBuilder::new();
+		let centre = PointF { x: 40.0 + (index % 12) as f32 * 50.0, y: 40.0 + (index / 12) as f32 * 44.0 };
+		fill.move_to(PointF { x: centre.x, y: centre.y - 18.0 })?;
+		fill.quad_to(PointF { x: centre.x + 24.0, y: centre.y }, PointF { x: centre.x, y: centre.y + 18.0 })?;
+		fill.quad_to(PointF { x: centre.x - 24.0, y: centre.y }, PointF { x: centre.x, y: centre.y - 18.0 })?;
+		fill.close()?;
+		canvas.fill_path(fill.finish(), Paint::Solid(Color::new(0.2, 0.7, 0.4, 0.7, ColorSpace::Srgb)), FillRule::NonZero)?;
+	}
+	canvas.finish()
+}
+
+/// SCALING AND COLOUR CONVERSION, which is the scene whose cost is the sampler and the pipeline.
+fn image_stress() -> Result<DrawList, Error> {
+	let mut canvas = Canvas::new();
+	let photo = ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 };
+	let wide = ImageRecord { identity: 3, layout_generation: 1, content_generation: 1 };
+	// A LARGE DOWNSCALE, which is what the pyramid is for.
+	for index in 0..8 {
+		let x = (index % 4) as f32 * 160.0;
+		let y = (index / 4) as f32 * 120.0;
+		canvas.draw_image(photo, RectF::new(0.0, 0.0, 512.0, 512.0), RectF::new(x, y, 158.0, 118.0), ImageQuality::Mipmapped)?;
+	}
+	// AN UPSCALE AT EACH QUALITY, which is where the three filters differ.
+	for (index, quality) in [ImageQuality::Nearest, ImageQuality::Bilinear, ImageQuality::Bicubic].into_iter().enumerate() {
+		canvas.draw_image(photo, RectF::new(0.0, 0.0, 64.0, 64.0), RectF::new(index as f32 * 200.0, 250.0, 190.0, 190.0), quality)?;
+	}
+	// AND A WIDE-GAMUT SOURCE INTO AN sRGB TARGET, which is the conversion half of the scene.
+	for index in 0..12 {
+		let x = (index % 6) as f32 * 106.0;
+		let y = 250.0 + (index / 6) as f32 * 110.0;
+		canvas.draw_image(wide, RectF::new(0.0, 0.0, 256.0, 256.0), RectF::new(x, y, 104.0, 108.0), ImageQuality::Bilinear)?;
+	}
+	canvas.set_operator(Operator::SrcOver);
+	canvas.draw_image(wide, RectF::new(0.0, 0.0, 256.0, 256.0), RectF::new(0.0, 0.0, 640.0, 480.0), ImageQuality::Mipmapped)?;
+	canvas.finish()
+}
