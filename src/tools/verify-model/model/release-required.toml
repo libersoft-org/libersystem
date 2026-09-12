@@ -227,6 +227,7 @@ keys = [
 	"host.topology / host / host / default",
 	"host.udf / host / host / default",
 	"host.uefi / host / host / default",
+	"host.unicode-bidi / host / host / default",
 	"host.unicode-segmentation / host / host / default",
 	"host.unicode-tables / host / host / default",
 	"host.unsafe-inventory / host / host / default",

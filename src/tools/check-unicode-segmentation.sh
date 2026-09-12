@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Segmentation is generated from a pinned Unicode release, and measured against Unicode's own answers.
 #
-# WHAT THIS REFUSES. Three things a text stack gets wrong quietly: a property table that has drifted
-# from the release it claims, a grapheme cluster boundary in the middle of a letter, and a line break
-# where the algorithm does not allow one. None of them crashes anything - they put a cursor inside a
-# character, delete half an emoji, or break a line where no language would - so nothing but a
-# conformance run finds them.
+# WHAT THIS REFUSES. Four things a text stack gets wrong quietly: a property table that has drifted
+# from the release it claims, a grapheme cluster boundary in the middle of a letter, a line break
+# where the algorithm does not allow one, and a bidirectional ordering that is subtly wrong. None of
+# them crashes anything - they put a cursor inside a character, delete half an emoji, break a line
+# where no language would, or render Arabic that looks plausible and is not - so nothing but a
+# conformance run finds them, and the last is the one a reader who cannot read the script cannot see.
 #
-# THE ANSWERS ARE UNICODE'S, NOT THIS TREE'S. `GraphemeBreakTest`, `WordBreakTest` and
-# `LineBreakTest` are run IN FULL: every case the release publishes, including the ones no
+# THE ANSWERS ARE UNICODE'S, NOT THIS TREE'S. `GraphemeBreakTest`, `WordBreakTest`, `LineBreakTest`,
+# `BidiTest` and `BidiCharacterTest` are run IN FULL: every case the release publishes, including the ones no
 # implementer would think to write. A representative sample is exactly the set of cases somebody
 # already believed they handled.
 #
@@ -20,6 +21,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 TABLES="src/user/libs/text/unicode-tables/Cargo.toml"
 SEGMENTATION="src/user/libs/text/unicode-segmentation/Cargo.toml"
+BIDI="src/user/libs/text/unicode-bidi/Cargo.toml"
 GENERATOR="src/tools/ucd-gen/Cargo.toml"
 CONFORMANCE="src/tools/unicode-conformance/Cargo.toml"
 
@@ -33,6 +35,7 @@ fi
 # person can check by hand. Everything below reads them.
 cargo test --quiet --offline --manifest-path "$TABLES" || exit 1
 cargo test --quiet --offline --manifest-path "$SEGMENTATION" || exit 1
+cargo test --quiet --offline --manifest-path "$BIDI" || exit 1
 
 # Then that they are what the pinned release generates, rather than what somebody edited them into.
 cargo run --quiet --offline --manifest-path "$GENERATOR" -- --check || exit 1

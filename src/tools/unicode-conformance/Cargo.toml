@@ -8,6 +8,7 @@ description = "Run the NORMATIVE Unicode segmentation conformance files against 
 # run rather than a self-consistency check is that the ANSWERS come from a file Unicode publishes.
 unicode-segmentation = { path = "../../user/libs/text/unicode-segmentation" }
 unicode-tables = { path = "../../user/libs/text/unicode-tables" }
+unicode-bidi = { path = "../../user/libs/text/unicode-bidi" }
 
 [lints.rust]
 warnings = "deny"

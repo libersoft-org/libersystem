@@ -217,6 +217,10 @@ path = "user/libs/text/unicode-tables"
 owner = "unicode-segmentation"
 path = "user/libs/text/unicode-segmentation"
 
+[[sources]]
+owner = "unicode-bidi"
+path = "user/libs/text/unicode-bidi"
+
 # THE FONT CATALOGUE'S PROTOCOL. Generated from `idl/font.lsidl` like every other package. It has no
 # consumer yet - the catalogue service it describes is not built - so it carries a source row and no
 # library row: a package that is generated and checked but staged nowhere.

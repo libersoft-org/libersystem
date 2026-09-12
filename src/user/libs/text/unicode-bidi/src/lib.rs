@@ -83,9 +83,10 @@ pub fn paragraph_level(text: &str, direction: ParagraphDirection) -> u8 {
 
 /// The embedding levels of a paragraph.
 pub fn levels(text: &str, direction: ParagraphDirection) -> Levels {
-	let classes: Vec<BidiClass> = text.chars().take(MAX_PARAGRAPH).map(bidi_class).collect();
+	let characters: Vec<char> = text.chars().take(MAX_PARAGRAPH).collect();
+	let classes: Vec<BidiClass> = characters.iter().map(|character| bidi_class(*character)).collect();
 	let paragraph = paragraph_level(text, direction);
-	resolve(&classes, paragraph)
+	resolve(&classes, Some(&characters), paragraph)
 }
 
 /// The same, for a caller that already has the classes - which the conformance file does, and which
@@ -96,7 +97,7 @@ pub fn levels_of_classes(classes: &[BidiClass], direction: ParagraphDirection) -
 		ParagraphDirection::RightToLeft => 1,
 		ParagraphDirection::Auto => auto_level(classes),
 	};
-	resolve(classes, paragraph)
+	resolve(classes, None, paragraph)
 }
 
 /// P2 and P3 over a class sequence.
@@ -120,9 +121,9 @@ mod reorder;
 
 pub use reorder::{mirrored, reorder_visual};
 
-fn resolve(classes: &[BidiClass], paragraph_level: u8) -> Levels {
+fn resolve(classes: &[BidiClass], text: Option<&[char]>, paragraph_level: u8) -> Levels {
 	let mut state = explicit::resolve_explicit(classes, paragraph_level);
-	implicit::resolve_implicit(classes, &mut state, paragraph_level);
+	implicit::resolve_implicit(classes, text, &mut state, paragraph_level);
 	Levels { paragraph_level, levels: state.levels, classes: state.classes }
 }
 
@@ -136,7 +137,6 @@ pub(crate) struct Working {
 	/// For each isolate initiator, the index of its matching PDI - BD9, which X10's run sequences
 	/// are built out of.
 	pub matching_pdi: Vec<usize>,
-	pub matching_initiator: Vec<usize>,
 }
 
 #[cfg(test)]

@@ -78,9 +78,10 @@ declare -A GATES=(
 	# draw. Its publication is a START GATE for the parser that reads untrusted font bytes, and a
 	# start gate that drifts before the work begins has bounded nothing. Host-only and seconds.
 	["opentype-profile"]="tools/check-opentype-profile.sh"
-	# Unicode segmentation, measured against Unicode's OWN answers rather than against a sample: the
-	# three normative conformance files in full, plus the tables regenerated from the pinned release
-	# and compared. Host-only; the line break file alone is nineteen thousand cases and still seconds.
+	# Unicode segmentation AND the bidirectional algorithm, measured against Unicode's OWN answers
+	# rather than against a sample: five normative conformance files in full - and `BidiTest` alone is
+	# seven hundred thousand cases - plus the tables regenerated from the pinned release and compared.
+	# Host-only, and still seconds.
 	["unicode-segmentation"]="tools/check-unicode-segmentation.sh"
 	# Static initialisation is a mechanism the converged closure ADMITS, so it gets positive gates:
 	# order across the provider DAG, what a constructor that stopped half way leaves behind,

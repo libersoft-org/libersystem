@@ -20,10 +20,17 @@ struct Sequence {
 	start_of_level: BidiClass,
 	end_of_level: BidiClass,
 	level: u8,
+	/// The characters this sequence covers, when the caller gave the algorithm real text. `None`
+	/// when it was run over classes alone - the bracket rule is the only one that needs them, and a
+	/// conformance file stating classes has no brackets to pair.
+	characters: Option<Vec<char>>,
+	/// The ORIGINAL classes of those characters, which N0's note about combining marks reads: by the
+	/// time it runs, W1 has already changed them.
+	original: Vec<BidiClass>,
 }
 
-pub(crate) fn resolve_implicit(original: &[BidiClass], state: &mut Working, paragraph_level: u8) {
-	for sequence in sequences(original, state, paragraph_level) {
+pub(crate) fn resolve_implicit(original: &[BidiClass], text: Option<&[char]>, state: &mut Working, paragraph_level: u8) {
+	for sequence in sequences(original, text, state, paragraph_level) {
 		let mut classes: Vec<BidiClass> = sequence.indices.iter().map(|index| state.classes[*index]).collect();
 		weak_rules(&mut classes, &sequence);
 		bracket_rule(original, &sequence, &mut classes);
@@ -42,7 +49,7 @@ pub(crate) fn resolve_implicit(original: &[BidiClass], state: &mut Working, para
 }
 
 /// BD13 and X10: the level runs, joined across matching isolates, with the surrounding directions.
-fn sequences(original: &[BidiClass], state: &Working, paragraph_level: u8) -> Vec<Sequence> {
+fn sequences(original: &[BidiClass], text: Option<&[char]>, state: &Working, paragraph_level: u8) -> Vec<Sequence> {
 	let length = original.len();
 	// The characters X9 removed take no part in a sequence at all.
 	let kept: Vec<usize> = (0..length).filter(|index| !state.removed[*index]).collect();
@@ -100,7 +107,7 @@ fn sequences(original: &[BidiClass], state: &Working, paragraph_level: u8) -> Ve
 		} else {
 			kept.iter().find(|candidate| **candidate > last).map(|candidate| state.levels[*candidate]).unwrap_or(paragraph_level)
 		};
-		out.push(Sequence { start_of_level: if level.max(before) % 2 == 1 { BidiClass::R } else { BidiClass::L }, end_of_level: if level.max(after_level) % 2 == 1 { BidiClass::R } else { BidiClass::L }, level, indices });
+		out.push(Sequence { start_of_level: if level.max(before) % 2 == 1 { BidiClass::R } else { BidiClass::L }, end_of_level: if level.max(after_level) % 2 == 1 { BidiClass::R } else { BidiClass::L }, level, characters: text.map(|text| indices.iter().map(|index| text[*index]).collect()), original: indices.iter().map(|index| original[*index]).collect(), indices });
 	}
 	out
 }
@@ -191,8 +198,7 @@ fn weak_rules(classes: &mut [BidiClass], sequence: &Sequence) {
 /// bounded at 63 pairs by the document itself, which is what this stops at rather than growing.
 fn bracket_rule(original: &[BidiClass], sequence: &Sequence, classes: &mut [BidiClass]) {
 	let _ = original;
-	let characters = sequence.characters();
-	let Some(characters) = characters else { return };
+	let Some(characters) = sequence.characters.as_ref() else { return };
 	let mut stack: Vec<(u32, usize)> = Vec::new();
 	let mut pairs: Vec<(usize, usize)> = Vec::new();
 	for (position, character) in characters.iter().enumerate() {
@@ -351,13 +357,6 @@ fn canonical(character: char) -> u32 {
 }
 
 impl Sequence {
-	/// The characters this sequence covers, when the caller gave the algorithm real text. `None`
-	/// when it was run over classes alone - the bracket rule is the only one that needs them, and a
-	/// conformance file that states classes has no brackets to pair.
-	fn characters(&self) -> Option<&Vec<char>> {
-		self.characters.as_ref()
-	}
-
 	/// The ORIGINAL class of the character at a position in this sequence.
 	fn original_class(&self, position: usize) -> Option<BidiClass> {
 		self.original.get(position).copied()

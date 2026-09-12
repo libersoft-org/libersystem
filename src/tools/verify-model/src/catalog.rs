@@ -545,7 +545,7 @@ const GATES: [(&str, &str); 115] = [
 	// seconds; always selected for the same reason the graphics one is - the thing it guards against
 	// is a list growing somewhere a narrowed selection would not look.
 	("opentype-profile", "harness.tools"),
-	// Unicode segmentation against the normative conformance files. It reads the generated tables,
+	// Unicode segmentation and the bidirectional algorithm against the normative conformance files. It reads the generated tables,
 	// the algorithms over them and the pinned UCD in the cache - never the network - so it costs
 	// seconds and belongs to the harness like every other source-reading gate.
 	("unicode-segmentation", "harness.tools"),

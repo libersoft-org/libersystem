@@ -169,7 +169,8 @@ pub(crate) fn resolve_explicit(classes: &[BidiClass], paragraph_level: u8) -> Wo
 		}
 	}
 
-	Working { levels, classes: resolved, removed, matching_pdi, matching_initiator }
+	let _ = matching_initiator;
+	Working { levels, classes: resolved, removed, matching_pdi }
 }
 
 /// The least greater odd or even level, as X2 to X5c ask for it.

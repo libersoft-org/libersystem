@@ -571,3 +571,48 @@ NOT PERFORMED:
   - nothing consumes these yet. The shaping stack that will read the joining types and the Indic
     categories is the next items and is not written; what is checked here is that the boundaries are
     Unicode's, not that anything downstream uses them.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-12T14:25:56Z):
+
+## What was delivered
+
+The Unicode bidirectional algorithm, whole: `src/user/libs/text/unicode-bidi`.
+
+Every rule of UAX #9 is implemented and named at the code that implements it - P2/P3, X1 to X10,
+BD9's isolate matching, BD13's isolating run sequences, W1 to W7, N0 with BD16's bracket stack, N1
+and N2, I1 and I2, L1, L2 and L4. Three decisions worth recording:
+
+  - THE WEAK AND NEUTRAL RULES RUN PER ISOLATING RUN SEQUENCE, not over the paragraph. That is the
+    part an implementation written from the rule names alone gets wrong: over the paragraph it gives
+    the right answer for text with no isolates and the wrong one for text with any.
+  - THE BRACKET RULE IS THE ONLY ONE THAT NEEDS THE CHARACTERS, so the algorithm takes them when it
+    has them and works from classes alone when it does not - which is what lets the class-sequence
+    conformance file drive it at all.
+  - MIRRORING IS ANSWERED, NOT APPLIED. Which glyph is drawn is the font's decision; a face may carry
+    its own mirrored form through `rtlm`, and substituting here would take that away.
+
+`toolchain.lock` gains four more pinned files: `DerivedBidiClass.txt`, `BidiBrackets.txt`,
+`BidiTest.txt` and `BidiCharacterTest.txt`.
+
+THE BIDI CLASS NEEDED A TABLE SHAPE THE OTHERS DID NOT. Its default is per BLOCK rather than once -
+an unassigned code point in the Hebrew or Arabic blocks is `R` or `AL`, stated in the file's
+`@missing` lines rather than in its records - so the generator now reads those lines, keeps the runs
+whose value is the default for this property alone, and the lookup distinguishes "not mentioned" from
+"mentioned as the default". Without that, an unassigned code point in the middle of Arabic text would
+have been laid out left to right.
+
+## Verification
+
+PERFORMED and passing:
+
+  - `BidiTest.txt` - 770241 cases, all of them. `BidiCharacterTest.txt` - 91707 cases, all of them.
+    Both at every paragraph direction the file states, with rule L1 applied as the file assumes.
+  - `cargo test` in `unicode-bidi` - 8 fixtures.
+  - `./check.sh --gate unicode-segmentation` now covers five normative files and three crates;
+    `--gate verify-model` consistent; `system-manifest check`, `check-source-hygiene.sh` clean.
+  - The generated tables still regenerate to what is on disk after `./format.sh`.
+
+NOT PERFORMED:
+
+  - nothing consumes the levels yet. The shaping stack and line layout that will read them are later
+    items; what is checked is that the ORDER is Unicode's, not that anything draws it.

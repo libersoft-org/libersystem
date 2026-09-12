@@ -10,21 +10,5 @@ dependencies = [
 ]
 
 [[package]]
-name = "unicode-conformance"
-version = "0.0.0"
-dependencies = [
- "unicode-bidi",
- "unicode-segmentation",
- "unicode-tables",
-]
-
-[[package]]
-name = "unicode-segmentation"
-version = "0.0.0"
-dependencies = [
- "unicode-tables",
-]
-
-[[package]]
 name = "unicode-tables"
 version = "0.0.0"

@@ -13,6 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod bidi;
+
 use unicode_segmentation::{LineBreakOpportunity, grapheme_boundaries, line_break_opportunities, word_boundaries};
 
 /// How many failures are printed before the rest are counted. A broken rule fails thousands of
@@ -33,6 +35,8 @@ fn main() -> std::process::ExitCode {
 	ok &= run(&cache.join("GraphemeBreakTest.txt"), Kind::Grapheme);
 	ok &= run(&cache.join("WordBreakTest.txt"), Kind::Word);
 	ok &= run(&cache.join("LineBreakTest.txt"), Kind::Line);
+	ok &= bidi::run_class_file(&cache.join("BidiTest.txt"));
+	ok &= bidi::run_character_file(&cache.join("BidiCharacterTest.txt"));
 	if ok { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::FAILURE }
 }
 
