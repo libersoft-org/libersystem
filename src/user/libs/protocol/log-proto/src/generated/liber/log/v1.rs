@@ -684,7 +684,7 @@ impl Severity {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			Severity::Trace => out.push_str("\"trace\""),
 			Severity::Debug => out.push_str("\"debug\""),
@@ -694,7 +694,7 @@ impl Severity {
 			Severity::Fatal => out.push_str("\"fatal\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			Severity::Trace => out.push_str("trace"),
 			Severity::Debug => out.push_str("debug"),
@@ -704,7 +704,7 @@ impl Severity {
 			Severity::Fatal => out.push_str("fatal"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			Severity::Trace => crate::codec::cbor::text(out, "trace"),
 			Severity::Debug => crate::codec::cbor::text(out, "debug"),
@@ -732,7 +732,7 @@ impl Field {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"key\":");
 		crate::codec::json_escape(&self.key, out);
@@ -741,7 +741,7 @@ impl Field {
 		crate::codec::json_escape(&self.value, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("key=");
 		out.push_str(&self.key);
@@ -750,7 +750,7 @@ impl Field {
 		out.push_str(&self.value);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "key");
 		crate::codec::cbor::text(out, &self.key);
@@ -775,7 +775,7 @@ impl Entry {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"timestamp\":");
 		let _ = write!(out, "{}", self.timestamp);
@@ -799,7 +799,7 @@ impl Entry {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("timestamp=");
 		let _ = write!(out, "{}", self.timestamp);
@@ -823,7 +823,7 @@ impl Entry {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "timestamp");
 		crate::codec::cbor::uint(out, self.timestamp as u64);
@@ -855,7 +855,7 @@ impl Query {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"since\":");
 		match &self.since {
@@ -901,7 +901,7 @@ impl Query {
 		let _ = write!(out, "{}", self.limit);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("since=");
 		match &self.since {
@@ -947,7 +947,7 @@ impl Query {
 		let _ = write!(out, "{}", self.limit);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "since");
 		match &self.since {

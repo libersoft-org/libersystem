@@ -22,7 +22,7 @@ SCRIPT_NAME=gen.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display security session input storage font)
+PACKAGES=(base audio device log network observability resources time config process display security session input storage font graphics)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -37,17 +37,21 @@ declare -A EXTERNAL=(
 	[time]="base"
 	[config]="base storage"
 	[process]="base resources"
-	[display]="base process"
+	[display]="base process graphics"
 	[security]="base process"
 	[session]="base process"
 	[input]="base"
 	[storage]="base"
 	[font]="base"
+	# A VALUE-ONLY PACKAGE. It declares no interface and imports nothing: an extent and a pixel
+	# format need no error type, and a shared vocabulary that depended on another package would make
+	# every importer depend on that one too.
+	[graphics]=""
 )
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(audio base config device display font input log network observability process resources security session storage time)
+AGGREGATE_EXTERNAL=(audio base config device display font graphics input log network observability process resources security session storage time)
 
 help() {
 	usage_and_exit <<EOF

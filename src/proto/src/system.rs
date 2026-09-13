@@ -5,6 +5,10 @@ pub use crate::generated::liber::base::v1::*;
 pub use crate::generated::liber::config::v1::*;
 pub use crate::generated::liber::device::v1::*;
 pub use crate::generated::liber::display::v1::*;
+// The shared graphics value types - extent, rect, pixel format, colour space, alpha mode, row origin
+// and damage. `liber:display@1` declared its own one-member `pixel-format` until 2026-09-13; it
+// imports this one now, and so does every other graphics interface.
+pub use crate::generated::liber::graphics::v1::*;
 pub use crate::generated::liber::input::v1::*;
 pub use crate::generated::liber::log::v1::*;
 pub use crate::generated::liber::network::v1::*;

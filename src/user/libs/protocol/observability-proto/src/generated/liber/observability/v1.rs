@@ -949,21 +949,21 @@ impl ComponentType {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			ComponentType::Service => out.push_str("\"service\""),
 			ComponentType::Driver => out.push_str("\"driver\""),
 			ComponentType::Device => out.push_str("\"device\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			ComponentType::Service => out.push_str("service"),
 			ComponentType::Driver => out.push_str("driver"),
 			ComponentType::Device => out.push_str("device"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			ComponentType::Service => crate::codec::cbor::text(out, "service"),
 			ComponentType::Driver => crate::codec::cbor::text(out, "driver"),
@@ -988,7 +988,7 @@ impl ComponentState {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			ComponentState::Running => out.push_str("\"running\""),
 			ComponentState::Stopped => out.push_str("\"stopped\""),
@@ -997,7 +997,7 @@ impl ComponentState {
 			ComponentState::Pending => out.push_str("\"pending\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			ComponentState::Running => out.push_str("running"),
 			ComponentState::Stopped => out.push_str("stopped"),
@@ -1006,7 +1006,7 @@ impl ComponentState {
 			ComponentState::Pending => out.push_str("pending"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			ComponentState::Running => crate::codec::cbor::text(out, "running"),
 			ComponentState::Stopped => crate::codec::cbor::text(out, "stopped"),
@@ -1033,7 +1033,7 @@ impl Counters {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"messages-sent\":");
 		let _ = write!(out, "{}", self.messages_sent);
@@ -1057,7 +1057,7 @@ impl Counters {
 		crate::codec::json_escape(&self.last_failure, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("messages-sent=");
 		let _ = write!(out, "{}", self.messages_sent);
@@ -1081,7 +1081,7 @@ impl Counters {
 		out.push_str(&self.last_failure);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 7);
 		crate::codec::cbor::text(out, "messages-sent");
 		crate::codec::cbor::uint(out, self.messages_sent as u64);
@@ -1116,7 +1116,7 @@ impl Component {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -1143,7 +1143,7 @@ impl Component {
 		self.counters.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -1170,7 +1170,7 @@ impl Component {
 		self.counters.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -1204,7 +1204,7 @@ impl TraceSpan {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -1213,7 +1213,7 @@ impl TraceSpan {
 		let _ = write!(out, "{}", self.duration_ns);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -1222,7 +1222,7 @@ impl TraceSpan {
 		let _ = write!(out, "{}", self.duration_ns);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -1247,7 +1247,7 @@ impl Graph {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
@@ -1274,7 +1274,7 @@ impl Graph {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
@@ -1301,7 +1301,7 @@ impl Graph {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
@@ -1332,7 +1332,7 @@ impl SupervisorStat {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -1359,7 +1359,7 @@ impl SupervisorStat {
 		crate::codec::json_escape(&self.last_failure, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -1386,7 +1386,7 @@ impl SupervisorStat {
 		out.push_str(&self.last_failure);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 8);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);

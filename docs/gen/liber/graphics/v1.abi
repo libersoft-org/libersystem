@@ -1,0 +1,10 @@
+package liber:graphics@1
+record extent-2d(width:u32,height:u32)
+record offset-2d(x:i32,y:i32)
+record rect(origin:offset-2d,size:extent-2d)
+enum pixel-format(a8-unorm=0,r8-unorm=1,r8g8-unorm=2,b8g8r8x8-unorm=3,r8g8b8x8-unorm=4,b8g8r8a8-unorm=5,r8g8b8a8-unorm=6,r10g10b10a2-unorm=7,r16g16b16a16-unorm=8,r16g16b16a16-float=9,r32-uint=10,r32g32b32a32-float=11)
+enum alpha-mode(opaque=0,straight=1,premultiplied=2)
+enum color-space(srgb=0,srgb-linear=1,display-p3=2,display-p3-linear=3,rec2020=4,rec2020-linear=5,rec2020-pq=6,rec2020-hlg=7)
+enum row-origin(top-left=0,bottom-left=1)
+record image-layout(size:extent-2d,pitch:u32,format:pixel-format,alpha:alpha-mode,color-space:color-space,origin:row-origin)
+record damage-region(whole:bool,rects:list<rect>:bound=16)

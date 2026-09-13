@@ -889,7 +889,7 @@ impl ConfigEntry {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"key\":");
 		crate::codec::json_escape(&self.key, out);
@@ -898,7 +898,7 @@ impl ConfigEntry {
 		crate::codec::json_escape(&self.value, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("key=");
 		out.push_str(&self.key);
@@ -907,7 +907,7 @@ impl ConfigEntry {
 		out.push_str(&self.value);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "key");
 		crate::codec::cbor::text(out, &self.key);
@@ -932,7 +932,7 @@ impl Picked {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"file\":");
 		let _ = write!(out, "{}", self.file);
@@ -944,7 +944,7 @@ impl Picked {
 		crate::codec::json_escape(&self.name, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("file=");
 		let _ = write!(out, "{}", self.file);
@@ -956,7 +956,7 @@ impl Picked {
 		out.push_str(&self.name);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "file");
 		crate::codec::cbor::uint(out, self.file as u64);

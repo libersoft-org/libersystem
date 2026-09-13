@@ -4038,7 +4038,7 @@ impl Ipv4Addr {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"a\":");
 		let _ = write!(out, "{}", self.a);
@@ -4053,7 +4053,7 @@ impl Ipv4Addr {
 		let _ = write!(out, "{}", self.d);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("a=");
 		let _ = write!(out, "{}", self.a);
@@ -4068,7 +4068,7 @@ impl Ipv4Addr {
 		let _ = write!(out, "{}", self.d);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "a");
 		crate::codec::cbor::uint(out, self.a as u64);
@@ -4097,7 +4097,7 @@ impl Ipv6Addr {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"o0\":");
 		let _ = write!(out, "{}", self.o0);
@@ -4148,7 +4148,7 @@ impl Ipv6Addr {
 		let _ = write!(out, "{}", self.o15);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("o0=");
 		let _ = write!(out, "{}", self.o0);
@@ -4199,7 +4199,7 @@ impl Ipv6Addr {
 		let _ = write!(out, "{}", self.o15);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 16);
 		crate::codec::cbor::text(out, "o0");
 		crate::codec::cbor::uint(out, self.o0 as u64);
@@ -4252,7 +4252,7 @@ impl MacAddr {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"a\":");
 		let _ = write!(out, "{}", self.a);
@@ -4273,7 +4273,7 @@ impl MacAddr {
 		let _ = write!(out, "{}", self.f);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("a=");
 		let _ = write!(out, "{}", self.a);
@@ -4294,7 +4294,7 @@ impl MacAddr {
 		let _ = write!(out, "{}", self.f);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "a");
 		crate::codec::cbor::uint(out, self.a as u64);
@@ -4327,7 +4327,7 @@ impl IpAddress {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			IpAddress::V4(v67) => {
 				out.push_str("{\"v4\":");
@@ -4341,7 +4341,7 @@ impl IpAddress {
 			}
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			IpAddress::V4(v69) => {
 				out.push_str("v4(");
@@ -4355,7 +4355,7 @@ impl IpAddress {
 			}
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			IpAddress::V4(v71) => {
 				crate::codec::cbor::map(out, 1);
@@ -4387,7 +4387,7 @@ impl InterfaceId {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"index\":");
 		let _ = write!(out, "{}", self.index);
@@ -4396,7 +4396,7 @@ impl InterfaceId {
 		let _ = write!(out, "{}", self.generation);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("index=");
 		let _ = write!(out, "{}", self.index);
@@ -4405,7 +4405,7 @@ impl InterfaceId {
 		let _ = write!(out, "{}", self.generation);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
@@ -4430,7 +4430,7 @@ impl ScopedAddress {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
 		self.addr.to_json_into(out);
@@ -4446,7 +4446,7 @@ impl ScopedAddress {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("addr=");
 		self.addr.to_text_into(out);
@@ -4462,7 +4462,7 @@ impl ScopedAddress {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
@@ -4494,7 +4494,7 @@ impl ScopedEndpoint {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
 		self.addr.to_json_into(out);
@@ -4503,7 +4503,7 @@ impl ScopedEndpoint {
 		let _ = write!(out, "{}", self.port);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("addr=");
 		self.addr.to_text_into(out);
@@ -4512,7 +4512,7 @@ impl ScopedEndpoint {
 		let _ = write!(out, "{}", self.port);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
@@ -4537,7 +4537,7 @@ impl AddressState {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			AddressState::Tentative => out.push_str("\"tentative\""),
 			AddressState::Preferred => out.push_str("\"preferred\""),
@@ -4545,7 +4545,7 @@ impl AddressState {
 			AddressState::Invalid => out.push_str("\"invalid\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			AddressState::Tentative => out.push_str("tentative"),
 			AddressState::Preferred => out.push_str("preferred"),
@@ -4553,7 +4553,7 @@ impl AddressState {
 			AddressState::Invalid => out.push_str("invalid"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			AddressState::Tentative => crate::codec::cbor::text(out, "tentative"),
 			AddressState::Preferred => crate::codec::cbor::text(out, "preferred"),
@@ -4579,7 +4579,7 @@ impl InterfaceAddress {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
 		self.addr.to_json_into(out);
@@ -4597,7 +4597,7 @@ impl InterfaceAddress {
 		let _ = write!(out, "{}", self.valid_seconds);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("addr=");
 		self.addr.to_text_into(out);
@@ -4615,7 +4615,7 @@ impl InterfaceAddress {
 		let _ = write!(out, "{}", self.valid_seconds);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
@@ -4646,7 +4646,7 @@ impl NextHop {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			NextHop::Direct => out.push_str("\"direct\""),
 			NextHop::Via(v76) => {
@@ -4656,7 +4656,7 @@ impl NextHop {
 			}
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			NextHop::Direct => out.push_str("direct"),
 			NextHop::Via(v77) => {
@@ -4666,7 +4666,7 @@ impl NextHop {
 			}
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			NextHop::Direct => crate::codec::cbor::text(out, "direct"),
 			NextHop::Via(v78) => {
@@ -4694,21 +4694,21 @@ impl RoutePreference {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			RoutePreference::Low => out.push_str("\"low\""),
 			RoutePreference::Medium => out.push_str("\"medium\""),
 			RoutePreference::High => out.push_str("\"high\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			RoutePreference::Low => out.push_str("low"),
 			RoutePreference::Medium => out.push_str("medium"),
 			RoutePreference::High => out.push_str("high"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			RoutePreference::Low => crate::codec::cbor::text(out, "low"),
 			RoutePreference::Medium => crate::codec::cbor::text(out, "medium"),
@@ -4733,7 +4733,7 @@ impl Reachability {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			Reachability::Incomplete => out.push_str("\"incomplete\""),
 			Reachability::Reachable => out.push_str("\"reachable\""),
@@ -4743,7 +4743,7 @@ impl Reachability {
 			Reachability::Unreachable => out.push_str("\"unreachable\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			Reachability::Incomplete => out.push_str("incomplete"),
 			Reachability::Reachable => out.push_str("reachable"),
@@ -4753,7 +4753,7 @@ impl Reachability {
 			Reachability::Unreachable => out.push_str("unreachable"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			Reachability::Incomplete => crate::codec::cbor::text(out, "incomplete"),
 			Reachability::Reachable => crate::codec::cbor::text(out, "reachable"),
@@ -4781,7 +4781,7 @@ impl RouteEntry {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"destination\":");
 		self.destination.to_json_into(out);
@@ -4802,7 +4802,7 @@ impl RouteEntry {
 		self.hop.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("destination=");
 		self.destination.to_text_into(out);
@@ -4823,7 +4823,7 @@ impl RouteEntry {
 		self.hop.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "destination");
 		self.destination.to_cbor_into(out);
@@ -4856,7 +4856,7 @@ impl RouterEntry {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
 		self.addr.to_json_into(out);
@@ -4874,7 +4874,7 @@ impl RouterEntry {
 		let _ = write!(out, "{}", self.lifetime_seconds);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("addr=");
 		self.addr.to_text_into(out);
@@ -4892,7 +4892,7 @@ impl RouterEntry {
 		let _ = write!(out, "{}", self.lifetime_seconds);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
@@ -4923,7 +4923,7 @@ impl DnsServer {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
 		self.addr.to_json_into(out);
@@ -4932,7 +4932,7 @@ impl DnsServer {
 		self.scope.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("addr=");
 		self.addr.to_text_into(out);
@@ -4941,7 +4941,7 @@ impl DnsServer {
 		self.scope.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
@@ -4966,7 +4966,7 @@ impl Neighbor {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"addr\":");
 		self.addr.to_json_into(out);
@@ -4978,7 +4978,7 @@ impl Neighbor {
 		self.scope.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("addr=");
 		self.addr.to_text_into(out);
@@ -4990,7 +4990,7 @@ impl Neighbor {
 		self.scope.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "addr");
 		self.addr.to_cbor_into(out);
@@ -5017,7 +5017,7 @@ impl NetInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"scope\":");
 		self.scope.to_json_into(out);
@@ -5092,7 +5092,7 @@ impl NetInfo {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("scope=");
 		self.scope.to_text_into(out);
@@ -5167,7 +5167,7 @@ impl NetInfo {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 9);
 		crate::codec::cbor::text(out, "scope");
 		self.scope.to_cbor_into(out);
@@ -5221,7 +5221,7 @@ impl FamilyReadiness {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FamilyReadiness::Disabled => out.push_str("\"disabled\""),
 			FamilyReadiness::Configuring => out.push_str("\"configuring\""),
@@ -5229,7 +5229,7 @@ impl FamilyReadiness {
 			FamilyReadiness::Failed => out.push_str("\"failed\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FamilyReadiness::Disabled => out.push_str("disabled"),
 			FamilyReadiness::Configuring => out.push_str("configuring"),
@@ -5237,7 +5237,7 @@ impl FamilyReadiness {
 			FamilyReadiness::Failed => out.push_str("failed"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FamilyReadiness::Disabled => crate::codec::cbor::text(out, "disabled"),
 			FamilyReadiness::Configuring => crate::codec::cbor::text(out, "configuring"),
@@ -5263,7 +5263,7 @@ impl NetCapacity {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"clients\":");
 		let _ = write!(out, "{}", self.clients);
@@ -5293,7 +5293,7 @@ impl NetCapacity {
 		let _ = write!(out, "{}", self.diagnostic_refusals);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("clients=");
 		let _ = write!(out, "{}", self.clients);
@@ -5323,7 +5323,7 @@ impl NetCapacity {
 		let _ = write!(out, "{}", self.diagnostic_refusals);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 9);
 		crate::codec::cbor::text(out, "clients");
 		crate::codec::cbor::uint(out, self.clients as u64);
@@ -5362,21 +5362,21 @@ impl PingStatus {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			PingStatus::Reply => out.push_str("\"reply\""),
 			PingStatus::Timeout => out.push_str("\"timeout\""),
 			PingStatus::Unreachable => out.push_str("\"unreachable\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			PingStatus::Reply => out.push_str("reply"),
 			PingStatus::Timeout => out.push_str("timeout"),
 			PingStatus::Unreachable => out.push_str("unreachable"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			PingStatus::Reply => crate::codec::cbor::text(out, "reply"),
 			PingStatus::Timeout => crate::codec::cbor::text(out, "timeout"),
@@ -5401,7 +5401,7 @@ impl PingReply {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"status\":");
 		self.status.to_json_into(out);
@@ -5413,7 +5413,7 @@ impl PingReply {
 		let _ = write!(out, "{}", self.rtt_us);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("status=");
 		self.status.to_text_into(out);
@@ -5425,7 +5425,7 @@ impl PingReply {
 		let _ = write!(out, "{}", self.rtt_us);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "status");
 		self.status.to_cbor_into(out);
@@ -5452,7 +5452,7 @@ impl HopStatus {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			HopStatus::TimeExceeded => out.push_str("\"time-exceeded\""),
 			HopStatus::Reply => out.push_str("\"reply\""),
@@ -5460,7 +5460,7 @@ impl HopStatus {
 			HopStatus::Timeout => out.push_str("\"timeout\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			HopStatus::TimeExceeded => out.push_str("time-exceeded"),
 			HopStatus::Reply => out.push_str("reply"),
@@ -5468,7 +5468,7 @@ impl HopStatus {
 			HopStatus::Timeout => out.push_str("timeout"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			HopStatus::TimeExceeded => crate::codec::cbor::text(out, "time-exceeded"),
 			HopStatus::Reply => crate::codec::cbor::text(out, "reply"),
@@ -5494,7 +5494,7 @@ impl TraceHop {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"status\":");
 		self.status.to_json_into(out);
@@ -5506,7 +5506,7 @@ impl TraceHop {
 		let _ = write!(out, "{}", self.rtt_us);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("status=");
 		self.status.to_text_into(out);
@@ -5518,7 +5518,7 @@ impl TraceHop {
 		let _ = write!(out, "{}", self.rtt_us);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "status");
 		self.status.to_cbor_into(out);
@@ -5545,7 +5545,7 @@ impl OpenTarget {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"destinations\":");
 		out.push('[');
@@ -5573,7 +5573,7 @@ impl OpenTarget {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("destinations=");
 		out.push('[');
@@ -5601,7 +5601,7 @@ impl OpenTarget {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "destinations");
 		crate::codec::cbor::array(out, self.destinations.len());
@@ -5638,7 +5638,7 @@ impl TcpRequest {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"target\":");
 		self.target.to_json_into(out);
@@ -5656,7 +5656,7 @@ impl TcpRequest {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("target=");
 		self.target.to_text_into(out);
@@ -5674,7 +5674,7 @@ impl TcpRequest {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "target");
 		self.target.to_cbor_into(out);
@@ -5702,21 +5702,21 @@ impl FetchOutcome {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FetchOutcome::Complete => out.push_str("\"complete\""),
 			FetchOutcome::Truncated => out.push_str("\"truncated\""),
 			FetchOutcome::Failed => out.push_str("\"failed\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FetchOutcome::Complete => out.push_str("complete"),
 			FetchOutcome::Truncated => out.push_str("truncated"),
 			FetchOutcome::Failed => out.push_str("failed"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FetchOutcome::Complete => crate::codec::cbor::text(out, "complete"),
 			FetchOutcome::Truncated => crate::codec::cbor::text(out, "truncated"),
@@ -5741,7 +5741,7 @@ impl FetchChunk {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
@@ -5766,7 +5766,7 @@ impl FetchChunk {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
@@ -5791,7 +5791,7 @@ impl FetchChunk {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
@@ -5826,21 +5826,21 @@ impl BindMode {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			BindMode::Ipv4Only => out.push_str("\"ipv4-only\""),
 			BindMode::Ipv6Only => out.push_str("\"ipv6-only\""),
 			BindMode::DualStack => out.push_str("\"dual-stack\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			BindMode::Ipv4Only => out.push_str("ipv4-only"),
 			BindMode::Ipv6Only => out.push_str("ipv6-only"),
 			BindMode::DualStack => out.push_str("dual-stack"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			BindMode::Ipv4Only => crate::codec::cbor::text(out, "ipv4-only"),
 			BindMode::Ipv6Only => crate::codec::cbor::text(out, "ipv6-only"),
@@ -5865,7 +5865,7 @@ impl ListenRequest {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"mode\":");
 		self.mode.to_json_into(out);
@@ -5877,7 +5877,7 @@ impl ListenRequest {
 		let _ = write!(out, "{}", self.backlog);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("mode=");
 		self.mode.to_text_into(out);
@@ -5889,7 +5889,7 @@ impl ListenRequest {
 		let _ = write!(out, "{}", self.backlog);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "mode");
 		self.mode.to_cbor_into(out);
@@ -5916,7 +5916,7 @@ impl ListenResult {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"listener\":");
 		let _ = write!(out, "{}", self.listener);
@@ -5925,7 +5925,7 @@ impl ListenResult {
 		let _ = write!(out, "{}", self.backlog);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("listener=");
 		let _ = write!(out, "{}", self.listener);
@@ -5934,7 +5934,7 @@ impl ListenResult {
 		let _ = write!(out, "{}", self.backlog);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "listener");
 		crate::codec::cbor::uint(out, self.listener as u64);
@@ -5959,7 +5959,7 @@ impl SockState {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			SockState::Closed => out.push_str("\"closed\""),
 			SockState::SynSent => out.push_str("\"syn-sent\""),
@@ -5969,7 +5969,7 @@ impl SockState {
 			SockState::Listen => out.push_str("\"listen\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			SockState::Closed => out.push_str("closed"),
 			SockState::SynSent => out.push_str("syn-sent"),
@@ -5979,7 +5979,7 @@ impl SockState {
 			SockState::Listen => out.push_str("listen"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			SockState::Closed => crate::codec::cbor::text(out, "closed"),
 			SockState::SynSent => crate::codec::cbor::text(out, "syn-sent"),
@@ -6007,7 +6007,7 @@ impl SockInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"local\":");
 		self.local.to_json_into(out);
@@ -6019,7 +6019,7 @@ impl SockInfo {
 		self.state.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("local=");
 		self.local.to_text_into(out);
@@ -6031,7 +6031,7 @@ impl SockInfo {
 		self.state.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "local");
 		self.local.to_cbor_into(out);
@@ -6058,7 +6058,7 @@ impl AcceptResult {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"socket\":");
 		let _ = write!(out, "{}", self.socket);
@@ -6070,7 +6070,7 @@ impl AcceptResult {
 		self.remote.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("socket=");
 		let _ = write!(out, "{}", self.socket);
@@ -6082,7 +6082,7 @@ impl AcceptResult {
 		self.remote.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "socket");
 		crate::codec::cbor::uint(out, self.socket as u64);
@@ -6109,7 +6109,7 @@ impl Chunk {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
@@ -6124,7 +6124,7 @@ impl Chunk {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
@@ -6139,7 +6139,7 @@ impl Chunk {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());

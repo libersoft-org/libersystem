@@ -1498,7 +1498,7 @@ impl ProcessInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"koid\":");
 		let _ = write!(out, "{}", self.koid);
@@ -1507,7 +1507,7 @@ impl ProcessInfo {
 		crate::codec::json_escape(&self.name, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("koid=");
 		let _ = write!(out, "{}", self.koid);
@@ -1516,7 +1516,7 @@ impl ProcessInfo {
 		out.push_str(&self.name);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "koid");
 		crate::codec::cbor::uint(out, self.koid as u64);
@@ -1541,7 +1541,7 @@ impl StartResult {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"task\":");
 		let _ = write!(out, "{}", self.task);
@@ -1550,7 +1550,7 @@ impl StartResult {
 		self.info.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("task=");
 		let _ = write!(out, "{}", self.task);
@@ -1559,7 +1559,7 @@ impl StartResult {
 		self.info.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "task");
 		crate::codec::cbor::uint(out, self.task as u64);

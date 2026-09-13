@@ -526,7 +526,7 @@ impl ResourceType {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			ResourceType::Memory => out.push_str("\"memory\""),
 			ResourceType::Handles => out.push_str("\"handles\""),
@@ -536,7 +536,7 @@ impl ResourceType {
 			ResourceType::Stack => out.push_str("\"stack\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			ResourceType::Memory => out.push_str("memory"),
 			ResourceType::Handles => out.push_str("handles"),
@@ -546,7 +546,7 @@ impl ResourceType {
 			ResourceType::Stack => out.push_str("stack"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			ResourceType::Memory => crate::codec::cbor::text(out, "memory"),
 			ResourceType::Handles => crate::codec::cbor::text(out, "handles"),
@@ -574,7 +574,7 @@ impl ResourceUsage {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"type\":");
 		self.r#type.to_json_into(out);
@@ -586,7 +586,7 @@ impl ResourceUsage {
 		let _ = write!(out, "{}", self.limit);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("type=");
 		self.r#type.to_text_into(out);
@@ -598,7 +598,7 @@ impl ResourceUsage {
 		let _ = write!(out, "{}", self.limit);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "type");
 		self.r#type.to_cbor_into(out);
@@ -625,7 +625,7 @@ impl Budget {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -643,7 +643,7 @@ impl Budget {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -661,7 +661,7 @@ impl Budget {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);

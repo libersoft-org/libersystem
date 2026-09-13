@@ -291,6 +291,15 @@ path = "user/libs/protocol/font-proto"
 # not instantiate the generic transport itself - that monomorphises the whole codec into the
 # consumer, which the shared-image inventory refuses - so the instantiation lives in `font-proto`
 # and reaches a tool through these two.
+# THE SHARED GRAPHICS VALUE TYPES. A package with no interface in it: an extent, a rectangle, a
+# pixel format, a colour space and an alpha mode cross several graphics interfaces, and each one
+# declaring its own copy declares a DIFFERENT type with the same name. Generated and checked like
+# every other package; it carries a source row and no library row until a shared-image consumer
+# needs it staged.
+[[sources]]
+owner = "graphics-proto"
+path = "user/libs/protocol/graphics-proto"
+
 [[sources]]
 owner = "font-client"
 path = "user/libs/clients/font-client"
@@ -1948,6 +1957,23 @@ destination = "motd.txt"
 # satisfies it - see the tool and the milestone. The sidecar is staged beside the face because the
 # catalogue reads the pair: the face is the bytes and the declaration is what they claim to be, and
 # the truth oracle refuses any disagreement between them.
+# THE LAST-RESORT FACE AND ITS DECLARATION. Authored by `src/tools/font-gen` rather than imported,
+# because the licence decision for FONTS admits public domain and Unlicense only and no existing face
+# satisfies it - see the tool and the milestone. The sidecar is staged beside the face because the
+# catalogue reads the pair: the face is the bytes and the declaration is what they claim to be, and
+# the truth oracle refuses any disagreement between them.
+[[factory_files]]
+name = "font-lastresort"
+kind = "source"
+source = "volume/share/fonts/lastresort.ttf"
+destination = "share/fonts/lastresort.ttf"
+
+[[factory_files]]
+name = "font-lastresort-declaration"
+kind = "source"
+source = "volume/share/fonts/lastresort.ttf.face"
+destination = "share/fonts/lastresort.ttf.face"
+
 [[factory_files]]
 name = "wallpaper-logo"
 kind = "source"
@@ -2105,7 +2131,13 @@ restart = "transparent"
 # instance re-reads the directory and is in the same place. It persists nothing of its own.
 state_class = "ephemeral"
 state_scope = "service"
-dependencies = ["log_service", "storage_service"]
+# PROCESSSERVICE IS A DEPENDENCY OF EVERY SERVICE LOADED FROM THE VOLUME, and this row omitted it
+# (corrected 2026-09-13). A `stage = "volume"` service is launched by ServiceManager through
+# ProcessService, so a supervisor that starts it first finds a zero client and `launch_from_volume`
+# refuses immediately - which reached the console as `font_catalogue: FAILED to start` with no
+# reason at all, and took PermissionManager, ConsoleService, SystemGraphService and the shell down
+# behind it, because each waits on the one before. Every other volume-staged service declares it.
+dependencies = ["log_service", "storage_service", "process_service"]
 
 # THE ONE READ-ONLY DIRECTORY THIS SERVICE MAY READ, minted from StorageService's ADMIN root rather
 # than duplicated from its ordinary one - a `client` row would hand over the whole volume, which is

@@ -1264,7 +1264,7 @@ impl Capability {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			Capability::Log => out.push_str("\"log\""),
 			Capability::Storage => out.push_str("\"storage\""),
@@ -1293,7 +1293,7 @@ impl Capability {
 			Capability::FontAdmin => out.push_str("\"font-admin\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			Capability::Log => out.push_str("log"),
 			Capability::Storage => out.push_str("storage"),
@@ -1322,7 +1322,7 @@ impl Capability {
 			Capability::FontAdmin => out.push_str("font-admin"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			Capability::Log => crate::codec::cbor::text(out, "log"),
 			Capability::Storage => crate::codec::cbor::text(out, "storage"),
@@ -1369,7 +1369,7 @@ impl Manifest {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"component\":");
 		crate::codec::json_escape(&self.component, out);
@@ -1399,7 +1399,7 @@ impl Manifest {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("component=");
 		out.push_str(&self.component);
@@ -1429,7 +1429,7 @@ impl Manifest {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "component");
 		crate::codec::cbor::text(out, &self.component);
@@ -1462,7 +1462,7 @@ impl AuditEntry {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"component\":");
 		crate::codec::json_escape(&self.component, out);
@@ -1485,7 +1485,7 @@ impl AuditEntry {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("component=");
 		out.push_str(&self.component);
@@ -1508,7 +1508,7 @@ impl AuditEntry {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "component");
 		crate::codec::cbor::text(out, &self.component);
@@ -1537,7 +1537,7 @@ impl PipelineStage {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -1553,7 +1553,7 @@ impl PipelineStage {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -1569,7 +1569,7 @@ impl PipelineStage {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -1596,7 +1596,7 @@ impl PipelineResult {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"group\":");
 		let _ = write!(out, "{}", self.group);
@@ -1605,7 +1605,7 @@ impl PipelineResult {
 		let _ = write!(out, "{}", self.stages);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("group=");
 		let _ = write!(out, "{}", self.group);
@@ -1614,7 +1614,7 @@ impl PipelineResult {
 		let _ = write!(out, "{}", self.stages);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "group");
 		crate::codec::cbor::uint(out, self.group as u64);

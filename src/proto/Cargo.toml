@@ -25,6 +25,7 @@ channel-client-impl = [
 	"device-proto/channel-client-impl",
 	"display-proto/channel-client-impl",
 	"font-proto/channel-client-impl",
+	"graphics-proto/channel-client-impl",
 	"input-proto/channel-client-impl",
 	"log-proto/channel-client-impl",
 	"network-proto/channel-client-impl",
@@ -43,6 +44,7 @@ shared-image = [
 	"device-proto/shared-image",
 	"display-proto/shared-image",
 	"font-proto/shared-image",
+	"graphics-proto/shared-image",
 	"input-proto/shared-image",
 	"ipc-client/shared-image",
 	"log-proto/shared-image",
@@ -69,6 +71,7 @@ config-proto = { path = "../user/libs/protocol/config-proto" }
 device-proto = { path = "../user/libs/protocol/device-proto" }
 display-proto = { path = "../user/libs/protocol/display-proto" }
 font-proto = { path = "../user/libs/protocol/font-proto" }
+graphics-proto = { path = "../user/libs/protocol/graphics-proto" }
 input-proto = { path = "../user/libs/protocol/input-proto" }
 log-proto = { path = "../user/libs/protocol/log-proto" }
 network-proto = { path = "../user/libs/protocol/network-proto" }

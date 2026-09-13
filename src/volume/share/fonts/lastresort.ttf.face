@@ -1,0 +1,12 @@
+# Authored by `src/tools/font-gen`, which is the only way a face enters this tree: the
+# licence decision in P02M0136 admits public domain and Unlicense only, and nothing this
+# project did not write can satisfy it. Regenerate with
+#   cargo run --manifest-path src/tools/font-gen/Cargo.toml
+family = LiberSystem Last Resort
+style = Regular
+format = truetype-glyf
+face-index = 0
+weight = 400
+width = normal
+slant = upright
+digest = 03f8a2c108272d22268ec9ef8848d95c09bb5a5d2881a68da8c2bde427ac90c3

@@ -1,0 +1,17 @@
+[package]
+name = "graphics-proto"
+edition = "2024"
+description = "Generated LSIDL graphics bindings: the value types every graphics interface shares"
+
+[features]
+default = []
+channel-client-impl = ["dep:ipc-client"]
+shared-image = ["channel-client-impl", "ipc-client/shared-image"]
+
+[dependencies]
+wire = { path = "../../../../wire" }
+ipc-client = { path = "../../ipc/ipc-client", optional = true }
+
+# A WARNING IS AN ERROR HERE, as everywhere else in this tree.
+[lints.rust]
+warnings = "deny"

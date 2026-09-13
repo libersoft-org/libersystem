@@ -366,7 +366,7 @@ impl EnvVar {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -375,7 +375,7 @@ impl EnvVar {
 		crate::codec::json_escape(&self.value, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -384,7 +384,7 @@ impl EnvVar {
 		out.push_str(&self.value);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -409,7 +409,7 @@ impl LaunchContext {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"arguments\":");
 		crate::codec::json_escape(&self.arguments, out);
@@ -430,7 +430,7 @@ impl LaunchContext {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("arguments=");
 		out.push_str(&self.arguments);
@@ -451,7 +451,7 @@ impl LaunchContext {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "arguments");
 		crate::codec::cbor::text(out, &self.arguments);
@@ -481,7 +481,7 @@ impl SelectedFile {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"uri\":");
 		crate::codec::json_escape(&self.uri, out);
@@ -497,7 +497,7 @@ impl SelectedFile {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("uri=");
 		out.push_str(&self.uri);
@@ -513,7 +513,7 @@ impl SelectedFile {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "uri");
 		crate::codec::cbor::text(out, &self.uri);
@@ -540,7 +540,7 @@ impl Error {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			Error::Denied => out.push_str("\"denied\""),
 			Error::NotFound => out.push_str("\"not-found\""),
@@ -558,7 +558,7 @@ impl Error {
 			Error::AddressUnavailable => out.push_str("\"address-unavailable\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			Error::Denied => out.push_str("denied"),
 			Error::NotFound => out.push_str("not-found"),
@@ -576,7 +576,7 @@ impl Error {
 			Error::AddressUnavailable => out.push_str("address-unavailable"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			Error::Denied => crate::codec::cbor::text(out, "denied"),
 			Error::NotFound => crate::codec::cbor::text(out, "not-found"),

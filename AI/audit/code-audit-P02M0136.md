@@ -2055,3 +2055,44 @@ ligatures and kerning, Arabic in four joining forms, Hebrew with marks, Devanaga
 without spaces, Khmer stacking and emoji sequences - which needs faces with real `GSUB`/`GPOS` for
 those scripts. That is a type-design job, not a generator, and no amount of mechanical authoring
 produces it.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-13T14:05:00Z):
+
+THE FONT CATALOGUE HAD NEVER STARTED, AND NOBODY KNEW.
+
+Staging the authored face was supposed to give the catalogue something to read. What it actually did
+was make a pre-existing failure visible: the service could not start AT ALL, on any boot, since the
+day it was added - and the boot chain behind it (PermissionManager, ConsoleService,
+SystemGraphService, Shell) had been down with it. The console said `font_catalogue: FAILED to start`
+and nothing else, and every service after it said it was waiting, which reads like a slow boot rather
+than a missing edge.
+
+IT WAS NOT THE FACE. Proved by a control run: the same failure with the face staged and with it
+removed. Three defects in one path, each hidden by the one before it:
+
+  1. THE MANIFEST ROW DID NOT DECLARE `process_service`. A `stage = "volume"` service is launched
+     BY ProcessService, so a supervisor that starts it first finds a zero client and
+     `launch_from_volume` refuses at its first line. Every other volume-staged service declares the
+     dependency; this one did not. The refusal returned `-1` with no message, which the supervisor
+     turned into `State::Failed` with an empty reason.
+
+  2. THE `FONTDIR` BRANCH DID NOT NARROW ITS HANDLE. `open-directory` answers with a connection
+     carrying every right its pair was made with, because StorageService made the pair; the receiver
+     checks the ceiling its role kind declares and refuses the excess. The plan executor's own
+     `RoleKind::Factory` arm narrows for exactly this reason, and a hand-written branch that bypasses
+     the executor has to do what the executor does. Symptom, once defect 1 was fixed:
+     `FONTDIR: role carried more rights than it is allowed`.
+
+  3. THE BOOT TEST DID NOT KNOW THE SERVICE EXISTS. `FontCatalogue: online` was not in
+     `online_reports`, so the first boot on which it arrived counted it as a LIFECYCLE report - an
+     unrecognised message falls into that bucket by construction - and the suite failed with
+     thirteen where it wanted twelve.
+
+VERIFIED: `./test.sh --arch x86_64 --tags boot` - PASS, 15 passed, with the face staged. Before these
+three, the same tag failed with four services missing.
+
+AND THE SILENCE IS CLOSED WHERE IT WAS. Three refusals that said nothing now say what they are: the
+volume launch names the missing dependency by name, the font-directory mint says it could not be
+minted, and a role refusal fills the supervisor's reason field instead of leaving it empty. That is
+the actual cost of this defect - not that it happened, but that it took a full day of boots to find
+something the machine could have said in one line.

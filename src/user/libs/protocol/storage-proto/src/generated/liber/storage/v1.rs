@@ -3957,7 +3957,7 @@ impl OpenOpts {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"path\":");
 		crate::codec::json_escape(&self.path, out);
@@ -3977,7 +3977,7 @@ impl OpenOpts {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("path=");
 		out.push_str(&self.path);
@@ -3997,7 +3997,7 @@ impl OpenOpts {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "path");
 		crate::codec::cbor::text(out, &self.path);
@@ -4024,7 +4024,7 @@ impl OpenResult {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"file\":");
 		let _ = write!(out, "{}", self.file);
@@ -4033,7 +4033,7 @@ impl OpenResult {
 		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("file=");
 		let _ = write!(out, "{}", self.file);
@@ -4042,7 +4042,7 @@ impl OpenResult {
 		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "file");
 		crate::codec::cbor::uint(out, self.file as u64);
@@ -4067,19 +4067,19 @@ impl FileType {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FileType::File => out.push_str("\"file\""),
 			FileType::Dir => out.push_str("\"dir\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FileType::File => out.push_str("file"),
 			FileType::Dir => out.push_str("dir"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FileType::File => crate::codec::cbor::text(out, "file"),
 			FileType::Dir => crate::codec::cbor::text(out, "dir"),
@@ -4103,7 +4103,7 @@ impl FileInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -4121,7 +4121,7 @@ impl FileInfo {
 		let _ = write!(out, "{}", self.ctime);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -4139,7 +4139,7 @@ impl FileInfo {
 		let _ = write!(out, "{}", self.ctime);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -4170,21 +4170,21 @@ impl FileEventKind {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FileEventKind::Created => out.push_str("\"created\""),
 			FileEventKind::Modified => out.push_str("\"modified\""),
 			FileEventKind::Removed => out.push_str("\"removed\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FileEventKind::Created => out.push_str("created"),
 			FileEventKind::Modified => out.push_str("modified"),
 			FileEventKind::Removed => out.push_str("removed"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FileEventKind::Created => crate::codec::cbor::text(out, "created"),
 			FileEventKind::Modified => crate::codec::cbor::text(out, "modified"),
@@ -4209,7 +4209,7 @@ impl FileEvent {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"path\":");
 		crate::codec::json_escape(&self.path, out);
@@ -4221,7 +4221,7 @@ impl FileEvent {
 		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("path=");
 		out.push_str(&self.path);
@@ -4233,7 +4233,7 @@ impl FileEvent {
 		let _ = write!(out, "{}", self.size);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "path");
 		crate::codec::cbor::text(out, &self.path);
@@ -4260,19 +4260,19 @@ impl WriterMode {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			WriterMode::Replace => out.push_str("\"replace\""),
 			WriterMode::Append => out.push_str("\"append\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			WriterMode::Replace => out.push_str("replace"),
 			WriterMode::Append => out.push_str("append"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			WriterMode::Replace => crate::codec::cbor::text(out, "replace"),
 			WriterMode::Append => crate::codec::cbor::text(out, "append"),
@@ -4296,7 +4296,7 @@ impl SnapshotInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -4305,7 +4305,7 @@ impl SnapshotInfo {
 		let _ = write!(out, "{}", self.generation);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -4314,7 +4314,7 @@ impl SnapshotInfo {
 		let _ = write!(out, "{}", self.generation);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -4339,7 +4339,7 @@ impl VolumeStatus {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"label\":");
 		crate::codec::json_escape(&self.label, out);
@@ -4368,7 +4368,7 @@ impl VolumeStatus {
 		crate::codec::json_escape(&self.filesystem, out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("label=");
 		out.push_str(&self.label);
@@ -4397,7 +4397,7 @@ impl VolumeStatus {
 		out.push_str(&self.filesystem);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "label");
 		crate::codec::cbor::text(out, &self.label);
@@ -4430,7 +4430,7 @@ impl FsckReport {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"checksum-failures\":");
 		let _ = write!(out, "{}", self.checksum_failures);
@@ -4469,7 +4469,7 @@ impl FsckReport {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("checksum-failures=");
 		let _ = write!(out, "{}", self.checksum_failures);
@@ -4508,7 +4508,7 @@ impl FsckReport {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "checksum-failures");
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);

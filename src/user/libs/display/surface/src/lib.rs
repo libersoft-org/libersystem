@@ -29,7 +29,7 @@ impl Mapping {
 	pub fn from_info(info: SurfaceInfo) -> Option<Mapping> {
 		let handle = info.pixels.handle;
 		let expected = (info.pitch as u64).checked_mul(info.height as u64)?;
-		if handle == 0 || info.format != PixelFormat::B8g8r8x8 || info.width == 0 || info.height == 0 || info.pitch < info.width.checked_mul(4)? || info.pixels.len < expected {
+		if handle == 0 || info.format != PixelFormat::B8g8r8x8Unorm || info.width == 0 || info.height == 0 || info.pitch < info.width.checked_mul(4)? || info.pixels.len < expected {
 			if handle != 0 {
 				close(handle);
 			}

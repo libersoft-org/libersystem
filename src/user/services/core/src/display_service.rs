@@ -153,7 +153,7 @@ impl DisplayState {
 		if self.active == 0 || chan != self.console {
 			self.set_active(chan);
 		}
-		Ok(SurfaceInfo { pixels: Buffer { handle: granted as u64, len }, width, height, pitch, format: PixelFormat::B8g8r8x8 })
+		Ok(SurfaceInfo { pixels: Buffer { handle: granted as u64, len }, width, height, pitch, format: PixelFormat::B8g8r8x8Unorm })
 	}
 
 	fn present(&mut self, chan: u64, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error> {

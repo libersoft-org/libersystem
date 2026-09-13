@@ -279,19 +279,19 @@ impl Timestamp {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"unix-secs\":");
 		let _ = write!(out, "{}", self.unix_secs);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("unix-secs=");
 		let _ = write!(out, "{}", self.unix_secs);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "unix-secs");
 		crate::codec::cbor::uint(out, self.unix_secs as u64);

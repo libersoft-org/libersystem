@@ -4,13 +4,13 @@ package liber:display@1;
 
 use liber:base@1.{error};
 use liber:process@1.{task};
-
-/// Pixel layouts accepted by DisplayService. The first format matches the existing
-/// virtio-gpu scanout and ConsoleService representation: in memory B, G, R, unused;
-/// as a little-endian u32, 0xXXRRGGBB.
-enum pixel-format {
-	b8g8r8x8,
-}
+// THE PIXEL FORMAT IS NOT THIS PACKAGE'S TO DECLARE (2026-09-13). It was an enumeration of one
+// member here, and a second interface needing one would have declared a second enumeration with the
+// same name and a different meaning - two types a reader cannot tell apart and a version cannot be
+// declared against. It lives in `liber:graphics@1` with the rest of the shared value vocabulary,
+// which carries the twelve formats `Image Colour Profile 1` freezes rather than the one this
+// service happens to accept today.
+use liber:graphics@1.{pixel-format};
 
 /// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
 /// retains a read+map duplicate and transfers a write+map handle to the client. Its

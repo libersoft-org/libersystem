@@ -1,0 +1,134 @@
+//! LiberSystem graphics package - the VALUE TYPES every graphics interface shares.
+//!
+//! WHY A PACKAGE OF ITS OWN, WITH NO INTERFACE IN IT. An extent, a rectangle, a pixel format, a
+//! colour space and an alpha mode cross the application display interface, the display-device
+//! interface and their generated crates. Each interface that declared its own copy would be
+//! declaring a DIFFERENT type with the same name: `liber:display@1` had its own `pixel-format` with
+//! one member, and a second interface adding a second member would have produced two enumerations
+//! that a reader cannot tell apart and a version cannot be declared against.
+//!
+//! THESE ARE THE WIRE TYPES AND NOT THE PROGRAM'S TYPES, and the difference is the whole design.
+//! What crosses a channel is an unvalidated descriptor somebody else wrote: a pitch that does not
+//! cover a row, an extent that overflows when multiplied, a format a reader does not know. The
+//! in-process types live in `graphics-core`, are constructed only through checked conversions from
+//! these, and every trust boundary crosses in that one direction. Treating the wire record as the
+//! program's type would delete the boundary that proves a hostile descriptor was checked, and would
+//! tie the in-process layout to a schema this project versions independently.
+//!
+//! THE CLOSED SETS BELOW ARE THE PROFILE'S. `Image Colour Profile 1` freezes twelve formats, three
+//! alpha modes and eight colour spaces, with a hash over the canonical form; this package carries
+//! exactly those, in that order, because a wire enumeration that admitted a thirteenth format would
+//! be a format no profile describes and no backend is required to implement.
+
+package liber:graphics@1;
+
+/// A size in pixels. Zero in either component is a legal EMPTY extent and is not an error: a surface
+/// that has not been sized yet, and a damage region that covers nothing, are both ordinary.
+record extent-2d {
+	width:  u32,
+	height: u32,
+}
+
+/// A position in pixels, from the top-left corner. SIGNED, because a rectangle may be clipped to a
+/// surface it starts outside of, and expressing that with an unsigned origin means the clipper has
+/// to carry the sign somewhere else.
+record offset-2d {
+	x: i32,
+	y: i32,
+}
+
+/// A rectangle as an origin and an extent rather than as two corners.
+///
+/// TWO CORNERS ARE TWO WAYS TO SAY ONE THING and one of them is wrong: a rectangle whose second
+/// corner is above its first is a rectangle every reader normalises differently, and a normalisation
+/// nobody agreed on is a rectangle that differs by a pixel across a boundary. An origin and an
+/// extent cannot express it at all.
+record rect {
+	origin: offset-2d,
+	size:   extent-2d,
+}
+
+/// The pixel formats `Image Colour Profile 1` freezes, in the profile's own order.
+///
+/// THE NAME STATES THE MEMORY ORDER AND NEVER HOST ENDIANNESS. `B8G8R8A8_UNORM` has blue in its
+/// first byte on every machine; a format named for a `u32` value means something different on a
+/// big-endian one, which is the ambiguity this naming exists to remove.
+enum pixel-format {
+	a8-unorm             = 0,
+	r8-unorm             = 1,
+	r8g8-unorm           = 2,
+	b8g8r8x8-unorm       = 3,
+	r8g8b8x8-unorm       = 4,
+	b8g8r8a8-unorm       = 5,
+	r8g8b8a8-unorm       = 6,
+	r10g10b10a2-unorm    = 7,
+	r16g16b16a16-unorm   = 8,
+	r16g16b16a16-float   = 9,
+	r32-uint             = 10,
+	r32g32b32a32-float   = 11,
+}
+
+/// What the alpha channel MEANS, which is not something a format says.
+///
+/// A FORMAT WITH AN ALPHA CHANNEL DOES NOT SAY WHETHER THE COLOUR IS MULTIPLIED BY IT. Compositing
+/// the two the same way is the classic dark halo, and it is invisible until somebody looks at an
+/// edge - so the meaning travels beside the format rather than being inferred from it.
+enum alpha-mode {
+	/// The alpha channel is present and is not to be read: the image is opaque.
+	opaque        = 0,
+	/// Colour is independent of alpha.
+	straight      = 1,
+	/// Colour has already been multiplied by alpha.
+	premultiplied = 2,
+}
+
+/// The colour spaces `Image Colour Profile 1` freezes, in the profile's own order. Each names
+/// primaries and a transfer function together, because either alone leaves an image undefined.
+enum color-space {
+	srgb              = 0,
+	srgb-linear       = 1,
+	display-p3        = 2,
+	display-p3-linear = 3,
+	rec2020           = 4,
+	rec2020-linear    = 5,
+	rec2020-pq        = 6,
+	rec2020-hlg       = 7,
+}
+
+/// WHICH ROW IS THE FIRST ONE IN MEMORY.
+///
+/// A scanout is top-down and a captured or firmware-provided buffer can be bottom-up, and an image
+/// handed over without saying which is an image that is sometimes upside down. It is not a property
+/// of the format and not a property of the device: it is a property of THIS buffer.
+enum row-origin {
+	top-left    = 0,
+	bottom-left = 1,
+}
+
+/// How the bytes of one image plane are arranged, and what they mean.
+///
+/// `pitch` IS IN BYTES AND MAY EXCEED THE ROW, which is why it is here rather than derived: an
+/// aligned allocation, a sub-image of a larger one and a device requirement all produce a pitch
+/// larger than `width * bytes-per-pixel`, and a reader that assumed otherwise reads the wrong row.
+/// Nothing here is trusted: `graphics-core`'s conversion checks that the pitch covers a row, that
+/// the arithmetic does not overflow, and that the buffer holds what the layout claims.
+record image-layout {
+	size:        extent-2d,
+	pitch:       u32,
+	format:      pixel-format,
+	alpha:       alpha-mode,
+	color-space: color-space,
+	origin:      row-origin,
+}
+
+/// The rectangles of an image that changed, with an explicit WHOLE-SURFACE answer.
+///
+/// A LIST AND A FLAG RATHER THAN AN EMPTY LIST MEANING EVERYTHING. An empty list is the one case two
+/// implementations read in opposite ways - nothing changed, or everything did - and the difference
+/// is a frame that is not drawn versus a frame that is drawn entirely. Stating it removes the
+/// question: `whole` is the answer to "I do not know what changed", and an empty `rects` with
+/// `whole` false means exactly nothing changed.
+record damage-region {
+	whole: bool,
+	@bound(16) rects: list<rect>,
+}

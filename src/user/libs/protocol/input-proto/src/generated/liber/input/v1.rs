@@ -600,7 +600,7 @@ impl PointerEvent {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"col\":");
 		let _ = write!(out, "{}", self.col);
@@ -612,7 +612,7 @@ impl PointerEvent {
 		let _ = write!(out, "{}", self.buttons);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("col=");
 		let _ = write!(out, "{}", self.col);
@@ -624,7 +624,7 @@ impl PointerEvent {
 		let _ = write!(out, "{}", self.buttons);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "col");
 		crate::codec::cbor::uint(out, self.col as u64);
@@ -651,7 +651,7 @@ impl KeyEvent {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"code\":");
 		let _ = write!(out, "{}", self.code);
@@ -664,7 +664,7 @@ impl KeyEvent {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("code=");
 		let _ = write!(out, "{}", self.code);
@@ -677,7 +677,7 @@ impl KeyEvent {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "code");
 		crate::codec::cbor::uint(out, self.code as u64);

@@ -1467,7 +1467,7 @@ impl JobInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"id\":");
 		let _ = write!(out, "{}", self.id);
@@ -1490,7 +1490,7 @@ impl JobInfo {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("id=");
 		let _ = write!(out, "{}", self.id);
@@ -1513,7 +1513,7 @@ impl JobInfo {
 		}
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "id");
 		crate::codec::cbor::uint(out, self.id as u64);
@@ -1542,7 +1542,7 @@ impl JobTarget {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			JobTarget::Process(v35) => {
 				out.push_str("{\"process\":");
@@ -1556,7 +1556,7 @@ impl JobTarget {
 			}
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			JobTarget::Process(v37) => {
 				out.push_str("process(");
@@ -1570,7 +1570,7 @@ impl JobTarget {
 			}
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			JobTarget::Process(v39) => {
 				crate::codec::cbor::map(out, 1);
@@ -1602,7 +1602,7 @@ impl JobEntry {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"info\":");
 		self.info.to_json_into(out);
@@ -1611,7 +1611,7 @@ impl JobEntry {
 		self.target.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("info=");
 		self.info.to_text_into(out);
@@ -1620,7 +1620,7 @@ impl JobEntry {
 		self.target.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "info");
 		self.info.to_cbor_into(out);
@@ -1645,7 +1645,7 @@ impl JobSignalKind {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			JobSignalKind::Term => out.push_str("\"term\""),
 			JobSignalKind::Kill => out.push_str("\"kill\""),
@@ -1654,7 +1654,7 @@ impl JobSignalKind {
 			JobSignalKind::Cont => out.push_str("\"cont\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			JobSignalKind::Term => out.push_str("term"),
 			JobSignalKind::Kill => out.push_str("kill"),
@@ -1663,7 +1663,7 @@ impl JobSignalKind {
 			JobSignalKind::Cont => out.push_str("cont"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			JobSignalKind::Term => crate::codec::cbor::text(out, "term"),
 			JobSignalKind::Kill => crate::codec::cbor::text(out, "kill"),

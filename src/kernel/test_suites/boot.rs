@@ -123,7 +123,7 @@ fn init_package_starts_system_manager() {
 	// NetworkService that failed its bootstrap was a machine with no shell, not a machine with no
 	// network. On an enforcing boot the driver is admitted and the same report means a live link;
 	// which of the two this boot is, the console says beside the DHCP line.
-	let online_reports: [&[u8]; 23] = [
+	let online_reports: [&[u8]; 24] = [
 		b"LogService: online",
 		b"DeviceManager: online",
 		b"StorageService: online (vol://system)",
@@ -135,6 +135,12 @@ fn init_package_starts_system_manager() {
 		b"StorageService: online (vol://tmp)",
 		b"ProcessService: online",
 		b"ConfigService: online",
+		// THE FONT CATALOGUE IS A MANIFEST SERVICE AND REPORTS LIKE ONE, and this list did not know
+		// it (added 2026-09-13). It could not start at all until its manifest row gained the
+		// `process_service` dependency every volume-launched service needs, so its report had never
+		// arrived - and the first boot on which it did counted it as a LIFECYCLE report, because an
+		// unrecognised message falls into that bucket by construction.
+		b"FontCatalogue: online",
 		b"AudioService: online",
 		b"InputService: online",
 		b"ResourceManager: online",

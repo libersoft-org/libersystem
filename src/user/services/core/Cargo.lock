@@ -50,6 +50,7 @@ name = "display-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "graphics-proto",
  "ipc-client",
  "process-proto",
  "wire",
@@ -95,6 +96,14 @@ dependencies = [
 [[package]]
 name = "graphics-profile"
 version = "0.0.0"
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "hashbrown"
@@ -221,6 +230,7 @@ dependencies = [
  "device-proto",
  "display-proto",
  "font-proto",
+ "graphics-proto",
  "input-proto",
  "ipc-client",
  "log-proto",

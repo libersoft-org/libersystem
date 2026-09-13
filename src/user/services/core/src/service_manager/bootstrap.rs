@@ -202,6 +202,14 @@ pub(super) fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, ex
 // stays pristine). Returns the new process handle, or a negative value on failure.
 pub(super) fn launch_from_volume(process_client: u64, name: &[u8], bootstrap: u64) -> i64 {
 	if process_client == 0 {
+		// A SERVICE LOADED FROM THE VOLUME NEEDS PROCESSSERVICE, and a manifest row that does not
+		// declare it as a dependency is started before it exists. That is a plan error rather than a
+		// runtime one, and it used to be invisible: the caller turns this into `State::Failed` with
+		// no reason, so the console said only that the service failed - and every service waiting on
+		// it then said it was waiting, which reads like a hang rather than a missing edge.
+		print(b"ServiceManager: ");
+		print(name);
+		print(b" is launched from the volume and ProcessService is not up yet - its manifest row does not declare `process_service` as a dependency\n");
 		return -1;
 	}
 	let name_str: &str = match core::str::from_utf8(name) {
@@ -612,8 +620,20 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 						// whole boot chain behind this service and tells them nothing about which
 						// step went wrong.
 						print(b"ServiceManager: the font directory could not be minted from StorageService's admin root\n");
+						return None;
 					}
-					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
+					// NARROWED LIKE EVERY OTHER FACTORY ROLE, and this branch was not (corrected
+					// 2026-09-13). `open-directory` hands back a connection carrying every right its
+					// pair was made with, because StorageService made the pair - and the receiver
+					// checks the ceiling its role kind declares and refuses the excess, correctly.
+					// The plan's own `RoleKind::Factory` arm narrows for exactly this reason; a
+					// hand-written branch that bypasses the executor has to do what the executor
+					// does, and this one returned the raw handle. The symptom was
+					// `FONTDIR: role carried more rights than it is allowed` - and before the
+					// missing `process_service` dependency was fixed, not even that.
+					let narrowed: i64 = duplicate(scoped, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+					close(scoped);
+					return if narrowed > 0 { Some((role.tag.to_vec(), narrowed as u64)) } else { None };
 				}
 				// THE INIT PACKAGE, under the rights a launcher needs: read it, map it, pass it on.
 				// The message carries its length behind the tag because a memory object does not

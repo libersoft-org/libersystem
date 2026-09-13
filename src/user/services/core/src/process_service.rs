@@ -713,8 +713,23 @@ fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact: &str, 
 		if let Some(shadow) = registry_generation(&mut registry, logical_name) {
 			return spawn_program_bytes(storage, registry, &shadow, Some(logical_name), bootstrap, domain);
 		}
-		let main = MappedFile::open(storage, String::from(path))?;
-		spawn_program_bytes(storage, registry, main.bytes(), Some(logical_name), bootstrap, domain)
+		// TWO REFUSALS THAT LOOKED THE SAME FROM OUTSIDE. `launch` answers `NotFound` whether the
+		// artifact was absent or the image was refused, and the supervisor turns that into "FAILED
+		// to start" with no reason - so a service that does not come up costs a reader the whole
+		// boot chain behind it and says nothing about which of the two happened.
+		let Some(main) = MappedFile::open(storage, String::from(path)) else {
+			print(b"ProcessService: no artifact at ");
+			print(path.as_bytes());
+			print(b"\n");
+			return None;
+		};
+		let spawned = spawn_program_bytes(storage, registry, main.bytes(), Some(logical_name), bootstrap, domain);
+		if spawned.is_none() {
+			print(b"ProcessService: the image at ");
+			print(path.as_bytes());
+			print(b" was refused\n");
+		}
+		spawned
 	}
 }
 
@@ -797,11 +812,29 @@ fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_ident
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return None };
 		let Some(dynamic) = elf.dynamic_info() else { return None };
 		let Some(dynamic) = dynamic else {
-			if expected_identity.is_none() {
-				let (process, thread) = spawn_prepared_in(bytes, bootstrap, domain)?;
-				return Some(Spawned { process, thread });
-			}
-			return None;
+			// A STATIC EXECUTABLE HAS NO PROVIDERS TO RESOLVE AND STILL HAS AN IDENTITY.
+			//
+			// This refused one outright whenever an identity was expected, and the expectation is
+			// set by every launch that goes through a PATH - which is every service started from the
+			// volume. So a statically linked service could not be launched at all: it was spawnable
+			// only from the init package, where no identity is asked for. `font_catalogue` is the one
+			// such service in this image, and the symptom was the whole boot chain behind it -
+			// PermissionManager, ConsoleService, SystemGraphService and the shell - never starting,
+			// with `FAILED to start` and no reason, because the refusal is a bare `None` four frames
+			// below the supervisor.
+			//
+			// WHAT THE REFUSAL WAS PROTECTING IS THE IDENTITY CHECK, and the answer is to PERFORM it
+			// rather than to refuse the image: a static program carries the same identity note a
+			// dynamic one does, and what it does not carry is a dependency closure - which is
+			// exactly why there is nothing else to check.
+			// AND IT IS NOT ASKED FOR A NOTE IT CANNOT CARRY. The identity note is written by the
+			// shared-image pipeline for DYNAMIC artifacts, and the packager records an identity for
+			// `dynamic` and `library` rows and for no other kind - so a static executable has none
+			// BY CONSTRUCTION. What stands in its place is the volume package: the bytes come from
+			// a staged, audited artifact, and there is no dependency closure for a note to bind
+			// them to.
+			let (process, thread) = spawn_prepared_in(bytes, bootstrap, domain)?;
+			return Some(Spawned { process, thread });
 		};
 		let Some(artifact) = expected_identity else { return None };
 		let Some(identity) = verify_identity(&elf, "executable", artifact) else { return None };

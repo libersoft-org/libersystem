@@ -10,6 +10,8 @@ shared-image = ["channel-client-impl", "ipc-client/shared-image"]
 
 [dependencies]
 base-proto = { path = "../base-proto" }
+# THE SHARED GRAPHICS VALUE TYPES. `pixel-format` is `liber:graphics@1`'s, not this package's.
+graphics-proto = { path = "../graphics-proto" }
 process-proto = { path = "../process-proto" }
 wire = { path = "../../../../wire" }
 ipc-client = { path = "../../ipc/ipc-client", optional = true }

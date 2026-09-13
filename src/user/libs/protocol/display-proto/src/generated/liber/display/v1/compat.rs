@@ -2,14 +2,6 @@ use super::*;
 use alloc::string::String;
 
 #[test]
-fn pixel_format_wire_is_stable() {
-	let sample = PixelFormat::B8g8r8x8;
-	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[0];
-	assert_eq!(bytes, golden);
-	assert_eq!(PixelFormat::decode(&bytes).unwrap(), sample);
-}
-#[test]
 fn display_event_wire_is_stable() {
 	let sample = DisplayEvent { width: 7, height: 7 };
 	let bytes = sample.encode_vec().expect("encode");

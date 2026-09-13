@@ -9,61 +9,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use crate::generated::liber::base::v1::Error;
-
-/// Pixel layouts accepted by DisplayService. The first format matches the existing
-/// virtio-gpu scanout and ConsoleService representation: in memory B, G, R, unused;
-/// as a little-endian u32, 0xXXRRGGBB.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PixelFormat {
-	B8g8r8x8 = 0,
-}
-
-impl PixelFormat {
-	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
-		let mut w = SliceWriter::new(out);
-		self.write(&mut w)?;
-		// `finish` refuses while a capability is recorded, because returning the
-		// length alone would drop it.
-		w.finish()
-	}
-	pub fn encode_vec(&self) -> Option<Vec<u8>> {
-		let mut w = VecWriter::new();
-		self.write(&mut w)?;
-		// `into_inner` refuses while a capability is recorded, because returning
-		// the bytes alone would drop it.
-		w.into_inner()
-	}
-	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
-		let mut w = VecWriter::new();
-		self.write(&mut w)?;
-		Some(w.into_message())
-	}
-	pub fn decode(bytes: &[u8]) -> Option<PixelFormat> {
-		let mut r = Reader::new(bytes);
-		let value = PixelFormat::read(&mut r)?;
-		r.finish()?;
-		Some(value)
-	}
-	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PixelFormat> {
-		let mut r = Reader::with_handles(bytes, handles);
-		let value = PixelFormat::read(&mut r)?;
-		r.finish()?;
-		// The frame is good, so the capabilities it carried are the value's now. A
-		// refusal above leaves them in the caller's list, which is the half that closes.
-		handles.clear();
-		Some(value)
-	}
-	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
-		w.u8(*self as u8)
-	}
-	pub fn read(r: &mut Reader) -> Option<PixelFormat> {
-		match r.u8()? {
-			0 => Some(PixelFormat::B8g8r8x8),
-			_ => None,
-		}
-	}
-}
+use crate::generated::liber::graphics::v1::PixelFormat;
 
 /// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
 /// retains a read+map duplicate and transfers a write+map handle to the client. Its
@@ -1087,39 +1033,6 @@ pub mod display_admin {
 	}
 }
 
-impl PixelFormat {
-	pub fn to_json(&self) -> String {
-		let mut s = String::new();
-		self.to_json_into(&mut s);
-		s
-	}
-	pub fn to_text(&self) -> String {
-		let mut s = String::new();
-		self.to_text_into(&mut s);
-		s
-	}
-	pub fn to_cbor(&self) -> Vec<u8> {
-		let mut v = Vec::new();
-		self.to_cbor_into(&mut v);
-		v
-	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
-		match self {
-			PixelFormat::B8g8r8x8 => out.push_str("\"b8g8r8x8\""),
-		}
-	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
-		match self {
-			PixelFormat::B8g8r8x8 => out.push_str("b8g8r8x8"),
-		}
-	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		match self {
-			PixelFormat::B8g8r8x8 => crate::codec::cbor::text(out, "b8g8r8x8"),
-		}
-	}
-}
-
 impl SurfaceInfo {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1136,7 +1049,7 @@ impl SurfaceInfo {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"pixels\":");
 		let _ = write!(out, "{}", self.pixels.len);
@@ -1154,7 +1067,7 @@ impl SurfaceInfo {
 		self.format.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("pixels=");
 		let _ = write!(out, "{}", self.pixels.len);
@@ -1172,7 +1085,7 @@ impl SurfaceInfo {
 		self.format.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "pixels");
 		crate::codec::cbor::uint(out, self.pixels.len);
@@ -1203,7 +1116,7 @@ impl DisplayEvent {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"width\":");
 		let _ = write!(out, "{}", self.width);
@@ -1212,7 +1125,7 @@ impl DisplayEvent {
 		let _ = write!(out, "{}", self.height);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("width=");
 		let _ = write!(out, "{}", self.width);
@@ -1221,7 +1134,7 @@ impl DisplayEvent {
 		let _ = write!(out, "{}", self.height);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "width");
 		crate::codec::cbor::uint(out, self.width as u64);
@@ -1246,7 +1159,7 @@ impl PresentationStats {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"presents\":");
 		let _ = write!(out, "{}", self.presents);
@@ -1273,7 +1186,7 @@ impl PresentationStats {
 		let _ = write!(out, "{}", self.max_present_ns);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("presents=");
 		let _ = write!(out, "{}", self.presents);
@@ -1300,7 +1213,7 @@ impl PresentationStats {
 		let _ = write!(out, "{}", self.max_present_ns);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 8);
 		crate::codec::cbor::text(out, "presents");
 		crate::codec::cbor::uint(out, self.presents as u64);

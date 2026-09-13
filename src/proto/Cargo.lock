@@ -46,6 +46,7 @@ name = "display-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "graphics-proto",
  "ipc-client",
  "process-proto",
  "wire",
@@ -56,6 +57,14 @@ name = "font-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
  "ipc-client",
  "wire",
 ]
@@ -125,6 +134,7 @@ dependencies = [
  "device-proto",
  "display-proto",
  "font-proto",
+ "graphics-proto",
  "input-proto",
  "ipc-client",
  "log-proto",

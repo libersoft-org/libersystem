@@ -18,8 +18,16 @@ name = "display-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "graphics-proto",
  "ipc-client",
  "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
  "wire",
 ]
 

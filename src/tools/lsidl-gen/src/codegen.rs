@@ -1271,7 +1271,13 @@ impl Cg {
 		let ty = camel(&r.name);
 		self.line(&format!("impl {ty} {{"));
 		self.render_wrappers();
-		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		// PUBLIC, NOT CRATE-PRIVATE, AND THE REASON IS CROSS-PACKAGE EMBEDDING (2026-09-13). A record
+		// of one package may hold a type declared in another - `liber:display@1`'s `surface-info`
+		// holds `liber:graphics@1`'s `pixel-format` - and its renderers call the field's renderer. A
+		// `pub(crate)` helper is invisible across the crate boundary those two packages become, so
+		// the whole shared-vocabulary arrangement this tree moved to would not compile. Nothing else
+		// changes: these are generated renderers over generated types.
+		self.line("\tpub fn to_json_into(&self, out: &mut String) {");
 		self.line("\t\tout.push('{');");
 		for (idx, f) in r.fields.iter().enumerate() {
 			if idx > 0 {
@@ -1283,7 +1289,7 @@ impl Cg {
 		}
 		self.line("\t\tout.push('}');");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_text_into(&self, out: &mut String) {");
 		self.line("\t\tout.push('{');");
 		for (idx, f) in r.fields.iter().enumerate() {
 			if idx > 0 {
@@ -1295,7 +1301,7 @@ impl Cg {
 		}
 		self.line("\t\tout.push('}');");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\tpub fn to_cbor_into(&self, out: &mut Vec<u8>) {");
 		self.line(&format!("\t\tcrate::codec::cbor::map(out, {});", r.fields.len()));
 		for f in &r.fields {
 			self.line(&format!("\t\tcrate::codec::cbor::text(out, \"{}\");", f.name));
@@ -1312,21 +1318,21 @@ impl Cg {
 		let ty = camel(&e.name);
 		self.line(&format!("impl {ty} {{"));
 		self.render_wrappers();
-		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_json_into(&self, out: &mut String) {");
 		self.line("\t\tmatch self {");
 		for c in &e.cases {
 			self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"\\\"{}\\\"\"),", camel(&c.name), c.name));
 		}
 		self.line("\t\t}");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_text_into(&self, out: &mut String) {");
 		self.line("\t\tmatch self {");
 		for c in &e.cases {
 			self.line(&format!("\t\t\t{ty}::{} => out.push_str(\"{}\"),", camel(&c.name), c.name));
 		}
 		self.line("\t\t}");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\tpub fn to_cbor_into(&self, out: &mut Vec<u8>) {");
 		self.line("\t\tmatch self {");
 		for c in &e.cases {
 			self.line(&format!("\t\t\t{ty}::{} => crate::codec::cbor::text(out, \"{}\"),", camel(&c.name), c.name));
@@ -1341,7 +1347,7 @@ impl Cg {
 		let ty = camel(&v.name);
 		self.line(&format!("impl {ty} {{"));
 		self.render_wrappers();
-		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_json_into(&self, out: &mut String) {");
 		self.line("\t\tmatch self {");
 		for c in &v.cases {
 			match &c.payload {
@@ -1355,7 +1361,7 @@ impl Cg {
 		}
 		self.line("\t\t}");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_text_into(&self, out: &mut String) {");
 		self.line("\t\tmatch self {");
 		for c in &v.cases {
 			match &c.payload {
@@ -1369,7 +1375,7 @@ impl Cg {
 		}
 		self.line("\t\t}");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\tpub fn to_cbor_into(&self, out: &mut Vec<u8>) {");
 		self.line("\t\tmatch self {");
 		for c in &v.cases {
 			match &c.payload {
@@ -1392,7 +1398,7 @@ impl Cg {
 		let ty = camel(&f.name);
 		self.line(&format!("impl {ty} {{"));
 		self.render_wrappers();
-		self.line("\tpub(crate) fn to_json_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_json_into(&self, out: &mut String) {");
 		self.line("\t\tout.push('[');");
 		self.line("\t\tlet mut first = true;");
 		for flag in &f.flags {
@@ -1400,14 +1406,14 @@ impl Cg {
 		}
 		self.line("\t\tout.push(']');");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_text_into(&self, out: &mut String) {");
+		self.line("\tpub fn to_text_into(&self, out: &mut String) {");
 		self.line("\t\tlet mut any = false;");
 		for flag in &f.flags {
 			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ if any {{ out.push('|'); }} any = true; out.push_str(\"{}\"); }}", screaming(&flag.name), flag.name));
 		}
 		self.line("\t\tif !any { out.push('-'); }");
 		self.line("\t}");
-		self.line("\tpub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {");
+		self.line("\tpub fn to_cbor_into(&self, out: &mut Vec<u8>) {");
 		self.line("\t\tlet mut count = 0usize;");
 		for flag in &f.flags {
 			self.line(&format!("\t\tif self.0 & Self::{} != 0 {{ count += 1; }}", screaming(&flag.name)));

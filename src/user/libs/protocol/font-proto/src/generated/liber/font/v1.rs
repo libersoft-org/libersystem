@@ -1704,7 +1704,7 @@ impl FaceFormat {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FaceFormat::TruetypeGlyf => out.push_str("\"truetype-glyf\""),
 			FaceFormat::OpentypeCff => out.push_str("\"opentype-cff\""),
@@ -1712,7 +1712,7 @@ impl FaceFormat {
 			FaceFormat::Collection => out.push_str("\"collection\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FaceFormat::TruetypeGlyf => out.push_str("truetype-glyf"),
 			FaceFormat::OpentypeCff => out.push_str("opentype-cff"),
@@ -1720,7 +1720,7 @@ impl FaceFormat {
 			FaceFormat::Collection => out.push_str("collection"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FaceFormat::TruetypeGlyf => crate::codec::cbor::text(out, "truetype-glyf"),
 			FaceFormat::OpentypeCff => crate::codec::cbor::text(out, "opentype-cff"),
@@ -1746,7 +1746,7 @@ impl FaceWidth {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FaceWidth::UltraCondensed => out.push_str("\"ultra-condensed\""),
 			FaceWidth::ExtraCondensed => out.push_str("\"extra-condensed\""),
@@ -1759,7 +1759,7 @@ impl FaceWidth {
 			FaceWidth::UltraExpanded => out.push_str("\"ultra-expanded\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FaceWidth::UltraCondensed => out.push_str("ultra-condensed"),
 			FaceWidth::ExtraCondensed => out.push_str("extra-condensed"),
@@ -1772,7 +1772,7 @@ impl FaceWidth {
 			FaceWidth::UltraExpanded => out.push_str("ultra-expanded"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FaceWidth::UltraCondensed => crate::codec::cbor::text(out, "ultra-condensed"),
 			FaceWidth::ExtraCondensed => crate::codec::cbor::text(out, "extra-condensed"),
@@ -1803,21 +1803,21 @@ impl FaceSlant {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			FaceSlant::Upright => out.push_str("\"upright\""),
 			FaceSlant::Italic => out.push_str("\"italic\""),
 			FaceSlant::Oblique => out.push_str("\"oblique\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			FaceSlant::Upright => out.push_str("upright"),
 			FaceSlant::Italic => out.push_str("italic"),
 			FaceSlant::Oblique => out.push_str("oblique"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			FaceSlant::Upright => crate::codec::cbor::text(out, "upright"),
 			FaceSlant::Italic => crate::codec::cbor::text(out, "italic"),
@@ -1842,7 +1842,7 @@ impl FaceIdentity {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"digest\":");
 		out.push('[');
@@ -1860,7 +1860,7 @@ impl FaceIdentity {
 		let _ = write!(out, "{}", self.index);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("digest=");
 		out.push('[');
@@ -1878,7 +1878,7 @@ impl FaceIdentity {
 		let _ = write!(out, "{}", self.index);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "digest");
 		crate::codec::cbor::array(out, self.digest.len());
@@ -1906,7 +1906,7 @@ impl VariationAxis {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"tag\":");
 		let _ = write!(out, "{}", self.tag);
@@ -1921,7 +1921,7 @@ impl VariationAxis {
 		let _ = write!(out, "{}", self.maximum);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("tag=");
 		let _ = write!(out, "{}", self.tag);
@@ -1936,7 +1936,7 @@ impl VariationAxis {
 		let _ = write!(out, "{}", self.maximum);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "tag");
 		crate::codec::cbor::uint(out, self.tag as u64);
@@ -1965,7 +1965,7 @@ impl FaceRecord {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"identity\":");
 		self.identity.to_json_into(out);
@@ -2001,7 +2001,7 @@ impl FaceRecord {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("identity=");
 		self.identity.to_text_into(out);
@@ -2037,7 +2037,7 @@ impl FaceRecord {
 		out.push(']');
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 8);
 		crate::codec::cbor::text(out, "identity");
 		self.identity.to_cbor_into(out);
@@ -2077,7 +2077,7 @@ impl FaceBytes {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"identity\":");
 		self.identity.to_json_into(out);
@@ -2089,7 +2089,7 @@ impl FaceBytes {
 		let _ = write!(out, "{}", self.length);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("identity=");
 		self.identity.to_text_into(out);
@@ -2101,7 +2101,7 @@ impl FaceBytes {
 		let _ = write!(out, "{}", self.length);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "identity");
 		self.identity.to_cbor_into(out);
@@ -2128,7 +2128,7 @@ impl ResolveOutcome {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			ResolveOutcome::Filled(v42) => {
 				out.push_str("{\"filled\":");
@@ -2147,7 +2147,7 @@ impl ResolveOutcome {
 			}
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			ResolveOutcome::Filled(v45) => {
 				out.push_str("filled(");
@@ -2166,7 +2166,7 @@ impl ResolveOutcome {
 			}
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			ResolveOutcome::Filled(v48) => {
 				crate::codec::cbor::map(out, 1);
@@ -2203,19 +2203,19 @@ impl GenerationEvent {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"generation\":");
 		let _ = write!(out, "{}", self.generation);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("generation=");
 		let _ = write!(out, "{}", self.generation);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "generation");
 		crate::codec::cbor::uint(out, self.generation as u64);
@@ -2238,7 +2238,7 @@ impl Ceiling {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			Ceiling::None => out.push_str("\"none\""),
 			Ceiling::InstalledFaces => out.push_str("\"installed-faces\""),
@@ -2246,7 +2246,7 @@ impl Ceiling {
 			Ceiling::ListReplyBytes => out.push_str("\"list-reply-bytes\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			Ceiling::None => out.push_str("none"),
 			Ceiling::InstalledFaces => out.push_str("installed-faces"),
@@ -2254,7 +2254,7 @@ impl Ceiling {
 			Ceiling::ListReplyBytes => out.push_str("list-reply-bytes"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			Ceiling::None => crate::codec::cbor::text(out, "none"),
 			Ceiling::InstalledFaces => crate::codec::cbor::text(out, "installed-faces"),
@@ -2280,21 +2280,21 @@ impl RejectionReason {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			RejectionReason::Declaration => out.push_str("\"declaration\""),
 			RejectionReason::Relabelled => out.push_str("\"relabelled\""),
 			RejectionReason::PastCeiling => out.push_str("\"past-ceiling\""),
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			RejectionReason::Declaration => out.push_str("declaration"),
 			RejectionReason::Relabelled => out.push_str("relabelled"),
 			RejectionReason::PastCeiling => out.push_str("past-ceiling"),
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			RejectionReason::Declaration => crate::codec::cbor::text(out, "declaration"),
 			RejectionReason::Relabelled => crate::codec::cbor::text(out, "relabelled"),
@@ -2319,7 +2319,7 @@ impl Rejection {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"name\":");
 		crate::codec::json_escape(&self.name, out);
@@ -2328,7 +2328,7 @@ impl Rejection {
 		self.reason.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("name=");
 		out.push_str(&self.name);
@@ -2337,7 +2337,7 @@ impl Rejection {
 		self.reason.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
@@ -2362,7 +2362,7 @@ impl ScanReport {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("\"generation\":");
 		let _ = write!(out, "{}", self.generation);
@@ -2405,7 +2405,7 @@ impl ScanReport {
 		self.breach.to_json_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		out.push('{');
 		out.push_str("generation=");
 		let _ = write!(out, "{}", self.generation);
@@ -2448,7 +2448,7 @@ impl ScanReport {
 		self.breach.to_text_into(out);
 		out.push('}');
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "generation");
 		crate::codec::cbor::uint(out, self.generation as u64);
@@ -2487,7 +2487,7 @@ impl RescanOutcome {
 		self.to_cbor_into(&mut v);
 		v
 	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
+	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			RescanOutcome::Completed(v61) => {
 				out.push_str("{\"completed\":");
@@ -2506,7 +2506,7 @@ impl RescanOutcome {
 			}
 		}
 	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
+	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			RescanOutcome::Completed(v64) => {
 				out.push_str("completed(");
@@ -2524,7 +2524,7 @@ impl RescanOutcome {
 			}
 		}
 	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			RescanOutcome::Completed(v67) => {
 				crate::codec::cbor::map(out, 1);
