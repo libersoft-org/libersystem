@@ -441,6 +441,9 @@ audiorec = { path = "../../libs/audio/audiorec" }
 # `audiorec` writes its own container, so it holds the encoder and the sink trait directly rather
 # than through a conversion library the way `audioconv` does.
 pcm = { path = "../../libs/audio/pcm" }
+# THE SHARED IMAGE MODEL, for the one tool that draws onto a display surface: the surface describes
+# itself with a layout, and the viewer's destination is built from that rather than from its fields.
+graphics-core = { path = "../../libs/graphics/core" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }

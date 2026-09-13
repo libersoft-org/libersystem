@@ -28,6 +28,7 @@ name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
@@ -102,6 +103,7 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "display-proto",
+ "graphics-core",
  "input-proto",
  "ipc-client",
  "pix",

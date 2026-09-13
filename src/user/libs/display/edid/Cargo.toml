@@ -1,0 +1,12 @@
+[package]
+name = "edid"
+edition = "2024"
+description = "A bounded EDID reader: what a monitor says about itself, checked before any of it is arithmetic"
+
+# NO DEPENDENCIES. Every answer here is a function of 128 bytes and of the blocks after them, so a host
+# test drives the whole parser against a fixture in microseconds - which is what lets this half be
+# finished while no display controller in this tree can yet fetch those bytes over DDC.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

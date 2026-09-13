@@ -334,3 +334,120 @@ A JUDGEMENT THAT SHOULD BE READ BY SOMEBODY ELSE: the credit rates - a quarter a
 256-bit threshold are this implementation's choices. They are conservative relative to what Linux
 credits a virtio-rng source, and the plan asked for conservative. They are not derived from a
 measurement, because nothing inside a guest can measure them.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-09-13 19:05):
+
+THE FADT AND GAS PARSER, as `src/acpi`. A shared-library item, closed the way the file's completion
+section says one closes: on host tests and hostile fixtures, with no bind, no device and no claim.
+
+WHY IT IS A CRATE AND NOT A KERNEL MODULE. Three fixed-hardware items follow this one - event
+delivery, the power button, and the battery/AC/thermal classes - and each would otherwise read the
+FADT with its own offsets and its own idea of which fields its revision may be believed about. It is
+`&[u8]`-shaped rather than `phys_to_virt`-shaped like `fdt`, because everything that reads a FADT
+reads it through a mapping that already exists, and because that is what makes a hostile fixture a
+byte array in a test rather than a mapping a test has to fake.
+
+WHAT THE 22 TESTS HOLD. One is the well-formed table, and it is the least interesting. The rest are
+fixtures that are wrong on purpose: a length below the header, a length past the buffer, a length no
+real table has, a checksum that does not sum, another table's signature, a revision-1 table asked for
+revision-5 fields, a revision-6 table truncated before its sleep registers, an access size of five, an
+address with no width, a width with no address, an address at the top of the space with a width that
+runs past it, a machine that declares a reset register and no support for it, a machine with no CMOS
+clock and a century index anyway, a zero SMI command port, and a hardware-reduced machine whose fixed
+hardware fields are filled in and must be ignored.
+
+THE ORDER OF THE REFUSALS IS PART OF THE CONTRACT and one test says so: an absurd declared length is
+refused BEFORE the checksum walks it, because walking four billion bytes is the work the bound exists
+to prevent.
+
+THREE PIECES OF DRIFT WERE FOUND AND FIXED WHILE REGISTERING IT, all of them mine from earlier in this
+job and all of them reported by `verify-model check` rather than noticed:
+  - `check.sh` ran the `run-verdict` gate and the catalog did not know it, so nothing would ever have
+    selected it. It is registered now, with its subject.
+  - `host.graphics-proto` was derived as release-required and was not in the frozen set.
+  - `host.acpi` needed the same entry, which is what a new crate with tests always needs.
+`verify-model check` is clean, and its own 157 tests are green.
+
+NOT PERFORMED: nothing binds this parser yet, by design. The first consumer is the ACPI fixed-hardware
+event item, which is an architectural-prerequisite item and is not this one.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-09-13 19:40):
+
+HID OVER I2C, THE PROTOCOL HALF, as `src/user/libs/driver/hid-i2c`. The second shared-library item
+closed today, and closed the same way: on host tests over a fake device, with no bind.
+
+THE BUS CONTRACT IS THE PART WORTH REVIEWING. This item is the first implemented consumer of an I2C
+bus in this tree, so by the milestone's own shared-contract rule it states the contract - and the
+temptation was to state a controller. It states three operations instead: `write`, `read`, and
+`write_read`. The third is there because a register read IS a write-then-read with no stop between
+the two halves, and an implementation that offered only the first two would force every caller to
+split the transaction where another master can act.
+
+WHAT THE 13 TESTS HOLD, and the shape is the same as the ACPI parser's: one test is the well-formed
+case and the other twelve are devices behaving the way real ones do when something is wrong. A device
+still in reset answering with thirty zero bytes. A maximum input length of zero, of one, and of one
+past what the bus carries. A report descriptor of zero length. A report whose declared length is
+longer than what the bus returned. A bus that stops four bytes short. A report id of 15 and of 200,
+which take the escape form. A power transition, asserted on the BYTES rather than on the call
+returning `Ok`.
+
+THE ONE DESIGN DECISION THAT COULD HAVE GONE THE OTHER WAY: `Device` does not own the bus. A touchpad
+shares its bus with every other device on it, so a type that owned one could not be built twice; the
+bus is passed to each operation instead. That is also what let the fake device be the bus in the
+tests.
+
+NOT PERFORMED: the binding half. It needs an I2C controller driver with a real fixture and the
+firmware-node device identity, and neither has an owner - which is precisely why the milestone splits
+the two and why this half could close today.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-09-13 21:00):
+
+TWO MORE ITEMS, AND ONE OF THEM IS A DECISION THE FILE HAD BEEN CARRYING SINCE AUGUST.
+
+THE EDID PARSER AND THE MONITOR VOCABULARY, split from its transport by this file's own rule. DDC is
+I2C on the display connector; there is no I2C controller in this tree and no display driver that can
+reach one, so the FETCH has no event that closes it and the PARSE does. `src/user/libs/display/edid`,
+13 host tests, and the transport half is now a named blocked item rather than half of a closed one.
+The parse is the ordinary half; the vocabulary is the half worth reviewing. `PhysicalSize` has three
+answers because a compositor that computes a DPI from an undefined size divides by zero. `VideoInput`
+answers `None` for a bit depth on EDID 1.3, where the byte carried none, rather than reading the
+analogue flags as a colour depth. `Manufactured` separates a week from a bare year from a MODEL year,
+because week 255 is not a week. And a timing is refused before it is arithmetic: no active pixels, no
+blanking (the refresh rate divides by active plus blanking), or a sync pulse that runs past the
+blanking interval it lives in.
+
+THE USB EXECUTION MODEL, DECIDED AND IMPLEMENTED. The first answer: a class driver is a module inside
+the controller's process and Domain, holding no claim and no Domain of its own. The second answer -
+one binding unit per USB interface - is a sub-function identity, the same cross-cutting case as the
+firmware node, which P02M0163 already refused and which would have put every USB class item behind an
+unowned prerequisite.
+
+AND THE MECHANISM IS WHERE THE REAL FINDING WAS. Writing the isolation clause down meant looking at
+what the two class modules actually hold, and both were unbounded:
+  - `Hids::entries` is a `Vec` with no ceiling. A tier of hubs full of keyboards configures one HID
+    module entry each, and each entry is an endpoint and a DMA page of the CONTROLLER'S, held for as
+    long as the device stays plugged in.
+  - `Storage::fit_data` grows the data buffer to the largest request ever made and never shrinks.
+    The bound on a DMA span inside the controller's Domain was therefore whatever the largest transfer
+    anybody had asked for.
+`drivers::usb_class` is the budget: eight HID devices with their endpoints, rings and in-flight
+reports; one mass-storage device with two endpoints, two rings and a data buffer bounded at a
+megabyte. Charged when a module takes a device, given back when the port goes away, in the same two
+places that already allocate and free the pages - so the count cannot drift from the memory.
+
+THREE DETAILS THAT WOULD HAVE BEEN WRONG THE OBVIOUS WAY. The charge is taken when the module TAKES
+the device and not when the admission is asked for, because `configure_hid` answers `None` for
+anything that is not a HID and charging that would spend the keyboard budget on every device on the
+bus. A refused device is left ADDRESSED and in the inventory rather than released, so a later detach
+still gives its pages back. And the refusal is only PRINTED for a device whose class byte could
+plausibly belong to the module, because "the keyboard budget is full" about a printer is a lie.
+
+EVIDENCE: 8 new host tests (drivers 45 total, green) at each ceiling and one past it, including a
+hundred plug/unplug cycles ending where they started and sixteen refusals costing nothing; the guest
+`usb` and `storage` tags pass 59 tests over the real emulated controller.
+
+NOT PERFORMED: the per-class detach-under-load case and the budget-exhaustion refusal AS A GUEST
+observation. Both need a QEMU fixture that adds and removes USB devices while traffic is in flight,
+which the harness has no mechanism for today; the budget's own behaviour is held by the host tests
+above, and the gate contract that names those two cases belongs to the first in-controller class
+module item rather than to this decision.

@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use graphics_core::composite::{BlendMode, Operator, composite};
-use graphics_core::format::{PackedChannel, PackedRgbLayout};
+use graphics_core::format::PackedRgbLayout;
 use graphics_core::geom::Extent2D;
 use graphics_core::layout::{ImageLayout, RowOrigin};
 use graphics_core::pixel::{Decoder, Rgba as Colour, Working, quantise, write_packed};
@@ -300,25 +300,127 @@ pub struct Rect {
 	pub height: u32,
 }
 
+/// A source image, described by the SHARED image model rather than by four loose numbers.
+///
+/// WHAT THE FOUR NUMBERS COULD NOT SAY. `data/width/height/pitch` carries no format, no alpha mode,
+/// no colour space and no row origin, so every consumer had to assume all four - and the assumption
+/// was written down nowhere. This holds a `graphics_core::ImageView`, which cannot be constructed
+/// over a buffer too small for what it claims and cannot exist without saying what its bytes mean.
 pub struct Image<'a> {
-	pub data: &'a [u8],
-	pub width: u32,
-	pub height: u32,
-	pub pitch: u32,
+	view: ImageView<'a>,
 }
 
+impl<'a> Image<'a> {
+	/// THE DECODERS' FORM: four 8-bit channels, in memory order B, G, R, A, straight alpha in the
+	/// sRGB space with the first row at the top. Every image decoder in this tree produces exactly
+	/// that, and it was the assumption the four loose numbers left unwritten.
+	pub fn rgba(data: &'a [u8], width: u32, height: u32, pitch: u32) -> Option<Self> {
+		let layout = ImageLayout::new(Extent2D { width, height }, pitch, PixelStorage::Known(PixelFormat::B8G8R8A8Unorm), RowOrigin::TopLeft, ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight }).ok()?;
+		Some(Self { view: ImageView::new(layout, data).ok()? })
+	}
+
+	pub fn width(&self) -> u32 {
+		self.view.layout().extent.width
+	}
+
+	pub fn height(&self) -> u32 {
+		self.view.layout().extent.height
+	}
+
+	pub fn pitch(&self) -> u32 {
+		self.view.layout().pitch
+	}
+
+	pub fn bytes(&self) -> &[u8] {
+		self.view.bytes()
+	}
+}
+
+/// A destination, which is the one place a firmware-described layout legitimately appears.
+///
+/// THE SIX SHIFT/SIZE FIELDS WERE A PACKED LAYOUT WITHOUT THE NAME. A scanout handed over by
+/// firmware describes its channels by masks rather than by a format name, and `graphics-core` models
+/// exactly that as `PixelStorage::PackedRgbUnorm` - with the validation the loose fields never had:
+/// channels inside the element and channels that do not OVERLAP. Two channels sharing a bit means
+/// one changes when the other is written, which is a picture whose colours shift as its content
+/// does.
 pub struct Target<'a> {
-	pub data: &'a mut [u8],
-	pub width: u32,
-	pub height: u32,
-	pub pitch: u32,
-	pub bytes_per_pixel: u32,
-	pub red_shift: u8,
-	pub red_size: u8,
-	pub green_shift: u8,
-	pub green_size: u8,
-	pub blue_shift: u8,
-	pub blue_size: u8,
+	view: ImageViewMut<'a>,
+}
+
+impl<'a> Target<'a> {
+	/// A destination whose channels are described by masks, as firmware described them.
+	#[allow(clippy::too_many_arguments)]
+	pub fn packed(data: &'a mut [u8], width: u32, height: u32, pitch: u32, bytes_per_pixel: u32, red: (u8, u8), green: (u8, u8), blue: (u8, u8)) -> Option<Self> {
+		// THE RESERVED BITS ARE NOT THIS BLITTER'S TO SET, and the shared constructor is where that
+		// is written down: the shared packer writes a declared reserved span with ALL BITS SET, so
+		// declaring one here would turn every `0x00rrggbb` this blitter writes into `0xffrrggbb`.
+		// (Measured: three blit tests failed on exactly that byte.)
+		let packed = PackedRgbLayout::from_masks(bytes_per_pixel, red, green, blue)?;
+		Self::from_layout(data, ImageLayout::scanout(Extent2D { width, height }, pitch, PixelStorage::PackedRgbUnorm(packed)).ok()?)
+	}
+
+	/// A destination THE DISPLAY ALREADY DESCRIBED, adopted rather than taken apart into loose
+	/// numbers and rebuilt. A surface mapping and a scanout adapter both hold a layout the shared
+	/// model checked once; re-deriving it per call is how the copy that differs appears.
+	pub fn from_layout(data: &'a mut [u8], layout: ImageLayout) -> Option<Self> {
+		Some(Self { view: ImageViewMut::new(layout, data).ok()? })
+	}
+
+	pub fn width(&self) -> u32 {
+		self.view.layout().extent.width
+	}
+
+	pub fn height(&self) -> u32 {
+		self.view.layout().extent.height
+	}
+
+	pub fn pitch(&self) -> u32 {
+		self.view.layout().pitch
+	}
+
+	pub fn bytes_mut(&mut self) -> &mut [u8] {
+		self.view.bytes_mut()
+	}
+
+	/// How many bytes this destination holds. A LENGTH IS NOT A WRITE: asking `bytes_mut` for it
+	/// would make every caller that only validates take a mutable borrow, and `validate` takes a
+	/// shared one on purpose.
+	pub fn len(&self) -> usize {
+		self.view.as_view().bytes().len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.len() == 0
+	}
+
+	/// This target's channel masks, from its own storage and from the shared registry - not from a
+	/// private copy.
+	///
+	/// `None` FOR A DESTINATION THIS BLITTER CANNOT WRITE. A named format has masks when its bytes
+	/// are one 8-bit channel each; a float or wide destination has none, and it used to be handed
+	/// `B8G8R8A8`'s and written as if it were one.
+	pub fn channels(&self) -> Option<PackedRgbLayout> {
+		self.view.layout().storage.packed_masks()
+	}
+
+	pub fn bytes_per_pixel(&self) -> u32 {
+		self.view.layout().storage.bytes_per_pixel()
+	}
+
+	/// Whether this destination is byte-for-byte what a decoder produces, which is what lets a blit
+	/// copy rows instead of packing pixels.
+	///
+	/// THE QUESTION IS ASKED OF THE REGISTRY and not of a table kept here: `B8G8R8A8` as masks is
+	/// what the shared model says that name means, and a destination whose three colour channels sit
+	/// where those do takes the copy. The fourth lane is not part of the question - a decoder's
+	/// alpha byte lands in a scanout's padding, which is what a scanout's padding is for.
+	pub fn is_bgra8(&self) -> bool {
+		let (Some(packed), Some(bgra8)) = (self.channels(), PixelFormat::B8G8R8A8Unorm.packed_masks()) else {
+			return false;
+		};
+		packed.bytes_per_pixel == 4 && packed.red == bgra8.red && packed.green == bgra8.green && packed.blue == bgra8.blue
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,28 +439,31 @@ pub extern "C" fn liber_pix_probe() -> u64 {
 
 pub fn blit(source: Image<'_>, mut target: Target<'_>, damage: Rect, first: bool) -> Option<BlitResult> {
 	validate(&source, &target, damage)?;
-	let direct = source.width == target.width && source.height == target.height && target.bytes_per_pixel == 4 && target.red_shift == 16 && target.red_size == 8 && target.green_shift == 8 && target.green_size == 8 && target.blue_shift == 0 && target.blue_size == 8;
+	// THE FAST PATH IS A QUESTION ABOUT THE FORMAT, and it used to be asked as nine comparisons on
+	// loose fields - four bytes per pixel with red at 16, green at 8 and blue at 0, each eight bits
+	// wide. That IS `B8G8R8A8` in memory order, and the shared model can say so by name.
+	let direct = source.width() == target.width() && source.height() == target.height() && target.is_bgra8();
 	if direct {
-		let rect = if first { Rect { x: 0, y: 0, width: source.width, height: source.height } } else { damage };
+		let rect = if first { Rect { x: 0, y: 0, width: source.width(), height: source.height() } } else { damage };
 		let bytes = rect.width as usize * 4;
 		for row in rect.y..rect.y + rect.height {
-			let src = row as usize * source.pitch as usize + rect.x as usize * 4;
-			let dst = row as usize * target.pitch as usize + rect.x as usize * 4;
-			target.data[dst..dst + bytes].copy_from_slice(&source.data[src..src + bytes]);
+			let src = row as usize * source.pitch() as usize + rect.x as usize * 4;
+			let dst = row as usize * target.pitch() as usize + rect.x as usize * 4;
+			target.bytes_mut()[dst..dst + bytes].copy_from_slice(&source.bytes()[src..src + bytes]);
 		}
 		return Some(BlitResult { rect, pixels: rect.width as u64 * rect.height as u64, direct: true });
 	}
 
-	let sw = source.width as u64;
-	let sh = source.height as u64;
-	let dw = target.width as u64;
-	let dh = target.height as u64;
+	let sw = source.width() as u64;
+	let sh = source.height() as u64;
+	let dw = target.width() as u64;
+	let dh = target.height() as u64;
 	let width_limited = dw.saturating_mul(sh) <= dh.saturating_mul(sw);
-	let (out_width, out_height) = if width_limited { (target.width, ((sh * dw) / sw).max(1) as u32) } else { (((sw * dh) / sh).max(1) as u32, target.height) };
-	let offset_x = (target.width - out_width) / 2;
-	let offset_y = (target.height - out_height) / 2;
+	let (out_width, out_height) = if width_limited { (target.width(), ((sh * dw) / sw).max(1) as u32) } else { (((sw * dh) / sh).max(1) as u32, target.height()) };
+	let offset_x = (target.width() - out_width) / 2;
+	let offset_y = (target.height() - out_height) / 2;
 	let (x0, y0, x1, y1) = if first {
-		target.data.fill(0);
+		target.bytes_mut().fill(0);
 		(0, 0, out_width, out_height)
 	} else {
 		let end_x = (damage.x + damage.width) as u64 * out_width as u64;
@@ -366,55 +471,55 @@ pub fn blit(source: Image<'_>, mut target: Target<'_>, damage: Rect, first: bool
 		((damage.x as u64 * out_width as u64 / sw) as u32, (damage.y as u64 * out_height as u64 / sh) as u32, end_x.div_ceil(sw) as u32, end_y.div_ceil(sh) as u32)
 	};
 	for output_y in y0..y1 {
-		let source_y = (output_y as u64 * source.height as u64 / out_height as u64) as u32;
+		let source_y = (output_y as u64 * source.height() as u64 / out_height as u64) as u32;
 		for output_x in x0..x1 {
-			let source_x = (output_x as u64 * source.width as u64 / out_width as u64) as u32;
-			let source_offset = source_y as usize * source.pitch as usize + source_x as usize * 4;
-			let pixel = u32::from_le_bytes(source.data[source_offset..source_offset + 4].try_into().ok()?);
+			let source_x = (output_x as u64 * source.width() as u64 / out_width as u64) as u32;
+			let source_offset = source_y as usize * source.pitch() as usize + source_x as usize * 4;
+			let pixel = u32::from_le_bytes(source.bytes()[source_offset..source_offset + 4].try_into().ok()?);
 			write_pixel(&mut target, offset_x + output_x, offset_y + output_y, pixel);
 		}
 	}
 	let width = x1 - x0;
 	let height = y1 - y0;
-	let written = width as u64 * height as u64 + if first { target.width as u64 * target.height as u64 } else { 0 };
-	let rect = if first { Rect { x: 0, y: 0, width: target.width, height: target.height } } else { Rect { x: offset_x + x0, y: offset_y + y0, width, height } };
+	let written = width as u64 * height as u64 + if first { target.width() as u64 * target.height() as u64 } else { 0 };
+	let rect = if first { Rect { x: 0, y: 0, width: target.width(), height: target.height() } } else { Rect { x: offset_x + x0, y: offset_y + y0, width, height } };
 	Some(BlitResult { rect, pixels: written, direct: false })
 }
 
 pub fn blit_crop(source: Image<'_>, mut target: Target<'_>, source_x: u32, source_y: u32) -> Option<BlitResult> {
-	validate(&source, &target, Rect { x: 0, y: 0, width: source.width, height: source.height })?;
-	if source_x >= source.width || source_y >= source.height {
+	validate(&source, &target, Rect { x: 0, y: 0, width: source.width(), height: source.height() })?;
+	if source_x >= source.width() || source_y >= source.height() {
 		return None;
 	}
-	let width = (source.width - source_x).min(target.width);
-	let height = (source.height - source_y).min(target.height);
-	let offset_x = (target.width - width) / 2;
-	let offset_y = (target.height - height) / 2;
-	target.data.fill(0);
+	let width = (source.width() - source_x).min(target.width());
+	let height = (source.height() - source_y).min(target.height());
+	let offset_x = (target.width() - width) / 2;
+	let offset_y = (target.height() - height) / 2;
+	target.bytes_mut().fill(0);
 	for y in 0..height {
 		for x in 0..width {
-			let source_offset = (source_y + y) as usize * source.pitch as usize + (source_x + x) as usize * 4;
-			let pixel = u32::from_le_bytes(source.data[source_offset..source_offset + 4].try_into().ok()?);
+			let source_offset = (source_y + y) as usize * source.pitch() as usize + (source_x + x) as usize * 4;
+			let pixel = u32::from_le_bytes(source.bytes()[source_offset..source_offset + 4].try_into().ok()?);
 			write_pixel(&mut target, offset_x + x, offset_y + y, pixel);
 		}
 	}
-	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width, height: target.height }, pixels: target.width as u64 * target.height as u64, direct: false })
+	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width(), height: target.height() }, pixels: target.width() as u64 * target.height() as u64, direct: false })
 }
 
 pub fn blit_view(source: Image<'_>, mut target: Target<'_>, view_width: u32, view_height: u32, view_x: u32, view_y: u32) -> Option<BlitResult> {
-	validate(&source, &target, Rect { x: 0, y: 0, width: source.width, height: source.height })?;
+	validate(&source, &target, Rect { x: 0, y: 0, width: source.width(), height: source.height() })?;
 	if view_width == 0 || view_height == 0 {
 		return None;
 	}
-	let max_x = view_width.saturating_sub(target.width);
-	let max_y = view_height.saturating_sub(target.height);
+	let max_x = view_width.saturating_sub(target.width());
+	let max_y = view_height.saturating_sub(target.height());
 	let view_x = view_x.min(max_x);
 	let view_y = view_y.min(max_y);
-	let offset_x = target.width.saturating_sub(view_width) / 2;
-	let offset_y = target.height.saturating_sub(view_height) / 2;
-	target.data.fill(0);
-	for output_y in 0..target.height {
-		let display_y = if view_height > target.height {
+	let offset_x = target.width().saturating_sub(view_width) / 2;
+	let offset_y = target.height().saturating_sub(view_height) / 2;
+	target.bytes_mut().fill(0);
+	for output_y in 0..target.height() {
+		let display_y = if view_height > target.height() {
 			view_y as u64 + output_y as u64
 		} else if output_y < offset_y {
 			continue;
@@ -424,9 +529,9 @@ pub fn blit_view(source: Image<'_>, mut target: Target<'_>, view_width: u32, vie
 		if display_y >= view_height as u64 {
 			continue;
 		}
-		let source_y = (display_y * source.height as u64 / view_height as u64).min(source.height as u64 - 1) as u32;
-		for output_x in 0..target.width {
-			let display_x = if view_width > target.width {
+		let source_y = (display_y * source.height() as u64 / view_height as u64).min(source.height() as u64 - 1) as u32;
+		for output_x in 0..target.width() {
+			let display_x = if view_width > target.width() {
 				view_x as u64 + output_x as u64
 			} else if output_x < offset_x {
 				continue;
@@ -436,30 +541,30 @@ pub fn blit_view(source: Image<'_>, mut target: Target<'_>, view_width: u32, vie
 			if display_x >= view_width as u64 {
 				continue;
 			}
-			let source_x = (display_x * source.width as u64 / view_width as u64).min(source.width as u64 - 1) as u32;
-			let source_offset = source_y as usize * source.pitch as usize + source_x as usize * 4;
-			let pixel = u32::from_le_bytes(source.data[source_offset..source_offset + 4].try_into().ok()?);
+			let source_x = (display_x * source.width() as u64 / view_width as u64).min(source.width() as u64 - 1) as u32;
+			let source_offset = source_y as usize * source.pitch() as usize + source_x as usize * 4;
+			let pixel = u32::from_le_bytes(source.bytes()[source_offset..source_offset + 4].try_into().ok()?);
 			write_pixel(&mut target, output_x, output_y, pixel);
 		}
 	}
-	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width, height: target.height }, pixels: target.width as u64 * target.height as u64, direct: false })
+	Some(BlitResult { rect: Rect { x: 0, y: 0, width: target.width(), height: target.height() }, pixels: target.width() as u64 * target.height() as u64, direct: false })
 }
 
 fn validate(source: &Image<'_>, target: &Target<'_>, damage: Rect) -> Option<()> {
-	if source.width == 0 || source.height == 0 || target.width == 0 || target.height == 0 {
+	if source.width() == 0 || source.height() == 0 || target.width() == 0 || target.height() == 0 {
 		return None;
 	}
-	if source.pitch < source.width.checked_mul(4)? || target.bytes_per_pixel == 0 || target.bytes_per_pixel > 4 || target.pitch < target.width.checked_mul(target.bytes_per_pixel)? {
+	if source.pitch() < source.width().checked_mul(4)? || target.bytes_per_pixel() == 0 || target.bytes_per_pixel() > 4 || target.pitch() < target.width().checked_mul(target.bytes_per_pixel())? {
 		return None;
 	}
-	let source_len = source.pitch as usize * source.height as usize;
-	let target_len = target.pitch as usize * target.height as usize;
-	if source.data.len() < source_len || target.data.len() < target_len {
+	let source_len = source.pitch() as usize * source.height() as usize;
+	let target_len = target.pitch() as usize * target.height() as usize;
+	if source.bytes().len() < source_len || target.len() < target_len {
 		return None;
 	}
 	let end_x = damage.x.checked_add(damage.width)?;
 	let end_y = damage.y.checked_add(damage.height)?;
-	if damage.width == 0 || damage.height == 0 || end_x > source.width || end_y > source.height {
+	if damage.width == 0 || damage.height == 0 || end_x > source.width() || end_y > source.height() {
 		return None;
 	}
 	Some(())
@@ -471,25 +576,15 @@ fn validate(source: &Image<'_>, target: &Target<'_>, damage: Rect) -> Option<()>
 /// eventually produces: the element size, the shifts and the widths have to come from the layout the
 /// firmware described, and there is one implementation of that arithmetic in `graphics-core`.
 fn write_pixel(target: &mut Target<'_>, x: u32, y: u32, bgrx: u32) {
-	let layout = packed_layout(target);
-	let offset = y as usize * target.pitch as usize + x as usize * target.bytes_per_pixel as usize;
-	let width = target.bytes_per_pixel as usize;
-	let Some(pixel) = target.data.get_mut(offset..offset + width) else { return };
+	// A DESTINATION WITH NO MASKS IS NOT WRITTEN. This blitter's whole arithmetic is 8-bit channels
+	// packed into an element; a float or wide destination is not one, and writing it through these
+	// masks anyway is how a picture becomes noise rather than an error.
+	let Some(layout) = target.channels() else { return };
+	let offset = y as usize * target.pitch() as usize + x as usize * target.bytes_per_pixel() as usize;
+	let width = target.bytes_per_pixel() as usize;
+	let Some(pixel) = target.bytes_mut().get_mut(offset..offset + width) else { return };
 	let value = Colour::new(((bgrx >> 16) & 0xff) as f32 / 255.0, ((bgrx >> 8) & 0xff) as f32 / 255.0, (bgrx & 0xff) as f32 / 255.0, 1.0);
 	write_packed(layout, pixel, value);
-}
-
-/// This target's channel masks, as the shared model describes them.
-fn packed_layout(target: &Target<'_>) -> PackedRgbLayout {
-	PackedRgbLayout {
-		bytes_per_pixel: target.bytes_per_pixel.min(8) as u8,
-		red: PackedChannel { shift: target.red_shift, bits: target.red_size },
-		green: PackedChannel { shift: target.green_shift, bits: target.green_size },
-		blue: PackedChannel { shift: target.blue_shift, bits: target.blue_size },
-		// THE RESERVED BITS ARE NOT THIS BLITTER'S TO SET. A scanout target's unused lane is written
-		// by whoever owns the format; here the three channels are the whole contract.
-		reserved: PackedChannel { shift: 0, bits: 0 },
-	}
 }
 
 #[cfg(test)]

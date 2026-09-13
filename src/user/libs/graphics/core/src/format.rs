@@ -95,6 +95,37 @@ impl PixelFormat {
 	pub fn minimum_row_bytes(self, width: u32) -> Option<u32> {
 		width.checked_mul(self.bytes_per_pixel())
 	}
+
+	/// THIS NAMED FORMAT AS CHANNEL MASKS, for the four whose bytes are one 8-bit channel each.
+	///
+	/// IT EXISTS SO A WRITER THAT PACKS DOES NOT NEED A SECOND PATH FOR A NAMED SURFACE. A boot
+	/// console and a blitter's destination write pixels through masks; a display surface arrives
+	/// NAMED. Without this, each of them keeps a hard-coded mask table for the one name it expects -
+	/// which is true for `B8G8R8X8` and `B8G8R8A8`, silently wrong for the `R8G8B8` pair, and
+	/// nonsense for the rest.
+	///
+	/// THE NAME IS IN MEMORY ORDER AND THE SHIFTS ARE NOT. `B8G8R8X8` puts blue in the first byte, so
+	/// on a little-endian element blue sits at 0 and red at 16; `R8G8B8X8` is the mirror of that.
+	///
+	/// THE FOURTH LANE IS NOT DESCRIBED, deliberately. It is alpha in one format and padding in
+	/// another, and this description is of what makes the COLOUR: a packer told about a reserved span
+	/// writes it with all its bits set, which would turn a blitter's `0x00rrggbb` into `0xffrrggbb`
+	/// and would write over a destination's alpha. A consumer that owns the fourth lane writes it by
+	/// name, through the `Known` path.
+	///
+	/// EVERYTHING ELSE ANSWERS `None`, and the match is total so a new format has to decide: a
+	/// 10-bit, 16-bit or float format is not four 8-bit spans, and `R10G10B10A2` would additionally
+	/// need a packing order the registry does not state.
+	pub const fn packed_masks(self) -> Option<PackedRgbLayout> {
+		const fn masks(red: u8, green: u8, blue: u8) -> Option<PackedRgbLayout> {
+			Some(PackedRgbLayout { bytes_per_pixel: 4, red: PackedChannel { shift: red, bits: 8 }, green: PackedChannel { shift: green, bits: 8 }, blue: PackedChannel { shift: blue, bits: 8 }, reserved: PackedChannel { shift: 0, bits: 0 } })
+		}
+		match self {
+			PixelFormat::B8G8R8X8Unorm | PixelFormat::B8G8R8A8Unorm => masks(16, 8, 0),
+			PixelFormat::R8G8B8X8Unorm | PixelFormat::R8G8B8A8Unorm => masks(0, 8, 16),
+			PixelFormat::A8Unorm | PixelFormat::R8Unorm | PixelFormat::R8G8Unorm | PixelFormat::R10G10B10A2Unorm | PixelFormat::R16G16B16A16Unorm | PixelFormat::R16G16B16A16Float | PixelFormat::R32Uint | PixelFormat::R32G32B32A32Float => None,
+		}
+	}
 }
 
 /// How the alpha channel is to be read.
@@ -142,6 +173,22 @@ pub struct PackedRgbLayout {
 }
 
 impl PackedRgbLayout {
+	/// THE SIX NUMBERS A MODE LINE CARRIES, as one layout.
+	///
+	/// A boot framebuffer, an ABI `Framebuffer` and a display server's surface all describe their
+	/// pixels as a byte count plus a shift and a size per channel, and every consumer that copied
+	/// those six numbers into its own fields is a consumer that can copy one of them wrongly. The
+	/// byte count is an element size, so a value that is not one to eight bytes is refused here
+	/// rather than indexed with.
+	///
+	/// THE RESERVED SPAN IS NOT DESCRIBED BY A MODE LINE and is left empty. It is not the same as
+	/// zero bits at shift zero being harmless: the shared packer writes a DECLARED reserved span
+	/// with all its bits set, so inventing one here would turn every `0x00rrggbb` a caller writes
+	/// into `0xffrrggbb`. A format that owns its unused lane says so by name, through `Known`.
+	pub fn from_masks(bytes_per_pixel: u32, red: (u8, u8), green: (u8, u8), blue: (u8, u8)) -> Option<Self> {
+		Some(Self { bytes_per_pixel: u8::try_from(bytes_per_pixel).ok()?, red: PackedChannel { shift: red.0, bits: red.1 }, green: PackedChannel { shift: green.0, bits: green.1 }, blue: PackedChannel { shift: blue.0, bits: blue.1 }, reserved: PackedChannel { shift: 0, bits: 0 } })
+	}
+
 	/// Check a firmware-described layout: the channels must be inside the element and must not
 	/// overlap.
 	///
@@ -196,6 +243,18 @@ impl PixelStorage {
 
 	pub fn minimum_row_bytes(&self, width: u32) -> Option<u32> {
 		width.checked_mul(self.bytes_per_pixel())
+	}
+
+	/// THE CHANNEL MASKS THIS STORAGE WRITES THROUGH, whichever arm described it.
+	///
+	/// The packed arm IS masks; the named arm has them for the four byte-packed colour formats and
+	/// `None` for the rest. A caller that packs pixels asks this once instead of matching on the arm
+	/// and keeping a mask table for the named case.
+	pub const fn packed_masks(&self) -> Option<PackedRgbLayout> {
+		match self {
+			PixelStorage::Known(format) => format.packed_masks(),
+			PixelStorage::PackedRgbUnorm(layout) => Some(*layout),
+		}
 	}
 
 	/// Whether a renderer may SAMPLE this storage. The packed arm may not, and the refusal is here

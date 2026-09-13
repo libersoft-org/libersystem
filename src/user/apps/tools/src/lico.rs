@@ -1708,6 +1708,9 @@ fn volume_words(error: Error) -> &'static [u8] {
 		// A volume is not reached over an address, so this cannot come from one - but the vocabulary
 		// is shared, and a reader is better served by the literal truth than by a guess.
 		Error::AddressUnavailable => b"a local address went away",
+		// Nor does a volume carry generations, for the same reason and with the same answer: the
+		// words say what happened rather than guessing at what a volume might have meant by it.
+		Error::Stale => b"what it was asked about had already been replaced",
 	}
 }
 

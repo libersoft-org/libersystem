@@ -12,6 +12,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use graphics_core::geom::Extent2D;
+use graphics_core::layout::ImageLayout;
 use keys::usage;
 use pix::{Image, Target};
 use proto::system::{LaunchContext, OpenOpts, input};
@@ -68,20 +70,20 @@ enum SerialInput {
 }
 
 impl Viewport {
-	fn new(image: &DecodedImage, framebuffer: Framebuffer) -> Option<Self> {
-		let (base_width, base_height) = fit_dimensions(image.width, image.height, framebuffer)?;
+	fn new(image: &DecodedImage, screen: Extent2D) -> Option<Self> {
+		let (base_width, base_height) = fit_dimensions(image.width, image.height, screen)?;
 		Some(Viewport { base_width, base_height, zoom: ZOOM_MIN, width: base_width, height: base_height, pan_x: 0, pan_y: 0 })
 	}
 
-	fn set_zoom(&mut self, zoom: u32, framebuffer: Framebuffer) -> bool {
+	fn set_zoom(&mut self, zoom: u32, screen: Extent2D) -> bool {
 		let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
 		if zoom == self.zoom {
 			return false;
 		}
 		let old_width = self.width.max(1);
 		let old_height = self.height.max(1);
-		let old_center_x = visible_center(self.width, self.pan_x, framebuffer.width);
-		let old_center_y = visible_center(self.height, self.pan_y, framebuffer.height);
+		let old_center_x = visible_center(self.width, self.pan_x, screen.width);
+		let old_center_y = visible_center(self.height, self.pan_y, screen.height);
 		let Some(width) = scaled_dimension(self.base_width, zoom) else {
 			return false;
 		};
@@ -93,44 +95,44 @@ impl Viewport {
 		self.height = height;
 		let center_x = old_center_x * width as u64 / old_width as u64;
 		let center_y = old_center_y * height as u64 / old_height as u64;
-		self.pan_x = pan_for_center(center_x, width, framebuffer.width);
-		self.pan_y = pan_for_center(center_y, height, framebuffer.height);
+		self.pan_x = pan_for_center(center_x, width, screen.width);
+		self.pan_y = pan_for_center(center_y, height, screen.height);
 		true
 	}
 
-	fn zoom_in(&mut self, framebuffer: Framebuffer) -> bool {
-		self.set_zoom(self.zoom.saturating_add(ZOOM_STEP), framebuffer)
+	fn zoom_in(&mut self, screen: Extent2D) -> bool {
+		self.set_zoom(self.zoom.saturating_add(ZOOM_STEP), screen)
 	}
 
-	fn zoom_out(&mut self, framebuffer: Framebuffer) -> bool {
-		self.set_zoom(self.zoom.saturating_sub(ZOOM_STEP), framebuffer)
+	fn zoom_out(&mut self, screen: Extent2D) -> bool {
+		self.set_zoom(self.zoom.saturating_sub(ZOOM_STEP), screen)
 	}
 
-	fn can_pan(&self, framebuffer: Framebuffer) -> bool {
-		self.width > framebuffer.width || self.height > framebuffer.height
+	fn can_pan(&self, screen: Extent2D) -> bool {
+		self.width > screen.width || self.height > screen.height
 	}
 
-	fn pan(&mut self, code: u16, framebuffer: Framebuffer) -> bool {
+	fn pan(&mut self, code: u16, screen: Extent2D) -> bool {
 		let old_x = self.pan_x;
 		let old_y = self.pan_y;
-		let step_x = (framebuffer.width / PAN_STEP_DIVISOR).max(1);
-		let step_y = (framebuffer.height / PAN_STEP_DIVISOR).max(1);
+		let step_x = (screen.width / PAN_STEP_DIVISOR).max(1);
+		let step_y = (screen.height / PAN_STEP_DIVISOR).max(1);
 		match code {
 			usage::LEFT => self.pan_x = self.pan_x.saturating_sub(step_x),
-			usage::RIGHT => self.pan_x = self.pan_x.saturating_add(step_x).min(self.width.saturating_sub(framebuffer.width)),
+			usage::RIGHT => self.pan_x = self.pan_x.saturating_add(step_x).min(self.width.saturating_sub(screen.width)),
 			usage::UP => self.pan_y = self.pan_y.saturating_sub(step_y),
-			usage::DOWN => self.pan_y = self.pan_y.saturating_add(step_y).min(self.height.saturating_sub(framebuffer.height)),
+			usage::DOWN => self.pan_y = self.pan_y.saturating_add(step_y).min(self.height.saturating_sub(screen.height)),
 			_ => {}
 		}
 		self.pan_x != old_x || self.pan_y != old_y
 	}
 }
 
-fn fit_dimensions(width: u32, height: u32, framebuffer: Framebuffer) -> Option<(u32, u32)> {
-	if width == 0 || height == 0 || framebuffer.width == 0 || framebuffer.height == 0 {
+fn fit_dimensions(width: u32, height: u32, screen: Extent2D) -> Option<(u32, u32)> {
+	if width == 0 || height == 0 || screen.width == 0 || screen.height == 0 {
 		return None;
 	}
-	if framebuffer.width as u64 * height as u64 <= framebuffer.height as u64 * width as u64 { Some((framebuffer.width, ((height as u64 * framebuffer.width as u64) / width as u64).max(1) as u32)) } else { Some((((width as u64 * framebuffer.height as u64) / height as u64).max(1) as u32, framebuffer.height)) }
+	if screen.width as u64 * height as u64 <= screen.height as u64 * width as u64 { Some((screen.width, ((height as u64 * screen.width as u64) / width as u64).max(1) as u32)) } else { Some((((width as u64 * screen.height as u64) / height as u64).max(1) as u32, screen.height)) }
 }
 
 fn scaled_dimension(base: u32, zoom: u32) -> Option<u32> {
@@ -156,14 +158,14 @@ fn arrow_mask(code: u16) -> u8 {
 	}
 }
 
-fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, framebuffer: Framebuffer, held: &mut u8) -> ViewAction {
+fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, screen: Extent2D, held: &mut u8) -> ViewAction {
 	if pressed && matches!(code, usage::ESCAPE | usage::Q) {
 		return ViewAction::Exit;
 	}
 	if matches!(code, usage::PLUS | usage::KEYPAD_PLUS) {
 		if pressed {
 			*held = (*held & !HELD_ZOOM_OUT) | HELD_ZOOM_IN;
-			return if viewport.zoom_in(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+			return if viewport.zoom_in(screen) { ViewAction::Redraw } else { ViewAction::None };
 		}
 		*held &= !HELD_ZOOM_IN;
 		return ViewAction::None;
@@ -171,7 +173,7 @@ fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, framebuffer: F
 	if matches!(code, usage::MINUS | usage::KEYPAD_MINUS) {
 		if pressed {
 			*held = (*held & !HELD_ZOOM_IN) | HELD_ZOOM_OUT;
-			return if viewport.zoom_out(framebuffer) { ViewAction::Redraw } else { ViewAction::None };
+			return if viewport.zoom_out(screen) { ViewAction::Redraw } else { ViewAction::None };
 		}
 		*held &= !HELD_ZOOM_OUT;
 		return ViewAction::None;
@@ -181,18 +183,18 @@ fn handle_code(code: u16, pressed: bool, viewport: &mut Viewport, framebuffer: F
 		return ViewAction::None;
 	}
 	if pressed {
-		if !viewport.can_pan(framebuffer) {
+		if !viewport.can_pan(screen) {
 			return ViewAction::None;
 		}
 		*held |= mask;
-		if viewport.pan(code, framebuffer) { ViewAction::Redraw } else { ViewAction::None }
+		if viewport.pan(code, screen) { ViewAction::Redraw } else { ViewAction::None }
 	} else {
 		*held &= !mask;
 		ViewAction::None
 	}
 }
 
-fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: u8, viewport: &mut Viewport, framebuffer: Framebuffer) -> ViewAction {
+fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: u8, viewport: &mut Viewport, screen: Extent2D) -> ViewAction {
 	match *state {
 		SerialInput::Ground => match byte {
 			0x1b => {
@@ -202,14 +204,14 @@ fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: 
 			}
 			b'q' => ViewAction::Exit,
 			b'+' | b'=' => {
-				if viewport.zoom_in(framebuffer) {
+				if viewport.zoom_in(screen) {
 					ViewAction::Redraw
 				} else {
 					ViewAction::None
 				}
 			}
 			b'-' => {
-				if viewport.zoom_out(framebuffer) {
+				if viewport.zoom_out(screen) {
 					ViewAction::Redraw
 				} else {
 					ViewAction::None
@@ -232,35 +234,35 @@ fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: 
 				b'D' => usage::LEFT,
 				_ => return ViewAction::None,
 			};
-			if viewport.can_pan(framebuffer) && viewport.pan(code, framebuffer) { ViewAction::Redraw } else { ViewAction::None }
+			if viewport.can_pan(screen) && viewport.pan(code, screen) { ViewAction::Redraw } else { ViewAction::None }
 		}
 	}
 }
 
-fn zoom_held(viewport: &mut Viewport, framebuffer: Framebuffer, held: u8) -> bool {
+fn zoom_held(viewport: &mut Viewport, screen: Extent2D, held: u8) -> bool {
 	let mut changed = false;
 	if held & HELD_ZOOM_IN != 0 {
-		changed |= viewport.zoom_in(framebuffer);
+		changed |= viewport.zoom_in(screen);
 	}
 	if held & HELD_ZOOM_OUT != 0 {
-		changed |= viewport.zoom_out(framebuffer);
+		changed |= viewport.zoom_out(screen);
 	}
 	changed
 }
 
-fn pan_held(viewport: &mut Viewport, framebuffer: Framebuffer, held: u8) -> bool {
+fn pan_held(viewport: &mut Viewport, screen: Extent2D, held: u8) -> bool {
 	let mut changed = false;
 	if held & HELD_LEFT != 0 {
-		changed |= viewport.pan(usage::LEFT, framebuffer);
+		changed |= viewport.pan(usage::LEFT, screen);
 	}
 	if held & HELD_RIGHT != 0 {
-		changed |= viewport.pan(usage::RIGHT, framebuffer);
+		changed |= viewport.pan(usage::RIGHT, screen);
 	}
 	if held & HELD_UP != 0 {
-		changed |= viewport.pan(usage::UP, framebuffer);
+		changed |= viewport.pan(usage::UP, screen);
 	}
 	if held & HELD_DOWN != 0 {
-		changed |= viewport.pan(usage::DOWN, framebuffer);
+		changed |= viewport.pan(usage::DOWN, screen);
 	}
 	changed
 }
@@ -396,16 +398,17 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			eprint(b"imgview: cannot acquire display\n");
 			return;
 		};
-		let framebuffer = surface.framebuffer();
-		let target_len = match (framebuffer.pitch as usize).checked_mul(framebuffer.height as usize) {
+		let layout = surface.layout();
+		let screen = layout.extent;
+		let target_len = match (layout.pitch as usize).checked_mul(screen.height as usize) {
 			Some(len) => len,
 			None => return,
 		};
-		let Some(mut viewport) = Viewport::new(&image, framebuffer) else {
+		let Some(mut viewport) = Viewport::new(&image, screen) else {
 			let _ = surface::release(&display);
 			return;
 		};
-		if !present_view(&display, &surface, framebuffer, target_len, &image, &viewport) {
+		if !present_view(&display, &surface, layout, target_len, &image, &viewport) {
 			let _ = surface::release(&display);
 			return;
 		}
@@ -432,7 +435,7 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		let mut next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
 		let mut exit_requested = false;
 		while !exit_requested {
-			let repeat_pan = held & HELD_PAN != 0 && viewport.can_pan(framebuffer);
+			let repeat_pan = held & HELD_PAN != 0 && viewport.can_pan(screen);
 			let repeat_zoom = held & HELD_ZOOM != 0;
 			let repeat_deadline = if repeat_pan || repeat_zoom { next_repeat } else { 0 };
 			let deadline = match (repeat_deadline, serial_escape_deadline) {
@@ -467,8 +470,8 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 					continue;
 				}
 				if now >= next_repeat {
-					if zoom_held(&mut viewport, framebuffer, held) || pan_held(&mut viewport, framebuffer, held) {
-						let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
+					if zoom_held(&mut viewport, screen, held) || pan_held(&mut viewport, screen, held) {
+						let _ = present_view(&display, &surface, layout, target_len, &image, &viewport);
 					}
 					next_repeat = now.saturating_add(PAN_REPEAT_TICKS);
 				}
@@ -484,12 +487,12 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 				match recv_caps_blocking(key_stream, &mut key_frame) {
 					ReceivedCaps::Message { len, handles: mut frame_handles } => {
 						if let Some(event) = input::subscribe_keys_read(&key_frame[..len], &mut frame_handles) {
-							let action = handle_code(event.code, event.pressed, &mut viewport, framebuffer, &mut held);
+							let action = handle_code(event.code, event.pressed, &mut viewport, screen, &mut held);
 							if action == ViewAction::Exit {
 								exit_requested = true;
 							} else if action == ViewAction::Redraw {
 								next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
-								let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
+								let _ = present_view(&display, &surface, layout, target_len, &image, &viewport);
 							}
 						}
 						for handle in frame_handles.as_slice() {
@@ -505,14 +508,14 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 							close(handle);
 						}
 						for &byte in &stdin_frame[..len] {
-							let action = handle_serial_byte(&mut serial_input, &mut serial_escape_deadline, byte, &mut viewport, framebuffer);
+							let action = handle_serial_byte(&mut serial_input, &mut serial_escape_deadline, byte, &mut viewport, screen);
 							if action == ViewAction::Exit {
 								exit_requested = true;
 								break;
 							}
 							if action == ViewAction::Redraw {
 								next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
-								let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
+								let _ = present_view(&display, &surface, layout, target_len, &image, &viewport);
 							}
 						}
 					}
@@ -532,14 +535,18 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 	}
 }
 
-fn target(data: &mut [u8], framebuffer: Framebuffer) -> Target<'_> {
-	Target { data, width: framebuffer.width, height: framebuffer.height, pitch: framebuffer.pitch, bytes_per_pixel: framebuffer.bytes_per_pixel, red_shift: framebuffer.red_shift, red_size: framebuffer.red_size, green_shift: framebuffer.green_shift, green_size: framebuffer.green_size, blue_shift: framebuffer.blue_shift, blue_size: framebuffer.blue_size }
-}
-
-unsafe fn present_view(display: &surface::Client, surface: &surface::Mapping, framebuffer: Framebuffer, target_len: usize, image: &DecodedImage, viewport: &Viewport) -> bool {
+// `None` FOR A SURFACE THAT DOES NOT DESCRIBE ITSELF, which a struct literal could not express. The
+// checked constructor refuses a buffer too small for the geometry and channel masks that overlap;
+// both were previously assumed by everything downstream of this function.
+unsafe fn present_view(display: &surface::Client, surface: &surface::Mapping, layout: ImageLayout, target_len: usize, image: &DecodedImage, viewport: &Viewport) -> bool {
 	// SAFETY: the caller's contract - `surface` is a live mapping of at least `target_len` bytes.
 	let output = unsafe { core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len) };
-	let Some(blit) = pix::blit_view(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), viewport.width, viewport.height, viewport.pan_x, viewport.pan_y) else {
+	// THE DESTINATION IS THE SURFACE'S OWN DESCRIPTION, adopted. This used to take the mapping's
+	// framebuffer record apart into eight arguments and rebuild the same thing from them.
+	let (Some(source), Some(destination)) = (Image::rgba(&image.pixels, image.width, image.height, image.pitch), Target::from_layout(output, layout)) else {
+		return false;
+	};
+	let Some(blit) = pix::blit_view(source, destination, viewport.width, viewport.height, viewport.pan_x, viewport.pan_y) else {
 		return false;
 	};
 	matches!(surface::present(display, blit.rect), Some(Ok(())))

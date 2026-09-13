@@ -21,4 +21,7 @@ pub mod net;
 pub mod port;
 pub mod snd;
 pub mod usb;
+// The in-controller class-module execution model: what a USB class driver IS in this system, and the
+// per-class budget that stops two of them inside one Domain from starving each other.
+pub mod usb_class;
 pub mod virtio;

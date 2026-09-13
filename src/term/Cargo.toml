@@ -13,5 +13,12 @@ description = "Graphics-free terminal model (L2): the cell grid, escape parser, 
 #
 # `[lints]` rather than `RUSTFLAGS`: this denies in THIS package only. RUSTFLAGS would deny inside
 # `build-std`'s `core` and `compiler_builtins` too, where a warning is not ours to answer.
+# THE SHARED IMAGE MODEL. A framebuffer's extent, pitch and channel masks are described ONCE in this
+# tree, and the packing of a colour into them happens once: this renderer used to carry a private
+# copy of both. The crate is `no_std` and reaches no runtime, which is what lets the kernel's boot
+# console keep using it.
+[dependencies]
+graphics-core = { path = "../user/libs/graphics/core" }
+
 [lints.rust]
 warnings = "deny"

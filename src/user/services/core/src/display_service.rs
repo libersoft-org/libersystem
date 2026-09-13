@@ -17,7 +17,8 @@ use pix::{Image, Rect, Target};
 use proto::codec::{Buffer, Handles};
 use proto::system::display::{self, Service};
 use proto::system::display_admin::{self, Service as AdminService};
-use proto::system::{DisplayEvent, Error, PixelFormat, PresentationStats, ProviderInfo, ProviderKind, SurfaceInfo, provider_catalogue};
+use proto::system::display_device::{self};
+use proto::system::{ColorSpace, DamageRegion, DeviceEvent, DisplayEvent, Error, Extent2d, Offset2d, OutputColour, PixelFormat, PresentationStats, ProviderInfo, ProviderKind, Rect as WireRect, Scanout as DeviceScanout, SurfaceInfo, provider_catalogue};
 use rt::*;
 
 const MAX_DIM: u32 = 8192;
@@ -31,6 +32,13 @@ struct Scanout {
 	fb: Framebuffer,
 	width: u32,
 	height: u32,
+	/// WHICH GENERATION THESE PIXELS ARE. The driver moves it when the BACKING moves, and every
+	/// present names it - so a frame drawn against a backing the driver has given back is refused
+	/// rather than transferred into memory that is no longer ours.
+	generation: u32,
+	/// The device's event stream, or zero when this scanout came from the boot framebuffer rather
+	/// than from a driver.
+	events: u64,
 }
 
 impl Scanout {
@@ -153,37 +161,95 @@ impl DisplayState {
 		if self.active == 0 || chan != self.console {
 			self.set_active(chan);
 		}
-		Ok(SurfaceInfo { pixels: Buffer { handle: granted as u64, len }, width, height, pitch, format: PixelFormat::B8g8r8x8Unorm })
+		Ok(SurfaceInfo { pixels: Buffer { handle: granted as u64, len }, width, height, pitch, format: PixelFormat::B8g8r8x8Unorm, colour: self.output_colour() })
 	}
 
-	fn present(&mut self, chan: u64, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error> {
+	// WHAT THIS SERVICE'S OUTPUT CAN SHOW, reported rather than assumed.
+	//
+	// THE COLOUR SPACE IS KNOWN AND THE LUMINANCE IS NOT, and the difference is the whole reason the
+	// fields are optional. The space follows from the format every scanout in this system uses; the
+	// luminance would come from the panel, over DDC, which needs an I2C or AUX transport no driver
+	// here can reach yet - so this service says `none` rather than inventing a number, and a consumer
+	// handed `none` uses the profile's own stated reference white point. When the display-discovery
+	// item lands, the numbers come from the monitor and nothing above here changes shape.
+	fn output_colour(&self) -> OutputColour {
+		OutputColour { space: ColorSpace::Srgb, sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None }
+	}
+
+	// PRESENT ONE FRAME'S DAMAGE, which is a bounded list with an explicit whole-surface variant.
+	//
+	// THE NINE ANSWERS ARE `WSI Profile 1`'S AND THEY ARE IMPLEMENTED HERE RATHER THAN RESTATED. An
+	// empty list is "nothing changed": the present is ordered, it completes, and nothing is copied. A
+	// rectangle outside the extent is a typed refusal and never a clamp, because clamping presents
+	// pixels nobody asked to present. More than the bound never reaches here at all - the wire list
+	// is bounded and the decoder refuses a seventeenth rectangle, which is what makes "the caller's
+	// problem, solved by merging or by sending `whole`" true rather than hopeful.
+	// AND THE RECTANGLES ARE TRANSFERRED SEPARATELY. The profile permits a backend to merge when
+	// merging is cheaper than transferring separately and forbids the unconditional union of
+	// everything - which is exactly what turns two corners of a screen into most of it.
+	fn present(&mut self, chan: u64, damage: &DamageRegion) -> Result<(), Error> {
 		let index: usize = self.surface_index(chan).ok_or(Error::Invalid)?;
 		let surface: &Surface = &self.surfaces[index];
-		let x1: u32 = x.checked_add(width).ok_or(Error::Invalid)?;
-		let y1: u32 = y.checked_add(height).ok_or(Error::Invalid)?;
-		if width == 0 || height == 0 || x1 > surface.width || y1 > surface.height {
-			return Err(Error::Invalid);
+		let (surface_width, surface_height): (u32, u32) = (surface.width, surface.height);
+		// EVERY RECTANGLE IS CHECKED BEFORE ANY OF THEM IS DRAWN. A frame whose fourth rectangle is
+		// out of bounds must present none of it: half a frame is a frame nobody asked for, and the
+		// typed refusal has to mean the whole call was refused.
+		let mut rects: Vec<Rect> = Vec::new();
+		if damage.whole {
+			rects.push(Rect { x: 0, y: 0, width: surface_width, height: surface_height });
+		} else {
+			for rect in &damage.rects {
+				let x: u32 = u32::try_from(rect.origin.x).map_err(|_| Error::Invalid)?;
+				let y: u32 = u32::try_from(rect.origin.y).map_err(|_| Error::Invalid)?;
+				let x1: u32 = x.checked_add(rect.size.width).ok_or(Error::Invalid)?;
+				let y1: u32 = y.checked_add(rect.size.height).ok_or(Error::Invalid)?;
+				if rect.size.width == 0 || rect.size.height == 0 || x1 > surface_width || y1 > surface_height {
+					return Err(Error::Invalid);
+				}
+				rects.push(Rect { x, y, width: rect.size.width, height: rect.size.height });
+			}
 		}
 		if chan != self.active {
 			return Ok(());
 		}
-		let source_pixels: u64 = width as u64 * height as u64;
+		// AN EMPTY LIST COMPLETES WITHOUT COPYING. The frame is pixel-identical to the last one, so
+		// there is nothing to transfer - and answering an error here would make "nothing changed" a
+		// failure a client has to work around.
+		if rects.is_empty() {
+			self.stats.presents = self.stats.presents.saturating_add(1);
+			return Ok(());
+		}
+		let source_pixels: u64 = rects.iter().map(|rect| rect.width as u64 * rect.height as u64).sum();
 		let start_ns: u64 = clock_ns();
-		let blit: pix::BlitResult = self.blit(index, Rect { x, y, width, height });
+		let mut output_pixels: u64 = 0;
+		let mut direct: bool = true;
+		// EVERY RECTANGLE IS COPIED, THEN ALL OF THEM ARE PRESENTED IN ONE CALL. The blit's own
+		// rectangle is what the device is told about, because a scaled surface's damage lands
+		// somewhere else on the scanout than where the client drew it.
+		let mut transferred: Vec<Rect> = Vec::new();
+		for rect in &rects {
+			let blit: pix::BlitResult = self.blit(index, *rect);
+			output_pixels = output_pixels.saturating_add(blit.pixels);
+			direct &= blit.direct;
+			if transferred.try_reserve(1).is_err() {
+				break;
+			}
+			transferred.push(blit.rect);
+		}
 		let blit_done_ns: u64 = clock_ns();
-		let result: Result<(), Error> = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
+		let result: Result<(), Error> = self.flush_damage(&transferred);
 		let done_ns: u64 = clock_ns();
 		let blit_ns: u64 = blit_done_ns.saturating_sub(start_ns);
 		let flush_ns: u64 = done_ns.saturating_sub(blit_done_ns);
 		let total_ns: u64 = done_ns.saturating_sub(start_ns);
 		self.stats.presents = self.stats.presents.saturating_add(1);
-		if blit.direct {
+		if direct {
 			self.stats.direct_presents = self.stats.direct_presents.saturating_add(1);
 		} else {
 			self.stats.scaled_presents = self.stats.scaled_presents.saturating_add(1);
 		}
 		self.stats.source_pixels = self.stats.source_pixels.saturating_add(source_pixels);
-		self.stats.output_pixels = self.stats.output_pixels.saturating_add(blit.pixels);
+		self.stats.output_pixels = self.stats.output_pixels.saturating_add(output_pixels);
 		self.stats.blit_ns = self.stats.blit_ns.saturating_add(blit_ns);
 		self.stats.flush_ns = self.stats.flush_ns.saturating_add(flush_ns);
 		self.stats.max_present_ns = self.stats.max_present_ns.max(total_ns);
@@ -338,7 +404,7 @@ impl DisplayState {
 		let width: u32 = self.surfaces[index].width;
 		let height: u32 = self.surfaces[index].height;
 		let blit: pix::BlitResult = self.blit(index, Rect { x: 0, y: 0, width, height });
-		let _ = self.flush((blit.rect.x, blit.rect.y, blit.rect.width, blit.rect.height));
+		let _ = self.flush_damage(&[blit.rect]);
 	}
 
 	fn blit(&mut self, index: usize, damage: Rect) -> pix::BlitResult {
@@ -349,44 +415,45 @@ impl DisplayState {
 		let target_len: usize = self.scanout.fb.pitch as usize * self.scanout.height as usize;
 		let source: &[u8] = unsafe { core::slice::from_raw_parts(surface.addr as *const u8, source_len) };
 		let target: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(self.scanout.addr as *mut u8, target_len) };
-		pix::blit(Image { data: source, width: surface.width, height: surface.height, pitch: surface.pitch }, Target { data: target, width: self.scanout.width, height: self.scanout.height, pitch: self.scanout.fb.pitch, bytes_per_pixel: self.scanout.fb.bytes_per_pixel, red_shift: self.scanout.fb.red_shift, red_size: self.scanout.fb.red_size, green_shift: self.scanout.fb.green_shift, green_size: self.scanout.fb.green_size, blue_shift: self.scanout.fb.blue_shift, blue_size: self.scanout.fb.blue_size }, damage, first).expect("DisplayService validates surface and scanout bounds before blitting")
+		// THE DESCRIPTORS ARE CHECKED WHERE THEY ARE BUILT NOW, not assumed by the blitter. Both
+		// constructors refuse a buffer too small for the geometry it claims and a scanout whose
+		// channel masks overlap - the firmware hand-off is the one place masks come from, and two
+		// channels sharing a bit is a picture whose colours shift as its content does.
+		let source = Image::rgba(source, surface.width, surface.height, surface.pitch).expect("DisplayService sized the surface it is presenting");
+		let fb = &self.scanout.fb;
+		let target = Target::packed(target, self.scanout.width, self.scanout.height, fb.pitch, fb.bytes_per_pixel, (fb.red_shift, fb.red_size), (fb.green_shift, fb.green_size), (fb.blue_shift, fb.blue_size)).expect("DisplayService validates the scanout it was handed before presenting into it");
+		pix::blit(source, target, damage, first).expect("DisplayService validates surface and scanout bounds before blitting")
 	}
 
-	fn flush(&mut self, rect: (u32, u32, u32, u32)) -> Result<(), Error> {
-		if self.scanout.gpu == 0 {
+	// TRANSFER THE DAMAGED RECTANGLES AND WAIT FOR THE DEVICE TO ACKNOWLEDGE THEM.
+	//
+	// ONE CALL FOR THE WHOLE FRAME. This used to be one `PRESENT` message per rectangle, each with
+	// its own reply, and the driver coalesced whatever it found queued; the typed call carries the
+	// LIST, so the driver keeps the rectangles apart without a second protocol for saying so.
+	// AND THE INTERLEAVING IS GONE WITH IT. A resize used to arrive on the same channel as the
+	// present's answer, so this loop had to recognise and handle a framebuffer replacement while
+	// waiting for an acknowledgement. Events have their own stream now: what comes back from a
+	// present is the present's answer and nothing else.
+	fn flush_damage(&mut self, rects: &[Rect]) -> Result<(), Error> {
+		if self.scanout.gpu == 0 || rects.is_empty() {
 			return Ok(());
 		}
-		let mut msg: [u8; 23] = [0; 23];
-		msg[..7].copy_from_slice(b"PRESENT");
-		msg[7..11].copy_from_slice(&rect.0.to_le_bytes());
-		msg[11..15].copy_from_slice(&rect.1.to_le_bytes());
-		msg[15..19].copy_from_slice(&rect.2.to_le_bytes());
-		msg[19..23].copy_from_slice(&rect.3.to_le_bytes());
-		if !send_blocking(self.scanout.gpu, &msg, 0) {
-			return Err(Error::Closed);
+		let mut wire: Vec<WireRect> = Vec::new();
+		if wire.try_reserve_exact(rects.len()).is_err() {
+			return Err(Error::Exhausted);
 		}
-		let mut reply: [u8; 64] = [0; 64];
-		loop {
-			match recv_blocking(self.scanout.gpu, &mut reply) {
-				Received::Message { len, handle } if len >= 2 && &reply[..2] == b"OK" => {
-					if handle != 0 {
-						close(handle);
-					}
-					return Ok(());
-				}
-				Received::Message { len, handle } if len >= 3 && &reply[..3] == b"ERR" => {
-					if handle != 0 {
-						close(handle);
-					}
-					return Err(Error::Again);
-				}
-				Received::Message { len, handle } => {
-					if self.handle_gpu_message(&reply[..len], handle) {
-						self.notify_resize();
-					}
-				}
-				Received::Closed => return Err(Error::Closed),
-			}
+		for rect in rects {
+			let (Ok(x), Ok(y)) = (i32::try_from(rect.x), i32::try_from(rect.y)) else {
+				return Err(Error::Invalid);
+			};
+			wire.push(WireRect { origin: Offset2d { x, y }, size: Extent2d { width: rect.width, height: rect.height } });
+		}
+		let damage = DamageRegion { whole: false, rects: wire };
+		let mut client = display_device::Client::new(ChannelTransport { chan: self.scanout.gpu });
+		match client.present(&self.scanout.generation, &damage) {
+			Some(Ok(())) => Ok(()),
+			Some(Err(error)) => Err(error),
+			None => Err(Error::Closed),
 		}
 	}
 
@@ -418,20 +485,14 @@ impl DisplayState {
 	// released only once the new one is known good. Every surface is marked uninitialised because
 	// each is copied into the scanout on its next present and the scanout it was last drawn against
 	// is gone.
-	fn adopt_scanout(&mut self, gpu: u64, buf: &mut [u8]) -> bool {
+	fn adopt_scanout(&mut self, gpu: u64, _buf: &mut [u8]) -> bool {
 		unsafe {
-			send_blocking(gpu, b"FB", 0);
-			let Received::Message { len, handle } = recv_blocking(gpu, buf) else { return false };
-			let fb_len: usize = core::mem::size_of::<Framebuffer>();
-			if handle == 0 || len < fb_len + 8 {
-				if handle != 0 {
-					close(handle);
-				}
+			let Some(described) = ask_scanout(gpu) else { return false };
+			let handle: u64 = described.backing.handle;
+			let Some((fb, width, height)) = describe_framebuffer(&described) else {
+				close(handle);
 				return false;
-			}
-			let fb: Framebuffer = (buf.as_ptr() as *const Framebuffer).read_unaligned();
-			let width: u32 = read_u32(buf, fb_len);
-			let height: u32 = read_u32(buf, fb_len + 4);
+			};
 			let addr: i64 = dma_buffer_map(handle);
 			if sys_is_err(addr as u64) || !valid_scanout(&fb, width, height) {
 				if !sys_is_err(addr as u64) {
@@ -440,8 +501,12 @@ impl DisplayState {
 				close(handle);
 				return false;
 			}
+			let old_events: u64 = self.scanout.events;
 			let old: u64 = self.scanout.handle;
-			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height };
+			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, events: open_device_events(gpu) };
+			if old_events != 0 {
+				close(old_events);
+			}
 			// THE NEXT PRESENT IS THE EVIDENCE THIS ADOPTION WORKED, so it is reported - see
 			// `DisplayState::report_present`.
 			self.report_present = true;
@@ -456,59 +521,58 @@ impl DisplayState {
 		}
 	}
 
-	fn handle_gpu_message(&mut self, msg: &[u8], handle: u64) -> bool {
-		if msg.len() >= 5 && &msg[..5] == b"FBNEW" && handle != 0 {
-			let fb_len: usize = core::mem::size_of::<Framebuffer>();
-			if msg.len() < 5 + fb_len + 8 {
-				close(handle);
-				return false;
-			}
-			let fb: Framebuffer = unsafe { (msg[5..].as_ptr() as *const Framebuffer).read_unaligned() };
-			let width: u32 = read_u32(msg, 5 + fb_len);
-			let height: u32 = read_u32(msg, 5 + fb_len + 4);
-			let addr: i64 = unsafe { dma_buffer_map(handle) };
-			if sys_is_err(addr as u64) || !valid_scanout(&fb, width, height) {
-				if !sys_is_err(addr as u64) {
-					dma_buffer_unmap(handle);
+	// WHAT THE DEVICE REPORTED, ACTED ON.
+	//
+	// TWO EVENTS AND THEY ARE NOT THE SAME EVENT, which is the whole reason the wire distinguishes
+	// them: a RESIZE is the same pixels differently framed and costs nothing but a reflow, and a
+	// REPLACEMENT is a new backing at a new generation, where everything drawn against the old one is
+	// gone. Answering both by remapping would remap on every window drag; answering both by reflowing
+	// would draw into memory the driver has given back.
+	fn handle_device_event(&mut self, event: DeviceEvent) -> bool {
+		let replaced = match event {
+			DeviceEvent::Resized(extent) => {
+				if extent.width == 0 || extent.height == 0 || extent.width > self.scanout.fb.width || extent.height > self.scanout.fb.height {
+					return false;
 				}
-				close(handle);
-				return false;
-			}
-			let old: u64 = self.scanout.handle;
-			self.scanout.handle = handle;
-			self.scanout.addr = addr as u64;
-			self.scanout.fb = fb;
-			self.scanout.width = width;
-			self.scanout.height = height;
-			for surface in &mut self.surfaces {
-				surface.initialized = false;
-			}
-			if old != 0 {
-				dma_buffer_unmap(old);
-				close(old);
-			}
-			return true;
-		}
-		if msg.len() >= 14 && &msg[..6] == b"RESIZE" {
-			if handle != 0 {
-				close(handle);
-			}
-			let width: u32 = read_u32(msg, 6);
-			let height: u32 = read_u32(msg, 10);
-			if width != 0 && height != 0 && width <= self.scanout.fb.width && height <= self.scanout.fb.height {
-				self.scanout.width = width;
-				self.scanout.height = height;
+				self.scanout.width = extent.width;
+				self.scanout.height = extent.height;
 				for surface in &mut self.surfaces {
 					surface.initialized = false;
 				}
 				return true;
 			}
+			DeviceEvent::Replaced(scanout) => scanout,
+		};
+		let handle: u64 = replaced.backing.handle;
+		let Some((fb, width, height)) = describe_framebuffer(&replaced) else {
+			close(handle);
+			return false;
+		};
+		let addr: i64 = unsafe { dma_buffer_map(handle) };
+		if sys_is_err(addr as u64) || !valid_scanout(&fb, width, height) {
+			if !sys_is_err(addr as u64) {
+				dma_buffer_unmap(handle);
+			}
+			close(handle);
 			return false;
 		}
-		if handle != 0 {
-			close(handle);
+		let old: u64 = self.scanout.handle;
+		self.scanout.handle = handle;
+		self.scanout.addr = addr as u64;
+		self.scanout.fb = fb;
+		self.scanout.width = width;
+		self.scanout.height = height;
+		// THE GENERATION MOVES WITH THE BACKING, and the next present names the new one. A present
+		// still in flight for the old generation is refused by the driver rather than drawn.
+		self.scanout.generation = replaced.generation;
+		for surface in &mut self.surfaces {
+			surface.initialized = false;
 		}
-		false
+		if old != 0 {
+			dma_buffer_unmap(old);
+			close(old);
+		}
+		true
 	}
 }
 
@@ -522,8 +586,8 @@ impl Service for DisplayCall<'_> {
 		self.state.acquire(self.chan, width, height)
 	}
 
-	fn present(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error> {
-		self.state.present(self.chan, x, y, width, height)
+	fn present(&mut self, damage: DamageRegion) -> Result<(), Error> {
+		self.state.present(self.chan, &damage)
 	}
 
 	fn release(&mut self) -> Result<(), Error> {
@@ -693,30 +757,72 @@ fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> u64
 	}
 }
 
-unsafe fn init_scanout(gpu: u64, display_ctl: u64, buf: &mut [u8]) -> Scanout {
+// Ask a display device for its scanout, over the typed wire.
+fn ask_scanout(gpu: u64) -> Option<DeviceScanout> {
+	let mut client = display_device::Client::new(ChannelTransport { chan: gpu });
+	match client.scanout() {
+		Some(Ok(scanout)) if scanout.backing.handle != 0 => Some(scanout),
+		Some(Ok(scanout)) => {
+			// A DESCRIPTION WITH NO BACKING IS NOT A SCANOUT, and the handle is zero rather than
+			// absent because the wire carries a buffer either way.
+			if scanout.backing.handle != 0 {
+				close(scanout.backing.handle);
+			}
+			None
+		}
+		_ => None,
+	}
+}
+
+// Open the device's event stream, or zero when it has none to give.
+fn open_device_events(gpu: u64) -> u64 {
+	let mut client = display_device::Client::new(ChannelTransport { chan: gpu });
+	client.events().unwrap_or(0)
+}
+
+// The ABI framebuffer a scanout description implies, plus the visible extent.
+//
+// THE DESCRIPTION IS CHECKED HERE AND THE MASKS COME FROM THE REGISTRY. A driver names a format; what
+// that name means as channel shifts is the shared model's answer, not this service's - which is what
+// stops a `R8G8B8X8` device from being drawn into as though it were `B8G8R8X8`.
+fn describe_framebuffer(scanout: &DeviceScanout) -> Option<(Framebuffer, u32, u32)> {
+	let layout = graphics_core::layout::ImageLayout::try_from(&scanout.layout).ok()?;
+	let masks = layout.storage.packed_masks()?;
+	let fb = Framebuffer { width: layout.extent.width, height: layout.extent.height, pitch: layout.pitch, bytes_per_pixel: masks.bytes_per_pixel as u32, red_shift: masks.red.shift, red_size: masks.red.bits, green_shift: masks.green.shift, green_size: masks.green.bits, blue_shift: masks.blue.shift, blue_size: masks.blue.bits, _pad: [0; 2] };
+	// THE BACKING MUST HOLD WHAT THE LAYOUT DESCRIBES. A driver that hands over a shorter object
+	// than its own description is a mapping this service would read past.
+	if scanout.backing.len < layout.backend_access_span(true)? {
+		return None;
+	}
+	Some((fb, scanout.visible.width, scanout.visible.height))
+}
+
+unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 	unsafe {
-		if gpu != 0 {
-			send_blocking(gpu, b"FB", 0);
-			if let Received::Message { len, handle } = recv_blocking(gpu, buf) {
-				let fb_len: usize = core::mem::size_of::<Framebuffer>();
-				if handle != 0 && len >= fb_len + 8 {
-					let fb: Framebuffer = (buf.as_ptr() as *const Framebuffer).read_unaligned();
-					let width: u32 = read_u32(buf, fb_len);
-					let height: u32 = read_u32(buf, fb_len + 4);
+		if gpu != 0
+			&& let Some(described) = ask_scanout(gpu)
+		{
+			let handle: u64 = described.backing.handle;
+			match describe_framebuffer(&described) {
+				Some((fb, width, height)) => {
 					let addr: i64 = dma_buffer_map(handle);
 					if !sys_is_err(addr as u64) && valid_scanout(&fb, width, height) {
-						return Scanout { gpu, handle, addr: addr as u64, fb, width, height };
+						return Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, events: open_device_events(gpu) };
 					}
 					if !sys_is_err(addr as u64) {
 						dma_buffer_unmap(handle);
 					}
 					close(handle);
 				}
+				None => close(handle),
 			}
 		}
+		// THE BOOT FRAMEBUFFER, which is not a device and has no generation to move: it is one
+		// mapping for the life of the process, so a present names generation zero and nothing ever
+		// makes that stale.
 		let mut fb: Framebuffer = Framebuffer::default();
 		let addr: i64 = framebuffer_map(display_ctl, &mut fb);
-		if !sys_is_err(addr as u64) && valid_scanout(&fb, fb.width, fb.height) { Scanout { gpu: 0, handle: 0, addr: addr as u64, width: fb.width, height: fb.height, fb } } else { Scanout { gpu: 0, handle: 0, addr: 0, fb: Framebuffer::default(), width: 0, height: 0 } }
+		if !sys_is_err(addr as u64) && valid_scanout(&fb, fb.width, fb.height) { Scanout { gpu: 0, handle: 0, addr: addr as u64, width: fb.width, height: fb.height, fb, generation: 0, events: 0 } } else { Scanout { gpu: 0, handle: 0, addr: 0, fb: Framebuffer::default(), width: 0, height: 0, generation: 0, events: 0 } }
 	}
 }
 
@@ -726,6 +832,12 @@ fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut 
 	let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 	loop {
 		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 4);
+		// THE DEVICE'S EVENT STREAM AND THE DEVICE'S CHANNEL ARE TWO DIFFERENT WAITS NOW. A present
+		// is a call on the channel and answers on it; a resize or a replacement arrives on the
+		// stream. Waiting on the channel is still what notices the driver going away.
+		if state.scanout.events != 0 {
+			waits.push(state.scanout.events);
+		}
 		if state.scanout.gpu != 0 {
 			waits.push(state.scanout.gpu);
 		}
@@ -741,13 +853,43 @@ fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut 
 		if ready < 0 {
 			continue;
 		}
-		let gpu_first: bool = state.scanout.gpu != 0;
-		if gpu_first && ready == 0 {
-			match recv_blocking(state.scanout.gpu, &mut request) {
-				Received::Message { len, handle } => {
-					if state.handle_gpu_message(&request[..len], handle) {
+		let events_first: bool = state.scanout.events != 0;
+		if events_first && ready == 0 {
+			match recv_caps_blocking(state.scanout.events, &mut request) {
+				ReceivedCaps::Message { len, handles: mut frame_handles } => {
+					// THE FRAME'S CAPABILITIES ARE SPENT BY A SUCCESSFUL READ and what is left is
+					// closed unconditionally, which is the rule this transport already states: the
+					// alternative is a reader that closes before decoding on one path and after on
+					// the other, correct only by accident of the element type.
+					let event = display_device::events_read(&request[..len], &mut frame_handles);
+					for handle in frame_handles.as_slice() {
+						close(*handle);
+					}
+					if let Some(event) = event
+						&& state.handle_device_event(event)
+					{
 						state.notify_resize();
 						state.present_active_full();
+					}
+				}
+				// THE STREAM ENDED. The device is still there - a stream can be lost on its own -
+				// so the channel is given back and the next adoption opens a new one.
+				ReceivedCaps::Closed => {
+					close(state.scanout.events);
+					state.scanout.events = 0;
+				}
+			}
+			continue;
+		}
+		let gpu_first: bool = state.scanout.gpu != 0;
+		if gpu_first && ready == if events_first { 1 } else { 0 } {
+			// NOTHING ARRIVES ON THIS CHANNEL UNASKED any more: a present's answer is read by the
+			// call that made it, and events have their own stream. What this wait notices is the
+			// driver GOING AWAY, which is the one thing a channel says without being asked.
+			match recv_blocking(state.scanout.gpu, &mut request) {
+				Received::Message { handle, .. } => {
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				// THE DRIVER WENT AWAY, AND WHAT IT LEFT GOES WITH IT. This only cleared the
@@ -766,7 +908,7 @@ fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut 
 		// its provider, and the display path comes back without restarting the service or
 		// anything above it. A withdrawal needs nothing here - the driver channel closing is the
 		// authoritative signal and the arm above already handles it.
-		let providers_index: usize = gpu_first as usize;
+		let providers_index: usize = events_first as usize + gpu_first as usize;
 		let providers_present: bool = providers != 0;
 		if providers_present && ready as usize == providers_index {
 			match recv_blocking(providers, &mut request) {
@@ -818,7 +960,7 @@ fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut 
 			}
 			continue;
 		}
-		let kill_index: usize = gpu_first as usize + providers_present as usize;
+		let kill_index: usize = events_first as usize + gpu_first as usize + providers_present as usize;
 		let kill_present: bool = state.kill_control != 0;
 		if kill_present && ready as usize == kill_index {
 			match recv_blocking(state.kill_control, &mut request) {
@@ -848,7 +990,7 @@ fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut 
 			}
 			continue;
 		}
-		let admin_index: usize = gpu_first as usize + providers_present as usize + kill_present as usize;
+		let admin_index: usize = events_first as usize + gpu_first as usize + providers_present as usize + kill_present as usize;
 		if ready as usize == admin_index {
 			match recv_caps_blocking(admin, &mut request) {
 				ReceivedCaps::Message { len, handles: caps } => {

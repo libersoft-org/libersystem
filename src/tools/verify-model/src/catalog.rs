@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 117] = [
+const GATES: [(&str, &str); 118] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -498,6 +498,16 @@ const GATES: [(&str, &str); 117] = [
 	("one-wait", "services"),
 	("driver-event-dispatch", "services"),
 	("guest-verdict", "harness.tools"),
+	// EVERY RUN SAYS HOW IT ENDED, and this proves it by making runs FAIL. A refused flag, a refused
+	// architecture, a successful listing and a SIGNALLED run each have to print a verdict line and
+	// leave a status file that agrees with it - which is what a waiter reads instead of grepping a
+	// log for words the failure may not use. Its subject is the harness, because the verdict is
+	// `lib.sh`'s and every script in the tree inherits it.
+	//
+	// REGISTERED ON THE NEXT RUN RATHER THAN THE SAME ONE, and the check caught it exactly as the
+	// entries above describe: "check.sh runs gate 'run-verdict', which the catalog does not know
+	// about - nothing would ever select it". The two lists disagreed loudly and this is the answer.
+	("run-verdict", "harness.tools"),
 	// Every capability the security IDL declares is one PermissionManager's grant loop walks. Two
 	// were missing and both were silent: the manager reported success having sent nothing, and the
 	// launched program read the NEXT capability under the missing one's tag. Its subject is the

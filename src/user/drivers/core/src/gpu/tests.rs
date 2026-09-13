@@ -1,5 +1,5 @@
 // DRV-010's negatives, each held against the decision that closes it.
-use super::{BYTES_PER_PIXEL, MAX_EXTENT, backing_bytes, display_geometry, pitch_bytes, transfer_offset, union_rect, visible_rect};
+use super::{BYTES_PER_PIXEL, DamageSet, MAX_DAMAGE_RECTS, MAX_EXTENT, backing_bytes, display_geometry, pitch_bytes, transfer_offset, union_rect, visible_rect};
 
 const FALLBACK: (u32, u32) = (1024, 768);
 
@@ -66,4 +66,64 @@ fn a_transfer_offset_that_does_not_fit_is_refused() {
 	assert_eq!(transfer_offset(0, 0, 1920), Some(0));
 	assert_eq!(transfer_offset(10, 2, 1920), Some((2 * 1920 + 10) * 4));
 	assert_eq!(transfer_offset(u32::MAX, u32::MAX, u32::MAX), None);
+}
+
+#[test]
+// THE DEFECT, WRITTEN AS A TEST. Two opposite corners of a screen have a bounding box of the whole
+// screen, and this driver used to transfer that. They stay two rectangles now, and the sum of their
+// areas is what moves.
+fn two_corners_are_two_transfers_and_not_the_screen_between_them() {
+	let mut damage = DamageSet::new();
+	damage.add((0, 0, 8, 8));
+	damage.add((1016, 760, 8, 8));
+	assert_eq!(damage.rects().len(), 2, "a thousand pixels apart is not one rectangle");
+	let moved: u64 = damage.rects().iter().map(|rect| rect.2 as u64 * rect.3 as u64).sum();
+	assert_eq!(moved, 128, "two corners, and nothing between them");
+	assert_eq!(union_rect(damage.rects()[0], damage.rects()[1]), (0, 0, 1024, 768), "which is what the union would have cost");
+}
+
+#[test]
+// Merging where it costs nothing is the other half of the rule: a client that damages the same
+// region twice, or two regions that touch, pays for one transfer.
+fn rectangles_that_overlap_or_touch_become_one() {
+	let mut damage = DamageSet::new();
+	damage.add((10, 10, 20, 20));
+	damage.add((15, 15, 20, 20));
+	assert_eq!(damage.rects(), &[(10, 10, 25, 25)], "overlapping rectangles merge");
+
+	let mut touching = DamageSet::new();
+	touching.add((0, 0, 10, 10));
+	touching.add((10, 0, 10, 10));
+	assert_eq!(touching.rects(), &[(0, 0, 20, 10)], "two rectangles side by side are one strip");
+
+	let mut contained = DamageSet::new();
+	contained.add((0, 0, 100, 100));
+	contained.add((10, 10, 5, 5));
+	assert_eq!(contained.rects(), &[(0, 0, 100, 100)], "a rectangle inside another adds nothing");
+}
+
+#[test]
+// An empty rectangle is not damage, and the set stays bounded however many arrive.
+fn the_set_is_bounded_and_ignores_what_is_not_damage() {
+	let mut damage = DamageSet::new();
+	assert!(damage.is_empty());
+	damage.add((5, 5, 0, 10));
+	damage.add((5, 5, 10, 0));
+	assert!(damage.is_empty(), "a rectangle with no pixels is not damage");
+
+	// Thirty-two rectangles far enough apart that none of them merges cheaply: the set holds its cap
+	// and the rest are merged into what is there rather than dropped.
+	for index in 0..32u32 {
+		damage.add((index * 64, index * 32, 8, 8));
+	}
+	assert_eq!(damage.rects().len(), MAX_DAMAGE_RECTS, "the cap holds");
+	// EVERY DAMAGED PIXEL IS STILL COVERED, which is the property that matters: a dropped rectangle
+	// would leave the screen showing something that is no longer there.
+	for index in 0..32u32 {
+		let (x, y) = (index * 64, index * 32);
+		assert!(damage.rects().iter().any(|rect| x >= rect.0 && y >= rect.1 && x < rect.0 + rect.2 && y < rect.1 + rect.3), "rectangle {index} is still covered");
+	}
+
+	damage.clear();
+	assert!(damage.is_empty());
 }

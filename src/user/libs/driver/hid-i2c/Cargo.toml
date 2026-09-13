@@ -1,0 +1,13 @@
+[package]
+name = "hid-i2c"
+edition = "2024"
+description = "The HID-over-I2C descriptor and register protocol, over a bounded I2C bus contract"
+
+# NO DEPENDENCIES, AND THAT IS WHAT MAKES IT TESTABLE. Every answer here is a function of bytes and of
+# a bus the caller supplies, so a host test drives the whole protocol against a fake in the same
+# process. A crate that reached the runtime could not be host-tested at all - `rt` and `std` both
+# define `panic_impl` - which is why `driver-binding` and `entropy` exist as they do.
+[dependencies]
+
+[lints.rust]
+warnings = "deny"

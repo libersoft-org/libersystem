@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use graphics_core::geom::{Extent2D, PixelRect};
 use graphics_core::layout::{ImageLayout, RowOrigin};
-use graphics_core::pixel::{Decoder, Encoder, Rgba, TransferTable, Working, read_row, write_row};
+use graphics_core::pixel::{Decoder, Encoder, OutputLuminance, Rgba, TransferTable, Working, read_row, write_row};
 use graphics_core::semantics::ImageSemantics;
 use graphics_core::view::{ImageView, ImageViewMut};
 use graphics_core::{AlphaMode, ColorSpace, Error as CoreError, OwnedImage, PixelFormat, PixelStorage};
@@ -181,9 +181,9 @@ impl Surface {
 	/// THE DITHER PHASE IS THE TARGET'S x AND y, which is why they are passed through rather than the
 	/// surface's own: a tile-relative phase makes the ordered pattern restart at every tile boundary,
 	/// and that is the artefact that looks like a seam.
-	pub fn store(&self, target: &mut ImageViewMut<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
+	pub fn store(&self, target: &mut ImageViewMut<'_>, bounds: PixelRect, working: Working, output: OutputLuminance, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
 		let (semantics, storage) = (target.layout().semantics, target.layout().storage);
-		let encoder = Encoder::new(&semantics, storage, working).map_err(from_core)?;
+		let encoder = Encoder::new_for_output(&semantics, storage, working, output).map_err(from_core)?;
 		let width = (bounds.width as usize).min(scratch.len());
 		if width == 0 {
 			return Ok(());
@@ -311,9 +311,9 @@ impl Tile {
 	/// THE DITHER PHASE IS THE TARGET'S x AND y, which is why they are passed through rather than the
 	/// tile's own: a tile-relative phase makes the ordered pattern restart at every tile boundary, and
 	/// that is the artefact that looks like a seam.
-	pub fn store(&self, target: &mut ImageViewMut<'_>, bounds: PixelRect, working: Working, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
+	pub fn store(&self, target: &mut ImageViewMut<'_>, bounds: PixelRect, working: Working, output: OutputLuminance, table: Option<&TransferTable>, scratch: &mut [Rgba]) -> Result<(), Error> {
 		let (semantics, storage) = (target.layout().semantics, target.layout().storage);
-		let encoder = Encoder::new(&semantics, storage, working).map_err(from_core)?;
+		let encoder = Encoder::new_for_output(&semantics, storage, working, output).map_err(from_core)?;
 		let width = (bounds.width as usize).min(scratch.len());
 		for y in bounds.y..bounds.y.saturating_add(bounds.height) {
 			let Some(start) = self.index(bounds.x, y) else { continue };

@@ -19,7 +19,10 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use term::{Geometry, Raster, Surface, Term, TextSink};
+use graphics_core::format::{PackedRgbLayout, PixelStorage};
+use graphics_core::geom::Extent2D;
+use graphics_core::layout::ImageLayout;
+use term::{Raster, Surface, Term, TextSink};
 
 use crate::sync::SpinLock;
 
@@ -88,12 +91,24 @@ pub fn init(info: FbInfo) {
 	if info.width == 0 || info.height == 0 || info.bytes_per_pixel == 0 {
 		return;
 	}
-	let geometry = Geometry { width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: info.bytes_per_pixel, red_shift: info.red_shift, red_size: info.red_size, green_shift: info.green_shift, green_size: info.green_size, blue_shift: info.blue_shift, blue_size: info.blue_size };
+	// THE ONE-WAY ADAPTER FROM THE BOOT HAND-OFF INTO THE IMAGE MODEL, and it belongs here rather
+	// than in either type: a boot framebuffer record is what firmware described to the loader, and
+	// the image model is where those six loose numbers are checked and given a name. Nothing
+	// converts back - a hand-off and a general image are different layers.
+	let (Ok(width), Ok(height), Ok(pitch)) = (u32::try_from(info.width), u32::try_from(info.height), u32::try_from(info.pitch)) else {
+		return;
+	};
+	let Some(packed) = PackedRgbLayout::from_masks(info.bytes_per_pixel as u32, (info.red_shift, info.red_size), (info.green_shift, info.green_size), (info.blue_shift, info.blue_size)) else {
+		return;
+	};
+	let Ok(layout) = ImageLayout::scanout(Extent2D::new(width, height), pitch, PixelStorage::PackedRgbUnorm(packed)) else {
+		return;
+	};
 	// SAFETY: `info` comes from the boot protocol's framebuffer record - a mapping the loader made
-	// and handed over, valid for the life of the kernel and touched by nothing else. The
-	// constructor checks the geometry it was given; a mode line this renderer cannot address is a
-	// console that does not start, not a panic on the first pixel.
-	let Some(raster) = (unsafe { Raster::new(info.addr as u64, &geometry) }) else {
+	// and handed over, valid for the life of the kernel and touched by nothing else. The layout
+	// above was checked against that record; a mode line this renderer cannot address is a console
+	// that does not start, not a panic on the first pixel.
+	let Some(raster) = (unsafe { Raster::new(info.addr as u64, &layout) }) else {
 		return;
 	};
 	// ALLOC-OK: boot, the kernel's own console surface, built once during bring-up

@@ -51,14 +51,16 @@ fn bytes(pixels: &[u32]) -> Vec<u8> {
 }
 
 fn target(data: &mut [u8], width: u32, height: u32) -> Target<'_> {
-	Target { data, width, height, pitch: width * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 }
+	// The scanout shape every one of these cases uses: four bytes with blue first in memory, which
+	// as a little-endian `u32` puts red at 16 and blue at 0.
+	Target::packed(data, width, height, width * 4, 4, (16, 8), (8, 8), (0, 8)).expect("a target this test sized itself")
 }
 
 #[test]
 fn first_direct_present_copies_the_whole_surface() {
 	let source = bytes(&[1, 2, 3, 4]);
 	let mut output = vec![0xaau8; 16];
-	let result = blit(Image { data: &source, width: 2, height: 2, pitch: 8 }, target(&mut output, 2, 2), Rect { x: 0, y: 0, width: 1, height: 1 }, true).unwrap();
+	let result = blit(Image::rgba(&source, 2, 2, 8).expect("an image this test sized itself"), target(&mut output, 2, 2), Rect { x: 0, y: 0, width: 1, height: 1 }, true).unwrap();
 	assert_eq!(result.rect, Rect { x: 0, y: 0, width: 2, height: 2 });
 	assert_eq!(output, source);
 }
@@ -67,11 +69,11 @@ fn first_direct_present_copies_the_whole_surface() {
 fn scaled_damage_updates_only_its_output_rectangle() {
 	let mut source = bytes(&[0x0011_2233, 0x0044_5566, 0x0077_8899, 0x00aa_bbcc]);
 	let mut output = vec![0xaau8; 64];
-	let image = Image { data: &source, width: 2, height: 2, pitch: 8 };
+	let image = Image::rgba(&source, 2, 2, 8).expect("an image this test sized itself");
 	let first = blit(image, target(&mut output, 4, 4), Rect { x: 0, y: 0, width: 1, height: 1 }, true).unwrap();
 	assert_eq!(first.pixels, 32);
 	source[..4].copy_from_slice(&0x00dd_eeffu32.to_le_bytes());
-	let damage = blit(Image { data: &source, width: 2, height: 2, pitch: 8 }, target(&mut output, 4, 4), Rect { x: 0, y: 0, width: 1, height: 1 }, false).unwrap();
+	let damage = blit(Image::rgba(&source, 2, 2, 8).expect("an image this test sized itself"), target(&mut output, 4, 4), Rect { x: 0, y: 0, width: 1, height: 1 }, false).unwrap();
 	assert_eq!(damage.rect, Rect { x: 0, y: 0, width: 2, height: 2 });
 	assert_eq!(damage.pixels, 4);
 	assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 0x00dd_eeff);
@@ -82,7 +84,7 @@ fn scaled_damage_updates_only_its_output_rectangle() {
 fn first_scaled_present_clears_letterbox_rows() {
 	let source = bytes(&[0x0011_2233, 0x0044_5566]);
 	let mut output = vec![0xaau8; 64];
-	blit(Image { data: &source, width: 2, height: 1, pitch: 8 }, target(&mut output, 4, 4), Rect { x: 0, y: 0, width: 2, height: 1 }, true).unwrap();
+	blit(Image::rgba(&source, 2, 1, 8).expect("an image this test sized itself"), target(&mut output, 4, 4), Rect { x: 0, y: 0, width: 2, height: 1 }, true).unwrap();
 	assert_eq!(&output[..16], &[0; 16]);
 	assert_eq!(&output[48..], &[0; 16]);
 }
@@ -91,12 +93,12 @@ fn first_scaled_present_clears_letterbox_rows() {
 fn native_crop_uses_the_requested_source_origin_and_clears_the_target() {
 	let source = bytes(&[1, 2, 3, 4, 5, 6]);
 	let mut output = vec![0xaau8; 16];
-	let result = blit_crop(Image { data: &source, width: 3, height: 2, pitch: 12 }, target(&mut output, 2, 2), 1, 0).unwrap();
+	let result = blit_crop(Image::rgba(&source, 3, 2, 12).expect("an image this test sized itself"), target(&mut output, 2, 2), 1, 0).unwrap();
 	assert_eq!(result.rect, Rect { x: 0, y: 0, width: 2, height: 2 });
 	assert_eq!(output, bytes(&[2, 3, 5, 6]));
 
 	let mut letterbox = vec![0xaau8; 24];
-	blit_crop(Image { data: &source, width: 3, height: 2, pitch: 12 }, target(&mut letterbox, 3, 2), 2, 0).unwrap();
+	blit_crop(Image::rgba(&source, 3, 2, 12).expect("an image this test sized itself"), target(&mut letterbox, 3, 2), 2, 0).unwrap();
 	assert_eq!(&letterbox[..4], &[0; 4]);
 	assert_eq!(u32::from_le_bytes(letterbox[4..8].try_into().unwrap()), 3);
 }
@@ -105,12 +107,12 @@ fn native_crop_uses_the_requested_source_origin_and_clears_the_target() {
 fn viewport_blit_scales_and_clamps_a_centered_crop() {
 	let source = bytes(&[1, 2, 3, 4]);
 	let mut output = vec![0xaau8; 16];
-	let result = blit_view(Image { data: &source, width: 2, height: 2, pitch: 8 }, target(&mut output, 2, 2), 4, 4, 1, 1).unwrap();
+	let result = blit_view(Image::rgba(&source, 2, 2, 8).expect("an image this test sized itself"), target(&mut output, 2, 2), 4, 4, 1, 1).unwrap();
 	assert_eq!(result.rect, Rect { x: 0, y: 0, width: 2, height: 2 });
 	assert_eq!(output, bytes(&[1, 2, 3, 4]));
 
 	let mut letterbox = vec![0xaau8; 64];
-	blit_view(Image { data: &source, width: 2, height: 2, pitch: 8 }, target(&mut letterbox, 4, 4), 2, 2, 99, 99).unwrap();
+	blit_view(Image::rgba(&source, 2, 2, 8).expect("an image this test sized itself"), target(&mut letterbox, 4, 4), 2, 2, 99, 99).unwrap();
 	assert_eq!(&letterbox[..16], &[0; 16]);
 	assert_eq!(&letterbox[48..], &[0; 16]);
 	assert_eq!(u32::from_le_bytes(letterbox[20..24].try_into().unwrap()), 1);

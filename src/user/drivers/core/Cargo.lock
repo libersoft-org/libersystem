@@ -39,6 +39,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "graphics-proto",
+ "wire",
+]
+
+[[package]]
 name = "display-proto"
 version = "0.0.0"
 dependencies = [
@@ -59,6 +68,7 @@ dependencies = [
 name = "drivers"
 version = "0.0.0"
 dependencies = [
+ "display-device-proto",
  "driver-protocol",
  "ipc-client",
  "proto",
@@ -138,6 +148,7 @@ dependencies = [
  "base-proto",
  "config-proto",
  "device-proto",
+ "display-device-proto",
  "display-proto",
  "font-proto",
  "graphics-proto",

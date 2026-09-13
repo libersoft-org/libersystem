@@ -52,8 +52,11 @@ impl Default for EncodeOptions {
 }
 
 impl Image {
-	pub fn as_pix(&self) -> pix::Image<'_> {
-		pix::Image { data: &self.pixels, width: self.width, height: self.height, pitch: self.pitch }
+	pub fn as_pix(&self) -> Option<pix::Image<'_>> {
+		// The checked constructor refuses a buffer too small for what the header claims, which a
+		// struct literal could not: a decoder that produced fewer rows than it said would have handed
+		// the blitter a view over somebody else's memory.
+		pix::Image::rgba(&self.pixels, self.width, self.height, self.pitch)
 	}
 }
 

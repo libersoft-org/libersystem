@@ -7,6 +7,13 @@
 use crate::screen::{MAX_SCROLLBACK_BYTES, SCROLLBACK_ROWS};
 use crate::{Echo, EchoBuf, Ld, RawSink, Screen, TextSink};
 use alloc::vec::Vec;
+use graphics_core::format::{PackedRgbLayout, PixelFormat, PixelStorage};
+use graphics_core::geom::Extent2D;
+use graphics_core::layout::ImageLayout;
+
+// The mode line every raster in these tests is built from: four bytes per pixel with red at 16,
+// green at 8 and blue at 0 - `B8G8R8X8` as firmware describes it.
+const TEST_MASKS: ((u8, u8), (u8, u8), (u8, u8)) = ((16, 8), (8, 8), (0, 8));
 
 fn dump(screen: &Screen) -> Vec<u8> {
 	let mut sink = TextSink::new();
@@ -320,33 +327,66 @@ fn extends_a_path_segment_to_the_common_prefix() {
 }
 
 #[test]
-fn a_geometry_the_renderer_cannot_address_is_refused_rather_than_panicking() {
+fn a_mode_line_the_renderer_cannot_address_is_refused_rather_than_panicking() {
 	// `put_pixel` writes `bytes[i]` for `i in 0..bytes_per_pixel` over a `[u8; 4]`, so a
-	// `bytes_per_pixel` of 5 was an index panic rather than a refusal; `channel` shifts a `u32`, so
-	// a `red_shift` of 32 panicked in a debug build. Neither was checked anywhere, and both are
-	// ordinary values for a mode line to carry wrongly - a display backend reporting a format this
-	// renderer does not implement should get "no console", not a crash on the first glyph.
-	let sane = crate::render::Geometry { width: 64, height: 32, pitch: 64 * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 };
-	let mut backing = alloc::vec![0u8; sane.pitch * sane.height];
+	// `bytes_per_pixel` of 5 was an index panic rather than a refusal; the private packer this
+	// renderer used to carry shifted a `u32`, so a `red_shift` of 32 panicked in a debug build.
+	// Neither was checked anywhere, and both are ordinary values for a mode line to carry wrongly -
+	// a display backend reporting a format this renderer does not implement should get "no console",
+	// not a crash on the first glyph.
+	//
+	// THE REFUSAL NOW HAPPENS AT TWO LAYERS, and this asserts what the RENDERER ends up with rather
+	// than which layer spoke: the shared layout constructor refuses a pitch that does not hold a row
+	// and masks that leave the element or overlap each other, and `Raster::new` refuses what is left
+	// - an element wider than the `u32` it packs into.
+	let mut backing = alloc::vec![0u8; 64 * 8 * 32];
 	let addr = backing.as_mut_ptr() as u64;
-	// SAFETY: `backing` is a real allocation of exactly the size the geometry describes and
-	// outlives every `Raster` below.
-	assert!(unsafe { crate::render::Raster::new(addr, &sane) }.is_some(), "the sane geometry must be accepted, or nothing below means anything");
-
-	let refused = |what: &str, edit: &dyn Fn(&mut crate::render::Geometry)| {
-		let mut g: crate::render::Geometry = sane.clone();
-		edit(&mut g);
-		assert!(unsafe { crate::render::Raster::new(addr, &g) }.is_none(), "{what}");
+	let accepted = |bytes_per_pixel: u32, red: (u8, u8), green: (u8, u8), blue: (u8, u8), pitch: u32| -> bool {
+		let Some(packed) = PackedRgbLayout::from_masks(bytes_per_pixel, red, green, blue) else {
+			return false;
+		};
+		let Ok(layout) = ImageLayout::scanout(Extent2D::new(64, 32), pitch, PixelStorage::PackedRgbUnorm(packed)) else {
+			return false;
+		};
+		// SAFETY: `backing` is a real allocation larger than any layout accepted here describes, it
+		// outlives every raster built below, and none of them is ever drawn into.
+		unsafe { crate::render::Raster::new(addr, &layout) }.is_some()
 	};
-	refused("five bytes per pixel writes past a u32", &|g| g.bytes_per_pixel = 5);
-	refused("zero bytes per pixel writes nothing and divides nothing", &|g| g.bytes_per_pixel = 0);
-	refused("a pitch shorter than a row overlaps the next one", &|g| g.pitch = 64 * 4 - 1);
-	refused("a red shift past the word", &|g| g.red_shift = 32);
-	refused("a green channel wider than a byte", &|g| g.green_size = 9);
-	refused("a blue channel that ends past the word", &|g| {
-		g.blue_shift = 28;
-		g.blue_size = 8;
-	});
+	let (red, green, blue) = TEST_MASKS;
+	assert!(accepted(4, red, green, blue, 64 * 4), "the sane mode line must be accepted, or nothing below means anything");
+	assert!(!accepted(5, red, green, blue, 64 * 5), "five bytes per pixel writes past a u32");
+	assert!(!accepted(0, red, green, blue, 64 * 4), "zero bytes per pixel writes nothing and divides nothing");
+	assert!(!accepted(4, red, green, blue, 64 * 4 - 1), "a pitch shorter than a row overlaps the next one");
+	assert!(!accepted(4, (32, 8), green, blue, 64 * 4), "a red shift past the word");
+	assert!(!accepted(4, red, (8, 9), blue, 64 * 4), "a green channel wider than a byte runs into the one above it");
+	assert!(!accepted(4, red, green, (28, 8), 64 * 4), "a blue channel that ends past the word");
+}
+
+#[test]
+// A DISPLAY SERVER HANDS OVER A NAMED FORMAT AND FIRMWARE HANDS OVER MASKS, and this renderer takes
+// both. It did not, for one afternoon: `Raster::new` accepted only the mask arm, so the boot console
+// still drew and the userspace console silently had no terminal at all - the surface was mapped, the
+// service came online, and every VT was blank. The guest console test is what caught it; this is what
+// catches it next time, in milliseconds.
+fn a_named_scanout_format_is_a_raster_as_well_as_a_mode_line() {
+	let mut backing = alloc::vec![0u8; 64 * 4 * 32];
+	let addr = backing.as_mut_ptr() as u64;
+	let named = ImageLayout::scanout(Extent2D::new(64, 32), 64 * 4, PixelStorage::Known(PixelFormat::B8G8R8X8Unorm)).expect("what a display server describes");
+	// SAFETY: `backing` is a real allocation of exactly the size this layout describes and outlives
+	// the raster, which is never drawn into.
+	let raster = unsafe { crate::render::Raster::new(addr, &named) }.expect("a named scanout is a raster");
+	assert_eq!((raster.width(), raster.height()), (64, 32));
+	// AND THE PIXELS PACK THE SAME WAY as they do through the mask form of the same thing: blue is
+	// the first byte in memory, so as a little-endian element red sits at 16.
+	let (red, green, blue) = TEST_MASKS;
+	let masks = ImageLayout::scanout(Extent2D::new(64, 32), 64 * 4, PixelStorage::PackedRgbUnorm(PackedRgbLayout::from_masks(4, red, green, blue).expect("a mode line"))).expect("what firmware describes");
+	let from_masks = unsafe { crate::render::Raster::new(addr, &masks) }.expect("a mode line is a raster");
+	assert_eq!(raster.pack(0x11, 0x22, 0x33), from_masks.pack(0x11, 0x22, 0x33));
+
+	// A FORMAT THAT IS NOT FOUR 8-BIT CHANNELS HAS NO MASKS and is refused rather than written as if
+	// it had: a half-float target through an integer packer is noise.
+	let wide = ImageLayout::scanout(Extent2D::new(64, 32), 64 * 8, PixelStorage::Known(PixelFormat::R16G16B16A16Float)).expect("a legal layout this renderer cannot write");
+	assert!(unsafe { crate::render::Raster::new(addr, &wide) }.is_none());
 }
 
 #[test]
@@ -592,12 +632,16 @@ impl crate::render::Surface for TestSurface {
 }
 
 fn test_term(cols: usize, rows: usize, scrollback: usize) -> crate::Term {
-	use crate::render::{CELL_H, CELL_W, Geometry};
-	let g = Geometry { width: cols * CELL_W, height: rows * CELL_H, pitch: cols * CELL_W * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 };
-	let mut pixels: Vec<u8> = alloc::vec![0u8; g.pitch * g.height];
-	// SAFETY: the mapping is this vector, it is big enough for the geometry, and it is moved into
+	use crate::render::{CELL_H, CELL_W};
+	let (width, height) = (cols * CELL_W, rows * CELL_H);
+	let pitch = width * 4;
+	let (red, green, blue) = TEST_MASKS;
+	let packed = PackedRgbLayout::from_masks(4, red, green, blue).expect("the test mode line");
+	let layout = ImageLayout::scanout(Extent2D::new(width as u32, height as u32), pitch as u32, PixelStorage::PackedRgbUnorm(packed)).expect("the test layout");
+	let mut pixels: Vec<u8> = alloc::vec![0u8; pitch * height];
+	// SAFETY: the mapping is this vector, it is big enough for the layout, and it is moved into
 	// the surface below so it outlives the raster and nothing else references it.
-	let raster = unsafe { crate::render::Raster::new(pixels.as_mut_ptr() as u64, &g) }.expect("test geometry");
+	let raster = unsafe { crate::render::Raster::new(pixels.as_mut_ptr() as u64, &layout) }.expect("the test raster");
 	crate::Term::new(alloc::boxed::Box::new(TestSurface { raster, _pixels: pixels }), scrollback)
 }
 

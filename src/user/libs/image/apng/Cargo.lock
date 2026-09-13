@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,12 +32,20 @@ name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
 [[package]]
 name = "graphics-profile"
 version = "0.0.0"
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "inflate"
@@ -76,4 +88,11 @@ name = "quantize"
 version = "0.0.0"
 dependencies = [
  "pix",
+]
+
+[[package]]
+name = "wire"
+version = "0.0.0"
+dependencies = [
+ "abi",
 ]

@@ -39,7 +39,8 @@ use alloc::vec::Vec;
 // display `Surface`. This service supplies the userspace display backends - the boot
 // framebuffer and the virtio-gpu shared backing - and drives `Term`; the kernel boot
 // console shares the same `Term`.
-use term::{CELL_H, CELL_W, Echo, EchoBuf, Geometry, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
+use graphics_core::layout::ImageLayout;
+use term::{CELL_H, CELL_W, Echo, EchoBuf, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
 
 // A DisplayService surface: the raster writes the client-owned MemoryObject and each
 // present synchronously copies the damage rectangle to the service-owned scanout.
@@ -72,19 +73,17 @@ impl Surface for DisplaySurface {
 	}
 }
 
-fn make_surface(addr: u64, fb: &Framebuffer, client: &DisplayClient) -> Option<Box<dyn Surface>> {
-	// SAFETY: `addr` is the base of the framebuffer this service just mapped through the display
-	// protocol, and `fb` is the geometry the same call reported for it. The mapping outlives the
-	// surface. A geometry the renderer cannot address is refused here rather than panicking on the
-	// first pixel - which is what an out-of-range `bytes_per_pixel` or channel shift used to do.
-	let raster = unsafe { Raster::new(addr, &geometry(fb)) }?;
+fn make_surface(addr: u64, layout: &ImageLayout, client: &DisplayClient) -> Option<Box<dyn Surface>> {
+	// SAFETY: `addr` is the base of the surface this service just mapped through the display
+	// protocol, and `layout` is what the same call described it as - checked when the mapping was
+	// built. The mapping outlives the surface. A layout the renderer cannot address is refused here
+	// rather than panicking on the first pixel, which is what an out-of-range element size or
+	// channel shift used to do.
+	//
+	// NO SECOND DESCRIPTION IN BETWEEN. This used to take an ABI `Framebuffer` apart into the
+	// renderer's own `Geometry`, field by field; both are now the shared model's one layout.
+	let raster = unsafe { Raster::new(addr, layout) }?;
 	Some(Box::new(DisplaySurface { raster, client: client.clone() }))
-}
-
-// The renderer's `Geometry` for a mapped ABI `Framebuffer`: the pixel format the display
-// backends hand to a `Raster`.
-fn geometry(fb: &Framebuffer) -> Geometry {
-	Geometry { width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size }
 }
 
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
@@ -326,7 +325,9 @@ struct Console {
 	// keyboard and the pointer for its duration. A program can ring the bell as often as it likes.
 	// The loop already wakes on its own timing for the caret blink; this rides the same wake.
 	bell_until: u64,
-	fb: Framebuffer,
+	// What the mapped surface's pixels are, or None when this console is headless. The renderer is
+	// built from it and every VT's grid is sized by it.
+	fb: Option<ImageLayout>,
 	// The mapped client-owned surface and typed DisplayService connection. The event
 	// sub-channel carries host display resizes without sharing the physical scanout.
 	surface: Option<Mapping>,
@@ -446,9 +447,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let display: DisplayClient = surface::connect(display_chan);
 		let surface: Option<Mapping> = if display_chan == 0 { None } else { surface::acquire(&display, 0, 0).and_then(Result::ok) };
 		let display_events: u64 = if display_chan == 0 { 0 } else { surface::events(&display).unwrap_or(0) };
-		let (addr, fb): (u64, Framebuffer) = surface.as_ref().map_or((0, Framebuffer::default()), |surface| (surface.addr(), surface.framebuffer()));
-		let cur_w: u32 = fb.width;
-		let cur_h: u32 = fb.height;
+		let addr: u64 = surface.as_ref().map_or(0, |surface| surface.addr());
+		let fb: Option<ImageLayout> = surface.as_ref().map(|surface| surface.layout());
+		let cur_w: u32 = fb.map_or(0, |layout| layout.extent.width);
+		let cur_h: u32 = fb.map_or(0, |layout| layout.extent.height);
 		let has_fb: bool = surface.is_some();
 		// The console's own ConfigService client (minted under the bounded wait) and
 		// VT 1's terminal policy: the scrollback and history depths are the config
@@ -464,7 +466,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// A geometry the renderer cannot address means no terminal on this VT, not a panic on the
 		// first pixel: `has_fb` says a framebuffer was mapped, and this says it is one we can draw
 		// into.
-		let drawable: Option<Box<dyn Surface>> = if has_fb { make_surface(addr, &fb, &display) } else { None };
+		let drawable: Option<Box<dyn Surface>> = fb.as_ref().and_then(|layout| make_surface(addr, layout, &display));
 		let term: Option<Term> = if let Some(mut t) = drawable.and_then(|d| Term::try_new(d, vt_scrollback)) {
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			let mut log: Vec<u8> = alloc::vec![0u8; 16384];
@@ -1305,15 +1307,15 @@ fn handle_display_resize(console: &mut Console) {
 		return;
 	};
 	let new_addr: u64 = new_surface.addr();
-	let new_fb: Framebuffer = new_surface.framebuffer();
+	let new_fb: ImageLayout = new_surface.layout();
 	let old_surface: Option<Mapping> = console.surface.replace(new_surface);
 	console.addr = new_addr;
-	console.fb = new_fb;
-	console.cur_w = new_fb.width;
-	console.cur_h = new_fb.height;
+	console.fb = Some(new_fb);
+	console.cur_w = new_fb.extent.width;
+	console.cur_h = new_fb.extent.height;
 	console.has_fb = true;
-	let cols: usize = new_fb.width as usize / CELL_W;
-	let rows: usize = new_fb.height as usize / CELL_H;
+	let cols: usize = new_fb.extent.width as usize / CELL_W;
+	let rows: usize = new_fb.extent.height as usize / CELL_H;
 	let client: DisplayClient = console.display.clone();
 	let n: usize = console.vts.len();
 	for vi in 0..n {
@@ -1346,7 +1348,7 @@ fn create_vt(console: &mut Console) {
 		return;
 	}
 	let broker: u64 = console.broker;
-	if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, &console.fb, &console.display, console.cur_w, console.cur_h) {
+	if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, console.fb.as_ref(), &console.display, console.cur_w, console.cur_h) {
 		console.vts.push(vt);
 		console.fg = console.vts.len() - 1;
 		repaint(console);
@@ -1860,7 +1862,7 @@ fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_cont
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, fb: &Framebuffer, display: &DisplayClient, cur_w: u32, cur_h: u32) -> Option<Vt> {
+fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, layout: Option<&ImageLayout>, display: &DisplayClient, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	let (vt_service, vt_client): (u64, u64) = channel()?;
 	let (control_console, control_shell): (u64, u64) = channel()?;
 	if !spawn_shell(facs, broker, vt_client, control_shell, 0) {
@@ -1880,7 +1882,7 @@ fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, fb
 	// geometry cannot be addressed, rather than a panic on the first pixel.
 	// `and_then`, not `map`: a VT whose grid cannot be allocated has no terminal, the same answer
 	// an unaddressable geometry gives, rather than aborting the whole console service.
-	let term: Option<Term> = make_surface(addr, fb, display).and_then(|drawable| {
+	let term: Option<Term> = layout.and_then(|layout| make_surface(addr, layout, display)).and_then(|drawable| {
 		let mut t = Term::try_new(drawable, vt_scrollback)?;
 		t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		t.screen.clear();

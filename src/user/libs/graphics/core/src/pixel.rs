@@ -593,6 +593,50 @@ pub struct Encoder {
 	/// Whether the target can hold values above one. A narrower target is TONE MAPPED rather than
 	/// clipped, which is the difference between a bright window and a white rectangle.
 	tone_map: bool,
+	/// The luminance this encoder sends to one, relative to diffuse white: the DESTINATION'S when it
+	/// reported one, and the profile's constant when it did not.
+	tone_white: f64,
+}
+
+/// WHAT THE DESTINATION DISPLAY CAN ACTUALLY SHOW, in the terms a tone map needs.
+///
+/// A COLOUR SPACE NAME IS NOT ENOUGH TO TONE MAP WITH. The operator sends one luminance to one, and
+/// WHICH luminance that is depends on the display: a two-thousand-nit highlight shown on a
+/// two-hundred-nit panel and on a thousand-nit one are two different curves, and a conversion that
+/// does not know the destination's luminance is guessing at the one number that decides how the
+/// image looks.
+///
+/// EVERY FIELD IS OPTIONAL AND `None` IS NOT ZERO. A display that does not report its luminance is
+/// the ordinary case - nothing in this system asks a panel yet - and the profile's rule for absent
+/// HDR metadata is that it is a refusal to assume rather than a default to invent. What an unknown
+/// destination gets is the profile's STATED reference white point, which is one assumption written
+/// down in one place rather than one made per conversion.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct OutputLuminance {
+	/// What a relative 1.0 is, in cd/m².
+	pub sdr_white_nits: Option<f32>,
+	pub min_nits: Option<f32>,
+	/// The peak the display can show.
+	pub max_nits: Option<f32>,
+	/// The peak it can hold over a whole frame, which is lower than the peak on most panels.
+	pub max_frame_average_nits: Option<f32>,
+}
+
+impl OutputLuminance {
+	/// A destination that reported nothing.
+	pub const UNKNOWN: Self = Self { sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None };
+
+	/// The luminance the tone map sends to 1.0, RELATIVE TO DIFFUSE WHITE.
+	///
+	/// `max / sdr_white` when the display reported both and the numbers can be believed. A peak below
+	/// diffuse white, a zero or a non-finite value is a display description that cannot be true, and
+	/// the answer there is the profile's constant rather than a curve computed from nonsense.
+	pub fn tone_map_white(&self) -> f64 {
+		match (self.sdr_white_nits, self.max_nits) {
+			(Some(white), Some(max)) if white > 0.0 && white.is_finite() && max.is_finite() && max >= white => (max as f64) / (white as f64),
+			_ => graphics_profile::image::tone_map::WHITE,
+		}
+	}
 }
 
 impl Encoder {
@@ -601,13 +645,30 @@ impl Encoder {
 		self.transfer
 	}
 
+	/// An encoder for a destination whose luminance is not known, which is the profile's own
+	/// reference white point.
 	pub fn new(semantics: &ImageSemantics, storage: PixelStorage, working: Working) -> Result<Self, Error> {
+		Self::new_for_output(semantics, storage, working, OutputLuminance::UNKNOWN)
+	}
+
+	/// An encoder for a destination THAT SAID WHAT IT CAN SHOW.
+	///
+	/// THE DIFFERENCE IS THE ONE NUMBER THE TONE MAP TURNS ON. Mapping a highlight for a
+	/// two-hundred-nit panel and for a thousand-nit one are different curves, and every conversion
+	/// that did not ask used the same one.
+	pub fn new_for_output(semantics: &ImageSemantics, storage: PixelStorage, working: Working, output: OutputLuminance) -> Result<Self, Error> {
 		let space = semantics.color_space().ok_or(Error::NotColour)?;
 		let alpha = semantics.alpha_mode().ok_or(Error::NotColour)?;
 		working.validate()?;
 		let matrix = conversion(working.space(), space)?;
 		let steps = quantisation_steps(storage);
-		Ok(Self { transfer: space.transfer(), matrix, luminance: luminance_coefficients(space)?, alpha, working_is_linear: working.is_linear(), steps, step: steps.map(|steps| 1.0 / steps).unwrap_or(0.0), tone_map: steps.is_some() })
+		Ok(Self { transfer: space.transfer(), matrix, luminance: luminance_coefficients(space)?, alpha, working_is_linear: working.is_linear(), steps, step: steps.map(|steps| 1.0 / steps).unwrap_or(0.0), tone_map: steps.is_some(), tone_white: output.tone_map_white() })
+	}
+
+	/// What this encoder maps to one, relative to diffuse white - the destination's own when it
+	/// reported it, and the profile's constant when it did not.
+	pub fn tone_map_white(&self) -> f64 {
+		self.tone_white
 	}
 
 	/// The final stages: tone map where the target is narrower, convert, unpremultiply where the
@@ -650,7 +711,7 @@ impl Encoder {
 			// is inside the range already, and the luminance dot product to discover that is three
 			// multiplies per pixel; one comparison answers it.
 			if self.tone_map && (colour.red > 1.0 || colour.green > 1.0 || colour.blue > 1.0) {
-				colour = tone_mapped(colour, self.luminance);
+				colour = tone_mapped(colour, self.luminance, self.tone_white);
 			}
 			if let Some(matrix) = &self.matrix {
 				let converted = color::multiply_vector(matrix, [colour.red as f64, colour.green as f64, colour.blue as f64]);
@@ -700,14 +761,13 @@ fn conversion(from: ColorSpace, to: ColorSpace) -> Result<Option<Matrix3>, Error
 ///
 /// ON LUMINANCE AND NOT PER CHANNEL, because a per-channel curve shifts hue - and it shifts it most
 /// on exactly the saturated colours a wide-gamut image was made for.
-fn tone_mapped(colour: Rgba, luminance: (f64, f64, f64)) -> Rgba {
+fn tone_mapped(colour: Rgba, luminance: (f64, f64, f64), white: f64) -> Rgba {
 	let light = colour.red as f64 * luminance.0 + colour.green as f64 * luminance.1 + colour.blue as f64 * luminance.2;
 	// WRITTEN OUT BECAUSE EVERY COMPARISON WITH NaN IS FALSE: a NaN luminance must fall through
 	// unmapped rather than be scaled by a NaN ratio.
 	if !matches!(light.partial_cmp(&1.0), Some(core::cmp::Ordering::Greater)) {
 		return colour;
 	}
-	let white = graphics_profile::image::tone_map::WHITE;
 	let mapped = light * (1.0 + light / (white * white)) / (1.0 + light);
 	let scale = (mapped / light) as f32;
 	Rgba::new(colour.red * scale, colour.green * scale, colour.blue * scale, colour.alpha)

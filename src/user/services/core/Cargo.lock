@@ -46,6 +46,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "graphics-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "display-proto"
 version = "0.0.0"
 dependencies = [
@@ -90,6 +100,7 @@ name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
@@ -113,9 +124,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "indexmap"
-version = "2.14.0"
+version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown",
@@ -228,6 +239,7 @@ dependencies = [
  "base-proto",
  "config-proto",
  "device-proto",
+ "display-device-proto",
  "display-proto",
  "font-proto",
  "graphics-proto",
@@ -349,8 +361,10 @@ version = "0.0.0"
 dependencies = [
  "abi",
  "bootproto",
+ "display-device-proto",
  "driver-binding",
  "driver-protocol",
+ "graphics-core",
  "ipc-client",
  "keys",
  "pcm",
@@ -391,6 +405,7 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "display-proto",
+ "graphics-core",
  "input-proto",
  "ipc-client",
  "pix",
@@ -399,9 +414,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.4"
+version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -421,6 +436,9 @@ dependencies = [
 [[package]]
 name = "term"
 version = "0.0.0"
+dependencies = [
+ "graphics-core",
+]
 
 [[package]]
 name = "time-proto"

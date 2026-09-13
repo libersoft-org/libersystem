@@ -2,6 +2,7 @@ use super::*;
 
 use graphics_core::ColorSpace;
 use graphics_core::geom::{PointF, RectF};
+use graphics_core::pixel::OutputLuminance;
 
 fn rect_path(rect: RectF) -> Path {
 	let mut builder = PathBuilder::new();
@@ -268,7 +269,7 @@ fn every_prepared_dependency_invalidates_alone_and_is_named() {
 	let image = ImageRecord { identity: 7, layout_generation: 1, content_generation: 1 };
 	canvas.draw_image(image, RectF::new(0.0, 0.0, 4.0, 4.0), RectF::new(0.0, 0.0, 4.0, 4.0), ImageQuality::Bilinear).expect("an image");
 	let list = canvas.finish().expect("balanced");
-	let target = TargetDescription { extent: Extent2D::new(64, 64), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::SrgbLinear, scale: 1.0 };
+	let target = TargetDescription { extent: Extent2D::new(64, 64), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::SrgbLinear, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
 	let key = PreparedKey::of(&list, &target, ("soft2d", 1), 5);
 	assert!(key.compatible_with(&key).is_ok());
 

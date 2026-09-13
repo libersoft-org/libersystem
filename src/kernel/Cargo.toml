@@ -40,6 +40,24 @@ storage-proto = { path = "../user/libs/protocol/storage-proto" }
 # features only: the channel client half is behind `channel-client-impl` and needs the userspace
 # runtime, which the kernel does not have.
 device-proto = { path = "../user/libs/protocol/device-proto" }
+# THE SHARED GRAPHICS VALUE TYPES, for the same reason and the same suites. Two harnesses in
+# `tests.rs` stand in for DisplayService and answer an `acquire` with a surface description, and one
+# of that description's fields is a `pixel-format` - an enumeration that moved when it became the
+# shared `liber:graphics@1` one. Both harnesses wrote its ordinal by hand as a zero, which was
+# `b8g8r8x8` in the display package's own one-member enumeration and is `a8-unorm` in the shared
+# twelve-member one, so the client refused every surface and the test hung waiting for a frame that
+# was never going to come. Naming the value is what makes that a compile error next time.
+graphics-proto = { path = "../user/libs/protocol/graphics-proto" }
+# THE DISPLAY WIRE, for the same reason and the same two harnesses: they stand in for DisplayService
+# and answer an `acquire` with a `surface-info`, which now carries what the output can show. A
+# harness that appended those bytes by hand would be a second encoder of a record this tree generates
+# one for. Default features only, like `device-proto`: the channel client half needs the userspace
+# runtime, which the kernel does not have.
+display-proto = { path = "../user/libs/protocol/display-proto" }
+# AND THE DEVICE SIDE OF IT, for the harness that stands in for the DISPLAY DRIVER: it answers
+# `scanout` with a backing and a generation, which is a record with a capability in it - and a
+# harness writing those bytes by hand would be the second encoder this tree generates one for.
+display-device-proto = { path = "../user/libs/protocol/display-device-proto" }
 # The network wire types, for the same reason and in the same way: the permission-manager scenario
 # stands in for NetworkService so a governed `ip` has something to query, and a hand-written copy of
 # `net-info` is how that harness and the service drift apart - which is exactly what happened when
@@ -76,6 +94,11 @@ liberfs = { path = "../fs/liberfs" }
 # the fixture and the format from drifting (the checksums especially).
 partition = { path = "../fs/partition" }
 fscore = { path = "../fs/core" }
+# THE SHARED IMAGE MODEL, for the boot console's framebuffer description. The loader hands over a
+# mode line as six loose numbers; this is where they are checked and named, with the same constructor
+# every other consumer of a scanout surface in this tree uses. It arrived in the kernel's graph with
+# `pix` already - naming it here is what lets `console.rs` write the adapter.
+graphics-core = { path = "../user/libs/graphics/core" }
 # The shared terminal stack (grid model + framebuffer renderer): the boot console and
 # the ConsoleService renderer are the same `term::Term`, so there is one renderer.
 term = { path = "../term" }

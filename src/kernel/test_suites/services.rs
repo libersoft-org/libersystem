@@ -1,4 +1,6 @@
 use super::*;
+use display_device_proto::codec as wire;
+use display_device_proto::generated::liber::display_device::v1 as display_device;
 
 // A managed service that cannot complete a required bootstrap step reports the failing
 // step and the reason over its bootstrap channel before exiting, so the supervisor
@@ -310,6 +312,28 @@ fn display_service_restores_the_console_surface() {
 		Message::new(bytes, alloc::vec::Vec::new())
 	}
 
+	// A present, with its damage ENCODED BY THE GENERATED WRITER rather than by four `u32`s written
+	// out here. Damage is a bounded list with a whole-surface variant now, and a harness that laid its
+	// bytes out by hand would be a second encoder of a record this tree already generates one for -
+	// which is how a wire change becomes a test that waits for a frame nobody is going to send.
+	fn present_rects_request(corr: u32, rects: &[(i32, i32, u32, u32)]) -> Message {
+		use graphics_proto::generated::liber::graphics::v1::{DamageRegion, Extent2d, Offset2d, Rect};
+		let damage = DamageRegion { whole: false, rects: rects.iter().map(|(x, y, width, height)| Rect { origin: Offset2d { x: *x, y: *y }, size: Extent2d { width: *width, height: *height } }).collect() };
+		let mut bytes = 2u16.to_le_bytes().to_vec();
+		bytes.extend_from_slice(&corr.to_le_bytes());
+		bytes.extend_from_slice(&damage.encode_vec().expect("a damage region encodes"));
+		Message::new(bytes, alloc::vec::Vec::new())
+	}
+
+	fn present_request(corr: u32, x: i32, y: i32, width: u32, height: u32) -> Message {
+		use graphics_proto::generated::liber::graphics::v1::{DamageRegion, Extent2d, Offset2d, Rect};
+		let damage = DamageRegion { whole: false, rects: alloc::vec![Rect { origin: Offset2d { x, y }, size: Extent2d { width, height } }] };
+		let mut bytes = 2u16.to_le_bytes().to_vec();
+		bytes.extend_from_slice(&corr.to_le_bytes());
+		bytes.extend_from_slice(&damage.encode_vec().expect("a damage region encodes"));
+		Message::new(bytes, alloc::vec::Vec::new())
+	}
+
 	fn connect(root: &Channel) -> alloc::sync::Arc<Channel> {
 		root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("connect request");
 		sched::run_until_idle();
@@ -377,11 +401,25 @@ fn display_service_restores_the_console_surface() {
 		scanout_pixel_at(scanout, 0, 0)
 	}
 
+	// The rectangles a typed `present` carried, DECODED BY THE GENERATED READER. The message is the
+	// op, the correlation, the generation the frame was drawn for and the damage; a harness that read
+	// the rectangle at a byte offset would be a harness that breaks when a field moves - which is how
+	// this one spent three minutes waiting for a frame this morning.
+	fn present_rects(present: &Message) -> alloc::vec::Vec<(u32, u32, u32, u32)> {
+		let body = &present.bytes[10..];
+		let damage = display_device::DamageRegion::decode(body).expect("a present carries a damage region");
+		damage.rects.iter().map(|rect| (rect.origin.x as u32, rect.origin.y as u32, rect.size.width, rect.size.height)).collect()
+	}
+
+	// Answer one typed `present` on the device wire, the way a driver does: the op, then a reply that
+	// echoes the correlation and says the device acknowledged the transfer.
 	fn acknowledge_present(gpu: &Channel, client: Option<(&Channel, u32)>) -> Message {
 		sched::run_until_idle();
-		let present = gpu.recv().expect("synchronous PRESENT reaches the gpu");
-		assert_eq!(&present.bytes[..7], b"PRESENT", "DisplayService uses the acknowledged present path");
-		gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("present acknowledgement");
+		let present = gpu.recv().expect("synchronous present reaches the gpu");
+		assert_eq!(le_u16(&present.bytes, 0), 2, "DisplayService uses the acknowledged present path");
+		let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
+		reply.push(1);
+		gpu.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
 		sched::run_until_idle();
 		if let Some((channel, corr)) = client {
 			let reply = channel.recv().expect("typed display reply");
@@ -433,20 +471,21 @@ fn display_service_restores_the_console_surface() {
 	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
 	sched::run_until_idle();
 	let fb_request = gpu_kernel.recv().expect("framebuffer request");
-	assert_eq!(&fb_request.bytes[..], b"FB", "DisplayService requests the scanout");
+	assert_eq!(le_u16(&fb_request.bytes, 0), 1, "DisplayService asks the device for its scanout");
 	let scanout = match DmaBuffer::create_in(&sched::root_domain(), 4 * 4 * 4) {
 		Ok(scanout) => scanout,
 		Err(_) => panic!("stand-in scanout"),
 	};
-	let fb = abi::Framebuffer { width: 4, height: 4, pitch: 16, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
-	let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
-	fb_reply.extend_from_slice(&4u32.to_le_bytes());
-	fb_reply.extend_from_slice(&4u32.to_le_bytes());
+	let fb_reply = crate::tests::scanout_reply(le_u32(&fb_request.bytes, 2), 4, 4, 4 * 4 * 4);
 	// `WRITE` EXPLICITLY: DisplayService COMPOSITES into this scanout. It was handed over with `MAP`
 	// alone, which worked only while every mapping was writable regardless of what the capability
 	// said - `sys_memory_map` and `sys_dma_buffer_map` now set the writable bit from `Rights::WRITE`,
 	// so a surface to be drawn into has to say it is one.
 	send_cap(&gpu_kernel, &fb_reply, scanout.clone(), Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+	sched::run_until_idle();
+	// AND THE DEVICE'S EVENT STREAM, which the service opens as soon as it has adopted the device: a
+	// resize and a replacement arrive there, and not on the channel a present is answered on.
+	let device_stream = crate::tests::answer_device_events(&gpu_kernel);
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("DisplayService online report");
 	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
@@ -454,7 +493,7 @@ fn display_service_restores_the_console_surface() {
 	// The root connection is the native-size console surface.
 	let console = acquire(&console_client, &focus_input, b"CONSOLE", 1, 0, 0);
 	fill(&console, 0x0011_2233, 16);
-	console_client.send(request(2, 2, &[0, 0, 4, 4])).expect("console present");
+	console_client.send(present_request(2, 0, 0, 4, 4)).expect("console present");
 	acknowledge_present(&gpu_kernel, Some((&console_client, 2)));
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "console pixels reach the scanout");
 	console_client.send(request(4, 8, &[])).expect("display events request");
@@ -463,10 +502,14 @@ fn display_service_restores_the_console_surface() {
 	assert_eq!(le_u32(&events_reply.bytes, 0), 8, "events reply echoes correlation id");
 	let events_cap = events_reply.caps.first().expect("display event stream");
 	let events = events_cap.object().into_any_arc().downcast::<Channel>().expect("event stream is a channel");
-	let mut resize = b"RESIZE".to_vec();
-	resize.extend_from_slice(&4u32.to_le_bytes());
-	resize.extend_from_slice(&4u32.to_le_bytes());
-	gpu_kernel.send(Message::new(resize, alloc::vec::Vec::new())).expect("gpu resize event");
+	// THE DEVICE'S OWN EVENT STREAM, which the service opened when it adopted this device: a resize
+	// arrives there rather than on the channel a present is answered on.
+	let device_events = device_stream.expect("DisplayService opened the device's event stream");
+	let mut resize_frame = [0u8; 64];
+	let mut resize_handles = wire::Handles::new();
+	let resized = display_device::DeviceEvent::Resized(display_device::Extent2d { width: 4, height: 4 });
+	let resize_len = display_device::display_device::events_frame(0, &resized, &mut resize_frame, &mut resize_handles).expect("a device event encodes");
+	device_events.send(Message::new(resize_frame[..resize_len].to_vec(), alloc::vec::Vec::new())).expect("gpu resize event");
 	acknowledge_present(&gpu_kernel, None);
 	let resize_event = events.recv().expect("typed display resize event");
 	assert_eq!(le_u32(&resize_event.bytes, 4), 4, "resize event width");
@@ -486,16 +529,16 @@ fn display_service_restores_the_console_surface() {
 	let replay_reply = app.recv().expect("replayed focus proof reply");
 	assert_eq!(replay_reply.bytes[4], 0, "focus proof is one-shot");
 	fill(&app_surface, 0x00aa_bbcc, 4);
-	app.send(request(2, 4, &[0, 0, 1, 1])).expect("app first present");
+	app.send(present_request(4, 0, 0, 1, 1)).expect("app first present");
 	let first_scaled = acknowledge_present(&gpu_kernel, Some((&app, 4)));
-	assert_eq!((le_u32(&first_scaled.bytes, 7), le_u32(&first_scaled.bytes, 11), le_u32(&first_scaled.bytes, 15), le_u32(&first_scaled.bytes, 19)), (0, 0, 4, 4), "first present initializes the whole scanout");
+	assert_eq!(present_rects(&first_scaled), alloc::vec![(0, 0, 4, 4)], "first present initializes the whole scanout");
 	assert_eq!(scanout_pixel(&scanout), 0x00aa_bbcc, "foreground app replaces the console");
 	assert_eq!(scanout_pixel_at(&scanout, 3, 3), 0x00aa_bbcc, "first small damage cannot leak the previous console outside its rectangle");
 	let before_damage = display_stats(&display_admin, 60);
 	set_surface_pixel(&app_surface, 0, 0x0055_6677);
-	app.send(request(2, 61, &[0, 0, 1, 1])).expect("incremental scaled damage");
+	app.send(present_request(61, 0, 0, 1, 1)).expect("incremental scaled damage");
 	let scaled_damage = acknowledge_present(&gpu_kernel, Some((&app, 61)));
-	assert_eq!((le_u32(&scaled_damage.bytes, 7), le_u32(&scaled_damage.bytes, 11), le_u32(&scaled_damage.bytes, 15), le_u32(&scaled_damage.bytes, 19)), (0, 0, 2, 2), "scaled damage maps to its conservative output rectangle");
+	assert_eq!(present_rects(&scaled_damage), alloc::vec![(0, 0, 2, 2)], "scaled damage maps to its conservative output rectangle");
 	assert_eq!(scanout_pixel_at(&scanout, 0, 0), 0x0055_6677);
 	assert_eq!(scanout_pixel_at(&scanout, 1, 1), 0x0055_6677);
 	assert_eq!(scanout_pixel_at(&scanout, 2, 2), 0x00aa_bbcc, "scaled damage leaves unaffected output pixels unchanged");
@@ -504,6 +547,48 @@ fn display_service_restores_the_console_surface() {
 	assert_eq!(after_damage[3] - before_damage[3], 1, "one source damage pixel");
 	assert_eq!(after_damage[4] - before_damage[4], 4, "only four scaled output pixels written");
 	assert!(after_damage[7] != 0, "present latency is measured in nanoseconds");
+
+	// TWO CORNERS ARE TWO TRANSFERS AND NOT THEIR BOUNDING BOX, which is the whole reason damage is a
+	// list. The client's surface is 2x2 scaled onto a 4x4 scanout, so the two opposite corners have a
+	// bounding box of the entire surface: a service that unioned them would send one transfer of four
+	// source pixels, and the assertions below would both fail.
+	let before_list = display_stats(&display_admin, 63);
+	set_surface_pixel(&app_surface, 0, 0x0011_2233);
+	set_surface_pixel(&app_surface, 3, 0x0044_5566);
+	app.send(present_rects_request(64, &[(0, 0, 1, 1), (1, 1, 1, 1)])).expect("two corners in one present");
+	let two_corners = acknowledge_present(&gpu_kernel, Some((&app, 64)));
+	// ONE PRESENT ON THE DEVICE WIRE CARRYING TWO RECTANGLES, and their union is the whole scanout: a
+	// service that merged them would send `(0, 0, 4, 4)` here and four source pixels below.
+	assert_eq!(present_rects(&two_corners), alloc::vec![(0, 0, 2, 2), (2, 2, 2, 2)], "both corners are transferred, each on its own");
+	let after_list = display_stats(&display_admin, 65);
+	assert_eq!(after_list[0] - before_list[0], 1, "two rectangles are ONE present");
+	assert_eq!(after_list[3] - before_list[3], 2, "and two source pixels, not the four of their bounding box");
+	assert_eq!(scanout_pixel_at(&scanout, 0, 0), 0x0011_2233);
+	assert_eq!(scanout_pixel_at(&scanout, 2, 2), 0x0044_5566);
+	assert_eq!(scanout_pixel_at(&scanout, 2, 0), 0x00aa_bbcc, "the pixels between the two corners are not touched");
+
+	// AN EMPTY LIST IS "NOTHING CHANGED": ordered, completed, and nothing copied. A service that
+	// answered an error would make the profile's own answer a failure every client has to work
+	// around, and one that transferred the surface would make it the most expensive present there is.
+	app.send(present_rects_request(66, &[])).expect("an empty damage list");
+	sched::run_until_idle();
+	let empty_reply = app.recv().expect("an empty present still completes");
+	assert_eq!(le_u32(&empty_reply.bytes, 0), 66);
+	assert_eq!(empty_reply.bytes[4], 1, "nothing changed is a success");
+	assert!(gpu_kernel.recv().is_err(), "and nothing was transferred");
+	let after_empty = display_stats(&display_admin, 67);
+	assert_eq!(after_empty[0] - after_list[0], 1, "the present is still counted");
+	assert_eq!(after_empty[3] - after_list[3], 0, "and it carried no pixels");
+
+	// A RECTANGLE OUTSIDE THE EXTENT IS A TYPED REFUSAL AND NEVER A CLAMP, and a frame whose second
+	// rectangle is out of bounds presents NONE of it rather than half.
+	app.send(present_rects_request(68, &[(0, 0, 1, 1), (1, 1, 2, 2)])).expect("a rectangle past the extent");
+	sched::run_until_idle();
+	let refused = app.recv().expect("a refusal is still a reply");
+	assert_eq!(le_u32(&refused.bytes, 0), 68);
+	assert_eq!(refused.bytes[4], 0, "out of bounds is refused rather than clamped");
+	assert!(gpu_kernel.recv().is_err(), "and the rectangle that WAS valid was not presented either");
+
 	app.send(request(3, 5, &[])).expect("app release");
 	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, Some((&app, 5)));
@@ -525,7 +610,7 @@ fn display_service_restores_the_console_surface() {
 	assert!(frozen.recv().is_err(), "process-bound display connection cannot mint an unbound child");
 	let frozen_surface = acquire(&frozen, &focus_input, b"SET", 9, 2, 2);
 	fill(&frozen_surface, 0x0000_77dd, 4);
-	frozen.send(request(2, 10, &[0, 0, 2, 2])).expect("frozen app present");
+	frozen.send(present_request(10, 0, 0, 2, 2)).expect("frozen app present");
 	acknowledge_present(&gpu_kernel, Some((&frozen, 10)));
 	kill_input.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new())).expect("emergency display revoke");
 	acknowledge_focus(&focus_input, b"CONSOLE");
@@ -538,7 +623,7 @@ fn display_service_restores_the_console_surface() {
 	let crashed = connect(&console_client);
 	let crashed_surface = acquire(&crashed, &focus_input, b"SET", 6, 2, 2);
 	fill(&crashed_surface, 0x00dd_4400, 4);
-	crashed.send(request(2, 7, &[0, 0, 2, 2])).expect("crashed app present");
+	crashed.send(present_request(7, 0, 0, 2, 2)).expect("crashed app present");
 	acknowledge_present(&gpu_kernel, Some((&crashed, 7)));
 	assert_eq!(scanout_pixel(&scanout), 0x00dd_4400, "second foreground app reaches scanout");
 	drop(crashed);
@@ -567,10 +652,10 @@ fn display_service_restores_the_console_surface() {
 	let benchmark_surface = acquire(&benchmark, &focus_input, b"SET", 70, 320, 200);
 	fill(&benchmark_surface, 0x0033_6699, 320 * 200);
 	let before_full = display_stats(&display_admin, 71);
-	benchmark.send(request(2, 72, &[0, 0, 320, 200])).expect("full benchmark present");
+	benchmark.send(present_request(72, 0, 0, 320, 200)).expect("full benchmark present");
 	acknowledge_present(&gpu_kernel, Some((&benchmark, 72)));
 	let after_full = display_stats(&display_admin, 73);
-	benchmark.send(request(2, 74, &[32, 20, 32, 20])).expect("damage benchmark present");
+	benchmark.send(present_request(74, 32, 20, 32, 20)).expect("damage benchmark present");
 	acknowledge_present(&gpu_kernel, Some((&benchmark, 74)));
 	let after_damage = display_stats(&display_admin, 75);
 	let full_blit_ns = after_full[5] - before_full[5];

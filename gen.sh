@@ -26,7 +26,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display security session input storage font graphics)
+PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -42,6 +42,10 @@ declare -A EXTERNAL=(
 	[config]="base storage"
 	[process]="base resources"
 	[display]="base process graphics"
+	# THE DEVICE SIDE OF THE DISPLAY, which imports the shared graphics values and the base error and
+	# declares no client-facing type of its own: a driver's wire and an application's wire are two
+	# contracts, and one package carrying both would make every application depend on the device one.
+	[display - device]="base graphics"
 	[security]="base process"
 	[session]="base process"
 	[input]="base"
@@ -55,7 +59,7 @@ declare -A EXTERNAL=(
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(audio base config device display font graphics input log network observability process resources security session storage time)
+AGGREGATE_EXTERNAL=(audio base config device display display-device font graphics input log network observability process resources security session storage time)
 
 help() {
 	usage_and_exit <<EOF
@@ -139,7 +143,10 @@ for package in "${PACKAGES[@]}"; do
 	out="$(crate_dir "$package")"
 	args=(--rust-package "liber:$package@1")
 	for external in ${EXTERNAL[$package]}; do
-		args+=(--external-rust-package "liber:$external@1=${external}_proto::generated::liber::$external")
+		# THE RUST SIDE SPELLS A HYPHEN AS AN UNDERSCORE and the wire side does not: `liber:display-device@1`
+		# is the package, `display_device_proto` is the crate and `display_device` is the module. One
+		# substitution here rather than a second list nobody keeps in step.
+		args+=(--external-rust-package "liber:$external@1=${external//-/_}_proto::generated::liber::${external//-/_}")
 	done
 	generate "$out" "${args[@]}"
 done
@@ -147,7 +154,7 @@ done
 out="$(crate_dir proto)"
 args=()
 for external in "${AGGREGATE_EXTERNAL[@]}"; do
-	args+=(--external-rust-package "liber:$external@1=${external}_proto::generated::liber::$external")
+	args+=(--external-rust-package "liber:$external@1=${external//-/_}_proto::generated::liber::${external//-/_}")
 done
 args+=(--docs-dir ../../../docs/gen)
 generate "$out" "${args[@]}"

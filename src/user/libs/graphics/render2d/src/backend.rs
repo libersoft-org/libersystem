@@ -7,6 +7,7 @@
 //! so BEFORE it starts drawing rather than failing halfway through a filter chain - which leaves a
 //! half-drawn frame on the screen.
 
+use graphics_core::pixel::OutputLuminance;
 use graphics_core::{ColorSpace, Extent2D, ImageViewMut, PixelFormat};
 
 use crate::Error;
@@ -22,6 +23,13 @@ pub struct TargetDescription {
 	/// Physical pixels per logical pixel. Curves are flattened in DEVICE space, so this is part of
 	/// what a prepared list is bound to.
 	pub scale: f32,
+	/// WHAT THE DESTINATION CAN ACTUALLY SHOW, which the tone map needs and a colour space name does
+	/// not say. A target that reports nothing gets the profile's stated reference white point.
+	///
+	/// IT IS NOT PART OF THE PREPARED KEY, deliberately: the tone curve is applied when a tile is
+	/// ENCODED into the target, and preparation flattens geometry and builds shaders. A display that
+	/// changes what it can show changes the pixels, not the preparation.
+	pub luminance: OutputLuminance,
 }
 
 /// What a backend hands back from `prepare`.

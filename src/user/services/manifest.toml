@@ -159,9 +159,33 @@ path = "user/libs/protocol/device-proto"
 owner = "display-proto"
 path = "user/libs/protocol/display-proto"
 
+# The DEVICE side of the display, which is a different contract from the application side: one is
+# what a driver serves and the other is what an application calls. Two packages so that an
+# application never links the driver's wire and a driver never links the application's.
+[[sources]]
+owner = "display-device-proto"
+path = "user/libs/protocol/display-device-proto"
+
 [[sources]]
 owner = "driver-binding"
 path = "user/libs/driver/binding"
+
+# What a monitor says about itself, as a parser and a vocabulary. A SOURCE ROW AND NO LIBRARY ROW for
+# the same reason `hid-i2c` has none: EDID arrives over DDC, which is I2C on the display connector,
+# and nothing in this tree can fetch it yet - so the parser is proved on the host and staged when the
+# display controller that reads it exists.
+[[sources]]
+owner = "edid"
+path = "user/libs/display/edid"
+
+# The HID-over-I2C descriptor and register protocol. A SOURCE ROW AND NO LIBRARY ROW, deliberately:
+# nothing links it yet. There is no I2C controller driver in this tree and no provider kind for one,
+# so the protocol half is a parser proved on the host while the binding half waits for a controller
+# item with a real fixture - and staging a library nothing imports would put an artifact in the image
+# for no consumer.
+[[sources]]
+owner = "hid-i2c"
+path = "user/libs/driver/hid-i2c"
 
 # The entropy pool's policy - what a seed submission is credited and what the pool refuses below its
 # threshold. A kernel dependency that lives outside the kernel for the reason `driver-binding` does:
@@ -719,8 +743,21 @@ stage = "volume"
 destination = "libexec/display_service.lsexe"
 # `device-proto` and `ipc-client` because this service DISCOVERS its display: it holds a
 # provider-catalogue connection and subscribes to the display kind rather than being handed a driver
-# channel. `base-proto` comes with the catalogue's error type.
-providers = ["pix", "display-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+# channel. `base-proto` comes with the catalogue's error type, and `graphics-proto` with the damage
+# region a present carries - the shared value package the display interface imports rather than
+# declaring its own.
+providers = [
+	"pix",
+	"display-proto",
+	"display-device-proto",
+	"graphics-core",
+	"graphics-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"lsrt",
+]
 
 [[programs]]
 name = "dmesg"
@@ -3405,6 +3442,16 @@ features = ["shared-image"]
 # `liber:graphics@1`'s type, so this library calls its reader and writer.
 providers = ["base-proto", "graphics-proto", "ipc-client", "wire", "lsrt"]
 
+# THE TYPED WIRE BETWEEN DISPLAYSERVICE AND A DISPLAY DRIVER, which was seven byte strings and a
+# framebuffer record memcpy'd out of a message at an offset. Staged as a library because both ends
+# link it - the service calls it and the driver serves it.
+[[libraries]]
+name = "display-device-proto"
+owner = "display-device-proto"
+destination = "lib/protocol/display-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "graphics-proto", "ipc-client", "wire", "lsrt"]
+
 # THE SHARED GRAPHICS VALUE TYPES, staged as a library because more than one graphics interface
 # calls into them. It declares no interface of its own - an extent, a rectangle, a pixel format, a
 # colour space and an alpha mode - and every package that used to declare its own copy imports it.
@@ -3413,7 +3460,10 @@ name = "graphics-proto"
 owner = "graphics-proto"
 destination = "lib/protocol/graphics-proto.lslib"
 features = ["shared-image"]
-providers = ["ipc-client", "wire", "lsrt"]
+# NO `ipc-client`, and the inventory is what says so: this package declares no INTERFACE, so nothing
+# in it calls a transport. A provider that satisfies no direct import is a dependency nobody needs,
+# which the shared-image graph refuses by name rather than carrying.
+providers = ["wire", "lsrt"]
 
 # The synthetic ICD. It carries no Vulkan entry point: what it implements is the Loader/Driver
 # INTERFACE - two exports and the version negotiation between them - which is what a selection slot
@@ -3744,14 +3794,14 @@ name = "surface"
 owner = "surface"
 destination = "lib/display/surface.lslib"
 features = []
-providers = ["base-proto", "display-proto", "ipc-client", "lsrt"]
+providers = ["base-proto", "display-proto", "graphics-core", "ipc-client", "lsrt"]
 
 [[libraries]]
 name = "term"
 owner = "term"
 destination = "lib/terminal/term.lslib"
 features = []
-providers = ["lsrt"]
+providers = ["graphics-core", "lsrt"]
 
 [[libraries]]
 name = "tga"

@@ -2,6 +2,7 @@ use super::*;
 
 use graphics_core::geom::{Extent2D, PointF, RectF};
 use graphics_core::layout::{ImageLayout, RowOrigin};
+use graphics_core::pixel::OutputLuminance;
 use graphics_core::semantics::ImageSemantics;
 use graphics_core::{AlphaMode, ColorSpace, OwnedImage, PixelFormat, PixelStorage};
 use render2d::backend::{Backend, TargetDescription};
@@ -19,7 +20,7 @@ fn target(width: u32, height: u32) -> OwnedImage {
 }
 
 fn description(image: &OwnedImage) -> TargetDescription {
-	TargetDescription { extent: image.layout().extent, format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 }
+	TargetDescription { extent: image.layout().extent, format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN }
 }
 
 /// The stored bytes of one pixel, which is what a fixture states its expectations in.
@@ -379,7 +380,7 @@ fn nothing_is_written_outside_the_target() {
 	canvas.fill_path(rect_path(RectF::new(-8.0, -8.0, 64.0, 64.0)), red(), FillRule::NonZero).expect("a fill reaching past every edge");
 	let list = canvas.finish().expect("a list");
 	let mut backend = Soft2d::new();
-	let description = TargetDescription { extent: Extent2D::new(width, height), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 };
+	let description = TargetDescription { extent: Extent2D::new(width, height), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
 	let prepared = backend.prepare(&list, &description).expect("a preparation");
 	{
 		let mut view = graphics_core::ImageViewMut::new(layout, &mut bytes).expect("a view");
@@ -930,7 +931,7 @@ fn hostile_input_is_answered_rather_than_crashed_on() {
 			let layout = ImageLayout::new(Extent2D::new(9, 7), 9 * 4 + 5, storage, RowOrigin::TopLeft, semantics).expect("a layout");
 			let mut bytes = alloc::vec![0xC3u8; (9 * 4 + 5) * 7 + 32];
 			let mut backend = Soft2d::new();
-			let description = TargetDescription { extent: Extent2D::new(9, 7), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 };
+			let description = TargetDescription { extent: Extent2D::new(9, 7), format: PixelFormat::R8G8B8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
 			if let Ok(prepared) = backend.prepare(&list, &description) {
 				let mut view = graphics_core::ImageViewMut::new(layout, &mut bytes).expect("a view");
 				let _ = backend.render(&prepared, &mut view);

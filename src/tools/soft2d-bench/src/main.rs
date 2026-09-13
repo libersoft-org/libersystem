@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use graphics_core::geom::{Extent2D, PointF, RectF};
 use graphics_core::layout::{ImageLayout, RowOrigin};
+use graphics_core::pixel::OutputLuminance;
 use graphics_core::semantics::ImageSemantics;
 use graphics_core::{AlphaMode, ColorSpace, ImageView, OwnedImage, PixelFormat, PixelStorage};
 use render2d::backend::{Backend, TargetDescription};
@@ -144,7 +145,7 @@ fn main() {
 		}
 
 		let mut target = target();
-		let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0 };
+		let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
 		let mut backend = Soft2d::new().with_images(&images);
 		let started = Instant::now();
 		let prepared = backend.prepare(&list, &description).expect("a preparation");

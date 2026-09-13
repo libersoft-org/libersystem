@@ -619,3 +619,181 @@ fn a_planar_source_samples_through_the_shared_pipeline() {
 	let averaged = pixel::read(&top, 0, 0).expect("its one texel");
 	assert!((averaged.red - 1.0).abs() < 0.02, "an all-white frame averages to white: {averaged:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The wire boundary: `liber:graphics@1`'s descriptors becoming this library's validated types.
+//
+// WHAT THESE HOLD IS THAT THERE IS NO OTHER WAY IN. Each case is a descriptor a peer could send and
+// a consumer would otherwise trust: a pitch that does not cover a row, an extent of zero, an alpha
+// mode the format has no channel for. The refusals are `ImageLayout::new`'s and are tested there
+// too; what is tested HERE is that crossing the boundary reaches them.
+// ---------------------------------------------------------------------------------------------
+
+use graphics_proto::generated::liber::graphics::v1 as gw;
+
+fn wire_layout(width: u32, height: u32, pitch: u32, format: gw::PixelFormat, alpha: gw::AlphaMode) -> gw::ImageLayout {
+	gw::ImageLayout { size: gw::Extent2d { width, height }, pitch, format, alpha, color_space: gw::ColorSpace::Srgb, origin: gw::RowOrigin::TopLeft }
+}
+
+#[test]
+fn a_wire_descriptor_whose_pitch_does_not_cover_a_row_is_refused_at_the_boundary() {
+	// 4 bytes per pixel over 16 pixels is 64, and 63 is the descriptor that makes every row after
+	// the first read into the one before it.
+	let short = wire_layout(16, 8, 63, gw::PixelFormat::B8g8r8a8Unorm, gw::AlphaMode::Premultiplied);
+	assert_eq!(ImageLayout::try_from(&short), Err(Error::PitchTooSmall));
+	// And the pitch that exactly covers it is admitted, so the bound is the row and not a margin.
+	let exact = wire_layout(16, 8, 64, gw::PixelFormat::B8g8r8a8Unorm, gw::AlphaMode::Premultiplied);
+	assert!(ImageLayout::try_from(&exact).is_ok());
+}
+
+#[test]
+fn a_wire_descriptor_with_no_pixels_in_it_is_refused() {
+	// A ZERO EXTENT IS A REFUSAL AND NOT AN EMPTY IMAGE: every consumer that divides by an extent
+	// would otherwise have to check, and one of them will not.
+	for (width, height) in [(0u32, 8u32), (16, 0), (0, 0)] {
+		let empty = wire_layout(width, height, 64, gw::PixelFormat::B8g8r8a8Unorm, gw::AlphaMode::Premultiplied);
+		assert_eq!(ImageLayout::try_from(&empty), Err(Error::ZeroExtent), "{width}x{height} was admitted");
+	}
+}
+
+#[test]
+fn a_wire_descriptor_claiming_alpha_a_format_does_not_have_is_refused() {
+	// `B8G8R8X8` has four bytes and three channels: the fourth is unused, so `Straight` describes a
+	// channel that is not there. Refusing it at the boundary keeps the combination out of every
+	// backend's match arms.
+	let impossible = wire_layout(16, 8, 64, gw::PixelFormat::B8g8r8x8Unorm, gw::AlphaMode::Straight);
+	assert!(ImageLayout::try_from(&impossible).is_err());
+}
+
+#[test]
+fn a_validated_layout_round_trips_through_the_wire_unchanged() {
+	// THE DIRECTION THAT CANNOT FAIL. A validated colour layout is expressible by construction, so
+	// `to_wire` answers `Some` - and the value that comes back through `try_from` is the same one.
+	for format in [gw::PixelFormat::B8g8r8a8Unorm, gw::PixelFormat::R8g8b8a8Unorm, gw::PixelFormat::R16g16b16a16Float] {
+		for origin in [gw::RowOrigin::TopLeft, gw::RowOrigin::BottomLeft] {
+			let mut sent = wire_layout(32, 4, 256, format, gw::AlphaMode::Premultiplied);
+			sent.origin = origin;
+			sent.color_space = gw::ColorSpace::Rec2020Pq;
+			let validated = ImageLayout::try_from(&sent).expect("a descriptor this test built is admissible");
+			let back = validated.to_wire().expect("a colour layout is expressible on the wire");
+			assert_eq!(back, sent);
+		}
+	}
+}
+
+#[test]
+fn a_layout_the_wire_cannot_describe_answers_none_rather_than_inventing_one() {
+	// The wire record holds a colour space and an alpha mode and has nothing that could say the
+	// image is depth or a mask. Answering `None` is the honest form; inventing a colour space for a
+	// depth buffer is the quiet nonsense a boundary exists to stop.
+	let depth = ImageLayout::new(Extent2D { width: 8, height: 8 }, 32, PixelStorage::Known(PixelFormat::R32Uint), RowOrigin::TopLeft, ImageSemantics::Depth).expect("a depth layout");
+	assert!(depth.to_wire().is_none());
+}
+
+#[test]
+// A NAMED SCANOUT FORMAT AND A MODE LINE ARE TWO WAYS OF SAYING ONE THING, and the tree used to say
+// it in three places: a boot console, a blitter's destination and a display client each kept its own
+// `16/8/0`. One of those is right for `B8G8R8X8` and wrong for `R8G8B8X8`, and nothing would have
+// caught the difference but a screen full of swapped colours.
+fn a_named_packed_format_describes_itself_as_masks() {
+	let bgr = PixelFormat::B8G8R8X8Unorm.packed_masks().expect("a scanout format has masks");
+	// The NAME is memory order and the SHIFTS are not: blue is the first byte, so on a little-endian
+	// element blue sits at 0 and red at 16.
+	assert_eq!((bgr.red.shift, bgr.green.shift, bgr.blue.shift), (16, 8, 0));
+	assert_eq!(PixelFormat::B8G8R8A8Unorm.packed_masks(), Some(bgr), "the two BGR formats differ in their fourth lane, which these masks do not describe");
+
+	let rgb = PixelFormat::R8G8B8X8Unorm.packed_masks().expect("the firmware RGB hand-off has masks");
+	assert_eq!((rgb.red.shift, rgb.green.shift, rgb.blue.shift), (0, 8, 16), "the mirror of the BGR pair, which a hard-coded table got wrong");
+	assert_eq!(PixelFormat::R8G8B8A8Unorm.packed_masks(), Some(rgb));
+
+	// THE FOURTH LANE IS NOT DESCRIBED. The shared packer writes a declared reserved span with all
+	// its bits set, so describing one here would turn a blitter's `0x00rrggbb` into `0xffrrggbb` and
+	// write over a destination's alpha. (Measured: three blit tests failed on exactly that byte.)
+	assert_eq!(bgr.reserved.bits, 0, "the fourth lane belongs to whoever owns the format");
+	assert!(bgr.validate().is_ok(), "and what it describes is a layout the packer accepts");
+
+	// EVERYTHING ELSE IS HONEST ABOUT NOT BEING FOUR 8-BIT SPANS, rather than being handed BGRA's.
+	for format in [
+		PixelFormat::A8Unorm,
+		PixelFormat::R8Unorm,
+		PixelFormat::R8G8Unorm,
+		PixelFormat::R10G10B10A2Unorm,
+		PixelFormat::R16G16B16A16Unorm,
+		PixelFormat::R16G16B16A16Float,
+		PixelFormat::R32Uint,
+		PixelFormat::R32G32B32A32Float,
+	] {
+		assert_eq!(format.packed_masks(), None, "{} is not four 8-bit channels", format.name());
+	}
+
+	// AND THE STORAGE ASKS THE SAME QUESTION FOR BOTH ARMS, so a writer that packs never matches on
+	// which arm described its destination.
+	assert_eq!(PixelStorage::Known(PixelFormat::B8G8R8X8Unorm).packed_masks(), Some(bgr));
+	assert_eq!(PixelStorage::PackedRgbUnorm(bgr).packed_masks(), Some(bgr));
+	assert_eq!(PixelStorage::Known(PixelFormat::R32Uint).packed_masks(), None);
+}
+
+#[test]
+// THE SCANOUT LAYOUT IS BUILT IN FOUR PLACES AND DECIDED IN ONE. A boot console, a display client's
+// mapping, a terminal renderer and a blitter's destination each restated "top-left, opaque, sRGB" -
+// three constants that are not a choice at this layer, and three chances to differ.
+fn a_scanout_layout_carries_the_constants_a_scanout_does_not_choose() {
+	let masks = PackedRgbLayout::from_masks(4, (16, 8), (8, 8), (0, 8)).expect("a four-byte mode line");
+	let layout = ImageLayout::scanout(Extent2D::new(64, 32), 64 * 4, PixelStorage::PackedRgbUnorm(masks)).expect("the ordinary firmware hand-off");
+	assert_eq!(layout.origin, RowOrigin::TopLeft);
+	assert_eq!(layout.semantics, ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Opaque });
+	assert_eq!(layout.storage, PixelStorage::PackedRgbUnorm(masks));
+	assert_eq!(layout.minimum_visible_bytes(), Some(64 * 4 * 32));
+
+	// IT IS THE CHECKED CONSTRUCTOR AND NOT A SHORTHAND AROUND IT: a pitch that does not hold a row
+	// is refused here exactly as it is there.
+	assert_eq!(ImageLayout::scanout(Extent2D::new(64, 32), 64 * 4 - 1, PixelStorage::PackedRgbUnorm(masks)).err(), Some(Error::PitchTooSmall));
+	// An element size a mode line cannot have is refused before a layout exists at all.
+	assert_eq!(PackedRgbLayout::from_masks(256, (16, 8), (8, 8), (0, 8)), None);
+	// And the six numbers never describe a reserved span, for the reason stated above.
+	assert_eq!(masks.reserved.bits, 0);
+}
+
+#[test]
+// A COLOUR SPACE NAME IS NOT ENOUGH TO TONE MAP WITH, which is this test's whole point: the same
+// bright pixel encodes differently for a dim panel and for a bright one, and identically for two
+// displays that said nothing.
+fn the_tone_map_asks_the_destination_what_it_can_show() {
+	use crate::pixel::{Encoder, OutputLuminance, Working};
+	let working = Working::linear(ColorSpace::Srgb);
+	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Premultiplied };
+	let storage = PixelStorage::Known(PixelFormat::R8G8B8A8Unorm);
+
+	// A destination that said nothing gets the profile's own stated white point, and that is the
+	// ASSUMPTION WRITTEN DOWN ONCE rather than one made per conversion.
+	let unknown = Encoder::new(&semantics, storage, working).expect("an encoder");
+	assert_eq!(unknown.tone_map_white(), graphics_profile::image::tone_map::WHITE);
+	assert_eq!(OutputLuminance::UNKNOWN.tone_map_white(), graphics_profile::image::tone_map::WHITE);
+	assert_eq!(OutputLuminance::default(), OutputLuminance::UNKNOWN);
+
+	// A thousand-nit display whose diffuse white is the profile's 203 maps its peak at about five
+	// times white, which is a different curve from the default four.
+	let bright = OutputLuminance { sdr_white_nits: Some(203.0), max_nits: Some(1015.0), min_nits: Some(0.1), max_frame_average_nits: Some(600.0) };
+	assert!((bright.tone_map_white() - 5.0).abs() < 1e-6);
+	let encoder = Encoder::new_for_output(&semantics, storage, working, bright).expect("an encoder");
+	assert_eq!(encoder.tone_map_white(), bright.tone_map_white());
+
+	// AND THE TWO CURVES PRODUCE DIFFERENT PIXELS, which is what makes the metadata worth carrying: a
+	// highlight at three times diffuse white is darker on the panel that cannot show it.
+	let highlight = crate::pixel::Rgba::new(3.0, 3.0, 3.0, 1.0);
+	assert_ne!(unknown.encode(highlight, 0, 0), encoder.encode(highlight, 0, 0), "the destination's luminance changed the pixel");
+
+	// A DISPLAY DESCRIPTION THAT CANNOT BE TRUE FALLS BACK rather than computing a curve from
+	// nonsense: a zero white, a peak below diffuse white, and a non-finite number are each refused.
+	for impossible in [
+		OutputLuminance { sdr_white_nits: Some(0.0), max_nits: Some(1000.0), ..OutputLuminance::UNKNOWN },
+		OutputLuminance { sdr_white_nits: Some(203.0), max_nits: Some(100.0), ..OutputLuminance::UNKNOWN },
+		OutputLuminance { sdr_white_nits: Some(f32::NAN), max_nits: Some(1000.0), ..OutputLuminance::UNKNOWN },
+		OutputLuminance { sdr_white_nits: Some(203.0), max_nits: Some(f32::INFINITY), ..OutputLuminance::UNKNOWN },
+		// Half a description is not a description.
+		OutputLuminance { max_nits: Some(1000.0), ..OutputLuminance::UNKNOWN },
+		OutputLuminance { sdr_white_nits: Some(203.0), ..OutputLuminance::UNKNOWN },
+	] {
+		assert_eq!(impossible.tone_map_white(), graphics_profile::image::tone_map::WHITE, "{impossible:?} is not a display");
+	}
+}

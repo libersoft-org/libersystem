@@ -95,6 +95,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "graphics-proto",
+ "wire",
+]
+
+[[package]]
+name = "display-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "graphics-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "dma"
 version = "0.0.0"
 
@@ -160,12 +179,20 @@ name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
 [[package]]
 name = "graphics-profile"
 version = "0.0.0"
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "hashbrown"
@@ -214,6 +241,8 @@ dependencies = [
  "bootproto",
  "buddy",
  "device-proto",
+ "display-device-proto",
+ "display-proto",
  "dma",
  "driver-binding",
  "driver-protocol",
@@ -222,6 +251,8 @@ dependencies = [
  "flac",
  "fscore",
  "gif",
+ "graphics-core",
+ "graphics-proto",
  "liberfs",
  "mp3",
  "network-proto",
@@ -339,6 +370,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "resources-proto",
+ "wire",
+]
+
+[[package]]
 name = "quantize"
 version = "0.0.0"
 dependencies = [
@@ -352,6 +392,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "resources-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
 ]
 
 [[package]]
@@ -442,6 +490,9 @@ dependencies = [
 [[package]]
 name = "term"
 version = "0.0.0"
+dependencies = [
+ "graphics-core",
+]
 
 [[package]]
 name = "tga"

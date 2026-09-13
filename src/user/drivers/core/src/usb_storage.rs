@@ -113,6 +113,13 @@ impl Storage {
 			if bytes <= self.data_bytes {
 				return true;
 			}
+			// THE BUFFER IS BOUNDED BY WHAT THE ADMISSION RESERVED. It grows to the largest request
+			// anybody makes and never shrinks, inside the controller's Domain, for the life of the
+			// process - so without this the bound on it is whatever the largest transfer ever asked
+			// for was. The number is the class module's own, charged when this device was admitted.
+			if !drivers::usb_class::Budget::buffer_within(drivers::usb_class::ClassKind::Storage, bytes) {
+				return false;
+			}
 			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer_for(crate::device(), bytes) {
 				Some(t) => t,
 				None => return false,

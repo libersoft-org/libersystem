@@ -20,10 +20,21 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
 use drivers::{common, gpu, virtio};
+
+// THE TYPED WIRE THIS DRIVER SERVES. It was seven byte strings and a framebuffer record memcpy'd out
+// of a message at an offset; `liber:display-device@1` is the same conversation with a generated
+// reader and writer at each end, and its module documentation is where the lifecycle this driver
+// implements is written down.
+use alloc::vec::Vec;
+use display_device_proto::codec::Handles;
+use display_device_proto::generated::liber::display_device::v1 as wire;
+use display_device_proto::generated::liber::graphics::v1 as graphics;
 
 // virtio-gpu control commands (the 2D subset) and the two responses we check.
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
@@ -432,11 +443,129 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // host-supported resolution renders in full. "FB" hands back the framebuffer
 // (allocated geometry + current size + a MAP|TRANSFER dup of the backing); "FLUSH"
 // presents the current rectangle (backing -> host resource -> display).
-unsafe fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, irq: u64) -> ! {
-	unsafe {
-		let mut cur_w: u32 = backing.w;
-		let mut cur_h: u32 = backing.h;
-		let mut req: [u8; 32] = [0u8; 32];
+// THE DEVICE AS THE TYPED INTERFACE SEES IT: the backing it owns, how much of it is visible, and
+// which generation those pixels belong to.
+//
+// THE GENERATION IS THE POINT OF THIS STRUCT. It moves when the BACKING moves and not when the
+// visible size does, which is the difference between "the same pixels, differently framed" and "your
+// pixels are gone" - and a present naming an old generation is refused rather than drawn into memory
+// the driver has given back.
+struct Scanout<'a> {
+	gpu: &'a Gpu,
+	backing: Backing,
+	visible: (u32, u32),
+	generation: u32,
+	/// The event stream's producer end, or zero before the service opens one.
+	events: u64,
+}
+
+impl Scanout<'_> {
+	// The current scanout as the wire describes it, with a mappable duplicate of the backing.
+	//
+	// `RIGHT_WRITE` EXPLICITLY. The receiver maps this framebuffer and DRAWS into it, and it used to
+	// be handed over with `MAP` alone - which worked only because every mapping was made writable
+	// whether or not the capability said so. Now that `WRITE` is what decides, the intent has to be
+	// stated: this is a surface to render into, so the grant says so.
+	fn describe(&self) -> Option<wire::Scanout> {
+		let dup: i64 = duplicate(self.backing.handle, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER);
+		if dup < 0 {
+			return None;
+		}
+		let pitch = drivers::gpu::pitch_bytes(self.backing.w)?;
+		let len = (pitch as u64).checked_mul(self.backing.h as u64)?;
+		Some(wire::Scanout {
+			backing: display_device_proto::codec::Buffer { handle: dup as u64, len },
+			// THE ALLOCATED EXTENT AND NOT THE VISIBLE ONE. A driver allocates at least what the
+			// display asked for and may allocate more, so a later resize needs no new backing; the
+			// layout describes the memory and `visible` describes the picture.
+			layout: graphics::ImageLayout { size: graphics::Extent2d { width: self.backing.w, height: self.backing.h }, pitch, format: graphics::PixelFormat::B8g8r8x8Unorm, alpha: graphics::AlphaMode::Opaque, color_space: graphics::ColorSpace::Srgb, origin: graphics::RowOrigin::TopLeft },
+			visible: wire::Extent2d { width: self.visible.0, height: self.visible.1 },
+			generation: self.generation,
+		})
+	}
+
+	// Push one event to the service, dropping it when there is no stream or the peer is gone.
+	//
+	// BOUNDED AND IDEMPOTENT, which is what makes dropping safe here: both events are snapshots of
+	// the current state rather than deltas, so the newest one is the true one and a lost older one
+	// costs nothing.
+	fn emit(&mut self, event: &wire::DeviceEvent, seq: &mut u32) {
+		if self.events == 0 {
+			return;
+		}
+		let mut frame: [u8; 96] = [0u8; 96];
+		let mut handles = Handles::new();
+		let sent = match wire::display_device::events_frame(*seq, event, &mut frame, &mut handles) {
+			Some(n) => send_caps_blocking(self.events, &frame[..n], handles.as_slice()),
+			None => false,
+		};
+		if sent {
+			*seq = seq.wrapping_add(1);
+			return;
+		}
+		for handle in handles.as_slice() {
+			close(*handle);
+		}
+		close(self.events);
+		self.events = 0;
+	}
+}
+
+impl wire::display_device::Service for Scanout<'_> {
+	fn scanout(&mut self) -> Result<wire::Scanout, wire::Error> {
+		// A DRIVER THAT CANNOT HAND ITS BACKING OVER IS OUT OF WHAT IT NEEDS TO DO SO - a handle, or
+		// an arithmetic that fits - which is `exhausted` and not `invalid`: nothing was wrong with
+		// the request.
+		self.describe().ok_or(wire::Error::Exhausted)
+	}
+
+	fn present(&mut self, generation: u32, damage: wire::DamageRegion) -> Result<(), wire::Error> {
+		// A BACKING FROM AN OLD GENERATION CAN NEVER BE PRESENTED INTO A NEW ONE. The frame was drawn
+		// against pixels this driver has given back, and transferring it would show whatever is in
+		// that memory now.
+		if generation != self.generation {
+			return Err(wire::Error::Stale);
+		}
+		let mut set: drivers::gpu::DamageSet = drivers::gpu::DamageSet::new();
+		if damage.whole {
+			set.add((0, 0, self.visible.0, self.visible.1));
+		} else {
+			for rect in &damage.rects {
+				let (Ok(x), Ok(y)) = (u32::try_from(rect.origin.x), u32::try_from(rect.origin.y)) else {
+					return Err(wire::Error::Invalid);
+				};
+				set.add((x, y, rect.size.width, rect.size.height));
+			}
+		}
+		// AN EMPTY LIST IS "NOTHING CHANGED" and completes without touching the device, which is the
+		// same answer the service gives its own clients.
+		for rect in set.rects() {
+			// CLIPPED TO THE VISIBLE SCANOUT AND NOT CLAMPED TO IT: pixels past it need no transfer,
+			// a rectangle entirely past it presents nothing, and the transfer must stay inside the
+			// resource.
+			if let Some((x, y, w, h)) = drivers::gpu::visible_rect(*rect, self.visible)
+				&& !self.gpu.present(self.backing.id, x, y, w, h, self.backing.w)
+			{
+				return Err(wire::Error::Io);
+			}
+		}
+		Ok(())
+	}
+
+	fn events(&mut self) -> Vec<wire::DeviceEvent> {
+		Vec::new()
+	}
+}
+
+// SAFE NOW, AND SAYING SO IS THE POINT. It was `unsafe fn` with an `unsafe` body because it decoded a
+// framebuffer record out of a message with `read_unaligned` and wrote one out with
+// `copy_nonoverlapping`; the typed wire has a generated reader and writer, so nothing in this loop
+// dereferences anything the compiler cannot see.
+fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, backing: Backing, service: u64, irq: u64) -> ! {
+	{
+		let mut scanout: Scanout<'_> = Scanout { gpu, visible: (backing.w, backing.h), backing, generation: 1, events: 0 };
+		let mut seq: u32 = 0;
+		let mut req: [u8; 128] = [0u8; 128];
 		loop {
 			// wake on a service request or on a display change. The interrupt path blocks
 			// with no deadline; the poll fallback is a housekeeping wake (WAIT_PERIODIC), so
@@ -477,146 +606,123 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu,
 				// a display change (or poll timeout): a resize shows up as a new
 				// GET_DISPLAY_INFO size.
 				let (mut nw, mut nh) = gpu.display_size();
-				if nw > 0 && nh > 0 && (nw, nh) != (cur_w, cur_h) {
-					if nw > backing.w || nh > backing.h {
+				if nw > 0 && nh > 0 && (nw, nh) != scanout.visible {
+					if nw > scanout.backing.w || nh > scanout.backing.h {
 						// the display outgrew the allocation: reallocate at the new geometry
 						// (each axis at least what the old backing held, so a wider-but-
 						// shorter window never shrinks an axis mid-swap), rebind the scanout,
 						// release the old resource, and hand the new backing to ConsoleService.
-						match create_backing(gpu, backing.id + 1, nw.max(backing.w), nh.max(backing.h)) {
+						match create_backing(gpu, scanout.backing.id + 1, nw.max(scanout.backing.w), nh.max(scanout.backing.h)) {
 							Some(replacement) => {
 								if !gpu.set_scanout(replacement.id, nw, nh) {
 									release_backing(gpu, replacement);
 									continue;
 								}
-								let old: Backing = core::mem::replace(&mut backing, replacement);
+								let old: Backing = core::mem::replace(&mut scanout.backing, replacement);
 								release_backing(gpu, old);
-								cur_w = nw;
-								cur_h = nh;
-								// FBNEW: the new backing's geometry, the display size, and a
-								// mappable dup - ConsoleService remaps, swaps its surfaces, and
-								// closes its old handle (which frees the old buffer).
-								// `RIGHT_WRITE` EXPLICITLY. The receiver maps this framebuffer and DRAWS into it, and it
-								// used to be handed over with `MAP` alone - which worked only because every
-								// mapping was made writable whether or not the capability said so. Now that
-								// `WRITE` is what decides, the intent has to be stated: this is a surface to
-								// render into, so the grant says so.
-								let dup: i64 = duplicate(backing.handle, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER);
-								if dup < 0 {
-									exit();
+								scanout.visible = (nw, nh);
+								// THE BACKING MOVED, SO THE GENERATION MOVES. Everything the service
+								// drew against the old one is gone, and a present naming that
+								// generation is refused rather than transferred into memory this
+								// driver has already given back.
+								scanout.generation = scanout.generation.wrapping_add(1);
+								// The replacement, as an event: the service remaps, swaps its
+								// surfaces and closes its old handle, which frees the old buffer.
+								match scanout.describe() {
+									Some(described) => {
+										let event = wire::DeviceEvent::Replaced(described);
+										scanout.emit(&event, &mut seq);
+									}
+									// A duplicate this driver cannot make is a driver that cannot
+									// hand its backing over at all; the service asks again through
+									// `scanout` when it next adopts.
+									None => (),
 								}
-								let mut msg: [u8; 45] = [0u8; 45];
-								msg[..5].copy_from_slice(b"FBNEW");
-								let info = framebuffer_info(backing.w, backing.h);
-								let fb_len: usize = core::mem::size_of::<Framebuffer>();
-								core::ptr::copy_nonoverlapping(&info as *const Framebuffer as *const u8, msg[5..].as_mut_ptr(), fb_len);
-								msg[5 + fb_len..5 + fb_len + 4].copy_from_slice(&cur_w.to_le_bytes());
-								msg[5 + fb_len + 4..5 + fb_len + 8].copy_from_slice(&cur_h.to_le_bytes());
-								send_blocking(service, &msg[..5 + fb_len + 8], dup as u64);
 								continue;
 							}
 							None => {
 								// the reallocation failed (memory pressure): clamp to the standing
 								// allocation rather than blanking the screen, and fall through to
 								// the in-allocation rebind below.
-								nw = nw.min(backing.w);
-								nh = nh.min(backing.h);
-								if (nw, nh) == (cur_w, cur_h) {
+								nw = nw.min(scanout.backing.w);
+								nh = nh.min(scanout.backing.h);
+								if (nw, nh) == scanout.visible {
 									continue;
 								}
 							}
 						}
 					}
-					cur_w = nw;
-					cur_h = nh;
-					gpu.set_scanout(backing.id, cur_w, cur_h);
-					// ask ConsoleService to reflow to the new display (it then renders and
-					// FLUSHes, which presents the new frame).
-					let mut msg: [u8; 14] = [0u8; 14];
-					msg[..6].copy_from_slice(b"RESIZE");
-					msg[6..10].copy_from_slice(&cur_w.to_le_bytes());
-					msg[10..14].copy_from_slice(&cur_h.to_le_bytes());
-					send_blocking(service, &msg, 0);
+					scanout.visible = (nw, nh);
+					gpu.set_scanout(scanout.backing.id, nw, nh);
+					// A RESIZE INSIDE THE EXISTING BACKING KEEPS ITS GENERATION: the same pixels are
+					// still there and what changed is how much of them is shown. The service reflows
+					// and presents the new frame against the backing it already holds.
+					let event = wire::DeviceEvent::Resized(wire::Extent2d { width: nw, height: nh });
+					scanout.emit(&event, &mut seq);
 				}
 				continue;
 			}
-			// A message woke us: drain every queued request, coalescing FLUSHes so a backlog
-			// of deferred presents collapses into a single present. Each FLUSH carries the
-			// rectangle the console repainted; the queued rectangles are united into one
-			// bounding box, so a backlog still moves only the changed region of the newest
-			// frame (the console always renders into the shared backing). A bare FLUSH (no
-			// rectangle) presents the whole display.
-			let mut flush_rect: Option<(u32, u32, u32, u32)> = None;
-			let mut acknowledged: bool = false;
+			// A message woke us: drain every queued request and ANSWER EACH ONE, through the
+			// generated dispatch. The coalescing this loop used to do across messages is gone with
+			// the byte protocol that needed it: a present is one call with one answer, and the
+			// merging that is still worth doing happens inside one present's damage list.
 			loop {
-				match try_recv(service, &mut req) {
-					Polled::Message { len, .. } => {
-						let m: &[u8] = &req[..len];
-						if m.starts_with(b"FB") {
-							// hand back the allocated framebuffer geometry (pitch and extent),
-							// the current display size, and a mappable, transferable dup of the
-							// backing handle (we keep our own handle to stay pinned).
-							// `RIGHT_WRITE` EXPLICITLY. The receiver maps this framebuffer and DRAWS into it, and it
-							// used to be handed over with `MAP` alone - which worked only because every
-							// mapping was made writable whether or not the capability said so. Now that
-							// `WRITE` is what decides, the intent has to be stated: this is a surface to
-							// render into, so the grant says so.
-							let dup: i64 = duplicate(backing.handle, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER);
-							if dup < 0 {
-								exit();
+				match try_recv_caps(service, &mut req) {
+					PolledCaps::Message { len, mut handles } => {
+						let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+						if op == wire::display_device::OP_EVENTS {
+							open_event_stream(service, &req[..len], &mut handles, &mut scanout);
+						} else {
+							let mut reply: [u8; 128] = [0u8; 128];
+							let mut reply_handles = Handles::new();
+							match wire::display_device::dispatch(&mut scanout, &req[..len], &mut handles, &mut reply, &mut reply_handles) {
+								Some(n) => {
+									if !send_caps_blocking(service, &reply[..n], reply_handles.as_slice()) {
+										for handle in reply_handles.as_slice() {
+											close(*handle);
+										}
+									}
+								}
+								None => {
+									for handle in reply_handles.as_slice() {
+										close(*handle);
+									}
+								}
 							}
-							let info = framebuffer_info(backing.w, backing.h);
-							let fb_len: usize = core::mem::size_of::<Framebuffer>();
-							let mut reply: [u8; 32] = [0u8; 32];
-							core::ptr::copy_nonoverlapping(&info as *const Framebuffer as *const u8, reply.as_mut_ptr(), fb_len);
-							reply[fb_len..fb_len + 4].copy_from_slice(&cur_w.to_le_bytes());
-							reply[fb_len + 4..fb_len + 8].copy_from_slice(&cur_h.to_le_bytes());
-							send_blocking(service, &reply[..fb_len + 8], dup as u64);
-						} else if m.starts_with(b"FLUSH") {
-							let r = if m.len() >= 21 { (rd32_le(m, 5), rd32_le(m, 9), rd32_le(m, 13), rd32_le(m, 17)) } else { (0, 0, cur_w, cur_h) };
-							flush_rect = Some(match flush_rect {
-								Some(u) => drivers::gpu::union_rect(u, r),
-								None => r,
-							});
-						} else if m.starts_with(b"PRESENT") && m.len() >= 23 {
-							let r = (rd32_le(m, 7), rd32_le(m, 11), rd32_le(m, 15), rd32_le(m, 19));
-							flush_rect = Some(match flush_rect {
-								Some(u) => drivers::gpu::union_rect(u, r),
-								None => r,
-							});
-							acknowledged = true;
+						}
+						// EVERY CAPABILITY THE REQUEST CARRIED IS CLOSED, claimed or not: a dispatch
+						// that refused the frame leaves whatever it held, and a driver that dropped
+						// the list would leak one handle per malformed request.
+						for handle in handles.as_slice() {
+							close(*handle);
 						}
 					}
-					Polled::Empty => break,
-					Polled::Closed => exit(),
-				}
-			}
-			if let Some(rect) = flush_rect {
-				// CLIPPED TO THE VISIBLE SCANOUT AND NOT CLAMPED TO IT: pixels past it need no
-				// transfer, a rectangle entirely past it presents nothing, and the transfer must stay
-				// inside the resource.
-				let ok: bool = match drivers::gpu::visible_rect(rect, (cur_w, cur_h)) {
-					Some((x, y, w, h)) => gpu.present(backing.id, x, y, w, h, backing.w),
-					None => true,
-				};
-				if acknowledged {
-					send_blocking(service, if ok { b"OK" } else { b"ERR" }, 0);
+					PolledCaps::Empty => break,
+					PolledCaps::Closed => exit(),
 				}
 			}
 		}
 	}
 }
 
-// Read a little-endian u32 at `at` in `m`.
-fn rd32_le(m: &[u8], at: usize) -> u32 {
-	u32::from_le_bytes([m[at], m[at + 1], m[at + 2], m[at + 3]])
-}
-
-// The ABI Framebuffer describing a backing of the given allocated geometry (the
-// B8G8R8X8 pixel layout every consumer renders with).
-fn framebuffer_info(w: u32, h: u32) -> Framebuffer {
-	// The pitch is checked where the geometry is admitted; this cannot fail for a geometry that got
-	// this far, and answering zero for one that did not is a framebuffer nothing will draw into.
-	let pitch = drivers::gpu::pitch_bytes(w).unwrap_or(0);
-	Framebuffer { width: w, height: h, pitch, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] }
+// Open the event stream: a channel pair, the consumer end to the service, the producer kept here.
+//
+// ONE STREAM AT A TIME, and a second `events` call replaces the first. There is one consumer of a
+// display device in this system - the service that adopted it - and a driver holding two producers
+// would be a driver deciding which of them is the real one.
+fn open_event_stream(service: u64, request: &[u8], request_handles: &mut Handles, scanout: &mut Scanout<'_>) {
+	if request.len() != 6 || !request_handles.is_empty() {
+		return;
+	}
+	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+	let Some((producer, consumer)) = channel() else { return };
+	if !send_blocking(service, &corr.to_le_bytes(), consumer) {
+		close(producer);
+		close(consumer);
+		return;
+	}
+	if scanout.events != 0 {
+		close(scanout.events);
+	}
+	scanout.events = producer;
 }

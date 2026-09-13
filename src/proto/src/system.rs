@@ -5,6 +5,9 @@ pub use crate::generated::liber::base::v1::*;
 pub use crate::generated::liber::config::v1::*;
 pub use crate::generated::liber::device::v1::*;
 pub use crate::generated::liber::display::v1::*;
+// The DEVICE side of the display, which is a different contract from the application side: the
+// service calls it and a driver serves it.
+pub use crate::generated::liber::display_device::v1::*;
 // The shared graphics value types - extent, rect, pixel format, colour space, alpha mode, row origin
 // and damage. `liber:display@1` declared its own one-member `pixel-format` until 2026-09-13; it
 // imports this one now, and so does every other graphics interface.

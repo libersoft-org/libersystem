@@ -125,6 +125,9 @@ pub struct SoftPrepared {
 	glyph_runs: Vec<render2d::list::RecordedGlyphRun>,
 	working: Working,
 	target_transfer: graphics_profile::image::Transfer,
+	/// What the destination said it can show, carried from the description to the one place that
+	/// encodes into it.
+	output: graphics_core::pixel::OutputLuminance,
 	expansion: u32,
 	scratch_bytes: u64,
 	damage: Option<PixelRect>,
@@ -436,7 +439,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 
 		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
-		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), expansion, scratch_bytes, damage })
+		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage })
 	}
 
 	fn render(&mut self, prepared: &Self::Prepared, target: &mut ImageViewMut<'_>) -> Result<(), Error> {
@@ -676,7 +679,7 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 			pool.give(layer.surface);
 		}
 		clips.drain_into(masks);
-		surface.store(target, tile, prepared.working, table, &mut spans.filter_input)
+		surface.store(target, tile, prepared.working, prepared.output, table, &mut spans.filter_input)
 	}
 }
 

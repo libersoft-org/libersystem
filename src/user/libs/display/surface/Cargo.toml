@@ -8,6 +8,9 @@ base-proto = { path = "../../protocol/base-proto" }
 display-proto = { path = "../../protocol/display-proto" }
 input-proto = { path = "../../protocol/input-proto" }
 ipc-client = { path = "../../ipc/ipc-client" }
+# THE SHARED IMAGE MODEL: a mapped surface is described by the same layout every other image in this
+# tree carries, rather than by a rebuilt `Framebuffer` with its channel shifts written out by hand.
+graphics-core = { path = "../../graphics/core" }
 rt = { path = "../../../runtime/rt" }
 pix = { path = "../../image/pix" }
 

@@ -51,6 +51,10 @@ pub fn is_refusal(error: Error) -> bool {
 		// which the guest neither chose nor can see, so blaming its authority for it would be wrong
 		// in the same way `NotFound` would be.
 		Error::AddressUnavailable => false,
+		// AND A GENERATION MOVED UNDER ONE, which is the same shape of answer: the thing the request
+		// named was replaced by the host's own state changing, and the guest is told to re-read and
+		// rebuild rather than that it was not allowed.
+		Error::Stale => false,
 	}
 }
 

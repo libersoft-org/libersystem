@@ -4,6 +4,9 @@ edition = "2024"
 description = "The canonical image model: layouts, views, owned images, formats, colour spaces and the two coordinate spaces"
 
 [dependencies]
+# THE WIRE VOCABULARY. This library owns the VALIDATED types; `graphics-proto` owns the descriptors
+# that cross a channel, and `wire.rs` is the only conversion between them.
+graphics-proto = { path = "../../protocol/graphics-proto" }
 # THE FROZEN REGISTRY THIS IMPLEMENTS. Every format, colour constant and byte-span rule comes from
 # there rather than being restated here - a second copy of a matrix is a second answer.
 graphics-profile = { path = "../profile" }

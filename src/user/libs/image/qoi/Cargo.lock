@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13,12 +17,20 @@ name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
 [[package]]
 name = "graphics-profile"
 version = "0.0.0"
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "libm"
@@ -48,4 +60,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "wire"
+version = "0.0.0"
+dependencies = [
+ "abi",
 ]

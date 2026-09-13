@@ -289,6 +289,16 @@ pub enum Error {
 	/// silent re-selection - naming a source has a reason, and quietly using a different one is the
 	/// failure the override exists to prevent.
 	AddressUnavailable = 13,
+	/// The request names a GENERATION that is no longer current: the thing it was prepared against
+	/// has been replaced, and what the caller holds describes something that is gone.
+	///
+	/// DISTINCT FROM `invalid` AND FROM `again`, and the difference is what a caller does next. An
+	/// invalid request is wrong and stays wrong however often it is sent; an `again` is the same
+	/// request retried unchanged; a STALE one is well formed and was right until a moment ago, and
+	/// the caller's answer is to re-read what replaced it and rebuild - which is a different code
+	/// path from either of the other two. A display frame drawn for a backing the driver has since
+	/// given back is the case this was added for.
+	Stale = 14,
 }
 
 impl Error {
@@ -345,6 +355,7 @@ impl Error {
 			11 => Some(Error::Cancelled),
 			12 => Some(Error::CommitUncertain),
 			13 => Some(Error::AddressUnavailable),
+			14 => Some(Error::Stale),
 			_ => None,
 		}
 	}
@@ -556,6 +567,7 @@ impl Error {
 			Error::Cancelled => out.push_str("\"cancelled\""),
 			Error::CommitUncertain => out.push_str("\"commit-uncertain\""),
 			Error::AddressUnavailable => out.push_str("\"address-unavailable\""),
+			Error::Stale => out.push_str("\"stale\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -574,6 +586,7 @@ impl Error {
 			Error::Cancelled => out.push_str("cancelled"),
 			Error::CommitUncertain => out.push_str("commit-uncertain"),
 			Error::AddressUnavailable => out.push_str("address-unavailable"),
+			Error::Stale => out.push_str("stale"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -592,6 +605,7 @@ impl Error {
 			Error::Cancelled => crate::codec::cbor::text(out, "cancelled"),
 			Error::CommitUncertain => crate::codec::cbor::text(out, "commit-uncertain"),
 			Error::AddressUnavailable => crate::codec::cbor::text(out, "address-unavailable"),
+			Error::Stale => crate::codec::cbor::text(out, "stale"),
 		}
 	}
 }

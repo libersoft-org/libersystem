@@ -35,6 +35,7 @@ use rt::*;
 
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, configure_hid, handle_hid_event, post_reports};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
+use drivers::usb_class::ClassKind;
 use drivers::{common, keys};
 
 // Capability registers (at the mapped BAR base).
@@ -300,6 +301,12 @@ struct Xhci {
 	// wait that is not interested in a port-status event still cannot drop it - which is what left a
 	// device plugged in during a block read invisible until something unrelated woke the loop.
 	ports_changed: drivers::port::PortSignal,
+	// WHAT THE CLASS MODULES INSIDE THIS PROCESS ARE HOLDING. They live in this Domain and share its
+	// endpoints, its DMA pages and its in-flight transfers, so one of them can starve the other and
+	// both can starve the controller. The controller drives attach and detach, so the controller is
+	// where their cost is counted - a module keeping its own count is a module that can forget to
+	// give something back.
+	budget: drivers::usb_class::Budget,
 }
 
 // One addressed USB device: its slot, root-hub port, route string (the hub-port
@@ -600,7 +607,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new() })
 	}
 }
 
@@ -871,12 +878,21 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			// inventory holds it until the port it is on goes away.
 			let slot = dev.slot;
 			slots.keep(slot, dev);
-		} else if let Some(h) = configure_hid(hc, &mut dev) {
+		} else if admits(hc, ClassKind::Hid, dev.class)
+			&& let Some(h) = configure_hid(hc, &mut dev)
+		{
+			// THE CHARGE IS TAKEN WHEN THE MODULE TAKES THE DEVICE and not when the admission was
+			// asked for: `configure_hid` answers `None` for a device that is not a HID at all, and
+			// charging that one would spend the keyboard budget on every mouse-shaped thing that is
+			// neither.
+			let _ = hc.budget.admit(ClassKind::Hid);
 			slots.set_kind(dev.slot, if h.layout.has_keyboard() { KIND_KEYBOARD } else { KIND_POINTER });
 			hids.entries.push((dev, h));
 		} else if storage.is_none()
+			&& admits(hc, ClassKind::Storage, dev.class)
 			&& let Some(st) = configure_storage(hc, &mut dev)
 		{
+			let _ = hc.budget.admit(ClassKind::Storage);
 			slots.set_kind(dev.slot, KIND_STORAGE);
 			*storage = Some((dev, st));
 		} else {
@@ -885,6 +901,40 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			let slot = dev.slot;
 			slots.keep(slot, dev);
 		}
+	}
+}
+
+// Whether a class module has room for another device, reported when it has not.
+//
+// THE REFUSAL IS PRINTED HERE AND NOWHERE ELSE, so a controller that will not take a ninth keyboard
+// says which ceiling it reached rather than leaving a device addressed and silent. The device is not
+// released by a refusal: it stays in the inventory like every other unbound device, which is what
+// lets a later detach give its pages back.
+fn admits(hc: &Xhci, kind: ClassKind, class: u8) -> bool {
+	let mut trial = hc.budget;
+	match trial.admit(kind) {
+		Ok(()) => true,
+		Err(refusal) => {
+			// A device that is not of this class would be refused by its own configure step anyway,
+			// and saying "the keyboard budget is full" about a printer would be a lie.
+			if class_is_plausible(kind, class) {
+				print(b"driver.xhci: ");
+				print(if matches!(kind, ClassKind::Hid) { b"HID".as_slice() } else { b"storage".as_slice() });
+				print(b" module is full (");
+				print(refusal.describe());
+				print(b"), device left unbound\n");
+			}
+			false
+		}
+	}
+}
+
+// Whether a device's class byte could belong to this module at all. A composite device declares zero
+// at the device level and names its classes per interface, so zero is plausible for both.
+fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
+	match kind {
+		ClassKind::Hid => class == 0 || class == 0x03,
+		ClassKind::Storage => class == 0 || class == 0x08,
 	}
 }
 
@@ -1306,6 +1356,10 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 				for (dev, hid) in hids.entries.iter_mut().filter(|(dev, _)| dev.port == port) {
 					hid.release();
 					dev.release(hc);
+					// AND THE CHARGE GOES BACK WITH THE PAGES. A release that gave the memory back and
+					// kept the budget would turn a port somebody plugs and unplugs into a controller
+					// that stops accepting keyboards.
+					hc.budget.release(ClassKind::Hid);
 				}
 				hids.entries.retain(|(dev, _)| dev.port != port);
 				if let Some((dev, st)) = storage.as_mut()
@@ -1313,6 +1367,7 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 				{
 					st.release();
 					dev.release(hc);
+					hc.budget.release(ClassKind::Storage);
 					*storage = None;
 				}
 				while let Some(mut rec) = slots.take_port(port) {

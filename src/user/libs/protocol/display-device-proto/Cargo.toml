@@ -1,0 +1,19 @@
+[package]
+name = "display-device-proto"
+edition = "2024"
+description = "Generated LSIDL display-device bindings: the typed wire between DisplayService and a display driver"
+
+[features]
+default = []
+channel-client-impl = ["dep:ipc-client"]
+shared-image = ["channel-client-impl", "ipc-client/shared-image"]
+
+[dependencies]
+base-proto = { path = "../base-proto" }
+graphics-proto = { path = "../graphics-proto" }
+wire = { path = "../../../../wire" }
+ipc-client = { path = "../../ipc/ipc-client", optional = true }
+
+# A WARNING IS AN ERROR HERE, as everywhere else in this tree.
+[lints.rust]
+warnings = "deny"

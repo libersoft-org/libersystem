@@ -3,16 +3,28 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
 name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
 [[package]]
 name = "graphics-profile"
 version = "0.0.0"
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
+ "wire",
+]
 
 [[package]]
 name = "libm"
@@ -25,4 +37,11 @@ name = "pix"
 version = "0.0.0"
 dependencies = [
  "graphics-core",
+]
+
+[[package]]
+name = "wire"
+version = "0.0.0"
+dependencies = [
+ "abi",
 ]

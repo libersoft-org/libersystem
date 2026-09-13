@@ -195,6 +195,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "graphics-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "display-proto"
 version = "0.0.0"
 dependencies = [
@@ -262,6 +272,7 @@ name = "graphics-core"
 version = "0.0.0"
 dependencies = [
  "graphics-profile",
+ "graphics-proto",
  "libm",
 ]
 
@@ -561,6 +572,7 @@ dependencies = [
  "base-proto",
  "config-proto",
  "device-proto",
+ "display-device-proto",
  "display-proto",
  "font-proto",
  "graphics-proto",
@@ -710,6 +722,7 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "display-proto",
+ "graphics-core",
  "input-proto",
  "ipc-client",
  "pix",
@@ -780,6 +793,7 @@ dependencies = [
  "flac",
  "font-client",
  "font-client-provider",
+ "graphics-core",
  "imgconv",
  "ipc-client",
  "keys",

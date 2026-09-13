@@ -87,3 +87,84 @@ pub fn transfer_offset(x: u32, y: u32, stride: u32) -> Option<u64> {
 
 #[cfg(test)]
 mod tests;
+
+// A BOUNDED SET OF DAMAGED RECTANGLES, and the rule for when two of them become one.
+//
+// THE UNCONDITIONAL UNION IS THE DEFECT. This driver drained its queue and unioned everything it
+// found into one rectangle before transferring, so a client that updated two opposite corners of the
+// screen had the whole screen transferred - which is the cost `WSI Profile 1` names when it says a
+// backend "may merge, when merging is cheaper than transferring separately" and that "what is
+// forbidden is the unconditional union of everything".
+//
+// SO MERGING IS A MEASUREMENT AND NOT A HABIT. Two rectangles become one when their bounding box is
+// no larger than the two of them apart - which is true when they overlap or touch, and false for two
+// corners of a screen. The set is bounded by the profile's own damage cap, and a set that is full
+// merges the two whose bounding box wastes the least, because dropping a rectangle would leave the
+// screen showing something that is no longer there and refusing a present would make a frame
+// somebody drew disappear.
+pub const MAX_DAMAGE_RECTS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DamageSet {
+	rects: [(u32, u32, u32, u32); MAX_DAMAGE_RECTS],
+	len: usize,
+}
+
+impl DamageSet {
+	pub const fn new() -> DamageSet {
+		DamageSet { rects: [(0, 0, 0, 0); MAX_DAMAGE_RECTS], len: 0 }
+	}
+
+	pub const fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+
+	pub fn rects(&self) -> &[(u32, u32, u32, u32)] {
+		&self.rects[..self.len]
+	}
+
+	pub fn clear(&mut self) {
+		self.len = 0;
+	}
+
+	// Add one damaged rectangle, merging where merging costs nothing and keeping it apart where it
+	// would not.
+	pub fn add(&mut self, rect: (u32, u32, u32, u32)) {
+		if rect.2 == 0 || rect.3 == 0 {
+			return;
+		}
+		// AN OVERLAPPING OR TOUCHING RECTANGLE IS ABSORBED, which is what keeps a client that damages
+		// the same region twice in one frame from paying for two transfers of it.
+		for index in 0..self.len {
+			let merged = union_rect(self.rects[index], rect);
+			if area(merged) <= area(self.rects[index]).saturating_add(area(rect)) {
+				self.rects[index] = merged;
+				return;
+			}
+		}
+		if self.len < MAX_DAMAGE_RECTS {
+			self.rects[self.len] = rect;
+			self.len += 1;
+			return;
+		}
+		// THE SET IS FULL, so the cheapest merge happens rather than a rectangle being dropped. The
+		// caller's own cap is the profile's, and a backend that is handed more than it can hold
+		// merges - it never shows pixels that are no longer there.
+		let mut best = 0;
+		let mut best_waste = u64::MAX;
+		for index in 0..self.len {
+			let waste = area(union_rect(self.rects[index], rect)).saturating_sub(area(self.rects[index]).saturating_add(area(rect)));
+			if waste < best_waste {
+				best_waste = waste;
+				best = index;
+			}
+		}
+		self.rects[best] = union_rect(self.rects[best], rect);
+	}
+}
+
+// A rectangle's area, saturating: the rectangles reaching here have been clipped, and an area is a
+// comparison rather than an allocation.
+fn area(rect: (u32, u32, u32, u32)) -> u64 {
+	rect.2 as u64 * rect.3 as u64
+}

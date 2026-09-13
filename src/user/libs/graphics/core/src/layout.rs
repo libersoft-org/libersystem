@@ -9,7 +9,8 @@
 //! check into a length check that passes.
 
 use crate::Error;
-use crate::format::PixelStorage;
+use crate::color::ColorSpace;
+use crate::format::{AlphaMode, PixelStorage};
 use crate::geom::Extent2D;
 use crate::semantics::ImageSemantics;
 
@@ -63,6 +64,19 @@ impl ImageLayout {
 			return Err(Error::AlphaModeNotAdmitted);
 		}
 		Ok(Self { extent, pitch, storage, origin, semantics })
+	}
+
+	/// A SCANOUT SURFACE AS FIRMWARE OR A DISPLAY SERVER DESCRIBED IT: the first row at the top,
+	/// opaque colour in the one space the display contract names, and whichever storage described it
+	/// - a mode line's masks from firmware, a NAME from a display server.
+	///
+	/// IT EXISTS BECAUSE FOUR PLACES BUILT THIS EXACT LAYOUT and each of them restated the three
+	/// constants: a boot console, a display client's mapping, a terminal renderer and a blitter's
+	/// destination. None of the three is a choice at this layer - a scanout surface has no alpha to
+	/// interpret, counts rows from the top, and is sRGB - so a caller that has to choose them is a
+	/// caller that can choose differently from the one beside it.
+	pub fn scanout(extent: Extent2D, pitch: u32, storage: PixelStorage) -> Result<Self, Error> {
+		Self::new(extent, pitch, storage, RowOrigin::TopLeft, ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Opaque })
 	}
 
 	/// `width * bytes_per_pixel`, checked.

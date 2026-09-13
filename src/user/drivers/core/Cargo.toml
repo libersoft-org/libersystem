@@ -89,6 +89,11 @@ proto = { path = "../../../proto" }
 # SystemManager to stop the machine instead of holding the capability that would let them do it.
 ipc-client = { path = "../../libs/ipc/ipc-client" }
 
+# THE TYPED DISPLAY-DEVICE WIRE, which the virtio-gpu driver SERVES. A separate package from the
+# application-facing display one: a driver's contract and an application's are two things, and one
+# package carrying both would make every application link the driver's wire.
+display-device-proto = { path = "../../libs/protocol/display-device-proto" }
+
 
 # THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are
 # tested on the host; the runtime they link is built with its `host-tests` feature for the test

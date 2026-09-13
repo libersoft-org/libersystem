@@ -10,7 +10,30 @@ use liber:process@1.{task};
 // declared against. It lives in `liber:graphics@1` with the rest of the shared value vocabulary,
 // which carries the twelve formats `Image Colour Profile 1` freezes rather than the one this
 // service happens to accept today.
-use liber:graphics@1.{pixel-format};
+use liber:graphics@1.{color-space, damage-region, pixel-format};
+
+/// WHAT THE OUTPUT CAN ACTUALLY SHOW, which a colour-space NAME does not say.
+///
+/// A tone map sends one luminance to one, and WHICH luminance that is depends on the display: a
+/// two-thousand-nit highlight on a two-hundred-nit panel and on a thousand-nit one are two different
+/// curves. A conversion that does not know the destination's luminance is guessing at the one number
+/// that decides how the image looks.
+///
+/// EVERY LUMINANCE IS OPTIONAL AND `none` IS NOT ZERO. A display that does not report what it can do
+/// is the ordinary case - nothing in this system asks a panel yet, because DDC needs a bus no driver
+/// here can reach - and `Image and Colour Profile 1` says absent HDR metadata is a refusal to assume
+/// rather than a default to invent. A consumer handed `none` uses the profile's own stated reference
+/// white point, which is one assumption written down in one place.
+record output-colour {
+	space:                  color-space,
+	/// What a relative 1.0 is, in cd/m².
+	sdr-white-nits:         option<f32>,
+	min-nits:               option<f32>,
+	/// The peak the display can show.
+	max-nits:               option<f32>,
+	/// The peak it can hold over a whole frame, which is lower than the peak on most panels.
+	max-frame-average-nits: option<f32>,
+}
 
 /// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
 /// retains a read+map duplicate and transfers a write+map handle to the client. Its
@@ -23,6 +46,10 @@ record surface-info {
 	height: u32,
 	pitch:  u32,
 	format: pixel-format,
+	/// What the output this surface reaches can show. It travels WITH the surface because it is a
+	/// property of the destination the client is drawing for, and a client that had to ask for it
+	/// separately would be a client that draws one frame before it knows.
+	colour: output-colour,
 }
 
 /// A new preferred logical size for a native-sized surface. Fixed-size clients may
@@ -49,9 +76,9 @@ record presentation-stats {
 }
 
 /// One display connection owns at most one surface. `present` is synchronous: the
-/// service validates the damage rectangle, copies/scales that rectangle to its
-/// scanout and completes the device flush before replying; the client must not modify
-/// pixels inside the rectangle until the call returns. `release`, channel peer-close,
+/// service validates the damage, copies/scales the damaged pixels to its scanout and
+/// completes the device flush before replying; the client must not modify pixels
+/// inside the damaged area until the call returns. `release`, channel peer-close,
 /// or process death drops the surface and restores the console with a full repaint.
 /// The client is not told whether its surface is fullscreen; a compositor can later
 /// implement this same contract without an API break. `(0, 0)` requests the server's
@@ -59,7 +86,19 @@ record presentation-stats {
 /// bounded-channel stream of preferred-size changes.
 interface display {
 	@op(1) acquire: func(width: u32, height: u32) -> result<surface-info, error>;
-	@op(2) present: func(x: u32, y: u32, width: u32, height: u32) -> result<unit, error>;
+	/// DAMAGE IS A BOUNDED LIST WITH AN EXPLICIT WHOLE-SURFACE VARIANT, and the nine
+	/// answers `WSI Profile 1` freezes are the contract this call implements. An EMPTY
+	/// list means nothing changed: the present is still ordered and still completes.
+	/// The whole surface is `whole`, never one rectangle covering the extent, because a
+	/// rectangle can be wrong by a pixel and a variant cannot. A rectangle outside the
+	/// extent is a typed `invalid` and never a silent clamp. More than the bound is the
+	/// caller's problem, solved by merging or by sending `whole` - never the service's,
+	/// solved by dropping rectangles. Overlapping rectangles are legal. The coordinates
+	/// are in the surface's own image space.
+	/// A SINGLE RECTANGLE WAS NOT ENOUGH AND THE COST WAS NOT THEORETICAL: a client
+	/// updating two corners of a screen sent their bounding box, which is most of the
+	/// screen, and the service transferred all of it.
+	@op(2) present: func(damage: damage-region) -> result<unit, error>;
 	@op(3) release: func() -> result<unit, error>;
 	@op(4) events:  func() -> stream<display-event>;
 	/// Return the one-shot proof channel for this connection's active surface. The

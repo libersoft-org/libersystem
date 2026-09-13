@@ -915,3 +915,145 @@ positions, GGX with Smith height-correlated visibility, column-major matrices, t
 F0 - and where practice is split the reason for the side taken is written beside the value. A
 reviewer who disagrees with one should say so now: after a backend exists, changing one is a version
 change and a re-measurement.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-13 18:20):
+
+THE PIXEL-PLANE CONVERGENCE, WHICH IS THE `a-common` ITEM'S LAST OPEN HALF. Four types described a
+plane of pixels in this tree: `pix::Image`, `pix::Target`, `term::Geometry`/`term::Raster` and
+`surface::Mapping`. They are now one description - `graphics_core::ImageLayout` - and one packer.
+
+WHAT CHANGED, FILE BY FILE:
+
+  `graphics-core`   `PackedRgbLayout::from_masks`, `ImageLayout::scanout` and
+                      `PixelFormat::packed_masks` (plus `PixelStorage::packed_masks`, which asks the
+                      same question of either arm). `wire.rs` gained `From<wire::PixelFormat>` in
+                      both directions, so a consumer holding ONE field rather than a whole descriptor
+                      goes through the same door.
+  `term`            `Geometry` deleted. `Raster` is `{ base, layout, packed }`; `new` takes an
+                      `&ImageLayout` and refuses only what is its OWN limit (an element wider than
+                      the `u32` it packs into, and a `pitch * height` that does not fit). Its private
+                      `channel`/`pack` arithmetic is `graphics_core::pixel::write_packed`.
+  `surface`         `Mapping` carries an `ImageLayout`; `framebuffer()` is `layout()`. The format
+                      check is on the core enumeration after the wire conversion, and the length
+                      check is `backend_access_span(true)` rather than a hand-multiplied product.
+  `pix`             `Target::from_layout` (adopt a description the display already made);
+                      `channels()` returns `Option` and comes from the registry; `BGRA8_MASKS` and
+                      the `Known(_) => BGRA8_MASKS` fallback are gone.
+  `console_service` `geometry()` deleted; `make_surface` takes the layout the mapping reported.
+                      `Console::fb` is an `Option<ImageLayout>` rather than a `Framebuffer` that had
+                      to have a zero-valued default for the headless case.
+  `imgview`         the viewport arithmetic takes an `Extent2D` (which is all it ever used) and the
+                      destination is `Target::from_layout`; the eight-argument rebuild is gone.
+  kernel            `console.rs` holds the one-way adapter from the boot-protocol framebuffer record
+                      into the image model. `graphics-core` is named in the kernel's dependency list;
+                      it was already in its graph through `pix`.
+
+WHAT I DELIBERATELY DID NOT DO. `PixelFormat::packed_masks` does NOT describe the fourth lane of
+`B8G8R8X8`/`B8G8R8A8`. The shared packer writes a declared reserved span with ALL BITS SET, so
+describing one would turn every `0x00rrggbb` a blitter writes into `0xffrrggbb` and would write over
+a destination's alpha - three blit tests failed on exactly that byte when it was tried. The boot
+console's pixel output is therefore byte-for-byte what it was.
+
+NOT PERFORMED: the guest boot suite. The kernel console and ConsoleService are both on this path and
+a boot run is what proves them; it is held for the end of the whole job with the other long runs, by
+the project owner's instruction that long tests run last and only over what needs them.
+
+IMPLEMENTER'S FOLLOW-UP ON P02M0103 (2026-09-13 20:10):
+
+THE GUEST RUN FOUND TWO DEFECTS THE HOST SUITES COULD NOT, and both are worth reading as evidence
+about where this kind of change goes wrong rather than as two fixed bugs.
+
+ONE: `term::Raster::new` REFUSED A NAMED FORMAT. I converged the renderer onto `ImageLayout` and made
+its constructor take only `PixelStorage::PackedRgbUnorm` - which is what firmware describes and what
+the boot console therefore hands it. A display server hands over `PixelStorage::Known(B8G8R8X8Unorm)`.
+So the boot console kept drawing and every userspace VT went blank: `surface::Mapping` mapped the
+pixels, ConsoleService reported online, and `make_surface` answered `None` for every VT. Nothing in
+the host suites could see it - `term`'s own tests build their rasters from masks, because that is what
+`term`'s own callers did before this change. The fix is one line (`layout.storage.packed_masks()`),
+and the test that would have caught it now exists: a raster built from each arm, required to pack the
+same pixel to the same bytes.
+
+TWO: A WIRE ORDINAL MOVED UNDER TWO HAND-WRITTEN HARNESSES. `liber:display@1`'s own one-member
+`pixel-format` was deleted in favour of `liber:graphics@1`'s twelve-member one, and `b8g8r8x8` moved
+from 0 to 3. Every producer and consumer that NAMES the value was unaffected. Two harnesses in
+`src/kernel/tests.rs` stand in for DisplayService and hand-wrote the byte as `0`, which is now
+`a8-unorm`; the client refused the surface, imgview exited, and the harness waited three minutes for a
+present. That is the exact drift the kernel's own dependency list already warns about for
+`device-proto` and `network-proto` - "answering it from a hand-written copy of the wire format is how
+the two drift apart" - so `graphics-proto` joins them and both harnesses name the value.
+
+WHAT THIS SAYS ABOUT THE CHANGE ITSELF: the convergence is right and the two defects were in the
+seams, which is where a convergence puts its risk. Both seams are now covered by a test that runs in
+milliseconds on the host, plus the guest tags that caught them.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103a-wsi (2026-09-13 22:10):
+
+DAMAGE IS A BOUNDED LIST NOW, ON BOTH SIDES. The item named the cost and it was not theoretical: a
+client updating two opposite corners of a screen sent their bounding box, and the driver unioned
+everything in its queue on top of that.
+
+THE INTERFACE. `present` takes `liber:graphics@1`'s `damage-region` - a `whole` variant and a list
+bounded at the profile's own sixteen - instead of four numbers. A pre-release ABI break of
+`liber:display@1`, taken with `--accept-breaking`, because nothing external depends on it.
+
+THE NINE ANSWERS `WSI Profile 1` FREEZES ARE WHAT THE SERVICE IMPLEMENTS, and three of them are
+places an implementation would ordinarily go wrong:
+  - An EMPTY list is "nothing changed" and must COMPLETE. It is tempting to answer `invalid`, and
+    that would make the profile's own answer a failure every client has to work around.
+  - A rectangle outside the extent is a typed refusal and NEVER a clamp, and the frame is refused
+    whole: every rectangle is checked before any of them is drawn, because half a frame is a frame
+    nobody asked for.
+  - More than the bound is refused by the DECODER rather than by the service, which is what makes
+    "the caller's problem" true rather than hopeful.
+
+AND THE DRIVER HALF IS WHERE THE SAVING ACTUALLY IS. `drivers::gpu::DamageSet` merges two rectangles
+only when their bounding box is no larger than the two of them apart - true when they overlap or
+touch, false for two corners. A full set merges the cheapest pair rather than dropping a rectangle,
+because a dropped rectangle leaves the screen showing something that is no longer there. That rule is
+the profile's: a backend MAY merge when merging is cheaper than transferring separately, and what is
+forbidden is the unconditional union.
+
+THE HARNESSES WERE UPDATED THE WAY TODAY'S EARLIER LESSON SAYS. Both kernel harnesses that speak this
+wire now ENCODE and DECODE the damage through the generated codec instead of laying bytes out at
+offsets - which is the same defect class that cost three minutes of timeout this morning when a
+renumbered enum moved under a hand-written zero.
+
+EVIDENCE: 3 new host tests in `drivers::gpu`, 45 in the crate, green. In the guest: a two-corner
+present on a scaled surface moves two source pixels rather than the four of its bounding box, an
+empty present completes and transfers nothing, an out-of-bounds rectangle refuses the whole frame,
+and `boot,display,console,imgview` pass 23 tests.
+
+NOT PERFORMED: the driver's byte protocol still carries ONE rectangle per message. It no longer
+matters for the union - the service sends one message per rectangle and the driver keeps them apart -
+and replacing that protocol with a typed LSIDL interface is its own item in this part.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103a-wsi (2026-09-13 23:05):
+
+OUTPUT COLOUR METADATA, in both halves the item asks for.
+
+THE REPORT. `surface-info` carries `output-colour`: the space plus SDR white, minimum, maximum and
+maximum frame-average luminance. It travels with the surface rather than being a second call, because
+a client that had to ask separately is a client that draws one frame before it knows.
+
+THE DECISION WORTH REVIEWING IS THE FOUR `none`s. Nothing in this system asks a panel what it can
+show - DDC needs a bus no driver here can reach - so DisplayService reports the colour space, which
+follows from the format, and declines to invent the luminances. That is the profile's own rule for
+absent HDR metadata ("a refusal to assume rather than a default to invent"), and it is why the fields
+are `option<f32>` rather than numbers with a documented default: a zero would be a display that emits
+no light, and a plausible default would be a guess nobody could tell from a measurement.
+
+THE CONSUMPTION. `OutputLuminance::tone_map_white` is `max / sdr_white` when both are reported and
+believable, and the profile's constant otherwise. `Encoder::new` keeps its meaning (an unknown
+destination) and `Encoder::new_for_output` is the one that asks. Six impossible descriptions fall back
+rather than compute: a zero white, a peak below diffuse white, NaN, infinity, and either half of the
+pair on its own.
+
+AND IT REACHES THE RENDERER rather than stopping at the library boundary: `render2d`'s
+`TargetDescription` carries it and `soft2d` hands it to the encoder that writes each tile back. It is
+NOT in the prepared key, and that is a decision rather than an omission - the tone curve is applied
+at encode time, so a display that changes what it can show changes the pixels and not the flattened
+geometry.
+
+NOT PERFORMED: nothing produces a non-`none` luminance yet, so the bright-display path is exercised by
+host tests rather than by a guest. The first real numbers arrive with EDID over a DDC transport, which
+is a blocked item in `P02M0099` - and when they do, nothing above the service changes shape.

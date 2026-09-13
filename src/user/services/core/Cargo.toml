@@ -177,6 +177,12 @@ term = { path = "../../../term" }
 # the ones worth testing.
 wasm = { path = "../../../wasm" }
 
+# THE SHARED IMAGE MODEL. A mapped display surface arrives described by it, and the console's
+# renderer is built from that description rather than from a second one assembled here.
+graphics-core = { path = "../../libs/graphics/core" }
+# THE TYPED DISPLAY-DEVICE WIRE, which DisplayService CALLS. It reaches the generated client through
+# the aggregate as well, and naming it here is what lets the shared-image linker see the archive.
+display-device-proto = { path = "../../libs/protocol/display-device-proto" }
 # Shared pixel vocabulary and direct/scaled blitters. Kept as a separate crate so
 # graphical applications and DisplayService use exactly the same geometry semantics.
 pix = { path = "../../libs/image/pix" }

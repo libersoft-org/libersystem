@@ -11,6 +11,10 @@
 
 use alloc::boxed::Box;
 
+use graphics_core::format::PackedRgbLayout;
+use graphics_core::layout::ImageLayout;
+use graphics_core::pixel::{Rgba, write_packed};
+
 use crate::screen::{Cell, Color, CursorShape, Screen, ScrollOp};
 
 // The 8x16 bitmap font: Unscii 2.1 (unscii-16 by Viznut, public domain), 2,997 glyphs
@@ -103,110 +107,112 @@ fn glyph_bitmap(cp: u32) -> &'static [u8] {
 	glyph_bitmap(b'?' as u32)
 }
 
-// A linear framebuffer's geometry and pixel format, handed to a `Raster`. Decouples the
-// renderer from any particular framebuffer description (the kernel's boot framebuffer, the
-// userspace ABI `Framebuffer`): each caller fills this from its own source.
-#[derive(Clone)]
-pub struct Geometry {
-	pub width: usize,
-	pub height: usize,
-	pub pitch: usize,
-	pub bytes_per_pixel: usize,
-	pub red_shift: u8,
-	pub red_size: u8,
-	pub green_shift: u8,
-	pub green_size: u8,
-	pub blue_shift: u8,
-	pub blue_size: u8,
-}
-
-// The raw pixel buffer: a mapped linear framebuffer, its geometry, and its pixel format.
-// The only place that touches pixels and the framebuffer address. A display backend (the
-// boot framebuffer, the virtio-gpu shared backing) is a `Raster` plus how to make its writes
-// visible; it holds no grid and no terminal state.
+// The raw pixel buffer: a mapped linear framebuffer and the layout that describes it. The only
+// place that touches pixels and the framebuffer address. A display backend (the boot framebuffer,
+// the virtio-gpu shared backing) is a `Raster` plus how to make its writes visible; it holds no
+// grid and no terminal state.
+//
+// THE DESCRIPTION IS THE SHARED MODEL'S, AND SO IS THE PACKER. This renderer used to carry its own
+// `Geometry` - an extent, a pitch, a byte count and six channel shift/size fields - validate it with
+// its own rules and pack pixels with its own arithmetic. That was one of four copies of a pixel
+// plane in this tree, and the private packer behind it is exactly the kind of copy a literal 32 once
+// hid in. `graphics_core::ImageLayout` is the description, its constructor is the validation and
+// `graphics_core::pixel::write_packed` is the packer. What remains here is what the shared model
+// deliberately does not express: a DEVICE MAPPING addressed by a raw address rather than by a slice,
+// written with volatile stores.
 pub struct Raster {
-	addr: u64,
-	width: usize,
-	height: usize,
-	pitch: usize,
-	bytes_per_pixel: usize,
-	red_shift: u8,
-	red_size: u8,
-	green_shift: u8,
-	green_size: u8,
-	blue_shift: u8,
-	blue_size: u8,
+	base: u64,
+	layout: ImageLayout,
+	// The channel masks, lifted out of the layout once: every pixel written asks for them, and the
+	// storage arm they live in was already decided when this raster was built.
+	packed: PackedRgbLayout,
 }
 
 impl Raster {
 	// Wrap a mapped linear framebuffer.
 	//
-	// UNSAFE, and it always was - the object's every method dereferences `addr`, and all of them
-	// are reachable through the safe `Surface` trait. Safe Rust could write `Raster::new(1, &g)`
+	// UNSAFE, and it always was - the object's every method dereferences `base`, and all of them
+	// are reachable through the safe `Surface` trait. Safe Rust could write `Raster::new(1, &layout)`
 	// and then `fill()`. Both callers in this tree take the address from a real mapping, so this
 	// was never a live exploit; it was the one thing in this crate that broke a LANGUAGE guarantee
 	// rather than a terminal one, and the signature is where that gets said.
 	//
 	// # Safety
 	//
-	// `addr` must be the base of a readable and writable mapping of at least `g.pitch * g.height`
-	// bytes, valid for as long as this `Raster` lives, and not aliased by any Rust reference. The
-	// geometry must describe that mapping: `bytes_per_pixel` in `1..=4`, `pitch >= width *
-	// bytes_per_pixel`, and every channel's shift plus its size within 32 - which the constructor
-	// checks rather than trusts, because those three are the ones that turn a plausible mode line
-	// into an index panic or a shift overflow.
-	pub unsafe fn new(addr: u64, g: &Geometry) -> Option<Raster> {
-		// Validated ONCE, here, where the numbers arrive. `put_pixel` writes `bytes[i]` over a
-		// `[u8; 4]`, so a `bytes_per_pixel` of 5 was an index panic rather than a refusal, and
-		// `channel` shifts a `u32`, so a `red_shift` of 32 panicked in a debug build. Neither was
-		// checked anywhere, and both are ordinary values for a mode line to carry wrongly.
-		if !(1..=4).contains(&g.bytes_per_pixel) {
+	// `base` must be the base of a readable and writable mapping of at least
+	// `layout.backend_access_span(true)` bytes, valid for as long as this `Raster` lives, and not
+	// aliased by any Rust reference. The layout must describe that mapping.
+	pub unsafe fn new(base: u64, layout: &ImageLayout) -> Option<Raster> {
+		// THE LAYOUT ARRIVED CHECKED: its constructor proved a non-zero extent, a pitch that holds a
+		// row, and channel masks that lie inside the element and do not overlap each other. Two
+		// checks remain, and both are THIS renderer's limits rather than the model's.
+		//
+		// THE MASKS COME FROM WHICHEVER ARM DESCRIBED THE SURFACE. Firmware describes a boot
+		// framebuffer with masks; a display server hands over a NAMED format, and the shared registry
+		// is what says what that name means as masks. Asking the storage once is what lets both
+		// callers reach this renderer - and refusing the named arm is exactly the bug that left the
+		// userspace console with no terminal while the boot console still drew.
+		let Some(packed) = layout.storage.packed_masks() else {
+			return None;
+		};
+		// `put_pixel` assembles the element in a `u32`, so five bytes per pixel was an index past a
+		// `[u8; 4]` rather than a refusal. The shared model admits up to eight because other
+		// consumers can carry them; this one says so instead of indexing.
+		if packed.bytes_per_pixel > 4 {
 			return None;
 		}
-		if g.pitch < g.width.checked_mul(g.bytes_per_pixel)? {
-			return None;
-		}
-		for (shift, size) in [(g.red_shift, g.red_size), (g.green_shift, g.green_size), (g.blue_shift, g.blue_size)] {
-			if size > 8 || shift as u32 + size.min(8) as u32 > 32 {
-				return None;
-			}
-		}
-		if g.pitch.checked_mul(g.height).is_none() {
-			return None;
-		}
-		Some(Raster { addr, width: g.width, height: g.height, pitch: g.pitch, bytes_per_pixel: g.bytes_per_pixel, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size })
+		// And the whole mapping is addressed as `pitch * height`, so a product that does not fit is
+		// refused here rather than wrapping into a pointer.
+		layout.backend_access_span(true)?;
+		Some(Raster { base, layout: *layout, packed })
 	}
 
-	// Position one 8-bit colour channel into the framebuffer pixel value.
+	pub fn width(&self) -> usize {
+		self.layout.extent.width as usize
+	}
+
+	pub fn height(&self) -> usize {
+		self.layout.extent.height as usize
+	}
+
+	// What this raster draws into, for a backend that has to describe its own backing - the
+	// description is the shared model's, so it travels rather than being rebuilt.
+	pub fn layout(&self) -> &ImageLayout {
+		&self.layout
+	}
+
+	fn pitch(&self) -> usize {
+		self.layout.pitch as usize
+	}
+
+	fn bytes_per_pixel(&self) -> usize {
+		self.packed.bytes_per_pixel as usize
+	}
+
+	// Position a colour into this framebuffer's element, THROUGH THE SHARED PACKER.
 	//
-	// A ZERO-WIDTH CHANNEL CONTRIBUTES NOTHING AND SHIFTS NOTHING. The validation admits
-	// `size = 0` with `shift = 32`, because its test is `shift + size.min(8) > 32` and `32 + 0` is
-	// not greater than 32 - so this evaluated `x << 32` on a `u32`, which panics in debug and is
-	// meaningless in release. `Mapping::from_info` accepts only `B8g8r8x8` today so no caller
-	// reaches it, and that is not the standard for a function whose whole purpose in this milestone
-	// was to stop being unsound: a safety boundary holds for every argument it admits.
-	fn channel(&self, value: u8, size: u8, shift: u8) -> u32 {
-		let size = (size as u32).min(8);
-		if size == 0 || shift >= 32 {
-			return 0;
-		}
-		((value as u32) >> (8 - size)) << (shift as u32)
-	}
-
-	fn pack(&self, r: u8, g: u8, b: u8) -> u32 {
-		self.channel(r, self.red_size, self.red_shift) | self.channel(g, self.green_size, self.green_shift) | self.channel(b, self.blue_size, self.blue_shift)
+	// The renderer's currency is one packed `u32` element, and the shared packer writes bytes, so
+	// the element is assembled in a four-byte buffer and read back little-endian - which is the form
+	// `put_pixel` then stores. A zero-width channel contributing nothing, a shift at or past the
+	// word, and a reserved span this layout never declared being left alone are all the shared
+	// packer's rules now, rather than a second statement of them here.
+	pub fn pack(&self, r: u8, g: u8, b: u8) -> u32 {
+		let mut element = [0u8; 4];
+		let colour = Rgba::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+		write_packed(self.packed, &mut element[..self.bytes_per_pixel()], colour);
+		u32::from_le_bytes(element)
 	}
 
 	#[inline]
 	fn put_pixel(&self, x: usize, y: usize, color: u32) {
-		if x >= self.width || y >= self.height {
+		if x >= self.width() || y >= self.height() {
 			return;
 		}
-		let offset = y * self.pitch + x * self.bytes_per_pixel;
+		let offset = y * self.pitch() + x * self.bytes_per_pixel();
 		let bytes = color.to_le_bytes();
 		unsafe {
-			let base = (self.addr as *mut u8).add(offset);
-			for i in 0..self.bytes_per_pixel {
+			let base = (self.base as *mut u8).add(offset);
+			for i in 0..self.bytes_per_pixel() {
 				core::ptr::write_volatile(base.add(i), bytes[i]);
 			}
 		}
@@ -216,14 +222,14 @@ impl Raster {
 	// the existing on-screen pixels into the new backing.
 	#[inline]
 	fn read_pixel(&self, x: usize, y: usize) -> u32 {
-		if x >= self.width || y >= self.height {
+		if x >= self.width() || y >= self.height() {
 			return 0;
 		}
-		let offset = y * self.pitch + x * self.bytes_per_pixel;
+		let offset = y * self.pitch() + x * self.bytes_per_pixel();
 		let mut bytes = [0u8; 4];
 		unsafe {
-			let base = (self.addr as *const u8).add(offset);
-			for i in 0..self.bytes_per_pixel {
+			let base = (self.base as *const u8).add(offset);
+			for i in 0..self.bytes_per_pixel() {
 				bytes[i] = core::ptr::read_volatile(base.add(i));
 			}
 		}
@@ -232,8 +238,8 @@ impl Raster {
 
 	// Fill the whole framebuffer with one colour.
 	fn fill(&self, color: u32) {
-		for y in 0..self.height {
-			for x in 0..self.width {
+		for y in 0..self.height() {
+			for x in 0..self.width() {
 				self.put_pixel(x, y, color);
 			}
 		}
@@ -246,17 +252,17 @@ impl Raster {
 	fn scroll_pixels_up(&self, top: usize, bot: usize, n: usize) {
 		let dy = n * CELL_H;
 		let y_first = top * CELL_H;
-		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		let y_end = ((bot + 1) * CELL_H).min(self.height());
 		if dy >= y_end.saturating_sub(y_first) {
 			return;
 		}
-		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		let row_bytes = (self.width() * self.bytes_per_pixel()).min(self.pitch());
 		unsafe {
-			let base = self.addr as *mut u8;
+			let base = self.base as *mut u8;
 			let mut y = y_first;
 			while y + dy < y_end {
-				let dst = base.add(y * self.pitch);
-				let src = base.add((y + dy) * self.pitch);
+				let dst = base.add(y * self.pitch());
+				let src = base.add((y + dy) * self.pitch());
 				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
 				y += 1;
 			}
@@ -268,18 +274,18 @@ impl Raster {
 	fn scroll_pixels_down(&self, top: usize, bot: usize, n: usize) {
 		let dy = n * CELL_H;
 		let y_first = top * CELL_H;
-		let y_end = ((bot + 1) * CELL_H).min(self.height);
+		let y_end = ((bot + 1) * CELL_H).min(self.height());
 		if dy >= y_end.saturating_sub(y_first) {
 			return;
 		}
-		let row_bytes = (self.width * self.bytes_per_pixel).min(self.pitch);
+		let row_bytes = (self.width() * self.bytes_per_pixel()).min(self.pitch());
 		unsafe {
-			let base = self.addr as *mut u8;
+			let base = self.base as *mut u8;
 			let mut y = y_end;
 			while y > y_first + dy {
 				y -= 1;
-				let dst = base.add(y * self.pitch);
-				let src = base.add((y - dy) * self.pitch);
+				let dst = base.add(y * self.pitch());
+				let src = base.add((y - dy) * self.pitch());
 				core::ptr::copy_nonoverlapping(src, dst, row_bytes);
 			}
 		}
@@ -301,10 +307,10 @@ pub trait Surface {
 	fn present(&self, x: u32, y: u32, w: u32, h: u32);
 
 	fn width(&self) -> usize {
-		self.raster().width
+		self.raster().width()
 	}
 	fn height(&self) -> usize {
-		self.raster().height
+		self.raster().height()
 	}
 	fn pack(&self, r: u8, g: u8, b: u8) -> u32 {
 		self.raster().pack(r, g, b)

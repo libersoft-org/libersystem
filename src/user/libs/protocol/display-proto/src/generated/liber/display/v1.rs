@@ -9,7 +9,118 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 pub use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::graphics::v1::ColorSpace;
+pub use crate::generated::liber::graphics::v1::DamageRegion;
 pub use crate::generated::liber::graphics::v1::PixelFormat;
+
+/// WHAT THE OUTPUT CAN ACTUALLY SHOW, which a colour-space NAME does not say.
+///
+/// A tone map sends one luminance to one, and WHICH luminance that is depends on the display: a
+/// two-thousand-nit highlight on a two-hundred-nit panel and on a thousand-nit one are two different
+/// curves. A conversion that does not know the destination's luminance is guessing at the one number
+/// that decides how the image looks.
+///
+/// EVERY LUMINANCE IS OPTIONAL AND `none` IS NOT ZERO. A display that does not report what it can do
+/// is the ordinary case - nothing in this system asks a panel yet, because DDC needs a bus no driver
+/// here can reach - and `Image and Colour Profile 1` says absent HDR metadata is a refusal to assume
+/// rather than a default to invent. A consumer handed `none` uses the profile's own stated reference
+/// white point, which is one assumption written down in one place.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputColour {
+	pub space: ColorSpace,
+	/// What a relative 1.0 is, in cd/m².
+	pub sdr_white_nits: Option<f32>,
+	pub min_nits: Option<f32>,
+	/// The peak the display can show.
+	pub max_nits: Option<f32>,
+	/// The peak it can hold over a whole frame, which is lower than the peak on most panels.
+	pub max_frame_average_nits: Option<f32>,
+}
+
+impl OutputColour {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<OutputColour> {
+		let mut r = Reader::new(bytes);
+		let value = OutputColour::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<OutputColour> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = OutputColour::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.space.write(w)?;
+		match &self.sdr_white_nits {
+			Some(v0) => {
+				w.u8(1)?;
+				w.f32(*v0)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.min_nits {
+			Some(v1) => {
+				w.u8(1)?;
+				w.f32(*v1)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.max_nits {
+			Some(v2) => {
+				w.u8(1)?;
+				w.f32(*v2)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		match &self.max_frame_average_nits {
+			Some(v3) => {
+				w.u8(1)?;
+				w.f32(*v3)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<OutputColour> {
+		let space = ColorSpace::read(r)?;
+		let sdr_white_nits = if r.tag()? { Some(r.f32()?) } else { None };
+		let min_nits = if r.tag()? { Some(r.f32()?) } else { None };
+		let max_nits = if r.tag()? { Some(r.f32()?) } else { None };
+		let max_frame_average_nits = if r.tag()? { Some(r.f32()?) } else { None };
+		Some(OutputColour { space, sdr_white_nits, min_nits, max_nits, max_frame_average_nits })
+	}
+}
 
 /// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
 /// retains a read+map duplicate and transfers a write+map handle to the client. Its
@@ -23,6 +134,10 @@ pub struct SurfaceInfo {
 	pub height: u32,
 	pub pitch: u32,
 	pub format: PixelFormat,
+	/// What the output this surface reaches can show. It travels WITH the surface because it is a
+	/// property of the destination the client is drawing for, and a client that had to ask for it
+	/// separately would be a client that draws one frame before it knows.
+	pub colour: OutputColour,
 }
 
 impl SurfaceInfo {
@@ -67,6 +182,7 @@ impl SurfaceInfo {
 		w.u32(self.height)?;
 		w.u32(self.pitch)?;
 		self.format.write(w)?;
+		self.colour.write(w)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<SurfaceInfo> {
@@ -79,7 +195,8 @@ impl SurfaceInfo {
 		let height = r.u32()?;
 		let pitch = r.u32()?;
 		let format = PixelFormat::read(r)?;
-		Some(SurfaceInfo { pixels, width, height, pitch, format })
+		let colour = OutputColour::read(r)?;
+		Some(SurfaceInfo { pixels, width, height, pitch, format, colour })
 	}
 }
 
@@ -215,9 +332,9 @@ impl PresentationStats {
 }
 
 /// One display connection owns at most one surface. `present` is synchronous: the
-/// service validates the damage rectangle, copies/scales that rectangle to its
-/// scanout and completes the device flush before replying; the client must not modify
-/// pixels inside the rectangle until the call returns. `release`, channel peer-close,
+/// service validates the damage, copies/scales the damaged pixels to its scanout and
+/// completes the device flush before replying; the client must not modify pixels
+/// inside the damaged area until the call returns. `release`, channel peer-close,
 /// or process death drops the surface and restores the console with a full repaint.
 /// The client is not told whether its surface is fullscreen; a compositor can later
 /// implement this same contract without an API break. `(0, 0)` requests the server's
@@ -237,7 +354,19 @@ pub mod display {
 
 	pub trait Service {
 		fn acquire(&mut self, width: u32, height: u32) -> Result<SurfaceInfo, Error>;
-		fn present(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<(), Error>;
+		/// DAMAGE IS A BOUNDED LIST WITH AN EXPLICIT WHOLE-SURFACE VARIANT, and the nine
+		/// answers `WSI Profile 1` freezes are the contract this call implements. An EMPTY
+		/// list means nothing changed: the present is still ordered and still completes.
+		/// The whole surface is `whole`, never one rectangle covering the extent, because a
+		/// rectangle can be wrong by a pixel and a variant cannot. A rectangle outside the
+		/// extent is a typed `invalid` and never a silent clamp. More than the bound is the
+		/// caller's problem, solved by merging or by sending `whole` - never the service's,
+		/// solved by dropping rectangles. Overlapping rectangles are legal. The coordinates
+		/// are in the surface's own image space.
+		/// A SINGLE RECTANGLE WAS NOT ENOUGH AND THE COST WAS NOT THEORETICAL: a client
+		/// updating two corners of a screen sent their bounding box, which is most of the
+		/// screen, and the service transferred all of it.
+		fn present(&mut self, damage: DamageRegion) -> Result<(), Error>;
 		fn release(&mut self) -> Result<(), Error>;
 		fn events(&mut self) -> Vec<DisplayEvent>;
 		/// Return the one-shot proof channel for this connection's active surface. The
@@ -276,13 +405,13 @@ pub mod display {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v0) => {
+						Ok(v4) => {
 							w.u8(1)?;
-							v0.write(w)?;
+							v4.write(w)?;
 						}
-						Err(v1) => {
+						Err(v5) => {
 							w.u8(0)?;
-							v1.write(w)?;
+							v5.write(w)?;
 						}
 					}
 					Some(())
@@ -305,23 +434,20 @@ pub mod display {
 				}
 			}
 			OP_PRESENT => {
-				let x = r.u32()?;
-				let y = r.u32()?;
-				let width = r.u32()?;
-				let height = r.u32()?;
+				let damage = DamageRegion::read(r)?;
 				r.finish()?;
 				request_handles.clear();
-				let result = service.present(x, y, width, height);
+				let result = service.present(damage);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v2) => {
+						Ok(v6) => {
 							w.u8(1)?;
 						}
-						Err(v3) => {
+						Err(v7) => {
 							w.u8(0)?;
-							v3.write(w)?;
+							v7.write(w)?;
 						}
 					}
 					Some(())
@@ -351,12 +477,12 @@ pub mod display {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v4) => {
+						Ok(v8) => {
 							w.u8(1)?;
 						}
-						Err(v5) => {
+						Err(v9) => {
 							w.u8(0)?;
-							v5.write(w)?;
+							v9.write(w)?;
 						}
 					}
 					Some(())
@@ -386,14 +512,14 @@ pub mod display {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v6) => {
+						Ok(v10) => {
 							w.u8(1)?;
-							w.set_handle(*v6)?;
+							w.set_handle(*v10)?;
 							w.u32(0)?;
 						}
-						Err(v7) => {
+						Err(v11) => {
 							w.u8(0)?;
-							v7.write(w)?;
+							v11.write(w)?;
 						}
 					}
 					Some(())
@@ -570,16 +696,13 @@ pub mod display {
 			}
 			decoded
 		}
-		pub fn present(&mut self, x: &u32, y: &u32, width: &u32, height: &u32) -> Option<Result<(), Error>> {
+		pub fn present(&mut self, damage: &DamageRegion) -> Option<Result<(), Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
 			w.u16(OP_PRESENT)?;
 			w.u32(corr)?;
-			w.u32(*x)?;
-			w.u32(*y)?;
-			w.u32(*width)?;
-			w.u32(*height)?;
+			damage.write(w)?;
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -715,9 +838,9 @@ pub mod display {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_display_display_present")]
-	fn channel_invoke_present(chan: u64, x: &u32, y: &u32, width: &u32, height: &u32) -> Option<Result<(), Error>> {
+	fn channel_invoke_present(chan: u64, damage: &DamageRegion) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.present(x, y, width, height)
+		client.present(damage)
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -807,14 +930,14 @@ pub mod display_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v8) => {
+						Ok(v12) => {
 							w.u8(1)?;
-							w.set_handle(*v8)?;
+							w.set_handle(*v12)?;
 							w.u32(0)?;
 						}
-						Err(v9) => {
+						Err(v13) => {
 							w.u8(0)?;
-							v9.write(w)?;
+							v13.write(w)?;
 						}
 					}
 					Some(())
@@ -1033,6 +1156,157 @@ pub mod display_admin {
 	}
 }
 
+impl OutputColour {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"space\":");
+		self.space.to_json_into(out);
+		out.push(',');
+		out.push_str("\"sdr-white-nits\":");
+		match &self.sdr_white_nits {
+			Some(v14) => {
+				let _ = write!(out, "{}", v14);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"min-nits\":");
+		match &self.min_nits {
+			Some(v15) => {
+				let _ = write!(out, "{}", v15);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"max-nits\":");
+		match &self.max_nits {
+			Some(v16) => {
+				let _ = write!(out, "{}", v16);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"max-frame-average-nits\":");
+		match &self.max_frame_average_nits {
+			Some(v17) => {
+				let _ = write!(out, "{}", v17);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("space=");
+		self.space.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("sdr-white-nits=");
+		match &self.sdr_white_nits {
+			Some(v18) => {
+				let _ = write!(out, "{}", v18);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("min-nits=");
+		match &self.min_nits {
+			Some(v19) => {
+				let _ = write!(out, "{}", v19);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("max-nits=");
+		match &self.max_nits {
+			Some(v20) => {
+				let _ = write!(out, "{}", v20);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("max-frame-average-nits=");
+		match &self.max_frame_average_nits {
+			Some(v21) => {
+				let _ = write!(out, "{}", v21);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::text(out, "space");
+		self.space.to_cbor_into(out);
+		crate::codec::cbor::text(out, "sdr-white-nits");
+		match &self.sdr_white_nits {
+			Some(v22) => {
+				crate::codec::cbor::f32(out, *v22);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "min-nits");
+		match &self.min_nits {
+			Some(v23) => {
+				crate::codec::cbor::f32(out, *v23);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "max-nits");
+		match &self.max_nits {
+			Some(v24) => {
+				crate::codec::cbor::f32(out, *v24);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "max-frame-average-nits");
+		match &self.max_frame_average_nits {
+			Some(v25) => {
+				crate::codec::cbor::f32(out, *v25);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+	}
+}
+
 impl SurfaceInfo {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1065,6 +1339,9 @@ impl SurfaceInfo {
 		out.push(',');
 		out.push_str("\"format\":");
 		self.format.to_json_into(out);
+		out.push(',');
+		out.push_str("\"colour\":");
+		self.colour.to_json_into(out);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1083,10 +1360,13 @@ impl SurfaceInfo {
 		out.push_str(", ");
 		out.push_str("format=");
 		self.format.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("colour=");
+		self.colour.to_text_into(out);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "pixels");
 		crate::codec::cbor::uint(out, self.pixels.len);
 		crate::codec::cbor::text(out, "width");
@@ -1097,6 +1377,8 @@ impl SurfaceInfo {
 		crate::codec::cbor::uint(out, self.pitch as u64);
 		crate::codec::cbor::text(out, "format");
 		self.format.to_cbor_into(out);
+		crate::codec::cbor::text(out, "colour");
+		self.colour.to_cbor_into(out);
 	}
 }
 

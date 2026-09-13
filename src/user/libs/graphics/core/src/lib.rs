@@ -28,6 +28,9 @@ pub mod planar;
 pub mod sample;
 pub mod semantics;
 pub mod view;
+// THE ONE DOOR FROM THE WIRE. `liber:graphics@1`'s descriptors become this library's validated
+// types here and nowhere else - see the module.
+pub mod wire;
 
 pub use color::ColorSpace;
 pub use composite::{BlendMode, Operator, composite};

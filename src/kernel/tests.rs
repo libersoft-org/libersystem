@@ -120,7 +120,7 @@ pub(crate) fn launch_context(arguments: &[u8], cwd: &[u8]) -> alloc::vec::Vec<u8
 	out
 }
 
-fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
+pub(crate) fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
 	let cap = object::handle::Capability::new(object, rights);
 	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap])).map_err(|_| "bootstrap capability send failed")
 }
@@ -1811,12 +1811,20 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	acquire_reply.extend_from_slice(&1u32.to_le_bytes());
 	acquire_reply.extend_from_slice(&1u32.to_le_bytes());
 	acquire_reply.extend_from_slice(&4u32.to_le_bytes());
-	acquire_reply.push(0);
+	// THE FORMAT IS NAMED AND NOT NUMBERED. This was a literal zero, which was `b8g8r8x8` while
+	// `liber:display@1` carried its own one-member enumeration and became `a8-unorm` when the shared
+	// `liber:graphics@1` list replaced it - so this harness offered a surface the client was right to
+	// refuse, and the test waited for a frame nobody was going to send.
+	acquire_reply.push(graphics_proto::generated::liber::graphics::v1::PixelFormat::B8g8r8x8Unorm as u8);
+	acquire_reply.extend_from_slice(&unknown_output_colour());
 	send_cap(&view_display_server, &acquire_reply, surface.clone(), Rights::ALL)?;
 	sched::run_until_idle();
 
 	let present = view_display_server.recv().map_err(|_| "imgview did not present its decoded image")?;
-	if present.bytes.len() < 22 || le_u16(&present.bytes, 0) != 2 || le_u32(&present.bytes, 14) != 1 || le_u32(&present.bytes, 18) != 1 {
+	// THE DAMAGE IS DECODED BY THE GENERATED READER and not read at hand-written offsets: it is a
+	// bounded list with a whole-surface variant now, and a harness that knew where the fields used to
+	// be is a harness that waits for a frame nobody is going to send.
+	if le_u16(&present.bytes, 0) != 2 || !present_covers(&present.bytes, 1, 1) {
 		return Err("imgview sent an invalid first present");
 	}
 	if !read_from_object(&surface, 4).iter().any(|byte| *byte != 0) {
@@ -1868,7 +1876,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview pan key")?;
 	sched::run_until_idle();
 	let pan_present = view_display_server.recv().map_err(|_| "imgview did not present after arrow-key pan")?;
-	if pan_present.bytes.len() < 22 || le_u16(&pan_present.bytes, 0) != 2 || le_u32(&pan_present.bytes, 14) != 1 || le_u32(&pan_present.bytes, 18) != 1 {
+	if le_u16(&pan_present.bytes, 0) != 2 || !present_covers(&pan_present.bytes, 1, 1) {
 		return Err("imgview sent an invalid pan present");
 	}
 	let pan_corr = le_u32(&pan_present.bytes, 2);
@@ -5842,10 +5850,71 @@ fn run_volume_tool(tool_elf: &[u8], args: &[u8], system: &mut StorageHarness, me
 	run_volume_tool_in(sched::root_domain(), tool_elf, args, system, media).0
 }
 
+// The tail of a `surface-info`: what the output can show, which these harnesses do not know and
+// therefore do not claim. ENCODED BY THE GENERATED WRITER rather than appended as five bytes, for the
+// reason the format byte beside it carries: a record's layout is not a harness's to remember.
+fn unknown_output_colour() -> alloc::vec::Vec<u8> {
+	use display_proto::generated::liber::display::v1::OutputColour;
+	use graphics_proto::generated::liber::graphics::v1::ColorSpace;
+	OutputColour { space: ColorSpace::Srgb, sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None }.encode_vec().expect("an output colour encodes")
+}
+
+// The reply a display DEVICE gives to `scanout`, ENCODED BY THE GENERATED WRITER.
+//
+// The record carries a capability, so the bytes and the handle are two halves of one message: the
+// writer records the capability and the caller sends the handle beside the bytes, which is what
+// `send_cap` does. Generation one, because a harness that hands over one backing and never replaces
+// it has exactly one generation - and naming it is what lets the service's presents be accepted.
+pub(crate) fn scanout_reply(corr: u32, width: u32, height: u32, len: u64) -> alloc::vec::Vec<u8> {
+	use display_device_proto::generated::liber::display_device::v1::Scanout;
+	use display_device_proto::generated::liber::graphics::v1::{AlphaMode, ColorSpace, Extent2d, ImageLayout, PixelFormat, RowOrigin};
+	let described = Scanout { backing: display_device_proto::codec::Buffer { handle: 0, len }, layout: ImageLayout { size: Extent2d { width, height }, pitch: width * 4, format: PixelFormat::B8g8r8x8Unorm, alpha: AlphaMode::Opaque, color_space: ColorSpace::Srgb, origin: RowOrigin::TopLeft }, visible: Extent2d { width, height }, generation: 1 };
+	let (body, _handles) = described.encode_message().expect("a scanout encodes");
+	let mut reply = corr.to_le_bytes().to_vec();
+	reply.push(1);
+	reply.extend_from_slice(&body);
+	reply
+}
+
+// Answer the service's `events` call on a display device: a channel pair, the consumer end to the
+// service, the producer kept for the harness to push events down.
+//
+// `None` WHEN THE SERVICE DID NOT ASK, which is a real answer rather than a failure: a harness that
+// panicked here would be asserting the order of two calls the interface does not order.
+pub(crate) fn answer_device_events(gpu: &object::channel::Channel) -> Option<alloc::sync::Arc<object::channel::Channel>> {
+	use object::channel::Channel;
+	use object::rights::Rights;
+	let request = gpu.recv().ok()?;
+	if le_u16(&request.bytes, 0) != 3 {
+		return None;
+	}
+	let (producer, consumer) = Channel::create();
+	send_cap(gpu, &le_u32(&request.bytes, 2).to_le_bytes(), consumer, Rights::ALL).ok()?;
+	Some(producer)
+}
+
+// Whether a typed `present` request's damage covers exactly the rectangle a harness expects, decoded
+// through the generated reader. `whole` covers anything, which is what the first present of a
+// generation sends.
+fn present_covers(bytes: &[u8], width: u32, height: u32) -> bool {
+	use graphics_proto::generated::liber::graphics::v1::DamageRegion;
+	let Some(body) = bytes.get(6..) else { return false };
+	let Some(damage) = DamageRegion::decode(body) else { return false };
+	if damage.whole {
+		return true;
+	}
+	damage.rects.iter().any(|rect| rect.size.width == width && rect.size.height == height)
+}
+
 fn viewer_surface(image: &pix::RgbaImage) -> alloc::vec::Vec<u8> {
 	let source = image.to_bgrx().expect("viewer source converts to BGRX");
 	let mut output = alloc::vec![0u8; 16];
-	let result = pix::blit(pix::Image { data: &source, width: image.width, height: image.height, pitch: image.pitch }, pix::Target { data: &mut output, width: 2, height: 2, pitch: 8, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 }, pix::Rect { x: 0, y: 0, width: image.width, height: image.height }, true);
+	// THE DESCRIPTORS ARE CHECKED WHERE THEY ARE BUILT, which is what the struct literals could not
+	// do: a buffer too small for the geometry it claims, and channel masks that overlap, are both
+	// refused here rather than trusted by the blitter.
+	let source_image = pix::Image::rgba(&source, image.width, image.height, image.pitch).expect("a decoded image describes itself");
+	let destination = pix::Target::packed(&mut output, 2, 2, 8, 4, (16, 8), (8, 8), (0, 8)).expect("a target this test sized itself");
+	let result = pix::blit(source_image, destination, pix::Rect { x: 0, y: 0, width: image.width, height: image.height }, true);
 	assert!(result.is_some(), "expected viewer pixels render");
 	output
 }
@@ -5936,7 +6005,9 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	reply.extend_from_slice(&2u32.to_le_bytes());
 	reply.extend_from_slice(&2u32.to_le_bytes());
 	reply.extend_from_slice(&8u32.to_le_bytes());
-	reply.push(0);
+	// Named rather than numbered, for the reason written out at the other harness above.
+	reply.push(graphics_proto::generated::liber::graphics::v1::PixelFormat::B8g8r8x8Unorm as u8);
+	reply.extend_from_slice(&unknown_output_colour());
 	send_cap(&display, &reply, surface.clone(), Rights::ALL).expect("imgview acquire reply");
 
 	let present = loop {
@@ -6183,13 +6254,15 @@ impl ConsoleHarness {
 		serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 		sched::run_until_idle();
 		let fb_request = gpu.recv().expect("framebuffer request");
-		assert_eq!(&fb_request.bytes[..], b"FB", "DisplayService requests the scanout");
+		assert_eq!(le_u16(&fb_request.bytes, 0), 1, "DisplayService asks the device for its scanout");
 		let Ok(scanout) = DmaBuffer::create_in(&sched::root_domain(), (width * height * 4) as usize) else { panic!("stand-in scanout") };
-		let fb = abi::Framebuffer { width, height, pitch: width * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
-		let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
-		fb_reply.extend_from_slice(&width.to_le_bytes());
-		fb_reply.extend_from_slice(&height.to_le_bytes());
+		let fb_reply = scanout_reply(le_u32(&fb_request.bytes, 2), width, height, (width * height * 4) as u64);
 		send_cap(&gpu, &fb_reply, scanout, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+		sched::run_until_idle();
+		// AND THE EVENT STREAM THE SERVICE OPENS NEXT. A harness that answered the scanout and not
+		// this one leaves the service waiting for a reply that never comes, which is exactly what it
+		// looks like: a display that never reports online.
+		let device_events = answer_device_events(&gpu);
 		sched::run_until_idle();
 		let online = display_boot.recv().expect("DisplayService online report");
 		assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
@@ -6211,7 +6284,14 @@ impl ConsoleHarness {
 		send_cap(&console_boot, b"POINTER", pointer_console, Rights::ALL).expect("POINTER bootstrap");
 		console_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("READY bootstrap");
 
-		let mut harness = ConsoleHarness { gpu, focus, pointer, program: vt1_program, cols, rows, _open: alloc::vec![kill_keep, display_admin_keep, ctl_keep, dummy_keep] };
+		let mut open: alloc::vec::Vec<alloc::sync::Arc<object::channel::Channel>> = alloc::vec![kill_keep, display_admin_keep, ctl_keep, dummy_keep];
+		// THE DEVICE'S EVENT PRODUCER IS HELD BY THE HARNESS, because dropping it closes the stream
+		// the service is waiting on - and a service whose device stream ends releases it and looks,
+		// to anything watching, like a driver that went away.
+		if let Some(events) = device_events {
+			open.push(events);
+		}
+		let mut harness = ConsoleHarness { gpu, focus, pointer, program: vt1_program, cols, rows, _open: open };
 		// SEVERAL SETTLES, not one: bring-up crosses timed waits (the bounded wait for a
 		// ConfigService that is not there, and the display round trips), and `run_until_idle`
 		// returns while a thread is parked on a deadline.
@@ -6235,9 +6315,15 @@ impl ConsoleHarness {
 			sched::run_until_idle();
 		}
 		while let Ok(message) = self.gpu.recv() {
-			if message.bytes.starts_with(b"PRESENT") {
+			// THE TYPED PRESENT, ANSWERED THE WAY A DRIVER ANSWERS IT: the correlation echoed and the
+			// acknowledgement that the device took the transfer. Anything else on this channel is a
+			// call this stand-in does not implement, and leaving it unanswered is what a device that
+			// does not implement it looks like.
+			if le_u16(&message.bytes, 0) == 2 {
 				presented += 1;
-				self.gpu.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("present acknowledgement");
+				let mut reply = le_u32(&message.bytes, 2).to_le_bytes().to_vec();
+				reply.push(1);
+				self.gpu.send(object::channel::Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
 			}
 			sched::run_until_idle();
 		}
