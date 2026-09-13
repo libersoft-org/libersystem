@@ -249,9 +249,6 @@ struct DevAgent {
 	// The agent's bootstrap. It is both how capabilities reach the agent and how this program
 	// learns the agent is gone: it closes when the process ends, however it ended.
 	bootstrap: u64,
-	// The transport driver's bootstrap, over which a replacement agent's wire is handed down.
-	// The driver keeps its device and its port across the gap and waits for that message.
-	driver: u64,
 	// A volume client of this program's own, kept past driver bring-up. The connection the
 	// drivers were read through belongs to ServiceManager's message and is closed with it,
 	// and a replacement has to be read off the volume long after that.
@@ -322,13 +319,13 @@ impl DevAgent {
 	// The agent's bootstrap became readable. Anything it says is passed through to the console;
 	// its closing means the process ended, and a fresh one takes its place.
 	#[cfg(feature = "development")]
-	fn supervise(&mut self, buf: &mut [u8]) {
+	fn supervise(&mut self, buf: &mut [u8], clients: &mut CatalogueClients) {
 		match recv_blocking(self.bootstrap, buf) {
 			Received::Message { len, .. } => {
 				print(&buf[..len]);
 				print(b"\n");
 			}
-			Received::Closed => self.restart(),
+			Received::Closed => self.restart(clients),
 		}
 	}
 
@@ -337,20 +334,27 @@ impl DevAgent {
 	// a restart. A failure at any step leaves the port transport-only rather than half-wired,
 	// and says so.
 	#[cfg(feature = "development")]
-	fn restart(&mut self) {
+	fn restart(&mut self, clients: &mut CatalogueClients) {
 		unsafe {
 			close(self.bootstrap);
 			self.bootstrap = 0;
-			if self.driver == 0 || self.storage == 0 {
+			if self.storage == 0 {
 				return;
 			}
-			let Some((driver_side, agent_side)) = channel() else { return };
-			// The agent is started before the driver is told, so a start that fails leaves the
-			// driver waiting for a channel that will be offered again rather than holding one
-			// whose other end never appears.
-			self.bootstrap = start_dev_agent(self.storage, agent_side, self.console_input, &self.nonce);
-			if self.bootstrap == 0 || !send_blocking(self.driver, b"BYTES", driver_side) {
-				close(driver_side);
+			// A CONNECTION OF ITS OWN, AND NOTHING SAID TO THE DRIVER. The replacement used to be
+			// re-wired from here: this program made a channel pair, started the agent on one end
+			// and sent the other down to the transport driver under a `BYTES` tag, so a restart was
+			// a three-party hand-off that only worked because this program knew which driver the
+			// wire belonged to. The agent now subscribes to the catalogue and opens the provider
+			// itself, so a restart owes it exactly what a first start owes it, and the driver is
+			// told nothing at all: the connection it lost closed with the process that held it, and
+			// the one the replacement opens arrives as an ordinary `CONNECT`.
+			let Some(catalogue) = channel_pair_for_catalogue(clients) else {
+				print(b"DeviceManager: no catalogue connection for the replacement development agent; it is not restarted\n");
+				return;
+			};
+			self.bootstrap = start_dev_agent(self.storage, catalogue, self.console_input, &self.nonce);
+			if self.bootstrap == 0 {
 				print(b"DeviceManager: the development agent did not restart; the control channel is transport-only\n");
 				return;
 			}
@@ -749,7 +753,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// this program is what started it.
 					#[cfg(feature = "development")]
 					if dev.bootstrap != 0 && at == dev_at {
-						dev.supervise(&mut buf);
+						dev.supervise(&mut buf, &mut catalogue_clients);
 						continue;
 					}
 					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
@@ -770,10 +774,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery, &mut dev);
-					#[cfg(not(feature = "development"))]
 					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery);
+					// THE DEVELOPMENT AGENT IS STARTED HERE, ONCE, AND NOT BY A DRIVER'S NAME.
+					//
+					// It used to be started from `route_offers`, the moment a binding whose artifact
+					// was called `dev_channel` reported - so the one consumer of the one provider
+					// this machine publishes existed only if that exact driver bound, and only for
+					// as long as the pass that bound it. It is started now because this is a
+					// development image, which is the only thing that is actually true of it, and it
+					// finds its provider through the catalogue like everything else. A machine with
+					// no development device gets an agent with no wire, which is what an idle
+					// subscription is for.
+					#[cfg(feature = "development")]
+					if dev.bootstrap == 0 {
+						dev.storage = service_connect(recovery.storage).unwrap_or(0);
+						// INSECURE by name, because that is what this is: an identifier that tells
+						// one boot from another, not a secret. Asking for the secure one would
+						// refuse on every machine with no hardware random source - which is two of
+						// the three architectures - for a number that never needed to be
+						// unguessable.
+						random_insecure(&mut dev.nonce);
+						dev.console_input = console_input;
+						match channel_pair_for_catalogue(&mut catalogue_clients) {
+							// SAFETY: `start_dev_agent` maps the agent's ELF and reads it as a
+							// slice, which is the one genuinely unsafe thing on this path.
+							Some(connection) => dev.bootstrap = unsafe { start_dev_agent(dev.storage, connection, console_input, &dev.nonce) },
+							None => print(b"DeviceManager: no catalogue connection for the development agent; it is not started\n"),
+						}
+						if dev.bootstrap == 0 {
+							print(b"DeviceManager: the development agent did not start; the control channel is transport-only\n");
+						}
+					}
 					// NOT CLOSED: `Recovery` holds it, because rebinding a crashed driver means
 					// reading its artifact off the volume again. See `Recovery`.
 					// THE TAG CARRIES A FACT, NOT A CHANNEL - the network half, the same shape as the
@@ -1063,7 +1094,7 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
+fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1140,9 +1171,6 @@ fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Ve
 					Step::Waiting => {}
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
-						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], catalogue, name, storage, console_input, dev);
-						#[cfg(not(feature = "development"))]
 						route_offers(&mut nodes[at], name);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
@@ -1337,7 +1365,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 // extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
 // so what a capability was for was decided by parsing a string the driver chose.
 #[allow(clippy::too_many_arguments)]
-fn route_offers(node: &mut Node, #[cfg(feature = "development")] catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+fn route_offers(node: &mut Node, driver_name: &[u8]) {
 	let _ = driver_name;
 	// PUBLISHED FIRST, ROUTED SECOND. Everything this binding offered enters the catalogue with
 	// an identity this service minted; what follows takes from the catalogue rather than from
@@ -1364,41 +1392,23 @@ fn route_offers(node: &mut Node, #[cfg(feature = "development")] catalogue: &mut
 	// the first consumer - which is also what makes the late-publication case work, since a
 	// sound card bound after the service started reaches it down the same subscription.
 	//
+	// AND THE DEVELOPMENT CHANNEL IS NOT ROUTED ANY MORE EITHER, WHICH WAS THE LAST ONE (2026-09-13).
+	//
+	// It was the only provider in this machine whose consumer was chosen by the DRIVER'S NAME: this
+	// function took the `console-bytes` publication out of the catalogue, compared the binding's
+	// artifact name against `dev_channel`, started the development agent on the channel it had
+	// taken, and CLOSED the publication of any other driver that offered the same kind. So the
+	// catalogue could show that provider to nobody, a second publisher of the kind was silently
+	// discarded, and a provider that appeared after this pass - a rebind, or a driver bound later -
+	// had no path to its consumer at all.
+	//
+	// The agent subscribes for itself now and is started once, after phase two, whether or not the
+	// device is there; what it is given is a catalogue connection, and what it does with it is what
+	// every other consumer in this tree does. So nothing of this kind is routed here: the
+	// publication stays in the catalogue with its offered channel intact, and `open` hands that
+	// channel to the consumer that asks for it.
+	//
 	// The other kinds still route; each is its own seam and moves on its own.
-	// The development channel driver hands up a raw byte channel, and the agent that speaks the
-	// protocol over it is started here rather than by ServiceManager. It exists exactly when the
-	// device does, it has no other client, and its whole reason to be a separate process is to
-	// keep the artifact registry out of the address space that holds a device capability - so it
-	// is started where that device is bound, and nowhere else.
-	#[cfg(feature = "development")]
-	{
-		let dev_bytes: u64 = catalogue.take_from(node.id, driver_protocol::provider::CONSOLE_BYTES);
-		if driver_name == b"dev_channel" && dev_bytes != 0 {
-			// The driver's bootstrap is kept rather than left to leak, because a replacement
-			// agent's wire is handed down over it; and a volume connection of this program's own
-			// is opened, because the one these drivers were read through is closed as soon as
-			// the caller returns.
-			if let Some(binding) = &node.binding {
-				dev.driver = binding.channel;
-			}
-			dev.storage = service_connect(storage).unwrap_or(0);
-			// INSECURE by name, because that is what this is: an identifier that tells one boot
-			// from another, not a secret. Asking for the secure one would refuse on every
-			// machine with no hardware random source - which is two of the three architectures -
-			// for a number that never needed to be unguessable.
-			random_insecure(&mut dev.nonce);
-			dev.console_input = console_input;
-			// SAFETY: `start_dev_agent` maps the agent's ELF and reads it as a slice, which is the
-			// one genuinely unsafe thing left on this path - the wrappers around it became safe and
-			// took the enclosing block with them, which is what left this call bare.
-			dev.bootstrap = unsafe { start_dev_agent(dev.storage, dev_bytes, console_input, &dev.nonce) };
-			if dev.bootstrap == 0 {
-				print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
-			}
-		} else if dev_bytes != 0 {
-			close(dev_bytes);
-		}
-	}
 	// The pointer flavour of virtio_input offers an INPUT provider; the keyboard flavour offers
 	// none, so an absent one is a state rather than a failure.
 	// AND THE USB CONTROLLER'S PROVIDERS ARE NOT ROUTED HERE ANY MORE EITHER (2026-09-03).
@@ -1420,7 +1430,7 @@ fn route_offers(node: &mut Node, #[cfg(feature = "development")] catalogue: &mut
 // a failure to start is reported rather than retried - a development instance without its
 // agent is still a usable guest, just one whose control channel carries nothing.
 #[cfg(feature = "development")]
-unsafe fn start_dev_agent(storage: u64, bytes: u64, console_input: u64, nonce: &[u8; 8]) -> u64 {
+unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonce: &[u8; 8]) -> u64 {
 	unsafe {
 		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
 		let (file, mapped, size): (u64, u64, usize) = match loaded {
@@ -1428,10 +1438,12 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64, console_input: u64, nonce: &
 			None => return 0,
 		};
 		let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
-		// The agent gets a bootstrap of its own and the byte channel transferred over it. The
-		// byte channel is the wire: anything sent on it goes out of the port, so it is not a
-		// place to report in, and DeviceManager must never read from it either - every byte on
-		// it belongs to the agent.
+		// The agent gets a bootstrap of its own and a PROVIDER-CATALOGUE connection transferred
+		// over it. What used to travel here was the wire itself - the byte channel this program had
+		// taken out of the catalogue when a driver whose NAME it recognised reported - and that is
+		// the whole of what this item changed: the agent is given the means to find its provider
+		// rather than the provider, so a channel published late, or republished after a rebind, or
+		// published by some other driver of the same kind, reaches it down the same path.
 		let (dm_side, agent_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => {
@@ -1443,12 +1455,12 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64, console_input: u64, nonce: &
 		let started: bool = spawn(elf, agent_side) >= 0;
 		unmap_object(file);
 		close(file);
-		// The wire and the boot's identity in one message: the identity is not the agent's to
+		// The catalogue and the boot's identity in one message: the identity is not the agent's to
 		// draw, since it outlives any one agent, and one message leaves no order to get wrong.
-		let mut opening: [u8; 13] = [0u8; 13];
-		opening[..5].copy_from_slice(b"BYTES");
-		opening[5..].copy_from_slice(nonce);
-		if !started || !send_blocking(dm_side, &opening, bytes) {
+		let mut opening: [u8; 11] = [0u8; 11];
+		opening[..3].copy_from_slice(b"CAT");
+		opening[3..].copy_from_slice(nonce);
+		if !started || !send_blocking(dm_side, &opening, catalogue) {
 			return 0;
 		}
 		// A volume connection of its own, so the agent can read the installed artifact a
