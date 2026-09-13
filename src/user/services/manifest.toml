@@ -3526,12 +3526,33 @@ destination = "lib/image/pcx.lslib"
 features = []
 providers = ["quantize", "pix", "lsrt"]
 
+# THE FROZEN GRAPHICS REGISTRY, as a library, because the image model reads every format, colour
+# constant and byte-span rule out of it rather than restating them - and a second copy of a matrix is
+# a second answer.
+[[libraries]]
+name = "graphics-profile"
+owner = "graphics-profile"
+destination = "lib/graphics/graphics-profile.lslib"
+features = []
+providers = ["lsrt"]
+
+# THE CANONICAL IMAGE MODEL: layouts, views, owned images, the one pixel pipeline, the compositing
+# arithmetic and the one sampler. It is in the image because `pix` calls it - the blending and the
+# packed-pixel writing that used to be private copies - and DisplayService reaches the same code
+# through `pix::blit`, which is its copy-and-scale path.
+[[libraries]]
+name = "graphics-core"
+owner = "graphics-core"
+destination = "lib/graphics/graphics-core.lslib"
+features = []
+providers = ["graphics-profile", "lsrt"]
+
 [[libraries]]
 name = "pix"
 owner = "pix"
 destination = "lib/image/pix.lslib"
 features = []
-providers = ["lsrt"]
+providers = ["graphics-core", "lsrt"]
 
 [[libraries]]
 name = "png"

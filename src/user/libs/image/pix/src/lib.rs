@@ -6,9 +6,12 @@ use alloc::vec::Vec;
 
 use graphics_core::composite::{BlendMode, Operator, composite};
 use graphics_core::format::{PackedChannel, PackedRgbLayout};
+use graphics_core::geom::Extent2D;
+use graphics_core::layout::{ImageLayout, RowOrigin};
 use graphics_core::pixel::{Decoder, Rgba as Colour, Working, quantise, write_packed};
 use graphics_core::semantics::ImageSemantics;
-use graphics_core::{AlphaMode, ColorSpace};
+use graphics_core::view::{ImageView, ImageViewMut};
+use graphics_core::{AlphaMode, ColorSpace, PixelFormat, PixelStorage};
 
 #[cfg(test)]
 extern crate std;
@@ -25,23 +28,66 @@ pub enum Error {
 	TooLarge,
 }
 
+/// An RGBA8 image, WITH ITS MEANING.
+///
+/// AN IMAGE WITH NO COLOUR METADATA IS A BACK DOOR INTO THE IMAGE MODEL. Width, height, pitch and
+/// bytes say nothing about what a byte MEANS: whether 128 is half the light or half the encoded
+/// value, whether the colour has already been multiplied by its alpha, and which primaries it was
+/// authored against. Every consumer that guessed guessed sRGB with straight alpha and was usually
+/// right, which is what makes the door hard to notice.
+///
+/// SO THE SEMANTICS TRAVEL WITH THE PIXELS, and the default is what every decoder in this tree
+/// actually produces - sRGB, straight alpha - stated rather than assumed. A decoder that knows
+/// better says so; a consumer that hands these pixels to `graphics-core` hands over the semantics
+/// with them, through `view`, and there is no other way in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RgbaImage {
 	pub width: u32,
 	pub height: u32,
 	pub pitch: u32,
 	pub pixels: Vec<u8>,
+	/// What the bytes mean. `Color { srgb, straight }` unless a decoder says otherwise.
+	pub semantics: ImageSemantics,
 }
+
+/// What a decoder produces unless it says otherwise: sRGB, straight alpha.
+pub const DEFAULT_SEMANTICS: ImageSemantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
 
 impl RgbaImage {
 	pub fn new(width: u32, height: u32, pixels: Vec<u8>) -> Result<Self, Error> {
+		Self::new_with_semantics(width, height, pixels, DEFAULT_SEMANTICS)
+	}
+
+	/// The same, for a decoder that knows what its bytes mean - an opaque format whose alpha lane is
+	/// padding, or a source tagged with a wider colour space.
+	pub fn new_with_semantics(width: u32, height: u32, pixels: Vec<u8>, semantics: ImageSemantics) -> Result<Self, Error> {
 		validate_geometry(width, height)?;
 		let pitch = width.checked_mul(4).ok_or(Error::TooLarge)?;
 		let expected = usize::try_from(pitch).ok().and_then(|pitch| pitch.checked_mul(height as usize)).ok_or(Error::TooLarge)?;
 		if pixels.len() != expected {
 			return Err(Error::Invalid);
 		}
-		Ok(Self { width, height, pitch, pixels })
+		Ok(Self { width, height, pitch, pixels, semantics })
+	}
+
+	/// This image as the shared model sees it: a CHECKED view, which is the only way its pixels enter
+	/// anything that draws.
+	///
+	/// THE CHECK IS NOT CEREMONY. The layout constructor is what proves the pitch holds a row, that
+	/// the alpha mode is one the format admits and that the buffer is long enough - and a view built
+	/// here rather than by each consumer is the check happening once instead of nowhere.
+	pub fn view(&self) -> Result<ImageView<'_>, Error> {
+		let layout = self.layout()?;
+		ImageView::new(layout, &self.pixels).map_err(|_| Error::Invalid)
+	}
+
+	pub fn view_mut(&mut self) -> Result<ImageViewMut<'_>, Error> {
+		let layout = self.layout()?;
+		ImageViewMut::new(layout, &mut self.pixels).map_err(|_| Error::Invalid)
+	}
+
+	fn layout(&self) -> Result<ImageLayout, Error> {
+		ImageLayout::new(Extent2D::new(self.width, self.height), self.pitch, PixelStorage::Known(PixelFormat::R8G8B8A8Unorm), RowOrigin::TopLeft, self.semantics).map_err(|_| Error::Invalid)
 	}
 
 	pub fn pixel_count(&self) -> u64 {
@@ -151,6 +197,14 @@ impl Compositor {
 		Self::new_with_background(width, height, [0; 4])
 	}
 
+	/// A compositor over a canvas of stated meaning. THE BACKGROUND IS IN THE CANVAS'S OWN SEMANTICS,
+	/// because a colour is not a colour until something says what its numbers mean.
+	pub fn new_with_semantics(width: u32, height: u32, background: [u8; 4], semantics: ImageSemantics) -> Result<Self, Error> {
+		let mut compositor = Self::new_with_background(width, height, background)?;
+		compositor.canvas.semantics = semantics;
+		Ok(compositor)
+	}
+
 	pub fn new_with_background(width: u32, height: u32, background: [u8; 4]) -> Result<Self, Error> {
 		let length = usize::try_from(width).ok().and_then(|width| width.checked_mul(height as usize)).and_then(|pixels| pixels.checked_mul(4)).ok_or(Error::TooLarge)?;
 		let mut pixels = alloc::vec![0; length];
@@ -175,7 +229,10 @@ impl Compositor {
 				if frame.blend == Blend::Source {
 					self.canvas.pixels[destination..destination + 4].copy_from_slice(&pixel);
 				} else {
-					blend_over(&mut self.canvas.pixels[destination..destination + 4], pixel);
+					// THE CANVAS'S OWN SEMANTICS AND NOT AN ASSUMED sRGB. A compositor that blended
+					// every canvas as though it were sRGB would be the back door this crate just
+					// closed, reopened one layer up.
+					blend_over(&mut self.canvas.pixels[destination..destination + 4], pixel, self.canvas.semantics);
 				}
 			}
 		}
@@ -203,9 +260,12 @@ impl Compositor {
 /// it is wrong in the darks, and for a decoder handing frames to a viewer it is the answer the format
 /// itself specifies. Saying so is what stops it being the silent default in a compositor that needs
 /// light instead; the same function, told `LinearPremultiplied`, is what `soft2d` composites with.
-fn blend_over(destination: &mut [u8], source: [u8; 4]) {
-	let semantics = ImageSemantics::Color { color_space: ColorSpace::Srgb, alpha_mode: AlphaMode::Straight };
-	let Ok(decoder) = Decoder::new(&semantics, Working::EncodedStraight(ColorSpace::Srgb)) else { return };
+fn blend_over(destination: &mut [u8], source: [u8; 4], semantics: ImageSemantics) {
+	// THE WORKING SPACE IS THE CANVAS'S OWN, encoded and straight - which is what this crate's frames
+	// are and what the animation formats themselves specify. A compositor that blended every canvas as
+	// though it were sRGB would be the back door this crate just closed, reopened one layer up.
+	let space = semantics.color_space().unwrap_or(ColorSpace::Srgb);
+	let Ok(decoder) = Decoder::new(&semantics, Working::EncodedStraight(space)) else { return };
 	// THE DECODER IS WHAT APPLIES THE WORKING SPACE. Told `EncodedStraight` it premultiplies and
 	// leaves the transfer function alone, which is this crate's contract; told `LinearPremultiplied`
 	// the same function decodes to light, which is what a compositor wants. Neither is written here.

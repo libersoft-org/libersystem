@@ -67,12 +67,26 @@ impl Spread {
 
 /// Samples one image, in the working space, with a stated spread.
 pub struct Sampler<'a> {
-	view: ImageView<'a>,
+	source: Source<'a>,
 	decoder: Decoder,
 	spread: Spread,
 	/// THE TRANSFER FUNCTION AS A TABLE, when the caller has one. A power per channel per texel is
 	/// most of the cost of sampling an encoded image, and a bilinear tap reads four texels.
 	table: Option<&'a TransferTable>,
+}
+
+/// What a sampler is reading.
+///
+/// THE TWO SOURCES DIFFER ONLY IN HOW A TEXEL IS FETCHED. Everything after that - the transfer
+/// function, the primaries, the premultiply, the filter and the pyramid - is the same code, which is
+/// what "drawn through the same pipeline" has to mean if a video frame is to composite identically to
+/// an image of it.
+enum Source<'a> {
+	Packed(ImageView<'a>),
+	/// PLANES, reconstructed and matrixed to ENCODED RGB before anything else touches them. Applying
+	/// an RGB sampling recipe directly to YUV bytes decodes the transfer function of a signal that is
+	/// not yet a colour.
+	Planar(crate::planar::MultiPlaneView<'a>),
 }
 
 impl<'a> Sampler<'a> {
@@ -87,20 +101,49 @@ impl<'a> Sampler<'a> {
 			return Err(Error::UnknownFormat);
 		}
 		let decoder = Decoder::new(&view.layout().semantics, working)?;
-		Ok(Self { view, decoder, spread, table })
+		Ok(Self { source: Source::Packed(view), decoder, spread, table })
 	}
 
-	pub fn layout(&self) -> &ImageLayout {
-		self.view.layout()
+	/// A sampler over PLANES.
+	///
+	/// ITS DECODER IS BUILT FROM THE PLANAR LAYOUT'S OWN COLOUR SPACE, with straight alpha and an
+	/// opaque image: what the plane reconstruction produces is encoded RGB in that space, which is
+	/// exactly what the ordinary decoder's first stage expects.
+	pub fn planar(view: crate::planar::MultiPlaneView<'a>, working: Working, spread: Spread, table: Option<&'a TransferTable>) -> Result<Self, Error> {
+		let semantics = ImageSemantics::Color { color_space: view.layout().color_space, alpha_mode: AlphaMode::Opaque };
+		let decoder = Decoder::new(&semantics, working)?;
+		Ok(Self { source: Source::Planar(view), decoder, spread, table })
+	}
+
+	/// The extent this sampler reads, whatever its source is.
+	pub fn extent(&self) -> crate::geom::Extent2D {
+		match &self.source {
+			Source::Packed(view) => view.layout().extent,
+			Source::Planar(view) => view.layout().extent,
+		}
+	}
+
+	/// The single-plane layout, for a caller that knows it has one.
+	pub fn layout(&self) -> Option<&ImageLayout> {
+		match &self.source {
+			Source::Packed(view) => Some(view.layout()),
+			Source::Planar(_) => None,
+		}
 	}
 
 	/// One texel, wrapped by the spread mode, decoded and premultiplied.
 	pub fn texel(&self, x: i64, y: i64) -> Rgba {
-		let extent = self.view.layout().extent;
+		let extent = self.extent();
 		let (Some(x), Some(y)) = (self.spread.wrap(x, extent.width), self.spread.wrap(y, extent.height)) else {
 			return Rgba::TRANSPARENT;
 		};
-		match read(&self.view, x, y) {
+		let raw = match &self.source {
+			Source::Packed(view) => read(view, x, y),
+			// RECONSTRUCT AND MATRIX FIRST, which produces the encoded RGB the decoder below takes -
+			// the same decoder, applying the same transfer function and the same primaries.
+			Source::Planar(view) => Some(view.encoded_rgb(x, y)),
+		};
+		match raw {
 			Some(raw) => match self.table {
 				Some(table) => self.decoder.decode_tabled(table, raw),
 				None => self.decoder.decode(raw),
@@ -141,13 +184,13 @@ impl<'a> Sampler<'a> {
 			let mut accumulated = Rgba::TRANSPARENT;
 			for column in 0..4i64 {
 				let weight = mitchell(column as f32 - 1.0 - fx);
-				accumulated = accumulated.add(self.texel(x0 - 1 + column, sample_y).scaled(weight));
+				accumulated = accumulated.plus(self.texel(x0 - 1 + column, sample_y).scaled(weight));
 			}
 			*row = accumulated;
 		}
 		let mut out = Rgba::TRANSPARENT;
 		for (index, row) in rows.iter().enumerate() {
-			out = out.add(row.scaled(mitchell(index as f32 - 1.0 - fy)));
+			out = out.plus(row.scaled(mitchell(index as f32 - 1.0 - fy)));
 		}
 		// A CUBIC KERNEL OVERSHOOTS, which is what makes it look sharp, and a negative alpha or a
 		// colour above its own alpha is not a premultiplied colour any more.
@@ -174,10 +217,16 @@ impl Pyramid {
 
 	/// Build, decoding the base level through a prepared table.
 	pub fn build_with(base: &ImageView<'_>, working: Working, table: Option<&TransferTable>) -> Result<Self, Error> {
+		let sampler = Sampler::with_table(ImageView::new(*base.layout(), base.bytes())?, working, Spread::Clamp, table)?;
+		Self::from_sampler(&sampler, working)
+	}
+
+	/// Build from any sampler, which is what lets a PLANAR source have a pyramid without a second
+	/// filtering path: the levels are decoded light either way.
+	pub fn from_sampler(sampler: &Sampler<'_>, working: Working) -> Result<Self, Error> {
 		working.validate()?;
 		let space = working.space();
-		let sampler = Sampler::with_table(ImageView::new(*base.layout(), base.bytes())?, working, Spread::Clamp, table)?;
-		let mut extent = base.layout().extent;
+		let mut extent = sampler.extent();
 		let mut levels: Vec<OwnedImage> = Vec::new();
 		// LEVEL ZERO IS THE SOURCE IN THE WORKING FORMAT, so every level after it is filtered from
 		// decoded light rather than from the source's own encoding - and so one sampling path serves
@@ -213,7 +262,7 @@ impl Pyramid {
 							// without a decoder is correct, and it is correct because the level above
 							// was written by this same function.
 							if let Some(texel) = read(&previous, sample_x, sample_y) {
-								sum = sum.add(texel);
+								sum = sum.plus(texel);
 								count += 1.0;
 							}
 						}
@@ -290,7 +339,7 @@ impl Pyramid {
 			// The taps are spread SYMMETRICALLY about the sample point, so the result does not drift
 			// toward one end of the footprint as the tap count changes.
 			let offset = (tap as f32 + 0.5) / taps as f32 - 0.5;
-			accumulated = accumulated.add(self.sample(x + step.0 * offset, y + step.1 * offset, level_of_detail, spread));
+			accumulated = accumulated.plus(self.sample(x + step.0 * offset, y + step.1 * offset, level_of_detail, spread));
 		}
 		accumulated.scaled(1.0 / taps as f32)
 	}
@@ -354,7 +403,7 @@ fn floor_i64(value: f32) -> i64 {
 
 fn lerp(from: Rgba, to: Rgba, t: f32) -> Rgba {
 	let t = t.clamp(0.0, 1.0);
-	from.scaled(1.0 - t).add(to.scaled(t))
+	from.scaled(1.0 - t).plus(to.scaled(t))
 }
 
 /// A premultiplied colour whose channels exceed its alpha is not one. The cubic kernel's overshoot is

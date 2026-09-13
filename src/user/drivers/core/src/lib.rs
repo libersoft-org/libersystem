@@ -13,5 +13,12 @@
 // deleted before the move, not carried across by it.
 pub mod blk;
 pub mod common;
+pub mod descriptor;
+pub mod gpu;
+pub mod input;
 pub mod keys;
+pub mod net;
+pub mod port;
+pub mod snd;
+pub mod usb;
 pub mod virtio;

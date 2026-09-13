@@ -51,13 +51,63 @@ pub trait Cancellation {
 
 /// One command, with everything that can be worked out before the frame.
 enum Step {
-	Fill { edges: crate::raster::Edges, rule: FillRule, paint: Paint, transform: Transform, antialias: Antialias, blend: BlendMode, operator: Operator, opacity: f32 },
-	Image { edges: crate::raster::Edges, paint: Paint, transform: Transform, blend: BlendMode, operator: Operator, opacity: f32 },
-	Glyphs { run: u32, paint: Paint, transform: Transform, blend: BlendMode, operator: Operator, opacity: f32 },
-	PushClip { edges: crate::raster::Edges, rule: FillRule, antialias: Antialias, bounds: PixelRect, inverse: bool },
-	PushClipMask { image: render2d::resource::ImageHandle, transform: Transform, inverse: bool },
+	Fill {
+		edges: crate::raster::Edges,
+		rule: FillRule,
+		paint: Paint,
+		transform: Transform,
+		antialias: Antialias,
+		blend: BlendMode,
+		operator: Operator,
+		opacity: f32,
+	},
+	Image {
+		edges: crate::raster::Edges,
+		paint: Paint,
+		transform: Transform,
+		blend: BlendMode,
+		operator: Operator,
+		opacity: f32,
+	},
+	Glyphs {
+		run: u32,
+		paint: Paint,
+		transform: Transform,
+		blend: BlendMode,
+		operator: Operator,
+		opacity: f32,
+	},
+	/// A stroke that is an ALIASED ONE-PIXEL POLYLINE, which is a diagram's grid, a chart's axis and a
+	/// pixel-exact rule - and which the coverage rasteriser would spend sixteen sub-scanlines on to
+	/// produce the same one pixel per column.
+	AliasedLines {
+		points: Vec<(i32, i32)>,
+		paint: Paint,
+		transform: Transform,
+		blend: BlendMode,
+		operator: Operator,
+		opacity: f32,
+	},
+	PushClip {
+		edges: crate::raster::Edges,
+		rule: FillRule,
+		antialias: Antialias,
+		bounds: PixelRect,
+		inverse: bool,
+	},
+	PushClipMask {
+		image: render2d::resource::ImageHandle,
+		transform: Transform,
+		inverse: bool,
+	},
 	PopClip,
-	BeginLayer { bounds: Option<RectF>, opacity: f32, blend: BlendMode, operator: Operator, filter: Option<FilterHandle> },
+	BeginLayer {
+		bounds: Option<RectF>,
+		opacity: f32,
+		blend: BlendMode,
+		operator: Operator,
+		filter: Option<FilterHandle>,
+	},
 	EndLayer,
 }
 
@@ -257,6 +307,19 @@ impl<'a> Backend for Soft2d<'a> {
 						}
 						None => flattened,
 					};
+					// THE ALIASED ONE-PIXEL LINE IS AN EXPLICIT FAST PATH and keeps the rule it already
+					// had: integer Bresenham with BOTH endpoints included, ties at `error == 0` broken
+					// toward the smaller minor coordinate, and clipping applied BEFORE rasterising so
+					// a clipped line covers the same pixels as the visible part of the unclipped one.
+					if matches!(antialias, Antialias::Off) && parameters.width <= 1.0 && style.dash.is_none() {
+						let points = integer_polyline(&dashed_contours);
+						if let Some(points) = points {
+							let bound = polyline_bounds(&points).map(|rect| rect.intersection(&target_rect));
+							steps.push(Step::AliasedLines { points, paint: *paint, transform: *transform, blend: *blend, operator: *operator, opacity: *opacity });
+							bounds.push(bound);
+							continue;
+						}
+					}
 					let contours = outline(&dashed_contours, parameters);
 					let bound = contour_bounds(&contours).map(cover).map(|rect| rect.intersection(&target_rect));
 					widest_edges = widest_edges.max(edge_count(&contours));
@@ -321,18 +384,29 @@ impl<'a> Backend for Soft2d<'a> {
 			if !wants_pyramid(list, index as u32) {
 				continue;
 			}
-			let Some(transfer) = self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space()).map(|space| space.transfer()) else { continue };
-			self.ensure_table(transfer);
-			let table = Self::table_for(&self.tables, transfer);
-			let Some(view) = self.images.image(record.identity) else { continue };
-			match Pyramid::build_with(&view, working, table) {
+			let planar_space = self.images.planes(record.identity).map(|view| view.layout().color_space);
+			let packed_space = self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space());
+			let Some(space) = planar_space.or(packed_space) else { continue };
+			self.ensure_table(space.transfer());
+			let table = Self::table_for(&self.tables, space.transfer());
+			// A PLANAR SOURCE GETS ITS PYRAMID FROM THE SAME SAMPLER the drawing will use, so its
+			// levels are the same decoded light rather than a second reconstruction.
+			let built = match self.images.planes(record.identity) {
+				Some(view) => graphics_core::sample::Sampler::planar(view, working, graphics_core::sample::Spread::Clamp, table).and_then(|sampler| Pyramid::from_sampler(&sampler, working)),
+				None => {
+					let Some(view) = self.images.image(record.identity) else { continue };
+					Pyramid::build_with(&view, working, table)
+				}
+			};
+			match built {
 				Ok(pyramid) => pyramids.push((index as u32, pyramid)),
 				Err(error) => return Err(crate::target::from_core(error)),
 			}
 		}
 
 		for record in resources.images.iter() {
-			if let Some(space) = self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space()) {
+			let space = self.images.planes(record.identity).map(|view| view.layout().color_space).or_else(|| self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space()));
+			if let Some(space) = space {
 				self.ensure_table(space.transfer());
 			}
 		}
@@ -361,7 +435,7 @@ impl<'a> Backend for Soft2d<'a> {
 			return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling });
 		}
 
-		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(|left, right| union(left, right));
+		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
 		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), expansion, scratch_bytes, damage })
 	}
 
@@ -383,7 +457,7 @@ impl<'a> Backend for Soft2d<'a> {
 			.steps
 			.iter()
 			.map(|step| match step {
-				Step::Fill { paint, transform, .. } | Step::Image { paint, transform, .. } | Step::Glyphs { paint, transform, .. } => shader(paint, transform, prepared.working, &prepared.stops, &lookup),
+				Step::Fill { paint, transform, .. } | Step::Image { paint, transform, .. } | Step::Glyphs { paint, transform, .. } | Step::AliasedLines { paint, transform, .. } => shader(paint, transform, prepared.working, &prepared.stops, &lookup),
 				_ => Shader::Nothing,
 			})
 			.collect();
@@ -458,6 +532,14 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						None => (&mut *surface, tile),
 					};
 					draw_glyphs(raster, spans, cache, glyphs, recorded, transform, bounds, into, shader, &clips, *opacity, *blend, *operator, prepared.working);
+				}
+				Step::AliasedLines { points, blend, operator, opacity, .. } => {
+					let Some(shader) = shaders.get(*command as usize) else { continue };
+					let (into, bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
+						Some(layer) => (&mut layer.surface, layer.bounds),
+						None => (&mut *surface, tile),
+					};
+					draw_aliased_lines(points, bounds, into, shader, &clips, *opacity, *blend, *operator);
 				}
 				Step::PushClip { edges, rule, antialias, bounds, inverse } => {
 					let parent = match layers.last() {
@@ -674,6 +756,65 @@ fn fill_edges(raster: &mut Rasteriser, spans: &mut Spans, edges: &crate::raster:
 	});
 }
 
+/// Draw an aliased polyline, one pixel per step.
+#[allow(clippy::too_many_arguments)]
+fn draw_aliased_lines(points: &[(i32, i32)], bounds: PixelRect, into: &mut dyn Raster, shader: &Shader<'_>, clips: &ClipStack, opacity: f32, blend: BlendMode, operator: Operator) {
+	let opacity = opacity.clamp(0.0, 1.0);
+	if opacity <= 0.0 {
+		return;
+	}
+	for pair in points.windows(2) {
+		crate::raster::aliased_line(pair[0], pair[1], bounds, |x, y| {
+			let coverage = opacity * clips.coverage(x, y);
+			if coverage <= 0.0 {
+				return;
+			}
+			let source = shader.at(x as f32, y as f32).scaled(coverage);
+			let backdrop = into.get(x, y);
+			into.set(x, y, graphics_core::composite::composite(operator, blend, source, backdrop));
+		});
+	}
+}
+
+/// A flattened contour set as integer points, when it is ONE open polyline and nothing else.
+///
+/// THE FAST PATH IS NARROW ON PURPOSE. A one-pixel aliased line has an exact rule; a shape does not,
+/// and a fast path that guessed which shapes it applied to would produce a different picture from the
+/// rasteriser for the same drawing.
+fn integer_polyline(contours: &[Contour]) -> Option<Vec<(i32, i32)>> {
+	let [contour] = contours else { return None };
+	if contour.closed || contour.points.len() < 2 || contour.points.len() > 1024 {
+		return None;
+	}
+	let mut points = Vec::with_capacity(contour.points.len());
+	for point in &contour.points {
+		if !(point.x.is_finite() && point.y.is_finite()) {
+			return None;
+		}
+		// THE PIXEL A COORDINATE FALLS IN, which for a one-pixel line is what "on" means: a line from
+		// `(0, 0.5)` to `(10, 0.5)` covers the first row of pixels and not the boundary between two.
+		points.push((libm::floorf(point.x) as i32, libm::floorf(point.y) as i32));
+	}
+	Some(points)
+}
+
+fn polyline_bounds(points: &[(i32, i32)]) -> Option<PixelRect> {
+	let mut minimum = (i32::MAX, i32::MAX);
+	let mut maximum = (i32::MIN, i32::MIN);
+	for (x, y) in points {
+		minimum = (minimum.0.min(*x), minimum.1.min(*y));
+		maximum = (maximum.0.max(*x), maximum.1.max(*y));
+	}
+	if minimum.0 > maximum.0 {
+		return None;
+	}
+	let x = minimum.0.max(0) as u32;
+	let y = minimum.1.max(0) as u32;
+	let right = maximum.0.max(0) as u32;
+	let bottom = maximum.1.max(0) as u32;
+	Some(PixelRect::new(x, y, right.saturating_sub(x) + 1, bottom.saturating_sub(y) + 1))
+}
+
 /// Draw one recorded run, glyph by glyph, through the cache.
 #[allow(clippy::too_many_arguments)]
 fn draw_glyphs(raster: &mut Rasteriser, spans: &mut Spans, cache: &mut GlyphRaster, provider: &dyn GlyphProvider, run: &render2d::list::RecordedGlyphRun, transform: &Transform, bounds: PixelRect, into: &mut dyn Raster, shader: &Shader<'_>, clips: &ClipStack, opacity: f32, blend: BlendMode, operator: Operator, working: Working) {
@@ -865,6 +1006,15 @@ struct Lookup<'a> {
 }
 
 impl ImageLookup for Lookup<'_> {
+	fn planes(&self, handle: u32) -> Option<(graphics_core::planar::MultiPlaneView<'_>, Option<&Pyramid>, Option<&TransferTable>)> {
+		let record = self.records.get(handle as usize)?;
+		let view = self.source.planes(record.identity)?;
+		let pyramid = self.pyramids.iter().find(|(index, _)| *index == handle).map(|(_, pyramid)| pyramid);
+		let transfer = view.layout().color_space.transfer();
+		let table = self.tables.iter().find(|(kind, _)| *kind == transfer).map(|(_, table)| table);
+		Some((view, pyramid, table))
+	}
+
 	fn lookup(&self, handle: u32) -> Option<(ImageView<'_>, Option<&Pyramid>, Option<&TransferTable>)> {
 		let record = self.records.get(handle as usize)?;
 		let view = self.source.image(record.identity)?;

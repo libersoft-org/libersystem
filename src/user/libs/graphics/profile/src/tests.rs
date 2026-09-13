@@ -629,3 +629,88 @@ fn every_prepared_list_dependency_is_named_with_its_reason() {
 	assert!(filter::BOUNDS_MAP.contains("output rectangle"));
 	assert!(filter::SCRATCH.contains("refused up front"), "a frame that cannot fit says so before it starts drawing");
 }
+
+#[test]
+// A STATE MACHINE WITH A STATE NOTHING LEAVES, OR AN EDGE TO A STATE THAT DOES NOT EXIST, IS NOT A
+// MACHINE. The present queue's is the part of a window system an implementation gets wrong after
+// shipping - a resized window that leaks an image per resize, an acquired image with no way back
+// that is not a present - so the closure is checked here rather than discovered there.
+fn the_present_queue_state_machine_is_closed_and_has_its_awkward_edges() {
+	use wsi::{IMAGE_STATES, TRANSITIONS};
+	let names: std::vec::Vec<&str> = IMAGE_STATES.iter().map(|state| state.name).collect();
+	assert_eq!(names.len(), 4);
+	for transition in TRANSITIONS {
+		assert!(names.contains(&transition.from), "a transition leaves a state that does not exist: {}", transition.from);
+		assert!(names.contains(&transition.to), "a transition arrives at a state that does not exist: {}", transition.to);
+		assert!(!transition.why.is_empty());
+	}
+	// EVERY STATE IS ENTERED AND LEFT. A state nothing enters is dead; one nothing leaves is a leak.
+	for state in IMAGE_STATES {
+		assert!(TRANSITIONS.iter().any(|transition| transition.to == state.name), "nothing enters {}", state.name);
+		assert!(TRANSITIONS.iter().any(|transition| transition.from == state.name), "nothing leaves {}", state.name);
+	}
+	// THE EDGE AN IMPLEMENTATION FORGETS: acquire, then decide not to draw.
+	assert!(TRANSITIONS.iter().any(|transition| transition.from == "Acquired" && transition.event == "abandon" && transition.to == "Available"), "a client that acquired and did not draw must have a way back that is not a present");
+	// AND THE THREE RESIZE TRANSITIONS, one per state a generation change can catch an image in.
+	for from in ["Available", "Acquired", "PendingPresent"] {
+		assert!(TRANSITIONS.iter().any(|transition| transition.from == from && transition.event == "generation changed" && transition.to == "Stale"), "a generation change must have an answer for an image that is {from}");
+	}
+}
+
+#[test]
+// EVERY NUMBER IN A WINDOW-SYSTEM CONTRACT IS ONE TWO SIDES ROUND DIFFERENTLY IF IT IS NOT STATED,
+// and every list is one an implementation will otherwise extend quietly. These are the ones a
+// conformance suite is measured against.
+fn the_window_system_numbers_and_lists_are_frozen() {
+	use wsi::{COMPLETION_FACTS, COMPLETION_PAIRS, CONFIGURATION, DAMAGE_RULES, EVENTS, MAX_DAMAGE_RECTS, MAX_IMAGES, MIN_IMAGES, PRESENT_MODES, PRESENT_OUTCOMES, RESERVED_PRESENT_MODES, SCALE_REPRESENTATION, TIMESTAMP_EVIDENCE};
+	// THE SCALE IS A RATIO AND NEVER A FLOAT on the wire, which is the whole of the one-pixel seam.
+	assert!(SCALE_REPRESENTATION.contains("numerator") && SCALE_REPRESENTATION.contains("denominator") && SCALE_REPRESENTATION.contains("never a float"));
+
+	// NEGOTIATED STAYS NEGOTIATED, but a service free to answer one turns the double-or-triple
+	// buffering gate into a test of nothing.
+	assert!(MIN_IMAGES >= 2 && MAX_IMAGES >= MIN_IMAGES, "{MIN_IMAGES}..={MAX_IMAGES}");
+	assert_eq!(MAX_DAMAGE_RECTS, 16, "a small cap is not an ABI");
+
+	// NO NAME APPEARS TWICE in any of the lists, which is what makes each of them an enumeration.
+	let unique = |names: std::vec::Vec<&str>| {
+		let mut sorted = names.clone();
+		sorted.sort_unstable();
+		sorted.dedup();
+		assert_eq!(sorted.len(), names.len(), "a name appears twice: {names:?}");
+	};
+	unique(CONFIGURATION.iter().map(|field| field.name).collect());
+	unique(EVENTS.iter().map(|event| event.name).collect());
+	unique(PRESENT_OUTCOMES.iter().map(|outcome| outcome.name).collect());
+	unique(DAMAGE_RULES.iter().map(|rule| rule.question).collect());
+	unique(COMPLETION_PAIRS.iter().map(|pair| pair.name).collect());
+
+	// WHAT INVALIDATES AN IMAGE GENERATION IS EXACTLY WHAT THE LIFECYCLE SAYS: extent, scale,
+	// orientation and presentable format. A field that quietly joined them would throw away every
+	// image on a change that does not need to.
+	let invalidating: std::vec::Vec<&str> = CONFIGURATION.iter().filter(|field| field.invalidates_images).map(|field| field.name).collect();
+	assert_eq!(invalidating, std::vec!["logical extent", "physical extent", "scale", "transform", "presentable pixel format"]);
+
+	// `Fifo` IS DEFINED AND THE OTHER TWO HAVE A PLACE rather than a meaning.
+	assert_eq!(PRESENT_MODES, &["Fifo"]);
+	assert_eq!(RESERVED_PRESENT_MODES, &["Mailbox", "Immediate"]);
+
+	// A PRESENT HAS FOUR FATES, and a bare completion cannot express them: "every present is
+	// displayed" cannot hold for a background client that must also not be blocked forever.
+	assert_eq!(PRESENT_OUTCOMES.len(), 4);
+	assert!(PRESENT_OUTCOMES.iter().any(|outcome| outcome.name == "DiscardedOccluded"));
+
+	// AND "DISPLAYED" IS THREE FACTS, of which the current backend can observe two. This pins the
+	// honest answer: when a vblank capability arrives, the third becomes observable in a DIFF.
+	assert_eq!(COMPLETION_FACTS.len(), 3);
+	let physical = COMPLETION_FACTS.iter().find(|fact| fact.name == "PhysicallyDisplayed").expect("the third fact");
+	assert!(!physical.observable_today, "reporting a command acknowledgement as physical presentation is what this flag exists to prevent");
+	assert_eq!(TIMESTAMP_EVIDENCE, &["Unavailable", "Estimated(t)", "Measured(t)"]);
+
+	// THE COMPLETION PAIRS SPLIT AUTHORITY, which is why they are two pairs and not one duplex
+	// channel: the client may signal readiness and may not signal completion.
+	let producer = COMPLETION_PAIRS.iter().find(|pair| pair.name == "PRODUCER_READY").expect("the producer pair");
+	let done = COMPLETION_PAIRS.iter().find(|pair| pair.name == "PRESENT_DONE").expect("the completion pair");
+	assert_eq!(producer.client_rights, "SEND");
+	assert_eq!(done.service_rights, "SEND");
+	assert!(done.client_rights.contains("RECEIVE") && !done.client_rights.contains("SEND"));
+}

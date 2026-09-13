@@ -9,8 +9,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
+name = "graphics-core"
+version = "0.0.0"
+dependencies = [
+ "graphics-profile",
+ "libm",
+]
+
+[[package]]
+name = "graphics-profile"
+version = "0.0.0"
+
+[[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "pix"
 version = "0.0.0"
+dependencies = [
+ "graphics-core",
+]
 
 [[package]]
 name = "qoi"

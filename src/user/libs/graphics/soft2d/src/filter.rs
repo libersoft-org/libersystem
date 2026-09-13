@@ -29,6 +29,7 @@ use crate::target::Surface;
 /// THE SOURCE IS THE THING BEING FILTERED and the graph's `Source` node is where it enters. A graph
 /// with no `Source` is a legal graph that ignores its input - a flood, a gradient of nodes, an image
 /// composited on its own - and it is not an error.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::target::Raster, bounds: PixelRect, pool: &mut Pool, spans: &mut crate::backend::Spans, working: Working, images: &dyn crate::paint::ImageLookup) -> Result<Surface, Error> {
 	let mut results: Vec<Option<Surface>> = Vec::with_capacity(graph.nodes().len());
 	let mut outcome: Result<Surface, Error> = Err(Error::Allocation);
@@ -196,7 +197,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 					// its edge would smear the border of a layer outward, which is visible as a bright
 					// rim around every shadow.
 					if tap >= 0 && (tap as usize) < width {
-						sum = sum.add(spans.filter_input[tap as usize].scaled(*weight));
+						sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
 					}
 				}
 				spans.filter_output[x] = sum;
@@ -215,7 +216,7 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 				for (index, weight) in vertical.iter().enumerate() {
 					let tap = y as i64 + index as i64 - offset;
 					if tap >= 0 && (tap as usize) < height {
-						sum = sum.add(spans.filter_input[tap as usize].scaled(*weight));
+						sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
 					}
 				}
 				spans.filter_output[y] = sum;
@@ -261,9 +262,9 @@ fn sample_bilinear(from: &Surface, x: f32, y: f32) -> Rgba {
 		}
 		from.get(x as u32, y as u32)
 	};
-	let top = at(x0, y0).scaled(1.0 - fx).add(at(x0 + 1, y0).scaled(fx));
-	let bottom = at(x0, y0 + 1).scaled(1.0 - fx).add(at(x0 + 1, y0 + 1).scaled(fx));
-	top.scaled(1.0 - fy).add(bottom.scaled(fy))
+	let top = at(x0, y0).scaled(1.0 - fx).plus(at(x0 + 1, y0).scaled(fx));
+	let bottom = at(x0, y0 + 1).scaled(1.0 - fx).plus(at(x0 + 1, y0 + 1).scaled(fx));
+	top.scaled(1.0 - fy).plus(bottom.scaled(fy))
 }
 
 /// A colour matrix, applied to UNPREMULTIPLIED linear colour - which is what the node's definition

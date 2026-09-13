@@ -18,7 +18,7 @@ use rt::*;
 
 use crate::keys::Mods;
 use crate::virtio::{Queue, Virtio};
-use drivers::{common, keys, virtio};
+use drivers::{common, input, keys, virtio};
 
 // virtio_input_event record: { type: u16, code: u16, value: u32 } little-endian,
 // 8 bytes. `type` EV_KEY carries a key event; `value` is 1 (press), 2 (autorepeat)
@@ -30,15 +30,6 @@ const EVENT_SIZE: u64 = 8;
 // group, EV_REL (2) carries a relative axis delta (a mouse), EV_ABS (3) an absolute
 // axis value (a tablet). The axis codes (REL_/ABS_ X = 0, Y = 1) and the button
 // codes a mouse emits as EV_KEY (left/right/middle).
-const EV_SYN: u16 = 0;
-const EV_REL: u16 = 2;
-const EV_ABS: u16 = 3;
-const AXIS_X: u16 = 0;
-const AXIS_Y: u16 = 1;
-const REL_WHEEL: u16 = 8;
-const BTN_LEFT: u16 = 0x110;
-const BTN_RIGHT: u16 = 0x111;
-const BTN_MIDDLE: u16 = 0x112;
 
 // virtio-input config access: a select/subsel pair (config offsets 0/1) chooses a
 // config block, whose byte length appears at offset 2 and whose data union starts at
@@ -54,8 +45,6 @@ const CFG_EV_BITS: u8 = 0x11;
 const CFG_ABS_INFO: u8 = 0x12;
 // The normalized coordinate range pointer events are scaled into (0..=NORM_MAX), and
 // the fallback clamp range for a relative (mouse) device that reports no ABS range.
-const NORM_MAX: u32 = 0xffff;
-const REL_RANGE: i32 = 0x7fff;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -69,7 +58,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 2. self-identify. A virtio-input device is a keyboard or a pointer (mouse /
 		//    tablet); the same binary drives both. The device's config tells which: a
 		//    pointer reports EV_ABS (a tablet) or EV_REL (a mouse) events.
-		let is_pointer: bool = ev_supported(&device, EV_ABS as u8) || ev_supported(&device, EV_REL as u8);
+		let is_pointer: bool = ev_supported(&device, input::EV_ABS as u8) || ev_supported(&device, input::EV_REL as u8);
 		// 3. the rest of what the handshake brought. DeviceManager supplies one producer endpoint
 		//    shared by every keyboard driver; pointer instances receive it too but never emit key
 		//    events. `SYS_SYSTEM_POWER` and `SYS_CONSOLE_FEED` each require their capability, and a
@@ -116,8 +105,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				Some(pair) => pair,
 				None => exit(),
 			};
-			let max_x: i32 = axis_max(&device, AXIS_X);
-			let max_y: i32 = axis_max(&device, AXIS_Y);
+			let max_x: Option<i32> = axis_max(&device, input::AXIS_X);
+			let max_y: Option<i32> = axis_max(&device, input::AXIS_Y);
 			// ONE NAME PER DEVICE TYPE, AND THE ROLE AS DETAIL. This announced itself as
 			// `virtio-pointer` while the kernel's DMA audit called the same PCI function
 			// `virtio-input`, so two reports one screen apart named the same device two ways and
@@ -148,19 +137,19 @@ fn ev_supported(device: &Virtio, ev: u8) -> bool {
 // The maximum value an absolute axis reports, read from its ABS_INFO block (the union
 // is min/max/fuzz/flat/res, u32 each; max is the second word). Returns 0 if the axis
 // has no ABS_INFO (a relative device), so the caller falls back to a default range.
-fn axis_max(device: &Virtio, axis: u16) -> i32 {
+fn axis_max(device: &Virtio, axis: u16) -> Option<i32> {
 	device.config_write(CFG_SELECT, CFG_ABS_INFO);
 	device.config_write(CFG_SUBSEL, axis as u8);
-	if device.config_read(CFG_SIZE) < 8 {
-		return 0;
-	}
+	let size: u8 = device.config_read(CFG_SIZE);
 	let mut max: u32 = 0;
 	let mut i: u64 = 0;
 	while i < 4 {
 		max |= (device.config_read(CFG_DATA + 4 + i) as u32) << (8 * i);
 		i += 1;
 	}
-	max as i32
+	// WHETHER THAT IS A RANGE is the tested decision: a block too short to hold the field does not
+	// hold it, and a maximum that is zero or negative once it is signed is not a range.
+	input::axis_max(size, max)
 }
 
 // Block on the device interrupt forever: each time it fires, drain every event buffer
@@ -193,28 +182,20 @@ fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue,
 	}
 }
 
-// The accumulated pointer state across an event group: the absolute position (device
-// units, clamped to the axis range) and the button bitmask (bit 0 left, 1 right, 2
-// middle). Compared between frames so an unchanged frame sends nothing.
-#[derive(Default, Clone, Copy, PartialEq)]
-struct Pointer {
-	x: i32,
-	y: i32,
-	buttons: u8,
-}
-
 // Block on the pointer's interrupt forever: each time it fires, drain the event
 // buffers the device filled, fold them into the current pointer state, and - once a
 // frame completes (EV_SYN) and the state actually changed - send the normalized
 // position and buttons to InputService (which maps them to the text-cell grid). The
 // send coalesces motion within one interrupt (the latest position wins). Consumer closure returns
 // its allowance while the provider keeps accepting replacements, even with no pointer activity.
-fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: i32, max_y: i32) -> ! {
+fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: Option<i32>, max_y: Option<i32>) -> ! {
 	unsafe {
-		let bound_x: i32 = if max_x > 0 { max_x } else { REL_RANGE };
-		let bound_y: i32 = if max_y > 0 { max_y } else { REL_RANGE };
-		let mut state: Pointer = Pointer::default();
-		let mut sent: Pointer = Pointer { x: -1, y: -1, buttons: 0 };
+		// THE BOUND IS THE DEVICE'S OWN RANGE WHEN IT HAS ONE, and the relative range otherwise -
+		// which is what a mouse gets, because a mouse reports no axis block at all.
+		let bound_x: i32 = input::axis_bound(max_x);
+		let bound_y: i32 = input::axis_bound(max_y);
+		let mut state: input::Pointer = input::Pointer::default();
+		let mut sent: input::Pointer = input::Pointer { x: -1, y: -1, buttons: 0 };
 		let mut serving = common::Serving::new(sink, 0);
 		loop {
 			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
@@ -253,8 +234,8 @@ fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queu
 			// Send when a frame completed and either the position/buttons changed or the
 			// wheel ticked (the wheel is a momentary delta, not part of the held state).
 			if synced && (connected || state != sent || wheel != 0) {
-				let nx: u16 = normalize(state.x, bound_x);
-				let ny: u16 = normalize(state.y, bound_y);
+				let nx: u16 = input::normalize(state.x, bound_x);
+				let ny: u16 = input::normalize(state.y, bound_y);
 				let mut msg: [u8; 6] = [0u8; 6];
 				msg[0..2].copy_from_slice(&nx.to_le_bytes());
 				msg[2..4].copy_from_slice(&ny.to_le_bytes());
@@ -277,58 +258,15 @@ fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queu
 // EV_REL wheel tick accumulates into `wheel` (a momentary delta, reset after each send).
 // Returns true on EV_SYN - the end of an event group, the point at which the
 // accumulated state is a complete frame ready to send.
-unsafe fn pointer_event(addr: u64, state: &mut Pointer, wheel: &mut i32, max_x: i32, max_y: i32) -> bool {
+unsafe fn pointer_event(addr: u64, state: &mut input::Pointer, wheel: &mut i32, max_x: i32, max_y: i32) -> bool {
 	unsafe {
 		let kind: u16 = (addr as *const u16).read_volatile();
 		let code: u16 = ((addr + 2) as *const u16).read_volatile();
 		let value: i32 = ((addr + 4) as *const u32).read_volatile() as i32;
-		match kind {
-			EV_SYN => return true,
-			EV_ABS => {
-				if code == AXIS_X {
-					state.x = value.clamp(0, max_x);
-				} else if code == AXIS_Y {
-					state.y = value.clamp(0, max_y);
-				}
-			}
-			EV_REL => {
-				if code == AXIS_X {
-					state.x = (state.x + value).clamp(0, max_x);
-				} else if code == AXIS_Y {
-					state.y = (state.y + value).clamp(0, max_y);
-				} else if code == REL_WHEEL {
-					*wheel += value;
-				}
-			}
-			EV_KEY => {
-				let bit: u8 = match code {
-					BTN_LEFT => 1,
-					BTN_RIGHT => 2,
-					BTN_MIDDLE => 4,
-					_ => 0,
-				};
-				if bit != 0 {
-					if value != 0 {
-						state.buttons |= bit;
-					} else {
-						state.buttons &= !bit;
-					}
-				}
-			}
-			_ => {}
-		}
-		false
+		// THE FOLD IS FOUR RULES AND THEY ARE TESTED WHERE THEY LIVE. What is left here is reading
+		// three fields out of the event the device wrote, which is the part that is `unsafe`.
+		input::fold(state, wheel, kind, code, value, max_x, max_y)
 	}
-}
-
-// Scale an axis value in [0, max] into the normalized 0..=NORM_MAX range InputService
-// maps to the text-cell grid. A zero or negative max (no range) yields 0.
-fn normalize(v: i32, max: i32) -> u16 {
-	if max <= 0 {
-		return 0;
-	}
-	let v: i32 = v.clamp(0, max);
-	((v as u64 * NORM_MAX as u64) / max as u64) as u16
 }
 
 // Decode the virtio_input_event at `addr` and feed a key event into the shared

@@ -115,3 +115,33 @@ fn viewport_blit_scales_and_clamps_a_centered_crop() {
 	assert_eq!(&letterbox[48..], &[0; 16]);
 	assert_eq!(u32::from_le_bytes(letterbox[20..24].try_into().unwrap()), 1);
 }
+
+#[test]
+// AN IMAGE WITH NO COLOUR METADATA IS A BACK DOOR INTO THE IMAGE MODEL: width, height, pitch and
+// bytes say nothing about whether 128 is half the light or half the encoded value, or whether the
+// colour has already been multiplied by its alpha. The semantics travel with the pixels, and the only
+// way these pixels enter anything that draws is through a CHECKED view that carries them.
+fn an_image_carries_its_meaning_and_enters_the_model_checked() {
+	let image = RgbaImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 128]).unwrap();
+	assert_eq!(image.semantics, DEFAULT_SEMANTICS, "what every decoder in this tree produces, stated rather than assumed");
+
+	let view = image.view().expect("a checked view");
+	assert_eq!(view.layout().extent.width, 2);
+	assert_eq!(view.layout().semantics, DEFAULT_SEMANTICS);
+	// THE VIEW IS THE SEAM, so what a renderer sees is the bytes AND what they mean.
+	let raw = graphics_core::pixel::read(&view, 0, 0).expect("a pixel");
+	assert_eq!((raw.red, raw.alpha), (1.0, 1.0));
+
+	// A DECODER THAT KNOWS BETTER SAYS SO, and the view carries that instead.
+	let opaque = graphics_core::semantics::ImageSemantics::Color { color_space: graphics_core::ColorSpace::DisplayP3, alpha_mode: graphics_core::AlphaMode::Opaque };
+	let wide = RgbaImage::new_with_semantics(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 128], opaque).unwrap();
+	assert_eq!(wide.view().expect("a view").layout().semantics, opaque);
+	// And the two are different images, because their bytes mean different things.
+	assert!(wide != image);
+
+	// AN ALPHA MODE THE FORMAT DOES NOT ADMIT IS REFUSED at the seam rather than drawn: the check is
+	// the layout constructor's, which is why it happens once here instead of nowhere.
+	let mask = graphics_core::semantics::ImageSemantics::Mask { interpretation: graphics_core::semantics::MaskInterpretation::Coverage };
+	let as_mask = RgbaImage::new_with_semantics(2, 1, vec![0; 8], mask).unwrap();
+	assert!(as_mask.view().is_ok(), "a mask is a legal meaning for these bytes; what it is not is a colour");
+}

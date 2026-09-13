@@ -17,15 +17,12 @@ use alloc::vec::Vec;
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
-use drivers::{common, virtio};
+use drivers::net::NET_HDR_LEN;
+use drivers::{common, net, virtio};
 
-// The virtio_net_hdr prepended to every frame on both queues (VERSION_1: 12 bytes).
-const NET_HDR_LEN: u64 = 12;
 // The device-specific VIRTIO_NET_F_MTU feature: the device reports the link's MTU
 // in config space (u16 at offset 10) - what the host side of the link carries.
 const FEATURE_MTU: u32 = 1 << 3;
-// The default MTU when the device does not report one: standard Ethernet.
-const DEFAULT_MTU: u64 = 1500;
 // The receive buffer pool: a handful of slots, each holding one full frame (the
 // 12-byte header + an Ethernet frame of the link's MTU); the slot size follows
 // the reported MTU, so jumbo links get jumbo slots.
@@ -51,16 +48,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		for (i, b) in mac.iter_mut().enumerate() {
 			*b = device.config_read(i as u64);
 		}
-		let mtu: u64 = if device.features_word0() & FEATURE_MTU != 0 {
-			let v: u64 = device.config_read(10) as u64 | (device.config_read(11) as u64) << 8;
-			if v == 0 { DEFAULT_MTU } else { v }
+		let reported: Option<u64> = if device.features_word0() & FEATURE_MTU != 0 {
+			// THE MTU SIZES EVERY BUFFER THIS DRIVER ALLOCATES and it is the DEVICE's number: a zero
+			// was refused and everything else believed, so sixty-five thousand was half a megabyte of
+			// pool asked for on the device's word.
+			Some(device.config_read(10) as u64 | (device.config_read(11) as u64) << 8)
 		} else {
-			DEFAULT_MTU
+			None
 		};
-		// the largest L2 frame the link carries (MTU + the 14-byte Ethernet header),
-		// and the receive slot / transmit buffer that holds it behind the virtio header.
-		let frame_max: u64 = mtu + 14;
-		let slot: u64 = NET_HDR_LEN + frame_max;
+		let mtu: u64 = net::link_mtu(reported);
+		// the receive slot / transmit buffer: the virtio header, the Ethernet header and the payload.
+		let slot: u64 = net::slot_bytes(mtu);
 		// 2. set up the queues: receiveq 0 (interrupt-driven), transmitq 1 (polled).
 		let mut rx: Queue = match device.setup_queue(0) {
 			Some(q) => q,
@@ -116,7 +114,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // transmit queue. A frame that does not fit the buffer is dropped.
 unsafe fn transmit_frame(tx: &Queue, tx_virt: u64, tx_phys: u64, slot: u64, frame: &[u8]) {
 	unsafe {
-		if frame.is_empty() || frame.len() > (slot - NET_HDR_LEN) as usize {
+		if !net::transmit_fits(frame.len(), slot) {
 			return;
 		}
 		core::ptr::write_bytes(tx_virt as *mut u8, 0, NET_HDR_LEN as usize);
@@ -153,8 +151,11 @@ unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq:
 				}
 				common::ProviderReady::Device(0) => {
 					while let Some((id, len)) = rx.take_used() {
-						if id < RX_SLOTS && len as u64 > NET_HDR_LEN {
-							let f: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * slot + NET_HDR_LEN) as *const u8, (len as u64 - NET_HDR_LEN) as usize);
+						// WHERE THE FRAME IS AND HOW LONG IT IS, from the index and length the device
+						// published - including the case the ring check cannot answer, a length past
+						// the slot it claims to be in, which reads into the next slot of the pool.
+						if let Some((offset, bytes)) = net::received_frame(id, len, RX_SLOTS, slot) {
+							let f: &[u8] = core::slice::from_raw_parts((rx_virt + offset) as *const u8, bytes);
 							for at in (0..serving.as_slice().len()).rev() {
 								if !send_blocking(serving.at(at), f, 0) {
 									let token = serving.close_at(at);

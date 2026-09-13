@@ -226,6 +226,7 @@ keys = [
 	"host.session-proto / host / host / default",
 	"host.sign-manifest / host / host / default",
 	"host.smpboot / host / host / default",
+	"host.soft2d / host / host / default",
 	"host.storage-proto / host / host / default",
 	"host.system-manifest / host / host / default",
 	"host.term / host / host / default",

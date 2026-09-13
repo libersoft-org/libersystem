@@ -47,10 +47,10 @@ impl GlyphImage {
 	/// What holding this costs, which is what the cache's bound is measured in.
 	pub fn bytes(&self) -> u64 {
 		match self {
-			GlyphImage::Outline(path) => (path.points().len() * core::mem::size_of::<graphics_core::geom::PointF>() + path.verbs().len()) as u64,
+			GlyphImage::Outline(path) => (core::mem::size_of_val(path.points()) + path.verbs().len()) as u64,
 			GlyphImage::Mask { coverage, .. } => coverage.len() as u64,
 			GlyphImage::Bitmap { image, .. } => image.allocation_len() as u64,
-			GlyphImage::Layers(layers) => layers.iter().map(|(path, _)| (path.points().len() * 8 + path.verbs().len()) as u64).sum(),
+			GlyphImage::Layers(layers) => layers.iter().map(|(path, _)| (core::mem::size_of_val(path.points()) + path.verbs().len()) as u64).sum(),
 			GlyphImage::Missing => 0,
 		}
 	}

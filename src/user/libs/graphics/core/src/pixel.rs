@@ -49,7 +49,10 @@ impl Rgba {
 		Self { red: self.red * factor, green: self.green * factor, blue: self.blue * factor, alpha: self.alpha * factor }
 	}
 
-	pub fn add(self, other: Self) -> Self {
+	/// Channel-wise addition. NOT `core::ops::Add`, deliberately: an operator on a premultiplied
+	/// colour would read as arithmetic that is meaningful for any two colours, and adding two
+	/// premultiplied colours is meaningful only where a filter is accumulating weighted taps.
+	pub fn plus(self, other: Self) -> Self {
 		Self { red: self.red + other.red, green: self.green + other.green, blue: self.blue + other.blue, alpha: self.alpha + other.alpha }
 	}
 }

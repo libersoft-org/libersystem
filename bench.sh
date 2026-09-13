@@ -17,6 +17,7 @@ declare -A SUITES=(
 	["image"]="tools/image-bench"
 	["image-mutate"]="tools/image-mutate"
 	["lico"]="tools/lico-bench"
+	["soft2d"]="tools/soft2d-bench"
 )
 
 help() {

@@ -988,3 +988,107 @@ fn hostile_input_is_answered_rather_than_crashed_on() {
 	backend.render(&prepared, &mut view).expect("a frame under sixteen nested clips");
 	assert!(pixel(&image, 8, 8)[3] > 0, "the drawing survives the nesting");
 }
+
+#[test]
+// THE ALIASED INTEGER LINE IS AN EXPLICIT FAST PATH and keeps the rule it already had: both endpoints
+// included, ties broken toward the smaller minor coordinate, and clipping applied BEFORE rasterising -
+// so a clipped line covers the same pixels as the visible part of the unclipped one.
+fn an_aliased_one_pixel_line_covers_exactly_its_pixels() {
+	let line = |from: PointF, to: PointF, width: u32, height: u32| {
+		let mut image = target(width, height);
+		let mut canvas = Canvas::new();
+		canvas.set_antialias(Antialias::Off);
+		let mut builder = PathBuilder::new();
+		builder.move_to(from).expect("a start");
+		builder.line_to(to).expect("a line");
+		canvas.stroke_path(builder.finish(), red(), render2d::path::StrokeStyle { width: 1.0, ..render2d::path::StrokeStyle::default() }).expect("a stroke");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		image
+	};
+
+	// A HORIZONTAL LINE IS ONE ROW OF PIXELS, both ends included.
+	let horizontal = line(PointF { x: 1.5, y: 3.5 }, PointF { x: 6.5, y: 3.5 }, 8, 8);
+	for x in 1..=6 {
+		assert_eq!(pixel(&horizontal, x, 3)[3], 255, "pixel {x} of the line");
+	}
+	assert_eq!(pixel(&horizontal, 0, 3)[3], 0, "and nothing before its start");
+	assert_eq!(pixel(&horizontal, 7, 3)[3], 0, "or after its end");
+	assert_eq!(pixel(&horizontal, 3, 2)[3], 0, "one row is one row");
+
+	// A DIAGONAL STEPS ONE PIXEL AT A TIME, with no partial coverage anywhere.
+	let diagonal = line(PointF { x: 0.5, y: 0.5 }, PointF { x: 7.5, y: 7.5 }, 8, 8);
+	for index in 0..8 {
+		assert_eq!(pixel(&diagonal, index, index)[3], 255, "the diagonal at {index}");
+	}
+	for y in 0..8 {
+		for x in 0..8 {
+			let alpha = pixel(&diagonal, x, y)[3];
+			assert!(alpha == 0 || alpha == 255, "an aliased line has no partial coverage at {x},{y}: {alpha}");
+		}
+	}
+
+	// CLIPPING HAPPENS BEFORE RASTERISING, so the visible part is the same pixels it would have had.
+	let clipped = line(PointF { x: -20.5, y: 2.5 }, PointF { x: 20.5, y: 2.5 }, 8, 8);
+	for x in 0..8 {
+		assert_eq!(pixel(&clipped, x, 2)[3], 255, "the visible part of a line that starts off the target: {x}");
+	}
+}
+
+/// A source whose image is PLANES: what a decoder or a camera actually hands over.
+struct VideoFrame {
+	layout: graphics_core::planar::MultiPlaneLayout,
+	luma: alloc::vec::Vec<u8>,
+	chroma: alloc::vec::Vec<u8>,
+}
+
+impl ImageSource for VideoFrame {
+	fn image(&self, _identity: u64) -> Option<graphics_core::ImageView<'_>> {
+		// A PLANAR SOURCE HAS NO SINGLE-PLANE VIEW. Answering one here would be the full-frame
+		// conversion per frame that the multi-plane model exists to remove.
+		None
+	}
+
+	fn planes(&self, identity: u64) -> Option<graphics_core::planar::MultiPlaneView<'_>> {
+		(identity == 11).then(|| graphics_core::planar::MultiPlaneView::new(self.layout, [&self.luma, &self.chroma, &[]]).expect("a view"))
+	}
+}
+
+#[test]
+// A VIDEO FRAME IS DRAWN FROM ITS PLANES, through the same sampler, the same transfer function and
+// the same compositor as every other image. Without this a player converts every frame to RGBA
+// first - a full-frame conversion on the CPU, once per frame, for the one workload where that cost
+// is least affordable.
+fn a_planar_video_frame_draws_without_being_converted_first() {
+	use graphics_core::planar::{MultiPlaneLayout, PlanarFormat, YuvMatrix, YuvRange};
+	let extent = Extent2D::new(8, 8);
+	let layout = MultiPlaneLayout::new(extent, PlanarFormat::Nv12, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Srgb, [8, 8, 0]).expect("a layout");
+	// The left half is white and the right half is black, so the drawing has an edge to be in the
+	// right place.
+	let mut luma = alloc::vec![16u8; 64];
+	for y in 0..8 {
+		for x in 0..4 {
+			luma[y * 8 + x] = 235;
+		}
+	}
+	let source = VideoFrame { layout, luma, chroma: alloc::vec![128u8; 64] };
+
+	let mut image = target(16, 16);
+	let mut canvas = Canvas::new();
+	canvas.draw_image(render2d::list::ImageRecord { identity: 11, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 8.0, 8.0), RectF::new(0.0, 0.0, 16.0, 16.0), render2d::paint::ImageQuality::Nearest).expect("a frame");
+	let list = canvas.finish().expect("a list");
+	let mut backend = Soft2d::new().with_images(&source);
+	let prepared = backend.prepare(&list, &description(&image)).expect("a preparation");
+	{
+		let mut view = image.view_mut();
+		backend.render(&prepared, &mut view).expect("a frame");
+	}
+
+	let white = pixel(&image, 2, 8);
+	let black = pixel(&image, 13, 8);
+	assert!(white[0] > 240 && white[1] > 240 && white[2] > 240, "limited-range 235 is white: {white:?}");
+	assert!(black[0] < 20, "limited-range 16 is black: {black:?}");
+	assert_eq!(white[3], 255, "a video frame is opaque");
+	// AND THE EDGE IS WHERE THE SOURCE PUT IT, doubled by the scale rather than shifted by a
+	// reconstruction that sited its chroma wrongly.
+	assert!(pixel(&image, 7, 8)[0] > 240 && pixel(&image, 8, 8)[0] < 20, "the edge is in the middle: {:?} then {:?}", pixel(&image, 7, 8), pixel(&image, 8, 8));
+}

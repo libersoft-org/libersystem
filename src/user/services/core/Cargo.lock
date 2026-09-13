@@ -85,6 +85,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphics-core"
+version = "0.0.0"
+dependencies = [
+ "graphics-profile",
+ "libm",
+]
+
+[[package]]
+name = "graphics-profile"
+version = "0.0.0"
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -131,6 +143,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "log-proto"
 version = "0.0.0"
 dependencies = [
@@ -170,6 +188,9 @@ version = "0.0.0"
 [[package]]
 name = "pix"
 version = "0.0.0"
+dependencies = [
+ "graphics-core",
+]
 
 [[package]]
 name = "proc-macro2"

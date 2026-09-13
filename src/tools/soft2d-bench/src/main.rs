@@ -60,7 +60,7 @@ const SCENES: [Scene; 4] = [
 	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 16.7, commands: 252, resources: 153 },
 	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 66.7, commands: 45, resources: 34 },
 	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 66.7, commands: 240, resources: 241 },
-	Scene { name: "image-stress", ceiling_ms: 16.7, budget_ms: 16.7, commands: 24, resources: 2 },
+	Scene { name: "image-stress", ceiling_ms: 16.7, budget_ms: 16.7, commands: 25, resources: 3 },
 ];
 
 /// The images the scenes reference, under their recorded identities.
@@ -68,6 +68,39 @@ struct Images {
 	photo: OwnedImage,
 	icon: OwnedImage,
 	wide: OwnedImage,
+	/// THE YUV SOURCE the image scene names: planes, as a decoder hands them over, drawn without
+	/// being converted to RGBA first.
+	video: VideoFrame,
+}
+
+/// One `NV12` frame, generated from its coordinates so it is the same on every machine.
+struct VideoFrame {
+	layout: graphics_core::planar::MultiPlaneLayout,
+	luma: Vec<u8>,
+	chroma: Vec<u8>,
+}
+
+impl VideoFrame {
+	fn new(extent: Extent2D) -> Self {
+		use graphics_core::planar::{MultiPlaneLayout, PlanarFormat, YuvMatrix, YuvRange};
+		let (width, height) = (extent.width as usize, extent.height as usize);
+		let mut luma = vec![0u8; width * height];
+		for y in 0..height {
+			for x in 0..width {
+				luma[y * width + x] = (16 + ((x + y) % 220)) as u8;
+			}
+		}
+		let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+		let mut chroma = vec![128u8; chroma_width * 2 * chroma_height];
+		for y in 0..chroma_height {
+			for x in 0..chroma_width {
+				chroma[y * chroma_width * 2 + x * 2] = (64 + (x % 128)) as u8;
+				chroma[y * chroma_width * 2 + x * 2 + 1] = (64 + (y % 128)) as u8;
+			}
+		}
+		let layout = MultiPlaneLayout::new(extent, PlanarFormat::Nv12, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Rec2020, [width as u32, chroma_width as u32 * 2, 0]).expect("a layout");
+		Self { layout, luma, chroma }
+	}
 }
 
 impl ImageSource for Images {
@@ -78,6 +111,10 @@ impl ImageSource for Images {
 			3 => Some(self.wide.view()),
 			_ => None,
 		}
+	}
+
+	fn planes(&self, identity: u64) -> Option<graphics_core::planar::MultiPlaneView<'_>> {
+		(identity == 4).then(|| graphics_core::planar::MultiPlaneView::new(self.video.layout, [&self.video.luma, &self.video.chroma, &[]]).expect("a view"))
 	}
 }
 
@@ -176,9 +213,10 @@ fn build_images() -> Images {
 	Images {
 		photo: make(Extent2D::new(512, 512), ColorSpace::Srgb, &|x, y| [(x % 256) as f32 / 255.0, (y % 256) as f32 / 255.0, ((x ^ y) % 256) as f32 / 255.0, 1.0]),
 		icon: make(Extent2D::new(32, 32), ColorSpace::Srgb, &|x, y| [1.0, (x + y) as f32 / 64.0, 0.25, if (x / 4 + y / 4) % 2 == 0 { 1.0 } else { 0.5 }]),
-		// A WIDE-GAMUT SOURCE, which is the colour-conversion half of the image scene. The YUV source
-		// the plan also names needs the multi-plane image model, which `P02M0103a-common` still owes.
+		// A WIDE-GAMUT SOURCE, which is the colour-conversion half of the image scene.
 		wide: make(Extent2D::new(256, 256), ColorSpace::DisplayP3, &|x, y| [(x % 128) as f32 / 127.0, 0.5, (y % 128) as f32 / 127.0, 1.0]),
+		// AND ONE YUV SOURCE, in Rec. 2020 limited range, which is what a decoded video frame is.
+		video: VideoFrame::new(Extent2D::new(320, 240)),
 	}
 }
 
@@ -308,5 +346,9 @@ fn image_stress() -> Result<DrawList, Error> {
 	}
 	canvas.set_operator(Operator::SrcOver);
 	canvas.draw_image(wide, RectF::new(0.0, 0.0, 256.0, 256.0), RectF::new(0.0, 0.0, 640.0, 480.0), ImageQuality::Mipmapped)?;
+	// THE YUV SOURCE, drawn from its planes at the size a player would: no conversion pass, and the
+	// matrix, the range and the primaries all on the shared path.
+	let video = ImageRecord { identity: 4, layout_generation: 1, content_generation: 1 };
+	canvas.draw_image(video, RectF::new(0.0, 0.0, 320.0, 240.0), RectF::new(0.0, 0.0, 640.0, 480.0), ImageQuality::Bilinear)?;
 	canvas.finish()
 }

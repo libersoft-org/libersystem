@@ -478,3 +478,144 @@ fn the_transfer_tables_agree_with_the_exact_functions() {
 	assert_eq!(table.encode(4.0), color::encode(Transfer::Srgb, 4.0) as f32);
 	assert_eq!(table.decode(-1.0), color::decode(Transfer::Srgb, -1.0) as f32);
 }
+
+#[test]
+// EVERY MANDATORY FORMAT BEING RGB IS WHY A VIDEO PLAYER CONVERTS EVERY FRAME BEFORE ANYTHING WILL
+// DRAW IT. The planar model is what removes that conversion, and its arithmetic is the part a recipe
+// written for RGB gets wrong: the matrix and the range come FIRST, on code values, and produce
+// ENCODED RGB - the transfer function has not been touched yet.
+fn the_planar_model_reconstructs_reads_and_refuses_by_the_frozen_rules() {
+	use planar::{MultiPlaneLayout, MultiPlaneView, PlanarFormat, YuvMatrix, YuvRange};
+
+	// THE REGISTRY IS THE LIST AND THIS IS THE CODE. Three layouts and three matrices, by name.
+	assert_eq!(planar::ALL_PLANAR_FORMATS.len(), graphics_profile::image::YUV_LAYOUTS.len());
+	for (format, described) in planar::ALL_PLANAR_FORMATS.iter().zip(graphics_profile::image::YUV_LAYOUTS.iter()) {
+		assert_eq!(format.name(), described.name);
+		assert_eq!(format.planes(), described.planes as usize);
+		assert_eq!(format.bits(), described.bits);
+	}
+	assert_eq!(planar::ALL_YUV_MATRICES.len(), graphics_profile::image::YUV_MATRICES.len());
+
+	// AN INTERLEAVED CHROMA ROW IS TWICE ITS SAMPLE COUNT AND A PLANAR ONE IS ONCE, which is the
+	// arithmetic that puts a decoder half a row out.
+	let extent = Extent2D::new(4, 4);
+	assert_eq!(PlanarFormat::Nv12.minimum_row_bytes(1, extent), Some(4), "two chroma samples for each of two columns");
+	assert_eq!(PlanarFormat::I420.minimum_row_bytes(1, extent), Some(2), "one sample for each of two columns");
+	assert_eq!(PlanarFormat::P010.minimum_row_bytes(0, extent), Some(8), "ten bits live in a sixteen-bit word");
+	// AN ODD EXTENT'S CHROMA PLANE IS THE CEILING OF HALF THE LUMA EXTENT.
+	assert_eq!(PlanarFormat::Nv12.plane_extent(1, Extent2D::new(5, 5)), Some(Extent2D::new(3, 3)));
+
+	// A MALFORMED PLANE IS A REFUSAL AND NOT A CLAMP: a chroma pitch half a row short is a decoder's
+	// arithmetic error, and accepting it draws a picture that shears.
+	assert_eq!(MultiPlaneLayout::new(extent, PlanarFormat::Nv12, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Srgb, [4, 2, 0]).err(), Some(Error::PitchTooSmall));
+
+	// A LIMITED-RANGE WHITE IS 235, NOT 255, and a full-range one is 255 - which is the single
+	// commonest cause of washed-out or crushed video and is not detectable from the samples.
+	let white = |range: YuvRange, luma: u8| {
+		let layout = MultiPlaneLayout::new(extent, PlanarFormat::Nv12, YuvMatrix::Bt709, range, ColorSpace::Srgb, [4, 4, 0]).expect("a layout");
+		let luma_plane = [luma; 16];
+		let chroma_plane = [128u8; 16];
+		let view = MultiPlaneView::new(layout, [&luma_plane, &chroma_plane, &[]]).expect("a view");
+		view.encoded_rgb(1, 1)
+	};
+	let limited = white(YuvRange::Limited, 235);
+	assert!((limited.red - 1.0).abs() < 0.01 && (limited.green - 1.0).abs() < 0.01 && (limited.blue - 1.0).abs() < 0.01, "limited-range white: {limited:?}");
+	let full = white(YuvRange::Full, 255);
+	assert!((full.red - 1.0).abs() < 0.01, "full-range white: {full:?}");
+	// AND THE SAME BYTES READ AS THE OTHER RANGE ARE A DIFFERENT COLOUR, which is what makes the flag
+	// part of the image rather than a hint.
+	let misread = white(YuvRange::Full, 235);
+	assert!(misread.red < 0.95, "235 read as full range is not white: {misread:?}");
+
+	// THE MATRIX IS DERIVED FROM ITS TWO COEFFICIENTS, so BT.601 and BT.709 disagree about the same
+	// bytes - which they must, or one of them is not implemented.
+	let coloured = |matrix: YuvMatrix| {
+		let layout = MultiPlaneLayout::new(extent, PlanarFormat::Nv12, matrix, YuvRange::Limited, ColorSpace::Srgb, [4, 4, 0]).expect("a layout");
+		let luma_plane = [120u8; 16];
+		let chroma_plane = [200u8, 90, 200, 90, 200, 90, 200, 90, 200, 90, 200, 90, 200, 90, 200, 90];
+		let view = MultiPlaneView::new(layout, [&luma_plane, &chroma_plane, &[]]).expect("a view");
+		view.encoded_rgb(1, 1)
+	};
+	assert!(coloured(YuvMatrix::Bt601) != coloured(YuvMatrix::Bt709));
+	assert!(coloured(YuvMatrix::Bt709) != coloured(YuvMatrix::Bt2020));
+
+	// `P010` IS THE HIGH TEN BITS OF A LITTLE-ENDIAN WORD, and the low six are ignored on read: the
+	// same ten-bit value with noise in its low bits is the same colour.
+	let ten_bit = |low: u8| {
+		let layout = MultiPlaneLayout::new(extent, PlanarFormat::P010, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Srgb, [8, 8, 0]).expect("a layout");
+		let word = (940u16 << 6) | low as u16;
+		let mut luma_plane = [0u8; 32];
+		for pair in luma_plane.chunks_exact_mut(2) {
+			pair.copy_from_slice(&word.to_le_bytes());
+		}
+		let mut chroma_plane = [0u8; 32];
+		for pair in chroma_plane.chunks_exact_mut(2) {
+			pair.copy_from_slice(&((512u16 << 6).to_le_bytes()));
+		}
+		let view = MultiPlaneView::new(layout, [&luma_plane, &chroma_plane, &[]]).expect("a view");
+		view.encoded_rgb(1, 1)
+	};
+	assert_eq!(ten_bit(0), ten_bit(63), "the low six bits are ignored on read");
+	assert!((ten_bit(0).red - 1.0).abs() < 0.01, "940 of 64..940 is white at ten bits: {:?}", ten_bit(0));
+
+	// I420's THREE PLANES SAY THE SAME THING AS NV12's TWO, which is what makes them one model.
+	let planar_white = {
+		let layout = MultiPlaneLayout::new(extent, PlanarFormat::I420, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Srgb, [4, 2, 2]).expect("a layout");
+		let luma_plane = [235u8; 16];
+		let cb = [128u8; 4];
+		let cr = [128u8; 4];
+		let view = MultiPlaneView::new(layout, [&luma_plane, &cb, &cr]).expect("a view");
+		view.encoded_rgb(1, 1)
+	};
+	let interleaved_white = white(YuvRange::Limited, 235);
+	assert!((planar_white.red - interleaved_white.red).abs() < 0.01 && (planar_white.blue - interleaved_white.blue).abs() < 0.01, "{planar_white:?} against {interleaved_white:?}");
+
+	// A CROP MUST LAND ON A CHROMA SAMPLE, or the crop's own chroma is between two of them.
+	assert!(planar::crop_is_aligned(PlanarFormat::Nv12, (2, 4), Extent2D::new(4, 2)));
+	assert!(!planar::crop_is_aligned(PlanarFormat::Nv12, (1, 4), Extent2D::new(4, 2)));
+	assert!(!planar::crop_is_aligned(PlanarFormat::Nv12, (2, 4), Extent2D::new(3, 2)));
+
+	// AND A SHORT PLANE IS REFUSED RATHER THAN READ PAST.
+	let layout = MultiPlaneLayout::new(extent, PlanarFormat::Nv12, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Srgb, [4, 4, 0]).expect("a layout");
+	let short = [0u8; 8];
+	let chroma = [128u8; 16];
+	assert_eq!(MultiPlaneView::new(layout, [&short, &chroma, &[]]).err(), Some(Error::BufferTooShort));
+}
+
+#[test]
+// A VIDEO FRAME IS SAMPLED BY THE SAME SAMPLER AS EVERYTHING ELSE. The plane reconstruction and the
+// matrix are the only things that differ, and they happen before the shared pipeline starts: the
+// transfer function, the primaries, the premultiply and the filter are one implementation.
+fn a_planar_source_samples_through_the_shared_pipeline() {
+	use planar::{MultiPlaneLayout, MultiPlaneView, PlanarFormat, YuvMatrix, YuvRange};
+	let extent = Extent2D::new(4, 4);
+	let layout = MultiPlaneLayout::new(extent, PlanarFormat::Nv12, YuvMatrix::Bt709, YuvRange::Limited, ColorSpace::Srgb, [4, 4, 0]).expect("a layout");
+	let luma_plane = [235u8; 16];
+	let chroma_plane = [128u8; 16];
+	let view = MultiPlaneView::new(layout, [&luma_plane, &chroma_plane, &[]]).expect("a view");
+	let working = pixel::Working::linear(ColorSpace::Srgb);
+	let sampler = sample::Sampler::planar(view, working, sample::Spread::Clamp, None).expect("a sampler");
+	// WHITE IN, WHITE OUT - in LIGHT, which means the sRGB transfer function was applied after the
+	// matrix and not before it.
+	let texel = sampler.texel(1, 1);
+	assert!((texel.red - 1.0).abs() < 0.02 && (texel.alpha - 1.0).abs() < 0.01, "{texel:?}");
+	// A mid-grey luma decodes to LESS than half the light, which is the transfer function having been
+	// applied at all.
+	let dark = {
+		let luma_plane = [126u8; 16];
+		let view = MultiPlaneView::new(layout, [&luma_plane, &chroma_plane, &[]]).expect("a view");
+		let sampler = sample::Sampler::planar(view, working, sample::Spread::Clamp, None).expect("a sampler");
+		sampler.texel(1, 1)
+	};
+	assert!(dark.red < 0.3 && dark.red > 0.1, "a mid-grey code value is a fifth of the light: {dark:?}");
+
+	// AND A PYRAMID IS BUILT FROM THE SAME SAMPLER, so a scaled video frame is filtered in the same
+	// light as a scaled image - not through a second reconstruction of its own.
+	let view = MultiPlaneView::new(layout, [&luma_plane, &chroma_plane, &[]]).expect("a view");
+	let sampler = sample::Sampler::planar(view, working, sample::Spread::Clamp, None).expect("a sampler");
+	let pyramid = sample::Pyramid::from_sampler(&sampler, working).expect("a pyramid");
+	assert_eq!(pyramid.levels(), 3, "four by four halves twice");
+	let top = pyramid.level(2).expect("the top");
+	let averaged = pixel::read(&top, 0, 0).expect("its one texel");
+	assert!((averaged.red - 1.0).abs() < 0.02, "an all-white frame averages to white: {averaged:?}");
+}

@@ -1,0 +1,67 @@
+profile=wsi version=1
+scale representation={ numerator: u32, denominator: u32 }, exact, never a float on the wire authoritative=physical; the logical extent is derived from it and the scale, and never the other way round
+edge-rule=an edge at logical coordinate `l` is the physical coordinate `round_half_away_from_zero(l * numerator / denominator)`, computed in integers from the ratio and never from a rounded float, so both neighbours of a shared edge compute the same number
+damage-rounding=left and top round down, right and bottom round up; conservative, and not a promise of non-overlap between independently rounded geometry
+input-mapping=a physical input coordinate maps to logical by the exact inverse ratio, rounding half away from zero, after the output transform is undone
+transforms=Normal,Rotate90,Rotate180,Rotate270,FlippedNormal,FlippedRotate90,FlippedRotate180,FlippedRotate270
+configuration=serial invalidates-images=false why=what an acknowledgement names; a stale or unknown serial is refused rather than applied
+configuration=generation invalidates-images=false why=which image generation this configuration belongs to; every present carries one and it must match
+configuration=logical extent invalidates-images=true why=what an application lays out in
+configuration=physical extent invalidates-images=true why=what the backend rasterises; the authoritative one
+configuration=scale invalidates-images=true why=the ratio between them, exact
+configuration=transform invalidates-images=true why=the output's orientation, which input mapping is the inverse of
+configuration=output invalidates-images=false why=which output the surface is on, so a client can follow its refresh interval
+configuration=presentable pixel format invalidates-images=true why=immutable within a generation; changing it is a new generation
+configuration=colour information invalidates-images=false why=the space AND the luminances, because a colour-space name alone cannot tone map
+configuration=subpixel layout invalidates-images=false why=which geometry an LCD mask may be rasterised for, and `None` when it is unknown
+configuration=visibility invalidates-images=false why=whether this surface is the visible one; acquiring from a hidden surface answers NotVisible
+configuration=focus invalidates-images=false why=focus is a property of a SURFACE and not of a connection
+configuration-lifecycle=configure(snapshot) -> rebuild -> ack_configure(serial) -> first present Full; a present names its configuration serial and its image generation, and both must match the acknowledged current configuration at acceptance
+colour-metadata=colour space,SDR white luminance in cd/m²,minimum luminance in cd/m²,maximum luminance in cd/m²,maximum frame-average luminance in cd/m²
+event=Configure carries=one SurfaceConfiguration snapshot why=the atomic set above; the client rebuilds and acknowledges by serial
+event=ImageAvailable carries=nothing why=what a client waits on INSTEAD of blocking inside acquire, which is what keeps one dispatch loop alive
+event=PresentComplete carries=the present's serial, its outcome and its timestamp evidence why=a present's fate is reported per present rather than inferred from the next acquire
+event=CloseRequested carries=nothing why=a REQUEST and not a teardown: the application decides, which is what makes an unsaved-changes prompt possible
+event=VisibilityChanged carries=the new visibility why=a background client stops drawing rather than discovering it by a refusal
+event=FocusChanged carries=whether this surface has focus why=focus belongs to the surface, so the event does too
+image-state=Available meaning=the queue owns it and it can be acquired
+image-state=Acquired meaning=the client owns it and may draw into it
+image-state=PendingPresent meaning=the service owns it; it has been accepted and not yet completed
+image-state=Stale meaning=it belongs to a generation that no longer exists and is never presented into a new one
+transition=Available --acquire--> Acquired why=the ordinary path
+transition=Acquired --present--> PendingPresent why=the ordinary path; `present` CONSUMES the acquired image, so there is no safe path back to the pixels
+transition=PendingPresent --released--> Available why=the service is done with it, whatever the outcome was
+transition=Acquired --abandon--> Available why=a client that acquired and then decided not to draw returns it without presenting a frame nobody wanted
+transition=Available --generation changed--> Stale why=its extent, scale, orientation or format is not the current one
+transition=Acquired --generation changed--> Stale why=the client discards it rather than presenting it into a generation it was not drawn for
+transition=PendingPresent --generation changed--> Stale why=it completes or is discarded FIRST - a frame in flight is not un-submitted - and is then stale
+transition=Stale --reclaimed--> Available why=the queue rebuilds its images for the new generation
+acquire-answers=an image | Again, when none is available - the client waits on ImageAvailable rather than inside the call | NotVisible, when the surface is occluded or in the background | OutOfDate, when the configuration has moved on
+present-outcome=Displayed meaning=it reached logical presentation; on a backend that cannot observe scanout this means DRIVER-COMPLETED
+present-outcome=DiscardedOccluded meaning=it was accepted while visible and completed while not; it kept its place in the order and never reached a screen
+present-outcome=ReplacedByResize meaning=a generation change overtook it
+present-outcome=DriverLost meaning=the backend went away under it
+fifo=FIFO is the order of ACCEPTED presents, by present-call order and not by acquire order; while visible every accepted frame reaches logical presentation, and while occluded or backgrounded new acquires answer NotVisible and already-accepted frames still complete IN ORDER, possibly as discarded
+present-modes=Fifo reserved=Mailbox,Immediate
+images min=2 max=3
+completion-fact=Accepted observable-today=true meaning=the service took the frame and it has a place in the order
+completion-fact=DriverCompleted observable-today=true meaning=the backend acknowledged the commands that carried it
+completion-fact=PhysicallyDisplayed observable-today=false meaning=a scanout of this frame was observed
+timestamp-evidence=Unavailable,Estimated(t),Measured(t)
+timing=preferred frame deadline,the output's refresh interval,the completed present's timestamp evidence,the present outcome optionality=every timing field is optional and typed as such; a backend that cannot supply one says so rather than inventing it
+max-damage-rects=16
+damage=what an EMPTY list means answer=nothing changed: the frame is pixel-identical to the previously presented one, the present is still ordered and still completes, and the service may release the image without copying
+damage=how the whole surface is spelled answer=an explicit Full variant, never one rectangle covering the extent - a rectangle can be wrong by a pixel and a variant cannot
+damage=a rectangle outside the extent answer=a TYPED invalid, never a silent clamp
+damage=exceeding the cap answer=the caller's problem, solved by merging or by sending Full - never the service's, solved by dropping rectangles
+damage=overlapping rectangles answer=legal, and may be normalised by the backend
+damage=what the coordinates are in answer=the image space of the generation the present belongs to
+damage=damage relative to WHAT, when consecutive frames are drawn into different images answer=EVERY PRESENTED IMAGE CONTAINS A COMPLETE VALID FRAME; damage is a HINT about which pixels changed against the previously presented frame and is never permission to leave the rest undefined
+damage=the first present of a generation answer=Full
+damage=whether a backend may merge answer=it may, when merging is cheaper than transferring separately - what is forbidden is the unconditional union of everything, which turns two corners into most of the screen
+completion-pair=PRODUCER_READY client=SEND service=RECEIVE | WAIT
+completion-pair=PRESENT_DONE client=RECEIVE | WAIT service=SEND
+completion depth=each endpoint is created with depth max_images, so at three images at most six messages are queued across both directions attenuation=client endpoints carry neither DUPLICATE nor TRANSFER; a safe completion token may move inside its own process, and the raw endpoint is never exposed beside it
+memory=a v1 presentable image is COHERENT CPU-VISIBLE memory: a send is a release and a receive is an acquire, in both directions, and there is no explicit flush or invalidate in the contract because there is no non-coherent import in v1
+visibility=at most ONE surface is visible and scanout-bound; other surfaces keep independent resources, generations and queues while hidden, acquiring from them answers NotVisible, frames accepted before a visibility change still settle in FIFO order with the appropriate discarded outcome, and focus belongs to the visible surface
+not-in-v1=popup position,z-order,simultaneous composition,a measured presentation timestamp,buffer age,deferred replies with a pending-call table

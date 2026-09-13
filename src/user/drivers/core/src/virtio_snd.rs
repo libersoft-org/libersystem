@@ -28,6 +28,7 @@
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
+use drivers::snd::{PeriodFault, capture_outcome, period_outcome, playback_reply};
 use drivers::{common, virtio};
 
 // virtio-sound control requests (the PCM subset) and the success status.
@@ -179,23 +180,54 @@ struct Tx {
 	period_virt: u64,
 	period_phys: u64,
 	status_phys: u64,
+	// The status structure's own address in this process, because the device writes its answer there
+	// and the old path never read it.
+	status_virt: u64,
 }
 
 impl Tx {
 	// Play one period: the PCM is already in `period_virt` (received straight into it).
 	// Submit [xfer][pcm][status], then block on the device's MSI-X interrupt until it
 	// has consumed the chain, reap the completion, and re-arm the interrupt.
-	fn play(&mut self, irq: u64) -> bool {
-		if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, false), (self.status_phys, 8, true)]) {
-			return false;
+	fn play(&mut self, irq: u64) -> Result<u32, PeriodFault> {
+		unsafe {
+			// THE STATUS IS CLEARED BEFORE THE SUBMISSION, so a device that writes nothing cannot be
+			// read as the PREVIOUS period's success: the page is reused, and its old content is an
+			// `S_OK` that belonged to a period that finished a moment ago.
+			wr32(self.status_virt, 0);
+			wr32(self.status_virt + 4, 0);
 		}
-		// block until the device raises its MSI-X interrupt for the consumed period.
-		wait(irq, 0);
-		self.q.take_used();
-		// clear the pending flag so the next period wakes us (edge-triggered MSI-X).
-		interrupt_ack(irq);
-		true
+		if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, false), (self.status_phys, 8, true)]) {
+			return Err(PeriodFault::NoCompletion);
+		}
+		wait_for_completion(&mut self.q, irq, self.status_virt, |completion, status| period_outcome(completion, 0, status))
 	}
+}
+
+// How many times a wait is repeated before a period is called uncompleted.
+//
+// AN INTERRUPT IS NOT A COMPLETION: the vector is shared with the queues this driver sets up and does
+// not drive, so a wake with an empty used ring is ordinary and waiting again is the right answer. It
+// is BOUNDED because the other possibility is a device that has stopped, and a driver that waits for
+// it forever takes its service's whole loop with it.
+const COMPLETION_WAITS: u32 = 4;
+
+// Block on the device's interrupt until THIS submission completes, and decide what it did.
+fn wait_for_completion(queue: &mut Queue, irq: u64, status_virt: u64, decide: impl Fn(Option<(u16, u32)>, u32) -> Result<u32, PeriodFault>) -> Result<u32, PeriodFault> {
+	let mut last = Err(PeriodFault::NoCompletion);
+	for _ in 0..COMPLETION_WAITS {
+		wait(irq, 0);
+		let completion = queue.take_used();
+		// The pending flag is cleared whether or not the completion was ours, so the next period's
+		// interrupt still wakes us (edge-triggered MSI-X).
+		interrupt_ack(irq);
+		let status = unsafe { rd32(status_virt) };
+		last = decide(completion, status);
+		if !matches!(last, Err(PeriodFault::NoCompletion)) {
+			return last;
+		}
+	}
+	last
 }
 
 // The receive queue and its own DMA page, laid out exactly like the transmit one.
@@ -210,19 +242,21 @@ struct Rx {
 	period_virt: u64,
 	period_phys: u64,
 	status_phys: u64,
+	status_virt: u64,
 }
 
 impl Rx {
 	// Capture one period into `period_virt`: submit [xfer][space][status], block on the device's
 	// MSI-X interrupt until it has filled the chain, reap the completion and re-arm.
-	fn capture(&mut self, irq: u64) -> bool {
-		if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, true), (self.status_phys, 8, true)]) {
-			return false;
+	fn capture(&mut self, irq: u64) -> Result<u32, PeriodFault> {
+		unsafe {
+			wr32(self.status_virt, 0);
+			wr32(self.status_virt + 4, 0);
 		}
-		wait(irq, 0);
-		self.q.take_used();
-		interrupt_ack(irq);
-		true
+		if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, true), (self.status_phys, 8, true)]) {
+			return Err(PeriodFault::NoCompletion);
+		}
+		wait_for_completion(&mut self.q, irq, self.status_virt, |completion, status| capture_outcome(completion, 0, status, PERIOD_BYTES))
 	}
 }
 
@@ -270,12 +304,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// one page: xfer header @0 (4B), status @8 (8B), PCM period @64 (PERIOD_BYTES).
 		let (_tx_h, tx_virt, tx_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
 		wr32(tx_virt, 0); // xfer header = stream id (filled below once known)
-		let mut tx = Tx { q: txq, xfer_phys: tx_phys, period_virt: tx_virt + 64, period_phys: tx_phys + 64, status_phys: tx_phys + 8 };
+		let mut tx = Tx { q: txq, xfer_phys: tx_phys, period_virt: tx_virt + 64, period_phys: tx_phys + 64, status_phys: tx_phys + 8, status_virt: tx_virt + 8 };
 		// The capture page is its own, not a second use of the transmit one: a captured period is
 		// device-written while a played one is device-read, and one page serving both would be a
 		// buffer the device may write while the driver is filling it for playback.
 		let (_rx_h, rx_virt, rx_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
-		let mut rx = Rx { q: rxq, xfer_phys: rx_phys, period_virt: rx_virt + 64, period_phys: rx_phys + 64, status_phys: rx_phys + 8 };
+		let mut rx = Rx { q: rxq, xfer_phys: rx_phys, period_virt: rx_virt + 64, period_phys: rx_phys + 64, status_phys: rx_phys + 8, status_virt: rx_virt + 8 };
 
 		// 5. read the PCM stream count from the device config (virtio_snd_config: jacks
 		//    @0, streams @4, chmaps @8), find the output stream, and write its id into the
@@ -356,10 +390,11 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, ctl: &Ctl, tx: &mut Tx, rx:
 					if !started {
 						started = ctl.set_params(stream) && ctl.stream_cmd(R_PCM_PREPARE, stream) && ctl.stream_cmd(R_PCM_START, stream);
 					}
-					if started {
-						tx.play(irq);
-					}
-					send_blocking(service, b"OK", 0);
+					// A PERIOD THAT WAS NOT PLAYED IS NOT ANSWERED AS PLAYED. The reply is what
+					// AudioService paces against; answering "OK" for a period the device refused is
+					// how a stream of silence looks exactly like a stream of audio from outside.
+					let outcome = if started { tx.play(irq) } else { Err(PeriodFault::NoCompletion) };
+					send_blocking(service, playback_reply(outcome), 0);
 				}
 				Received::Closed => {
 					if started {
@@ -397,7 +432,7 @@ unsafe fn serve_command(ctl: &Ctl, rx: &mut Rx, irq: u64, capture: Option<u32>, 
 				if !*capturing {
 					*capturing = ctl.set_params(stream) && ctl.stream_cmd(R_PCM_PREPARE, stream) && ctl.stream_cmd(R_PCM_START, stream);
 				}
-				if !*capturing || !rx.capture(irq) {
+				if !*capturing || rx.capture(irq).is_err() {
 					send_blocking(service, &[], 0);
 					return;
 				}

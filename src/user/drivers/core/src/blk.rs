@@ -34,6 +34,10 @@ pub enum Refusal {
 	Rights,
 	// The object is smaller than the bytes the request says it holds.
 	Size,
+	// The address does not fit the command this transport would send it in. A ten-byte SCSI command
+	// carries a THIRTY-TWO-BIT block address, and a driver that truncates one writes to a block two
+	// terabytes away from the one the caller named.
+	Addressing,
 }
 
 // The sector range a request names, admitted or refused. `count` is the wire value as sent - no
@@ -64,6 +68,20 @@ pub fn write_source(info: &ObjectInfo, bytes: u64) -> Result<(), Refusal> {
 		return Err(Refusal::Size);
 	}
 	Ok(())
+}
+
+// The block address a ten-byte SCSI command can carry, admitted or refused.
+//
+// TRUNCATION IS THE FAILURE MODE, and it is silent: `lba as u32` on a request past two terabytes
+// names a block near the start of the medium, so a write lands on somebody else's data and reports
+// success. The refusal is typed, and the transport that needs larger addresses is a sixteen-byte
+// command this driver does not yet send.
+pub fn command_lba32(lba: u64, count: u32) -> Result<u32, Refusal> {
+	let end = lba.checked_add(count as u64).ok_or(Refusal::Range)?;
+	if end > u32::MAX as u64 + 1 {
+		return Err(Refusal::Addressing);
+	}
+	u32::try_from(lba).map_err(|_| Refusal::Addressing)
 }
 
 #[cfg(test)]

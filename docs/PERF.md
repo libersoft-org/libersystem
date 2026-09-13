@@ -4,6 +4,66 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## soft2d, the CPU 2D backend (2026-09-12)
+
+`./bench.sh --suite soft2d` records four frozen scenes at 640x480 and reports what a PREPARED
+replay costs. It needs no surface, no DisplayService, no guest and no application: each scene is a
+bounded `DrawList` recorded once and replayed into an `OwnedImage`, which is what makes the number a
+person can get in a second on a host rather than a boot away.
+
+**The reference host.** Intel Xeon Platinum 8272CL at 2.60 GHz, 100 logical CPUs, single-threaded
+throughout - `soft2d` has no worker pool and Profile 1 does not ask for one. Built `--release` by
+`rustc 1.93.1 (01f6ddf75 2026-02-11)` with the workspace's own flags, run from `src/tools`. The clock
+is `std::time::Instant`. Five warmup frames are discarded and thirty are measured; the first replay
+of a list touches every page of the reservation and would otherwise be divided into every sample.
+Preparation is reported separately from replay because they are different claims: `prepare` flattens,
+strokes, bins, builds pyramids and reserves ONCE, and `render` is what a repeated frame costs.
+
+**The scenes are frozen and the runner checks that they are.** Each one's command count and resource
+count are asserted against the numbers recorded in the tool before the clock starts, so a later
+simplification cannot quietly lower the workload and report the same milliseconds against an easier
+scene.
+
+| scene | commands | resources | prepare | replay median | replay p99 | ceiling |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UI-basic | 252 | 153 | 0.9 ms | 78.8 ms | 84.2 ms | 16.7 ms |
+| UI-effects | 45 | 34 | 1.3 ms | 385.1 ms | 401.7 ms | 66.7 ms |
+| vector-stress | 240 | 241 | 7.2 ms | 245.8 ms | 247.3 ms | 66.7 ms |
+| image-stress | 25 | 3 | 42.4 ms | 419.0 ms | 421.0 ms | 16.7 ms |
+
+**THE FLOOR IS NOT MET.** The ceilings are fixed independently of the implementation and stay where
+they are; these are the measurements as they stand, and the gap is between four and twenty-five times. The
+image scene grew its YUV source when the multi-plane model landed, which is a full-screen `NV12`
+frame reconstructed, matrixed, transfer-decoded and converted from Rec. 2020 per pixel - it is the
+workload the scene is for, and it moved that row from 267 ms to 419 ms.
+The numbers above are already between three and six times better than the first working version
+(UI-basic 289 ms, UI-effects 2401 ms, vector-stress 1198 ms, image-stress 786 ms), through changes
+that were worth making on their own:
+
+- The transfer functions became TABLES built once per frame rather than a `powf` per channel per
+  pixel. A 640x480 frame decodes and re-encodes nearly two million channels; the tables agree with
+  the exact functions within the profile's own round-trip tolerance, which a fixture holds them to.
+- Shaders are built ONCE PER FRAME instead of once per tile. A solid paint's colour conversion, a
+  gradient's ramp and an image's sampler were each being rebuilt for every tile the command touched -
+  eighty times over, for two hundred commands.
+- The rasteriser keeps an ACTIVE EDGE LIST. It was testing every edge of a shape against every
+  sub-scanline, which for a stroke of six hundred edges over a thousand sub-scanlines is the product
+  of the two. This alone took vector-stress from 1025 ms to 275 ms.
+- The target's working copy of a tile is `f32` rather than the canonical half-float format. Layers
+  and filter intermediates stay `R16G16B16A16_FLOAT`, which the profile fixes; the tile copy is this
+  backend's own scratch and never leaves it, and holding it as halves cost eight conversions per
+  pixel per composite.
+- A surface addresses its own bytes instead of building a checked `ImageView` per pixel access.
+
+What the remaining gap is made of, measured on the same host with a 640x480 target: an EMPTY list
+costs 21 ms, which is the tile decode and re-encode of the whole frame and nothing else; one
+full-screen antialiased fill costs 30 ms more, of which 13 ms is the sixteen sub-scanlines of
+coverage and 17 ms is the span composite. Closing the gap needs the three things this implementation
+does not have: an exact-area rasteriser that computes coverage in one pass instead of sixteen, a
+vector span composite over more than four scalar lanes, and a specialised path for an opaque solid
+fill that skips reading the backdrop entirely. None of them is a change to what is drawn, and all
+three are ordinary work rather than a redesign.
+
 ## Development loop baseline (2026-07-26)
 
 `./dev.sh baseline <cold|warm|leaf|provider> [test-tags]` records one

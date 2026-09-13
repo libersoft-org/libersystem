@@ -73,6 +73,7 @@ pub mod layers;
 pub mod limits;
 pub mod render2d;
 pub mod render3d;
+pub mod wsi;
 
 pub use capability::{Coverage, Range};
 pub use image::{AlphaMode, Carries, ColorSpace, Encoding, Format, IMAGE_COLOR_PROFILE_VERSION, Primaries, Semantics, Transfer, YuvLayout, YuvMatrix};

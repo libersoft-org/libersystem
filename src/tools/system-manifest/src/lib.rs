@@ -1546,9 +1546,23 @@ const MAX_SLOT_CANDIDATES: usize = 16;
 const ADMITTED_SLOT_KINDS: [&str; 1] = ["vulkan-icd"];
 
 fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a str> {
-	if let Some(relative) = source.strip_prefix("user/libs/") {
-		let (category, leaf) = relative.split_once('/')?;
-		return (leaf == owner && !category.is_empty() && !category.contains('/')).then_some(category);
+	if let Some(relative) = source.strip_prefix("user/libs/")
+		&& let Some((category, leaf)) = relative.split_once('/')
+		&& leaf == owner
+		&& !category.is_empty()
+		&& !category.contains('/')
+	{
+		return Some(category);
+	}
+	// AND THE ONES WHOSE DIRECTORY IS NOT THEIR NAME. The rule above reads the category out of the
+	// path when the leaf IS the owner, which is most of them; these are named because their crate is
+	// `graphics-core` in a directory called `core` - the directory says which family it belongs to
+	// and the crate name says so too, and renaming either to satisfy a path rule would make the
+	// import in every consumer read worse.
+	match (name, owner, source) {
+		("graphics-profile", "graphics-profile", "user/libs/graphics/profile") => return Some("graphics"),
+		("graphics-core", "graphics-core", "user/libs/graphics/core") => return Some("graphics"),
+		_ => {}
 	}
 	match (name, owner, source) {
 		("lsrt", "rt", "user/runtime/rt") => Some("runtime"),

@@ -660,3 +660,195 @@ WHERE THIS SITS
 
 `b` is 0 open items. `c` - soft2d, the CPU implementation of the whole profile - is next, and it is
 what the text milestone's guest gate is waiting for. The milestone as a whole is 95 open items.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T21:01:11Z):
+
+P02M0103c IS IMPLEMENTED AND ONE OF ITS FOURTEEN ITEMS IS NOT MET. `soft2d` exists, implements the
+whole of `Render2D Core Profile 1`, and is registered as a source, a host suite and a benchmark. The
+performance floor is over its ceilings and the item stays open; the numbers are below and in
+`docs/PERF.md`.
+
+WHAT WAS DELIVERED
+
+`src/user/libs/graphics/soft2d` - eleven modules. The two phases are the whole shape of it:
+`prepare` validates the list, flattens every path under its own command's transform, converts every
+stroke into a fill (caps, joins, miter limit, dashing by arc length), builds the edge lists, computes
+per-command device bounds, bins them into 64-pixel tiles, builds the image pyramids, works out the
+filter expansion from the graphs the list actually carries rather than from the profile's ceiling, and
+reserves the layer surfaces, the clip masks, the coverage row and the span buffers - then refuses with
+a named limit if the total is over the profile's scratch ceiling. `render` replays and allocates
+nothing.
+
+The rasteriser is EXACT IN X AND SAMPLED IN Y at sixteen sub-scanlines, with an active edge list so a
+six-hundred-edge stroke is not tested against every sub-scanline of every tile. Antialiasing off is
+one sample at the pixel centre in BOTH directions, which is what a pixel-exact grid needs. The aliased
+integer line is a separate path with the rule the milestone states - both endpoints included, ties
+toward the smaller minor coordinate, clipped before rasterising - and it is reached by a one-pixel
+aliased stroke of an open polyline, not guessed at for shapes.
+
+Clipping is a coverage mask with a rectangle fast path that costs no storage, an inverse flag that is
+one subtraction over the same mask, and an alpha-mask clip from an image. Both were missing from the
+API: `Command::PushClip` gained `inverse` and `Command::PushClipMask` is new, because the profile
+lists "rect, rounded rect, path, nested, alpha mask, inverse" and `b` had the first four.
+`FilterNode::Backdrop` is new for the same reason: a frosted panel is a blur of its backdrop, and
+without the node the whole class of backdrop effects has to be built by drawing the scene twice.
+Dash patterns got their own resource kind - they had been sharing the gradient stop table, where a
+dash length is an offset with a colour attached.
+
+THE ONE PIXEL PIPELINE IS NOW SHARED AND CALLED. `graphics-core` gained `pixel` (the stage order,
+the decoder and encoder, the packed-layout pair, the transfer tables, the quantiser and the ordered
+dither), `composite` (the thirteen operators and sixteen blend modes with their frozen equations, the
+luminance and saturation model and the gamut clip) and `sample` (nearest, bilinear, Mitchell bicubic,
+the pyramid and a bounded anisotropic tap). `render2d` re-exports the operator, blend, quality and
+spread enumerations from there rather than declaring its own; `pix` calls the shared compositor and
+the shared packer instead of its private integer blend; DisplayService reaches the same code through
+`pix::blit`, which is its copy-and-scale path.
+
+That change corrected a defect. `pix`'s integer source-over divided by `out_alpha * 255` in
+integers; over the whole 8-bit space, compared against the exact answer, it was wrong by up to 255
+levels where the resulting alpha was small. The shared path is wrong by at most one, which is the
+rounding. One webp fixture pinned a hash of the OLD composite and now pins the corrected one; the
+decoded frames' hashes are unchanged, because the decoder was never the question.
+
+WHAT WAS VERIFIED, AND HOW
+
+`cargo test` for `soft2d`: 20 passed, all without a display. Rectangles half-open and exact, coverage
+along a known edge at half a pixel, both fill rules differing, caps and joins reaching where they
+should, dashing leaving the gaps it states, clips nesting and inverting and rounding, group opacity
+against a hand-computed reference (half over half is three quarters when composited twice and a half
+when composited once), every operator and every blend mode reaching the pixels, every filter node
+alone plus a composed shadow and a backdrop blur, every glyph kind and the cache keying them apart,
+conservative damage clipped to the target, guarded canaries around a target with pitch padding, the
+wide span path bit-identical to the scalar reference at twelve lengths around the lane width, a
+cancelled frame stopping at a tile boundary, prepared-list invalidation by name, and hostile input -
+twelve extreme coordinates under four transforms each, with the canary checked every iteration.
+
+`graphics-core`: 17 passed, including the transfer tables held to the profile's round-trip tolerance
+on all four transfer functions, the premultiply-before-interpolate halo case, the pyramid averaging in
+linear light, and every operator and blend mode against its frozen equation.
+`render2d`: 21 passed. `pix`: 9 passed. `check-host-tests.sh`: 94 suites, all green.
+`cargo clippy --all-targets -D warnings` on all five crates: clean. `./format.sh` was run.
+
+THE MEASUREMENT, AND THE ITEM THAT IS NOT MET
+
+`./bench.sh --suite soft2d`, 640x480, five warmup frames and thirty measured, on the Xeon 8272CL
+recorded in `docs/PERF.md`:
+
+    scene           prepare    replay median   replay p99   ceiling
+    UI-basic         1.1 ms        79.3 ms       81.9 ms    16.7 ms
+    UI-effects       1.3 ms       385.1 ms      401.7 ms    66.7 ms
+    vector-stress    7.2 ms       245.8 ms      247.3 ms    66.7 ms
+    image-stress    43.5 ms       267.2 ms      287.4 ms    16.7 ms
+
+That is between four and sixteen times over. The ceilings were not moved and the budgets were not
+raised: the item stays open and the runner is registered in `bench.sh` as a measurement rather than
+in `check.sh` as a gate, because a gate that cannot pass is not a gate. The numbers are already three
+to six times better than the first working version (289, 2401, 1198 and 786 ms), through five changes
+that were worth making on their own - transfer tables instead of a power per channel per pixel,
+shaders built once per frame instead of once per tile, an active edge list, an `f32` tile working copy
+with the canonical half-float format kept for layers and filter intermediates where the profile fixes
+it, and surfaces addressing their own bytes instead of building a checked view per pixel.
+`docs/PERF.md` records what the remaining gap is made of, measured: an EMPTY list costs 21 ms, which
+is the tile decode and re-encode alone; one full-screen antialiased fill costs 30 ms more, of which
+13 ms is the sixteen sub-scanlines and 17 ms the span composite. Closing it needs an exact-area
+rasteriser, a wider span composite and an opaque-fill path that skips reading the backdrop.
+
+NOT PERFORMED: the full gate sweep, aarch64 and riscv64, and the YUV source of the image scene, which
+needs the multi-plane image model `P02M0103a-common` still owes.
+
+WHERE THIS SITS
+
+`c` is 1 open item of fourteen. The milestone is 82 open items, down from 95.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-12T21:09:06Z):
+
+THE MULTI-PLANE IMAGE MODEL IS IMPLEMENTED, which was the largest functional hole left in the 2D half:
+every mandatory format is RGB or RGBA, so a video player, a camera preview and a hardware decoder had
+to convert every frame to RGBA before `render2d` would draw it - a full-frame conversion on the CPU,
+once per frame, for the one workload where that cost is least affordable.
+
+WHAT WAS DELIVERED
+
+`graphics-core::planar`: `PlanarFormat` (NV12, I420, P010), `YuvMatrix` (BT.601, BT.709, BT.2020),
+`YuvRange`, `MultiPlaneLayout` with a checking constructor, and `MultiPlaneView` with the plane
+reconstruction. A SEPARATE TYPE AND NOT A WIDER `ImageLayout`, so a single-plane image never grows a
+plane count, a subsampling factor, a chroma siting and a range it cannot use.
+
+Every rule comes from the frozen registry rather than being restated: the per-layout pitch rule (an
+interleaved chroma row is TWICE its sample count and a planar one is once, which is the arithmetic
+that puts a decoder half a row out), the odd-extent rule (the chroma extent is the ceiling of half the
+luma extent and the final sample is REPLICATED rather than read past), the limited and full ranges at
+both bit depths, P010's ten bits in the HIGH bits of a little-endian word with the low six ignored on
+read, the siting (left horizontally, centre vertically) with bilinear reconstruction, and the crop
+alignment. The inverse matrix is DERIVED from each entry's two coefficients rather than tabulated.
+
+AND THE ORDER OF OPERATIONS IS THE PROFILE'S, which is the part a recipe written for RGB gets wrong:
+planes are reconstructed and the matrix applied FIRST, producing ENCODED RGB; only then does transfer
+decoding, primary conversion and premultiplication happen. `Sampler` gained a PLANAR source rather
+than a second sampler: the texel fetch differs and everything after it - the transfer function, the
+primaries, the premultiply, the filter, the pyramid - is the same code, which is what "drawn through
+the same shared pipeline" has to mean if a video frame is to composite identically to an image of it.
+`Pyramid::from_sampler` is how a planar source gets a pyramid without a second reconstruction.
+
+`soft2d`'s `ImageSource` gained `planes`, defaulting to `None`: a source that has planes answers
+there INSTEAD of at `image`, because a decoded frame has no single-plane view to fall back to and
+synthesising one would be the conversion this model removes.
+
+WHAT WAS VERIFIED, AND HOW
+
+`graphics-core`: 19 passed. The new fixtures pin the registry agreement by name, both pitch rules, the
+odd extent, the malformed-plane REFUSAL, limited-range white at 235 against full-range white at 255
+with the same bytes read as the other range being a different colour, BT.601 against BT.709 against
+BT.2020 on identical bytes, P010's low six bits being ignored, I420's three planes agreeing with
+NV12's two, the crop alignment in both directions, and a short plane refused rather than read past.
+The sampler fixture checks that white in is white in LIGHT - which is the transfer function having
+been applied AFTER the matrix and not before it - and that a pyramid built from a planar sampler
+averages in that same light.
+
+`soft2d`: 21 passed, including a video frame drawn end to end: limited-range 235 comes out white,
+16 comes out black, the frame is opaque, and the edge between the halves lands in the middle of the
+doubled destination rather than shifted by a wrongly sited reconstruction.
+
+`cargo clippy --all-targets -D warnings`: clean. `./format.sh` was run.
+
+The benchmark's image scene gained the YUV source it always named - a full-screen NV12 frame in
+Rec. 2020 limited range - which is why that row moved from 267 ms to 419 ms: it is the workload the
+scene is for, and it was previously absent because the model did not exist. `docs/PERF.md` is updated.
+
+NOT PERFORMED: the full gate sweep, aarch64 and riscv64.
+
+WHERE THIS SITS
+
+`a-common` is 2 open items: converging the remaining pixel-plane types with the wire-side IDL package,
+and migrating `pix::RgbaImage` onto the model. The milestone is 81 open items.
+
+IMPLEMENTER'S VERIFICATION NOTE ON P02M0103 (2026-09-13T00:23:14Z):
+
+THE GRAPHICS WORK IS IN THE IMAGE NOW, which it was not before: `graphics-profile` and
+`graphics-core` are declared libraries staged at `lib/graphics/`, and `pix` links against the second
+of them - so the one pixel pipeline is not merely shared in the source tree, it is the code the
+shipped `pix.lslib` calls. Three things had to be settled for that:
+
+THE LIBRARY CATEGORY. `system-manifest` reads a library's staging directory out of its source path
+when the path's leaf IS the owner's name, which is most of them; `graphics-core` lives in
+`user/libs/graphics/core`, so it is named explicitly beside the five that were already named. The
+alternative was renaming the directory or the crate, and both make the import in every consumer read
+worse than one line in the table that already exists for this.
+
+THE TRANSCENDENTALS. `graphics-core` uses `libm` for the transfer functions' `powf`, and `libm` is
+not a provider anything else in the image links against - so the archive is linked INTO the library,
+which is what `vorbis` already does for the same reason and through the same branch.
+
+AND THE BUILD PROVED IT: `./build.sh --arch all` stages both libraries on all three architectures,
+and `LIBER_DEVELOPMENT=1 ./build.sh --arch all` does too.
+
+VERIFIED: `check-host-tests.sh` - 94 suites, all green, including `graphics-core` (19),
+`graphics-profile` (30), `render2d` (21), `soft2d` (21) and `pix` (10). The `graphics-profile` gate is
+green: every generated document matches its registry, with the WSI profile now among them.
+`source-hygiene` is clean. `cargo clippy --all-targets` with `-D warnings` is clean on every crate
+this work touched.
+
+NOT PERFORMED: the full gate sweep was stopped part way - one aarch64 IOMMU gate takes over an hour
+under TCG here - and three gates are red for reasons this work did not cause (`foreign-facilities-guest`
+needs the foreign audit substrate staged, and `boot-harness` and `qemu-arch-profiles` fail on a
+DMA-mode change in the harness and loader that this work does not touch).

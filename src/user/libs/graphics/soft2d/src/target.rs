@@ -28,6 +28,16 @@ use render2d::Error;
 /// outlives an image is a lookup that answers `None` rather than a dangling reference.
 pub trait ImageSource {
 	fn image(&self, identity: u64) -> Option<ImageView<'_>>;
+
+	/// The same image as PLANES, for a decoder or a camera that hands over `NV12`, `I420` or `P010`.
+	///
+	/// A DEFAULT OF `None` AND NOT A SECOND TRAIT. Almost every source is single-plane, and a source
+	/// that has planes answers here instead of at `image` - which is what lets one lookup serve both
+	/// and keeps the video path out of every consumer that has no video.
+	fn planes(&self, identity: u64) -> Option<graphics_core::planar::MultiPlaneView<'_>> {
+		let _ = identity;
+		None
+	}
 }
 
 /// The source for a drawing that references no images.

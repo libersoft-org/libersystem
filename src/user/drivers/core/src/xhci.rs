@@ -230,17 +230,31 @@ struct Ring {
 	phys: u64,
 	index: u64,
 	cycle: u32,
+	// THE PAGE'S HANDLE, kept so the ring can be released. It used to be dropped at the end of the
+	// constructor, which pinned the page for ever - correct while the device is there and a leak of
+	// one page per attach once it is not.
+	handle: u64,
 }
 
 impl Ring {
 	// Allocate the ring page and plant the wrapping link TRB.
 	unsafe fn new() -> Option<Ring> {
 		unsafe {
-			let (_h, virt, phys): (u64, u64, u64) = dma_page()?;
+			let (handle, virt, phys): (u64, u64, u64) = dma_page()?;
 			let link: u64 = virt + (RING_TRBS - 1) * 16;
 			(link as *mut u64).write_volatile(phys);
 			((link + 12) as *mut u32).write_volatile(TRB_LINK << 10 | TRB_TOGGLE_CYCLE);
-			Some(Ring { virt, phys, index: 0, cycle: 1 })
+			Some(Ring { virt, phys, index: 0, cycle: 1, handle })
+		}
+	}
+
+	// Give the ring's page back. A ring is released when its device goes away, and a driver that
+	// released nothing leaked a page per attach - which on a port somebody plugs and unplugs is a
+	// leak with a person operating it.
+	fn release(&mut self) {
+		if self.handle != 0 {
+			close(self.handle);
+			self.handle = 0;
 		}
 	}
 
@@ -282,6 +296,10 @@ struct Xhci {
 	evt_cycle: u32,
 	// Device context base address array (virtual base; entry per slot).
 	dcbaa_virt: u64,
+	// THE PORT CHANGE NOTHING MAY LOSE. Every event passes through `take_event`, so a synchronous
+	// wait that is not interested in a port-status event still cannot drop it - which is what left a
+	// device plugged in during a block read invisible until something unrelated woke the loop.
+	ports_changed: drivers::port::PortSignal,
 }
 
 // One addressed USB device: its slot, root-hub port, route string (the hub-port
@@ -298,16 +316,49 @@ struct UsbDevice {
 	in_phys: u64,
 	data_virt: u64,
 	data_phys: u64,
+	// THE HANDLES THIS DEVICE OWNS: its device context, its input context and its control data page.
+	// They used to be dropped at the end of `address_device`, which is correct for as long as the
+	// device is attached and a leak of three pages the moment it is not - and on a partial failure
+	// during enumeration, a leak of three pages and a slot that stays enabled for ever.
+	ctx_handle: u64,
+	in_handle: u64,
+	data_handle: u64,
 	// The device descriptor's identity fields.
 	vendor: u16,
 	product: u16,
 	class: u8,
 }
 
+impl UsbDevice {
+	// Give everything this device owns back: its pages, its default endpoint's ring, its place in the
+	// context array and its slot.
+	//
+	// ONE PLACE THAT UNDOES WHAT ENUMERATION DID, called from the partial-failure path and from the
+	// detach path - because two places that undo half of it each is how a slot stays enabled on one
+	// path and a page stays mapped on the other.
+	fn release(&mut self, hc: &mut Xhci) {
+		unsafe {
+			if self.slot != 0 {
+				command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | self.slot << 24);
+				let mut none: Hids = Hids::new();
+				let _ = wait_command(hc, &mut none);
+				((hc.dcbaa_virt + self.slot as u64 * 8) as *mut u64).write_volatile(0);
+				self.slot = 0;
+			}
+		}
+		self.ep0.release();
+		for handle in [&mut self.ctx_handle, &mut self.in_handle, &mut self.data_handle] {
+			if *handle != 0 {
+				close(*handle);
+				*handle = 0;
+			}
+		}
+	}
+}
+
 // One addressed device's inventory record: its root port and slot (the state a
 // detach tears down), plus the identity its device descriptor reported and the
 // role the driver bound it to - the `usb.list` inventory.
-#[derive(Clone, Copy)]
 struct SlotRec {
 	port: u32,
 	slot: u32,
@@ -316,6 +367,11 @@ struct SlotRec {
 	product: u16,
 	class: u8,
 	kind: u8,
+	// THE DEVICE ITSELF, for the ones nothing else holds: a hub, and anything the driver left
+	// addressed without binding. A device whose resources nobody owns is a slot that stays enabled
+	// and three pages that stay pinned when its port is unplugged - which is the leak the debt names.
+	// HID and storage devices live in their own structures and this is `None` for them.
+	device: Option<UsbDevice>,
 }
 
 // The roles a device may be bound to, reported in the inventory.
@@ -356,10 +412,17 @@ impl Slots {
 		self.entries.iter().any(|r| r.port == port)
 	}
 
+	// Attach the device to its record, for the ones no other structure holds.
+	fn keep(&mut self, slot: u32, device: UsbDevice) {
+		if let Some(rec) = self.entries.iter_mut().find(|r| r.slot == slot) {
+			rec.device = Some(device);
+		}
+	}
+
 	// Remove and return one slot on this root port (call until None on a detach).
-	fn take_port(&mut self, port: u32) -> Option<u32> {
+	fn take_port(&mut self, port: u32) -> Option<SlotRec> {
 		let i: usize = self.entries.iter().position(|r| r.port == port)?;
-		Some(self.entries.swap_remove(i).slot)
+		Some(self.entries.swap_remove(i))
 	}
 }
 
@@ -537,7 +600,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, dcbaa_virt })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt })
 	}
 }
 
@@ -621,6 +684,9 @@ unsafe fn take_event(hc: &mut Xhci) -> Option<(u64, u32, u32)> {
 		}
 		let param: u64 = (trb as *const u64).read_volatile();
 		let status: u32 = ((trb + 8) as *const u32).read_volatile();
+		if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
+			hc.ports_changed.record();
+		}
 		hc.evt_index += 1;
 		if hc.evt_index == RING_TRBS {
 			hc.evt_index = 0;
@@ -707,12 +773,30 @@ unsafe fn address_device(hc: &mut Xhci, root_port: u32, route: u32, speed: u32) 
 		if slot == 0 || slot > 255 {
 			return None;
 		}
-		let (_dh, _ctx_virt, ctx_phys): (u64, u64, u64) = dma_page()?;
-		((hc.dcbaa_virt + slot as u64 * 8) as *mut u64).write_volatile(ctx_phys);
-
-		let (_ih, in_virt, in_phys): (u64, u64, u64) = dma_page()?;
-		let (_bh, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
-		let mut dev: UsbDevice = UsbDevice { slot, port: root_port, route, speed, ep0: Ring::new()?, in_virt, in_phys, data_virt, data_phys, vendor: 0, product: 0, class: 0 };
+		// EVERY ALLOCATION FROM HERE IS OWNED BY THE DEVICE, so a failure part way through releases
+		// what it got rather than leaving a slot enabled and three pages pinned to a device that
+		// never came up.
+		let mut dev = UsbDevice { slot, port: root_port, route, speed, ep0: Ring { virt: 0, phys: 0, index: 0, cycle: 1, handle: 0 }, in_virt: 0, in_phys: 0, data_virt: 0, data_phys: 0, ctx_handle: 0, in_handle: 0, data_handle: 0, vendor: 0, product: 0, class: 0 };
+		let built = (|| {
+			let (ctx_handle, _ctx_virt, ctx_phys): (u64, u64, u64) = dma_page()?;
+			dev.ctx_handle = ctx_handle;
+			((hc.dcbaa_virt + slot as u64 * 8) as *mut u64).write_volatile(ctx_phys);
+			let (in_handle, in_virt, in_phys): (u64, u64, u64) = dma_page()?;
+			dev.in_handle = in_handle;
+			dev.in_virt = in_virt;
+			dev.in_phys = in_phys;
+			let (data_handle, data_virt, data_phys): (u64, u64, u64) = dma_page()?;
+			dev.data_handle = data_handle;
+			dev.data_virt = data_virt;
+			dev.data_phys = data_phys;
+			dev.ep0 = Ring::new()?;
+			Some(())
+		})();
+		if built.is_none() {
+			dev.release(hc);
+			return None;
+		}
+		let (in_virt, in_phys, data_virt) = (dev.in_virt, dev.in_phys, dev.data_virt);
 		// no HID device can have reports in flight during bring-up (report TRBs are
 		// only posted once the service loop starts), so the waits see no HID events.
 		let mut pending: Hids = Hids::new();
@@ -720,23 +804,41 @@ unsafe fn address_device(hc: &mut Xhci, root_port: u32, route: u32, speed: u32) 
 		// address the device: an input context whose slot context names the port and
 		// whose endpoint-0 context points at the transfer ring.
 		write_address_contexts(hc, &dev, initial_packet_size(speed));
-		command_and_wait(hc, in_phys, 0, TRB_ADDRESS_DEVICE << 10 | slot << 24)?;
-
-		// read the descriptor head first: its bMaxPacketSize0 field tells the real
-		// default-endpoint packet size, which full-speed devices are allowed to vary.
-		control_in(hc, &mut pending, &mut dev, DESC_DEVICE, 8)?;
-		let mps: u32 = r8(data_virt + 7) as u32;
-		if mps != initial_packet_size(speed) && mps >= 8 {
-			// fix endpoint 0 up with an evaluate-context command, then re-read.
-			write_address_contexts(hc, &dev, mps);
-			// evaluate-context consumes only the endpoint-0 add flag.
-			((in_virt + 4) as *mut u32).write_volatile(1 << 1);
-			command_and_wait(hc, in_phys, 0, TRB_EVALUATE_CONTEXT << 10 | slot << 24)?;
+		// THE SAME RULE FOR THE REST OF ENUMERATION: every step that can fail is inside one closure,
+		// and a failure anywhere in it releases the slot and the pages rather than returning `None`
+		// past them. A device unplugged MID-ENUMERATION takes this path, which is the case the debt
+		// names - and it used to leave its slot enabled and its three pages pinned for ever.
+		let identified = (|dev: &mut UsbDevice| {
+			command_and_wait(hc, in_phys, 0, TRB_ADDRESS_DEVICE << 10 | slot << 24)?;
+			// read the descriptor head first: its bMaxPacketSize0 field tells the real
+			// default-endpoint packet size, which full-speed devices are allowed to vary.
+			// EIGHT BYTES, AND THE MAXIMUM PACKET SIZE IS THE EIGHTH. A device that returned four has
+			// not sent it, and the byte read from the page is the previous transfer's.
+			if control_in(hc, &mut pending, dev, DESC_DEVICE, 8)? < 8 {
+				return None;
+			}
+			let mps: u32 = r8(data_virt + 7) as u32;
+			if mps != initial_packet_size(speed) && mps >= 8 {
+				// fix endpoint 0 up with an evaluate-context command, then re-read.
+				write_address_contexts(hc, dev, mps);
+				// evaluate-context consumes only the endpoint-0 add flag.
+				((in_virt + 4) as *mut u32).write_volatile(1 << 1);
+				command_and_wait(hc, in_phys, 0, TRB_EVALUATE_CONTEXT << 10 | slot << 24)?;
+			}
+			// The identity fields ride at offsets four to eleven, so a short answer is not an
+			// identity.
+			if control_in(hc, &mut pending, dev, DESC_DEVICE, 18)? < 12 {
+				return None;
+			}
+			dev.class = r8(data_virt + 4);
+			dev.vendor = r8(data_virt + 8) as u16 | (r8(data_virt + 9) as u16) << 8;
+			dev.product = r8(data_virt + 10) as u16 | (r8(data_virt + 11) as u16) << 8;
+			Some(())
+		})(&mut dev);
+		if identified.is_none() {
+			dev.release(hc);
+			return None;
 		}
-		control_in(hc, &mut pending, &mut dev, DESC_DEVICE, 18)?;
-		dev.class = r8(data_virt + 4);
-		dev.vendor = r8(data_virt + 8) as u16 | (r8(data_virt + 9) as u16) << 8;
-		dev.product = r8(data_virt + 10) as u16 | (r8(data_virt + 11) as u16) << 8;
 		Some(dev)
 	}
 }
@@ -760,11 +862,15 @@ fn initial_packet_size(speed: u32) -> u32 {
 fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
 	unsafe {
 		report_device(&dev);
-		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE });
+		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE, device: None });
 		*devices += 1;
 		if dev.class == CLASS_HUB {
 			slots.set_kind(dev.slot, KIND_HUB);
 			expand_hub(hc, &mut dev, slots, devices, hids, storage);
+			// A HUB STAYS ADDRESSED because its downstream devices reach the bus through it, so the
+			// inventory holds it until the port it is on goes away.
+			let slot = dev.slot;
+			slots.keep(slot, dev);
 		} else if let Some(h) = configure_hid(hc, &mut dev) {
 			slots.set_kind(dev.slot, if h.layout.has_keyboard() { KIND_KEYBOARD } else { KIND_POINTER });
 			hids.entries.push((dev, h));
@@ -773,6 +879,11 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 		{
 			slots.set_kind(dev.slot, KIND_STORAGE);
 			*storage = Some((dev, st));
+		} else {
+			// NOTHING ELSE HOLDS IT, so the inventory does. A device left addressed without being
+			// bound still owns a slot and three pages, and dropping it here is what leaked them.
+			let slot = dev.slot;
+			slots.keep(slot, dev);
 		}
 	}
 }
@@ -787,7 +898,7 @@ fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &m
 		// no HID device is serving yet, so the control waits see no HID events.
 		let mut pending: Hids = Hids::new();
 		// select the hub's configuration (the head of its config descriptor names it).
-		if control_in(hc, &mut pending, hub, DESC_CONFIG, 9).is_none() {
+		if control_in(hc, &mut pending, hub, DESC_CONFIG, 9).unwrap_or(0) < 9 {
 			return;
 		}
 		let config_value: u16 = r8(hub.data_virt + 5) as u16;
@@ -795,7 +906,8 @@ fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &m
 			return;
 		}
 		// the hub class descriptor: bNbrPorts rides at offset 2.
-		if control_in_req(hc, &mut pending, hub, RT_CLASS_DEVICE_IN, REQ_GET_DESCRIPTOR, DESC_HUB << 8, 0, 9).is_none() {
+		// bNbrPorts rides at offset two, so anything shorter than three bytes is not a hub descriptor.
+		if control_in_req(hc, &mut pending, hub, RT_CLASS_DEVICE_IN, REQ_GET_DESCRIPTOR, DESC_HUB << 8, 0, 9).unwrap_or(0) < 3 {
 			return;
 		}
 		let ports: u32 = r8(hub.data_virt + 2) as u32;
@@ -908,7 +1020,7 @@ unsafe fn write_address_contexts(hc: &Xhci, dev: &UsbDevice, mps: u32) {
 
 // Read `len` bytes of descriptor `desc` from the device into its data page with a
 // standard GET_DESCRIPTOR control transfer on the default endpoint.
-fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<()> {
+fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, len: u16) -> Option<u32> {
 	control_in_req(hc, hids, dev, 0x80, REQ_GET_DESCRIPTOR, desc << 8, 0, len)
 }
 
@@ -918,7 +1030,10 @@ fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, le
 // event. The hub class requests (GET_STATUS on a port, the hub descriptor) ride
 // through here too. A stall halts endpoint 0; it is recovered before reporting
 // failure, so the endpoint stays usable.
-fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<()> {
+// THE ANSWER IS HOW MANY BYTES ARRIVED, not merely that the transfer did not fail. The data page is
+// reused between transfers, so a caller that cannot tell a short answer from a complete one reads the
+// PREVIOUS transfer's bytes past the end of this one.
+fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<u32> {
 	unsafe {
 		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
 		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
@@ -926,12 +1041,17 @@ fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_t
 		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_IOC);
 		// ring the device slot's doorbell for the default control endpoint (DCI 1).
 		w32(hc.db + dev.slot as u64 * 4, 1);
-		let code: u32 = wait_transfer(hc, hids, dev.slot, 1)?;
+		let (code, residual) = wait_transfer_len(hc, hids, dev.slot, 1)?;
 		if code == CC_STALL {
 			recover_ep0(hc, hids, dev);
 			return None;
 		}
-		if code != CC_SUCCESS && code != CC_SHORT_PACKET { None } else { Some(()) }
+		if code != CC_SUCCESS && code != CC_SHORT_PACKET {
+			return None;
+		}
+		// The transfer event's length field is what was NOT transferred, so what arrived is the
+		// difference - and a residual larger than the request is a device inventing one.
+		Some(len as u32 - residual.min(len as u32))
 	}
 }
 
@@ -1036,7 +1156,10 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			}
 			interrupt_ack(irq);
 			w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
-			if rescan {
+			// THE FLAG AND THE DRAIN ARE THE SAME QUESTION, and the flag is the half that survives a
+			// synchronous wait - a block transfer that ran while a device was plugged in took the
+			// event off the ring, and without this the loop never learned of it.
+			if rescan || hc.ports_changed.take() {
 				reconcile_ports(hc, slots, &mut hids, &mut storage);
 			}
 			let common::ProviderReady::Consumer(at) = ready else { continue };
@@ -1162,7 +1285,10 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 			let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
 			let connected: bool = r32(addr) & PORTSC_CCS != 0;
 			let known: bool = slots.has_port(port);
-			if connected && !known {
+			// THE ACTION IS DECIDED FROM THE PORT'S OWN REGISTER and not from a list of events, so a
+			// connect and a disconnect in one window are one attach and one detach rather than two
+			// replays of whichever arrived twice.
+			if drivers::port::port_action(connected, known) == drivers::port::PortAction::Attach {
 				let mut devices: u32 = 0;
 				if let Some(dev) = attach_port(hc, port) {
 					register_device(hc, dev, slots, &mut devices, hids, storage);
@@ -1170,18 +1296,37 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 				// a HID device configured by this attach starts serving: post its first
 				// report TRB (the boot-time ones are posted before the service loop).
 				post_reports(hc, hids);
-			} else if !connected && known {
+			} else if drivers::port::port_action(connected, known) == drivers::port::PortAction::Detach {
 				// acknowledge the disconnect and tear the port's devices down.
 				portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
-				while let Some(slot) = slots.take_port(port) {
-					command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | slot << 24);
-					let mut none: Hids = Hids::new();
-					let _ = wait_command(hc, &mut none);
-					((hc.dcbaa_virt + slot as u64 * 8) as *mut u64).write_volatile(0);
+				// EVERYTHING THIS PORT OWNED IS GIVEN BACK, and each device is released by whoever
+				// holds it: the ones bound to a role live in their own structures, and the rest live
+				// in the inventory. Disabling the slot without closing the pages - which is what this
+				// did - leaks three pages per attach on a port somebody plugs and unplugs.
+				for (dev, hid) in hids.entries.iter_mut().filter(|(dev, _)| dev.port == port) {
+					hid.release();
+					dev.release(hc);
 				}
 				hids.entries.retain(|(dev, _)| dev.port != port);
-				if storage.as_ref().is_some_and(|(dev, _)| dev.port == port) {
+				if let Some((dev, st)) = storage.as_mut()
+					&& dev.port == port
+				{
+					st.release();
+					dev.release(hc);
 					*storage = None;
+				}
+				while let Some(mut rec) = slots.take_port(port) {
+					match rec.device.take() {
+						Some(mut dev) => dev.release(hc),
+						None => {
+							// A record whose device another structure held: its pages went with it,
+							// and the slot is disabled here.
+							command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | rec.slot << 24);
+							let mut none: Hids = Hids::new();
+							let _ = wait_command(hc, &mut none);
+							((hc.dcbaa_virt + rec.slot as u64 * 8) as *mut u64).write_volatile(0);
+						}
+					}
 				}
 				print(b"driver.xhci: port detached\n");
 			}
@@ -1194,13 +1339,18 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 // that arrive in the meantime inline (a keystroke during a disk transfer). Returns
 // the completion code, or None on budget exhaustion.
 fn wait_transfer(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<u32> {
+	wait_transfer_len(hc, hids, slot, dci).map(|(code, _)| code)
+}
+
+// The same wait, answering the completion code AND the transfer event's residual length.
+fn wait_transfer_len(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<(u32, u32)> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
 			if let Some((_p, status, control)) = take_event(hc) {
 				let kind: u32 = control >> 10 & 0x3f;
 				if kind == TRB_EV_TRANSFER && control >> 24 == slot && (control >> 16 & 0x1f) == dci {
-					return Some(status >> 24);
+					return Some((status >> 24, status & 0x00ff_ffff));
 				}
 				handle_hid_event(hc, hids, status, control);
 				continue;

@@ -65,7 +65,7 @@ impl Ramp {
 					return high.1;
 				}
 				let t = (position - low.0) / span;
-				return low.1.scaled(1.0 - t).add(high.1.scaled(t));
+				return low.1.scaled(1.0 - t).plus(high.1.scaled(t));
 			}
 		}
 		last.1
@@ -230,12 +230,9 @@ fn radial_position(point: PointF, from: PointF, from_radius: f32, to: PointF, to
 		return None;
 	}
 	let root = libm::sqrtf(discriminant);
-	for t in [(b + root) / a, (b - root) / a] {
-		if from_radius + t * dr >= 0.0 {
-			return Some(t);
-		}
-	}
-	None
+	// THE LARGER ROOT FIRST, which is the circle in front - and a root whose interpolated radius is
+	// negative is behind the cone and is not an answer.
+	[(b + root) / a, (b - root) / a].into_iter().find(|t| from_radius + t * dr >= 0.0)
 }
 
 /// Apply a spread mode to a gradient position.
@@ -292,6 +289,16 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 			Some(list) => Shader::Conic { ramp: Ramp::new(list, working), centre: *centre, start_angle: *start_angle, end_angle: *end_angle, spread: *spread, inverse },
 			None => Shader::Nothing,
 		},
+		// PLANES FIRST, because a source that has them has them INSTEAD: a video frame handed over as
+		// `NV12` has no single-plane view to fall back to, and converting one here would be the
+		// full-frame conversion per frame that the multi-plane model exists to remove.
+		Paint::Image { image, source, quality, spread, .. } if images.planes(image.0).is_some() => match images.planes(image.0) {
+			Some((view, pyramid, table)) => match Sampler::planar(view, working, *spread, table) {
+				Ok(sampler) => Shader::Image { sampler, pyramid, quality: *quality, spread: *spread, inverse, source: *source },
+				Err(_) => Shader::Nothing,
+			},
+			None => Shader::Nothing,
+		},
 		Paint::Image { image, source, quality, spread, .. } => match images.lookup(image.0) {
 			Some((view, pyramid, table)) => match Sampler::with_table(view, working, *spread, table) {
 				Ok(sampler) => Shader::Image { sampler, pyramid, quality: *quality, spread: *spread, inverse, source: *source },
@@ -305,4 +312,10 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 /// What a shader needs to find an image: the pixels, and the pyramid `prepare` built for them.
 pub trait ImageLookup {
 	fn lookup(&self, handle: u32) -> Option<(ImageView<'_>, Option<&Pyramid>, Option<&graphics_core::pixel::TransferTable>)>;
+
+	/// The same handle as PLANES, when the source has them.
+	fn planes(&self, handle: u32) -> Option<(graphics_core::planar::MultiPlaneView<'_>, Option<&Pyramid>, Option<&graphics_core::pixel::TransferTable>)> {
+		let _ = handle;
+		None
+	}
 }

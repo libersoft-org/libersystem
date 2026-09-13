@@ -30,6 +30,7 @@ mod opentype;
 mod render2d_spec;
 mod scan;
 mod selftest;
+mod wsi;
 
 use scan::{Claim, Marker};
 
@@ -519,6 +520,43 @@ fn main() -> std::process::ExitCode {
 		}
 		if check {
 			println!("graphics-layers: {} names, {} ownership edges, {} routes and {} validation boundaries, hashed", graphics_profile::layers::LAYERS.len(), graphics_profile::layers::OWNERSHIP.len(), graphics_profile::layers::ROUTES.len(), graphics_profile::layers::BOUNDARIES.len());
+		}
+	}
+
+	// THE WINDOW-SYSTEM PROFILE. Frozen before `a-wsi` implements it, because every number in it is
+	// one two sides round differently if it is not stated.
+	{
+		let canonical = wsi::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/wsi/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/WSI_PROFILE_1.md"), wsi::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("wsi: {} configuration fields, {} events, {} image transitions, {} present outcomes and {} damage answers, hashed", graphics_profile::wsi::CONFIGURATION.len(), graphics_profile::wsi::EVENTS.len(), graphics_profile::wsi::TRANSITIONS.len(), graphics_profile::wsi::PRESENT_OUTCOMES.len(), graphics_profile::wsi::DAMAGE_RULES.len());
 		}
 	}
 

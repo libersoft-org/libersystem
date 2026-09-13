@@ -2555,10 +2555,14 @@ for spec in "$@"; do
 		fi
 		link_inputs=(--whole-archive "$rlib" "$nanomp3_archive" --no-whole-archive)
 		;;
-	vorbis)
+	vorbis | graphics-core)
+		# The transcendentals `core` does not have. A colour pipeline's transfer functions are a
+		# `powf` and a decoder's window is an `exp`; both crates carry the same vendored archive
+		# INTO their own library rather than importing it, because `libm` is not a provider anything
+		# else in this image links against.
 		libm_archive="$(newest_matching "$deps" 'liblibm-*.rlib')"
 		if [[ -z "$libm_archive" ]]; then
-			echo "build-shared: missing libm archive for vorbis.lslib" >&2
+			echo "build-shared: missing libm archive for $artifact.lslib" >&2
 			exit 1
 		fi
 		link_inputs=(--whole-archive "$rlib" "$libm_archive" --no-whole-archive)

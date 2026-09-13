@@ -232,5 +232,10 @@ fn decodes_external_libwebp_static_and_animation_profiles() {
 	assert_eq!(animation.frames.iter().map(|frame| (frame.x, frame.y, frame.image.width, frame.image.height, frame.duration_ms, frame.blend, frame.disposal)).collect::<Vec<_>>(), vec![(0, 0, 23, 15, 0, pix::Blend::Source, pix::Disposal::Background), (2, 2, 19, 13, 37, pix::Blend::Over, pix::Disposal::Keep)]);
 	assert_eq!(animation.frames.iter().map(|frame| fnv1a(&frame.image.pixels)).collect::<Vec<_>>(), vec![0x8cb7_e5da_66d8_51a1, 0x35fa_330e_0391_3460]);
 	let mut compositor = pix::Compositor::new_with_background(animation.width, animation.height, animation.background).unwrap();
-	assert_eq!(animation.frames.iter().map(|frame| fnv1a(&compositor.render(frame).unwrap().pixels)).collect::<Vec<_>>(), vec![0x8cb7_e5da_66d8_51a1, 0xa9ed_68c4_c84d_1792]);
+	// THE SECOND FRAME'S COMPOSITE CHANGED WHEN `pix` STOPPED BLENDING BY ITS OWN INTEGER FORMULA and
+	// started calling the shared one. The old formula divided by `out_alpha * 255` in integers, which
+	// over the whole 8-bit space is wrong by up to 255 levels where the resulting alpha is small; the
+	// shared path is wrong by at most one, which is the rounding. The hash below is the corrected
+	// composite - the DECODED frames above are unchanged, because the decoder was never the question.
+	assert_eq!(animation.frames.iter().map(|frame| fnv1a(&compositor.render(frame).unwrap().pixels)).collect::<Vec<_>>(), vec![0x8cb7_e5da_66d8_51a1, 0x9f30_7486_da38_d21c]);
 }

@@ -131,6 +131,9 @@ impl Tone {
 	}
 }
 
+// How many refused periods in a row mean the device is not playing anything.
+const REFUSAL_LIMIT: u32 = 8;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DriverPending {
 	None,
@@ -167,6 +170,11 @@ struct Audio {
 	tones: Vec<Tone>,
 	driver_pending: DriverPending,
 	driver_running: bool,
+	// HOW MANY PERIODS IN A ROW THE DRIVER REFUSED. A period the device would not play is answered
+	// with an EMPTY reply rather than "OK", and one of those is ordinary - a stream that was stopped
+	// under us, a device busy for a moment. A run of them is a device that is not playing anything,
+	// and a service that kept feeding it would produce silence that looks exactly like audio.
+	driver_refusals: u32,
 	capture_running: bool,
 	period: Vec<u8>,
 }
@@ -191,7 +199,7 @@ struct Client {
 
 impl Audio {
 	fn new(snd: u64) -> Audio {
-		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, capture_running: false, period: alloc::vec![0; PERIOD_BYTES] }
+		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, driver_refusals: 0, capture_running: false, period: alloc::vec![0; PERIOD_BYTES] }
 	}
 
 	fn has_audio(&self) -> bool {
@@ -319,7 +327,7 @@ impl Audio {
 		}
 	}
 
-	fn driver_ready(&mut self, handle: u64) {
+	fn driver_ready(&mut self, handle: u64, played: bool) {
 		if handle != 0 {
 			close(handle);
 		}
@@ -327,6 +335,19 @@ impl Audio {
 			self.driver_running = false;
 		}
 		self.driver_pending = DriverPending::None;
+		// A REFUSAL IS AN EMPTY REPLY and a played period is answered "OK", which is the convention
+		// this driver already uses for capture. The stream is marked not running so the next period
+		// re-prepares it, and a device that refuses REFUSAL_LIMIT in a row is treated as lost rather
+		// than fed forever.
+		if played {
+			self.driver_refusals = 0;
+			return;
+		}
+		self.driver_running = false;
+		self.driver_refusals = self.driver_refusals.saturating_add(1);
+		if self.driver_refusals >= REFUSAL_LIMIT {
+			self.driver_failed();
+		}
 	}
 
 	fn driver_failed(&mut self) {
@@ -820,7 +841,9 @@ fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: A
 					}
 				}
 				_ => match recv_blocking(state.snd, &mut request) {
-					Received::Message { handle, .. } => state.driver_ready(handle),
+					// THE REPLY'S CONTENT IS THE ANSWER. An empty one is the driver saying the period
+					// was not played; "OK" is the period having reached the device.
+					Received::Message { len, handle } => state.driver_ready(handle, len > 0),
 					Received::Closed => state.driver_failed(),
 				},
 			}

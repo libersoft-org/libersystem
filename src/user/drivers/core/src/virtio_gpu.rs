@@ -23,7 +23,7 @@
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
-use drivers::{common, virtio};
+use drivers::{common, gpu, virtio};
 
 // virtio-gpu control commands (the 2D subset) and the two responses we check.
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
@@ -123,7 +123,10 @@ impl Gpu {
 			// pmodes[0].r.width @ hdr + 8, .height @ hdr + 12.
 			let w = rd32(self.resp_virt + HDR_LEN + 8);
 			let h = rd32(self.resp_virt + HDR_LEN + 12);
-			if w == 0 || h == 0 { (FALLBACK_W, FALLBACK_H) } else { (w, h) }
+			// THE DEVICE CHOOSES THIS NUMBER. A zero was always refused; everything else it could say
+			// - four billion, or anything whose pitch has already wrapped - was believed, and the
+			// framebuffer described from it is the one ConsoleService maps and draws into.
+			gpu::display_geometry((w, h), (FALLBACK_W, FALLBACK_H))
 		}
 	}
 
@@ -244,10 +247,15 @@ impl Gpu {
 	// offset of the rectangle's first pixel in the backing.
 	fn present(&self, id: u32, x: u32, y: u32, w: u32, h: u32, stride: u32) -> bool {
 		unsafe {
+			// THE OFFSET IS THE LAST ARITHMETIC BEFORE THE DEVICE IS TOLD WHERE TO READ, and an
+			// unchecked one addresses the resource outside itself.
+			let Some(offset) = gpu::transfer_offset(x, y, stride) else {
+				return false;
+			};
 			// TRANSFER_TO_HOST_2D: rect, offset(u64), resource_id, padding.
 			self.hdr(CMD_TRANSFER_TO_HOST_2D);
 			self.rect(24, x, y, w, h);
-			wr64(self.cmd_virt + 40, (y as u64 * stride as u64 + x as u64) * 4);
+			wr64(self.cmd_virt + 40, offset);
 			wr32(self.cmd_virt + 48, id);
 			wr32(self.cmd_virt + 52, 0);
 			if self.submit(56, HDR_LEN as u32) != Some(RESP_OK_NODATA) {
@@ -308,7 +316,9 @@ struct Backing {
 // its old backing).
 fn create_backing(gpu: &Gpu, id: u32, w: u32, h: u32) -> Option<Backing> {
 	unsafe {
-		let fb_size = align_up(w as u64 * h as u64 * 4, PAGE);
+		// A PRODUCT THAT DOES NOT FIT IS NOT AN ALLOCATION THAT FAILS - it is a smaller one that
+		// succeeds, which is a backing shorter than the picture it is said to hold.
+		let fb_size = align_up(drivers::gpu::backing_bytes(w, h)?, PAGE);
 		let pages = fb_size / PAGE;
 		let handle: i64 = dma_buffer_create_for(gpu.q.capability, fb_size);
 		if handle < 0 {
@@ -565,13 +575,13 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu,
 						} else if m.starts_with(b"FLUSH") {
 							let r = if m.len() >= 21 { (rd32_le(m, 5), rd32_le(m, 9), rd32_le(m, 13), rd32_le(m, 17)) } else { (0, 0, cur_w, cur_h) };
 							flush_rect = Some(match flush_rect {
-								Some(u) => union_rect(u, r),
+								Some(u) => drivers::gpu::union_rect(u, r),
 								None => r,
 							});
 						} else if m.starts_with(b"PRESENT") && m.len() >= 23 {
 							let r = (rd32_le(m, 7), rd32_le(m, 11), rd32_le(m, 15), rd32_le(m, 19));
 							flush_rect = Some(match flush_rect {
-								Some(u) => union_rect(u, r),
+								Some(u) => drivers::gpu::union_rect(u, r),
 								None => r,
 							});
 							acknowledged = true;
@@ -581,14 +591,14 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu,
 					Polled::Closed => exit(),
 				}
 			}
-			if let Some((x, y, w, h)) = flush_rect {
-				// Clamp to the visible scanout: pixels past it need no transfer, and the
-				// transfer must stay inside the resource.
-				let x = x.min(cur_w);
-				let y = y.min(cur_h);
-				let w = w.min(cur_w - x);
-				let h = h.min(cur_h - y);
-				let ok: bool = w == 0 || h == 0 || gpu.present(backing.id, x, y, w, h, backing.w);
+			if let Some(rect) = flush_rect {
+				// CLIPPED TO THE VISIBLE SCANOUT AND NOT CLAMPED TO IT: pixels past it need no
+				// transfer, a rectangle entirely past it presents nothing, and the transfer must stay
+				// inside the resource.
+				let ok: bool = match drivers::gpu::visible_rect(rect, (cur_w, cur_h)) {
+					Some((x, y, w, h)) => gpu.present(backing.id, x, y, w, h, backing.w),
+					None => true,
+				};
 				if acknowledged {
 					send_blocking(service, if ok { b"OK" } else { b"ERR" }, 0);
 				}
@@ -605,14 +615,8 @@ fn rd32_le(m: &[u8], at: usize) -> u32 {
 // The ABI Framebuffer describing a backing of the given allocated geometry (the
 // B8G8R8X8 pixel layout every consumer renders with).
 fn framebuffer_info(w: u32, h: u32) -> Framebuffer {
-	Framebuffer { width: w, height: h, pitch: w * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] }
-}
-
-// The bounding box of two rectangles (x, y, w, h).
-fn union_rect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
-	let x0 = a.0.min(b.0);
-	let y0 = a.1.min(b.1);
-	let x1 = (a.0 + a.2).max(b.0 + b.2);
-	let y1 = (a.1 + a.3).max(b.1 + b.3);
-	(x0, y0, x1 - x0, y1 - y0)
+	// The pitch is checked where the geometry is admitted; this cannot fail for a geometry that got
+	// this far, and answering zero for one that did not is a framebuffer nothing will draw into.
+	let pitch = drivers::gpu::pitch_bytes(w).unwrap_or(0);
+	Framebuffer { width: w, height: h, pitch, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] }
 }

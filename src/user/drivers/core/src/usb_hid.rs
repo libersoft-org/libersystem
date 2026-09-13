@@ -17,6 +17,7 @@ use crate::hid;
 use crate::{CC_SHORT_PACKET, CC_STALL, CC_SUCCESS, DESC_CONFIG, DT_ENDPOINT, DT_INTERFACE, FEATURE_ENDPOINT_HALT, REQ_CLEAR_FEATURE, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION, RT_ENDPOINT, SPEED_HIGH, SPEED_SUPER, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_IOC, TRB_NORMAL};
 use crate::{Ring, UsbDevice, Xhci};
 use crate::{command_and_wait, control_in, control_in_req, control_nodata, r8, reset_endpoint, w32};
+use drivers::descriptor;
 use drivers::keys::{self, Mods};
 
 // The HID class SET_PROTOCOL request (to the interface): wValue 0 selects the
@@ -51,6 +52,14 @@ pub struct Hid {
 	x: i32,
 	y: i32,
 	buttons: u8,
+}
+
+impl Hid {
+	// Give this endpoint's ring back. Called when the device goes away: the ring is a DMA page, and a
+	// page that nobody closes is a page leaked per attach.
+	pub fn release(&mut self) {
+		self.ring.release();
+	}
 }
 
 // The bound HID devices the service loop reaps reports for. The synchronous
@@ -97,47 +106,49 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Hid> {
 		// no HID device is serving yet, so the control waits see no HID events.
 		let mut pending: Hids = Hids::new();
 		// the configuration descriptor head names the total length; read it whole.
-		control_in(hc, &mut pending, dev, DESC_CONFIG, 9)?;
-		let total: u16 = (r8(dev.data_virt + 2) as u16 | (r8(dev.data_virt + 3) as u16) << 8).min(1024);
-		let config_value: u16 = r8(dev.data_virt + 5) as u16;
-		control_in(hc, &mut pending, dev, DESC_CONFIG, total)?;
+		let head = control_in(hc, &mut pending, dev, DESC_CONFIG, 9)?;
+		// THE HEAD IS A RECORD LIKE ANY OTHER: nine bytes, of which the total length is two and the
+		// configuration value is one - and a device that returned four of them has not sent them.
+		let head_bytes = core::slice::from_raw_parts(dev.data_virt as *const u8, head.min(9) as usize);
+		let head_record = descriptor::Walk::new(head_bytes).next()?;
+		descriptor::check_type(DESC_CONFIG as u8, head_record.kind).ok()?;
+		let total: u16 = head_record.field16(2).ok()?.min(1024);
+		let config_value: u16 = head_record.field(5).ok()? as u16;
+		let received = control_in(hc, &mut pending, dev, DESC_CONFIG, total)?;
+		// AND THE WHOLE DESCRIPTOR HAS TO HAVE ARRIVED before it is walked.
+		let total = descriptor::check_transfer(total, received).ok()?;
+		let config_bytes = core::slice::from_raw_parts(dev.data_virt as *const u8, total as usize);
 
 		// walk the descriptors for a HID interface, its report descriptor's length
 		// (the HID class descriptor rides between the interface and its endpoints)
 		// and its interrupt IN endpoint.
-		let mut offset: u64 = 0;
 		let mut in_hid: bool = false;
 		let mut boot_keyboard: bool = false;
 		let mut iface: u16 = 0;
 		let mut desc_len: u16 = 0;
 		let mut found: Option<(u32, u32, u32)> = None; // (dci, mps, interval)
-		while offset + 2 <= total as u64 {
-			let length: u64 = r8(dev.data_virt + offset) as u64;
-			let kind: u8 = r8(dev.data_virt + offset + 1);
-			if length < 2 {
-				break;
-			}
+		// EVERY FIELD IS READ FROM INSIDE ITS OWN RECORD. A record whose `bLength` is two is legal,
+		// and the class byte at offset five of it is the next record's header.
+		for record in descriptor::Walk::new(config_bytes) {
+			let kind = record.kind;
 			if kind == DT_INTERFACE && found.is_none() {
-				in_hid = r8(dev.data_virt + offset + 5) == CLASS_HID;
+				in_hid = record.field(5) == Ok(CLASS_HID);
 				if in_hid {
-					iface = r8(dev.data_virt + offset + 2) as u16;
-					boot_keyboard = r8(dev.data_virt + offset + 6) == SUBCLASS_BOOT && r8(dev.data_virt + offset + 7) == PROTOCOL_KEYBOARD;
+					iface = record.field(2).unwrap_or(0) as u16;
+					boot_keyboard = record.field(6) == Ok(SUBCLASS_BOOT) && record.field(7) == Ok(PROTOCOL_KEYBOARD);
 				}
 			}
-			if kind == DT_HID && in_hid && found.is_none() && length >= 9 {
+			if kind == DT_HID && in_hid && found.is_none() {
 				// wDescriptorLength of the (first) class descriptor, the report one.
-				desc_len = r8(dev.data_virt + offset + 7) as u16 | (r8(dev.data_virt + offset + 8) as u16) << 8;
+				desc_len = record.field16(7).unwrap_or(0);
 			}
 			if kind == DT_ENDPOINT && in_hid && found.is_none() {
-				let ep_addr: u8 = r8(dev.data_virt + offset + 2);
-				let attrs: u8 = r8(dev.data_virt + offset + 3);
+				let (Ok(ep_addr), Ok(attrs)) = (record.field(2), record.field(3)) else { continue };
 				if ep_addr & 0x80 != 0 && attrs & 0x3 == EP_ATTR_INTERRUPT {
-					let mps: u32 = r8(dev.data_virt + offset + 4) as u32 | (r8(dev.data_virt + offset + 5) as u32) << 8;
-					let interval: u32 = ep_interval(dev.speed, r8(dev.data_virt + offset + 6) as u32);
-					found = Some(((ep_addr & 0xf) as u32 * 2 + 1, mps, interval));
+					let (Ok(mps), Ok(interval)) = (record.field16(4), record.field(6)) else { continue };
+					found = Some(((ep_addr & 0xf) as u32 * 2 + 1, mps as u32, ep_interval(dev.speed, interval as u32)));
 				}
 			}
-			offset += length;
 		}
 		let (dci, mps, interval): (u32, u32, u32) = found?;
 
@@ -167,8 +178,11 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Hid> {
 		control_nodata(hc, &mut pending, dev, 0x00, REQ_SET_CONFIGURATION, config_value, 0)?;
 		let layout: hid::Layout = match desc_len {
 			0 => hid::Layout::empty(),
+			// A REPORT DESCRIPTOR IS PARSED OVER WHAT ARRIVED and not over what was asked for: the
+			// data page is reused, so the bytes past a short answer are the configuration descriptor
+			// this driver read a moment ago.
 			_ => match control_in_req(hc, &mut pending, dev, RT_INTERFACE_IN, REQ_GET_DESCRIPTOR, DESC_REPORT << 8, iface, desc_len.min(1024)) {
-				Some(()) => hid::parse(core::slice::from_raw_parts(dev.data_virt as *const u8, desc_len.min(1024) as usize)),
+				Some(received) => hid::parse(core::slice::from_raw_parts(dev.data_virt as *const u8, received.min(desc_len.min(1024) as u32) as usize)),
 				None => hid::Layout::empty(),
 			},
 		};
