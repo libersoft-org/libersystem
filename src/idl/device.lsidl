@@ -288,6 +288,58 @@ interface provider-catalogue {
 	@op(3) open: func(provider: provider-info) -> result<handle<channel>, error>;
 }
 
+/// THE LARGEST FRAME EITHER DIRECTION OF A CONSOLE BYTE STREAM WILL CARRY, and the version the two
+/// ends agreed on.
+///
+/// A byte stream is the one contract whose breakage is undetectable after the fact: bytes framed by
+/// one version and read by another are refused nowhere, they simply arrive somewhere else in the
+/// consumer's parser. So the version is asked for and answered BEFORE any byte moves, and a provider
+/// that cannot speak what was asked refuses the attachment rather than carrying it.
+record console-attachment {
+	/// The version this provider speaks, which is the one the consumer asked for. Answering with a
+	/// different number would be a negotiation, and a negotiation is a second contract.
+	version:   u32,
+	/// The largest `write` this provider accepts and the largest chunk it delivers. A consumer that
+	/// knows the bound refuses a frame of its own rather than discovering the limit as a write that
+	/// was taken in part.
+	max-frame: u32,
+}
+
+/// One run of bytes as the port delivered them, with none of the consumer's own framing implied: a
+/// chunk is what arrived in one receive buffer and nothing more.
+///
+/// A RECORD RATHER THAN A BARE LIST, because a stream frame is a message on the wire and a message
+/// that is only a list can never gain a field without becoming a different stream.
+record console-chunk {
+	@bound(4096) bytes: list<u8>,
+}
+
+/// THE DEVICE-SIDE CONTRACT A `console-bytes` PROVIDER SERVES.
+///
+/// It used to be a raw channel: the driver sent whatever a receive buffer held as an untyped
+/// message, the consumer sent its frames back the same way, and an EMPTY message meant the port
+/// would not take a write. Three conventions with no version between them, and a replacement
+/// consumer was handed down out of band under a magic tag. Every one of those is expressible here,
+/// so none of them has to be remembered by both ends separately.
+///
+/// `write` is a request with a reply because BACKPRESSURE IS AN ANSWER. A port whose host has
+/// stopped reading still accepts sends into the channel, so a consumer that must know whether its
+/// bytes reached the device cannot learn it from a transport that always succeeds.
+interface console-stream {
+	/// Ask for a version and learn the bounds that go with it. Refused with `unsupported` when this
+	/// provider does not speak the version asked for; every other operation on a connection that has
+	/// not attached is refused with `invalid`, so an unattached consumer cannot move a byte by
+	/// accident.
+	@op(1) attach:  func(version: u32) -> result<console-attachment, error>;
+	/// Bytes to the port, and how many of them it took. `again` says the device still owns the
+	/// buffer the previous write went into, which is what a host that stopped reading looks like
+	/// from inside the guest; `closed` says the port is gone.
+	@op(2) write:   func(@bound(65535) bytes: list<u8>) -> result<u32, error>;
+	/// Bytes from the port, as a stream of chunks. One subscription per connection: a second ask is
+	/// refused rather than answered with an endpoint nobody would drain.
+	@op(3) receive: func() -> result<stream<console-chunk>, error>;
+}
+
 /// One enumerated USB device, as the xHCI driver addressed it: the root port it hangs
 /// off (a device behind a hub reports the hub's root port), its speed, the vendor and
 /// product ids from its device descriptor, its class code, and the role the driver

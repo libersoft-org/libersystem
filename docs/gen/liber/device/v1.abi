@@ -21,6 +21,12 @@ interface provider-catalogue
 method provider-catalogue.subscribe op=1 (kind:provider-kind:rights=) -> stream<provider-info>
 method provider-catalogue.bindings op=2 () -> list<binding-record>
 method provider-catalogue.open op=3 (provider:provider-info:rights=) -> result<handle<channel>, liber:base@1::error>
+record console-attachment(version:u32,max-frame:u32)
+record console-chunk(bytes:list<u8>:bound=4096)
+interface console-stream
+method console-stream.attach op=1 (version:u32:rights=) -> result<console-attachment, liber:base@1::error>
+method console-stream.write op=2 (bytes:list<u8>:bound=65535:rights=) -> result<u32, liber:base@1::error>
+method console-stream.receive op=3 () -> stream<console-chunk>
 record usb-device(port:u32,speed:string,vendor:u32,product:u32,class:u32,type:string)
 interface usb
 method usb.list op=1 () -> result<list<usb-device>, liber:base@1::error>

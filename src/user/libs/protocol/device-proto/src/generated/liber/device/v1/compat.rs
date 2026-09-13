@@ -163,6 +163,22 @@ fn incident_report_wire_is_stable() {
 	assert_eq!(IncidentReport::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn console_attachment_wire_is_stable() {
+	let sample = ConsoleAttachment { version: 7, max_frame: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ConsoleAttachment::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn console_chunk_wire_is_stable() {
+	let sample = ConsoleChunk { bytes: alloc::vec![7] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(ConsoleChunk::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn usb_device_wire_is_stable() {
 	let sample = UsbDevice { port: 7, speed: String::from("x"), vendor: 7, product: 7, class: 7, r#type: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");
