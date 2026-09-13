@@ -2401,6 +2401,24 @@ pub fn cpu_name(buf: &mut [u8]) -> i64 {
 
 // Read the physical-memory and kernel-heap totals into `stats`. A free syscall
 // feeding the `free` inventory command.
+// SEED THE MACHINE'S ENTROPY POOL FROM AN ENTROPY DEVICE.
+//
+// `device` is the DeviceMemory capability of the function these bytes came from, and it is the whole
+// authority: the kernel checks it against the CURRENT claim on a device whose type is the entropy
+// device's, so a capability from a binding that is over - or for some other device - seeds nothing.
+//
+// Answers the number of BITS credited, which is smaller than the number of bits handed over and is
+// often zero. The caller does not get to say what its bytes are worth; that division is what stops a
+// driver seeding a machine to "fully seeded" with a constant.
+pub fn entropy_add(device: u64, bytes: &[u8]) -> i64 {
+	unsafe { syscall(SYS_ENTROPY_ADD, device, bytes.as_ptr() as u64, bytes.len() as u64, 0) as i64 }
+}
+
+// What the pool holds and where it came from. Counts and provenance; no verdict - see `EntropyHealth`.
+pub fn entropy_health(health: &mut EntropyHealth) -> i64 {
+	unsafe { syscall(SYS_ENTROPY_HEALTH, health as *mut EntropyHealth as u64, 0, 0, 0) as i64 }
+}
+
 pub fn memory_stats(stats: &mut MemoryStats) -> i64 {
 	unsafe { syscall(SYS_MEMORY_STATS, stats as *mut MemoryStats as u64, core::mem::size_of::<MemoryStats>() as u64, 0, 0) as i64 }
 }

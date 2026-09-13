@@ -221,3 +221,116 @@ files are untouched by this work.
 `qemu-arch-profiles` fails its `no-dt-absent` case - the loader loads a kernel after refusing the
 absent DMA-mode record - in loader and image code this work does not touch, and consistent with the
 same unfinished DMA-mode change the `boot-harness` failure names.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-09-13T02:20:00Z):
+
+THE LAST CONSUMER CHOSEN BY A DRIVER'S NAME IS GONE.
+
+`virtio-console maintenance` owed the `console-bytes` provider's migration onto the catalogue, and
+that item is now implemented. What was there, read out of the code rather than out of the intent:
+
+  - `route_offers` called `Catalogue::take_from`, which LIFTED the publication out of the catalogue,
+    compared the binding's artifact name against the literal `dev_channel`, started the development
+    agent on the channel it had taken, and CLOSED the publication of any other driver that offered
+    the same kind. So the one provider this machine publishes could be shown to nobody, a second
+    publisher was silently discarded, and a provider bound after that pass had no path to a consumer.
+  - The wire was untyped messages in both directions. An EMPTY message meant the port would not take
+    a write; a handle under a `BYTES` tag on the driver's own bootstrap meant a replacement consumer;
+    the version was not on the wire at all. Three conventions, each remembered separately by both
+    ends.
+  - `virtio_console` declared `provides = [{ kind = "console-bytes", most = 1 }]` and publishes no
+    provider at all.
+
+WHAT IS THERE NOW:
+
+  - `liber:device@1` carries `console-stream`: `attach(version) -> console-attachment` settles a
+    version and a frame bound before a byte moves, `write(bytes) -> u32` answers with what the port
+    took (`again` is a host that stopped reading), and `receive() -> stream<console-chunk>` grants
+    the inbound endpoint. Regenerated with ./gen.sh; `./gen.sh --check` reports no drift.
+  - `dev_channel` serves that contract over `common::Serving`, so a replacement consumer arrives as
+    an ordinary `CONNECT` and a departed one is reported with `DISCONNECT` - which is what frees the
+    single-consumer slot the next `open` is checked against. The `BYTES` tag and the `adopt` loop
+    that waited for it are deleted.
+  - `dev_agent` holds a `provider-catalogue` connection, subscribes to `console-bytes`, opens what it
+    finds, settles the version, asks for the stream, and holds the provider's identity - slot,
+    provider generation, binding generation. A withdrawal naming that identity detaches and ends the
+    session it carried; a later publication attaches. A replacement agent does all of this from
+    scratch, so DeviceManager no longer re-wires one.
+  - DeviceManager starts the agent ONCE, after phase two, because the image is a development image -
+    not because a driver with a particular name bound. `Catalogue::take_from` has no caller left in
+    any image and is removed.
+  - The manifest no longer claims a provider `virtio_console` does not publish.
+
+WHAT IS DELIBERATELY NOT DONE, AND IT IS RECORDED IN THE PLAN AND THE MANIFEST: a SECOND
+`console-bytes` publisher would be indistinguishable from the development channel to a consumer that
+selects by kind, because both would speak the same version. Telling two publishers of one kind apart
+needs a ROLE the registry declares and the catalogue carries, and nothing in this tree has one. The
+first item that adds a second console byte stream owes that role before it can close its gate.
+
+THE DECISIONS ARE SHARED AND HOST-TESTED, AND EACH WAS WATCHED TO FAIL. `driver_protocol::console`
+holds version agreement, publication identity, the cutting of a long frame and the meaning of a
+refused write, in the crate both ends already link. Seven tests, and the mutations:
+
+  - identity compared by slot alone -> `a_withdrawal_that_names_another_provider_does_not_detach_this_one` FAILS
+  - a partial write counted as a whole one -> `a_partial_write_loses_the_provider_and_a_backpressure_refusal_does_not` FAILS
+  - a version mismatch downgraded instead of refused -> `a_version_that_was_not_asked_for_is_refused_rather_than_downgraded` FAILS
+  - a span that stops one byte short -> `a_frame_longer_than_the_bound_is_cut_into_spans_that_cover_it_exactly` FAILS
+
+  Reverted, 34 of 34 pass.
+
+VERIFIED: `cargo test` over driver-protocol (34 tests, green); `./build.sh --part user` for x86_64 in
+BOTH profiles - ordinary and LIBER_DEVELOPMENT=1 - green; `./gen.sh --check` green; `format.sh` run.
+NOT PERFORMED: the three-target suite run, and the guest boot that would exercise the new wire end to
+end. The item is therefore NOT ticked. Nothing about the migration has been observed in a running
+guest yet; what is proven is that it compiles for the shipped image and that its decisions refuse
+what they say they refuse.
+
+AND A MARKER WAS REMOVED FROM THE INDEX. `docs/todo/TODO.md` carried this document as `[i]`, a state
+`check-milestone-index.sh` counts as neither open nor done and refuses to let anything tick. The
+project owner has said plainly that a marker meaning "skip" was never agreed to. The row is `[ ]`
+now, the status line no longer calls the document non-completable, and the gate passes. It closes
+when its items do.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0099 (2026-09-13T03:20:00Z):
+
+VIRTIO-RNG, AND THE ONE CONCLUSION THE MACHINE WILL NOT DRAW FROM IT.
+
+`SYS_RANDOM_GET` had exactly one answer on a machine with no hardware random instruction:
+`ERR_UNSUPPORTED`. That is two of this system's three architectures, so anything wanting key material
+had nowhere to go and the only call that always answered was the one named `insecure`. This item
+closes that, and the whole of the care is in not closing it too far.
+
+WHAT IS THERE:
+
+  - `entropy::Pool`, a crate outside the kernel for the reason `driver-binding` is one: the kernel is
+    not host-testable and these are decisions. A paravirtual submission is credited at a QUARTER of
+    its length, a hardware one at a half, no single submission is worth more than 512 bits however
+    large, the pool holds at most 4096 bits, and below 256 credited bits `draw` answers NOTHING.
+  - `SYS_ENTROPY_ADD`, whose authority is the device capability checked against the CURRENT claim on
+    a function whose device type is the entropy device's. The submitter hands over BYTES and the
+    KERNEL decides the credit - a driver that could name its own credit could seed a machine to
+    "fully seeded" with a constant.
+  - `SYS_ENTROPY_HEALTH`, which answers credit and provenance and never a verdict.
+  - `driver.virtio-rng`, which publishes NO provider: what it produces goes to the pool, and a
+    channel handing out raw host bytes is the one thing it exists not to be.
+  - `random_into` draws from the pool when there is no hardware instruction and the pool is seeded.
+
+EVIDENCE, AND WHAT IT IS WORTH:
+
+  - Eight host tests in `entropy`, green. The deterministic-injection case pins a draw computed by an
+    INDEPENDENT SHA-256 - the construction written out against Python's `hashlib` - so it asserts the
+    chain this pool documents rather than self-agreement.
+  - Two kernel tagged tests, compiled into the test binary and confirmed present by `nm`: a
+    capability that names no binding is refused, the submission bounds are refused before the
+    capability is looked at, and a machine with no instruction refuses the secure draw until the pool
+    is seeded and answers afterwards.
+  - `./build.sh --part kernel` and `--part user` for x86_64, green.
+
+NOT PERFORMED: the guest run. The harness now attaches `virtio-rng-pci` on all three targets in test
+mode, and no guest has yet booted with it. The two kernel tests have not been RUN, only built. The
+item is therefore not ticked.
+
+A JUDGEMENT THAT SHOULD BE READ BY SOMEBODY ELSE: the credit rates - a quarter and a half - and the
+256-bit threshold are this implementation's choices. They are conservative relative to what Linux
+credits a virtio-rng source, and the plan asked for conservative. They are not derived from a
+measurement, because nothing inside a guest can measure them.

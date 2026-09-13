@@ -374,7 +374,7 @@ impl PathBuilder {
 	}
 
 	fn push(&mut self, verb: Verb, points: &[PointF]) -> Result<&mut Self, Error> {
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		if self.path.verbs.len() as u64 + 1 > limits.max_path_verbs as u64 {
 			return Err(Error::LimitExceeded { limit: "path verbs", ceiling: limits.max_path_verbs as u64 });
 		}

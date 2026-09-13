@@ -163,6 +163,13 @@ path = "user/libs/protocol/display-proto"
 owner = "driver-binding"
 path = "user/libs/driver/binding"
 
+# The entropy pool's policy - what a seed submission is credited and what the pool refuses below its
+# threshold. A kernel dependency that lives outside the kernel for the reason `driver-binding` does:
+# the kernel is not host-testable and these are decisions a test has to be able to watch refuse.
+[[sources]]
+owner = "entropy"
+path = "user/libs/entropy"
+
 [[sources]]
 owner = "driver-protocol"
 path = "user/libs/driver/protocol"
@@ -1706,11 +1713,25 @@ stage = "volume"
 destination = "drivers/virtio_console.lsexe"
 providers = []
 
+# IT DECLARED A PROVIDER IT NEVER PUBLISHED, and the declaration is what went (2026-09-13).
+#
+# This entry said `provides = [{ kind = "console-bytes", most = 1 }]` and the driver publishes
+# nothing at all: it brings the port up, writes its banner over the transmit queue and stands. A
+# declaration nothing satisfies is not harmless here - `provides` is what the manager sizes a
+# binding's provider slots from and what a consumer reads as "this image has one of those", so the
+# machine claimed a console byte stream that no `open` could ever reach.
+#
+# The alternative was to make this driver serve the stream. It is NOT taken, and the reason is worth
+# writing down: a second `console-bytes` publisher in a development image would be
+# indistinguishable from the development channel to a consumer that selects by kind, and the version
+# handshake cannot tell them apart because both would speak the same version. Telling two publishers
+# of one kind apart needs a ROLE the registry declares and the catalogue carries, and nothing in this
+# tree has one yet. So this driver publishes nothing and says so, and the first item that adds a
+# second console byte stream - virtio-serial multiport is the candidate - owes that role first.
 [programs.driver]
 lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 3 }]
-provides = [{ kind = "console-bytes", most = 1 }]
 heartbeat-deadline = 100
 
 [[programs]]
@@ -1800,6 +1821,27 @@ lifecycle = "controller"
 dma = "iommu-required"
 match = [{ transport = "virtio-pci", virtio-type = 1 }]
 provides = [{ kind = "net", most = 1 }]
+heartbeat-deadline = 100
+
+# THE ENTROPY SOURCE. It publishes no provider, and that is the entry's most important line: what it
+# produces goes to the kernel's pool through a syscall whose authority is this device's own
+# capability. There is nothing for a consumer to connect to, and a channel handing out raw host bytes
+# is the one thing this driver exists not to be.
+[[programs]]
+name = "virtio_rng"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_rng.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# The device writes into a buffer this driver owns and reads nothing else, which is the same shape
+# every other virtio device on this machine has.
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 4 }]
 heartbeat-deadline = 100
 
 [[programs]]
@@ -1901,6 +1943,11 @@ kind = "source"
 source = "volume/motd.txt"
 destination = "motd.txt"
 
+# THE LAST-RESORT FACE AND ITS DECLARATION. Authored by `src/tools/font-gen` rather than imported,
+# because the licence decision for FONTS admits public domain and Unlicense only and no existing face
+# satisfies it - see the tool and the milestone. The sidecar is staged beside the face because the
+# catalogue reads the pair: the face is the bytes and the declaration is what they claim to be, and
+# the truth oracle refuses any disagreement between them.
 [[factory_files]]
 name = "wallpaper-logo"
 kind = "source"

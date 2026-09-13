@@ -374,7 +374,7 @@ impl<'a> Backend for Soft2d<'a> {
 				expansion = expansion.max(libm::ceilf(grow) as u32);
 			}
 		}
-		expansion = expansion.min(graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_filter_radius);
+		expansion = expansion.min(graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_radius);
 
 		// THE PYRAMIDS, for the images this list samples with minification. Built here because a
 		// pyramid is an allocation and a pyramid per frame is the allocation this design exists to
@@ -428,7 +428,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 
 		let scratch_bytes = self.pool.scratch_bytes() + self.masks.scratch_bytes() + self.raster.scratch_bytes() + self.spans.scratch_bytes() + bins.scratch_bytes() + self.tile.as_ref().map(|tile| tile.scratch_bytes()).unwrap_or(0) + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>();
-		let ceiling = graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_prepared_scratch_bytes;
+		let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
 		if scratch_bytes > ceiling {
 			// A FRAME THAT CANNOT FIT SAYS SO BEFORE IT STARTS DRAWING. Discovering it halfway through
 			// a filter chain leaves a half-drawn frame, which is worse than an honest refusal.
@@ -618,7 +618,7 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 					let layer_rect = layer_bounds(*bounds, parent, expansion);
 					match pool.take(layer_rect) {
 						Some(layer_surface) => layers.push(Layer { surface: layer_surface, bounds: layer_rect, opacity: *opacity, blend: *blend, operator: *operator, filter: *filter, clip_depth: clips.depth() }),
-						None => return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_prepared_scratch_bytes }),
+						None => return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes }),
 					}
 				}
 				Step::EndLayer => {

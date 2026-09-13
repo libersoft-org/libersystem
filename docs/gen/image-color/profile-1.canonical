@@ -85,3 +85,6 @@ row=pitch value=the layout's own, at least the minimum row
 span=minimum-visible-bytes value=(height - 1) * pitch + minimum_row_bytes
 span=backend-access-span value=every byte the selected display or DMA backend may touch, including the final row's pitch padding where it reads that
 span=allocation-len value=the owned allocation's own length, at least the backend access span for a presentable or DMA image
+threshold=a colour conversion's round trip tolerance=<= 1 code value at 8 bits, <= 4 at 10 bits, and <= 1e-4 relative in a floating-point space why=one code value is the quantisation itself; anything larger is the conversion being wrong rather than the storage being coarse
+threshold=the tone-map operator's output tolerance=<= 2 ULP of f32 against the operator's own expression why=it is a closed-form expression with no iteration, so the only error is rounding order
+threshold=the comparison space for a final colour tolerance=NAMED: linear Rec. 709 premultiplied, at f32. A comparison in an encoded space hides a large linear error in the dark half and inflates a small one in the bright half why=two suites comparing in different spaces disagree about the same pair of images

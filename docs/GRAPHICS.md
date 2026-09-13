@@ -91,3 +91,34 @@ happens, and a statement that it does not happen again deeper.
 The image model, the colour model, the formats and every numeric rule they need are in
 [`graphics/IMAGE_COLOR_PROFILE_1.md`](graphics/IMAGE_COLOR_PROFILE_1.md).
 
+## The profiles
+
+Each profile is a machine-readable registry with a document generated from it and a SHA-256 over
+its canonical form. `docs/gen/profiles.manifest` binds the three together - name, version, hash,
+canonical file and document - and `./gen.sh --check` refuses any of them that disagrees.
+
+| profile | document |
+| --- | --- |
+| Image Colour Profile 1 | [`graphics/IMAGE_COLOR_PROFILE_1.md`](graphics/IMAGE_COLOR_PROFILE_1.md) |
+| Render2D Profile 1 | [`graphics/RENDER2D_PROFILE_1.md`](graphics/RENDER2D_PROFILE_1.md) |
+| Render3D Profile 1 | [`graphics/RENDER3D_PROFILE_1.md`](graphics/RENDER3D_PROFILE_1.md) |
+| Shader IR 1 | [`graphics/SHADER_IR_1.md`](graphics/SHADER_IR_1.md) |
+| Scene3D Core Profile 1 | [`graphics/SCENE3D_PROFILE_1.md`](graphics/SCENE3D_PROFILE_1.md) |
+| Scene3D Extended 1 | [`graphics/SCENE3D_EXTENDED_1.md`](graphics/SCENE3D_EXTENDED_1.md) |
+| WSI Profile 1 | [`graphics/WSI_PROFILE_1.md`](graphics/WSI_PROFILE_1.md) |
+
+### How a profile is hashed
+
+| question | answer |
+| --- | --- |
+| the input inventory | every registry the profile is made of, in a FIXED order written in the generator - not in the order a directory listing or a hash map produces, which differ between runs and between machines |
+| within a registry | the DECLARATION ORDER of the list, which is part of the profile: several of these lists are ordered on purpose - the clip planes, the render queues, the light accumulation - and sorting them would destroy the meaning the order carries |
+| the text encoding | UTF-8, with LF line endings and exactly one trailing newline per line. A CRLF anywhere would make the same profile hash differently on a machine that checked out with translation |
+| string encoding | verbatim, with no trimming, case folding or whitespace collapsing. A string in a registry is a value, and normalising it would make two different answers hash the same |
+| integer encoding | decimal, no separators, no leading zeros, with a leading `-` for a negative value |
+| float encoding | a fixed number of decimal places per field, chosen so the value round-trips - four places for a sample position, twelve for an epsilon. Never the shortest representation, which changes when a compiler's formatter changes |
+| boolean encoding | `true` and `false`, which is what a reader of the canonical file sees rather than 1 and 0 |
+| the hash field | EXCLUDED from its own input. The canonical form contains no hash, so the hash is a function of the profile alone and a document that states it cannot change it |
+| what the document contributes | NOTHING. The Markdown is generated FROM the canonical form and is not an input to it, so a prose rewrap or a corrected example is not a profile change |
+| when the hash may change | when the semantic input changes, and then the profile's VERSION changes with it. A semantic correction is a version change; a non-normative correction is neither |
+| what the gate checks | that each document states the hash its registry produces, that the manifest names the same hash, and that no generated coverage table claims a feature the profile does not have |

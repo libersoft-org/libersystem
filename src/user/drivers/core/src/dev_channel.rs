@@ -56,14 +56,13 @@ const RX_SLOT: u64 = 4096;
 // with more to say than the contract's bound simply says it in two writes.
 const MAX_FRAME: usize = 65536;
 
-// THE CONTRACT'S OWN BOUND, and it is not a choice. A `list<u8>` is length-prefixed with a `u16` on
-// this wire, so 65535 is the largest one that can be expressed at all - the schema refuses a
-// `@bound` above it rather than letting a driver promise a frame the encoder could not write.
-const MAX_WRITE: usize = 65535;
-
-// The version of `console-stream` this driver speaks. A consumer that asks for another one is
-// refused: guessing at framing is exactly what the handshake exists to stop.
-const CONTRACT_VERSION: u32 = 1;
+// THE CONTRACT'S OWN BOUND AND VERSION, READ FROM THE ONE PLACE BOTH ENDS READ THEM FROM. A
+// constant this driver defined for itself and another the consumer defined for itself are two
+// constants, and the day they differ is the day a byte stream starts arriving somewhere else in the
+// reader with nothing refused anywhere. `driver_protocol::console` is the shared crate, and the
+// decisions made from these numbers are host-tested there rather than only in a booted guest.
+const MAX_WRITE: usize = driver_protocol::console::MAX_WRITE as usize;
+const CONTRACT_VERSION: u32 = driver_protocol::console::WIRE_VERSION;
 
 // How long a write may wait for the transmit buffer to come back, in scheduler ticks
 // (100 Hz). The host end can stop reading at any moment, and QEMU then stops consuming the
@@ -267,19 +266,25 @@ struct Console<'a, 'b> {
 
 impl console_stream::Service for Console<'_, '_> {
 	fn attach(&mut self, version: u32) -> Result<ConsoleAttachment, Error> {
-		if version != CONTRACT_VERSION {
-			return Err(Error::Unsupported);
+		match driver_protocol::console::attach(version, CONTRACT_VERSION, MAX_WRITE as u32) {
+			driver_protocol::console::Attach::Speak { version, max_frame } => {
+				self.state.attached = true;
+				Ok(ConsoleAttachment { version, max_frame })
+			}
+			// A version this driver does not serve, or a bound it could not honour. Either way the
+			// connection stays unattached, and every operation on it goes on being refused.
+			_ => Err(Error::Unsupported),
 		}
-		self.state.attached = true;
-		Ok(ConsoleAttachment { version: CONTRACT_VERSION, max_frame: MAX_WRITE as u32 })
 	}
 
 	fn write(&mut self, bytes: Vec<u8>) -> Result<u32, Error> {
-		// NOT ATTACHED IS NOT A SMALL WRITE. A consumer that has not settled a version does not
-		// know how this driver frames what it sends back, so letting its bytes reach the host would
-		// put a stream on the wire that neither end can parse.
-		if !self.state.attached {
-			return Err(Error::Invalid);
+		// NOT ATTACHED IS NOT A SMALL WRITE, and neither is a length this contract cannot carry.
+		// Both are refusals rather than adjustments: a consumer that has not settled a version does
+		// not know how what comes back is framed, and a write silently cut to fit is a frame the
+		// reader will never reassemble.
+		match driver_protocol::console::admit_write(self.state.attached, bytes.len(), MAX_WRITE as u32) {
+			driver_protocol::console::Admit::Write => {}
+			driver_protocol::console::Admit::NotAttached | driver_protocol::console::Admit::BadLength => return Err(Error::Invalid),
 		}
 		// SAFETY: the port's transmit buffer and its queue are this driver's for the life of the
 		// process; `write` is unsafe because it copies into that mapping and submits a descriptor.
@@ -287,13 +292,12 @@ impl console_stream::Service for Console<'_, '_> {
 	}
 
 	fn receive(&mut self) -> Result<Vec<ConsoleChunk>, Error> {
-		if !self.state.attached {
-			return Err(Error::Invalid);
-		}
-		// ONE SUBSCRIPTION PER CONNECTION. A second endpoint would be a second reader of one port,
-		// and the bytes would be split between them by whichever happened to be drained first.
-		if self.state.stream != 0 {
-			return Err(Error::Again);
+		match driver_protocol::console::grant_stream(self.state.attached, self.state.stream != 0) {
+			driver_protocol::console::Grant::Mint => {}
+			driver_protocol::console::Grant::NotAttached => return Err(Error::Invalid),
+			// ONE SUBSCRIPTION PER CONNECTION. A second endpoint would be a second reader of one
+			// port, and the bytes would be divided between them by whichever was drained first.
+			driver_protocol::console::Grant::AlreadyGranted => return Err(Error::Again),
 		}
 		let Some((producer, consumer)) = channel_with_depth(STREAM_DEPTH) else {
 			return Err(Error::Exhausted);

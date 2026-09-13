@@ -43,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -524,6 +524,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_RANDOM_INSECURE => sys_random_insecure(a0, a1),
+		SYS_ENTROPY_ADD => sys_entropy_add(a0, a1, a2),
+		SYS_ENTROPY_HEALTH => sys_entropy_health(a0),
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0, a1),
 		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
@@ -1507,6 +1509,56 @@ fn sys_random_insecure(buf_ptr: u64, len: u64) -> i64 {
 	random_into(buf_ptr, len, false)
 }
 
+// SEED THE MACHINE'S POOL FROM AN ENTROPY DEVICE.
+//
+// The caller hands over BYTES and a capability, and the kernel decides what the bytes are worth. That
+// division is the whole security of this call: a driver that could name its own credit could seed a
+// machine to "fully seeded" with a constant, and nothing downstream of `SYS_RANDOM_GET` could tell.
+//
+// Answers the number of BITS credited, which is smaller than the number of bits submitted and is
+// often zero - a device that answered a request with nothing has still said something, and the
+// submission still moves the pool so that a failing device cannot make it repeatable.
+fn sys_entropy_add(device_handle: u64, buf_ptr: u64, len: u64) -> i64 {
+	// A BOUND ON THE COPY, not on the credit - the credit is capped far below this anyway. An
+	// unbounded copy driven by a device interrupt is a kernel stall a driver can simply ask for.
+	if len == 0 || len > abi::MAX_ENTROPY_SUBMISSION {
+		return ERR_INVALID;
+	}
+	if !user_buf_ok(buf_ptr, len) {
+		return ERR_INVALID;
+	}
+	let memory = match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::READ) {
+		Ok(m) => m,
+		Err(e) => return e,
+	};
+	// A bare MMIO window belongs to no binding, a stale capability belongs to a binding that is over,
+	// and a capability for some other kind of device is not a licence to decide what this machine's
+	// randomness is made of. All three are the same refusal.
+	let Some(source) = crate::entropy::source_for(memory.claim()) else {
+		return ERR_ACCESS_DENIED;
+	};
+	let mut scratch = [0u8; abi::MAX_ENTROPY_SUBMISSION as usize];
+	let taken = len as usize;
+	if let Err(error) = copy_from_user_exact(scratch.as_mut_ptr(), buf_ptr, taken) {
+		return error;
+	}
+	let credited = crate::entropy::absorb(&scratch[..taken], source);
+	// The submission is not left in kernel memory after it has been folded in. It is already mixed
+	// beyond recovery, and a scratch buffer holding raw device bytes is a thing to have to reason
+	// about on every path that reuses this stack.
+	scratch[..taken].fill(0);
+	credited as i64
+}
+
+// What the pool holds and where it came from. Counts and provenance; no verdict - see `EntropyHealth`.
+fn sys_entropy_health(out_ptr: u64) -> i64 {
+	let health = crate::entropy::health(arch::random::secure_available());
+	match write_user(out_ptr, health) {
+		Ok(()) => 0,
+		Err(error) => error,
+	}
+}
+
 fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 	if len == 0 {
 		return 0;
@@ -1514,9 +1566,17 @@ fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 	if !user_buf_ok(buf_ptr, len) {
 		return ERR_INVALID;
 	}
-	if must_be_secure && !arch::random::secure_available() {
-		// No retry and no smaller request changes this, which is what `ERR_UNSUPPORTED` says and
-		// `ERR_RESOURCE_EXHAUSTED` would not.
+	// THE POOL IS THE SECOND ANSWER, AND IT IS WHY MOST OF THIS SYSTEM'S MACHINES HAVE ONE AT ALL.
+	//
+	// This refused outright without a hardware instruction, which is two of the three architectures
+	// - so on those, anything wanting key material had nowhere to go and the only call that always
+	// answered was the one named `insecure`. A seeded pool answers instead. It is NOT a claim that
+	// the machine is healthy: the credit behind it is a fraction of what was submitted, the pool
+	// refuses below its threshold, and what seeded it is visible through `SYS_ENTROPY_HEALTH`.
+	let from_pool: bool = must_be_secure && !arch::random::secure_available();
+	if from_pool && !crate::entropy::seeded() {
+		// No retry and no smaller request changes this while the pool is unseeded, which is what
+		// `ERR_UNSUPPORTED` says and `ERR_RESOURCE_EXHAUSTED` would not.
 		return ERR_UNSUPPORTED;
 	}
 	// Generate into a kernel buffer in bounded chunks, then copy out to the caller.
@@ -1525,7 +1585,15 @@ fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 	let mut filled: u64 = 0;
 	while filled < len {
 		let n = ((len - filled) as usize).min(CHUNK);
-		if must_be_secure {
+		if from_pool {
+			if !crate::entropy::draw(&mut scratch[..n]) {
+				// The pool was seeded when this call started and is not now, which cannot happen
+				// while credit only rises - but a buffer half from the pool and half from somewhere
+				// else is a key nobody can reason about, so the refusal is here rather than assumed
+				// away.
+				return ERR_UNSUPPORTED;
+			}
+		} else if must_be_secure {
 			if !arch::random::secure(&mut scratch[..n]) {
 				// The source stopped answering part-way. Refuse rather than finish the buffer from
 				// somewhere else: a half-hardware key is a key nobody can reason about.

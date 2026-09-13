@@ -408,6 +408,15 @@ pub fn claim_state(index: usize) -> Option<ClaimState> {
 // which is a different statement and was not being verified anywhere: on a machine with no IOMMU it
 // was the only statement being made. This is the check for that case, against the authority that can
 // answer it, and `iommu::msi_deliverable` and `SYS_DEVICE_MSIX_ACQUIRE` both use it.
+// THE TYPE OF ONE DEVICE-TABLE ENTRY, which is the virtio specification's own device type for a
+// virtio function and a code above that space for everything else.
+//
+// Asked by the entropy path, where "this capability names a device" is not enough: a claim on a NIC
+// is not a licence to decide what this machine's randomness is made of.
+pub fn device_type_at(index: usize) -> Option<u16> {
+	DEVICES.lock().get(index).map(|entry| entry.device_type)
+}
+
 pub fn claim_is_current(key: abi::ClaimKey) -> bool {
 	let claims = CLAIMS.lock();
 	match claims.get(key.device_index as usize) {

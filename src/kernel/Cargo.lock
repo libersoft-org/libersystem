@@ -113,6 +113,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "entropy"
+version = "0.0.0"
+dependencies = [
+ "bootproto",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -210,6 +217,7 @@ dependencies = [
  "dma",
  "driver-binding",
  "driver-protocol",
+ "entropy",
  "fdt",
  "flac",
  "fscore",

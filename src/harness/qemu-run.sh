@@ -620,6 +620,26 @@ qemu_attach_xhci() {
 # multiport driver can host the same protocol on a named port unchanged.
 DEV_CHANNEL_PCI_SLOT="0x1e"
 
+# THE ENTROPY SOURCE THE SUITE SEEDS FROM.
+#
+# Two of this system's three architectures have no hardware random instruction, so without a device
+# here `SYS_RANDOM_GET` refuses on them and the only call that always answers is the one named
+# `insecure`. The suite needs BOTH states to be reachable: a guest with no entropy device (every
+# profile that does not call this) proves the refusal, and a guest with one proves the seeding.
+#
+# `virtio-rng-pci` with no backend reads the host's own `/dev/urandom`, which is what a guest gets on
+# a real hypervisor and is exactly the source the pool credits conservatively: the guest cannot see
+# what is behind it, which is the whole reason the credit is a quarter of the length.
+qemu_attach_entropy() {
+	local -n arr=$1
+	local opts="${2:-}"
+	if [[ -n "$opts" ]]; then
+		arr+=(-device "virtio-rng-pci,$opts")
+	else
+		arr+=(-device "virtio-rng-pci")
+	fi
+}
+
 qemu_attach_dev_channel() {
 	local -n arr=$1
 	local socket_path="$2"
@@ -1715,6 +1735,7 @@ qemu_run_x86_64() {
 		if [[ "$dma_fixture" != "1" ]]; then
 			qemu_append_audio qemu_args
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
+			qemu_attach_entropy qemu_args
 		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
@@ -1918,6 +1939,7 @@ qemu_run_aarch64() {
 			# arm for what the recording test can and cannot prove with it.
 			qemu_append_audio qemu_args
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,$virtio_opts")
+			qemu_attach_entropy qemu_args "$virtio_opts"
 		fi
 	else
 		if [[ "$reduced" != "1" ]]; then
@@ -2204,6 +2226,7 @@ qemu_run_riscv64() {
 			# arm for what the recording test can and cannot prove with it.
 			qemu_append_audio qemu_args
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,$virtio_opts")
+			qemu_attach_entropy qemu_args "$virtio_opts"
 		fi
 	else
 		if [[ "$reduced" != "1" ]]; then

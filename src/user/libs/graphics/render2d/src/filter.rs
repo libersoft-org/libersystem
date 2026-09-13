@@ -102,7 +102,7 @@ impl FilterGraph {
 	/// by a check that a later edit can defeat. A cycle is a filter that never finishes, and finding
 	/// one during preparation is later than finding it here.
 	pub fn push(&mut self, node: FilterNode) -> Result<u16, Error> {
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		if self.nodes.len() as u64 + 1 > limits.max_filter_nodes as u64 {
 			return Err(Error::LimitExceeded { limit: "filter nodes", ceiling: limits.max_filter_nodes as u64 });
 		}

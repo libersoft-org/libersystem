@@ -424,6 +424,56 @@ pub const SYS_DEVICE_CLAIM_SNAPSHOT: u64 = 81;
 // handle because there is no other process it could name: a table of addresses in another process-s
 // address space would mean nothing here.
 pub const SYS_PROCESS_LIFECYCLE: u64 = 82;
+
+// ENTROPY IN, AND THE SUBMITTER DOES NOT SAY WHAT IT IS WORTH.
+//
+// A driver holding a live claim on an entropy device hands the kernel BYTES; the kernel decides what
+// they are credited, from the kind of source, at a rate below one bit per bit. That division is the
+// whole security of the call: a submitter that could name its own credit could seed a machine to
+// "fully healthy" with a constant, and nothing downstream of `SYS_RANDOM_GET` could tell.
+//
+// The authority is the device capability, checked against the CURRENT claim on a function whose type
+// is the entropy device's. A capability from a previous binding is held by somebody who is no longer
+// driving that device, which is the same rule `SYS_DEVICE_QUIESCED` applies for the same reason.
+//
+// Answers the number of BITS credited - which is not the number of bytes submitted and is often
+// zero, because a device that answered a request with nothing has still said something.
+pub const SYS_ENTROPY_ADD: u64 = 83;
+
+// What the pool holds and where it came from, as `EntropyHealth`. CREDIT AND PROVENANCE, NEVER A
+// VERDICT: whether a machine seeded only by a paravirtual device is good enough for a given purpose
+// is the caller's question, and a kernel that answered it would be answering for every future caller
+// too.
+pub const SYS_ENTROPY_HEALTH: u64 = 84;
+
+// The largest submission `SYS_ENTROPY_ADD` will read in one call. A bound rather than a buffer size:
+// the credit is capped far below this anyway, so a larger call would be a larger copy for no more
+// credit - and an unbounded copy driven by a device interrupt is a kernel stall a driver can ask for.
+pub const MAX_ENTROPY_SUBMISSION: u64 = 4096;
+
+// WHAT THE ENTROPY POOL SAYS ABOUT ITSELF. Every field is a count; none of them is an opinion.
+//
+// `seeded` is the one boolean and it says the credit threshold was reached - NOT that this machine
+// has cryptographic-quality randomness. A guest resumed from a snapshot has a seeded pool and a host
+// that is about to hand it the same bytes again, and no field here can detect that: what the numbers
+// are for is letting an operator see that a machine is running on one paravirtual source.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EntropyHealth {
+	pub credited_bits: u32,
+	pub submissions: u32,
+	pub paravirtual_submissions: u32,
+	pub hardware_submissions: u32,
+	pub draws: u64,
+	// 1 when the credit threshold has been reached, 0 otherwise. A `u8` rather than a `bool` because
+	// this crosses the syscall boundary, where a `bool` with a value other than 0 or 1 is undefined
+	// behaviour the moment it is read.
+	pub seeded: u8,
+	// 1 when this machine has a hardware random instruction at all. Two of this system's three
+	// architectures do not, which is the fact that makes the pool worth having.
+	pub hardware_available: u8,
+	pub _pad: [u8; 6],
+}
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

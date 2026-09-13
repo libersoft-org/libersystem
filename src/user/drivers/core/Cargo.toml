@@ -35,6 +35,12 @@ bench = false
 required-features = ["development"]
 
 [[bin]]
+name = "virtio_rng"
+path = "src/virtio_rng.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "virtio_input"
 path = "src/virtio_input.rs"
 test = false

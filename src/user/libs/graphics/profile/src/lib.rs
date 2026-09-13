@@ -68,17 +68,27 @@ pub mod capability;
 pub mod compositing;
 pub mod contracts;
 pub mod geometry;
+pub mod hashing;
 pub mod image;
 pub mod layers;
 pub mod limits;
 pub mod render2d;
 pub mod render3d;
+// The numbers and rules behind the 3D feature list: clip space, formats, MSAA positions, depth
+// semantics, the sampler contract and the hazard policy. See the module.
+pub mod render3d_spec;
+// What a shader MEANS: overflow, division by zero, NaN, layout, derivatives, the strict arithmetic a
+// position depends on, and the serialised encoding. See the module.
+pub mod scene3d;
+pub mod scene3d_extended;
+pub mod shader_ir;
+pub mod thresholds;
 pub mod wsi;
 
 pub use capability::{Coverage, Range};
 pub use image::{AlphaMode, Carries, ColorSpace, Encoding, Format, IMAGE_COLOR_PROFILE_VERSION, Primaries, Semantics, Transfer, YuvLayout, YuvMatrix};
 pub use layers::{Boundary, Edge, Layer, Route};
-pub use limits::{RENDER2D_PROFILE_1_MINIMA, Render2DLimits};
+pub use limits::{RENDER2D_PROFILE_1_MIN_LIMITS, Render2DLimits};
 pub use render2d::{RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, Render2DFeature};
 pub use render3d::{RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS, Render3DFeature};
 

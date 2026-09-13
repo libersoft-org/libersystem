@@ -115,6 +115,7 @@ pub fn canonical() -> String {
 	] {
 		let _ = writeln!(out, "span={name} value={value}");
 	}
+	out.push_str(&crate::thresholds::canonical_for("image-colour", false));
 	out
 }
 
@@ -402,5 +403,6 @@ pub fn document(hash: &str) -> String {
 	] {
 		let _ = writeln!(out, "| {name} | {value} |");
 	}
+	out.push_str(&crate::thresholds::chapter("image-colour", false));
 	out
 }

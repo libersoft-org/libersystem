@@ -150,6 +150,18 @@ generate "$out" "${args[@]}"
 # capability report are generated from them with a hash over the canonical form. They are here
 # because a reader who has just edited a profile runs the command the generated file names, and
 # every generated file under docs/gen names this one.
+# THE LAST-RESORT FACE, WHICH IS GENERATED AND NOT IMPORTED. The licence decision for fonts admits
+# public domain and Unlicense only, so the only face this tree can stage is one it wrote - and a
+# staged binary nobody can regenerate is a binary nobody can audit. `--check` proves the bytes on
+# disk are the bytes this generator produces.
+font_gen=(cargo run --quiet --offline --manifest-path tools/font-gen/Cargo.toml --)
+[[ "$mode" == check ]] && font_gen+=(--check)
+if ((dry_run)); then
+	printf '%s\n' "${font_gen[*]}"
+else
+	(cd "$SRC_DIR" && "${font_gen[@]}")
+fi
+
 profile_doc=(cargo run --quiet --offline --manifest-path tools/profile-doc/Cargo.toml --)
 [[ "$mode" == check ]] && profile_doc+=(--check)
 if ((dry_run)); then

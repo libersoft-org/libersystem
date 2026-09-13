@@ -134,7 +134,7 @@ impl DrawList {
 	pub fn validate(&self) -> Result<(), Error> {
 		let mut clips = 0usize;
 		let mut layers = 0usize;
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		for command in &self.commands {
 			for (kind, index, length) in self.referenced(command) {
 				if index as usize >= length {
@@ -302,7 +302,7 @@ impl DrawListBuilder {
 	}
 
 	pub fn push(&mut self, command: Command) -> Result<(), Error> {
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		if self.commands.len() as u64 + 1 > limits.max_commands as u64 {
 			return Err(Error::LimitExceeded { limit: "commands", ceiling: limits.max_commands as u64 });
 		}
@@ -319,7 +319,7 @@ impl DrawListBuilder {
 	}
 
 	fn reserve_resource(&self, existing: usize) -> Result<(), Error> {
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		if existing as u64 + 1 > limits.max_resources as u64 {
 			return Err(Error::LimitExceeded { limit: "resources", ceiling: limits.max_resources as u64 });
 		}

@@ -1,0 +1,19 @@
+[package]
+name = "entropy"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "The entropy pool: what a seed is worth, and what a machine may conclude from one source"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# SHA-256, which already exists in this tree and is the only primitive this pool needs. A second
+# implementation of it here would be a second thing to keep correct, and the one nobody looks at is
+# the one that is wrong.
+bootproto = { path = "../../../boot/protocol" }
+
+# A WARNING IS AN ERROR HERE, as everywhere else in this tree.
+[lints.rust]
+warnings = "deny"

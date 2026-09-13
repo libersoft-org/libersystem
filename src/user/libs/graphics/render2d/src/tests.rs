@@ -113,7 +113,7 @@ fn a_handle_the_table_does_not_have_is_refused_by_name() {
 // and the ceiling is NAMED so the caller knows which way - "invalid" would leave them reading their
 // own drawing code.
 fn a_profile_ceiling_is_refused_by_name_while_building() {
-	let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+	let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 	let mut builder = PathBuilder::new();
 	builder.move_to(PointF { x: 0.0, y: 0.0 }).expect("a start");
 	let mut error = None;
@@ -154,7 +154,7 @@ fn a_filter_graph_is_acyclic_by_construction_and_its_bounds_run_backwards() {
 
 	// AND A RADIUS PAST THE PROFILE'S CEILING IS REFUSED, because the scratch a blur reserves is the
 	// scratch its radius decides.
-	let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+	let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 	let mut graph = FilterGraph::default();
 	graph.push(FilterNode::Source).expect("a source");
 	assert_eq!(graph.push(FilterNode::Blur { input: 0, x: limits.max_filter_radius as f32, y: 0.0 }).err(), Some(Error::LimitExceeded { limit: "filter radius", ceiling: limits.max_filter_radius as u64 }));
@@ -558,7 +558,7 @@ fn hostile_geometry_is_answered_rather_than_crashed_on() {
 	}
 
 	// DEEP NESTING, to the profile's own ceiling and one past it - and the refusal is by name.
-	let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+	let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 	let mut canvas = Canvas::new();
 	for _ in 0..limits.max_layer_depth {
 		canvas.begin_layer(None, 1.0, BlendMode::Normal, None).expect("within the ceiling");

@@ -96,5 +96,32 @@ pub fn document(hash: &str) -> String {
 	}
 	let _ = writeln!(out, "\nThe image model, the colour model, the formats and every numeric rule they need are in");
 	let _ = writeln!(out, "[`graphics/IMAGE_COLOR_PROFILE_1.md`](graphics/IMAGE_COLOR_PROFILE_1.md).\n");
+
+	// THE PROFILES, AND WHAT THEIR HASHES ARE HASHES OF. Written once, here, because it is one rule
+	// for every profile and a copy in each document would be several rules the moment one was
+	// corrected.
+	let _ = writeln!(out, "## The profiles\n");
+	let _ = writeln!(out, "Each profile is a machine-readable registry with a document generated from it and a SHA-256 over");
+	let _ = writeln!(out, "its canonical form. `docs/gen/profiles.manifest` binds the three together - name, version, hash,");
+	let _ = writeln!(out, "canonical file and document - and `./gen.sh --check` refuses any of them that disagrees.\n");
+	let _ = writeln!(out, "| profile | document |");
+	let _ = writeln!(out, "| --- | --- |");
+	for (name, path) in [
+		("Image Colour Profile 1", "graphics/IMAGE_COLOR_PROFILE_1.md"),
+		("Render2D Profile 1", "graphics/RENDER2D_PROFILE_1.md"),
+		("Render3D Profile 1", "graphics/RENDER3D_PROFILE_1.md"),
+		("Shader IR 1", "graphics/SHADER_IR_1.md"),
+		("Scene3D Core Profile 1", "graphics/SCENE3D_PROFILE_1.md"),
+		("Scene3D Extended 1", "graphics/SCENE3D_EXTENDED_1.md"),
+		("WSI Profile 1", "graphics/WSI_PROFILE_1.md"),
+	] {
+		let _ = writeln!(out, "| {name} | [`{path}`]({path}) |");
+	}
+	let _ = writeln!(out, "\n### How a profile is hashed\n");
+	let _ = writeln!(out, "| question | answer |");
+	let _ = writeln!(out, "| --- | --- |");
+	for rule in graphics_profile::hashing::CANONICAL_ENCODING {
+		let _ = writeln!(out, "| {} | {} |", rule.question, rule.answer);
+	}
 	out
 }

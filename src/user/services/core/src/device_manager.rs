@@ -798,7 +798,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						match channel_pair_for_catalogue(&mut catalogue_clients) {
 							// SAFETY: `start_dev_agent` maps the agent's ELF and reads it as a
 							// slice, which is the one genuinely unsafe thing on this path.
-							Some(connection) => dev.bootstrap = unsafe { start_dev_agent(dev.storage, connection, console_input, &dev.nonce) },
+							Some(connection) => dev.bootstrap = start_dev_agent(dev.storage, connection, console_input, &dev.nonce),
 							None => print(b"DeviceManager: no catalogue connection for the development agent; it is not started\n"),
 						}
 						if dev.bootstrap == 0 {
@@ -1067,9 +1067,9 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 		}
 		probe_blocks.push(minted);
 	}
-	// GLOBAL ON PURPOSE, unlike the takes in `route_offers`: this caller is choosing AMONG every
-	// block provider the boot found, by bus address, which is what `take` is for. See `take_from`
-	// for the other case, where one driver's own offers are being routed.
+	// GLOBAL ON PURPOSE: this caller is choosing AMONG every block provider the boot found, by bus
+	// address, which is what `take` is for. It is the last take in this program - the origin-scoped
+	// one it used to be contrasted with is gone, along with the consumer that needed it.
 	loop {
 		let taken = catalogue.take(driver_protocol::provider::BLOCK);
 		if taken == 0 {
@@ -2466,29 +2466,14 @@ impl Catalogue {
 	// inside `route_offers` and is therefore origin-scoped by construction. It is not: where a call
 	// SITS says nothing about what it SELECTS, and this one selected from the whole catalogue. The
 	// binding is what makes origin a rule rather than a likelihood, so it is passed in.
-	// THE LAST ROUTE THIS TAKES, and it is not a shipping one (2026-09-03).
+	// AND THERE IS NO PRIVATE TAKE LEFT AT ALL (2026-09-13).
 	//
-	// Every consumer of a published provider now subscribes or is handed a minted connection, so the
-	// only caller left is the development channel's raw byte pipe - which is not a provider anybody
-	// opens: it is the wire an agent this program starts speaks over, and it belongs to that agent
-	// alone. A shipping image has no such driver, so this method is not compiled into one.
-	#[cfg(feature = "development")]
-	fn take_from(&mut self, binding: BindingId, kind: u16) -> u64 {
-		let Some(slot) = self.entries.iter().position(|entry| entry.as_ref().is_some_and(|held| held.kind == kind && held.handle != 0 && held.binding_is(binding))) else {
-			return 0;
-		};
-		match self.entries[slot].as_mut() {
-			Some(provider) => {
-				let handle = provider.handle;
-				provider.handle = 0;
-				// One consumer, counted - the same rule `take` states below.
-				provider.consumers = provider.consumers.saturating_add(1);
-				handle
-			}
-			None => 0,
-		}
-	}
-
+	// `take_from` stood here: it lifted one binding's publication OUT of the catalogue and handed
+	// the raw channel to a consumer this program picked by the driver's artifact name. Its last
+	// caller was the development channel's byte pipe, and that pipe is now an ordinary provider -
+	// published, subscribed to, and opened by the agent itself. So the method has no caller in any
+	// image, and a routing primitive with no caller is not kept for the next one: what made it
+	// necessary was a consumer that could not ask, and there is no longer such a consumer.
 	fn take(&mut self, kind: u16) -> u64 {
 		// Deterministic handoff order only. StorageService classifies every probe and ServiceManager
 		// selects media roles from its table; USB discovery matches the exact publishing binding.

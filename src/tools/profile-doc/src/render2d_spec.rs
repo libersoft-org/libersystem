@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use graphics_profile::compositing::{BLENDS, COMPOSITING_EQUATION, NON_SEPARABLE_BLENDS, OPERATORS, lcd, model};
 use graphics_profile::contracts::{CONTENT_REFRESH, ON_MISMATCH, PREPARED_DEPENDENCIES, builder, filter};
 use graphics_profile::geometry::{AT_MAX_DEPTH, BOOLEAN_RULES, COINCIDENCE_EPSILON_PIXELS, FLATTENING_TOLERANCE_PIXELS, HORIZON_RULE, MAX_SUBDIVISION_DEPTH, PROJECTIVE_W_EPSILON};
-use graphics_profile::{RENDER2D_CORE_PROFILE_1, RENDER2D_PROFILE_1_MINIMA};
+use graphics_profile::{RENDER2D_CORE_PROFILE_1, RENDER2D_PROFILE_1_MIN_LIMITS};
 
 /// The canonical machine-readable form the hash is taken over.
 pub fn canonical() -> String {
@@ -43,9 +43,10 @@ pub fn canonical() -> String {
 	let _ = writeln!(out, "prepared on-mismatch={ON_MISMATCH} content-refresh={CONTENT_REFRESH}");
 	let _ = writeln!(out, "builder within={} beyond={} snapshots={} scratch={}", builder::WITHIN_RESERVATION, builder::BEYOND_RESERVATION, builder::SNAPSHOTS, builder::SCRATCH_REUSE);
 	let _ = writeln!(out, "filter shape={} bounds={} working={} edge={} scratch={}", filter::SHAPE, filter::BOUNDS_MAP, filter::WORKING_FORMAT, filter::EDGE_MODE, filter::SCRATCH);
-	let minima = RENDER2D_PROFILE_1_MINIMA;
+	let minima = RENDER2D_PROFILE_1_MIN_LIMITS;
 	let _ = writeln!(out, "minima commands={} resources={} path-verbs={} path-points={} subpaths={} clip-depth={} layer-depth={} filter-nodes={} filter-radius={} glyphs-per-run={} image-extent={} layer-pixels={} prepared-scratch={} cache={} display-list={}", minima.max_commands, minima.max_resources, minima.max_path_verbs, minima.max_path_points, minima.max_subpaths, minima.max_clip_depth, minima.max_layer_depth, minima.max_filter_nodes, minima.max_filter_radius, minima.max_glyphs_per_run, minima.max_image_extent, minima.max_layer_pixels, minima.max_prepared_scratch_bytes, minima.max_cache_bytes, minima.max_display_list_bytes);
 	let _ = writeln!(out, "features={}", RENDER2D_CORE_PROFILE_1.len());
+	out.push_str(&crate::thresholds::canonical_for("render2d", false));
 	out
 }
 
@@ -190,27 +191,32 @@ pub fn document(hash: &str) -> String {
 	let _ = writeln!(out, "## Guaranteed minima\n");
 	let _ = writeln!(out, "A backend may raise any of them; none may be lowered. Without them \"supports Profile 1\" can mean");
 	let _ = writeln!(out, "\"accepts ten path points\".\n");
-	let minima = RENDER2D_PROFILE_1_MINIMA;
-	let _ = writeln!(out, "| limit | minimum |");
-	let _ = writeln!(out, "| --- | ---: |");
-	for (name, value) in [
-		("commands in one list", minima.max_commands as u64),
-		("distinct resources", minima.max_resources as u64),
-		("path verbs", minima.max_path_verbs as u64),
-		("path points", minima.max_path_points as u64),
-		("subpaths", minima.max_subpaths as u64),
-		("clip depth", minima.max_clip_depth as u64),
-		("layer depth", minima.max_layer_depth as u64),
-		("filter nodes", minima.max_filter_nodes as u64),
-		("filter radius, device pixels", minima.max_filter_radius as u64),
-		("glyphs per run", minima.max_glyphs_per_run as u64),
-		("image extent", minima.max_image_extent as u64),
-		("layer pixels", minima.max_layer_pixels),
-		("prepared scratch bytes", minima.max_prepared_scratch_bytes),
-		("cache bytes", minima.max_cache_bytes),
-		("display-list bytes", minima.max_display_list_bytes),
+	let minima = RENDER2D_PROFILE_1_MIN_LIMITS;
+	// THE FIELD NAME IS THE FIRST COLUMN, not the prose. An implementer looks a floor up by the name
+	// it has in `Render2DLimits`, and a document that only described them in words could not be
+	// checked against the structure it is describing - which is exactly the check `profile-doc`
+	// applies to all four profile documents.
+	let _ = writeln!(out, "| limit | what it bounds | minimum |");
+	let _ = writeln!(out, "| --- | --- | ---: |");
+	for (field, name, value) in [
+		("max_commands", "commands in one list", minima.max_commands as u64),
+		("max_resources", "distinct resources", minima.max_resources as u64),
+		("max_path_verbs", "path verbs", minima.max_path_verbs as u64),
+		("max_path_points", "path points", minima.max_path_points as u64),
+		("max_subpaths", "subpaths", minima.max_subpaths as u64),
+		("max_clip_depth", "clip depth", minima.max_clip_depth as u64),
+		("max_layer_depth", "layer depth", minima.max_layer_depth as u64),
+		("max_filter_nodes", "filter nodes", minima.max_filter_nodes as u64),
+		("max_filter_radius", "filter radius, device pixels", minima.max_filter_radius as u64),
+		("max_glyphs_per_run", "glyphs per run", minima.max_glyphs_per_run as u64),
+		("max_image_extent", "image extent", minima.max_image_extent as u64),
+		("max_layer_pixels", "layer pixels", minima.max_layer_pixels),
+		("max_prepared_scratch_bytes", "prepared scratch bytes", minima.max_prepared_scratch_bytes),
+		("max_cache_bytes", "cache bytes", minima.max_cache_bytes),
+		("max_display_list_bytes", "display-list bytes", minima.max_display_list_bytes),
 	] {
-		let _ = writeln!(out, "| {name} | {value} |");
+		let _ = writeln!(out, "| `{field}` | {name} | {value} |");
 	}
+	out.push_str(&crate::thresholds::chapter("render2d", false));
 	out
 }

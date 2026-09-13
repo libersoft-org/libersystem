@@ -153,6 +153,11 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// because there is no other process it could name: a table of addresses in another address space
 	// would mean nothing here.
 	(SYS_PROCESS_LIFECYCLE, 82),
+	// ENTROPY IN, AND WHAT THE POOL HOLDS. The submitter hands over bytes and the KERNEL decides
+	// what they are credited - a driver that could name its own credit could seed a machine to
+	// "fully seeded" with a constant, and nothing downstream of `SYS_RANDOM_GET` could tell.
+	(SYS_ENTROPY_ADD, 83),
+	(SYS_ENTROPY_HEALTH, 84),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -699,6 +704,20 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	);
 
 	assert_layout!(covered, MemoryStats, 32, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24);
+	// THE TWO BOOLEANS ARE `u8` AND THE PADDING IS EXPLICIT, which is what makes this struct safe to
+	// build out of bytes a caller supplied: a `bool` holding anything but 0 or 1 is undefined
+	// behaviour the moment it is read, and implicit tail padding is bytes nobody has agreed about.
+	assert_layout!(
+		covered, EntropyHealth, 32, 8,
+		credited_bits => 0,
+		submissions => 4,
+		paravirtual_submissions => 8,
+		hardware_submissions => 12,
+		draws => 16,
+		seeded => 24,
+		hardware_available => 25,
+		_pad => 26,
+	);
 	assert_layout!(covered, MemmapRegion, 24, 8, base => 0, length => 8, kind => 16, _pad => 20);
 	assert_layout!(covered, ModuleLifecycle, 40, 8, init_array => 0, init_count => 8, fini_array => 16, fini_count => 24, is_main_image => 32);
 	assert_layout!(covered, IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);

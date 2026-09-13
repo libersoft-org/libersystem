@@ -113,17 +113,17 @@ fn the_3d_profile_carries_every_depth_format_sample_count_and_readback_the_plan_
 
 #[test]
 fn a_declaration_below_the_guaranteed_minima_is_refused_and_names_the_field() {
-	assert_eq!(RENDER2D_PROFILE_1_MINIMA.meets_profile_1(), Ok(()), "the minima meet themselves");
+	assert_eq!(RENDER2D_PROFILE_1_MIN_LIMITS.meets_profile_1(), Ok(()), "the minima meet themselves");
 	// RAISING IS ALLOWED AND LOWERING IS NOT, which is what "guaranteed minimum" means.
-	let generous = Render2DLimits { max_commands: RENDER2D_PROFILE_1_MINIMA.max_commands * 2, ..RENDER2D_PROFILE_1_MINIMA };
+	let generous = Render2DLimits { max_commands: RENDER2D_PROFILE_1_MIN_LIMITS.max_commands * 2, ..RENDER2D_PROFILE_1_MIN_LIMITS };
 	assert_eq!(generous.meets_profile_1(), Ok(()));
 	// EVERY FIELD IS CHECKED, one at a time, and the refusal names the one that is short - which is
 	// the difference between a reader raising the right number and comparing fifteen pairs by hand.
-	let short = Render2DLimits { max_path_points: 10, ..RENDER2D_PROFILE_1_MINIMA };
+	let short = Render2DLimits { max_path_points: 10, ..RENDER2D_PROFILE_1_MIN_LIMITS };
 	assert_eq!(short.meets_profile_1(), Err("max_path_points"), "a profile that accepted ten path points is what the minima exist to refuse");
-	let shallow = Render2DLimits { max_clip_depth: 1, ..RENDER2D_PROFILE_1_MINIMA };
+	let shallow = Render2DLimits { max_clip_depth: 1, ..RENDER2D_PROFILE_1_MIN_LIMITS };
 	assert_eq!(shallow.meets_profile_1(), Err("max_clip_depth"));
-	let small_layer = Render2DLimits { max_layer_pixels: 1, ..RENDER2D_PROFILE_1_MINIMA };
+	let small_layer = Render2DLimits { max_layer_pixels: 1, ..RENDER2D_PROFILE_1_MIN_LIMITS };
 	assert_eq!(small_layer.meets_profile_1(), Err("max_layer_pixels"));
 }
 
@@ -713,4 +713,624 @@ fn the_window_system_numbers_and_lists_are_frozen() {
 	assert_eq!(producer.client_rights, "SEND");
 	assert_eq!(done.service_rights, "SEND");
 	assert!(done.client_rights.contains("RECEIVE") && !done.client_rights.contains("SEND"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// `Render3D Profile 1`: the numbers and the rules.
+//
+// A SPECIFICATION REGISTRY IS ONLY WORTH WHAT ITS SELF-CONSISTENCY IS. These do not check that the
+// answers are the right ones - nothing can, they are decisions - but they check that the registry
+// cannot answer one question twice, cannot declare a capability that contradicts another, and cannot
+// lose an entry the feature list requires it to have.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn no_question_in_the_render3d_registry_has_two_answers() {
+	use crate::render3d_spec::{CLIP_COORD_Q, DEPTH_RULES, HAZARD_RULES, MSAA_RULES, PROVOKING_VERTEX, SAMPLER_RULES, SUBMISSION_RULES, VERTEX_NORMALISATION};
+	// A registry with the same question twice is a registry whose reader gets whichever answer the
+	// iteration reached first, and the two need not agree.
+	for (name, rules) in [
+		("clip-coord-q", CLIP_COORD_Q),
+		("provoking-vertex", PROVOKING_VERTEX),
+		("vertex-normalisation", VERTEX_NORMALISATION),
+		("msaa", MSAA_RULES),
+		("depth", DEPTH_RULES),
+		("sampler", SAMPLER_RULES),
+		("hazard", HAZARD_RULES),
+		("submission", SUBMISSION_RULES),
+	] {
+		for (index, rule) in rules.iter().enumerate() {
+			assert!(!rule.question.is_empty(), "{name} has an empty question");
+			assert!(!rule.answer.is_empty(), "{name}: `{}` has no answer", rule.question);
+			assert!(rules[..index].iter().all(|earlier| earlier.question != rule.question), "{name} answers `{}` twice", rule.question);
+		}
+	}
+}
+
+#[test]
+fn every_multisample_position_is_inside_its_pixel_and_distinct() {
+	use crate::render3d_spec::{MSAA_2X, MSAA_4X};
+	for (count, samples) in [(2usize, MSAA_2X), (4usize, MSAA_4X)] {
+		assert_eq!(samples.len(), count, "the {count}x table must have {count} positions");
+		for (index, sample) in samples.iter().enumerate() {
+			// THE INDEX IS THE SAMPLE MASK'S BIT NUMBER, so a table whose indices are not 0..n is a
+			// table where a mask names the wrong sample.
+			assert_eq!(sample.index as usize, index);
+			assert!(sample.x > 0.0 && sample.x < 1.0, "sample {index} of {count}x is outside its pixel in x");
+			assert!(sample.y > 0.0 && sample.y < 1.0, "sample {index} of {count}x is outside its pixel in y");
+			// Two samples at one position is a coverage level that can never be produced.
+			for earlier in &samples[..index] {
+				assert!(earlier.x != sample.x || earlier.y != sample.y, "samples {} and {index} of {count}x are at the same point", earlier.index);
+			}
+		}
+	}
+	// AND THE 4x GRID IS ROTATED, not axis-aligned: no two samples share a row or a column, which is
+	// the whole reason a rotated grid gives a near-horizontal edge more than two coverage levels.
+	for (index, sample) in MSAA_4X.iter().enumerate() {
+		for earlier in &MSAA_4X[..index] {
+			assert!(earlier.x != sample.x, "two 4x samples share a column, which is an axis-aligned grid");
+			assert!(earlier.y != sample.y, "two 4x samples share a row, which is an axis-aligned grid");
+		}
+	}
+}
+
+#[test]
+fn a_format_capability_row_cannot_contradict_itself() {
+	use crate::render3d_spec::COLOUR_FORMATS;
+	for format in COLOUR_FORMATS {
+		// Filtering is a way of sampling, blending is a way of writing an attachment, and an
+		// attachment is a thing that is rendered to. A row that claimed the second without the first
+		// would be a row no backend could implement as written.
+		assert!(!format.filterable || format.sampled, "{}: filterable without sampled", format.name);
+		assert!(!format.blendable || format.renderable, "{}: blendable without renderable", format.name);
+		assert!(!format.attachment || format.renderable, "{}: an attachment that is not renderable", format.name);
+		assert!(!format.msaa || format.renderable, "{}: multisampled without being renderable", format.name);
+		assert!(format.bits_per_texel > 0 && format.bits_per_texel % 8 == 0, "{}: a texel that is not a whole number of bytes", format.name);
+		// THE FULL NAME IS THE POINT OF THE COLUMN. `RGBA8` says nothing about whether it is
+		// normalised or sRGB-encoded, and the table exists to stop that being a guess.
+		assert!(format.full_name.len() > format.name.len(), "{}: the full name is not fuller than the short one", format.name);
+	}
+	// The profile's own feature list names seven colour formats, and this table is the same seven.
+	assert_eq!(COLOUR_FORMATS.len(), 7);
+}
+
+#[test]
+fn the_clip_plane_order_starts_at_the_horizon_and_the_epsilon_is_the_two_d_one() {
+	use crate::geometry::PROJECTIVE_W_EPSILON;
+	use crate::render3d_spec::{CLIP_PLANE_ORDER, CLIP_W_EPSILON};
+	// The w plane is FIRST or a vertex just behind the eye is divided before it is clipped, which is
+	// the coordinate at ten million pixels this order exists to prevent.
+	assert!(CLIP_PLANE_ORDER[0].starts_with("w ="), "the horizon plane must be clipped first");
+	assert_eq!(CLIP_PLANE_ORDER.len(), 7, "six volume planes and the horizon");
+	// ONE EPSILON FOR ONE QUESTION. A projective singularity does not become a different singularity
+	// because the geometry has three dimensions, and a reader who learned the 2D value has learned
+	// this one.
+	assert_eq!(CLIP_W_EPSILON, PROJECTIVE_W_EPSILON);
+}
+
+#[test]
+fn every_topology_in_the_feature_list_has_a_provoking_vertex_rule() {
+	use crate::render3d_spec::PROVOKING_VERTEX;
+	// A `flat` attribute without a rule for a topology is a colour that depends on the backend, and
+	// the feature list has six topologies plus primitive restart.
+	for topology in ["triangle list", "triangle strip", "triangle fan", "line list", "line strip", "point list", "after primitive restart", "after fan triangulation"] {
+		assert!(PROVOKING_VERTEX.iter().any(|rule| rule.question == topology), "no provoking-vertex rule for `{topology}`");
+	}
+}
+
+#[test]
+fn every_qualifier_says_what_a_clip_does_to_it() {
+	use crate::render3d_spec::QUALIFIERS;
+	// The five the shader model has. A qualifier whose clip behaviour is unstated is the kink at a
+	// clip edge that this whole section exists to remove.
+	assert_eq!(QUALIFIERS.len(), 5);
+	for name in ["smooth", "noperspective", "flat", "centroid", "sample"] {
+		let qualifier = QUALIFIERS.iter().find(|qualifier| qualifier.name == name).unwrap_or_else(|| panic!("no rule for `{name}`"));
+		assert!(!qualifier.at_a_clip_intersection.is_empty());
+		assert!(!qualifier.why.is_empty(), "`{name}` states a rule and not a reason");
+	}
+	// AND THE THREE BASE QUALIFIERS DIFFER FROM EACH OTHER AT A CLIP, which is the property the
+	// section is about: homogeneous for `smooth`, projected for `noperspective`, unchanged for
+	// `flat`. A registry where two of them said the same thing would have lost the distinction.
+	let smooth = QUALIFIERS.iter().find(|qualifier| qualifier.name == "smooth").expect("smooth");
+	let noperspective = QUALIFIERS.iter().find(|qualifier| qualifier.name == "noperspective").expect("noperspective");
+	let flat = QUALIFIERS.iter().find(|qualifier| qualifier.name == "flat").expect("flat");
+	assert_ne!(smooth.at_a_clip_intersection, noperspective.at_a_clip_intersection);
+	assert_ne!(smooth.at_a_clip_intersection, flat.at_a_clip_intersection);
+}
+
+#[test]
+fn every_minimum_limit_is_a_floor_somebody_could_fail() {
+	use crate::render3d_spec::RENDER3D_PROFILE_1_MIN_LIMITS;
+	for limit in RENDER3D_PROFILE_1_MIN_LIMITS {
+		// A minimum of zero is not a floor: it is the absence of one written down.
+		assert!(limit.minimum > 0, "{} has no floor", limit.name);
+		assert!(!limit.why.is_empty(), "{} states a number and not a reason", limit.name);
+	}
+	// The ones an implementation is most tempted to under-provide, pinned by value so a later edit
+	// that lowered them is a visible change rather than a quiet one.
+	let by_name = |name: &str| RENDER3D_PROFILE_1_MIN_LIMITS.iter().find(|limit| limit.name == name).unwrap_or_else(|| panic!("no minimum for `{name}`")).minimum;
+	assert_eq!(by_name("max_texture_extent_2d"), 4096);
+	assert_eq!(by_name("max_colour_attachments"), 4);
+	assert_eq!(by_name("max_draws_per_pass"), 65536);
+	assert_eq!(by_name("max_shader_instructions"), 4096);
+}
+
+#[test]
+fn the_depth32f_question_is_answered_rather_than_described() {
+	use crate::render3d_spec::{DEPTH_FORMATS, DEPTH32F_ANSWER};
+	// THE PLAN NAMES THIS ONE BY NAME as the question the freeze has to settle, and an answer that
+	// listed the alternatives would be the open question with more words.
+	assert!(DEPTH32F_ANSWER.contains("NOT QUANTISED"), "the answer must say which of the two behaviours this profile has");
+	assert!(DEPTH32F_ANSWER.contains("LessOrEqual"), "the answer must state the consequence a caller has to act on");
+	assert_eq!(DEPTH_FORMATS.len(), 5);
+	let depth32f = DEPTH_FORMATS.iter().find(|format| format.name == "Depth32F").expect("Depth32F");
+	assert!(depth32f.comparison.contains("STORED FLOATS"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// `Shader IR 1`: what a shader means.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn no_question_in_the_shader_ir_registry_has_two_answers() {
+	use crate::shader_ir::{CONVERSION_RULES, ENCODING_RULES, MATRIX_LAYOUT, NUMERIC_RULES, STAGE_RULES, STRICT_F32_RULES, UNIFORM_LAYOUT};
+	for (name, rules) in [
+		("numeric", NUMERIC_RULES),
+		("conversion", CONVERSION_RULES),
+		("uniform-layout", UNIFORM_LAYOUT),
+		("matrix-layout", MATRIX_LAYOUT),
+		("stage", STAGE_RULES),
+		("strict-f32", STRICT_F32_RULES),
+		("encoding", ENCODING_RULES),
+	] {
+		for (index, rule) in rules.iter().enumerate() {
+			assert!(!rule.answer.is_empty(), "{name}: `{}` has no answer", rule.question);
+			assert!(rules[..index].iter().all(|earlier| earlier.question != rule.question), "{name} answers `{}` twice", rule.question);
+		}
+	}
+}
+
+#[test]
+fn every_undefined_behaviour_a_shading_language_usually_has_is_defined_here() {
+	use crate::shader_ir::NUMERIC_RULES;
+	// THE LIST IS THE POINT. Each of these is undefined in at least one shipping shading language,
+	// and each has produced a bug that behaves differently on two machines. A registry that lost one
+	// of them would be a specification with a hole exactly where implementations differ.
+	for question in [
+		"signed integer overflow",
+		"integer division by zero",
+		"integer modulo by zero",
+		"float division by zero",
+		"NaN comparison",
+		"signed zero",
+		"subnormals",
+		"uninitialised values",
+		"out-of-bounds array read",
+		"out-of-bounds array write",
+	] {
+		let rule = NUMERIC_RULES.iter().find(|rule| rule.question == question).unwrap_or_else(|| panic!("`{question}` is not answered"));
+		// "IT IS UNDEFINED" AS AN ANSWER WOULD BE THE QUESTION RESTATED. The word itself is allowed
+		// and is used deliberately - several of these answers say what they are NOT, and "not
+		// undefined" is the most useful thing to say about a behaviour every other system leaves
+		// open. What is refused is the answer that declares it.
+		assert!(!rule.answer.to_ascii_lowercase().contains("is undefined"), "`{question}` is answered with `undefined`");
+	}
+}
+
+#[test]
+fn an_out_of_bounds_read_answers_zero_rather_than_a_plausible_neighbour() {
+	use crate::shader_ir::NUMERIC_RULES;
+	let read = NUMERIC_RULES.iter().find(|rule| rule.question == "out-of-bounds array read").expect("the read rule");
+	assert!(read.answer.contains("ZERO"));
+	// Clamping to the last element is the alternative, and it is the one that hides the bug: the
+	// shader reads a real value from the wrong place and the picture looks almost right.
+	assert!(read.answer.contains("not a clamp"), "the rule must say what it is NOT, because the alternative is the plausible one");
+	let write = NUMERIC_RULES.iter().find(|rule| rule.question == "out-of-bounds array write").expect("the write rule");
+	assert!(write.answer.contains("DISCARDED"));
+}
+
+#[test]
+fn every_accuracy_bound_is_a_number_and_sqrt_is_exact() {
+	use crate::shader_ir::TRANSCENDENTAL_ACCURACY;
+	for accuracy in TRANSCENDENTAL_ACCURACY {
+		assert!(!accuracy.domain.is_empty(), "{} states a bound over no domain", accuracy.operation);
+		// A bound above 16 ULP is not a bound: it admits an implementation a conformance suite
+		// cannot distinguish from a wrong one.
+		assert!(accuracy.max_ulp <= 16, "{} has a bound that admits anything", accuracy.operation);
+	}
+	let sqrt = TRANSCENDENTAL_ACCURACY.iter().find(|accuracy| accuracy.operation == "sqrt").expect("sqrt");
+	// It is an IEEE 754 operation, so 0 ULP is not a demand - it is what every implementation
+	// already does, and accepting less would be admitting a backend that reimplemented it worse.
+	assert_eq!(sqrt.max_ulp, 0);
+}
+
+#[test]
+fn the_strict_path_refuses_what_it_cannot_reproduce_and_says_where() {
+	use crate::shader_ir::STRICT_F32_RULES;
+	let transcendental = STRICT_F32_RULES.iter().find(|rule| rule.question == "a transcendental on a position path").expect("the transcendental rule");
+	// `sqrt` is allowed and `sin` is not, and the distinction is the accuracy bound - which is the
+	// only principled line between them.
+	assert!(transcendental.answer.contains("sqrt") && transcendental.answer.contains("sin"));
+	let refusal = STRICT_F32_RULES.iter().find(|rule| rule.question == "what happens on a refusal").expect("the refusal rule");
+	// AT LOAD AND NOT AT DRAW. A shader that compiles and then refuses to draw is a failure nobody
+	// can attribute to the line that caused it.
+	assert!(refusal.answer.contains("Not at draw time"));
+	let fragment = STRICT_F32_RULES.iter().find(|rule| rule.question == "fragment arithmetic").expect("the fragment rule");
+	assert!(fragment.answer.contains("does NOT acquire strict requirements"));
+}
+
+#[test]
+fn a_discarded_lane_keeps_running_so_its_neighbours_derivatives_are_real() {
+	use crate::shader_ir::STAGE_RULES;
+	let discard = STAGE_RULES.iter().find(|rule| rule.question == "a derivative after `discard`").expect("the discard rule");
+	assert!(discard.answer.contains("HELPER LANE"));
+	let helper = STAGE_RULES.iter().find(|rule| rule.question == "helper lanes").expect("the helper rule");
+	// It runs AND writes nothing: either half alone is a different and wrong contract.
+	assert!(helper.answer.contains("RUNS") && helper.answer.contains("WRITES NOTHING"));
+	// And implicit LOD is fragment-only, because no other stage has a quad to take a derivative over.
+	let implicit = STAGE_RULES.iter().find(|rule| rule.question == "implicit LOD").expect("the LOD rule");
+	assert!(implicit.answer.contains("FRAGMENT stage only"));
+}
+
+#[test]
+fn the_encoding_refuses_an_unknown_instruction_rather_than_skipping_it() {
+	use crate::shader_ir::{ENCODING_RULES, SHADER_IR_VERSION};
+	assert_eq!(SHADER_IR_VERSION, 1);
+	let forward = ENCODING_RULES.iter().find(|rule| rule.question == "forward compatibility").expect("the compatibility rule");
+	// Skipping produces a program that RUNS and computes something else, which is the failure mode a
+	// refusal exists to prevent.
+	assert!(forward.answer.contains("REFUSAL"));
+	let identity = ENCODING_RULES.iter().find(|rule| rule.question == "instruction identity").expect("the identity rule");
+	assert!(identity.answer.contains("retired rather than reused"));
+	let constants = ENCODING_RULES.iter().find(|rule| rule.question == "canonical constants").expect("the constant rule");
+	// `-0.0` normalised to `0.0` changes the sign of a division, which is a real picture difference.
+	assert!(constants.answer.contains("-0.0"));
+}
+
+#[test]
+fn a_three_component_vector_is_aligned_as_four_and_a_matrix_is_column_major() {
+	use crate::shader_ir::{MATRIX_LAYOUT, UNIFORM_LAYOUT};
+	let vec3 = UNIFORM_LAYOUT.iter().find(|rule| rule.question.contains("three- or four-component")).expect("the vec3 rule");
+	// THE ONE EVERYBODY GETS WRONG ONCE, and the host side writes bytes against it.
+	assert!(vec3.answer.contains("FOUR times"));
+	let order = MATRIX_LAYOUT.iter().find(|rule| rule.question == "the order").expect("the matrix order");
+	assert!(order.answer.contains("COLUMN-MAJOR"));
+	let multiply = MATRIX_LAYOUT.iter().find(|rule| rule.question == "multiplication order").expect("the multiplication order");
+	// A profile that stated the storage order and not the multiplication order would still let two
+	// implementations transpose each other.
+	assert!(multiply.answer.contains("COLUMN"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// `Scene3D Core Profile 1`: the retained layer's contract.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn no_question_in_the_scene3d_registry_has_two_answers() {
+	use crate::scene3d::{CAMERA_RULES, CULLING_RULES, HIERARCHY_RULES, INSTANCING_RULES, LIGHTING_RULES, MATERIAL_RULES, PICKING_RULES, QUEUE_RULES};
+	for (name, rules) in [
+		("hierarchy", HIERARCHY_RULES),
+		("camera", CAMERA_RULES),
+		("queue", QUEUE_RULES),
+		("culling", CULLING_RULES),
+		("instancing", INSTANCING_RULES),
+		("material", MATERIAL_RULES),
+		("lighting", LIGHTING_RULES),
+		("picking", PICKING_RULES),
+	] {
+		for (index, rule) in rules.iter().enumerate() {
+			assert!(!rule.answer.is_empty(), "{name}: `{}` has no answer", rule.question);
+			assert!(rules[..index].iter().all(|earlier| earlier.question != rule.question), "{name} answers `{}` twice", rule.question);
+		}
+	}
+}
+
+#[test]
+fn the_three_queues_order_and_write_depth_the_way_transparency_needs() {
+	use crate::scene3d::QUEUES;
+	assert_eq!(QUEUES.len(), 3);
+	let opaque = &QUEUES[0];
+	let mask = &QUEUES[1];
+	let transparent = &QUEUES[2];
+	assert_eq!((opaque.name, mask.name, transparent.name), ("Opaque", "AlphaMask", "Transparent"));
+	// FRONT TO BACK for the two that write depth, so the depth test rejects the most fragments;
+	// BACK TO FRONT for the one that blends, because a blend is order-dependent.
+	assert!(opaque.order.contains("FRONT TO BACK"));
+	assert!(transparent.order.contains("BACK TO FRONT"));
+	// AND THE TRANSPARENT QUEUE DOES NOT WRITE DEPTH. Writing it makes a transparent surface hide
+	// the one behind it, which is the commonest transparency bug there is.
+	assert!(opaque.depth_write && mask.depth_write);
+	assert!(!transparent.depth_write);
+	// The sort must be stable, or two coincident objects flicker between frames.
+	assert!(transparent.order.contains("STABLE"));
+}
+
+#[test]
+fn the_transform_order_and_the_normal_matrix_are_both_stated() {
+	use crate::scene3d::HIERARCHY_RULES;
+	let compose = HIERARCHY_RULES.iter().find(|rule| rule.question == "transform composition order").expect("the composition rule");
+	// The three do not commute, and a scene authored under one order looks wrong under the other.
+	assert!(compose.answer.contains("TRANSLATION * ROTATION * SCALE"));
+	let normals = HIERARCHY_RULES.iter().find(|rule| rule.question == "non-uniform scale and normals").expect("the normal rule");
+	assert!(normals.answer.contains("INVERSE TRANSPOSE"));
+}
+
+#[test]
+fn the_light_accumulation_order_is_fixed_because_addition_is_not_associative() {
+	use crate::scene3d::LIGHTING_RULES;
+	let which = LIGHTING_RULES.iter().find(|rule| rule.question == "which lights affect a drawable").expect("the selection rule");
+	// TWO IMPLEMENTATIONS THAT ACCUMULATE IN DIFFERENT ORDERS PRODUCE DIFFERENT COLOURS, which a
+	// conformance comparison sees - so the order is part of the profile rather than an optimisation.
+	assert!(which.answer.contains("DESCENDING contribution"));
+	assert!(which.answer.contains("not associative"));
+	let accumulate = LIGHTING_RULES.iter().find(|rule| rule.question == "accumulation").expect("the accumulation rule");
+	assert!(accumulate.answer.contains("linear space"));
+	// Shadows are Extended, and the core profile says so rather than leaving it to be discovered.
+	assert!(accumulate.answer.contains("Unshadowed"));
+}
+
+#[test]
+fn blinn_phong_states_its_equation_rather_than_its_name() {
+	use crate::scene3d::MATERIALS;
+	assert_eq!(MATERIALS.len(), 4);
+	for name in ["Unlit", "VertexColor", "Lambert", "BlinnPhong"] {
+		assert!(MATERIALS.iter().any(|material| material.name == name), "`{name}` is not in the core material set");
+	}
+	let blinn = MATERIALS.iter().find(|material| material.name == "BlinnPhong").expect("BlinnPhong");
+	// THE HALF VECTOR IS WHAT MAKES IT BLINN-PHONG. A material named for an equation and specified
+	// without one is a material two implementations write differently.
+	assert!(blinn.equation.contains("normalize(L + V)"));
+	assert!(blinn.equation.contains("shininess"));
+	// And every material's equation is an equation, not a description.
+	for material in MATERIALS {
+		assert!(material.equation.contains('='), "{} has no equation", material.name);
+	}
+}
+
+#[test]
+fn a_bounding_sphere_does_not_grow_as_its_object_rotates() {
+	use crate::scene3d::CULLING_RULES;
+	let derive = CULLING_RULES.iter().find(|rule| rule.question == "how the world sphere is derived").expect("the derivation rule");
+	// Recomputing a tight box per frame is the bounds that inflate until everything is visible.
+	assert!(derive.answer.contains("LARGEST of the three axis scale factors"));
+	let unbounded = CULLING_RULES.iter().find(|rule| rule.question == "a drawable with no bounds").expect("the unbounded rule");
+	assert!(unbounded.answer.contains("NEVER culled"));
+	let observable = CULLING_RULES.iter().find(|rule| rule.question == "whether culling is observable").expect("the observability rule");
+	assert!(observable.answer.contains("only in performance"));
+}
+
+#[test]
+fn picking_answers_what_rather_than_where_and_reserves_zero() {
+	use crate::scene3d::PICKING_RULES;
+	let read = PICKING_RULES.iter().find(|rule| rule.question == "what is read").expect("the read rule");
+	assert!(read.answer.contains("integer attachment"));
+	let id = PICKING_RULES.iter().find(|rule| rule.question == "the id").expect("the id rule");
+	// Zero reserved is what makes a pick on the background unambiguous rather than a valid id.
+	assert!(id.answer.contains("Zero is reserved"));
+}
+
+#[test]
+fn every_scene_minimum_is_a_floor_with_a_reason() {
+	use crate::scene3d::SCENE3D_PROFILE_1_MIN_LIMITS;
+	for limit in SCENE3D_PROFILE_1_MIN_LIMITS {
+		assert!(limit.minimum > 0, "{} has no floor", limit.name);
+		assert!(!limit.why.is_empty(), "{} states a number and not a reason", limit.name);
+	}
+	let by_name = |name: &str| SCENE3D_PROFILE_1_MIN_LIMITS.iter().find(|limit| limit.name == name).unwrap_or_else(|| panic!("no minimum for `{name}`")).minimum;
+	// The depth floor is the one a recursive traversal depends on, and it is bounded on BOTH sides
+	// by the reason: deep enough for an articulated model, shallow enough not to overflow a stack.
+	assert_eq!(by_name("max_hierarchy_depth"), 64);
+	assert_eq!(by_name("max_lights_per_drawable"), 8);
+	assert_eq!(by_name("max_instances_per_drawable"), 4096);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `Scene3D Extended 1`: the equations.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn every_pbr_term_is_an_equation_and_says_why_this_one() {
+	use crate::scene3d_extended::PBR_TERMS;
+	assert_eq!(PBR_TERMS.len(), 5);
+	for term in PBR_TERMS {
+		assert!(term.equation.contains('='), "{} names a function without giving it", term.name);
+		// WHY THIS ONE is the column that matters: every published renderer picks slightly different
+		// terms, and a profile that listed its choices without the reason cannot be argued with.
+		assert!(!term.why.is_empty(), "{} states an equation and not a reason", term.name);
+	}
+	let visibility = PBR_TERMS.iter().find(|term| term.name.contains("visibility")).expect("the visibility term");
+	// THE FOUR-TIMES-TOO-BRIGHT BUG. The Smith visibility form used here absorbs the specular
+	// denominator, and an implementation that divided again would halve every highlight.
+	assert!(visibility.why.contains("denominator"));
+	let distribution = PBR_TERMS.iter().find(|term| term.name.contains("normal distribution")).expect("the NDF");
+	assert!(distribution.equation.contains("roughness^2"));
+}
+
+#[test]
+fn the_roughness_floor_exists_because_zero_is_a_delta_function() {
+	use crate::scene3d_extended::PBR_CONSTANTS;
+	let minimum = PBR_CONSTANTS.iter().find(|rule| rule.question == "the minimum roughness").expect("the roughness floor");
+	assert!(minimum.answer.contains("0.045"));
+	// A roughness of zero is an infinite highlight at one pixel and a NaN in a filtered environment
+	// lookup, which is why the floor is a value rather than a suggestion.
+	assert!(minimum.answer.contains("NaN"));
+	let remap = PBR_CONSTANTS.iter().find(|rule| rule.question == "the roughness remapping").expect("the remapping");
+	assert!(remap.answer.contains("PERCEPTUAL"));
+}
+
+#[test]
+fn the_split_sum_states_both_halves_because_one_is_useless_alone() {
+	use crate::scene3d_extended::ENVIRONMENT_RULES;
+	let split = ENVIRONMENT_RULES.iter().find(|rule| rule.question == "the split-sum approximation").expect("the split sum");
+	assert!(split.answer.contains("prefiltered") && split.answer.contains("brdf"));
+	let table = ENVIRONMENT_RULES.iter().find(|rule| rule.question == "the BRDF lookup table").expect("the table");
+	// ITS GENERATION IS PART OF THE PROFILE, or two implementations build two different tables and
+	// the prefilter that matches one is wrong with the other.
+	assert!(table.answer.contains("generated by the same GGX and Smith terms"));
+}
+
+#[test]
+fn the_shadow_bias_is_named_rather_than_left_to_be_tuned() {
+	use crate::scene3d_extended::SHADOW_RULES;
+	let bias = SHADOW_RULES.iter().find(|rule| rule.question == "the bias").expect("the bias rule");
+	// A scene tuned against an unstated bias acnes on the next implementation.
+	assert!(bias.answer.contains("0.0015") && bias.answer.contains("2.0"));
+	let outside = SHADOW_RULES.iter().find(|rule| rule.question == "what is outside the last cascade").expect("the outside rule");
+	assert!(outside.answer.contains("UNSHADOWED"));
+	let format = SHADOW_RULES.iter().find(|rule| rule.question == "the map format").expect("the format rule");
+	// It names the 3D profile's comparison rule rather than restating it, so the two cannot drift.
+	assert!(format.answer.contains("not quantised"));
+}
+
+#[test]
+fn tone_mapping_is_the_two_d_operator_and_comes_last() {
+	use crate::scene3d_extended::POSTPROCESS_RULES;
+	let tone = POSTPROCESS_RULES.iter().find(|rule| rule.question == "tone mapping").expect("the tone rule");
+	// TWO OPERATORS IN ONE SYSTEM IS TWO SYSTEMS: a 3D frame composited with a 2D one would have two
+	// different highlights at the same radiance.
+	assert!(tone.answer.contains("SAME operator") && tone.answer.contains("WHITE = 4.0"));
+	let order = POSTPROCESS_RULES.iter().find(|rule| rule.question == "the order").expect("the order rule");
+	assert!(order.answer.contains("LAST"));
+	let luminance = POSTPROCESS_RULES.iter().find(|rule| rule.question == "the luminance used").expect("the luminance rule");
+	assert!(luminance.answer.contains("0.2126"));
+}
+
+#[test]
+fn root_motion_is_chosen_rather_than_required_and_rotation_slerps() {
+	use crate::scene3d_extended::ANIMATION_RULES;
+	let root = ANIMATION_RULES.iter().find(|rule| rule.question == "the root-motion policy").expect("the root-motion rule");
+	// The plan asks for a policy CHOSEN rather than required, and a default that does not surprise:
+	// an application that never asked for root motion should not have its character drift.
+	assert!(root.answer.contains("CHOSEN RATHER THAN REQUIRED"));
+	assert!(root.answer.contains("EXTRACTED by default"));
+	let interpolation = ANIMATION_RULES.iter().find(|rule| rule.question == "interpolation").expect("the interpolation rule");
+	assert!(interpolation.answer.contains("SPHERICAL LINEAR"));
+	let weights = ANIMATION_RULES.iter().find(|rule| rule.question == "the skinning model").expect("the skinning rule");
+	// Normalised at LOAD, so an authoring error is paid for once rather than every frame.
+	assert!(weights.answer.contains("at load"));
+}
+
+#[test]
+fn the_extended_profile_is_separate_from_the_core_one() {
+	use crate::scene3d::SCENE3D_PROFILE_1_MIN_LIMITS;
+	use crate::scene3d_extended::SCENE3D_EXTENDED_1_MIN_LIMITS;
+	// NO LIMIT IS IN BOTH. A limit in both profiles is a limit an implementation could satisfy in
+	// one and not the other, and a conformance claim that means two things.
+	for extended in SCENE3D_EXTENDED_1_MIN_LIMITS {
+		assert!(SCENE3D_PROFILE_1_MIN_LIMITS.iter().all(|core| core.name != extended.name), "`{}` is in both profiles", extended.name);
+		assert!(extended.minimum > 0);
+		assert!(!extended.why.is_empty());
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Conformance thresholds.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn every_compared_profile_publishes_thresholds_and_none_is_written_twice() {
+	use crate::thresholds::THRESHOLDS;
+	// A PROFILE WITH NO THRESHOLD IS ONE WHOSE SUITE EITHER DEMANDS BIT-EXACTNESS OR DEMANDS
+	// NOTHING, and both are ways of not checking.
+	for profile in ["image-colour", "render2d", "render3d", "scene3d", "scene3d-extended"] {
+		assert!(THRESHOLDS.iter().any(|threshold| threshold.profile == profile), "`{profile}` publishes no threshold");
+	}
+	for (index, threshold) in THRESHOLDS.iter().enumerate() {
+		assert!(!threshold.tolerance.is_empty(), "{}/{}: no tolerance", threshold.profile, threshold.what);
+		assert!(!threshold.why.is_empty(), "{}/{}: a number with no reason", threshold.profile, threshold.what);
+		assert!(THRESHOLDS[..index].iter().all(|earlier| earlier.profile != threshold.profile || earlier.what != threshold.what), "{}/{} is written twice", threshold.profile, threshold.what);
+	}
+}
+
+#[test]
+fn what_has_no_tolerance_says_none_rather_than_being_absent() {
+	use crate::thresholds::{THRESHOLD_RULES, THRESHOLDS};
+	// THE LIST HAS TO READ AS DELIBERATE. A classification that simply had no row would be
+	// indistinguishable from one somebody forgot, so the ones with no tolerance are IN the table and
+	// say so.
+	for (profile, what) in [("render3d", "a clip-space position"), ("render3d", "sample ownership"), ("scene3d", "a pick result")] {
+		let threshold = THRESHOLDS.iter().find(|threshold| threshold.profile == profile && threshold.what == what).unwrap_or_else(|| panic!("`{profile}`/`{what}` is missing"));
+		assert!(threshold.tolerance.starts_with("NONE"), "`{what}` must state that it has no tolerance");
+	}
+	let none = THRESHOLD_RULES.iter().find(|rule| rule.question == "what has no tolerance at all").expect("the no-tolerance rule");
+	assert!(none.answer.contains("clip-space positions") && none.answer.contains("pick ids"));
+}
+
+#[test]
+fn a_tolerance_may_not_be_loosened_per_architecture() {
+	use crate::thresholds::THRESHOLD_RULES;
+	let per_arch = THRESHOLD_RULES.iter().find(|rule| rule.question == "per-architecture loosening").expect("the architecture rule");
+	// A tolerance that widened on the slow target would stop checking exactly where the second
+	// implementation is, which is the only place the comparison is worth making.
+	assert!(per_arch.answer.contains("REFUSED"));
+	let space = THRESHOLD_RULES.iter().find(|rule| rule.question == "where a tolerance is compared").expect("the space rule");
+	assert!(space.answer.contains("NAMED comparison space"));
+	let reference = THRESHOLD_RULES.iter().find(|rule| rule.question == "the reference").expect("the reference rule");
+	// Comparing two f32 implementations against each other alone passes two that are wrong the same
+	// way, which is why the reference is f64 wherever an expression exists.
+	assert!(reference.answer.contains("f64"));
+	let incomplete = THRESHOLD_RULES.iter().find(|rule| rule.question == "a freeze with no thresholds").expect("the completeness rule");
+	assert!(incomplete.answer.contains("NOT COMPLETE"));
+}
+
+#[test]
+fn the_two_d_coverage_bound_is_bounded_per_pixel_and_in_the_mean() {
+	use crate::thresholds::THRESHOLDS;
+	let coverage = THRESHOLDS.iter().find(|threshold| threshold.what == "antialiasing coverage").expect("the coverage threshold");
+	// THE MEAN BOUND IS THE ONE THAT CATCHES A SYSTEMATIC BIAS. A per-pixel bound alone passes an
+	// implementation whose every pixel is one step light.
+	assert!(coverage.tolerance.contains("2/255") && coverage.tolerance.contains("mean"));
+	let edge = THRESHOLDS.iter().find(|threshold| threshold.what == "the edge policy").expect("the edge threshold");
+	// A fully covered pixel that differs at all is a colour error wearing an antialiasing tolerance.
+	assert!(edge.tolerance.contains("EXACTLY"));
+	let mask = THRESHOLDS.iter().find(|threshold| threshold.what == "the image comparison mask").expect("the mask threshold");
+	assert!(mask.tolerance.contains("EVERY pixel"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// How a profile is hashed.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_canonical_encoding_rule_excludes_the_hash_and_the_prose() {
+	use crate::hashing::CANONICAL_ENCODING;
+	for (index, rule) in CANONICAL_ENCODING.iter().enumerate() {
+		assert!(!rule.answer.is_empty(), "`{}` has no answer", rule.question);
+		assert!(CANONICAL_ENCODING[..index].iter().all(|earlier| earlier.question != rule.question), "`{}` is answered twice", rule.question);
+	}
+	let hash_field = CANONICAL_ENCODING.iter().find(|rule| rule.question == "the hash field").expect("the hash-field rule");
+	// A HASH THAT COVERED ITSELF COULD NOT BE COMPUTED. Saying so is what stops somebody adding it
+	// to the canonical form later.
+	assert!(hash_field.answer.contains("EXCLUDED"));
+	let document = CANONICAL_ENCODING.iter().find(|rule| rule.question == "what the document contributes").expect("the document rule");
+	// Hashing the Markdown would make rewrapping a paragraph a profile change AND would let a
+	// corrected number pass unnoticed if the prose around it was rewritten at the same time.
+	assert!(document.answer.contains("NOTHING"));
+}
+
+#[test]
+fn the_ordering_rule_does_not_sort_lists_whose_order_is_the_profile() {
+	use crate::hashing::CANONICAL_ENCODING;
+	let within = CANONICAL_ENCODING.iter().find(|rule| rule.question == "within a registry").expect("the ordering rule");
+	// SORTING WOULD DESTROY MEANING. The clip planes, the render queues and the light accumulation
+	// are all ordered on purpose, and a canonical form that sorted them would hash two different
+	// profiles the same.
+	assert!(within.answer.contains("DECLARATION ORDER"));
+	assert!(within.answer.contains("clip planes"));
+	let inventory = CANONICAL_ENCODING.iter().find(|rule| rule.question == "the input inventory").expect("the inventory rule");
+	// A directory listing or a hash map differs between runs and between machines, which is a hash
+	// that changes with nothing.
+	assert!(inventory.answer.contains("FIXED order"));
+}
+
+#[test]
+fn a_version_changes_with_the_semantics_and_not_with_the_prose() {
+	use crate::hashing::CANONICAL_ENCODING;
+	let when = CANONICAL_ENCODING.iter().find(|rule| rule.question == "when the hash may change").expect("the version rule");
+	assert!(when.answer.contains("VERSION changes with it"));
+	let gate = CANONICAL_ENCODING.iter().find(|rule| rule.question == "what the gate checks").expect("the gate rule");
+	// The three things that have to agree, named - so a gate that checked one of them would be
+	// visibly short of what the rule says.
+	assert!(gate.answer.contains("document") && gate.answer.contains("manifest") && gate.answer.contains("coverage table"));
 }

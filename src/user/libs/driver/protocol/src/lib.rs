@@ -338,6 +338,11 @@ impl ResourceKind {
 //
 // These are what today's drivers publish, named so the manager and the drivers agree on the numbers
 // rather than each writing its own.
+// The decisions of `liber:device@1`'s `console-stream`, shared by the driver that serves it and the
+// program that consumes it. See the module: they are here because one rule in one place is what
+// stops two ends remembering a convention separately.
+pub mod console;
+
 pub mod provider {
 	pub const BLOCK: u16 = 1;
 	pub const NET: u16 = 2;

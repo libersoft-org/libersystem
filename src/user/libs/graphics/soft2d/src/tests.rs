@@ -970,7 +970,7 @@ fn hostile_input_is_answered_rather_than_crashed_on() {
 	}
 
 	// AND A CLIP STACK AT ITS CEILING, which is the other bound a drawing can reach.
-	let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+	let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 	let mut canvas = Canvas::new();
 	for index in 0..limits.max_clip_depth.min(16) {
 		canvas.save().expect("a state");

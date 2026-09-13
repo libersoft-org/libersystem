@@ -605,6 +605,14 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 						return Some((role.tag.to_vec(), 0));
 					}
 					let scoped: u64 = open_storage_directory_read_only(storage_adm, service_logic::font_record::FONT_DIRECTORY);
+					if scoped == 0 {
+						// A REFUSAL THAT SAYS NOTHING IS THE FAILURE THIS FILE CRITICISES ELSEWHERE.
+						// `deliver_roles` answers a bare false and the supervisor prints "FAILED to
+						// start" with no reason, so a mint that goes wrong here costs a reader the
+						// whole boot chain behind this service and tells them nothing about which
+						// step went wrong.
+						print(b"ServiceManager: the font directory could not be minted from StorageService's admin root\n");
+					}
 					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
 				}
 				// THE INIT PACKAGE, under the rights a launcher needs: read it, map it, pass it on.
@@ -697,6 +705,13 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 				}
 			}
 			if !delivered {
+				// THE REASON IS THE POINT OF THE FIELD. It was left empty here, so every role
+				// refusal reached the console as a bare "FAILED to start" - and the supervisor's
+				// own comment says a service that did not start says so BY NAME, which a name
+				// without a reason only half does.
+				if failure_out.is_empty() {
+					*failure_out = String::from("a bootstrap role was refused; the role's own line above says which");
+				}
 				return (State::Failed, Reason::BootstrapRefused);
 			}
 			// THE ENDS THIS SUPERVISOR KEEPS, copied out of the plan's own table into the names the

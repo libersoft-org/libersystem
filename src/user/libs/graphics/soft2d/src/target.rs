@@ -236,7 +236,7 @@ pub fn canonical_layout(extent: Extent2D, space: ColorSpace) -> Result<ImageLayo
 pub fn from_core(error: CoreError) -> Error {
 	match error {
 		CoreError::Allocation => Error::Allocation,
-		CoreError::Overflow | CoreError::ZeroExtent | CoreError::PitchTooSmall | CoreError::BufferTooShort => Error::LimitExceeded { limit: "target extent", ceiling: graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_image_extent as u64 },
+		CoreError::Overflow | CoreError::ZeroExtent | CoreError::PitchTooSmall | CoreError::BufferTooShort => Error::LimitExceeded { limit: "target extent", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_image_extent as u64 },
 		_ => Error::UnknownResource { kind: render2d::resource::ResourceKind::Image, index: 0 },
 	}
 }

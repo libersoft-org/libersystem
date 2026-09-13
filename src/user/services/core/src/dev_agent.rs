@@ -49,10 +49,13 @@ use rt::*;
 
 use crate::dev_protocol::{HEADER_LEN, MAGIC, MAX_PAYLOAD, PARTIAL_FRAME_TICKS, SESSION_IDLE_TICKS, Session, Sink, VERSION};
 
-// The version of `liber:device@1`'s `console-stream` this agent speaks. A provider that answers
-// `attach` with a refusal is not this agent's wire, whatever kind it publishes under: the whole
-// point of asking first is that a byte stream cannot report a framing disagreement later.
-const WIRE_VERSION: u32 = 1;
+// The version of `liber:device@1`'s `console-stream` this agent speaks, READ FROM THE ONE PLACE THE
+// PROVIDER READS IT FROM. A provider that answers `attach` with a refusal is not this agent's wire,
+// whatever kind it publishes under: the whole point of asking first is that a byte stream cannot
+// report a framing disagreement later. The decisions made from it - which publication to follow,
+// how a long frame is cut, what a refused write means - are `driver_protocol::console`'s, and are
+// host-tested there rather than only in a booted guest.
+use driver_protocol::console::{self, Follow, Identity, WIRE_VERSION, WriteAnswer, Wrote};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -128,8 +131,8 @@ impl Wire {
 	// Whether a publication names the provider this agent is attached to. A withdrawal arrives
 	// after its handle is gone, so identity is the only thing left to recognise it by - and the
 	// manager's own three numbers are what make a reused slot unmistakable for its predecessor.
-	fn is_current(&self, info: &ProviderInfo) -> bool {
-		self.provider.as_ref().is_some_and(|held| held.slot == info.slot && held.provider_generation == info.provider_generation && held.binding_generation == info.binding_generation)
+	fn held(&self) -> Option<Identity> {
+		self.provider.as_ref().map(|held| Identity { slot: held.slot, provider_generation: held.provider_generation, binding_generation: held.binding_generation })
 	}
 
 	// Let go of the provider being used. Everything the attachment held goes with it, because the
@@ -171,7 +174,9 @@ impl Wire {
 			}
 		};
 		let max_frame: usize = match console_stream::Client::new(ChannelTransport { chan: control }).attach(&WIRE_VERSION) {
-			Some(Ok(attachment)) if attachment.version == WIRE_VERSION && attachment.max_frame > 0 => attachment.max_frame as usize,
+			// THE ANSWER IS CHECKED, NOT TAKEN. A provider that answered a version nobody asked for,
+			// or a bound the wire cannot express, is refused by the same rule it was asked under.
+			Some(Ok(attachment)) if console::attach(WIRE_VERSION, attachment.version, attachment.max_frame) == (console::Attach::Speak { version: WIRE_VERSION, max_frame: attachment.max_frame }) => attachment.max_frame as usize,
 			_ => {
 				print(b"agent.dev: a console-bytes provider would not speak this wire version; it is not this agent's channel\n");
 				close(control);
@@ -218,15 +223,16 @@ impl Wire {
 			if info.kind != ProviderKind::ConsoleBytes {
 				continue;
 			}
-			if !info.live {
-				if self.is_current(&info) {
+			let seen: Identity = Identity { slot: info.slot, provider_generation: info.provider_generation, binding_generation: info.binding_generation };
+			match console::follow(self.held(), seen, info.live) {
+				Follow::Attach => {
+					self.attach_to(&info);
+				}
+				Follow::Detach => {
 					self.detach();
 					lost = true;
 				}
-				continue;
-			}
-			if self.control == 0 {
-				self.attach_to(&info);
+				Follow::Ignore => {}
 			}
 		}
 		lost
@@ -243,22 +249,22 @@ impl Wire {
 	// provider itself, so the attachment goes and the subscription finds the next one.
 	fn write_all(&mut self, bytes: &[u8]) -> bool {
 		let mut at: usize = 0;
-		while at < bytes.len() {
-			if self.control == 0 || self.max_frame == 0 {
+		while let Some((from, to)) = console::write_span(at, bytes.len(), self.max_frame as u32) {
+			if self.control == 0 {
 				return false;
 			}
-			let end: usize = (at + self.max_frame).min(bytes.len());
-			match console_stream::Client::new(ChannelTransport { chan: self.control }).write(&bytes[at..end]) {
-				Some(Ok(taken)) if taken as usize == end - at => at = end,
-				// A PARTIAL WRITE IS NOT A WRITE. The contract answers with what the port took, and
-				// a provider that took some of a frame has left the stream in a state no reader can
-				// recover: the remainder would be read as the beginning of the next frame.
-				Some(Ok(_)) => {
-					self.detach();
-					return false;
-				}
-				Some(Err(Error::Again)) => return false,
-				_ => {
+			let answer: WriteAnswer = match console_stream::Client::new(ChannelTransport { chan: self.control }).write(&bytes[from..to]) {
+				Some(Ok(taken)) => WriteAnswer::Took(taken),
+				Some(Err(Error::Again)) => WriteAnswer::Again,
+				Some(Err(_)) => WriteAnswer::Refused,
+				None => WriteAnswer::NoAnswer,
+			};
+			match console::classify_write(answer, to - from) {
+				Wrote::All => at = to,
+				// The port is fine and the tool at the far end of it is not. Tearing down a working
+				// device because somebody closed a terminal is what this distinction prevents.
+				Wrote::SessionOver => return false,
+				Wrote::ProviderLost => {
 					self.detach();
 					return false;
 				}

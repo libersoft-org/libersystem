@@ -2009,3 +2009,49 @@ twenty-two ceilings exercised at their exact bound and one past it. The three th
 that does not exist, the gate names them on every run, and the cap means a fourth cannot be added
 quietly. I am not ticking it over an absence - I am ticking it because the bounds that have work
 behind them all refuse, and the ones that do not are named and counted.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-13T03:10:00Z):
+
+THE FACE IS AUTHORED, AND THAT IS WHAT WAS BLOCKING EVERYTHING.
+
+The destination, the manifest admission, the `FONTDIR` role and the catalogue service were all built
+in an earlier round. What was missing was a FACE: nothing could be staged, `font-oracle` reported
+`NOT PERFORMED - no face is staged`, the catalogue had nothing to enumerate, and the guest gate had
+nothing to render. The licence decision admits public domain and Unlicense only, and every face a
+text stack reaches for is outside that set - Noto, Liberation, Inter and Unicode's own Last Resort
+are SIL OFL, DejaVu carries the Bitstream Vera terms, Roboto and Droid are Apache-2.0.
+
+The plan itself named the route and left it untaken: AUTHOR one rather than import one, because
+anything this tree writes is Unlicense. That is now done. `src/tools/font-gen` writes
+`src/volume/share/fonts/lastresort.ttf` and its sidecar declaration: three glyphs (`.notdef`, a blank
+space, a ring-shaped box), a `cmap` format 4 subtable covering the whole basic multilingual plane,
+real `glyf` outlines, and `head`/`hhea`/`hmtx`/`maxp`/`name`/`post`/`OS/2` written out in full.
+
+WHY FORMAT 4 WITH A GLYPH ARRAY, AND NOT THE FORMAT THE SPECIFICATION HAS FOR THIS. Format 13 exists
+for exactly a many-to-one last-resort mapping and is NOT in the set this profile admits; adding it
+would be a profile change rather than a face. Format 4's `idDelta` maps a segment to CONSECUTIVE
+glyph ids, so a range cannot be sent to one glyph without the glyph array - which is why the file is
+132 kB, and the size is the price of not changing a frozen profile to stage a face.
+
+FOUR DESIGN ANSWERS ARE IN THE TOOL RATHER THAN IN A READER'S HEAD: nothing maps to glyph 0, because
+zero is how a `cmap` says NOT COVERED; the space is blank, because a box where a space belongs breaks
+every line break above it; the control ranges are not claimed, because a text stack handles them
+before it asks a face; and the box's two contours are wound opposite ways, because two contours wound
+alike fill solid under a non-zero rule.
+
+VERIFIED: the generator opens its own output with `font-parse` - the parser that reads it at runtime -
+and parses its own declaration with `service_logic::font_record`, in the run that writes them, so it
+cannot pass by agreeing with itself. `check-font-declarations.sh` now reports `1 staged face(s) agree
+with their declarations` and its self-test still refuses eight altered declarations field by field.
+`./gen.sh --check` reports the staged bytes are exactly what the generator produces. `./build.sh
+--part volume` stages the pair into the volume image; the face's name appears in the built image.
+
+NOT PERFORMED: the guest gate. Nothing has yet booted with this face and rendered from it, and the
+catalogue's enumeration of it has not been observed in a running system. The item stays open.
+
+AND THE OTHER HALF IS STILL BLOCKED, ON EXACTLY WHAT IT WAS BLOCKED ON. Every code point this face
+covers draws the SAME box. The host gates want expected glyph indices and positions for Latin
+ligatures and kerning, Arabic in four joining forms, Hebrew with marks, Devanagari reordering, Thai
+without spaces, Khmer stacking and emoji sequences - which needs faces with real `GSUB`/`GPOS` for
+those scripts. That is a type-design job, not a generator, and no amount of mechanical authoring
+produces it.

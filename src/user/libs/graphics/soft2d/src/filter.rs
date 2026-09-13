@@ -38,7 +38,7 @@ pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::tar
 			// THE POOL IS THE RESERVATION `prepare` MADE, so exhausting it is a budget that was too
 			// small rather than a machine that is out of memory - and the caller is told which.
 			give_back(pool, results);
-			return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_prepared_scratch_bytes });
+			return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes });
 		};
 		let input = |slot: u16| -> Option<&Surface> { results.get(slot as usize).and_then(|entry| entry.as_ref()) };
 		match node {
@@ -71,7 +71,7 @@ pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::tar
 					(_, None) => {
 						pool.give(into);
 						give_back(pool, results);
-						return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_prepared_scratch_bytes });
+						return Err(Error::LimitExceeded { limit: "prepared scratch", ceiling: graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes });
 					}
 				}
 			}
@@ -235,7 +235,7 @@ fn kernel(sigma: f32) -> Vec<f32> {
 	if !(sigma.is_finite() && sigma > 0.0) {
 		return alloc::vec![1.0];
 	}
-	let ceiling = graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_filter_radius as f32;
+	let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_filter_radius as f32;
 	let radius = (libm::ceilf(sigma * 3.0).min(ceiling)).max(1.0) as usize;
 	let mut weights = Vec::with_capacity(radius * 2 + 1);
 	let mut total = 0.0f32;

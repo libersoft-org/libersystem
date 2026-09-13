@@ -99,7 +99,7 @@ pub struct GlyphRaster {
 
 impl Default for GlyphRaster {
 	fn default() -> Self {
-		Self::new(graphics_profile::RENDER2D_PROFILE_1_MINIMA.max_cache_bytes)
+		Self::new(graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_cache_bytes)
 	}
 }
 

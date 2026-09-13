@@ -22,14 +22,19 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use graphics_profile::capability::{Coverage, Range};
-use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MINIMA, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS};
+use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MIN_LIMITS, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS};
 
 mod graphics;
 mod image;
 mod opentype;
 mod render2d_spec;
+mod render3d_spec;
 mod scan;
+mod scene3d;
+mod scene3d_extended;
 mod selftest;
+mod shader_ir;
+mod thresholds;
 mod wsi;
 
 use scan::{Claim, Marker};
@@ -67,6 +72,23 @@ fn owner_name(owner: FeatureOwner) -> &'static str {
 
 /// The digest as it is written into the document: lower-case hexadecimal, because the profile hash
 /// is something a person compares by eye against a diff.
+/// What a profile document fails to state about its own floors: the section, and each named limit.
+///
+/// A FUNCTION RATHER THAN A LOOP INSIDE THE CHECK, so the negative cases above go through exactly
+/// the code the positive ones do. A self-test that reimplements the rule tests its own copy.
+fn missing_minima(document: &str, names: &[String]) -> Vec<String> {
+	let mut missing = Vec::new();
+	if !document.contains("Guaranteed minimum") && !document.contains("Guaranteed minima") {
+		missing.push(String::from("a guaranteed-minima section at all, so every limit in it is implementation-defined with no floor"));
+	}
+	for name in names {
+		if !document.contains(name.as_str()) {
+			missing.push(format!("the guaranteed minimum `{name}`"));
+		}
+	}
+	missing
+}
+
 fn hex(digest: &[u8; 32]) -> String {
 	let mut out = String::with_capacity(64);
 	for byte in digest {
@@ -97,7 +119,7 @@ fn canonical(profile: &Profile) -> String {
 /// The 2D guaranteed minima, named and in one order, because they are hashed with the profile: a
 /// list that could be lowered without changing the hash is a list that can be lowered quietly.
 fn minima() -> Vec<(&'static str, u64)> {
-	let limits = RENDER2D_PROFILE_1_MINIMA;
+	let limits = RENDER2D_PROFILE_1_MIN_LIMITS;
 	vec![
 		("max_commands", u64::from(limits.max_commands)),
 		("max_resources", u64::from(limits.max_resources)),
@@ -523,6 +545,240 @@ fn main() -> std::process::ExitCode {
 		}
 	}
 
+	// THE SCENE LAYER'S CORE PROFILE. Separate from the 3D one because they are conformed to
+	// separately: a backend implements `render3d` and a library implements the scene above it.
+	{
+		let canonical = scene3d::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/scene3d/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/SCENE3D_PROFILE_1.md"), scene3d::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("scene3d: {} hierarchy rules, {} camera rules, {} queues, {} culling rules, {} materials, {} lighting rules and {} minimum limits, hashed", graphics_profile::scene3d::HIERARCHY_RULES.len(), graphics_profile::scene3d::CAMERA_RULES.len(), graphics_profile::scene3d::QUEUES.len(), graphics_profile::scene3d::CULLING_RULES.len(), graphics_profile::scene3d::MATERIALS.len(), graphics_profile::scene3d::LIGHTING_RULES.len(), graphics_profile::scene3d::SCENE3D_PROFILE_1_MIN_LIMITS.len());
+		}
+	}
+
+	// EVERY PROFILE DOCUMENT STATES ITS OWN GUARANTEED MINIMA, and this is the check that it does.
+	//
+	// AN IMPLEMENTATION-DEFINED LIMIT WITHOUT A FLOOR LETS A BACKEND PASS CONFORMANCE WHILE BEING
+	// USELESS: a maximum texture extent of 16, a maximum draw count of 1 or a maximum shader length
+	// of 8 satisfies every other sentence in these documents. The floors are in the registries; what
+	// this refuses is a DOCUMENT that does not carry them, because a floor a reader cannot find is a
+	// floor nobody implements against.
+	if check {
+		let published: &[(&str, Vec<String>)] = &[
+			(
+				"docs/graphics/RENDER2D_PROFILE_1.md",
+				// EVERY FIELD OF `Render2DLimits`, not a sample of them: a check over four of fifteen
+				// would approve a document that lost the other eleven.
+				[
+					"max_commands",
+					"max_resources",
+					"max_path_verbs",
+					"max_path_points",
+					"max_subpaths",
+					"max_clip_depth",
+					"max_layer_depth",
+					"max_filter_nodes",
+					"max_filter_radius",
+					"max_glyphs_per_run",
+					"max_image_extent",
+					"max_layer_pixels",
+					"max_prepared_scratch_bytes",
+					"max_cache_bytes",
+					"max_display_list_bytes",
+				]
+				.iter()
+				.map(|name| String::from(*name))
+				.collect(),
+			),
+			("docs/graphics/RENDER3D_PROFILE_1.md", graphics_profile::render3d_spec::RENDER3D_PROFILE_1_MIN_LIMITS.iter().map(|limit| String::from(limit.name)).collect()),
+			("docs/graphics/SCENE3D_PROFILE_1.md", graphics_profile::scene3d::SCENE3D_PROFILE_1_MIN_LIMITS.iter().map(|limit| String::from(limit.name)).collect()),
+			("docs/graphics/SCENE3D_EXTENDED_1.md", graphics_profile::scene3d_extended::SCENE3D_EXTENDED_1_MIN_LIMITS.iter().map(|limit| String::from(limit.name)).collect()),
+		];
+		// IT PROVES IT REFUSES BEFORE IT IS TRUSTED TO APPROVE, and through the SAME function: the
+		// tree is consistent right now, so a run over the tree alone would pass just as well if the
+		// check had stopped looking. Two negative cases - a document with no section at all, and one
+		// with the section and a floor missing from it.
+		let without_section = missing_minima("# X\n\nno floors here\n", &[String::from("max_nodes")]);
+		let without_floor = missing_minima("# X\n\n## Guaranteed minimum limits\n\n| `max_nodes` | 1 |\n", &[String::from("max_nodes"), String::from("max_hierarchy_depth")]);
+		if without_section.len() != 2 || without_floor != vec![String::from("the guaranteed minimum `max_hierarchy_depth`")] {
+			eprintln!("profile-doc: SELF-TEST FAILED - the minima check did not refuse a document that states no floors");
+			ok = false;
+		}
+		for (path, names) in published {
+			let document = match std::fs::read_to_string(root.join(path)) {
+				Ok(document) => document,
+				Err(error) => {
+					eprintln!("profile-doc: cannot read {path}: {error}");
+					ok = false;
+					continue;
+				}
+			};
+			for problem in missing_minima(&document, names) {
+				eprintln!("profile-doc: {path} does not state {problem}");
+				ok = false;
+			}
+		}
+		if ok {
+			println!("minima: {} profile documents state every floor their registries publish, and the check refuses one that does not", published.len());
+			// AND EVERY PROFILE THAT IS COMPARED HAS THRESHOLDS. A profile with none is one whose
+			// suite either demands bit-exactness or demands nothing, and both are ways of not
+			// checking - so the count is reported rather than assumed.
+			let mut thresholds_ok = true;
+			for profile in ["image-colour", "render2d", "render3d", "scene3d", "scene3d-extended"] {
+				let count = thresholds::count(profile);
+				if count == 0 {
+					eprintln!("profile-doc: `{profile}` publishes no conformance threshold, so nothing bounds a comparison against it");
+					thresholds_ok = false;
+				}
+			}
+			ok &= thresholds_ok;
+			if thresholds_ok {
+				println!("thresholds: image-colour {}, render2d {}, render3d {}, scene3d {}, scene3d-extended {}", thresholds::count("image-colour"), thresholds::count("render2d"), thresholds::count("render3d"), thresholds::count("scene3d"), thresholds::count("scene3d-extended"));
+			}
+		}
+	}
+
+	// THE SCENE LAYER'S EXTENDED PROFILE. Its own hash, because conforming to it is a separate claim.
+	{
+		let canonical = scene3d_extended::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [
+			(root.join("docs/gen/scene3d-extended/profile-1.canonical"), canonical.clone()),
+			(root.join("docs/graphics/SCENE3D_EXTENDED_1.md"), scene3d_extended::document(&hash)),
+		] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("scene3d-extended: {} PBR terms, {} constants, {} environment rules, {} shadow rules, {} post-process rules, {} animation rules and {} minimum limits, hashed", graphics_profile::scene3d_extended::PBR_TERMS.len(), graphics_profile::scene3d_extended::PBR_CONSTANTS.len(), graphics_profile::scene3d_extended::ENVIRONMENT_RULES.len(), graphics_profile::scene3d_extended::SHADOW_RULES.len(), graphics_profile::scene3d_extended::POSTPROCESS_RULES.len(), graphics_profile::scene3d_extended::ANIMATION_RULES.len(), graphics_profile::scene3d_extended::SCENE3D_EXTENDED_1_MIN_LIMITS.len());
+		}
+	}
+
+	// THE SHADER IR'S SEMANTICS, frozen with the 3D specification because a position's arithmetic is
+	// half in each: the clipping rules are there and the rule that makes the arithmetic reproducible
+	// is here.
+	{
+		let canonical = shader_ir::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/shader-ir/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/SHADER_IR_1.md"), shader_ir::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("shader-ir: {} numeric answers, {} conversions, {} accuracy bounds, {} layout rules, {} stage rules, {} strict-f32 rules and {} encoding rules, hashed", graphics_profile::shader_ir::NUMERIC_RULES.len(), graphics_profile::shader_ir::CONVERSION_RULES.len(), graphics_profile::shader_ir::TRANSCENDENTAL_ACCURACY.len(), graphics_profile::shader_ir::UNIFORM_LAYOUT.len() + graphics_profile::shader_ir::MATRIX_LAYOUT.len(), graphics_profile::shader_ir::STAGE_RULES.len(), graphics_profile::shader_ir::STRICT_F32_RULES.len(), graphics_profile::shader_ir::ENCODING_RULES.len());
+		}
+	}
+
+	// THE 3D SPECIFICATION, frozen before `render3d` and `soft3d` exist. The feature list says what a
+	// backend must be able to do; this says what the answers are, and two backends that implement
+	// every feature can still produce different images if these are left open.
+	{
+		let canonical = render3d_spec::canonical();
+		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+		for (path, contents) in [(root.join("docs/gen/render3d-spec/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/RENDER3D_PROFILE_1.md"), render3d_spec::document(&hash))] {
+			if check {
+				match std::fs::read_to_string(&path) {
+					Ok(existing) if existing == contents => {}
+					Ok(_) => {
+						eprintln!("profile-doc: {} differs from the registry", path.display());
+						ok = false;
+					}
+					Err(error) => {
+						eprintln!("profile-doc: cannot read {}: {error}", path.display());
+						ok = false;
+					}
+				}
+				continue;
+			}
+			if let Some(parent) = path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&path, &contents) {
+				eprintln!("profile-doc: cannot write {}: {error}", path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", path.display());
+		}
+		if check {
+			println!("render3d-spec: {} colour formats, {} vertex formats, {} interpolation qualifiers, {} MSAA answers, {} depth formats, {} sampler answers and {} minimum limits, hashed", graphics_profile::render3d_spec::COLOUR_FORMATS.len(), graphics_profile::render3d_spec::VERTEX_FORMATS.len(), graphics_profile::render3d_spec::QUALIFIERS.len(), graphics_profile::render3d_spec::MSAA_RULES.len(), graphics_profile::render3d_spec::DEPTH_FORMATS.len(), graphics_profile::render3d_spec::SAMPLER_RULES.len(), graphics_profile::render3d_spec::RENDER3D_PROFILE_1_MIN_LIMITS.len());
+		}
+	}
+
 	// THE WINDOW-SYSTEM PROFILE. Frozen before `a-wsi` implements it, because every number in it is
 	// one two sides round differently if it is not stated.
 	{
@@ -595,6 +851,92 @@ fn main() -> std::process::ExitCode {
 		}
 		if check {
 			println!("render2d-spec: {} operators, {} separable and {} non-separable blend modes, {} boolean answers and {} prepared dependencies, hashed", graphics_profile::compositing::OPERATORS.len(), graphics_profile::compositing::BLENDS.len(), graphics_profile::compositing::NON_SEPARABLE_BLENDS.len(), graphics_profile::geometry::BOOLEAN_RULES.len(), graphics_profile::contracts::PREPARED_DEPENDENCIES.len());
+		}
+	}
+
+	// THE MANIFEST THAT BINDS A DOCUMENT TO ITS PROFILE.
+	//
+	// The semantic input is the REGISTRY and never the Markdown: hashing the prose would make
+	// rewrapping a paragraph a profile change, and would let a corrected number pass unnoticed if the
+	// sentence around it was rewritten in the same commit. So the document is bound INSTEAD - it
+	// states the hash, the manifest records it, and this recomputes the hash from the registry and
+	// refuses any of the three that disagrees.
+	{
+		let profiles: &[(&str, u32, String, &str, &str)] = &[
+			("image-colour", 1, image::canonical(), "docs/gen/image-color/profile-1.canonical", "docs/graphics/IMAGE_COLOR_PROFILE_1.md"),
+			("render2d-spec", 1, render2d_spec::canonical(), "docs/gen/render2d-spec/profile-1.canonical", "docs/graphics/RENDER2D_PROFILE_1.md"),
+			("render3d-spec", 1, render3d_spec::canonical(), "docs/gen/render3d-spec/profile-1.canonical", "docs/graphics/RENDER3D_PROFILE_1.md"),
+			("shader-ir", graphics_profile::shader_ir::SHADER_IR_VERSION, shader_ir::canonical(), "docs/gen/shader-ir/profile-1.canonical", "docs/graphics/SHADER_IR_1.md"),
+			("scene3d", 1, scene3d::canonical(), "docs/gen/scene3d/profile-1.canonical", "docs/graphics/SCENE3D_PROFILE_1.md"),
+			("scene3d-extended", 1, scene3d_extended::canonical(), "docs/gen/scene3d-extended/profile-1.canonical", "docs/graphics/SCENE3D_EXTENDED_1.md"),
+			("wsi", 1, wsi::canonical(), "docs/gen/wsi/profile-1.canonical", "docs/graphics/WSI_PROFILE_1.md"),
+		];
+		let mut manifest = String::from("# @generated by profile-doc. Do not edit; run `./gen.sh`.\n");
+		manifest.push_str("# The semantic input of a profile is its REGISTRY. The document is the normative explanation and\n");
+		manifest.push_str("# is bound to the profile here rather than hashed as text - see `graphics_profile::hashing`.\n");
+		for (name, version, canonical, canonical_path, document_path) in profiles {
+			let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
+			manifest.push_str(&format!("profile={name} version={version} hash={hash} canonical={canonical_path} document={document_path}\n"));
+			if !check {
+				continue;
+			}
+			// THE DOCUMENT STATES ITS OWN HASH, and this is where the statement is checked against
+			// the registry that produced it.
+			match std::fs::read_to_string(root.join(document_path)) {
+				Ok(document) => {
+					if !document.contains(&hash) {
+						eprintln!("profile-doc: {document_path} does not state the hash `{hash}` its registry produces");
+						ok = false;
+					}
+				}
+				Err(error) => {
+					eprintln!("profile-doc: cannot read {document_path}: {error}");
+					ok = false;
+				}
+			}
+			// AND THE CANONICAL FILE IS THE ONE THE HASH WAS TAKEN OVER, which the per-profile blocks
+			// above already compare byte for byte; this is the check that the pair on disk belongs
+			// together rather than being two files that happen to exist.
+			match std::fs::read_to_string(root.join(canonical_path)) {
+				Ok(existing) if hex(&bootproto::sha256::digest(existing.as_bytes())) == hash => {}
+				Ok(_) => {
+					eprintln!("profile-doc: {canonical_path} does not hash to `{hash}`");
+					ok = false;
+				}
+				Err(error) => {
+					eprintln!("profile-doc: cannot read {canonical_path}: {error}");
+					ok = false;
+				}
+			}
+		}
+		let manifest_path = root.join("docs/gen/profiles.manifest");
+		if check {
+			match std::fs::read_to_string(&manifest_path) {
+				Ok(existing) if existing == manifest => {}
+				Ok(_) => {
+					eprintln!("profile-doc: docs/gen/profiles.manifest does not match the profiles it names");
+					ok = false;
+				}
+				Err(error) => {
+					eprintln!("profile-doc: cannot read docs/gen/profiles.manifest: {error}");
+					ok = false;
+				}
+			}
+			if ok {
+				println!("manifest: {} profiles bound to their documents by hash and version", profiles.len());
+			}
+		} else {
+			if let Some(parent) = manifest_path.parent()
+				&& let Err(error) = std::fs::create_dir_all(parent)
+			{
+				eprintln!("profile-doc: cannot create {}: {error}", parent.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			if let Err(error) = std::fs::write(&manifest_path, &manifest) {
+				eprintln!("profile-doc: cannot write {}: {error}", manifest_path.display());
+				return std::process::ExitCode::FAILURE;
+			}
+			println!("profile-doc: wrote {}", manifest_path.display());
 		}
 	}
 

@@ -852,3 +852,66 @@ NOT PERFORMED: the full gate sweep was stopped part way - one aarch64 IOMMU gate
 under TCG here - and three gates are red for reasons this work did not cause (`foreign-facilities-guest`
 needs the foreign audit substrate staged, and `boot-harness` and `qemu-arch-profiles` fail on a
 DMA-mode change in the harness and loader that this work does not touch).
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-13T04:30:00Z):
+
+THE `s` FREEZE IS COMPLETE. All eight of its items are done, and the part went 70 to 78.
+
+WHAT WAS FROZEN, AND WHAT EACH FREEZE HAD TO DECIDE RATHER THAN DESCRIBE:
+
+  RENDER3D_PROFILE_1.md. The feature list already existed and said what a backend must be able to do;
+  this says what the answers ARE. Seven colour formats with all eight capability columns and full
+  names rather than `RGBA8` shorthand, ten vertex formats with their normalisation rules, eight
+  rasteriser state fields with the depth-bias equation written out, the EXACT 2x and 4x sample
+  positions with nine MSAA answers, five depth formats, twelve sampler answers including the LOD
+  formula and the cube seam rule, seven hazard rules, six submission rules and eleven minima. The
+  three questions the plan named as the freeze's own are answered rather than listed: `Depth32F`
+  compares the STORED FLOATS and does not quantise the incoming depth; `ClipCoordQ` is seven rules
+  including the non-finite refusal and an epsilon that is the SAME value the 2D profile uses; and the
+  submission/readback lifecycle is bound before a backend exists.
+
+  SHADER_IR_1.md. Fifteen numeric answers closing every behaviour a shading language usually leaves
+  open - signed overflow wraps, division by zero has a value, an out-of-bounds read returns ZERO
+  rather than clamping to a plausible neighbour - plus ten accuracy bounds, eleven layout rules,
+  seven stage rules covering helper lanes and post-`discard` derivatives, seven StrictF32 rules, and
+  seven encoding rules under which an unknown instruction id is a REFUSAL rather than a skip.
+
+  SCENE3D_PROFILE_1.md and SCENE3D_EXTENDED_1.md. The core carries the hierarchy, the camera, three
+  queues, culling, instancing, four materials with their equations, unshadowed multi-light
+  accumulation IN A FIXED ORDER - because floating-point addition is not associative - and picking.
+  The extended carries the PBR terms as equations with a `why this one` column each, the split-sum
+  approximation with BOTH halves, named shadow bias values, the bloom knee and kernel, the fog
+  equation, and a root-motion policy CHOSEN rather than required.
+
+  THE THREE CROSS-CUTTING ITEMS. Guaranteed minima exist for all four profiles under one naming
+  convention and `profile-doc --check` now REFUSES a document that does not state a floor its
+  registry publishes - which found two floors missing from the 2D document the first time it ran.
+  Twenty-one conformance thresholds across five profiles are in one registry and rendered into each
+  document's conformance chapter and into the canonical form its hash covers, with the classifications
+  that have NO tolerance in the table saying so. Seven profiles are bound to their documents by
+  `docs/gen/profiles.manifest`, the canonical encoding is eleven stated rules in
+  `graphics_profile::hashing`, and the gate recomputes every hash from the registry and refuses three
+  separate disagreements.
+
+  AND THE GRAPHICS_2D/3D MOVE, which is a MOVE and not a write: neither document exists, so what the
+  item owns is where their content lives. The part-`i` item that publishes them is restated to
+  publish OVERVIEWS - every clause it dropped is one a frozen profile document now carries.
+
+EVIDENCE: 33 new tests in `graphics-profile` (68 total, green). They are consistency tests rather
+than correctness tests, and that distinction is worth stating: nothing can test whether 4 ULP is the
+right bound for a sine, because it is a decision. What they hold is that no question is answered
+twice, that every sample position is inside its pixel and the 4x grid is genuinely rotated, that no
+format row contradicts itself, that every material carries an equation, that the no-tolerance entries
+say NONE, and that the hash excludes itself and the prose. `./gen.sh --check` reports no drift across
+16 packages, the aggregate and every profile.
+
+NOT PERFORMED: nothing here has been implemented against. These are specifications, and a
+specification's real test is a backend built to it disagreeing with another - which is parts `e`
+through `i` and is not started.
+
+A JUDGEMENT THAT SHOULD BE READ BY SOMEBODY ELSE: every number in these four documents is a choice
+this implementation made. They follow mainstream practice where one exists - the rotated-grid sample
+positions, GGX with Smith height-correlated visibility, column-major matrices, the 0.04 dielectric
+F0 - and where practice is split the reason for the side taken is written beside the value. A
+reviewer who disagrees with one should say so now: after a backend exists, changing one is a version
+change and a re-measurement.

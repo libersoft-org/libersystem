@@ -102,6 +102,91 @@ fn random_fills_distinct_bytes_from_whichever_source_is_honest() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
+crate::tagged_test!(the_entropy_pool_refuses_a_capability_that_names_no_binding, [Syscall], id = "kernel.syscall.the_entropy_pool_refuses_a_capability_that_names_no_binding", covers = ["kernel"]);
+fn the_entropy_pool_refuses_a_capability_that_names_no_binding() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		use crate::object::device_memory::DeviceMemory;
+		use crate::object::rights::Rights;
+		// A BARE MMIO WINDOW: a real `DeviceMemory` that names no device-table entry and therefore
+		// no claim. It is the cheapest form of what this refusal exists for - a capability that is
+		// genuine and is not evidence that its holder drives an entropy device.
+		let bare = DeviceMemory::new(0xfeed_9000, 0x1000).expect("a bare mmio window");
+		let handle = {
+			let thread = crate::sched::current_thread().expect("a thread to hold the handle");
+			let installed = thread.handles().lock().insert_object(bare, Rights::READ | Rights::WRITE);
+			installed.raw()
+		};
+		unsafe {
+			let seed = [0x5Au8; 32];
+			let refused = arch::syscall::invoke(SYS_ENTROPY_ADD, handle, seed.as_ptr() as u64, seed.len() as u64, 0);
+			assert_eq!(refused as i64, ERR_ACCESS_DENIED, "a capability that names no binding must not be able to seed this machine");
+			// AND THE BOUNDS ARE REFUSED BEFORE THE CAPABILITY IS LOOKED AT, so an oversized
+			// submission cannot be used to make the kernel copy megabytes per device interrupt.
+			let oversized = arch::syscall::invoke(SYS_ENTROPY_ADD, handle, seed.as_ptr() as u64, abi::MAX_ENTROPY_SUBMISSION + 1, 0);
+			assert_eq!(oversized as i64, ERR_INVALID);
+			let empty = arch::syscall::invoke(SYS_ENTROPY_ADD, handle, seed.as_ptr() as u64, 0, 0);
+			assert_eq!(empty as i64, ERR_INVALID);
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	crate::sched::spawn(body, 0);
+	crate::sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+}
+
+crate::tagged_test!(a_seeded_pool_is_what_lets_a_machine_without_the_instruction_answer, [Syscall], id = "kernel.syscall.a_seeded_pool_is_what_lets_a_machine_without_the_instruction_answer", covers = ["kernel"]);
+fn a_seeded_pool_is_what_lets_a_machine_without_the_instruction_answer() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// THE STATE EVERY GUEST BOOTS IN, on the two architectures with no random instruction: the
+	// secure draw refuses, and it refuses for a reason no retry changes.
+	let hardware = arch::random::secure_available();
+	if !hardware && !crate::entropy::seeded() {
+		extern "C" fn refuses(_arg: u64) {
+			unsafe {
+				let mut out = [0u8; 32];
+				let refused = arch::syscall::invoke(SYS_RANDOM_GET, out.as_mut_ptr() as u64, out.len() as u64, 0, 0);
+				assert_eq!(refused as i64, ERR_UNSUPPORTED, "an unseeded machine with no instruction must refuse rather than answer weakly");
+				assert_eq!(out, [0u8; 32], "a refused draw writes nothing");
+			}
+		}
+		crate::sched::spawn(refuses, 0);
+		crate::sched::run_until_idle();
+	}
+	// Seeded the way a driver seeds it, minus the capability check the test above is about. 128
+	// bytes from a paravirtual source is 256 bits at the quarter rate, which is the threshold
+	// exactly - so this asserts the arithmetic as well as the effect.
+	let credited = crate::entropy::absorb(&[0xA5u8; 128], entropy::Source::Paravirtual);
+	assert!(credited <= 256, "a paravirtual submission is credited below its own length");
+	assert!(crate::entropy::seeded());
+	extern "C" fn answers(_arg: u64) {
+		unsafe {
+			let mut first = [0u8; 32];
+			let mut second = [0u8; 32];
+			let first_len = arch::syscall::invoke(SYS_RANDOM_GET, first.as_mut_ptr() as u64, first.len() as u64, 0, 0);
+			let second_len = arch::syscall::invoke(SYS_RANDOM_GET, second.as_mut_ptr() as u64, second.len() as u64, 0, 0);
+			assert_eq!(first_len as usize, first.len(), "a seeded machine fills the whole buffer");
+			assert_eq!(second_len as usize, second.len());
+			assert_ne!(first, [0u8; 32], "the draw left the buffer zeroed");
+			assert_ne!(first, second, "two draws were identical");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	crate::sched::spawn(answers, 0);
+	crate::sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst));
+	// AND WHAT IT REPORTS IS CREDIT AND PROVENANCE, NEVER HEALTH. The one boolean says the threshold
+	// was reached; the submission counts are what tell an operator this machine is running on one
+	// paravirtual source.
+	let health = crate::entropy::health(hardware);
+	assert_ne!(health.seeded, 0);
+	assert!(health.paravirtual_submissions >= 1);
+	assert_eq!(health.hardware_available, u8::from(hardware));
+	assert!(health.draws >= 1 || hardware, "a machine that answered from the pool recorded the draw");
+}
+
 crate::tagged_test!(the_syscall_image_buffer_allocates_and_survives_on_a_spawned_thread, [Kernel, Syscall, Memory], id = "kernel.syscall.the_syscall_image_buffer_allocates_and_survives_on_a_spawned_thread", covers = ["kernel"]);
 fn the_syscall_image_buffer_allocates_and_survives_on_a_spawned_thread() {
 	// `SYS_PROCESS_LOAD` buffers the caller's image into the kernel before parsing it, and that

@@ -1,0 +1,22 @@
+[package]
+name = "font-gen"
+edition = "2024"
+description = "The last-resort face, authored rather than imported: a box for every code point this system has no other face for"
+
+[[bin]]
+name = "font-gen"
+path = "src/main.rs"
+
+[dependencies]
+# The face is checked with the SAME parser that reads it at runtime, in the same run that writes it.
+# A generator that validated its output with its own writer would only ever prove it agrees with
+# itself.
+font-parse = { path = "../../user/libs/text/font-parse" }
+# The declaration vocabulary, so the sidecar this writes is parsed by the code that consumes it
+# rather than by a second description of the same format.
+service-logic = { path = "../../user/services/logic" }
+# SHA-256 for the digest the declaration carries, from the one implementation this tree has.
+bootproto = { path = "../../boot/protocol" }
+
+[lints.rust]
+warnings = "deny"

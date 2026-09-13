@@ -54,7 +54,7 @@ pub struct Render2DLimits {
 /// text is tens of thousands of path points once its glyphs are outlines, a UI is hundreds of
 /// commands deep before any content, and a filter chain behind a panel is a handful of nodes with a
 /// radius in the tens of pixels.
-pub const RENDER2D_PROFILE_1_MINIMA: Render2DLimits = Render2DLimits { max_commands: 65_536, max_resources: 4_096, max_path_verbs: 65_536, max_path_points: 262_144, max_subpaths: 8_192, max_clip_depth: 32, max_layer_depth: 16, max_filter_nodes: 64, max_filter_radius: 256, max_glyphs_per_run: 4_096, max_image_extent: 16_384, max_layer_pixels: 64 * 1024 * 1024, max_prepared_scratch_bytes: 64 * 1024 * 1024, max_cache_bytes: 256 * 1024 * 1024, max_display_list_bytes: 32 * 1024 * 1024 };
+pub const RENDER2D_PROFILE_1_MIN_LIMITS: Render2DLimits = Render2DLimits { max_commands: 65_536, max_resources: 4_096, max_path_verbs: 65_536, max_path_points: 262_144, max_subpaths: 8_192, max_clip_depth: 32, max_layer_depth: 16, max_filter_nodes: 64, max_filter_radius: 256, max_glyphs_per_run: 4_096, max_image_extent: 16_384, max_layer_pixels: 64 * 1024 * 1024, max_prepared_scratch_bytes: 64 * 1024 * 1024, max_cache_bytes: 256 * 1024 * 1024, max_display_list_bytes: 32 * 1024 * 1024 };
 
 impl Render2DLimits {
 	/// Does this declaration meet Profile 1's guaranteed minima?
@@ -62,7 +62,7 @@ impl Render2DLimits {
 	/// FIELD BY FIELD, AND THE FIRST SHORTFALL IS NAMED. "The limits are too small" sends a reader
 	/// to compare fifteen pairs of numbers by hand, which is how the wrong one gets raised.
 	pub fn meets_profile_1(&self) -> Result<(), &'static str> {
-		let minima = RENDER2D_PROFILE_1_MINIMA;
+		let minima = RENDER2D_PROFILE_1_MIN_LIMITS;
 		let checks: [(&'static str, u64, u64); 15] = [
 			("max_commands", u64::from(self.max_commands), u64::from(minima.max_commands)),
 			("max_resources", u64::from(self.max_resources), u64::from(minima.max_resources)),

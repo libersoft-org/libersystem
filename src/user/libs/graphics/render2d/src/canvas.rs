@@ -66,7 +66,7 @@ impl Canvas {
 	}
 
 	pub fn save(&mut self) -> Result<(), Error> {
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		if self.saved.len() as u64 + 1 > limits.max_clip_depth as u64 {
 			return Err(Error::LimitExceeded { limit: "saved states", ceiling: limits.max_clip_depth as u64 });
 		}
@@ -173,7 +173,7 @@ impl Canvas {
 	/// composited as ONE thing - which is what group opacity means and why it cannot be done by
 	/// multiplying each drawing's alpha.
 	pub fn begin_layer(&mut self, bounds: Option<RectF>, opacity: f32, blend: BlendMode, filter: Option<FilterHandle>) -> Result<(), Error> {
-		let limits = graphics_profile::RENDER2D_PROFILE_1_MINIMA;
+		let limits = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS;
 		if self.layers as u64 + 1 > limits.max_layer_depth as u64 {
 			return Err(Error::LimitExceeded { limit: "layer depth", ceiling: limits.max_layer_depth as u64 });
 		}

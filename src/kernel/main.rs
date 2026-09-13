@@ -17,6 +17,8 @@ mod console_input;
 mod device;
 mod dma_policy;
 mod elf;
+// The machine's entropy pool, and who is allowed to add to it. See the module.
+mod entropy;
 mod extable;
 mod fault;
 #[cfg(test)]
