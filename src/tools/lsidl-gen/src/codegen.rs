@@ -285,7 +285,13 @@ impl Cg {
 		let mut imports: Vec<(&String, &ResolvedSymbol)> = imports.iter().filter(|(_, symbol)| symbol.kind == SymbolKind::Value).collect();
 		imports.sort_by(|a, b| a.0.cmp(b.0));
 		for (local, symbol) in &imports {
-			self.line(&format!("use {} as {};", resolve::import_rust_path(symbol), camel(local)));
+			// `pub use`, NOT `use` (2026-09-13). A package's records may hold a type another package
+			// declares, and a consumer that reads such a record has to be able to NAME that type -
+			// `liber:display@1`'s `surface-info` holds `liber:graphics@1`'s `pixel-format`, and a
+			// private import made it unnameable through the package that hands the record over. The
+			// alternative is every consumer depending on every package its records transitively
+			// mention, which is the dependency fan-out a shared value package exists to avoid.
+			self.line(&format!("pub use {} as {};", resolve::import_rust_path(symbol), camel(local)));
 		}
 		if !imports.is_empty() {
 			self.line("");

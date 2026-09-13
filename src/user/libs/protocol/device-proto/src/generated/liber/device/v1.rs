@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// The class of a discovered device, mirroring the kernel's device type codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

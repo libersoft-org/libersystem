@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// A 32-bit IPv4 address as four octets - the canonical typed network address, never
 /// a parsed string on the wire (a textual form is only ever a rendering of these

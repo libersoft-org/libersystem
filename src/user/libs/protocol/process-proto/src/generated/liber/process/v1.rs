@@ -8,9 +8,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
-use crate::generated::liber::base::v1::Koid;
-use crate::generated::liber::resources::v1::Budget;
+pub use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Koid;
+pub use crate::generated::liber::resources::v1::Budget;
 
 /// One process the ProcessService has started: the kernel object id of the new
 /// process and the init-package entry name it was launched from.

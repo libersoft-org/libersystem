@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// One pointer event mapped to the text-cell grid: the cursor's column and row, and
 /// the button bitmask (bit 0 left, bit 1 right, bit 2 middle). The canonical typed

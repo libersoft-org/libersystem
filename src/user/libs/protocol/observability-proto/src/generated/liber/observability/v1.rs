@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// The class of a System Graph node: a userspace system service, a userspace device
 /// driver, or a hardware device node. The label that turns the boot dependency tree

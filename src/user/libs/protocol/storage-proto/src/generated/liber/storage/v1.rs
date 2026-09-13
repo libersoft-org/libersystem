@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// Options for opening a path on a volume.
 #[derive(Clone, Debug, PartialEq)]

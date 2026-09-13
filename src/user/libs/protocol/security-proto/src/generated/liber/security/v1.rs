@@ -8,9 +8,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::EnvVar;
-use crate::generated::liber::base::v1::Error;
-use crate::generated::liber::process::v1::StartResult as ProcessStartResult;
+pub use crate::generated::liber::base::v1::EnvVar;
+pub use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::process::v1::StartResult as ProcessStartResult;
 
 /// The kinds of capability a component may be declared to receive: a connection to one
 /// of the system services. The typed vocabulary a permission manifest is written in - a

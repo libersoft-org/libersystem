@@ -8,8 +8,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
-use crate::generated::liber::graphics::v1::PixelFormat;
+pub use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::graphics::v1::PixelFormat;
 
 /// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
 /// retains a read+map duplicate and transfers a write+map handle to the client. Its

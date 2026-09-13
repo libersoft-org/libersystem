@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// One configuration node: a dotted-path key (the tree path, e.g. "system.name")
 /// and its string value. The hierarchy lives in the key; the typed entry is the

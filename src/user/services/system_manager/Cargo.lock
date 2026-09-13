@@ -43,6 +43,7 @@ name = "display-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "graphics-proto",
  "process-proto",
  "wire",
 ]
@@ -52,6 +53,13 @@ name = "font-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "graphics-proto"
+version = "0.0.0"
+dependencies = [
  "wire",
 ]
 
@@ -106,6 +114,7 @@ dependencies = [
  "device-proto",
  "display-proto",
  "font-proto",
+ "graphics-proto",
  "input-proto",
  "log-proto",
  "network-proto",

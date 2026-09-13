@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// AudioService: headless PCM playback and capture over the virtio-sound device. `beep` queues a
 /// tone of the given frequency (Hz) and duration (milliseconds) into the same mixer - the device is

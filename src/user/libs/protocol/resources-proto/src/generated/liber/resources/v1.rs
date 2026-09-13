@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// The types of resource the kernel accounts and the ResourceManager budgets per Domain:
 /// physical memory held, live handles, live threads, in-transit IPC message bytes,

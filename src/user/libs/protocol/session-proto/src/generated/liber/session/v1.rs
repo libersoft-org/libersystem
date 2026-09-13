@@ -8,8 +8,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::EnvVar;
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::EnvVar;
+pub use crate::generated::liber::base::v1::Error;
 
 /// One tracked job in a session's job table: its small id (assigned by the session and
 /// stable across shell restarts), the program name shown by `jobs`, and whether it is

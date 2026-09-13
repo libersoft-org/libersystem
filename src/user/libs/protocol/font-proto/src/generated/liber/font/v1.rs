@@ -18,7 +18,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// The formats a face may be declared as. CLOSED: a declaration outside this vocabulary is refused
 /// at staging and refused again at runtime, because fallback and resolution are steered by it.

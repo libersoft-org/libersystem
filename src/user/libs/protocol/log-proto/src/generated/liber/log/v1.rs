@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// Log severity, ordered least to most urgent. The ordinal is the stable wire
 /// encoding and matches abi::log::Severity byte for byte.

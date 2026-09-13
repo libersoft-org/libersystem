@@ -8,7 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::generated::liber::base::v1::Error;
+pub use crate::generated::liber::base::v1::Error;
 
 /// A wall-clock instant: seconds since the Unix epoch (1970-01-01 UTC). The canonical
 /// time object - the CLI renders it as ISO-8601 / epoch / human, all representations
