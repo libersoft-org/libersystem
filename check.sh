@@ -8,6 +8,10 @@
 
 SCRIPT_NAME=check.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
+# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
+# build came to be waited on for half an hour.
+arm_run_verdict
 source "$SRC_DIR/tools/evidence.sh"
 install_guest_cleanup
 
@@ -188,6 +192,10 @@ declare -A GATES=(
 	["identity-note"]="tools/check-static-injection.sh identity-note"
 	["volume-layout"]="tools/check-volume-layout.sh ../.build/boot/volume-x86_64.pkg"
 	["milestone-index"]="tools/check-milestone-index.sh"
+	# EVERY ENTRY POINT ENDS WITH A VERDICT, proved by making them FAIL. A gate that only ran them
+	# successfully would prove nothing about the defect it exists for: a failed run and a running run
+	# were indistinguishable, and the failure paths are where the shapes differ.
+	["run-verdict"]="tools/check-run-verdict.sh"
 	# THE DRIVER PROTOCOL VERSION, IN THE BYTES THAT SHIPPED. It is read before a driver is given a
 	# device, so a note that did not survive the link and the strip would make that refusal a check
 	# of nothing - silently, because a driver with no note reads exactly like one that declares no

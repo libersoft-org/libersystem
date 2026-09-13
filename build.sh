@@ -8,6 +8,10 @@
 
 SCRIPT_NAME=build.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
+# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
+# build came to be waited on for half an hour.
+arm_run_verdict
 
 # The build steps live here rather than in a file of their own.
 #
@@ -49,7 +53,7 @@ target_flag() {
 }
 
 step_sdk() {
-	note "sdk"
+	step "sdk"
 	# `--workspace`, because `src/sdk` is the SDK LIBRARY now and the component is the example
 	# beside it. Without it cargo builds the root package only and the staged `.wasm` is whatever
 	# the last build left behind.
@@ -82,7 +86,7 @@ step_sdk() {
 
 step_libs() {
 	local arch="$1"
-	note "libs ($arch)"
+	step "libs ($arch)"
 	local pairs=()
 	mapfile -t pairs < <(shared_libs)
 	[[ ${#pairs[@]} -gt 0 ]] || die "the manifest lists no shared libraries"
@@ -93,7 +97,7 @@ step_user() {
 	local arch="$1" flag
 	ensure step_libs "$arch"
 	flag="$(target_flag "$arch")"
-	note "user ($arch)"
+	step "user ($arch)"
 	# shellcheck disable=SC2046,SC2086
 	(cd "$(source_path system_manager)" && cargo build $flag)
 	# shellcheck disable=SC2046,SC2086
@@ -107,14 +111,14 @@ step_user() {
 step_kernel() {
 	local arch="$1" flag
 	flag="$(target_flag "$arch")"
-	note "kernel ($arch)"
+	step "kernel ($arch)"
 	# shellcheck disable=SC2086
 	(cd "$SRC_DIR/kernel" && cargo build $flag)
 }
 
 step_loader() {
 	local arch="$1"
-	note "loader ($arch)"
+	step "loader ($arch)"
 	# UNDER THE SHARED LOADER LOCK (2026-09-01).
 	#
 	# Every loader build in this tree writes ONE output path per target, and the test harness stages a
@@ -155,7 +159,7 @@ export LIBER_PUBLISH_LOCK="$SRC_DIR/../.build/state/kernel-test-build.lock"
 
 step_packages() {
 	local arch="$1"
-	note "packages ($arch)"
+	step "packages ($arch)"
 	mkdir -p "$SRC_DIR/../.build/state"
 	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "$arch")
 }
@@ -177,7 +181,7 @@ step_volume() {
 			"$kernel_strip" "$source_kernel" "$staged_kernel"
 		args+=("--with-kernel=$staged_kernel")
 	fi
-	note "volume ($arch)"
+	step "volume ($arch)"
 	local status=0
 	mkdir -p "$SRC_DIR/../.build/state"
 	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "${args[@]}") || status=$?
@@ -270,6 +274,11 @@ while [[ $# -gt 0 ]]; do
 		export LIBER_DMA_MODE="$2"
 		shift 2
 		;;
+	--stall)
+		[[ $# -ge 2 ]] || die "--stall needs a number of seconds"
+		BUILD_STALL="$2"
+		shift 2
+		;;
 	--rebuild)
 		# EXPORTED rather than passed along: `build-shared.sh` and `build-exe-start.sh` both read
 		# it, and the parts below call them through several layers. The flag is what a person
@@ -301,6 +310,57 @@ wants() {
 # `--` arguments only make sense for the cargo-driven parts; say so rather than ignore them.
 if [[ ${#cargo_args[@]} -gt 0 ]] && ! wants user && ! wants kernel; then
 	die "arguments after -- are passed to cargo, which only the 'user' and 'kernel' parts run"
+fi
+
+# A BUILD THAT STOPS MAKING PROGRESS SAYS SO WHILE IT IS STILL STOPPED.
+#
+# The guest runner has had a stall watchdog for months and the build had nothing: a build that wedged
+# on a lock nobody released, or on a compiler that did not return, was discovered by a person
+# eventually. This is the same design with the one difference the subject forces.
+#
+# IT WATCHES A MARK, NOT A LOG, because `build.sh` has no log of its own - its output goes wherever
+# the caller sent it, and a watchdog cannot count lines it cannot see. Each step stamps a file with
+# its own name; the watchdog compares that file's age against the window. It is the same "count the
+# runner's OWN completions" rule the guest watchdog states, arrived at from the other side.
+#
+# AND IT REPORTS RATHER THAN KILLS. A guest can be shot down and restarted; a build killed mid-link
+# leaves artifacts nobody can reason about, and the person watching is the one who should decide. The
+# whole defect being fixed is not knowing - so saying it is the whole fix.
+BUILD_STALL="${BUILD_STALL:-900}"
+BUILD_STEP_MARK="$BUILD_DIR/state/build-step.$$"
+mkdir -p "$BUILD_DIR/state"
+: >"$BUILD_STEP_MARK"
+# ARMED TWICE, DELIBERATELY. The verdict was armed at the top so a run that dies in flag parsing
+# still reports one; installing the mark's cleanup here REPLACES that trap, so the verdict is chained
+# back onto it. `arm_run_verdict` chains rather than overwrites, which is what makes both true.
+trap 'rm -f "$BUILD_STEP_MARK"' EXIT
+arm_run_verdict
+
+# Announce a step AND stamp it, so the two cannot drift: a step that printed and did not stamp would
+# be a step the watchdog thinks never started.
+step() {
+	note "$*"
+	printf '%s\n' "$*" >"$BUILD_STEP_MARK"
+}
+
+if [[ "$BUILD_STALL" != "0" ]]; then
+	(
+		parent=$$
+		reported=0
+		while sleep 30; do
+			[[ -f "$BUILD_STEP_MARK" ]] || break
+			kill -0 "$parent" 2>/dev/null || break
+			age=$(($(date +%s) - $(stat -c %Y "$BUILD_STEP_MARK" 2>/dev/null || date +%s)))
+			if ((age >= BUILD_STALL)); then
+				if ((reported == 0)); then
+					echo "build.sh: STALLED - no step has started for ${age}s; the last one was '$(cat "$BUILD_STEP_MARK" 2>/dev/null || echo unknown)'" >&2
+					reported=1
+				fi
+			else
+				reported=0
+			fi
+		done
+	) &
 fi
 
 wants sdk && ensure step_sdk

@@ -107,6 +107,36 @@ including the passing ones, 400% CPU is eight emulated cores doing work, and the
 take minutes per test. Check the clock and the load before the diff - and now, check the per-test
 timings, which is the line that would have settled it in one glance.
 
+## Has it finished, and how did it end
+
+**Read the verdict, never the log.** Every entry point - `build.sh`, `test.sh`, `check.sh`, `gen.sh`
+and `verify.sh` - ends with exactly one line in exactly one shape:
+
+    build.sh: RESULT failed exit=1 seconds=9
+
+It is emitted from a `trap ... EXIT`, so it appears when the script succeeds, when it fails, when
+`set -e` aborts it mid-way and when a signal kills it - a run shot down with `SIGTERM` reports
+`RESULT failed exit=143` rather than claiming success. Set `RUN_STATUS_FILE` to a path and the same
+fields are written there as `key=value` lines; the file's EXISTENCE is the signal, because it is
+written when the run ends and is absent while it runs. "Has it finished" is then a file test.
+
+**Do not decide a run's state by searching its log for words.** This is written down because it cost
+half an hour: a build failed in nine seconds with `build-shared: Cargo image graph did not stop after
+emitting its ET_REL seed object`, and the thing watching the log was watching for `error` and
+`built:` - neither of which appeared. A failed run and a running run produced the same observable, a
+log that had stopped growing. Failures arrive in at least six shapes across the tools this tree
+drives; the verdict is the one shape that is always there.
+
+**Start a detached run with `setsid`.** Without it the run belongs to the process group of the shell
+that launched it, and that shell exiting takes the whole tree with it - leaving a log that simply
+stops mid-step with no error and no verdict, because the script never got to run its trap. Three runs
+died that way on 2026-09-13 before the cause was found.
+
+**A build that stops making progress says so.** `build.sh --stall SEC` (or `BUILD_STALL`, default
+900, `0` disables) reports a build whose steps have stopped starting, and names the step it was on.
+It REPORTS and does not kill: a guest can be shot down and restarted, a build killed mid-link leaves
+artifacts nobody can reason about, and the person watching is the one who should decide.
+
 ## Reading a guest run's logs
 
 `test.sh` writes two files per run and names both when it finishes:

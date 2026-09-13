@@ -252,6 +252,7 @@ or preventing further development of `v1`.
 - [x] [P02M0176 - Audit unsafe boundaries in the kernel and userspace before changing them](P02M0176.md) - complete 2026-09-09: the derived fifteen-row matrix, the `unsafe-inventory` tool with completeness fixtures, 5732 classified sites, the report, and the corrective follow-up P02M0178
 - [x] [P02M0178 - Narrow the userspace runtime's unsafe surface to the contracts callers actually hold](P02M0178.md) - the corrective follow-up the unsafe-boundary audit routed: safe signatures for the propagated syscall wrappers, the propagation removed downstream, and the kernel's `read_user` bounded
 - [x] [P02M0177 - A change is verified in proportion to itself, and integration bugs are catchable without a guest](P02M0177.md)
+- [x] [P02M0179 - A run that ends says so, and a run that stalls says so while it is still stalling](P02M0179.md) - tooling correctness, not a product feature: every entry point ends with one verdict line in one shape emitted from a trap, a status file exists exactly when a run has ended, and the build gets the stall window the guest runner already has. Written after a failed build was waited on for thirty minutes because the failure did not match the words being watched for, and after three runs died silently when the shell that launched them was killed
 
 ### Definition of done (phase 2)
 

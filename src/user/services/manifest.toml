@@ -3401,7 +3401,19 @@ name = "display-proto"
 owner = "display-proto"
 destination = "lib/protocol/display-proto.lslib"
 features = ["shared-image"]
-providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+# `graphics-proto` IS A DIRECT PROVIDER NOW: `surface-info` holds a `pixel-format`, which is
+# `liber:graphics@1`'s type, so this library calls its reader and writer.
+providers = ["base-proto", "graphics-proto", "ipc-client", "wire", "lsrt"]
+
+# THE SHARED GRAPHICS VALUE TYPES, staged as a library because more than one graphics interface
+# calls into them. It declares no interface of its own - an extent, a rectangle, a pixel format, a
+# colour space and an alpha mode - and every package that used to declare its own copy imports it.
+[[libraries]]
+name = "graphics-proto"
+owner = "graphics-proto"
+destination = "lib/protocol/graphics-proto.lslib"
+features = ["shared-image"]
+providers = ["ipc-client", "wire", "lsrt"]
 
 # The synthetic ICD. It carries no Vulkan entry point: what it implements is the Loader/Driver
 # INTERFACE - two exports and the version negotiation between them - which is what a selection slot

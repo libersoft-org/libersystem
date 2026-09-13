@@ -91,6 +91,70 @@ note() {
 	echo "${SCRIPT_NAME:-$(basename "$0")}: $*" >&2
 }
 
+# ONE VERDICT, ONE SHAPE, FROM A TRAP - so a run that ENDS always says so.
+#
+# WHAT THIS FIXES, MEASURED. Every entry point announced success in its own words (`built: ...`,
+# `all selected checks passed`, `PASS:`) and announced FAILURE in whatever words the tool underneath
+# it happened to use - `error[E0603]`, `build-shared: ... status=1`, `... did not stop after emitting
+# its ET_REL seed object`, `warning: build failed`. So a finished-and-failed run and a still-running
+# one looked THE SAME to anything reading the log, and on 2026-09-13 a build that had failed in nine
+# seconds was waited on for thirty minutes because the failure did not match the words being watched
+# for. That is the whole defect: the absence of a verdict, not the variety of the messages.
+#
+# IT IS A TRAP AND NOT A LINE AT THE BOTTOM, because the runs that are hardest to notice are exactly
+# the ones that never reach the bottom: `set -e` aborting mid-script, a signal, a killed parent
+# taking the process group with it. A trap fires on all of those.
+#
+# AND IT WRITES A FILE, because prose is not a protocol. `<log>.status` exists when the run has
+# ENDED and does not exist while it runs, so "has it finished" is a file test rather than a search
+# for words. Set `RUN_STATUS_FILE` before the run to choose where it lands; without it only the line
+# is printed, which is what an interactive run wants.
+RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%s)}"
+run_verdict() {
+	# THE STATUS IS PASSED IN WHEN THERE IS A TRAP BEFORE THIS ONE, and taken from `$?` when there is
+	# not. Chaining `trap "cleanup; run_verdict" EXIT` makes `$?` the status of CLEANUP rather than of
+	# the script, so a run that failed reported `ok` as soon as its cleanup succeeded - which is the
+	# same lie the signal case told, arriving by a different route. `arm_run_verdict` captures the
+	# script's status first and hands it over.
+	local status="${1:-$?}"
+	local seconds=$(($(date +%s) - RUN_STARTED_AT))
+	local outcome=ok
+	[[ "$status" == 0 ]] || outcome=failed
+	local name="${SCRIPT_NAME:-$(basename "$0")}"
+	echo "$name: RESULT $outcome exit=$status seconds=$seconds" >&2
+	if [[ -n "${RUN_STATUS_FILE:-}" ]]; then
+		# The directory may not exist yet on a run that failed before it built anything.
+		mkdir -p "$(dirname "$RUN_STATUS_FILE")" 2>/dev/null || true
+		printf 'script=%s\noutcome=%s\nexit=%s\nseconds=%s\n' "$name" "$outcome" "$status" "$seconds" >"$RUN_STATUS_FILE" 2>/dev/null || true
+	fi
+	return "$status"
+}
+
+# Arm the verdict for this script. Called once, near the top, AFTER `SCRIPT_NAME` is set.
+#
+# It chains rather than replaces: `test.sh` and `check.sh` already install a guest cleanup on EXIT,
+# and an entry point that armed this by overwriting the trap would leave a guest holding a disk image
+# - which is the failure `install_guest_cleanup` exists to prevent.
+arm_run_verdict() {
+	local existing
+	existing="$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/")"
+	if [[ -n "$existing" && "$existing" != "trap -- '' EXIT" ]]; then
+		trap "__run_status=\$?; $existing; run_verdict \"\$__run_status\"" EXIT
+	else
+		trap run_verdict EXIT
+	fi
+	# AND A KILLED RUN REPORTS A FAILURE, WHICH IS THE WHOLE POINT OF THE EXERCISE.
+	#
+	# The EXIT trap alone is not enough: a script killed by a signal runs it with `$?` still zero, so
+	# the verdict said `ok exit=0` over a run that was shot down. That is WORSE than no verdict - a
+	# reader is told the run succeeded. Each signal exits with the shell's own 128+n convention, and
+	# that status is what the EXIT trap then reports.
+	local signal
+	for signal in INT TERM HUP QUIT; do
+		trap "exit \$((128 + \$(kill -l "$signal")))" "$signal"
+	done
+}
+
 # Expand `all` and validate. Accepts repeated flags and comma-separated lists, so
 # `--arch aarch64 --arch riscv64` and `--arch aarch64,riscv64` mean the same thing.
 parse_list() {

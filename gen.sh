@@ -20,6 +20,10 @@
 
 SCRIPT_NAME=gen.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
+# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
+# build came to be waited on for half an hour.
+arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
 PACKAGES=(base audio device log network observability resources time config process display security session input storage font graphics)
