@@ -142,8 +142,12 @@ impl Scene {
 	/// edge, a projectively transformed image, a clipped and scrolled column, a nested and an inverse
 	/// clip, a group-opacity layer, blend modes including a non-separable one, a backdrop-blurred
 	/// panel and a line of text with a colour glyph in it.
-	fn record(&self, extent: Extent2D, phase: Phase, images: &Images) -> Result<DrawList, Error> {
-		let mut canvas = Canvas::new();
+	fn record(&self, canvas: &mut Canvas, extent: Extent2D, phase: Phase, images: &Images) -> Result<DrawList, Error> {
+		// THE CANVAS IS REUSED AND NOT REBUILT. `restart` keeps the resource tables and their
+		// capacity, which is what makes re-recording the same scene every frame cost no new
+		// allocation for the paths, the stops and the filter graphs it holds - a recorder that built
+		// a new one each frame would allocate sixty times a second for ever.
+		canvas.restart();
 		let width = extent.width as f32;
 		let height = extent.height as f32;
 		// THE BACKGROUND IS A MULTI-STOP CONIC GRADIENT, whose angle moves only in the phases that
@@ -479,6 +483,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	let mut scene = Scene::new();
+	let mut canvas = Canvas::new();
 	let mut backend = Soft2d::new();
 	let provider = Forms;
 	let mut phase_index = 0usize;
@@ -535,7 +540,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let Some(frame) = frames.acquire() else { continue };
 				let extent = frame.layout.extent;
 				let phase = Phase::ORDER[phase_index];
-				let list = match scene.record(extent, phase, &images) {
+				let list = match scene.record(&mut canvas, extent, phase, &images) {
 					Ok(list) => list,
 					Err(_) => {
 						print(b"test2d-sw: the scene was refused\n");
@@ -648,7 +653,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						Step::Draw => {
 							let Some(frame) = second.acquire() else { continue };
 							let extent = frame.layout.extent;
-							match scene.record(extent, Phase::Full, &images) {
+							match scene.record(&mut canvas, extent, Phase::Full, &images) {
 								Ok(list) if draw(&mut backend, &provider, &images, &list, &frame) => {
 									if second.present_whole(frame) {
 										second_presents += 1;

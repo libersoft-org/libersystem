@@ -3041,4 +3041,29 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	// with the first one's resources and generation surviving it.
 	assert!(!contains(b"second=0 "), "the second surface presented: {output:?}");
 	assert!(contains(b"test2d-sw: done"), "and the run ended cleanly: {output:?}");
+
+	// AND THE CONSOLE IS BACK. A demo that took the screen and gave nothing back would leave a system
+	// with no visible console - which is what a person sees as a machine that died - so the console's
+	// own surface is presented after the demo ended and the frame is expected to reach the DEVICE.
+	let console_surface = create_surface(&console_client, &focus_input, b"OK", 700, 0, 0, 2);
+	let console_configuration = adopt(&console_surface, 702);
+	let (console_queue, _producer, _done) = present_queue(&console_surface, 706);
+	let _images = provide_queue(&console_surface, 710, &console_queue, console_configuration.physical_extent.height);
+	assert_eq!(acquire_next(&console_surface, 720), display_v1::AcquiredImage::Image(0), "the console's queue has an image to draw into");
+	send_present(&console_surface, 721, 0, &console_configuration, &damage(&[(0, 0, 8, 8)]));
+	let mut reached = false;
+	for _ in 0..4_000u32 {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		if focus_input.recv().is_ok() {
+			focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
+		}
+		if let Ok(present) = gpu_kernel.recv() {
+			let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
+			reply.push(1);
+			gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
+			reached = true;
+			break;
+		}
+	}
+	assert!(reached, "the console's own frame reaches the device once the demo has gone");
 }
