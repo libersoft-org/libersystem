@@ -394,30 +394,31 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 	unsafe {
 		let display = surface::connect(display_channel);
-		let Some(surface) = surface::acquire(&display, 0, 0).and_then(Result::ok) else {
+		// TWO IMAGES, which is the fewest a present queue will negotiate: a viewer redraws on a key
+		// and never several frames ahead, so a third would be memory it does not use.
+		let Some(surface) = surface::Surface::create(&display, surface::wire_extent(0, 0), 2).and_then(Result::ok) else {
 			eprint(b"imgview: cannot acquire display\n");
 			return;
 		};
-		let layout = surface.layout();
+		let Some(layout) = surface.image(0).map(|image| image.layout()) else {
+			eprint(b"imgview: the display gave a surface with no images\n");
+			return;
+		};
 		let screen = layout.extent;
 		let target_len = match (layout.pitch as usize).checked_mul(screen.height as usize) {
 			Some(len) => len,
 			None => return,
 		};
 		let Some(mut viewport) = Viewport::new(&image, screen) else {
-			let _ = surface::release(&display);
 			return;
 		};
-		if !present_view(&display, &surface, layout, target_len, &image, &viewport) {
-			let _ = surface::release(&display);
+		if !present_view(&surface, layout, target_len, &image, &viewport) {
 			return;
 		}
-		let Some(focus) = surface::input_focus(&display).and_then(Result::ok) else {
-			let _ = surface::release(&display);
+		let Some(focus) = surface.input_focus().and_then(Result::ok) else {
 			return;
 		};
 		let Some(key_stream) = surface::subscribe_keys(input_channel, focus) else {
-			let _ = surface::release(&display);
 			return;
 		};
 		let stdin_channel = stdin();
@@ -471,7 +472,7 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 				}
 				if now >= next_repeat {
 					if zoom_held(&mut viewport, screen, held) || pan_held(&mut viewport, screen, held) {
-						let _ = present_view(&display, &surface, layout, target_len, &image, &viewport);
+						let _ = present_view(&surface, layout, target_len, &image, &viewport);
 					}
 					next_repeat = now.saturating_add(PAN_REPEAT_TICKS);
 				}
@@ -492,7 +493,7 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 								exit_requested = true;
 							} else if action == ViewAction::Redraw {
 								next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
-								let _ = present_view(&display, &surface, layout, target_len, &image, &viewport);
+								let _ = present_view(&surface, layout, target_len, &image, &viewport);
 							}
 						}
 						for handle in frame_handles.as_slice() {
@@ -515,7 +516,7 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 							}
 							if action == ViewAction::Redraw {
 								next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
-								let _ = present_view(&display, &surface, layout, target_len, &image, &viewport);
+								let _ = present_view(&surface, layout, target_len, &image, &viewport);
 							}
 						}
 					}
@@ -531,23 +532,35 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			}
 			set_stdin(0);
 		}
-		let _ = surface::release(&display);
 	}
 }
 
 // `None` FOR A SURFACE THAT DOES NOT DESCRIBE ITSELF, which a struct literal could not express. The
 // checked constructor refuses a buffer too small for the geometry and channel masks that overlap;
 // both were previously assumed by everything downstream of this function.
-unsafe fn present_view(display: &surface::Client, surface: &surface::Mapping, layout: ImageLayout, target_len: usize, image: &DecodedImage, viewport: &Viewport) -> bool {
-	// SAFETY: the caller's contract - `surface` is a live mapping of at least `target_len` bytes.
-	let output = unsafe { core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len) };
+unsafe fn present_view(surface: &surface::Surface, layout: ImageLayout, target_len: usize, image: &DecodedImage, viewport: &Viewport) -> bool {
+	// THE IMAGE IS ACQUIRED, DRAWN WHOLE AND PRESENTED WHOLE. A viewer redraws its entire picture on
+	// every change, so there is no damage to track - and drawing the whole image is what makes
+	// presenting into whichever one the queue hands over correct without a shadow.
+	let index = match surface.acquire() {
+		Some(Ok(surface::AcquiredImage::Image(index))) => index,
+		_ => return false,
+	};
+	let Some(mapping) = surface.image(index) else {
+		let _ = surface.abandon(index);
+		return false;
+	};
+	// SAFETY: the caller's contract - the mapping is live and at least `target_len` bytes.
+	let output = unsafe { core::slice::from_raw_parts_mut(mapping.addr() as *mut u8, target_len) };
 	// THE DESTINATION IS THE SURFACE'S OWN DESCRIPTION, adopted. This used to take the mapping's
 	// framebuffer record apart into eight arguments and rebuild the same thing from them.
 	let (Some(source), Some(destination)) = (Image::rgba(&image.pixels, image.width, image.height, image.pitch), Target::from_layout(output, layout)) else {
 		return false;
 	};
 	let Some(blit) = pix::blit_view(source, destination, viewport.width, viewport.height, viewport.pan_x, viewport.pan_y) else {
+		let _ = surface.abandon(index);
 		return false;
 	};
-	matches!(surface::present(display, blit.rect), Some(Ok(())))
+	let _ = blit;
+	matches!(surface.present_whole(index), Some(Ok(_)))
 }

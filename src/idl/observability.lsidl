@@ -42,16 +42,37 @@ record counters {
 	last-failure:      string,
 }
 
+/// One bounded count a component reports about ITSELF, which the kernel charges nobody for.
+///
+/// THE KERNEL'S COUNTERS ARE THE ONES ABOVE and they cover what it charges: messages, handles,
+/// mapped bytes. A service also holds structures the kernel knows nothing about - a display
+/// service's surfaces and present queues, a session service's sessions - and those are exactly what
+/// an adversarial client multiplies. A count on its own says nothing, so each carries the BOUND it
+/// is held to: `live` at `bound` is a component refusing new work, which is a different fact from
+/// `live` being large.
+///
+/// OBSERVATION AND NEVER ENFORCEMENT. The bound is enforced where the structure is allocated; this
+/// is the number a reader sees, and reading it changes nothing.
+record resource-count {
+	/// What is being counted, as the component names it (`surfaces`, `present-images`, ...).
+	name:  string,
+	live:  u64,
+	bound: u64,
+}
+
 /// One node in the System Graph: a component's name, its type, its live state, the
 /// names of the components it depends on (the graph edges), and its counters. A
 /// service or driver carries live kernel counters; a device node carries the device's
 /// identity with zero counters.
 record component {
-	name:     string,
-	type:     component-type,
-	state:    component-state,
-	deps:     list<string>,
-	counters: counters,
+	name:      string,
+	type:      component-type,
+	state:     component-state,
+	deps:      list<string>,
+	counters:  counters,
+	/// What this component reports about structures the kernel charges nobody for. EMPTY for a
+	/// component that reports none, which is every one that has nothing an adversary can multiply.
+	resources: list<resource-count>,
 }
 
 /// One lightweight trace span recorded while building a snapshot: the downstream call

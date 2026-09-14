@@ -27,6 +27,7 @@ use std::cell::Cell;
 // generator emits that same 1024 into the guard. Written out rather than imported so a change to
 // either side is a failure here instead of two constants moving together.
 const RIGHT_MANAGE: u32 = 1 << 10;
+const RIGHT_WAIT: u32 = 1 << 11;
 const RIGHT_READ: u32 = 1 << 0;
 
 // The stable object-type codes. `liber:process@1` declares `@kernel(process)` on its `task`
@@ -76,6 +77,10 @@ impl Service for Recording {
 	fn stats(&mut self) -> PresentationStats {
 		unimplemented!("no test in this module reaches stats")
 	}
+
+	fn set_visible(&mut self, _task: u64, _surface: u64) -> Result<(), Error> {
+		unimplemented!("no test in this module reaches set-visible")
+	}
 }
 
 // The bytes a generated client writes for `bind`: the opcode, the correlation id, and the u32
@@ -124,7 +129,7 @@ fn a_refusal_releases_the_handle_it_refused_and_an_acceptance_does_not() {
 	let (_, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_READ));
 	assert_eq!(outcome, Err(Error::Denied));
 	assert_eq!(released_handles(), vec![0x11], "the one handle the refused request carried was released");
-	let (_, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_MANAGE));
+	let (_, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_MANAGE | RIGHT_WAIT));
 	assert_eq!(outcome, Ok(0x5eed));
 	assert!(released_handles().is_empty(), "an accepted request's handle belongs to the service and is not released by the guard");
 	// Repeated refusals release one handle each - the shape of a caller retrying against a
@@ -137,10 +142,21 @@ fn a_refusal_releases_the_handle_it_refused_and_an_acceptance_does_not() {
 }
 
 #[test]
-fn a_task_handle_carrying_manage_reaches_the_service() {
-	let (service, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_MANAGE | RIGHT_READ));
+fn a_task_handle_carrying_manage_and_wait_reaches_the_service() {
+	let (service, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_MANAGE | RIGHT_WAIT | RIGHT_READ));
 	assert_eq!(outcome, Ok(0x5eed), "the service answered");
 	assert_eq!(service.binds, 1, "the service was called exactly once");
+}
+
+// `wait` IS PART OF WHAT THE SIGNATURE ASKS FOR, and a handle carrying only `manage` is the shape
+// the caller that had not been updated produces. The display service SIGNALS the bound task, which
+// is `manage`, and WATCHES it so a dead client's surfaces are released - which `manage` cannot
+// express and a channel cannot answer, because a channel stays open while anyone holds its peer.
+#[test]
+fn a_task_handle_without_wait_is_refused_even_when_it_carries_manage() {
+	let (service, outcome) = bind_with(packed(TYPE_PROCESS, RIGHT_MANAGE));
+	assert_eq!(outcome, Err(Error::Denied), "the schema asks for both");
+	assert_eq!(service.binds, 0, "the service was never reached");
 }
 
 #[test]
@@ -156,6 +172,10 @@ fn a_task_handle_without_manage_is_refused_before_the_service_sees_it() {
 fn every_right_except_manage_is_still_a_refusal() {
 	let all_but_manage = u32::MAX & !RIGHT_MANAGE;
 	let (service, outcome) = bind_with(packed(TYPE_PROCESS, all_but_manage));
+	assert_eq!(outcome, Err(Error::Denied));
+	assert_eq!(service.binds, 0, "the service was never reached");
+	let all_but_wait = u32::MAX & !RIGHT_WAIT;
+	let (service, outcome) = bind_with(packed(TYPE_PROCESS, all_but_wait));
 	assert_eq!(outcome, Err(Error::Denied));
 	assert_eq!(service.binds, 0, "the service was never reached");
 }

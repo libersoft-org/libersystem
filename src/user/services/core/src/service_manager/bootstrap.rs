@@ -379,7 +379,7 @@ fn parse_classification_report(report: &[u8], expected: usize) -> Result<(usize,
 	Ok((text, table))
 }
 
-pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut Vec<u64>, role_blocks: &mut Vec<u64>, block_formats: &mut Vec<u8>, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
+pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut Vec<u64>, role_blocks: &mut Vec<u64>, block_formats: &mut Vec<u8>, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, display_stats: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	let (manager_side, service_side): (u64, u64) = match channel() {
 		Some(pair) => pair,
 		None => return (State::Failed, Reason::BootstrapRefused),
@@ -762,6 +762,9 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 				b"display_service" => {
 					*display_client = kept.end_of(name, CAP_SERVE);
 					*display_admin = kept.end_of(name, b"ADMIN");
+					// THE OBSERVATION ROOT, WHICH IS NOT THE ADMIN ONE: what SystemGraphService is
+					// handed can answer what the display path holds and can change nothing.
+					*display_stats = kept.end_of(name, b"STATS");
 				}
 				b"input_service" => {
 					*input_client = kept.end_of(name, CAP_SERVE);
@@ -786,7 +789,7 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 		// DEVPRIV is appended AFTER CONSOLE, and every launcher of device_manager owes it: the
 		// bootstrap is read positionally, so `recv_tagged` checks the tag of the next message rather
 		// than searching for one, and anything inserted in the middle shifts every read after it.
-		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), graph_client, stats_server) {
+		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), *display_stats, graph_client, stats_server) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		// THE FONT ENDPOINTS, read from what this supervisor KEPT rather than threaded through the
@@ -1032,7 +1035,7 @@ pub(super) fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> State {
 // ("SERVE"), kept in `*graph_client` for the shell. SystemGraphService comes up after
 // every component it observes, so their handles are all captured and their state is
 // Running when its node set is built.
-pub(super) fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, device_manager_catalogue: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
+pub(super) fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, device_manager_catalogue: u64, display_stats: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
 	let mut i: usize = 0;
 	while i < N {
 		let name: &[u8] = MANIFEST[i].name;
@@ -1089,6 +1092,14 @@ pub(super) fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N]
 		return false;
 	}
 	*stats_server = stats_srv;
+	// DISPLAYSERVICE'S OBSERVATION ROOT, which can answer what the display path holds and can change
+	// nothing. OPTIONAL in exactly one way: a boot that started no display service sends the tag
+	// carrying nothing, because the read is positional and a missing message would shift every one
+	// after it.
+	let display: u64 = if display_stats != 0 { service_connect(display_stats).unwrap_or(0) } else { 0 };
+	if !send_blocking(manager_side, b"DISPLAY", display) {
+		return false;
+	}
 	// The channel its clients (the shell) reach it on; the client end is kept in
 	// `*graph_client` for the shell's own bootstrap.
 	bootstrap_serve(manager_side, graph_client)

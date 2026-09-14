@@ -1,0 +1,7 @@
+[package]
+name = "render-math"
+edition = "2024"
+description = "The frozen 3D math contract: one handedness, one storage order, one depth range, one winding, and a typed refusal wherever a value cannot be one"
+
+[lints.rust]
+warnings = "deny"

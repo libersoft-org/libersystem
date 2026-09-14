@@ -218,6 +218,21 @@ pub const SYS_PCI_INFO: u64 = 58;
 // queue is empty and the peer is gone), so a receiver can size its buffer exactly
 // instead of guessing a ceiling.
 pub const SYS_CHANNEL_PEEK: u64 = 59;
+// THE UNIT EVERY SYSCALL DEADLINE IS IN.
+//
+// `SYS_CLOCK_GET` answers the scheduler's coarse tick counter and every `deadline` argument in this
+// ABI - `SYS_WAIT`, `SYS_WAIT_ANY`, `SYS_WAITSET_WAIT`, `SYS_TIMER_SET` - is an absolute value on
+// that counter. `SYS_CLOCK_MONO_NS` answers NANOSECONDS, which is the unit every TIMING CONTRACT in
+// this system is expressed in, because a frame deadline measured in ten-millisecond steps is not a
+// frame deadline at all.
+//
+// SO THE TWO UNITS MEET IN USERSPACE, and the conversion needs the rate. It was written out as a
+// private `100` in the one service that needed it, and the next caller that needed it got the
+// conversion wrong in the direction that never wakes up: a nanosecond value passed as a tick
+// deadline is a wait of about four months. It is stated here, once, beside the calls that take it.
+pub const TICKS_PER_SECOND: u64 = 100;
+pub const NANOS_PER_TICK: u64 = 1_000_000_000 / TICKS_PER_SECOND;
+
 // Report the ABI revision the caller was built against (a0 = its abi::ABI_VERSION); the
 // kernel returns 0 on a match and ERR_ABI_MISMATCH otherwise. The runtime issues it as
 // its first syscall, so a binary built against a different ABI is refused before it runs.
@@ -445,6 +460,24 @@ pub const SYS_ENTROPY_ADD: u64 = 83;
 // is the caller's question, and a kernel that answered it would be answering for every future caller
 // too.
 pub const SYS_ENTROPY_HEALTH: u64 = 84;
+
+// Move SEVERAL capabilities, each with less authority than the sender holds.
+//
+// `SYS_CHANNEL_SEND_ATTENUATED` moves exactly one, and one is not enough for a reply that hands over
+// a PAIR: a present queue's two completion endpoints travel in the same answer, and sending them one
+// at a time would mean two messages for a record the schema says is one. `caps_ptr` points at
+// `[count, CapTransfer * count]` - the count travels with the list for the same reason the ordinary
+// multi-cap send's does, which is that the four argument registers are already spent.
+//
+// Each receiver end gets the INTERSECTION of that capability's rights and its own mask, and the masks
+// are per capability because the two halves of a completion pair are not the same authority: one may
+// only SEND and the other may only RECEIVE and WAIT. A mask naming a right the capability does not
+// hold is not an error, because an intersection cannot widen.
+//
+// EVERY handle must carry TRANSFER before anything is sent, exactly as in the unattenuated form, so a
+// list with one bad entry moves nothing - and a refused send leaves every one of the sender's handles
+// open at the same value with its rights unchanged.
+pub const SYS_CHANNEL_SEND_CAPS_ATTENUATED: u64 = 85;
 
 // The largest submission `SYS_ENTROPY_ADD` will read in one call. A bound rather than a buffer size:
 // the credit is capped far below this anyway, so a larger call would be a larger copy for no more

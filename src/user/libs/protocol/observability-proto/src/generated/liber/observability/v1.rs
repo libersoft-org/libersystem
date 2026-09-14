@@ -208,6 +208,74 @@ impl Counters {
 	}
 }
 
+/// One bounded count a component reports about ITSELF, which the kernel charges nobody for.
+///
+/// THE KERNEL'S COUNTERS ARE THE ONES ABOVE and they cover what it charges: messages, handles,
+/// mapped bytes. A service also holds structures the kernel knows nothing about - a display
+/// service's surfaces and present queues, a session service's sessions - and those are exactly what
+/// an adversarial client multiplies. A count on its own says nothing, so each carries the BOUND it
+/// is held to: `live` at `bound` is a component refusing new work, which is a different fact from
+/// `live` being large.
+///
+/// OBSERVATION AND NEVER ENFORCEMENT. The bound is enforced where the structure is allocated; this
+/// is the number a reader sees, and reading it changes nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceCount {
+	/// What is being counted, as the component names it (`surfaces`, `present-images`, ...).
+	pub name: String,
+	pub live: u64,
+	pub bound: u64,
+}
+
+impl ResourceCount {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ResourceCount> {
+		let mut r = Reader::new(bytes);
+		let value = ResourceCount::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ResourceCount> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ResourceCount::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.name.as_bytes())?;
+		w.u64(self.live)?;
+		w.u64(self.bound)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ResourceCount> {
+		let name = r.string_lp()?;
+		let live = r.u64()?;
+		let bound = r.u64()?;
+		Some(ResourceCount { name, live, bound })
+	}
+}
+
 /// One node in the System Graph: a component's name, its type, its live state, the
 /// names of the components it depends on (the graph edges), and its counters. A
 /// service or driver carries live kernel counters; a device node carries the device's
@@ -219,6 +287,9 @@ pub struct Component {
 	pub state: ComponentState,
 	pub deps: Vec<String>,
 	pub counters: Counters,
+	/// What this component reports about structures the kernel charges nobody for. EMPTY for a
+	/// component that reports none, which is every one that has nothing an adversary can multiply.
+	pub resources: Vec<ResourceCount>,
 }
 
 impl Component {
@@ -268,6 +339,13 @@ impl Component {
 			w.bytes_lp(v0.as_bytes())?;
 		}
 		self.counters.write(w)?;
+		if self.resources.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.resources.len() as u16)?;
+		for v1 in self.resources.iter() {
+			v1.write(w)?;
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Component> {
@@ -275,16 +353,25 @@ impl Component {
 		let r#type = ComponentType::read(r)?;
 		let state = ComponentState::read(r)?;
 		let deps = {
-			let v1 = r.u16()? as usize;
-			let mut v2 = Vec::new();
-			v2.try_reserve_exact(v1).ok()?;
-			for _ in 0..v1 {
-				v2.push(r.string_lp()?);
+			let v2 = r.u16()? as usize;
+			let mut v3 = Vec::new();
+			v3.try_reserve_exact(v2).ok()?;
+			for _ in 0..v2 {
+				v3.push(r.string_lp()?);
 			}
-			v2
+			v3
 		};
 		let counters = Counters::read(r)?;
-		Some(Component { name, r#type, state, deps, counters })
+		let resources = {
+			let v4 = r.u16()? as usize;
+			let mut v5 = Vec::new();
+			v5.try_reserve_exact(v4).ok()?;
+			for _ in 0..v4 {
+				v5.push(ResourceCount::read(r)?);
+			}
+			v5
+		};
+		Some(Component { name, r#type, state, deps, counters, resources })
 	}
 }
 
@@ -394,36 +481,36 @@ impl Graph {
 			return None;
 		}
 		w.u16(self.components.len() as u16)?;
-		for v3 in self.components.iter() {
-			v3.write(w)?;
+		for v6 in self.components.iter() {
+			v6.write(w)?;
 		}
 		if self.spans.len() > u16::MAX as usize {
 			return None;
 		}
 		w.u16(self.spans.len() as u16)?;
-		for v4 in self.spans.iter() {
-			v4.write(w)?;
+		for v7 in self.spans.iter() {
+			v7.write(w)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Graph> {
 		let components = {
-			let v5 = r.u16()? as usize;
-			let mut v6 = Vec::new();
-			v6.try_reserve_exact(v5).ok()?;
-			for _ in 0..v5 {
-				v6.push(Component::read(r)?);
+			let v8 = r.u16()? as usize;
+			let mut v9 = Vec::new();
+			v9.try_reserve_exact(v8).ok()?;
+			for _ in 0..v8 {
+				v9.push(Component::read(r)?);
 			}
-			v6
+			v9
 		};
 		let spans = {
-			let v7 = r.u16()? as usize;
-			let mut v8 = Vec::new();
-			v8.try_reserve_exact(v7).ok()?;
-			for _ in 0..v7 {
-				v8.push(TraceSpan::read(r)?);
+			let v10 = r.u16()? as usize;
+			let mut v11 = Vec::new();
+			v11.try_reserve_exact(v10).ok()?;
+			for _ in 0..v10 {
+				v11.push(TraceSpan::read(r)?);
 			}
-			v8
+			v11
 		};
 		Some(Graph { components, spans })
 	}
@@ -473,13 +560,13 @@ pub mod system_graph {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v9) => {
+						Ok(v12) => {
 							w.u8(1)?;
-							v9.write(w)?;
+							v12.write(w)?;
 						}
-						Err(v10) => {
+						Err(v13) => {
 							w.u8(0)?;
-							v10.write(w)?;
+							v13.write(w)?;
 						}
 					}
 					Some(())
@@ -760,19 +847,19 @@ pub mod supervisor {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v11) => {
+						Ok(v14) => {
 							w.u8(1)?;
-							if v11.len() > u16::MAX as usize {
+							if v14.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v11.len() as u16)?;
-							for v13 in v11.iter() {
-								v13.write(w)?;
+							w.u16(v14.len() as u16)?;
+							for v16 in v14.iter() {
+								v16.write(w)?;
 							}
 						}
-						Err(v12) => {
+						Err(v15) => {
 							w.u8(0)?;
-							v12.write(w)?;
+							v15.write(w)?;
 						}
 					}
 					Some(())
@@ -902,13 +989,13 @@ pub mod supervisor {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v14 = r.u16()? as usize;
-						let mut v15 = Vec::new();
-						v15.try_reserve_exact(v14).ok()?;
-						for _ in 0..v14 {
-							v15.push(SupervisorStat::read(r)?);
+						let v17 = r.u16()? as usize;
+						let mut v18 = Vec::new();
+						v18.try_reserve_exact(v17).ok()?;
+						for _ in 0..v17 {
+							v18.push(SupervisorStat::read(r)?);
 						}
-						v15
+						v18
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1100,6 +1187,57 @@ impl Counters {
 	}
 }
 
+impl ResourceCount {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"live\":");
+		let _ = write!(out, "{}", self.live);
+		out.push(',');
+		out.push_str("\"bound\":");
+		let _ = write!(out, "{}", self.bound);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("live=");
+		let _ = write!(out, "{}", self.live);
+		out.push_str(", ");
+		out.push_str("bound=");
+		let _ = write!(out, "{}", self.bound);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "live");
+		crate::codec::cbor::uint(out, self.live as u64);
+		crate::codec::cbor::text(out, "bound");
+		crate::codec::cbor::uint(out, self.bound as u64);
+	}
+}
+
 impl Component {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1129,18 +1267,30 @@ impl Component {
 		out.push(',');
 		out.push_str("\"deps\":");
 		out.push('[');
-		let mut v17 = true;
-		for v16 in self.deps.iter() {
-			if !v17 {
+		let mut v20 = true;
+		for v19 in self.deps.iter() {
+			if !v20 {
 				out.push(',');
 			}
-			v17 = false;
-			crate::codec::json_escape(v16, out);
+			v20 = false;
+			crate::codec::json_escape(v19, out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"counters\":");
 		self.counters.to_json_into(out);
+		out.push(',');
+		out.push_str("\"resources\":");
+		out.push('[');
+		let mut v22 = true;
+		for v21 in self.resources.iter() {
+			if !v22 {
+				out.push(',');
+			}
+			v22 = false;
+			v21.to_json_into(out);
+		}
+		out.push(']');
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1156,22 +1306,34 @@ impl Component {
 		out.push_str(", ");
 		out.push_str("deps=");
 		out.push('[');
-		let mut v19 = true;
-		for v18 in self.deps.iter() {
-			if !v19 {
+		let mut v24 = true;
+		for v23 in self.deps.iter() {
+			if !v24 {
 				out.push_str(", ");
 			}
-			v19 = false;
-			out.push_str(v18);
+			v24 = false;
+			out.push_str(v23);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("counters=");
 		self.counters.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("resources=");
+		out.push('[');
+		let mut v26 = true;
+		for v25 in self.resources.iter() {
+			if !v26 {
+				out.push_str(", ");
+			}
+			v26 = false;
+			v25.to_text_into(out);
+		}
+		out.push(']');
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 5);
+		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "type");
@@ -1180,11 +1342,16 @@ impl Component {
 		self.state.to_cbor_into(out);
 		crate::codec::cbor::text(out, "deps");
 		crate::codec::cbor::array(out, self.deps.len());
-		for v20 in self.deps.iter() {
-			crate::codec::cbor::text(out, v20);
+		for v27 in self.deps.iter() {
+			crate::codec::cbor::text(out, v27);
 		}
 		crate::codec::cbor::text(out, "counters");
 		self.counters.to_cbor_into(out);
+		crate::codec::cbor::text(out, "resources");
+		crate::codec::cbor::array(out, self.resources.len());
+		for v28 in self.resources.iter() {
+			v28.to_cbor_into(out);
+		}
 	}
 }
 
@@ -1251,25 +1418,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("\"components\":");
 		out.push('[');
-		let mut v22 = true;
-		for v21 in self.components.iter() {
-			if !v22 {
+		let mut v30 = true;
+		for v29 in self.components.iter() {
+			if !v30 {
 				out.push(',');
 			}
-			v22 = false;
-			v21.to_json_into(out);
+			v30 = false;
+			v29.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"spans\":");
 		out.push('[');
-		let mut v24 = true;
-		for v23 in self.spans.iter() {
-			if !v24 {
+		let mut v32 = true;
+		for v31 in self.spans.iter() {
+			if !v32 {
 				out.push(',');
 			}
-			v24 = false;
-			v23.to_json_into(out);
+			v32 = false;
+			v31.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1278,25 +1445,25 @@ impl Graph {
 		out.push('{');
 		out.push_str("components=");
 		out.push('[');
-		let mut v26 = true;
-		for v25 in self.components.iter() {
-			if !v26 {
+		let mut v34 = true;
+		for v33 in self.components.iter() {
+			if !v34 {
 				out.push_str(", ");
 			}
-			v26 = false;
-			v25.to_text_into(out);
+			v34 = false;
+			v33.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("spans=");
 		out.push('[');
-		let mut v28 = true;
-		for v27 in self.spans.iter() {
-			if !v28 {
+		let mut v36 = true;
+		for v35 in self.spans.iter() {
+			if !v36 {
 				out.push_str(", ");
 			}
-			v28 = false;
-			v27.to_text_into(out);
+			v36 = false;
+			v35.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1305,13 +1472,13 @@ impl Graph {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "components");
 		crate::codec::cbor::array(out, self.components.len());
-		for v29 in self.components.iter() {
-			v29.to_cbor_into(out);
+		for v37 in self.components.iter() {
+			v37.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "spans");
 		crate::codec::cbor::array(out, self.spans.len());
-		for v30 in self.spans.iter() {
-			v30.to_cbor_into(out);
+		for v38 in self.spans.iter() {
+			v38.to_cbor_into(out);
 		}
 	}
 }

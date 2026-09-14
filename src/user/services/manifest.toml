@@ -272,8 +272,50 @@ path = "user/libs/text/font-run"
 # colour spaces and the two coordinate spaces. It implements the frozen registry above rather than
 # restating it, which is why the two are separate packages.
 [[sources]]
+owner = "graphics-app"
+path = "user/libs/graphics/app"
+
+[[sources]]
 owner = "graphics-core"
 path = "user/libs/graphics/core"
+
+# THE 3D MATH CONTRACT. It stages nothing and depends on nothing: one handedness, one storage order,
+# one depth range, one winding, and a typed refusal wherever a value cannot be one. It is a Cargo
+# package under `user/` that builds no program, so its source has to resolve like any other owner.
+[[sources]]
+owner = "render-math"
+path = "user/libs/graphics/render-math"
+
+# THE VALIDATED PORTABLE SHADER IR. Explicitly not Rust closures: a future GPU backend cannot take
+# one, so the day it arrives every shader in every application would be rewritten. It stages nothing -
+# no backend interprets it yet - and builds no program, so its source resolves like any other owner.
+[[sources]]
+owner = "render-shader"
+path = "user/libs/graphics/render-shader"
+
+# THE BACKEND-NEUTRAL 3D API: the blend state, the MSAA geometry, the depth and stencil semantics,
+# the device limits and the typed refusals. It reads the frozen profile rather than restating it and
+# stages nothing: no backend implements it yet, which is the point of a backend-neutral layer.
+[[sources]]
+owner = "render3d"
+path = "user/libs/graphics/render3d"
+
+# THE RETAINED SCENE LAYER, which decides WHAT to tell `render3d` to draw: the hierarchy, the
+# cameras, the four core materials, the lights and their accumulation order, the bounds and the
+# culling, the three render queues, instancing, the pass graph and picking. It contains no
+# backend-specific path - everything it produces is a `render3d` command - and it builds no program,
+# so its source resolves like any other owner.
+[[sources]]
+owner = "scene3d"
+path = "user/libs/graphics/scene3d"
+
+# THE COMPLETE CPU IMPLEMENTATION OF THE 3D PROFILE. Fixed-point coverage, qualifier-aware clipping,
+# a shader interpreter, the full sampler set, depth, stencil and MSAA. A feature the profile mandates
+# that this cannot execute is a defect here, not an `Unsupported` - which is what a closed profile is
+# for. It builds no program of its own, so its source resolves like any other owner.
+[[sources]]
+owner = "soft3d"
+path = "user/libs/graphics/soft3d"
 
 # THE 2D DRAWING API, separate from any rasteriser - which is the boundary a GPU backend later
 # arrives at. What a `Canvas` produces is a bounded, validated, immutable display list; what draws it
@@ -812,6 +854,15 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/free.lsexe"
 providers = ["base-proto", "lsrt"]
+
+[[programs]]
+name = "frame_probe"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/frame_probe.lsexe"
+providers = ["graphics-app", "graphics-core", "surface", "lsrt"]
 
 [[programs]]
 name = "graphics_probe"
@@ -1689,7 +1740,15 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/system_graph_service.lsexe"
-providers = ["observability-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+providers = [
+	"observability-proto",
+	"device-proto",
+	"display-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"lsrt",
+]
 
 [[programs]]
 name = "system_manager"
@@ -2503,6 +2562,21 @@ kind = "factory"
 provider = "device_manager"
 source = "SERVE"
 interface = "liber:device@1/provider-catalogue"
+presence = "optional"
+
+
+# THE OBSERVATION ROOT, AND IT IS NOT THE ADMIN ONE. Authority to READ what this service holds must
+# not be authority to bind a process to a display or to take the screen, so the System Graph is
+# handed this and nothing else. Optional: a boot that grants none reports no display resources,
+# which is a smaller graph rather than a broken display.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY from the generated
+# `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.
+[[services.roles]]
+tag = "STATS"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display-stats"
 presence = "optional"
 
 [[services]]
@@ -3708,6 +3782,15 @@ providers = ["lsrt"]
 # arithmetic and the one sampler. It is in the image because `pix` calls it - the blending and the
 # packed-pixel writing that used to be private copies - and DisplayService reaches the same code
 # through `pix::blit`, which is its copy-and-scale path.
+[[libraries]]
+name = "graphics-app"
+owner = "graphics-app"
+destination = "lib/graphics/graphics-app.lslib"
+# THE POLICY HALF BUILDS WITHOUT A RUNTIME so the host gate can run it as arithmetic; the image
+# wants the loop that drives a real surface, which is what `runtime` adds.
+features = ["runtime"]
+providers = ["surface", "lsrt"]
+
 [[libraries]]
 name = "graphics-core"
 owner = "graphics-core"

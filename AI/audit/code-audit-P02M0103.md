@@ -1101,3 +1101,419 @@ became one pass: `vector-stress` 245.8 -> 97.0 ms, `UI-basic` 78.8 -> 46.4 ms, `
 385.1 -> 332.0 ms, `image-stress` 419.0 -> 377.7 ms, same host, same frozen fixtures. The floor is
 still not met and the ceilings stay where they are; what the change did was take `vector-stress` from
 3.8x over to 1.5x, and make the 21 ms empty-list floor the largest single term in `UI-basic`.
+
+IMPLEMENTER'S 3D FOUNDATION ON P02M0103 (2026-09-14 06:30):
+
+SIX ITEMS CLOSED, and all six are the same kind of work: a rule the plan states in prose becoming a
+type and an arithmetic that a conformance suite can compare.
+
+`render-math` IS THE CONTRACT AND THE VALUES ARE PICKED. "State the handedness" is not a
+specification; a handedness is. Radians, column-major, `M * v`, right-handed world and view space,
+clip depth in `[0, 1]`, counter-clockwise front faces, `+Y` up, the camera along `-Z`, NDC `+1` at the
+top, a top-left row origin, and `y_window = (1 - (y_ndc * 0.5 + 0.5)) * height`. The constructors are
+named for what they encode - `perspective_rh_zo`, `orthographic_rh_zo`, `look_at_rh` - and there is no
+`perspective`, because a generically named constructor is how a caller picks the wrong convention and
+finds out three layers later.
+
+THE FOUR CHOICES THAT ONLY WORK TOGETHER HAVE ONE FIXTURE BETWEEN THEM. `facing` takes NDC positions
+and `window_from_ndc` is documented as coming after it, and a single test asserts BOTH halves: a
+counter-clockwise triangle in NDC is the front, and the same three vertices are CLOCKWISE once the
+viewport has inverted Y. An implementation that culled after the inversion satisfies every other
+sentence in the plan and fails that one.
+
+IT CARRIES ITS OWN `sqrt`, `sin`, `cos` AND `acos` because `no_std` has none and taking a maths
+library here would put one in every consumer. Each is held against the host's `f64` version over the
+range it is used in, including at every quadrant boundary, which is where a range reduction is wrong
+if it is wrong anywhere.
+
+`render3d` IS THE BACKEND-NEUTRAL API AND IT READS THE FROZEN PROFILE RATHER THAN RESTATING IT. The
+sample positions, the depth format table and the minimum limits live in `graphics-profile`, are
+generated into `RENDER3D_PROFILE_1.md` and are bound to it by hash; a second copy would be a second
+list to keep in step, and the first one somebody corrects without the other. Five items:
+
+  MSAA        the positions, the shading rate DERIVED from the shader rather than set, the centroid
+                as a centre of mass rather than a covered sample, alpha-to-coverage in INDEX order
+                rather than by a dither pattern, the order of the two maskings, and two resolve rules
+  depth       `Stored` with TWO shapes, because a normalised format compares integers and a float one
+                compares floats; the `Depth32F` answer implemented as written; the bias unit that is
+                the format's own; and the stencil test BEFORE the depth test with the operation
+                selected by both outcomes
+  limits      the profile's minimums as the floor, checked by iterating the FROZEN TABLE so a minimum
+                added without a field here is a refusal; a texture checked against the extent AND the
+                bytes; and negotiation that never grants more than was asked for
+  blend       every factor and operation the plan names, with the three things the enumeration alone
+                would not have settled: `SrcAlphaSaturate`'s asymmetry, `Min`/`Max` ignoring the
+                factors, and the write mask applying AFTER the blend
+  errors      exactly the twelve named, with three pairs kept apart on purpose and a fixture that
+                builds one of each and asserts every pair is distinct
+
+Forty-five fixtures across the two crates, each holding a CONVENTION rather than an implementation:
+the values are hand-computed or computed in `f64` from the definition, so a rewrite that changes the
+arithmetic and keeps the contract passes.
+
+IMPLEMENTER'S 3D API ON P02M0103 (2026-09-14 07:40):
+
+FOUR MORE ITEMS, and `render3d` is now the whole backend-neutral surface: descriptors, views,
+hazards, the command model and the submission model. Forty-eight fixtures.
+
+THE RESOURCE MODEL'S ONE IDEA IS THE SUBRESOURCE. A shadow pass renders to ONE CUBE FACE AND ONE MIP,
+so attachments are built from a `TextureViewDesc` rather than from whole textures - and every hazard
+rule is then stated about `overlaps`, which is what makes "a texture sampled while it is an
+attachment" refuse the real conflict and ADMIT the common case of sampling one mip while rendering
+into another. A whole-texture test would refuse both.
+
+`Contents` HAS THREE STATES BECAUSE A REPORT NEEDS THEM. `Undefined` is a subresource nothing has
+written and `Discarded` is one a pass threw away; both refuse a read and they say different things.
+`after` carries the rule that LOADING WHAT WAS DISCARDED IS STILL DISCARDED - a pass that keeps
+contents nobody may read has kept nothing, and a store does not make them readable.
+
+THE INTEROP ITEM'S DELIVERABLE IS THAT THERE IS NO BRIDGE TYPE. A compatible single-sample colour
+target IS the `OwnedImage`; `bridge_for_attachment` answers `Direct`. What gets built instead, and
+did not, is a `Texture::from_image` that copies. What is NOT compatible is named as one operation -
+`Resolve`, `ConvertFormat`, `ConvertColourSpace`, `ConvertAlpha` - IN THE ORDER THE OPERATIONS RUN,
+so a caller is never told to convert something it has to resolve anyway.
+
+THE COMMAND MODEL VALIDATES AT THE CALL. A list that records anything and validates at submission has
+moved every error message away from the code that caused it. Every binding is per pass, with its own
+fixture, because carrying a pipeline across a pass boundary would make its compatibility check
+silent. The base vertex is SIGNED and the range is checked through it, which catches the read BEFORE
+the buffer that a per-index check at draw time cannot.
+
+THE SUBMISSION MODEL WAS DEFINED BEFORE EITHER BACKEND, which is the item's own instruction and the
+reason it is worth stating: a software backend finishes inside `submit` and a GPU one does not, and an
+API shaped around the first has nowhere to put the second. `Status` has five values rather than an
+`Option<Result>`, because "no answer yet" and "no answer ever" are different things with the same
+shape in that type. The completion is ownership-consuming, so "waited for exactly once" is a property
+of the type. And resources are released IN SUBMISSION ORDER rather than as each finishes, with the
+fixture that makes it visible: the second settles first and nothing comes back until the first does.
+
+IMPLEMENTER'S SHADER MODEL AND CLIPPER ON P02M0103 (2026-09-14 08:40):
+
+`render-shader` IS THE LARGEST SINGLE ITEM OF PART `e` AND IT IS DONE. What makes it worth its size
+is what it is NOT: Rust closures. A closure is the obvious shortcut and a dead end, because a future
+GPU backend cannot take one - so the day that backend arrives every shader in every application would
+be rewritten. An IR costs more now and costs nothing then.
+
+THREE THINGS ARE UNREPRESENTABLE RATHER THAN CHECKED, which is stronger than validating them. There
+is no call instruction, so recursion cannot be written. Control flow is structured with no label and
+no jump, so there is no irreducible graph to analyse. And `Loop` CARRIES ITS TRIP COUNT AS A FIELD,
+so an unbounded loop does not type-check - a `while` is a `Loop` with a `Break` and the bound is
+still required.
+
+THE POSITION DEPENDENCY SLICE IS THE PART WORTH READING. StrictF32 applies to every DATA AND CONTROL
+dependency of a position, and the control half is the one a naive implementation misses: a position
+SELECTED by `if (sin(t) > 0)` is as backend-dependent as one computed from `sin(t)`, because two
+backends take different branches at the boundary. The fixture for it is the discriminating one - two
+positions, neither touching the transcendental, refused because the BRANCH does. And the slice is
+complete rather than one step: a matrix built from a transcendental is what a real shader looks like.
+
+WHICH OPERATIONS ARE STRICT IS DERIVED FROM THE FROZEN ACCURACY TABLE. A zero-ULP bound is what "a
+strict definition" means, so `sqrt` is allowed and `inversesqrt` at two ULP is not - and an accuracy
+corrected in the profile corrects this without a second edit here. The refusal is AT MODULE LOAD and
+names the operation, its bound and how far from the position it was found, because "this shader is
+not deterministic" is not something anybody can act on.
+
+`ClipCoordQ` IS A NEWTYPE AND NOT A `Vec4`, because "a vec4" is not a definition: what the type
+carries is the promise that the value came out of the vertex stage and has NOT been divided, and a
+divided position would pass every check and be wrong. The plane order is held against the frozen list
+name for name - clipping is not associative in floating point, so the order is the contract - and the
+three answers the profile distinguishes are three rather than two: a non-finite component REFUSES the
+primitive, everything behind the eye CULLS, and a straddling primitive is cut against
+`w = CLIP_W_EPSILON` FIRST.
+
+WHAT THE StrictF32 ITEM STILL OWES, AND IT IS NOT THIS ITEM'S TO BUILD: "quantized raster coverage"
+needs a rasteriser, which is `soft3d`, and the cross-architecture cases that place
+transcendental-derived vertices on both sides of a clip boundary need the 3D conformance suite. Both
+are their own items in the parts below, and the box stays open until they exist.
+
+## 2026-09-14 - `scene3d`, the retained scene layer (implementer note)
+
+Built `src/user/libs/graphics/scene3d` against the FROZEN `Scene3D Core Profile 1` registry rather
+than against the milestone prose. Nine modules, 52 host fixtures, all green; registered in
+`src/user/services/manifest.toml` `[[sources]]` and in `release-required.toml` as `host.scene3d`.
+
+Things worth recording for whoever touches this next:
+
+1. **The milestone's `BlinnPhong` attenuation and the frozen profile's disagree.** The milestone
+   carries `1 / max(kc + kl*d + kq*d*d, EPS)` from an earlier pass; `graphics-profile::scene3d`
+   freezes `1 / (1 + d^2/r^2)` with a multiplicative `saturate(1 - (d/range)^4)^2`. The frozen,
+   hashed registry is the authority, so that is what is implemented. The `EPS` the milestone asks to
+   be named has nothing to guard under the frozen form - no term can be zero, because a zero source
+   radius is refused where the light enters. The rest of the milestone's clause IS implemented:
+   specular carries its own colour, lighting never changes alpha, and the clamp is applied in linear
+   light before the transfer function.
+
+2. **The milestone defers the sorted transparent queue to `f-ext`; the frozen profile puts it in the
+   core.** Three queues are implemented. Deferring the third would claim conformance to a document
+   this layer does not implement.
+
+3. **Two real defects found in neighbouring code while building this.**
+   - `render-math` had no infinite far plane. The scene profile permits one ("expressed as a far of
+     infinity") and `perspective_rh_zo` refuses a non-finite `far`, so a conforming camera could not
+     be built at all. Added `perspective_infinite_rh_zo` with a fixture that holds it against the
+     finite form at `far = 1e9` element by element.
+   - `render_math::quaternion::sin_cos` was `pub(crate)`. The spot-cone fall-off needs a cosine and
+     this stack has no libm, so it is now `pub`. Nothing else in the tree computed a cosine outside
+     `render-math`, which is why it had not come up.
+
+4. **`f32::round`, `powf`, `exp` and `ln` are still absent.** The specular exponent is therefore an
+   INTEGER in `1..=1024` evaluated by squaring. This is exact and identical on every target, which
+   matters more here than a fractional exponent does - but a future `render-shader` lowering will
+   want `Transcendental::Pow`, and the two must then agree at the integer exponents.
+
+5. **What is left in section `f`: the closed `enum Scene3DFeature` registry.** The guaranteed minima
+   and every rule are already in `graphics-profile::scene3d` and hashed into
+   `docs/graphics/SCENE3D_PROFILE_1.md`. What does not exist is the feature ENUM with per-feature
+   `Handles:`/`Covers:` source markers that `profile-doc` scans for the other two profiles. Adding it
+   changes the coverage report, not the hashed specification - the two are separate outputs in
+   `profile-doc` - so the freeze is not at risk.
+
+### The closed `Scene3DFeature` list (same day)
+
+Section `f` is now complete. Two notes for later:
+
+- **The scene spec's slug moved to `scene3d-spec`.** It had the plain `scene3d` slug, which is where
+  a feature list belongs under the convention `render2d`/`render2d-spec` and `render3d`/
+  `render3d-spec` already set. The canonical file moved directories; the hash did not change, which
+  is the evidence the move was a rename. Only `profile-doc/src/main.rs` referenced the old path.
+- **`profile-doc` routed claims with a two-profile special case** (`if slug == "render2d" { (2d, 3d) }
+  else { (3d, 2d) }`). That is now "the profile that owns this name, and anything a different profile
+  owns", so a fourth profile is a row in the array rather than an edit to the routing.
+- **render2d and render3d still report `NOT PERFORMED` for coverage.** Neither has a single
+  `@covers:` marker, so their matrices are empty and the gate says so rather than passing. scene3d is
+  the first profile with real coverage. Marking up the other two is not this milestone's work, but it
+  is worth knowing the gate is a no-op for them until somebody does it.
+
+## 2026-09-14 - `soft3d`, the CPU implementation (implementer note, part 1)
+
+`src/user/libs/graphics/soft3d` now holds the foundation: `fixed`, `raster`, `clip`, `interp`,
+`geometry`, `value`, `interpreter`, `texture` and `pass`. 54 host fixtures, all green. Registered in
+the shared-image manifest and in the release list as `host.soft3d`.
+
+Four of part `g`'s eleven items are ticked: the rasteriser, the qualifier-aware clipper, the shader
+interpreter and the sampler/texture set. What is NOT done yet, so nobody has to re-derive it:
+
+- **The PREPARE/EXECUTE split.** `soft2d` has it and `g`'s first item requires the same shape here.
+  The pieces are all written as free functions over explicit state, so the split is a matter of
+  introducing the two types and moving the entry points - not a rewrite.
+- **Multiple colour attachments.** `pass::write_fragment` takes ONE `Colour`. The blend state,
+  write mask and integer refusal are all per attachment already; what is missing is the loop.
+- **Depth bias.** `render3d::depth::bias` exists and is not yet applied; it needs the maximum of
+  `|dz/dx|` and `|dz/dy|` over the primitive, which the triangle setup has the data for.
+- **Instancing at the draw level.** `geometry::assemble` handles topologies, restart and the base
+  vertex; the instance count and the base instance are a draw parameter the frame driver owns, and
+  there is no frame driver yet.
+- **Ingestion validation, Domain accounting and frame-allocation reuse.** `raster::Bins` already
+  reuses its storage across frames; nothing else does yet.
+- **The frame-scheduling integration gate** is blocked on `a-wsi` by its own terms.
+
+Two things changed OUTSIDE this crate, both because the profile was incomplete:
+
+1. **`render3d_spec` gained `LINE_POINT_RULES`,** ten frozen answers about line and point
+   rasterisation: the diamond-exit rule and why it rather than a midpoint walk, line width, the line
+   interpolation parameter, point size and its clamp, point coverage as a half-open square, that
+   BACK-FACE CULLING APPLIES TO TRIANGLES ONLY, how lines and points clip, and their depth rule. The
+   milestone's own words are that a profile mandating six topologies and specifying one is a profile
+   with five gaps; this closes them. `docs/graphics/RENDER3D_PROFILE_1.md` regenerated with a new
+   hash, which is expected - the hash binds the document to the registry and the registry grew.
+
+2. **`render-shader` gained `Sampling::{Pixel, Centroid, Sample}`.** The frozen profile has FIVE
+   interpolation qualifiers and the IR had three, so `centroid smooth` was unwritable - a real gap,
+   not a naming one. The profile's own words are that `centroid` "chooses an evaluation LOCATION and
+   does not change the interpolation rule", so it is a separate field rather than two more
+   `Interpolation` variants; that also makes `centroid flat` unwritable, which is the combination
+   that means nothing. `Module::per_sample_shading()` is now derived from the varyings, because the
+   shading rate is a consequence of the shader and not a state a caller sets, and `validate` refuses
+   a location qualifier on a `flat` varying or on a vertex stage.
+
+### `soft3d` part 2: the frame driver, and what is precisely still missing
+
+`soft3d::frame` is the PREPARE/EXECUTE boundary and the whole pipeline now runs end to end: a
+clip-space triangle through the vertex stage, the clipper, setup, binning, per-tile rasterisation,
+the fragment stage and the attachments. Three more of part `g`'s items are ticked (the split, the
+geometry set, the passes and attachments); 64 fixtures.
+
+Two things were added that the milestone lists under the "REAL software renderer" item and that are
+worth knowing are already there: **hierarchical depth** and **render-to-texture**.
+
+The hi-z bound is READ BACK FROM THE DEPTH BUFFER once per tile rather than inferred from the
+triangles that covered it. The first attempt inferred it - narrow the tile's bound when a triangle
+covers the whole tile - and it never fired, because after clipping a polygon is fan-triangulated and
+each piece covers only part of a tile. Reading the buffer is exact, costs one pass over the tile, and
+cannot be wrong; the bound is frame-scoped, so `clear` between draws keeps it and only `reset_depth`
+drops it, which is what lets a later draw be rejected by an earlier one's depth.
+
+**WHAT IS STILL MISSING IN PART `g`, precisely:**
+
+1. **Per-primitive allocation.** `stage_triangle` clones a `Vec<f32>` per vertex per qualifier, and
+   the clipper allocates its polygon buffers per primitive. The item requires "allocate nothing per
+   primitive during traversal and clipping". The fix is inline fixed-capacity varying storage bounded
+   by a stated maximum - 32 components is the GL ES 2 floor and is defensible - which makes
+   `clip::Vertex` `Copy` and removes every allocation below the frame level. It is a contained
+   refactor of `clip.rs` and `frame.rs` and nothing else depends on the current shape.
+2. **Domain accounting.** "Account peak memory to the process Domain" needs the process API wired
+   in; nothing in the graphics stack reaches it yet.
+3. **SIMD interpolation and shading, and a texture cache.** The honesty rule exempts the
+   DIFFERENTIAL TEST until a parallel path exists - it does not exempt the features. Tiling, binning,
+   mip selection and hierarchical depth are all in; these two are not.
+4. **The frame-scheduling integration gate** is blocked on `a-wsi` by its own terms.
+5. **Host tests for `g`** as its own item: the fixtures exist and cover clipping, winding, the
+   qualifiers, depth, stencil, shared-edge fill, sub-pixel coverage, every topology, instancing,
+   addressing, filtering, mip selection and MSAA - but the item also names cross-architecture
+   comparison, which needs the conformance suite in `h`.
+
+### `soft3d` part 3: allocation-free traversal, and what the fuzz found
+
+Part `g` is 10 of 11. The last item is the frame-scheduling integration gate, blocked on `a-wsi` by
+its own terms. 80 fixtures.
+
+**The no-allocation claim is now a measurement.** The test build installs a counting global allocator
+with a THREAD-LOCAL counter - so the harness's own parallelism cannot make one fixture's count
+another's - and a fixture runs two warm-up frames and asserts the third asks the allocator for
+nothing. It counts `realloc` as well as `alloc`.
+
+Getting there took four changes. Three were predictable: inline fixed-capacity varyings (32
+components, the GL ES 2 floor), inline shader values up to 16 words with a heap fallback for arrays
+only, and a reusable interpreter `Machine`. **The fourth was invisible until it was measured:**
+`core::mem::take` on a `Box` builds a fresh default one, so taking the clipper's workspace out of the
+scratch allocated a new workspace per primitive. It is an `Option<Box<_>>` now. Nothing about the
+code looked wrong; only the counter found it.
+
+**The fuzz found two real defects in this backend on its first run,** both in the sampler and both
+from the same cause - a texture coordinate is SHADER OUTPUT and can be anything:
+
+1. `f32 as i64` saturates at `i64::MAX` for an infinite coordinate, and the `+1` that finds the
+   neighbouring texel then overflowed. Bounded at `2^24` now, which is where an `f32` stops naming
+   adjacent integers, so the clamp cannot lose a texel a shader could have meant.
+2. A non-finite LOD - the `log2` of a derivative the shader produced - carried a NaN through the
+   trilinear blend and out through every channel. A non-finite level is the sharpest one now.
+
+Neither was reachable from any fixture written by hand, because both need a value nobody writes on
+purpose.
+
+**Two things to know before writing more clipping fixtures.** A triangle that CONTAINS the clip
+volume comes back as its four-cornered cross-section - two fan triangles, not several - so a fixture
+that wants many pieces needs one that CUTS THE CORNERS instead. And an unclipped triangle cannot be
+put through `raster::setup` to compare fields, because it reaches outside the raster grid by
+construction; the comparison is done in floating point with the same arithmetic the rasteriser uses.
+
+**`render3d::clip::classify_positions`** was added so a backend that keeps its varyings inline can
+reach the same classification without building the `Vec`-carrying `ClipVertex` - otherwise it would
+allocate exactly what it was avoiding, or reimplement "what is outside" as a second answer.
+
+## 2026-09-14 - `a-wsi`: the display contract, replaced
+
+Six of the eight items are closed. The whole x86_64 build is green and every client in the tree moved
+in the same change - there is NO compatibility path, which is what the item asked for.
+
+**What replaced what.** `liber:display@1` was one interface with `acquire`, `present`, `release` and
+`input-focus` at CONNECTION level and a synchronous present. It is now three: `display` (a
+connection, whose only calls are `create-surface` and `image-limits`), `surface` (a capability with
+its own present queue, its own event stream and its own configuration snapshot) and `display-admin`.
+`input-focus` moved to the surface, because focus is a property of the thing that has it.
+
+**Two things the tooling refused, both correctly.**
+
+1. `record present-queue` originally carried `list<buffer>`. The IDL generator refused it: a
+   collection of capabilities has a count no schema can bound, and an encode that stopped part way
+   could not hand back the ones it had already taken. Images are fetched one at a time by
+   `image(index)` instead - which is also how the negotiated count stays out of the ABI.
+2. `gen.sh` refused the removal of `display.input-focus` until `--accept-breaking` was passed. That
+   is the flag for exactly this: nothing is versioned before the first release and no external
+   software depends on it.
+
+**The console needed a shadow buffer, and the reason is worth recording.** It drew straight into the
+one surface it had. A present QUEUE hands out a different image from one frame to the next, and every
+presented image must contain a COMPLETE valid frame - damage is a hint about what changed and never
+permission to leave the rest undefined. A console that kept drawing into whichever image it was given
+would present a frame missing everything drawn while a different image was current. So it now draws
+into a shadow it owns, tracks per image whether that image has ever held a complete frame, and fills
+a fresh one whole before presenting it. `imgview` needed none of this: it redraws its entire picture
+on every change, so it presents `full` into whichever image it is handed.
+
+**What is left in `a-wsi`:**
+
+- **Domain accounting through the kernel's counters, observed through SystemGraph.** Nothing in the
+  display path reports to a Domain yet.
+- **The hostile-input and lifecycle tests.** The item lists them precisely - malformed descriptors,
+  overflowed image sizes, invalid generations, duplicate acquire and present, completion races,
+  driver death, truncated messages, forged imports, a surface channel offered from a second process,
+  per-connection exhaustion and cleanup during in-flight presentation - and none exists yet. The
+  guest harness starts the real DisplayService, so that is where they belong.
+
+**And `soft3d`'s last item unblocks with these two**: the frame-scheduling integration gate is
+written against exactly this contract - acquire, render, PRODUCER_READY, wait for PRESENT_DONE, pace
+against the timing contract - and every piece of it now exists.
+
+## Implementer note - 2026-09-14, a-wsi accounting and observation
+
+The display contract's client-facing half is now the present-queue model end to end, and the
+accounting item is closed with it.
+
+What changed, in the order it had to happen:
+
+1. `SYS_CHANNEL_SEND_CAPS_ATTENUATED` (syscall 85). The single-handle attenuating send could not
+   carry a completion PAIR, so a service wanting to hand over two endpoints with different masks had
+   to send two messages for a record the schema says is one. The new call takes
+   `[count, CapTransfer * count]` and applies a mask per capability, under the same all-or-nothing
+   transaction as the ordinary multi-capability send. `rt::send_caps_blocking_attenuated` wraps it.
+   Covered by `kernel.object.channel.a_multi_capability_attenuating_send_narrows_each_one_on_its_own`.
+
+2. `surface.image` -> `surface.provide-image`. The client creates its own memory objects and imports
+   them; DisplayService allocates no client pixels. `image-object` is declared
+   `@kernel(memory-object)` so the generated `@rights(read, map)` guard checks the object TYPE as
+   well as the rights. The service validates the object's own size rather than a client-declared
+   length.
+
+3. Every capability the service hands a client is now attenuated by the SEND. The surface endpoint
+   has no `transfer` and no `duplicate`, which is what makes "one process identity owns a surface" a
+   kernel property rather than a comment. The old code's apologetic note about needing a kernel
+   change to strip rights on receipt was wrong: `SYS_CHANNEL_SEND_ATTENUATED` already existed and the
+   service was simply not using it.
+
+4. Two defects found on the way, both from the surface rewrite and neither caught by any test:
+   - the emergency KILL searched `clients` for a channel equal to `state.active`, which is a SURFACE
+     channel now and never a connection channel, so the command revoked nothing at all;
+   - `surface.close` tore the surface down INSIDE the handler, closing the very channel its declared
+     `result<unit, error>` reply had to travel on. The teardown is deferred by one loop iteration.
+
+5. Bounds, typed exhaustion, a waitable bound task in the wait loop, and a `display-stats` root that
+   answers live counts beside their bounds and can do nothing else.
+
+The kernel harnesses were rewritten with it: `display_service_restores_the_console_surface` speaks
+the queue contract through the generated codecs, `SurfaceHost` in `tests.rs` is a stand-in display
+service for the two viewer harnesses, and the permission-manager scenario's display half goes through
+the same one.
+
+## Implementer note - 2026-09-14, the frame loop an application has
+
+`graphics-app` is the shared helper the 2D and 3D sides both use, and it is deliberately two halves:
+
+- `Pacing` is the policy and has no syscalls in it. Everything the integration gate names - the
+  in-flight bound, the deadline arithmetic, the rebuild-before-everything rule, the background
+  throttle, `again` waiting for the event - is a function of state and a clock reading, so each is a
+  host fixture. The crate's DEFAULT feature set is this half alone: `rt` defines `panic_impl`, so a
+  test binary that linked it collides with `std`'s, and `runtime` is what every consumer in the image
+  turns on.
+- `FrameLoop` is the syscall half: acquire, map, present, park, rebuild.
+
+Two defects the gate found, both of which would have been invisible in a unit test:
+
+1. `rt::clock()` answers the scheduler's TICK counter (100 Hz) and `frame-timing` is in NANOSECONDS.
+   The first version paced in nanoseconds and passed the result where an absolute tick deadline
+   belongs, which is a wait of about four months. `abi` now states `TICKS_PER_SECOND` and
+   `NANOS_PER_TICK` beside the calls that take a deadline, DeviceManager's private `100` reads them,
+   and the conversion lives at the one place the two units meet.
+2. `sched::run_until_idle()` sleeps to the nearest THREAD deadline and keeps going. Against a client
+   that paces itself on a timer it never returns: the harness's first call ran the probe to its own
+   iteration ceiling before the loop saw a second pass. A harness driving such a client needs
+   `run_until_idle_until(ticks + 1)`.
+
+And one correctness point worth keeping: a present settles by SERIAL rather than by decrementing a
+counter, because the same present settles by two routes - the completion event and the PRESENT_DONE
+release - and a loop that reads both would otherwise free the same image twice.
+
+PRODUCER_READY is now used rather than merely minted: the loop signals it when the render is
+complete, and the service drains the endpoint from the present or the abandon that follows. A queue
+nothing read would fill after a few dozen frames, after which a client doing exactly what the
+contract asks starts failing to signal.

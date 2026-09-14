@@ -243,6 +243,15 @@ path = "src/user/libs/foreign/lifecycle"
 component = "lifecycle"
 
 [[non_code]]
+path = "src/tests/fonts"
+# THE TEXT CONFORMANCE CORPUS: four faces this tree authors and the file that pins them by SHA-256.
+# They are an INPUT TO A GATE and to nothing else - no image stages them, no crate links them, and
+# `./gen.sh --check` regenerates and compares them, so a corpus that drifted is a failure rather than
+# a quietly different test. Owning them by a component would say a change to them changes an
+# artifact, which is the one thing they cannot do.
+reason = "the authored text conformance corpus; a gate's input, regenerated and compared by gen.sh, staged in no image"
+
+[[non_code]]
 path = "third_party"
 # The recorded licence review. It is a record ABOUT the tree rather than a part of what is built, and
 # the `dependency-policy` gate is what holds the tree and the record to each other.

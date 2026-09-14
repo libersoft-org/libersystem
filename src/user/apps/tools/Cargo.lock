@@ -299,6 +299,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphics-app"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "display-proto",
+ "graphics-core",
+ "rt",
+ "surface",
+]
+
+[[package]]
 name = "graphics-core"
 version = "0.0.0"
 dependencies = [
@@ -870,6 +881,7 @@ dependencies = [
  "font-parse",
  "font-run",
  "font-shape",
+ "graphics-app",
  "graphics-core",
  "imgconv",
  "ipc-client",

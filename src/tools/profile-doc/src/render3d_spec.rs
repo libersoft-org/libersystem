@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use graphics_profile::render3d_spec::{CLIP_COORD_Q, CLIP_PLANE_ORDER, CLIP_ROUNDING, CLIP_VOLUME, CLIP_W_EPSILON, COLOUR_FORMATS, DEPTH_BIAS_EQUATION, DEPTH_FORMATS, DEPTH_RULES, DEPTH32F_ANSWER, FORMAT_EXCEPTIONS, HAZARD_RULES, LOD_FORMULA, MSAA_2X, MSAA_4X, MSAA_RULES, PROVOKING_VERTEX, QUALIFIERS, RASTERISER_STATE, RENDER3D_PROFILE_1_MIN_LIMITS, SAMPLER_RULES, SUBMISSION_RULES, VERTEX_FORMATS, VERTEX_NORMALISATION};
+use graphics_profile::render3d_spec::{CLIP_COORD_Q, CLIP_PLANE_ORDER, CLIP_ROUNDING, CLIP_VOLUME, CLIP_W_EPSILON, COLOUR_FORMATS, DEPTH_BIAS_EQUATION, DEPTH_FORMATS, DEPTH_RULES, DEPTH32F_ANSWER, FORMAT_EXCEPTIONS, HAZARD_RULES, LINE_POINT_RULES, LOD_FORMULA, MSAA_2X, MSAA_4X, MSAA_RULES, PROVOKING_VERTEX, QUALIFIERS, RASTERISER_STATE, RENDER3D_PROFILE_1_MIN_LIMITS, SAMPLER_RULES, SUBMISSION_RULES, VERTEX_FORMATS, VERTEX_NORMALISATION};
 
 /// The canonical machine-readable form the hash is taken over.
 pub fn canonical() -> String {
@@ -41,6 +41,9 @@ pub fn canonical() -> String {
 	}
 	for field in RASTERISER_STATE {
 		let _ = writeln!(out, "rasteriser={} values={} default={} why={}", field.name, field.values, field.default, field.why);
+	}
+	for rule in LINE_POINT_RULES {
+		let _ = writeln!(out, "line-point={} answer={}", rule.question, rule.answer);
 	}
 	let _ = writeln!(out, "depth-bias={DEPTH_BIAS_EQUATION}");
 	for sample in MSAA_2X {
@@ -149,6 +152,14 @@ pub fn document(hash: &str) -> String {
 	let _ = writeln!(out, "| --- | --- | --- | --- |");
 	for field in RASTERISER_STATE {
 		let _ = writeln!(out, "| {} | {} | `{}` | {} |", field.name, field.values, field.default, field.why);
+	}
+	let _ = writeln!(out);
+	let _ = writeln!(out, "### Lines and points\n");
+	let _ = writeln!(out, "A profile that mandates six topologies and specifies one is a profile with five gaps.\n");
+	let _ = writeln!(out, "| question | answer |");
+	let _ = writeln!(out, "| --- | --- |");
+	for rule in LINE_POINT_RULES {
+		let _ = writeln!(out, "| {} | {} |", rule.question, rule.answer);
 	}
 	let _ = writeln!(out);
 	let _ = writeln!(out, "Depth bias: {DEPTH_BIAS_EQUATION}\n");

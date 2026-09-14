@@ -268,7 +268,12 @@ pub fn parse(desc: &[u8]) -> Layout {
 					let cursor: &mut u32 = cursor_for(&mut cursors, g.id);
 					let bits: u32 = g.size.saturating_mul(g.count);
 					let interesting: bool = matches!(g.page, PAGE_GENERIC_DESKTOP | PAGE_KEYBOARD | PAGE_BUTTON | PAGE_CONSUMER);
-					if data & INPUT_CONSTANT == 0 && interesting && g.size >= 1 && g.size <= 32 && *cursor + bits <= MAX_REPORT_BYTES * 8 {
+					// SATURATING, NOT `+`. The cursor itself saturates as a descriptor walks past the
+					// bound, so a plain addition here overflows on the very descriptor the check
+					// exists to refuse - which panics in a debug build and, in a release one, wraps
+					// to a small number and ADMITS the segment it was meant to reject.
+					let end: u32 = cursor.saturating_add(bits);
+					if data & INPUT_CONSTANT == 0 && interesting && g.size >= 1 && g.size <= 32 && end <= MAX_REPORT_BYTES * 8 {
 						let logical_max: i32 = if g.logical_min >= 0 && g.logical_max < g.logical_min { g.logical_max_raw as i32 } else { g.logical_max };
 						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max });
 					}
@@ -347,6 +352,18 @@ pub fn boot_keyboard() -> Layout {
 	parse(&DESC)
 }
 
+// Record a report body as the state the NEXT diff runs against.
+//
+// THE TAIL IS ZEROED AND NOT LEFT. A report shorter than the last one used to overwrite only the
+// bytes it carried, so whatever the previous report held past its end stayed in the state - and a
+// key whose usage lives in that tail is never released. It reads as a key that sticks down after a
+// truncated report, which is what a device sends when it is unplugged mid-transfer.
+pub fn remember(state: &mut [u8; MAX_REPORT_BYTES as usize], body: &[u8]) {
+	let len: usize = body.len().min(MAX_REPORT_BYTES as usize);
+	state[..len].copy_from_slice(&body[..len]);
+	state[len..].fill(0);
+}
+
 // The bit cursor of report id `id`, created at zero on first use.
 fn cursor_for(cursors: &mut Vec<(u8, u32)>, id: u8) -> &mut u32 {
 	if let Some(i) = cursors.iter().position(|&(cid, _)| cid == id) {
@@ -408,7 +425,11 @@ fn array_usages(seg: &Segment, body: &[u8]) -> ([u32; ARRAY_MAX], usize) {
 		if v == 0 || v < seg.logical_min {
 			continue;
 		}
-		let usage: u32 = seg.usage_min.saturating_add((v - seg.logical_min) as u32);
+		// IN `i64`, THEN CLAMPED. Both operands come from a descriptor the device wrote: a logical
+		// minimum of `i32::MIN` against a reading of zero overflows an `i32` subtraction, which
+		// panics in a debug build and wraps to a plausible-looking usage in a release one.
+		let offset: i64 = (v as i64 - seg.logical_min as i64).clamp(0, u32::MAX as i64);
+		let usage: u32 = seg.usage_min.saturating_add(offset as u32);
 		if seg.page == PAGE_KEYBOARD && usage & 0xffff <= 3 {
 			continue;
 		}
@@ -419,3 +440,6 @@ fn array_usages(seg: &Segment, body: &[u8]) -> ([u32; ARRAY_MAX], usize) {
 	}
 	(out, n)
 }
+
+#[cfg(test)]
+mod tests;

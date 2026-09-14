@@ -1798,56 +1798,39 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	}
 	let view_process = view_reply.caps.first().ok_or("imgview run returned no Process handle")?.object().into_any_arc().downcast::<Process>().map_err(|_| "imgview run handle was not a Process")?;
 
-	let acquire = view_display_server.recv().map_err(|_| "imgview did not acquire a surface")?;
-	if acquire.bytes.len() < 14 || le_u16(&acquire.bytes, 0) != 1 || le_u32(&acquire.bytes, 6) != 0 || le_u32(&acquire.bytes, 10) != 0 {
-		return Err("imgview sent an invalid acquire request");
+	// THE DISPLAY HALF IS A PRESENT QUEUE, so this stand-in is one. A 1x1 surface is the smallest
+	// thing a viewer can be given, which is all this scenario needs: what it is here to prove is
+	// that a GOVERNED launch reaches a display and an input service at all, and that the focus proof
+	// the surface minted is the one the viewer hands on.
+	let mut view_host = SurfaceHost::new(view_display_server, 1, 1);
+	view_host.settle(HostCall::Presented, "imgview did not present its decoded image")?;
+	// THE FIRST PRESENT OF A GENERATION IS THE WHOLE SURFACE, spelled as the variant rather than as
+	// a rectangle covering the extent - a rectangle can be wrong by a pixel and a variant cannot.
+	if !view_host.last_whole {
+		return Err("imgview's first present was not the whole surface");
 	}
-	let surface = MemoryObject::create(4).ok_or("imgview surface allocation failed")?;
-	let acquire_corr = le_u32(&acquire.bytes, 2);
-	let mut acquire_reply = alloc::vec::Vec::new();
-	acquire_reply.extend_from_slice(&acquire_corr.to_le_bytes());
-	acquire_reply.push(1);
-	acquire_reply.extend_from_slice(&4u64.to_le_bytes());
-	acquire_reply.extend_from_slice(&1u32.to_le_bytes());
-	acquire_reply.extend_from_slice(&1u32.to_le_bytes());
-	acquire_reply.extend_from_slice(&4u32.to_le_bytes());
-	// THE FORMAT IS NAMED AND NOT NUMBERED. This was a literal zero, which was `b8g8r8x8` while
-	// `liber:display@1` carried its own one-member enumeration and became `a8-unorm` when the shared
-	// `liber:graphics@1` list replaced it - so this harness offered a surface the client was right to
-	// refuse, and the test waited for a frame nobody was going to send.
-	acquire_reply.push(graphics_proto::generated::liber::graphics::v1::PixelFormat::B8g8r8x8Unorm as u8);
-	acquire_reply.extend_from_slice(&unknown_output_colour());
-	send_cap(&view_display_server, &acquire_reply, surface.clone(), Rights::ALL)?;
-	sched::run_until_idle();
-
-	let present = view_display_server.recv().map_err(|_| "imgview did not present its decoded image")?;
-	// THE DAMAGE IS DECODED BY THE GENERATED READER and not read at hand-written offsets: it is a
-	// bounded list with a whole-surface variant now, and a harness that knew where the fields used to
-	// be is a harness that waits for a frame nobody is going to send.
-	if le_u16(&present.bytes, 0) != 2 || !present_covers(&present.bytes, 1, 1) {
-		return Err("imgview sent an invalid first present");
-	}
-	if !read_from_object(&surface, 4).iter().any(|byte| *byte != 0) {
+	if !read_from_object(&view_host.image(0), 4).iter().any(|byte| *byte != 0) {
 		return Err("imgview presented a blank decoded image");
 	}
-	let present_corr = le_u32(&present.bytes, 2);
-	view_display_server.send(Message::new([present_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview present reply failed")?;
-	sched::run_until_idle();
 
-	let focus_request = view_display_server.recv().map_err(|_| "imgview did not request input focus")?;
-	if focus_request.bytes.len() < 6 || le_u16(&focus_request.bytes, 0) != 5 {
-		return Err("imgview sent an invalid input-focus request");
-	}
-	let focus_corr = le_u32(&focus_request.bytes, 2);
-	let (_focus_server, focus_client) = Channel::create();
-	let mut focus_reply = alloc::vec::Vec::new();
-	focus_reply.extend_from_slice(&focus_corr.to_le_bytes());
-	focus_reply.push(1);
-	focus_reply.extend_from_slice(&0u32.to_le_bytes());
-	send_cap(&view_display_server, &focus_reply, focus_client.clone(), Rights::ALL)?;
-	sched::run_until_idle();
+	view_host.settle(HostCall::Focus, "imgview did not request input focus")?;
+	let focus_client = view_host.focus_proof.clone().ok_or("imgview's surface minted no focus proof")?;
 
-	let subscribe = view_input_server.recv().map_err(|_| "imgview did not subscribe to focused keys")?;
+	// The subscription is the NEXT thing the viewer does with the proof it was just handed, and it
+	// goes to a different service - so the scheduler runs on rather than the answer being expected
+	// to have arrived already.
+	let subscribe = {
+		let mut arrived = None;
+		for _ in 0..4_000 {
+			sched::run_until_idle();
+			view_host.poll();
+			if let Ok(request) = view_input_server.recv() {
+				arrived = Some(request);
+				break;
+			}
+		}
+		arrived.ok_or("imgview did not subscribe to focused keys")?
+	};
 	if subscribe.bytes.len() < 10 || le_u16(&subscribe.bytes, 0) != 2 || subscribe.caps.is_empty() {
 		return Err("imgview sent an invalid key subscription");
 	}
@@ -1866,22 +1849,11 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// which is what this scenario did, and why it had never passed.
 	let zoom_frame = [0, 0, 0, 0, 0x2e, 0, 1];
 	key_producer.send(Message::new(zoom_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview zoom key")?;
-	sched::run_until_idle();
-	let zoom_present = view_display_server.recv().map_err(|_| "imgview did not present after zoom-in")?;
-	let zoom_corr = le_u32(&zoom_present.bytes, 2);
-	view_display_server.send(Message::new([zoom_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview zoom-present reply failed")?;
-	sched::run_until_idle();
+	view_host.settle(HostCall::Presented, "imgview did not present after zoom-in")?;
 
 	let pan_frame = [0, 0, 0, 0, 0x4f, 0, 1];
 	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview pan key")?;
-	sched::run_until_idle();
-	let pan_present = view_display_server.recv().map_err(|_| "imgview did not present after arrow-key pan")?;
-	if le_u16(&pan_present.bytes, 0) != 2 || !present_covers(&pan_present.bytes, 1, 1) {
-		return Err("imgview sent an invalid pan present");
-	}
-	let pan_corr = le_u32(&pan_present.bytes, 2);
-	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview pan-present reply failed")?;
-	sched::run_until_idle();
+	view_host.settle(HostCall::Presented, "imgview did not present after arrow-key pan")?;
 	// Release the arrow, because panning is continuous while a key is held: a press that is
 	// never released keeps producing presents, and how many arrive before the next step is a
 	// matter of how fast the target runs. Emulated riscv64 is roughly twenty-five times slower
@@ -1891,29 +1863,14 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	sched::run_until_idle();
 	let quit_frame = [1, 0, 0, 0, 0x14, 0, 1];
 	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview quit key")?;
-	sched::run_until_idle();
-
-	// Answer any presents still in flight before the release. Requiring the release to be the
-	// very next message would make this scenario depend on the target's speed rather than on
-	// `imgview` giving the surface back, which is what it is here to prove.
-	let release = loop {
-		let message = view_display_server.recv().map_err(|_| "imgview did not release its surface after q")?;
-		if message.bytes.len() >= 6 && le_u16(&message.bytes, 0) == 3 {
-			break message;
-		}
-		if message.bytes.len() < 6 || le_u16(&message.bytes, 0) != 2 {
-			return Err("imgview sent an invalid release request");
-		}
-		let corr = le_u32(&message.bytes, 2);
-		view_display_server.send(Message::new([corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview trailing-present reply failed")?;
-		sched::run_until_idle();
-	};
-	let release_corr = le_u32(&release.bytes, 2);
-	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview release reply failed")?;
+	// Presents still in flight before the release are answered on the way, which is what `settle`
+	// does: requiring the close to be the very next message would make this scenario depend on the
+	// target's speed rather than on `imgview` giving the surface back, which is what it is here for.
+	view_host.settle(HostCall::Closed, "imgview did not close its surface after q")?;
 	core::mem::drop(view_output);
 	sched::run_until_idle();
 	if !view_process.is_terminated() {
-		return Err("imgview did not exit after releasing the surface");
+		return Err("imgview did not exit after closing the surface");
 	}
 
 	let (mp3_audio_server, mp3_audio_client) = Channel::create();
@@ -5851,15 +5808,6 @@ fn run_volume_tool(tool_elf: &[u8], args: &[u8], system: &mut StorageHarness, me
 	run_volume_tool_in(sched::root_domain(), tool_elf, args, system, media).0
 }
 
-// The tail of a `surface-info`: what the output can show, which these harnesses do not know and
-// therefore do not claim. ENCODED BY THE GENERATED WRITER rather than appended as five bytes, for the
-// reason the format byte beside it carries: a record's layout is not a harness's to remember.
-fn unknown_output_colour() -> alloc::vec::Vec<u8> {
-	use display_proto::generated::liber::display::v1::OutputColour;
-	use graphics_proto::generated::liber::graphics::v1::ColorSpace;
-	OutputColour { space: ColorSpace::Srgb, sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None }.encode_vec().expect("an output colour encodes")
-}
-
 // The reply a display DEVICE gives to `scanout`, ENCODED BY THE GENERATED WRITER.
 //
 // The record carries a capability, so the bytes and the handle are two halves of one message: the
@@ -5892,19 +5840,6 @@ pub(crate) fn answer_device_events(gpu: &object::channel::Channel) -> Option<all
 	let (producer, consumer) = Channel::create();
 	send_cap(gpu, &le_u32(&request.bytes, 2).to_le_bytes(), consumer, Rights::ALL).ok()?;
 	Some(producer)
-}
-
-// Whether a typed `present` request's damage covers exactly the rectangle a harness expects, decoded
-// through the generated reader. `whole` covers anything, which is what the first present of a
-// generation sends.
-fn present_covers(bytes: &[u8], width: u32, height: u32) -> bool {
-	use graphics_proto::generated::liber::graphics::v1::DamageRegion;
-	let Some(body) = bytes.get(6..) else { return false };
-	let Some(damage) = DamageRegion::decode(body) else { return false };
-	if damage.whole {
-		return true;
-	}
-	damage.rects.iter().any(|rect| rect.size.width == width && rect.size.height == height)
 }
 
 fn viewer_surface(image: &pix::RgbaImage) -> alloc::vec::Vec<u8> {
@@ -5969,9 +5904,295 @@ fn run_imgview_harness(imgview_elf: &[u8], path: &[u8], expected: &[u8], system:
 	run_imgview_harness_with_exit(imgview_elf, path, expected, system, media, ImgviewExit::KeyQ);
 }
 
+// A STAND-IN DISPLAY SERVICE FOR ONE SURFACE, speaking the present-queue contract.
+//
+// The viewer harnesses are about the VIEWER - what it draws and when it redraws - so the service
+// half here is the smallest one that is still CORRECT rather than a second DisplayService: one
+// surface, one generation, a negotiated queue, and a present that completes the moment it is
+// accepted. EVERY FRAME IS DECODED BY THE GENERATED READER AND ANSWERED BY THE GENERATED WRITER,
+// which is what stops a harness from becoming a private second copy of a wire format - and what
+// makes a wire change break it at the decode instead of silently at a byte offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostCall {
+	Presented,
+	Focus,
+	Closed,
+}
+
+struct SurfaceHost {
+	display: alloc::sync::Arc<object::channel::Channel>,
+	surface: Option<alloc::sync::Arc<object::channel::Channel>>,
+	/// The queue's slots. A slot exists from `create-surface` and its pixels arrive later, because
+	/// the images are the CLIENT's: it creates them and provides them one at a time.
+	images: alloc::vec::Vec<Option<alloc::sync::Arc<object::memory_object::MemoryObject>>>,
+	/// The image the client owns, which is the one a present may consume.
+	acquired: Option<u32>,
+	width: u32,
+	height: u32,
+	serial: u64,
+	generation: u64,
+	next_present: u64,
+	presents: usize,
+	/// Whether the last present named the WHOLE surface rather than a rectangle list. The first
+	/// present of a generation must be this one, and a rectangle covering the extent is not it.
+	last_whole: bool,
+	/// The client's end of the focus proof, kept so a caller can prove the proof a client
+	/// transferred onward is the one this surface minted rather than one it invented.
+	focus_proof: Option<alloc::sync::Arc<object::channel::Channel>>,
+	/// The service ends of everything minted for the client, held open for as long as it holds its
+	/// half: a peer that goes away turns the client's endpoint into a closed channel.
+	kept: alloc::vec::Vec<alloc::sync::Arc<object::channel::Channel>>,
+}
+
+impl SurfaceHost {
+	fn new(display: alloc::sync::Arc<object::channel::Channel>, width: u32, height: u32) -> SurfaceHost {
+		SurfaceHost { display, surface: None, images: alloc::vec::Vec::new(), acquired: None, width, height, serial: 1, generation: 1, next_present: 1, presents: 0, last_whole: false, focus_proof: None, kept: alloc::vec::Vec::new() }
+	}
+
+	fn pitch(&self) -> u32 {
+		self.width * 4
+	}
+
+	fn image_len(&self) -> u64 {
+		u64::from(self.pitch()) * u64::from(self.height)
+	}
+
+	fn image(&self, index: usize) -> alloc::sync::Arc<object::memory_object::MemoryObject> {
+		self.images[index].clone().expect("the viewer supplied this image")
+	}
+
+	fn complete(&self) -> bool {
+		!self.images.is_empty() && self.images.iter().all(Option::is_some)
+	}
+
+	fn configuration(&self) -> display_proto::generated::liber::display::v1::SurfaceConfiguration {
+		use display_proto::generated::liber::display::v1 as display_v1;
+		use graphics_proto::generated::liber::graphics::v1::{ColorSpace, Extent2d, PixelFormat};
+		display_v1::SurfaceConfiguration { serial: self.serial, generation: self.generation, logical_extent: Extent2d { width: self.width, height: self.height }, physical_extent: Extent2d { width: self.width, height: self.height }, scale: display_v1::ScaleRatio { numerator: 1, denominator: 1 }, transform: display_v1::OutputTransform::Normal, output: 0, format: PixelFormat::B8g8r8x8Unorm, colour: display_v1::OutputColour { space: ColorSpace::Srgb, sdr_white_nits: None, min_nits: None, max_nits: None, max_frame_average_nits: None }, subpixel: display_v1::SubpixelLayout::Unknown, visible: true, focused: true }
+	}
+
+	// The correlation, the success tag, then whatever the schema names.
+	fn ok_reply(corr: u32, body: &[u8]) -> alloc::vec::Vec<u8> {
+		let mut reply = corr.to_le_bytes().to_vec();
+		reply.push(1);
+		reply.extend_from_slice(body);
+		reply
+	}
+
+	// Answer at most one pending request, and report the ones a harness waits on.
+	fn poll(&mut self) -> Option<HostCall> {
+		if let Ok(request) = self.display.recv() {
+			return self.connection_call(&request);
+		}
+		let surface = self.surface.clone()?;
+		let request = surface.recv().ok()?;
+		self.surface_call(&surface, &request)
+	}
+
+	// Run the scheduler and answer until the wanted call arrives. For the scenarios driven by
+	// `run_until_idle` rather than by a storage harness's pump.
+	fn settle(&mut self, wanted: HostCall, what: &'static str) -> Result<(), &'static str> {
+		for _ in 0..4_000 {
+			sched::run_until_idle();
+			if self.poll() == Some(wanted) {
+				return Ok(());
+			}
+		}
+		Err(what)
+	}
+
+	fn connection_call(&mut self, request: &object::channel::Message) -> Option<HostCall> {
+		use display_proto::codec::Reader;
+		use display_proto::generated::liber::display::v1 as display_v1;
+		use object::channel::{Channel, Message};
+		use object::handle::Capability;
+		use object::rights::Rights;
+
+		let mut reader = Reader::new(&request.bytes);
+		let op: u16 = reader.u16().expect("a display request names its op");
+		let corr: u32 = reader.u32().expect("a display request carries a correlation id");
+		match op {
+			display_v1::display::OP_CREATE_SURFACE => {
+				let wanted = display_v1::SurfaceRequest::read(&mut reader).expect("a surface request decodes");
+				reader.finish().expect("and the request is the whole message");
+				// `(0, 0)` ASKS FOR THE SERVER'S PREFERRED SIZE, which here is the harness's grid.
+				assert_eq!((wanted.logical_extent.width, wanted.logical_extent.height), (0, 0), "the viewer asks for the native size");
+				// THE COUNT IS NEGOTIATED AND CLAMPED RATHER THAN REFUSED, and the answer says what
+				// was given - which is why `queue` reports it rather than the interface declaring it.
+				let images: u32 = wanted.images.clamp(2, 3);
+				let (service_end, client_end) = Channel::create();
+				// SLOTS, AND NOT IMAGES. The pixels are the client's to create and to pay for, so
+				// what a surface starts with is the count it negotiated and nothing behind it.
+				self.images.clear();
+				for _ in 0..images {
+					self.images.push(None);
+				}
+				self.surface = Some(service_end);
+				self.display.send(Message::new(Self::ok_reply(corr, &0u32.to_le_bytes()), alloc::vec![Capability::new(client_end, Rights::ALL)])).expect("a create-surface reply");
+				None
+			}
+			display_v1::display::OP_IMAGE_LIMITS => {
+				let body = display_v1::ImageLimits { minimum: 2, maximum: 3 }.encode_vec().expect("the negotiable range encodes");
+				self.display.send(Message::new(Self::ok_reply(corr, &body), alloc::vec::Vec::new())).expect("an image-limits reply");
+				None
+			}
+			other => panic!("the viewer made an unexpected display call {other}"),
+		}
+	}
+
+	fn surface_call(&mut self, surface: &object::channel::Channel, request: &object::channel::Message) -> Option<HostCall> {
+		use display_proto::codec::{Reader, VecWriter};
+		use display_proto::generated::liber::display::v1 as display_v1;
+		use display_v1::surface as surface_wire;
+		use object::channel::{Channel, Message};
+		use object::handle::Capability;
+		use object::rights::Rights;
+
+		let mut reader = Reader::new(&request.bytes);
+		let op: u16 = reader.u16().expect("a surface request names its op");
+		let corr: u32 = reader.u32().expect("a surface request carries a correlation id");
+		match op {
+			surface_wire::OP_CONFIGURATION => {
+				reader.finish().expect("a configuration takes no argument");
+				let body = self.configuration().encode_vec().expect("a configuration snapshot encodes");
+				surface.send(Message::new(Self::ok_reply(corr, &body), alloc::vec::Vec::new())).expect("a configuration reply");
+				None
+			}
+			surface_wire::OP_ACK_CONFIGURE => {
+				let serial: u64 = reader.u64().expect("an acknowledgement names a serial");
+				reader.finish().expect("and nothing else");
+				assert_eq!(serial, self.serial, "an acknowledgement names the current configuration");
+				surface.send(Message::new(Self::ok_reply(corr, &[]), alloc::vec::Vec::new())).expect("an acknowledgement reply");
+				None
+			}
+			surface_wire::OP_QUEUE => {
+				reader.finish().expect("a queue takes no argument");
+				let (producer_service, producer_client) = Channel::create();
+				let (done_service, done_client) = Channel::create();
+				// THE RECORD'S OWN WRITER RECORDS THE TWO CAPABILITIES: the bytes and the handles
+				// are two halves of one message, which is why the capabilities travel beside them.
+				let mut writer = VecWriter::new();
+				display_v1::PresentQueue { images: self.images.len() as u32, pitch: self.pitch(), generation: self.generation, producer: 0, done: 0 }.write(&mut writer).expect("a present queue encodes");
+				let (body, _handles) = writer.into_message();
+				self.kept.push(producer_service);
+				self.kept.push(done_service);
+				surface.send(Message::new(Self::ok_reply(corr, &body), alloc::vec![Capability::new(producer_client, Rights::ALL), Capability::new(done_client, Rights::ALL)])).expect("a queue reply");
+				None
+			}
+			surface_wire::OP_PROVIDE_IMAGE => {
+				let index: u32 = reader.u32().expect("a supplied image is named by index");
+				let _ = reader.u32().expect("the handle's inline placeholder");
+				reader.finish().expect("and nothing else");
+				// THE CLIENT CREATED IT AND THE CLIENT PAYS FOR IT, and what arrives is a capability
+				// rather than a request for one. The rights are checked because the schema declares
+				// them: a service composes FROM these pixels, so `read` and `map` are what it needs
+				// and `write` is what it must not be handed.
+				let capability = request.caps.first().expect("a supplied image carries its memory object");
+				let rights = capability.rights();
+				assert!(rights.contains(object::rights::Rights::READ | object::rights::Rights::MAP), "a supplied image carries read and map");
+				assert!(!rights.contains(object::rights::Rights::WRITE), "and never write: the service composes from these pixels and not into them");
+				let object = capability.object().into_any_arc().downcast::<object::memory_object::MemoryObject>().expect("a presentable image is a MemoryObject");
+				// THE OBJECT'S OWN SIZE AND NOT A LENGTH THE CLIENT DECLARED: a supplier that said
+				// one number and handed over something smaller would be describing a buffer the
+				// service then reads past.
+				assert!(object.size() as u64 >= self.image_len(), "a supplied image holds at least pitch by height");
+				let slot = self.images.get_mut(index as usize).expect("an index inside the negotiated count");
+				assert!(slot.is_none(), "a slot already filled is not refilled within a generation");
+				*slot = Some(object);
+				surface.send(Message::new(Self::ok_reply(corr, &[]), alloc::vec::Vec::new())).expect("a provide-image reply");
+				None
+			}
+			surface_wire::OP_ACQUIRE_NEXT => {
+				reader.finish().expect("an acquire takes no argument");
+				// A PRESENT COMPLETES AS SOON AS IT IS ACCEPTED HERE, so the first image is always
+				// the one available - and a second acquire while one is out answers `again` rather
+				// than blocking, which is the property the whole non-blocking rule exists for.
+				let answer = match self.acquired {
+					// A PARTIALLY SUPPLIED QUEUE IS A QUEUE THAT CANNOT BE PRESENTED FROM, and a
+					// second acquire while one image is out answers `again` rather than blocking -
+					// which is the property the whole non-blocking rule exists for.
+					_ if !self.complete() => display_v1::AcquiredImage::Again,
+					Some(_) => display_v1::AcquiredImage::Again,
+					None => {
+						self.acquired = Some(0);
+						display_v1::AcquiredImage::Image(0)
+					}
+				};
+				let body = answer.encode_vec().expect("an acquire answer encodes");
+				surface.send(Message::new(Self::ok_reply(corr, &body), alloc::vec::Vec::new())).expect("an acquire reply");
+				None
+			}
+			surface_wire::OP_ABANDON => {
+				let image: u32 = reader.u32().expect("an abandon names an image");
+				reader.finish().expect("and nothing else");
+				assert_eq!(self.acquired, Some(image), "only an acquired image can be given back");
+				self.acquired = None;
+				surface.send(Message::new(Self::ok_reply(corr, &[]), alloc::vec::Vec::new())).expect("an abandon reply");
+				None
+			}
+			surface_wire::OP_PRESENT => {
+				let image: u32 = reader.u32().expect("a present names its image");
+				let serial: u64 = reader.u64().expect("a present names its configuration serial");
+				let generation: u64 = reader.u64().expect("a present names its image generation");
+				let damage = display_v1::DamageRegion::read(&mut reader).expect("a present carries a damage region");
+				reader.finish().expect("and the damage is the whole request");
+				self.last_whole = damage.whole;
+				// BOTH MUST MATCH THE ACKNOWLEDGED CONFIGURATION AT ACCEPTANCE, which is what stops
+				// a frame drawn for one size from ever being shown at another.
+				assert_eq!(serial, self.serial, "a present names the configuration serial it was drawn for");
+				assert_eq!(generation, self.generation, "and the generation its image belongs to");
+				assert_eq!(self.acquired, Some(image), "a present CONSUMES an acquired image");
+				self.acquired = None;
+				let accepted: u64 = self.next_present;
+				self.next_present = accepted + 1;
+				self.presents += 1;
+				surface.send(Message::new(Self::ok_reply(corr, &accepted.to_le_bytes()), alloc::vec::Vec::new())).expect("a present reply");
+				Some(HostCall::Presented)
+			}
+			surface_wire::OP_INPUT_FOCUS => {
+				reader.finish().expect("a focus proof takes no argument");
+				let (kept, client) = Channel::create();
+				self.kept.push(kept);
+				self.focus_proof = Some(client.clone());
+				surface.send(Message::new(Self::ok_reply(corr, &0u32.to_le_bytes()), alloc::vec![Capability::new(client, Rights::ALL)])).expect("a focus proof reply");
+				Some(HostCall::Focus)
+			}
+			surface_wire::OP_CLOSE => {
+				reader.finish().expect("a close takes no argument");
+				surface.send(Message::new(Self::ok_reply(corr, &[]), alloc::vec::Vec::new())).expect("a close reply");
+				Some(HostCall::Closed)
+			}
+			other => panic!("the viewer made an unexpected surface call {other}"),
+		}
+	}
+}
+
+// Pump the storage harnesses and the stand-in display until it reports the call being waited on.
+fn await_host(host: &mut SurfaceHost, system: &mut StorageHarness, media: &mut StorageHarness, wanted: HostCall, what: &str) {
+	for _ in 0..200_000 {
+		system.pump();
+		media.pump();
+		if host.poll() == Some(wanted) {
+			return;
+		}
+	}
+	panic!("{what}");
+}
+
+// NOTHING MAY REDRAW: pump and watch the present counter stand still. A key that produced a frame
+// here would be a viewer redrawing for input that changed nothing.
+fn assert_no_redraw(host: &mut SurfaceHost, system: &mut StorageHarness, media: &mut StorageHarness, rounds: usize, what: &str) {
+	let before = host.presents;
+	for _ in 0..rounds {
+		system.pump();
+		media.pump();
+		host.poll();
+	}
+	assert_eq!(host.presents, before, "{what}");
+}
+
 fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8], system: &mut StorageHarness, media: &mut StorageHarness, exit: ImgviewExit) {
 	use object::channel::{Channel, Message};
-	use object::memory_object::MemoryObject;
 	use object::rights::Rights;
 	let (bootstrap, child) = Channel::create();
 	let (stdout, child_stdout) = Channel::create();
@@ -5990,56 +6211,18 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("imgview display");
 	send_cap(&bootstrap, b"INPUT_KEYS", input_client, Rights::ALL).expect("imgview input");
 
-	let acquire = loop {
-		system.pump();
-		media.pump();
-		if let Ok(request) = display.recv() {
-			break request;
-		}
-	};
-	assert_eq!(le_u16(&acquire.bytes, 0), 1, "imgview acquires a surface");
-	let surface = MemoryObject::create(16).expect("imgview surface");
-	let mut reply = alloc::vec::Vec::new();
-	reply.extend_from_slice(&le_u32(&acquire.bytes, 2).to_le_bytes());
-	reply.push(1);
-	reply.extend_from_slice(&16u64.to_le_bytes());
-	reply.extend_from_slice(&2u32.to_le_bytes());
-	reply.extend_from_slice(&2u32.to_le_bytes());
-	reply.extend_from_slice(&8u32.to_le_bytes());
-	// Named rather than numbered, for the reason written out at the other harness above.
-	reply.push(graphics_proto::generated::liber::graphics::v1::PixelFormat::B8g8r8x8Unorm as u8);
-	reply.extend_from_slice(&unknown_output_colour());
-	send_cap(&display, &reply, surface.clone(), Rights::ALL).expect("imgview acquire reply");
-
-	let present = loop {
-		system.pump();
-		media.pump();
-		if let Ok(request) = display.recv() {
-			break request;
-		}
-	};
-	assert_eq!(le_u16(&present.bytes, 0), 2, "imgview presents converted image");
-	assert_eq!(read_from_object(&surface, 16), expected, "imgview presents the expected alpha-converted composited frame");
-	display.send(Message::new([le_u32(&present.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview present reply");
-
-	let focus = loop {
-		system.pump();
-		media.pump();
-		if let Ok(request) = display.recv() {
-			break request;
-		}
-	};
-	assert_eq!(le_u16(&focus.bytes, 0), 5, "imgview requests focus");
-	let (_focus_server, focus_client) = Channel::create();
-	let mut focus_reply = alloc::vec::Vec::new();
-	focus_reply.extend_from_slice(&le_u32(&focus.bytes, 2).to_le_bytes());
-	focus_reply.push(1);
-	focus_reply.extend_from_slice(&0u32.to_le_bytes());
-	send_cap(&display, &focus_reply, focus_client, Rights::ALL).expect("imgview focus reply");
+	// THE DISPLAY HALF IS A PRESENT QUEUE NOW, so the harness is one: a surface of its own, a
+	// negotiated image count, and a present that names the serial and the generation it was drawn
+	// for. The viewer asks for the native size, which is this 2x2 grid.
+	let mut host = SurfaceHost::new(display, 2, 2);
+	await_host(&mut host, system, media, HostCall::Presented, "imgview presents its first frame");
+	assert_eq!(read_from_object(&host.image(0), 16), expected, "imgview presents the expected alpha-converted composited frame");
+	await_host(&mut host, system, media, HostCall::Focus, "imgview asks for its surface's input focus");
 
 	let subscribe = loop {
 		system.pump();
 		media.pump();
+		host.poll();
 		if let Ok(request) = input.recv() {
 			break request;
 		}
@@ -6062,98 +6245,52 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				keys.send(Message::new(alloc::vec![0, 0, 0, 0, code as u8, (code >> 8) as u8, pressed as u8], alloc::vec::Vec::new())).expect("imgview interaction key");
 			};
 			send_key(0x4f, true);
-			system.pump();
-			media.pump();
-			assert!(display.recv().is_err(), "fit-to-screen arrow must not redraw or auto-zoom");
+			assert_no_redraw(&mut host, system, media, 32, "fit-to-screen arrow must not redraw or auto-zoom");
 			send_key(0x4f, false);
 			for iteration in 0..8 {
 				let zoom_in_code = if iteration % 2 == 0 { 0x2e } else { 0x57 };
 				send_key(zoom_in_code, true);
-				let request = loop {
-					system.pump();
-					media.pump();
-					if let Ok(request) = display.recv() {
-						break request;
-					}
-				};
-				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction redraws with a present request");
-				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview interaction present reply");
+				await_host(&mut host, system, media, HostCall::Presented, "imgview interaction redraws with a present");
 				send_key(zoom_in_code, false);
 			}
 			for zoom_out_code in [0x56, 0x2d] {
 				send_key(zoom_out_code, true);
-				let request = loop {
-					system.pump();
-					media.pump();
-					if let Ok(request) = display.recv() {
-						break request;
-					}
-				};
-				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms out with a present request");
-				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview zoom-out present reply");
+				await_host(&mut host, system, media, HostCall::Presented, "imgview interaction zooms out with a present");
 				send_key(zoom_out_code, false);
 			}
 			for _ in 0..20 {
 				send_key(0x57, true);
-				let request = loop {
-					system.pump();
-					media.pump();
-					if let Ok(request) = display.recv() {
-						break request;
-					}
-				};
-				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms with keypad plus");
-				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview keypad zoom present reply");
+				await_host(&mut host, system, media, HostCall::Presented, "imgview interaction zooms with keypad plus");
 				send_key(0x57, false);
 			}
 			stdout.send(Message::new(alloc::vec![0x1b, b'[', b'C'], alloc::vec::Vec::new())).expect("imgview serial right arrow");
-			let request = loop {
-				system.pump();
-				media.pump();
-				if let Ok(request) = display.recv() {
-					break request;
-				}
-			};
-			assert_eq!(le_u16(&request.bytes, 0), 2, "imgview serial arrow redraws with a present request");
-			display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview serial-arrow present reply");
+			await_host(&mut host, system, media, HostCall::Presented, "imgview serial arrow redraws with a present");
 			send_key(0x4f, true);
-			let mut repeat_presents = 0usize;
+			let before_repeat = host.presents;
 			for _ in 0..1_000 {
 				system.pump();
 				media.pump();
-				while let Ok(request) = display.recv() {
-					assert_eq!(le_u16(&request.bytes, 0), 2, "imgview held arrow redraws with a present request");
-					display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview held-arrow present reply");
-					repeat_presents += 1;
-				}
-				if repeat_presents >= 2 {
+				host.poll();
+				if host.presents >= before_repeat + 2 {
 					break;
 				}
 				arch::idle_halt();
 			}
-			assert!(repeat_presents >= 2, "held arrow must produce repeated pan redraws");
+			assert!(host.presents >= before_repeat + 2, "held arrow must produce repeated pan redraws");
 			send_key(0x4f, false);
-			for _ in 0..10 {
-				system.pump();
-				media.pump();
-				assert!(display.recv().is_err(), "released arrow must stop repeated pan redraws");
-			}
+			assert_no_redraw(&mut host, system, media, 32, "released arrow must stop repeated pan redraws");
 			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new())).expect("imgview serial escape");
 		}
 	}
 
-	let release = loop {
-		system.pump();
-		media.pump();
-		if let Ok(request) = display.recv() {
-			break request;
-		}
-	};
-	assert_eq!(le_u16(&release.bytes, 0), 3, "imgview releases its surface");
-	display.send(Message::new([le_u32(&release.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview release reply");
+	// THE SURFACE IS CLOSED BEFORE THE PROGRAM GOES, and the close is ANSWERED: the reply travels on
+	// the surface's own channel, so a client that never received one would wait inside its own
+	// destructor rather than exiting.
+	await_host(&mut host, system, media, HostCall::Closed, "imgview closes its surface");
 	for _ in 0..100_000 {
 		system.pump();
 		media.pump();
+		host.poll();
 		if process.is_terminated() {
 			return;
 		}
@@ -6248,6 +6385,9 @@ impl ConsoleHarness {
 		// framebuffer handshake below, which is the order the service performs them in.
 		let (catalogue_server, catalogue_client) = Channel::create();
 		send_cap(&display_boot, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+		// AN OPTIONAL ROLE'S TAG STILL TRAVELS, carrying nothing: the bootstrap is read POSITIONALLY,
+		// so a missing message shifts every read after it.
+		display_boot.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("display stats bootstrap");
 
 		let width: u32 = (cols * 8) as u32;
 		let height: u32 = (rows * 16) as u32;
@@ -6296,10 +6436,19 @@ impl ConsoleHarness {
 		// SEVERAL SETTLES, not one: bring-up crosses timed waits (the bounded wait for a
 		// ConfigService that is not there, and the display round trips), and `run_until_idle`
 		// returns while a thread is parked on a deadline.
-		for _ in 0..8 {
+		// PUMP UNTIL IT REPORTS, BOUNDED - not a fixed count. Bring-up crosses timed waits and a
+		// round trip through this harness for every focus command, and the number of those is a
+		// property of the display contract rather than a constant a test should encode: the present
+		// queue made it several calls where it was one, and a fixed eight silently became too few.
+		let mut reported = None;
+		for _ in 0..400 {
 			harness.pump();
+			if let Ok(message) = console_boot.recv() {
+				reported = Some(message);
+				break;
+			}
 		}
-		let online = console_boot.recv().expect("ConsoleService online report");
+		let online = reported.expect("ConsoleService online report");
 		assert_eq!(&online.bytes[..], b"ConsoleService: online", "ConsoleService reports in");
 		harness
 	}

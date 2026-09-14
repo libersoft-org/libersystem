@@ -1,0 +1,17 @@
+[package]
+name = "render3d"
+edition = "2024"
+description = "The backend-neutral 3D API: the blend state, the MSAA geometry, the depth and stencil semantics, the device limits and the typed refusals that go with them"
+
+[dependencies]
+# THE FROZEN PROFILE, READ RATHER THAN RESTATED. The sample positions, the depth rules, the clip
+# volume and the minimum limits are `s-3d`'s and this crate implements them; a second copy here would
+# be a second list to keep in step with the document its hash is taken over.
+graphics-profile = { path = "../profile" }
+# The one image and colour vocabulary, so an attachment's format is the same type everywhere.
+graphics-core = { path = "../core" }
+# The frozen math contract: one handedness, one storage order, one depth range, one winding.
+render-math = { path = "../render-math" }
+
+[lints.rust]
+warnings = "deny"

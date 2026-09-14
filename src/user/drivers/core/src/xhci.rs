@@ -22,7 +22,6 @@
 
 extern crate alloc;
 
-mod hid;
 mod usb_hid;
 mod usb_storage;
 

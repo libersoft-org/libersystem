@@ -1,0 +1,18 @@
+[package]
+name = "scene3d"
+edition = "2024"
+description = "The retained scene layer: hierarchy, cameras, lights, bounds, frustum culling, render queues and a pass graph, emitting render3d commands and nothing else"
+
+[dependencies]
+# THE COMMAND MODEL THIS LAYER GENERATES. It contains no backend-specific path: everything it
+# produces is a `render3d` command, which is what makes it a convenience rather than a second API.
+render3d = { path = "../render3d" }
+# The frozen math contract: one handedness, one storage order, one depth range, one winding.
+render-math = { path = "../render-math" }
+# `Scene3D Core Profile 1` itself. The limits, the queue order, the attenuation equations and the
+# picking answers are the profile's and this crate implements them; a second copy here would be a
+# second list to keep in step with the document its hash is taken over.
+graphics-profile = { path = "../profile" }
+
+[lints.rust]
+warnings = "deny"

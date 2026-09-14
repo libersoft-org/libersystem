@@ -1,16 +1,84 @@
-//! LiberSystem display package - capability-scoped application surfaces.
+//! LiberSystem display package - capability-scoped surfaces with their own present queues.
+//!
+//! ONE CONNECTION, MANY SURFACES. The previous contract said "one display connection owns at most
+//! one surface" and put `acquire`, `present`, `release` and `input-focus` at connection level. Every
+//! desktop and mobile application is more than one surface - a main window, a dialog, a popup, a
+//! menu, a tooltip, a video surface, offscreen content - so that object model is one a compositor
+//! would have to break. A surface is its own capability here, with its own queue, its own events and
+//! its own configuration.
+//!
+//! AND THERE IS NO COMPATIBILITY PATH. Nothing is versioned before the first release and no external
+//! software depends on this; a compatibility shim would be a second object model to keep correct.
+//!
+//! EVERY ANSWER HERE IS `WSI Profile 1`'s. The twelve configuration fields, the six events, the four
+//! image states and eight transitions, the four acquire answers, the four present outcomes, the nine
+//! damage rules and the two completion pairs are frozen in `docs/graphics/WSI_PROFILE_1.md`; this
+//! package is how they are spelled on the wire.
 
 package liber:display@1;
 
 use liber:base@1.{error};
 use liber:process@1.{task};
-// THE PIXEL FORMAT IS NOT THIS PACKAGE'S TO DECLARE (2026-09-13). It was an enumeration of one
-// member here, and a second interface needing one would have declared a second enumeration with the
-// same name and a different meaning - two types a reader cannot tell apart and a version cannot be
-// declared against. It lives in `liber:graphics@1` with the rest of the shared value vocabulary,
-// which carries the twelve formats `Image Colour Profile 1` freezes rather than the one this
-// service happens to accept today.
-use liber:graphics@1.{color-space, damage-region, pixel-format};
+// THE PIXEL FORMAT IS NOT THIS PACKAGE'S TO DECLARE. It lives in `liber:graphics@1` with the rest of
+// the shared value vocabulary, which carries the twelve formats `Image Colour Profile 1` freezes
+// rather than the one this service happens to accept today.
+use liber:graphics@1.{color-space, damage-region, extent-2d, pixel-format};
+
+/// A PRESENTABLE IMAGE THE CLIENT CREATED, for the service to compose from.
+///
+/// THE SUPPLIER ALLOCATES AND THE SUPPLIER PAYS. `SYS_MEMORY_OBJECT_CREATE` charges the Domain that
+/// CREATED the object, and the charge stays with it when the capability moves - so a service that
+/// allocated its clients' images would pay for every one of them, and one client could exhaust the
+/// service's quota while its own budget still looked healthy. That is the accounting defect this
+/// contract exists to remove, and the answer is that the queue's images come from the client.
+///
+/// WHAT IS GUARANTEED IS THAT NO DOMAIN PAYS FOR STORAGE IT DID NOT ITSELF ALLOCATE, and not that
+/// the paying Domain is the requesting one: `ObjectInfo` carries koid, type, rights, generation and
+/// size and NO charged Domain, so the service cannot tell a client-created object from one a third
+/// Domain created and handed over. Sponsorship is therefore possible and is a capability-system
+/// consequence rather than a hole - it requires that Domain to allocate and transfer deliberately,
+/// which is what a capability IS.
+///
+/// `@kernel(memory-object)` is what makes the `@rights` guard on `provide-image` refuse a handle of
+/// any other kernel object rather than checking rights on whatever it was handed.
+@kernel(memory-object)
+resource image-object;
+
+/// THE SCALE IS A RATIO AND NEVER A FLOAT ON THE WIRE.
+///
+/// A fractional scale that two sides round differently produces an off-by-one extent, and that is
+/// the bug that shows as a one-pixel seam nobody can reproduce. With the ratio, both neighbours of a
+/// shared edge compute the same integer from the same two integers.
+record scale-ratio {
+	numerator:   u32,
+	denominator: u32,
+}
+
+/// The output's orientation. INPUT MAPPING IS THE INVERSE OF THIS, which is why the two are frozen
+/// together: a client that undoes the transform one way and the service the other puts every touch
+/// in the wrong place.
+enum output-transform {
+	normal,
+	rotate90,
+	rotate180,
+	rotate270,
+	flipped-normal,
+	flipped-rotate90,
+	flipped-rotate180,
+	flipped-rotate270,
+}
+
+/// Which geometry an LCD mask may be rasterised for. `unknown` IS NOT `none-layout`: the first says
+/// nothing was reported and the second says the panel has no subpixel geometry to exploit, and a
+/// text rasteriser treats them differently.
+enum subpixel-layout {
+	unknown,
+	none-layout,
+	horizontal-rgb,
+	horizontal-bgr,
+	vertical-rgb,
+	vertical-bgr,
+}
 
 /// WHAT THE OUTPUT CAN ACTUALLY SHOW, which a colour-space NAME does not say.
 ///
@@ -20,10 +88,9 @@ use liber:graphics@1.{color-space, damage-region, pixel-format};
 /// that decides how the image looks.
 ///
 /// EVERY LUMINANCE IS OPTIONAL AND `none` IS NOT ZERO. A display that does not report what it can do
-/// is the ordinary case - nothing in this system asks a panel yet, because DDC needs a bus no driver
-/// here can reach - and `Image and Colour Profile 1` says absent HDR metadata is a refusal to assume
-/// rather than a default to invent. A consumer handed `none` uses the profile's own stated reference
-/// white point, which is one assumption written down in one place.
+/// is the ordinary case - nothing here asks a panel yet, because DDC needs a bus no driver can reach
+/// - and `Image and Colour Profile 1` says absent HDR metadata is a refusal to assume rather than a
+/// default to invent.
 record output-colour {
 	space:                  color-space,
 	/// What a relative 1.0 is, in cd/m².
@@ -35,35 +102,166 @@ record output-colour {
 	max-frame-average-nits: option<f32>,
 }
 
-/// A writable application surface. `pixels` is a shared MemoryObject: DisplayService
-/// retains a read+map duplicate and transfers a write+map handle to the client. Its
-/// wire length is exactly `pitch * height`; `pitch` is at least `width * 4` and all
-/// arithmetic is checked before allocation. The client owns the pixels, never the
-/// physical scanout.
-record surface-info {
-	pixels: buffer,
-	width:  u32,
-	height: u32,
-	pitch:  u32,
-	format: pixel-format,
-	/// What the output this surface reaches can show. It travels WITH the surface because it is a
-	/// property of the destination the client is drawing for, and a client that had to ask for it
-	/// separately would be a client that draws one frame before it knows.
-	colour: output-colour,
+/// ONE ATOMIC SNAPSHOT OF EVERYTHING THAT DECIDES HOW A CLIENT DRAWS.
+///
+/// THE FIELDS TRAVEL TOGETHER OR THE CLIENT RENDERS AT A SIZE NOTHING ASKED FOR. A client that
+/// applied a new scale with an old extent would lay out for a window that does not exist, which is
+/// the whole reason this is a snapshot rather than a set of events.
+///
+/// THE PHYSICAL EXTENT IS THE AUTHORITATIVE ONE and the logical extent is derived from it and the
+/// scale, never the other way round - so a rounding difference cannot make the two disagree.
+record surface-configuration {
+	/// What an acknowledgement names. A stale or unknown serial is REFUSED rather than applied.
+	serial:           u64,
+	/// Which image generation this configuration belongs to. Every present carries one and it must
+	/// match the acknowledged current configuration at acceptance.
+	generation:       u64,
+	/// What an application lays out in.
+	logical-extent:   extent-2d,
+	/// What the backend rasterises. THE AUTHORITATIVE ONE.
+	physical-extent:  extent-2d,
+	scale:            scale-ratio,
+	transform:        output-transform,
+	/// Which output the surface is on, so a client can follow its refresh interval.
+	output:           u32,
+	/// IMMUTABLE WITHIN A GENERATION. Changing it is a new generation.
+	format:           pixel-format,
+	colour:           output-colour,
+	subpixel:         subpixel-layout,
+	/// Whether this surface is the visible one. Acquiring from a hidden surface answers `not-visible`.
+	visible:          bool,
+	/// FOCUS IS A PROPERTY OF A SURFACE AND NOT OF A CONNECTION, so it is in the surface's snapshot.
+	focused:          bool,
 }
 
-/// A new preferred logical size for a native-sized surface. Fixed-size clients may
-/// ignore it and remain scaled/centered; a client that acquired `(0, 0)` releases and
-/// reacquires at the new size. Events are coalesced, so only the newest size matters.
-record display-event {
-	width:  u32,
-	height: u32,
+/// How much of a frame's timing the backend can actually say.
+///
+/// TYPED AND NOT A BARE NUMBER, so a client that requires a real measurement refuses on a backend
+/// that cannot produce one instead of pacing against a fabricated one. The current virtio-gpu path
+/// acknowledges a transfer and a flush and nothing else: there is no vblank, no page-flip timing and
+/// no evidence a scanout happened.
+variant timestamp-evidence {
+	unavailable,
+	/// A time the backend inferred rather than observed.
+	estimated(u64),
+	/// A time the backend observed.
+	measured(u64),
 }
 
-/// Cumulative DisplayService presentation work. `source-pixels` is the client damage
-/// area accepted; `output-pixels` is the number of scanout pixels written by the CPU,
-/// including a first-frame clear. Times use the monotonic nanosecond clock and split
-/// CPU blit/scale work from the synchronous virtio-gpu transfer+flush acknowledgement.
+/// What became of one present.
+///
+/// A BARE COMPLETION CANNOT EXPRESS THESE, and "every present is displayed" cannot hold for a
+/// background client that must also not be blocked for ever.
+enum present-outcome {
+	/// It reached logical presentation. On a backend that cannot observe scanout this means
+	/// DRIVER-COMPLETED, and the evidence field is what says which.
+	displayed,
+	/// Accepted while visible, completed while not: it kept its place in the order and never reached
+	/// a screen.
+	discarded-occluded,
+	/// A generation change overtook it.
+	replaced-by-resize,
+	/// The backend went away under it.
+	driver-lost,
+}
+
+/// What a frame loop is given INSTEAD OF A CLOCK TO SLEEP ON.
+///
+/// EVERY FIELD IS OPTIONAL because the current backend can supply none of them, and a backend that
+/// cannot supply one says so rather than inventing it. An application that sleeps on a hard-coded
+/// sixteen milliseconds is an application that is wrong on every display that is not sixty hertz.
+record frame-timing {
+	/// When the next frame ought to be ready, in monotonic nanoseconds.
+	preferred-deadline: option<u64>,
+	/// The output's refresh interval in nanoseconds.
+	refresh-interval:   option<u64>,
+}
+
+/// One present's completion, as the surface reports it.
+record present-complete {
+	serial:   u64,
+	outcome:  present-outcome,
+	evidence: timestamp-evidence,
+	timing:   frame-timing,
+}
+
+/// What a surface tells its client.
+///
+/// SEPARATE EVENTS AND NOT ONE "SOMETHING CHANGED". A client that has to re-read everything to find
+/// out what happened re-reads everything sixty times a second.
+variant surface-event {
+	/// The atomic snapshot. The client rebuilds and acknowledges by serial.
+	configure(surface-configuration),
+	/// WHAT A CLIENT WAITS ON INSTEAD OF BLOCKING INSIDE `acquire-next`, which is what keeps one
+	/// dispatch loop alive.
+	image-available,
+	/// A present's fate, reported PER PRESENT rather than inferred from the next acquire.
+	present-complete(present-complete),
+	/// A REQUEST AND NOT A TEARDOWN: the application decides, which is what makes an unsaved-changes
+	/// prompt possible.
+	close-requested,
+	/// A background client stops drawing rather than discovering it by a refusal.
+	visibility-changed(bool),
+	/// Focus belongs to the surface, so the event does too.
+	focus-changed(bool),
+}
+
+/// What `acquire-next` answers.
+///
+/// IT DOES NOT BLOCK, and that is a property of the service rather than a preference: handlers are
+/// synchronous and one dispatch loop serves the backend, the admin channel and every client.
+/// Blocking inside an acquire handler stops the only loop that could deliver the release that would
+/// unblock it, so a conforming implementation would deadlock under ordinary queue pressure.
+variant acquired-image {
+	/// The index of an image the client now owns and may draw into.
+	image(u32),
+	/// None is available. The client waits for `image-available` rather than inside the call.
+	again,
+	/// The surface is occluded or in the background.
+	not-visible,
+	/// The configuration has moved on; the client rebuilds.
+	out-of-date,
+}
+
+/// The images of a surface's present queue, as the client sees them.
+///
+/// THE COUNT IS NEGOTIATED AND IS NOT IN THE INTERFACE. The service advertises a minimum and a
+/// maximum, the client asks, and the service answers with what it gave - so a number nobody agreed
+/// to cannot be written into the ABI.
+record present-queue {
+	/// How many images the queue has, and therefore how many the client must SUPPLY. They are
+	/// provided ONE AT A TIME by `provide-image`, because a message carrying a LIST of capabilities
+	/// has a count no schema can bound - and a decode that stopped part way could not hand back the
+	/// handles it had already taken.
+	images:     u32,
+	pitch:      u32,
+	generation: u64,
+	/// The client's end of PRODUCER_READY, carrying SEND alone.
+	producer:   handle<channel>,
+	/// The client's end of PRESENT_DONE, carrying RECEIVE and WAIT.
+	done:       handle<channel>,
+}
+
+/// What the service will negotiate.
+///
+/// A RANGE AND NOT A NUMBER IN THE INTERFACE. Two images is the fewest that can double-buffer and
+/// three is the most this service will hold; writing either into the ABI would make changing it a
+/// version bump rather than a negotiation.
+record image-limits {
+	minimum: u32,
+	maximum: u32,
+}
+
+/// What a surface is created with.
+record surface-request {
+	/// `(0, 0)` asks for the server's preferred logical size; a zero on ONE axis is invalid.
+	logical-extent: extent-2d,
+	/// How many images the client would like. The service answers with what it gave, between its own
+	/// advertised minimum and maximum.
+	images:         u32,
+}
+
+/// Cumulative DisplayService presentation work.
 record presentation-stats {
 	presents:        u64,
 	direct-presents: u64,
@@ -73,49 +271,154 @@ record presentation-stats {
 	blit-ns:         u64,
 	flush-ns:        u64,
 	max-present-ns:  u64,
+	/// How many presents each outcome accounted for, so a client's own report and the service's can
+	/// be compared rather than argued about.
+	displayed:       u64,
+	discarded:       u64,
+	replaced:        u64,
+	lost:            u64,
 }
 
-/// One display connection owns at most one surface. `present` is synchronous: the
-/// service validates the damage, copies/scales the damaged pixels to its scanout and
-/// completes the device flush before replying; the client must not modify pixels
-/// inside the damaged area until the call returns. `release`, channel peer-close,
-/// or process death drops the surface and restores the console with a full repaint.
-/// The client is not told whether its surface is fullscreen; a compositor can later
-/// implement this same contract without an API break. `(0, 0)` requests the server's
-/// preferred logical size; a zero on only one axis is invalid. `events` is a live,
-/// bounded-channel stream of preferred-size changes.
+/// WHAT THE DISPLAY PATH HOLDS THAT THE KERNEL CHARGES NOBODY FOR.
+///
+/// A PRESENTABLE IMAGE IS A MEMORYOBJECT and is charged to the Domain that created it, which under
+/// this contract is the client's. EVERYTHING ELSE here - the surface record, its queue slots, its
+/// pending-present list, its event stream and its place in the service's wait vector - is service
+/// heap and a service wait set, charged to nobody. Those are exactly what an adversarial client can
+/// multiply, so each is reported with the bound it is held to.
+///
+/// OBSERVATION AND NEVER ENFORCEMENT. Reading these changes nothing; the bounds are enforced where
+/// the structures are allocated, and a reader that found a count at its bound has learned that a
+/// client is being refused rather than caused it to be.
+///
+/// AND NEVER IMAGE CONTENTS. There is no field here from which a pixel can be recovered: what a
+/// surface SHOWS is not an observability question.
+record display-resources {
+	/// Live surfaces across every connection, and the service-wide ceiling.
+	surfaces:        u64,
+	surface-bound:   u64,
+	/// Queue slots across every surface, supplied or not, and the most one surface may negotiate.
+	present-images:  u64,
+	image-bound:     u64,
+	/// Accepted presents not yet settled, and the most one surface may have outstanding.
+	queued-presents: u64,
+	present-bound:   u64,
+	/// Damage rectangles this service RETAINS, and the most one present may carry.
+	///
+	/// THE LIVE COUNT IS ZERO IN THIS IMPLEMENTATION AND THAT IS THE POINT: damage lives for the
+	/// duration of the present call that carried it and is never stored, so there is nothing here
+	/// for a client to multiply. An implementation that deferred presents would retain them, and
+	/// this is the field it would have to report.
+	damage-entries:  u64,
+	damage-bound:    u64,
+	/// Handles this service's one progress loop waits on, and the kernel's ceiling on a wait set.
+	waiters:         u64,
+	waiter-bound:    u64,
+	/// How many times the display path has been RESET: a scanout adopted after the previous one
+	/// went away. A machine whose GPU driver keeps restarting shows it here.
+	resets:          u64,
+	/// Whether this service currently has NO scanout at all - the fault state, which is different
+	/// from a reset that succeeded.
+	faulted:         bool,
+}
+
+/// OBSERVATION AND NEVER ENFORCEMENT: what the display path holds, for the System Graph.
+///
+/// A SEPARATE INTERFACE AND NOT A `display-admin` OPERATION, because authority to READ what a
+/// service holds must not be authority to bind a process to a display or to take the screen. The
+/// System Graph is handed this endpoint and nothing else, which is what makes "never as enforcement"
+/// a property of the capability rather than a promise about the caller.
+interface display-stats {
+	@op(1) resources: func() -> display-resources;
+}
+
+/// ONE SURFACE: its own queue, its own events, its own configuration.
+interface surface {
+	/// The current configuration. A client that missed the event can ask.
+	@op(1) configuration: func() -> result<surface-configuration, error>;
+	/// Acknowledge a configuration by serial, which is what the lifecycle turns on:
+	/// `configure -> rebuild -> ack -> first present Full`. A stale or unknown serial is refused.
+	@op(2) ack-configure: func(serial: u64) -> result<unit, error>;
+	/// The present queue for the current generation: how many images it has, their pitch, the
+	/// generation they belong to and the two completion endpoints. Calling it again after a
+	/// generation change is how a client rebuilds.
+	@op(3) queue: func() -> result<present-queue, error>;
+	/// Take the next image, WITHOUT BLOCKING.
+	@op(4) acquire-next: func() -> result<acquired-image, error>;
+	/// Give an acquired image back WITHOUT presenting it.
+	///
+	/// THE EDGE AN IMPLEMENTATION FORGETS. A client that acquired and then decided not to draw - a
+	/// resize arrived, the window closed - must have a way back that is not a present, or a resized
+	/// window leaks an image per resize.
+	@op(5) abandon: func(image: u32) -> result<unit, error>;
+	/// Submit an acquired image. IT CONSUMES THE IMAGE: there is no safe path back to the pixels.
+	///
+	/// THE PRESENT NAMES ITS CONFIGURATION SERIAL AND ITS IMAGE GENERATION, and both must match the
+	/// acknowledged current configuration at acceptance - which is what stops a frame drawn for one
+	/// size from being shown at another.
+	///
+	/// DAMAGE IS A HINT AND NEVER PERMISSION. Every presented image contains a COMPLETE VALID FRAME;
+	/// the damage says which pixels changed against the previously presented one. An empty list
+	/// means nothing changed and the present is still ordered and still completes. The whole surface
+	/// is the `full` variant and never one rectangle covering the extent, because a rectangle can be
+	/// wrong by a pixel and a variant cannot. A rectangle outside the extent is a typed refusal and
+	/// never a silent clamp.
+	@op(6) present: func(image: u32, serial: u64, generation: u64, damage: damage-region) -> result<u64, error>;
+	/// The live event stream: configuration, image availability, per-present completion, close
+	/// requests, visibility and focus.
+	@op(7) events: func() -> stream<surface-event>;
+	/// The one-shot proof channel for this surface's input focus. The client transfers it to
+	/// `input.subscribe-keys`; a surface without focus has no proof, and a focus change revokes the
+	/// previous peer.
+	@op(8) input-focus: func() -> result<handle<channel>, error>;
+	/// Drop the surface and everything it owns.
+	@op(9) close: func() -> result<unit, error>;
+	/// SUPPLY one image of the current generation's queue: a MemoryObject the CLIENT created, of at
+	/// least `pitch * height` bytes.
+	///
+	/// A V1 PRESENTABLE IMAGE IS COHERENT CPU-VISIBLE MEMORY: a send is a release and a receive is
+	/// an acquire, in both directions, and there is no explicit flush in the contract because there
+	/// is no non-coherent import in v1.
+	///
+	/// THE SERVICE NEEDS `read` AND `map` AND DOES NOT NEED `write`. It composes FROM these pixels
+	/// and never into them, the client keeps its own handles, and the service never transfers an
+	/// imported image onward - which is what makes delegation a decision rather than an accident.
+	///
+	/// A PARTIALLY SUPPLIED QUEUE IS A QUEUE THAT CANNOT BE PRESENTED FROM, so `acquire-next`
+	/// answers `again` until every index has been provided. An index past the negotiated count, a
+	/// slot already filled for this generation, or an object shorter than the layout needs is a
+	/// typed refusal - and a generation change releases the whole set, because no image ever
+	/// crosses a generation.
+	@op(10) provide-image: func(index: u32, @rights(read, map) image: handle<image-object>) -> result<unit, error>;
+}
+
+/// A connection, which owns as many surfaces as the application needs.
 interface display {
-	@op(1) acquire: func(width: u32, height: u32) -> result<surface-info, error>;
-	/// DAMAGE IS A BOUNDED LIST WITH AN EXPLICIT WHOLE-SURFACE VARIANT, and the nine
-	/// answers `WSI Profile 1` freezes are the contract this call implements. An EMPTY
-	/// list means nothing changed: the present is still ordered and still completes.
-	/// The whole surface is `whole`, never one rectangle covering the extent, because a
-	/// rectangle can be wrong by a pixel and a variant cannot. A rectangle outside the
-	/// extent is a typed `invalid` and never a silent clamp. More than the bound is the
-	/// caller's problem, solved by merging or by sending `whole` - never the service's,
-	/// solved by dropping rectangles. Overlapping rectangles are legal. The coordinates
-	/// are in the surface's own image space.
-	/// A SINGLE RECTANGLE WAS NOT ENOUGH AND THE COST WAS NOT THEORETICAL: a client
-	/// updating two corners of a screen sent their bounding box, which is most of the
-	/// screen, and the service transferred all of it.
-	@op(2) present: func(damage: damage-region) -> result<unit, error>;
-	@op(3) release: func() -> result<unit, error>;
-	@op(4) events:  func() -> stream<display-event>;
-	/// Return the one-shot proof channel for this connection's active surface. The
-	/// client transfers it to `input.subscribe-keys`; a background or released
-	/// surface has no proof, and changing foreground revokes the previous peer.
-	@op(5) input-focus: func() -> result<handle<channel>, error>;
+	/// Create a surface. BEFORE A COMPOSITOR EXISTS at most one surface is visible and
+	/// scanout-bound; the others keep independent resources, generations and queues while hidden,
+	/// and acquiring from them answers `not-visible`.
+	@op(1) create-surface: func(request: surface-request) -> result<handle<channel>, error>;
+	/// What the service will negotiate: the fewest and the most images it will hand out.
+	@op(2) image-limits: func() -> result<image-limits, error>;
 }
 
-/// Privileged launcher boundary. PermissionManager transfers the Process capability
-/// returned by ProcessService and receives a fresh display connection bound to that
-/// exact process. Ordinary display clients never receive this interface and cannot
-/// bind themselves or another task; emergency revocation signals the bound task.
+/// Privileged launcher boundary. PermissionManager transfers the Process capability returned by
+/// ProcessService and receives a fresh display connection bound to that exact process. Ordinary
+/// display clients never receive this interface and cannot bind themselves or another task;
+/// emergency revocation signals the bound task.
 interface display-admin {
-	/// The task handle must already carry `manage`, which is what a `task` capability IS: the
-	/// process resource says the launcher receives it "carrying MANAGE" so it can do job control.
-	/// Binding a display to a process it cannot manage would hand out a connection whose emergency
-	/// revocation - signalling the bound task - could not be carried out.
-	@op(1) bind: func(@rights(manage) task: handle<task>) -> result<handle<channel>, error>;
+	/// The task handle must already carry `manage`, which is what a `task` capability IS: binding a
+	/// display to a process it cannot manage would hand out a connection whose emergency revocation
+	/// - signalling the bound task - could not be carried out.
+	///
+	/// AND `wait`, WHICH IS THE OTHER HALF OF THE SAME OWNERSHIP. Cleanup cannot be left to the
+	/// connection's channel: a channel stays open while ANYONE holds its peer, so a surface's
+	/// imported images would outlive the process the contract says owns them. A waitable task is how
+	/// the service learns that process ended, independently of channel peer lifetime and of whether
+	/// the display driver is making progress.
+	@op(1) bind: func(@rights(manage, wait) task: handle<task>) -> result<handle<channel>, error>;
 	@op(2) stats: func() -> presentation-stats;
+	/// Make one surface the visible, scanout-bound one. THE VISIBILITY RULE IS THE SERVICE'S AND NOT
+	/// A CLIENT'S: a client that could make itself visible is a client that can take the screen.
+	@op(3) set-visible: func(@rights(manage) task: handle<task>, surface: u64) -> result<unit, error>;
 }

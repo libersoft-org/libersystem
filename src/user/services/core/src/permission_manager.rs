@@ -537,7 +537,11 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 			if clients.display_admin == 0 {
 				return 0;
 			}
-			let bound_task: i64 = duplicate(task, RIGHT_MANAGE | RIGHT_TRANSFER);
+			// `RIGHT_WAIT` AS WELL AS `RIGHT_MANAGE`: the display service signals this task on an
+			// emergency revoke, which is `manage`, and WATCHES it so a surface's imported images are
+			// released when the process ends - which `manage` cannot express and a channel cannot
+			// answer, because a channel stays open while anyone holds its peer.
+			let bound_task: i64 = duplicate(task, RIGHT_MANAGE | RIGHT_WAIT | RIGHT_TRANSFER);
 			if bound_task < 0 {
 				return 0;
 			}

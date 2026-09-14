@@ -9,3 +9,8 @@ pub mod generated;
 // the only place worth testing it. Host-only: the guard calls a runtime symbol this module stubs.
 #[cfg(test)]
 mod authority;
+
+// The other half of what a hostile message meets: the generated DECODERS and the generated
+// DISPATCH, swept over the byte strings a client can send that are not requests.
+#[cfg(test)]
+mod hostile;

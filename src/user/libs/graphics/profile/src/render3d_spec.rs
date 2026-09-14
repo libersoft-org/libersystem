@@ -93,6 +93,26 @@ pub const QUALIFIERS: &[Qualifier] = &[
 	Qualifier { name: "sample", across_the_primitive: "as its base qualifier, evaluated once per COVERED SAMPLE rather than once per pixel", at_a_clip_intersection: "as its base qualifier, for the same reason as `centroid`", why: "it is what makes per-sample shading mean anything: a fragment shader run once per pixel cannot produce different values at two samples of it" },
 ];
 
+/// LINE AND POINT RASTERISATION, which a profile that mandates six topologies and specifies one
+/// would leave to every implementation to invent.
+///
+/// THE TRIANGLE RULES DO NOT COVER THESE. A line has no interior and no winding; a point has neither
+/// and no edges either. Every question the triangle rules answer - which samples are covered, which
+/// side is the front, what the fill rule decides at a tie - has to be answered again here or it is
+/// answered differently by every backend.
+pub const LINE_POINT_RULES: &[Rule] = &[
+	Rule { question: "line coverage", answer: "the DIAMOND-EXIT rule. A line covers a pixel when the segment, travelled from its first endpoint to its second, EXITS the diamond inscribed in that pixel - the set of points whose Manhattan distance from the pixel centre is below half a pixel. The first endpoint's own pixel is covered only if the segment leaves its diamond, and the second endpoint's pixel is covered only if the segment enters and leaves that diamond" },
+	Rule { question: "why the diamond-exit rule and not a midpoint walk", answer: "two segments that meet end to end must together cover each pixel EXACTLY once, the same requirement the top-left rule meets for triangles. A midpoint or Bresenham walk covers the shared endpoint's pixel from both segments, which is visible the moment a polyline is drawn with any blending at all" },
+	Rule { question: "line width", answer: "exactly 1.0, which the rasteriser state already fixes. A wide line is ten different rules across implementations and belongs to the 2D profile's stroker, which has defined joins and caps" },
+	Rule { question: "line interpolation parameter", answer: "the distance along the segment in WINDOW space, so `noperspective` varyings are linear along the drawn line; `smooth` varyings apply the same `1/w` correction they do on a triangle, with the two endpoint weights being `1 - s` and `s`" },
+	Rule { question: "point size", answer: "the `PointSize` output of the vertex stage, in PIXELS, clamped to `[1.0, 64.0]` and rounded to the nearest integer with ties away from zero. A size of zero draws nothing rather than one pixel, because a program that computes a size from a distance expects it to vanish" },
+	Rule { question: "point coverage", answer: "the axis-aligned SQUARE of that size centred on the point's window position, with the same sample test and the same top-left tie rule a triangle's edges get - so two adjacent points of the same size tile without overlap" },
+	Rule { question: "point interpolation", answer: "NONE. Every varying takes the point's own vertex value, whatever its qualifier, because a point has one vertex and there is nothing to interpolate between" },
+	Rule { question: "culling", answer: "BACK-FACE CULLING APPLIES TO TRIANGLES ONLY. A line and a point have no winding, so a cull mode cannot remove them; a backend that applied the triangle rule to them would make a wireframe overlay disappear at half the angles" },
+	Rule { question: "clipping", answer: "against the SAME six planes and the same `w` plane, in the same order. A line is clipped as a two-vertex polygon and keeps two vertices or none; a point is IN or OUT with no partial case, and a point whose centre is outside the volume is removed whole even when its square would have covered visible pixels - the alternative is a point that is clipped to a rectangle, which is not a point" },
+	Rule { question: "depth for lines and points", answer: "interpolated along the line and constant across a point, in both cases in WINDOW space without the perspective correction, exactly as for a triangle" },
+];
+
 /// Which vertex of a primitive a `flat` attribute comes from, per topology.
 ///
 /// STATED PER TOPOLOGY AND NOT AS ONE SENTENCE, because a strip and a fan number their vertices

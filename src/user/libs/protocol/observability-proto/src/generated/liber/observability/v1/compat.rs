@@ -26,8 +26,16 @@ fn counters_wire_is_stable() {
 	assert_eq!(Counters::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn resource_count_wire_is_stable() {
+	let sample = ResourceCount { name: String::from("x"), live: 7, bound: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ResourceCount::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn component_wire_is_stable() {
-	let sample = Component { name: String::from("x"), r#type: ComponentType::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } };
+	let sample = Component { name: String::from("x"), r#type: ComponentType::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") }, resources: alloc::vec![ResourceCount { name: String::from("x"), live: 7, bound: 7 }] };
 	let bytes = sample.encode_vec().expect("encode");
 	let golden: &[u8] = &[
 		1,
@@ -83,6 +91,27 @@ fn component_wire_is_stable() {
 		1,
 		0,
 		120,
+		1,
+		0,
+		1,
+		0,
+		120,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
 	];
 	assert_eq!(bytes, golden);
 	assert_eq!(Component::decode(&bytes).unwrap(), sample);
@@ -97,7 +126,7 @@ fn trace_span_wire_is_stable() {
 }
 #[test]
 fn graph_wire_is_stable() {
-	let sample = Graph { components: alloc::vec![Component { name: String::from("x"), r#type: ComponentType::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") } }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
+	let sample = Graph { components: alloc::vec![Component { name: String::from("x"), r#type: ComponentType::Service, state: ComponentState::Running, deps: alloc::vec![String::from("x")], counters: Counters { messages_sent: 7, messages_received: 7, handles: 7, memory_bytes: 7, restarts: 7, watchdog_trips: 7, last_failure: String::from("x") }, resources: alloc::vec![ResourceCount { name: String::from("x"), live: 7, bound: 7 }] }], spans: alloc::vec![TraceSpan { name: String::from("x"), duration_ns: 7 }] };
 	let bytes = sample.encode_vec().expect("encode");
 	let golden: &[u8] = &[
 		1,
@@ -155,6 +184,27 @@ fn graph_wire_is_stable() {
 		1,
 		0,
 		120,
+		1,
+		0,
+		1,
+		0,
+		120,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		7,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
 		1,
 		0,
 		1,

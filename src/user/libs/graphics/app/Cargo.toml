@@ -1,0 +1,24 @@
+[package]
+name = "graphics-app"
+edition = "2024"
+description = "The frame loop an application has: acquire, pace, present, complete, rebuild"
+
+# THE POLICY BUILDS WITHOUT A RUNTIME AND THE LOOP DOES NOT, which is what makes the policy
+# host-testable at all: `rt` defines `panic_impl`, so a test binary that linked it would collide with
+# `std`'s. The default is the pure half, every consumer in the image asks for `runtime`, and the host
+# gate runs the rules as arithmetic rather than by booting a machine to check them.
+[features]
+default = []
+runtime = ["dep:rt", "dep:surface", "dep:graphics-core"]
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+display-proto = { path = "../../protocol/display-proto" }
+graphics-core = { path = "../core", optional = true }
+surface = { path = "../../display/surface", optional = true }
+rt = { path = "../../../runtime/rt", optional = true }
+
+# A WARNING IS AN ERROR HERE, for the reason every other crate in this tree says: reporting switched
+# off file by file is reporting nobody decided to switch off.
+[lints.rust]
+warnings = "deny"

@@ -2875,6 +2875,47 @@ pub fn try_send_caps_outcome(channel: u64, bytes: &[u8], handles: &[u64]) -> Sen
 	}
 }
 
+// Send `bytes` and move SEVERAL handles, each with LESS AUTHORITY THAN THIS PROCESS HOLDS.
+//
+// THE MASKS ARE PER HANDLE, which is why this exists beside `send_blocking_attenuated`: the two
+// halves of a completion pair travel in ONE reply and are not the same authority - the producer end
+// may only SEND and the completion end may only RECEIVE and WAIT. Each receiver end gets the
+// intersection of the handle's rights and its own mask; a mask naming a right the handle does not
+// hold is not an error, because an intersection cannot widen.
+//
+// A send that fails leaves every one of this process's handles open at the same value with its
+// rights unchanged, exactly as the unattenuated multi-cap send does.
+pub fn send_caps_blocking_attenuated(channel: u64, bytes: &[u8], handles: &[u64], rights: &[u32]) -> bool {
+	if handles.is_empty() || handles.len() > MAX_MESSAGE_CAPS || handles.len() != rights.len() {
+		return false;
+	}
+	// `[count, CapTransfer * count]` in one buffer, because the four argument registers are already
+	// spent on the channel, the payload and its length. Written as BYTES rather than as a struct
+	// array so the layout the kernel reads is the one this side wrote, whatever the alignment of a
+	// stack array happens to be on a given target.
+	const ENTRY: usize = core::mem::size_of::<CapTransfer>();
+	let mut buffer = [0u8; 8 + MAX_MESSAGE_CAPS * ENTRY];
+	buffer[..8].copy_from_slice(&(handles.len() as u64).to_le_bytes());
+	for (index, (handle, mask)) in handles.iter().zip(rights.iter()).enumerate() {
+		let at = 8 + index * ENTRY;
+		buffer[at..at + 8].copy_from_slice(&handle.to_le_bytes());
+		buffer[at + 8..at + 12].copy_from_slice(&mask.to_le_bytes());
+	}
+	unsafe {
+		loop {
+			let result: u64 = syscall(SYS_CHANNEL_SEND_CAPS_ATTENUATED, channel, bytes.as_ptr() as u64, bytes.len() as u64, buffer.as_ptr() as u64);
+			let signed: i64 = result as i64;
+			if signed == ERR_WOULD_BLOCK {
+				if wait_writable(channel) < 0 {
+					yield_now();
+				}
+				continue;
+			}
+			return signed == 0;
+		}
+	}
+}
+
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
 pub fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {

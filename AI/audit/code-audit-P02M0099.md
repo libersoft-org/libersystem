@@ -451,3 +451,106 @@ observation. Both need a QEMU fixture that adds and removes USB devices while tr
 which the harness has no mechanism for today; the budget's own behaviour is held by the host tests
 above, and the gate contract that names those two cases belongs to the first in-controller class
 module item rather than to this decision.
+
+IMPLEMENTER'S EVIDENCE RUN ON P02M0099 (2026-09-14 04:20):
+
+THE THREE-TARGET SUITE HAS RUN, AND FIVE MAINTENANCE ITEMS WERE WAITING ON EXACTLY THAT.
+
+    x86_64    394 tests   225 s   KVM
+    aarch64   382 tests  3477 s   TCG
+    riscv64   385 tests  4102 s   TCG
+
+plus the 48 host tests in `src/user/drivers/core`, whose per-module counts are the ones the gate
+clauses name: `net` 3, `input` 4, `snd` 5, `gpu` 8, `blk` 4 with `virtio` 5, and the xHCI four -
+`usb` 4, `usb_class` 8, `descriptor` 4, `port` 3. Ticked: virtio-net, virtio-input, virtio-console,
+virtio-snd and xHCI.
+
+AND THE RUN FOUND A REAL DEFECT, WHICH IS WHAT A THREE-TARGET RUN IS FOR.
+`kernel.kernel.a_secure_random_syscall_refuses_rather_than_answering_from_a_formula` failed on
+aarch64 and on nothing else. The assertion said "a machine with no hardware source refuses rather
+than substituting", and that WAS the contract until the seeded entropy pool arrived as the second
+answer - the reason most of this system's machines can answer `SYS_RANDOM_GET` at all, since two of
+its three architectures have no instruction. The syscall answered from the pool on aarch64 while the
+test still demanded `ERR_UNSUPPORTED`, and the disagreement was invisible on x86_64 because `RDRAND`
+takes the first branch there. The test now states the contract in three cases - hardware, no hardware
+with a seeded pool, neither - and what is refused is still the thing that matters: no hardware AND no
+pool means a refusal and an untouched buffer rather than a formula under a name that promises
+otherwise.
+
+TWO MAINTENANCE ITEMS ARE NOT TICKED AND SAY WHY.
+  virtio-blk  needs `check.sh --gate qemu-virtio-iommu-x86_64`, whose preconditions did not come
+                together: the gate requires an ISO keyed to this tree AND, inside itself, a
+                `./test.sh` that accepts the build. The shipping ISO is signed `enforcing-required`
+                and is keyed over the bootable volume, so the volume has to be signed that way for
+                the key to match - and with that volume in place `test.sh` refuses the build as not
+                matching the sources. Each half is reachable and not both at once. It is a procedural
+                knot in the gate's own preconditions rather than anything about the driver, it
+                predates this session's work, and it is left for whoever owns that gate.
+  virtio-gpu  needs the display endpoint under translation on P02M0173's profiles, which is the
+                per-profile IOMMU gate set rather than the suite.
+
+IMPLEMENTER'S DEBT CLOSURES ON P02M0099 (2026-09-14 05:10):
+
+SIX MAINTENANCE ITEMS AND EIGHT DEBT ROWS CLOSED, against evidence that has actually run.
+
+  virtio-blk      `check.sh --gate qemu-virtio-iommu-x86_64` green - the controller out of bypass,
+                    five hostile cases refused by the hardware, a DHCP lease through the enforcing
+                    controller, and THE SYSTEM VOLUME READ THROUGH virtio-blk AT 00:04.0 behind the
+                    controller, which is this item's own oracle
+  virtio-net, virtio-input, virtio-console, virtio-snd, xHCI, virtio-rng
+                  their host tests plus the three-target suite
+
+  debt rows       DRV-001, DRV-002, DRV-003/WIRE-002, DRV-005, DRV-006, DRV-007/-008, DRV-009 and
+                    DRV-012, each ticked against the item whose gate names it
+
+THE GATE'S PRECONDITIONS ARE AN ORDER AND NOTHING SAID SO. `qemu-virtio-iommu-x86_64` needs a
+shipping ISO keyed to this tree AND, inside itself, a `./test.sh` that accepts the build. The volume
+has TWO shapes with TWO receipts - `built-x86_64-volume-test` for the shape the suite boots and
+`built-x86_64-volume` for the bootable one the ISO is keyed over - so the order that satisfies both
+is `./build.sh --arch x86_64`, then `./image.sh --format iso --dma-mode enforcing-required`, then the
+gate. The other order leaves the test receipt stale and the gate fails INSIDE its own `./test.sh`
+with "the build does not match the sources", which reads like a build problem and is an ordering one.
+It cost an afternoon; it is written into the virtio-blk item so it costs nobody else one.
+
+WHAT IS LEFT OF THE MAINTENANCE SET IS ONE ITEM, AND IT IS NOT WAITING ON A RUN. virtio-gpu's gate
+asks for the display endpoint under translation on P02M0173's profiles, and those profiles DROP the
+display device by design: `check-qemu-iommu-ports.sh` boots a reduced machine because the full
+interactive one does not finish attach-and-map inside DeviceManager's boot window on an emulated
+port. The proof cannot be obtained by running those gates as they stand; it needs a display phase
+added to them, with that boot-window cost measured rather than assumed. Recorded in the item.
+
+## 2026-09-14 - HID defects, and why they survived (implementer note)
+
+DRV-011, DRV-013 and DRV-014 are closed, each with a fixture that FAILS against the code as it was.
+The overflow one is worth recording in full because the fixture proves it: with the old
+`*cursor + bits <= MAX_REPORT_BYTES * 8` the test panics with `attempt to add with overflow` at
+`hid.rs:275`, and with `cursor.saturating_add(bits)` it passes. In a release build the same
+expression wraps to a small number and ADMITS the segment the check exists to refuse.
+
+**Why all three survived: the parser lived inside a binary.** `hid.rs` was `mod hid;` in `xhci.rs`,
+so nothing could reach it from a host test - there was no seam at all, not a missing test. It is now
+`drivers::hid`, which is also where it belongs on its own terms: a report descriptor is not
+transport-specific, and the I2C and Bluetooth HID bindings this roadmap lists will want the same
+parser. `drivers` gained `extern crate alloc` for it.
+
+Two smaller things went in with them:
+
+- **`hid::remember`** is now the single place the previous-report state is written, so the
+  zero-the-tail rule has one implementation and one test rather than living inline in the xHCI
+  driver's event path where nothing could see it.
+- **`Mods::release_all`** exists for the other half of DRV-014: a device that goes away with a
+  modifier down otherwise leaves it down for ever, and the next thing typed arrives shifted. Nothing
+  calls it yet - the disconnect path is the xHCI driver's and is not in this change - and it is
+  written so that when that path lands there is a correct thing to call.
+
+**DRV-015 closed on its own stated trigger**, which is a threat-model statement rather than a driver
+change, and `docs/THREAT_MODEL.md` already carries it in three places: section 2.2 on what an
+untranslated DMA capability actually hands a driver, the paragraph on the boot mode being stated
+rather than inferred (so the limit is never silent), and section 5's non-goal naming the
+architectures and backends that are not claimed.
+
+**What is left of DRV-010 is a GATE PHASE, not a driver change.** The display half is implemented and
+tested; the item waits on a display phase in `check-qemu-iommu-ports.sh`, which drops the display
+device by design because the full interactive machine does not finish attach-and-map inside
+DeviceManager's boot window on an emulated port. That is gate work with its own boot-window cost to
+measure, and it is the one thing standing between this row and closed.

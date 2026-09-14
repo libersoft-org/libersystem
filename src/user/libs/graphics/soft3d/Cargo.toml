@@ -1,0 +1,24 @@
+[package]
+name = "soft3d"
+edition = "2024"
+description = "The complete CPU implementation of Render3D Core Profile 1: fixed-point rasterisation, qualifier-aware clipping, a shader interpreter, textures, depth, stencil and MSAA"
+
+[dependencies]
+# THE API THIS IMPLEMENTS. `soft3d` is a backend behind `render3d` and never beside it: an
+# application that reached this crate directly would be an application a GPU backend cannot serve.
+render3d = { path = "../render3d" }
+# The frozen math contract: one handedness, one storage order, one depth range, one winding.
+render-math = { path = "../render-math" }
+# The validated portable IR this interprets. NOT Rust closures, for the reason that crate states.
+render-shader = { path = "../render-shader" }
+# The frozen numbers: sample positions, clip coordinates, format tables and the minimum limits.
+graphics-profile = { path = "../profile" }
+# The one image and colour vocabulary, so a target's format is the same type everywhere.
+graphics-core = { path = "../core" }
+# The transcendentals a shader interpreter needs. `core` has none, and these are on the TOLERANCE
+# side of this stack's split - a position may depend only on the operations the profile bounds at
+# zero ULP, which `render-shader::validate` is what enforces.
+libm = "0.2"
+
+[lints.rust]
+warnings = "deny"

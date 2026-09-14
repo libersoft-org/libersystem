@@ -1,5 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 // WHAT EVERY DRIVER BINARY SHARES, as a library, because that is what it already was.
 //
 // These three were `mod` declarations repeated in each binary: the transport compiled seven times,
@@ -15,6 +17,12 @@ pub mod blk;
 pub mod common;
 pub mod descriptor;
 pub mod gpu;
+// THE HID REPORT-DESCRIPTOR PARSER AND REPORT DECODER. It was a module INSIDE the xHCI binary,
+// where it could not be tested on the host at all - which is how a descriptor whose bit cursor
+// overflows the admission check, and a short report that leaves the previous one's tail standing,
+// both survived. Nothing about it is transport-specific: a USB HID device, an I2C one and a
+// Bluetooth one all speak the same descriptors.
+pub mod hid;
 pub mod input;
 pub mod keys;
 pub mod net;

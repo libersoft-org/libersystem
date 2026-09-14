@@ -83,6 +83,22 @@ impl Capability {
 		self.object.object_type()
 	}
 
+	// The authority this capability carries.
+	//
+	// FOR A RECEIVER THAT MUST CHECK WHAT IT WAS HANDED rather than what it asked for: a service
+	// given an image to compose FROM has to be able to say that what arrived carries `read` and
+	// `map` and does not carry `write`. Reading cannot widen, and `attenuated` is the only way to
+	// change a set at all, so exposing this adds no authority.
+	//
+	// `#[cfg(test)]` BECAUSE THE ONLY RECEIVER IN THIS KERNEL IS A HARNESS. Userspace asks the same
+	// question through `SYS_OBJECT_INFO_GET`, which is the boundary a service is on; nothing inside
+	// the kernel receives a capability and then interrogates its rights, so an ungated accessor
+	// would be an API with no caller.
+	#[cfg(test)]
+	pub fn rights(&self) -> Rights {
+		self.rights
+	}
+
 	// The kernel object this capability refers to (a new reference). Used by
 	// kernel-internal paths that receive a transferred capability and need to act
 	// on the object directly, without a handle table to install it into.

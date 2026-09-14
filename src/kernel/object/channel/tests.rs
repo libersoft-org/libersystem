@@ -435,3 +435,86 @@ fn an_attenuating_send_that_fails_leaves_the_sender_exactly_where_it_was() {
 	assert_eq!(rights & abi::RIGHT_WRITE, abi::RIGHT_WRITE, "and the mask that would have been applied did NOT touch what the sender holds");
 	assert_eq!(rights & abi::RIGHT_TRANSFER, abi::RIGHT_TRANSFER, "including the right the send itself needed");
 }
+
+crate::tagged_test!(a_multi_capability_attenuating_send_narrows_each_one_on_its_own, [Channel, Ipc, Handle, Kernel, Syscall], id = "kernel.object.channel.a_multi_capability_attenuating_send_narrows_each_one_on_its_own", covers = ["kernel"]);
+fn a_multi_capability_attenuating_send_narrows_each_one_on_its_own() {
+	// THE MASKS ARE PER CAPABILITY, which is the whole reason this exists beside the single-handle
+	// form: the two halves of a completion pair travel in ONE reply and are not the same authority -
+	// one end may only SEND and the other may only RECEIVE and WAIT. A service that could only
+	// attenuate one at a time would have to send them in two messages, which is a second wire for a
+	// record the schema says is one.
+	//
+	// And neither arrives able to move again, which is what makes "this endpoint belongs to the
+	// process that was given it" a property of the kernel rather than a promise in a comment.
+	static FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
+	static SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
+	static ONWARD: AtomicI64 = AtomicI64::new(0);
+	static OK: AtomicBool = AtomicBool::new(false);
+	extern "C" fn sender(channel: u64) {
+		unsafe {
+			let (mut producer, mut producer_peer): (u64, u64) = (0, 0);
+			let (mut done, mut done_peer): (u64, u64) = (0, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut producer as *mut u64 as u64, &mut producer_peer as *mut u64 as u64, 0, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut done as *mut u64 as u64, &mut done_peer as *mut u64 as u64, 0, 0) as i64, 0);
+			// `[count, CapTransfer * count]` in one buffer, because the four argument registers are
+			// already spent on the channel, the payload and its length.
+			let mut buffer = [0u8; 8 + 2 * core::mem::size_of::<abi::CapTransfer>()];
+			buffer[..8].copy_from_slice(&2u64.to_le_bytes());
+			let entry = core::mem::size_of::<abi::CapTransfer>();
+			for (index, (handle, mask)) in [(producer_peer, abi::RIGHT_SEND), (done_peer, abi::RIGHT_RECEIVE | abi::RIGHT_WAIT)].into_iter().enumerate() {
+				let at = 8 + index * entry;
+				buffer[at..at + 8].copy_from_slice(&handle.to_le_bytes());
+				buffer[at + 8..at + 12].copy_from_slice(&mask.to_le_bytes());
+			}
+			let payload = *b"pair";
+			let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS_ATTENUATED, channel, payload.as_ptr() as u64, payload.len() as u64, buffer.as_ptr() as u64);
+			assert_eq!(sent as i64, 0, "the attenuating multi-capability send delivers");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, producer_peer, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "and both handles are spent, exactly as an ordinary transfer spends them");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, done_peer, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE);
+			arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, producer, 0, 0, 0);
+			arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, done, 0, 0, 0);
+		}
+	}
+	extern "C" fn receiver(channel: u64) {
+		unsafe {
+			let mut buf = [0u8; 8];
+			// `[count, handle0, handle1, ...]`, the count written back by the kernel.
+			let mut packed = [0u64; abi::MAX_MESSAGE_CAPS + 1];
+			loop {
+				let length = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, channel, buf.as_mut_ptr() as u64, buf.len() as u64, packed.as_mut_ptr() as u64);
+				if !syscall::sys_is_err(length) {
+					break;
+				}
+				sched::yield_now();
+			}
+			assert_eq!(packed[0], 2, "both halves of the pair arrived");
+			let size = core::mem::size_of::<abi::ObjectInfo>() as u64;
+			for (slot, store) in [(1usize, &FIRST), (2usize, &SECOND)] {
+				let mut info = abi::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+				assert_eq!(arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, packed[slot], &mut info as *mut _ as u64, size, 0) as i64, 1);
+				store.store(info.rights as u64, Ordering::SeqCst);
+			}
+			// AND NEITHER CAN BE PASSED ON. Without RIGHT_TRANSFER the move is refused, which is the
+			// rule the whole call exists to state: the holder is the end of the line.
+			let (mut onward, mut peer): (u64, u64) = (0, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut onward as *mut u64 as u64, &mut peer as *mut u64 as u64, 0, 0) as i64, 0, "a channel to try to pass one on over");
+			let payload = *b"x";
+			ONWARD.store(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, onward, payload.as_ptr() as u64, payload.len() as u64, packed[1]) as i64, Ordering::SeqCst);
+			OK.store(true, Ordering::SeqCst);
+		}
+	}
+	let (sender_end, receiver_end) = Channel::create();
+	sched::spawn_with_object(sender, sender_end, Rights::ALL);
+	sched::spawn_with_object(receiver, receiver_end, Rights::ALL);
+	sched::run_until_idle();
+	assert!(OK.load(Ordering::SeqCst), "both halves ran");
+	let producer = FIRST.load(Ordering::SeqCst) as u32;
+	let done = SECOND.load(Ordering::SeqCst) as u32;
+	assert_eq!(producer & abi::RIGHT_SEND, abi::RIGHT_SEND, "the producer end may send");
+	assert_eq!(producer & abi::RIGHT_RECEIVE, 0, "and may not be used as the other half");
+	assert_eq!(done & (abi::RIGHT_RECEIVE | abi::RIGHT_WAIT), abi::RIGHT_RECEIVE | abi::RIGHT_WAIT, "the completion end may receive and wait");
+	assert_eq!(done & abi::RIGHT_SEND, 0, "and may not be used as the other half either");
+	assert_eq!(producer & abi::RIGHT_TRANSFER, 0, "neither carries transfer");
+	assert_eq!(done & abi::RIGHT_TRANSFER, 0);
+	assert_eq!(ONWARD.load(Ordering::SeqCst), syscall::ERR_ACCESS_DENIED, "and the attempt to pass one on is refused rather than ignored");
+}

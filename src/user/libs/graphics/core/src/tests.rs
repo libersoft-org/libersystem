@@ -797,3 +797,60 @@ fn the_tone_map_asks_the_destination_what_it_can_show() {
 		assert_eq!(impossible.tone_map_white(), graphics_profile::image::tone_map::WHITE, "{impossible:?} is not a display");
 	}
 }
+
+// WHAT A CHECKED LAYOUT HELPER OWES AN ADVERSARIAL DESCRIPTION, WHICH IS AN ANSWER AND NEVER A WRAP.
+//
+// EVERY EXTENT AND PITCH IN THIS TREE COMES FROM SOMEWHERE ELSE: firmware's mode line, a driver's
+// scanout record, a client's surface request. Each of those is a number this process did not choose,
+// and each is multiplied by another one to decide how many bytes something may touch - so the one
+// thing these helpers must never do is answer a SMALL number for a description whose real span does
+// not fit. A wrap here is an out-of-bounds read with a length check in front of it that passed.
+//
+// SWEPT RATHER THAN FUZZED, for the reason the codec sweep beside it gives: a deterministic sweep is
+// what a build gate can run. What is swept is the boundary set - zero, one, the powers of two either
+// side of a `u32`, and the maxima - in both axes and in the pitch, across every format the registry
+// carries.
+#[test]
+fn a_checked_layout_answers_or_refuses_and_never_wraps() {
+	const EDGES: [u32; 10] = [0, 1, 2, 3, 4, 0xffff, 0x1_0000, 0x7fff_ffff, 0xffff_fffe, u32::MAX];
+	for &format in format::ALL_FORMATS.iter() {
+		for &width in EDGES.iter() {
+			for &height in EDGES.iter() {
+				for &pitch in EDGES.iter() {
+					let Ok(layout) = ImageLayout::scanout(Extent2D::new(width, height), pitch, PixelStorage::Known(format)) else {
+						continue;
+					};
+					// A LAYOUT THAT VALIDATED CARRIES ITS OWN INVARIANT: the pitch holds a row.
+					let row = layout.minimum_row_bytes().expect("a validated layout has a minimum row");
+					assert!(pitch >= row, "{format:?} {width}x{height} pitch {pitch} validated below its own minimum row {row}");
+					assert!(width > 0 && height > 0, "a zero extent is a refusal and not an empty image");
+					// AND THE TWO SPANS ARE ORDERED. The backend that reads the final row's padding
+					// may touch at least as much as the one that does not, and a helper that
+					// answered otherwise would be describing a driver reading behind itself.
+					match (layout.backend_access_span(false), layout.backend_access_span(true)) {
+						(Some(visible), Some(whole)) => {
+							assert!(whole >= visible, "{format:?} {width}x{height} pitch {pitch}: the padded span {whole} is smaller than the visible one {visible}");
+							// AND NEITHER WRAPPED. Recomputed in `u128`, where nothing this tree
+							// can express overflows, so a `u64` answer that is smaller than the
+							// truth is a failure here rather than a read past a buffer somewhere.
+							let exact = u128::from(height) * u128::from(pitch);
+							assert_eq!(u128::from(whole), exact, "{format:?} {width}x{height} pitch {pitch}: the padded span is not height by pitch");
+							let exact_visible = (u128::from(height) - 1) * u128::from(pitch) + u128::from(row);
+							assert_eq!(u128::from(visible), exact_visible, "{format:?} {width}x{height} pitch {pitch}: the visible span is not what whole rows plus a last row is");
+						}
+						// A SPAN THAT DOES NOT FIT IS `None` AND NOT A WRAPPED NUMBER, which is the
+						// whole point of the checked arithmetic underneath.
+						(visible, whole) => {
+							let exact = u128::from(height) * u128::from(pitch);
+							assert!(exact > u128::from(u64::MAX) || whole.is_none() || visible.is_none(), "{format:?} {width}x{height} pitch {pitch}: a span that fits was refused");
+						}
+					}
+					// The pixel count is the same question in the other unit, and has the same duty.
+					if let Some(pixels) = layout.pixels() {
+						assert_eq!(u128::from(pixels), u128::from(width) * u128::from(height), "{format:?} {width}x{height}: the pixel count wrapped");
+					}
+				}
+			}
+		}
+	}
+}

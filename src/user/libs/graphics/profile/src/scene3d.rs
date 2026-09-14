@@ -13,6 +13,7 @@
 //! to the core without claiming the rest.
 
 use crate::render3d_spec::Rule;
+use crate::{FeatureOwner, ProfileEntry};
 
 /// The node and hierarchy model.
 pub const HIERARCHY_RULES: &[Rule] = &[
@@ -137,3 +138,189 @@ pub const SCENE3D_PROFILE_1_MIN_LIMITS: &[SceneLimit] = &[
 	SceneLimit { name: "max_materials", minimum: 4096, why: "one per distinct surface in a detailed scene" },
 	SceneLimit { name: "max_cameras", minimum: 8, why: "a main view, a picture-in-picture, a reflection and room to spare" },
 ];
+
+/// One feature of `Scene3D Core Profile 1`.
+///
+/// THE GRANULARITY IS "SOMETHING AN IMPLEMENTATION CAN FAIL TO DO", as in the two profiles below it.
+/// The three queues are separate variants because a layer can carry the opaque one and get the
+/// transparent one's direction wrong, and a matrix that could only say "queues" would call that
+/// conforming. The same reasoning splits the four light kinds, the four materials and the three
+/// readbacks.
+///
+/// WHAT IS DELIBERATELY NOT HERE. Everything in `Scene3D Extended 1` - physically based materials,
+/// shadows, skinning, animation, post-processing - is a separate closed list with a separate hash,
+/// so an implementation conforms to the core without claiming the rest. And the command model below
+/// this layer is `Render3D Core Profile 1`: a scene feature is a DECISION about what to draw, and a
+/// backend feature is an ability to draw it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scene3DFeature {
+	// The hierarchy.
+	Node,
+	ParentChildTransform,
+	LocalTransformOrder,
+	QuaternionRotation,
+	NormalMatrix,
+	LazyWorldTransforms,
+	HierarchyCycleRefusal,
+	HierarchyDepthLimit,
+	VisibilityMask,
+	NodeEnable,
+	// The camera.
+	PerspectiveCamera,
+	OrthographicCamera,
+	InfiniteFarPlane,
+	ViewFromNodeTransform,
+	CustomProjection,
+	DegenerateProjectionRefusal,
+	// The queues.
+	OpaqueQueue,
+	AlphaMaskQueue,
+	TransparentQueue,
+	DistanceSortKey,
+	StableTiebreak,
+	FixedQueueOrder,
+	TransparentDepthNoWrite,
+	// Bounds and culling.
+	LocalBoundingBox,
+	WorldBoundingSphere,
+	FrustumPlaneExtraction,
+	SphereFrustumTest,
+	BoxFrustumTest,
+	FixedPlaneTestOrder,
+	UnboundedNeverCulled,
+	// Instancing.
+	InstanceStream,
+	PerInstanceCulling,
+	InstanceCompaction,
+	SingleSortPerInstanceSet,
+	TransparentInstancingApproximate,
+	// Materials.
+	MaterialUnlit,
+	MaterialVertexColor,
+	MaterialLambert,
+	MaterialBlinnPhong,
+	LinearColourSpace,
+	NormalRenormalisation,
+	TwoSidedNormalFlip,
+	AlphaThresholdDiscard,
+	QueueFromBlending,
+	PerDrawBlendState,
+	PerDrawColorWriteMask,
+	// Lighting.
+	LightAmbient,
+	LightDirectional,
+	LightPoint,
+	LightSpot,
+	LightSelectionOrder,
+	LightsPerDrawableLimit,
+	PointAttenuation,
+	SpotConeAttenuation,
+	DirectionalNoAttenuation,
+	// Picking and readback.
+	ObjectIdAttachment,
+	ReservedZeroIdentity,
+	ApplicationAssignedIdentity,
+	SelectionPass,
+	TransparentWritesNoIdentity,
+	IdentityReadback,
+	DepthReadback,
+	ColourReadback,
+	AsynchronousReadback,
+	PickOutsideAttachmentRefusal,
+	// Passes and limits.
+	RenderPassGraph,
+	DerivedPassOrder,
+	PassCycleRefusal,
+	OffscreenTarget,
+	SceneLimits,
+	LimitRefusal,
+}
+
+profile! {
+	/// `Scene3D Core Profile 1`, closed and enumerated.
+	SCENE3D_CORE_PROFILE_1: Scene3DFeature;
+	"hierarchy", Scene3D, Node;
+	"hierarchy", Scene3D, ParentChildTransform;
+	"hierarchy", Scene3D, LocalTransformOrder;
+	"hierarchy", Scene3D, QuaternionRotation;
+	"hierarchy", Scene3D, NormalMatrix;
+	"hierarchy", Scene3D, LazyWorldTransforms;
+	"hierarchy", Scene3D, HierarchyCycleRefusal;
+	"hierarchy", Scene3D, HierarchyDepthLimit;
+	"hierarchy", Scene3D, VisibilityMask;
+	"hierarchy", Scene3D, NodeEnable;
+	"camera", Scene3D, PerspectiveCamera;
+	"camera", Scene3D, OrthographicCamera;
+	"camera", Scene3D, InfiniteFarPlane;
+	"camera", Scene3D, ViewFromNodeTransform;
+	"camera", Scene3D, CustomProjection;
+	"camera", Scene3D, DegenerateProjectionRefusal;
+	"queues", Scene3D, OpaqueQueue;
+	"queues", Scene3D, AlphaMaskQueue;
+	"queues", Scene3D, TransparentQueue;
+	"queues", Scene3D, DistanceSortKey;
+	"queues", Scene3D, StableTiebreak;
+	"queues", Scene3D, FixedQueueOrder;
+	"queues", Scene3D, TransparentDepthNoWrite;
+	"culling", Scene3D, LocalBoundingBox;
+	"culling", Scene3D, WorldBoundingSphere;
+	"culling", Scene3D, FrustumPlaneExtraction;
+	"culling", Scene3D, SphereFrustumTest;
+	"culling", Scene3D, BoxFrustumTest;
+	"culling", Scene3D, FixedPlaneTestOrder;
+	"culling", Scene3D, UnboundedNeverCulled;
+	"instancing", Scene3D, InstanceStream;
+	"instancing", Scene3D, PerInstanceCulling;
+	"instancing", Scene3D, InstanceCompaction;
+	"instancing", Scene3D, SingleSortPerInstanceSet;
+	"instancing", Scene3D, TransparentInstancingApproximate;
+	"materials", Scene3D, MaterialUnlit;
+	"materials", Scene3D, MaterialVertexColor;
+	"materials", Scene3D, MaterialLambert;
+	"materials", Scene3D, MaterialBlinnPhong;
+	"materials", Scene3D, LinearColourSpace;
+	"materials", Scene3D, NormalRenormalisation;
+	"materials", Scene3D, TwoSidedNormalFlip;
+	"materials", Scene3D, AlphaThresholdDiscard;
+	"materials", Scene3D, QueueFromBlending;
+	"materials", Scene3D, PerDrawBlendState;
+	"materials", Scene3D, PerDrawColorWriteMask;
+	"lighting", Scene3D, LightAmbient;
+	"lighting", Scene3D, LightDirectional;
+	"lighting", Scene3D, LightPoint;
+	"lighting", Scene3D, LightSpot;
+	"lighting", Scene3D, LightSelectionOrder;
+	"lighting", Scene3D, LightsPerDrawableLimit;
+	"lighting", Scene3D, PointAttenuation;
+	"lighting", Scene3D, SpotConeAttenuation;
+	"lighting", Scene3D, DirectionalNoAttenuation;
+	"picking", Scene3D, ObjectIdAttachment;
+	"picking", Scene3D, ReservedZeroIdentity;
+	"picking", Scene3D, ApplicationAssignedIdentity;
+	"picking", Scene3D, SelectionPass;
+	"picking", Scene3D, TransparentWritesNoIdentity;
+	"picking", Backend, IdentityReadback;
+	"picking", Backend, DepthReadback;
+	"picking", Backend, ColourReadback;
+	"picking", Backend, AsynchronousReadback;
+	"picking", Scene3D, PickOutsideAttachmentRefusal;
+	"passes", Scene3D, RenderPassGraph;
+	"passes", Scene3D, DerivedPassOrder;
+	"passes", Scene3D, PassCycleRefusal;
+	"passes", Backend, OffscreenTarget;
+	"limits", Scene3D, SceneLimits;
+	"limits", Scene3D, LimitRefusal;
+}
+
+/// The groups, in the order the profile documents them.
+pub const SCENE3D_GROUPS: &[&str] = &["hierarchy", "camera", "queues", "culling", "instancing", "materials", "lighting", "picking", "passes", "limits"];
+
+/// Is this feature in Profile 1?
+pub fn in_profile_1(feature: Scene3DFeature) -> bool {
+	SCENE3D_CORE_PROFILE_1.iter().any(|entry| entry.feature == feature)
+}
+
+/// The entry for a feature named as the profile spells it.
+pub fn entry_by_name(name: &str) -> Option<&'static ProfileEntry<Scene3DFeature>> {
+	SCENE3D_CORE_PROFILE_1.iter().find(|entry| entry.name == name)
+}

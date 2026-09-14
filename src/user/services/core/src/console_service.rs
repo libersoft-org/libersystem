@@ -21,7 +21,7 @@ use rt::*;
 
 use proto::system::{config, network, process};
 use services::executable;
-use surface::{Client as DisplayClient, Mapping, Rect};
+use surface::{Client as DisplayClient, Rect, Surface as DisplaySurfaceHandle};
 
 include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 
@@ -42,11 +42,113 @@ use alloc::vec::Vec;
 use graphics_core::layout::ImageLayout;
 use term::{CELL_H, CELL_W, Echo, EchoBuf, LD_HIST_MAX, Ld, Raster, RawSink, SCROLLBACK_ROWS, Surface, Term};
 
-// A DisplayService surface: the raster writes the client-owned MemoryObject and each
-// present synchronously copies the damage rectangle to the service-owned scanout.
+// A DisplayService surface: the raster writes a SHADOW the console owns, and each present acquires
+// an image of the present queue, brings it up to date and submits it.
+//
+// THE SHADOW IS NOT AN EXTRA COPY FOR ITS OWN SAKE. A present QUEUE hands out a different image from
+// one frame to the next, and every presented image must contain a COMPLETE VALID FRAME - damage is a
+// hint about what changed and never permission to leave the rest undefined. A console that drew
+// straight into whichever image it was given would present a frame missing everything drawn while a
+// different image was current. So it draws into one place it owns, and an image that has not held a
+// complete frame yet is filled whole before it is presented.
+struct Presenter {
+	surface: DisplaySurfaceHandle,
+	/// The pixels the console draws into, at the surface's own pitch and height.
+	shadow: Vec<u8>,
+	pitch: u32,
+	height: u32,
+	/// Whether each image already holds a complete frame. AN IMAGE THAT DOES NOT IS FILLED WHOLE,
+	/// which is what makes a queue of several images correct rather than nearly correct.
+	complete: Vec<bool>,
+}
+
+impl Presenter {
+	fn create(client: &DisplayClient) -> Option<Presenter> {
+		let surface = DisplaySurfaceHandle::create(client, surface::wire_extent(0, 0), 2)?.ok()?;
+		Presenter::wrap(surface)
+	}
+
+	fn wrap(surface: DisplaySurfaceHandle) -> Option<Presenter> {
+		let (pitch, height) = (surface.pitch(), surface.configuration().physical_extent.height);
+		let mut shadow: Vec<u8> = Vec::new();
+		shadow.try_reserve_exact(pitch as usize * height as usize).ok()?;
+		shadow.resize(pitch as usize * height as usize, 0);
+		let complete = alloc::vec![false; surface.image_count()];
+		Some(Presenter { surface, shadow, pitch, height, complete })
+	}
+
+	/// Re-size the shadow for the surface's current generation, answering its base and layout.
+	fn wrap_existing(held: &alloc::rc::Rc<core::cell::RefCell<Presenter>>) -> Option<(u64, ImageLayout)> {
+		let mut presenter = held.borrow_mut();
+		let (pitch, height) = (presenter.surface.pitch(), presenter.surface.configuration().physical_extent.height);
+		let length: usize = pitch as usize * height as usize;
+		if presenter.shadow.len() != length {
+			presenter.shadow.clear();
+			presenter.shadow.try_reserve_exact(length).ok()?;
+			presenter.shadow.resize(length, 0);
+		}
+		presenter.pitch = pitch;
+		presenter.height = height;
+		// EVERY IMAGE OF A NEW GENERATION HOLDS NOTHING YET, so the first present into each fills it
+		// whole - which is the profile's own rule for the first present of a generation.
+		let images: usize = presenter.surface.image_count();
+		presenter.complete.clear();
+		presenter.complete.resize(images, false);
+		Some((presenter.shadow.as_ptr() as u64, presenter.layout()))
+	}
+
+	fn addr(&self) -> u64 {
+		self.shadow.as_ptr() as u64
+	}
+
+	/// The shadow's layout, which is the IMAGES' layout - the surface library already built and
+	/// checked it when it mapped them, so taking it from there is one description rather than a
+	/// second one that could disagree.
+	fn layout(&self) -> ImageLayout {
+		self.surface.image(0).map(|image| image.layout()).expect("a surface has at least one image while it has a generation")
+	}
+
+	/// Bring one image up to date and present it.
+	///
+	/// `Again` IS NOT A FAILURE. It means every image is in flight, and the console's answer is to
+	/// skip this frame rather than to block the only loop it has - the next change presents.
+	fn present(&mut self, rect: Rect) -> bool {
+		let index = match self.surface.acquire() {
+			Some(Ok(surface::AcquiredImage::Image(index))) => index,
+			_ => return false,
+		};
+		let Some(image) = self.surface.image(index) else {
+			let _ = self.surface.abandon(index);
+			return false;
+		};
+		let complete: bool = self.complete.get(index as usize).copied().unwrap_or(false);
+		let length: usize = self.shadow.len();
+		// SAFETY: the image is exactly `pitch * height` bytes - the service allocated it and the
+		// mapping checked it - and the shadow is the same length by construction.
+		let target: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(image.addr() as *mut u8, length) };
+		if complete {
+			// Only what changed, row by row.
+			let bytes: usize = rect.width as usize * 4;
+			for row in rect.y..rect.y.saturating_add(rect.height) {
+				let start: usize = row as usize * self.pitch as usize + rect.x as usize * 4;
+				if start + bytes <= length {
+					target[start..start + bytes].copy_from_slice(&self.shadow[start..start + bytes]);
+				}
+			}
+		} else {
+			target.copy_from_slice(&self.shadow);
+		}
+		let outcome = if complete { self.surface.present_rects(index, core::slice::from_ref(&rect)) } else { self.surface.present_whole(index) };
+		if let Some(slot) = self.complete.get_mut(index as usize) {
+			*slot = true;
+		}
+		matches!(outcome, Some(Ok(_)))
+	}
+}
+
 struct DisplaySurface {
 	raster: Raster,
-	client: DisplayClient,
+	presenter: alloc::rc::Rc<core::cell::RefCell<Presenter>>,
 }
 
 // WHETHER THE FIRST PRESENT HAS BEEN REPORTED, and how it went. A frame reaching the display is what
@@ -64,7 +166,7 @@ impl Surface for DisplaySurface {
 		&self.raster
 	}
 	fn present(&self, x: u32, y: u32, w: u32, h: u32) {
-		let landed = matches!(surface::present(&self.client, Rect { x, y, width: w, height: h }), Some(Ok(())));
+		let landed = self.presenter.borrow_mut().present(Rect { x, y, width: w, height: h });
 		let want = if landed { PRESENT_OK } else { PRESENT_FAILED };
 		if PRESENTED.load(core::sync::atomic::Ordering::Relaxed) & want == 0 && PRESENTED.fetch_or(want, core::sync::atomic::Ordering::AcqRel) & want == 0 {
 			print(if landed { b"ConsoleService: a frame reached the display\n".as_slice() } else { b"ConsoleService: a frame did NOT reach the display\n".as_slice() });
@@ -73,7 +175,7 @@ impl Surface for DisplaySurface {
 	}
 }
 
-fn make_surface(addr: u64, layout: &ImageLayout, client: &DisplayClient) -> Option<Box<dyn Surface>> {
+fn make_surface(addr: u64, layout: &ImageLayout, presenter: &alloc::rc::Rc<core::cell::RefCell<Presenter>>) -> Option<Box<dyn Surface>> {
 	// SAFETY: `addr` is the base of the surface this service just mapped through the display
 	// protocol, and `layout` is what the same call described it as - checked when the mapping was
 	// built. The mapping outlives the surface. A layout the renderer cannot address is refused here
@@ -83,7 +185,7 @@ fn make_surface(addr: u64, layout: &ImageLayout, client: &DisplayClient) -> Opti
 	// NO SECOND DESCRIPTION IN BETWEEN. This used to take an ABI `Framebuffer` apart into the
 	// renderer's own `Geometry`, field by field; both are now the shared model's one layout.
 	let raster = unsafe { Raster::new(addr, layout) }?;
-	Some(Box::new(DisplaySurface { raster, client: client.clone() }))
+	Some(Box::new(DisplaySurface { raster, presenter: presenter.clone() }))
 }
 
 // Control-byte chords intercepted by the console (never forwarded to a shell): the
@@ -330,7 +432,7 @@ struct Console {
 	fb: Option<ImageLayout>,
 	// The mapped client-owned surface and typed DisplayService connection. The event
 	// sub-channel carries host display resizes without sharing the physical scanout.
-	surface: Option<Mapping>,
+	surface: Option<alloc::rc::Rc<core::cell::RefCell<Presenter>>>,
 	has_fb: bool,
 	display: DisplayClient,
 	display_events: u64,
@@ -445,10 +547,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    owns the boot framebuffer or virtio-gpu scanout; this process maps only its
 		//    client surface and receives host resize events on a separate sub-channel.
 		let display: DisplayClient = surface::connect(display_chan);
-		let surface: Option<Mapping> = if display_chan == 0 { None } else { surface::acquire(&display, 0, 0).and_then(Result::ok) };
-		let display_events: u64 = if display_chan == 0 { 0 } else { surface::events(&display).unwrap_or(0) };
-		let addr: u64 = surface.as_ref().map_or(0, |surface| surface.addr());
-		let fb: Option<ImageLayout> = surface.as_ref().map(|surface| surface.layout());
+		let surface: Option<alloc::rc::Rc<core::cell::RefCell<Presenter>>> = if display_chan == 0 { None } else { Presenter::create(&display).map(|presenter| alloc::rc::Rc::new(core::cell::RefCell::new(presenter))) };
+		let display_events: u64 = match surface.as_ref() {
+			Some(presenter) => presenter.borrow().surface.events().unwrap_or(0),
+			None => 0,
+		};
+		let addr: u64 = surface.as_ref().map_or(0, |presenter| presenter.borrow().addr());
+		let fb: Option<ImageLayout> = surface.as_ref().map(|presenter| presenter.borrow().layout());
 		let cur_w: u32 = fb.map_or(0, |layout| layout.extent.width);
 		let cur_h: u32 = fb.map_or(0, |layout| layout.extent.height);
 		let has_fb: bool = surface.is_some();
@@ -466,7 +571,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// A geometry the renderer cannot address means no terminal on this VT, not a panic on the
 		// first pixel: `has_fb` says a framebuffer was mapped, and this says it is one we can draw
 		// into.
-		let drawable: Option<Box<dyn Surface>> = fb.as_ref().and_then(|layout| make_surface(addr, layout, &display));
+		let drawable: Option<Box<dyn Surface>> = match (fb.as_ref(), surface.as_ref()) {
+			(Some(layout), Some(presenter)) => make_surface(addr, layout, presenter),
+			_ => None,
+		};
 		let term: Option<Term> = if let Some(mut t) = drawable.and_then(|d| Term::try_new(d, vt_scrollback)) {
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			let mut log: Vec<u8> = alloc::vec![0u8; 16384];
@@ -1300,15 +1408,25 @@ fn handle_display_resize(console: &mut Console) {
 	for handle in frame_handles.as_slice() {
 		close(*handle);
 	}
-	if decoded.is_none() {
-		return;
-	}
-	let Some(new_surface) = surface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
+	// ONLY A CONFIGURATION REBUILDS. The stream carries six kinds of event and five of them are
+	// ordinary traffic: an image became available, a present completed, visibility or focus moved.
+	// Rebuilding on any of them would rebuild after every frame - which is a loop, because a rebuild
+	// redraws and a redraw presents and a present completes.
+	let Some(surface::SurfaceEvent::Configure(_)) = decoded else {
 		return;
 	};
-	let new_addr: u64 = new_surface.addr();
-	let new_fb: ImageLayout = new_surface.layout();
-	let old_surface: Option<Mapping> = console.surface.replace(new_surface);
+	// A CONFIGURATION EVENT IS REBUILT FROM, not re-created from. The surface is the same capability;
+	// what changed is its generation, and rebuilding is what the lifecycle calls for.
+	if let Some(presenter) = console.surface.as_ref() {
+		if presenter.borrow_mut().surface.rebuild().is_none_or(|outcome| outcome.is_err()) {
+			return;
+		}
+	}
+	let Some(new_surface) = console.surface.as_ref().and_then(|presenter| Presenter::wrap_existing(presenter)) else {
+		return;
+	};
+	let new_addr: u64 = new_surface.0;
+	let new_fb: ImageLayout = new_surface.1;
 	console.addr = new_addr;
 	console.fb = Some(new_fb);
 	console.cur_w = new_fb.extent.width;
@@ -1318,13 +1436,14 @@ fn handle_display_resize(console: &mut Console) {
 	let rows: usize = new_fb.extent.height as usize / CELL_H;
 	let client: DisplayClient = console.display.clone();
 	let n: usize = console.vts.len();
+	let Some(presenter) = console.surface.clone() else { return };
+	let _ = client;
 	for vi in 0..n {
-		if let (Some(t), Some(surface)) = (console.vts[vi].term.as_mut(), make_surface(new_addr, &new_fb, &client)) {
+		if let (Some(t), Some(surface)) = (console.vts[vi].term.as_mut(), make_surface(new_addr, &new_fb, &presenter)) {
 			t.set_surface(surface);
 		}
 		resize_vt(console, vi, cols, rows);
 	}
-	drop(old_surface);
 }
 
 // Toggle the foreground VT's caret blink phase, presenting only when a pixel actually
@@ -1348,7 +1467,7 @@ fn create_vt(console: &mut Console) {
 		return;
 	}
 	let broker: u64 = console.broker;
-	if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, console.fb.as_ref(), &console.display, console.cur_w, console.cur_h) {
+	if let Some(vt) = spawn_vt(&mut console.facs, broker, console.config_client, console.addr, console.fb.as_ref(), console.surface.as_ref(), console.cur_w, console.cur_h) {
 		console.vts.push(vt);
 		console.fg = console.vts.len() - 1;
 		repaint(console);
@@ -1862,7 +1981,7 @@ fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_cont
 // Open one VT's shell: create the VT's console + control channels, spawn a fully-capable
 // shell over them, nudge it to print its first prompt, and return the VT (its cleared grid
 // + the service ends of those channels). None on any failure.
-fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, layout: Option<&ImageLayout>, display: &DisplayClient, cur_w: u32, cur_h: u32) -> Option<Vt> {
+fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, layout: Option<&ImageLayout>, presenter: Option<&alloc::rc::Rc<core::cell::RefCell<Presenter>>>, cur_w: u32, cur_h: u32) -> Option<Vt> {
 	let (vt_service, vt_client): (u64, u64) = channel()?;
 	let (control_console, control_shell): (u64, u64) = channel()?;
 	if !spawn_shell(facs, broker, vt_client, control_shell, 0) {
@@ -1882,7 +2001,11 @@ fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: u64, la
 	// geometry cannot be addressed, rather than a panic on the first pixel.
 	// `and_then`, not `map`: a VT whose grid cannot be allocated has no terminal, the same answer
 	// an unaddressable geometry gives, rather than aborting the whole console service.
-	let term: Option<Term> = layout.and_then(|layout| make_surface(addr, layout, display)).and_then(|drawable| {
+	let term: Option<Term> = match (layout, presenter) {
+		(Some(layout), Some(presenter)) => make_surface(addr, layout, presenter),
+		_ => None,
+	}
+	.and_then(|drawable| {
 		let mut t = Term::try_new(drawable, vt_scrollback)?;
 		t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 		t.screen.clear();

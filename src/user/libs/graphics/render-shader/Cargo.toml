@@ -1,0 +1,12 @@
+[package]
+name = "render-shader"
+edition = "2024"
+description = "The validated portable shader IR: a programmatic builder, a typed module, and a validator that refuses an unbounded loop, an out-of-range access and a non-deterministic operation on a position path"
+
+[dependencies]
+# THE FROZEN SEMANTICS, READ RATHER THAN RESTATED: the accuracy bounds that decide which operations
+# may contribute to a position, and the StrictF32 rules that say what that means.
+graphics-profile = { path = "../profile" }
+
+[lints.rust]
+warnings = "deny"

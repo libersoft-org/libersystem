@@ -43,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -567,6 +567,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CHANNEL_CREATE => sys_channel_create(a0, a1, a2),
 		SYS_CHANNEL_SEND => sys_channel_send(a0, a1, a2, a3),
 		SYS_CHANNEL_SEND_ATTENUATED => sys_channel_send_attenuated(a0, a1, a2, a3),
+		SYS_CHANNEL_SEND_CAPS_ATTENUATED => sys_channel_send_caps_attenuated(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV => sys_channel_recv(a0, a1, a2, a3),
 		SYS_CHANNEL_SEND_CAPS => sys_channel_send_caps(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV_CAPS => sys_channel_recv_caps(a0, a1, a2, a3),
@@ -3029,6 +3030,122 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 			// and still the same values, so the caller can close them or try again.
 			let mut table = thread.handles().lock();
 			for (handle, cap) in taken.into_iter().zip(err.1) {
+				table.restore_taken(handle, cap);
+			}
+			match err.0 {
+				ChannelError::PeerClosed => ERR_PEER_CLOSED,
+				_ => ERR_WOULD_BLOCK,
+			}
+		}
+	}
+}
+
+// Send a message transferring SEVERAL capabilities, each with less authority than the sender holds.
+// `caps_ptr` points at `[count, CapTransfer * count]`.
+//
+// THE MASKS ARE PER CAPABILITY, and that is the whole reason this exists beside the single-handle
+// form: the two halves of a completion pair travel in ONE reply and are not the same authority - the
+// producer end may only SEND and the completion end may only RECEIVE and WAIT. A service that could
+// only attenuate one at a time would have to send them in two messages, which is a second wire for a
+// record the schema says is one.
+//
+// Everything else is `sys_channel_send_caps`: every handle is taken under one lock or none is, each
+// original is KEPT and the attenuated copy is what travels, and a refused send leaves every handle
+// open at the same value with its rights unchanged.
+fn sys_channel_send_caps_attenuated(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64) -> i64 {
+	if bytes_len as usize > abi::MAX_MESSAGE_BYTES {
+		return ERR_INVALID;
+	}
+	let thread = current_thread!();
+	if !user_buf_ok(bytes_ptr, bytes_len) || !user_buf_ok(caps_ptr, 8) {
+		return ERR_INVALID;
+	}
+	let count = read_user::<u64>(caps_ptr) as usize;
+	if count == 0 || count > abi::MAX_MESSAGE_CAPS {
+		return ERR_INVALID;
+	}
+	let entry = core::mem::size_of::<abi::CapTransfer>() as u64;
+	if !user_buf_ok(caps_ptr, 8 + count as u64 * entry) {
+		return ERR_INVALID;
+	}
+	let mut transfers = [abi::CapTransfer::default(); abi::MAX_MESSAGE_CAPS];
+	for (index, slot) in transfers.iter_mut().take(count).enumerate() {
+		*slot = read_user::<abi::CapTransfer>(caps_ptr + 8 + index as u64 * entry);
+	}
+	// A SEND THAT MOVES NOTHING IS NOT THIS CALL, for the reason the single-handle form gives: the
+	// ordinary send carries a bare message, and a zero here would make this a second way of doing
+	// the same thing with a mask nobody reads.
+	if transfers[..count].iter().any(|transfer| transfer.handle == 0) {
+		return ERR_INVALID;
+	}
+
+	let object = {
+		let table = thread.handles().lock();
+		match table.lookup_typed(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
+			Ok(object) => object,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
+		}
+	};
+	let channel: Arc<Channel> = object.into_any_arc().downcast::<Channel>().ok().expect("type checked by lookup_typed");
+	let Some(mut bytes) = try_zeroed_bytes(bytes_len as usize) else {
+		return ERR_NO_MEMORY;
+	};
+	if let Err(error) = copy_from_user_exact(bytes.as_mut_ptr(), bytes_ptr, bytes_len as usize) {
+		return error;
+	}
+	let mut raw = [0u64; abi::MAX_MESSAGE_CAPS];
+	for (slot, transfer) in raw.iter_mut().take(count).zip(transfers.iter()) {
+		*slot = transfer.handle;
+	}
+	if has_repeat(&raw[..count]) {
+		return ERR_INVALID;
+	}
+
+	let mut caps: Vec<Capability> = Vec::new();
+	let mut taken: Vec<(Handle, Capability)> = Vec::new();
+	if caps.try_reserve(count).is_err() || taken.try_reserve(count).is_err() {
+		return ERR_NO_MEMORY;
+	}
+	{
+		let mut table = thread.handles().lock();
+		for transfer in transfers.iter().take(count) {
+			let handle = Handle::from_raw(transfer.handle);
+			match table.take_for_transfer(handle, Rights::TRANSFER) {
+				Ok(cap) => {
+					// THE ORIGINAL IS KEPT AND THE ATTENUATED COPY IS WHAT TRAVELS, so a refused
+					// send restores exactly what came out of the slot rather than a narrowed one -
+					// putting a widened capability back is a primitive this kernel should not have.
+					caps.push(cap.attenuated(Rights::from_bits(transfer.rights)));
+					taken.push((handle, cap));
+				}
+				Err(err) => {
+					for (handle, cap) in taken {
+						table.restore_taken(handle, cap);
+					}
+					return match err {
+						HandleError::AccessDenied => ERR_ACCESS_DENIED,
+						_ => ERR_BAD_HANDLE,
+					};
+				}
+			}
+		}
+	}
+	match channel.send_charged_or_return(Message::new(bytes, caps), thread.domain()) {
+		Ok(()) => {
+			let mut table = thread.handles().lock();
+			for (handle, _) in taken {
+				table.commit_taken(handle);
+			}
+			thread.process().record_send();
+			0
+		}
+		Err(err) => {
+			// The attenuated copies the message carried are dropped, and what goes back into each
+			// slot is the capability that came out of it.
+			drop(err.1);
+			let mut table = thread.handles().lock();
+			for (handle, cap) in taken {
 				table.restore_taken(handle, cap);
 			}
 			match err.0 {

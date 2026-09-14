@@ -204,6 +204,10 @@ name = "play"
 path = "src/play.rs"
 
 [[bin]]
+name = "frame_probe"
+path = "src/frame_probe.rs"
+
+[[bin]]
 name = "graphics_probe"
 path = "src/graphics_probe.rs"
 
@@ -466,6 +470,7 @@ soft2d = { path = "../../libs/graphics/soft2d" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }
+graphics-app = { path = "../../libs/graphics/app", features = ["runtime"] }
 aiff = { path = "../../libs/audio/aiff" }
 flac = { path = "../../libs/audio/flac" }
 mp3 = { path = "../../libs/audio/mp3" }

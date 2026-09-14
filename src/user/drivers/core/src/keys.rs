@@ -274,6 +274,12 @@ const KEYMAP_SHIFT: [u8; 64] = [
 ];
 
 // The live modifier and lock state, tracked across key press / release events.
+//
+// EACH SIDE OF A MODIFIER IS TRACKED SEPARATELY and the public boolean is derived from both. A
+// keyboard has two Shift keys, and folding them into one boolean means releasing the right one
+// cancels a left one that is still held - which is the defect that drops the capital letter out of
+// the middle of a word typed with both hands, and which nobody reproduces on purpose because it
+// needs two keys in a particular order.
 pub struct Mods {
 	pub shift: bool,
 	pub ctrl: bool,
@@ -286,13 +292,56 @@ pub struct Mods {
 	// Scroll Lock toggles; nothing consumes it yet (terminals use it for output
 	// flow control, which the console does not implement).
 	pub scroll: bool,
+	// Which side of each modifier is down, in the bit order of `HID_MODIFIER_KEYCODES`:
+	// LCtrl, LShift, LAlt, LGui, RCtrl, RShift, RAlt, RGui.
+	held: u8,
+}
+
+// The bit of each side within `Mods::held`.
+const HELD_LEFT_CTRL: u8 = 1 << 0;
+const HELD_LEFT_SHIFT: u8 = 1 << 1;
+const HELD_LEFT_ALT: u8 = 1 << 2;
+const HELD_LEFT_META: u8 = 1 << 3;
+const HELD_RIGHT_CTRL: u8 = 1 << 4;
+const HELD_RIGHT_SHIFT: u8 = 1 << 5;
+const HELD_RIGHT_ALT: u8 = 1 << 6;
+const HELD_RIGHT_META: u8 = 1 << 7;
+
+impl Mods {
+	// Record one side of one modifier, then recompute the booleans the rest of the console reads.
+	fn side(&mut self, bit: u8, down: bool) {
+		if down {
+			self.held |= bit;
+		} else {
+			self.held &= !bit;
+		}
+		self.shift = self.held & (HELD_LEFT_SHIFT | HELD_RIGHT_SHIFT) != 0;
+		self.ctrl = self.held & (HELD_LEFT_CTRL | HELD_RIGHT_CTRL) != 0;
+		self.alt = self.held & (HELD_LEFT_ALT | HELD_RIGHT_ALT) != 0;
+		self.meta = self.held & (HELD_LEFT_META | HELD_RIGHT_META) != 0;
+	}
+
+	// Which sides are currently held, for a caller that needs to tell them apart.
+	pub fn held_sides(&self) -> u8 {
+		self.held
+	}
+
+	// FORGET EVERY HELD MODIFIER. A device that goes away while a key is down leaves that key down
+	// for ever otherwise, and the next thing typed arrives shifted.
+	pub fn release_all(&mut self) {
+		self.held = 0;
+		self.shift = false;
+		self.ctrl = false;
+		self.alt = false;
+		self.meta = false;
+	}
 }
 
 impl Default for Mods {
 	// NumLock starts on, so the keypad types digits out of the box (there are no
 	// keyboard LEDs to mirror the state anyway).
 	fn default() -> Mods {
-		Mods { shift: false, ctrl: false, alt: false, meta: false, caps: false, numlock: true, scroll: false }
+		Mods { shift: false, ctrl: false, alt: false, meta: false, caps: false, numlock: true, scroll: false, held: 0 }
 	}
 }
 
@@ -307,20 +356,36 @@ pub fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 	// toggle on press. They emit no character, so handle them before the press-only
 	// gate below.
 	match code {
-		KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
-			mods.shift = value != 0;
+		KEY_LEFTSHIFT => {
+			mods.side(HELD_LEFT_SHIFT, value != 0);
 			return;
 		}
-		KEY_LEFTCTRL | KEY_RIGHTCTRL => {
-			mods.ctrl = value != 0;
+		KEY_RIGHTSHIFT => {
+			mods.side(HELD_RIGHT_SHIFT, value != 0);
 			return;
 		}
-		KEY_LEFTALT | KEY_RIGHTALT => {
-			mods.alt = value != 0;
+		KEY_LEFTCTRL => {
+			mods.side(HELD_LEFT_CTRL, value != 0);
 			return;
 		}
-		KEY_LEFTMETA | KEY_RIGHTMETA => {
-			mods.meta = value != 0;
+		KEY_RIGHTCTRL => {
+			mods.side(HELD_RIGHT_CTRL, value != 0);
+			return;
+		}
+		KEY_LEFTALT => {
+			mods.side(HELD_LEFT_ALT, value != 0);
+			return;
+		}
+		KEY_RIGHTALT => {
+			mods.side(HELD_RIGHT_ALT, value != 0);
+			return;
+		}
+		KEY_LEFTMETA => {
+			mods.side(HELD_LEFT_META, value != 0);
+			return;
+		}
+		KEY_RIGHTMETA => {
+			mods.side(HELD_RIGHT_META, value != 0);
 			return;
 		}
 		KEY_CAPSLOCK => {
@@ -626,3 +691,6 @@ pub fn consumer_keycode(usage: u16) -> u16 {
 // LCtrl, LShift, LAlt, LGui, RCtrl, RShift, RAlt, RGui. The GUI bits map to the
 // Windows (meta) keycodes.
 pub const HID_MODIFIER_KEYCODES: [u16; 8] = [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_LEFTMETA, KEY_RIGHTCTRL, KEY_RIGHTSHIFT, KEY_RIGHTALT, KEY_RIGHTMETA];
+
+#[cfg(test)]
+mod tests;

@@ -1,14 +1,38 @@
 package liber:display@1
+resource image-object
+record scale-ratio(numerator:u32,denominator:u32)
+enum output-transform(normal=0,rotate90=1,rotate180=2,rotate270=3,flipped-normal=4,flipped-rotate90=5,flipped-rotate180=6,flipped-rotate270=7)
+enum subpixel-layout(unknown=0,none-layout=1,horizontal-rgb=2,horizontal-bgr=3,vertical-rgb=4,vertical-bgr=5)
 record output-colour(space:liber:graphics@1::color-space,sdr-white-nits:option<f32>,min-nits:option<f32>,max-nits:option<f32>,max-frame-average-nits:option<f32>)
-record surface-info(pixels:buffer,width:u32,height:u32,pitch:u32,format:liber:graphics@1::pixel-format,colour:output-colour)
-record display-event(width:u32,height:u32)
-record presentation-stats(presents:u64,direct-presents:u64,scaled-presents:u64,source-pixels:u64,output-pixels:u64,blit-ns:u64,flush-ns:u64,max-present-ns:u64)
+record surface-configuration(serial:u64,generation:u64,logical-extent:liber:graphics@1::extent-2d,physical-extent:liber:graphics@1::extent-2d,scale:scale-ratio,transform:output-transform,output:u32,format:liber:graphics@1::pixel-format,colour:output-colour,subpixel:subpixel-layout,visible:bool,focused:bool)
+variant timestamp-evidence(unavailable=0:unit,estimated=1:u64,measured=2:u64)
+enum present-outcome(displayed=0,discarded-occluded=1,replaced-by-resize=2,driver-lost=3)
+record frame-timing(preferred-deadline:option<u64>,refresh-interval:option<u64>)
+record present-complete(serial:u64,outcome:present-outcome,evidence:timestamp-evidence,timing:frame-timing)
+variant surface-event(configure=0:surface-configuration,image-available=1:unit,present-complete=2:present-complete,close-requested=3:unit,visibility-changed=4:bool,focus-changed=5:bool)
+variant acquired-image(image=0:u32,again=1:unit,not-visible=2:unit,out-of-date=3:unit)
+record present-queue(images:u32,pitch:u32,generation:u64,producer:handle<channel>,done:handle<channel>)
+record image-limits(minimum:u32,maximum:u32)
+record surface-request(logical-extent:liber:graphics@1::extent-2d,images:u32)
+record presentation-stats(presents:u64,direct-presents:u64,scaled-presents:u64,source-pixels:u64,output-pixels:u64,blit-ns:u64,flush-ns:u64,max-present-ns:u64,displayed:u64,discarded:u64,replaced:u64,lost:u64)
+record display-resources(surfaces:u64,surface-bound:u64,present-images:u64,image-bound:u64,queued-presents:u64,present-bound:u64,damage-entries:u64,damage-bound:u64,waiters:u64,waiter-bound:u64,resets:u64,faulted:bool)
+interface display-stats
+method display-stats.resources op=1 () -> display-resources
+interface surface
+method surface.configuration op=1 () -> result<surface-configuration, liber:base@1::error>
+method surface.ack-configure op=2 (serial:u64:rights=) -> result<unit, liber:base@1::error>
+method surface.queue op=3 () -> result<present-queue, liber:base@1::error>
+method surface.acquire-next op=4 () -> result<acquired-image, liber:base@1::error>
+method surface.abandon op=5 (image:u32:rights=) -> result<unit, liber:base@1::error>
+method surface.present op=6 (image:u32:rights=,serial:u64:rights=,generation:u64:rights=,damage:liber:graphics@1::damage-region:rights=) -> result<u64, liber:base@1::error>
+method surface.events op=7 () -> stream<surface-event>
+method surface.input-focus op=8 () -> result<handle<channel>, liber:base@1::error>
+method surface.close op=9 () -> result<unit, liber:base@1::error>
+method surface.provide-image op=10 (index:u32:rights=,image:handle<image-object>:rights=read+map) -> result<unit, liber:base@1::error>
 interface display
-method display.acquire op=1 (width:u32:rights=,height:u32:rights=) -> result<surface-info, liber:base@1::error>
-method display.present op=2 (damage:liber:graphics@1::damage-region:rights=) -> result<unit, liber:base@1::error>
-method display.release op=3 () -> result<unit, liber:base@1::error>
-method display.events op=4 () -> stream<display-event>
-method display.input-focus op=5 () -> result<handle<channel>, liber:base@1::error>
+method display.create-surface op=1 (request:surface-request:rights=) -> result<handle<channel>, liber:base@1::error>
+method display.image-limits op=2 () -> result<image-limits, liber:base@1::error>
 interface display-admin
-method display-admin.bind op=1 (task:handle<liber:process@1::task>:rights=manage) -> result<handle<channel>, liber:base@1::error>
+method display-admin.bind op=1 (task:handle<liber:process@1::task>:rights=manage+wait) -> result<handle<channel>, liber:base@1::error>
 method display-admin.stats op=2 () -> presentation-stats
+method display-admin.set-visible op=3 (task:handle<liber:process@1::task>:rights=manage,surface:u64:rights=) -> result<unit, liber:base@1::error>

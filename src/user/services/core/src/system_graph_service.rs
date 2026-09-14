@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::{ChannelTransport, SvcTransport};
-use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, Error, FailureCause, Graph, TraceSpan, device, provider_catalogue, supervisor, system_graph};
+use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, DisplayResources, Error, FailureCause, Graph, ResourceCount, TraceSpan, device, display_stats, provider_catalogue, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -54,6 +54,10 @@ struct GraphService {
 	// that looks most like a status display being the one showing none.
 	bindings: u64,
 	supervisor_client: u64,
+	/// DisplayService's OBSERVATION root, which is not its admin one: what it can answer is what
+	/// the display path holds, and nothing on it can change a thing. Zero when the boot granted
+	/// none, which is a smaller graph rather than a broken one.
+	display_stats: u64,
 }
 
 // A binding state as the graph's component state. The two vocabularies meet HERE and nowhere else,
@@ -117,7 +121,7 @@ impl system_graph::Service for GraphService {
 				Some(s) => (map_state(s.state), Counters { messages_sent: s.messages_sent, messages_received: s.messages_received, handles: s.handle_count, memory_bytes: s.memory_bytes, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 				None => (ComponentState::Failed, Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() }),
 			};
-			components.push(Component { name: node.name.clone(), r#type: ComponentType::Service, state, deps: node.deps.clone(), counters });
+			components.push(Component { name: node.name.clone(), r#type: ComponentType::Service, state, deps: node.deps.clone(), counters, resources: Vec::new() });
 		}
 		spans.push(TraceSpan { name: String::from("process.stats"), duration_ns: clock_ns().wrapping_sub(stats_start) });
 
@@ -163,7 +167,7 @@ impl system_graph::Service for GraphService {
 				None => (ComponentState::Pending, String::new()),
 			};
 			let restarts: u32 = record.map_or(0, |record| record.attempts);
-			components.push(Component { name: device_name(d), r#type: ComponentType::Device, state, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts, watchdog_trips: 0, last_failure: failure } });
+			components.push(Component { name: device_name(d), r#type: ComponentType::Device, state, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts, watchdog_trips: 0, last_failure: failure }, resources: Vec::new() });
 		}
 
 		// Supervisor history: query the ServiceManager supervisor and fold each managed
@@ -186,15 +190,53 @@ impl system_graph::Service for GraphService {
 						}
 					}
 					if s.name == "watchdog_probe" {
-						components.push(Component { name: s.name.clone(), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: s.restarts, watchdog_trips: s.watchdog_trips, last_failure: s.last_failure.clone() } });
+						components.push(Component { name: s.name.clone(), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: s.restarts, watchdog_trips: s.watchdog_trips, last_failure: s.last_failure.clone() }, resources: Vec::new() });
 					}
 				}
 			}
 			spans.push(TraceSpan { name: String::from("supervisor.status"), duration_ns: clock_ns().wrapping_sub(sup_start) });
 		}
 
+		// WHAT A SERVICE HOLDS THAT THE KERNEL CHARGES NOBODY FOR, from the one process that knows.
+		//
+		// The kernel's counters above cover what it charges - messages, handles, mapped bytes - and
+		// a display service's surfaces, queue slots and pending presents are none of those: they are
+		// service heap and a service wait set, and they are exactly what an adversarial client
+		// multiplies. Each arrives with the BOUND it is held to, because a count alone cannot say
+		// whether a client is being refused.
+		if self.display_stats != 0 {
+			let display_start: u64 = clock_ns();
+			if let Some(resources) = display_stats::Client::new(ChannelTransport { chan: self.display_stats }).resources() {
+				for component in components.iter_mut() {
+					if component.name.as_bytes() == b"display_service" {
+						component.resources = display_rows(&resources);
+						break;
+					}
+				}
+			}
+			spans.push(TraceSpan { name: String::from("display.resources"), duration_ns: clock_ns().wrapping_sub(display_start) });
+		}
+
 		Ok(Graph { components, spans })
 	}
+}
+
+// The display service's own counts, as the graph's generic `live` / `bound` rows.
+//
+// NAMED BY WHAT IS COUNTED AND NOT BY WHERE IT LIVES, so a reader who has never seen this service's
+// source can tell what "surfaces 3 of 64" means. `faulted` and `resets` are state rather than
+// counts, and they are carried the same way rather than through a second mechanism: a display path
+// that has reset four times and is currently faulted is exactly what an operator is looking for.
+fn display_rows(resources: &DisplayResources) -> Vec<ResourceCount> {
+	alloc::vec![
+		ResourceCount { name: String::from("surfaces"), live: resources.surfaces, bound: resources.surface_bound },
+		ResourceCount { name: String::from("present-images"), live: resources.present_images, bound: resources.image_bound },
+		ResourceCount { name: String::from("queued-presents"), live: resources.queued_presents, bound: resources.present_bound },
+		ResourceCount { name: String::from("damage-entries"), live: resources.damage_entries, bound: resources.damage_bound },
+		ResourceCount { name: String::from("waiters"), live: resources.waiters, bound: resources.waiter_bound },
+		ResourceCount { name: String::from("scanout-resets"), live: resources.resets, bound: 0 },
+		ResourceCount { name: String::from("scanout-faulted"), live: u64::from(resources.faulted), bound: 1 },
+	]
 }
 
 // Map a kernel ProcessStats liveness code to the typed component state.
@@ -233,6 +275,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The binding snapshot's client, or 0 on a boot that granted none - in which case the device
 	// nodes carry no state rather than an invented one.
 	let mut bindings_client: u64 = 0;
+	// DisplayService's OBSERVATION root, or 0 on a boot that granted none - in which case the graph
+	// reports no display resources rather than inventing any.
+	let mut display_stats_client: u64 = 0;
 	let service: u64 = loop {
 		match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } => {
@@ -242,6 +287,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					supervisor_client = handle;
 				} else if len >= 8 && &buf[..8] == b"BINDINGS" {
 					bindings_client = handle;
+				} else if len >= 7 && &buf[..7] == b"DISPLAY" {
+					display_stats_client = handle;
 				} else if len >= 6 && &buf[..6] == b"DEVICE" {
 					device_client = handle;
 				} else if len >= 5 && &buf[..5] == b"SERVE" {
@@ -264,7 +311,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    name requires: the supervisor mints a fresh connection per client from this root, so a
 	//    client that lost its channel when this process was replaced can ask for another. A
 	//    service served on one channel can be restarted, but nobody can reconnect to it.
-	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client };
+	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client, display_stats: display_stats_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { system_graph::dispatch(&mut graph, req, handle, out, reply_handle) });

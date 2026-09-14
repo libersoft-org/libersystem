@@ -22,7 +22,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use graphics_profile::capability::{Coverage, Range};
-use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MIN_LIMITS, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS};
+use graphics_profile::{FeatureOwner, ProfileEntry, RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, RENDER2D_PROFILE_1_MIN_LIMITS, RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS, SCENE3D_CORE_PROFILE_1, SCENE3D_GROUPS};
 
 mod graphics;
 mod image;
@@ -366,6 +366,11 @@ fn main() -> std::process::ExitCode {
 	let profiles = [
 		Profile { slug: "render2d", title: "Render2D Core Profile 1", groups: RENDER2D_GROUPS, entries: Entries::of(RENDER2D_CORE_PROFILE_1) },
 		Profile { slug: "render3d", title: "Render3D Core Profile 1", groups: RENDER3D_GROUPS, entries: Entries::of(RENDER3D_CORE_PROFILE_1) },
+		// THE SCENE LAYER IS A THIRD CLOSED LIST, not a section of the 3D one: `render3d` is a pass
+		// and pipeline API and contains no hierarchy, materials, lights, sorted queues or picking -
+		// yet those are exactly what "a complete 3D library" means to an application, and with them
+		// outside every registry they are the one part free to drift away from its tests.
+		Profile { slug: "scene3d", title: "Scene3D Core Profile 1", groups: SCENE3D_GROUPS, entries: Entries::of(SCENE3D_CORE_PROFILE_1) },
 	];
 
 	let source = root.join("src");
@@ -392,9 +397,18 @@ fn main() -> std::process::ExitCode {
 		let mine = |claims: &[Claim], known: &dyn Fn(&str) -> bool, other: &dyn Fn(&str) -> bool| -> Vec<Claim> { claims.iter().filter(|claim| known(&claim.feature) || !other(&claim.feature)).cloned().collect() };
 		let in_2d = |name: &str| graphics_profile::render2d::entry_by_name(name).is_some();
 		let in_3d = |name: &str| graphics_profile::render3d::entry_by_name(name).is_some();
-		let (known, other): (&dyn Fn(&str) -> bool, &dyn Fn(&str) -> bool) = if profile.slug == "render2d" { (&in_2d, &in_3d) } else { (&in_3d, &in_2d) };
-		let handled = mine(&handled, known, other);
-		let covered = mine(&covered, known, other);
+		let in_scene = |name: &str| graphics_profile::scene3d::entry_by_name(name).is_some();
+		let known: &dyn Fn(&str) -> bool = match profile.slug {
+			"render2d" => &in_2d,
+			"render3d" => &in_3d,
+			_ => &in_scene,
+		};
+		// ANYTHING A DIFFERENT PROFILE OWNS. A claim in no profile at all belongs to none of them,
+		// so it reaches every one and is reported by each as outside the profile - which is what it
+		// is, and reporting it once per profile is better than reporting it nowhere.
+		let other = |name: &str| (in_2d(name) || in_3d(name) || in_scene(name)) && !known(name);
+		let handled = mine(&handled, known, &other);
+		let covered = mine(&covered, known, &other);
 
 		for output in outputs(&root, profile, &handled, &covered) {
 			if check {
@@ -423,7 +437,11 @@ fn main() -> std::process::ExitCode {
 				println!("profile-doc: wrote {}", output.path.display());
 			}
 		}
-		let passed = if profile.slug == "render2d" { checks(profile.slug, RENDER2D_CORE_PROFILE_1, &handled, &covered) } else { checks(profile.slug, RENDER3D_CORE_PROFILE_1, &handled, &covered) };
+		let passed = match profile.slug {
+			"render2d" => checks(profile.slug, RENDER2D_CORE_PROFILE_1, &handled, &covered),
+			"render3d" => checks(profile.slug, RENDER3D_CORE_PROFILE_1, &handled, &covered),
+			_ => checks(profile.slug, SCENE3D_CORE_PROFILE_1, &handled, &covered),
+		};
 		if !passed {
 			ok = false;
 		}
@@ -550,7 +568,7 @@ fn main() -> std::process::ExitCode {
 	{
 		let canonical = scene3d::canonical();
 		let hash = hex(&bootproto::sha256::digest(canonical.as_bytes()));
-		for (path, contents) in [(root.join("docs/gen/scene3d/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/SCENE3D_PROFILE_1.md"), scene3d::document(&hash))] {
+		for (path, contents) in [(root.join("docs/gen/scene3d-spec/profile-1.canonical"), canonical.clone()), (root.join("docs/graphics/SCENE3D_PROFILE_1.md"), scene3d::document(&hash))] {
 			if check {
 				match std::fs::read_to_string(&path) {
 					Ok(existing) if existing == contents => {}
@@ -867,7 +885,7 @@ fn main() -> std::process::ExitCode {
 			("render2d-spec", 1, render2d_spec::canonical(), "docs/gen/render2d-spec/profile-1.canonical", "docs/graphics/RENDER2D_PROFILE_1.md"),
 			("render3d-spec", 1, render3d_spec::canonical(), "docs/gen/render3d-spec/profile-1.canonical", "docs/graphics/RENDER3D_PROFILE_1.md"),
 			("shader-ir", graphics_profile::shader_ir::SHADER_IR_VERSION, shader_ir::canonical(), "docs/gen/shader-ir/profile-1.canonical", "docs/graphics/SHADER_IR_1.md"),
-			("scene3d", 1, scene3d::canonical(), "docs/gen/scene3d/profile-1.canonical", "docs/graphics/SCENE3D_PROFILE_1.md"),
+			("scene3d-spec", 1, scene3d::canonical(), "docs/gen/scene3d-spec/profile-1.canonical", "docs/graphics/SCENE3D_PROFILE_1.md"),
 			("scene3d-extended", 1, scene3d_extended::canonical(), "docs/gen/scene3d-extended/profile-1.canonical", "docs/graphics/SCENE3D_EXTENDED_1.md"),
 			("wsi", 1, wsi::canonical(), "docs/gen/wsi/profile-1.canonical", "docs/graphics/WSI_PROFILE_1.md"),
 		];

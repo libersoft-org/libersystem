@@ -104,7 +104,9 @@ fn report_boot_window() {
 // settle, so what matters is not what one device may cost but what every device may cost together.
 //
 // A tick is a hundredth of a second, which is what `clock()` counts and what `wait` takes.
-const TICKS_PER_SECOND: u64 = 100;
+// THE ABI'S OWN NUMBER, because a deadline's unit is the ABI's and not a service's: this was a
+// private `100` here, and the next caller that needed the conversion wrote its own.
+const TICKS_PER_SECOND: u64 = rt::TICKS_PER_SECOND;
 
 // How long one attempt may wait for `READY` after its `BIND`. Two seconds, for the reason the
 // development agent's deadline is two seconds: ServiceManager is blocked on this program's phase-2
