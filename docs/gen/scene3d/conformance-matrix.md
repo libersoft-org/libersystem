@@ -29,7 +29,7 @@ rather than counted, because a test measuring an extension must not report Profi
 | `DistanceSortKey` | queues | scene3d | `user/libs/graphics/scene3d/src/tests.rs:472` |
 | `StableTiebreak` | queues | scene3d | `user/libs/graphics/scene3d/src/tests.rs:491` |
 | `FixedQueueOrder` | queues | scene3d | `user/libs/graphics/scene3d/src/tests.rs:445` |
-| `TransparentDepthNoWrite` | queues | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1153` |
+| `TransparentDepthNoWrite` | queues | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1144` |
 | `LocalBoundingBox` | culling | scene3d | `user/libs/graphics/scene3d/src/tests.rs:320` |
 | `WorldBoundingSphere` | culling | scene3d | `user/libs/graphics/scene3d/src/tests.rs:320`, `user/libs/graphics/scene3d/src/tests.rs:333` |
 | `FrustumPlaneExtraction` | culling | scene3d | `user/libs/graphics/scene3d/src/tests.rs:394` |
@@ -41,12 +41,12 @@ rather than counted, because a test measuring an extension must not report Profi
 | `PerInstanceCulling` | instancing | scene3d | `user/libs/graphics/scene3d/src/tests.rs:527` |
 | `InstanceCompaction` | instancing | scene3d | `user/libs/graphics/scene3d/src/tests.rs:527` |
 | `SingleSortPerInstanceSet` | instancing | scene3d | `user/libs/graphics/scene3d/src/tests.rs:527` |
-| `TransparentInstancingApproximate` | instancing | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1220` |
+| `TransparentInstancingApproximate` | instancing | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1211` |
 | `MaterialUnlit` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:691` |
 | `MaterialVertexColor` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:691` |
 | `MaterialLambert` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:691` |
 | `MaterialBlinnPhong` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:691` |
-| `LinearColourSpace` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1241` |
+| `LinearColourSpace` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1232` |
 | `NormalRenormalisation` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:796` |
 | `TwoSidedNormalFlip` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:796` |
 | `AlphaThresholdDiscard` | materials | scene3d | `user/libs/graphics/scene3d/src/tests.rs:773` |
@@ -75,7 +75,7 @@ rather than counted, because a test measuring an extension must not report Profi
 | `RenderPassGraph` | passes | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1011` |
 | `DerivedPassOrder` | passes | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1011` |
 | `PassCycleRefusal` | passes | scene3d | `user/libs/graphics/scene3d/src/tests.rs:1034` |
-| `OffscreenTarget` | passes | backend | `user/libs/graphics/scene3d/src/tests.rs:1105` |
+| `OffscreenTarget` | passes | backend | `user/libs/graphics/scene3d/src/tests.rs:1096` |
 | `SceneLimits` | limits | scene3d | `user/libs/graphics/scene3d/src/tests.rs:231` |
 | `LimitRefusal` | limits | scene3d | `user/libs/graphics/scene3d/src/tests.rs:231` |
 

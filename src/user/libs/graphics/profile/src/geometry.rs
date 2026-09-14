@@ -66,3 +66,44 @@ pub const BOOLEAN_RULES: &[BooleanRule] = &[
 /// vertices are one. Using the tolerance for both merges vertices a quarter of a pixel apart, which
 /// collapses thin features that were meant to be there.
 pub const COINCIDENCE_EPSILON_PIXELS: f64 = 1.0 / 256.0;
+
+/// THE CONTROL-POINT RATIO THAT MAKES FOUR CUBICS A CIRCLE, frozen because it is a CHOICE.
+///
+/// A quarter circle has no exact cubic form, so every implementation approximates it - and the two
+/// common answers differ. `4/3 * (sqrt(2) - 1)` is the one that passes through the quadrant's
+/// midpoint exactly; a ratio fitted to minimise the maximum radial error instead is about 0.5519,
+/// which is a slightly better curve and a DIFFERENT one. Two backends that picked differently would
+/// disagree about every rounded corner in a UI by a fraction of a pixel, which is exactly the size of
+/// a difference that shows as a seam where a rounded panel meets a square one.
+pub const QUADRANT_CONTROL_RATIO: f64 = 0.552_284_749_830_793_4;
+
+/// One question the shape constructors ask, and the answer this profile gives.
+///
+/// SAME SHAPE AS `BooleanRule` AND A SEPARATE LIST, because these are answered by the geometry that
+/// BUILDS a path and those by the geometry that COMBINES two. A reader looking for what a circle's
+/// first point is should not have to read the winding rules of a union.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShapeRule {
+	pub question: &'static str,
+	pub answer: &'static str,
+}
+
+/// What the shape constructors mean, so that a rounded rectangle is ONE shape across backends.
+///
+/// WHY THESE ARE HERE AT ALL, given that a shape is built into a path once and the path is what a
+/// backend sees. Because a fill rule, a dash phase, a stroke's first cap and a hit test all depend on
+/// WHERE a shape starts and WHICH WAY it goes: a dashed circle whose first point differs by a
+/// quadrant has its dashes in different places, and two nested shapes wound the same way are a solid
+/// under the non-zero rule where two wound oppositely are a ring.
+pub const SHAPE_RULES: &[ShapeRule] = &[
+	ShapeRule { question: "which way a closed shape is wound", answer: "in the direction of INCREASING angle in the device's y-down space, which is clockwise on screen - the same direction `add_rect` goes, so a shape and a rectangle nest predictably under the non-zero rule. A hole is the same shape with its points in the opposite order" },
+	ShapeRule { question: "where a circle, an ellipse and a rounded rectangle START", answer: "a circle and an ellipse at the +x extreme, `(centre.x + radius_x, centre.y)`; a rounded rectangle at the end of its top-left corner, `(left + radius_x, top)`, which is where the top edge begins. A dash pattern and a stroke's caps are placed from there" },
+	ShapeRule { question: "how many segments a circle or an ellipse is", answer: "FOUR cubics, one per quadrant, with control points at `QUADRANT_CONTROL_RATIO` of the radius along the tangent. An eight-segment approximation is closer to a circle and is not this one" },
+	ShapeRule { question: "how an arc's angles are measured", answer: "in RADIANS from the +x axis, increasing toward +y - clockwise on screen, because y is down. A sweep is signed: positive sweeps clockwise on screen and negative anticlockwise, and the arc is split into equal segments of at most a quarter turn each" },
+	ShapeRule { question: "what an arc does about the current point", answer: "it LINES to its first point when a subpath is open and MOVES to it otherwise, which is what makes an arc usable as one segment of a larger outline rather than only as a shape of its own" },
+	ShapeRule { question: "a sweep beyond a full turn", answer: "clamped to a full turn in the direction asked for. A sweep of ten radians draws a circle and not two and a half of them, because the second lap is invisible for a fill and doubles the winding number for the non-zero rule" },
+	ShapeRule { question: "a rounded rectangle whose corner radii do not fit", answer: "ALL FOUR corners are scaled by ONE factor, the smallest ratio any side demands, so the shape stays similar to the one asked for. Clamping each corner independently makes a rectangle whose corners have different curvatures - a shape nobody asked for, arrived at silently" },
+	ShapeRule { question: "a radius of zero and a radius below zero", answer: "zero is a SQUARE corner and is drawn as one, so a rounded rectangle with no radius is exactly the rectangle. A negative or non-finite radius is REFUSED rather than clamped: it is a computed value that went wrong, and drawing something for it hides the mistake" },
+	ShapeRule { question: "what a line, a polyline and a polygon are", answer: "a line and a polyline are OPEN subpaths and a polygon is CLOSED - which is the whole difference between them, and the reason a polygon is a separate constructor rather than a polyline the caller remembered to close. A polyline needs two points and a polygon three; fewer is refused, because a polygon with two points is a caller's loop that produced nothing" },
+	ShapeRule { question: "whether a shape joins what was drawn before it", answer: "NEVER. Every shape constructor starts its own subpath, so appending a circle after an open outline does not draw a line from the outline's last point to the circle's first" },
+];

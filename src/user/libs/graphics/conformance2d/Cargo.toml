@@ -1,0 +1,21 @@
+[package]
+name = "render2d-conformance"
+edition = "2024"
+description = "The Render2D Core Profile 1 conformance suite: one scene per profile feature, with a stated pass condition per scene"
+
+[dependencies]
+# The profile itself, which is what the suite walks: a feature added there with no scene here is a
+# gate failure rather than a feature nobody tested.
+graphics-profile = { path = "../profile" }
+graphics-core = { path = "../core" }
+render2d = { path = "../render2d" }
+# THE BACKEND UNDER TEST. One today; the suite is written against the `Backend` trait so a second one
+# is a different constructor and the same scenes.
+soft2d = { path = "../soft2d" }
+font-contract = { path = "../../text/font-contract" }
+# The scenes that state a transcendental expectation - a coverage gamma, an angle round a conic
+# gradient - compute it rather than tabulating it, and `no_std` has neither a power nor an arctangent.
+libm = "0.2"
+
+[lints.rust]
+warnings = "deny"

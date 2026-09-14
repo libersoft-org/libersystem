@@ -129,10 +129,15 @@ impl Path {
 					for axis in 0..2 {
 						let (p0, p1, p2, p3) = (axis_of(current, axis), axis_of(points[0], axis), axis_of(points[1], axis), axis_of(points[2], axis));
 						// The cubic's derivative is a quadratic; its roots are the extrema.
+						// `B'(t) / 3` is `a*t^2 + b*t + c` with these three, and the roots of a quadratic
+						// do not change when every coefficient is scaled - so the factor of three is
+						// dropped rather than applied to some of them, which is how this had the
+						// middle coefficient doubled and put the extremum of a symmetric curve at
+						// three quarters of the way along it instead of at the half.
 						let a = -p0 + 3.0 * p1 - 3.0 * p2 + p3;
 						let b = 2.0 * (p0 - 2.0 * p1 + p2);
 						let c = p1 - p0;
-						for t in quadratic_roots(3.0 * a, 2.0 * b / 2.0 * 2.0, 3.0 * c) {
+						for t in quadratic_roots(a, b, c) {
 							if t > 0.0 && t < 1.0 {
 								extremes.push(cubic_at(current, points[0], points[1], points[2], t));
 							}
@@ -347,9 +352,18 @@ impl PathBuilder {
 		self.push(Verb::CubicTo, &[first, second, point])
 	}
 
+	/// Close the subpath, and END it.
+	///
+	/// A DRAWING CALL AFTER A `close` NEEDS ITS OWN `move_to`, because "where a line after a close
+	/// starts" has two plausible answers - the closed subpath's first point, or its last - and a
+	/// library that picks one silently draws a segment the caller did not mean in the other. It is
+	/// also what makes "a subpath is open" answerable, which is what an arc consults to decide
+	/// between lining to its first point and moving to it.
 	pub fn close(&mut self) -> Result<&mut Self, Error> {
 		self.require_open()?;
-		self.push(Verb::Close, &[])
+		self.push(Verb::Close, &[])?;
+		self.open = false;
+		Ok(self)
 	}
 
 	/// A rectangle, as the four lines it is - so that everything downstream has ONE kind of shape to
@@ -364,6 +378,12 @@ impl PathBuilder {
 
 	pub fn finish(self) -> Path {
 		self.path
+	}
+
+	/// Whether a subpath is being built, which is what decides whether an arc lines to its first
+	/// point or moves to it.
+	pub fn is_open(&self) -> bool {
+		self.open
 	}
 
 	/// A DRAWING CALL BEFORE A `move_to` IS A CALLER'S MISTAKE AND NOT AN IMPLICIT ORIGIN. Starting a

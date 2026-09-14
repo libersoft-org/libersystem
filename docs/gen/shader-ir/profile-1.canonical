@@ -61,3 +61,5 @@ accuracy=exp, exp2 max-ulp=4 domain=the whole representable range
 accuracy=log, log2 max-ulp=4 domain=the whole positive range
 accuracy=pow max-ulp=16 domain=positive base; a negative base with a non-integer exponent is a NaN
 accuracy=reciprocal max-ulp=2 domain=the whole range; on a StrictF32 path a reciprocal is a DIVISION and is correctly rounded
+accuracy=length max-ulp=0 domain=`sqrt(dot(v, v))`, with the dot product accumulated in COMPONENT ORDER and with separate multiply and add - the no-FMA rule applies to it as to every other strict expression. `sqrt` is correctly rounded, so the whole composition is
+accuracy=normalize max-ulp=0 domain=`v / length(v)`, a DIVISION and not a multiply by `inversesqrt`: the reciprocal square root carries two ULP and would make every normalised position backend-dependent, which is the one thing a strict path may not be. A vector whose length is zero or non-finite normalises to ITSELF rather than to a NaN, because one NaN in a lighting term makes a whole surface black

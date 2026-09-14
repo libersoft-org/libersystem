@@ -23,6 +23,14 @@ use graphics_core::pixel::Rgba;
 ///
 /// FOUR, because four `f32` lanes is the width every architecture this system targets has - SSE2 on
 /// x86_64, NEON on aarch64 and the smallest useful vector length on riscv64.
+///
+/// AND EIGHT WAS TRIED AND MEASURED AND IS NOT HERE (2026-09-14). The performance item names "a span
+/// composite over more than four scalar lanes" as one of two remaining optimisations; widening this
+/// constant to eight moved three of the four benchmark scenes by less than half a percent and made
+/// `vector-stress` about three percent SLOWER, twice, on the reference host. The reason is in the
+/// measurements beside it: the time in these scenes is the tile decode and encode, not the span
+/// arithmetic, so a wider span loop has nothing to win and pays for the longer tail. Recorded here
+/// rather than left as an idea somebody tries again.
 pub const LANES: usize = 4;
 
 /// Composite a run of source pixels onto a run of destination pixels.

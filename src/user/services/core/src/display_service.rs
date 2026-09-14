@@ -1600,8 +1600,15 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 	}
 }
 
-fn serve_display(root: u64, admin: u64, mut stats_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
+fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
+	// THE OBSERVATION ROOT IS A FACTORY LIKE EVERY OTHER ROOT IN THIS SYSTEM, and it was not: it
+	// answered `resources()` and NOTHING else, so a supervisor minting an independent connection
+	// from it - which is what `service_connect` does, and what the whole broker pattern is - sent
+	// the reserved connect opcode, got no reply at all, and blocked FOREVER inside its own
+	// bootstrap. The boot chain stopped there: SystemGraphService never received its serve root and
+	// the shell after it was never started, on a system whose display was working perfectly.
+	let mut stats: Vec<u64> = if stats_root != 0 { alloc::vec![stats_root] } else { Vec::new() };
 	let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 	let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 	loop {
@@ -1630,9 +1637,10 @@ fn serve_display(root: u64, admin: u64, mut stats_root: u64, catalogue: u64, mut
 		waits.push(admin);
 		// THE OBSERVATION ROOT, WHICH IS WAITED ON LIKE ANY OTHER and answers like no other: nothing
 		// reachable from it changes a thing.
-		let stats_present: bool = stats_root != 0;
-		if stats_present {
-			waits.push(stats_root);
+		// EVERY OBSERVATION CHANNEL IS WAITED ON: the root, and each connection minted from it.
+		let stats_count: usize = stats.len();
+		for &observation in &stats {
+			waits.push(observation);
 		}
 		waits.extend(clients.iter().map(|client| client.chan));
 		// EVERY SURFACE IS ITS OWN CHANNEL AND ITS OWN WAIT. A surface whose channel was not waited
@@ -1835,31 +1843,54 @@ fn serve_display(root: u64, admin: u64, mut stats_root: u64, catalogue: u64, mut
 			}
 			continue;
 		}
-		if stats_present && ready as usize == admin_index + 1 {
-			match recv_blocking(stats_root, &mut request) {
+		if stats_count > 0 && ready as usize > admin_index && ready as usize <= admin_index + stats_count {
+			let which: usize = ready as usize - admin_index - 1;
+			let observation: u64 = stats[which];
+			match recv_blocking(observation, &mut request) {
 				Received::Message { len, handle } => {
 					if handle != 0 {
 						close(handle);
 					}
-					// THE NUMBER THE LOOP ITSELF WAITS ON, passed in rather than recomputed: a
-					// second answer to the same question is how an observability field comes to
-					// disagree with the thing it observes.
-					let mut reply_handle = proto::codec::Handles::new();
-					let mut request_handle = proto::codec::Handles::new();
-					let mut call = StatsCall { state: &state, waiters: waits.len() as u64 };
-					if let Some(n) = display_stats::dispatch(&mut call, &request[..len], &mut request_handle, &mut reply, &mut reply_handle) {
-						send_blocking(stats_root, &reply[..n], 0);
+					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+					if op == HEARTBEAT_OP {
+						send_blocking(observation, b"PONG", 0);
+					} else if op == CONNECT_OP {
+						// AN INDEPENDENT CONNECTION, because two observers sharing one channel take
+						// each other's replies - the same reason every other root in this system
+						// mints rather than shares.
+						match channel() {
+							Some((mine, theirs)) => {
+								stats.push(mine);
+								send_blocking(observation, &[], theirs);
+							}
+							None => {
+								send_blocking(observation, &[], 0);
+							}
+						}
+					} else {
+						// THE NUMBER THE LOOP ITSELF WAITS ON, passed in rather than recomputed: a
+						// second answer to the same question is how an observability field comes to
+						// disagree with the thing it observes.
+						let mut reply_handle = proto::codec::Handles::new();
+						let mut request_handle = proto::codec::Handles::new();
+						let mut call = StatsCall { state: &state, waiters: waits.len() as u64 };
+						if let Some(n) = display_stats::dispatch(&mut call, &request[..len], &mut request_handle, &mut reply, &mut reply_handle) {
+							send_blocking(observation, &reply[..n], 0);
+						}
 					}
 				}
-				// THE OBSERVER WENT AWAY, which changes nothing about serving a display.
+				// AN OBSERVER WENT AWAY, which changes nothing about serving a display. The ROOT
+				// going away is the same: what is left is the connections already minted from it.
 				Received::Closed => {
-					close(stats_root);
-					stats_root = 0;
+					close(observation);
+					stats.remove(which);
 				}
 			}
 			continue;
 		}
-		let client_index: usize = ready as usize - admin_index - 1 - stats_present as usize;
+		// PAST THE ADMIN ROOT AND PAST EVERY OBSERVATION CHANNEL: the admin root is one slot and the
+		// observation channels are `stats_count` of them, so a client's own index starts after both.
+		let client_index: usize = ready as usize - admin_index - 1 - stats_count;
 		// PAST THE CONNECTIONS IS A SURFACE, and a surface channel is dispatched to the surface
 		// interface rather than to the connection's. Past the surfaces is a WATCHED CLIENT PROCESS.
 		if client_index >= connections + surfaces_watched {

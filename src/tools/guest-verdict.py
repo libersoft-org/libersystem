@@ -121,6 +121,19 @@ CASES = {
         (r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: boot DMA mode enforcing-required \(harness provenance", r"dma: every bus-mastering device is translated", r"driver\.virtio-net: online \(", r"network: configured via DHCP", r"driver\.virtio-blk: online \(", r"storage: vol://system mounted through its block provider"),
         HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"dma: ADMITTED UNTRANSLATED", r"REFUSED - the entry declares iommu-required", r"did not confirm its reset", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=240, health=True,
     ),
+    # THE DISPLAY ENDPOINT UNDER TRANSLATION, which is what `virtio-gpu maintenance` asks for and
+    # what the ordinary rows cannot show: they boot the reduced machine, which has no GPU at all. The
+    # display phase boots that same reduced machine plus exactly one endpoint, so the boot window the
+    # reduction exists to protect is spent on the device the claim is about.
+    #
+    # AND "A FRAME REACHED THE DISPLAY" IS THE ORACLE, not "the driver reported online". The driver
+    # reports online before any frame exists - it has a device, not a picture - and a boot where every
+    # present failed behind the controller looks exactly like one where they all landed unless
+    # somebody says which.
+    "iommu-port-display": Case(
+        (r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: every bus-mastering device is translated", r"driver\.virtio-gpu: online \(", r"ConsoleService: a frame reached the display"),
+        HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"dma: ADMITTED UNTRANSLATED", r"REFUSED - the entry declares iommu-required", r"did not confirm its reset", r"present but NOT enforcing", r"iommu: FAULT", r"DeviceManager: restarting virtio-gpu", r"ConsoleService: a frame did NOT reach the display"), timeout=1500, observe=300, health=True,
+    ),
     "iommu-port-transition": Case(
         (r"iommu: the controller at [0-9a-f:.]* masters the bus", r"iommu: quiesced [a-z]* at [0-9a-f:.]* - ", r"iommu: virtio-iommu is translating - bypass is off and read back as off", r"dma: every bus-mastering device is translated"),
         HEALTH_FAILURES + (r"dma: DEGRADED ISOLATION", r"did not confirm its reset", r"did not confirm CC.EN", r"present but NOT enforcing", r"iommu: FAULT"), timeout=1500, observe=120, health=True,

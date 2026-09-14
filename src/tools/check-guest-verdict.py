@@ -512,7 +512,22 @@ class PerfImageIsolation(unittest.TestCase):
             kernel.parent.mkdir(parents=True)
             kernel.write_text("kernel fixture")
             (root / "product.conf").write_text((ROOT / "product.conf").read_text())
+            # AND WHAT THE IMAGE BUILDER SNAPSHOTS. `mkimage.sh` copies the services manifest into
+            # the run's own snapshot of its inputs, so a sandbox without it cannot assemble an image
+            # at all - and the failure surfaces as "the guest produced no verdict", which reads as
+            # the gate's subject rather than as a missing file.
+            manifest = root / "src/user/services/manifest.toml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text((ROOT / "src/user/services/manifest.toml").read_text())
+            stager = tools / "stage-kernel.sh"
+            stager.write_text((HERE / "stage-kernel.sh").read_text())
+            stager.chmod(0o755)
             (tools / "volume-pairing.sh").write_text((HERE / "volume-pairing.sh").read_text())
+            # THE FIXTURE COPIES WHAT THE SCRIPT SOURCES, and `check-perf-anchor.sh` grew an
+            # `evidence.sh` of its own. A sandbox missing one of a script's sources does not test the
+            # script, it tests the sandbox - and the failure reads as the gate's subject rather than
+            # as the copy list, which is how this one stayed red.
+            (tools / "evidence.sh").write_text((HERE / "evidence.sh").read_text())
             watcher_script = tools / "guest-verdict.py"
             watcher_script.write_text((HERE / "guest-verdict.py").read_text())
             watcher_script.chmod(0o755)
@@ -531,9 +546,13 @@ class PerfImageIsolation(unittest.TestCase):
             # and receipt publication. Stub only expensive payload validation/production.
             maker = (ROOT / "src/harness/mkimage.sh").read_text()
             if ignore_private_output:
-                selected = 'output="${LIBER_IMAGE_OUTPUT:-$BUILD/$SLUG.iso}"'
+                # THE LINE IS MATCHED AS THE PRODUCER WRITES IT TODAY, and the producer grew a
+                # DMA-mode suffix. A negative control that patches a line the file no longer contains
+                # is a control that proves nothing, so the count is asserted rather than assumed -
+                # which is what caught this.
+                selected = 'output="${LIBER_IMAGE_OUTPUT:-$BUILD/$SLUG$DMA_SUFFIX.iso}"'
                 self.assertEqual(maker.count(selected), 1)
-                maker = maker.replace(selected, 'output="$BUILD/$SLUG.iso"')
+                maker = maker.replace(selected, 'output="$BUILD/$SLUG$DMA_SUFFIX.iso"')
             def replace_function(name, body):
                 nonlocal maker
                 pattern = r"(^" + name + r"\(\) \{\n).*?(^\}\n)"
@@ -548,6 +567,11 @@ class PerfImageIsolation(unittest.TestCase):
             maker_script.chmod(0o755)
             for name in ("system-volume-bootable-x86_64.img", "system-volume-bootable-x86_64.uuid"):
                 (boot / name).write_text("fixture")
+            # AND THE MODE THE VOLUME WAS SIGNED FOR, which `mkimage.sh` now requires to MATCH the
+            # one the medium is being signed for - a volume and a medium that disagree about DMA
+            # isolation is exactly what that check exists to refuse, and a fixture without the
+            # sidecar cannot get past it to reach the subject of this gate.
+            (boot / "system-volume-bootable-x86_64.dma-mode").write_text("enforcing-required")
             shipping = [boot / ("libersystem.iso" + suffix) for suffix in ("", ".build-key", ".build-digest")]
             for path in shipping:
                 path.write_text("shipping input: " + path.name)
@@ -599,6 +623,12 @@ class KernelBuildOnly(unittest.TestCase):
             harness.mkdir(parents=True)
             (root / "src/kernel").mkdir()
             (root / "bin").mkdir()
+            # WHAT THE SCRIPT SOURCES, which `test-kernel.sh` grew: the evidence machinery. Without
+            # it the script dies at the `source` line - before the cleanup trap is installed, which
+            # is how this fixture came to report a leaked staged kernel rather than a missing file.
+            tools = root / "src/tools"
+            tools.mkdir(parents=True)
+            (tools / "evidence.sh").write_text((HERE / "evidence.sh").read_text())
             source = (ROOT / "src/harness/test-kernel.sh").read_text()
             if remove_return:
                 start = source.index('if [[ "$BUILD_ONLY" == "1" ]]; then\n\tif [[ -n "${LIBER_TIMING_LOG:-}"')

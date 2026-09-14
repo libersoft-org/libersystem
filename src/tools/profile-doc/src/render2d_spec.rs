@@ -9,8 +9,9 @@
 use std::fmt::Write as _;
 
 use graphics_profile::compositing::{BLENDS, COMPOSITING_EQUATION, NON_SEPARABLE_BLENDS, OPERATORS, lcd, model};
+use graphics_profile::contracts::filter::NODES as FILTER_NODES;
 use graphics_profile::contracts::{CONTENT_REFRESH, ON_MISMATCH, PREPARED_DEPENDENCIES, builder, filter};
-use graphics_profile::geometry::{AT_MAX_DEPTH, BOOLEAN_RULES, COINCIDENCE_EPSILON_PIXELS, FLATTENING_TOLERANCE_PIXELS, HORIZON_RULE, MAX_SUBDIVISION_DEPTH, PROJECTIVE_W_EPSILON};
+use graphics_profile::geometry::{AT_MAX_DEPTH, BOOLEAN_RULES, COINCIDENCE_EPSILON_PIXELS, FLATTENING_TOLERANCE_PIXELS, HORIZON_RULE, MAX_SUBDIVISION_DEPTH, PROJECTIVE_W_EPSILON, QUADRANT_CONTROL_RATIO, SHAPE_RULES};
 use graphics_profile::{RENDER2D_CORE_PROFILE_1, RENDER2D_PROFILE_1_MIN_LIMITS};
 
 /// The canonical machine-readable form the hash is taken over.
@@ -37,12 +38,19 @@ pub fn canonical() -> String {
 	for rule in BOOLEAN_RULES {
 		let _ = writeln!(out, "boolean={} answer={}", rule.question, rule.answer);
 	}
+	let _ = writeln!(out, "quadrant-control-ratio={QUADRANT_CONTROL_RATIO}");
+	for rule in SHAPE_RULES {
+		let _ = writeln!(out, "shape={} answer={}", rule.question, rule.answer);
+	}
 	for dependency in PREPARED_DEPENDENCIES {
 		let _ = writeln!(out, "prepared-dependency={} why={}", dependency.name, dependency.why);
 	}
 	let _ = writeln!(out, "prepared on-mismatch={ON_MISMATCH} content-refresh={CONTENT_REFRESH}");
 	let _ = writeln!(out, "builder within={} beyond={} snapshots={} scratch={}", builder::WITHIN_RESERVATION, builder::BEYOND_RESERVATION, builder::SNAPSHOTS, builder::SCRATCH_REUSE);
 	let _ = writeln!(out, "filter shape={} bounds={} working={} edge={} scratch={}", filter::SHAPE, filter::BOUNDS_MAP, filter::WORKING_FORMAT, filter::EDGE_MODE, filter::SCRATCH);
+	for node in FILTER_NODES {
+		let _ = writeln!(out, "filter-node={} meaning={}", node.name, node.meaning);
+	}
 	let minima = RENDER2D_PROFILE_1_MIN_LIMITS;
 	let _ = writeln!(out, "minima commands={} resources={} path-verbs={} path-points={} subpaths={} clip-depth={} layer-depth={} filter-nodes={} filter-radius={} glyphs-per-run={} image-extent={} layer-pixels={} prepared-scratch={} cache={} display-list={}", minima.max_commands, minima.max_resources, minima.max_path_verbs, minima.max_path_points, minima.max_subpaths, minima.max_clip_depth, minima.max_layer_depth, minima.max_filter_nodes, minima.max_filter_radius, minima.max_glyphs_per_run, minima.max_image_extent, minima.max_layer_pixels, minima.max_prepared_scratch_bytes, minima.max_cache_bytes, minima.max_display_list_bytes);
 	let _ = writeln!(out, "features={}", RENDER2D_CORE_PROFILE_1.len());
@@ -146,6 +154,21 @@ pub fn document(hash: &str) -> String {
 		let _ = writeln!(out, "| {} | {} |", rule.question, rule.answer);
 	}
 
+	let _ = writeln!(out, "\n## Shapes: where they start and which way they go\n");
+	let _ = writeln!(out, "A shape is built into a path once and a backend never sees that it was a circle, which is why these");
+	let _ = writeln!(out, "look like they need not be frozen. They do: a fill rule, a dash phase, a stroke's first cap and a hit");
+	let _ = writeln!(out, "test all depend on WHERE a shape starts and WHICH WAY it goes. A dashed circle whose first point is a");
+	let _ = writeln!(out, "quadrant away has its dashes somewhere else, and two nested shapes wound the same way are a solid");
+	let _ = writeln!(out, "under the non-zero rule where two wound oppositely are a ring.\n");
+	let _ = writeln!(out, "| question | answer |");
+	let _ = writeln!(out, "| --- | --- |");
+	for rule in SHAPE_RULES {
+		let _ = writeln!(out, "| {} | {} |", rule.question, rule.answer);
+	}
+	let _ = writeln!(out, "\nThe quadrant control ratio is `{QUADRANT_CONTROL_RATIO}`: a quarter circle has no exact cubic form, so");
+	let _ = writeln!(out, "this is a CHOICE, and the other common answer - about 0.5519, fitted to minimise the maximum radial");
+	let _ = writeln!(out, "error - is a slightly better curve and a different one.\n");
+
 	let _ = writeln!(out, "\n## Filter graphs: the per-node contract\n");
 	let _ = writeln!(out, "| rule | value |");
 	let _ = writeln!(out, "| --- | --- |");
@@ -158,6 +181,16 @@ pub fn document(hash: &str) -> String {
 	] {
 		let _ = writeln!(out, "| {name} | {value} |");
 	}
+	let _ = writeln!(out, "\n### What each node MEANS\n");
+	let _ = writeln!(out, "\"Convolution\" and \"morphology\" are families of definitions, and a graph whose nodes are named but not");
+	let _ = writeln!(out, "defined is a graph two backends evaluate differently. Every node below computes in the working format,");
+	let _ = writeln!(out, "over premultiplied colour, and reads transparent black outside its input.\n");
+	let _ = writeln!(out, "| node | meaning |");
+	let _ = writeln!(out, "| --- | --- |");
+	for node in FILTER_NODES {
+		let _ = writeln!(out, "| `{}` | {} |", node.name, node.meaning);
+	}
+
 	let _ = writeln!(out, "\nWithout the bounds map the whole graph has to be computed over the whole surface, because nothing can");
 	let _ = writeln!(out, "say which part of the input a part of the output depends on - which is why a blur over a small dirty");
 	let _ = writeln!(out, "region costs a full-screen blur in implementations that skipped it.\n");

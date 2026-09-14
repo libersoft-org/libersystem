@@ -28,12 +28,13 @@ pub mod path;
 pub mod prepared;
 pub mod query;
 pub mod resource;
+pub mod shape;
 pub mod transform;
 
 pub use backend::{Backend, Prepared, TargetDescription};
 pub use blend::{Antialias, BlendMode, Operator};
 pub use canvas::Canvas;
-pub use filter::{FilterGraph, FilterNode};
+pub use filter::{Channel, FilterGraph, FilterNode};
 pub use list::{Command, DRAW_LIST_VERSION, DrawList, DrawListBuilder, ImageRecord, RecordedGlyphRun, ResourceTable};
 pub use paint::{Color, GradientStop, ImageQuality, Paint, SpreadMode};
 pub use path::{Cap, FillRule, Join, Path, PathBuilder, StrokeStyle, Verb};
@@ -67,6 +68,10 @@ pub enum Error {
 	FilterCycle,
 	/// A geometry that has no image: a control point at or beyond the projective horizon.
 	BeyondHorizon,
+	/// A shape whose numbers do not describe one: a negative or non-finite radius, a polyline of one
+	/// point, a polygon of two. NAMED rather than "invalid", because each of these is a different
+	/// caller mistake and the name is what says which.
+	DegenerateShape { what: &'static str },
 	/// A dash pattern with no positive length. A dasher walking it never advances, so it is refused
 	/// where it is recorded rather than detected in the loop that draws.
 	DegenerateDash,

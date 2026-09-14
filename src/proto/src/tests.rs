@@ -898,8 +898,10 @@ fn query_renders_cbor_with_options() {
 fn graph_round_trips() {
 	let g = Graph {
 		components: alloc::vec![
-			Component { name: String::from("log-service"), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() } },
-			Component { name: String::from("device-manager"), r#type: ComponentType::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") } },
+			Component { name: String::from("log-service"), r#type: ComponentType::Service, state: ComponentState::Running, deps: Vec::new(), counters: Counters { messages_sent: 7, messages_received: 3, handles: 5, memory_bytes: 8192, restarts: 0, watchdog_trips: 0, last_failure: String::new() }, resources: Vec::new() },
+			// AND ONE COMPONENT THAT REPORTS WHAT THE KERNEL CHARGES NOBODY FOR, because a round trip
+			// over a list that is always empty is a round trip over a length of zero.
+			Component { name: String::from("device-manager"), r#type: ComponentType::Service, state: ComponentState::Stopped, deps: alloc::vec![String::from("log-service")], counters: Counters { messages_sent: 1, messages_received: 1, handles: 2, memory_bytes: 4096, restarts: 1, watchdog_trips: 1, last_failure: String::from("hung") }, resources: alloc::vec![ResourceCount { name: String::from("surfaces"), live: 3, bound: 64 }] },
 		],
 		spans: alloc::vec![TraceSpan { name: String::from("device.list"), duration_ns: 1234 }],
 	};
@@ -911,9 +913,9 @@ fn graph_round_trips() {
 // enums, its deps as an array, and its counters as a nested map.
 #[test]
 fn component_renders_cbor_map() {
-	let c = Component { name: String::from("net"), r#type: ComponentType::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2, watchdog_trips: 0, last_failure: String::new() } };
+	let c = Component { name: String::from("net"), r#type: ComponentType::Driver, state: ComponentState::Failed, deps: alloc::vec![String::from("device-manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 1, memory_bytes: 0, restarts: 2, watchdog_trips: 0, last_failure: String::new() }, resources: Vec::new() };
 	let mut want = Vec::new();
-	want.push(0xa5); // map(5)
+	want.push(0xa6); // map(6)
 	want.push(0x64);
 	want.extend_from_slice(b"name");
 	want.push(0x63);
@@ -955,6 +957,12 @@ fn component_renders_cbor_map() {
 	want.push(0x6c);
 	want.extend_from_slice(b"last-failure");
 	want.push(0x60); // text(0)
+	// AND THE RESOURCE ROWS, which are empty here: a component that reports nothing the kernel
+	// charges nobody for still carries the field, because a key that appears only sometimes is a
+	// shape two readers disagree about.
+	want.push(0x69);
+	want.extend_from_slice(b"resources");
+	want.push(0x80); // array(0)
 	assert_eq!(c.to_cbor(), want);
 }
 

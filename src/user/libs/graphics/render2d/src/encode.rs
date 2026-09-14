@@ -259,7 +259,47 @@ fn encode_filter(node: &crate::filter::FilterNode, out: &mut Vec<u8>) {
 			out.extend_from_slice(&input.to_le_bytes());
 			out.extend_from_slice(&mask.to_le_bytes());
 		}
+		FilterNode::Convolution { input, weights, divisor, bias } => {
+			out.push(11);
+			out.extend_from_slice(&input.to_le_bytes());
+			for row in weights {
+				for value in row {
+					out.extend_from_slice(&value.to_bits().to_le_bytes());
+				}
+			}
+			out.extend_from_slice(&divisor.to_bits().to_le_bytes());
+			out.extend_from_slice(&bias.to_bits().to_le_bytes());
+		}
+		// DILATE AND ERODE ARE TWO TAGS AND NOT ONE WITH A FLAG: the encoding is what a cache is keyed
+		// by, and a flag inside a tag is a byte a reader can miss while still parsing the node.
+		FilterNode::MorphologyDilate { input, x, y } => encode_morphology(12, *input, *x, *y, out),
+		FilterNode::MorphologyErode { input, x, y } => encode_morphology(13, *input, *x, *y, out),
+		FilterNode::DisplacementMap { input, map, scale, x_channel, y_channel } => {
+			out.push(14);
+			out.extend_from_slice(&input.to_le_bytes());
+			out.extend_from_slice(&map.to_le_bytes());
+			out.extend_from_slice(&scale.to_bits().to_le_bytes());
+			out.push(*x_channel as u8);
+			out.push(*y_channel as u8);
+		}
+		FilterNode::Crop { input, rect } => {
+			out.push(15);
+			out.extend_from_slice(&input.to_le_bytes());
+			encode_rect(rect, out);
+		}
+		FilterNode::Tile { input, rect } => {
+			out.push(16);
+			out.extend_from_slice(&input.to_le_bytes());
+			encode_rect(rect, out);
+		}
 	}
+}
+
+fn encode_morphology(tag: u8, input: u16, x: f32, y: f32, out: &mut Vec<u8>) {
+	out.push(tag);
+	out.extend_from_slice(&input.to_le_bytes());
+	out.extend_from_slice(&x.to_bits().to_le_bytes());
+	out.extend_from_slice(&y.to_bits().to_le_bytes());
 }
 
 fn encode_transform(transform: &crate::transform::Transform, out: &mut Vec<u8>) {

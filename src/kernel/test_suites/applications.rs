@@ -1966,7 +1966,7 @@ fn a_launch_transaction_rolls_back_on_every_fault() {
 	assert_eq!(cases.len(), 15, "every scripted case was run and asserted");
 }
 
-tagged_test!(the_text_stack_draws_its_corpus_to_the_analytic_oracle, [Text, Service, Storage, Slow], id = "kernel.applications.the_text_stack_draws_its_corpus_to_the_analytic_oracle", covers = ["bin.textconf", "kernel", "services"]);
+tagged_test!(the_text_stack_draws_its_corpus_to_the_analytic_oracle, [Text, Service, Storage, Slow], id = "kernel.applications.the_text_stack_draws_its_corpus_to_the_analytic_oracle", covers = ["bin.textconf", "bin.font_catalogue", "kernel", "services"]);
 // THE THREE-ARCHITECTURE CLAIM, MADE WHERE IT CAN BE CHECKED. "The host tests pass on all three
 // architectures" has no executable meaning: a host test runs once, on the machine that built the
 // image. What the claim is about is the text stack running on the TARGET - the same shaping, the
@@ -2065,4 +2065,77 @@ fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
 	assert!(printed.iter().any(|line| line.starts_with("textconf: 50 px:")), "the aligned size was compared, and printed: {shown}");
 	assert!(printed.iter().any(|line| line.starts_with("textconf: 37 px:")), "the fractional size was compared, and printed: {shown}");
 	assert!(printed.iter().any(|line| line.starts_with("textconf: PASSED")), "the corpus rendered to the analytic oracle, and printed: {shown}");
+}
+
+tagged_test!(the_2d_profile_conforms_on_the_target, [Image, Process, Slow], id = "kernel.applications.the_2d_profile_conforms_on_the_target", covers = ["bin.test2d-conformance-sw", "render2d", "soft2d", "kernel"]);
+// `Render2D Core Profile 1`, WALKED ENTRY BY ENTRY WHERE THE ARITHMETIC ACTUALLY RUNS.
+//
+// THE HOST TESTS OF THE SAME SCENES ARE NOT THIS CLAIM. A host test runs on the machine that built
+// the image, once, with that machine's floating point; what "the profile is implemented on all three
+// architectures" is about is the same rasteriser running on the target. The suite is a library for
+// exactly this reason, and this runs the staged program that is a few lines around it.
+//
+// IT HOLDS NOTHING. No display, no input, no volume, no font catalogue: every scene draws into
+// memory it allocated itself and reads the pixels back, so a failure here is about the profile and
+// not about a service that happened to be running - which is also why this test is twenty lines
+// where the text one is a hundred.
+//
+// AND IT FAILS ON `Unsupported` AS WELL AS ON A WRONG PICTURE. The profile is a CLOSED list: a
+// backend that refuses a Profile 1 drawing is not a backend with a gap, it is a backend that does not
+// conform, and the program reports the two apart so a reader can tell "this is wrong" from "this is
+// missing".
+fn the_2d_profile_conforms_on_the_target() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let suite_elf = program_elf(&package, volume, b"test2d-conformance-sw").expect("test2d-conformance-sw in the package or volume");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (console, program_console) = Channel::create();
+	let _suite = spawn_dynamic_test_process(sched::root_domain(), suite_elf, boot_user);
+	send_cap(&boot_kernel, b"STDOUT", program_console, Rights::ALL).expect("the suite's console");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	boot_kernel.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new())).expect("the suite's launch context");
+
+	// EVERY LINE IT PRINTS, and a bound on the waiting. A run that never answers is a failure with
+	// something to show rather than a suite that stops.
+	let mut printed: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	let mut idle = 0usize;
+	while idle < 4_000 {
+		// THE SUITE HAS TO BE GIVEN THE PROCESSOR. Nothing else here is pumping a service, so a loop
+		// that only polled its end of the channel would spin at the same priority as the program it
+		// is waiting for and read an empty channel for ever.
+		sched::run_until_idle();
+		match console.recv() {
+			Ok(message) => {
+				idle = 0;
+				for line in message.bytes.split(|byte| *byte == b'\n') {
+					if line.is_empty() {
+						continue;
+					}
+					printed.push(alloc::string::String::from_utf8_lossy(line).into_owned());
+				}
+				if printed.iter().any(|line| line.contains("conforms") || line.contains("DOES NOT CONFORM")) {
+					break;
+				}
+			}
+			Err(_) => idle += 1,
+		}
+	}
+
+	// THE FAILURES, IN THE RUN'S OWN LOG, one line each and named by feature - which is the whole
+	// difference between this and a screenshot comparison: a reader sees WHICH entry of the profile
+	// is not implemented rather than that something changed.
+	for line in printed.iter().filter(|line| !line.starts_with("test2d-conformance: pass ")) {
+		crate::serial_println!("  {line}");
+	}
+	let shown: alloc::string::String = printed.iter().filter(|line| !line.starts_with("test2d-conformance: pass ")).cloned().collect::<alloc::vec::Vec<_>>().join(" | ");
+	let passes = printed.iter().filter(|line| line.starts_with("test2d-conformance: pass ")).count();
+	assert!(printed.iter().any(|line| line.starts_with("test2d-conformance: start")), "the suite started, and printed: {shown}");
+	assert!(passes > 100, "every feature of the profile has a scene and each one printed its own line: {passes} passed, {shown}");
+	// THE COUNT THE PROGRAM ITSELF KEEPS, including the features with no scene at all - without that
+	// last number a feature added to the profile is a feature nobody tests and the run still passes.
+	assert!(printed.iter().any(|line| line.contains("0 failed, 0 unsupported, 0 untested")), "nothing failed, nothing was refused and nothing is untested: {shown}");
+	assert!(printed.iter().any(|line| line == "test2d-conformance: conforms"), "the run conforms, and printed: {shown}");
 }

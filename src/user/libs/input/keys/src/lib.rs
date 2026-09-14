@@ -12,7 +12,9 @@ pub mod usage {
 	pub const PLUS: u16 = 0x2e;
 	pub const KEYPAD_PLUS: u16 = 0x57;
 	pub const Q: u16 = 0x14;
+	pub const R: u16 = 0x15;
 	pub const ESCAPE: u16 = 0x29;
+	pub const SPACE: u16 = 0x2c;
 	pub const RIGHT: u16 = 0x4f;
 	pub const LEFT: u16 = 0x50;
 	pub const DOWN: u16 = 0x51;

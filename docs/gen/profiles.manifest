@@ -2,9 +2,9 @@
 # The semantic input of a profile is its REGISTRY. The document is the normative explanation and
 # is bound to the profile here rather than hashed as text - see `graphics_profile::hashing`.
 profile=image-colour version=1 hash=1d26185113aee8df4c471f223a6119e550d03c01b5275734d2859eae05042fde canonical=docs/gen/image-color/profile-1.canonical document=docs/graphics/IMAGE_COLOR_PROFILE_1.md
-profile=render2d-spec version=1 hash=7444768605c70c2d19802035ed46da2e74a13a6e7d39b4a823bfe2e1cbc2aedd canonical=docs/gen/render2d-spec/profile-1.canonical document=docs/graphics/RENDER2D_PROFILE_1.md
+profile=render2d-spec version=1 hash=a202ee3e29cbde4611d955f4d2dbf1cae103a7bb74d5b43726593ed017bbc7fb canonical=docs/gen/render2d-spec/profile-1.canonical document=docs/graphics/RENDER2D_PROFILE_1.md
 profile=render3d-spec version=1 hash=f2e62bf7a6ee19110f654f02254d8428a9296b0d17b09eef1f269538823ee0c5 canonical=docs/gen/render3d-spec/profile-1.canonical document=docs/graphics/RENDER3D_PROFILE_1.md
-profile=shader-ir version=1 hash=8f54665321087dbda626b7ddf2cee9e91c6e2efc9cd9ab3ae9dc37e598213c0a canonical=docs/gen/shader-ir/profile-1.canonical document=docs/graphics/SHADER_IR_1.md
+profile=shader-ir version=1 hash=471922b42b96c523ef27a78a10149ecb06648a8b35b9527c0146d6c03c5ebdfc canonical=docs/gen/shader-ir/profile-1.canonical document=docs/graphics/SHADER_IR_1.md
 profile=scene3d-spec version=1 hash=26b625e7943bc9d3553e9a7286341474ffa776c8583c84212ff78c72f7436a6a canonical=docs/gen/scene3d-spec/profile-1.canonical document=docs/graphics/SCENE3D_PROFILE_1.md
 profile=scene3d-extended version=1 hash=198e9d1850a30c0ccef1ce7980c5a2ceebe9efcff217bd9606fd957fbd713a65 canonical=docs/gen/scene3d-extended/profile-1.canonical document=docs/graphics/SCENE3D_EXTENDED_1.md
 profile=wsi version=1 hash=e1c658c607f3837e413cf32165904ec5447c929172b05160bf8c70a23732d60d canonical=docs/gen/wsi/profile-1.canonical document=docs/graphics/WSI_PROFILE_1.md

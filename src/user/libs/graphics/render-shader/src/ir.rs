@@ -184,6 +184,42 @@ pub enum UnaryOp {
 	Convert(ScalarType),
 }
 
+impl UnaryOp {
+	/// The name the frozen accuracy table uses for this operation, or `None` for one IEEE 754
+	/// already determines exactly.
+	///
+	/// A NEGATION, AN ABSOLUTE VALUE, A FLOOR AND A CONVERSION NEED NO ENTRY because there is
+	/// nothing for a profile to freeze: the standard fixes the result bit for bit. `normalize` and
+	/// `length` are COMPOSITIONS - a sum of products and a root - and two backends that compose them
+	/// differently produce different positions, so each needs a stated definition or it is refused.
+	pub const fn accuracy_name(self) -> Option<&'static str> {
+		match self {
+			Self::Normalize => Some("normalize"),
+			Self::Length => Some("length"),
+			_ => None,
+		}
+	}
+
+	/// The ULP bound the profile freezes, READ FROM THE TABLE rather than restated.
+	pub fn max_ulp(self) -> Option<u32> {
+		let name = self.accuracy_name()?;
+		graphics_profile::shader_ir::TRANSCENDENTAL_ACCURACY.iter().find(|entry| entry.operation == name).map(|entry| entry.max_ulp)
+	}
+
+	/// Whether a POSITION may depend on this operation.
+	///
+	/// AN OPERATION WITH NO FROZEN DEFINITION IS REFUSED AND NOT WALKED THROUGH, which is the whole
+	/// difference between an operation the profile permits on a strict path and one nobody has
+	/// decided about. The day a composition is added to this enumeration without an accuracy entry,
+	/// a position that depends on it stops validating - which is the answer a profile should give.
+	pub fn strict(self) -> bool {
+		match self.accuracy_name() {
+			None => true,
+			Some(_) => self.max_ulp() == Some(0),
+		}
+	}
+}
+
 /// A binary operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BinaryOp {

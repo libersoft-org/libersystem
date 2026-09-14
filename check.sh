@@ -118,6 +118,12 @@ declare -A GATES=(
 	# phase on the test kernel, an ordinary phase on the built system - every phase its own gate and
 	# its own catalog key, the rows and `iommu-ports` umbrellas a person runs by name. Emulated, so
 	# minutes per phase.
+	# THE LIVE HALF OF THE 2D DEMO'S PROOF: three timed frames off a real screen, with pixel checks
+	# for the things a log cannot say - that the picture MOVES, that a shallow edge is antialiased,
+	# that a blend is a mix, that a filtered region is filtered and that the line of text carries a
+	# colour glyph in its own palette. It boots its own guest unless one is up, and takes down only
+	# what it started.
+	["qemu-2d-demo"]="tools/check-qemu-2d-demo.sh"
 	["iommu-ports"]="tools/check-qemu-iommu-ports.sh"
 	["iommu-aarch64-direct-gicv2"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2"
 	["iommu-aarch64-direct-gicv2-hostile"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2:hostile"
@@ -128,12 +134,14 @@ declare -A GATES=(
 	["iommu-aarch64-uefi-gicv2"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2"
 	["iommu-aarch64-uefi-gicv2-transition"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2:transition"
 	["iommu-aarch64-uefi-gicv2-ordinary"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2:ordinary"
+	["iommu-aarch64-uefi-gicv2-display"]="tools/check-qemu-iommu-ports.sh --only aarch64:uefi-gicv2:display"
 	["iommu-riscv64-direct-aia"]="tools/check-qemu-iommu-ports.sh --only riscv64:direct-aia"
 	["iommu-riscv64-direct-aia-hostile"]="tools/check-qemu-iommu-ports.sh --only riscv64:direct-aia:hostile"
 	["iommu-riscv64-direct-aia-ordinary"]="tools/check-qemu-iommu-ports.sh --only riscv64:direct-aia:ordinary"
 	["iommu-riscv64-uefi-aia"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia"
 	["iommu-riscv64-uefi-aia-transition"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia:transition"
 	["iommu-riscv64-uefi-aia-ordinary"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia:ordinary"
+	["iommu-riscv64-uefi-aia-display"]="tools/check-qemu-iommu-ports.sh --only riscv64:uefi-aia:display"
 	# TWO SUITES OF ONE ARCHITECTURE AT ONCE, each proving it ran its OWN selection. The per-run
 	# staging of the kernel, the medium and the loader was argued for in comments and reproduced by
 	# hand once; this is the standing proof, and it is the one gate here that deliberately overlaps

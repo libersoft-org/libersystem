@@ -386,6 +386,13 @@ STAGED_TEST_KERNEL_DIGEST="$(<"$STAGED_TEST_KERNEL.sha256")"
 export LIBER_STAGED_KERNEL_DIGEST="$STAGED_TEST_KERNEL_DIGEST"
 echo "[test-$ARCH] STAGED-KERNEL sha256=$STAGED_TEST_KERNEL_DIGEST $STAGED_TEST_KERNEL"
 
+# THE COPY IS THIS RUN'S FROM THE MOMENT IT EXISTS, so the removal is armed here and the publishing
+# is added to it below. The trap used to be installed twenty lines further down, after the evidence
+# machinery was sourced and its publisher defined - so anything that failed in between left this
+# run's staged kernel in `.build/state`, where the next run's inventory finds a kernel nobody is
+# running. Cleanup must not wait for the reporting.
+trap 'rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KERNEL.tmp.$$" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
+
 # THE SUITE'S EVIDENCE, published from the EXIT trap so every way out of this script - the verdict,
 # a timeout, a stalled guest, a guest that booted the wrong kernel - leaves an envelope behind when
 # a run is collecting them, and BEFORE the staged kernel is removed, so the envelope can name it by
@@ -410,7 +417,12 @@ publish_suite_evidence() {
 }
 # The staged copy is this run's, and it goes when the run does - read-only, so its own directory's
 # permissions are what allow the removal.
-trap 'publish_suite_evidence; rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KERNEL.tmp.$$" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
+# CLEANUP DOES NOT DEPEND ON PUBLISHING. `set -e` is in force inside a trap too, so a publish that
+# failed - a missing tool, an unwritable evidence directory, a fixture that supplies neither - aborted
+# the handler before the removal and LEAKED this run's staged kernel into `.build/state`, where the
+# next run's inventory sees a kernel nobody is running. The evidence is worth reporting and it is not
+# worth the cleanup.
+trap 'publish_suite_evidence || true; rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KERNEL.tmp.$$" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
 
 # Inventory discovery needs only the descriptor-bearing executable in Cargo's target directory.
 # Build-only never starts the watchdog or runner: a cold inventory needs no volume or medium.

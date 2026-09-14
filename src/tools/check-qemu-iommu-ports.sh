@@ -18,9 +18,17 @@
 #
 #   aarch64:direct-gicv2       hostile (test kernel), ordinary (run.sh)      4 cores, GICv2 + v2m
 #   aarch64:direct-gicv3-its   transition (test kernel), ordinary (run.sh)   4 cores, GICv3 + ITS
-#   aarch64:uefi-gicv2         transition (run.sh, AAVMF), ordinary (run.sh) 4 cores, GICv2 + v2m
+#   aarch64:uefi-gicv2         transition, ordinary, display (run.sh, AAVMF)  4 cores, GICv2 + v2m
 #   riscv64:direct-aia         hostile (test kernel), ordinary (run.sh)      4 cores, AIA/IMSIC
-#   riscv64:uefi-aia           transition (run.sh, U-Boot), ordinary (run.sh) 4 cores, AIA/IMSIC
+#   riscv64:uefi-aia           transition, ordinary, display (run.sh, U-Boot) 4 cores, AIA/IMSIC
+#
+# THE DISPLAY PHASE IS ON THE UEFI ROWS ONLY, and it boots the reduced machine PLUS ONE ENDPOINT. A
+# direct `-kernel` boot runs no loader, promotes no root and never starts DisplayService, so there is
+# nothing there to present a frame; and the full interactive machine is what does not finish
+# attach-and-map inside DeviceManager's boot window on an emulated port, which is why the ordinary
+# rows drop the display in the first place. One device back is the difference between a claim that
+# can be gated and a boot that times out - and every phase now reports its boot window, so that
+# difference is measured rather than assumed.
 #
 # EVERY PHASE KEEPS ITS CENSUS: the kernel's own list of the bus masters it admitted, with their
 # addresses and translation, taken from the phase's result log - so a bus master added to a machine
@@ -70,7 +78,12 @@ row_env() {
 row_phases() {
 	case "$1:$2" in
 	aarch64:direct-gicv2 | riscv64:direct-aia) printf 'hostile ordinary' ;;
-	aarch64:direct-gicv3-its | aarch64:uefi-gicv2 | riscv64:uefi-aia) printf 'transition ordinary' ;;
+	aarch64:direct-gicv3-its) printf 'transition ordinary' ;;
+	# THE DISPLAY PHASE IS ON THE UEFI ROWS AND NOWHERE ELSE, because a direct `-kernel` boot runs no
+	# loader, promotes no root, and never starts DisplayService at all - there is nothing there to
+	# present a frame, so asserting on one would be asserting about a machine the profile does not
+	# have.
+	aarch64:uefi-gicv2 | riscv64:uefi-aia) printf 'transition ordinary display' ;;
 	*) return 1 ;;
 	esac
 }
@@ -89,8 +102,10 @@ row_quiesced() {
 		esac
 		return
 	fi
-	# The reduced machines - the ordinary phases and the `DMA_FIXTURE` test-kernel phases. The
-	# riscv64 UEFI ESP is an NVMe namespace, and it is kept, because it is what the loader read.
+	# The reduced machines - the ordinary and display phases and the `DMA_FIXTURE` test-kernel ones.
+	# The display phase adds the GPU and nothing else, which quiesces as a virtio endpoint like the
+	# rest. The riscv64 UEFI ESP is an NVMe namespace, and it is kept, because it is what the loader
+	# read.
 	if [[ "$arch" == riscv64 && "$profile" == uefi-* ]]; then
 		printf 'virtio nvme'
 	else
@@ -169,7 +184,7 @@ phase_test_kernel() {
 
 # A RUN.SH PHASE: the built system on the row's machine, the verdict tool watching its console.
 phase_run() {
-	local arch="$1" profile="$2" phase="$3" case_name="$4" reduced="${5:-0}" row_environment
+	local arch="$1" profile="$2" phase="$3" case_name="$4" reduced="${5:-0}" display="${6:-0}" row_environment
 	row_environment="$(row_env "$arch" "$profile")"
 	local log="$work/$arch-$profile-$phase.log"
 	echo "iommu-ports: $arch:$profile:$phase - the built system through run.sh (${row_environment})"
@@ -181,11 +196,45 @@ phase_run() {
 	# reduced machine keeps every endpoint this phase's claim is about (the controller, the system
 	# volume, the NIC, and the ESP on a UEFI boot) and drops the fixture media, the USB controller
 	# and the interactive display, input and audio devices, which no assertion here reads.
+	# THE BOOT WINDOW IS MEASURED RATHER THAN ASSUMED, which is the whole risk the display phase
+	# carries: the reduction exists because an emulated port does not finish attach-and-map for a
+	# dozen endpoints in DeviceManager's window, and adding one back is a claim about how long that
+	# takes. So every phase reports its own wall time and the display phase's is the number that
+	# answers it.
+	local started finished
+	started="$(date +%s)"
 	# shellcheck disable=SC2086
-	env $row_environment DMA_ORDINARY="$reduced" SERIAL="file:$log" src/tools/guest-verdict.py "$case_name" "$log" -- ./run.sh --arch "$arch" --smp 4 || fail "$arch:$profile:$phase: the verdict tool refused the boot"
+	env $row_environment DMA_ORDINARY="$reduced" DMA_DISPLAY="$display" SERIAL="file:$log" src/tools/guest-verdict.py "$case_name" "$log" -- ./run.sh --arch "$arch" --smp 4 || fail "$arch:$profile:$phase: the verdict tool refused the boot"
+	finished="$(date +%s)"
+	echo "iommu-ports:     boot window: $((finished - started))s"
 	assert_transition "$log" "$arch" "$profile" "$phase"
 	census "$log" "$work/$arch-$profile-$phase.census"
 	RAN=$((RAN + 1))
+}
+
+# THE DISPLAY ENDPOINT UNDER TRANSLATION.
+#
+# `virtio-gpu maintenance` asks for this and the ordinary phases cannot give it: they boot the
+# reduced machine, whose own comment lists the display among what it drops. This boots that same
+# reduced machine plus EXACTLY ONE endpoint, so the boot window the reduction protects is spent on
+# the device the claim is about rather than on a dozen the claim is not.
+#
+# AND THE ORACLE IS A FRAME AND NOT A DRIVER STATE. The driver reports online before any frame
+# exists - it has a device, not a picture - and a boot where every present failed behind the
+# controller looks exactly like one where they all landed. ConsoleService says which, once.
+phase_display() {
+	local arch="$1" profile="$2"
+	local log="$work/$arch-$profile-display.log"
+	phase_run "$arch" "$profile" display iommu-port-display 1 1
+	grep -aq "driver\.virtio-gpu: online (" "$log" || fail "$arch:$profile:display: the display driver did not come online behind the controller"
+	local online
+	online="$(grep -ac "driver\.virtio-gpu: online (" "$log" || true)"
+	[[ "$online" == 1 ]] || fail "$arch:$profile:display: virtio-gpu reported itself online $online times - it is restarting, not running"
+	! grep -aq "DeviceManager: restarting virtio-gpu" "$log" || fail "$arch:$profile:display: virtio-gpu was restarted - it came up and did not stay up"
+	grep -aq "ConsoleService: a frame reached the display" "$log" || fail "$arch:$profile:display: no frame reached the display behind the controller"
+	! grep -aq "ConsoleService: a frame did NOT reach the display" "$log" || fail "$arch:$profile:display: a frame failed to reach the display behind the controller"
+	! grep -aq "dma: DEGRADED ISOLATION\|ADMITTED UNTRANSLATED" "$log" || fail "$arch:$profile:display: a bus master was admitted untranslated"
+	echo "iommu-ports:   $arch:$profile:display: the display endpoint attached and translated, the driver ran without restarting, and a frame reached the screen"
 }
 
 phase_ordinary() {
@@ -235,6 +284,7 @@ run_row() {
 			fi
 			;;
 		ordinary) phase_ordinary "$arch" "$profile" ;;
+		display) phase_display "$arch" "$profile" ;;
 		esac
 	done
 }

@@ -75,4 +75,32 @@ pub mod filter {
 	/// cannot fit says so before it starts drawing rather than failing halfway through a filter chain,
 	/// which leaves a half-drawn frame on the screen.
 	pub const SCRATCH: &str = "computed for the whole graph during preparation, and refused up front";
+
+	/// One node kind and what it MEANS, rather than what it is called.
+	pub struct Node {
+		pub name: &'static str,
+		pub meaning: &'static str,
+	}
+
+	/// WHAT EACH NODE DOES, frozen - because "convolution" and "morphology" are families of
+	/// definitions and a graph whose nodes are named but not defined is a graph two backends evaluate
+	/// differently. Every one of them computes in the working format above, over PREMULTIPLIED colour,
+	/// and reads transparent black outside its input.
+	pub const NODES: &[Node] = &[
+		Node { name: "Source", meaning: "the thing being filtered, which is where the layer's own drawing enters the graph" },
+		Node { name: "Backdrop", meaning: "what is already under the layer, read BEFORE the layer composites over it - which is what makes a frosted panel a blur of the scene rather than of itself" },
+		Node { name: "Image", meaning: "an image from the list's resource table, sampled bilinearly with its top-left at the output rectangle's origin" },
+		Node { name: "Blur", meaning: "a SEPARABLE GAUSSIAN with the given standard deviations, not three box passes: the bounds map grows the input by three standard deviations because that is where a Gaussian has fallen to nothing, and a box approximation with that bound has a visible edge where the profile says there is none" },
+		Node { name: "Offset", meaning: "a translation, sampled bilinearly from the source MINUS the offset" },
+		Node { name: "ColorMatrix", meaning: "five columns by four rows, applied to UNPREMULTIPLIED linear colour and premultiplied again after, with the fifth column an addend in the same units" },
+		Node { name: "Flood", meaning: "one colour over the whole output rectangle" },
+		Node { name: "Composite", meaning: "two inputs under a Porter-Duff operator, with the blend mode Normal" },
+		Node { name: "Blend", meaning: "two inputs under a blend mode, with the operator SourceOver" },
+		Node { name: "In", meaning: "the first input scaled by the second's ALPHA, which is what every clip-shaped effect is built on" },
+		Node { name: "Convolution", meaning: "a THREE BY THREE kernel over premultiplied colour, weights in row-major order with the centre weight at [1][1], divided by the stated divisor and offset by the stated bias. Three by three and not a general size: a larger kernel is either a blur, which has its own node and a separable implementation, or a graph of these - and a variable-size kernel makes a node an allocation and its cost per pixel unbounded" },
+		Node { name: "MorphologyDilate and MorphologyErode", meaning: "the per-channel MAXIMUM and MINIMUM over a RECTANGULAR structuring element of the given radii in device pixels, on premultiplied colour. Rectangular and not circular, because a rectangle is separable and a circle is not, and the difference at the radii a UI uses - thickening text, fattening an outline - is a corner" },
+		Node { name: "DisplacementMap", meaning: "each output pixel is sampled from the input at an offset of `scale * (channel - 0.5)` in each axis, with the channels named by the node and read from the map input's UNPREMULTIPLIED colour. The half is what makes a map of flat 0.5 grey the identity" },
+		Node { name: "Crop", meaning: "the input inside a rectangle and transparent black outside it, which is what bounds an effect that would otherwise reach across a whole surface" },
+		Node { name: "Tile", meaning: "the input's contents inside a rectangle, repeated over the whole output - the rectangle's pixels taken once and wrapped, so a pattern is one drawing and not a loop in the caller" },
+	];
 }

@@ -1517,3 +1517,152 @@ PRODUCER_READY is now used rather than merely minted: the loop signals it when t
 complete, and the service drains the endpoint from the present or the abandon that follows. A queue
 nothing read would fill after a few dozen frames, after which a client doing exactly what the
 contract asks starts failing to signal.
+
+## The 2D conformance suite, and the four things writing it found (2026-09-14)
+
+`user/libs/graphics/conformance2d` walks `Render2D Core Profile 1` entry by entry: 110 scenes, one
+per profile feature, plus two that are not features at all - wide-gamut composition and the
+quantisation at the end of a frame - because those are properties of the path every feature takes.
+`bin/test2d-conformance-sw.lsexe` is the few lines around it, and the guest gate
+`kernel.applications.the_2d_profile_conforms_on_the_target` runs it inside a booted system.
+
+WHAT MADE THE SCENES WRITABLE AT ALL is the LINEAR target. A stored byte is the value times 255, so
+a pass condition is arithmetic the profile states - "half multiplied by four fifths is two fifths" -
+rather than an expectation plus a second implementation of the sRGB encoding. The sRGB path is not
+untested by that choice: `ImageColorSpaceConversion` is its own scene and checks both directions.
+
+FOUR THINGS IT FOUND, and none of them would have shown up in a unit test of the code that has them:
+
+1. SEVEN PROFILE ENTRIES HAD NOTHING BEHIND THEM. `ShapeRoundedRect`, `ShapeCircle`, `ShapeEllipse`,
+   `ShapeArc`, `ShapeLine`, `ShapePolyline` and `ShapePolygon` were in the closed list and
+   `PathBuilder` had `add_rect` alone. They are now `render2d::shape` with their conventions frozen
+   in `graphics_profile::geometry::SHAPE_RULES` and generated into the spec: winding, start point,
+   the four-cubic approximation and its control ratio, the arc's angle convention and what it does
+   about the current point, the one-factor radius fit, and the refusal of a negative radius.
+2. SIX FILTER NODES HAD NOTHING BEHIND THEM EITHER: `FilterConvolution`, the two morphologies,
+   `FilterDisplacementMap`, `FilterCrop` and `FilterTile`. Each now has a node, a bounds map, a
+   ceiling, a canonical encoding and an evaluator, and each one's meaning is frozen in the profile's
+   per-node table rather than left to an implementation - "convolution" and "morphology" are
+   families of definitions.
+3. `Path::tight_bounds` PUT A CUBIC'S EXTREMUM IN THE WRONG PLACE. The derivative's middle
+   coefficient was scaled by two where the others were scaled by three, so the peak of a symmetric
+   curve came out at three quarters of the way along instead of the half - the bound on a curve
+   peaking at 75 read 66.7. A layer sized by it is allocated short and a damage rectangle computed
+   from it leaves a strip undrawn.
+4. A GLYPH RUN WAS NOT TRANSFORMED. `soft2d` put the form at the pen's USER-space coordinates, so
+   text in a scrolled, scaled or rotated drawing stayed where it was recorded while the drawing moved
+   around it. The pen is now mapped through the transform, and the subpixel phase is taken from the
+   DEVICE position - which is the drift subpixel positioning exists to remove, and which the
+   untransformed phase reintroduced for every fractional translation.
+
+AND ONE THING ABOUT THE GATE ITSELF. Its first version printed nothing at all: a loop that only
+polls its end of a channel spins at the same priority as the program it is waiting for. With nothing
+else to pump, the harness has to call `sched::run_until_idle()` so the suite gets the processor.
+
+TWO SCENE-DESIGN POINTS WORTH KEEPING:
+  * The operator scene uses a source alpha of SIX TENTHS. At a half, `as` and `1 - as` are the same
+    number and four pairs of operators become indistinguishable - which is how a suite passes a
+    backend with `Xor` and `DestinationAtop` swapped.
+  * Expectations that depend on a pixel's position are computed from the pixel CENTRE. A bilinear
+    ramp probed at x=12 is `(12.5 - 8) / 16` and not "a quarter", and the difference is larger than
+    any tolerance worth having.
+
+## The interactive 2D demo, and a boot-chain hang that is not its doing (2026-09-14)
+
+`bin/test2d-sw.lsexe` draws one scene through `render2d` into a real surface's images, paced by
+`graphics-app`'s frame loop, and reports what it did. The gate
+`kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage` drives it against a real
+DisplayService with a stand-in GPU and reads the DAMAGE at the device end.
+
+WHAT THE GATE ACTUALLY PROVES, and it is the damage: the multi-rect phase's two distant regions reach
+the driver as TWO rectangles rather than as one union covering the screen between them. That is the
+whole cost the damage model exists to avoid, and the only place it is observable is the device end of
+the path.
+
+FOUR THINGS THIS COST AN ITERATION EACH, all of them worth keeping:
+1. THE ARGUMENTS ARE IN THE LAUNCH CONTEXT, not in its bytes. A program that scans the encoded record
+   for its own flags finds none, runs with its defaults - and this demo's default is "run until
+   stopped", so the harness waited for a program that was never going to finish, with no output at
+   all because the hang was before its first print.
+2. A CAPABILITY IT WAITED FOR AND THE HARNESS DID NOT SEND. `recv_tagged` BLOCKS; the demo waited for
+   `INPUT_KEYS` in a harness with no input service, which is the same silent hang from the other end.
+3. THE SURFACE HAS TO ASK FOR THE SCREEN'S OWN SIZE. A surface with a logical size of its own is not
+   reconfigured when the output changes, so a demo that asked for 640x480 never saw the resize -
+   and the resize phase is the one this scene is built around.
+4. A SCENE LAID OUT IN FIXED PIXELS PUTS ITS OBJECTS PAST THE EDGE of a small surface, and a damage
+   rectangle that leaves the surface is a present the service REFUSES. The scene is now laid out from
+   the extent each frame arrives with.
+
+AND A HANG THAT IS NOT THIS WORK'S. `kernel.boot.init_package_starts_system_manager` - the full
+boot-chain test - hangs after ConsoleService's first frame, on x86_64, with a 15-minute suite budget
+and again with a 900-second one. It was ALREADY recorded as failed in the last verify run before this
+session (`.build/state/verify-tiers/run.7ZBjqB/outcomes.tsv`, 2026-09-13), and the changes in this
+session touch nothing in the boot chain: the graphics libraries, two new staged tools, a library, the
+verification model, two host checkers and the kernel test suites.
+THE REAL SYSTEM BOOTS. `./image.sh` plus `./run.sh --no-iommu` reaches "shell attached", with sixteen
+services reporting online and both DisplayService and ConsoleService presenting a frame - so what is
+stuck is the TEST's own collection, not the system it boots. What that test waits for and never gets
+is where a fix starts: `SystemGraphService: online` and `Shell: online` are the two reports of its
+twenty-three that do not appear on the serial log of a real boot either.
+
+## The boot chain was hanging, and the display service's observation root was why (2026-09-14)
+
+`./test.sh` on x86_64 timed out - the whole suite, not one test - with the serial log ending at
+"ConsoleService: a frame reached the display". After the two fixes below the FULL suite passes: 399
+tests in 234 seconds.
+
+1. `sched::run_until_idle()` NEVER RETURNS ONCE THE SYSTEM IS UP. It returns when the run queue
+   empties and the next deadline is beyond its own, and a booted system has ConsoleService in it
+   pacing frames - so the boot test's drain, taken right after `spawn_system_manager`, ran the guest
+   for ever and the report-collection loop under it was never entered even once. The bounded drain
+   `run_until_idle_until(ticks + n)` is the fix, the same one the frame-loop gate needed, and the
+   loop now prints how many reports it has every five hundred passes so a stall is a POSITION rather
+   than a silence.
+2. AND THEN THE REAL DEFECT CAME OUT FROM UNDER IT: two of the twenty-four services never reported.
+   `SystemGraphService` and, after it, the `Shell`. DisplayService's OBSERVATION root answered
+   `resources()` and nothing else - no `CONNECT_OP` - while ServiceManager's bootstrap for the graph
+   service mints an independent connection from it with `service_connect`, which sends the reserved
+   connect opcode and BLOCKS on the reply. There was no reply, so the supervisor stopped inside its
+   own bootstrap: no serve root for the graph service, no shell after it, on a system whose display
+   was working perfectly. The root is now a factory like every other root here - it mints a channel
+   per observer, because two observers sharing one take each other's replies - and the loop waits on
+   the root plus every connection minted from it.
+   THE INDEX ARITHMETIC IS THE PART TO READ TWICE. The wait list is positional: device stream, device
+   channel, providers, kill, admin, THEN the observation channels, then clients, then surfaces, then
+   watched processes. Turning one observation slot into `stats_count` of them moves every index after
+   it, and getting that wrong wedges the service in a way that looks exactly like the bug being
+   fixed - it did, for one run.
+
+WHAT THIS SAYS ABOUT THE PATTERN. Every root in this system is a factory; a root that answers only
+its own typed operations is a root nothing can mint from, and the failure is not a refusal - it is a
+caller blocked for ever, one process away from the thing that looks broken.
+
+## What a live screen found that no host test did (2026-09-15)
+
+`./check.sh --gate qemu-2d-demo` boots a guest, runs `test2d-sw` and reads three timed frames back as
+pixels. Writing it found three things in one afternoon, and the first two were in the DEMO while the
+third was in the backend every drawing in this system goes through.
+
+1. DAMAGE IS OWED TO THE QUEUE'S DEPTH AND NOT TO THE LAST FRAME. With two images, the image being
+   drawn into now is the one presented TWO frames ago, so a damage rectangle covering what moved
+   since the last frame leaves that image's older content on screen wherever the thing moved in
+   between. It looked like a trail of stale bands behind everything that moved.
+2. A PHASE CHANGE IS A CHANGE TO THE WHOLE PICTURE. Switching from an animating background to a still
+   one changes every pixel relative to what each image in the queue holds, so the first frames of the
+   new phase - one per image - have to be whole-surface presents. Without that, bands of an older
+   background stood where nothing had been damaged since.
+3. AND THE ONE THAT WAS NOT THE DEMO'S: A RECTANGULAR CLIP WAS NOT APPLIED AT ALL OUTSIDE ITS OWN
+   TILES. `fill_edges` skips the per-pixel clip test when the stack is all rectangles, on the stated
+   grounds that a rectangular clip "is already in the bounds" - and the bounds handed to it were the
+   TILE's, never intersected with the clip's. In every tile the clip's shape does not reach, the
+   level pushed is the empty rectangle that clips everything away, and it was skipped along with the
+   rest: the drawing came out in full. On screen it was the far end of a scrolling column standing
+   outside the rounded panel that was clipping it perfectly three tiles higher up. The fix is one
+   intersection at each of the three call sites - fills, glyph runs and aliased lines - and the host
+   test that pins it draws into a 256 by 256 target BECAUSE a single-tile target cannot tell the two
+   behaviours apart.
+
+WHAT THAT SAYS ABOUT THE HOST SUITE. Every one of the 112 conformance scenes passes on a 32-pixel
+target, and none of them could have caught a per-tile clip: the defect needs a drawing bigger than a
+tile, a clip in one part of it and a shape in another. A live screen is 1280 by 800 and every scene
+on it is that drawing.

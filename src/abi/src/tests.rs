@@ -158,6 +158,7 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// "fully seeded" with a constant, and nothing downstream of `SYS_RANDOM_GET` could tell.
 	(SYS_ENTROPY_ADD, 83),
 	(SYS_ENTROPY_HEALTH, 84),
+	(SYS_CHANNEL_SEND_CAPS_ATTENUATED, 85),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.

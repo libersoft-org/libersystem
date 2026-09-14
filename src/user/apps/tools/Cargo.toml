@@ -208,6 +208,14 @@ name = "frame_probe"
 path = "src/frame_probe.rs"
 
 [[bin]]
+name = "test2d-conformance-sw"
+path = "src/test2d_conformance.rs"
+
+[[bin]]
+name = "test2d-sw"
+path = "src/test2d_sw.rs"
+
+[[bin]]
 name = "graphics_probe"
 path = "src/graphics_probe.rs"
 
@@ -467,6 +475,9 @@ text-pipeline = { path = "../../libs/text/text-pipeline" }
 unicode-bidi = { path = "../../libs/text/unicode-bidi" }
 render2d = { path = "../../libs/graphics/render2d" }
 soft2d = { path = "../../libs/graphics/soft2d" }
+# The conformance suite itself, which is a library so that the same scenes run as host tests on the
+# build machine and inside a guest on each architecture.
+render2d-conformance = { path = "../../libs/graphics/conformance2d" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }

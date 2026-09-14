@@ -75,6 +75,13 @@ pub const TRANSCENDENTAL_ACCURACY: &[Accuracy] = &[
 	Accuracy { operation: "log, log2", max_ulp: 4, domain: "the whole positive range" },
 	Accuracy { operation: "pow", max_ulp: 16, domain: "positive base; a negative base with a non-integer exponent is a NaN" },
 	Accuracy { operation: "reciprocal", max_ulp: 2, domain: "the whole range; on a StrictF32 path a reciprocal is a DIVISION and is correctly rounded" },
+	// THE TWO COMPOSITIONS, FROZEN AS COMPOSITIONS rather than left as whatever a backend's library
+	// happens to do. Both are named in the profile's required operation set and both reach a vertex
+	// position in ordinary shaders, so "no strict definition, therefore refused" would refuse the
+	// shaders the profile exists to describe. What makes them strict is that the definition below
+	// uses only operations this table already fixes at zero ULP.
+	Accuracy { operation: "length", max_ulp: 0, domain: "`sqrt(dot(v, v))`, with the dot product accumulated in COMPONENT ORDER and with separate multiply and add - the no-FMA rule applies to it as to every other strict expression. `sqrt` is correctly rounded, so the whole composition is" },
+	Accuracy { operation: "normalize", max_ulp: 0, domain: "`v / length(v)`, a DIVISION and not a multiply by `inversesqrt`: the reciprocal square root carries two ULP and would make every normalised position backend-dependent, which is the one thing a strict path may not be. A vector whose length is zero or non-finite normalises to ITSELF rather than to a NaN, because one NaN in a lighting term makes a whole surface black" },
 ];
 
 // ---------------------------------------------------------------------------------------------

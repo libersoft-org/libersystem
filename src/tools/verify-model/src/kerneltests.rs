@@ -499,7 +499,12 @@ fn called_in(body: &str) -> BTreeSet<String> {
 }
 
 fn push_program(name: &str, reached: &mut BTreeSet<String>) {
-	if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+	// A HYPHEN IS A LEGAL PROGRAM NAME. The manifest's own names carry them - a library is
+	// `render2d-conformance` and a canonical artifact is `test2d-conformance-sw.lsexe` - and a filter
+	// that admitted only identifiers made the first hyphenated program INVISIBLE here: its test's
+	// `covers` clause then named a component the scan had not reached, which reads as a wrong
+	// annotation rather than as a name this function would not spell.
+	if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-') {
 		reached.insert(format!("bin.{name}"));
 	}
 }

@@ -288,6 +288,11 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
 		b"imgview" => Some(granted("imgview", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
+		// THE 2D DEMO HOLDS A SCREEN AND A KEYBOARD AND NOTHING ELSE. Its scene is computed, its
+		// images are generated and its glyph forms are its own, so a volume or a font capability
+		// would be authority it has no use for - and the demo is also the proof that a drawing
+		// application needs no more than this.
+		b"test2d-sw" => Some(granted("test2d-sw", alloc::vec![Capability::Display, Capability::InputKeys])),
 		b"licoview" => Some(granted("licoview", alloc::vec![Capability::Volumes, Capability::AppAssets])),
 		b"licoedit" => Some(granted("licoedit", alloc::vec![Capability::Volumes, Capability::AppAssets])),
 		// THE MANAGER GETS THE NARROW LAUNCH BROKER AND NOT PROCESS AUTHORITY. `Permission` lets it

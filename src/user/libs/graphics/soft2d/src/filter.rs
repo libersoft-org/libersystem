@@ -124,6 +124,90 @@ pub fn evaluate(graph: &FilterGraph, source: &Surface, backdrop: &dyn crate::tar
 					}
 				}
 			}
+			// THE CONVOLUTION IS THREE BY THREE AND READS THROUGH THE SURFACE rather than through a
+			// span buffer: nine taps a pixel is not what the blur's row cache exists for, and a
+			// second buffered path would be a second place for the edge rule to be wrong.
+			FilterNode::Convolution { input: slot, weights, divisor, bias } => {
+				if let Some(from) = input(*slot) {
+					// A DIVISOR OF ZERO IS THE SUM OF THE WEIGHTS, and a sum of zero is one - so an
+					// edge-detect kernel, whose weights cancel, does not have to state the obvious.
+					let sum: f32 = weights.iter().flatten().sum();
+					let divisor = if *divisor != 0.0 {
+						*divisor
+					} else if sum != 0.0 {
+						sum
+					} else {
+						1.0
+					};
+					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+							let mut total = Rgba::TRANSPARENT;
+							for (row, line) in weights.iter().enumerate() {
+								for (column, weight) in line.iter().enumerate() {
+									let tap_x = x as i64 + column as i64 - 1;
+									let tap_y = y as i64 + row as i64 - 1;
+									total = total.plus(at(from, tap_x, tap_y).scaled(*weight));
+								}
+							}
+							into.set(x, y, finish_channels(total, divisor, *bias));
+						}
+					}
+				}
+			}
+			FilterNode::MorphologyDilate { input: slot, x: radius_x, y: radius_y } => {
+				if let Some(from) = input(*slot) {
+					morphology(from, &mut into, bounds, *radius_x, *radius_y, true);
+				}
+			}
+			FilterNode::MorphologyErode { input: slot, x: radius_x, y: radius_y } => {
+				if let Some(from) = input(*slot) {
+					morphology(from, &mut into, bounds, *radius_x, *radius_y, false);
+				}
+			}
+			FilterNode::DisplacementMap { input: slot, map, scale, x_channel, y_channel } => {
+				if let (Some(from), Some(displacement)) = (input(*slot), input(*map)) {
+					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+							// THE MAP IS READ UNPREMULTIPLIED, because a displacement is a NUMBER
+							// carried in a channel rather than a colour: a half-transparent red that
+							// meant "half a scale to the right" would mean a quarter of one premultiplied.
+							let value = straight(displacement.get(x, y));
+							let offset_x = scale * (channel_of(value, *x_channel) - 0.5);
+							let offset_y = scale * (channel_of(value, *y_channel) - 0.5);
+							into.set(x, y, sample_bilinear(from, x as f32 + offset_x, y as f32 + offset_y));
+						}
+					}
+				}
+			}
+			FilterNode::Crop { input: slot, rect } => {
+				if let Some(from) = input(*slot) {
+					let keep = pixel_rect(*rect);
+					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+						for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+							let inside = x >= keep.0 && y >= keep.1 && x < keep.2 && y < keep.3;
+							into.set(x, y, if inside { from.get(x, y) } else { Rgba::TRANSPARENT });
+						}
+					}
+				}
+			}
+			FilterNode::Tile { input: slot, rect } => {
+				if let Some(from) = input(*slot) {
+					let keep = pixel_rect(*rect);
+					let (width, height) = (keep.2.saturating_sub(keep.0), keep.3.saturating_sub(keep.1));
+					if width > 0 && height > 0 {
+						for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+							for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+								// WRAPPED ABOUT THE RECTANGLE'S OWN ORIGIN, so the tile that lands on
+								// the rectangle is the rectangle - a wrap about the surface origin
+								// would shift the pattern whenever the tile moved.
+								let tile_x = keep.0 + wrap(x as i64 - keep.0 as i64, width);
+								let tile_y = keep.1 + wrap(y as i64 - keep.1 as i64, height);
+								into.set(x, y, from.get(tile_x, tile_y));
+							}
+						}
+					}
+				}
+			}
 			FilterNode::In { input: slot, mask } => {
 				if let (Some(from), Some(mask)) = (input(*slot), input(*mask)) {
 					for y in bounds.y..bounds.y.saturating_add(bounds.height) {
@@ -277,4 +361,73 @@ fn colour_matrix(colour: Rgba, matrix: &[[f32; 5]; 4]) -> Rgba {
 	}
 	let alpha = out[3].clamp(0.0, 1.0);
 	Rgba::new(out[0].clamp(0.0, 1.0) * alpha, out[1].clamp(0.0, 1.0) * alpha, out[2].clamp(0.0, 1.0) * alpha, alpha)
+}
+
+/// A tap outside the surface is TRANSPARENT BLACK, which is the graph's stated edge rule - and the
+/// reason a convolution of a shape does not smear its border outward the way a clamped edge would.
+fn at(from: &Surface, x: i64, y: i64) -> Rgba {
+	if x < 0 || y < 0 { Rgba::TRANSPARENT } else { from.get(x as u32, y as u32) }
+}
+
+/// Divide a convolution's weighted sum, add its bias, and keep the result a colour.
+///
+/// THE CLAMP IS WHAT MAKES A SHARPEN A PICTURE. An unclamped kernel produces channels above one and
+/// below zero at every edge it sharpens, and a premultiplied colour whose channels exceed its alpha
+/// composites as a colour nobody chose.
+fn finish_channels(total: Rgba, divisor: f32, bias: f32) -> Rgba {
+	let apply = |value: f32| (value / divisor + bias).clamp(0.0, 1.0);
+	let alpha = apply(total.alpha);
+	Rgba::new(apply(total.red).min(alpha), apply(total.green).min(alpha), apply(total.blue).min(alpha), alpha)
+}
+
+/// The per-channel maximum or minimum over a RECTANGULAR structuring element.
+///
+/// RECTANGULAR BECAUSE IT IS SEPARABLE and a disc is not: two passes of `2r` taps rather than one of
+/// `4r^2`. What that costs is the corner - a dilated square has square corners where a disc would
+/// round them - and at the radii a UI uses, thickening text or fattening an outline, that is the
+/// whole of the difference.
+fn morphology(from: &Surface, into: &mut Surface, bounds: PixelRect, radius_x: f32, radius_y: f32, dilate: bool) {
+	let reach_x = radius_x.abs() as i64;
+	let reach_y = radius_y.abs() as i64;
+	let pick = |left: f32, right: f32| if dilate { left.max(right) } else { left.min(right) };
+	for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+		for x in bounds.x..bounds.x.saturating_add(bounds.width) {
+			// THE ELEMENT STARTS AT THE PIXEL ITSELF and not at transparent black: an erosion seeded
+			// with zero erodes everything, and a dilation seeded with one fills the surface.
+			let mut value = from.get(x, y);
+			for tap_y in -reach_y..=reach_y {
+				for tap_x in -reach_x..=reach_x {
+					let tap = at(from, x as i64 + tap_x, y as i64 + tap_y);
+					value = Rgba::new(pick(value.red, tap.red), pick(value.green, tap.green), pick(value.blue, tap.blue), pick(value.alpha, tap.alpha));
+				}
+			}
+			into.set(x, y, value);
+		}
+	}
+}
+
+/// A premultiplied colour as a straight one, which is how a displacement map's channels are read.
+fn straight(colour: Rgba) -> Rgba {
+	if colour.alpha > 0.0 { Rgba::new(colour.red / colour.alpha, colour.green / colour.alpha, colour.blue / colour.alpha, colour.alpha) } else { Rgba::TRANSPARENT }
+}
+
+fn channel_of(colour: Rgba, channel: render2d::filter::Channel) -> f32 {
+	match channel {
+		render2d::filter::Channel::Red => colour.red,
+		render2d::filter::Channel::Green => colour.green,
+		render2d::filter::Channel::Blue => colour.blue,
+		render2d::filter::Channel::Alpha => colour.alpha,
+	}
+}
+
+/// A rectangle in device space as the half-open pixel range it covers: left, top, right, bottom.
+fn pixel_rect(rect: graphics_core::geom::RectF) -> (u32, u32, u32, u32) {
+	let clamp = |value: f32| -> u32 { if !value.is_finite() || value <= 0.0 { 0 } else { value as u32 } };
+	(clamp(rect.x), clamp(rect.y), clamp(rect.right()), clamp(rect.bottom()))
+}
+
+/// A non-negative remainder, which is what a tile needs and what `%` does not give for a negative.
+fn wrap(value: i64, period: u32) -> u32 {
+	let period = period as i64;
+	(((value % period) + period) % period) as u32
 }

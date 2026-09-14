@@ -105,7 +105,12 @@ fn init_package_starts_system_manager() {
 	// found out the hard way.
 	const TEST_BOOT_WINDOW: u64 = 100_000;
 	let (kernel_ep, _manager) = spawn_system_manager(arch::apic::ticks().saturating_add(TEST_BOOT_WINDOW), TEST_BOOT_WINDOW).expect("SystemManager should start from the init package");
-	sched::run_until_idle();
+	// A BOUNDED DRAIN, AND THIS IS THE ONE THAT USED TO HANG THE WHOLE SUITE. `run_until_idle` returns
+	// when the run queue empties and the next deadline is further out than the drain's own; a booted
+	// system with ConsoleService in it never reaches that state, because the console PACES ITS FRAMES
+	// - so this call never returned, the collection loop below was never entered, and the last line
+	// on the serial log was the console's first frame.
+	sched::run_until_idle_until(arch::apic::ticks().saturating_add(200));
 	// Seven StorageService instances: the system volume, media, iso, udf, usb, and the two
 	// memory volumes (ram and tmp). They NAME THEMSELVES now, so this asserts the set that came up
 	// rather than a count of identical strings - seven anonymous reports could be the same volume
@@ -184,8 +189,14 @@ fn init_package_starts_system_manager() {
 	// every report has arrived. It only changes what happens when something is genuinely stuck, and
 	// there the suite's own no-progress watchdog is the backstop.
 	let give_up = arch::apic::ticks() + 4000;
+	let mut passes: u32 = 0;
 	while arch::apic::ticks() < give_up {
-		sched::run_until_idle();
+		// A BOUNDED DRAIN AND NOT AN UNBOUNDED ONE. `run_until_idle` sleeps to the nearest THREAD
+		// deadline and keeps going, so once anything in the booted system paces itself on a timer -
+		// which ConsoleService now does, presenting frames through the display service - it never
+		// returns at all, and this loop's own bound below is never reached. The symptom is a suite
+		// that hangs with the console's first frame as its last line, which is what this was.
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
 		while let Ok(message) = kernel_ep.recv() {
 			if online_reports.iter().any(|expected| message.bytes.as_slice() == *expected) {
 				actual_online_reports.push(message.bytes);
@@ -195,6 +206,14 @@ fn init_package_starts_system_manager() {
 		}
 		if actual_online_reports.len() >= online_reports.len() && actual_lifecycle_reports.len() >= lifecycle_reports.len() {
 			break;
+		}
+		// WHERE THE CHAIN GOT TO, WHILE IT IS STILL GOING. A boot that stops halfway prints nothing
+		// at all otherwise: the reports are channel messages rather than console lines, so a reader
+		// watching the serial log sees the last SERVICE's own line and no sign of what was still
+		// awaited. One line per tick-thousand is cheap and turns a hang into a position.
+		passes += 1;
+		if passes % 500 == 0 {
+			crate::serial_println!("boot: {} online report(s) and {} lifecycle report(s) after {passes} pass(es)", actual_online_reports.len(), actual_lifecycle_reports.len());
 		}
 		arch::idle_halt();
 	}

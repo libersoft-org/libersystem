@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 119] = [
+const GATES: [(&str, &str); 122] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -349,6 +349,10 @@ const GATES: [(&str, &str); 119] = [
 	// own measured cost, release-required by class. The five composites below them are umbrellas:
 	// runnable by name, never selected, never required. A row with a missing phase is a missing
 	// REQUIRED key, which the dossier refuses by name rather than inferring the row from an exit.
+	// THE 2D DEMO ON A REAL SCREEN. It boots a guest, runs the demo and reads three timed frames back
+	// as pixels - the half of that proof a log cannot make, because a renderer that draws nothing
+	// reports exactly what a renderer that draws everything reports.
+	("qemu-2d-demo", "bin.test2d-sw"),
 	("iommu-ports", "kernel"),
 	("iommu-aarch64-direct-gicv2", "kernel"),
 	("iommu-aarch64-direct-gicv2-hostile", "kernel"),
@@ -359,12 +363,14 @@ const GATES: [(&str, &str); 119] = [
 	("iommu-aarch64-uefi-gicv2", "kernel"),
 	("iommu-aarch64-uefi-gicv2-transition", "kernel"),
 	("iommu-aarch64-uefi-gicv2-ordinary", "kernel"),
+	("iommu-aarch64-uefi-gicv2-display", "kernel"),
 	("iommu-riscv64-direct-aia", "kernel"),
 	("iommu-riscv64-direct-aia-hostile", "kernel"),
 	("iommu-riscv64-direct-aia-ordinary", "kernel"),
 	("iommu-riscv64-uefi-aia", "kernel"),
 	("iommu-riscv64-uefi-aia-transition", "kernel"),
 	("iommu-riscv64-uefi-aia-ordinary", "kernel"),
+	("iommu-riscv64-uefi-aia-display", "kernel"),
 	("implementation-mutations", "kernel"),
 	// The model's invariants proved capable of failing. Same subject as the model
 	// itself, because a mutation is a statement about the code the model describes.
@@ -678,17 +684,19 @@ const UMBRELLA_GATES: [&str; 9] = [
 // NOT one step per profile with a `--jobs` of its own - that is the second scheduler M3.6 refuses.
 // Each is an ordinary serial step that boots its guests one at a time; what it gains is an identity
 // and a duration of its own.
-pub const PROFILE_ROW_GATES: [&str; 30] = [
+pub const PROFILE_ROW_GATES: [&str; 32] = [
 	"iommu-aarch64-direct-gicv2-hostile",
 	"iommu-aarch64-direct-gicv2-ordinary",
 	"iommu-aarch64-direct-gicv3-its-transition",
 	"iommu-aarch64-direct-gicv3-its-ordinary",
 	"iommu-aarch64-uefi-gicv2-transition",
 	"iommu-aarch64-uefi-gicv2-ordinary",
+	"iommu-aarch64-uefi-gicv2-display",
 	"iommu-riscv64-direct-aia-hostile",
 	"iommu-riscv64-direct-aia-ordinary",
 	"iommu-riscv64-uefi-aia-transition",
 	"iommu-riscv64-uefi-aia-ordinary",
+	"iommu-riscv64-uefi-aia-display",
 	"arch-profile-aarch64-gicv2-1",
 	"arch-profile-aarch64-gicv2-4",
 	"arch-profile-aarch64-gicv3-1",
@@ -725,8 +733,9 @@ pub const PROFILE_ROW_GATES: [&str; 30] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 29] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 30] = [
 	"dma-mode-x86_64",
+	"qemu-2d-demo",
 	"iommu-ports",
 	"iommu-aarch64-direct-gicv2",
 	"iommu-aarch64-direct-gicv2-hostile",
@@ -855,6 +864,14 @@ impl Catalog {
 			// receive must work, beyond the provider connection exercised by the boot-chain test.
 			if gate == "qemu-virtio-iommu-x86_64" {
 				covers.push("bin.virtio_net".to_string());
+			}
+			// THE DEMO IS THE SUBJECT AND THE STACK UNDER IT IS COVERED TOO: what the frames prove is
+			// the RASTERISER's antialiasing, the drawing API's blending and filtering and the frame
+			// loop's pacing, so a change to any of them is a change this gate can catch.
+			if gate == "qemu-2d-demo" {
+				for component in ["render2d", "soft2d", "surface", "graphics-app"] {
+					covers.push(component.to_string());
+				}
 			}
 			// THE UNION ENTRIES ARE IN THE CATALOG WITH THEIR CLASS, and never selected or required:
 			// a person may run `--gate arch-profiles`, but the obligation is the profiles.

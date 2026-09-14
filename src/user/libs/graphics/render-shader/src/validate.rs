@@ -353,11 +353,20 @@ fn strict_position_slice(module: &Module) -> Result<(), Error> {
 		}
 		seen[index] = true;
 		let Some(op) = find_assignment(&module.body, value) else { continue };
-		if let Op::Transcendental(which, ..) = op {
+		match op {
 			// PERMITTED ONLY WITH A STRICT DEFINITION, which is what a zero-ULP bound is.
-			if !which.strict() {
+			Op::Transcendental(which, ..) if !which.strict() => {
 				return Err(Error::NonDeterministicPosition { operation: which.name(), max_ulp: which.max_ulp().unwrap_or(u32::MAX), depth });
 			}
+			// AND A COMPOSITION IS ONE OF THESE TOO. `normalize` and `length` are a sum of products
+			// and a root, not a single IEEE operation - two backends that compose them differently
+			// produce different positions - so each is on this path exactly as a transcendental is,
+			// and an operation with NO frozen definition is refused rather than walked through.
+			Op::Unary(which, _) if !which.strict() => {
+				let name = which.accuracy_name().unwrap_or("an operation with no frozen definition");
+				return Err(Error::NonDeterministicPosition { operation: name, max_ulp: which.max_ulp().unwrap_or(u32::MAX), depth });
+			}
+			_ => {}
 		}
 		for operand in operands(op) {
 			frontier.push((operand, depth + 1));

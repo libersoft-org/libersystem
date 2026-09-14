@@ -554,3 +554,40 @@ tested; the item waits on a display phase in `check-qemu-iommu-ports.sh`, which 
 device by design because the full interactive machine does not finish attach-and-map inside
 DeviceManager's boot window on an emulated port. That is gate work with its own boot-window cost to
 measure, and it is the one thing standing between this row and closed.
+
+## Implementer note - 2026-09-14, DRV-004, DRV-010 and the display phase
+
+DRV-004 closed on its stated trigger - the first item that changes a service protocol's handle
+handling, which was the display service's move to client-supplied images and attenuated replies. The
+survey behind it is worth keeping: every one of the fifteen hand-written multi-capability receives in
+the tree already closes what it did not adopt, and `Reader::finish` refuses a request whose signature
+does not account for the handles it carried, because it checks `taken == count` as well as the byte
+position. What was missing was a FIXTURE, and there are now two: a host one in `display-proto` that
+sends the same well-formed request bare and with a capability attached, and a guest one that requires
+the smuggled channel's peer to be CLOSED - the half a host fixture cannot show.
+
+DRV-010's finding is recorded closed where the finding lives; what stays open is `virtio-gpu
+maintenance`'s gate clause, which asks for the display endpoint under translation on the port
+profiles. That phase now EXISTS: `check-qemu-iommu-ports.sh` has a `display` phase on the two UEFI
+rows, `DMA_DISPLAY=1` is the reduced machine plus exactly one endpoint, every phase reports its boot
+window so the added endpoint's cost is measured rather than assumed, and the oracle is a frame
+reaching the display rather than a driver reporting online. It is an emulated port boot and belongs
+with the other slow gates at the end of a batch.
+
+THREE GATES WERE RED BEFORE THIS WORK AND ARE NOT NOW, all of the same shape - a fixture that had not
+followed the script it tests:
+
+- the guest-case inventory named none of the twelve virtio-iommu port rows, neither DMA-mode row,
+  neither no-DT-absent row, the evidence gate or twenty-one cases. It said "all nine" and "all
+  sixteen" in prose, and the count agreed with nothing, so nothing disagreed with it. The numbers are
+  gone and the rows are written out.
+- `check-perf-anchor.sh`'s sandbox lacked `evidence.sh`, the services manifest, `stage-kernel.sh` and
+  the volume's `dma-mode` sidecar, and its negative control patched a line `mkimage.sh` no longer
+  contains. Each failure read as the gate's subject rather than as the copy list.
+- `test-kernel.sh` installed its cleanup trap AFTER sourcing the evidence machinery, so anything that
+  failed in between leaked that run's staged kernel into `.build/state`. The trap is now armed at
+  staging and the publishing is added to it, and publishing cannot abort the cleanup.
+
+And two staged components had neither an oracle nor a stated reason: `font_catalogue`, which the text
+guest gate really does exercise and now names, and `virtio_rng`, which nothing starts - recorded as
+the gap it is.

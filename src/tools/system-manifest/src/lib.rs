@@ -1563,6 +1563,7 @@ fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a 
 		("graphics-profile", "graphics-profile", "user/libs/graphics/profile") => return Some("graphics"),
 		("graphics-core", "graphics-core", "user/libs/graphics/core") => return Some("graphics"),
 		("graphics-app", "graphics-app", "user/libs/graphics/app") => return Some("graphics"),
+		("render2d-conformance", "render2d-conformance", "user/libs/graphics/conformance2d") => return Some("graphics"),
 		_ => {}
 	}
 	match (name, owner, source) {

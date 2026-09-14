@@ -23,7 +23,11 @@ def item(source: str, start: str) -> str:
 def main() -> None:
     storage = (ROOT / "src/user/services/storage/src/service.rs").read_text()
     bootstrap = (ROOT / "src/user/services/core/src/service_manager/bootstrap.rs").read_text()
-    matcher = item(storage, "unsafe fn mount_by_uuid(")
+    # THE NAME AND NOT THE MODIFIER. This located the matcher by "unsafe fn", and the function stopped
+    # being `unsafe` - which made the gate fail with a Python traceback about a missing substring
+    # rather than with anything a reader could act on. A signature this transcribes twice is a gate
+    # that breaks on a change that is not about routing at all.
+    matcher = item(storage, "fn mount_by_uuid(")
     selector = item(bootstrap, "let mut take_format =") + ";"
     capture_begin = bootstrap.index("let expected_probes =")
     capture_end = bootstrap.index("// The pinned bootstrap set", capture_begin)
@@ -43,7 +47,7 @@ def main() -> None:
     live_count = storage[live_count_begin:live_count_end]
     failure_cleanup = item(bootstrap, 'if name == b"storage_service" && started.0 == State::Failed')
     forwarding = item(bootstrap, 'if let Some((bytes, handle)) = external(role)')
-    report_helpers = "\n".join([item(storage, "fn storage_bootstrap_report("), item(bootstrap, "fn classification_report_buffer("), item(bootstrap, "fn parse_classification_report("), item(bootstrap, "unsafe fn serve_root(")])
+    report_helpers = "\n".join([item(storage, "fn storage_bootstrap_report("), item(bootstrap, "fn classification_report_buffer("), item(bootstrap, "fn parse_classification_report("), item(bootstrap, "fn serve_root(")])
     fixture = r'''
 extern crate alloc;
 use std::{marker::PhantomData, sync::atomic::{AtomicBool, AtomicU64, Ordering}, cell::RefCell};
@@ -150,7 +154,7 @@ struct LiberFs<T> { uuid: [u8; 16], device: PhantomData<T> }
 impl<T> LiberFs<T> { fn uuid(&self) -> [u8; 16] { self.uuid } }
 #[derive(Clone, Copy)]
 enum RootMountError { Missing, Ambiguous }
-unsafe fn mount_system_volume(channel: u64) -> Option<LiberFs<ChannelBlockDevice>> {
+fn mount_system_volume(channel: u64) -> Option<LiberFs<ChannelBlockDevice>> {
     let id = match channel { 11 | 13 => 1, 12 | 22 => 2, _ => return None };
     Some(LiberFs { uuid: [id; 16], device: PhantomData })
 }
@@ -165,7 +169,7 @@ fn check_reports() {
         CLOSED.with_borrow_mut(Vec::clear); SENT.with_borrow_mut(Vec::clear);
         REFUSE_TRANSFER.store(if failure { 503 } else { 0 }, Ordering::Relaxed);
         let mut client = 0;
-        assert_eq!(unsafe { serve_root(90, b"SERVE", false, &mut client) }, !failure);
+        assert_eq!(serve_root(90, b"SERVE", false, &mut client), !failure);
         if failure { assert_eq!(client, 0); CLOSED.with_borrow(|closed| assert_eq!(closed, &[501, 503, 502])); }
         else { assert_eq!(client, 502); CLOSED.with_borrow(|closed| assert_eq!(closed, &[501])); }
     }

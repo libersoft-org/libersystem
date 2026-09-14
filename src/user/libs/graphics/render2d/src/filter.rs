@@ -45,15 +45,56 @@ pub enum FilterNode {
 	Blend { source: u16, backdrop: u16, mode: crate::blend::BlendMode },
 	/// Keep only where the second input has alpha, which is what every clip-shaped effect is built on.
 	In { input: u16, mask: u16 },
+	/// A THREE BY THREE convolution over premultiplied colour: sharpen, emboss, edge detect.
+	///
+	/// THREE BY THREE AND NOT A GENERAL SIZE. A larger kernel is either a blur - which has its own
+	/// node and a separable implementation - or a graph of these, and a variable-size kernel makes a
+	/// node an allocation and its per-pixel cost unbounded, which is the pair of properties the whole
+	/// graph exists to avoid.
+	Convolution {
+		input: u16,
+		/// Row-major, with the centre weight at `[1][1]`.
+		weights: [[f32; 3]; 3],
+		/// What the weighted sum is divided by. A divisor of zero uses the sum of the weights, and a
+		/// sum of zero uses one - so an edge-detect kernel does not have to state the obvious.
+		divisor: f32,
+		/// Added after the division, in the same units.
+		bias: f32,
+	},
+	/// The per-channel MAXIMUM over a rectangular structuring element: what thickens a glyph or an
+	/// outline.
+	MorphologyDilate { input: u16, x: f32, y: f32 },
+	/// The per-channel MINIMUM over the same element, which thins one.
+	MorphologyErode { input: u16, x: f32, y: f32 },
+	/// Sample the input at an offset read from another input's colour.
+	///
+	/// `scale * (channel - 0.5)` IN EACH AXIS, so a map of flat half-grey is the identity - which is
+	/// what makes a displacement map composable with a gradient, a noise field or a rendered shape
+	/// without the caller biasing it first.
+	DisplacementMap { input: u16, map: u16, scale: f32, x_channel: Channel, y_channel: Channel },
+	/// The input inside a rectangle and transparent black outside it.
+	Crop { input: u16, rect: RectF },
+	/// The input's contents inside a rectangle, repeated over the whole output.
+	Tile { input: u16, rect: RectF },
+}
+
+/// Which channel of a displacement map an axis is read from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Channel {
+	Red,
+	Green,
+	Blue,
+	Alpha,
 }
 
 impl FilterNode {
 	/// The nodes this one reads, by index.
 	pub fn inputs(&self) -> impl Iterator<Item = u16> + '_ {
 		let pair = match self {
-			FilterNode::Blur { input, .. } | FilterNode::Offset { input, .. } | FilterNode::ColorMatrix { input, .. } => (Some(*input), None),
+			FilterNode::Blur { input, .. } | FilterNode::Offset { input, .. } | FilterNode::ColorMatrix { input, .. } | FilterNode::Convolution { input, .. } | FilterNode::MorphologyDilate { input, .. } | FilterNode::MorphologyErode { input, .. } | FilterNode::Crop { input, .. } | FilterNode::Tile { input, .. } => (Some(*input), None),
 			FilterNode::Composite { source, backdrop, .. } | FilterNode::Blend { source, backdrop, .. } => (Some(*source), Some(*backdrop)),
 			FilterNode::In { input, mask } => (Some(*input), Some(*mask)),
+			FilterNode::DisplacementMap { input, map, .. } => (Some(*input), Some(*map)),
 			FilterNode::Source | FilterNode::Backdrop | FilterNode::Image(_) | FilterNode::Flood { .. } => (None, None),
 		};
 		[pair.0, pair.1].into_iter().flatten()
@@ -71,6 +112,26 @@ impl FilterNode {
 				RectF::new(output.x - grow_x, output.y - grow_y, output.width + grow_x * 2.0, output.height + grow_y * 2.0)
 			}
 			FilterNode::Offset { dx, dy, .. } => RectF::new(output.x - dx, output.y - dy, output.width, output.height),
+			// ONE PIXEL ON EVERY SIDE, which is the kernel's reach and is why the size is frozen: a
+			// bounds map for a kernel whose size is a parameter has to be computed rather than stated.
+			FilterNode::Convolution { .. } => RectF::new(output.x - 1.0, output.y - 1.0, output.width + 2.0, output.height + 2.0),
+			FilterNode::MorphologyDilate { x, y, .. } | FilterNode::MorphologyErode { x, y, .. } => {
+				let (grow_x, grow_y) = (x.abs(), y.abs());
+				RectF::new(output.x - grow_x, output.y - grow_y, output.width + grow_x * 2.0, output.height + grow_y * 2.0)
+			}
+			// THE WHOLE DISPLACEMENT IN EVERY DIRECTION. The map's own values decide where each pixel
+			// is read from, and nothing here knows them - so the bound is the largest offset the scale
+			// can produce, which is half the scale, taken conservatively as the whole of it.
+			FilterNode::DisplacementMap { scale, .. } => {
+				let reach = scale.abs();
+				RectF::new(output.x - reach, output.y - reach, output.width + reach * 2.0, output.height + reach * 2.0)
+			}
+			// A CROP NEEDS ONLY WHAT SURVIVES IT, which is what makes a crop the cheap way to bound an
+			// effect rather than a mask applied after the cost was already paid.
+			FilterNode::Crop { rect, .. } => output.intersection(rect),
+			// AND A TILE NEEDS ITS RECTANGLE WHATEVER IS ASKED FOR: every output pixel comes from
+			// inside it, and no output pixel comes from anywhere else.
+			FilterNode::Tile { rect, .. } => *rect,
 			_ => output,
 		}
 	}
@@ -112,11 +173,23 @@ impl FilterGraph {
 				return Err(Error::FilterCycle);
 			}
 		}
-		if let FilterNode::Blur { x, y, .. } = node {
-			let radius = x.abs().max(y.abs()) * 3.0;
-			if radius > limits.max_filter_radius as f32 {
-				return Err(Error::LimitExceeded { limit: "filter radius", ceiling: limits.max_filter_radius as u64 });
-			}
+		let radius = match node {
+			FilterNode::Blur { x, y, .. } => x.abs().max(y.abs()) * 3.0,
+			FilterNode::MorphologyDilate { x, y, .. } | FilterNode::MorphologyErode { x, y, .. } => x.abs().max(y.abs()),
+			// A DISPLACEMENT REACHES AS FAR AS ITS SCALE, so it is bounded by the same ceiling: a map
+			// with a scale of ten thousand is a filter that reads the whole surface for every pixel.
+			FilterNode::DisplacementMap { scale, .. } => scale.abs(),
+			_ => 0.0,
+		};
+		if radius > limits.max_filter_radius as f32 {
+			return Err(Error::LimitExceeded { limit: "filter radius", ceiling: limits.max_filter_radius as u64 });
+		}
+		// A TILE OF NOTHING NEVER ADVANCES, which is a loop that does not finish rather than a picture
+		// that is wrong - so it is refused where it is built.
+		if let FilterNode::Tile { rect, .. } = node
+			&& rect.is_empty()
+		{
+			return Err(Error::DegenerateShape { what: "a filter tile with no area" });
 		}
 		self.nodes.push(node);
 		Ok(next)

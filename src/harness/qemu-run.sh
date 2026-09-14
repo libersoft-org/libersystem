@@ -63,6 +63,13 @@
 #             services never start, on a boot whose isolation was perfectly correct. What it drops
 #             is the fixture media, the USB controller and the interactive display, input and audio
 #             devices; what it keeps is every endpoint the ordinary claim is about.
+#   DMA_DISPLAY=1
+#             aarch64/riscv64: the reduced machine above PLUS EXACTLY ONE ENDPOINT, the GPU. A gate
+#             whose claim is about the display endpoint under translation needs that endpoint and
+#             nothing else: asking for the whole interactive set to prove one device is what the
+#             reduction exists to avoid, and one device is the difference between a claim that can be
+#             gated and a boot that does not finish attach-and-map in time. Implies the reduced
+#             machine, so the two are never spelled together.
 #   LIBER_HARNESS_HOLD=FIFO
 #             A fixture hook: after every input is BOUND - the medium, the firmware image and the
 #             kernel opened once and hashed through their descriptors, the QEMU executable copied to
@@ -1856,12 +1863,20 @@ qemu_run_aarch64() {
 	PORT_IOMMU="$iommu"
 	local virtio_opts="disable-legacy=on"
 	local dma_fixture="${DMA_FIXTURE:-0}"
-	# THE REDUCED MACHINE, and the two switches that ask for it. `DMA_FIXTURE` is the hostile
-	# phase's machine; `DMA_ORDINARY` is the ordinary phase's, which keeps the system volume and the
-	# NIC because its whole claim is that they still work while translation is on. Both drop every
-	# bus master neither claim is about - see the header.
+	# THE REDUCED MACHINE, and the switches that ask for it. `DMA_FIXTURE` is the hostile phase's
+	# machine; `DMA_ORDINARY` is the ordinary phase's, which keeps the system volume and the NIC
+	# because its whole claim is that they still work while translation is on. Both drop every bus
+	# master neither claim is about - see the header.
+	#
+	# AND `DMA_DISPLAY` IS THE REDUCED MACHINE PLUS EXACTLY ONE ENDPOINT: the GPU. The display gate's
+	# claim is about the display endpoint under translation, and the full interactive machine is what
+	# does not finish attach-and-map inside DeviceManager's boot window on an emulated port - so
+	# asking for the whole interactive set to prove one endpoint is what the reduction exists to
+	# avoid. One device is the difference between a claim that can be gated and a boot that times out.
 	local reduced="$dma_fixture"
 	[[ "${DMA_ORDINARY:-0}" == "1" ]] && reduced=1
+	local dma_display="${DMA_DISPLAY:-0}"
+	[[ "$dma_display" == "1" ]] && reduced=1
 	if [[ "$iommu" == "1" ]]; then
 		port_iommu_probe aarch64
 		machine="$machine,default-bus-bypass-iommu=off"
@@ -1897,6 +1912,11 @@ qemu_run_aarch64() {
 
 	# Network: user-mode virtio-net.
 	qemu_attach_virtio_net qemu_args vnet0 "" "$virtio_opts"
+
+	# THE ONE ENDPOINT THE DISPLAY PHASE IS ABOUT, on the reduced machine.
+	if [[ "$dma_display" == "1" ]]; then
+		qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+	fi
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
 	if [[ "$reduced" != "1" ]]; then
@@ -2134,12 +2154,20 @@ qemu_run_riscv64() {
 	PORT_IOMMU="$iommu"
 	local virtio_opts="disable-legacy=on"
 	local dma_fixture="${DMA_FIXTURE:-0}"
-	# THE REDUCED MACHINE, and the two switches that ask for it. `DMA_FIXTURE` is the hostile
-	# phase's machine; `DMA_ORDINARY` is the ordinary phase's, which keeps the system volume and the
-	# NIC because its whole claim is that they still work while translation is on. Both drop every
-	# bus master neither claim is about - see the header.
+	# THE REDUCED MACHINE, and the switches that ask for it. `DMA_FIXTURE` is the hostile phase's
+	# machine; `DMA_ORDINARY` is the ordinary phase's, which keeps the system volume and the NIC
+	# because its whole claim is that they still work while translation is on. Both drop every bus
+	# master neither claim is about - see the header.
+	#
+	# AND `DMA_DISPLAY` IS THE REDUCED MACHINE PLUS EXACTLY ONE ENDPOINT: the GPU. The display gate's
+	# claim is about the display endpoint under translation, and the full interactive machine is what
+	# does not finish attach-and-map inside DeviceManager's boot window on an emulated port - so
+	# asking for the whole interactive set to prove one endpoint is what the reduction exists to
+	# avoid. One device is the difference between a claim that can be gated and a boot that times out.
 	local reduced="$dma_fixture"
 	[[ "${DMA_ORDINARY:-0}" == "1" ]] && reduced=1
+	local dma_display="${DMA_DISPLAY:-0}"
+	[[ "$dma_display" == "1" ]] && reduced=1
 	local -a bridge_args=()
 	# THE CONTROLLER IS NOT IN `qemu_args`, and that is the riscv64 difference. The direct boot below
 	# hands the guest the DUMPED tree with `-dtb`, and `virtio-iommu-pci` is the one device that
@@ -2185,6 +2213,11 @@ qemu_run_riscv64() {
 
 	# Network: user-mode virtio-net, modern-only like every other function here.
 	qemu_attach_virtio_net qemu_args vnet0 "" "$virtio_opts"
+
+	# THE ONE ENDPOINT THE DISPLAY PHASE IS ABOUT, on the reduced machine.
+	if [[ "$dma_display" == "1" ]]; then
+		qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+	fi
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
 	if [[ "$reduced" != "1" ]]; then

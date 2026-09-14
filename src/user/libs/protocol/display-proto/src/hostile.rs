@@ -172,3 +172,39 @@ fn every_display_dispatch_refuses_arbitrary_requests_without_panicking() {
 		}
 	}
 }
+
+// A REQUEST THAT CARRIES A CAPABILITY ITS SIGNATURE DOES NOT NAME.
+//
+// THE DEFECT THIS IS ABOUT IS NOT THE REFUSAL, IT IS WHAT HAPPENS TO THE HANDLE. A dispatch that
+// decoded the bytes it understood and ignored the rest would leave a live capability in nobody's
+// hands and nobody's list: not refused, not closed, and still charged to the sender's Domain for the
+// life of the process. One per request, from any client, with no privilege at all.
+//
+// `Reader::finish` is where it is caught, because it answers BOTH halves of "this message is over" -
+// the bytes AND the handles - and every generated op calls it. What reaches the service is a request
+// whose signature accounts for everything it carried, and what is left in the caller's list is
+// exactly what the serve loop then closes.
+#[test]
+fn a_request_carrying_a_capability_its_signature_does_not_name_is_refused() {
+	let mut out = [0u8; 256];
+	// `ack-configure` takes a serial and NO capability, written exactly as the generated client
+	// writes it: the op, the correlation, the argument.
+	let mut request = surface::OP_ACK_CONFIGURE.to_le_bytes().to_vec();
+	request.extend_from_slice(&7u32.to_le_bytes());
+	request.extend_from_slice(&1u64.to_le_bytes());
+
+	// First without one, so the fixture is measuring the handle and not the bytes.
+	let mut service = Refuser;
+	let mut none = Handles::new();
+	let mut reply = Handles::new();
+	assert!(surface::dispatch(&mut service, &request, &mut none, &mut out, &mut reply).is_some(), "the request itself is well formed");
+
+	// And now with one attached. The service is NOT reached, and the capability is still in the
+	// caller's list - which is where the serve loop's own sweep closes it.
+	let mut service = Refuser;
+	let mut carried = Handles::try_from_slice(&[0x4242]).expect("one handle fits");
+	let mut reply = Handles::new();
+	assert!(surface::dispatch(&mut service, &request, &mut carried, &mut out, &mut reply).is_none(), "a capability the signature does not name is a refusal");
+	assert_eq!(carried.as_slice(), &[0x4242], "and the handle is left for the caller to close rather than dropped");
+	assert!(reply.is_empty(), "a refused request hands nothing back");
+}

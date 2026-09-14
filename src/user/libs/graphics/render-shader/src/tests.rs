@@ -165,6 +165,59 @@ fn a_position_may_depend_on_sqrt_and_not_on_sin() {
 }
 
 #[test]
+// AND A COMPOSITION IS ON THAT PATH TOO, WITH A DEFINITION OR NOT AT ALL.
+//
+// `normalize` and `length` are not single IEEE operations - they are a sum of products and a root -
+// so two backends that compose them differently produce different positions. The profile therefore
+// freezes each as a COMPOSITION of operations it already fixes at zero ULP: `length` is
+// `sqrt(dot(v, v))` accumulated in component order without an FMA, and `normalize` is `v / length(v)`
+// and NOT a multiply by `inversesqrt`, which carries two ULP.
+//
+// THE PROPERTY THIS PINS IS THE REFUSAL BY DEFAULT. A composition added to the enumeration without an
+// accuracy entry is refused on a position path rather than walked through, which is the difference
+// between an operation the profile permits and one nobody has decided about.
+fn a_position_may_depend_on_a_composition_only_where_the_profile_defines_one() {
+	use crate::ir::UnaryOp;
+
+	let build = |which: UnaryOp| {
+		let mut builder = Builder::new(Stage::Vertex, "composition");
+		let attribute = builder.load(Type::vec(4), Binding::Attribute { location: 0 });
+		let composed = builder.assign(Type::vec(4), Op::Unary(which, attribute));
+		builder.store(Output::Position, composed);
+		builder.finish()
+	};
+	assert_eq!(validate(&build(UnaryOp::Normalize), &limits()), Ok(()), "the profile defines normalize as a division by a correctly rounded length");
+	assert_eq!(validate(&build(UnaryOp::Negate), &limits()), Ok(()), "and a negation needs no definition at all: IEEE 754 fixes it");
+
+	// EVERY COMPOSITION IN THE ENUMERATION HAS A FROZEN ENTRY, or it is not strict - and this is the
+	// half that fails the day one is added without freezing it, rather than the day a position drawn
+	// through it disagrees between two backends.
+	for which in [
+		UnaryOp::Negate,
+		UnaryOp::Not,
+		UnaryOp::Complement,
+		UnaryOp::Normalize,
+		UnaryOp::Length,
+		UnaryOp::Abs,
+		UnaryOp::Floor,
+		UnaryOp::Ceil,
+		UnaryOp::Fract,
+		UnaryOp::Convert(crate::ir::ScalarType::I32),
+	] {
+		match which.accuracy_name() {
+			// IEEE 754 determines it exactly; there is nothing for a profile to freeze.
+			None => assert!(which.strict(), "{which:?} needs no accuracy entry and must be usable on a position path"),
+			// A composition, which is permitted only at zero ULP and only because the profile says so.
+			Some(name) => {
+				let entry = graphics_profile::shader_ir::TRANSCENDENTAL_ACCURACY.iter().find(|entry| entry.operation == name);
+				assert!(entry.is_some(), "{which:?} is a composition with no entry in the frozen accuracy table");
+				assert_eq!(which.strict(), entry.expect("checked above").max_ulp == 0, "{which:?}: strictness is the table's answer and not a second opinion");
+			}
+		}
+	}
+}
+
+#[test]
 // IT IS THE COMPLETE DEPENDENCY SLICE AND NOT THE FINAL MULTIPLY. Walking one step back from the
 // position store would admit a matrix built from a transcendental - which is the shape a real shader
 // has, and the reason this check is a slice rather than a look at the last operation.

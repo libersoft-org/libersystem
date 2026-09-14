@@ -529,10 +529,18 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						_ => (FillRule::NonZero, Antialias::On),
 					};
 					let Some(shader) = shaders.get(*command as usize) else { continue };
+					// THE CLIP'S BOUNDS ARE PART OF THE DRAW'S BOUNDS, and this is where the fast path
+					// below gets its right to exist: a stack of plain RECTANGLES is not consulted per
+					// pixel because it is supposed to be in the bounds already - and it was not, so a
+					// rectangular clip (including the EMPTY one a tile outside the clip's shape
+					// pushes) was not applied at all. What that looked like was a shape drawn in full
+					// in every tile the clip's own shape did not reach, three tile rows away from a
+					// panel that was clipping it perfectly.
 					let (into, bounds): (&mut dyn Raster, PixelRect) = match layers.last_mut() {
 						Some(layer) => (&mut layer.surface, layer.bounds),
 						None => (&mut *surface, tile),
 					};
+					let bounds = bounds.intersection(&clips.bounds());
 					fill_edges(raster, spans, edges, rule, antialias, bounds, into, shader, &clips, *opacity, *blend, *operator);
 				}
 				Step::Glyphs { run, transform, blend, operator, opacity, .. } => {
@@ -542,6 +550,7 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						Some(layer) => (&mut layer.surface, layer.bounds),
 						None => (&mut *surface, tile),
 					};
+					let bounds = bounds.intersection(&clips.bounds());
 					draw_glyphs(raster, spans, cache, glyphs, recorded, transform, bounds, into, shader, &clips, *opacity, *blend, *operator, prepared.working);
 				}
 				Step::AliasedLines { points, blend, operator, opacity, .. } => {
@@ -550,6 +559,7 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						Some(layer) => (&mut layer.surface, layer.bounds),
 						None => (&mut *surface, tile),
 					};
+					let bounds = bounds.intersection(&clips.bounds());
 					draw_aliased_lines(points, bounds, into, shader, &clips, *opacity, *blend, *operator);
 				}
 				Step::PushClip { edges, rule, antialias, bounds, inverse } => {
@@ -834,8 +844,17 @@ fn draw_glyphs(raster: &mut Rasteriser, spans: &mut Spans, cache: &mut GlyphRast
 	for glyph in &run.glyphs {
 		let x = add_fixed(pen_x, glyph.x_offset);
 		let y = add_fixed(pen_y, glyph.y_offset);
-		let key = font_contract::cache::GlyphCacheKey { face: run.face.face, generation: run.face.generation, glyph: glyph.glyph, size: run.size, variation: run.variation, transform: font_contract::glyph::TransformKey::new([transform.m[0][0], transform.m[1][0], transform.m[0][1], transform.m[1][1], 0.0, 0.0]).unwrap_or(font_contract::glyph::TransformKey::IDENTITY), phase: font_contract::glyph::SubpixelPhase::of(x, y), kind: glyph.kind, selection: glyph.selection, mode: run.mode };
-		let origin = PointF { x: pixels(x), y: pixels(y) };
+		// THE PEN IS IN USER SPACE AND THE GLYPH IS DRAWN IN DEVICE SPACE. Mapping it is what makes a
+		// run inside a scrolled, scaled or rotated drawing land with the drawing rather than at the
+		// coordinates it was recorded at: the FORM is the provider's, keyed by the transform below,
+		// and WHERE it goes is this.
+		let placed_pen = PointF { x: pixels(x), y: pixels(y) };
+		let origin = transform.map_point(placed_pen).unwrap_or(placed_pen);
+		// THE PHASE IS THE DEVICE POSITION'S, not the pen's. A run at a whole user-space coordinate
+		// under a half-pixel translation lands between pixels, and rasterising it as though it were
+		// aligned is exactly the drift subpixel positioning exists to remove.
+		let device = |value: f32| font_contract::Fixed266::from_raw((value * 64.0) as i32);
+		let key = font_contract::cache::GlyphCacheKey { face: run.face.face, generation: run.face.generation, glyph: glyph.glyph, size: run.size, variation: run.variation, transform: font_contract::glyph::TransformKey::new([transform.m[0][0], transform.m[1][0], transform.m[0][1], transform.m[1][1], 0.0, 0.0]).unwrap_or(font_contract::glyph::TransformKey::IDENTITY), phase: font_contract::glyph::SubpixelPhase::of(device(origin.x), device(origin.y)), kind: glyph.kind, selection: glyph.selection, mode: run.mode };
 		match cache.get(&key, provider) {
 			GlyphImage::Missing => {}
 			GlyphImage::Outline(path) => {

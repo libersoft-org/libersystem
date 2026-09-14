@@ -1,7 +1,15 @@
 # P02M0177 guest case inventory
 
-The launchers and predicates below cover all nine `GATES_THAT_BOOT_A_GUEST`, all sixteen
-`PROFILE_ROW_GATES`, and `concurrent-selection` in `verify-model/src/catalog.rs`. Umbrella gates
+The launchers and predicates below cover EVERY `GATES_THAT_BOOT_A_GUEST`, EVERY `PROFILE_ROW_GATES`
+row, and `concurrent-selection` in `verify-model/src/catalog.rs`, and the gate that reads this file
+checks that by name rather than by count.
+
+(It said "all nine" and "all sixteen", and both numbers were the ones those lists held when this file
+was written. The DMA-mode rows, the rollback rows, the evidence gate and the twelve virtio-iommu port
+rows were added to the catalog afterwards and named nowhere here, so a file whose whole purpose is to
+say what each guest gate boots and what proves it had been silently describing a subset. Counting in
+prose is what let that happen: the count agreed with nothing, so nothing disagreed with it. Corrected
+2026-09-14, and the two numbers are gone rather than updated.) Umbrella gates
 run the listed cases serially; only `verify.sh` schedules separate steps. Each case keeps its existing
 post-run assertions. `src/tools/guest-verdict.py` now supplies the named early termination predicates;
 its `verdict` function is also the production seam exercised by negative fixtures.
@@ -69,7 +77,7 @@ minutes. The progress windows are 900, 2400 and 2400 seconds respectively. Named
 the existing harness's chosen timeout; no profile adds a shorter bound. `--build-only` stops after
 the locked compile and copy and never starts this predicate or a guest.
 
-## All sixteen profile rows
+## The architecture and NUMA profile rows
 
 `qemu-arch-profiles` is the umbrella for the first thirteen rows below, launched through
 `check-qemu-arch-profiles.sh:run_profile`. `qemu-numa` is the umbrella for the last three,
@@ -96,6 +104,89 @@ All interrupt rows require their controller identity and at least five delivered
 | `numa-profile-x86_64` | Two ACPI nodes with exact memory/CPU assignment and distances; all named allocation/placement tests, complete matrix and model trace; no weak placement. |
 | `numa-profile-aarch64` | Same two-node placement claims through device tree on direct boot. |
 | `numa-profile-riscv64` | Same two-node placement claims through device tree on direct boot. |
+
+## The DMA-mode rows, and what each entry path proves
+
+`dma-mode-x86_64`, `dma-mode-aarch64` and `dma-mode-riscv64` are the rows of `dma-mode-ports`, and
+`dma-mode-carrier` is the producer gate beside them. WHAT THEY ARE ABOUT IS THE STATED MODE AND NOT
+THE HARDWARE: one producer per entry path declares the boot's DMA mode, admission compares the
+machine against that statement, and a degraded boot is required to SAY so rather than to look like an
+enforcing one that happened to admit an endpoint untranslated.
+
+| Gate / case | Launcher and final predicate | Observation and backstop |
+| --- | --- | --- |
+| `dma-mode-x86_64`: admits / `dma-admits` | Shipping ISO under the translating machine; the produced record says enforcing-required, every bus master is translated, and the driver the degraded row refuses by name comes online and passes traffic | Health-watched; panic, loader fatal, degraded isolation or an `iommu-required` refusal fails. |
+| `dma-mode-x86_64`: degraded / `dma-degraded` | The same image with no controller; the record says no-iommu and the degraded profile is announced by name with every affected device listed | The `iommu-required` entry must be refused, not admitted quietly. |
+| `dma-mode-x86_64`: signed pair / `dma-signed-admits`, `dma-signed-degraded` | The same two boots over a SIGNED medium, so the mode travels with a manifest a verifier accepted rather than with a command line | Same predicates; a mode that changed across the signature fails. |
+| `dma-mode-x86_64`: refusals / `dma-loader-refused`, `dma-kernel-refused` | A machine whose statement and hardware disagree, refused at the loader and at the kernel respectively | Each must refuse at ITS OWN stage; refusing later is a different claim. |
+| `dma-mode-aarch64`, `dma-mode-riscv64` | The port rows of the same subject through `run.sh`, on the reduced ordinary machine | See the port cases below. |
+| `dma-mode-ports`: admits / `dma-port-admits`, `dma-port-admits-direct` | `run.sh --arch PORT` UEFI and a direct `-kernel` boot; enforcing-required, everything translated, and on the UEFI row the NIC online with a DHCP lease | The direct row promotes no root, so it asserts on the kernel's audit rather than on traffic. |
+| `dma-mode-ports`: degraded / `dma-port-degraded`, `dma-port-degraded-direct` | The same two with `--no-iommu`; the degraded profile announced and the `iommu-required` entry refused | A degraded boot that admitted it untranslated fails. |
+| `dma-mode-ports`: refusal / `dma-port-loader-refused` | A port boot whose statement the loader must refuse | Loader-only; no kernel handoff. |
+| `dma-mode-carrier`: two producers / `dma-port-two-producers` | Two independent producers of the boot-policy node - the ESP file and the firmware device tree - which the loader must refuse rather than choose between | The refusal is the claim; a boot that picked one fails. |
+
+## The rollback floor
+
+`rollback-floor-x86_64` boots the shipping medium against a provisioned floor and requires the
+answer to depend on the RECEIPT rather than on the image's own opinion of itself.
+
+| Case | Final predicate | Failures |
+| --- | --- | --- |
+| `rollback-accepted` | A release at or above the stored floor boots | A refusal here would make every ordinary boot a rollback. |
+| `rollback-refused` | A release below the floor is refused by name | Loading it anyway is the defect the floor exists for. |
+| `rollback-unprovisioned` | A machine with no stored floor says the floor is not enforced and boots | Inventing a floor is as wrong as ignoring one. |
+| `rollback-manifest-refused` | A floor record whose signature does not verify is refused | A floor nobody signed is not a floor. |
+| `rollback-not-enforced` | A trust profile that does not enforce the floor says so | Silence would read as enforcement. |
+
+## The virtio-iommu port rows
+
+`iommu-ports` is the umbrella; each row is `<arch>:<profile>` and each PHASE of a row is a catalog
+key of its own, because a single green row key binding hostile evidence to shipping claims is
+exactly the shape this gate refuses. The hostile and direct-transition phases boot the TEST kernel
+with the enforcing fixture; every other phase boots the built system through `run.sh`.
+
+EVERY PHASE KEEPS ITS CENSUS - the kernel's own list of the bus masters it admitted, with their
+addresses and translation - so a bus master added to a machine without a policy decision shows up as
+a census difference rather than as a quiet pass. And every phase reports its BOOT WINDOW, because the
+reduced machine exists precisely because an emulated port does not finish attach-and-map for a dozen
+endpoints in DeviceManager's window, and any phase that adds an endpoint back is making a claim about
+how long that takes.
+
+| Catalog row | Launcher and final predicate | Observation and backstop |
+| --- | --- | --- |
+| `iommu-aarch64-direct-gicv2` | The umbrella for the two rows below. | Serial. |
+| `iommu-aarch64-direct-gicv2-hostile` | `test.sh --arch aarch64 --tags dma` with the controller, virtio-net and two `edu` functions; the transition confirmed and the five hostile cases plus the forced release refused BY THE HARDWARE | Shared suite predicate; a case that reports itself absent or skipped fails. |
+| `iommu-aarch64-direct-gicv2-ordinary` / `iommu-port-ordinary-direct` | `run.sh` on the reduced machine; translating with bypass read back off, every bus master translated, and the block driver online behind the controller | A direct boot promotes no root, so traffic is proved on the UEFI row. Degraded or untranslated admission fails. |
+| `iommu-aarch64-direct-gicv3-its` | The umbrella for the two rows below, on the ITS interrupt path. | Serial. |
+| `iommu-aarch64-direct-gicv3-its-transition` | The test kernel again, for the transition on the ITS path | Same predicates as the hostile row's transition half. |
+| `iommu-aarch64-direct-gicv3-its-ordinary` / `iommu-port-ordinary-direct` | As the GICv2 ordinary row, on the ITS path. | Same. |
+| `iommu-aarch64-uefi-gicv2` | The umbrella for the three rows below. | Serial. |
+| `iommu-aarch64-uefi-gicv2-transition` / `iommu-port-transition` | The FULL machine through `run.sh` with AAVMF; every firmware-touched endpoint quiesced BY CLASS - virtio and xHCI - and bypass read back off before any driver mastered the bus | The full machine is deliberate: the xHCI controller is the endpoint that needs proving on. |
+| `iommu-aarch64-uefi-gicv2-ordinary` / `iommu-port-ordinary-uefi` | The reduced machine; a DHCP lease and the system volume through translated endpoints | Nothing degraded, no fault. |
+| `iommu-aarch64-uefi-gicv2-display` / `iommu-port-display` | The reduced machine PLUS EXACTLY ONE ENDPOINT, the GPU; the display driver online once, never restarted, and a FRAME REACHED THE DISPLAY | The driver reports online before any frame exists, so "online" is not the oracle; a boot where every present failed behind the controller looks identical until ConsoleService says which. |
+| `iommu-riscv64-direct-aia` | The umbrella for the two rows below, on the IMSIC interrupt path. | Serial. |
+| `iommu-riscv64-direct-aia-hostile` | As the aarch64 hostile row, on AIA/IMSIC. | Same. |
+| `iommu-riscv64-direct-aia-ordinary` / `iommu-port-ordinary-direct` | As the aarch64 direct ordinary row. | Same. |
+| `iommu-riscv64-uefi-aia` | The umbrella for the three rows below. | Serial. |
+| `iommu-riscv64-uefi-aia-transition` / `iommu-port-transition` | The full machine through U-Boot; virtio, NVMe and xHCI quiesced by class | The riscv64 ESP is an NVMe namespace, so `CC.EN` is proved here. |
+| `iommu-riscv64-uefi-aia-ordinary` / `iommu-port-ordinary-uefi` | As the aarch64 UEFI ordinary row; the ESP is kept because it is what the loader read. | Same. |
+| `iommu-riscv64-uefi-aia-display` / `iommu-port-display` | As the aarch64 display row, on AIA/IMSIC. | Same. |
+
+## The no-device-tree profile rows
+
+| Catalog row | Profile-specific final assertions |
+| --- | --- |
+| `arch-profile-aarch64-no-dt-absent-1` | The same treeless contract as `-no-dt-1` with the descriptor ABSENT: the kernel must refuse to select a controller it was never authorized for, rather than falling back to one it recognises. |
+| `arch-profile-riscv64-no-dt-absent-1` | The same absence contract for the riscv64 descriptor. |
+
+## The evidence gate
+
+`verify-evidence` boots a guest to prove the BINDING rather than the boot: every input is bound -
+the medium, the firmware image and the kernel opened once and hashed through their descriptors, the
+QEMU executable copied to a content-addressed run-private path and hashed there - and the fixture
+then replaces the tool and the firmware AT THEIR PATHNAMES inside that window through
+`LIBER_HARNESS_HOLD`. The boot must use the bound bytes anyway. A run that used the replacement, or
+one that noticed nothing because it re-opened by name, is the defect.
 
 ## Remaining ordinary gates and concurrent selection
 

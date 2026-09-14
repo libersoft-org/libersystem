@@ -804,8 +804,8 @@ fn the_wide_span_path_agrees_with_the_scalar_reference_exactly() {
 		Rgba::new(part(0) * alpha, part(8) * alpha, part(16) * alpha, alpha)
 	};
 	// LENGTHS AROUND THE LANE WIDTH, because the tail is where a wide loop goes wrong and every
-	// length that is a multiple of four would hide it.
-	for length in [0usize, 1, 3, 4, 5, 7, 8, 9, 16, 17, 64, 129] {
+	// length that is an exact multiple of it would hide it.
+	for length in [0usize, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 64, 129] {
 		let source: alloc::vec::Vec<Rgba> = (0..length).map(|index| value((index as u32).wrapping_mul(2_654_435_761))).collect();
 		let start: alloc::vec::Vec<Rgba> = (0..length).map(|index| value((index as u32).wrapping_mul(40_503).wrapping_add(7))).collect();
 		let mut wide = start.clone();
@@ -1233,4 +1233,149 @@ fn a_tile_no_command_reaches_is_left_byte_for_byte() {
 	assert_eq!(pixel(&image, 4, 4)[0], 255, "the corner was drawn");
 	let far = pixel(&image, 60, 60);
 	assert_eq!(far, [240, 240, 1, 253], "a pixel the drawing never reaches is exactly what it was: {far:?}");
+}
+
+#[test]
+// THE SIX NODES THAT ARE NOT AN EFFECT WITH A NAME - a convolution, two morphologies, a displacement,
+// a crop and a tile. Each is in the profile because the alternative is an application reaching for a
+// backend it cannot have: a sharpen, a thickened outline, a ripple, a bounded effect and a pattern
+// are all things a drawing does, and none of them is a blur.
+fn the_general_filter_nodes_do_what_the_profile_says_they_do() {
+	use render2d::filter::{Channel, FilterNode};
+
+	// ONE OPAQUE SQUARE, eight pixels on a side, with its own layer around it - so that every
+	// assertion below is about a shape whose extent is known exactly.
+	let with_graph = |build: &dyn Fn(&mut render2d::filter::FilterGraph)| {
+		let mut graph = render2d::filter::FilterGraph::default();
+		build(&mut graph);
+		let mut image = target(32, 32);
+		let mut canvas = Canvas::new();
+		let handle = canvas.resources().add_filter(graph).expect("a graph");
+		canvas.begin_layer(None, 1.0, BlendMode::Normal, Some(handle)).expect("a filtered layer");
+		canvas.fill_path(rect_path(RectF::new(12.0, 12.0, 8.0, 8.0)), red(), FillRule::NonZero).expect("a fill");
+		canvas.end_layer().expect("closed");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		image
+	};
+
+	// A CONVOLUTION WITH THE IDENTITY KERNEL IS THE IDENTITY, which is the check that distinguishes
+	// "the node ran" from "the node did nothing": a node that returned its input passes every
+	// assertion an effect makes about the middle of a shape.
+	let identity = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let weights = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+		graph.push(FilterNode::Convolution { input: source, weights, divisor: 1.0, bias: 0.0 }).expect("a convolution");
+	});
+	assert_eq!(
+		pixel(&identity, 16, 16),
+		pixel(
+			&with_graph(&|graph| {
+				graph.push(FilterNode::Source).expect("a node");
+			}),
+			16,
+			16
+		)
+	);
+
+	// AND AN EDGE-DETECT KERNEL IS ZERO WHERE THE PICTURE IS FLAT AND NOT ZERO AT AN EDGE, which is
+	// a property of the KERNEL rather than of this implementation: its weights sum to zero.
+	let edges = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let weights = [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]];
+		// A DIVISOR OF ZERO MEANS THE SUM OF THE WEIGHTS, and this kernel's sum is zero - so the
+		// stated fallback of one is what applies, and the test would fail with a division by zero if
+		// the node had taken the sum literally.
+		graph.push(FilterNode::Convolution { input: source, weights, divisor: 0.0, bias: 0.0 }).expect("a convolution");
+	});
+	assert_eq!(pixel(&edges, 16, 16)[3], 0, "the inside of a flat square has no edges in it");
+	assert!(pixel(&edges, 12, 16)[3] > 0, "and its left edge does: {:?}", pixel(&edges, 12, 16));
+
+	// DILATE GROWS THE SHAPE BY THE RADIUS AND ERODE SHRINKS IT BY THE SAME, which is the pair that
+	// makes them worth having separately: an outline is the difference between the two.
+	let dilated = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		graph.push(FilterNode::MorphologyDilate { input: source, x: 2.0, y: 2.0 }).expect("a dilation");
+	});
+	assert_eq!(pixel(&dilated, 10, 16)[3], 255, "two pixels outside the shape is now inside it");
+	assert_eq!(pixel(&dilated, 9, 16)[3], 0, "and three is still outside");
+	let eroded = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		graph.push(FilterNode::MorphologyErode { input: source, x: 2.0, y: 2.0 }).expect("an erosion");
+	});
+	assert_eq!(pixel(&eroded, 13, 16)[3], 0, "one pixel inside the edge is eroded away");
+	assert_eq!(pixel(&eroded, 16, 16)[3], 255, "and the middle survives");
+
+	// A DISPLACEMENT MAP OF FLAT HALF-GREY IS THE IDENTITY. That is what the minus a half in the
+	// node's definition buys, and it is why a map can be a gradient, a noise field or a rendered
+	// shape without the caller biasing it first.
+	let undisplaced = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let map = graph.push(FilterNode::Flood { color: Color::new(0.5, 0.5, 0.5, 1.0, ColorSpace::SrgbLinear) }).expect("a flat map");
+		graph.push(FilterNode::DisplacementMap { input: source, map, scale: 8.0, x_channel: Channel::Red, y_channel: Channel::Green }).expect("a displacement");
+	});
+	assert_eq!(pixel(&undisplaced, 16, 16)[3], 255, "a flat half-grey map moves nothing");
+	assert_eq!(pixel(&undisplaced, 10, 16)[3], 0, "and nothing arrives from anywhere else");
+
+	// A MAP AT ONE MOVES BY HALF THE SCALE, in the direction the channel names. `1.0 - 0.5` is a
+	// half, so a scale of eight is a displacement of four - and reading the map at its stated channel
+	// is what the two channel fields are for.
+	let displaced = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		let map = graph.push(FilterNode::Flood { color: Color::new(1.0, 0.5, 0.5, 1.0, ColorSpace::SrgbLinear) }).expect("a map");
+		graph.push(FilterNode::DisplacementMap { input: source, map, scale: 8.0, x_channel: Channel::Red, y_channel: Channel::Green }).expect("a displacement");
+	});
+	assert_eq!(pixel(&displaced, 12, 16)[3], 255, "the shape is read from four pixels to the right, so it appears four to the left");
+	assert_eq!(pixel(&displaced, 18, 16)[3], 0, "and its right edge has moved with it");
+
+	// A CROP IS THE INPUT INSIDE A RECTANGLE AND NOTHING OUTSIDE IT, which is the cheap way to bound
+	// an effect: the bounds map says so too, so what is outside is never computed.
+	let cropped = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		graph.push(FilterNode::Crop { input: source, rect: RectF::new(12.0, 12.0, 4.0, 8.0) }).expect("a crop");
+	});
+	assert_eq!(pixel(&cropped, 13, 16)[3], 255, "inside the crop the shape is there");
+	assert_eq!(pixel(&cropped, 17, 16)[3], 0, "and outside it there is nothing");
+
+	// A TILE REPEATS ONE RECTANGLE OVER THE WHOLE OUTPUT, wrapped about the RECTANGLE'S OWN origin -
+	// so the tile that lands on the rectangle is the rectangle, and moving the pattern moves it
+	// rather than reshuffling it.
+	let tiled = with_graph(&|graph| {
+		let source = graph.push(FilterNode::Source).expect("a node");
+		graph.push(FilterNode::Tile { input: source, rect: RectF::new(12.0, 12.0, 8.0, 8.0) }).expect("a tile");
+	});
+	assert_eq!(pixel(&tiled, 16, 16)[3], 255, "the tile itself is unchanged");
+	assert_eq!(pixel(&tiled, 24, 24)[3], 255, "and it repeats one period along both axes");
+	assert_eq!(pixel(&tiled, 4, 4)[3], 255, "in the negative direction too, which a plain remainder gets wrong");
+
+	// A TILE WITH NO AREA IS REFUSED WHERE IT IS BUILT. A period of zero is a loop that does not
+	// advance, which is a frame that never finishes rather than a picture that is wrong.
+	let mut degenerate = render2d::filter::FilterGraph::default();
+	let source = degenerate.push(FilterNode::Source).expect("a node");
+	assert!(matches!(degenerate.push(FilterNode::Tile { input: source, rect: RectF::new(0.0, 0.0, 0.0, 8.0) }), Err(render2d::Error::DegenerateShape { .. })));
+}
+
+#[test]
+// A FILL OUTSIDE A CLIP'S BOUNDS IS STILL CLIPPED, and this is the case a tiled clip mask gets wrong:
+// the mask is built over the clip's own rectangle, and a tile the mask does not cover has to mean
+// NOTHING PASSES rather than everything does. A live capture of the 2D demo showed the far end of a
+// scrolling column standing outside the rounded panel that was clipping it.
+fn a_shape_beyond_the_clips_bounds_is_clipped_away() {
+	// BIG ENOUGH TO SPAN SEVERAL TILES, which is the whole point: a clip mask built only for the
+	// tiles the clip touches leaves every other tile with no mask at all, and "no mask" has to mean
+	// nothing passes rather than everything does. A single-tile target cannot tell the two apart.
+	let mut image = target(256, 256);
+	let mut canvas = Canvas::new();
+	canvas.save().expect("a save");
+	let mut rounded = PathBuilder::new();
+	rounded.add_rounded_rect(RectF::new(16.0, 16.0, 96.0, 64.0), 12.0, 12.0).expect("a rounded rectangle");
+	canvas.set_clip(rounded.finish(), FillRule::NonZero).expect("a clip");
+	// One rectangle inside the clip and one well below it, in the same drawing.
+	canvas.fill_path(rect_path(RectF::new(32.0, 32.0, 48.0, 24.0)), red(), FillRule::NonZero).expect("inside");
+	canvas.fill_path(rect_path(RectF::new(32.0, 200.0, 48.0, 24.0)), red(), FillRule::NonZero).expect("three tile rows below");
+	canvas.restore().expect("a restore");
+	draw(&canvas.finish().expect("a list"), &mut image);
+
+	assert_eq!(pixel(&image, 40, 40)[3], 255, "the shape inside the clip is drawn: {:?}", pixel(&image, 40, 40));
+	assert_eq!(pixel(&image, 40, 208)[3], 0, "and the one three tile rows beyond the clip is not: {:?}", pixel(&image, 40, 208));
+	assert_eq!(pixel(&image, 40, 120)[3], 0, "nor anything between them: {:?}", pixel(&image, 40, 120));
 }

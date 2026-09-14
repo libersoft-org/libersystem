@@ -670,6 +670,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "render2d-conformance"
+version = "0.0.0"
+dependencies = [
+ "font-contract",
+ "graphics-core",
+ "graphics-profile",
+ "libm",
+ "render2d",
+ "soft2d",
+]
+
+[[package]]
 name = "resources-client"
 version = "0.0.0"
 dependencies = [
@@ -901,6 +913,7 @@ dependencies = [
  "process-client-provider",
  "proto",
  "render2d",
+ "render2d-conformance",
  "resources-client",
  "resources-client-provider",
  "rt",

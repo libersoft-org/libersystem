@@ -1195,6 +1195,21 @@ fn display_service_refuses_hostile_input() {
 	let after_junk = call(&console_surface, surface::OP_CONFIGURATION, 10, &[]);
 	succeeded(&after_junk, 10);
 
+	// A REQUEST THAT CARRIES A CAPABILITY ITS SIGNATURE DOES NOT NAME. The defect this is about is
+	// not the refusal but what happens to the HANDLE: a service that decoded the bytes it understood
+	// and ignored the rest would leave a live capability in nobody's hands and nobody's list - not
+	// refused, not closed, and still charged to the sender for the life of the process, one per
+	// request, from any client with no privilege at all.
+	let (smuggled, smuggled_peer) = Channel::create();
+	let mut smuggle = 1u64.to_le_bytes().to_vec();
+	send_cap(&console_surface, &request(surface::OP_ACK_CONFIGURE, 19, &smuggle).bytes, smuggled_peer, Rights::ALL).expect("a request carrying an unnamed capability");
+	sched::run_until_idle();
+	assert!(console_surface.recv().is_err(), "a request whose signature does not account for what it carried is not answered");
+	// AND THE CAPABILITY WAS CLOSED RATHER THAN KEPT. The service's own sweep closes what its
+	// dispatch refused, so the peer this test still holds sees the other end go.
+	assert!(smuggled.is_peer_closed(), "and the capability it smuggled in was released rather than held");
+	smuggle.clear();
+
 	// A FORGED IMPORT: a capability of the wrong KIND where an image belongs. The schema declares
 	// `handle<image-object>` with `@kernel(memory-object)`, so the generated guard checks the object
 	// type as well as the rights - a channel is refused before the service sees it at all.
@@ -2889,4 +2904,141 @@ fn storage_serves_staged_tool_binary() {
 	let actual = storage_read(b"vol://system/bin/cat.lsexe").expect("the staged tool read should succeed");
 	assert!(actual.len() > 4, "the staged tool should not be empty");
 	assert_eq!(&actual[..4], b"\x7fELF", "the staged tool should be an ELF image");
+}
+
+// THE INTERACTIVE 2D DEMO, AGAINST A REAL DISPLAYSERVICE.
+//
+// WHAT THE CONFORMANCE RUN CANNOT SHOW. That one walks the profile in memory it allocated itself and
+// answers "is each feature implemented"; this one draws a real scene into a real surface's images,
+// through a real present queue, and answers the other half: that a drawing made of those features
+// reaches a screen, that its DAMAGE is what it changed rather than what it feels like, and that a
+// generation change under it is survived rather than presented over.
+//
+// THE TWO RECTANGLES ARE THE POINT OF THE MIDDLE PHASE. An application that changes two distant
+// regions has to reach the driver as TWO transfers - a damage model that unions them covers the
+// screen between, which is the whole cost the model exists to avoid - and the only place that is
+// checkable is here, at the device end of the whole path.
+tagged_test!(the_2d_demo_draws_a_real_scene_with_real_damage, [Service, Display, Process, Image], id = "kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage", covers = ["bin.test2d-sw", "render2d", "soft2d", "graphics-app", "surface"]);
+fn the_2d_demo_draws_a_real_scene_with_real_damage() {
+	use display_harness::*;
+
+	// A SCANOUT BIG ENOUGH FOR THE SCENE'S OWN GEOMETRY. The patches the multi-rect phase changes sit
+	// twenty-four pixels in from two opposite corners, so a surface smaller than that would make the
+	// phase's two rectangles one.
+	let harness = display_harness::start(192, 128);
+	let console_client = harness.console;
+	let focus_input = harness.focus;
+	let gpu_kernel = harness.gpu;
+	let device_events = harness.device_events.expect("DisplayService opened the device's event stream");
+	let _display_service = harness.service;
+	let _boot_kernel = harness.boot;
+	let _stats = harness.stats;
+	let _admin = harness.admin;
+	let _scanout = harness.scanout;
+
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init_package_bytes().expect("init package module not found")).expect("init package parses");
+	let demo_elf = program_elf(&package, volume, b"test2d-sw").expect("test2d-sw in the package or volume");
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let display = connect(&console_client);
+	let process = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	// THE DETERMINISTIC CONTROLS, which are launch ARGUMENTS and not keys: a key that changed the run
+	// would be a key a person could press by accident. Three frames a phase is enough to see each
+	// phase's damage shape, and the run ends on its own frame count rather than on this loop's.
+	bootstrap.send(Message::new(crate::tests::launch_context(b"--frames=240 --phase-frames=3 --no-input", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
+	send_cap(&bootstrap, b"DISPLAY", display, Rights::ALL).expect("the demo's display");
+
+	let mut output: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let mut whole_surface_presents = 0usize;
+	let mut two_rectangle_presents = 0usize;
+	let mut presents = 0usize;
+	let mut resized = false;
+	for _ in 0..80_000u32 {
+		// A BOUNDED DRAIN, for the reason the frame-loop gate states: `run_until_idle` sleeps to the
+		// nearest thread deadline and keeps going, so against a client that paces itself it never
+		// returns.
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		if focus_input.recv().is_ok() {
+			focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
+		}
+		// EVERY PRESENT THE DEVICE SEES, WITH ITS RECTANGLES. This is the end of the path the damage
+		// travelled, and counting the SHAPES here is what the middle phase is for.
+		while let Ok(present) = gpu_kernel.recv() {
+			// THE DEVICE'S OWN VIEW OF THE DAMAGE, read the way the device reads it: the operation,
+			// the correlation, the backing generation, and then the region.
+			let mut reader = wire::Reader::new(&present.bytes);
+			let _op = reader.u16();
+			let _corr = reader.u32();
+			let _generation = reader.u32();
+			if let Some(region) = display_device::DamageRegion::read(&mut reader) {
+				match region.rects.len() {
+					2 => two_rectangle_presents += 1,
+					1 => {
+						let rect = &region.rects[0];
+						// A WHOLE-SURFACE PRESENT IS ONE RECTANGLE COVERING THE SURFACE, which is
+						// what `Full` becomes by the time the device sees it - and is a different
+						// thing from a one-rectangle partial update.
+						if rect.size.width >= 96 && rect.size.height >= 64 {
+							whole_surface_presents += 1;
+						}
+					}
+					_ => {}
+				}
+			}
+			let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
+			reply.push(1);
+			gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
+			presents += 1;
+		}
+		while let Ok(message) = stdout.recv() {
+			output.extend_from_slice(&message.bytes);
+		}
+		// RESIZE UNDER IT ONCE IT HAS DRAWN THROUGH ITS FIRST PHASES. A changed extent is a new
+		// generation: every image of the old one is stale, and what this checks is that the demo
+		// rebuilds and goes back to a WHOLE-surface damage rather than presenting a partial update
+		// computed for the size it no longer has.
+		// AFTER THE PHASES THAT COME BEFORE IT HAVE DRAWN. Three frames each for full, partial and
+		// multi-rect is nine, so a resize before the twelfth present would cut the middle phase off
+		// at its first frame - which is a gate that passes without ever seeing the thing it is for.
+		if !resized && presents >= 12 {
+			let mut frame = [0u8; 64];
+			let mut handles = wire::Handles::new();
+			let event = display_device::DeviceEvent::Resized(display_device::Extent2d { width: 160, height: 112 });
+			let len = display_device::display_device::events_frame(0, &event, &mut frame, &mut handles).expect("a device event encodes");
+			device_events.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).expect("gpu resize event");
+			resized = true;
+		}
+		if process.is_terminated() && resized {
+			break;
+		}
+	}
+	while let Ok(message) = stdout.recv() {
+		output.extend_from_slice(&message.bytes);
+	}
+	for line in output.split(|byte| *byte == b'\n') {
+		if !line.is_empty() {
+			crate::serial_println!("  {}", alloc::string::String::from_utf8_lossy(line));
+		}
+	}
+	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
+
+	assert!(process.is_terminated(), "the demo ran to completion rather than being cut off: {presents} device present(s), {whole_surface_presents} whole, {two_rectangle_presents} two-rect, output={output:?}");
+	assert!(contains(b"test2d-sw: open"), "it opened a surface: {output:?}");
+	// THE PHASES IT WENT THROUGH, NAMED. A demo whose phases are a comment is a demo whose damage
+	// nobody can attribute to a decision.
+	assert!(contains(b"test2d-sw: phase partial"), "it reached the partial-damage phase: {output:?}");
+	assert!(contains(b"test2d-sw: phase multi-rect"), "and the multi-rect one: {output:?}");
+	assert!(contains(b"test2d-sw: phase resize"), "and the resize, which a REBUILD enters and no counter does: {output:?}");
+	// THE WHOLE POINT, AT THE DEVICE END: two distant regions arrive as TWO rectangles.
+	assert!(two_rectangle_presents > 0, "the multi-rect phase's two rectangles reached the driver as two: {presents} presents, {output:?}");
+	// AND A FULL FRAME IS STILL A FULL FRAME, which is what the first phase and every generation's
+	// first frame are.
+	assert!(whole_surface_presents > 0, "the full phases presented the whole surface: {presents} presents");
+	// THE SECOND SURFACE, which is the object model's own proof: opened, presented to, and closed
+	// with the first one's resources and generation surviving it.
+	assert!(!contains(b"second=0 "), "the second surface presented: {output:?}");
+	assert!(contains(b"test2d-sw: done"), "and the run ended cleanly: {output:?}");
 }

@@ -332,6 +332,14 @@ path = "user/libs/graphics/render2d"
 owner = "soft2d"
 path = "user/libs/graphics/soft2d"
 
+# THE PROFILE, WALKED ENTRY BY ENTRY. One scene per feature with its own stated pass condition,
+# driven by the machine-readable registry - so a feature added to the profile with no scene here is a
+# gate failure rather than a feature nobody tested. It is a library because the same scenes run as
+# host tests where the tree is built and inside a booted guest on each architecture.
+[[sources]]
+owner = "render2d-conformance"
+path = "user/libs/graphics/conformance2d"
+
 # LINE LAYOUT ABOVE SHAPING: where the runs of a line sit, and where a caret lands. Separate from
 # the pipeline below because it decides GEOMETRY over the frozen run seam and reads no text at all,
 # which is what makes its decisions checkable on numbers a fixture states.
@@ -863,6 +871,39 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/frame_probe.lsexe"
 providers = ["graphics-app", "graphics-core", "surface", "lsrt"]
+
+# THE 2D CONFORMANCE RUN. It holds NO capability at all: every scene draws into memory it allocated
+# itself and reads the pixels back, so what it measures is the profile and not a service that happened
+# to be there.
+[[programs]]
+name = "test2d-conformance-sw"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/test2d-conformance-sw.lsexe"
+providers = ["render2d-conformance", "lsrt"]
+
+# THE INTERACTIVE 2D DEMO. `display` and `input-keys` and nothing else: the scene is made of shapes
+# this program computes, images it generates and glyph forms it carries, so it needs no volume and no
+# font catalogue to draw a line of text with a colour glyph in it.
+[[programs]]
+name = "test2d-sw"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/test2d-sw.lsexe"
+providers = [
+	"graphics-app",
+	"graphics-core",
+	"render2d",
+	"soft2d",
+	"surface",
+	"input-proto",
+	"base-proto",
+	"lsrt",
+]
 
 [[programs]]
 name = "graphics_probe"
@@ -3903,6 +3944,13 @@ owner = "soft2d"
 destination = "lib/graphics/soft2d.lslib"
 features = []
 providers = ["font-contract", "graphics-core", "render2d", "lsrt"]
+
+[[libraries]]
+name = "render2d-conformance"
+owner = "render2d-conformance"
+destination = "lib/graphics/render2d-conformance.lslib"
+features = []
+providers = ["font-contract", "graphics-core", "render2d", "soft2d", "lsrt"]
 
 [[libraries]]
 name = "png"
