@@ -8,9 +8,10 @@
 SCRIPT_NAME=test.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 install_guest_cleanup
-# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
-# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
-# build came to be waited on for half an hour.
+# EVERY RUN ENDS WITH A VERDICT, from the one EXIT dispatcher in lib.sh - and cleanups REGISTER with
+# it rather than installing traps of their own. A run that fails is otherwise indistinguishable from
+# a run that is still going, which is exactly how a failed build came to be waited on for half an
+# hour. `docs/TESTING.md` states what the line and the terminal record do and do not promise.
 arm_run_verdict
 
 help() {
@@ -329,9 +330,9 @@ run_arch() {
 	# UEFI=1 on the device-tree architectures: they have no other way in since the packaged
 	# bootstrap archive and the magic scan that found it were retired.
 	if [[ "$arch" == x86_64 ]]; then
-		(cd "$SRC_DIR" && harness/test-kernel.sh "${args[@]}")
+		run_owned_shell '(cd "$SRC_DIR" && harness/test-kernel.sh "${args[@]}")'
 	else
-		(cd "$SRC_DIR" && UEFI="${UEFI:-1}" harness/test-kernel.sh "${args[@]}")
+		run_owned_shell '(cd "$SRC_DIR" && UEFI="${UEFI:-1}" harness/test-kernel.sh "${args[@]}")'
 	fi
 	# AND ONCE MORE AT EL2, on aarch64, over the smoke tag only.
 	#
@@ -347,7 +348,7 @@ run_arch() {
 	# a second boot, and the person who wants it says so.
 	if [[ "$arch" == aarch64 && "${EL2:-0}" == "1" ]]; then
 		echo "[test-$arch] and again at EL2 (virtualization=on), smoke tag only"
-		(cd "$SRC_DIR" && UEFI=1 EL2=1 harness/test-kernel.sh "$arch" boot)
+		run_owned_shell '(cd "$SRC_DIR" && UEFI=1 EL2=1 harness/test-kernel.sh "$arch" boot)'
 	fi
 }
 

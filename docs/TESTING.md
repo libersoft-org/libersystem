@@ -110,15 +110,44 @@ timings, which is the line that would have settled it in one glance.
 ## Has it finished, and how did it end
 
 **Read the verdict, never the log.** Every entry point - `build.sh`, `test.sh`, `check.sh`, `gen.sh`
-and `verify.sh` - ends with exactly one line in exactly one shape:
+and `verify.sh` - ends with exactly one line, on stderr, in exactly one shape:
 
     build.sh: RESULT failed exit=1 seconds=9
 
-It is emitted from a `trap ... EXIT`, so it appears when the script succeeds, when it fails, when
-`set -e` aborts it mid-way and when a signal kills it - a run shot down with `SIGTERM` reports
-`RESULT failed exit=143` rather than claiming success. Set `RUN_STATUS_FILE` to a path and the same
-fields are written there as `key=value` lines; the file's EXISTENCE is the signal, because it is
-written when the run ends and is absent while it runs. "Has it finished" is then a file test.
+The four fields are the script's name, `ok` or `failed`, the exit code, and a nonnegative whole
+number of seconds for THAT invocation. `ok` means the code was zero and nothing else.
+
+It is emitted from one EXIT dispatcher, so it appears when the script succeeds, when it fails, when
+`set -e` aborts it mid-way and when a catchable signal ends it: a run shot down with `SIGTERM`
+reports `RESULT failed exit=143`, which is the shell's own 128+n convention. The dispatcher runs the
+run's registered cleanups FIRST and publishes afterwards, so the line means "the work and its cleanup
+are done", not "the script reached its last statement".
+
+**The terminal record, and the one rule that makes it readable.** Set `RUN_STATUS_FILE` to a
+**fresh, unused path** and the same four values are written there:
+
+    script=build.sh
+    outcome=failed
+    exit=1
+    seconds=9
+
+Allocate a NEW path for every run - a file inside a new `mktemp -d` directory is the intended shape -
+and do not pre-create it. A destination that already exists is refused with a diagnostic and left
+untouched: the run continues and keeps its own exit code, but it publishes no record, because
+overwriting one would destroy somebody else's answer and reusing one would let a stale success read
+as this run's. The file is written beside the destination and renamed into place, so a reader never
+sees half a record.
+
+**What its absence means: pending or unknown, never success.** The record appears only at the end,
+so its absence means the run is still going, or it died in a way no in-process trap can report -
+`SIGKILL`, the OOM killer, the machine going away, or a destination that could not be written. Use
+the launcher's own wait/exit information to tell a live run from an ended one with no record. Note
+also that publication becoming visible does not prove the process has already been reaped by the
+operating system; it proves the run reached terminal finalization.
+
+**Parent and child.** The destination belongs to ONE invocation: it is taken at arming and unexported
+immediately, so a script the run calls keeps its own RESULT line and has no destination unless its
+caller gives it a different fresh one. A nested run can never announce its parent's completion.
 
 **Do not decide a run's state by searching its log for words.** This is written down because it cost
 half an hour: a build failed in nine seconds with `build-shared: Cargo image graph did not stop after
@@ -127,15 +156,37 @@ emitting its ET_REL seed object`, and the thing watching the log was watching fo
 log that had stopped growing. Failures arrive in at least six shapes across the tools this tree
 drives; the verdict is the one shape that is always there.
 
-**Start a detached run with `setsid`.** Without it the run belongs to the process group of the shell
-that launched it, and that shell exiting takes the whole tree with it - leaving a log that simply
-stops mid-step with no error and no verdict, because the script never got to run its trap. Three runs
-died that way on 2026-09-13 before the cause was found.
+**Launching a detached run.** Redirect the streams explicitly and keep stderr, which is where the
+verdict goes:
 
-**A build that stops making progress says so.** `build.sh --stall SEC` (or `BUILD_STALL`, default
-900, `0` disables) reports a build whose steps have stopped starting, and names the step it was on.
+    dir="$(mktemp -d)"
+    setsid nohup ./build.sh --arch x86_64 >"$dir/log" 2>&1 &
+    RUN_STATUS_FILE="$dir/run.status" ...
+
+`setsid` puts the run in its own session and process group. That is useful - a signal aimed at the
+launching group no longer reaches it - and it is NOT insurance that a result will arrive: the shell
+exiting does not universally kill descendants, and a launcher's cleanup, a cgroup, the OOM killer or
+an explicit `SIGKILL` can still end a run before it says anything. Supervision and reaping belong to
+whatever started the run.
+
+**A build that stops making progress says so while it is still stopped.** `build.sh --stall SEC` -
+or `BUILD_STALL`, default 900, `0` to disable - watches `build.sh`'s OWN steps, not its output:
+
+    build.sh: STALLED - no step has started for 903s; the last one was 'libs (x86_64)'
+
+An explicit `--stall` overrides the environment, and an invalid window (a word, a negative, a
+fraction, or a value past 2147483647) ends the run through the ordinary failed verdict rather than
+being read as zero. The observer polls every second and reports when the measured age reaches the
+window, in practice by the window plus about two seconds on an ordinarily scheduled host with a
+stable clock; it is not a realtime guarantee under host suspension or a clock change. It reports ONCE
+per episode and rearms on the next step, so a build that stalls twice says so twice. Ordinary
+compiler output never postpones the report, and a step repeating an earlier step's name is still a
+new step.
+
 It REPORTS and does not kill: a guest can be shot down and restarted, a build killed mid-link leaves
-artifacts nobody can reason about, and the person watching is the one who should decide.
+artifacts nobody can reason about, and the person watching is the one who should decide. When the
+build ends, the observer and its sleeper are stopped and reaped before the verdict, so a finished
+build's output ends at once rather than at the next poll.
 
 ## Reading a guest run's logs
 

@@ -209,7 +209,7 @@ or preventing further development of `v1`.
 - [x] [P02M0133 - The parts are right; the transactions between them are not](P02M0133.md)
 - [x] [P02M0134 - The Wasm engine runs modules it has never validated](P02M0134.md)
 - [x] [P02M0135 - Foreign graphics-stack prerequisites](P02M0135.md)
-- [ ] [P02M0136 - Text foundation: shaping, fallback and layout](P02M0136.md)
+- [x] [P02M0136 - Text foundation: shaping, fallback and layout](P02M0136.md)
 - [x] [P02M0137 - Remove redundant dynamic-report work from warm builds](P02M0137.md)
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
@@ -252,7 +252,7 @@ or preventing further development of `v1`.
 - [x] [P02M0176 - Audit unsafe boundaries in the kernel and userspace before changing them](P02M0176.md) - complete 2026-09-09: the derived fifteen-row matrix, the `unsafe-inventory` tool with completeness fixtures, 5732 classified sites, the report, and the corrective follow-up P02M0178
 - [x] [P02M0178 - Narrow the userspace runtime's unsafe surface to the contracts callers actually hold](P02M0178.md) - the corrective follow-up the unsafe-boundary audit routed: safe signatures for the propagated syscall wrappers, the propagation removed downstream, and the kernel's `read_user` bounded
 - [x] [P02M0177 - A change is verified in proportion to itself, and integration bugs are catchable without a guest](P02M0177.md)
-- [ ] [P02M0179 - A run that ends says so, and a run that stalls says so while it is still stalling](P02M0179.md) - reopened 2026-09-13: complete the handled-exit verdict, invocation-owned atomic terminal file, bounded report-only build watchdog, failure-path coverage and verification-model integration; missing terminal information means pending or unknown
+- [x] [P02M0179 - A run that ends says so, and a run that stalls says so while it is still stalling](P02M0179.md) - complete 2026-09-13 against the reopened plan: one EXIT dispatcher with registered cleanups in all five entry points, an invocation-owned atomically published terminal file that a nested run can never write, a validated report-only build observer that owns its sleeper and rearms on real step progress, and a registered gate that proves each of those by making real runs fail in a private tree - a subordinate refusal, a compiler dying after setup, a stale image, a sweep that fails after its worktree exists - and that documents the one limit it cannot cross: after a `SIGKILL` a missing record means unknown, never success
 
 ### Definition of done (phase 2)
 

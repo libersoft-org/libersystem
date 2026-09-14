@@ -1965,3 +1965,104 @@ fn a_launch_transaction_rolls_back_on_every_fault() {
 	}
 	assert_eq!(cases.len(), 15, "every scripted case was run and asserted");
 }
+
+tagged_test!(the_text_stack_draws_its_corpus_to_the_analytic_oracle, [Text, Service, Storage, Slow], id = "kernel.applications.the_text_stack_draws_its_corpus_to_the_analytic_oracle", covers = ["bin.textconf", "kernel", "services"]);
+// THE THREE-ARCHITECTURE CLAIM, MADE WHERE IT CAN BE CHECKED. "The host tests pass on all three
+// architectures" has no executable meaning: a host test runs once, on the machine that built the
+// image. What the claim is about is the text stack running on the TARGET - the same shaping, the
+// same layout, the same rasteriser arithmetic - so this runs the staged `textconf` inside a booted
+// guest and reads its verdict.
+//
+// AND IT IS GOVERNED END TO END. The catalogue holds ONE read-only directory client and the program
+// holds ONE capability - the catalogue - so the face reaches the rasteriser along the path an
+// application would take and along no other. A test that handed the program its font bytes would
+// have proved the arithmetic and nothing about the system.
+//
+// WHAT IT COMPARES AGAINST IS GEOMETRY, not a captured image: every glyph of the staged face is an
+// axis-aligned ring, so each pixel's coverage is an exact product of two overlaps, which the program
+// computes from the outline the face declares. A baseline captured from `soft2d` would agree with
+// `soft2d` by construction.
+fn the_text_stack_draws_its_corpus_to_the_analytic_oracle() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let catalogue_elf = program_elf(&package, volume, b"font_catalogue").expect("font_catalogue in the package or volume");
+	let textconf_elf = program_elf(&package, volume, b"textconf").expect("textconf in the package or volume");
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+
+	// THE CATALOGUE'S WHOLE AUTHORITY. `writable: false` is not decoration: a read-only directory
+	// scope refuses the mutating operations by name, which is what lets a service that reads faces
+	// hold nothing that could change them.
+	let fontdir = storage.open_directory_scope(b"vol://system/share/fonts", false);
+	let (catalogue_boot_kernel, catalogue_boot_user) = Channel::create();
+	let (admin_server, _admin_client) = Channel::create();
+	let (serve_server, serve_client) = Channel::create();
+	// THE CATALOGUE IS STATICALLY LINKED, which is what its manifest row says and why it is spawned
+	// the way the boot chain spawns it rather than through the dynamic loader.
+	loader::spawn_elf_process(sched::root_domain(), catalogue_elf, catalogue_boot_user, Rights::ALL).expect("spawn FontCatalogue");
+	// THE RIGHTS THE SUPERVISOR HANDS, and no wider. The service checks its bootstrap against the
+	// generated plan and refuses a role that carries more than its row allows - correctly - so a
+	// harness standing in for the supervisor has to stand in accurately.
+	send_cap(&catalogue_boot_kernel, b"FONTDIR", fontdir, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue's font directory");
+	send_cap(&catalogue_boot_kernel, b"ADMIN", admin_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue's admin root");
+	send_cap(&catalogue_boot_kernel, b"SERVE", serve_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue's serve root");
+	let online = loop {
+		storage.pump();
+		if let Ok(message) = catalogue_boot_kernel.recv() {
+			break message;
+		}
+	};
+	assert_eq!(&online.bytes[..], b"FontCatalogue: online", "the catalogue started over the staged font directory");
+
+	// THE PROGRAM, with its console, its launch context and its ONE capability - in the order its
+	// bootstrap reads them, because a bootstrap is positional.
+	let (boot_kernel, boot_user) = Channel::create();
+	let (console, program_console) = Channel::create();
+	let _textconf = spawn_dynamic_test_process(sched::root_domain(), textconf_elf, boot_user);
+	send_cap(&boot_kernel, b"STDOUT", program_console, Rights::ALL).expect("the program's console");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	boot_kernel.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new())).expect("the program's launch context");
+	send_cap(&boot_kernel, b"FONT", serve_client, Rights::ALL).expect("the program's font catalogue");
+
+	// EVERY LINE IT PRINTS, and a bound on the waiting. A run that never answers is a failure with
+	// something to show rather than a suite that stops.
+	let mut printed: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	let mut idle = 0usize;
+	while idle < 200_000 {
+		storage.pump();
+		match console.recv() {
+			Ok(message) => {
+				idle = 0;
+				for line in message.bytes.split(|byte| *byte == b'\n') {
+					if line.is_empty() {
+						continue;
+					}
+					printed.push(alloc::string::String::from_utf8_lossy(line).into_owned());
+				}
+				if printed.iter().any(|line| line.starts_with("textconf: PASSED") || line.starts_with("textconf: FAILED")) {
+					break;
+				}
+			}
+			Err(_) => idle += 1,
+		}
+	}
+
+	// WHAT IT SAID, IN THE RUN'S OWN LOG. The program's console is this channel and not the serial
+	// port, so without this the evidence of a passing run exists only inside the assertion that reads
+	// it - and a reader looking at a green suite would have no way to see the numbers.
+	for line in &printed {
+		crate::serial_println!("  {line}");
+	}
+	let shown = printed.join(" | ");
+	assert!(printed.iter().any(|line| line.contains("through the catalogue")), "the program reached its face through the catalogue, and printed: {shown}");
+	// BOTH SIZES, AND THE TWO ARE DIFFERENT CHECKS. At the aligned size every pixel is wholly covered
+	// or wholly clear and is compared EXACTLY; at the fractional one most of the outline's boundary is
+	// partially covered and carries the frozen antialiasing tolerance. A run at one size alone would
+	// exercise one of the two rules and report a pass for both.
+	assert!(printed.iter().any(|line| line.starts_with("textconf: 50 px:")), "the aligned size was compared, and printed: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("textconf: 37 px:")), "the fractional size was compared, and printed: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("textconf: PASSED")), "the corpus rendered to the analytic oracle, and printed: {shown}");
+}

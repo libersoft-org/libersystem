@@ -1,0 +1,24 @@
+[package]
+name = "text-corpus"
+edition = "2024"
+description = "The text conformance gate: authored faces, pinned by digest, shaped and compared against expected glyph indices and positions"
+
+[[bin]]
+name = "text-corpus"
+path = "src/main.rs"
+
+[dependencies]
+# THE ONE COMPONENT ALLOWED TO READ A FONT, and the shaper above it. This gate reads the corpus
+# through exactly the code the system uses, because a gate with its own parser would be checking two
+# implementations against each other rather than checking the one that ships.
+font-parse = { path = "../../user/libs/text/font-parse" }
+font-shape = { path = "../../user/libs/text/font-shape" }
+font-contract = { path = "../../user/libs/text/font-contract" }
+text-pipeline = { path = "../../user/libs/text/text-pipeline" }
+unicode-bidi = { path = "../../user/libs/text/unicode-bidi" }
+# SHA-256 from the one implementation this tree has, so "pinned" means the same thing here as it
+# does everywhere else.
+bootproto = { path = "../../boot/protocol" }
+
+[lints.rust]
+warnings = "deny"

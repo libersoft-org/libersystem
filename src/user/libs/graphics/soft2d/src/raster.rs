@@ -5,12 +5,24 @@
 //! for strokes would be a second set of rules about where an edge is, and the two would disagree at
 //! exactly the places a drawing puts them next to each other.
 //!
-//! EXACT IN X, SAMPLED IN Y. Each pixel row is cut into sub-scanlines; on each of them the crossings
-//! are computed exactly, sorted, and the inside intervals added to the row with ANALYTIC horizontal
-//! coverage - a partially covered pixel at the end of an interval gets the fraction it is covered by,
-//! not a sample count. The vertical direction is sampled because an analytic answer there needs the
-//! edges sorted into an active list with their slopes, which buys accuracy the tolerance does not
-//! ask for. A near-horizontal edge is therefore the worst case, at a sixteenth of a level per step.
+//! EXACT IN BOTH DIRECTIONS, by accumulating AREA rather than by sampling. Each edge is clipped to
+//! the pixel row it crosses and then to each pixel column it passes through, and what is accumulated
+//! per pixel is two numbers: the signed vertical extent the edge spans there, and the area of that
+//! pixel lying to the RIGHT of the edge. A left-to-right sweep of the row turns those into the
+//! winding-weighted coverage of every pixel, exactly - a straight edge at any sub-pixel position
+//! produces the area it actually covers, in x and in y alike.
+//!
+//! IT USED TO SAMPLE THE VERTICAL DIRECTION at a sixteenth of a row, on the argument that the
+//! quantisation was "below what the conformance tolerance allows". It is not: the frozen render2d
+//! threshold is 2/255 per pixel AGAINST THE ANALYTIC AREA, and half a sixteenth of a level is 8/255 -
+//! four times it. That was measured by a text conformance run comparing a drawn frame against an
+//! oracle computed from the geometry, and it is why this file is an accumulation rasteriser now. The
+//! accumulation is also CHEAPER: one pass over the edges of a row rather than sixteen sweeps of
+//! crossings, each with a sort.
+//!
+//! THE ALIASED PATH IS STILL A SAMPLE, and it has to be: "a pixel is in or it is out" is a different
+//! question from "how much of it is covered", and a threshold on an area is not the same answer as a
+//! sample at the centre for a sliver narrower than half a pixel.
 //!
 //! DETERMINISTIC FOR A GIVEN INPUT, which the profile requires: the crossings are sorted by a total
 //! order, the intervals are walked in that order, and nothing here depends on a container's iteration
@@ -25,14 +37,6 @@ use graphics_core::geom::PixelRect;
 use render2d::blend::Antialias;
 use render2d::flatten::Contour;
 use render2d::path::FillRule;
-
-/// Sub-scanlines per pixel row.
-///
-/// SIXTEEN IS THE NUMBER THE CONTRACT CAN AFFORD. The profile fixes that an edge HAS a coverage value
-/// in `0..=255` and leaves the algorithm to the backend; sixteen steps quantise a near-horizontal
-/// edge to sixteen levels, which is below what the conformance tolerance for 2D coverage allows, and
-/// doubling it doubles the cost of every fill.
-pub const SUBSAMPLES: u32 = 16;
 
 /// One edge, as the rasteriser wants it: sorted by y, with the winding direction it lost by sorting.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -114,8 +118,12 @@ impl Edges {
 #[derive(Default)]
 pub struct Rasteriser {
 	coverage: Vec<f32>,
+	/// The signed vertical extent each pixel's edges span, and the area of each pixel to the RIGHT of
+	/// them. One row's worth; a left-to-right sweep turns the pair into coverage.
+	cover: Vec<f32>,
+	area: Vec<f32>,
 	crossings: Vec<(f32, i32)>,
-	/// The edges that cross the scanline being swept, as indices into the shape's own list.
+	/// The edges that cross the row being filled, as indices into the shape's own list.
 	active: Vec<u32>,
 }
 
@@ -129,12 +137,18 @@ impl Rasteriser {
 		if self.coverage.len() < width {
 			self.coverage.resize(width, 0.0);
 		}
+		if self.cover.len() < width {
+			self.cover.resize(width, 0.0);
+		}
+		if self.area.len() < width {
+			self.area.resize(width, 0.0);
+		}
 		self.crossings.reserve(edges.saturating_sub(self.crossings.capacity()));
 	}
 
 	/// What the reservation costs, which a caller compares against a budget.
 	pub fn scratch_bytes(&self) -> u64 {
-		(self.coverage.capacity() * core::mem::size_of::<f32>() + self.crossings.capacity() * core::mem::size_of::<(f32, i32)>() + self.active.capacity() * core::mem::size_of::<u32>()) as u64
+		((self.coverage.capacity() + self.cover.capacity() + self.area.capacity()) * core::mem::size_of::<f32>() + self.crossings.capacity() * core::mem::size_of::<(f32, i32)>() + self.active.capacity() * core::mem::size_of::<u32>()) as u64
 	}
 
 	/// Fill contours, emitting one row of coverage at a time.
@@ -152,25 +166,113 @@ impl Rasteriser {
 	/// THE EMITTED SLICE IS INDEXED FROM `bounds.x`, so a caller composites at `bounds.x + index`
 	/// without arithmetic of its own - which is the arithmetic that goes wrong when a tile's origin
 	/// and a clip's origin are not the same number.
-	pub fn fill_edges(&mut self, edges: &Edges, rule: FillRule, antialias: Antialias, bounds: PixelRect, mut row: impl FnMut(u32, &[f32])) {
+	pub fn fill_edges(&mut self, edges: &Edges, rule: FillRule, antialias: Antialias, bounds: PixelRect, row: impl FnMut(u32, &[f32])) {
 		if bounds.is_empty() || !edges.reaches(bounds.y as f32, (bounds.y + bounds.height) as f32) {
 			return;
 		}
+		match antialias {
+			Antialias::On => self.fill_by_area(edges, rule, bounds, row),
+			// A PIXEL IS IN OR IT IS OUT, which is a different question from how much of it is
+			// covered: a pixel-exact grid, a one-pixel rule and a screenshot comparison all need the
+			// binary answer, and thresholding an area is not the same answer for a sliver narrower
+			// than half a pixel.
+			Antialias::Off => self.fill_by_sample(edges, rule, bounds, row),
+		}
+	}
+
+	/// THE ANTIALIASED FILL: exact area, accumulated.
+	///
+	/// For every edge, clipped to this row and then to each pixel column it passes through, two
+	/// numbers are accumulated: `cover` is the signed vertical extent it spans in that pixel, which
+	/// every pixel to its RIGHT is fully covered by; `area` is the part of that pixel itself lying to
+	/// the right of it. A running sum of `cover` from the left, plus the pixel's own `area`, is the
+	/// winding-weighted coverage - exactly, at any sub-pixel position, in both directions.
+	fn fill_by_area(&mut self, edges: &Edges, rule: FillRule, bounds: PixelRect, mut row: impl FnMut(u32, &[f32])) {
+		let width = bounds.width as usize;
+		if self.coverage.len() < width {
+			self.coverage.resize(width, 0.0);
+		}
+		if self.cover.len() < width {
+			self.cover.resize(width, 0.0);
+		}
+		if self.area.len() < width {
+			self.area.resize(width, 0.0);
+		}
+		let left = bounds.x as f32;
+
+		// THE SWEEP STARTS AT THIS TILE'S TOP. Everything that begins above it and reaches into it is
+		// collected once, and everything that begins inside it is added as the sweep reaches it.
+		self.active.clear();
+		let mut cursor = 0usize;
+		let start = bounds.y as f32;
+		while cursor < edges.edges.len() && edges.edges[cursor].top_y <= start {
+			if edges.edges[cursor].bottom_y > start {
+				self.active.push(cursor as u32);
+			}
+			cursor += 1;
+		}
+
+		for y in bounds.y..bounds.y.saturating_add(bounds.height) {
+			let top = y as f32;
+			let bottom = top + 1.0;
+			while cursor < edges.edges.len() && edges.edges[cursor].top_y < bottom {
+				if edges.edges[cursor].bottom_y > top {
+					self.active.push(cursor as u32);
+				}
+				cursor += 1;
+			}
+			// AN EDGE LEAVES THE LIST WHEN THE SWEEP PASSES ITS BOTTOM, which is a retain over the
+			// active list and not a search over the shape.
+			self.active.retain(|index| edges.edges[*index as usize].bottom_y > top);
+			if self.active.is_empty() {
+				continue;
+			}
+			for value in self.cover[..width].iter_mut() {
+				*value = 0.0;
+			}
+			for value in self.area[..width].iter_mut() {
+				*value = 0.0;
+			}
+			// WHAT LIES LEFT OF THE TILE COVERS ALL OF IT. An edge outside the tile on that side is
+			// not skipped - every pixel in the row is to its right - and keeping that as a seed rather
+			// than clamping the edge's x is what makes the answer the same whatever the tiling is.
+			let mut seed = 0.0f32;
+			let mut touched = false;
+			for index in self.active.iter() {
+				let edge = &edges.edges[*index as usize];
+				let from_y = if edge.top_y > top { edge.top_y } else { top };
+				let to_y = if edge.bottom_y < bottom { edge.bottom_y } else { bottom };
+				if !(to_y > from_y) {
+					continue;
+				}
+				let from_x = edge.top_x + (from_y - edge.top_y) * edge.inverse_slope;
+				let to_x = edge.top_x + (to_y - edge.top_y) * edge.inverse_slope;
+				if !(from_x.is_finite() && to_x.is_finite()) {
+					continue;
+				}
+				accumulate(&mut self.cover[..width], &mut self.area[..width], &mut seed, from_x - left, from_y, to_x - left, to_y, edge.winding as f32);
+				touched = true;
+			}
+			if !touched {
+				continue;
+			}
+			let mut running = seed;
+			for index in 0..width {
+				let value = running + self.area[index];
+				running += self.cover[index];
+				self.coverage[index] = wind(value, rule);
+			}
+			row(y, &self.coverage[..width]);
+		}
+	}
+
+	/// THE ALIASED FILL: one sample at each pixel's centre, which is the rule it has always had.
+	fn fill_by_sample(&mut self, edges: &Edges, rule: FillRule, bounds: PixelRect, mut row: impl FnMut(u32, &[f32])) {
 		let (left, right) = (bounds.x as f32, bounds.x as f32 + bounds.width as f32);
 		let width = bounds.width as usize;
 		if self.coverage.len() < width {
 			self.coverage.resize(width, 0.0);
 		}
-		let samples = match antialias {
-			Antialias::On => SUBSAMPLES,
-			// THE ALIASED PATH IS ONE SAMPLE AT THE PIXEL'S CENTRE, which is the rule a pixel-exact
-			// grid, a one-pixel rule and a screenshot comparison need: a pixel is in or it is out.
-			Antialias::Off => 1,
-		};
-		let weight = 1.0 / samples as f32;
-		// THE SWEEP STARTS AT THIS TILE'S TOP. Everything that begins above it and reaches into it is
-		// collected once, and everything that begins inside it is added as the sweep reaches it - so
-		// the cost per sub-scanline is the edges that actually cross it.
 		let start = bounds.y as f32;
 		self.active.clear();
 		let mut cursor = 0usize;
@@ -185,33 +287,28 @@ impl Rasteriser {
 				*value = 0.0;
 			}
 			let mut touched = false;
-			for sample in 0..samples {
-				let scan = y as f32 + (sample as f32 + 0.5) / samples as f32;
-				while cursor < edges.edges.len() && edges.edges[cursor].top_y <= scan {
-					if edges.edges[cursor].bottom_y > scan {
-						self.active.push(cursor as u32);
-					}
-					cursor += 1;
+			let scan = y as f32 + 0.5;
+			while cursor < edges.edges.len() && edges.edges[cursor].top_y <= scan {
+				if edges.edges[cursor].bottom_y > scan {
+					self.active.push(cursor as u32);
 				}
-				// AN EDGE LEAVES THE LIST WHEN THE SWEEP PASSES ITS BOTTOM, which is a retain over the
-				// active list and not a search over the shape.
-				self.active.retain(|index| edges.edges[*index as usize].bottom_y > scan);
-				self.crossings.clear();
-				for index in self.active.iter() {
-					let edge = &edges.edges[*index as usize];
-					// HALF-OPEN IN Y: an edge covers `top <= scan < bottom`, so a vertex shared by two
-					// edges is counted once rather than twice or not at all.
-					if scan < edge.top_y {
-						continue;
-					}
-					let x = edge.top_x + (scan - edge.top_y) * edge.inverse_slope;
-					if x.is_finite() {
-						self.crossings.push((x, edge.winding));
-					}
-				}
-				if self.crossings.len() < 2 {
+				cursor += 1;
+			}
+			self.active.retain(|index| edges.edges[*index as usize].bottom_y > scan);
+			self.crossings.clear();
+			for index in self.active.iter() {
+				let edge = &edges.edges[*index as usize];
+				// HALF-OPEN IN Y: an edge covers `top <= scan < bottom`, so a vertex shared by two
+				// edges is counted once rather than twice or not at all.
+				if scan < edge.top_y {
 					continue;
 				}
+				let x = edge.top_x + (scan - edge.top_y) * edge.inverse_slope;
+				if x.is_finite() {
+					self.crossings.push((x, edge.winding));
+				}
+			}
+			if self.crossings.len() >= 2 {
 				self.crossings.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(core::cmp::Ordering::Equal));
 				let mut winding = 0i32;
 				let mut span_start = 0.0f32;
@@ -226,7 +323,7 @@ impl Rasteriser {
 					if !was_inside && inside {
 						span_start = x;
 					} else if was_inside && !inside {
-						touched |= add_span(&mut self.coverage[..width], span_start.max(left), x.min(right), left, weight, matches!(antialias, Antialias::Off));
+						touched |= add_span(&mut self.coverage[..width], span_start.max(left), x.min(right), left, 1.0, true);
 					}
 				}
 			}
@@ -235,6 +332,101 @@ impl Rasteriser {
 			}
 		}
 	}
+}
+
+/// The fill rule, applied to an accumulated winding-weighted area.
+///
+/// THE VALUE IS NOT A WINDING NUMBER AND NOT A COVERAGE, but the two multiplied: a pixel wholly
+/// inside one contour accumulates `1`, one wholly inside two nested contours wound the same way
+/// accumulates `2`, and a pixel an edge crosses accumulates the fraction. Saturating it is what makes
+/// the non-zero rule an area; folding it is what makes the even-odd rule one.
+fn wind(value: f32, rule: FillRule) -> f32 {
+	match rule {
+		FillRule::NonZero => {
+			let magnitude = if value < 0.0 { -value } else { value };
+			if magnitude > 1.0 { 1.0 } else { magnitude }
+		}
+		FillRule::EvenOdd => {
+			let magnitude = if value < 0.0 { -value } else { value };
+			let folded = magnitude - 2.0 * libm::floorf(magnitude / 2.0);
+			if folded > 1.0 { 2.0 - folded } else { folded }
+		}
+	}
+}
+
+/// One edge, clipped to a row already, accumulated into that row's `cover` and `area`.
+///
+/// THE COORDINATES ARE TILE-RELATIVE: column zero is the tile's first pixel. `seed` takes everything
+/// left of it, because every pixel of the row is to the right of an edge that far over.
+fn accumulate(cover: &mut [f32], area: &mut [f32], seed: &mut f32, x0: f32, y0: f32, x1: f32, y1: f32, winding: f32) {
+	let width = cover.len();
+	let dx = x1 - x0;
+	let dy = y1 - y0;
+	if dy == 0.0 {
+		return;
+	}
+	if dx == 0.0 {
+		// A VERTICAL EDGE IS ONE COLUMN, and the column it is in is the one its x falls in - except
+		// at a column boundary, where it belongs to the column on its right, which is the half-open
+		// rule every other clip here uses.
+		let column = libm::floorf(x0);
+		emit(cover, area, seed, width, column, x0, x0, dy * winding);
+		return;
+	}
+	let (low_x, high_x) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
+	// EVERYTHING LEFT OF THE TILE IN ONE PIECE, rather than one column at a time: an edge a thousand
+	// pixels to the left of a tile must not cost a thousand iterations.
+	if low_x < 0.0 {
+		let t = ((0.0 - x0) / dx).clamp(0.0, 1.0);
+		let (outside_from, outside_to) = if x0 < x1 { (0.0, t) } else { (t, 1.0) };
+		if outside_to > outside_from {
+			*seed += (outside_to - outside_from) * dy * winding;
+		}
+	}
+	if high_x <= 0.0 || low_x >= width as f32 {
+		return;
+	}
+	// THE COLUMNS THE SEGMENT ACTUALLY CROSSES, clamped to the tile. A column whose clipped piece is
+	// empty - which is what the one past the end is - is skipped by the `to > from` test below rather
+	// than by arithmetic here, because an off-by-one in a bound is harder to see than a loop that
+	// does nothing on its last step.
+	let first = libm::floorf(low_x.max(0.0)) as usize;
+	let last = (libm::floorf(high_x.min(width as f32)) as usize).min(width.saturating_sub(1));
+	for column in first..=last {
+		// THE SEGMENT CLIPPED TO ONE COLUMN, in the parameter it is straight in.
+		let lower = (column as f32 - x0) / dx;
+		let upper = ((column + 1) as f32 - x0) / dx;
+		let (from, to) = if lower <= upper { (lower, upper) } else { (upper, lower) };
+		let from = from.max(0.0);
+		let to = to.min(1.0);
+		if !(to > from) {
+			continue;
+		}
+		let at_from = x0 + from * dx;
+		let at_to = x0 + to * dx;
+		emit(cover, area, seed, width, column as f32, at_from, at_to, (to - from) * dy * winding);
+	}
+}
+
+/// One piece of an edge inside one column.
+fn emit(cover: &mut [f32], area: &mut [f32], seed: &mut f32, width: usize, column: f32, from_x: f32, to_x: f32, extent: f32) {
+	if extent == 0.0 {
+		return;
+	}
+	if column < 0.0 {
+		*seed += extent;
+		return;
+	}
+	let index = column as usize;
+	if index >= width {
+		return;
+	}
+	// THE AREA OF THIS PIXEL TO THE RIGHT OF THE EDGE, which is what the pixel itself is covered by;
+	// the pixels beyond it are covered by the whole extent, which is what `cover` carries.
+	let middle = (from_x + to_x) * 0.5;
+	let right = (column + 1.0 - middle).clamp(0.0, 1.0);
+	area[index] += extent * right;
+	cover[index] += extent;
 }
 
 /// Add one horizontal interval's coverage to a row, ANALYTICALLY.

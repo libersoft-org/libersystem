@@ -1,0 +1,81 @@
+# THE CONFORMANCE CORPUS, PINNED. Authored by `src/tools/font-gen`; regenerate with
+#   cargo run --manifest-path src/tools/font-gen/Cargo.toml
+# A face whose bytes are not these is refused by the text corpus gate rather than
+# quietly shaped: a corpus that drifted is a different test wearing the same name.
+# The glyph names are how the gate asks - never by number, because a number would
+# make the gate a test of this generator instead of a test of the shaper.
+face conformance-alpha.ttf b6b06b314ae90f2afaac622f11df65a801afbff232928bb6c794bae2f59da8bb
+glyph conformance-alpha.ttf .notdef 0
+glyph conformance-alpha.ttf space 1
+glyph conformance-alpha.ttf A 2
+glyph conformance-alpha.ttf V 3
+glyph conformance-alpha.ttf T 4
+glyph conformance-alpha.ttf f 5
+glyph conformance-alpha.ttf i 6
+glyph conformance-alpha.ttf l 7
+glyph conformance-alpha.ttf f_i 8
+glyph conformance-alpha.ttf f_f_l 9
+glyph conformance-alpha.ttf alef 10
+glyph conformance-alpha.ttf alef.isol 11
+glyph conformance-alpha.ttf alef.fina 12
+glyph conformance-alpha.ttf beh 13
+glyph conformance-alpha.ttf beh.isol 14
+glyph conformance-alpha.ttf beh.init 15
+glyph conformance-alpha.ttf beh.medi 16
+glyph conformance-alpha.ttf beh.fina 17
+glyph conformance-alpha.ttf jeem 18
+glyph conformance-alpha.ttf jeem.isol 19
+glyph conformance-alpha.ttf jeem.init 20
+glyph conformance-alpha.ttf jeem.medi 21
+glyph conformance-alpha.ttf jeem.fina 22
+glyph conformance-alpha.ttf lam 23
+glyph conformance-alpha.ttf lam.isol 24
+glyph conformance-alpha.ttf lam.init 25
+glyph conformance-alpha.ttf lam.medi 26
+glyph conformance-alpha.ttf lam.fina 27
+glyph conformance-alpha.ttf lam_alef 28
+glyph conformance-alpha.ttf he.alef 29
+glyph conformance-alpha.ttf he.bet 30
+glyph conformance-alpha.ttf dagesh 31
+glyph conformance-alpha.ttf qamats 32
+glyph conformance-alpha.ttf sheva 33
+face conformance-complex.ttf c37150f9e6a4b6e72419fa00340ba35cbbb637fec7c0eb6d85cf15c7e6ac6780
+glyph conformance-complex.ttf .notdef 0
+glyph conformance-complex.ttf space 1
+glyph conformance-complex.ttf dv.ka 2
+glyph conformance-complex.ttf dv.kha 3
+glyph conformance-complex.ttf dv.ra 4
+glyph conformance-complex.ttf dv.virama 5
+glyph conformance-complex.ttf dv.vowel-i 6
+glyph conformance-complex.ttf dv.vowel-aa 7
+glyph conformance-complex.ttf dv.ka.half 8
+glyph conformance-complex.ttf dv.repha 9
+glyph conformance-complex.ttf dv.ka_ra 10
+glyph conformance-complex.ttf th.ko 11
+glyph conformance-complex.ttf th.sara-a 12
+glyph conformance-complex.ttf th.sara-aa 13
+glyph conformance-complex.ttf th.sara-am 14
+glyph conformance-complex.ttf th.sara-i 15
+glyph conformance-complex.ttf th.mai-ek 16
+glyph conformance-complex.ttf th.nikhahit 17
+glyph conformance-complex.ttf km.ka 18
+glyph conformance-complex.ttf km.kha 19
+glyph conformance-complex.ttf km.coeng 20
+glyph conformance-complex.ttf km.ka.sub 21
+glyph conformance-complex.ttf km.kha.sub 22
+glyph conformance-complex.ttf km.sra-ii 23
+face conformance-emoji.ttf f098bef180870a0ec0b42026e5c91a8a86e2af34fdddcf68334a54401ef90cf2
+glyph conformance-emoji.ttf .notdef 0
+glyph conformance-emoji.ttf space 1
+glyph conformance-emoji.ttf man 2
+glyph conformance-emoji.ttf woman 3
+glyph conformance-emoji.ttf boy 4
+glyph conformance-emoji.ttf zwj 5
+glyph conformance-emoji.ttf tone.light 6
+glyph conformance-emoji.ttf thumbsup 7
+glyph conformance-emoji.ttf family.mwb 8
+glyph conformance-emoji.ttf thumbsup.light 9
+face conformance-variable.ttf e6f07ca98d42e6da21d3ae58ecb09dc99aac4571080276dbe9bb460df02e1d71
+glyph conformance-variable.ttf .notdef 0
+glyph conformance-variable.ttf space 1
+glyph conformance-variable.ttf bar 2

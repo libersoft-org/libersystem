@@ -858,6 +858,33 @@ providers = [
 	"lsrt",
 ]
 
+# THE TEXT AND RENDER CONFORMANCE RUN. It holds ONE capability - `font-catalogue` - and reaches its
+# face through it, which is what makes it a test of the stack an application can actually use rather
+# than of a path only a test takes.
+[[programs]]
+name = "textconf"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/textconf.lsexe"
+# WHAT IT ACTUALLY IMPORTS, which is shorter than what it uses: the profile's ceilings are `const`,
+# the seam's geometry is inlined, and a provider row satisfying no import is a claim the build
+# contradicts.
+providers = [
+	"base-proto",
+	"font-client",
+	"font-parse",
+	"font-run",
+	"font-shape",
+	"graphics-core",
+	"render2d",
+	"soft2d",
+	"text-layout",
+	"text-pipeline",
+	"lsrt",
+]
+
 [[programs]]
 name = "input_service"
 owner = "services"
@@ -3694,6 +3721,105 @@ owner = "pix"
 destination = "lib/image/pix.lslib"
 features = []
 providers = ["graphics-core", "lsrt"]
+
+# THE TEXT STACK, STAGED. Until now every one of these was a package with a source row and no library
+# row - built, gated and staged nowhere, which is a stack no program in the image could reach. The
+# conformance run is its first consumer and the reason they are here: the three-architecture claim is
+# about this code running on the TARGET, and code that is not in the image does not run there.
+#
+# THE ORDER OF THE ROWS IS NOT THE LINK ORDER - `providers` is - but they are written bottom-up
+# anyway, because a reader checking that a provider list is complete reads them that way.
+[[libraries]]
+name = "font-contract"
+owner = "font-contract"
+destination = "lib/text/font-contract.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "opentype-profile"
+owner = "opentype-profile"
+destination = "lib/text/opentype-profile.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "unicode-tables"
+owner = "unicode-tables"
+destination = "lib/text/unicode-tables.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "unicode-segmentation"
+owner = "unicode-segmentation"
+destination = "lib/text/unicode-segmentation.lslib"
+features = []
+providers = ["unicode-tables", "lsrt"]
+
+[[libraries]]
+name = "unicode-bidi"
+owner = "unicode-bidi"
+destination = "lib/text/unicode-bidi.lslib"
+features = []
+providers = ["unicode-tables", "lsrt"]
+
+[[libraries]]
+name = "font-parse"
+owner = "font-parse"
+destination = "lib/text/font-parse.lslib"
+features = []
+providers = ["opentype-profile", "lsrt"]
+
+[[libraries]]
+name = "font-shape"
+owner = "font-shape"
+destination = "lib/text/font-shape.lslib"
+features = []
+providers = ["font-parse", "unicode-tables", "lsrt"]
+
+[[libraries]]
+name = "font-run"
+owner = "font-run"
+destination = "lib/text/font-run.lslib"
+features = []
+providers = ["font-contract", "font-parse", "font-shape", "unicode-segmentation", "lsrt"]
+
+[[libraries]]
+name = "text-layout"
+owner = "text-layout"
+destination = "lib/text/text-layout.lslib"
+features = []
+providers = ["font-contract", "lsrt"]
+
+[[libraries]]
+name = "text-pipeline"
+owner = "text-pipeline"
+destination = "lib/text/text-pipeline.lslib"
+features = []
+providers = ["unicode-bidi", "unicode-segmentation", "unicode-tables", "lsrt"]
+
+# THE 2D DRAWING API AND THE RASTERISER UNDER IT. `render2d` produces a bounded, validated display
+# list and draws nothing; `soft2d` is the complete CPU implementation of Profile 1 behind the backend
+# trait. They are two libraries for the reason they are two packages: the boundary between them is
+# where a GPU backend later arrives.
+[[libraries]]
+name = "render2d"
+owner = "render2d"
+destination = "lib/graphics/render2d.lslib"
+features = []
+# EVERYTHING IT READS FROM THE LAYERS BELOW IT IS A CONSTANT OR A GENERIC, which is why this list is
+# short: the profile's limits are `const` and the image model's geometry is inlined, so the linked
+# library imports neither. A provider row that satisfied no import would be a claim about the build
+# that the build contradicts.
+providers = ["lsrt"]
+
+[[libraries]]
+name = "soft2d"
+owner = "soft2d"
+destination = "lib/graphics/soft2d.lslib"
+features = []
+providers = ["font-contract", "graphics-core", "render2d", "lsrt"]
 
 [[libraries]]
 name = "png"

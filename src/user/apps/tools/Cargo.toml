@@ -351,6 +351,13 @@ path = "src/ptyecho.rs"
 name = "readln"
 path = "src/readln.rs"
 
+# THE TEXT AND RENDER CONFORMANCE RUN, executed inside a booted guest. It is a staged program rather
+# than a host test because the three-architecture claim is about the stack running on the TARGET, and
+# a host test runs once, on the machine that built the image.
+[[bin]]
+name = "textconf"
+path = "src/textconf.rs"
+
 [features]
 default = []
 shared-image = [
@@ -444,6 +451,18 @@ pcm = { path = "../../libs/audio/pcm" }
 # THE SHARED IMAGE MODEL, for the one tool that draws onto a display surface: the surface describes
 # itself with a layout, and the viewer's destination is built from that rather than from its fields.
 graphics-core = { path = "../../libs/graphics/core" }
+# THE TEXT STACK AND THE 2D RENDERER, for the conformance run. This is the first program in the image
+# to link them, which is the point: a stack staged nowhere is a stack no application can reach, and
+# the three-architecture claim is about what runs on the target.
+font-contract = { path = "../../libs/text/font-contract" }
+font-parse = { path = "../../libs/text/font-parse" }
+font-shape = { path = "../../libs/text/font-shape" }
+font-run = { path = "../../libs/text/font-run" }
+text-layout = { path = "../../libs/text/text-layout" }
+text-pipeline = { path = "../../libs/text/text-pipeline" }
+unicode-bidi = { path = "../../libs/text/unicode-bidi" }
+render2d = { path = "../../libs/graphics/render2d" }
+soft2d = { path = "../../libs/graphics/soft2d" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }

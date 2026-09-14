@@ -8,9 +8,10 @@
 
 SCRIPT_NAME=build.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
-# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
-# build came to be waited on for half an hour.
+# EVERY RUN ENDS WITH A VERDICT, from the one EXIT dispatcher in lib.sh - and cleanups REGISTER with
+# it rather than installing traps of their own. A run that fails is otherwise indistinguishable from
+# a run that is still going, which is exactly how a failed build came to be waited on for half an
+# hour. `docs/TESTING.md` states what the line and the terminal record do and do not promise.
 arm_run_verdict
 
 # The build steps live here rather than in a file of their own.
@@ -62,7 +63,7 @@ step_sdk() {
 	# panic handler traps in silence - a component should not narrate its own failures to a log it
 	# does not own - and `mkpackages` reads `.build/cargo/sdk/.../liber_component.wasm` for exactly
 	# that reason.
-	(cd "$SRC_DIR/sdk" && cargo build --release --target wasm32-unknown-unknown --workspace)
+	run_owned_shell '(cd "$SRC_DIR/sdk" && cargo build --release --target wasm32-unknown-unknown --workspace)'
 	# A SIDECAR NAMING WHAT IT WAS BUILT FROM.
 	#
 	# A missing artifact is a failure and a STALE one used to pass: build the SDK, change
@@ -80,7 +81,7 @@ step_sdk() {
 	# nothing in the tree passed `--features` the half that ran was always the silent one -
 	# everything under `#[cfg(feature = "dev-diagnostics")]` in `src/sdk/src/panic.rs` had no
 	# automatic coverage against a real guest at all. Two artifacts, each asserted unconditionally.
-	(cd "$SRC_DIR/sdk" && CARGO_TARGET_DIR="$BUILD_DIR/cargo/sdk-dev" cargo build --release --target wasm32-unknown-unknown -p liber_component --features liber-sdk/dev-diagnostics)
+	run_owned_shell '(cd "$SRC_DIR/sdk" && CARGO_TARGET_DIR="$BUILD_DIR/cargo/sdk-dev" cargo build --release --target wasm32-unknown-unknown -p liber_component --features liber-sdk/dev-diagnostics)'
 	(cd "$SRC_DIR" && tools/sdk-inputs.sh dev-diagnostics) >"$BUILD_DIR/cargo/sdk-dev/wasm32-unknown-unknown/release/liber_component.wasm.inputs"
 }
 
@@ -90,7 +91,7 @@ step_libs() {
 	local pairs=()
 	mapfile -t pairs < <(shared_libs)
 	[[ ${#pairs[@]} -gt 0 ]] || die "the manifest lists no shared libraries"
-	(cd "$SRC_DIR" && tools/build-shared.sh "$(target_triple "$arch")" "${pairs[@]}")
+	run_owned_shell '(cd "$SRC_DIR" && tools/build-shared.sh "$(target_triple "$arch")" "${pairs[@]}")'
 }
 
 step_user() {
@@ -99,13 +100,13 @@ step_user() {
 	flag="$(target_flag "$arch")"
 	step "user ($arch)"
 	# shellcheck disable=SC2046,SC2086
-	(cd "$(source_path system_manager)" && cargo build $flag)
+	run_owned_shell '(cd "$(source_path system_manager)" && cargo build $flag)'
 	# shellcheck disable=SC2046,SC2086
-	(cd "$(source_path services)" && cargo build $flag $(dev_features))
+	run_owned_shell '(cd "$(source_path services)" && cargo build $flag $(dev_features))'
 	# shellcheck disable=SC2046,SC2086
-	(cd "$(source_path storage)" && cargo build $flag)
+	run_owned_shell '(cd "$(source_path storage)" && cargo build $flag)'
 	# shellcheck disable=SC2046,SC2086
-	(cd "$(source_path drivers)" && cargo build $flag $(dev_features))
+	run_owned_shell '(cd "$(source_path drivers)" && cargo build $flag $(dev_features))'
 }
 
 step_kernel() {
@@ -276,7 +277,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--stall)
 		[[ $# -ge 2 ]] || die "--stall needs a number of seconds"
-		BUILD_STALL="$2"
+		BUILD_STALL_FLAG="$2"
 		shift 2
 		;;
 	--rebuild)
@@ -326,41 +327,130 @@ fi
 # AND IT REPORTS RATHER THAN KILLS. A guest can be shot down and restarted; a build killed mid-link
 # leaves artifacts nobody can reason about, and the person watching is the one who should decide. The
 # whole defect being fixed is not knowing - so saying it is the whole fix.
-BUILD_STALL="${BUILD_STALL:-900}"
+# THE WINDOW, VALIDATED BEFORE ANYTHING IS CREATED FOR IT.
+#
+# `--stall` overrides `BUILD_STALL`, and an invalid value ends the run through the ordinary failed
+# verdict rather than being silently read as zero - which is what `((age >= BUILD_STALL))` did with a
+# word: it compared against nothing and never reported. An invalid value in the ENVIRONMENT does not
+# defeat a valid explicit flag, because the flag is the one the person typed.
+build_stall_window() {
+	local raw="$1" source="$2"
+	case "$raw" in
+	"" | *[!0-9]*) die "$source must be a whole number of seconds, not '$raw'" ;;
+	esac
+	# Normalised as decimal, so `0900` is nine hundred and not an octal surprise.
+	local value=$((10#$raw))
+	((value >= 0 && value <= 2147483647)) || die "$source is out of range: $raw"
+	printf '%s' "$value"
+}
+if [[ -n "${BUILD_STALL_FLAG:-}" ]]; then
+	BUILD_STALL="$(build_stall_window "$BUILD_STALL_FLAG" "--stall")"
+else
+	BUILD_STALL="$(build_stall_window "${BUILD_STALL:-900}" "BUILD_STALL")"
+fi
+
+# A BUILD THAT STOPS MAKING PROGRESS SAYS SO WHILE IT IS STILL STOPPED.
+#
+# The guest runner has had a stall watchdog for months and the build had nothing: a build that wedged
+# on a lock nobody released, or on a compiler that did not return, was discovered by a person
+# eventually. This is the same design with the one difference the subject forces.
+#
+# IT COUNTS THIS SCRIPT'S OWN STEPS, NOT OUTPUT, because `build.sh` has no log of its own - its output
+# goes wherever the caller sent it - and because a compiler that prints for an hour without finishing
+# is exactly the stall being watched for. Each `step` writes a GENERATION, a timestamp and a label
+# together; the observer compares that timestamp against the window. It is the same "count the
+# runner's OWN completions" rule the guest watchdog states, arrived at from the other side.
+#
+# THE GENERATION IS WHAT MAKES A REPEATED LABEL A NEW STEP. Two steps with the same name, or two
+# within one clock tick, are two steps - and an observer that compared only the label or only the
+# second would have treated the second as a continuation of the first and never rearmed.
+#
+# AND IT REPORTS RATHER THAN KILLS. A guest can be shot down and restarted; a build killed mid-link
+# leaves artifacts nobody can reason about, and the person watching is the one who should decide. The
+# whole defect being fixed is not knowing - so saying it is the whole fix.
 BUILD_STEP_MARK="$BUILD_DIR/state/build-step.$$"
+BUILD_STEP_GENERATION=0
 mkdir -p "$BUILD_DIR/state"
-: >"$BUILD_STEP_MARK"
-# ARMED TWICE, DELIBERATELY. The verdict was armed at the top so a run that dies in flag parsing
-# still reports one; installing the mark's cleanup here REPLACES that trap, so the verdict is chained
-# back onto it. `arm_run_verdict` chains rather than overwrites, which is what makes both true.
-trap 'rm -f "$BUILD_STEP_MARK"' EXIT
-arm_run_verdict
 
 # Announce a step AND stamp it, so the two cannot drift: a step that printed and did not stamp would
-# be a step the watchdog thinks never started.
+# be a step the observer thinks never started.
+#
+# WRITTEN WHOLE AND RENAMED, so the observer never reads half a record. It reads the file while the
+# build writes it, and a partial line there is an age of "now" over a label that is not there.
 step() {
 	note "$*"
-	printf '%s\n' "$*" >"$BUILD_STEP_MARK"
+	((BUILD_STEP_GENERATION += 1))
+	if ((BUILD_STALL > 0)); then
+		printf '%s %s %s\n' "$BUILD_STEP_GENERATION" "$(date +%s)" "$*" >"$BUILD_STEP_MARK.tmp" 2>/dev/null &&
+			mv -f "$BUILD_STEP_MARK.tmp" "$BUILD_STEP_MARK" 2>/dev/null || true
+	fi
 }
 
-if [[ "$BUILD_STALL" != "0" ]]; then
+remove_step_mark() {
+	rm -f "$BUILD_STEP_MARK" "$BUILD_STEP_MARK.tmp"
+}
+
+# Stop the observer and its sleeper, and reap both - before the mark goes, so the observer never
+# reads a mark that is being removed under it.
+#
+# REGISTERED BEFORE THE OBSERVER IS LAUNCHED, which is the rule that makes a failure between the two
+# clean up anyway. Only owned PIDs: this tree has killed its own gate by matching an executable name.
+BUILD_OBSERVER_PID=""
+stop_build_observer() {
+	[[ -n "${BUILD_OBSERVER_PID:-}" ]] || return 0
+	kill -TERM "$BUILD_OBSERVER_PID" 2>/dev/null || true
+	wait "$BUILD_OBSERVER_PID" 2>/dev/null || true
+	BUILD_OBSERVER_PID=""
+}
+register_run_cleanup stop_build_observer
+register_run_cleanup remove_step_mark
+
+if ((BUILD_STALL > 0)); then
+	# The setup label, so a build that stalls before its first step still names where it stopped.
+	step_mark_setup() {
+		printf '%s %s %s\n' 0 "$(date +%s)" "setting up" >"$BUILD_STEP_MARK.tmp" 2>/dev/null &&
+			mv -f "$BUILD_STEP_MARK.tmp" "$BUILD_STEP_MARK" 2>/dev/null || true
+	}
+	step_mark_setup
 	(
+		# THE OBSERVER OWNS ITS SLEEPER AND WAITS INTERRUPTIBLY. `while sleep 30` left a thirty-second
+		# sleep running after the build finished, so the pipe stayed open and a caller reading the
+		# build's output waited for a sleeper nobody needed. This one is stopped and reaped at once.
+		sleeper=""
+		stop_sleeper() {
+			[[ -n "$sleeper" ]] || return 0
+			kill -TERM "$sleeper" 2>/dev/null || true
+			wait "$sleeper" 2>/dev/null || true
+			sleeper=""
+		}
+		trap 'stop_sleeper; exit 0' TERM INT HUP QUIT
 		parent=$$
-		reported=0
-		while sleep 30; do
-			[[ -f "$BUILD_STEP_MARK" ]] || break
+		reported_generation=""
+		while :; do
+			# POLLED AT ONE SECOND, because the report has to arrive by the window plus the allowance
+			# and a thirty-second poll could not: it reported up to thirty seconds late by
+			# construction.
+			sleep 1 &
+			sleeper=$!
+			wait "$sleeper" 2>/dev/null || true
+			sleeper=""
 			kill -0 "$parent" 2>/dev/null || break
-			age=$(($(date +%s) - $(stat -c %Y "$BUILD_STEP_MARK" 2>/dev/null || date +%s)))
+			[[ -f "$BUILD_STEP_MARK" ]] || break
+			read -r generation stamp label <"$BUILD_STEP_MARK" 2>/dev/null || continue
+			[[ -n "$generation" && -n "$stamp" ]] || continue
+			age=$(($(date +%s) - stamp))
 			if ((age >= BUILD_STALL)); then
-				if ((reported == 0)); then
-					echo "build.sh: STALLED - no step has started for ${age}s; the last one was '$(cat "$BUILD_STEP_MARK" 2>/dev/null || echo unknown)'" >&2
-					reported=1
+				# ONCE PER EPISODE, and a new generation is a new episode even when the progress
+				# happened between two polls.
+				if [[ "$reported_generation" != "$generation" ]]; then
+					echo "build.sh: STALLED - no step has started for ${age}s; the last one was '${label:-unknown}'" >&2
+					reported_generation="$generation"
 				fi
-			else
-				reported=0
 			fi
 		done
+		stop_sleeper
 	) &
+	BUILD_OBSERVER_PID=$!
 fi
 
 wants sdk && ensure step_sdk

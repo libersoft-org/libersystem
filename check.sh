@@ -8,9 +8,10 @@
 
 SCRIPT_NAME=check.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
-# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
-# build came to be waited on for half an hour.
+# EVERY RUN ENDS WITH A VERDICT, from the one EXIT dispatcher in lib.sh - and cleanups REGISTER with
+# it rather than installing traps of their own. A run that fails is otherwise indistinguishable from
+# a run that is still going, which is exactly how a failed build came to be waited on for half an
+# hour. `docs/TESTING.md` states what the line and the terminal record do and do not promise.
 arm_run_verdict
 source "$SRC_DIR/tools/evidence.sh"
 install_guest_cleanup
@@ -84,6 +85,13 @@ declare -A GATES=(
 	["opentype-profile"]="tools/check-opentype-profile.sh"
 	["text-limits"]="tools/check-text-limits.sh"
 	["font-declarations"]="tools/check-font-declarations.sh"
+	# THE TEXT CONFORMANCE CORPUS: whole faces, authored and pinned by SHA-256, shaped and compared
+	# against expected glyph indices and positions - Latin ligatures and kerning, Arabic in all four
+	# joining forms, Hebrew marks in two classes, Devanagari reordering, Thai composition, Khmer
+	# stacking, emoji sequences, mixed-direction paragraphs and variable instances whose metrics move
+	# independently of their outlines. It also breaks the shaper four ways on a private copy and
+	# requires each defect to be caught. Host-only, and under a minute.
+	["text-corpus"]="tools/check-text-corpus.sh"
 	# Unicode segmentation AND the bidirectional algorithm, measured against Unicode's OWN answers
 	# rather than against a sample: five normative conformance files in full - and `BidiTest` alone is
 	# seven hundred thousand cases - plus the tables regenerated from the pinned release and compared.
@@ -419,14 +427,19 @@ run_gate() {
 	# INSIDE A RUN THE GATE'S OUTPUT IS ALSO ITS RESULT LOG: captured through `tee` - the person
 	# watching still sees it - and copied into the run by the envelope. `pipefail` makes the
 	# pipeline's status the gate's, a killed gate included.
-	local gate_log=""
+	local gate_log="" gate_pid
 	if evidence_active; then
 		gate_log="$(mktemp "${TMPDIR:-/tmp}/liber-gate-$name.XXXXXX")"
 		{ (cd "$SRC_DIR" && eval "$cmd") 2>&1 | tee "$gate_log"; } &
 	else
 		(cd "$SRC_DIR" && eval "$cmd") &
 	fi
-	wait $! || status=$?
+	gate_pid=$!
+	# AND THE GATE IS OWNED, so an interrupted `check.sh` stops the gate it started rather than
+	# leaving it to finish into a run nobody is waiting for.
+	register_run_child "$gate_pid"
+	wait "$gate_pid" || status=$?
+	forget_run_child "$gate_pid"
 	unset LIBER_GATE_KEY
 	if [[ -n "$gate_log" ]]; then
 		# PUBLISHED BEFORE THE FAILURE IS REPORTED, because reporting returns. `--if-absent`: a gate

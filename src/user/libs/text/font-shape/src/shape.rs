@@ -284,7 +284,7 @@ pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], lang
 	// The script tag the font's own tables are indexed by.
 	let script = scripts::script_tag(&characters);
 	// And the features that shaper turns on, each with the mask that says where.
-	let features: Vec<([u8; 4], u32)> = match shaper {
+	let mut features: Vec<([u8; 4], u32)> = match shaper {
 		Shaper::Default | Shaper::Universal => {
 			let mut features: Vec<([u8; 4], u32)> = scripts::universal_features().to_vec();
 			// The two every run gets: standard ligatures and contextual alternates.
@@ -307,6 +307,16 @@ pub fn shape_run(face: &Face<'_>, buffer: &mut Buffer, characters: &[char], lang
 		Shaper::Myanmar => with_marks(scripts::myanmar_features().to_vec()),
 		Shaper::Hangul => with_marks(scripts::hangul_features().to_vec()),
 	};
+	// `ccmp` BELONGS TO EVERY SCRIPT AND TO EVERY SHAPER, which is why it is added here rather than
+	// in any one of the lists above. It is how a face says that a precomposed character is DRAWN as
+	// two glyphs, or that two characters are drawn as one, and it is the feature a font expects to
+	// have applied before anything else looks at the run: a shaper that left it out renders Thai's
+	// sara am as a glyph the face never meant to be used alone, and every face that composes a
+	// letter with its accent as one glyph loses the composition.
+	//
+	// FIRST IN THE LIST, which is not what decides the order it runs in - the LOOKUP LIST decides
+	// that - but is what a reader of this function expects to find, and costs nothing to state.
+	features.insert(0, (*b"ccmp", crate::buffer::GLOBAL));
 	shape_with_masks(face, buffer, script, language, &features)?;
 	Ok(characters)
 }

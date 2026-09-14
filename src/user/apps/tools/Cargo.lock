@@ -250,12 +250,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "font-contract"
+version = "0.0.0"
+
+[[package]]
+name = "font-parse"
+version = "0.0.0"
+dependencies = [
+ "opentype-profile",
+]
+
+[[package]]
 name = "font-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
  "ipc-client",
  "wire",
+]
+
+[[package]]
+name = "font-run"
+version = "0.0.0"
+dependencies = [
+ "font-contract",
+ "font-parse",
+ "font-shape",
+ "opentype-profile",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "font-shape"
+version = "0.0.0"
+dependencies = [
+ "font-parse",
+ "opentype-profile",
+ "unicode-tables",
 ]
 
 [[package]]
@@ -504,6 +535,10 @@ name = "ogg"
 version = "0.0.0"
 
 [[package]]
+name = "opentype-profile"
+version = "0.0.0"
+
+[[package]]
 name = "pcm"
 version = "0.0.0"
 
@@ -615,6 +650,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "render2d"
+version = "0.0.0"
+dependencies = [
+ "font-contract",
+ "graphics-core",
+ "graphics-profile",
+]
+
+[[package]]
 name = "resources-client"
 version = "0.0.0"
 dependencies = [
@@ -708,6 +752,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "soft2d"
+version = "0.0.0"
+dependencies = [
+ "font-contract",
+ "graphics-core",
+ "graphics-profile",
+ "libm",
+ "render2d",
+]
+
+[[package]]
 name = "storage-proto"
 version = "0.0.0"
 dependencies = [
@@ -727,6 +782,24 @@ dependencies = [
  "ipc-client",
  "pix",
  "rt",
+]
+
+[[package]]
+name = "text-layout"
+version = "0.0.0"
+dependencies = [
+ "font-contract",
+]
+
+[[package]]
+name = "text-pipeline"
+version = "0.0.0"
+dependencies = [
+ "font-contract",
+ "opentype-profile",
+ "unicode-bidi",
+ "unicode-segmentation",
+ "unicode-tables",
 ]
 
 [[package]]
@@ -793,6 +866,10 @@ dependencies = [
  "flac",
  "font-client",
  "font-client-provider",
+ "font-contract",
+ "font-parse",
+ "font-run",
+ "font-shape",
  "graphics-core",
  "imgconv",
  "ipc-client",
@@ -811,6 +888,7 @@ dependencies = [
  "process-client",
  "process-client-provider",
  "proto",
+ "render2d",
  "resources-client",
  "resources-client-provider",
  "rt",
@@ -819,16 +897,38 @@ dependencies = [
  "service-logic",
  "session-client",
  "session-client-provider",
+ "soft2d",
  "storage-proto",
  "surface",
+ "text-layout",
+ "text-pipeline",
  "time-client",
  "time-client-provider",
+ "unicode-bidi",
  "volume-client",
  "volume-client-provider",
  "vorbis",
  "wav",
  "wavpack",
 ]
+
+[[package]]
+name = "unicode-bidi"
+version = "0.0.0"
+dependencies = [
+ "unicode-tables",
+]
+
+[[package]]
+name = "unicode-segmentation"
+version = "0.0.0"
+dependencies = [
+ "unicode-tables",
+]
+
+[[package]]
+name = "unicode-tables"
+version = "0.0.0"
 
 [[package]]
 name = "volume-client"

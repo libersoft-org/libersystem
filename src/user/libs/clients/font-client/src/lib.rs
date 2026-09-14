@@ -20,8 +20,13 @@ unsafe extern "Rust" {
 	fn font_list(chan: u64) -> Option<Result<Vec<FaceRecord>, Error>>;
 	#[link_name = "liber_channel_liber_font_font_catalogue_resolve_info"]
 	fn font_resolve_info(chan: u64, identity: &FaceIdentity) -> Option<Result<FaceBytes, Error>>;
+	// EVERY SCALAR CROSSES BY REFERENCE, the handle included. This one declared `target: u64` while
+	// the generated implementation takes `&u64` - a mismatch no compiler can see, because the two
+	// sides are in different crates and meet only at the linker. The callee dereferenced the handle
+	// VALUE as a pointer, so the first client ever to call this operation died on a page fault at the
+	// handle's numeric value. Found by the text conformance run, which is that first client.
 	#[link_name = "liber_channel_liber_font_font_catalogue_resolve_into"]
-	fn font_resolve_into(chan: u64, identity: &FaceIdentity, generation: &u64, target: u64) -> Option<Result<ResolveOutcome, Error>>;
+	fn font_resolve_into(chan: u64, identity: &FaceIdentity, generation: &u64, target: &u64) -> Option<Result<ResolveOutcome, Error>>;
 	#[link_name = "liber_channel_liber_font_font_catalogue_subscribe"]
 	fn font_subscribe(chan: u64) -> Option<u64>;
 	#[link_name = "liber_channel_liber_font_font_catalogue_admin_rescan"]
@@ -56,7 +61,7 @@ impl FontClient {
 	/// caller passes an attenuated DUPLICATE and keeps its own.
 	#[inline(always)]
 	pub fn resolve_into(&mut self, identity: &FaceIdentity, generation: u64, target: u64) -> Option<Result<ResolveOutcome, Error>> {
-		unsafe { font_resolve_into(self.chan, identity, &generation, target) }
+		unsafe { font_resolve_into(self.chan, identity, &generation, &target) }
 	}
 
 	/// The consumer end of a live generation stream.

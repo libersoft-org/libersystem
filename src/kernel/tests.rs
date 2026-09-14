@@ -3068,6 +3068,7 @@ define_test_tags! {
 	Storage => "storage",
 	Stress => "stress",
 	Syscall => "syscall",
+	Text => "text",
 	Usb => "usb",
 	VolumeLayout => "volume-layout",
 	VolumeScope => "volume-scope",

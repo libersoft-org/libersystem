@@ -26,10 +26,25 @@ scene.
 
 | scene | commands | resources | prepare | replay median | replay p99 | ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| UI-basic | 252 | 153 | 0.9 ms | 78.8 ms | 84.2 ms | 16.7 ms |
-| UI-effects | 45 | 34 | 1.3 ms | 385.1 ms | 401.7 ms | 66.7 ms |
-| vector-stress | 240 | 241 | 7.2 ms | 245.8 ms | 247.3 ms | 66.7 ms |
-| image-stress | 25 | 3 | 42.4 ms | 419.0 ms | 421.0 ms | 16.7 ms |
+| UI-basic | 252 | 153 | 1.1 ms | 46.4 ms | 65.0 ms | 16.7 ms |
+| UI-effects | 45 | 34 | 1.2 ms | 332.0 ms | 349.9 ms | 66.7 ms |
+| vector-stress | 240 | 241 | 7.1 ms | 97.0 ms | 97.9 ms | 66.7 ms |
+| image-stress | 25 | 3 | 41.5 ms | 377.7 ms | 379.4 ms | 16.7 ms |
+
+The row above replaced this one on 2026-09-14, when the rasteriser stopped sampling the vertical
+direction and started accumulating area. Same host, same fixtures, same flags:
+
+| scene | replay median before | after | |
+| --- | ---: | ---: | ---: |
+| UI-basic | 78.8 ms | 46.4 ms | 1.7x |
+| UI-effects | 385.1 ms | 332.0 ms | 1.2x |
+| vector-stress | 245.8 ms | 97.0 ms | 2.5x |
+| image-stress | 419.0 ms | 377.7 ms | 1.1x |
+
+THE CHANGE WAS MADE FOR CORRECTNESS AND PAID FOR ITSELF IN SPEED, which is the shape the analysis
+below predicted: sixteen sub-scanline sweeps, each with a sort of its crossings, became one pass in
+which every edge is clipped to the pixels it crosses and two numbers are accumulated. `vector-stress`
+is where it shows most, because a stroke's six hundred edges were being crossed sixteen times a row.
 
 **THE FLOOR IS NOT MET.** The ceilings are fixed independently of the implementation and stay where
 they are; these are the measurements as they stand, and the gap is between four and twenty-five times. The
@@ -55,14 +70,24 @@ that were worth making on their own:
   pixel per composite.
 - A surface addresses its own bytes instead of building a checked `ImageView` per pixel access.
 
+- A TILE NO COMMAND REACHES IS NOT REPLAYED (2026-09-14). An empty bin still decoded the tile into
+  the working space and re-encoded it, which is what made an EMPTY draw list cost 21 ms; the four
+  scenes above cover the whole frame so their medians do not move, and a compositor redrawing one
+  damaged corner stops paying that for every other tile of the frame.
+- The rasteriser accumulates AREA instead of sampling the vertical direction (2026-09-14). It used to
+  cut each pixel row into sixteen sub-scanlines, compute and SORT the crossings on each, and add the
+  inside intervals at a sixteenth of a level; it now clips every edge to the pixels it crosses and
+  accumulates two numbers per pixel, which a left-to-right sweep turns into coverage. One pass, no
+  sort, and exact in both directions rather than quantised in one - the change was made because the
+  sampling did not meet the frozen coverage threshold, and the speed is what fell out of it.
+
 What the remaining gap is made of, measured on the same host with a 640x480 target: an EMPTY list
-costs 21 ms, which is the tile decode and re-encode of the whole frame and nothing else; one
-full-screen antialiased fill costs 30 ms more, of which 13 ms is the sixteen sub-scanlines of
-coverage and 17 ms is the span composite. Closing the gap needs the three things this implementation
-does not have: an exact-area rasteriser that computes coverage in one pass instead of sixteen, a
-vector span composite over more than four scalar lanes, and a specialised path for an opaque solid
-fill that skips reading the backdrop entirely. None of them is a change to what is drawn, and all
-three are ordinary work rather than a redesign.
+cost 21 ms, which was the tile decode and re-encode of the whole frame and nothing else; a list with
+no commands now touches no tile at all, and what remains of that term is the load and store of the
+tiles a drawing DOES reach, which is still the largest single term in `UI-basic`. Of the three things the earlier analysis named as needed,
+the exact-area rasteriser is DONE; what is left is a vector span composite over more than four scalar
+lanes, and a specialised path for an opaque solid fill that skips reading the backdrop entirely.
+Neither is a change to what is drawn, and both are ordinary work rather than a redesign.
 
 ## Development loop baseline (2026-07-26)
 

@@ -1093,3 +1093,144 @@ fn a_planar_video_frame_draws_without_being_converted_first() {
 	// reconstruction that sited its chroma wrongly.
 	assert!(pixel(&image, 7, 8)[0] > 240 && pixel(&image, 8, 8)[0] < 20, "the edge is in the middle: {:?} then {:?}", pixel(&image, 7, 8), pixel(&image, 8, 8));
 }
+
+#[test]
+// THE FROZEN COVERAGE THRESHOLD, MEASURED AGAINST THE ANALYTIC AREA IN BOTH DIRECTIONS.
+//
+// `graphics-profile` freezes render2d antialiasing coverage at 2/255 absolute per pixel against the
+// analytic area, with 1/255 mean over the covered region, and it freezes the edge policy: a pixel
+// whose analytic coverage is exactly 0 or exactly 1 is compared EXACTLY. Nothing here had ever
+// checked that, and the rasteriser did not meet it: it sampled the vertical direction at a sixteenth
+// of a row, which puts a near-horizontal edge up to 8/255 out.
+//
+// AN AXIS-ALIGNED RECTANGLE IS THE SHAPE THE ANSWER IS KNOWN FOR. Its overlap with a pixel is the
+// product of two one-dimensional overlaps - a number this test computes from the rectangle rather
+// than from the rasteriser - so the comparison is against the geometry and not against a previous
+// run. The offsets walk a whole pixel in both axes, so every phase of an edge against the grid is
+// covered, and the fractional SIZE means the far edges are never at the same phase as the near ones.
+fn coverage_meets_the_frozen_threshold_against_the_analytic_area() {
+	const PER_PIXEL: f64 = 2.0 / 255.0;
+	const MEAN: f64 = 1.0 / 255.0;
+	let overlap = |low: f64, high: f64, from: f64, to: f64| (high.min(to) - low.max(from)).max(0.0);
+
+	let mut worst = 0.0f64;
+	let mut worst_at = (0u32, 0u32, 0.0f64);
+	let mut total = 0.0f64;
+	let mut partial = 0usize;
+	for step in 0..9 {
+		let offset = step as f64 / 8.0;
+		let (x, y, width, height) = (3.0 + offset, 2.0 + offset, 5.5, 4.25);
+		let mut image = target(16, 12);
+		let mut canvas = Canvas::new();
+		canvas.fill_path(rect_path(RectF::new(x as f32, y as f32, width as f32, height as f32)), Paint::Solid(Color::new(1.0, 1.0, 1.0, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a rectangle");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		for row in 0..12u32 {
+			for column in 0..16u32 {
+				let area = overlap(column as f64, column as f64 + 1.0, x, x + width) * overlap(row as f64, row as f64 + 1.0, y, y + height);
+				let drawn = pixel(&image, column, row)[3] as f64 / 255.0;
+				let difference = (drawn - area).abs();
+				if area <= 0.0 || area >= 1.0 {
+					// A FULLY COVERED PIXEL THAT DIFFERS AT ALL is a colour error wearing an
+					// antialiasing tolerance, so the frozen edge policy compares it exactly - which
+					// for an eight-bit target means the stored byte.
+					assert!(difference <= 0.5 / 255.0, "pixel ({column}, {row}) at offset {offset} has analytic coverage {area} and was drawn {drawn}");
+					continue;
+				}
+				partial += 1;
+				total += difference;
+				if difference > worst {
+					worst = difference;
+					worst_at = (column, row, offset);
+				}
+			}
+		}
+	}
+	assert!(partial > 0, "the sweep of offsets produced partially covered pixels to compare");
+	assert!(worst <= PER_PIXEL, "the worst pixel differs by {worst} at {worst_at:?}, and the frozen per-pixel bound is {PER_PIXEL}");
+	let mean = total / partial as f64;
+	assert!(mean <= MEAN, "the mean difference over {partial} partially covered pixel(s) is {mean}, and the frozen bound is {MEAN}");
+}
+
+#[test]
+// AND THE SAME FOR A SHAPE WHOSE EDGES ARE NOT AXIS-ALIGNED, where the vertical sampling used to be
+// worst: a near-horizontal edge crossed a pixel row over many columns, and every one of them carried
+// the same quantised value. A triangle with one shallow edge is that case.
+//
+// WHAT IS ASSERTED IS THE SUM, not each pixel: the analytic area of a triangle clipped to a pixel is
+// a five-case polygon clip, and writing that here would be writing a second rasteriser to check the
+// first. The total ink of the drawing is the triangle's own area, which is one multiplication - and a
+// rasteriser that quantises a shallow edge loses it there, because the loss is systematic.
+fn a_shallow_edge_carries_the_area_it_covers() {
+	let mut worst = 0.0f64;
+	for step in 0..9 {
+		let offset = step as f64 / 8.0;
+		let mut image = target(64, 16);
+		let mut builder = PathBuilder::new();
+		// A long, shallow triangle: eight pixels tall over fifty wide, so its upper edge crosses one
+		// pixel row every six columns.
+		builder.move_to(PointF { x: 4.0, y: (4.0 + offset) as f32 }).expect("a start");
+		builder.line_to(PointF { x: 54.0, y: (4.0 + offset) as f32 }).expect("along the top");
+		builder.line_to(PointF { x: 54.0, y: (12.0 + offset) as f32 }).expect("down the right");
+		builder.close().expect("closed");
+		let mut canvas = Canvas::new();
+		canvas.fill_path(builder.finish(), Paint::Solid(Color::new(1.0, 1.0, 1.0, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a triangle");
+		draw(&canvas.finish().expect("a list"), &mut image);
+		let mut ink = 0.0f64;
+		for row in 0..16u32 {
+			for column in 0..64u32 {
+				ink += pixel(&image, column, row)[3] as f64 / 255.0;
+			}
+		}
+		let area = 50.0 * 8.0 / 2.0;
+		let difference = (ink - area).abs();
+		if difference > worst {
+			worst = difference;
+		}
+		// HALF A CODE VALUE PER PIXEL IS THE FLOOR, and the triangle covers about four hundred of
+		// them, so the whole drawing may be two hundredths of a pixel out per pixel and no more.
+		assert!(difference <= 400.0 * 0.5 / 255.0, "at offset {offset} the triangle's ink is {ink} where its area is {area}");
+	}
+	assert!(worst < 1.0, "no offset loses a whole pixel of ink: the worst is {worst}");
+}
+
+#[test]
+// A PIXEL NO COMMAND REACHES COMES BACK EXACTLY AS IT WAS, bytes and all, because "unchanged" is not
+// a value that can be nearly right.
+//
+// THIS IS A CONTRACT AND NOT A PROOF OF THE OPTIMISATION BESIDE IT. Tiles with no commands are
+// skipped now rather than decoded into the working space and re-encoded, and for THIS target the
+// round trip was lossless anyway - so the skip is worth time and not pixels, and this fixture would
+// pass either way. What it pins is the property a target whose round trip is NOT lossless would lose
+// first, and the reason the skip is safe to make at all.
+fn a_tile_no_command_reaches_is_left_byte_for_byte() {
+	let mut image = target(64, 64);
+	// A recognisable backdrop, including values that do not survive a careless round trip.
+	{
+		let mut view = image.view_mut();
+		for y in 0..64u32 {
+			for x in 0..64u32 {
+				let row = view.row_mut(y).expect("a row");
+				let at = x as usize * 4;
+				row[at] = (x * 4) as u8;
+				row[at + 1] = (y * 4) as u8;
+				row[at + 2] = 1;
+				row[at + 3] = 253;
+			}
+		}
+	}
+	let before: alloc::vec::Vec<u8> = (0..64u32).flat_map(|y| image.view().row(y).expect("a row").to_vec()).collect();
+
+	// An empty list first: nothing anywhere.
+	let empty = Canvas::new().finish().expect("an empty list");
+	draw(&empty, &mut image);
+	let after_empty: alloc::vec::Vec<u8> = (0..64u32).flat_map(|y| image.view().row(y).expect("a row").to_vec()).collect();
+	assert_eq!(after_empty, before, "an empty draw list leaves every byte of the target alone");
+
+	// Then a drawing in one corner: the tiles it does not reach are just as untouched.
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(2.0, 2.0, 6.0, 6.0)), Paint::Solid(Color::new(1.0, 0.0, 0.0, 1.0, ColorSpace::Srgb)), FillRule::NonZero).expect("a corner");
+	draw(&canvas.finish().expect("a list"), &mut image);
+	assert_eq!(pixel(&image, 4, 4)[0], 255, "the corner was drawn");
+	let far = pixel(&image, 60, 60);
+	assert_eq!(far, [240, 240, 1, 253], "a pixel the drawing never reaches is exactly what it was: {far:?}");
+}

@@ -1057,3 +1057,47 @@ geometry.
 NOT PERFORMED: nothing produces a non-`none` luminance yet, so the bright-display path is exercised by
 host tests rather than by a guest. The first real numbers arrive with EDID over a DDC transport, which
 is a blocked item in `P02M0099` - and when they do, nothing above the service changes shape.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0103 (2026-09-14 00:30):
+
+THE RASTERISER ACCUMULATES AREA NOW, AND IT WAS A CORRECTNESS CHANGE THAT PAID FOR ITSELF.
+
+WHAT WAS WRONG. `graphics-profile::thresholds` freezes render2d antialiasing coverage at 2/255 per
+pixel AGAINST THE ANALYTIC AREA, with 1/255 mean. `soft2d` cut each pixel row into sixteen
+sub-scanlines, computed and sorted the crossings on each, and added the inside intervals at a
+sixteenth of a level - so a vertical edge was analytic and a near-horizontal one was quantised, up to
+8/255 out. The file's own comment said the sampling was "below what the conformance tolerance for 2D
+coverage allows", which is the claim that was wrong. Nothing had ever compared a drawn frame against
+an analytic area, so neither statement had been tested against the other.
+
+HOW IT WAS FOUND. The text milestone's guest conformance run draws a corpus through
+`render2d`/`soft2d` and compares against an oracle computed from the outline's geometry rather than
+from a captured baseline. At a size where every edge lands on a pixel boundary all 18432 pixels of
+the target agreed exactly; at a fractional size the pixels a VERTICAL edge cut agreed to half a code
+value and the pixels a HORIZONTAL edge cut were out by 6/255. One measurement, two directions, and
+the difference between them named the cause.
+
+WHAT REPLACED IT. Each edge is clipped to the pixel row it crosses and then to each pixel column it
+passes through, and two numbers are accumulated per pixel: the signed vertical extent it spans there,
+and the area of that pixel lying to the RIGHT of it. A left-to-right sweep turns the pair into the
+winding-weighted coverage of every pixel. The fill rule applies to that accumulated value - saturated
+for non-zero, folded for even-odd - rather than to a per-sub-scanline winding. Everything left of a
+tile is accumulated into a seed rather than by clamping the edge's x, so the answer does not depend
+on how the frame was tiled.
+
+THE ALIASED PATH IS UNCHANGED AND STAYS A SAMPLE AT THE PIXEL'S CENTRE. "A pixel is in or it is out"
+is a different question from "how much of it is covered", and thresholding an area answers it
+differently for a sliver narrower than half a pixel. Two rules, two paths, said out loud.
+
+WHAT HOLDS IT. Two new fixtures in `soft2d`: an axis-aligned rectangle of fractional size drawn at
+nine offsets walking a whole pixel in both axes, every pixel compared against the product of its two
+one-dimensional overlaps - exactly where the analytic coverage is 0 or 1, within the frozen bounds
+elsewhere; and a long shallow triangle whose upper edge crosses one pixel row every six columns, held
+to its own area, which is where a quantised near-horizontal edge loses systematically. Quantising the
+accumulated value to sixteenths makes the first fail at 4.2/255, so the comparison is live.
+
+AND IT IS THE FIRST OF THE THREE THINGS THE PERFORMANCE ITEM NAMED. Sixteen sweeps each with a sort
+became one pass: `vector-stress` 245.8 -> 97.0 ms, `UI-basic` 78.8 -> 46.4 ms, `UI-effects`
+385.1 -> 332.0 ms, `image-stress` 419.0 -> 377.7 ms, same host, same frozen fixtures. The floor is
+still not met and the ceilings stay where they are; what the change did was take `vector-stress` from
+3.8x over to 1.5x, and make the 21 ms empty-list floor the largest single term in `UI-basic`.

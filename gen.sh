@@ -20,9 +20,10 @@
 
 SCRIPT_NAME=gen.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
-# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
-# build came to be waited on for half an hour.
+# EVERY RUN ENDS WITH A VERDICT, from the one EXIT dispatcher in lib.sh - and cleanups REGISTER with
+# it rather than installing traps of their own. A run that fails is otherwise indistinguishable from
+# a run that is still going, which is exactly how a failed build came to be waited on for half an
+# hour. `docs/TESTING.md` states what the line and the terminal record do and do not promise.
 arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
@@ -45,7 +46,10 @@ declare -A EXTERNAL=(
 	# THE DEVICE SIDE OF THE DISPLAY, which imports the shared graphics values and the base error and
 	# declares no client-facing type of its own: a driver's wire and an application's wire are two
 	# contracts, and one package carrying both would make every application depend on the device one.
-	[display - device]="base graphics"
+	# QUOTED, because an unquoted hyphen inside a subscript reads as arithmetic to a shell formatter
+	# and comes back as `[display - device]` - a key nothing looks up, which stops the whole loop with
+	# `unbound variable` on the first hyphenated package.
+	["display-device"]="base graphics"
 	[security]="base process"
 	[session]="base process"
 	[input]="base"
@@ -129,6 +133,9 @@ crate_dir() {
 generate() {
 	local out="$1"
 	shift
+	# THE ARGUMENTS AS A NAMED ARRAY, because the owned runner is a FUNCTION and `$@` inside it is its
+	# own. A local is visible to what it calls; a positional parameter is not.
+	local generate_args=("$@")
 	if ((dry_run)); then
 		# The words, joined with single spaces - so a mode with no flag does not print a double one
 		# and read as a difference from the recipe it replaces.
@@ -136,7 +143,9 @@ generate() {
 		printf '%s\n' "${words[*]}"
 		return 0
 	fi
-	(cd "$SRC_DIR/tools/lsidl-gen" && cargo run --quiet -- "${mode_flag[@]}" --rust-dir "../../$out/src" "$@" ../../idl/*.lsidl)
+	# Owned and waited for, so an interrupted generation stops now rather than after the generator
+	# finishes - and so the verdict names the interruption.
+	run_owned_shell '(cd "$SRC_DIR/tools/lsidl-gen" && cargo run --quiet -- "${mode_flag[@]}" --rust-dir "../../$out/src" "${generate_args[@]}" ../../idl/*.lsidl)'
 }
 
 for package in "${PACKAGES[@]}"; do

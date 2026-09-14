@@ -62,6 +62,15 @@ _guest_descendants() {
 # to sweep a tree it does not own. That killed the mutation gate with SIGTERM before it had copied
 # the tree. A script that wants this calls `install_guest_cleanup` after sourcing.
 install_guest_cleanup() {
+	# REGISTERED WITH THE VERDICT DISPATCHER WHEN THERE IS ONE, and installed as its own trap when
+	# there is not. The five entry points arm the verdict first, so this REGISTERS there - which is
+	# what stopped `check.sh` from replacing the verdict with its guest cleanup, and what makes the
+	# guest cleanup run even on a refused flag. `run.sh` and anything else outside those five still
+	# gets the plain trap it always had.
+	if [[ "${__run_owner:-}" == "$BASHPID" ]]; then
+		register_run_cleanup guest_cleanup
+		return 0
+	fi
 	trap guest_cleanup EXIT
 	trap 'guest_cleanup; exit 130' INT
 	trap 'guest_cleanup; exit 143' TERM
@@ -91,7 +100,7 @@ note() {
 	echo "${SCRIPT_NAME:-$(basename "$0")}: $*" >&2
 }
 
-# ONE VERDICT, ONE SHAPE, FROM A TRAP - so a run that ENDS always says so.
+# ONE VERDICT, ONE SHAPE, FROM ONE OWNER - so a run that ENDS always says so.
 #
 # WHAT THIS FIXES, MEASURED. Every entry point announced success in its own words (`built: ...`,
 # `all selected checks passed`, `PASS:`) and announced FAILURE in whatever words the tool underneath
@@ -105,54 +114,214 @@ note() {
 # the ones that never reach the bottom: `set -e` aborting mid-script, a signal, a killed parent
 # taking the process group with it. A trap fires on all of those.
 #
-# AND IT WRITES A FILE, because prose is not a protocol. `<log>.status` exists when the run has
-# ENDED and does not exist while it runs, so "has it finished" is a file test rather than a search
-# for words. Set `RUN_STATUS_FILE` before the run to choose where it lands; without it only the line
-# is printed, which is what an interactive run wants.
-RUN_STARTED_AT="${RUN_STARTED_AT:-$(date +%s)}"
-run_verdict() {
-	# THE STATUS IS PASSED IN WHEN THERE IS A TRAP BEFORE THIS ONE, and taken from `$?` when there is
-	# not. Chaining `trap "cleanup; run_verdict" EXIT` makes `$?` the status of CLEANUP rather than of
-	# the script, so a run that failed reported `ok` as soon as its cleanup succeeded - which is the
-	# same lie the signal case told, arriving by a different route. `arm_run_verdict` captures the
-	# script's status first and hands it over.
-	local status="${1:-$?}"
-	local seconds=$(($(date +%s) - RUN_STARTED_AT))
-	local outcome=ok
-	[[ "$status" == 0 ]] || outcome=failed
-	local name="${SCRIPT_NAME:-$(basename "$0")}"
-	echo "$name: RESULT $outcome exit=$status seconds=$seconds" >&2
-	if [[ -n "${RUN_STATUS_FILE:-}" ]]; then
-		# The directory may not exist yet on a run that failed before it built anything.
-		mkdir -p "$(dirname "$RUN_STATUS_FILE")" 2>/dev/null || true
-		printf 'script=%s\noutcome=%s\nexit=%s\nseconds=%s\n' "$name" "$outcome" "$status" "$seconds" >"$RUN_STATUS_FILE" 2>/dev/null || true
+# AND IT IS ONE DISPATCHER RATHER THAN A CHAIN OF TRAP TEXT. The first version read the existing EXIT
+# trap back out of `trap -p`, pasted it into a new one and re-armed; every entry point that installed
+# a cleanup AFTER arming silently replaced the verdict, and every one that armed after a cleanup
+# carried that cleanup's text into a string nobody could read. There is one trap now, installed once
+# by the invocation that owns it, and cleanups REGISTER with it.
+#
+# WHAT AN OWNER IS. The shell whose `BASHPID` armed it. A subshell, a command substitution or a
+# background observer inherits the shell's functions and variables and MUST NOT finalize the run it
+# is part of - so every entry point below checks the owner before doing anything, and a separately
+# executed script arms its own independent invocation.
+#
+# AND IT WRITES A FILE, because prose is not a protocol. The record exists when the run has ENDED and
+# does not exist while it runs, so "has it finished" is a file test rather than a search for words.
+# Set `RUN_STATUS_FILE` to a FRESH, UNUSED path before the run to choose where it lands; without it
+# only the line is printed, which is what an interactive run wants. The rules that make a reader able
+# to trust it are in `docs/TESTING.md` and in `__run_claim_status_file` below.
+
+# The private state of one invocation. Never exported: a child gets its own.
+__run_owner=""
+__run_script=""
+__run_started=0
+__run_status_path=""
+__run_status_usable=0
+__run_finalized=0
+__run_cleanups=()
+__run_children=()
+
+# Arm the verdict for this invocation. Called once, near the top of an entry point, AFTER
+# `SCRIPT_NAME` is set and BEFORE argument handling - so a refused flag ends with a verdict too.
+#
+# IDEMPOTENT WITHIN ONE OWNER: a script that calls it twice keeps its first start time and its first
+# status destination, because an invocation has one elapsed time and one terminal record.
+arm_run_verdict() {
+	if [[ "${__run_owner:-}" == "$BASHPID" ]]; then
+		return 0
 	fi
+	__run_owner="$BASHPID"
+	__run_script="${SCRIPT_NAME:-$(basename "$0")}"
+	# THE START TIME IS THIS INVOCATION'S AND IS NOT INHERITED. It used to come from a `RUN_STARTED_AT`
+	# the environment could supply, so a child reported its parent's elapsed time.
+	__run_started="$(date +%s)"
+	__run_finalized=0
+	__run_cleanups=()
+	__run_children=()
+	__run_claim_status_file
+	trap '__run_finalize "$?"' EXIT
+	# A KILLED RUN REPORTS A FAILURE, WHICH IS THE WHOLE POINT OF THE EXERCISE. The EXIT trap alone is
+	# not enough: a script killed by a signal runs it with `$?` still zero, so the verdict said
+	# `ok exit=0` over a run that was shot down - which is WORSE than no verdict.
+	trap '__run_interrupt 1' HUP
+	trap '__run_interrupt 2' INT
+	trap '__run_interrupt 3' QUIT
+	trap '__run_interrupt 15' TERM
+}
+
+# Register a cleanup function to run once, in registration order, before the verdict.
+#
+# REGISTERED IMMEDIATELY AFTER THE RESOURCE IS ACQUIRED, which is the rule that makes a failure
+# BETWEEN acquisition and the rest of setup clean up anyway. A callback must tolerate partially
+# initialized state, must not call `exit`, and must not install another EXIT trap.
+register_run_cleanup() {
+	[[ "${__run_owner:-}" == "$BASHPID" ]] || return 0
+	__run_cleanups+=("$1")
+}
+
+# Record a child this invocation started, so an interruption stops and reaps what it owns - and only
+# what it owns. Never by executable name: this tree has killed its own gate that way.
+register_run_child() {
+	[[ "${__run_owner:-}" == "$BASHPID" ]] || return 0
+	__run_children+=("$1")
+}
+
+forget_run_child() {
+	local keep=() pid
+	for pid in ${__run_children[@]+"${__run_children[@]}"}; do
+		[[ "$pid" == "$1" ]] || keep+=("$pid")
+	done
+	__run_children=(${keep[@]+"${keep[@]}"})
+}
+
+# RUN A LEAF COMMAND SO A SIGNAL REACHES THIS SHELL WHILE IT IS RUNNING.
+#
+# Bash defers a trap until the FOREGROUND child returns, so a run interrupted during a twenty-minute
+# compile answered its signal twenty minutes later - which is the same missing verdict by another
+# route. Backgrounding the leaf and waiting interruptibly is what makes the trap prompt; the child's
+# real status (and `pipefail` inside a wrapped pipeline) is preserved and returned.
+run_owned() {
+	local status=0 pid
+	"$@" &
+	pid=$!
+	register_run_child "$pid"
+	wait "$pid" || status=$?
+	forget_run_child "$pid"
 	return "$status"
 }
 
-# Arm the verdict for this script. Called once, near the top, AFTER `SCRIPT_NAME` is set.
+# The same for a leaf that is a SHELL FRAGMENT rather than a command: a subshell that changes
+# directory first, or a pipeline whose status matters.
 #
-# It chains rather than replaces: `test.sh` and `check.sh` already install a guest cleanup on EXIT,
-# and an entry point that armed this by overwriting the trap would leave a guest holding a disk image
-# - which is the failure `install_guest_cleanup` exists to prevent.
-arm_run_verdict() {
-	local existing
-	existing="$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/")"
-	if [[ -n "$existing" && "$existing" != "trap -- '' EXIT" ]]; then
-		trap "__run_status=\$?; $existing; run_verdict \"\$__run_status\"" EXIT
-	else
-		trap run_verdict EXIT
+# `eval` INTO A BACKGROUND SUBSHELL keeps the caller's functions, variables and `pipefail`, which
+# `bash -c` would not - and the whole point is that the fragment behaves exactly as it did when it
+# ran in the foreground, except that a signal now reaches the shell waiting on it.
+run_owned_shell() {
+	local status=0 pid
+	# THE SUBSHELL EXITS EXPLICITLY WITH THE FRAGMENT'S STATUS, and that is not a formality: with
+	# `errexit` on, a fragment that fails inside `eval` makes the shell exit 1 rather than with the
+	# command's own status - so a compiler that refused with 37 was reported as a plain failure and a
+	# subordinate tool's exit code never reached the verdict. Measured here, not inferred.
+	(
+		set +e
+		eval "$1"
+		exit $?
+	) &
+	pid=$!
+	register_run_child "$pid"
+	wait "$pid" || status=$?
+	forget_run_child "$pid"
+	return "$status"
+}
+
+# Take the requested terminal destination ONCE, resolve it, and decide whether it is usable.
+#
+# THE REQUEST IS UNEXPORTED IMMEDIATELY, which is what stops a descendant from publishing into its
+# parent's record: a child keeps its own verdict LINE and has no destination unless its caller gives
+# it a different fresh one.
+__run_claim_status_file() {
+	__run_status_path=""
+	__run_status_usable=0
+	local request="${RUN_STATUS_FILE:-}"
+	unset RUN_STATUS_FILE
+	[[ -n "$request" ]] || return 0
+	# RESOLVED AGAINST THE INVOCATION'S ORIGINAL DIRECTORY, because a run that changes into a release
+	# snapshot later must not publish somewhere else.
+	local path="$request"
+	[[ "$path" == /* ]] || path="$PWD/$path"
+	local dir="${path%/*}"
+	[[ "$dir" == "$path" ]] && dir="."
+	if ! mkdir -p "$dir" 2>/dev/null; then
+		echo "$__run_script: no terminal record: the directory for $path cannot be created" >&2
+		return 0
 	fi
-	# AND A KILLED RUN REPORTS A FAILURE, WHICH IS THE WHOLE POINT OF THE EXERCISE.
-	#
-	# The EXIT trap alone is not enough: a script killed by a signal runs it with `$?` still zero, so
-	# the verdict said `ok exit=0` over a run that was shot down. That is WORSE than no verdict - a
-	# reader is told the run succeeded. Each signal exits with the shell's own 128+n convention, and
-	# that status is what the EXIT trap then reports.
-	local signal
-	for signal in INT TERM HUP QUIT; do
-		trap "exit \$((128 + \$(kill -l "$signal")))" "$signal"
+	# A DESTINATION THAT ALREADY EXISTS IS NOT THIS RUN'S. Deleting or truncating it would destroy
+	# somebody else's record and would make a stale success look like this run's answer, so the
+	# request is refused and the work continues without one.
+	if [[ -e "$path" || -L "$path" ]]; then
+		echo "$__run_script: no terminal record: $path already exists; give each run a fresh path" >&2
+		return 0
+	fi
+	__run_status_path="$path"
+	__run_status_usable=1
+}
+
+# The one EXIT dispatcher: save the status, run the registered cleanups once, then publish.
+__run_finalize() {
+	local status="$1" fn
+	[[ "${__run_owner:-}" == "$BASHPID" ]] || return 0
+	[[ "${__run_finalized:-0}" == 0 ]] || return 0
+	__run_finalized=1
+	# No second delivery: a cleanup that exits, or a signal arriving during cleanup, must not start
+	# this again or replace the status that is already saved.
+	trap - EXIT HUP INT QUIT TERM
+	for fn in ${__run_cleanups[@]+"${__run_cleanups[@]}"}; do
+		"$fn" || echo "$__run_script: cleanup '$fn' failed; the run's own result is unchanged" >&2
 	done
+	__run_publish "$status"
+	return 0
+}
+
+# Stop what this invocation started, then end with the shell's own 128+n convention - which is the
+# status the EXIT dispatcher then reports.
+__run_interrupt() {
+	local signal="$1" pid
+	if [[ "${__run_owner:-}" != "$BASHPID" ]]; then
+		exit $((128 + signal))
+	fi
+	for pid in ${__run_children[@]+"${__run_children[@]}"}; do
+		kill -TERM "$pid" 2>/dev/null || true
+	done
+	for pid in ${__run_children[@]+"${__run_children[@]}"}; do
+		wait "$pid" 2>/dev/null || true
+	done
+	__run_children=()
+	exit $((128 + signal))
+}
+
+# The line and the file, from the same four values, written once.
+__run_publish() {
+	local status="$1" outcome=ok now seconds tmp dir
+	[[ "$status" == 0 ]] || outcome=failed
+	now="$(date +%s)"
+	seconds=$((now - __run_started))
+	((seconds < 0)) && seconds=0
+	if ((__run_status_usable)); then
+		dir="${__run_status_path%/*}"
+		[[ "$dir" == "$__run_status_path" ]] && dir="."
+		tmp="$dir/.run-verdict.$$.$RANDOM.tmp"
+		# WRITTEN BESIDE THE DESTINATION AND RENAMED, so a reader never sees half a record. A rename
+		# within one directory is atomic; a writer that filled the terminal name in place would let a
+		# reader see an outcome without its exit code.
+		if printf 'script=%s\noutcome=%s\nexit=%s\nseconds=%s\n' "$__run_script" "$outcome" "$status" "$seconds" >"$tmp" 2>/dev/null &&
+			mv -f "$tmp" "$__run_status_path" 2>/dev/null; then
+			:
+		else
+			rm -f "$tmp" 2>/dev/null || true
+			echo "$__run_script: the terminal record could not be published to $__run_status_path" >&2
+		fi
+	fi
+	echo "$__run_script: RESULT $outcome exit=$status seconds=$seconds" >&2
 }
 
 # Expand `all` and validate. Accepts repeated flags and comma-separated lists, so
@@ -230,7 +399,7 @@ for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln 
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do TOOL_WAVES[$tool]=2; done
 for tool in date log config set lsdev lsfont lsusb lssvc usage ps run perm start stop beep; do TOOL_WAVES[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss traceroute; do TOOL_WAVES[$tool]=4; done
-for tool in imgview imgconv audioconv audiorec play graphics_probe lico licoedit licoview; do TOOL_WAVES[$tool]=5; done
+for tool in imgview imgconv audioconv audiorec play graphics_probe lico licoedit licoview textconf; do TOOL_WAVES[$tool]=5; done
 # Wave 6: the text-processing command family. They are their own wave because they share a shape - the
 # bounded window read, the shared parsers, the volume bundle - so a regression in that shape shows
 # as a wave rather than as one tool, and because measuring them beside the image and audio tools

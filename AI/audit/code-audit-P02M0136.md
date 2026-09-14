@@ -2096,3 +2096,87 @@ volume launch names the missing dependency by name, the font-directory mint says
 minted, and a role refusal fills the supervisor's reason field instead of leaving it empty. That is
 the actual cost of this defect - not that it happened, but that it took a full day of boots to find
 something the machine could have said in one line.
+
+IMPLEMENTER'S INITIAL IMPLEMENTATION ON P02M0136 (2026-09-13 22:00):
+
+THE CORPUS IS AUTHORED, AND THAT TURNED OUT TO BE THE BETTER ANSWER RATHER THAN THE AVAILABLE ONE.
+The plan had recorded the pinned font corpus as blocked on "faces this tree may not author", with
+real `GSUB`/`GPOS` for Arabic joining, Devanagari reordering, Thai and Khmer called a type-design job.
+That conflated two things. DRAWING a script is type design. Declaring the layout rules a shaper must
+obey is not: it is the same mechanical writing-out this tree already does for its Unicode tables. And
+an imported face would not have been the easy answer either - to assert an expected glyph INDEX and
+POSITION a gate has to know what the face DECLARES, and for an imported face that knowledge is
+reverse-engineered from the bytes and then written down as a guess. Here the face's rules and the
+gate's expectations are two statements of one design.
+
+WHAT WAS BUILT. `src/tools/font-gen` is restructured around one description of a face - a glyph list,
+a mapping and the tables that are not derived from them - and now authors five: the staged
+last-resort face, and four conformance faces carrying ligature, single, multiple, pair and
+mark-to-base lookups across seven script tags plus `fvar`/`gvar`/`HVAR`/`MVAR`. `src/tools/text-corpus`
+reads them and compares 31 cases against expectations written from the design. `src/tools/check-text-corpus.sh`
+runs the generator's `--check`, the gate's `--self-test`, the gate itself, and then four deliberate
+defects in the shaper on a private copy of the tree, each of which must be caught BY THE CASE IT WAS
+AIMED AT. `src/user/apps/tools/src/textconf.rs` is the guest half: it reaches a face through the
+catalogue capability, shapes and lays it out through the real pipeline, draws it through
+`render2d`/`soft2d`, and compares against an oracle computed from the outline's own geometry.
+
+FOUR DEFECTS CAME OUT OF IT, and each was invisible to everything that existed before.
+
+  1  `ccmp` WAS APPLIED BY NO SCRIPT and appeared nowhere in the text stack. It is the one feature
+     every OpenType shaper applies for every script, before anything else; without it a face's
+     statement that a precomposed character is drawn as two glyphs is ignored, and Thai's sara am
+     renders with a glyph no face means to be used alone. Found by writing a corpus case for it.
+
+  2  THE STAGED FACE'S `maxp` WAS TWO BYTES TOO LONG - fifteen `u16` fields written where the table
+     has fourteen. The parser tolerated it because it reads fields by offset, so nothing failed. It
+     surfaced only because expressing two different faces through ONE description made every derived
+     number comparable.
+
+  3  `font-client` DECLARED THE CATALOGUE'S `resolve-into` TRAMPOLINE WITH `target: u64` WHERE THE
+     GENERATED IMPLEMENTATION TAKES `&u64`. The two are in different crates and meet only at the
+     linker, so the callee dereferenced the handle VALUE as a pointer: the first client ever to call
+     that operation died on a ring-3 page fault at the handle's numeric value, which is how it was
+     found. `check-forwarded-abi` names exactly this class and catches it; the mismatch was in the
+     tree because the operation had no caller until now.
+
+  4  `soft2d` DOES NOT MEET THE COVERAGE THRESHOLD THIS PROJECT FROZE. The frozen render2d bound is
+     2/255 per pixel against the ANALYTIC area; the rasteriser is exact in X and sampled in Y at a
+     sixteenth of a row, so a near-horizontal edge is off by up to 8/255 - measured here at 6/255 on
+     a rectangle whose top edge falls at y = 26.4, with the vertical edges agreeing to the last bit.
+     The rasteriser's own comment says the sampling "buys accuracy the tolerance does not ask for",
+     which is the claim the measurement contradicts. Recorded as an open item on the milestone that
+     owns the rasteriser, with the observation that the fix - analytic area accumulation - is the
+     same change as the performance floor that milestone already owes.
+
+THE WHOLE TEXT STACK IS IN THE IMAGE NOW. Twelve crates had a source row and no library row, which is
+a stack built, gated and staged nowhere: `font-contract`, `opentype-profile`, `unicode-tables`,
+`unicode-segmentation`, `unicode-bidi`, `font-parse`, `font-shape`, `font-run`, `text-layout`,
+`text-pipeline`, `render2d` and `soft2d`. Each carries the providers the LINKER says it imports,
+which is shorter than what each one uses - the profile's ceilings are `const` and the seam's geometry
+is inlined - and the build refuses a provider row that satisfies no import in either direction.
+
+WHAT IS NOT DONE. The guest gate passes on x86_64 and has not been run on aarch64 or riscv64. Nothing
+in it is architecture-specific and the claim it makes is exactly that, but a claim about three
+architectures is made by running the suite there rather than by reasoning about one - and the
+standing instruction is that the slow-architecture runs come last, after every other task.
+
+IMPLEMENTER'S FINAL RUN ON P02M0136 (2026-09-14 02:40):
+
+THE THREE-ARCHITECTURE CLAIM IS MADE, AND THE ANSWERS ARE IDENTICAL. x86_64 under KVM, aarch64 and
+riscv64 under TCG, the same staged program reaching the same staged face through the same capability:
+
+    50 px    18432 exact pixel(s), 0 partial, worst 0.000000
+    37 px    17785 exact, 647 partial (231 cut by a horizontal edge),
+               worst across 0.001961, worst down 0.001914, mean 0.000801
+
+Not "within tolerance of each other" - the same numbers to the last digit printed, on all three. The
+run took 1151 s on aarch64 and 1295 s on riscv64 under emulation, against 47 s on x86_64.
+
+AND THE DEFECT THE FIRST RUN FOUND IS FIXED RATHER THAN TOLERATED. The earlier measurement read
+`worst down 0.023529` - 6/255 on the pixels a horizontal edge cuts - because `soft2d` was exact in X
+and sampled in Y at a sixteenth of a row, which the frozen render2d threshold does not admit. The
+rasteriser accumulates area now, the comparison applies the frozen bound in both directions, and the
+number above is what it reads. That change is recorded against the milestone that owns the rasteriser,
+where it also closed the first of the three optimisations the performance floor names.
+
+EVERY ITEM IN THIS MILESTONE IS NOW TICKED.

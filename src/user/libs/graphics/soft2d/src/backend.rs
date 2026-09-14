@@ -479,6 +479,14 @@ impl<'a> Backend for Soft2d<'a> {
 			if tile.is_empty() {
 				continue;
 			}
+			// A TILE NOTHING DRAWS INTO IS NOT REPLAYED. Replaying an empty bin still DECODED the tile
+			// into the working space and RE-ENCODED it - for the eight-bit sRGB target that round trip
+			// happens to be lossless, so what it cost was time and not pixels: an empty draw list cost
+			// 21 ms of it, which was the largest single term in the simplest scene, and a compositor
+			// redrawing one damaged corner paid it for every other tile of the frame.
+			if prepared.bins.commands(index).is_empty() {
+				continue;
+			}
 			surface.rebase((tile.x, tile.y));
 			let scratch = Scratch { raster, pool, masks, spans, cache, glyphs: *glyphs };
 			if let Err(error) = replay(prepared, target, tile, index, &mut surface, &shaders, &lookup, target_table, scratch) {

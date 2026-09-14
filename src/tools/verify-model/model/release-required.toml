@@ -145,6 +145,7 @@ keys = [
 	"gate.static-image / host / host / default",
 	"gate.targeted-cache / host / host / default",
 	"gate.test-tags / host / host / default",
+	"gate.text-corpus / host / host / default",
 	"gate.text-limits / host / host / default",
 	"gate.trust-profile / host / host / default",
 	"gate.undeclared-edge / host / host / default",

@@ -280,6 +280,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// and metadata pass is not. A build without this row is a build in which the catalogue's
 		// recovery scan cannot be issued at all.
 		b"lsfont" => Some(granted("lsfont", alloc::vec![Capability::FontCatalogue, Capability::FontAdmin])),
+		// THE CONFORMANCE RUN HOLDS THE READ AND NOTHING ELSE. It reaches its face through the
+		// catalogue, draws into memory it allocated itself, and prints its verdict on the console it
+		// was handed - so it needs no volume, no display and no scan authority.
+		b"textconf" => Some(granted("textconf", alloc::vec![Capability::FontCatalogue])),
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),

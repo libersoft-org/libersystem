@@ -2429,11 +2429,27 @@ fn a_secure_random_syscall_refuses_rather_than_answering_from_a_formula() {
 		unsafe {
 			let mut buf = [0u8; 32];
 			let secure = arch::syscall::invoke(syscall::SYS_RANDOM_GET, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as i64;
+			// THREE ANSWERS AND NOT TWO, which is what this assertion used to get wrong.
+			//
+			// It said "a machine with no hardware source refuses", and that WAS the contract until
+			// the seeded pool arrived as the second answer - the whole reason most of this system's
+			// machines can answer at all, since two of its three architectures have no instruction.
+			// The syscall then answered on aarch64 from a seeded pool while this test still demanded
+			// a refusal, and the disagreement was invisible on x86_64 because `RDRAND` takes the
+			// first branch there. Found by running the suite on all three targets, which is the only
+			// thing that could have found it.
+			//
+			// WHAT IS REFUSED IS STILL THE THING THAT MATTERS: no hardware AND no seeded pool means
+			// `ERR_UNSUPPORTED` and an untouched buffer, rather than a formula under a name that
+			// promises otherwise.
 			if arch::random::secure_available() {
 				assert_eq!(secure, buf.len() as i64, "a machine with a hardware source answers from it");
 				assert!(buf.iter().any(|&b| b != 0), "and the answer is not zeros");
+			} else if crate::entropy::seeded() {
+				assert_eq!(secure, buf.len() as i64, "a machine with no instruction but a SEEDED POOL answers from the pool");
+				assert!(buf.iter().any(|&b| b != 0), "and the answer is not zeros");
 			} else {
-				assert_eq!(secure, syscall::ERR_UNSUPPORTED, "a machine with no hardware source refuses rather than substituting");
+				assert_eq!(secure, syscall::ERR_UNSUPPORTED, "a machine with neither refuses rather than substituting");
 				assert_eq!(buf, [0u8; 32], "and writes nothing at all");
 			}
 

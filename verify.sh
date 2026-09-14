@@ -14,9 +14,10 @@
 
 SCRIPT_NAME=verify.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-# EVERY RUN ENDS WITH A VERDICT, and the verdict is a trap - see `run_verdict` in lib.sh. A run that
-# fails is otherwise indistinguishable from a run that is still going, which is exactly how a failed
-# build came to be waited on for half an hour.
+# EVERY RUN ENDS WITH A VERDICT, from the one EXIT dispatcher in lib.sh - and cleanups REGISTER with
+# it rather than installing traps of their own. A run that fails is otherwise indistinguishable from
+# a run that is still going, which is exactly how a failed build came to be waited on for half an
+# hour. `docs/TESTING.md` states what the line and the terminal record do and do not promise.
 arm_run_verdict
 source "$SRC_DIR/tools/evidence.sh"
 
@@ -358,7 +359,9 @@ release_prepare() {
 		[[ "$out_root" != "$release_snapshot"* ]] || die "--out-root must be OUTSIDE the snapshot, which is removed when the run ends"
 		note "release snapshot: $revision at $release_snapshot"
 		src/tools/release-snapshot.sh create "$release_snapshot" "$revision" >/dev/null || die "could not create the snapshot"
-		trap release_cleanup EXIT
+		# REGISTERED THE MOMENT THE SNAPSHOT EXISTS, so a failure between here and the rest of the
+		# release setup still removes it.
+		register_run_cleanup release_cleanup
 	fi
 	if [[ -n "$release_required_file" ]]; then
 		[[ "$release_required_file" == /* ]] || release_required_file="$PWD/$release_required_file"
@@ -426,8 +429,12 @@ if [[ "$mode" == sweep ]]; then
 	note "snapshot sweep at $revision"
 	rm -rf "$worktree"
 	git worktree add --detach "$worktree" "$revision" >/dev/null 2>&1 || die "could not create a worktree at $worktree"
-	# shellcheck disable=SC2064
-	trap "git worktree remove --force '$worktree' >/dev/null 2>&1 || true" EXIT
+	sweep_worktree="$worktree"
+	remove_sweep_worktree() {
+		[[ -n "${sweep_worktree:-}" ]] || return 0
+		git worktree remove --force "$sweep_worktree" >/dev/null 2>&1 || true
+	}
+	register_run_cleanup remove_sweep_worktree
 	status=0
 	# Serial for the same reason `run_full` is: this is the other flat path, and a second scheduler
 	# living in it would answer a different number from `--jobs`.
@@ -442,18 +449,16 @@ if [[ "$mode" == sweep ]]; then
 	exit 0
 fi
 
+# THE FOUR MODEL QUERIES RUN AS CHILDREN AND NOT AS `exec`.
+#
+# `exec` REPLACES THIS SHELL, so its EXIT trap never runs: every one of these four answered with the
+# planner's status and NO verdict at all - the exact silence this milestone exists to remove. Run as
+# an owned child, the planner's real status reaches the dispatcher, which reports it.
 case "$action" in
-catalog)
-	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- catalog
-	;;
-model-hash)
-	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash
-	;;
-age)
-	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- age
-	;;
-trust)
-	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- trust
+catalog | model-hash | age | trust)
+	model_status=0
+	run_owned cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "$action" || model_status=$?
+	exit "$model_status"
 	;;
 esac
 
@@ -503,7 +508,10 @@ note "$(printf '%s\n' "$changed" | wc -l) changed path(s)"
 # somewhere.
 if [[ "$action" == json || "$action" == plan ]]; then
 	rendered="$(mktemp)"
-	trap 'rm -f "$rendered"' EXIT
+	remove_rendered() {
+		rm -f "$rendered"
+	}
+	register_run_cleanup remove_rendered
 	if [[ "$action" == json ]]; then
 		printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- plan --stdin --json >"$rendered" || planner_failed "the planner exited non-zero"
 	else
@@ -540,7 +548,10 @@ if [[ "$action" == shadow ]]; then
 	mkdir -p "$BUILD_DIR/logs"
 	shadow_dir="$(mktemp -d "$BUILD_DIR/logs/verify-shadow.XXXXXXXX")"
 	pending_records="$shadow_dir/records.json"
-	trap 'rm -f "$pending_records"' EXIT
+	remove_pending_records() {
+		rm -f "$pending_records"
+	}
+	register_run_cleanup remove_pending_records
 	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" booted --stdin)" || planner_failed "the planner could not name the targets"
 	[[ -n "$targets" ]] || planner_failed "the plan named no target to sweep"
 	# THE BUILT SET, WHICH IS NOT THE BOOTED SET. A change that boots one target still has to compile
@@ -763,7 +774,13 @@ fi
 
 # Ask for the commands, and treat every way of not getting them as the same answer.
 steps_file="$(mktemp)"
-trap 'rm -f "$steps_file"; release_cleanup' EXIT
+remove_steps_file() {
+	rm -f "$steps_file"
+}
+register_run_cleanup remove_steps_file
+# AND THE RELEASE CLEANUP AGAIN, because this path is reached by a release run too - registration is
+# idempotent in effect: `release_cleanup` is written to tolerate having nothing to do.
+register_run_cleanup release_cleanup
 tier_mode=""
 tier_state=""
 tier_outcomes=""
@@ -1006,10 +1023,12 @@ run_one_step() {
 		# INSIDE A RUN THE STEP'S OUTPUT IS ITS RESULT LOG: streamed as before, through `tee`, and
 		# copied into the run by the envelope `record_one_step` publishes for a producer that did not
 		# publish its own. `pipefail` makes the pipeline's status the step's.
-		if ! eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"; then
+		# Owned and waited for, so a signal to the executor stops the step it started rather than
+		# being answered when that step finishes on its own.
+		if ! run_owned_shell 'eval "$command" 2>&1 | tee "$LIBER_VERIFY_RUN/logs/.step-$index.log"'; then
 			status=1
 		fi
-	elif ! eval "$command"; then
+	elif ! run_owned_shell 'eval "$command"'; then
 		status=1
 	fi
 	elapsed=$((SECONDS - started))
