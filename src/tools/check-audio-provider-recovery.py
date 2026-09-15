@@ -52,8 +52,13 @@ enum DriverPending { None, Period, Stop, Capture(usize) }
 struct Pending { caps: wire::Handles }
 struct Stream { chan: u64, pending: Option<Pending> }
 struct Capture { chan: u64, pending: Option<()>, unavailable: bool, ready: Option<()> }
+// THE FIELDS THE EXTRACTED METHODS TOUCH, and `driver_refusals` is one of them: the production
+// engine counts a device's consecutive refusals and treats the device as lost at `REFUSAL_LIMIT`,
+// and a double that does not carry the counter cannot compile the code that keeps it.
+const REFUSAL_LIMIT: u32 = 8;
 struct Audio {
     snd: u64, driver_pending: DriverPending, driver_running: bool, capture_running: bool,
+    driver_refusals: u32,
     streams: Vec<Stream>, captures: Vec<Capture>, tones: Vec<()>, period: Vec<u8>,
 }
 impl Audio {
@@ -74,11 +79,13 @@ fn step(state: &mut Audio, providers: &mut u64) {
 fn audio() -> Audio {
     RT.with_borrow_mut(|rt| *rt = Runtime::default());
     Audio { snd: 10, driver_pending: DriverPending::None, driver_running: false, capture_running: false,
-        streams: vec![], captures: vec![], tones: vec![], period: vec![0; PERIOD_BYTES] }
+        driver_refusals: 0, streams: vec![], captures: vec![], tones: vec![], period: vec![0; PERIOD_BYTES] }
 }
 fn announce(live: bool, generation: u64) {
+    // AN UNNAMED PUBLICATION, which is what a device with one provider of a kind publishes: the name
+    // selects among several of one kind and this machine's audio device has exactly one.
     let info = ProviderInfo { kind: ProviderKind::Audio, bus: 0, dev: 1, func: 0,
-        binding_generation: generation, slot: 0, provider_generation: generation as u32, live };
+        binding_generation: generation, slot: 0, provider_generation: generation as u32, live, name: String::new() };
     let mut frame = [0; 128]; let mut handles = wire::Handles::new();
     let len = provider_catalogue::subscribe_frame(0, &info, &mut frame, &mut handles).unwrap();
     RT.with_borrow_mut(|rt| rt.messages.entry(80).or_default().push_back(frame[..len].to_vec()));
@@ -122,7 +129,10 @@ fn a_pending_period_reply_still_completes_on_the_same_connection() {
 
 def main() -> None:
     source = (ROOT / "src/user/services/core/src/audio_engine.rs").read_text()
-    serving = source[source.index("unsafe fn serve(root:"):]
+    # THE LOCATOR IS THE SIGNATURE AS IT STANDS. It carried an `unsafe` the function no longer has -
+    # the runtime calls under it stopped being unsafe - so this gate died with a traceback about a
+    # missing substring instead of checking anything.
+    serving = source[source.index("fn serve(root:"):]
     events = serving[serving.index("let driver_first:"):serving.index("if ready_chan == admin {")]
     methods = "\n".join(method(source, name) for name in ("pump", "driver_ready", "driver_failed"))
     program = FIXTURE.replace("@@METHODS@@", methods).replace("@@WAIT_AND_EVENTS@@", events)

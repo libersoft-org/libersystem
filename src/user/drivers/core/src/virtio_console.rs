@@ -375,22 +375,25 @@ unsafe fn send_control(device: &virtio::Virtio, control_tx: &Queue, message: Con
 // queue and one without.
 fn describe_ports(out: &mut [u8], multiport: bool, discovered: u32, open: usize, served: usize, tx_ok: bool) -> usize {
 	let mut written = 0usize;
-	// SHORT, BECAUSE THE LINE IT GOES INTO IS SIXTY-FOUR BYTES and the address and the driver name
-	// are most of it: `multiport 1/1` is ports announced over ports open, which is the pair a reader
-	// needs - a device that announced three and opened one is a different picture from one that
-	// opened all three.
+	// SHORT, BECAUSE THE LINE IT GOES INTO IS SIXTY-FOUR BYTES and the driver name, the state and
+	// the address are forty of them. `multiport 2/2/1` is announced over open over SERVED, which is
+	// the triple a reader needs and all three are different questions: a device that announced three
+	// and opened one is a different picture from one that opened all three, and a port that is open
+	// but not served is a port nothing in this image can reach - the console port is never served,
+	// and neither is one past the bring-up protocol's publication bound.
+	//
+	// IT WAS A PAIR AND THE THIRD NUMBER DID NOT FIT AS A WORD. `multiport 2/2, 1 served, tx ok` is
+	// two characters past the line, and `describe` cuts rather than wraps - so the report lost its
+	// transmit verdict and its closing bracket, which is the half of the line that says the banner
+	// went out at all.
 	if multiport {
 		push_bytes(out, &mut written, b"multiport ");
 		push_number(out, &mut written, discovered as u64);
 		push_bytes(out, &mut written, b"/");
 		push_number(out, &mut written, open as u64);
-		push_bytes(out, &mut written, b", ");
-		// AND HOW MANY OF THE OPEN ONES ARE SERVED, which is not the same number: the console port
-		// is never published, and a device that opened more generic ports than one handshake may
-		// carry publications for has the rest open and unread. A reader comparing the two sees that
-		// rather than having to infer it.
+		push_bytes(out, &mut written, b"/");
 		push_number(out, &mut written, served as u64);
-		push_bytes(out, &mut written, b" served, ");
+		push_bytes(out, &mut written, b", ");
 	} else {
 		push_bytes(out, &mut written, b"one port, ");
 	}

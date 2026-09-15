@@ -77,6 +77,9 @@ fn open_subscription(_: u64, _: &mut Catalogue, _: &[Node], _: &[u8], _: &mut wi
 struct Entry { name: &'static [u8], provides: &'static [(u16, u16, u16)] }
 static SINGLE: Entry = Entry { name: b"single", provides: &[(driver_protocol::provider::BLOCK, 3, 1), (driver_protocol::provider::NET, 3, 1)] };
 static DOUBLE: Entry = Entry { name: b"double", provides: &[(driver_protocol::provider::BLOCK, 3, 2)] };
+// A registry entry that declares several publications of ONE kind, which is what a multiport
+// virtio-serial driver is: one byte stream per open port, each admitting a single consumer.
+static PORTS: Entry = Entry { name: b"ports", provides: &[(driver_protocol::provider::CONSOLE_BYTES, 4, 1)] };
 struct Binding { channel: u64 }
 struct Node { id: BindingId, binding: Option<Binding>, declared: &'static Entry }
 impl Node { fn entry(&self) -> Option<&'static Entry> { Some(self.declared) } }
@@ -88,8 +91,11 @@ impl Service for CatalogueView<'_> {
 }
 fn binding(device: u8) -> BindingId { BindingId::new(0, device, 0, 1) }
 fn publish(catalogue: &mut Catalogue, id: BindingId, entry: &'static Entry, token: u16, kind: u16) -> (usize, u64) {
+    publish_named(catalogue, id, entry, token, kind, b"")
+}
+fn publish_named(catalogue: &mut Catalogue, id: BindingId, entry: &'static Entry, token: u16, kind: u16, name: &[u8]) -> (usize, u64) {
     let (_, offered) = channel().unwrap(); let mut offers = Offers::new();
-    assert!(offers.push(kind, token, offered));
+    assert!(offers.push(kind, token, name, offered));
     (unsafe { catalogue.publish_all(id, entry, &mut offers) }, offered)
 }
 fn request_open(info: &proto::system::ProviderInfo, fail: bool) {
@@ -149,11 +155,36 @@ fn failed_root_connections_do_not_spend_client_slots() {
 #[test]
 fn handshake_tokens_are_unique_across_kinds() {
     let mut offers = Offers::new();
-    assert!(offers.push(driver_protocol::provider::BLOCK, 7, 10));
-    assert!(!offers.push(driver_protocol::provider::BLOCK, 7, 11));
-    assert!(!offers.push(driver_protocol::provider::NET, 7, 12));
-    assert!(offers.push(driver_protocol::provider::NET, 8, 13));
+    assert!(offers.push(driver_protocol::provider::BLOCK, 7, b"", 10));
+    assert!(!offers.push(driver_protocol::provider::BLOCK, 7, b"", 11));
+    assert!(!offers.push(driver_protocol::provider::NET, 7, b"", 12));
+    assert!(offers.push(driver_protocol::provider::NET, 8, b"", 13));
     assert_eq!(offers.count, 2);
+}
+#[test]
+fn a_publication_keeps_the_name_its_publisher_gave_it() {
+    // THE CASE THE NAME EXISTS FOR: one binding publishing two providers of ONE kind, whose every
+    // other catalogue field is identical - a virtio-serial console port and a named generic port.
+    // Without the name a consumer asking for the kind takes whichever it is handed, and for a byte
+    // stream that is refused nowhere: the bytes arrive at the other port.
+    let mut offers = Offers::new();
+    assert!(offers.push(driver_protocol::provider::CONSOLE_BYTES, 0, b"org.libersystem.diag", 10));
+    assert!(offers.push(driver_protocol::provider::CONSOLE_BYTES, 1, b"", 11));
+    assert_eq!(offers.name(0), b"org.libersystem.diag");
+    assert_eq!(offers.name(1), b"", "a publication with no name of its own is empty, not absent");
+
+    // A NAME PAST THE BOUND IS CUT RATHER THAN REFUSED. The publisher chose a name too long for the
+    // wire, which is a shorter name; refusing would lose the publication over its label.
+    let long = [b'x'; driver_protocol::MAX_PROVIDER_NAME + 7];
+    assert!(offers.push(driver_protocol::provider::CONSOLE_BYTES, 2, &long, 12));
+    assert_eq!(offers.name(2).len(), driver_protocol::MAX_PROVIDER_NAME);
+
+    // AND IT REACHES THE CONSUMER. `provider-info` is what a subscription carries and what `open`
+    // is asked with, so a name the catalogue held and did not render is a name nobody can select on.
+    let mut catalogue = Catalogue::new();
+    assert_eq!(publish_named(&mut catalogue, binding(1), &PORTS, 0, driver_protocol::provider::CONSOLE_BYTES, b"org.libersystem.diag").0, 1);
+    let published = catalogue.entries.iter().flatten().next().expect("the publication is in the catalogue");
+    assert_eq!(provider_info_wire(published, true).name, "org.libersystem.diag");
 }
 #[test]
 fn tokens_are_unique_for_the_complete_binding_generation() {
@@ -247,17 +278,26 @@ impl std::ops::DerefMut for TokenHistory { fn deref_mut(&mut self) -> &mut Self:
 def main() -> None:
     source = (ROOT / "src/user/services/core/src/device_manager.rs").read_text()
     definitions = ["struct Offers {", "impl Offers {", "struct Provider {", "impl Provider {", "struct Subscriber {", "struct Catalogue {", "impl Catalogue {", "impl driver_binding::Withdrawn<Provider> for Catalogue {", "struct CatalogueClients {", "impl CatalogueClients {"]
-    functions = ["fn outstanding(", "fn provider_kind_from_wire(", "fn provider_kind_wire(", "fn provider_info_wire(", "unsafe fn send_provider_frame(", "unsafe fn serve_catalogue_once(", "unsafe fn channel_pair_for_catalogue("]
+    # THE LOCATORS ARE THE SIGNATURES AS THEY STAND. Three of them carried an `unsafe` the functions
+    # no longer have - the runtime calls under them stopped being unsafe - so the extraction found
+    # nothing and the gate died with a Python traceback about a missing substring. A gate that cannot
+    # find the code it checks reports an error about itself, which reads like a broken tool rather
+    # than like an unverified claim.
+    functions = ["fn outstanding(", "fn provider_kind_from_wire(", "fn provider_kind_wire(", "fn provider_info_wire(", "fn send_provider_frame(", "fn serve_catalogue_once(", "fn channel_pair_for_catalogue("]
     opening = item(source[source.index("impl proto::system::provider_catalogue::Service for CatalogueView"):], "fn open(")
     program = FIXTURE.replace("OPEN_METHOD", opening) + "\n".join(item(source, start) for start in definitions + functions)
     program = program.replace("used_tokens: Vec<(BindingId, u16)>", "used_tokens: TokenHistory").replace("used_tokens: Vec::new()", "used_tokens: TokenHistory::new()")
+    # EVERY MUTATION IS CHECKED TO HAVE CHANGED SOMETHING, which is what caught these two: an
+    # indentation that moved when the loop left a nested block, and an `unsafe` the function no
+    # longer carries. A mutation that matches nothing is a defect this gate claims to reject and
+    # does not, so the locators are the source as it stands rather than as it once was.
     mutations = {
-        "unclosed factory reply": program.replace("for &handle in reply_handles.as_slice() {\n\t\t\tclose(handle);", "for &handle in reply_handles.as_slice() {"),
+        "unclosed factory reply": program.replace("for &handle in reply_handles.as_slice() {\n\t\tclose(handle);", "for &handle in reply_handles.as_slice() {"),
         "unretired root connection": program.replace("clients.retire(clients.count - 1);", ""),
         "duplicate handshake token": program.replace(" || self.tokens[..self.count].contains(&token)", ""),
         "live-only token validation": program.replace("if self.used_tokens.contains(&(binding, offers.tokens[index])) {", "if self.entries.iter().flatten().any(|provider| provider.binding_is(binding) && provider.token == offers.tokens[index]) {"),
         "unchecked token history reserve": program.replace("if self.used_tokens.try_reserve(1).is_err() {", "if false {"),
-        "early token retirement": program.replace("unsafe fn withdraw_binding(&mut self, binding: BindingId) -> usize {", "unsafe fn withdraw_binding(&mut self, binding: BindingId) -> usize { self.retire_binding(binding);"),
+        "early token retirement": program.replace("fn withdraw_binding(&mut self, binding: BindingId) -> usize {", "fn withdraw_binding(&mut self, binding: BindingId) -> usize { self.retire_binding(binding);"),
     }
     with tempfile.TemporaryDirectory(prefix="liber-provider-catalogue-") as directory:
         path = Path(directory)
@@ -268,9 +308,9 @@ def main() -> None:
         command = ["cargo", "test", "--offline", "--quiet", "--manifest-path", str(path / "Cargo.toml"), "--lib"]
         (path / "tests.rs").write_text(program)
         result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or "7 passed" not in result.stdout:
+        if result.returncode or "8 passed" not in result.stdout:
             raise SystemExit(result.stdout)
-        print("provider-catalogue: 7 production delivery and publication regressions passed")
+        print("provider-catalogue: 8 production delivery and publication regressions passed")
         for name, mutant in mutations.items():
             if mutant == program:
                 raise ValueError(f"{name}: mutation did not change code")

@@ -2151,12 +2151,6 @@ struct Provider {
 	name_len: u8,
 }
 
-impl Provider {
-	fn name(&self) -> &[u8] {
-		&self.name[..self.name_len as usize]
-	}
-}
-
 // A CONNECTION TO THE PROVIDER IN `slot`, by the rule `Devices::open` states: the OFFERED channel is
 // the first connection, and a later consumer gets a minted one.
 //
@@ -2611,6 +2605,12 @@ fn outstanding(provider: &Provider) -> u16 {
 }
 
 impl Provider {
+	// WHAT THE PUBLISHER CALLS IT, as it was offered. Empty for a publication with no name, which is
+	// every one until a driver publishes two providers of a single kind.
+	fn name(&self) -> &[u8] {
+		&self.name[..self.name_len as usize]
+	}
+
 	// Whether this provider belongs to that binding - the same function AND the same generation,
 	// because a provider published by a binding that is over is not this binding's.
 	fn binding_is(&self, binding: BindingId) -> bool {
@@ -5713,6 +5713,12 @@ fn report_catalogue(catalogue: &Catalogue, phase: &[u8]) {
 		(b"audio", driver_protocol::provider::AUDIO),
 		(b"input", driver_protocol::provider::INPUT),
 		(b"usb-bus", driver_protocol::provider::USB_BUS),
+		// THE TWO THAT WERE MISSING, and the omission is what this loop exists to stop: the line
+		// says what is published, so a kind it does not list reads as a kind nothing published. A
+		// multiport virtio-serial device publishes one byte stream per open generic port, and the
+		// pointer has been published since xHCI grew one.
+		(b"pointer", driver_protocol::provider::POINTER),
+		(b"console-bytes", driver_protocol::provider::CONSOLE_BYTES),
 	] {
 		let count = catalogue.count_of(kind);
 		if count == 0 || at + label.len() + 4 >= line.len() {

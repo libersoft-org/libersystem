@@ -22,6 +22,11 @@ def main():
     definitions = '\n'.join(re.search(r'^' + pattern + r'.*?^}', source, re.M | re.S).group() for pattern in (
         'pub enum ProviderReady ', 'pub struct Serving ', 'impl Serving ', 'enum Control '))
     functions = '\n'.join(function(source, name) for name in ('wait_providers_or_answer', 'drain_control_into', 'disconnected', 'pong'))
+    # THE STUBS ARE SAFE, LIKE THE `rt` CALLS THEY STAND IN FOR. They were `unsafe fn`, from a time
+    # when `close`, `poll_ready`, `wait_any` and `try_recv` were - so the extracted production code,
+    # which calls them from safe functions, stopped compiling the moment the runtime's did not. A
+    # gate that will not build is a gate that checks nothing, and it says so as a compile error about
+    # somebody else's function rather than as a failed claim.
     fixture = r'''
 use driver_protocol as proto;
 use std::collections::VecDeque;
@@ -36,23 +41,23 @@ static SENT: Mutex<Vec<(proto::Opcode, u64, Vec<u8>)>> = Mutex::new(Vec::new());
 static READY: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 struct Bind { generation: u64 }
 enum Polled { Message { len: usize, handle: u64 }, Empty, Closed }
-unsafe fn close(end: u64) { CLOSED.lock().unwrap().push(end); }
-unsafe fn poll_ready(end: u64) -> bool { READY.lock().unwrap().contains(&end) }
-unsafe fn wait_any(set: &[u64], _: u64) -> i64 {
+fn close(end: u64) { CLOSED.lock().unwrap().push(end); }
+fn poll_ready(end: u64) -> bool { READY.lock().unwrap().contains(&end) }
+fn wait_any(set: &[u64], _: u64) -> i64 {
     assert!(set.contains(&100), "an idle provider keeps its control channel in the wait");
     let mut scheduled = SCHEDULED.lock().unwrap();
     if scheduled.is_empty() { return -1 }
     QUEUED.lock().unwrap().append(&mut scheduled);
     0
 }
-unsafe fn try_recv(channel: u64, out: &mut [u8]) -> Polled {
+fn try_recv(channel: u64, out: &mut [u8]) -> Polled {
     assert_eq!(channel, 100);
     match QUEUED.lock().unwrap().pop_front() {
         Some((bytes, handle)) => { out[..bytes.len()].copy_from_slice(&bytes); Polled::Message { len: bytes.len(), handle } }
         None => Polled::Empty,
     }
 }
-unsafe fn send_frame(_: u64, opcode: proto::Opcode, generation: u64, payload: &[u8]) -> bool {
+fn send_frame(_: u64, opcode: proto::Opcode, generation: u64, payload: &[u8]) -> bool {
     SENT.lock().unwrap().push((opcode, generation, payload.to_vec())); true
 }
 fn connect(token: u16, end: u64, generation: u64) -> (Vec<u8>, u64) {
@@ -68,9 +73,9 @@ fn reset() {
 fn a_single_consumer_allowance_is_reusable_after_every_exit() {
     reset(); let bind = Bind { generation: 4 }; let mut serving = Serving::new(10, 0);
     for round in 0..12 {
-        assert!(matches!(unsafe { wait_providers_or_answer(100, &bind, &mut serving, &[200]) }, Some(ProviderReady::Connected(0))), "every connection gets its own initial metadata opportunity");
+        assert!(matches!(wait_providers_or_answer(100, &bind, &mut serving, &[200]), Some(ProviderReady::Connected(0))), "every connection gets its own initial metadata opportunity");
         let token = serving.close_at(0);
-        assert!(unsafe { disconnected(100, &bind, token) });
+        assert!(disconnected(100, &bind, token));
         assert!(serving.as_slice().is_empty());
         SCHEDULED.lock().unwrap().push_back(connect(0, 11 + round, 4));
     }
@@ -85,11 +90,11 @@ fn usb_connections_keep_their_publication_identity_across_removal_and_reopen() {
     assert_eq!(serving.at(1), 30); assert_eq!(serving.token_at(1), 2);
     assert_eq!(serving.first_for(2), 30);
     QUEUED.lock().unwrap().push_back(connect(1, 21, 4));
-    assert!(matches!(unsafe { drain_control_into(100, &bind, Some(&mut serving)) }, Control::Continue));
+    assert!(matches!(drain_control_into(100, &bind, Some(&mut serving)), Control::Continue));
     assert_eq!(serving.at(2), 21); assert_eq!(serving.token_at(2), 1);
     while !serving.as_slice().is_empty() { serving.close_at(0); }
     QUEUED.lock().unwrap().push_back(connect(2, 31, 4));
-    assert!(matches!(unsafe { wait_providers_or_answer(100, &bind, &mut serving, &[200]) }, Some(ProviderReady::Connected(0))));
+    assert!(matches!(wait_providers_or_answer(100, &bind, &mut serving, &[200]), Some(ProviderReady::Connected(0))));
     assert_eq!(serving.first_for(2), 31);
 }
 #[test]
@@ -98,7 +103,7 @@ fn refused_connections_return_allowance_and_stale_handles_are_closed() {
     for end in 11..18 { assert!(serving.accept(end, 0)); }
     QUEUED.lock().unwrap().push_back(connect(0, 99, 4));
     QUEUED.lock().unwrap().push_back(connect(0, 98, 3));
-    assert!(matches!(unsafe { drain_control_into(100, &bind, Some(&mut serving)) }, Control::Continue));
+    assert!(matches!(drain_control_into(100, &bind, Some(&mut serving)), Control::Continue));
     assert_eq!(*CLOSED.lock().unwrap(), [99, 98]);
     assert_eq!(SENT.lock().unwrap().len(), 1, "a stale generation cannot refund a current binding's allowance");
     assert_eq!(SENT.lock().unwrap()[0].0, proto::Opcode::Disconnect);
@@ -108,10 +113,10 @@ fn refused_connections_return_allowance_and_stale_handles_are_closed() {
 fn an_idle_provider_still_services_device_work_and_stop() {
     reset(); let bind = Bind { generation: 4 }; let mut serving = Serving::new(10, 0);
     serving.close_at(0); READY.lock().unwrap().push(200);
-    assert!(matches!(unsafe { wait_providers_or_answer(100, &bind, &mut serving, &[200]) }, Some(ProviderReady::Device(0))));
+    assert!(matches!(wait_providers_or_answer(100, &bind, &mut serving, &[200]), Some(ProviderReady::Device(0))));
     let bytes = proto::Header { version: proto::VERSION, opcode: proto::Opcode::Stop, generation: 4, payload_len: 0 }.encode().to_vec();
     QUEUED.lock().unwrap().push_back((bytes, 0));
-    assert!(unsafe { wait_providers_or_answer(100, &bind, &mut serving, &[200]) }.is_none());
+    assert!(wait_providers_or_answer(100, &bind, &mut serving, &[200]).is_none());
     assert!(STOP_PENDING.load(Ordering::Relaxed));
 }
 '''

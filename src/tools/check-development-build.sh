@@ -41,7 +41,14 @@ done
 # `required-features` programs, and `cargo build` would still succeed and still print nothing. The
 # manifest says which programs are development-only; this is the inverse of the check that proves
 # the shipping configuration does NOT build them.
-mapfile -t gated < <(tools/system-manifest.sh export-json | jq -r '.programs[] | select(.development == true) | .name' | sort)
+#
+# AUDIT-PRODUCED PROGRAMS ARE NOT IN THIS SET, and cannot be: `abiprobe` and `vkprobe` are
+# development-only AND `producer = "audit"`, which means they are LINKED against a pinned upstream
+# this tree deliberately does not carry and STAGED from that link's output. No `cargo build` of
+# services or drivers produces them, in either configuration, so demanding them here made this gate
+# fail for a tree that is behaving exactly as the manifest describes - and a gate that is red for a
+# correct tree is a gate nobody can use to find out about an incorrect one.
+mapfile -t gated < <(tools/system-manifest.sh export-json | jq -r '.programs[] | select(.development == true and .producer != "audit") | .name' | sort)
 if ((${#gated[@]} == 0)); then
 	fail "no program is marked development-only; the gate would pass vacuously"
 fi

@@ -670,3 +670,122 @@ today would not be worth having.
 WHAT IS LEFT for the item: the per-port byte PUMP - a receive pool, a transmit path and one provider
 per open port served to a consumer the way the development channel's single port is served today. The
 write direction and the name are done; the duplex stream is not.
+
+## The per-port byte pump, and the port module both drivers now share (2026-09-15)
+
+THE PORT IS A LIBRARY NOW, AND IT WAS MOVED RATHER THAN COPIED. `drivers::serial_port` holds what
+one virtio-serial port served as a byte stream IS: the receive pool's slot count and size, the
+bounded transmit wait and why its deadline is the session's rather than a shorter guess, the typed
+refusals (`again` is a host that stopped reading), the `console_stream::Service` implementation, the
+receive drain and the backpressure that answers the manager's pings while a consumer is behind. All
+of it came out of `dev_channel.rs`, which is where it was written, and none of it was duplicated
+into the console driver. That was the one duplication worth refusing outright: two copies of a
+byte-stream contract diverge invisibly, because mismatched bytes are refused nowhere - they arrive
+somewhere else in the reader. The dev-channel driver had said as much in its own header, that a later
+multiport driver should carry the same protocol on a named port without anything above it changing.
+
+`Stream` IS THE UNIT, AND THAT IS WHAT MADE THE SHARING POSSIBLE. One served port is both queues, the
+receive pool behind one and the transmit buffer behind the other, plus one consumer's session. A
+driver with a single port could keep those as six locals and did; a driver with N of them cannot, and
+the pieces are not independently useful - a receive pool with no attachment to hand bytes to is bytes
+discarded. Bundling them is also what makes "one port" the thing a loop iterates over.
+
+`Port` OWNS ITS TRANSMIT QUEUE NOW instead of borrowing one. A multiport device has one queue per
+port, and a set of borrows of one device's queues is a set no single scope can hand out. The queue is
+plain data - a ring's addresses and two indices - so moving it into the only thing allowed to drive
+it costs nothing.
+
+THE STAMP GOES OUT ON THE ASYNCHRONOUS PATH, and this was a real trap rather than a tidiness. The
+synchronous `Queue::submit` busy-polls the used ring without touching the indices `take_used`
+accounts against, so one synchronous write followed by an interrupt-driven pump leaves the reaper
+looking at a completion it was never told to expect - `check_used_advance` would refuse it. The stamp
+now uses `Port::send_now`, the same submit the first real write uses, and the pump's first `reclaim`
+takes its completion like any other.
+
+THE CONSOLE PORT IS NOT PUBLISHED, deliberately. Port 0 carries the guest's console and the banner;
+a second writer would interleave with both and a consumer reading it would be reading the boot log.
+What is published is the GENERIC ports the control queue opened, capped at the bring-up protocol's
+four publications per handshake - and the report says how many of the open ports that was
+(`multiport 2/2/1` is announced over open over served), so a port that is open with nothing able to
+reach it is visible rather than inferred. That distinction matters here because it is exactly what
+this driver was when only the control half had landed.
+
+THE CONSOLE DRIVER TAKES AN MSI-X VECTOR NOW, which is a DeviceManager change and not a driver one:
+the interrupt-driven list was a name list in `bind`, and `virtio_console` joined it. A byte stream
+must block on arriving bytes; polling one would spin for the guest's whole life, and under a
+cooperative scheduler a runnable spinner starves every thread that still has boot work. A binding
+that granted no vector leaves the driver publishing nothing and the console working exactly as it
+did, which is the honest degradation rather than a wait on a handle that is not one.
+
+THE REGISTRY DECLARATION CAME BACK, and the comment that removed it said what it was waiting for:
+"telling two publishers of one kind apart needs a ROLE the registry declares and the catalogue
+carries, and nothing in this tree has one yet". The name is that role. `most = 4` is the protocol's
+bound rather than a count of any machine's ports, and `consumers = 1` because a byte stream divided
+between two readers is bytes arriving at whichever drained first.
+
+AND THE CONSUMER SELECTS BY NAME. `driver_protocol::console::selects` is the decision, host-tested:
+exact bytes, an empty selector matching anything, an empty name matching only that. A prefix rule
+would attach the development agent to `org.libersystem.dev2` and a case-insensitive one to a port
+some host named in capitals, both silently. The development channel publishes under
+`provider::DEV_CHANNEL_NAME`, read by the driver and by the agent from the same constant, because a
+name each end spells for itself is two names.
+
+`MAX_PAYLOAD` WAS TWO BYTES TOO SMALL and nothing had found out. It was `BIND`'s payload alone; a
+named `OFFER` is four header bytes plus a forty-eight-byte name, which is fifty-two against fifty. A
+publication named to the bound would have been built into a frame buffer too short, and the failure
+would have been a panic in the sender rather than a refusal anywhere. It is a maximum over the
+opcodes now, with a fixture that asserts the property rather than today's answer.
+
+FOUR GATES FOR THIS EXACT CODE COULD NOT RUN AT ALL, and they are repaired in the same change.
+`check-provider-catalogue`, `check-driver-connections`, `check-no-fixed-provider-slots` and
+`check-audio-provider-recovery` extract production functions by signature and compile them against
+host doubles. Three locators carried an `unsafe` the functions no longer have; one mutation locator
+had lost a level of indentation when its loop left a nested block, so a defect the gate claims to
+reject was not being injected at all; one double was missing a field the extracted code reads; and
+one `ProviderInfo` literal predated the name. Each failed as a Python traceback or as a compile error
+about somebody else's function, which reads like a broken tool rather than like an unverified claim -
+which is why they had stayed broken. Two `impl Provider` blocks in one file were also merged into
+one, because the extraction takes the first and the first had become the wrong one.
+
+THE SERIAL CONTRACT IS DEFINED, because this was the first of its three claimants to be implemented
+and the milestone's rule says the first one answers for all three. The byte stream is the BASE -
+`console-stream`, with no baud, parity, stop bits, DTR, RTS or break in it - and the line coding and
+control lines are a SERIAL LAYER above it, a separate interface with its own provider kind owned by
+the first of 16550, PL011 and CDC-ACM that actually needs one. The reason is not symmetry: a
+virtio-serial port has no line coding at all, so a common contract carrying baud would make every
+virtio port answer a question it has no answer to, on every operation, for ever.
+
+VERIFIED: `./check.sh --gate virtio-multiport` green with the served count and the catalogue's
+published-provider count added to it; `./check.sh --gate qemu-2d-demo` green; the whole x86_64 guest
+suite at 399 passed with the console driver serving consumers where it used to stand.
+
+## Two development gates repaired, and one that is red for a reason outside this work (2026-09-15)
+
+`development-build` DEMANDED PROGRAMS NO `cargo build` CAN PRODUCE. `abiprobe` and `vkprobe` are
+`development = true` AND `producer = "audit"`: what is staged for them is linked against a pinned
+upstream this tree deliberately does not carry, and `build-shared.sh` deletes them from any image
+that is not the development one. The gate builds the services and drivers crates and then asserts
+every development-only program appeared - so it failed for a tree behaving exactly as its manifest
+describes. Audit-produced programs are now excluded from that inverse check, and only from it.
+
+`development-gate` DECLARED ITSELF BROKEN, WHICH IS THE ONE MESSAGE THAT STOPS WORK, and it had three
+causes stacked on each other. It re-execs itself to prove its own refusals, passing an injected
+manifest; the manifest travelled as an ENVIRONMENT VARIABLE, and Linux caps a single environment
+string at `MAX_ARG_STRLEN` - thirty-two pages, 128 kB, not the total `ARG_MAX` and not raisable -
+which the exported registry has outgrown at 153 kB. It also resolved `"$0"` AFTER `cd`-ing away from
+where it was invoked, so every re-exec from a relative path named nothing. Both failures surface as
+the same self-test message, and neither is about the manifest. The injection travels in a file now
+and the script resolves its own path first. Underneath them was a real check defect: the
+`required-features` test read four lines after the program's name, and `dev_channel` has two lines of
+comment saying WHY it is gated before the attribute - so a comment could turn the gate red. It reads
+the whole `[[bin]]` block.
+
+`development-lifecycle` IS RED AND IT IS NOT THIS WORK. The development IMAGE build fails at
+`verify_staged_selection_candidates`: `abiprobe` and `vkprobe` record the digest of the `icdprobe`
+they were linked against, and the staged `icdprobe.lslib` is a different one. Neither side is wrong -
+`icdprobe.c` has not changed, but the runtime it links against has, and the pass-2 audit link under
+`.build/foreign/pass2` is frozen at 2026-09-13. Re-running that link is what reconciles them, and it
+needs the pinned upstream, so it belongs to the foreign-artifact track rather than here. The
+consequence worth knowing: while it is red, no `harness/scenarios/` replay runs, and the development
+image cannot be built at all - which is why `dev_channel` and `dev_agent` were verified in this
+change by compiling the development configuration directly rather than by booting it.
