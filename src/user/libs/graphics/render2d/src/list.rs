@@ -106,7 +106,10 @@ pub struct ImageRecord {
 }
 
 /// An immutable, validated display list.
-#[derive(Clone, PartialEq, Debug)]
+///
+/// `Default` IS THE EMPTY LIST, and it exists so a frame loop can hold ONE of these for its whole
+/// life - see `DrawListBuilder::finish_into`. An empty list is a legal list: it draws nothing.
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct DrawList {
 	version: u32,
 	commands: Vec<Command>,
@@ -120,6 +123,32 @@ impl DrawList {
 
 	pub fn commands(&self) -> &[Command] {
 		&self.commands
+	}
+
+	/// Empty it, KEEPING what it has allocated.
+	///
+	/// It is what every refusal in `finish_into` leaves behind, so the rule is one rule whichever
+	/// check refused: a `finish_into` that answers an error leaves an EMPTY list. An empty list is
+	/// legal and draws nothing; the alternatives are a half-built list whose handles do not resolve,
+	/// or the PREVIOUS frame's list, which a caller that ignored the error would present again as
+	/// though it were this frame's.
+	pub fn clear(&mut self) {
+		self.commands.clear();
+		self.resources.paths.clear();
+		self.resources.images.clear();
+		self.resources.stops.clear();
+		self.resources.dashes.clear();
+		self.resources.glyph_runs.clear();
+		self.resources.filters.clear();
+	}
+
+	/// How much room the command buffer HAS, as against how much it uses.
+	///
+	/// It exists for one caller: the fixture that asserts a re-recorded frame does not reallocate.
+	/// An equal length is exactly what a reallocating implementation also produces, so length cannot
+	/// answer the question and the capacity is not otherwise reachable from outside this module.
+	pub fn command_capacity(&self) -> usize {
+		self.commands.capacity()
 	}
 
 	pub fn resources(&self) -> &ResourceTable {
@@ -313,9 +342,33 @@ impl DrawListBuilder {
 	/// Freeze the recording. The list is VALIDATED here, so a list that exists is a list that is
 	/// valid - and a backend receiving one does not have to wonder.
 	pub fn finish(&self) -> Result<DrawList, Error> {
-		let list = DrawList { version: DRAW_LIST_VERSION, commands: self.commands.clone(), resources: self.resources.clone() };
-		list.validate()?;
+		let mut list = DrawList::default();
+		self.finish_into(&mut list)?;
 		Ok(list)
+	}
+
+	/// The same list, built INTO one the caller already holds.
+	///
+	/// WHY IT EXISTS: `finish` allocates a fresh `Vec` per resource kind and one for the commands,
+	/// every time it is called - and an application's frame loop calls it sixty times a second with
+	/// the same shape of list each time. `restart` already made the BUILDER free to reuse; this is
+	/// the other half, and together they are what lets a steady loop record a frame without charging
+	/// a page for it. `clone_from` on a `Vec` keeps the allocation and overwrites the elements, which
+	/// is the whole mechanism.
+	///
+	/// A REFUSED LIST LEAVES AN EMPTY ONE rather than the half-built list that was refused. An empty
+	/// list is legal and draws nothing; a list that failed validation is one whose handles do not
+	/// resolve, and leaving it where a caller might present it would put the one thing this
+	/// boundary exists to catch on the other side of it.
+	pub fn finish_into(&self, list: &mut DrawList) -> Result<(), Error> {
+		list.version = DRAW_LIST_VERSION;
+		list.commands.clone_from(&self.commands);
+		list.resources.clone_from(&self.resources);
+		if let Err(error) = list.validate() {
+			list.clear();
+			return Err(error);
+		}
+		Ok(())
 	}
 
 	fn reserve_resource(&self, existing: usize) -> Result<(), Error> {

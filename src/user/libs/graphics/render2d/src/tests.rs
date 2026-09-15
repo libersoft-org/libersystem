@@ -924,3 +924,57 @@ fn the_general_filter_nodes_declare_what_they_read() {
 	assert!(matches!(graph.push(FilterNode::MorphologyDilate { input: source, x: ceiling + 1.0, y: 0.0 }), Err(Error::LimitExceeded { limit: "filter radius", .. })));
 	assert!(matches!(graph.push(FilterNode::DisplacementMap { input: source, map: source, scale: ceiling + 1.0, x_channel: Channel::Red, y_channel: Channel::Green }), Err(Error::LimitExceeded { limit: "filter radius", .. })));
 }
+
+#[test]
+// A FRAME LOOP RECORDS THE SAME SHAPE OF LIST SIXTY TIMES A SECOND, and what this asserts is that
+// doing so allocates nothing after the first time.
+//
+// THE CLAIM IS ABOUT CAPACITY AND SO IS THE CHECK. `restart` keeps the builder's tables and
+// `finish_into` keeps the finished list's; either one alone leaves the loop charging a `Vec` per
+// resource kind per frame, which is the allocation a steady drawing may not have. Reading the
+// capacity back is the only way to say so - a byte count from the allocator would be measuring the
+// whole process, and an equal LENGTH is exactly what a reallocating implementation also produces.
+fn a_list_recorded_into_an_existing_one_reuses_its_allocation() {
+	let mut canvas = Canvas::new();
+	let mut list = DrawList::default();
+	let record = |canvas: &mut Canvas, list: &mut DrawList| {
+		canvas.restart();
+		for step in 0..8u32 {
+			let offset = step as f32;
+			canvas.fill_path(rect_path(RectF { x: offset, y: offset, width: 4.0, height: 4.0 }), red(), FillRule::NonZero).expect("a fill records");
+		}
+		canvas.finish_into(list).expect("a balanced canvas finishes");
+	};
+	record(&mut canvas, &mut list);
+	let commands = list.commands().len();
+	let paths = list.resources().paths.len();
+	assert_eq!(commands, 8, "eight fills");
+	assert_eq!(paths, 8, "each with its own path, because they are different rectangles");
+	let command_capacity = list.command_capacity();
+	let path_capacity = list.resources().paths.capacity();
+
+	// THE SAME FRAME AGAIN, AND AGAIN. The capacity may not move: a second recording that grew the
+	// buffers would be one that threw the first one's away.
+	for _ in 0..16 {
+		record(&mut canvas, &mut list);
+		assert_eq!(list.commands().len(), commands, "the same scene records the same list");
+		assert_eq!(list.command_capacity(), command_capacity, "and does not reallocate its commands");
+		assert_eq!(list.resources().paths.capacity(), path_capacity, "nor its resource table");
+	}
+
+	// A REFUSED LIST LEAVES AN EMPTY ONE, not the half-built list that was refused. A list whose
+	// handles do not resolve is the one thing this boundary exists to catch; leaving it where a
+	// caller might present it would put it on the other side of the check.
+	let mut broken = Canvas::new();
+	broken.begin_layer(None, 1.0, BlendMode::Normal, None).expect("a layer opens");
+	assert!(matches!(broken.finish_into(&mut list), Err(Error::UnbalancedLayer)));
+	assert!(list.commands().is_empty(), "a refused recording leaves nothing a caller can present");
+	assert!(list.resources().paths.is_empty(), "and no resources either");
+	// AND THE ALLOCATION SURVIVES THE REFUSAL, which is what makes a transient failure free too.
+	assert_eq!(list.command_capacity(), command_capacity);
+
+	// `finish` IS THIS, INTO A FRESH LIST, and the two must not have drifted.
+	record(&mut canvas, &mut list);
+	let independent = canvas.finish().expect("a balanced canvas finishes");
+	assert_eq!(independent, list, "the allocating and the reusing form produce the same list");
+}

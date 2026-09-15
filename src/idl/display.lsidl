@@ -421,4 +421,22 @@ interface display-admin {
 	/// Make one surface the visible, scanout-bound one. THE VISIBILITY RULE IS THE SERVICE'S AND NOT
 	/// A CLIENT'S: a client that could make itself visible is a client that can take the screen.
 	@op(3) set-visible: func(@rights(manage) task: handle<task>, surface: u64) -> result<unit, error>;
+	/// THE OUTPUT'S SCALE, AND IT IS THE SYSTEM'S TO CHOOSE.
+	///
+	/// A client lays out in LOGICAL pixels and rasterises PHYSICAL ones, and the ratio between them
+	/// is a property of the output and the person looking at it - not of the application. A client
+	/// that could set it would be a client that decides how much memory every other client's images
+	/// need, so it is here beside `set-visible` for the same reason that one is: both are answers
+	/// only something holding the whole screen may give.
+	///
+	/// WHAT CHANGES AND WHAT DOES NOT. Every surface keeps the LOGICAL extent it has - a window is
+	/// the same size on the desk after the scale changes - and its PHYSICAL extent becomes that
+	/// logical extent times this ratio. So a scale change is a new generation with a new image set,
+	/// exactly like a resize, and is told apart from one by the configuration: the same logical
+	/// extent with a different scale is a scale change and nothing else is.
+	///
+	/// BOUNDED, because it decides an allocation. A ratio outside 1/8 .. 8/1, a zero on either side,
+	/// or one that would take any surface past the service's maximum dimension is refused whole -
+	/// no surface is reconfigured and the output keeps the scale it had.
+	@op(4) set-scale: func(scale: scale-ratio) -> result<unit, error>;
 }

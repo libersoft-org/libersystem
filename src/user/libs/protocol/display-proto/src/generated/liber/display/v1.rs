@@ -2738,6 +2738,7 @@ pub mod display_admin {
 	pub const OP_BIND: u16 = 1;
 	pub const OP_STATS: u16 = 2;
 	pub const OP_SET_VISIBLE: u16 = 3;
+	pub const OP_SET_SCALE: u16 = 4;
 
 	pub trait Service {
 		/// The task handle must already carry `manage`, which is what a `task` capability IS: binding a
@@ -2754,6 +2755,24 @@ pub mod display_admin {
 		/// Make one surface the visible, scanout-bound one. THE VISIBILITY RULE IS THE SERVICE'S AND NOT
 		/// A CLIENT'S: a client that could make itself visible is a client that can take the screen.
 		fn set_visible(&mut self, task: u64, surface: u64) -> Result<(), Error>;
+		/// THE OUTPUT'S SCALE, AND IT IS THE SYSTEM'S TO CHOOSE.
+		///
+		/// A client lays out in LOGICAL pixels and rasterises PHYSICAL ones, and the ratio between them
+		/// is a property of the output and the person looking at it - not of the application. A client
+		/// that could set it would be a client that decides how much memory every other client's images
+		/// need, so it is here beside `set-visible` for the same reason that one is: both are answers
+		/// only something holding the whole screen may give.
+		///
+		/// WHAT CHANGES AND WHAT DOES NOT. Every surface keeps the LOGICAL extent it has - a window is
+		/// the same size on the desk after the scale changes - and its PHYSICAL extent becomes that
+		/// logical extent times this ratio. So a scale change is a new generation with a new image set,
+		/// exactly like a resize, and is told apart from one by the configuration: the same logical
+		/// extent with a different scale is a scale change and nothing else is.
+		///
+		/// BOUNDED, because it decides an allocation. A ratio outside 1/8 .. 8/1, a zero on either side,
+		/// or one that would take any surface past the service's maximum dimension is refused whole -
+		/// no surface is reconfigured and the output keeps the scale it had.
+		fn set_scale(&mut self, scale: ScaleRatio) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -2872,6 +2891,42 @@ pub mod display_admin {
 						Err(v38) => {
 							w.u8(0)?;
 							v38.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SET_SCALE => {
+				let scale = ScaleRatio::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.set_scale(scale);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v39) => {
+							w.u8(1)?;
+						}
+						Err(v40) => {
+							w.u8(0)?;
+							v40.write(w)?;
 						}
 					}
 					Some(())
@@ -3086,6 +3141,39 @@ pub mod display_admin {
 			}
 			decoded
 		}
+		pub fn set_scale(&mut self, scale: &ScaleRatio) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SET_SCALE)?;
+			w.u32(corr)?;
+			scale.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -3110,6 +3198,14 @@ pub mod display_admin {
 	fn channel_invoke_set_visible(chan: u64, task: &u64, surface: &u64) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.set_visible(task, surface)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_display_display_admin_set_scale")]
+	fn channel_invoke_set_scale(chan: u64, scale: &ScaleRatio) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.set_scale(scale)
 	}
 }
 
@@ -3281,26 +3377,6 @@ impl OutputColour {
 		out.push(',');
 		out.push_str("\"sdr-white-nits\":");
 		match &self.sdr_white_nits {
-			Some(v39) => {
-				let _ = write!(out, "{}", v39);
-			}
-			None => {
-				out.push_str("null");
-			}
-		}
-		out.push(',');
-		out.push_str("\"min-nits\":");
-		match &self.min_nits {
-			Some(v40) => {
-				let _ = write!(out, "{}", v40);
-			}
-			None => {
-				out.push_str("null");
-			}
-		}
-		out.push(',');
-		out.push_str("\"max-nits\":");
-		match &self.max_nits {
 			Some(v41) => {
 				let _ = write!(out, "{}", v41);
 			}
@@ -3309,10 +3385,30 @@ impl OutputColour {
 			}
 		}
 		out.push(',');
-		out.push_str("\"max-frame-average-nits\":");
-		match &self.max_frame_average_nits {
+		out.push_str("\"min-nits\":");
+		match &self.min_nits {
 			Some(v42) => {
 				let _ = write!(out, "{}", v42);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"max-nits\":");
+		match &self.max_nits {
+			Some(v43) => {
+				let _ = write!(out, "{}", v43);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"max-frame-average-nits\":");
+		match &self.max_frame_average_nits {
+			Some(v44) => {
+				let _ = write!(out, "{}", v44);
 			}
 			None => {
 				out.push_str("null");
@@ -3327,26 +3423,6 @@ impl OutputColour {
 		out.push_str(", ");
 		out.push_str("sdr-white-nits=");
 		match &self.sdr_white_nits {
-			Some(v43) => {
-				let _ = write!(out, "{}", v43);
-			}
-			None => {
-				out.push('-');
-			}
-		}
-		out.push_str(", ");
-		out.push_str("min-nits=");
-		match &self.min_nits {
-			Some(v44) => {
-				let _ = write!(out, "{}", v44);
-			}
-			None => {
-				out.push('-');
-			}
-		}
-		out.push_str(", ");
-		out.push_str("max-nits=");
-		match &self.max_nits {
 			Some(v45) => {
 				let _ = write!(out, "{}", v45);
 			}
@@ -3355,10 +3431,30 @@ impl OutputColour {
 			}
 		}
 		out.push_str(", ");
-		out.push_str("max-frame-average-nits=");
-		match &self.max_frame_average_nits {
+		out.push_str("min-nits=");
+		match &self.min_nits {
 			Some(v46) => {
 				let _ = write!(out, "{}", v46);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("max-nits=");
+		match &self.max_nits {
+			Some(v47) => {
+				let _ = write!(out, "{}", v47);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("max-frame-average-nits=");
+		match &self.max_frame_average_nits {
+			Some(v48) => {
+				let _ = write!(out, "{}", v48);
 			}
 			None => {
 				out.push('-');
@@ -3372,24 +3468,6 @@ impl OutputColour {
 		self.space.to_cbor_into(out);
 		crate::codec::cbor::text(out, "sdr-white-nits");
 		match &self.sdr_white_nits {
-			Some(v47) => {
-				crate::codec::cbor::f32(out, *v47);
-			}
-			None => {
-				crate::codec::cbor::null(out);
-			}
-		}
-		crate::codec::cbor::text(out, "min-nits");
-		match &self.min_nits {
-			Some(v48) => {
-				crate::codec::cbor::f32(out, *v48);
-			}
-			None => {
-				crate::codec::cbor::null(out);
-			}
-		}
-		crate::codec::cbor::text(out, "max-nits");
-		match &self.max_nits {
 			Some(v49) => {
 				crate::codec::cbor::f32(out, *v49);
 			}
@@ -3397,10 +3475,28 @@ impl OutputColour {
 				crate::codec::cbor::null(out);
 			}
 		}
-		crate::codec::cbor::text(out, "max-frame-average-nits");
-		match &self.max_frame_average_nits {
+		crate::codec::cbor::text(out, "min-nits");
+		match &self.min_nits {
 			Some(v50) => {
 				crate::codec::cbor::f32(out, *v50);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "max-nits");
+		match &self.max_nits {
+			Some(v51) => {
+				crate::codec::cbor::f32(out, *v51);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "max-frame-average-nits");
+		match &self.max_frame_average_nits {
+			Some(v52) => {
+				crate::codec::cbor::f32(out, *v52);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3567,14 +3663,14 @@ impl TimestampEvidence {
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			TimestampEvidence::Unavailable => out.push_str("\"unavailable\""),
-			TimestampEvidence::Estimated(v51) => {
+			TimestampEvidence::Estimated(v53) => {
 				out.push_str("{\"estimated\":");
-				let _ = write!(out, "{}", v51);
+				let _ = write!(out, "{}", v53);
 				out.push('}');
 			}
-			TimestampEvidence::Measured(v52) => {
+			TimestampEvidence::Measured(v54) => {
 				out.push_str("{\"measured\":");
-				let _ = write!(out, "{}", v52);
+				let _ = write!(out, "{}", v54);
 				out.push('}');
 			}
 		}
@@ -3582,14 +3678,14 @@ impl TimestampEvidence {
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			TimestampEvidence::Unavailable => out.push_str("unavailable"),
-			TimestampEvidence::Estimated(v53) => {
+			TimestampEvidence::Estimated(v55) => {
 				out.push_str("estimated(");
-				let _ = write!(out, "{}", v53);
+				let _ = write!(out, "{}", v55);
 				out.push(')');
 			}
-			TimestampEvidence::Measured(v54) => {
+			TimestampEvidence::Measured(v56) => {
 				out.push_str("measured(");
-				let _ = write!(out, "{}", v54);
+				let _ = write!(out, "{}", v56);
 				out.push(')');
 			}
 		}
@@ -3597,15 +3693,15 @@ impl TimestampEvidence {
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			TimestampEvidence::Unavailable => crate::codec::cbor::text(out, "unavailable"),
-			TimestampEvidence::Estimated(v55) => {
+			TimestampEvidence::Estimated(v57) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "estimated");
-				crate::codec::cbor::uint(out, *v55 as u64);
+				crate::codec::cbor::uint(out, *v57 as u64);
 			}
-			TimestampEvidence::Measured(v56) => {
+			TimestampEvidence::Measured(v58) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "measured");
-				crate::codec::cbor::uint(out, *v56 as u64);
+				crate::codec::cbor::uint(out, *v58 as u64);
 			}
 		}
 	}
@@ -3673,8 +3769,8 @@ impl FrameTiming {
 		out.push('{');
 		out.push_str("\"preferred-deadline\":");
 		match &self.preferred_deadline {
-			Some(v57) => {
-				let _ = write!(out, "{}", v57);
+			Some(v59) => {
+				let _ = write!(out, "{}", v59);
 			}
 			None => {
 				out.push_str("null");
@@ -3683,8 +3779,8 @@ impl FrameTiming {
 		out.push(',');
 		out.push_str("\"refresh-interval\":");
 		match &self.refresh_interval {
-			Some(v58) => {
-				let _ = write!(out, "{}", v58);
+			Some(v60) => {
+				let _ = write!(out, "{}", v60);
 			}
 			None => {
 				out.push_str("null");
@@ -3696,8 +3792,8 @@ impl FrameTiming {
 		out.push('{');
 		out.push_str("preferred-deadline=");
 		match &self.preferred_deadline {
-			Some(v59) => {
-				let _ = write!(out, "{}", v59);
+			Some(v61) => {
+				let _ = write!(out, "{}", v61);
 			}
 			None => {
 				out.push('-');
@@ -3706,8 +3802,8 @@ impl FrameTiming {
 		out.push_str(", ");
 		out.push_str("refresh-interval=");
 		match &self.refresh_interval {
-			Some(v60) => {
-				let _ = write!(out, "{}", v60);
+			Some(v62) => {
+				let _ = write!(out, "{}", v62);
 			}
 			None => {
 				out.push('-');
@@ -3719,8 +3815,8 @@ impl FrameTiming {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "preferred-deadline");
 		match &self.preferred_deadline {
-			Some(v61) => {
-				crate::codec::cbor::uint(out, *v61 as u64);
+			Some(v63) => {
+				crate::codec::cbor::uint(out, *v63 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3728,8 +3824,8 @@ impl FrameTiming {
 		}
 		crate::codec::cbor::text(out, "refresh-interval");
 		match &self.refresh_interval {
-			Some(v62) => {
-				crate::codec::cbor::uint(out, *v62 as u64);
+			Some(v64) => {
+				crate::codec::cbor::uint(out, *v64 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -3815,30 +3911,30 @@ impl SurfaceEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			SurfaceEvent::Configure(v63) => {
+			SurfaceEvent::Configure(v65) => {
 				out.push_str("{\"configure\":");
-				v63.to_json_into(out);
+				v65.to_json_into(out);
 				out.push('}');
 			}
 			SurfaceEvent::ImageAvailable => out.push_str("\"image-available\""),
-			SurfaceEvent::PresentComplete(v64) => {
+			SurfaceEvent::PresentComplete(v66) => {
 				out.push_str("{\"present-complete\":");
-				v64.to_json_into(out);
+				v66.to_json_into(out);
 				out.push('}');
 			}
 			SurfaceEvent::CloseRequested => out.push_str("\"close-requested\""),
-			SurfaceEvent::VisibilityChanged(v65) => {
+			SurfaceEvent::VisibilityChanged(v67) => {
 				out.push_str("{\"visibility-changed\":");
-				if *v65 {
+				if *v67 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
 				}
 				out.push('}');
 			}
-			SurfaceEvent::FocusChanged(v66) => {
+			SurfaceEvent::FocusChanged(v68) => {
 				out.push_str("{\"focus-changed\":");
-				if *v66 {
+				if *v68 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
@@ -3849,30 +3945,30 @@ impl SurfaceEvent {
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			SurfaceEvent::Configure(v67) => {
+			SurfaceEvent::Configure(v69) => {
 				out.push_str("configure(");
-				v67.to_text_into(out);
+				v69.to_text_into(out);
 				out.push(')');
 			}
 			SurfaceEvent::ImageAvailable => out.push_str("image-available"),
-			SurfaceEvent::PresentComplete(v68) => {
+			SurfaceEvent::PresentComplete(v70) => {
 				out.push_str("present-complete(");
-				v68.to_text_into(out);
+				v70.to_text_into(out);
 				out.push(')');
 			}
 			SurfaceEvent::CloseRequested => out.push_str("close-requested"),
-			SurfaceEvent::VisibilityChanged(v69) => {
+			SurfaceEvent::VisibilityChanged(v71) => {
 				out.push_str("visibility-changed(");
-				if *v69 {
+				if *v71 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
 				}
 				out.push(')');
 			}
-			SurfaceEvent::FocusChanged(v70) => {
+			SurfaceEvent::FocusChanged(v72) => {
 				out.push_str("focus-changed(");
-				if *v70 {
+				if *v72 {
 					out.push_str("true");
 				} else {
 					out.push_str("false");
@@ -3883,27 +3979,27 @@ impl SurfaceEvent {
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			SurfaceEvent::Configure(v71) => {
+			SurfaceEvent::Configure(v73) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "configure");
-				v71.to_cbor_into(out);
+				v73.to_cbor_into(out);
 			}
 			SurfaceEvent::ImageAvailable => crate::codec::cbor::text(out, "image-available"),
-			SurfaceEvent::PresentComplete(v72) => {
+			SurfaceEvent::PresentComplete(v74) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "present-complete");
-				v72.to_cbor_into(out);
+				v74.to_cbor_into(out);
 			}
 			SurfaceEvent::CloseRequested => crate::codec::cbor::text(out, "close-requested"),
-			SurfaceEvent::VisibilityChanged(v73) => {
+			SurfaceEvent::VisibilityChanged(v75) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "visibility-changed");
-				crate::codec::cbor::boolean(out, *v73);
+				crate::codec::cbor::boolean(out, *v75);
 			}
-			SurfaceEvent::FocusChanged(v74) => {
+			SurfaceEvent::FocusChanged(v76) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "focus-changed");
-				crate::codec::cbor::boolean(out, *v74);
+				crate::codec::cbor::boolean(out, *v76);
 			}
 		}
 	}
@@ -3927,9 +4023,9 @@ impl AcquiredImage {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			AcquiredImage::Image(v75) => {
+			AcquiredImage::Image(v77) => {
 				out.push_str("{\"image\":");
-				let _ = write!(out, "{}", v75);
+				let _ = write!(out, "{}", v77);
 				out.push('}');
 			}
 			AcquiredImage::Again => out.push_str("\"again\""),
@@ -3939,9 +4035,9 @@ impl AcquiredImage {
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			AcquiredImage::Image(v76) => {
+			AcquiredImage::Image(v78) => {
 				out.push_str("image(");
-				let _ = write!(out, "{}", v76);
+				let _ = write!(out, "{}", v78);
 				out.push(')');
 			}
 			AcquiredImage::Again => out.push_str("again"),
@@ -3951,10 +4047,10 @@ impl AcquiredImage {
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			AcquiredImage::Image(v77) => {
+			AcquiredImage::Image(v79) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "image");
-				crate::codec::cbor::uint(out, *v77 as u64);
+				crate::codec::cbor::uint(out, *v79 as u64);
 			}
 			AcquiredImage::Again => crate::codec::cbor::text(out, "again"),
 			AcquiredImage::NotVisible => crate::codec::cbor::text(out, "not-visible"),

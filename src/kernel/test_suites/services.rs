@@ -1335,6 +1335,46 @@ fn display_service_refuses_hostile_input() {
 	assert!(matches!(surface_event(&console_events), display_v1::SurfaceEvent::ImageAvailable), "and the image comes back");
 	let counted = display_stats(&_admin, 84);
 	assert!(counted.lost > 0, "and the outcome is counted rather than only reported");
+
+	// THE OUTPUT'S SCALE IS AN INPUT, AND IT DECIDES AN ALLOCATION.
+	//
+	// Every surface's physical extent is its logical one times this ratio, and every image a client
+	// supplies is that extent's worth of memory - so a ratio nobody bounded is a way to make every
+	// client in the machine allocate whatever the caller chose. Zero on either side is not a ratio at
+	// all; past the bound is refused by the same rule the maximum dimension is.
+	let set_scale = |corr: u32, numerator: u32, denominator: u32| -> Message {
+		let mut writer = wire::VecWriter::new();
+		display_v1::ScaleRatio { numerator, denominator }.write(&mut writer).expect("a scale ratio encodes");
+		let body = writer.into_inner().expect("a scale ratio carries no capability");
+		_admin.send(request(display_admin::OP_SET_SCALE, corr, &body)).expect("a set-scale request");
+		sched::run_until_idle();
+		_admin.recv().expect("a set-scale reply")
+	};
+	for (index, (numerator, denominator)) in [(0u32, 1u32), (1, 0), (0, 0), (9, 1), (1, 9)].into_iter().enumerate() {
+		refused(&set_scale(90 + index as u32, numerator, denominator), 90 + index as u32);
+	}
+	// AND THE OUTPUT KEPT THE SCALE IT HAD. A refusal that had already reconfigured half the surfaces
+	// would be a screen whose windows disagree about what a logical pixel is.
+	let unchanged = call(&console_surface, surface::OP_CONFIGURATION, 95, &[]);
+	let unchanged = display_v1::SurfaceConfiguration::read(&mut wire::Reader::new(succeeded(&unchanged, 95))).expect("a configuration decodes");
+	assert_eq!((unchanged.scale.numerator, unchanged.scale.denominator), (1, 1), "a refused scale changes nothing");
+	assert_eq!((unchanged.physical_extent.width, unchanged.physical_extent.height), (4, 4), "and no surface was reconfigured");
+
+	// ONE THAT IS ACCEPTED, AND WHAT IT DOES: the LOGICAL extent is held - a window is the same size
+	// on the desk after the scale changes - and the PHYSICAL one becomes that times the ratio, in a
+	// new generation, because every image of the old one is the wrong number of pixels now.
+	succeeded(&set_scale(96, 2, 1), 96);
+	let scaled = loop {
+		match surface_event(&console_events) {
+			display_v1::SurfaceEvent::Configure(configuration) if configuration.scale.numerator == 2 => break configuration,
+			display_v1::SurfaceEvent::Configure(_) => continue,
+			other => panic!("expected the scale change's configuration, got {other:?}"),
+		}
+	};
+	assert_eq!((scaled.logical_extent.width, scaled.logical_extent.height), (4, 4), "the logical extent is held across a scale change");
+	assert_eq!((scaled.physical_extent.width, scaled.physical_extent.height), (8, 8), "and the physical one is it times the ratio");
+	assert_eq!((scaled.scale.numerator, scaled.scale.denominator), (2, 1), "which is what tells a client this was a scale change and not a resize");
+	assert!(scaled.generation > console_configuration.generation, "a new generation, because every image of the old one is the wrong size now");
 }
 
 // THE FRAME LOOP AN APPLICATION HAS, AGAINST A REAL DISPLAYSERVICE.
@@ -2933,7 +2973,7 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	let _display_service = harness.service;
 	let _boot_kernel = harness.boot;
 	let stats_root = harness.stats;
-	let _admin = harness.admin;
+	let admin = harness.admin;
 	let _scanout = harness.scanout;
 
 	let volume = volume_package_bytes().expect("volume package module not found");
@@ -2956,6 +2996,11 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	let mut two_rectangle_presents = 0usize;
 	let mut presents = 0usize;
 	let mut resized = false;
+	// THE SCALE CHANGE, WHICH IS THE ONE PHASE A COUNTER CANNOT REACH AND A RESIZE IS NOT. It is
+	// driven through the display ADMIN channel, because the scale is the system's to choose: a client
+	// that could set it would be deciding how much memory every other client's images need.
+	let mut scaled = false;
+	let mut scale_acknowledged = false;
 	// THE DEMO'S OWN CHARGED MEMORY, SAMPLED TWICE INSIDE ONE GENERATION. What a steady frame loop
 	// may not do is GROW: the queue and the resources exist after the first frames, and a loop that
 	// charged another page every frame would be a drawing that cannot run for an hour. Both samples
@@ -3122,6 +3167,24 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 			device_events.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).expect("gpu resize event");
 			resized = true;
 		}
+		// AND THEN THE SCALE, ONCE THE RESIZE HAS LANDED. The order matters: both are a rebuild, and
+		// what tells them apart is the configuration - the same LOGICAL extent with a different ratio
+		// is a scale change and nothing else is - so the resize has to have been seen and named
+		// before this one arrives, or the two would be one transition the demo could not attribute.
+		if !scaled && resized && output.windows(23).any(|window| window == b"test2d-sw: phase resize") {
+			let mut writer = wire::VecWriter::new();
+			display_v1::ScaleRatio { numerator: 2, denominator: 1 }.write(&mut writer).expect("a scale ratio encodes");
+			let body = writer.into_inner().expect("a scale ratio carries no capability");
+			admin.send(request(display_admin::OP_SET_SCALE, 910, &body)).expect("a set-scale request");
+			scaled = true;
+		}
+		if scaled
+			&& !scale_acknowledged
+			&& let Ok(reply) = admin.recv()
+		{
+			succeeded(&reply, 910);
+			scale_acknowledged = true;
+		}
 		if process.is_terminated() && resized {
 			break;
 		}
@@ -3143,6 +3206,12 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	assert!(contains(b"test2d-sw: phase partial"), "it reached the partial-damage phase: {output:?}");
 	assert!(contains(b"test2d-sw: phase multi-rect"), "and the multi-rect one: {output:?}");
 	assert!(contains(b"test2d-sw: phase resize"), "and the resize, which a REBUILD enters and no counter does: {output:?}");
+	// AND THE SCALE, WHICH IS A REBUILD TOO AND IS NOT A RESIZE. The demo tells them apart from the
+	// configuration alone - the same logical extent with a different ratio - so reaching this phase
+	// is proof of both halves: that the service held the logical size across the change, and that it
+	// gave the client a new PHYSICAL extent to resolve its edges at.
+	assert!(scale_acknowledged, "the display service accepted the scale change");
+	assert!(contains(b"test2d-sw: phase scale"), "and the demo entered the scale phase, with its layout unchanged and its edges resolved at the new physical resolution: {output:?}");
 	// THE WHOLE POINT, AT THE DEVICE END: two distant regions arrive as TWO rectangles.
 	assert!(two_rectangle_presents > 0, "the multi-rect phase's two rectangles reached the driver as two: {presents} presents, {output:?}");
 	// AND A FULL FRAME IS STILL A FULL FRAME, which is what the first phase and every generation's

@@ -142,11 +142,13 @@ impl Scene {
 	/// edge, a projectively transformed image, a clipped and scrolled column, a nested and an inverse
 	/// clip, a group-opacity layer, blend modes including a non-separable one, a backdrop-blurred
 	/// panel and a line of text with a colour glyph in it.
-	fn record(&self, canvas: &mut Canvas, extent: Extent2D, phase: Phase, images: &Images) -> Result<DrawList, Error> {
-		// THE CANVAS IS REUSED AND NOT REBUILT. `restart` keeps the resource tables and their
-		// capacity, which is what makes re-recording the same scene every frame cost no new
-		// allocation for the paths, the stops and the filter graphs it holds - a recorder that built
-		// a new one each frame would allocate sixty times a second for ever.
+	// THE LIST IS RECORDED INTO ONE THE CALLER ALREADY HOLDS, and so is the canvas reused.
+	//
+	// BOTH HALVES ARE NEEDED FOR THE LOOP TO ALLOCATE NOTHING. `restart` keeps the BUILDER's tables
+	// and their capacity, and `finish_into` keeps the finished LIST's - a recorder that kept the
+	// first and cloned the second would still charge a `Vec` per resource kind every frame, sixty
+	// times a second, for ever.
+	fn record(&self, canvas: &mut Canvas, list: &mut DrawList, extent: Extent2D, phase: Phase, images: &Images) -> Result<(), Error> {
 		canvas.restart();
 		let width = extent.width as f32;
 		let height = extent.height as f32;
@@ -261,7 +263,7 @@ impl Scene {
 			canvas.fill_path(rect_path(rect), Paint::Solid(srgb(0.9, 0.2, 0.5, 1.0)), FillRule::NonZero)?;
 		}
 
-		canvas.finish()
+		canvas.finish_into(list)
 	}
 }
 
@@ -495,6 +497,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	let mut scene = Scene::new();
 	let mut canvas = Canvas::new();
+	// ONE LIST FOR THE WHOLE RUN. It is overwritten every frame and its allocations are kept, which
+	// is the other half of the canvas being reused: together they are what makes "no steady-state
+	// allocation" a claim this demo can make rather than a hope.
+	let mut list = DrawList::default();
 	let mut backend = Soft2d::new();
 	let provider = Forms;
 	let mut phase_index = 0usize;
@@ -524,6 +530,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut draw_total_ns: u64 = 0;
 	let mut draw_worst_ns: u64 = 0;
 	let mut draw_count: u64 = 0;
+	// THE SAME FRAME AT A HiDPI SCALE, COUNTED APART FROM THE REST.
+	//
+	// A mean over a whole run that changed resolution half way through is a number about neither
+	// resolution. What a HiDPI measurement asks is what the SAME layout costs when every edge is
+	// resolved at more pixels, so the frames drawn under the scaled configuration are their own
+	// total: the scene is identical, the logical extent is identical, and the only thing that moved
+	// is how many physical pixels it lands on.
+	let mut scaled_draw_total_ns: u64 = 0;
+	let mut scaled_draw_worst_ns: u64 = 0;
+	let mut scaled_draw_count: u64 = 0;
 	let mut interval_total_ns: u64 = 0;
 	let mut interval_worst_ns: u64 = 0;
 	let mut interval_count: u64 = 0;
@@ -563,14 +579,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let Some(frame) = frames.acquire() else { continue };
 				let extent = frame.layout.extent;
 				let phase = Phase::ORDER[phase_index];
-				let list = match scene.record(&mut canvas, extent, phase, &images) {
-					Ok(list) => list,
-					Err(_) => {
-						print(b"test2d-sw: the scene was refused\n");
-						frames.abandon(frame);
-						break;
-					}
-				};
+				if scene.record(&mut canvas, &mut list, extent, phase, &images).is_err() {
+					print(b"test2d-sw: the scene was refused\n");
+					frames.abandon(frame);
+					break;
+				}
 				let drawing_began_ns = clock_ns();
 				if !draw(&mut backend, &provider, &images, &list, &frame) {
 					print(b"test2d-sw: the backend refused the frame\n");
@@ -578,9 +591,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					break;
 				}
 				let drawing_took_ns = clock_ns().saturating_sub(drawing_began_ns);
-				draw_total_ns = draw_total_ns.saturating_add(drawing_took_ns);
-				draw_worst_ns = draw_worst_ns.max(drawing_took_ns);
-				draw_count += 1;
+				if matches!(phase, Phase::Scale) {
+					scaled_draw_total_ns = scaled_draw_total_ns.saturating_add(drawing_took_ns);
+					scaled_draw_worst_ns = scaled_draw_worst_ns.max(drawing_took_ns);
+					scaled_draw_count += 1;
+				} else {
+					draw_total_ns = draw_total_ns.saturating_add(drawing_took_ns);
+					draw_worst_ns = draw_worst_ns.max(drawing_took_ns);
+					draw_count += 1;
+				}
 				// THE DAMAGE IS WHAT THE SCENE MOVED, and the phase says which shape that takes.
 				let movers = scene.movers(scene.tick, extent);
 				let presented_ok = if full_frames_owed > 0 {
@@ -698,8 +717,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						Step::Draw => {
 							let Some(frame) = second.acquire() else { continue };
 							let extent = frame.layout.extent;
-							match scene.record(&mut canvas, extent, Phase::Full, &images) {
-								Ok(list) if draw(&mut backend, &provider, &images, &list, &frame) => {
+							match scene.record(&mut canvas, &mut list, extent, Phase::Full, &images) {
+								Ok(()) if draw(&mut backend, &provider, &images, &list, &frame) => {
 									if second.present_whole(frame) {
 										second_presents += 1;
 									}
@@ -759,6 +778,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// the budget this is compared against is stated in milliseconds.
 		(b" draw-mean-us=", (draw_total_ns / draw_count.max(1) / 1_000) as u32),
 		(b" draw-worst-us=", (draw_worst_ns / 1_000) as u32),
+		// ZERO WHEN NO SCALE CHANGE REACHED THIS RUN, which is every run nothing privileged drove:
+		// the scale is the system's to set, so a demo left alone never sees one.
+		(b" scale-frames=", scaled_draw_count as u32),
+		(b" scale-draw-mean-us=", (scaled_draw_total_ns / scaled_draw_count.max(1) / 1_000) as u32),
+		(b" scale-draw-worst-us=", (scaled_draw_worst_ns / 1_000) as u32),
 		(b" interval-mean-us=", (interval_total_ns / interval_count.max(1) / 1_000) as u32),
 		(b" interval-worst-us=", (interval_worst_ns / 1_000) as u32),
 	] {

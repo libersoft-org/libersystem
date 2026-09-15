@@ -33,6 +33,13 @@ use proto::system::{AcquiredImage, ColorSpace, DamageRegion, DeviceEvent, Displa
 use rt::*;
 
 const MAX_DIM: u32 = 8192;
+/// THE LARGEST EITHER HALF OF THE OUTPUT SCALE MAY BE.
+///
+/// A scale is a ratio and it decides an ALLOCATION: every surface's physical extent is its logical
+/// one times this, and every image the client supplies is that extent's worth of memory. Eight is
+/// four times the largest scale any shipping panel asks for and small enough that the largest
+/// surface this service admits, scaled, still has a describable pitch.
+const MAX_SCALE: u32 = 8;
 const REQUEST_MAX: usize = 128;
 const REPLY_MAX: usize = 128;
 
@@ -117,8 +124,22 @@ struct Surface {
 	/// The connection that created it, so closing a connection closes its surfaces.
 	owner: u64,
 	images: Vec<QueueImage>,
+	/// THE PHYSICAL EXTENT, WHICH IS THE AUTHORITATIVE ONE: what the client rasterises and what the
+	/// supplied images must hold. It is the logical extent below times the output's scale.
 	width: u32,
 	height: u32,
+	/// WHAT THE CLIENT LAYS OUT IN, which is what it asked for - or the output's own size for a
+	/// surface that asked for none. It is held across a SCALE change and follows the output across a
+	/// RESIZE, and that difference is the whole of how a client tells the two apart.
+	logical_width: u32,
+	logical_height: u32,
+	/// Whether this surface asked for the output's own size rather than naming one. A native surface
+	/// follows the scanout; a fixed-size one keeps its extent and is scaled into the output.
+	///
+	/// NOT THE SAME QUESTION AS `console` BELOW, which is the FIRST native surface and is what a
+	/// restore falls back to. The two were one field, so a second native surface did not follow a
+	/// resize at all - it kept an extent the output no longer had.
+	native: bool,
 	pitch: u32,
 	generation: u64,
 	serial: u64,
@@ -238,6 +259,11 @@ const MAX_DAMAGE_RECTS: u64 = 16;
 struct DisplayState {
 	scanout: Scanout,
 	surfaces: Vec<Surface>,
+	/// THE OUTPUT'S SCALE: how many physical pixels one logical pixel is, as a ratio. One to one
+	/// until something privileged says otherwise - see `display_admin::set_scale` - and never a
+	/// float, because two sides rounding a fraction differently is the one-pixel seam nobody can
+	/// reproduce.
+	scale: ScaleRatio,
 	focus_control: u64,
 	kill_control: u64,
 	console: u64,
@@ -268,9 +294,24 @@ struct DisplayState {
 	closing: Option<u64>,
 }
 
+/// One logical extent in physical pixels, under a scale.
+///
+/// CHECKED ARITHMETIC AND A BOUND, because both inputs are untrusted in different ways: the logical
+/// extent comes from a client and the ratio from whoever holds the admin channel. `None` is a
+/// geometry this service will not describe, and every caller refuses rather than clamping - a
+/// surface silently given an extent other than the one implied by its configuration is a client
+/// drawing into memory of the wrong size.
+fn physical_extent(logical: u32, scale: &ScaleRatio) -> Option<u32> {
+	if scale.numerator == 0 || scale.denominator == 0 {
+		return None;
+	}
+	let scaled: u32 = (logical as u64).checked_mul(scale.numerator as u64)?.checked_div(scale.denominator as u64)? as u32;
+	(scaled != 0 && scaled <= MAX_DIM).then_some(scaled)
+}
+
 impl DisplayState {
 	fn new(scanout: Scanout, focus_control: u64, kill_control: u64) -> DisplayState {
-		DisplayState { scanout, surfaces: Vec::new(), focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true, closing: None, resets: 0 }
+		DisplayState { scanout, surfaces: Vec::new(), scale: ScaleRatio { numerator: 1, denominator: 1 }, focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true, closing: None, resets: 0 }
 	}
 
 	fn surface_index(&self, chan: u64) -> Option<usize> {
@@ -290,11 +331,17 @@ impl DisplayState {
 			return Err(Error::NotFound);
 		}
 		let native: bool = request.logical_extent.width == 0;
-		let width: u32 = if native { self.scanout.width } else { request.logical_extent.width };
-		let height: u32 = if native { self.scanout.height } else { request.logical_extent.height };
-		if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
+		let logical_width: u32 = if native { self.scanout.width } else { request.logical_extent.width };
+		let logical_height: u32 = if native { self.scanout.height } else { request.logical_extent.height };
+		if logical_width == 0 || logical_height == 0 || logical_width > MAX_DIM || logical_height > MAX_DIM {
 			return Err(Error::Invalid);
 		}
+		// AND THE PHYSICAL EXTENT IS THE LOGICAL ONE UNDER THE OUTPUT'S SCALE, refused rather than
+		// clamped: a surface whose images are sized for one extent and whose configuration names
+		// another is a client drawing into the wrong amount of memory.
+		let (Some(width), Some(height)) = (physical_extent(logical_width, &self.scale), physical_extent(logical_height, &self.scale)) else {
+			return Err(Error::Invalid);
+		};
 		// THE COUNT IS NEGOTIATED AND CLAMPED RATHER THAN REFUSED. A client that asks for one image
 		// cannot double-buffer and a client that asks for ten is asking for memory this service will
 		// not hold; answering with what was given is the contract, and `queue` reports it.
@@ -327,7 +374,7 @@ impl DisplayState {
 			return Err(Error::Again);
 		};
 
-		let mut surface = Surface { chan: service_end, owner, images: Vec::new(), width, height, pitch, generation: 1, serial: 1, acknowledged: None, next_present: 1, pending: Vec::new(), focus_proof: 0, events: None, producer: producer_service, done: done_service, visible: false, initialized: false, console: false, pending_client_producer: 0, pending_client_done: 0 };
+		let mut surface = Surface { chan: service_end, owner, images: Vec::new(), width, height, logical_width, logical_height, native, pitch, generation: 1, serial: 1, acknowledged: None, next_present: 1, pending: Vec::new(), focus_proof: 0, events: None, producer: producer_service, done: done_service, visible: false, initialized: false, console: false, pending_client_producer: 0, pending_client_done: 0 };
 		if !reserve_slots(&mut surface, images) {
 			self.drop_surface_resources(&mut surface);
 			close(client_end);
@@ -397,12 +444,12 @@ impl DisplayState {
 		SurfaceConfiguration {
 			serial: surface.serial,
 			generation: surface.generation,
-			// THE PHYSICAL EXTENT IS AUTHORITATIVE AND THE LOGICAL ONE IS DERIVED. At a scale of one
-			// they are the same number, and they are still two fields - so the day a scale arrives,
-			// nothing above here changes shape.
-			logical_extent: Extent2d { width: surface.width, height: surface.height },
+			// THE PHYSICAL EXTENT IS AUTHORITATIVE AND THE LOGICAL ONE IS WHAT THE CLIENT ASKED FOR.
+			// At a scale of one they are the same number; they were always two fields so that the day
+			// a scale arrived nothing above here would change shape, and this is that day.
+			logical_extent: Extent2d { width: surface.logical_width, height: surface.logical_height },
 			physical_extent: Extent2d { width: surface.width, height: surface.height },
-			scale: ScaleRatio { numerator: 1, denominator: 1 },
+			scale: self.scale.clone(),
 			transform: OutputTransform::Normal,
 			output: 0,
 			format: PixelFormat::B8g8r8x8Unorm,
@@ -963,8 +1010,20 @@ impl DisplayState {
 	/// A NEW CONFIGURATION IS A NEW SERIAL, and a change to the extent is a new GENERATION with it -
 	/// every image of the old one becomes stale rather than being presented into a size it was not
 	/// drawn for.
-	fn reconfigure(&mut self, index: usize, width: u32, height: u32) {
+	/// Give a surface a new LOGICAL extent, with its physical extent derived from the output's scale.
+	///
+	/// THE LOGICAL EXTENT IS WHAT MOVES ON A RESIZE AND THE SCALE IS WHAT MOVES ON A SCALE CHANGE,
+	/// and both arrive here: what a client sees is one configuration with a new serial, a new
+	/// generation when the pixels it must supply changed, and the two extents plus the ratio to tell
+	/// which of the two happened. A physical extent this service will not describe leaves the surface
+	/// exactly as it was rather than half reconfigured.
+	fn reconfigure(&mut self, index: usize, logical_width: u32, logical_height: u32) {
+		let (Some(width), Some(height)) = (physical_extent(logical_width, &self.scale), physical_extent(logical_height, &self.scale)) else {
+			return;
+		};
 		let changed: bool = self.surfaces[index].width != width || self.surfaces[index].height != height;
+		self.surfaces[index].logical_width = logical_width;
+		self.surfaces[index].logical_height = logical_height;
 		self.surfaces[index].serial = self.surfaces[index].serial.saturating_add(1);
 		self.surfaces[index].acknowledged = None;
 		if changed {
@@ -1014,15 +1073,48 @@ impl DisplayState {
 	fn notify_resize(&mut self) {
 		let (width, height): (u32, u32) = (self.scanout.width, self.scanout.height);
 		for index in 0..self.surfaces.len() {
-			// ONLY A NATIVE-SIZED SURFACE FOLLOWS THE SCANOUT. A fixed-size client stays its own
-			// size and is scaled, which is what it asked for by naming one.
-			if self.surfaces[index].console {
+			// EVERY NATIVE-SIZED SURFACE FOLLOWS THE SCANOUT. A fixed-size client stays its own size
+			// and is scaled, which is what it asked for by naming one.
+			//
+			// IT USED TO BE THE `console` FLAG, which is the FIRST native surface and not every one:
+			// a second surface that asked for the output's own size kept an extent the output no
+			// longer had, and was told about the resize by a configuration whose numbers had not
+			// moved. One field cannot answer two questions.
+			if self.surfaces[index].native {
 				self.reconfigure(index, width, height);
 			} else {
 				let snapshot = self.snapshot(index);
 				self.emit(index, &SurfaceEvent::Configure(snapshot));
 			}
 		}
+	}
+
+	/// THE OUTPUT'S SCALE, SET BY SOMETHING PRIVILEGED - see the interface for why it is not a
+	/// client's to choose.
+	///
+	/// REFUSED WHOLE OR APPLIED WHOLE. The ratio is checked, and then every surface's physical extent
+	/// is computed BEFORE any of them is touched: a scale that one surface cannot express leaves the
+	/// output at the scale it had rather than a screen where some surfaces moved and some did not.
+	/// A scale that is already in force is a no-op rather than a round of pointless generations.
+	fn set_scale(&mut self, scale: ScaleRatio) -> Result<(), Error> {
+		if scale.numerator == 0 || scale.denominator == 0 || scale.numerator > MAX_SCALE || scale.denominator > MAX_SCALE {
+			return Err(Error::Invalid);
+		}
+		if scale.numerator == self.scale.numerator && scale.denominator == self.scale.denominator {
+			return Ok(());
+		}
+		for surface in &self.surfaces {
+			let (width, height) = if surface.native { (self.scanout.width, self.scanout.height) } else { (surface.logical_width, surface.logical_height) };
+			if physical_extent(width, &scale).is_none() || physical_extent(height, &scale).is_none() {
+				return Err(Error::Invalid);
+			}
+		}
+		self.scale = scale;
+		for index in 0..self.surfaces.len() {
+			let (width, height) = if self.surfaces[index].native { (self.scanout.width, self.scanout.height) } else { (self.surfaces[index].logical_width, self.surfaces[index].logical_height) };
+			self.reconfigure(index, width, height);
+		}
+		Ok(())
 	}
 
 	fn present_active_full(&mut self) {
@@ -1364,7 +1456,10 @@ impl StatsService for StatsCall<'_> {
 
 struct AdminCall<'a> {
 	clients: &'a mut Vec<Client>,
-	stats: &'a PerfStats,
+	/// THE WHOLE STATE, because one of these operations CHANGES it. `stats` and `bind` only read or
+	/// mint, and this borrowed the statistics alone for exactly that reason; `set_scale` reconfigures
+	/// every surface, which is the service's own state and not a view of it.
+	state: &'a mut DisplayState,
 }
 
 impl AdminService for AdminCall<'_> {
@@ -1384,7 +1479,7 @@ impl AdminService for AdminCall<'_> {
 	}
 
 	fn stats(&mut self) -> PresentationStats {
-		self.stats.snapshot()
+		self.state.stats.snapshot()
 	}
 
 	/// THE VISIBILITY RULE IS THE SERVICE'S AND NOT A CLIENT'S. A client that could make itself
@@ -1396,6 +1491,12 @@ impl AdminService for AdminCall<'_> {
 		}
 		let _ = surface;
 		Err(Error::Unsupported)
+	}
+
+	/// THE OUTPUT'S SCALE, for the same reason `set_visible` is here: a client that could set it
+	/// would be deciding how much memory every OTHER client's images need.
+	fn set_scale(&mut self, scale: ScaleRatio) -> Result<(), Error> {
+		self.state.set_scale(scale)
 	}
 }
 
@@ -1823,7 +1924,7 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut pro
 					// over the single-handle receive, which keeps the first and drops the rest - so a
 					// client sending stdin, stdout and stderr had two destroyed before dispatch.
 					let mut handle = caps;
-					let mut call = AdminCall { clients: &mut clients, stats: &state.stats };
+					let mut call = AdminCall { clients: &mut clients, state: &mut state };
 					if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 						if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
 							for &leftover in reply_handle.as_slice() {

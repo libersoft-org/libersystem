@@ -16,16 +16,43 @@ demo that reported only the second would look fast on a machine that throttled i
 | draw (record + replay) | 88.3 ms | 116.4 ms |
 | present interval | 141.4 ms | 178.6 ms |
 
-**THIS IS THE DEBUG BUILD AND IS NOT A BUDGET.** Everything the guest stages is built by
-`./build.sh` at the `dev` profile - unoptimized, with debug assertions - because that is what the
-image carries today, and the headless benchmark above measures `--release` on the host for exactly
-this reason. The two are not comparable and this table is not a floor: what it IS good for is the
-SHAPE - the draw is most of the interval, so what the loop waits for is the renderer rather than the
-display - and as a number to compare the next debug measurement against.
+**THIS IS THE RELEASE BUILD, ON THE TARGET, and the note here used to say the opposite** (corrected
+2026-09-15). It claimed the debug profile because `./build.sh` builds the static services and drivers
+at `dev` - which it does - and the staged PIE applications do not come from there: `build-shared`
+compiles every consumer object and every provider library with `--release`, into an image target
+directory that has no `debug` tree at all. So this IS the release measurement on the target that the
+milestone asks for, and it is comparable with the headless benchmark below, which measures the same
+profile on the host.
 
-**What it does not yet answer.** The release measurement on the target, and the HiDPI scale the
-milestone asks for beside it: `DisplayService` answers every surface `scale = 1:1` and has no source
-for another value, so there is no second scale to measure at.
+It is still not a FLOOR. The floor is the headless benchmark's, under its own frozen reference-host
+conditions; this is a live figure with a real display, a real service and a real present path in it,
+and it is reported separately for that reason. What it is good for beyond the number is the SHAPE:
+the draw is most of the interval, so what the loop waits for is the renderer rather than the display.
+
+### At a HiDPI scale
+
+**The same scene, the same logical layout, every edge resolved at more pixels.** `DisplayService`
+answers `set-scale` on its admin channel now, so there is a second scale to measure at - and what a
+HiDPI measurement asks is exactly this: not what a bigger scene costs, but what the SAME scene costs
+when its physical extent is its logical one times a ratio. Measured inside the guest suite, where the
+admin channel is part of the harness, by the gate that already runs every phase of the demo:
+
+| what | logical | physical | draw mean | draw worst |
+| --- | --- | --- | ---: | ---: |
+| scale 1:1 | 192x128 | 192x128 | 25.5 ms | 35.6 ms |
+| scale 2:1 | 192x128 | 384x256 | 40.1 ms | 45.8 ms |
+
+**Four times the pixels for 1.6 times the time**, which is the useful part. A frame's cost is not
+proportional to its area here: recording the list, walking the scene and the per-tile setup do not
+grow with resolution, and only the coverage and composite terms do. The ratio is what a HiDPI budget
+should be planned against - doubling the scale is not doubling the frame - and it is measured rather
+than assumed.
+
+**Nothing in a booted image sets a scale yet.** The ratio is the system's to choose and only something
+holding the whole screen may set it, which today is PermissionManager's admin connection and nothing
+above it: there is no compositor and no operator control. That is why this row is measured in the
+guest suite rather than in the live boot above, and it is a missing CONTROL rather than a missing
+capability.
 
 **The same demo inside the guest suite, at 192x128, on all three ports.** The gate
 `kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage` runs the same scene against a real

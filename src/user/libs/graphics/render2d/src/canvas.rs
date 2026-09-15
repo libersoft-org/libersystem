@@ -192,13 +192,30 @@ impl Canvas {
 	/// missing `end_layer` means everything since the `begin_layer` was recorded into an offscreen
 	/// nothing composites, and the drawing would simply be missing.
 	pub fn finish(&self) -> Result<DrawList, Error> {
+		let mut list = DrawList::default();
+		self.finish_into(&mut list)?;
+		Ok(list)
+	}
+
+	/// The same freeze, into a list the caller already holds - see `DrawListBuilder::finish_into`.
+	///
+	/// A frame loop records the same shape of list every tick, and a `finish` that allocated a fresh
+	/// one each time would charge a `Vec` per resource kind sixty times a second for ever. With
+	/// `restart` on the way in and this on the way out, a steady loop records a frame and allocates
+	/// nothing at all.
+	/// ONE RULE FOR EVERY REFUSAL: an error leaves the caller's list EMPTY. These two checks refuse
+	/// before anything is written, so the list would otherwise keep the PREVIOUS frame's recording -
+	/// which a caller that ignored the error would present again as though it were this frame's.
+	pub fn finish_into(&self, list: &mut DrawList) -> Result<(), Error> {
 		if !self.saved.is_empty() {
+			list.clear();
 			return Err(Error::UnbalancedSave);
 		}
 		if self.layers != 0 {
+			list.clear();
 			return Err(Error::UnbalancedLayer);
 		}
-		self.builder.finish()
+		self.builder.finish_into(list)
 	}
 
 	/// Refuse, AT THE CALL, a geometry that the current transform leaves with no image at all.
