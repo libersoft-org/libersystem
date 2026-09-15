@@ -248,7 +248,15 @@ impl Scene {
 
 		// A LINE OF TEXT, INCLUDING A COLOUR GLYPH - drawn as a run, which is the only way text
 		// enters this API.
-		canvas.draw_glyph_run(text_run(24.0, height * 0.11), Paint::Solid(srgb(1.0, 1.0, 1.0, 1.0)))?;
+		// BELOW THE MULTI-RECT PATCH AND LEFT OF THE STAR, and it was at `height * 0.11` - which put
+		// it under the patch at the top-left corner. That patch BLINKS between two sizes six frames
+		// apart, and at the larger one it covers the line of text completely: a capture landing on a
+		// large-patch frame showed a flat magenta where the colour glyph is, and one six frames later
+		// showed the glyph. The scene was drawing over its own text half the time.
+		//
+		// The patch spans `0.08h .. 0.24h` from the top-left corner and the star reaches `x = 0.22w`
+		// from the left, so `0.30h` at `x = 24` is clear of both with room either side.
+		canvas.draw_glyph_run(text_run(24.0, height * 0.30), Paint::Solid(srgb(1.0, 1.0, 1.0, 1.0)))?;
 
 		// THE MOVING OBJECTS, whose bounds are the partial phase's damage.
 		for (index, rect) in self.movers(self.tick, extent).into_iter().enumerate() {

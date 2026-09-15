@@ -153,20 +153,20 @@ impl Rasteriser {
 
 	/// Fill contours, emitting one row of coverage at a time.
 	///
-	/// THE EMITTED SLICE IS INDEXED FROM `bounds.x`, so a caller composites at `bounds.x + index`
-	/// without arithmetic of its own - which is the arithmetic that goes wrong when a tile's origin
-	/// and a clip's origin are not the same number.
-	pub fn fill(&mut self, contours: &[Contour], rule: FillRule, antialias: Antialias, bounds: PixelRect, row: impl FnMut(u32, &[f32])) {
+	/// THE EMITTED SLICE IS INDEXED FROM `bounds.x + start`, and `start` is the second argument. It
+	/// used to be indexed from `bounds.x` alone, over the whole width of the bounds - and most rows
+	/// of most shapes cover a handful of columns of a sixty-four-wide tile, so a caller then scanned
+	/// sixty-four values to find three. The origin is still explicit rather than implied, which is
+	/// the arithmetic that goes wrong when a tile's origin and a clip's origin are not the same
+	/// number; there is simply one more term in it.
+	pub fn fill(&mut self, contours: &[Contour], rule: FillRule, antialias: Antialias, bounds: PixelRect, row: impl FnMut(u32, usize, &[f32])) {
 		let edges = Edges::build(contours);
 		self.fill_edges(&edges, rule, antialias, bounds, row);
 	}
 
-	/// Fill a prebuilt edge list, emitting one row of coverage at a time.
-	///
-	/// THE EMITTED SLICE IS INDEXED FROM `bounds.x`, so a caller composites at `bounds.x + index`
-	/// without arithmetic of its own - which is the arithmetic that goes wrong when a tile's origin
-	/// and a clip's origin are not the same number.
-	pub fn fill_edges(&mut self, edges: &Edges, rule: FillRule, antialias: Antialias, bounds: PixelRect, row: impl FnMut(u32, &[f32])) {
+	/// Fill a prebuilt edge list, emitting one row of coverage at a time. See `fill` for the slice's
+	/// indexing.
+	pub fn fill_edges(&mut self, edges: &Edges, rule: FillRule, antialias: Antialias, bounds: PixelRect, row: impl FnMut(u32, usize, &[f32])) {
 		if bounds.is_empty() || !edges.reaches(bounds.y as f32, (bounds.y + bounds.height) as f32) {
 			return;
 		}
@@ -187,7 +187,7 @@ impl Rasteriser {
 	/// every pixel to its RIGHT is fully covered by; `area` is the part of that pixel itself lying to
 	/// the right of it. A running sum of `cover` from the left, plus the pixel's own `area`, is the
 	/// winding-weighted coverage - exactly, at any sub-pixel position, in both directions.
-	fn fill_by_area(&mut self, edges: &Edges, rule: FillRule, bounds: PixelRect, mut row: impl FnMut(u32, &[f32])) {
+	fn fill_by_area(&mut self, edges: &Edges, rule: FillRule, bounds: PixelRect, mut row: impl FnMut(u32, usize, &[f32])) {
 		let width = bounds.width as usize;
 		if self.coverage.len() < width {
 			self.coverage.resize(width, 0.0);
@@ -199,6 +199,17 @@ impl Rasteriser {
 			self.area.resize(width, 0.0);
 		}
 		let left = bounds.x as f32;
+		// THE ACCUMULATORS START CLEAN AND ARE LEFT CLEAN. Each row zeroes only the columns IT
+		// touched, at the end of the row, so the next row finds them already zero - which is what
+		// makes the per-row cost proportional to what the shape covers rather than to the tile's
+		// width. `resize` above only zeroes the part it grows, so this pass is what establishes the
+		// invariant the rows then keep.
+		for value in self.cover[..width].iter_mut() {
+			*value = 0.0;
+		}
+		for value in self.area[..width].iter_mut() {
+			*value = 0.0;
+		}
 
 		// THE SWEEP STARTS AT THIS TILE'S TOP. Everything that begins above it and reaches into it is
 		// collected once, and everything that begins inside it is added as the sweep reaches it.
@@ -227,17 +238,11 @@ impl Rasteriser {
 			if self.active.is_empty() {
 				continue;
 			}
-			for value in self.cover[..width].iter_mut() {
-				*value = 0.0;
-			}
-			for value in self.area[..width].iter_mut() {
-				*value = 0.0;
-			}
 			// WHAT LIES LEFT OF THE TILE COVERS ALL OF IT. An edge outside the tile on that side is
 			// not skipped - every pixel in the row is to its right - and keeping that as a seed rather
 			// than clamping the edge's x is what makes the answer the same whatever the tiling is.
 			let mut seed = 0.0f32;
-			let mut touched = false;
+			let mut touched = Touched::none();
 			for index in self.active.iter() {
 				let edge = &edges.edges[*index as usize];
 				let from_y = if edge.top_y > top { edge.top_y } else { top };
@@ -250,24 +255,45 @@ impl Rasteriser {
 				if !(from_x.is_finite() && to_x.is_finite()) {
 					continue;
 				}
-				accumulate(&mut self.cover[..width], &mut self.area[..width], &mut seed, from_x - left, from_y, to_x - left, to_y, edge.winding as f32);
-				touched = true;
+				accumulate(&mut self.cover[..width], &mut self.area[..width], &mut seed, &mut touched, from_x - left, from_y, to_x - left, to_y, edge.winding as f32);
 			}
-			if !touched {
+			// THE COLUMNS OUTSIDE THE TOUCHED RANGE HAVE ONE ANSWER EACH, and it is the same answer
+			// for the whole run: nothing accumulated there, so the winding is the seed on the left
+			// and whatever it became on the right. A run of one value is a fill rather than a
+			// per-column evaluation, and where that value is zero the run is not emitted at all.
+			let outside_left = wind(seed, rule);
+			let Some((low, high)) = touched.range() else {
+				if outside_left > 0.0 {
+					self.coverage[..width].fill(outside_left);
+					row(y, 0, &self.coverage[..width]);
+				}
 				continue;
-			}
+			};
 			let mut running = seed;
-			for index in 0..width {
+			for index in low..=high {
 				let value = running + self.area[index];
 				running += self.cover[index];
 				self.coverage[index] = wind(value, rule);
+				// LEFT CLEAN FOR THE NEXT ROW, in the same pass that reads them: a second loop over
+				// the same range would touch the same cache lines twice for no reason.
+				self.area[index] = 0.0;
+				self.cover[index] = 0.0;
 			}
-			row(y, &self.coverage[..width]);
+			let outside_right = wind(running, rule);
+			let first = if outside_left > 0.0 { 0 } else { low };
+			let last = if outside_right > 0.0 { width } else { high + 1 };
+			if first < low {
+				self.coverage[first..low].fill(outside_left);
+			}
+			if last > high + 1 {
+				self.coverage[high + 1..last].fill(outside_right);
+			}
+			row(y, first, &self.coverage[first..last]);
 		}
 	}
 
 	/// THE ALIASED FILL: one sample at each pixel's centre, which is the rule it has always had.
-	fn fill_by_sample(&mut self, edges: &Edges, rule: FillRule, bounds: PixelRect, mut row: impl FnMut(u32, &[f32])) {
+	fn fill_by_sample(&mut self, edges: &Edges, rule: FillRule, bounds: PixelRect, mut row: impl FnMut(u32, usize, &[f32])) {
 		let (left, right) = (bounds.x as f32, bounds.x as f32 + bounds.width as f32);
 		let width = bounds.width as usize;
 		if self.coverage.len() < width {
@@ -328,7 +354,10 @@ impl Rasteriser {
 				}
 			}
 			if touched {
-				row(y, &self.coverage[..width]);
+				// THE ALIASED PATH EMITS THE WHOLE ROW, because it sorts crossings rather than
+				// accumulating per column and therefore has no cheap answer for where the covered
+				// run begins. Its callers scan for it, which is what they did for both paths before.
+				row(y, 0, &self.coverage[..width]);
 			}
 		}
 	}
@@ -358,7 +387,35 @@ fn wind(value: f32, rule: FillRule) -> f32 {
 ///
 /// THE COORDINATES ARE TILE-RELATIVE: column zero is the tile's first pixel. `seed` takes everything
 /// left of it, because every pixel of the row is to the right of an edge that far over.
-fn accumulate(cover: &mut [f32], area: &mut [f32], seed: &mut f32, x0: f32, y0: f32, x1: f32, y1: f32, winding: f32) {
+/// THE COLUMNS ONE ROW'S EDGES REACHED, which is what makes the per-row work proportional to the
+/// shape rather than to the tile.
+///
+/// A row of a thin stroke crossing a sixty-four-wide tile touches two or three columns; zeroing,
+/// summing and evaluating all sixty-four was most of what such a row cost. Held as a pair rather
+/// than a `Range` because the empty state has to be representable and `lo > hi` says it without a
+/// second field.
+struct Touched {
+	low: usize,
+	high: usize,
+}
+
+impl Touched {
+	fn none() -> Self {
+		Self { low: usize::MAX, high: 0 }
+	}
+
+	fn mark(&mut self, index: usize) {
+		self.low = self.low.min(index);
+		self.high = self.high.max(index);
+	}
+
+	fn range(&self) -> Option<(usize, usize)> {
+		(self.low <= self.high).then_some((self.low, self.high))
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate(cover: &mut [f32], area: &mut [f32], seed: &mut f32, touched: &mut Touched, x0: f32, y0: f32, x1: f32, y1: f32, winding: f32) {
 	let width = cover.len();
 	let dx = x1 - x0;
 	let dy = y1 - y0;
@@ -370,7 +427,7 @@ fn accumulate(cover: &mut [f32], area: &mut [f32], seed: &mut f32, x0: f32, y0: 
 		// at a column boundary, where it belongs to the column on its right, which is the half-open
 		// rule every other clip here uses.
 		let column = libm::floorf(x0);
-		emit(cover, area, seed, width, column, x0, x0, dy * winding);
+		emit(cover, area, seed, touched, width, column, x0, x0, dy * winding);
 		return;
 	}
 	let (low_x, high_x) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
@@ -404,12 +461,13 @@ fn accumulate(cover: &mut [f32], area: &mut [f32], seed: &mut f32, x0: f32, y0: 
 		}
 		let at_from = x0 + from * dx;
 		let at_to = x0 + to * dx;
-		emit(cover, area, seed, width, column as f32, at_from, at_to, (to - from) * dy * winding);
+		emit(cover, area, seed, touched, width, column as f32, at_from, at_to, (to - from) * dy * winding);
 	}
 }
 
 /// One piece of an edge inside one column.
-fn emit(cover: &mut [f32], area: &mut [f32], seed: &mut f32, width: usize, column: f32, from_x: f32, to_x: f32, extent: f32) {
+#[allow(clippy::too_many_arguments)]
+fn emit(cover: &mut [f32], area: &mut [f32], seed: &mut f32, touched: &mut Touched, width: usize, column: f32, from_x: f32, to_x: f32, extent: f32) {
 	if extent == 0.0 {
 		return;
 	}
@@ -427,6 +485,7 @@ fn emit(cover: &mut [f32], area: &mut [f32], seed: &mut f32, width: usize, colum
 	let right = (column + 1.0 - middle).clamp(0.0, 1.0);
 	area[index] += extent * right;
 	cover[index] += extent;
+	touched.mark(index);
 }
 
 /// Add one horizontal interval's coverage to a row, ANALYTICALLY.

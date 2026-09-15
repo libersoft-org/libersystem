@@ -51,9 +51,22 @@ fi
 "$REPO_ROOT/lab.sh" sh --timeout 180 "test2d-sw --frames=600 --phase-frames=60" >"$FRAMES_DIR/demo.log" 2>&1 &
 DEMO_PID=$!
 
-# LONG ENOUGH FOR THE FIRST PHASE TO BE DRAWING, and then spaced so the captures land in different
-# frames of an animation that runs at the display's own pace.
-sleep 6
+# WAITED FOR RATHER THAN SLEPT THROUGH, and this was a race the gate lost intermittently. It was a
+# flat `sleep 6` - long enough for the demo to be drawing on a warm machine and not on a cold one -
+# and a capture taken before its first present shows the CONSOLE. That is not a blank screen: the
+# boot log is white text, the text check counts white pixels, so a console capture read as "the line
+# of text is drawn" while every colour check failed, and the gate blamed the colour glyph for its own
+# timing. The screen is polled until it is the demo's, which is a question about the frame rather
+# than about the clock.
+ready=0
+for _ in $(seq 1 40); do
+	if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/ready.ppm" >/dev/null 2>&1 && python3 "$REPO_ROOT/src/tools/check-2d-demo-frames.py" --ready "$FRAMES_DIR/ready.ppm"; then
+		ready=1
+		break
+	fi
+	sleep 1
+done
+((ready == 1)) || die "the demo never reached the screen: its output so far was $(tail -n 3 "$FRAMES_DIR/demo.log" 2>/dev/null)"
 captured=0
 for index in 1 2 3; do
 	if "$REPO_ROOT/lab.sh" shot "$FRAMES_DIR/frame-$index.ppm" >/dev/null 2>&1; then

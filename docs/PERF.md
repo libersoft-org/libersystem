@@ -13,8 +13,14 @@ demo that reported only the second would look fast on a machine that throttled i
 
 | what | mean | worst |
 | --- | ---: | ---: |
-| draw (record + replay) | 88.3 ms | 116.4 ms |
-| present interval | 141.4 ms | 178.6 ms |
+| draw (record + replay) | 79.6 ms | 104.3 ms |
+| present interval | 132.4 ms | 174.7 ms |
+
+Re-measured 2026-09-15 after the three backend changes recorded under `soft2d` below; it was 88.3 ms
+mean and 116.4 ms worst, with a 141.4 ms interval. The demo's own scene gains less than the
+benchmark's does, and the reason is worth knowing: its background is a four-stop CONIC GRADIENT, so
+no tile of it is covered by an opaque solid fill and the largest of the three changes does not apply.
+What it does gain is the working-space one, which its backdrop blur pays for per pixel.
 
 **THIS IS THE RELEASE BUILD, ON THE TARGET, and the note here used to say the opposite** (corrected
 2026-09-15). It claimed the debug profile because `./build.sh` builds the static services and drivers
@@ -39,10 +45,19 @@ admin channel is part of the harness, by the gate that already runs every phase 
 
 | what | logical | physical | draw mean | draw worst |
 | --- | --- | --- | ---: | ---: |
-| scale 1:1 | 192x128 | 192x128 | 25.5 ms | 35.6 ms |
-| scale 2:1 | 192x128 | 384x256 | 40.1 ms | 45.8 ms |
+| scale 1:1 | 192x128 | 192x128 | 20.6 ms | 29.6 ms |
+| scale 2:1 | 192x128 | 384x256 | 28.1 ms | 31.0 ms |
 
-**Four times the pixels for 1.6 times the time**, which is the useful part. A frame's cost is not
+The same pair on the two emulated ports, where four times the pixels costs about twice the time
+rather than 1.4 times - an emulator charges per instruction, and the terms that do not grow with
+resolution are the ones it makes cheapest to repeat:
+
+| port | scale 1:1 | scale 2:1 | |
+| --- | ---: | ---: | ---: |
+| aarch64 (TCG) | 406.6 ms | 673.7 ms | 1.7x |
+| riscv64 (TCG) | 496.4 ms | 876.5 ms | 1.8x |
+
+**Four times the pixels for 1.4 times the time**, which is the useful part. A frame's cost is not
 proportional to its area here: recording the list, walking the scene and the per-tile setup do not
 grow with resolution, and only the coverage and composite terms do. The ratio is what a HiDPI budget
 should be planned against - doubling the scale is not doubling the frame - and it is measured rather
@@ -60,11 +75,18 @@ DisplayService with a stand-in GPU, and the demo reports its own draw time there
 emulated ports are TCG - x86_64 has KVM - so what this table measures is the EMULATOR, and it is
 here because it is the number a reader will otherwise mistake for the port being slow.
 
-| port | draw mean | draw worst |
-| --- | ---: | ---: |
-| x86_64 (KVM) | 29.9 ms | 34.8 ms |
-| aarch64 (TCG) | 412.8 ms | 461.4 ms |
-| riscv64 (TCG) | 523.8 ms | 608.1 ms |
+| port | draw mean | draw worst | before 2026-09-15 |
+| --- | ---: | ---: | ---: |
+| x86_64 (KVM) | 20.6 ms | 29.6 ms | 29.9 ms |
+| aarch64 (TCG) | 406.6 ms | 516.8 ms | 412.8 ms |
+| riscv64 (TCG) | 496.4 ms | 564.5 ms | 523.8 ms |
+
+**The backend changes are worth a third on x86_64 and almost nothing under TCG**, which is the shape
+to expect rather than a disappointment. Three of the four remove WORK - a decode per tile, a mask per
+clip, a per-column evaluation - and an emulator charges for instructions retired rather than for the
+memory traffic and the branch misses that make those changes worth making on real silicon. The fourth,
+the wider intermediate, moves MORE bytes for fewer conversions, which under TCG is close to a wash.
+The rows are here so a guest run on those ports that looks stuck can be recognised as the emulator.
 
 Fourteen times and seventeen times the x86_64 figure, on a scene an eighth the area of the 640x480
 measurement above - which is the ratio to remember whenever a guest run on those ports looks stuck.
@@ -91,10 +113,56 @@ scene.
 
 | scene | commands | resources | prepare | replay median | replay p99 | ceiling |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| UI-basic | 252 | 153 | 1.1 ms | 46.4 ms | 65.0 ms | 16.7 ms |
-| UI-effects | 45 | 34 | 1.2 ms | 332.0 ms | 349.9 ms | 66.7 ms |
-| vector-stress | 240 | 241 | 7.1 ms | 97.0 ms | 97.9 ms | 66.7 ms |
-| image-stress | 25 | 3 | 41.5 ms | 377.7 ms | 379.4 ms | 16.7 ms |
+| UI-basic | 252 | 153 | 1.1 ms | 29.2 ms | 39.1 ms | 16.7 ms |
+| UI-effects | 45 | 34 | 2.7 ms | 232.6 ms | 251.5 ms | 66.7 ms |
+| vector-stress | 240 | 241 | 7.1 ms | 89.2 ms | 108.7 ms | 66.7 ms |
+| image-stress | 25 | 3 | 42.8 ms | 375.5 ms | 395.0 ms | 16.7 ms |
+
+That row replaced this one on 2026-09-15, through four changes measured one at a time on the same
+host with the same fixtures:
+
+| scene | before | skipped decode | rectangle clips | f32 working space + solid span | narrowed rows | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UI-basic | 46.1 ms | 35.6 ms | 32.2 ms | 30.2 ms | 29.2 ms | 1.6x |
+| UI-effects | 336.1 ms | 322.7 ms | 325.1 ms | 225.3 ms | 232.6 ms | 1.4x |
+| vector-stress | 99.0 ms | 97.2 ms | 97.5 ms | 97.2 ms | 89.2 ms | 1.1x |
+| image-stress | 380.6 ms | 383.2 ms | 376.7 ms | 375.9 ms | 375.5 ms | 1.0x |
+
+- **A tile nothing reads the backdrop of is not decoded.** Every tile was read out of the target into
+  the working space before it was replayed and written back afterwards; a tile that some command
+  covers COMPLETELY and OPAQUELY never needed the first half, because the only reason to read a
+  backdrop is to blend with it. The conditions are narrow on purpose - a solid fully opaque paint at
+  full opacity, `Normal` over or copied, over an axis-aligned rectangle, with no clip pushed and no
+  layer open - and each one of them is a way a pixel could otherwise depend on what was beneath it.
+  `UI-basic`'s full-screen panel qualifies and its eighty tiles each save a decode; the demo's conic
+  gradient does not, which is why the live figure above moves less.
+- **A rectangular clip needs no mask.** The clip stack has always had a rectangle level that costs no
+  storage and no per-pixel multiply, and nothing ever pushed one: every clip rasterised its edges
+  into a full-tile mask, zeroed first. `UI-basic` clips fifty times, in every one of eighty tiles.
+  The fast path is taken only when the rectangle is PIXEL-ALIGNED, because a rectangle level answers
+  one or zero and an edge between two pixel centres has an answer in between.
+- **The working intermediate is four singles and was four halves.** This machine has no hardware half
+  conversion in reach of a `no_std` build, so every read and write of a working pixel went through a
+  branchy software routine twice per channel. Doubling the scratch - hundreds of kilobytes against a
+  sixty-four megabyte ceiling - removes eight conversions per pixel per access, and it is MORE
+  accurate rather than less: the arithmetic above it was `f32` throughout and the half was rounding
+  between every pair of composites. `UI-effects` is where it shows, because a filter graph reads and
+  writes intermediates for every node. Measured with the solid-span fill below, which was too small
+  to separate: asking a solid paint for its colour per pixel is an enum match inside the hot loop.
+- **A row is only as wide as the shape reached.** The area rasteriser zeroed two accumulators across
+  the whole width of its bounds, summed them across the whole width, evaluated the winding rule at
+  every column, and handed the caller a full-width row to scan for the covered part. A row of a thin
+  stroke crossing a sixty-four-wide tile touches two or three columns. It now tracks the columns its
+  edges reached, keeps the accumulators clean by zeroing only those, and emits the covered run with
+  the index it starts at - the columns outside it have ONE answer each, which is a fill where it is
+  not zero and nothing at all where it is. `vector-stress` is where it shows, which is the scene
+  made of thin outlines.
+
+**Where it still is not enough, in one number.** `UI-basic` composites about 470,000 pixels for
+29 ms, which is sixty-two nanoseconds each on a 2.6 GHz host - about a hundred and sixty cycles
+per pixel for an arithmetic that is a multiply and an add per channel. The remaining factor is not
+another term of this kind; it is the shape of the per-pixel path itself, and closing it is the body
+of work the milestone declines to call a tail of this item.
 
 The row above replaced this one on 2026-09-14, when the rasteriser stopped sampling the vertical
 direction and started accumulating area. Same host, same fixtures, same flags:
@@ -112,7 +180,8 @@ which every edge is clipped to the pixels it crosses and two numbers are accumul
 is where it shows most, because a stroke's six hundred edges were being crossed sixteen times a row.
 
 **THE FLOOR IS NOT MET.** The ceilings are fixed independently of the implementation and stay where
-they are; these are the measurements as they stand, and the gap is between four and twenty-five times. The
+they are; these are the measurements as they stand, and the gap is between one and a half and
+twenty-three times. The
 image scene grew its YUV source when the multi-plane model landed, which is a full-screen `NV12`
 frame reconstructed, matrixed, transfer-decoded and converted from Rec. 2020 per pixel - it is the
 workload the scene is for, and it moved that row from 267 ms to 419 ms.

@@ -1379,3 +1379,121 @@ fn a_shape_beyond_the_clips_bounds_is_clipped_away() {
 	assert_eq!(pixel(&image, 40, 208)[3], 0, "and the one three tile rows beyond the clip is not: {:?}", pixel(&image, 40, 208));
 	assert_eq!(pixel(&image, 40, 120)[3], 0, "nor anything between them: {:?}", pixel(&image, 40, 120));
 }
+
+#[test]
+// A TILE SOMETHING OVERWRITES WHOLE IS NOT DECODED OUT OF THE TARGET FIRST, and the hazard in that
+// is exactly one thing: a tile wrongly believed covered shows the PREVIOUS TILE'S pixels, because
+// the scratch is reused across tiles and nothing put this tile's backdrop into it.
+//
+// EVERY CASE HERE IS A WAY THE COVER CAN BE WRONG. A shape that is not a rectangle, a paint that is
+// not opaque, a blend that reads the backdrop, a clip that narrows the fill to less than the tile,
+// and a layer that sends it somewhere else - each would leave a tile partly unwritten, and each
+// keeps its decode. The proof in every case is the same: what was in the target before the frame is
+// still visible where the drawing did not reach.
+fn a_tile_an_opaque_fill_covers_needs_no_backdrop_and_the_others_still_have_one() {
+	let tile = crate::TILE_SIZE;
+	let backdrop = [0x00u8, 0x00, 0xff, 0xff];
+	// THE MECHANISM IS ASSERTED AND NOT ONLY ITS PIXELS. A frame whose output is right because the
+	// fast path fired correctly and one whose output is right because it never fired at all look
+	// identical in the target, and the second is what a disabled optimisation looks like for ever.
+	let skipped = |list: &DrawList, image: &OwnedImage| -> usize {
+		let mut backend = Soft2d::new();
+		backend.prepare(list, &description(image)).expect("a preparation").tiles_without_backdrop()
+	};
+	let prefill = |image: &mut OwnedImage| {
+		for y in 0..image.layout().extent.height {
+			let row = image.view_mut().row_mut(y).expect("a row").to_vec();
+			let mut painted = row;
+			for pixel in painted.chunks_mut(4) {
+				pixel.copy_from_slice(&backdrop);
+			}
+			image.view_mut().row_mut(y).expect("a row").copy_from_slice(&painted);
+		}
+	};
+
+	// 1. A FULL-TARGET OPAQUE RECTANGLE. Every tile is covered, every decode is skipped, and every
+	//    pixel is the fill - which is what says the skipped decode did not lose the frame.
+	let mut image = target(tile * 2, tile * 2);
+	prefill(&mut image);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, (tile * 2) as f32, (tile * 2) as f32)), red(), FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	assert_eq!(skipped(&list, &image), 4, "all four tiles are covered whole");
+	draw(&list, &mut image);
+	assert_eq!(pixel(&image, 0, 0), [0xff, 0x00, 0x00, 0xff], "the covering fill reaches the first tile");
+	assert_eq!(pixel(&image, tile * 2 - 1, tile * 2 - 1), [0xff, 0x00, 0x00, 0xff], "and the last one");
+
+	// 2. A RECTANGLE COVERING ONE TILE OF FOUR. The covered tile takes the fill; the other three
+	//    keep their backdrop, which is the half a wrongly skipped decode destroys.
+	let mut image = target(tile * 2, tile * 2);
+	prefill(&mut image);
+	let mut canvas = Canvas::new();
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, tile as f32, tile as f32)), red(), FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	assert_eq!(skipped(&list, &image), 1, "one tile of the four is covered whole");
+	draw(&list, &mut image);
+	assert_eq!(pixel(&image, tile / 2, tile / 2), [0xff, 0x00, 0x00, 0xff], "the covered tile is the fill");
+	assert_eq!(pixel(&image, tile + tile / 2, tile / 2), backdrop, "and the tile beside it still holds what was under it");
+	assert_eq!(pixel(&image, tile / 2, tile + tile / 2), backdrop, "and the one below it");
+	assert_eq!(pixel(&image, tile + tile / 2, tile + tile / 2), backdrop, "and the one diagonally from it");
+
+	// 3. A HALF-TRANSPARENT FILL COVERS NOTHING, however rectangular it is: the result depends on
+	//    the backdrop, so the backdrop has to have been read.
+	let mut image = target(tile, tile);
+	prefill(&mut image);
+	let mut canvas = Canvas::new();
+	let translucent = Paint::Solid(Color::new(1.0, 0.0, 0.0, 0.5, ColorSpace::Srgb));
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, tile as f32, tile as f32)), translucent, FillRule::NonZero).expect("a fill");
+	let list = canvas.finish().expect("a list");
+	assert_eq!(skipped(&list, &image), 0, "a half-transparent fill covers nothing, so every tile keeps its decode");
+	draw(&list, &mut image);
+	let blended = pixel(&image, tile / 2, tile / 2);
+	assert!(blended[0] > 0x40 && blended[2] > 0x40, "half of the fill over half of the backdrop, not either alone: {blended:?}");
+
+	// 4. A CLIPPED FILL COVERS NOTHING THIS CAN PROVE. The clip could narrow it to less than the
+	//    tile - here it does - so the tile keeps its decode and the backdrop survives outside it.
+	let mut image = target(tile, tile);
+	prefill(&mut image);
+	let mut canvas = Canvas::new();
+	canvas.save().expect("a save");
+	canvas.set_clip(rect_path(RectF::new(0.0, 0.0, (tile / 2) as f32, tile as f32)), FillRule::NonZero).expect("a clip");
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, tile as f32, tile as f32)), red(), FillRule::NonZero).expect("a fill");
+	canvas.restore().expect("a restore");
+	let list = canvas.finish().expect("a list");
+	assert_eq!(skipped(&list, &image), 0, "a clipped fill covers nothing this can prove, so every tile keeps its decode");
+	draw(&list, &mut image);
+	assert_eq!(pixel(&image, tile / 4, tile / 2), [0xff, 0x00, 0x00, 0xff], "inside the clip is the fill");
+	assert_eq!(pixel(&image, tile - 1, tile / 2), backdrop, "and outside it the backdrop is still there");
+
+	// 5. A FILL INSIDE A LAYER GOES TO THE LAYER and not to the tile, so the tile keeps its decode.
+	//    With the layer at half opacity the result is a blend, which is only right if the backdrop
+	//    was read.
+	let mut image = target(tile, tile);
+	prefill(&mut image);
+	let mut canvas = Canvas::new();
+	canvas.begin_layer(None, 0.5, BlendMode::Normal, None).expect("a layer");
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, tile as f32, tile as f32)), red(), FillRule::NonZero).expect("a fill");
+	canvas.end_layer().expect("the layer closes");
+	let list = canvas.finish().expect("a list");
+	assert_eq!(skipped(&list, &image), 0, "a fill inside a layer goes to the layer, so every tile keeps its decode");
+	draw(&list, &mut image);
+	let layered = pixel(&image, tile / 2, tile / 2);
+	assert!(layered[0] > 0x40 && layered[2] > 0x40, "a half-opaque layer over the backdrop, not the fill alone: {layered:?}");
+
+	// 6. A ROTATED RECTANGLE IS NOT AN AXIS-ALIGNED ONE, and its corners leave the tile's corners
+	//    untouched - which is the geometric version of the same mistake.
+	let mut image = target(tile, tile);
+	prefill(&mut image);
+	let mut canvas = Canvas::new();
+	canvas.save().expect("a save");
+	// A ROTATION BY HAND, because the transform type carries the matrix and not a constructor per
+	// shape of it. Thirty degrees is enough that no edge stays axis-aligned.
+	let (sine, cosine) = (0.5f32, 0.866_025_4f32);
+	canvas.concat_transform(&render2d::transform::Transform { m: [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]] });
+	canvas.fill_path(rect_path(RectF::new(0.0, 0.0, tile as f32, tile as f32)), red(), FillRule::NonZero).expect("a fill");
+	canvas.restore().expect("a restore");
+	let list = canvas.finish().expect("a list");
+	assert_eq!(skipped(&list, &image), 0, "a rotated rectangle is not an axis-aligned one, so every tile keeps its decode");
+	draw(&list, &mut image);
+	assert_eq!(pixel(&image, tile - 1, 0), backdrop, "a corner the rotated rectangle does not reach still holds the backdrop");
+}

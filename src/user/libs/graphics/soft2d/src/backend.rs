@@ -95,6 +95,21 @@ enum Step {
 		bounds: PixelRect,
 		inverse: bool,
 	},
+	/// A CLIP THAT IS AN AXIS-ALIGNED, PIXEL-ALIGNED RECTANGLE, which needs no mask at all.
+	///
+	/// The clip stack has always had a rectangle level that costs no storage and no per-pixel
+	/// multiply - its own header says so - and nothing ever pushed one: every clip rasterised its
+	/// edges into a full mask. A scrolling list of fifty rows clips fifty times, in every tile of the
+	/// frame, and each of those was sixty-four rows of coverage written into a mask that says
+	/// `255` inside a rectangle and `0` outside.
+	///
+	/// PIXEL-ALIGNED IS PART OF THE CONDITION AND NOT A DETAIL. A rectangle whose edge falls between
+	/// two pixel centres has PARTIAL coverage along that edge, and a rectangle level answers `1` or
+	/// `0` - so the fast path is taken only where the two are the same answer, which is when every
+	/// edge is an integer.
+	PushClipRect {
+		bounds: PixelRect,
+	},
 	PushClipMask {
 		image: render2d::resource::ImageHandle,
 		transform: Transform,
@@ -131,6 +146,10 @@ pub struct SoftPrepared {
 	expansion: u32,
 	scratch_bytes: u64,
 	damage: Option<PixelRect>,
+	/// WHICH TILES NEED NO DECODE OF THE TARGET, one flag per tile - see `tiles_without_backdrop`.
+	/// Worked out here rather than per frame, because it is a function of the list and the target
+	/// and a prepared list is already bound to both.
+	no_backdrop: Vec<bool>,
 }
 
 impl SoftPrepared {
@@ -139,6 +158,16 @@ impl SoftPrepared {
 	/// changes nothing while covering a rectangle - and that cost defeats the purpose.
 	pub fn damage(&self) -> Option<PixelRect> {
 		self.damage
+	}
+
+	/// HOW MANY TILES THIS FRAME SKIPS THE DECODE FOR - see `tiles_without_backdrop`.
+	///
+	/// It is here so a fixture can assert the MECHANISM rather than only its pixels: a scene whose
+	/// output is right because the optimisation never fired and one whose output is right because it
+	/// fired correctly are indistinguishable from the target alone, and the first is what an
+	/// accidentally disabled fast path looks like for ever.
+	pub fn tiles_without_backdrop(&self) -> usize {
+		self.no_backdrop.iter().filter(|skipped| **skipped).count()
 	}
 
 	/// THE DAMAGE OF ONE DRAW, which is what a compositor asks when it wants to know what a single
@@ -261,6 +290,135 @@ fn contour_bounds(contours: &[Contour]) -> Option<RectF> {
 	(maximum.x >= minimum.x && maximum.y >= minimum.y).then(|| RectF::new(minimum.x, minimum.y, maximum.x - minimum.x, maximum.y - minimum.y))
 }
 
+/// THE RECTANGLE A COMMAND IS GUARANTEED TO LEAVE FULLY OPAQUE, or `None`.
+///
+/// WHY IT IS WORTH COMPUTING. Every tile is DECODED out of the target into the working space before
+/// it is replayed and ENCODED back afterwards, and for a 640x480 frame that round trip alone was
+/// twenty-one milliseconds against a sixteen-point-seven millisecond budget - the largest single term
+/// in the simplest scene. A tile that some command overwrites completely, with pixels that owe
+/// nothing to what was under them, never needed the decode: the whole point of reading the backdrop
+/// is to blend with it.
+///
+/// EVERY CONDITION HERE IS NECESSARY AND THE SET IS DELIBERATELY SMALL. A solid, fully opaque paint
+/// at full opacity, composited `Normal` over the backdrop or copied onto it, over a shape that is an
+/// axis-aligned RECTANGLE. Anything else - a gradient, an image, a blend mode, a hairline of alpha -
+/// can leave a pixel that depends on what was beneath it, and a backdrop that was never read is
+/// whatever the previous tile left in the scratch.
+///
+/// THE ROUNDING IS INWARD, which is the opposite of every other bound in this backend. `cover` rounds
+/// outward because a bound one pixel too small CLIPS a drawing; this rounds inward because a cover
+/// one pixel too large would claim a partially covered pixel is fully painted - and that pixel would
+/// then be composited against uninitialised scratch instead of against the backdrop.
+fn opaque_cover(contours: &[Contour], paint: &Paint, opacity: f32, blend: BlendMode, operator: Operator) -> Option<RectF> {
+	if opacity < 1.0 || !matches!(blend, BlendMode::Normal) || !matches!(operator, Operator::SrcOver | Operator::Src) {
+		return None;
+	}
+	match paint {
+		Paint::Solid(colour) if colour.alpha >= 1.0 => {}
+		_ => return None,
+	}
+	axis_aligned_rect(contours)
+}
+
+/// The rectangle a flattened contour set IS, when it is exactly one axis-aligned rectangle.
+///
+/// FLATTENING HAS ALREADY HAPPENED, so this is asked of device-space points and answers about the
+/// shape as it will actually be rasterised - a rotated rectangle is not one, and a rectangle under a
+/// scale-and-translate transform still is.
+fn axis_aligned_rect(contours: &[Contour]) -> Option<RectF> {
+	let [contour] = contours else { return None };
+	let points = &contour.points;
+	// FOUR CORNERS, OR FIVE WITH THE FIRST REPEATED. A flattener may or may not close the ring
+	// explicitly, and both spellings describe the same rectangle.
+	let corners: &[PointF] = match points.len() {
+		4 => points,
+		5 if points[0] == points[4] => &points[..4],
+		_ => return None,
+	};
+	for corner in corners {
+		if !(corner.x.is_finite() && corner.y.is_finite()) {
+			return None;
+		}
+	}
+	// EVERY EDGE AXIS-ALIGNED, which is what makes the four points a rectangle rather than any
+	// quadrilateral with the same bounding box.
+	for index in 0..4 {
+		let from = corners[index];
+		let to = corners[(index + 1) % 4];
+		if from.x != to.x && from.y != to.y {
+			return None;
+		}
+	}
+	let left = corners.iter().fold(f32::INFINITY, |least, point| least.min(point.x));
+	let right = corners.iter().fold(f32::NEG_INFINITY, |most, point| most.max(point.x));
+	let top = corners.iter().fold(f32::INFINITY, |least, point| least.min(point.y));
+	let bottom = corners.iter().fold(f32::NEG_INFINITY, |most, point| most.max(point.y));
+	// A DEGENERATE "RECTANGLE" IS NOT ONE. Two coincident corners describe a line, which covers
+	// nothing at all.
+	(right > left && bottom > top).then(|| RectF::new(left, top, right - left, bottom - top))
+}
+
+/// Whether every edge of a rectangle falls exactly on a pixel boundary.
+///
+/// IT IS WHAT LETS A RECTANGLE CLIP SKIP ITS MASK. A rectangle level answers one or zero, and an
+/// edge between two pixel centres has an answer in between - so the two agree only here.
+fn is_pixel_aligned(rect: RectF) -> bool {
+	[rect.x, rect.y, rect.right(), rect.bottom()].into_iter().all(|edge| edge.is_finite() && libm::floorf(edge) == edge)
+}
+
+/// The pixels a float rectangle covers ENTIRELY: inward on every side. See `opaque_cover`.
+fn covered(rect: RectF) -> PixelRect {
+	if !(rect.x.is_finite() && rect.y.is_finite() && rect.width.is_finite() && rect.height.is_finite()) {
+		return PixelRect::new(0, 0, 0, 0);
+	}
+	let left = libm::ceilf(rect.x).max(0.0);
+	let top = libm::ceilf(rect.y).max(0.0);
+	let right = libm::floorf(rect.right()).max(0.0);
+	let bottom = libm::floorf(rect.bottom()).max(0.0);
+	if right <= left || bottom <= top {
+		return PixelRect::new(0, 0, 0, 0);
+	}
+	let clamp = |value: f32| value.min(u32::MAX as f32) as u32;
+	PixelRect::new(clamp(left), clamp(top), clamp(right - left), clamp(bottom - top))
+}
+
+/// WHICH TILES NEED NO DECODE, worked out once in `prepare` rather than per frame.
+///
+/// A tile qualifies when some command in its own bin covers it completely and opaquely, with NO clip
+/// pushed and NO layer open at that point in the list. The two depth counters are what make this
+/// cheap and conservative at the same time: a clip could narrow the fill to less than the tile and a
+/// layer would send it somewhere else entirely, and rather than reason about either, a tile whose
+/// covering command is under one simply keeps its decode.
+///
+/// WHAT HAPPENS BEFORE THE COVERING COMMAND DOES NOT MATTER. Commands earlier in the bin blend
+/// against scratch that holds the previous tile's pixels, and every one of those pixels is then
+/// overwritten - the covering fill reaches all of them, which is what "covers it completely" means.
+fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>]) -> Vec<bool> {
+	let mut answer: Vec<bool> = Vec::with_capacity(tiling.count());
+	for index in 0..tiling.count() {
+		let tile = tiling.tile(index);
+		let mut clips: u32 = 0;
+		let mut layers: u32 = 0;
+		let mut covered_tile = false;
+		for command in bins.commands(index) {
+			match steps.get(*command as usize) {
+				Some(Step::PushClip { .. } | Step::PushClipRect { .. } | Step::PushClipMask { .. }) => clips += 1,
+				Some(Step::PopClip) => clips = clips.saturating_sub(1),
+				Some(Step::BeginLayer { .. }) => layers += 1,
+				Some(Step::EndLayer) => layers = layers.saturating_sub(1),
+				_ => {
+					if clips == 0 && layers == 0 && covers.get(*command as usize).copied().flatten().is_some_and(|cover| cover.contains_rect(&tile)) {
+						covered_tile = true;
+						break;
+					}
+				}
+			}
+		}
+		answer.push(covered_tile && !tile.is_empty());
+	}
+	answer
+}
+
 /// A rectangle as a path, which is how an image's destination enters the one rasteriser.
 fn rect_contours(rect: RectF, transform: &Transform) -> Vec<Contour> {
 	let mut builder = PathBuilder::new();
@@ -287,6 +445,10 @@ impl<'a> Backend for Soft2d<'a> {
 		let resources = list.resources();
 		let mut steps: Vec<Step> = Vec::with_capacity(list.commands().len());
 		let mut bounds: Vec<Option<PixelRect>> = Vec::with_capacity(list.commands().len());
+		// WHAT EACH COMMAND LEAVES FULLY OPAQUE, beside what it can touch. The two are different
+		// questions - one is conservative outward and the other conservative inward - and only the
+		// second can say a tile's backdrop will not be read.
+		let mut covers: Vec<Option<PixelRect>> = Vec::with_capacity(list.commands().len());
 		let target_rect = PixelRect::new(0, 0, target.extent.width, target.extent.height);
 		let mut widest_edges = 0usize;
 		for command in list.commands() {
@@ -295,6 +457,10 @@ impl<'a> Backend for Soft2d<'a> {
 					let contours = flatten_handle(resources, path.0, transform)?;
 					let bound = contour_bounds(&contours).map(cover).map(|rect| rect.intersection(&target_rect));
 					widest_edges = widest_edges.max(edge_count(&contours));
+					// THE ONLY COMMAND THAT CAN ANSWER THIS TODAY. A stroke's outline is a ring and
+					// covers nothing solidly, an image's opacity is the image's business, and a glyph
+					// run is glyphs - so the opaque cover is a filled rectangle's or nothing's.
+					covers.push(opaque_cover(&contours, paint, *opacity, *blend, *operator).map(covered).map(|rect| rect.intersection(&target_rect)));
 					(Step::Fill { edges: crate::raster::Edges::build(&contours), rule: *rule, paint: *paint, transform: *transform, antialias: *antialias, blend: *blend, operator: *operator, opacity: *opacity }, bound)
 				}
 				Command::StrokePath { path, paint, style, transform, antialias, blend, operator, opacity } => {
@@ -320,6 +486,7 @@ impl<'a> Backend for Soft2d<'a> {
 							let bound = polyline_bounds(&points).map(|rect| rect.intersection(&target_rect));
 							steps.push(Step::AliasedLines { points, paint: *paint, transform: *transform, blend: *blend, operator: *operator, opacity: *opacity });
 							bounds.push(bound);
+							covers.push(None);
 							continue;
 						}
 					}
@@ -351,6 +518,18 @@ impl<'a> Backend for Soft2d<'a> {
 					let contours = flatten_handle(resources, path.0, transform)?;
 					let clip_bounds = contour_bounds(&contours).map(cover).unwrap_or(PixelRect::new(0, 0, 0, 0)).intersection(&target_rect);
 					widest_edges = widest_edges.max(edge_count(&contours));
+					// THE RECTANGLE FAST PATH, WHICH IS MOST OF THE CLIPS IN A USER INTERFACE. See
+					// `Step::PushClipRect`: an inverse one is a hole and not a rectangle, so only the
+					// ordinary direction takes it.
+					if !*inverse
+						&& let Some(rect) = axis_aligned_rect(&contours)
+						&& is_pixel_aligned(rect)
+					{
+						steps.push(Step::PushClipRect { bounds: covered(rect).intersection(&target_rect) });
+						bounds.push(None);
+						covers.push(None);
+						continue;
+					}
 					// A CLIP IS A STATE COMMAND AND GOES INTO EVERY TILE, even the ones its shape does
 					// not reach: a tile that skipped the push would replay the rest of the list
 					// unclipped, which is the bug that looks like a random rectangle of extra content.
@@ -362,6 +541,11 @@ impl<'a> Backend for Soft2d<'a> {
 			};
 			steps.push(step);
 			bounds.push(bound);
+			// EVERY OTHER COMMAND COVERS NOTHING THIS CAN PROVE, and the vectors stay the same length
+			// as `steps` because they are indexed by the same command index.
+			if covers.len() < steps.len() {
+				covers.push(None);
+			}
 		}
 
 		// THE FILTER EXPANSION IS WHAT A LAYER'S SCRATCH IS GROWN BY, and it is taken from the graphs
@@ -415,6 +599,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 		let tiling = Tiling::new(target.extent, TILE_SIZE);
 		let bins = Bins::build(&tiling, &bounds);
+		let no_backdrop = tiles_without_backdrop(&tiling, &bins, &steps, &covers);
 		let scratch_extent = (TILE_SIZE + expansion * 2, TILE_SIZE + expansion * 2);
 		// ONE SURFACE PER OPEN LAYER, one per filter node of the largest graph, one for the blur's
 		// second pass, and one for the tile itself.
@@ -422,7 +607,9 @@ impl<'a> Backend for Soft2d<'a> {
 		let filter_nodes = resources.filters.iter().map(|graph| graph.nodes().len()).max().unwrap_or(0);
 		let surfaces = layers_wanted + filter_nodes + 2;
 		self.pool.reserve(surfaces, scratch_extent, target.color_space)?;
-		let clips_wanted = list.commands().iter().filter(|command| matches!(command, Command::PushClip { .. } | Command::PushClipMask { .. })).count();
+		// A RECTANGLE CLIP RESERVES NO MASK, because it never takes one - see `Step::PushClipRect`.
+		// Counting it would be scratch nothing reads, charged against the prepared-scratch ceiling.
+		let clips_wanted = steps.iter().filter(|step| matches!(step, Step::PushClip { .. } | Step::PushClipMask { .. })).count();
 		self.masks.reserve(clips_wanted, scratch_extent.0 as usize * scratch_extent.1 as usize);
 		self.raster.reserve(scratch_extent.0 as usize, widest_edges);
 		self.spans.reserve(scratch_extent.0 as usize);
@@ -439,7 +626,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 
 		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
-		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage })
+		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop })
 	}
 
 	fn render(&mut self, prepared: &Self::Prepared, target: &mut ImageViewMut<'_>) -> Result<(), Error> {
@@ -513,7 +700,12 @@ struct Scratch<'a, 'b> {
 fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRect, index: usize, surface: &mut Tile, shaders: &[Shader<'_>], lookup: &Lookup<'_>, table: Option<&TransferTable>, scratch: Scratch<'_, '_>) -> Result<(), Error> {
 	{
 		let Scratch { raster, pool, masks, spans, cache, glyphs } = scratch;
-		surface.load(target, tile, prepared.working, table)?;
+		// THE DECODE IS SKIPPED FOR A TILE SOMETHING OVERWRITES WHOLE. See `tiles_without_backdrop`:
+		// the scratch then still holds the previous tile's pixels, every one of which the covering
+		// command replaces, and the encode on the way out writes a full tile either way.
+		if !prepared.no_backdrop.get(index).copied().unwrap_or(false) {
+			surface.load(target, tile, prepared.working, table)?;
+		}
 		let mut clips = ClipStack::new();
 		clips.reset(tile);
 		let mut layers: Vec<Layer> = Vec::new();
@@ -579,10 +771,14 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 					match masks.take_filled(if *inverse { 255 } else { 0 }) {
 						Some(mut mask) => {
 							let stride = level_bounds.width as usize;
-							raster.fill_edges(edges, *rule, *antialias, level_bounds, |y, coverage| {
+							raster.fill_edges(edges, *rule, *antialias, level_bounds, |y, first, coverage| {
 								let Some(row) = y.checked_sub(level_bounds.y) else { return };
-								let start = row as usize * stride;
-								if let Some(slice) = mask.get_mut(start..start + stride.min(coverage.len())) {
+								// THE ROW'S COVERED RUN AND NOT ITS WHOLE WIDTH. The rest of the row
+								// is already what the mask was filled with - zero for an ordinary
+								// clip, `255` for an inverse one - which is exactly what a column no
+								// edge reached means in each direction.
+								let start = row as usize * stride + first;
+								if let Some(slice) = mask.get_mut(start..start + coverage.len().min(stride.saturating_sub(first))) {
 									write_mask_row(slice, coverage, *inverse);
 								}
 							});
@@ -593,6 +789,13 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 						// silently did nothing would let a child draw outside its parent.
 						None => clips.push(ClipLevel::rectangle(level_bounds)),
 					}
+				}
+				Step::PushClipRect { bounds } => {
+					let parent = match layers.last() {
+						Some(layer) => layer.bounds,
+						None => tile,
+					};
+					clips.push(ClipLevel::rectangle(parent.intersection(bounds)));
 				}
 				Step::PushClipMask { image, transform, inverse } => {
 					let parent = match layers.last() {
@@ -745,16 +948,19 @@ fn fill_edges(raster: &mut Rasteriser, spans: &mut Spans, edges: &crate::raster:
 	// A CLIP STACK OF PLAIN RECTANGLES IS ALREADY IN THE BOUNDS. Asking it per pixel would walk the
 	// stack and multiply by one, which on a scrolling list is most of what the composite costs.
 	let rectangular = clips.is_rectangular();
-	raster.fill_edges(edges, rule, antialias, bounds, |y, coverage| {
+	raster.fill_edges(edges, rule, antialias, bounds, |y, emitted, coverage| {
 		// THE RUN IS TRIMMED TO WHAT THE SHAPE ACTUALLY COVERS, because a row of a tile is sixty-four
 		// pixels and a shape's edge crosses a handful of them: compositing the whole row would spend
 		// the cost of a full-width span on a one-pixel line.
+		//
+		// THE RASTERISER NOW TRIMS THE FIRST HALF OF THAT ITSELF - `emitted` is where the row it
+		// handed over begins - so this walks what it was given rather than the tile.
 		let mut first = coverage.len();
 		let mut last = 0usize;
 		for (offset, value) in coverage.iter().enumerate() {
 			let mut weight = value.clamp(0.0, 1.0) * opacity;
 			if weight > 0.0 && !rectangular {
-				weight *= clips.coverage(bounds.x + offset as u32, y);
+				weight *= clips.coverage(bounds.x + (emitted + offset) as u32, y);
 			}
 			spans.weights[offset] = weight;
 			if weight > 0.0 {
@@ -765,12 +971,23 @@ fn fill_edges(raster: &mut Rasteriser, spans: &mut Spans, edges: &crate::raster:
 		if first >= last {
 			return;
 		}
+		let first = emitted + first;
+		let last = emitted + last;
 		let length = last - first;
-		for offset in 0..length {
-			let x = bounds.x + (first + offset) as u32;
-			spans.source[offset] = shader.at(x as f32, y as f32);
+		// A SOLID PAINT IS THE SAME COLOUR AT EVERY PIXEL, and asking it per pixel is a match on the
+		// shader enum inside the hot loop - which is both the arithmetic and the reason the loop
+		// cannot be vectorised. Filling the run is the same answer with the decision taken once.
+		// It matters because a solid is most of what a user interface is made of.
+		match shader {
+			Shader::Solid(colour) => spans.source[..length].fill(*colour),
+			_ => {
+				for offset in 0..length {
+					let x = bounds.x + (first + offset) as u32;
+					spans.source[offset] = shader.at(x as f32, y as f32);
+				}
+			}
 		}
-		crate::span::scale_span(&mut spans.source[..length], &spans.weights[first..last]);
+		crate::span::scale_span(&mut spans.source[..length], &spans.weights[first - emitted..last - emitted]);
 		into.read_span(bounds.x + first as u32, y, &mut spans.destination[..length]);
 		crate::span::composite_span(&mut spans.destination[..length], &spans.source[..length], operator, blend);
 		into.write_span(bounds.x + first as u32, y, &spans.destination[..length]);

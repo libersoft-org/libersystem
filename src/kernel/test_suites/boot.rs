@@ -826,3 +826,37 @@ fn no_selected_root_refuses_a_valid_block_volume() {
 	}
 	panic!("a storage instance with no selected root must refuse its otherwise valid disk");
 }
+
+// THE BOOT SURFACE'S ELEMENT SIZE, AND THE UNIT THE TWO DESCRIPTORS DISAGREE ABOUT.
+//
+// The loader states it in BITS and what the kernel hands userspace states it in BYTES, so there is a
+// division between them - and `BootInfo` is a wire between two SEPARATELY BUILT artifacts, which
+// makes the kernel its reader rather than its author. A reader that divides a number it did not
+// produce without asking whether the division is exact is one loader version away from a stride a
+// whole byte short of the one firmware described, which is a diagonal smear rather than a picture
+// and which no test on a matched pair would ever show.
+//
+// EVERY PRODUCER SUPPLIES A MULTIPLE OF EIGHT TODAY, which is exactly why this is a fixture and not
+// a bug report: the property holds, nothing enforced it, and this is what makes the enforcement
+// visible. The live machine's own answer is asserted alongside the refusals, so a change that made
+// this refuse a real boot surface fails here rather than on a blank screen.
+tagged_test!(a_boot_surface_states_its_element_size_in_whole_bytes, [Boot, Display], id = "kernel.boot.a_boot_surface_states_its_element_size_in_whole_bytes", covers = ["kernel"]);
+fn a_boot_surface_states_its_element_size_in_whole_bytes() {
+	assert_eq!(crate::element_bytes(32), Some(4), "the size every machine in the harness reports");
+	assert_eq!(crate::element_bytes(24), Some(3), "and a packed twenty-four-bit mode, which the loader also admits");
+	assert_eq!(crate::element_bytes(16), Some(2));
+	// REFUSED RATHER THAN ROUNDED. A surface whose element size this system cannot state is not one
+	// it can draw into, and the honest answer is what a machine with no video mode gets.
+	assert_eq!(crate::element_bytes(30), None, "a size that is not whole bytes is refused, not truncated to three");
+	assert_eq!(crate::element_bytes(1), None);
+	assert_eq!(crate::element_bytes(0), None, "and a zero is not a pixel at all");
+
+	// AND THE SURFACE THIS BOOT ACTUALLY HAS AGREES WITH ITS OWN PITCH. A pitch shorter than one row
+	// of the element size it claims is a descriptor whose two halves describe different surfaces.
+	if let Some((address, geometry)) = crate::framebuffer_geometry() {
+		assert!(address != 0, "a present boot surface has an address");
+		assert!(geometry.bytes_per_pixel > 0, "and an element size");
+		let row = geometry.width as u64 * geometry.bytes_per_pixel as u64;
+		assert!(geometry.pitch as u64 >= row, "the pitch holds a whole row: {} < {row}", geometry.pitch);
+	}
+}

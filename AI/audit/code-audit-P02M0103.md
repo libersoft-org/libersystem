@@ -1666,3 +1666,129 @@ WHAT THAT SAYS ABOUT THE HOST SUITE. Every one of the 112 conformance scenes pas
 target, and none of them could have caught a per-tile clip: the defect needs a drawing bigger than a
 tile, a clip in one part of it and a shape in another. A live screen is 1280 by 800 and every scene
 on it is that drawing.
+
+## The output scale, and the four backend changes under it (2026-09-15)
+
+THE SCALE PHASE WAS IMPLEMENTED AND UNREACHABLE, and what was missing was in the SERVICE rather than
+in the demo. `DisplayService` answered every surface `scale = 1:1` and had no source for another
+value, so the demo's own rule for telling a scale change from a resize - the same logical extent with
+a different ratio - could never fire. `display-admin` has `set-scale` now, beside `set-visible` and
+for the same reason: a client that could set the scale would be deciding how much memory every OTHER
+client's images need, which is an answer only something holding the whole screen may give.
+
+THE TWO EXTENTS STOPPED BEING ONE NUMBER. `Surface` carried a single extent that served as both the
+logical and the physical one, and a `console` flag doing duty as "native-sized". It now carries its
+logical extent, its physical one - the logical times the output's ratio - and whether it asked for
+the output's own size. That last separation was a defect on its own and not a tidiness: `console` is
+the FIRST native surface, so a SECOND surface that asked for the output's size did not follow a
+resize at all. It kept an extent the output no longer had, and was told about the change by a
+configuration whose numbers had not moved.
+
+THE RATIO IS BOUNDED AND APPLIED WHOLE. One eighth to eight, no zero on either side, and every
+surface's new physical extent is computed BEFORE any of them is touched - a scale that one surface
+cannot express leaves the output at the scale it had, rather than a screen whose windows disagree
+about what a logical pixel is. The refusals are asserted against the real service and the accepted
+case is asserted twice: as the configuration the service emits, and as the phase the demo reports
+having entered.
+
+AND THE RECORDING STOPPED ALLOCATING. `restart` already kept the builder's tables and their
+capacity; `finish` then CLONED the commands and every resource vector into a fresh `DrawList`, sixty
+times a second, for ever. `finish_into` writes into a list the caller already holds and `clone_from`
+keeps the allocation. One rule for every refusal: an error leaves the caller's list EMPTY, which
+covers both the canvas's balance checks - which refuse before writing anything, and would otherwise
+leave the PREVIOUS frame's list where a caller that ignored the error could present it again - and
+the list's own validation, which refuses half way through. The fixture asserts CAPACITY and not
+length, because an equal length is exactly what a reallocating implementation also produces.
+
+FOUR BACKEND CHANGES, EACH MEASURED ON ITS OWN, taking `UI-basic` from 46.1 ms to 29.2 ms and
+`UI-effects` from 336.1 ms to 232.6 ms. The conformance suite is unchanged by all four: 112 passed,
+0 failed, 0 unsupported, 0 untested, on the target.
+
+1. A TILE NOTHING READS THE BACKDROP OF IS NOT DECODED. The performance item had narrowed this
+   itself - "a tile that an opaque fill covers entirely should never be DECODED into the working
+   space in the first place" - and the conditions are the interesting part: a solid fully opaque
+   paint at full opacity, `Normal` over or copied, over an axis-aligned RECTANGLE, with no clip
+   pushed and no layer open. Each is a way a pixel could otherwise depend on what was under it, and
+   the scratch holds the PREVIOUS tile's pixels, so a tile wrongly believed covered shows them. The
+   cover rounds INWARD, which is the opposite of every other bound in this backend: `cover` rounds
+   outward because a bound one pixel too small clips a drawing, and this rounds inward because a
+   cover one pixel too large claims a partially covered pixel is fully painted.
+2. A RECTANGULAR CLIP NEEDS NO MASK, and this was not on anybody's list. `clip.rs`'s own header says
+   the axis-aligned rectangle keeps a fast path that needs no storage at all - and nothing ever
+   pushed one. Every clip rasterised its edges into a full-tile mask, zeroed first, in every tile of
+   the frame; `UI-basic` clips fifty times over eighty tiles. Taken only when the rectangle is
+   PIXEL-ALIGNED, because a rectangle level answers one or zero and an edge between two pixel centres
+   has an answer in between.
+3. THE WORKING INTERMEDIATE IS FOUR SINGLES AND WAS FOUR HALVES. No hardware half conversion is in
+   reach of a `no_std` build here, so every read and write of a working pixel went through a branchy
+   software routine, twice per channel. It is MORE accurate rather than less - the arithmetic above
+   it was `f32` throughout and the half rounded between every pair of composites - and it costs
+   hundreds of kilobytes against a sixty-four megabyte ceiling. Worth 30% of `UI-effects`.
+4. A ROW IS ONLY AS WIDE AS THE SHAPE REACHED. The area rasteriser zeroed two accumulators across the
+   whole width of its bounds, summed them across it, evaluated the winding rule at every column, and
+   handed its caller a full-width row to scan for the covered part - while a row of a thin stroke
+   crossing a sixty-four-wide tile touches two or three columns. It tracks the columns its edges
+   reached, keeps the accumulators clean by zeroing only those in the same pass that reads them, and
+   emits the covered run with the index it starts at. The columns outside have ONE answer each,
+   which is a fill where it is not zero and nothing at all where it is.
+
+WHERE IT STILL IS NOT ENOUGH, IN ONE NUMBER. `UI-basic` composites about 470,000 pixels in 29 ms:
+sixty-two nanoseconds each, a hundred and sixty cycles per pixel for an arithmetic that is a
+multiply and an add per channel. The remaining factor is not another term of this kind - it is the
+shape of the per-pixel path itself, and the milestone already declines to call that a tail of the
+item.
+
+AND THE MEASUREMENTS THE ITEM ASKED FOR ARE RECORDED. The live 640x480 figure turned out to be the
+RELEASE build on the target all along: `docs/PERF.md` claimed the debug profile because `./build.sh`
+builds the static services and drivers at `dev`, and the staged PIE applications do not come from
+there - `build-shared` compiles every consumer object and every provider library with `--release`,
+into an image target directory that has no `debug` tree at all. The HiDPI figure is new and is taken
+in the guest suite rather than the live boot, because nothing in a booted image SETS a scale: the
+ratio is the system's to choose and the only thing holding the admin channel is PermissionManager.
+That is a missing operator control rather than a missing capability, and it belongs to whoever writes
+the compositor.
+
+## The live gate was intermittent and the scene was drawing over its own text (2026-09-15)
+
+IT FAILED, PASSED ON A RE-RUN, AND FAILED AGAIN, always with the same line: "the colour glyph
+contributes 0 pixels of its own palette, so it is drawn in the run's paint or not at all". Two wrong
+diagnoses were made before the pixels were looked at - a rendering regression from the backend
+changes, then a race in the gate's timing - and both were wrong. The captures settled it in one
+reading:
+
+    shot1, y=80, x=162..178:  (24,54,93) (250,183,25) (51,25,0) (250,183,25) (24,54,93)
+    shot2, y=80, x=162..178:  (229,51,127) x 5
+
+The first is the colour glyph drawn exactly right: an orange ring around a dark centre. The second is
+a flat magenta over the whole of it. THE SCENE WAS DRAWING OVER ITS OWN TEXT. The multi-rect phase's
+patch sits at `(0.08h, 0.08h)` from the top-left corner and BLINKS between two sizes six frames
+apart; at the larger one it reaches `0.24h`, and the line of text was at `0.11h`. Half the frames of
+the demo had no visible text at all.
+
+IT IS A LATENT DEFECT THE BACKEND CHANGES EXPOSED rather than caused. The gate passed for as long as
+its captures happened to land on small-patch frames, and a faster renderer changes which tick a
+capture at a fixed wall-clock lands on. What the gate was reporting was true - the colour glyph was
+not on the screen - and what it blamed was not.
+
+THE FIX IS IN THE SCENE, because a line of text that is invisible half the time is a defect in the
+drawing and not in the measurement. It moved to `0.30h`, which is below the patch's band and left of
+the star, with room either side; the checker's sampled band moved with it, because where the text is
+and where the check looks are one fact and not two.
+
+AND TWO WEAKNESSES IN THE CHECKER WENT WITH IT, both of the same shape - a question asked in a way
+that could be answered by something other than what it was about.
+
+1. EVERY CHECK WAS ASKED OF THE FIRST FRAME, over a scene whose objects move across the whole
+   drawing. A capture with a mover parked on a sampled region reads as a property that is not drawn.
+   Each is now asked of all three captures and needs one to answer. That is not a weakening: three
+   captures two seconds apart of a drawing that never drew a colour glyph contain no colour glyph.
+2. THE CONSOLE PASSED A CHECK MEANT FOR THE DEMO. The gate slept six seconds and then captured; a
+   capture before the demo's first present shows the boot log, which is WHITE TEXT ON BLACK - so
+   "the line of text is being drawn" passed on a console screen while every colour check failed, and
+   the gate blamed the colour glyph for its own timing. It now waits for a frame that carries the
+   scene's coloured background, which no console screen has, and asks the same question of each of
+   the three captures.
+
+VERIFIED IN BOTH DIRECTIONS. A synthetic console frame - black with white text on it - fails all six
+checks and is named as what it is; the demo's own frames pass. Three consecutive green gate runs
+after the change, where before it was roughly one in two.

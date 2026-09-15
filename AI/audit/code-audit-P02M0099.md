@@ -789,3 +789,30 @@ needs the pinned upstream, so it belongs to the foreign-artifact track rather th
 consequence worth knowing: while it is red, no `harness/scenarios/` replay runs, and the development
 image cannot be built at all - which is why `dev_channel` and `dev_agent` were verified in this
 change by compiling the development configuration directly rather than by booting it.
+
+## The boot surface's element size, and a unit conversion nobody checked (2026-09-15)
+
+TWO DESCRIPTORS FOR ONE SURFACE, IN TWO UNITS. `bootproto::Framebuffer` states the element size in
+BITS and the `abi::Framebuffer` the kernel hands userspace states it in BYTES, so there is a division
+between them - and it was `fb.bpp / 8`, written twice in `kernel/main.rs`, unchecked at both.
+
+NOTHING TRUNCATES TODAY AND THAT IS THE POINT OF WRITING IT DOWN. Every producer supplies a multiple
+of eight: the UEFI path derives the element size from the channel masks and ROUNDS UP to whole bytes,
+and the two ramfb paths hard-code thirty-two. The division is exact on every machine this system
+boots. What was wrong is where the check was not - `BootInfo` is a wire between two SEPARATELY BUILT
+artifacts and the kernel is its READER, not its author. A reader that divides a number it did not
+produce without asking whether the division is exact is one loader version away from a stride a whole
+byte short of the one firmware described, and that is a diagonal smear rather than a picture. No test
+on a matched loader-and-kernel pair would ever show it.
+
+`element_bytes` IS THAT ONE PLACE, and it refuses rather than rounds. A surface whose element size
+this system cannot state is not a surface it can draw into, and the honest answer is the one a
+machine with no video mode gets: serial only. The fixture asserts the refusals, the live machine's
+own answer - so a change that made this refuse a real boot surface fails there rather than on a blank
+screen - and that this boot's pitch holds a whole row of the element size it claims, which is the
+other half of a descriptor whose two halves could describe different surfaces.
+
+IT IS ONE THIRD OF ONE OF THE THREE THINGS THE GOP ITEM'S PLAN NAMES, and the item stays open. The
+descriptor MERGE is not done, the early display is still a syscall rather than a provider, and the
+cache policy is still unstated. What the plan is for is that none of those three has to be
+rediscovered - and that the loader's mask checking, which IS done, is not redone by whoever takes it.

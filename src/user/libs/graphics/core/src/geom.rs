@@ -139,6 +139,18 @@ impl PixelRect {
 		}
 	}
 
+	/// Is `other` wholly inside this rectangle? An EMPTY `other` is inside anything, which is the
+	/// same convention the intersection above keeps: a rectangle with no pixels asks nothing of the
+	/// one it is compared against.
+	pub fn contains_rect(&self, other: &PixelRect) -> bool {
+		if other.is_empty() {
+			return true;
+		}
+		let (Some(right), Some(bottom)) = (self.right(), self.bottom()) else { return false };
+		let (Some(other_right), Some(other_bottom)) = (other.right(), other.bottom()) else { return false };
+		other.x >= self.x && other.y >= self.y && other_right <= right && other_bottom <= bottom
+	}
+
 	pub fn intersection(&self, other: &PixelRect) -> PixelRect {
 		let x = self.x.max(other.x);
 		let y = self.y.max(other.y);

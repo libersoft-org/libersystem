@@ -320,7 +320,31 @@ fn init_framebuffer() {
 		return;
 	}
 	let fb = &bi.framebuffer;
-	console::init(console::FbInfo { addr: fb.addr as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bpp as usize / 8, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size });
+	let Some(bytes_per_pixel) = element_bytes(fb.bpp) else { return };
+	console::init(console::FbInfo { addr: fb.addr as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size });
+}
+
+// THE BOOT SURFACE'S ELEMENT SIZE IN BYTES, or `None` for one this system cannot describe.
+//
+// THE TWO DESCRIPTORS DISAGREE ABOUT UNITS, which is why there is a conversion here at all: the
+// loader's `bootproto::Framebuffer` states the element size in BITS and the `abi::Framebuffer` the
+// kernel hands userspace states it in BYTES. It was `fb.bpp / 8` at both of this function's call
+// sites, unchecked.
+//
+// NOTHING TRUNCATES TODAY AND THAT IS NOT THE POINT. Every producer supplies a multiple of eight -
+// the UEFI path derives the size from the channel masks and rounds UP to whole bytes, and the two
+// ramfb paths hard-code thirty-two - so the division is exact on every machine this system boots.
+// What was wrong is where the check was not: `BootInfo` is a wire between two SEPARATELY BUILT
+// artifacts, the kernel is its reader, and a reader that divides a number it did not produce without
+// asking whether the division is exact is one loader version away from a stride that is a whole byte
+// short of the one the firmware described - which is a diagonal smear rather than a picture, and
+// which no test on a matched pair would ever show.
+//
+// REFUSED RATHER THAN ROUNDED. A surface whose element size this system cannot state is not a
+// surface it can draw into, and the honest answer is the one a machine with no video mode gets:
+// serial only.
+fn element_bytes(bits: u32) -> Option<u32> {
+	(bits != 0 && bits % 8 == 0).then(|| bits / 8)
 }
 
 // The boot framebuffer's virtual base + geometry, for the framebuffer_map syscall to
@@ -332,7 +356,7 @@ pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
 		return None;
 	}
 	let fb = &bi.framebuffer;
-	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: fb.bpp / 8, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] };
+	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: element_bytes(fb.bpp)?, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] };
 	Some((fb.addr, geom))
 }
 

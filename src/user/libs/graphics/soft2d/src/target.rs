@@ -207,23 +207,33 @@ impl Surface {
 	}
 }
 
-/// The canonical intermediate is four halves.
-const BYTES_PER_PIXEL: usize = 8;
+/// THE CANONICAL INTERMEDIATE IS FOUR SINGLES, and it was four halves (changed 2026-09-15).
+///
+/// WHY IT CHANGED: this machine has no hardware half conversion in reach of a `no_std` build, so
+/// every read and every write of a working pixel went through a branchy software routine - twice per
+/// channel, four channels, on the hot loop of the whole backend. Doubling the scratch to remove
+/// eight conversions per pixel per access is the trade, and the scratch it doubles is a tile plus a
+/// surface per open layer, measured in hundreds of kilobytes against a sixty-four megabyte ceiling.
+///
+/// AND IT IS MORE ACCURATE, not less. A half carries eleven bits of mantissa and the arithmetic
+/// above it is `f32` throughout, so the old intermediate ROUNDED between every pair of composites -
+/// which is a loss the conformance suite tolerated rather than wanted.
+const BYTES_PER_PIXEL: usize = 16;
 
 fn decode_half(pixel: &[u8]) -> Rgba {
-	let channel = |index: usize| graphics_core::pixel::half_to_f32(u16::from_le_bytes([pixel[index * 2], pixel[index * 2 + 1]]));
+	let channel = |index: usize| f32::from_le_bytes([pixel[index * 4], pixel[index * 4 + 1], pixel[index * 4 + 2], pixel[index * 4 + 3]]);
 	Rgba::new(channel(0), channel(1), channel(2), channel(3))
 }
 
 fn encode_half(pixel: &mut [u8], value: Rgba) {
 	for (index, channel) in [value.red, value.green, value.blue, value.alpha].into_iter().enumerate() {
-		pixel[index * 2..index * 2 + 2].copy_from_slice(&graphics_core::pixel::f32_to_half(channel).to_le_bytes());
+		pixel[index * 4..index * 4 + 4].copy_from_slice(&channel.to_le_bytes());
 	}
 }
 
 /// The layout of every intermediate this backend makes.
 pub fn canonical_layout(extent: Extent2D, space: ColorSpace) -> Result<ImageLayout, CoreError> {
-	let storage = PixelStorage::Known(PixelFormat::R16G16B16A16Float);
+	let storage = PixelStorage::Known(PixelFormat::R32G32B32A32Float);
 	let pitch = storage.minimum_row_bytes(extent.width).ok_or(CoreError::Overflow)?;
 	let semantics = ImageSemantics::Color { color_space: space.linear_counterpart(), alpha_mode: AlphaMode::Premultiplied };
 	ImageLayout::new(extent, pitch, storage, RowOrigin::TopLeft, semantics)

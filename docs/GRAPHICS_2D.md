@@ -87,8 +87,15 @@ silent re-preparation.
   in 64-pixel tiles, so a layer, a clip mask and a filter intermediate are sized to a tile plus what a
   filter reaches past it rather than to the surface: a four-thousand-pixel-wide drawing with three
   nested layers costs three tiles of scratch and not three screens.
-  As a formula: `tile_pixels = 64 * 64`, and a layer or mask costs `tile_pixels * 8 bytes` in the
-  canonical half-float intermediate, grown on each side by a filter's own declared reach.
+  As a formula: `tile_pixels = 64 * 64`, and a layer costs `tile_pixels * 16 bytes` in the canonical
+  intermediate - four singles per pixel - grown on each side by a filter's own declared reach. A clip
+  MASK is one byte per pixel and only when it is not a rectangle: an axis-aligned pixel-aligned clip
+  is two corners and no storage at all.
+  THE INTERMEDIATE WAS FOUR HALVES AND IS FOUR SINGLES (2026-09-15). There is no hardware half
+  conversion in reach of a `no_std` build here, so every read and write of a working pixel went
+  through a branchy software routine twice per channel; doubling the scratch removes eight
+  conversions per pixel per access, and it is MORE accurate rather than less, because the arithmetic
+  above it was `f32` throughout and the half rounded between every pair of composites.
 * **The glyph cache** is bounded and evicts in insertion order, which for text is close to
   least-recently-used and is deterministic: an eviction that depended on a clock would make two runs
   of one drawing do different work.
@@ -128,9 +135,16 @@ and nothing else.
 
 Two gates watch it. `kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage` runs it against
 a real DisplayService and reads the DAMAGE at the device end: the multi-rect phase's two distant
-regions arrive as TWO rectangles, a resize is survived by a rebuild, the screen is taken away and
-given back with nothing presented in between, and every surface it held is reclaimed when its process
-ends. `./check.sh --gate qemu-2d-demo` boots a guest and checks PIXELS: three timed frames that
+regions arrive as TWO rectangles, a resize is survived by a rebuild, a SCALE CHANGE is told apart
+from that resize and survived too, the screen is taken away and given back with nothing presented in
+between, and every surface it held is reclaimed when its process ends.
+
+A SCALE CHANGE AND A RESIZE ARE BOTH A NEW GENERATION, and what tells them apart is the
+configuration: a surface keeps the LOGICAL extent it has - a window is the same size on the desk -
+and its PHYSICAL extent becomes that times the output's ratio, so the same logical extent with a
+different ratio is a scale change and nothing else is. The ratio is the SYSTEM's to choose:
+`display-admin`'s `set-scale` sits beside `set-visible` because a client that could set it would be
+deciding how much memory every other client's images need. `./check.sh --gate qemu-2d-demo` boots a guest and checks PIXELS: three timed frames that
 differ, partially covered pixels along the shallow edge, a group-opacity overlap that is a mix of its
 children, a filtered image with more than two shade bands, and a text row carrying both white glyphs
 and a colour one.
@@ -144,8 +158,15 @@ tree holds no binary assets under `docs/` - and the command above is what produc
 The numbers and their conditions are in [`PERF.md`](PERF.md): the headless benchmark
 (`./bench.sh --suite soft2d`) measures four frozen 640x480 scenes at `--release` on a stated
 reference host, and the live measurement (`test2d-sw --size=640x480`) reports what a frame costs and
-what the loop's present interval came to inside a guest at the DEBUG profile the image stages. The
-two are not comparable and the document says so beside each.
+what the loop's present interval came to inside a guest. BOTH ARE `--release`: `build-shared` compiles
+every staged PIE and every provider library that way, which the performance document used to deny.
+They are still reported separately, because one has a real display, a real service and a real present
+path in it and the other has none of the three - and only the headless one is a floor.
+
+A HiDPI figure is beside them, which is the same scene at the same logical size with its physical
+extent doubled. It is measured in the guest suite rather than the live boot for a reason worth
+knowing: nothing in a booted image SETS a scale yet, because the only thing holding the display admin
+channel is PermissionManager. That is a missing operator control, not a missing capability.
 
 ## The tri-architecture matrix
 
