@@ -15,6 +15,10 @@ extern crate alloc;
 // deleted before the move, not carried across by it.
 pub mod blk;
 pub mod common;
+// VIRTIO-SERIAL MULTIPORT AS PURE DECISIONS: which queues a port owns, what a control message means,
+// and what this driver refuses. Every input here is bytes the DEVICE chose, which is why it is a
+// module with fixtures rather than a branch inside a binary nobody can run on the host.
+pub mod console;
 pub mod descriptor;
 pub mod gpu;
 // THE HID REPORT-DESCRIPTOR PARSER AND REPORT DECODER. It was a module INSIDE the xHCI binary,
@@ -27,6 +31,7 @@ pub mod input;
 pub mod keys;
 pub mod net;
 pub mod port;
+pub mod serial_port;
 pub mod snd;
 pub mod usb;
 // The in-controller class-module execution model: what a USB class driver IS in this system, and the

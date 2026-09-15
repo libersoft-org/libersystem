@@ -136,6 +136,7 @@ keys = [
 	"gate.provider-routing / host / host / default",
 	"gate.qemu-virtio-iommu-x86_64 / host / host / default",
 	"gate.qemu-2d-demo / host / host / default",
+	"gate.virtio-multiport / host / host / default",
 	"gate.rollback-floor-x86_64 / host / host / default",
 	"gate.run-verdict / host / host / default",
 	"gate.secure-boot / host / host / default",

@@ -591,3 +591,82 @@ followed the script it tests:
 And two staged components had neither an oracle nor a stated reason: `font_catalogue`, which the text
 guest gate really does exercise and now names, and `virtio_rng`, which nothing starts - recorded as
 the gap it is.
+
+## The written plan for virtio-serial multiport (2026-09-15)
+
+The milestone's own rule - NO ITEM IS STARTED WITHOUT ITS OWN WRITTEN PLAN - is why this exists
+before any code. Three facts in this tree decide the shape and none of them is in the item's
+sentence:
+
+1. THE HARNESS ALREADY PAYS FOR THE MISSING FEATURE, and says so. `qemu-run.sh` attaches the
+   development channel as a `virtconsole` rather than a `virtserialport` because without MULTIPORT
+   there is no control queue to open a generic port with - measured, per its own comment - and the
+   price is a UEFI firmware preamble on the channel that the framing above it skips. The feature is
+   not new capability for its own sake: it retires a workaround that is already documented.
+2. THE DESTINATION IS NOT A NEW SERVICE. `ProviderKind::ConsoleBytes` is published by DeviceManager
+   and subscribed by the development agent. What is missing is SELECTION: `ProviderInfo` has no name
+   field, so two open ports are two indistinguishable providers - and that field, or the ninth
+   provider kind the milestone's head allows, is what the implementer owns.
+3. THE QUEUE INDEX RULE IS THE SPECIFICATION'S. Port 0 keeps 0 and 1, control is 2 and 3, port n is
+   `2n + 2` and `2n + 3`. Numbering them otherwise produces a device that answers nothing, which
+   presents as a dead port rather than as a wrong index.
+
+AND THE GATE IS NAMED CONCRETELY, which is what the milestone demands of a gate: one
+`virtio-serial-pci` carrying BOTH a `virtconsole` and a `virtserialport,name=org.libersystem.dev`,
+each on its own chardev socket, with the observable effect being bytes written to the NAMED port
+arriving on that port's socket and on no other. A single-port driver cannot produce that effect at
+all, which is what makes it an oracle rather than a liveness check.
+
+## virtio-serial multiport: the control half has landed (2026-09-15)
+
+`VIRTIO_CONSOLE_F_MULTIPORT` is negotiated, the control queue pair is set up, `DEVICE_READY` goes
+out and every `PORT_ADD` is answered with `PORT_READY` - which is what an unanswered announcement
+costs: a port the device will never open. The test machine now carries a `virtserialport` named
+`org.libersystem.diag` beside the `virtconsole` on one `virtio-serial-pci`, and the driver's own line
+reads `multiport 2/2` against `multiport 1/1` on the machine's other console function.
+
+THE COUNT IS THE ORACLE AND NOT A LIVENESS LINE. A single-port driver cannot see the second port at
+all - there is no control queue to learn about it through - so "two ports found, two open" is an
+effect that only the feature produces. That is the shape this milestone's gate rule asks for.
+
+THE DECISIONS ARE IN A MODULE WITH FIXTURES, because every input is bytes the device chose:
+`drivers::console` holds the queue-index rule, the message, the port state machine and the refusals.
+Its seven tests are the hostile half - four thousand announced ports, a message shorter than its
+header, an undefined event, a name longer than the buffer, a repeated open, and the invariant that no
+port ever claims the control queue's indices.
+
+AND THE HANDSHAKE IS BOUNDED IN TWO DIRECTIONS: a round count, and a quiet count that ends it when
+the device stops answering. A driver that waited for a device that never speaks again would never
+report at all, which is a worse failure than a port nobody can use - and the console it already has
+keeps working either way.
+
+WHAT IS LEFT: the per-port byte pump, one `ConsoleBytes` provider per open port carrying the port's
+NAME (which `ProviderInfo` has no field for - that is the IDL change the plan names), and the gate
+that reads bytes back off the named port's own capture file.
+
+## The name on the wire, and the gate that reads a port's own chardev (2026-09-15)
+
+TWO PROVIDERS OF ONE KIND ON ONE DEVICE IS WHY `ProviderInfo` GAINED A NAME. A virtio-serial device
+with a console port and a named diagnostic port publishes two `console-bytes` providers whose every
+other field is identical - same address, same binding, same kind - so a consumer asking for the kind
+gets whichever the catalogue hands it. The name travels from the driver's own offer
+(`encode_offer_named`, bounded at forty-eight bytes) through DeviceManager's offer table and the
+catalogue entry into every snapshot and subscription frame.
+
+AND THE DECODE HAD TO CHANGE SHAPE, not just gain a field: `decode_offer` refused any payload that
+was not exactly four bytes, so a named publication from a newer driver would have read as a CORRUPT
+frame to an older manager rather than as a publication whose name it does not understand. It now
+takes anything from the header up to the header plus the bound, and refuses past it.
+
+THE GATE IS `./check.sh --gate virtio-multiport`, and what makes it an oracle rather than a liveness
+check is the chardev it reads: the test machine's `virtio-serial-pci` carries a `virtconsole` and a
+`virtserialport,name=org.libersystem.diag`, each with its own capture file. The driver writes one
+line to the GENERIC port, and the gate requires it on that port's capture and requires its ABSENCE
+from the console's. A single-port driver cannot see the port, open it or write to it - there is no
+control queue to learn about it through - so neither half of that is producible without the feature.
+The console's own banner is asserted in the same run, because a feature that cost the port that ships
+today would not be worth having.
+
+WHAT IS LEFT for the item: the per-port byte PUMP - a receive pool, a transmit path and one provider
+per open port served to a consumer the way the development channel's single port is served today. The
+write direction and the name are done; the duplex stream is not.

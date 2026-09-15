@@ -1636,10 +1636,18 @@ qemu_run_x86_64() {
 	if [[ "$dma_fixture" != "1" ]]; then
 		local vcon_out="$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.$$.out"
 		scratch_sweep "$QEMU_BUILD_DIR/virtio-console${artifact_suffix}" .out
+		# AND A SECOND, NAMED, GENERIC PORT ON THE SAME BUS. A `virtserialport` only opens once the
+		# guest driver has negotiated MULTIPORT and answered the control queue - which is what makes
+		# it an oracle rather than a decoration: a single-port driver cannot see this port at all,
+		# and the guest's own report says how many it found.
+		local vport_out="$QEMU_BUILD_DIR/virtio-serialport${artifact_suffix}.$$.out"
+		scratch_sweep "$QEMU_BUILD_DIR/virtio-serialport${artifact_suffix}" .out
 		qemu_args+=(
-			-device "virtio-serial-pci,$virtio_opts"
-			-device virtconsole,chardev=vcon
+			-device "virtio-serial-pci,id=multiport,$virtio_opts"
+			-device virtconsole,chardev=vcon,bus=multiport.0
 			-chardev "file,id=vcon,path=$vcon_out"
+			-device "virtserialport,chardev=vport,bus=multiport.0,name=org.libersystem.diag"
+			-chardev "file,id=vport,path=$vport_out"
 		)
 	fi
 

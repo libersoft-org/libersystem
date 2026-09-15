@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 122] = [
+const GATES: [(&str, &str); 123] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -353,6 +353,10 @@ const GATES: [(&str, &str); 122] = [
 	// as pixels - the half of that proof a log cannot make, because a renderer that draws nothing
 	// reports exactly what a renderer that draws everything reports.
 	("qemu-2d-demo", "bin.test2d-sw"),
+	// THE VIRTIO-SERIAL CONTROL QUEUE, whose subject is the driver that negotiates it: a generic port
+	// exists for a driver with MULTIPORT and for no other, so a change to this driver is what can
+	// break it.
+	("virtio-multiport", "bin.virtio_console"),
 	("iommu-ports", "kernel"),
 	("iommu-aarch64-direct-gicv2", "kernel"),
 	("iommu-aarch64-direct-gicv2-hostile", "kernel"),
@@ -733,8 +737,9 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 30] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 31] = [
 	"dma-mode-x86_64",
+	"virtio-multiport",
 	"qemu-2d-demo",
 	"iommu-ports",
 	"iommu-aarch64-direct-gicv2",

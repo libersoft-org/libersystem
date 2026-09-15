@@ -2056,26 +2056,44 @@ struct Offers {
 	// including after withdrawal; it is the only name the driver has for its own publication.
 	tokens: [u16; driver_protocol::MAX_INITIAL_OFFERS],
 	handles: [u64; driver_protocol::MAX_INITIAL_OFFERS],
+	// WHAT THE PUBLISHER CALLS IT, and empty for a publication with no name. One device can publish
+	// two providers of one KIND - a virtio-serial console port and a named diagnostic port are both
+	// `console-bytes` - and every other field the catalogue carries is the same for both, so without
+	// this a consumer asking for the kind gets whichever it is handed.
+	names: [[u8; driver_protocol::MAX_PROVIDER_NAME]; driver_protocol::MAX_INITIAL_OFFERS],
+	name_lens: [u8; driver_protocol::MAX_INITIAL_OFFERS],
 	count: usize,
 }
 
 impl Offers {
 	fn new() -> Self {
-		Self { kinds: [0; driver_protocol::MAX_INITIAL_OFFERS], tokens: [0; driver_protocol::MAX_INITIAL_OFFERS], handles: [0; driver_protocol::MAX_INITIAL_OFFERS], count: 0 }
+		Self { kinds: [0; driver_protocol::MAX_INITIAL_OFFERS], tokens: [0; driver_protocol::MAX_INITIAL_OFFERS], handles: [0; driver_protocol::MAX_INITIAL_OFFERS], names: [[0; driver_protocol::MAX_PROVIDER_NAME]; driver_protocol::MAX_INITIAL_OFFERS], name_lens: [0; driver_protocol::MAX_INITIAL_OFFERS], count: 0 }
 	}
 
 	// Answers false when the bound is reached or a token is repeated, so the caller can close its
 	// handle rather than accumulate. "Any number" is not a bound, and a driver is a separate process
 	// that may be wrong or malicious.
-	fn push(&mut self, kind: u16, token: u16, handle: u64) -> bool {
+	fn push(&mut self, kind: u16, token: u16, name: &[u8], handle: u64) -> bool {
 		if self.count >= driver_protocol::MAX_INITIAL_OFFERS || self.tokens[..self.count].contains(&token) {
 			return false;
 		}
 		self.kinds[self.count] = kind;
 		self.tokens[self.count] = token;
 		self.handles[self.count] = handle;
+		// TRUNCATED RATHER THAN REFUSED, and the decode above already refuses anything past the
+		// bound: what reaches here is at most a full name, and the copy is bounded regardless
+		// because a name is bytes a driver chose.
+		let keep = name.len().min(driver_protocol::MAX_PROVIDER_NAME);
+		self.names[self.count][..keep].copy_from_slice(&name[..keep]);
+		self.name_lens[self.count] = keep as u8;
 		self.count += 1;
 		true
+	}
+
+	// The name of one offer, as the catalogue records it.
+	fn name(&self, index: usize) -> &[u8] {
+		let length = self.name_lens.get(index).copied().unwrap_or(0) as usize;
+		self.names.get(index).map(|name| &name[..length]).unwrap_or(&[])
 	}
 
 	// THERE IS NO `take` HERE ANY MORE. Taking a provider straight off the driver's message is what
@@ -2126,6 +2144,17 @@ struct Provider {
 	// on the first client that ever connected. See `Catalogue::take`, `mint_connection`,
 	// `Devices::open` and `Catalogue::disconnected`.
 	consumers: u16,
+	// WHAT THE PUBLISHER CALLS IT, carried from the offer so a consumer can tell two providers of one
+	// kind on one device apart. Empty for a publication with no name of its own, which is every
+	// publication in this tree until a driver has two of the same kind.
+	name: [u8; driver_protocol::MAX_PROVIDER_NAME],
+	name_len: u8,
+}
+
+impl Provider {
+	fn name(&self) -> &[u8] {
+		&self.name[..self.name_len as usize]
+	}
 }
 
 // A CONNECTION TO THE PROVIDER IN `slot`, by the rule `Devices::open` states: the OFFERED channel is
@@ -2187,7 +2216,7 @@ fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u6
 
 // One provider, as the wire describes it. `live` is what tells a publication from a withdrawal.
 fn provider_info_wire(provider: &Provider, live: bool) -> proto::system::ProviderInfo {
-	proto::system::ProviderInfo { kind: provider_kind_from_wire(provider.kind), bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live }
+	proto::system::ProviderInfo { kind: provider_kind_from_wire(provider.kind), bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live, name: alloc::string::String::from_utf8_lossy(provider.name()).into_owned().into() }
 }
 
 // One frame on one subscription. Answers false when the endpoint would not take it, which is a
@@ -2434,7 +2463,10 @@ impl Catalogue {
 			// The count is now what it says it is - how many consumers have been GIVEN a
 			// connection - and every path that hands one out is the path that increments it:
 			// `take`, `mint_connection` and `open`.
-			let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 0 };
+			let mut name = [0u8; driver_protocol::MAX_PROVIDER_NAME];
+			let published_name = offers.name(index);
+			name[..published_name.len()].copy_from_slice(published_name);
+			let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 0, name, name_len: published_name.len() as u8 };
 			// AND EVERYONE WATCHING THAT KIND IS TOLD, which is the live half of a subscription:
 			// a consumer that subscribed before this driver bound sees it appear.
 			self.announce(&provider, true);
@@ -3011,11 +3043,11 @@ fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 				continue;
 			}
 			driver_protocol::Opcode::Offer => {
-				let Ok((kind, token)) = driver_protocol::decode_offer(header.payload(buf)) else {
+				let Ok((kind, token, name)) = driver_protocol::decode_offer(header.payload(buf)) else {
 					refuse(&handles);
 					continue;
 				};
-				if node.offers.push(kind, token, handles.as_slice()[0]) {
+				if node.offers.push(kind, token, name, handles.as_slice()[0]) {
 					node.push(BindingEvent::Offered { generation });
 				} else {
 					// PAST THE BOUND IS A REFUSAL WITH THE HANDLE CLOSED, not an accumulation.
@@ -3618,15 +3650,17 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// state one too many and the driver waits forever for a frame that is not coming.
 	//
 	// The interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci, virtio-gpu,
-	// dev-channel) each take their own per-device MSI-X vector, edge-triggered with no INTx
-	// sharing. The gpu routes only its CONFIG vector to it and keeps its control queue
-	// polled; the dev channel is idle almost always and must block on its interrupt rather
+	// dev-channel, virtio-console) each take their own per-device MSI-X vector, edge-triggered
+	// with no INTx sharing. The gpu routes only its CONFIG vector to it and keeps its control
+	// queue polled; the dev channel is idle almost always and must block on its interrupt rather
 	// than poll, because a spinning driver starves the cooperative scheduler for the guest's
-	// whole life. The remaining polling drivers get none, so their device IRQs stay silent.
+	// whole life - and the console driver joined that list when its multiport ports became byte
+	// streams served to consumers, which is the same idle-then-burst shape on the same hardware.
+	// The remaining polling drivers get none, so their device IRQs stay silent.
 	// RECORDED ON THE TRANSACTION AS THEY ARE TAKEN. The list used to be a local array, so a
 	// failure while acquiring a later entry - or while sending - reached `give_up` with the
 	// earlier ones held and nothing able to close them.
-	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel";
+	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel" || driver_name == b"virtio_console";
 	if use_msix {
 		let irq: i64 = device_msix_acquire(grant.claim);
 		if irq < 0 {
@@ -4654,7 +4688,7 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 
 	fn subscribe(&mut self, kind: proto::system::ProviderKind) -> Vec<proto::system::ProviderInfo> {
 		let wire: u16 = provider_kind_wire(kind);
-		self.catalogue.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live: true }).collect()
+		self.catalogue.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation, live: true, name: alloc::string::String::from_utf8_lossy(provider.name()).into_owned().into() }).collect()
 	}
 }
 

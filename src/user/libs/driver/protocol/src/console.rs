@@ -60,6 +60,26 @@ pub struct Identity {
 	pub binding_generation: u64,
 }
 
+// WHETHER A PUBLICATION IS THE ONE THIS CONSUMER ASKED FOR, by name.
+//
+// The KIND says what a provider is and the NAME says which one. A development image publishes
+// `console-bytes` from the development channel's own device AND from every generic port a multiport
+// virtio-serial device opens, and every other catalogue field is identical for all of them - so
+// without this a consumer takes whichever it is handed, and for a byte stream that is not refused
+// anywhere: the bytes simply arrive at the wrong port.
+//
+// AN EMPTY SELECTOR MATCHES ANYTHING, which is the consumer that has no preference and is happy with
+// whatever publishes this kind. An empty NAME matches only that consumer: a publication with no name
+// of its own cannot be what somebody asked for by name.
+//
+// EXACT BYTES, WITH NO PREFIX OR CASE RULE. A name is a selector a person types and a host
+// configures; "starts with" or "ignoring case" would make `org.libersystem.dev` match
+// `org.libersystem.dev2` or `ORG.LIBERSYSTEM.DEV`, and the failure would be a consumer quietly
+// attached to a port that is not its own.
+pub fn selects(published: &[u8], wanted: &[u8]) -> bool {
+	wanted.is_empty() || published == wanted
+}
+
 // What one publication frame means to a consumer holding `held`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Follow {

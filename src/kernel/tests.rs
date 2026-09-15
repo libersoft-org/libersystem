@@ -149,7 +149,7 @@ fn serve_provider_catalogue(server: &object::channel::Channel, kind: device_prot
 	use object::channel::{Channel, Message};
 	use object::handle::Capability;
 	use object::rights::Rights;
-	let info = device::ProviderInfo { kind, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, live: true };
+	let info = device::ProviderInfo { kind, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, name: alloc::string::String::new().into(), live: true };
 
 	// 1. THE SUBSCRIPTION. The reply is the correlation number and one handle - the stream - and
 	//    nothing else; the client checks exactly that.
@@ -281,7 +281,7 @@ fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<al
 				// no use for it: it collects what a handshake offered and asks by KIND. The real
 				// manager keeps it, because a driver withdrawing one of two providers of one kind
 				// has no other way to say which.
-				if let (Ok((kind, _token)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
+				if let (Ok((kind, _token, _name)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
 					offers.push((kind, cap.object()));
 				}
 			}

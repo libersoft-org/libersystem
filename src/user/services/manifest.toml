@@ -1886,25 +1886,33 @@ stage = "volume"
 destination = "drivers/virtio_console.lsexe"
 providers = []
 
-# IT DECLARED A PROVIDER IT NEVER PUBLISHED, and the declaration is what went (2026-09-13).
+# IT DECLARED A PROVIDER IT NEVER PUBLISHED, and the declaration went first (2026-09-13); then the
+# driver grew the publication and it came back, which is the order that was wanted.
 #
-# This entry said `provides = [{ kind = "console-bytes", most = 1 }]` and the driver publishes
-# nothing at all: it brings the port up, writes its banner over the transmit queue and stands. A
+# This entry said `provides = [{ kind = "console-bytes", most = 1 }]` while the driver published
+# nothing at all: it brought the port up, wrote its banner over the transmit queue and stood. A
 # declaration nothing satisfies is not harmless here - `provides` is what the manager sizes a
 # binding's provider slots from and what a consumer reads as "this image has one of those", so the
 # machine claimed a console byte stream that no `open` could ever reach.
 #
-# The alternative was to make this driver serve the stream. It is NOT taken, and the reason is worth
-# writing down: a second `console-bytes` publisher in a development image would be
-# indistinguishable from the development channel to a consumer that selects by kind, and the version
-# handshake cannot tell them apart because both would speak the same version. Telling two publishers
-# of one kind apart needs a ROLE the registry declares and the catalogue carries, and nothing in this
-# tree has one yet. So this driver publishes nothing and says so, and the first item that adds a
-# second console byte stream - virtio-serial multiport is the candidate - owes that role first.
+# What the removal was waiting for was written down with it: "a second `console-bytes` publisher in a
+# development image would be indistinguishable from the development channel to a consumer that
+# selects by kind, and the version handshake cannot tell them apart because both would speak the same
+# version. Telling two publishers of one kind apart needs a ROLE the registry declares and the
+# catalogue carries, and nothing in this tree has one yet." A publication now carries a NAME, the
+# catalogue carries it through to `provider-info`, and the development channel publishes under
+# `org.libersystem.dev` while each port here publishes under the name the host gave the port. That is
+# the role, so the declaration is honest again.
+#
+# `most` IS THE BRING-UP PROTOCOL'S BOUND, not a count of the ports any one machine has: four
+# publications travel with one handshake, so four is the most this driver can ever offer however many
+# ports a device opens. One consumer each, because a byte stream divided between two readers is bytes
+# arriving at whichever drained first.
 [programs.driver]
 lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 3 }]
+provides = [{ kind = "console-bytes", most = 4, consumers = 1 }]
 heartbeat-deadline = 100
 
 [[programs]]

@@ -4,6 +4,44 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## The 2D demo, live, at 640x480 (2026-09-15)
+
+`test2d-sw --frames=600 --phase-frames=60 --size=640x480` inside a booted guest, reporting its own
+two numbers: what a FRAME COSTS - record the list and replay it into the surface's image - and what
+the loop's present INTERVAL came to with the display's pacing in it. They are different claims, and a
+demo that reported only the second would look fast on a machine that throttled it.
+
+| what | mean | worst |
+| --- | ---: | ---: |
+| draw (record + replay) | 88.3 ms | 116.4 ms |
+| present interval | 141.4 ms | 178.6 ms |
+
+**THIS IS THE DEBUG BUILD AND IS NOT A BUDGET.** Everything the guest stages is built by
+`./build.sh` at the `dev` profile - unoptimized, with debug assertions - because that is what the
+image carries today, and the headless benchmark above measures `--release` on the host for exactly
+this reason. The two are not comparable and this table is not a floor: what it IS good for is the
+SHAPE - the draw is most of the interval, so what the loop waits for is the renderer rather than the
+display - and as a number to compare the next debug measurement against.
+
+**What it does not yet answer.** The release measurement on the target, and the HiDPI scale the
+milestone asks for beside it: `DisplayService` answers every surface `scale = 1:1` and has no source
+for another value, so there is no second scale to measure at.
+
+**The same demo inside the guest suite, at 192x128, on all three ports.** The gate
+`kernel.services.the_2d_demo_draws_a_real_scene_with_real_damage` runs the same scene against a real
+DisplayService with a stand-in GPU, and the demo reports its own draw time there too. The two
+emulated ports are TCG - x86_64 has KVM - so what this table measures is the EMULATOR, and it is
+here because it is the number a reader will otherwise mistake for the port being slow.
+
+| port | draw mean | draw worst |
+| --- | ---: | ---: |
+| x86_64 (KVM) | 29.9 ms | 34.8 ms |
+| aarch64 (TCG) | 412.8 ms | 461.4 ms |
+| riscv64 (TCG) | 523.8 ms | 608.1 ms |
+
+Fourteen times and seventeen times the x86_64 figure, on a scene an eighth the area of the 640x480
+measurement above - which is the ratio to remember whenever a guest run on those ports looks stuck.
+
 ## soft2d, the CPU 2D backend (2026-09-12)
 
 `./bench.sh --suite soft2d` records four frozen scenes at 640x480 and reports what a PREPARED

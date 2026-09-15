@@ -27,6 +27,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# THE PACKAGE AUDIT FIRST, because it needs no guest and answers a different question: what the
+# ARTIFACT is. A program carrying its own copy of the rasteriser draws the same picture as one using
+# the shared library, and a program holding capabilities it has no business with draws it too.
+python3 "$REPO_ROOT/src/tools/check-2d-demo-package.py" || die "the demo's package is not what its manifest says it is"
+
 # AN INSTANCE THAT IS ALREADY UP IS USED AS IT IS. The probe is a shell command rather than a socket
 # test: a socket that exists and answers nothing is the case a gate has to survive, and `uname` is
 # the cheapest question this system answers.

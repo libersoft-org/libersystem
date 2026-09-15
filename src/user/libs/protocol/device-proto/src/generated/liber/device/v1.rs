@@ -900,6 +900,15 @@ pub struct ProviderInfo {
 	/// publication that is going away; `slot` and `provider-generation` are what identify it, which
 	/// is why a withdrawal can be described at all after its handle has been closed.
 	pub live: bool,
+	/// WHAT THE PUBLISHER CALLS IT, and empty for a publication with no name of its own.
+	///
+	/// ONE DEVICE CAN PUBLISH TWO PROVIDERS OF ONE KIND. A virtio-serial device with a console port
+	/// and a named diagnostic port offers two `console-bytes` providers, and every other field here
+	/// is the same for both - same address, same binding, same kind - so a consumer asking for
+	/// console bytes would get whichever the catalogue handed it. The name is what makes "the one
+	/// called `org.libersystem.diag`" a thing a consumer can ASK for rather than discover by
+	/// connecting to each in turn.
+	pub name: String,
 }
 
 impl ProviderInfo {
@@ -946,6 +955,7 @@ impl ProviderInfo {
 		w.u32(self.slot)?;
 		w.u32(self.provider_generation)?;
 		w.boolean(self.live)?;
+		w.bytes_lp(self.name.as_bytes())?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ProviderInfo> {
@@ -957,7 +967,11 @@ impl ProviderInfo {
 		let slot = r.u32()?;
 		let provider_generation = r.u32()?;
 		let live = r.boolean()?;
-		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation, live })
+		let name = {
+			let v12 = r.string_lp()?;
+			(v12.len() <= 48).then_some(v12)?
+		};
+		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation, live, name })
 	}
 }
 
@@ -1281,13 +1295,13 @@ pub mod device_policy_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v12) => {
+						Ok(v13) => {
 							w.u8(1)?;
-							v12.write(w)?;
-						}
-						Err(v13) => {
-							w.u8(0)?;
 							v13.write(w)?;
+						}
+						Err(v14) => {
+							w.u8(0)?;
+							v14.write(w)?;
 						}
 					}
 					Some(())
@@ -1318,13 +1332,13 @@ pub mod device_policy_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v14) => {
+						Ok(v15) => {
 							w.u8(1)?;
-							w.bytes_lp(v14.as_bytes())?;
+							w.bytes_lp(v15.as_bytes())?;
 						}
-						Err(v15) => {
+						Err(v16) => {
 							w.u8(0)?;
-							v15.write(w)?;
+							v16.write(w)?;
 						}
 					}
 					Some(())
@@ -1355,13 +1369,13 @@ pub mod device_policy_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v16) => {
+						Ok(v17) => {
 							w.u8(1)?;
-							v16.write(w)?;
-						}
-						Err(v17) => {
-							w.u8(0)?;
 							v17.write(w)?;
+						}
+						Err(v18) => {
+							w.u8(0)?;
+							v18.write(w)?;
 						}
 					}
 					Some(())
@@ -1661,8 +1675,8 @@ pub mod provider_catalogue {
 						return None;
 					}
 					w.u16(result.len() as u16)?;
-					for v18 in result.iter() {
-						v18.write(w)?;
+					for v19 in result.iter() {
+						v19.write(w)?;
 					}
 					Some(())
 				})();
@@ -1685,14 +1699,14 @@ pub mod provider_catalogue {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v19) => {
+						Ok(v20) => {
 							w.u8(1)?;
-							w.set_handle(*v19)?;
+							w.set_handle(*v20)?;
 							w.u32(0)?;
 						}
-						Err(v20) => {
+						Err(v21) => {
 							w.u8(0)?;
-							v20.write(w)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -1886,13 +1900,13 @@ pub mod provider_catalogue {
 					return None;
 				}
 				let value = {
-					let v21 = r.u16()? as usize;
-					let mut v22 = Vec::new();
-					v22.try_reserve_exact(v21).ok()?;
-					for _ in 0..v21 {
-						v22.push(BindingRecord::read(r)?);
+					let v22 = r.u16()? as usize;
+					let mut v23 = Vec::new();
+					v23.try_reserve_exact(v22).ok()?;
+					for _ in 0..v22 {
+						v23.push(BindingRecord::read(r)?);
 					}
-					v22
+					v23
 				};
 				r.finish()?;
 				Some(value)
@@ -2085,21 +2099,21 @@ impl ConsoleChunk {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v23 in self.bytes.iter() {
-			w.u8(*v23)?;
+		for v24 in self.bytes.iter() {
+			w.u8(*v24)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ConsoleChunk> {
 		let bytes = {
-			let v24 = r.u16()? as usize;
-			let v24 = (v24 <= 4096).then_some(v24)?;
-			let mut v25 = Vec::new();
-			v25.try_reserve_exact(v24).ok()?;
-			for _ in 0..v24 {
-				v25.push(r.u8()?);
+			let v25 = r.u16()? as usize;
+			let v25 = (v25 <= 4096).then_some(v25)?;
+			let mut v26 = Vec::new();
+			v26.try_reserve_exact(v25).ok()?;
+			for _ in 0..v25 {
+				v26.push(r.u8()?);
 			}
-			v25
+			v26
 		};
 		Some(ConsoleChunk { bytes })
 	}
@@ -2170,13 +2184,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v26) => {
+						Ok(v27) => {
 							w.u8(1)?;
-							v26.write(w)?;
-						}
-						Err(v27) => {
-							w.u8(0)?;
 							v27.write(w)?;
+						}
+						Err(v28) => {
+							w.u8(0)?;
+							v28.write(w)?;
 						}
 					}
 					Some(())
@@ -2200,14 +2214,14 @@ pub mod console_stream {
 			}
 			OP_WRITE => {
 				let bytes = {
-					let v28 = r.u16()? as usize;
-					let v28 = (v28 <= 65535).then_some(v28)?;
-					let mut v29 = Vec::new();
-					v29.try_reserve_exact(v28).ok()?;
-					for _ in 0..v28 {
-						v29.push(r.u8()?);
+					let v29 = r.u16()? as usize;
+					let v29 = (v29 <= 65535).then_some(v29)?;
+					let mut v30 = Vec::new();
+					v30.try_reserve_exact(v29).ok()?;
+					for _ in 0..v29 {
+						v30.push(r.u8()?);
 					}
-					v29
+					v30
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2216,13 +2230,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v30) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							w.u32(*v30)?;
+							w.u32(*v31)?;
 						}
-						Err(v31) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v31.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -2424,8 +2438,8 @@ pub mod console_stream {
 				return None;
 			}
 			w.u16(bytes.len() as u16)?;
-			for v32 in bytes.iter() {
-				w.u8(*v32)?;
+			for v33 in bytes.iter() {
+				w.u8(*v33)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -2634,19 +2648,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v33) => {
+						Ok(v34) => {
 							w.u8(1)?;
-							if v33.len() > u16::MAX as usize {
+							if v34.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v33.len() as u16)?;
-							for v35 in v33.iter() {
-								v35.write(w)?;
+							w.u16(v34.len() as u16)?;
+							for v36 in v34.iter() {
+								v36.write(w)?;
 							}
 						}
-						Err(v34) => {
+						Err(v35) => {
 							w.u8(0)?;
-							v34.write(w)?;
+							v35.write(w)?;
 						}
 					}
 					Some(())
@@ -2776,13 +2790,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v36 = r.u16()? as usize;
-						let mut v37 = Vec::new();
-						v37.try_reserve_exact(v36).ok()?;
-						for _ in 0..v36 {
-							v37.push(UsbDevice::read(r)?);
+						let v37 = r.u16()? as usize;
+						let mut v38 = Vec::new();
+						v38.try_reserve_exact(v37).ok()?;
+						for _ in 0..v37 {
+							v38.push(UsbDevice::read(r)?);
 						}
-						v37
+						v38
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3275,6 +3289,9 @@ impl ProviderInfo {
 		} else {
 			out.push_str("false");
 		}
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3306,10 +3323,13 @@ impl ProviderInfo {
 		} else {
 			out.push_str("false");
 		}
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 8);
+		crate::codec::cbor::map(out, 9);
 		crate::codec::cbor::text(out, "kind");
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bus");
@@ -3326,6 +3346,8 @@ impl ProviderInfo {
 		crate::codec::cbor::uint(out, self.provider_generation as u64);
 		crate::codec::cbor::text(out, "live");
 		crate::codec::cbor::boolean(out, self.live);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
 	}
 }
 
@@ -3656,13 +3678,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v39 = true;
-		for v38 in self.bytes.iter() {
-			if !v39 {
+		let mut v40 = true;
+		for v39 in self.bytes.iter() {
+			if !v40 {
 				out.push(',');
 			}
-			v39 = false;
-			let _ = write!(out, "{}", v38);
+			v40 = false;
+			let _ = write!(out, "{}", v39);
 		}
 		out.push(']');
 		out.push('}');
@@ -3671,13 +3693,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v41 = true;
-		for v40 in self.bytes.iter() {
-			if !v41 {
+		let mut v42 = true;
+		for v41 in self.bytes.iter() {
+			if !v42 {
 				out.push_str(", ");
 			}
-			v41 = false;
-			let _ = write!(out, "{}", v40);
+			v42 = false;
+			let _ = write!(out, "{}", v41);
 		}
 		out.push(']');
 		out.push('}');
@@ -3686,8 +3708,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v42 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v42 as u64);
+		for v43 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v43 as u64);
 		}
 	}
 }

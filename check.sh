@@ -124,6 +124,11 @@ declare -A GATES=(
 	# colour glyph in its own palette. It boots its own guest unless one is up, and takes down only
 	# what it started.
 	["qemu-2d-demo"]="tools/check-qemu-2d-demo.sh"
+	# THE SECOND PORT OF A VIRTIO-SERIAL DEVICE, proved by the port's OWN chardev: a generic port is
+	# opened through the control queue, so a driver without MULTIPORT cannot see it, open it or write
+	# to it. What the gate reads is the line on that port's capture and its absence from the
+	# console's - which is routing rather than liveness.
+	["virtio-multiport"]="tools/check-qemu-virtio-multiport.sh"
 	["iommu-ports"]="tools/check-qemu-iommu-ports.sh"
 	["iommu-aarch64-direct-gicv2"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2"
 	["iommu-aarch64-direct-gicv2-hostile"]="tools/check-qemu-iommu-ports.sh --only aarch64:direct-gicv2:hostile"

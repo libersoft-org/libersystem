@@ -168,10 +168,16 @@ fn a_bind_carries_the_device_and_the_managers_own_count_of_what_follows() {
 
 #[test]
 fn the_declared_maximum_is_the_largest_payload_any_opcode_defines() {
-	// If it were smaller than `BIND`'s, a legal frame would be refused as oversized; if it were
-	// larger, the bound would not be the bound it claims to be.
-	assert_eq!(MAX_PAYLOAD, BIND_LEN, "the maximum is BIND's, which is the largest");
+	// If it were smaller than the largest, a legal frame would be refused as oversized; if it were
+	// larger than every opcode needs, the bound would not be the bound it claims to be.
+	//
+	// IT IS A MAXIMUM OVER THE OPCODES rather than `BIND`'s alone, which is what it used to be. A
+	// named `OFFER` is four header bytes and a name, and this states which of the two is larger
+	// TODAY without the answer being load-bearing: the day a name grows past a `BIND`, the constant
+	// follows and this fixture keeps asserting the same property.
+	assert_eq!(MAX_PAYLOAD, BIND_LEN.max(OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME), "the maximum is the largest any opcode defines");
 	assert!(U16_PAYLOAD_LEN <= MAX_PAYLOAD);
+	assert!(OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME <= MAX_PAYLOAD, "a fully named publication fits a frame");
 	let bind = header(Opcode::Bind, 1, BIND_LEN as u32);
 	let mut frame = [0u8; HEADER_LEN + BIND_LEN];
 	frame[..HEADER_LEN].copy_from_slice(&bind.encode());
@@ -206,7 +212,7 @@ fn an_offer_names_a_kind_and_the_publisher_s_own_token() {
 	// going away, and it cannot name the identity the manager minted because it never sees one.
 	let mut payload = [0u8; OFFER_PAYLOAD_LEN];
 	assert_eq!(encode_offer(provider::BLOCK, 3, &mut payload), OFFER_PAYLOAD_LEN);
-	assert_eq!(decode_offer(&payload), Ok((provider::BLOCK, 3)));
+	assert_eq!(decode_offer(&payload), Ok((provider::BLOCK, 3, &[][..])), "a publication with no name decodes to an empty one");
 
 	// Two publications of ONE kind are told apart by the token and by nothing else, which is the
 	// case the token exists for.
@@ -215,7 +221,7 @@ fn an_offer_names_a_kind_and_the_publisher_s_own_token() {
 	encode_offer(provider::BLOCK, 0, &mut first);
 	encode_offer(provider::BLOCK, 1, &mut second);
 	assert_ne!(first, second);
-	assert_eq!(decode_offer(&first).map(|(kind, _)| kind), decode_offer(&second).map(|(kind, _)| kind));
+	assert_eq!(decode_offer(&first).map(|(kind, _, _)| kind), decode_offer(&second).map(|(kind, _, _)| kind));
 }
 
 #[test]
@@ -236,7 +242,55 @@ fn an_offer_payload_of_the_old_length_is_refused_rather_than_read_short() {
 	// The offer carried two bytes before the token joined it. A decoder that accepted the shorter
 	// form would read a token of whatever followed - so the length is exact, not a minimum.
 	assert_eq!(decode_offer(&[1, 0]), Err(FrameError::PayloadShape));
-	assert_eq!(decode_offer(&[1, 0, 0, 0, 0]), Err(FrameError::PayloadShape));
+	// A PAYLOAD LONGER THAN THE HEADER IS A NAME NOW, so what is refused is a name past the bound
+	// rather than any extra byte at all.
+	assert_eq!(decode_offer(&[1, 0, 0, 0, b'a']), Ok((1, 0, &b"a"[..])));
+	let mut too_long = [0u8; OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME + 1];
+	too_long[0] = 1;
+	assert_eq!(decode_offer(&too_long), Err(FrameError::PayloadShape), "a name past the bound is a refusal rather than a truncation");
+}
+
+#[test]
+fn a_named_offer_fits_the_frame_its_sender_builds() {
+	// THE LONGEST NAME THE ENCODER ADMITS MUST FIT THE LARGEST FRAME THIS PROTOCOL DEFINES. It did
+	// not: `MAX_PAYLOAD` was `BIND`'s alone, and four header bytes plus a forty-eight-byte name is
+	// two more than that - so a publication named to the bound would have been built into a buffer
+	// too short, and the failure would have been a panic in the sender rather than a refusal.
+	assert!(OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME <= MAX_PAYLOAD);
+
+	let name = [b'n'; MAX_PROVIDER_NAME];
+	let mut payload = [0u8; MAX_PAYLOAD];
+	let len = encode_offer_named(provider::CONSOLE_BYTES, 2, &name, &mut payload);
+	assert_eq!(len, OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME);
+	assert_eq!(decode_offer(&payload[..len]), Ok((provider::CONSOLE_BYTES, 2, &name[..])));
+
+	// A NAME PAST THE BOUND IS CUT BY THE ENCODER rather than overflowing the caller's buffer: the
+	// publisher chose a name too long for the wire, which is a shorter name and not a failed offer.
+	let over = [b'n'; MAX_PROVIDER_NAME + 9];
+	let len = encode_offer_named(provider::CONSOLE_BYTES, 2, &over, &mut payload);
+	assert_eq!(len, OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME);
+	assert_eq!(decode_offer(&payload[..len]), Ok((provider::CONSOLE_BYTES, 2, &name[..])));
+}
+
+#[test]
+fn two_publications_of_one_kind_are_told_apart_by_name() {
+	// The case the name exists for: a development image publishes `console-bytes` from the
+	// development channel AND from every generic port a multiport virtio-serial device opened, and
+	// a consumer asking for the kind would otherwise take whichever it was handed.
+	assert!(console::selects(provider::DEV_CHANNEL_NAME, provider::DEV_CHANNEL_NAME));
+	assert!(!console::selects(b"org.libersystem.diag", provider::DEV_CHANNEL_NAME));
+
+	// EXACT BYTES. A prefix rule would attach the agent to `org.libersystem.dev2`, and a
+	// case-insensitive one to a port some host named in capitals - both silently.
+	assert!(!console::selects(b"org.libersystem.dev2", provider::DEV_CHANNEL_NAME));
+	assert!(!console::selects(b"ORG.LIBERSYSTEM.DEV", provider::DEV_CHANNEL_NAME));
+	assert!(!console::selects(b"org.libersystem.de", provider::DEV_CHANNEL_NAME));
+
+	// AN EMPTY SELECTOR IS A CONSUMER WITH NO PREFERENCE and takes anything; an empty NAME is a
+	// publication nobody can have asked for by name.
+	assert!(console::selects(b"org.libersystem.diag", b""));
+	assert!(console::selects(b"", b""));
+	assert!(!console::selects(b"", provider::DEV_CHANNEL_NAME));
 }
 
 // ------------------------------------------------------- the heartbeat

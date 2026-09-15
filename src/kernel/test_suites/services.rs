@@ -2932,7 +2932,7 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	let device_events = harness.device_events.expect("DisplayService opened the device's event stream");
 	let _display_service = harness.service;
 	let _boot_kernel = harness.boot;
-	let _stats = harness.stats;
+	let stats_root = harness.stats;
 	let _admin = harness.admin;
 	let _scanout = harness.scanout;
 
@@ -2956,6 +2956,18 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	let mut two_rectangle_presents = 0usize;
 	let mut presents = 0usize;
 	let mut resized = false;
+	// THE DEMO'S OWN CHARGED MEMORY, SAMPLED TWICE INSIDE ONE GENERATION. What a steady frame loop
+	// may not do is GROW: the queue and the resources exist after the first frames, and a loop that
+	// charged another page every frame would be a drawing that cannot run for an hour. Both samples
+	// are taken before the resize, because a new generation legitimately allocates a new set of
+	// images - measuring across one would be measuring the rebuild.
+	let mut settled_bytes: Option<u64> = None;
+	let mut later_bytes: Option<u64> = None;
+	let mut thief: Option<Arc<Channel>> = None;
+	let mut thief_requested = false;
+	let mut presents_when_hidden = 0usize;
+	let mut hidden_passes = 0u32;
+	let mut hidden_presents = usize::MAX;
 	for _ in 0..80_000u32 {
 		// A BOUNDED DRAIN, for the reason the frame-loop gate states: `run_until_idle` sleeps to the
 		// nearest thread deadline and keeps going, so against a client that paces itself it never
@@ -2996,14 +3008,113 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 		while let Ok(message) = stdout.recv() {
 			output.extend_from_slice(&message.bytes);
 		}
+		// TAKE THE SCREEN AWAY FROM IT, AND GIVE IT BACK. A second surface from another connection
+		// becomes the visible one, which is the transition an application has to survive: while it is
+		// in the background it may draw NOTHING - frames accepted while hidden are discarded in order
+		// and never reach a screen, so a loop that drew them would be doing work that is thrown away.
+		if !thief_requested && presents >= 6 {
+			let mut writer = wire::VecWriter::new();
+			display_v1::SurfaceRequest { logical_extent: display_v1::Extent2d { width: 32, height: 32 }, images: 2 }.write(&mut writer).expect("a surface request encodes");
+			let body = writer.into_inner().expect("a surface request carries no capability");
+			console_client.send(request(display::OP_CREATE_SURFACE, 900, &body)).expect("a create-surface request");
+			thief_requested = true;
+		}
+		if thief_requested
+			&& thief.is_none()
+			&& let Ok(reply) = console_client.recv()
+		{
+			succeeded(&reply, 900);
+			let taken: Arc<Channel> = reply.caps.first().expect("the surface capability").object().into_any_arc().downcast::<Channel>().expect("a surface is a channel");
+			presents_when_hidden = presents;
+			// AND THE OTHER SURFACE PRESENTS WHILE IT OWNS THE SCREEN, which is the half of the
+			// multi-surface claim a background client cannot make: two surfaces, each drawing while
+			// it is the visible one, on one connection's worth of service state.
+			//
+			// EVERY DRAIN HERE IS BOUNDED. The ordinary surface helpers call `run_until_idle`, which
+			// against a client pacing itself on a timer - and the demo is one, still running - does
+			// not return; so this sequence pumps a tick at a time and answers the focus and device
+			// channels on every pass, which is what the service is blocked on in between.
+			let pump = |waiting_for: &Channel, saw_present: &mut bool| -> Option<Message> {
+				for _ in 0..40_000u32 {
+					sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+					if focus_input.recv().is_ok() {
+						focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
+					}
+					while let Ok(present) = gpu_kernel.recv() {
+						let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
+						reply.push(1);
+						gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
+						*saw_present = true;
+					}
+					if let Ok(message) = waiting_for.recv() {
+						return Some(message);
+					}
+				}
+				None
+			};
+			let mut ignored = false;
+			taken.send(request(surface::OP_CONFIGURATION, 910, &[])).expect("a configuration request");
+			let reply = pump(&taken, &mut ignored).expect("the taken surface answers its configuration");
+			let configuration = display_v1::SurfaceConfiguration::decode(succeeded(&reply, 910)).expect("a configuration snapshot decodes");
+			assert!(configuration.visible, "the surface that just took the screen is the visible one");
+			taken.send(request(surface::OP_ACK_CONFIGURE, 911, &configuration.serial.to_le_bytes())).expect("an acknowledgement");
+			let acknowledged = pump(&taken, &mut ignored).expect("the acknowledgement is answered");
+			succeeded(&acknowledged, 911);
+			taken.send(request(surface::OP_QUEUE, 912, &[])).expect("a queue request");
+			let queue_reply = pump(&taken, &mut ignored).expect("the queue is answered");
+			let body = succeeded(&queue_reply, 912);
+			let mut placeholders = wire::Handles::new();
+			placeholders.push(1).expect("a stand-in producer handle");
+			placeholders.push(2).expect("a stand-in completion handle");
+			let mut reader = wire::Reader::with_handle_list(body, &placeholders);
+			let queue = display_v1::PresentQueue::read(&mut reader).expect("a present queue decodes");
+			let length: u64 = u64::from(queue.pitch) * u64::from(configuration.physical_extent.height);
+			let mut supplied: alloc::vec::Vec<Arc<MemoryObject>> = alloc::vec::Vec::new();
+			for index in 0..queue.images {
+				let object = MemoryObject::create(length as usize).expect("a presentable image");
+				let mut body = index.to_le_bytes().to_vec();
+				body.extend_from_slice(&0u32.to_le_bytes());
+				send_cap(&taken, &request(surface::OP_PROVIDE_IMAGE, 920 + index, &body).bytes, object.clone(), Rights::READ | Rights::MAP | Rights::TRANSFER).expect("a provide-image request");
+				let provided = pump(&taken, &mut ignored).expect("a provide-image is answered");
+				succeeded(&provided, 920 + index);
+				supplied.push(object);
+			}
+			taken.send(request(surface::OP_ACQUIRE_NEXT, 930, &[])).expect("an acquire");
+			let acquired_reply = pump(&taken, &mut ignored).expect("an acquire is answered");
+			let acquired = display_v1::AcquiredImage::decode(succeeded(&acquired_reply, 930)).expect("an acquire answers one of the four");
+			let display_v1::AcquiredImage::Image(image) = acquired else { panic!("the visible surface has an image to draw into, and answered {acquired:?}") };
+			let mut reached_the_device = false;
+			taken.send(request(surface::OP_PRESENT, 931, &present_body(image, &configuration, &damage(&[(0, 0, 8, 8)])))).expect("a present");
+			let presented = pump(&taken, &mut reached_the_device).expect("a present is answered");
+			succeeded(&presented, 931);
+			assert!(reached_the_device, "the frame of the surface that owns the screen reaches the device");
+			thief = Some(taken);
+			let _held = supplied;
+		}
+		// AND THE MOMENT IT COMES BACK IS THE MOMENT THE THIEF GOES. Dropping the channel ends the
+		// surface, and the demo's own surface is the visible one again.
+		if thief.is_some() && presents_when_hidden != 0 {
+			hidden_passes += 1;
+			if hidden_passes > 400 {
+				hidden_presents = presents - presents_when_hidden;
+				drop(thief.take());
+			}
+		}
+		if presents >= 4 && settled_bytes.is_none() {
+			settled_bytes = Some(process.domain().account().memory().used());
+		}
+		if presents >= 10 && later_bytes.is_none() {
+			later_bytes = Some(process.domain().account().memory().used());
+		}
 		// RESIZE UNDER IT ONCE IT HAS DRAWN THROUGH ITS FIRST PHASES. A changed extent is a new
 		// generation: every image of the old one is stale, and what this checks is that the demo
 		// rebuilds and goes back to a WHOLE-surface damage rather than presenting a partial update
 		// computed for the size it no longer has.
-		// AFTER THE PHASES THAT COME BEFORE IT HAVE DRAWN. Three frames each for full, partial and
-		// multi-rect is nine, so a resize before the twelfth present would cut the middle phase off
-		// at its first frame - which is a gate that passes without ever seeing the thing it is for.
-		if !resized && presents >= 12 {
+		// AFTER THE PHASES THAT COME BEFORE IT HAVE DRAWN, and after the screen has been taken away
+		// and given back. Three frames each for full, partial and multi-rect is nine, so a resize
+		// before the twelfth present would cut the middle phase off at its first frame - which is a
+		// gate that passes without ever seeing the thing it is for.
+		if !resized && presents >= 12 && hidden_presents != usize::MAX {
 			let mut frame = [0u8; 64];
 			let mut handles = wire::Handles::new();
 			let event = display_device::DeviceEvent::Resized(display_device::Extent2d { width: 160, height: 112 });
@@ -3040,30 +3151,39 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	// THE SECOND SURFACE, which is the object model's own proof: opened, presented to, and closed
 	// with the first one's resources and generation surviving it.
 	assert!(!contains(b"second=0 "), "the second surface presented: {output:?}");
+	// THE SCREEN CHANGED HANDS AND THE DEMO NOTICED. A client that kept drawing while hidden and one
+	// that never heard look identical in a frame count, which is why both halves are asserted: the
+	// transitions it SAW, and that nothing of its reached the device while it was in the background.
+	assert!(!contains(b"visibility=0 "), "the demo saw the screen change hands: {output:?}");
+	assert!(!contains(b"background=0 "), "and idled while it was not the visible surface: {output:?}");
+	assert_eq!(hidden_presents, 0, "and presented nothing at all while another surface owned the screen");
 	assert!(contains(b"test2d-sw: done"), "and the run ended cleanly: {output:?}");
+	// AND IT DID NOT GROW WHILE IT DREW. Six frames apart, inside one generation, with the queue and
+	// every resource already made: what this refuses is the loop that charges another page per frame.
+	if let (Some(settled), Some(later)) = (settled_bytes, later_bytes) {
+		assert!(later <= settled, "the demo's charged memory grew from {settled} to {later} bytes across six frames of a steady loop");
+	}
 
-	// AND THE CONSOLE IS BACK. A demo that took the screen and gave nothing back would leave a system
-	// with no visible console - which is what a person sees as a machine that died - so the console's
-	// own surface is presented after the demo ended and the frame is expected to reach the DEVICE.
-	let console_surface = create_surface(&console_client, &focus_input, b"OK", 700, 0, 0, 2);
-	let console_configuration = adopt(&console_surface, 702);
-	let (console_queue, _producer, _done) = present_queue(&console_surface, 706);
-	let _images = provide_queue(&console_surface, 710, &console_queue, console_configuration.physical_extent.height);
-	assert_eq!(acquire_next(&console_surface, 720), display_v1::AcquiredImage::Image(0), "the console's queue has an image to draw into");
-	send_present(&console_surface, 721, 0, &console_configuration, &damage(&[(0, 0, 8, 8)]));
-	let mut reached = false;
+	// AND WHAT THE DEMO HELD IS GONE. A demo that took the screen and left its surfaces behind would
+	// leave a system with no visible console - which a person sees as a machine that died - so the
+	// service's OBSERVATION root is asked what the display path still holds once the process has
+	// ended. The reclamation is the process's death and not a polite close: the demo exits without
+	// destroying anything, which is exactly what a crash looks like from here.
 	for _ in 0..4_000u32 {
 		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
 		if focus_input.recv().is_ok() {
 			focus_input.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
 		}
-		if let Ok(present) = gpu_kernel.recv() {
+		while let Ok(present) = gpu_kernel.recv() {
 			let mut reply = le_u32(&present.bytes, 2).to_le_bytes().to_vec();
 			reply.push(1);
 			gpu_kernel.send(Message::new(reply, alloc::vec::Vec::new())).expect("present acknowledgement");
-			reached = true;
+		}
+		if display_resources(&stats_root, 800).surfaces == 0 {
 			break;
 		}
 	}
-	assert!(reached, "the console's own frame reaches the device once the demo has gone");
+	let held = display_resources(&stats_root, 801);
+	assert_eq!(held.surfaces, 0, "every surface the demo held is reclaimed when its process ends: {held:?}");
+	assert_eq!(held.present_images, 0, "and so is every image of every queue it supplied");
 }

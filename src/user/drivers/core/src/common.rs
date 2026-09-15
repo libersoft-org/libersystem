@@ -157,9 +157,24 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 // something a driver chooses. A driver that publishes one provider of each kind may use the kind as
 // its token and lose nothing.
 pub fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16, handle: u64) -> bool {
-	let mut payload = [0u8; proto::OFFER_PAYLOAD_LEN];
-	proto::encode_offer(provider_kind, token, &mut payload);
-	send_frame_with(bootstrap, proto::Opcode::Offer, bind.generation, &payload, handle)
+	offer_named(bootstrap, bind, provider_kind, token, &[], handle)
+}
+
+// The same publication, WITH A NAME, for the driver that publishes more than one of a KIND.
+//
+// A kind is what a provider IS and a name is which one it is. The two are not interchangeable: a
+// virtio-serial device with a console port and a named diagnostic port publishes two `console-bytes`
+// providers whose every other catalogue field is identical, so a consumer asking for the kind gets
+// whichever it is handed - and for a byte stream that is not a refusal anywhere, it is a consumer
+// talking to the wrong port with nothing to notice.
+//
+// A NAME IS NOT A SECOND KIND. It selects among publications of one kind and confers nothing: a
+// consumer still settles the contract's version before a byte moves, because a name is a label the
+// publisher chose and the handshake is what proves what is on the other end.
+pub fn offer_named(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16, name: &[u8], handle: u64) -> bool {
+	let mut payload = [0u8; proto::OFFER_PAYLOAD_LEN + proto::MAX_PROVIDER_NAME];
+	let len = proto::encode_offer_named(provider_kind, token, name, &mut payload);
+	send_frame_with(bootstrap, proto::Opcode::Offer, bind.generation, &payload[..len], handle)
 }
 
 // "A CONSUMER of the provider I published under this token has gone."
@@ -339,16 +354,32 @@ pub fn hex2(byte: u8) -> [u8; 2] {
 // property: offers are held UNPUBLISHED by the manager until the terminal frame, so a driver that
 // dies between them announces nothing.
 pub fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16, u64)]) -> bool {
+	let mut named: [(u16, u64, &[u8]); proto::MAX_INITIAL_OFFERS] = [(0, 0, &[][..]); proto::MAX_INITIAL_OFFERS];
+	if offers.len() > named.len() {
+		return false;
+	}
+	for (slot, &(kind, handle)) in named.iter_mut().zip(offers) {
+		*slot = (kind, handle, &[]);
+	}
+	online_named(bootstrap, bind, report, &named[..offers.len()])
+}
+
+// The same, for a driver whose publications need telling apart by NAME - see `offer_named`.
+//
+// The report is printed by whichever of the two a driver calls, and `online` above is this with an
+// empty name on every offer, so the token rule is stated once and cannot drift between them.
+pub fn online_named(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16, u64, &[u8])]) -> bool {
 	print_line(report);
 	// THE TOKEN IS THE POSITION IN THIS DRIVER'S OWN OFFER LIST, which is unique within this
 	// driver by construction and costs a driver author no thought at all. The kind would do for
-	// every driver in the tree today, because none publishes two of one kind - and that is
-	// exactly the assumption a token exists to stop being load-bearing.
-	for (token, &(kind, handle)) in offers.iter().enumerate() {
+	// most drivers in the tree, because few publish two of one kind - and that is exactly the
+	// assumption a token exists to stop being load-bearing: the multiport console driver publishes
+	// one of a kind per open port.
+	for (token, &(kind, handle, name)) in offers.iter().enumerate() {
 		if handle == 0 {
 			continue;
 		}
-		if !offer(bootstrap, bind, kind, token as u16, handle) {
+		if !offer_named(bootstrap, bind, kind, token as u16, name, handle) {
 			return false;
 		}
 	}

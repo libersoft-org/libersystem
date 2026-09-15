@@ -41,9 +41,19 @@ pub const VERSION: u16 = 2;
 // magic(4) + version(2) + opcode(2) + generation(8) + payload_len(4).
 pub const HEADER_LEN: usize = 20;
 
-// The largest payload any opcode defines, which is `BIND`'s. A frame declaring more is refused
-// before anything is read.
-pub const MAX_PAYLOAD: usize = core::mem::size_of::<abi::DeviceInfo>() + 2;
+// The largest payload any opcode defines. A frame declaring more is refused before anything is read.
+//
+// TWO OPCODES COMPETE FOR IT NOW, and the larger of the two is the bound. It used to be `BIND`'s
+// alone - a `DeviceInfo` and two bytes - and then `OFFER` grew a name: four header bytes plus
+// `MAX_PROVIDER_NAME` is fifty-two, which is two more than a `BIND`. Left as it was, a publication
+// named with the full forty-eight bytes the encoder admits would have been built into a frame buffer
+// two bytes too short, and the failure would have been a panic in the sender rather than a refusal
+// anywhere. A bound that is a maximum over the opcodes cannot go stale the next time one grows.
+pub const MAX_PAYLOAD: usize = {
+	let bind: usize = core::mem::size_of::<abi::DeviceInfo>() + 2;
+	let offer: usize = OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME;
+	if bind > offer { bind } else { offer }
+};
 
 // The most providers a driver may offer during ONE handshake.
 //
@@ -352,6 +362,21 @@ pub mod provider {
 	pub const USB_BUS: u16 = 6;
 	pub const POINTER: u16 = 7;
 	pub const CONSOLE_BYTES: u16 = 8;
+
+	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
+	// a name at all.
+	//
+	// A development image holds two publishers of `CONSOLE_BYTES`: the development channel's own
+	// device, and whichever ports a multiport virtio-serial device opens. Both speak the same
+	// contract at the same version, so the version handshake - which is what used to select - cannot
+	// separate them, and a consumer asking for the kind gets whichever the catalogue hands it. For a
+	// byte stream that is not refused anywhere: the bytes simply arrive somewhere else.
+	//
+	// HERE RATHER THAN IN EITHER END, because a name each end spells for itself is two names, and the
+	// day they differ is the day the agent silently attaches to a diagnostic port instead. It is in
+	// the reverse-DNS form the virtio-serial specification uses for a port name, so the development
+	// channel's publication and a device-named port cannot collide by accident.
+	pub const DEV_CHANNEL_NAME: &[u8] = b"org.libersystem.dev";
 }
 
 // WHAT A DRIVER CAN HONESTLY KNOW ABOUT ITSELF.
@@ -626,17 +651,38 @@ pub fn decode_resource(payload: &[u8]) -> Result<ResourceKind, FrameError> {
 // numeric value. This names only its own publications, never another driver's.
 pub const OFFER_PAYLOAD_LEN: usize = 4;
 
+/// THE LONGEST NAME A PUBLICATION MAY CARRY, and why one carries a name at all: a device with two
+/// ports publishes two providers of the SAME KIND, and a consumer asking for "console bytes" gets
+/// whichever the catalogue hands it. A name is what makes "the one called `org.libersystem.diag`" a
+/// thing a consumer can ask for. Bounded, because it arrives over a channel: forty-eight bytes is
+/// longer than any name this tree uses and short enough to live in a fixed frame.
+pub const MAX_PROVIDER_NAME: usize = 48;
+
 pub fn encode_offer(kind: u16, token: u16, out: &mut [u8]) -> usize {
-	out[..2].copy_from_slice(&kind.to_le_bytes());
-	out[2..4].copy_from_slice(&token.to_le_bytes());
-	OFFER_PAYLOAD_LEN
+	encode_offer_named(kind, token, &[], out)
 }
 
-pub fn decode_offer(payload: &[u8]) -> Result<(u16, u16), FrameError> {
-	if payload.len() != OFFER_PAYLOAD_LEN {
+/// The same publication, NAMED. A driver with one provider per device passes an empty name and the
+/// payload is what it always was, which is why this is not a second opcode.
+pub fn encode_offer_named(kind: u16, token: u16, name: &[u8], out: &mut [u8]) -> usize {
+	out[..2].copy_from_slice(&kind.to_le_bytes());
+	out[2..4].copy_from_slice(&token.to_le_bytes());
+	let keep = name.len().min(MAX_PROVIDER_NAME).min(out.len().saturating_sub(OFFER_PAYLOAD_LEN));
+	out[OFFER_PAYLOAD_LEN..OFFER_PAYLOAD_LEN + keep].copy_from_slice(&name[..keep]);
+	OFFER_PAYLOAD_LEN + keep
+}
+
+/// The kind, the token, and the NAME - which is empty for a publication that has none.
+///
+/// A PAYLOAD LONGER THAN THE HEADER IS A NAME AND NOT A MALFORMED FRAME, which is the one behaviour
+/// this had to change: the old decode refused any length but four, so a named publication from a
+/// newer driver would have been read as a corrupt one by an older manager rather than as a
+/// publication whose name it does not understand.
+pub fn decode_offer(payload: &[u8]) -> Result<(u16, u16, &[u8]), FrameError> {
+	if payload.len() < OFFER_PAYLOAD_LEN || payload.len() > OFFER_PAYLOAD_LEN + MAX_PROVIDER_NAME {
 		return Err(FrameError::PayloadShape);
 	}
-	Ok((u16::from_le_bytes([payload[0], payload[1]]), u16::from_le_bytes([payload[2], payload[3]])))
+	Ok((u16::from_le_bytes([payload[0], payload[1]]), u16::from_le_bytes([payload[2], payload[3]]), &payload[OFFER_PAYLOAD_LEN..]))
 }
 
 pub fn decode_failed(payload: &[u8]) -> Result<DriverFailureCode, FrameError> {

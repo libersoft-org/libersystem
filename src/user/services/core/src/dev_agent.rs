@@ -152,10 +152,11 @@ impl Wire {
 
 	// Open one published provider, settle a version with it, and ask for its receive stream.
 	//
-	// THE HANDSHAKE IS WHAT SELECTS, not the publication. Any driver may publish this kind - a
-	// virtio-serial multiport port is the candidate second one - and a provider that will not speak
-	// this contract at this version is not this agent's wire, however it was published. Refusing
-	// here costs one connection; guessing costs a stream neither end can parse.
+	// THE NAME SELECTS AND THE HANDSHAKE CONFIRMS, and neither is redundant. The name is a label the
+	// publisher chose, so it says which publication this is and proves nothing about what is on the
+	// other end; a provider that will not speak this contract at this version is not this agent's
+	// wire however it was named. Refusing here costs one connection; guessing costs a stream neither
+	// end can parse.
 	fn attach_to(&mut self, info: &ProviderInfo) -> bool {
 		if self.catalogue == 0 || self.control != 0 || !info.live {
 			return false;
@@ -220,7 +221,13 @@ impl Wire {
 				print(b"agent.dev: a provider frame did not decode\n");
 				continue;
 			};
-			if info.kind != ProviderKind::ConsoleBytes {
+			// THE KIND AND THE NAME BOTH, because this image has more than one publisher of this
+			// kind: the development channel's device, and every generic port the multiport console
+			// driver opened. They speak the same contract at the same version, so the handshake
+			// below cannot separate them - it never could, and until there was a second publisher
+			// nothing depended on it being able to. This agent's channel is the one the development
+			// channel publishes, by name.
+			if info.kind != ProviderKind::ConsoleBytes || !console::selects(info.name.as_bytes(), driver_protocol::provider::DEV_CHANNEL_NAME) {
 				continue;
 			}
 			let seen: Identity = Identity { slot: info.slot, provider_generation: info.provider_generation, binding_generation: info.binding_generation };

@@ -407,11 +407,14 @@ struct Controls {
 	phase_frames: u32,
 	input: bool,
 	second_surface: bool,
+	/// The logical size to ask for, or zero for the screen's own.
+	width: u32,
+	height: u32,
 }
 
 impl Controls {
 	fn parse(args: &[u8]) -> Controls {
-		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true };
+		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT };
 		for word in args.split(|byte| *byte == b' ' || *byte == 0) {
 			if let Some(value) = word.strip_prefix(b"--frames=") {
 				controls.frames = number(value);
@@ -421,6 +424,14 @@ impl Controls {
 				controls.input = false;
 			} else if word == b"--no-second-surface" {
 				controls.second_surface = false;
+			} else if let Some(value) = word.strip_prefix(b"--size=") {
+				// A SIZE OF ITS OWN, for a MEASUREMENT run. A surface with a logical size is not
+				// reconfigured when the output changes, which is exactly wrong for the phase machine
+				// and exactly right for comparing two runs at the same number of pixels.
+				if let Some(cross) = value.iter().position(|byte| *byte == b'x') {
+					controls.width = number(&value[..cross]);
+					controls.height = number(&value[cross + 1..]);
+				}
 			}
 		}
 		controls
@@ -463,7 +474,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let client = surface::connect(display);
 	// TWO IMAGES, which is the fewest a present queue negotiates and the smallest number that can
 	// show a limit being reached at all.
-	let Some(Ok(mut frames)) = FrameLoop::open(&client, WIDTH, HEIGHT, 2) else {
+	let Some(Ok(mut frames)) = FrameLoop::open(&client, controls.width, controls.height, 2) else {
 		print(b"test2d-sw: no surface\n");
 		exit();
 	};
@@ -491,6 +502,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut presented = 0u32;
 	let mut rebuilt = 0u32;
 	let mut multi_rect_presents = 0u32;
+	let mut background = 0u32;
 	let mut partial_presents = 0u32;
 	// THE LAST TWO FRAMES' BOUNDS AND NOT THE LAST ONE'S. The queue holds TWO images, so the image
 	// being drawn into now is the one presented two frames ago - and a damage rectangle covering only
@@ -505,6 +517,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// reason: a live capture of the version without this shows bands of an older background standing
 	// where nothing has been damaged since.
 	let mut full_frames_owed: u32 = 2;
+	// WHAT A FRAME COSTS AND WHAT IT IS SPACED AT, which are two different numbers. The DRAW is what
+	// this renderer owes - record the list, replay it into the image - and the INTERVAL is what the
+	// loop achieved with the display's own pacing in it. A demo that reported only the second would
+	// look fast on a machine that throttled it and slow on one that did not.
+	let mut draw_total_ns: u64 = 0;
+	let mut draw_worst_ns: u64 = 0;
+	let mut draw_count: u64 = 0;
+	let mut interval_total_ns: u64 = 0;
+	let mut interval_worst_ns: u64 = 0;
+	let mut interval_count: u64 = 0;
+	let mut last_present_ns: u64 = 0;
 	let mut generation = frames.surface().generation();
 	let mut previous_scale = (frames.surface().configuration().scale.numerator, frames.surface().configuration().scale.denominator);
 	let mut previous_logical = (frames.surface().configuration().logical_extent.width, frames.surface().configuration().logical_extent.height);
@@ -548,11 +571,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						break;
 					}
 				};
+				let drawing_began_ns = clock_ns();
 				if !draw(&mut backend, &provider, &images, &list, &frame) {
 					print(b"test2d-sw: the backend refused the frame\n");
 					frames.abandon(frame);
 					break;
 				}
+				let drawing_took_ns = clock_ns().saturating_sub(drawing_began_ns);
+				draw_total_ns = draw_total_ns.saturating_add(drawing_took_ns);
+				draw_worst_ns = draw_worst_ns.max(drawing_took_ns);
+				draw_count += 1;
 				// THE DAMAGE IS WHAT THE SCENE MOVED, and the phase says which shape that takes.
 				let movers = scene.movers(scene.tick, extent);
 				let presented_ok = if full_frames_owed > 0 {
@@ -591,6 +619,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				};
 				if presented_ok {
 					presented += 1;
+					let now_ns = clock_ns();
+					if last_present_ns != 0 {
+						let interval = now_ns.saturating_sub(last_present_ns);
+						interval_total_ns = interval_total_ns.saturating_add(interval);
+						interval_worst_ns = interval_worst_ns.max(interval);
+						interval_count += 1;
+					}
+					last_present_ns = now_ns;
 					recent_movers[1] = recent_movers[0];
 					recent_movers[0] = Some(movers);
 					if !scene.paused {
@@ -636,7 +672,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					}
 				}
 			}
-			Step::Idle { until } => frames.park(until),
+			Step::Idle { until } => {
+				// A HIDDEN LOOP AND A PACED ONE TAKE THE SAME STEP AND MEAN DIFFERENT THINGS. One is
+				// this demo waiting its turn between frames; the other is it declining to draw frames
+				// nobody can see - and the second is counted, because "it stopped drawing while it
+				// was in the background" is the claim a harness taking the screen away is checking.
+				if !frames.pacing().visible() {
+					background += 1;
+				}
+				frames.park(until);
+			}
 		}
 	}
 
@@ -704,6 +749,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		(b" phase=", phase_index as u32),
 		(b" events=", frames.events_seen()),
 		(b" configures=", frames.configures_seen()),
+		// HOW MANY TIMES THE SCREEN CHANGED HANDS, which is the number a harness taking the screen
+		// away and giving it back reads to see that this loop NOTICED - a client that kept drawing
+		// while hidden and a client that never heard look identical in a frame count.
+		(b" visibility=", frames.visibility_seen()),
+		(b" background=", background),
+		(b" visible=", frames.pacing().visible() as u32),
+		// MICROSECONDS, because a nanosecond figure printed per frame is six digits nobody reads and
+		// the budget this is compared against is stated in milliseconds.
+		(b" draw-mean-us=", (draw_total_ns / draw_count.max(1) / 1_000) as u32),
+		(b" draw-worst-us=", (draw_worst_ns / 1_000) as u32),
+		(b" interval-mean-us=", (interval_total_ns / interval_count.max(1) / 1_000) as u32),
+		(b" interval-worst-us=", (interval_worst_ns / 1_000) as u32),
 	] {
 		line.extend_from_slice(name);
 		push_number(&mut line, value);

@@ -7,7 +7,7 @@ pub fn unopened_provider_withdrawal() {
 	let (server, offered) = channel().expect("withdrawal fixture channel");
 	let binding = BindingId::new(0, 0, 0, 1);
 	let mut catalogue = Catalogue::new();
-	catalogue.entries.push(Some(Provider { id: ProviderId::new(binding, 0, 1), kind: driver_protocol::provider::BLOCK, token: 1, handle: offered, consumers: 0 }));
+	catalogue.entries.push(Some(Provider { id: ProviderId::new(binding, 0, 1), kind: driver_protocol::provider::BLOCK, token: 1, handle: offered, consumers: 0, name: [0; driver_protocol::MAX_PROVIDER_NAME], name_len: 0 }));
 	let mut bytes = [0; 128];
 	assert!(matches!(try_recv(server, &mut bytes), Polled::Empty));
 	assert_eq!(catalogue.withdraw_binding(binding), 1);
@@ -25,7 +25,7 @@ pub fn unopened_provider_withdrawal() {
 	// does not let another withdrawal of the old binding close the replacement's endpoint.
 	let (replacement_server, replacement_offered) = channel().expect("replacement fixture channel");
 	let replacement = binding.rebound(2);
-	catalogue.entries[0] = Some(Provider { id: ProviderId::new(replacement, 0, 2), kind: driver_protocol::provider::BLOCK, token: 1, handle: replacement_offered, consumers: 0 });
+	catalogue.entries[0] = Some(Provider { id: ProviderId::new(replacement, 0, 2), kind: driver_protocol::provider::BLOCK, token: 1, handle: replacement_offered, consumers: 0, name: [0; driver_protocol::MAX_PROVIDER_NAME], name_len: 0 });
 	assert_eq!(catalogue.withdraw_binding(binding), 0);
 	assert!(matches!(try_recv(replacement_server, &mut bytes), Polled::Empty));
 	assert_eq!(catalogue.withdraw_binding(replacement), 1);
