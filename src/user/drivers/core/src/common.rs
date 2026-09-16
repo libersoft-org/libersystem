@@ -926,3 +926,55 @@ pub fn pong(bootstrap: u64, bind: &Bind, sequence: u32) -> bool {
 	proto::encode_sequence(sequence, &mut payload);
 	send_frame(bootstrap, proto::Opcode::Pong, bind.generation, &payload)
 }
+
+// A fixed-capacity byte buffer that drops what does not fit instead of panicking. The
+// alternative shape - a caller that keeps a running index and is responsible for staying under
+// the size - is what put an index panic one device away from a working driver, and it fails at
+// the append site where the size is least visible. Here every append is checked against the
+// same bound, and a report too long for the buffer arrives cut short: a truncated status line
+// is a cosmetic loss, while a driver that panics assembling one takes the bus down with it.
+pub struct Bounded<const N: usize> {
+	bytes: [u8; N],
+	len: usize,
+}
+
+impl<const N: usize> Bounded<N> {
+	pub fn new() -> Self {
+		Bounded { bytes: [0u8; N], len: 0 }
+	}
+
+	pub fn push(&mut self, data: &[u8]) {
+		let room = N - self.len;
+		let take = if data.len() < room { data.len() } else { room };
+		self.bytes[self.len..self.len + take].copy_from_slice(&data[..take]);
+		self.len += take;
+	}
+
+	pub fn decimal(&mut self, value: u64) {
+		let mut digits: [u8; 20] = [0u8; 20];
+		let written = push_decimal(&mut digits, value);
+		self.push(&digits[..written]);
+	}
+
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.bytes[..self.len]
+	}
+}
+
+pub fn push_decimal(out: &mut [u8], value: u64) -> usize {
+	let mut digits: [u8; 20] = [0u8; 20];
+	let mut v: u64 = value;
+	let mut n: usize = 0;
+	loop {
+		digits[n] = b'0' + (v % 10) as u8;
+		v /= 10;
+		n += 1;
+		if v == 0 {
+			break;
+		}
+	}
+	for i in 0..n {
+		out[i] = digits[n - 1 - i];
+	}
+	n
+}

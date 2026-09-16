@@ -506,7 +506,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// widening that followed only moved where the same edge is. What matters is that the
 		// bound is checked in one place instead of trusted at every append: an overlong report
 		// is a truncated line, never a dead driver, and the driver's job is the bus.
-		let mut report: Bounded<96> = Bounded::new();
+		let mut report: common::Bounded<96> = common::Bounded::new();
 		// ADDRESSED, like every other driver's report. Two controllers produced two identical online
 		// lines, and xHCI is an ordinary registry driver - a machine may have more than one.
 		report.push(b"driver.xhci: online (");
@@ -688,6 +688,24 @@ unsafe fn take_event(hc: &mut Xhci) -> Option<(u64, u32, u32)> {
 		if control & TRB_CYCLE != hc.evt_cycle {
 			return None;
 		}
+		// THE CYCLE BIT SAYS THIS TRB IS THIS PASS'S; IT DOES NOT SAY THE REST OF IT HAS ARRIVED.
+		//
+		// A sixteen-byte write from a controller is not atomic to this reader, and `read_volatile`
+		// says nothing about that - it stops the COMPILER reordering these three reads and orders
+		// nothing about a device write still in flight while they run. So the cycle bit can be
+		// visible while `param` and `status` are still the previous pass's contents, or the zeroes
+		// this ring was created with, and the event is then acted on with somebody else's slot id,
+		// somebody else's completion code, or a port number that is not the port that changed.
+		//
+		// FOUND WHILE WRITING THE NVMe DRIVER, where the same shape produced an intermittent
+		// bring-up failure roughly one boot in three: its phase bit arrived first and the driver
+		// believed a completion whose command id was still zero. `virtio.rs` has had the right shape
+		// all along - it reads `used.idx`, checks it, fences, and only then reads the element - and
+		// this is that fence, which was the one missing of the three ring consumers in this tree.
+		//
+		// NOTHING HERE CLAIMS TO HAVE SEEN THIS FAIL ON xHCI. It is the same defect in the same shape
+		// in a driver that ships, fixed because it is wrong rather than because it was caught.
+		core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 		let param: u64 = (trb as *const u64).read_volatile();
 		let status: u32 = ((trb + 8) as *const u32).read_volatile();
 		if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
@@ -1427,7 +1445,7 @@ fn report_device(dev: &UsbDevice) {
 		line[n] = b;
 		n += 1;
 	}
-	n += push_decimal(&mut line[n..], dev.port as u64);
+	n += common::push_decimal(&mut line[n..], dev.port as u64);
 	for &b in b" device " {
 		line[n] = b;
 		n += 1;
@@ -1440,64 +1458,13 @@ fn report_device(dev: &UsbDevice) {
 		line[n] = b;
 		n += 1;
 	}
-	n += push_decimal(&mut line[n..], dev.class as u64);
+	n += common::push_decimal(&mut line[n..], dev.class as u64);
 	line[n] = b'\n';
 	n += 1;
 	print(&line[..n]);
 }
 
 // Render a small decimal number into `out`, returning the digit count.
-// A fixed-capacity byte buffer that drops what does not fit instead of panicking. The
-// alternative shape - a caller that keeps a running index and is responsible for staying under
-// the size - is what put an index panic one device away from a working driver, and it fails at
-// the append site where the size is least visible. Here every append is checked against the
-// same bound, and a report too long for the buffer arrives cut short: a truncated status line
-// is a cosmetic loss, while a driver that panics assembling one takes the bus down with it.
-struct Bounded<const N: usize> {
-	bytes: [u8; N],
-	len: usize,
-}
-
-impl<const N: usize> Bounded<N> {
-	fn new() -> Self {
-		Bounded { bytes: [0u8; N], len: 0 }
-	}
-
-	fn push(&mut self, data: &[u8]) {
-		let room = N - self.len;
-		let take = if data.len() < room { data.len() } else { room };
-		self.bytes[self.len..self.len + take].copy_from_slice(&data[..take]);
-		self.len += take;
-	}
-
-	fn decimal(&mut self, value: u64) {
-		let mut digits: [u8; 20] = [0u8; 20];
-		let written = push_decimal(&mut digits, value);
-		self.push(&digits[..written]);
-	}
-
-	fn as_bytes(&self) -> &[u8] {
-		&self.bytes[..self.len]
-	}
-}
-
-fn push_decimal(out: &mut [u8], value: u64) -> usize {
-	let mut digits: [u8; 20] = [0u8; 20];
-	let mut v: u64 = value;
-	let mut n: usize = 0;
-	loop {
-		digits[n] = b'0' + (v % 10) as u8;
-		v /= 10;
-		n += 1;
-		if v == 0 {
-			break;
-		}
-	}
-	for i in 0..n {
-		out[i] = digits[n - 1 - i];
-	}
-	n
-}
 
 // Render a 16-bit value as four lowercase hex digits into `out`, returning 4.
 fn push_hex16(out: &mut [u8], value: u16) -> usize {

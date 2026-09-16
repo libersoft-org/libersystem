@@ -14,6 +14,14 @@ test = false
 bench = false
 
 [[bin]]
+# The NVM Express controller driver. Its decisions live in `src/nvme.rs`, which is part of the
+# library and host-tested; this binary is the MMIO, the DMA and the waiting.
+name = "nvme"
+path = "src/nvme_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "virtio_net"
 path = "src/virtio_net.rs"
 test = false

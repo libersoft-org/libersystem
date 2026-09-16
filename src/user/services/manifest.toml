@@ -1184,6 +1184,33 @@ providers = [
 ]
 
 [[programs]]
+name = "nvme"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/nvme.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# TRUSTED-UNTRANSLATED, THE SAME AS EVERY OTHER DMA-MASTERING STORAGE DRIVER HERE, and the reason is
+# worth stating rather than inheriting. `iommu-required` binds only where an enforcing controller
+# translates the device's addresses and REFUSES on a `no-iommu` machine, which is most profiles - so
+# declaring it would mean this controller never binds on the boots that would use it, a stricter
+# posture than this system takes for the disk it actually boots from. What that costs is written into
+# the threat model rather than left implied: without a controller in the path, this driver is a TCB
+# member for memory safety, because nothing between the device and RAM checks what its PRP entries
+# name.
+dma = "trusted-untranslated"
+# The class triple, not a vendor id: every vendor's NVMe controller and QEMU's model match one rule.
+match = [{ transport = "plain-pci", pci-class = 0x01, pci-subclass = 0x08, pci-interface = 0x02 }]
+# ONE BLOCK PROVIDER PER CONTROLLER. The binding unit is a PCI function and a namespace is not
+# expressible in one, so the driver picks the namespace and the provider is the controller's.
+provides = [{ kind = "block", most = 1, consumers = 4 }]
+heartbeat-deadline = 100
+
+[[programs]]
 name = "nslookup"
 owner = "tools"
 role = "tool"

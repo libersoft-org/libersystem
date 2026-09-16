@@ -941,3 +941,195 @@ The compatibility rule was also a property of one client rather than of the prot
 accepted a twelve-byte capacity reply so that a server predating the per-request bound still reports
 a size, written as `len >= 12` inside the service. `CAPACITY_SIZE_LEN` and `decode_capacity_bytes`
 name it, and two tests hold it.
+
+## NVMe: the driver is up, and what it cost to find out why it was not (2026-09-16)
+
+THE FIRST BRING-UP FAILED AND THE RESTART SUCCEEDED, and the log said "the driver says the device is
+not responding" - which is DeviceManager's category, not a diagnosis. The driver answered `None` from
+six different places and every one of them arrived at the manager as that one sentence.
+
+So the first fix was to the driver's ability to be read rather than to the driver: `bring_up` now
+returns a typed reason and prints it, and every admin command names its opcode and carries the
+controller's own status type and code. The next run said "the I/O queue pair was not created" on
+attempt 1 and "an admin command did not complete" on attempt 2, succeeding on attempt 3 - which is
+already a different kind of problem from the one "not responding" suggested. A driver that cannot say
+where it stopped makes its own log useless at the moment the log is the only thing there is.
+
+A HYPOTHESIS WAS CHECKED AND WAS WRONG, and it is recorded because it was nearly written down as the
+cause. `iommu/mod.rs` walks every PCI function during the bypass transition, finds the NVMe class
+triple and clears `CC.EN` - which would explain a controller being disabled underneath its driver at
+whatever command happened to be in flight. The logs carry no `quiesce` or `bypass` line at all on
+this profile, so the transition does not run here and that is not what happened.
+
+WHAT WAS GENUINELY WRONG, INDEPENDENT OF THE FLAKE: there was no barrier between the sixty-four bytes
+of a submission entry and the doorbell write that says the entry is there. `write_volatile` stops the
+COMPILER reordering those and says nothing about the machine. x86's store ordering usually hides it,
+which is precisely why it was worth fixing: this tree also builds for aarch64 and riscv64, where a
+controller reading a half-written submission entry is not a hypothetical. The completion side had the
+mirror of it - the phase bit is what says the other fifteen bytes belong to this pass, and reading
+them in an order the controller did not write them in is how a completion is believed while its
+status is still the previous command's.
+
+THE FLAKE IS NOT YET CLAIMED TO BE EXPLAINED. The fences are correct on their own terms; whether they
+are what the intermittent bring-up needed is a separate question, and a run that happens to pass is
+not an answer to it.
+
+## The NVMe defect has a name now, and the first fix for it was wrong (2026-09-16, later)
+
+THE DRIVER SAYS IT: "a completion for a command that is not outstanding", at the first bring-up and
+at the stop-time flush. One defect wearing three faces - the retried bring-up, the flush that cannot
+certify a clean stop, and the failure of the oracle test. It only has a name because the driver was
+taught to report where it stopped and what the controller answered; before that it was "the driver
+says the device is not responding", which is DeviceManager's category for six different places.
+
+THE FIX THAT WAS TRIED AND REVERTED, recorded because the theory behind it was reasonable and is now
+disproved. NVMe permits completions in any order, so an entry carrying an id this caller is not
+waiting for looked like a stale completion to be CONSUMED and stepped over - the queue cannot advance
+past an entry nobody consumes, and a driver that stops at the first one stops forever. Implemented,
+it made the symptom worse: the driver reported "never completed" instead, and the boot came up with
+five of twenty-four services. Draining the entry consumed the only completion that was going to
+arrive. So the ids genuinely do not match, rather than a stale entry being in the way of the right
+one, and the next attempt starts from that instead of from the theory.
+
+The submitted id and the awaited id were read back out of the generated source rather than assumed:
+they are the same `id` binding in all five admin call sites. So the mismatch is between what the
+driver writes into dword 0 and what it reads out of dword 3, or between the slot it reads and the
+slot the controller wrote - not a bookkeeping slip in the call sites.
+
+THE ORACLE WAS WRITTEN, RUN AND REMOVED. It drives the driver as DeviceManager does, takes the block
+provider, writes a non-constant pattern to LBA 7 - non-constant because the medium starts blank, so
+a read returning untouched medium would match a zero buffer and one returning a constant fill would
+match whatever offset it actually read - reads it back, compares, and checks that a range past the
+last block is refused with the typed status rather than clamped. It fails because spawning a second
+instance against a controller DeviceManager already owns destabilises the boot. A test that breaks
+the machine it observes is not yet a test, so it came out rather than being left red, and
+`component-oracle-exceptions.txt` carries a line saying exactly this rather than claiming the driver
+has coverage it does not.
+
+WHAT IS GREEN, AND WHAT THAT DOES AND DOES NOT MEAN. 401 tests pass with the controller on the bus
+and the driver bound; the driver reports its namespace from IDENTIFY rather than from anything the
+harness told it; three consecutive runs carried zero restarts after the memory fences went in. That
+is a working driver with a known intermittent defect that DeviceManager's restart hides, and the
+milestone says so in those words.
+
+## The NVMe defect, found (2026-09-16, later still)
+
+THE CONTROLLER WAS FETCHING SUBMISSION ENTRIES THIS DRIVER NEVER WROTE. The evidence is one number
+and it took three rounds of making the driver able to say things to get it.
+
+Round one: `bring_up` answered `None` from six places and the manager said "the device is not
+responding" for all of them. Round two: a typed reason per place, and every command naming its opcode
+and carrying the controller's own status - which turned "not responding" into "a completion for a
+command that is not outstanding". Round three: the id it actually saw and the raw dword it came out
+of, which is the one that settled it.
+
+    driver.nvme: sqe slot 0 dw0 00010006 entries 8
+    driver.nvme: command 06 got a completion for command id 0 while waiting for 1, dword 3 00010000
+
+The submission entry was read back out of queue memory before the doorbell: command id 1, opcode 6.
+The write had landed. The completion that came back carried command id 0 with a SUCCESS status, and a
+ZEROED submission entry is exactly that command - opcode 0x00 is FLUSH and its command id is 0. So
+the controller consumed a slot this driver never wrote, on the very first command of a fresh boot.
+
+It does that when its tail doorbell still holds a value from before the reset: on enable it believes
+there are entries queued up to that tail, consumes them, and they are the zeroed page. That also
+explains why it was INTERMITTENT and why it moved around - the failure lands on whichever command
+happens to be in flight when the phantom completions run out, which is why it was seen at IDENTIFY,
+at CREATE I/O COMPLETION QUEUE and at the stop-time FLUSH.
+
+THE FIX IS TWO STORES PER QUEUE AND CANNOT BE WRONG. A queue that has just been created is EMPTY, so
+zero is what both ends should believe; the driver writes its own view - tail zero, head zero - onto
+the admin pair after enable and onto the I/O pair after creation, rather than assuming the reset
+cleared the controller's. A driver may not assume that.
+
+WHAT THIS REPLACES: the earlier attempt to drain unexpected completions, which was reverted. That
+theory said a stale entry was IN THE WAY of the right one; draining it made things worse because
+there was no right one coming - the phantom completion was the controller's answer to a phantom
+command. The disproof was worth more than the change.
+
+## The NVMe defect, actually found: a torn completion entry (2026-09-16, final)
+
+THE PHASE BIT ARRIVED BEFORE THE ENTRY IT VALIDATES. Everything else followed from that, and it took
+three rounds of making the driver able to say things to see it.
+
+    driver.nvme: sqe slot 0 dw0 00010006 entries 8
+    driver.nvme: command 01 got id 0 waiting for 5, sq 0 head 0, dw3 00010000
+
+The submission entry was read back out of queue memory before the doorbell: command id 1, opcode 6,
+so the write landed where the controller reads. The completion did not come from the controller
+answering anything: dword 2's bottom half is the submission queue head, and `head 0` with five
+commands outstanding says it had consumed nothing. Every field of the entry was zero except the
+phase bit in dword 3.
+
+A SIXTEEN-BYTE WRITE FROM A DEVICE IS NOT ATOMIC TO ITS READER, and `read_volatile` says nothing
+about that: it stops the compiler reordering, not the write from being half-visible. An acquire fence
+BEFORE reading the entry orders the reader's own earlier accesses and orders nothing about a write
+that is still in flight while it runs. So the driver read sixteen bytes, saw a phase bit that said
+"this is yours", and believed a command id of zero.
+
+THE FIX IS TWO RULES, and both are about not believing a half-arrived entry:
+- The phase is read ON ITS OWN. Only once it says this entry belongs to this pass is an acquire
+  fence taken and the entry read AGAIN. Every real completion is read twice and every empty slot
+  once, which is what not believing an unfinished one costs.
+- COMMAND ID ZERO IS NEVER ISSUED. It is a rule the driver keeps rather than a fact that happens to
+  hold, and it makes "id 0" mean exactly one thing: an entry that has not finished arriving. Without
+  it, a torn entry and a completion belonging to somebody else are indistinguishable, and those want
+  opposite responses - keep waiting, or stop using the queue.
+
+EIGHT CONSECUTIVE RUNS: no restart, no unexpected completion, no timeout, no failed flush. Three of
+the ten runs before it carried a failure.
+
+TWO EARLIER CANDIDATES, KEPT IN THE RECORD BECAUSE EACH DISPROVED SOMETHING. Draining an unexpected
+completion and stepping over it was reverted - it made the symptom worse, which disproved "a stale
+entry is in the way of the right one" and pointed at there being no right one coming. Zeroing each
+queue's doorbells after creation was kept, because a queue that has just been created is empty and
+the two stores cannot be wrong, but six runs with it carried three failures, so it is not what fixed
+this and is not claimed to be.
+
+THE WIDER LESSON FOR THE NEXT DRIVER IN THIS TREE: the same read is in `virtio.rs` and in `xhci.rs`
+wherever a device-written descriptor is validated by one field and read as a whole. Nothing here
+asserts they are wrong - the used-ring and event-ring paths were not examined - but the shape is
+worth checking before the next one is written.
+
+## The same defect, in a driver that ships (2026-09-16)
+
+THREE PROGRAMS IN THIS TREE CONSUME A RING A DEVICE WRITES INTO and validate each entry by one
+field: `virtio.rs` by the used index, `xhci.rs` by the TRB cycle bit, `nvme_driver.rs` by the
+completion phase bit. Writing the third one and having it fail roughly one boot in three is what
+made the shape visible in the other two.
+
+`virtio.rs` is correct and has been: `take_used` reads `used.idx`, checks that it advanced by no more
+than the buffers outstanding, FENCES, and only then reads the element. That is the pattern.
+
+`xhci.rs` was not. `take_event` read the cycle bit out of the TRB's control dword, checked it against
+the expected cycle, and then read `param` and `status` with nothing between. The cycle bit says the
+TRB belongs to this pass; it does not say the other twelve bytes have arrived. Acted on torn, an
+event carries somebody else's slot id, somebody else's completion code, or - for a port-status event
+- a port number that is not the port that changed.
+
+ONE FENCE, AND NO CLAIM THAT IT WAS EVER SEEN TO FAIL. It is the same defect in the same shape in a
+driver that ships, fixed because it is wrong. 402 tests pass with it in.
+
+WHAT THIS SAYS ABOUT THE OTHER TWO THINGS THE TREE DOES WITH DEVICE-WRITTEN MEMORY: nothing yet. The
+virtio-gpu response reads and the virtio-snd period handling were not examined, and this note does
+not cover them.
+
+### And the sweep that closes it
+
+Every ring consumer in the tree was then checked rather than assumed, which is the half that turns
+one fix into a statement about the tree:
+
+- `virtio.rs::take_used` - CORRECT. Reads `used.idx`, checks it advanced by no more than the buffers
+  outstanding, fences, then reads the element.
+- `virtio.rs::submit` (the busy-polling path `virtio-gpu` uses, which reaches the used ring without
+  `take_used`) - CORRECT. After the poll loop observes the index bump there is an explicit fence,
+  with a comment naming the exact reordering it prevents on a weakly ordered core, before the element
+  is read.
+- every other virtio driver - covered, because `virtio_blk`, `virtio_net`, `virtio_input`,
+  `virtio_snd`, `virtio_console` and `serial_port` all reach the ring through one of those two, and
+  their direct `read_volatile` calls read the DMA payload AFTER the fence those paths take.
+- `xhci.rs::take_event` - WAS WRONG, now fixed.
+- `nvme_driver.rs` - was wrong, now fixed, and is where this started.
+
+So the defect class is closed across this tree's ring consumers rather than in the one driver where
+it was caught.

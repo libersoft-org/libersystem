@@ -141,6 +141,161 @@ fn device_table_exposes_the_xhci_controller() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the xHCI register file should map to a valid address");
 }
 
+tagged_test!(device_table_resources_the_nvme_controller, [Drivers, Pci], id = "kernel.hardware.device_table_resources_the_nvme_controller", covers = ["kernel"]);
+fn device_table_resources_the_nvme_controller() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	// THE SECOND FAMILY THE PLAIN-PCI RESOURCE PROFILE RESOLVES, and the reason this test exists
+	// rather than the xHCI one being taken as covering it: until this change there was exactly one
+	// resolver, so "a plain-PCI function gets a register window" and "the xHCI controller gets a
+	// register window" were the same sentence and the same code path. They are now a table and a
+	// row in it, and a row that resolves nothing would be invisible to every other test here.
+	//
+	// AND IT READS THE CONTROLLER THROUGH THE WINDOW, which is what a non-zero `bar_len` does not
+	// prove. A row carrying some other function's base is still a row with a BAR; a row whose base
+	// is the NVMe register file answers `CAP` with a controller that declares the NVM command set.
+	// That is the difference between resolving a number and resolving the right one.
+	static BAR_LEN: AtomicU64 = AtomicU64::new(0);
+	static FOUND: AtomicU64 = AtomicU64::new(0);
+	static CAP: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn body(_arg: u64) {
+		let mut info = abi::DeviceInfo::default();
+		let size = core::mem::size_of::<abi::DeviceInfo>() as u64;
+		unsafe {
+			let count = arch::syscall::invoke(syscall::SYS_DEVICE_COUNT, 0, 0, 0, 0);
+			for i in 0..count {
+				if arch::syscall::invoke(syscall::SYS_DEVICE_INFO, i, &mut info as *mut _ as u64, size, 0) as i64 != 0 {
+					continue;
+				}
+				if info.device_type != abi::DEVICE_TYPE_NVME {
+					continue;
+				}
+				FOUND.fetch_add(1, Ordering::SeqCst);
+				if BAR_LEN.load(Ordering::SeqCst) != 0 {
+					// The first one already answered CAP through its window; a second resourced row
+					// is what this count is here to see.
+					continue;
+				}
+				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
+				if let Ok(grant) = crate::tests::claim_device(i) {
+					let mapped = arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, grant.memory, 0, 0, 0);
+					if mapped != 0 && !syscall::sys_is_err(mapped) {
+						// CAP is the register file's first eight bytes, read as two halves because
+						// a 64-bit access to a controller register is not portable.
+						let low = (mapped as *const u32).read_volatile() as u64;
+						let high = ((mapped + 4) as *const u32).read_volatile() as u64;
+						CAP.store(low | (high << 32), Ordering::SeqCst);
+					}
+					crate::tests::release_device(&grant);
+				}
+			}
+		}
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(FOUND.load(Ordering::SeqCst) >= 2, "both NVMe controllers should be resourced, not just the first one the scan met ({} found)", FOUND.load(Ordering::SeqCst));
+	// A whole page at least: the controller registers and the first doorbell live inside it.
+	assert!(BAR_LEN.load(Ordering::SeqCst) >= 0x1000, "the NVMe BAR 0 should be at least a page (probed {:#x})", BAR_LEN.load(Ordering::SeqCst));
+	let cap = CAP.load(Ordering::SeqCst);
+	assert!(cap != 0 && cap != u64::MAX, "CAP read through the resolved window should be a real value, not {cap:#x}");
+	// CAP.MQES is zero-based and a queue of no entries is not a controller; CAP.CSS bit 37 is the
+	// NVM command set, which is the one this machine's driver speaks.
+	assert!(cap & 0xFFFF != 0, "CAP.MQES should describe at least one queue entry");
+	assert!((cap >> 37) & 1 != 0, "CAP.CSS should advertise the NVM command set");
+}
+
+tagged_test!(nvme_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.nvme_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.nvme"]);
+fn nvme_driver_serves_a_write_and_reads_it_back() {
+	use object::channel::{Channel, Message};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// THE OBSERVABLE EFFECT, AND NOT "THE DRIVER REACHED ONLINE". This tree's component-oracle
+	// convention rejects that, and it is right to: a driver that brings a controller up and then
+	// moves no bytes has done the easy half. So this harness drives `driver.nvme` the way
+	// DeviceManager does, takes the `block` provider it publishes, WRITES a pattern to a sector and
+	// READS IT BACK. A controller whose PRP arithmetic is wrong, whose completions are believed at
+	// the wrong phase, or whose doorbell is at the wrong stride fails at that comparison.
+	//
+	// ONE RESOURCE, NOT FOUR. This driver polls its completion queue, so it never asks for the
+	// interrupt the xHCI harness below must mint; an absent resource is a state it can see rather
+	// than a message it waits for, which is what `BIND` stating its own count is for.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/nvme.lsexe")).expect("the nvme.lsexe driver should be staged on the volume under drivers/");
+
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::DEVICE_TYPE_NVME {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the NVMe controller");
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the nvme driver should load");
+	// TAKEN, NOT MERELY MAPPED. A controller handed only its BAR brings its queues up, rings the
+	// doorbell and waits forever for a completion the bus will not let it write.
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the NVMe controller")).expect("the NVMe controller is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, key.generation, 1).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	sched::run_until_idle();
+
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the nvme driver should report READY");
+	let blk = offer_of(&offers, driver_protocol::provider::BLOCK).expect("the driver offers the controller's block service").into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+
+	// The capacity query first: the number the driver reports comes from IDENTIFY NAMESPACE rather
+	// than from anything this test told it.
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	blk.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the capacity request should send");
+	sched::run_until_idle();
+	let cap_reply = blk.recv().expect("the capacity reply should arrive");
+	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
+	assert_eq!(reported.bytes, 16 * 1024 * 1024, "the controller should report the attached medium's real size");
+	assert!(reported.max_sectors > 0, "and a per-request bound the client can size against");
+
+	// A PATTERN THAT IS NEITHER ZEROES NOR CONSTANT, because the medium starts blank: a read that
+	// returned untouched medium would match a zero buffer, and one that returned the same byte
+	// everywhere would match a constant fill whatever offset it actually read from.
+	const SECTOR: usize = 512;
+	let pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8) ^ 0xA5).collect();
+	let source = object::memory_object::MemoryObject::create(SECTOR).expect("a source buffer");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(pattern.as_ptr(), (hhdm + phys) as *mut u8, SECTOR) };
+	}
+	// LBA 7 rather than 0, so a driver that ignored the address and always moved the first sector
+	// would still be caught.
+	const LBA: u64 = 7;
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the write request should send");
+	sched::run_until_idle();
+	let write_reply = blk.recv().expect("the write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the write should succeed");
+
+	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the read request should send");
+	sched::run_until_idle();
+	let read_reply = blk.recv().expect("the read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the read should succeed");
+	let buf_cap = read_reply.caps.first().expect("the read should grant a buffer");
+	let object = buf_cap.object();
+	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(memory, SECTOR), pattern, "the sector read back should be the bytes that were written to it");
+
+	// AND A REQUEST PAST THE END IS REFUSED RATHER THAN CLAMPED, with the typed status that tells a
+	// caller it got the request wrong apart from one saying the device failed. A clamp here would
+	// turn a wrong request into a wrong WRITE somewhere the caller did not name.
+	let past = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: 1 << 40, count: 1 }.encode();
+	blk.send(Message::new(past.to_vec(), alloc::vec::Vec::new())).expect("the out-of-range request should send");
+	sched::run_until_idle();
+	let refused = blk.recv().expect("the refusal should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "a range past the last block is refused, and the controller is not asked");
+	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+}
+
 tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], id = "kernel.hardware.xhci_driver_enumerates_the_usb_bus", covers = ["kernel", "bin.xhci"]);
 fn xhci_driver_enumerates_the_usb_bus() {
 	use object::channel::{Channel, Message};

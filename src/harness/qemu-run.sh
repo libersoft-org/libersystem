@@ -601,6 +601,49 @@ qemu_attach_virtio_net() {
 	fi
 }
 
+# THE NVMe CONTROLLER, AND WHY ITS MEDIUM IS BLANK.
+#
+# The other fixture media carry something the guest is meant to find: a volume archive, a filesystem,
+# a package. This one carries nothing on purpose. What it is here to exercise is the CONTROLLER - the
+# reset and enable handshake, the admin queue pair, identify, the I/O queue pair and the block
+# provider the driver publishes - and a medium with content would make the first failure of any of
+# those look like a content problem instead.
+#
+# ATTACHED LAST, after the media disks, because the comment above the media block says PCI discovery
+# order is what the boot chain's volume and device inventory expects. A new function ahead of them
+# would renumber what every one of those expects; behind them it is an addition rather than a
+# reshuffle.
+#
+# Its own per-run copy like every other writable medium: the driver writes to it, and two runs of one
+# architecture sharing a file is the isolation failure `qemu_run_disk` exists to prevent.
+qemu_attach_nvme() {
+	local -n arr=$1
+	local disk="$QEMU_BUILD_DIR/nvme-scratch.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/nvme-scratch" .img
+	rm -f "$disk"
+	truncate -s 16M "$disk" || {
+		echo "qemu-run: could not make this run's NVMe scratch medium at $disk" >&2
+		return 1
+	}
+	# TWO CONTROLLERS, BECAUSE ONE CANNOT SHOW THAT BINDING IS PER FUNCTION. The roadmap's gate rule
+	# asks for two instances wherever the standard permits them, and NVMe permits them: two functions
+	# are two bindings, two driver processes and two block providers. With one controller, "the rule
+	# matched the class triple" and "the rule matched THIS function" are the same observation.
+	local second="$QEMU_BUILD_DIR/nvme-second.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/nvme-second" .img
+	rm -f "$second"
+	truncate -s 8M "$second" || {
+		echo "qemu-run: could not make this run's second NVMe medium at $second" >&2
+		return 1
+	}
+	arr+=(
+		-drive "file=$disk,if=none,id=nvmescratch,format=raw"
+		-device "nvme,serial=libersystem-nvme,drive=nvmescratch"
+		-drive "file=$second,if=none,id=nvmesecond,format=raw"
+		-device "nvme,serial=libersystem-nvme-2,drive=nvmesecond"
+	)
+}
+
 qemu_attach_xhci() {
 	local -n arr=$1
 	local usb_drive_id="${2:-}"
@@ -1702,6 +1745,11 @@ qemu_run_x86_64() {
 			[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
 		fi
 	fi
+
+	# AND THE NVMe CONTROLLER AFTER ALL OF THEM, for the reason given at the helper: the media block
+	# above says PCI discovery order is what the boot chain's inventory expects, so a new function is
+	# added behind them rather than in among them.
+	qemu_attach_nvme qemu_args
 
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
