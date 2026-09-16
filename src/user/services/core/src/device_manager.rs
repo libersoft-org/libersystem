@@ -1726,6 +1726,15 @@ struct Node {
 	// after the process is gone cannot ask the process anything.
 	last_opcode: u16,
 	last_frame_at: u64,
+	// WHEN `BIND` WENT OUT, so the window this driver actually took to answer it is a number rather
+	// than a budget nobody has measured.
+	//
+	// P02M0162 sets READY's maximum and says in as many words that the MEASUREMENT belongs to its
+	// consumers - every driver item owes its own window on every target it claims acceptance on. It
+	// was owed by all of them and produced by none, because nothing in the running system reported
+	// it: the incident report carries a silence interval, and only when something has already gone
+	// wrong. This is the ordinary case, on the ordinary path, for every driver at every boot.
+	bind_at: u64,
 	// WHICH of the chosen entry's rules matched this device. See `BindingRecord.rule`.
 	matched_rule: u32,
 	// How many resources the current bind granted: the MMIO window, an interrupt where the entry
@@ -1854,7 +1863,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, bind_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
 	}
 
 	// A manual grant is separate from the automatic count and survives only until one claim.
@@ -3061,6 +3070,36 @@ fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					if driver_binding::handshake_expired(node.record.state, node.ready_deadline, node.last_frame_at) {
 						node.push(BindingEvent::TimedOut { generation });
 					} else {
+						// THE WINDOW THIS DRIVER TOOK, printed on the ordinary path rather than only
+						// when something failed. The timer runs at 100 Hz on every architecture, so
+						// a tick is ten milliseconds and this is the number a driver item records
+						// for this target.
+						if node.bind_at != 0 {
+							let mut line = [0u8; 96];
+							let mut n = 0;
+							for byte in b"DeviceManager: bind window " {
+								line[n] = *byte;
+								n += 1;
+							}
+							let name = node.driver_name();
+							for byte in name.iter().take(24) {
+								line[n] = *byte;
+								n += 1;
+							}
+							for byte in b" = " {
+								line[n] = *byte;
+								n += 1;
+							}
+							let mut number = [0u8; 20];
+							let digits = decimal(clock().saturating_sub(node.bind_at), &mut number);
+							line[n..n + digits].copy_from_slice(&number[..digits]);
+							n += digits;
+							for byte in b" tick(s) from BIND to READY\n" {
+								line[n] = *byte;
+								n += 1;
+							}
+							print(&line[..n]);
+						}
 						node.push(BindingEvent::Ready { generation });
 					}
 				}
@@ -3697,6 +3736,7 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// development console and the ordinary one are the same artifact under two rules.
 	node.matched_rule = node.candidates.get(node.candidate).and_then(|entry| entry.rules.iter().position(|rule| rule.matches(info))).unwrap_or(0) as u32;
 	node.ready_deadline = node.incident.attempt_deadline();
+	node.bind_at = clock();
 	// `BIND` - the device, and the count of what follows. No capability travels with it.
 	let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
 	let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);

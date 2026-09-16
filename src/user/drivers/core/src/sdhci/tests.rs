@@ -1,0 +1,145 @@
+// EACH OF THESE WATCHES ONE WAY AN SD DRIVER IS WRONG, and the two that matter most are silent when
+// they happen: a capacity read with the wrong CSD encoding, and a block number sent to a card that
+// is addressed in bytes. Neither produces an error anywhere; the first reports a size off by orders
+// of magnitude and the second reads the first sector of the medium for every request, for ever.
+
+use super::*;
+
+#[test]
+fn a_version_one_card_and_a_version_two_card_are_sized_by_different_arithmetic() {
+	// Version 2: C_SIZE 15271 means (15271 + 1) * 512 KB, which is a 8 GB card in 512-byte blocks.
+	let v2 = [1u32 << 30, 15271 >> 16, (15271 & 0xFFFF) << 16, 0];
+	assert_eq!(csd_capacity(v2), Ok(Card { blocks: 15272 * 1024, block_bytes: 512 }));
+
+	// Version 1: C_SIZE 3751, C_SIZE_MULT 7, READ_BL_LEN 10 is the classic 2 GB encoding -
+	// (3751 + 1) * 2^9 * 2^10 bytes.
+	let c_size: u32 = 3751;
+	let mut v1 = [0u32; 4];
+	v1[1] = (10 << 16) | (c_size >> 2);
+	v1[2] = ((c_size & 0x03) << 30) | (7 << 15);
+	let card = csd_capacity(v1).expect("a version 1 card");
+	assert_eq!(card.blocks, ((c_size as u64 + 1) << 9 << 10) / 512);
+	assert_eq!(card.block_bytes, 512);
+}
+
+#[test]
+fn a_csd_version_this_driver_does_not_parse_is_refused_rather_than_guessed_at() {
+	// Guessing means reporting a capacity that is wrong by orders of magnitude, with no error.
+	assert_eq!(csd_capacity([2 << 30, 0, 0, 0]), Err(Unservable::UnknownCsdVersion));
+	assert_eq!(csd_capacity([3 << 30, 0, 0, 0]), Err(Unservable::UnknownCsdVersion));
+}
+
+#[test]
+fn a_card_reporting_no_blocks_is_refused() {
+	// A version 1 CSD of all zeroes is one block of one byte, which rounds to no blocks at all.
+	assert_eq!(csd_capacity([0, 0, 0, 0]), Err(Unservable::Empty));
+}
+
+#[test]
+fn the_addressing_bit_decides_whether_a_block_number_or_a_byte_offset_is_sent() {
+	// A block number sent to a byte-addressed card names byte 7 - inside the first sector - so every
+	// request in the system reads sector zero and reports success.
+	assert_eq!(address_for(7, true), 7);
+	assert_eq!(address_for(7, false), 7 * 512);
+	assert_eq!(address_for(0, false), 0, "and the first block is the same either way");
+}
+
+#[test]
+fn the_capacity_bit_is_not_read_before_the_card_says_it_is_ready() {
+	// Bit 30 is a field the card has not filled in until bit 31 is set, and reading it early is how
+	// a high-capacity card is driven as a standard one.
+	assert_eq!(ocr(0), Ocr { ready: false, high_capacity: false });
+	assert_eq!(ocr(1 << 30), Ocr { ready: false, high_capacity: false }, "not ready, so not read");
+	assert_eq!(ocr(1 << 31), Ocr { ready: true, high_capacity: false });
+	assert_eq!(ocr((1 << 31) | (1 << 30)), Ocr { ready: true, high_capacity: true });
+}
+
+#[test]
+fn a_command_waits_for_the_data_line_only_when_it_uses_it() {
+	// Waiting for both every time serialises a driver behind transfers it does not touch; waiting
+	// for neither sends a command the controller drops.
+	assert_eq!(may_send(0, false), Ok(()));
+	assert_eq!(may_send(PRESENT_DAT_INHIBIT, false), Ok(()), "a command with no data may go");
+	assert_eq!(may_send(PRESENT_DAT_INHIBIT, true), Err(Busy::Data));
+	assert_eq!(may_send(PRESENT_CMD_INHIBIT, false), Err(Busy::Command));
+	// The command inhibit stops everything, data or not.
+	assert_eq!(may_send(PRESENT_CMD_INHIBIT | PRESENT_DAT_INHIBIT, true), Err(Busy::Command));
+}
+
+#[test]
+fn an_error_is_read_before_a_completion_and_not_after_it() {
+	// A controller raising an error also raises the completion bits for some commands, so testing
+	// for completion first calls a failed read finished - and returns whatever was in the buffer.
+	assert_eq!(completion(0, INT_COMMAND_COMPLETE), Completion::Waiting);
+	assert_eq!(completion(INT_COMMAND_COMPLETE, INT_COMMAND_COMPLETE), Completion::Done);
+	assert_eq!(completion(INT_ERROR | (0x0008 << 16), INT_COMMAND_COMPLETE), Completion::Failed { errors: 0x0008 });
+	assert_eq!(completion(INT_ERROR | INT_COMMAND_COMPLETE | (0x0001 << 16), INT_COMMAND_COMPLETE), Completion::Failed { errors: 0x0001 }, "set together, the error wins");
+	// Every wanted bit, not any of them.
+	let both = INT_COMMAND_COMPLETE | INT_TRANSFER_COMPLETE;
+	assert_eq!(completion(INT_COMMAND_COMPLETE, both), Completion::Waiting);
+	assert_eq!(completion(both, both), Completion::Done);
+}
+
+#[test]
+fn a_commands_word_carries_its_index_its_response_shape_and_whether_it_moves_data() {
+	// The controller clocks in a fixed number of bits, so asking for the wrong shape reads a CID as
+	// a status word or waits for bits the card is not sending.
+	let read = command_word(CMD_READ_SINGLE_BLOCK, Response::Short, true);
+	assert_eq!(read >> 8, CMD_READ_SINGLE_BLOCK as u16, "the index is in the top byte");
+	assert_eq!(read & 0x03, 2, "a short response");
+	assert_ne!(read & (1 << 5), 0, "and it moves data");
+
+	let idle = command_word(CMD_GO_IDLE, Response::None, false);
+	assert_eq!(idle & 0x03, 0);
+	assert_eq!(idle & ((1 << 3) | (1 << 4)), 0, "nothing to check in a response that does not come");
+	assert_eq!(idle & (1 << 5), 0);
+
+	// A long response carries no command index, so only its CRC is checked.
+	let csd = command_word(CMD_SEND_CSD, Response::Long, false);
+	assert_eq!(csd & 0x03, 1);
+	assert_ne!(csd & (1 << 3), 0);
+	assert_eq!(csd & (1 << 4), 0, "no index to check in a 136-bit answer");
+
+	// A busy response is its own shape, not a short one with a flag.
+	assert_eq!(command_word(CMD_SELECT_CARD, Response::ShortBusy, false) & 0x03, 3);
+}
+
+#[test]
+fn the_clock_divider_never_rounds_upwards() {
+	// A clock above what the card negotiated is not a card running slightly fast; it is a card that
+	// stops answering.
+	assert_eq!(clock_divider(50_000_000, 400_000), 63, "400 kHz identification from a 50 MHz base");
+	assert!(50_000_000 / (2 * 63) <= 400_000, "and the result is at or below what was asked for");
+	assert_eq!(clock_divider(50_000_000, 50_000_000), 0, "the base clock undivided");
+	assert_eq!(clock_divider(50_000_000, 60_000_000), 0, "and never faster than the base");
+	assert_eq!(clock_divider(50_000_000, 0), 0, "a target of zero is not a division by zero");
+}
+
+#[test]
+fn the_clock_control_word_puts_the_divider_where_the_register_wants_it() {
+	let value = clock_control(63);
+	assert_eq!(value >> 8, 63);
+	assert_ne!(value & CLOCK_INTERNAL_ENABLE, 0, "and asks for the internal clock");
+}
+
+#[test]
+fn a_card_and_its_write_protect_switch_are_read_from_the_present_state() {
+	assert!(!card_present(0));
+	assert!(card_present(PRESENT_CARD_INSERTED));
+	// The write-protect line is ACTIVE LOW: the bit set means writable, so a driver reading it the
+	// obvious way round makes every ordinary card read-only.
+	assert!(write_protected(0), "the line low is a protected card");
+	assert!(!write_protected(PRESENT_WRITE_PROTECT), "and the line high is a writable one");
+}
+
+#[test]
+fn the_ocr_answer_is_asked_for_without_a_crc_check() {
+	// R3 has its CRC field filled with ones by the specification, so a controller asked to check it
+	// reports a CRC error on a card that answered correctly - and the identification sequence sends
+	// exactly one of these, which every bring-up depends on.
+	let opcond = command_word(ACMD_SD_SEND_OP_COND, Response::ShortNoCrc, false);
+	assert_eq!(opcond & 0x03, 2, "still a 48-bit answer");
+	assert_eq!(opcond & ((1 << 3) | (1 << 4)), 0, "and nothing about it is checked");
+	// The ordinary short response is unchanged and still checked both ways.
+	assert_eq!(command_word(CMD_SEND_IF_COND, Response::Short, false) & ((1 << 3) | (1 << 4)), (1 << 3) | (1 << 4));
+}

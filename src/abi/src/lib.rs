@@ -661,12 +661,34 @@ pub const DEVICE_TYPE_XHCI: u32 = 0x100;
 pub const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
 pub const PCI_SUBCLASS_NVM: u8 = 0x08;
 pub const PCI_PROG_IF_NVME: u8 = 0x02;
+// AHCI is the same mass-storage class as NVMe, a different subclass, and a programming interface
+// that is the whole distinction between a controller this driver can drive and one in a legacy IDE
+// compatibility mode that it must not touch.
+pub const PCI_SUBCLASS_SATA: u8 = 0x06;
+pub const PCI_PROG_IF_AHCI: u8 = 0x01;
+// An SD host controller is a base system peripheral rather than a mass-storage controller, which is
+// its own small surprise: the class says what the silicon IS and not what it carries.
+// HD Audio is a multimedia controller with an audio-device subclass and no programming interface of
+// its own, which is why the row below names zero rather than leaving it out: a triple with a hole in
+// it would match the vendor-specific audio devices that carry other interfaces.
+pub const PCI_CLASS_MULTIMEDIA: u8 = 0x04;
+pub const PCI_SUBCLASS_AUDIO_DEVICE: u8 = 0x03;
+pub const PCI_PROG_IF_HDA: u8 = 0x00;
+pub const PCI_CLASS_BASE_PERIPHERAL: u8 = 0x08;
+pub const PCI_SUBCLASS_SD_HOST: u8 = 0x05;
+pub const PCI_PROG_IF_SD_HOST: u8 = 0x01;
 pub const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
 pub const PCI_SUBCLASS_USB: u8 = 0x03;
 pub const PCI_PROG_IF_XHCI: u8 = 0x30;
 // An NVM Express controller. 0x101 is taken by the unresolved row below, which was allocated before
 // a second resolved family existed; the numbers are a namespace and not an order.
 pub const DEVICE_TYPE_NVME: u32 = 0x102;
+// A SATA controller in AHCI mode.
+pub const DEVICE_TYPE_AHCI: u32 = 0x103;
+// An Intel High Definition Audio controller.
+pub const DEVICE_TYPE_HDA: u32 = 0x105;
+// An SD/eMMC host controller conforming to the SD Host Controller specification.
+pub const DEVICE_TYPE_SDHCI: u32 = 0x104;
 
 // A FUNCTION THIS KERNEL RESOLVED NO PROFILE FOR, and that is a device type of its own rather than an
 // absence. Every PCI function is in the inventory; the ones outside the two resolvers carry their
@@ -691,6 +713,9 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_SOUND => "virtio-snd",
 		DEVICE_TYPE_XHCI => "xhci",
 		DEVICE_TYPE_NVME => "nvme",
+		DEVICE_TYPE_AHCI => "ahci",
+		DEVICE_TYPE_SDHCI => "sdhci",
+		DEVICE_TYPE_HDA => "hda",
 		DEVICE_TYPE_UNKNOWN => "unresolved-pci-function",
 		// A code this build does not classify. The NUMBER is kept, because a reader chasing an
 		// unrecognised device needs it and "unknown" alone sends them back to the source.

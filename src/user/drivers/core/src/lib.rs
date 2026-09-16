@@ -13,6 +13,9 @@ extern crate alloc;
 // A library says it properly: this is the surface a driver may use, and no binary owes it a caller.
 // Nothing here is exempt from having ONE - the items with no caller anywhere in the tree were
 // deleted before the move, not carried across by it.
+// THE AHCI DECISIONS, with no controller behind them: the port bitmap, the port state rules, the
+// scatter-gather arithmetic and the capacity parse, which is where an AHCI driver is actually wrong.
+pub mod ahci;
 pub mod blk;
 pub mod common;
 // VIRTIO-SERIAL MULTIPORT AS PURE DECISIONS: which queues a port owns, what a control message means,
@@ -21,6 +24,9 @@ pub mod common;
 pub mod console;
 pub mod descriptor;
 pub mod gpu;
+// THE HIGH DEFINITION AUDIO DECISIONS: the verb packing, the two rings, the widget graph walk and
+// the format word. Most of an HDA driver is not register access, and this is the part that is not.
+pub mod hda;
 // THE HID REPORT-DESCRIPTOR PARSER AND REPORT DECODER. It was a module INSIDE the xHCI binary,
 // where it could not be tested on the host at all - which is how a descriptor whose bit cursor
 // overflows the admission check, and a short report that leaves the previous one's tail standing,
@@ -35,6 +41,9 @@ pub mod net;
 // host test can watch failing.
 pub mod nvme;
 pub mod port;
+// THE SD PROTOCOL DECISIONS, kept independent of how the controller is attached exactly as the item
+// that owns them asks: no PCI, no ACPI, no device tree, so board glue stays outside the driver.
+pub mod sdhci;
 pub mod serial_port;
 pub mod snd;
 pub mod usb;

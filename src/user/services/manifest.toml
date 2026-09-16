@@ -615,6 +615,29 @@ owner = "wire"
 path = "wire"
 
 [[programs]]
+name = "ahci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/ahci.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# The same declaration every other DMA-mastering storage driver here carries, and the same cost,
+# which the threat model records: with no translating controller in the path this driver is a TCB
+# member for memory safety.
+dma = "trusted-untranslated"
+# THE PROGRAMMING INTERFACE IS PART OF THE IDENTITY, not decoration. A SATA controller in a legacy
+# IDE compatibility mode has the same class and subclass and a different interface, and it does not
+# answer the AHCI registers at all - so a rule naming only the class pair would bind this driver to a
+# controller it cannot drive.
+match = [{ transport = "plain-pci", pci-class = 0x01, pci-subclass = 0x06, pci-interface = 0x01 }]
+provides = [{ kind = "block", most = 1, consumers = 4 }]
+heartbeat-deadline = 100
+
+[[programs]]
 name = "arp"
 owner = "tools"
 role = "tool"
@@ -913,6 +936,29 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/graphics_probe.lsexe"
 providers = ["lsrt"]
+
+[[programs]]
+name = "hda"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/hda.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# It masters the bus: the command ring, the response ring and the audio buffer are all addresses the
+# controller is handed. The cost is the one the threat model records for every driver here that does.
+dma = "trusted-untranslated"
+# Multimedia controller / audio device, with the programming interface named rather than left out: a
+# triple with a hole in it would match vendor audio devices that carry other interfaces.
+match = [{ transport = "plain-pci", pci-class = 0x04, pci-subclass = 0x03, pci-interface = 0x00 }]
+# THE SAME PROVIDER KIND `virtio-snd` PUBLISHES, because the roadmap says the same PCM contract and
+# the block wire is the argument for taking that literally: three private copies of one protocol is
+# how two servers came to disagree about what a refusal means.
+provides = [{ kind = "audio", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "httpd"
@@ -1698,6 +1744,27 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/script.lsexe"
 providers = ["base-proto", "lsrt"]
+
+[[programs]]
+name = "sdhci"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/sdhci.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# The first slice is PIO, so this driver moves every block through the controller's data port and
+# never masters the bus. `none` is what that declares, and it is the policy the registry mechanism
+# exists for: bus mastering stays OFF and the binding cannot mint a DMA buffer at all.
+dma = "none"
+# An SD host controller is a BASE SYSTEM PERIPHERAL rather than a mass-storage controller: the class
+# says what the silicon is, not what it carries.
+match = [{ transport = "plain-pci", pci-class = 0x08, pci-subclass = 0x05, pci-interface = 0x01 }]
+provides = [{ kind = "block", most = 1, consumers = 4 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "service_manager"

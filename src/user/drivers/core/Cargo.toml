@@ -14,6 +14,31 @@ test = false
 bench = false
 
 [[bin]]
+# The Intel High Definition Audio controller driver. Its verb packing, ring arithmetic, graph walk
+# and format word live in `src/hda.rs`, which is part of the library and host-tested.
+name = "hda"
+path = "src/hda_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# The SD/eMMC host controller driver. Its SD protocol core lives in `src/sdhci.rs`, which knows
+# nothing about PCI so board glue can stay outside it; this binary is the attachment and the
+# register access.
+name = "sdhci"
+path = "src/sdhci_driver.rs"
+test = false
+bench = false
+
+[[bin]]
+# The AHCI SATA host bus adapter driver. Its decisions live in `src/ahci.rs`, which is part of the
+# library and host-tested; this binary is the MMIO, the DMA and the command issue.
+name = "ahci"
+path = "src/ahci_driver.rs"
+test = false
+bench = false
+
+[[bin]]
 # The NVM Express controller driver. Its decisions live in `src/nvme.rs`, which is part of the
 # library and host-tested; this binary is the MMIO, the DMA and the waiting.
 name = "nvme"

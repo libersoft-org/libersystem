@@ -636,11 +636,43 @@ qemu_attach_nvme() {
 		echo "qemu-run: could not make this run's second NVMe medium at $second" >&2
 		return 1
 	}
+	# AND A SATA CONTROLLER IN AHCI MODE BESIDE THEM, on its own blank medium, for the same reasons
+	# and attached in the same place. It is the second consumer of the plain-PCI resource profile and
+	# the first whose register file is NOT in BAR 0 - AHCI's ABAR is BAR 5 - so its presence is what
+	# makes "the resolver reads the BAR the family names" a thing the boot actually exercises.
+	# THE SD MEDIUM IS SIZED TO A POWER OF TWO AND NOT TO TASTE. QEMU's `sd-card` refuses an image
+	# whose size is not one, which is the card specification rather than an implementation quirk, and
+	# a driver reading a CSD would have no way to express anything else.
+	local sd="$QEMU_BUILD_DIR/sd-scratch.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/sd-scratch" .img
+	rm -f "$sd"
+	truncate -s 64M "$sd" || {
+		echo "qemu-run: could not make this run's SD medium at $sd" >&2
+		return 1
+	}
+	local sata="$QEMU_BUILD_DIR/ahci-scratch.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/ahci-scratch" .img
+	rm -f "$sata"
+	truncate -s 8M "$sata" || {
+		echo "qemu-run: could not make this run's AHCI scratch medium at $sata" >&2
+		return 1
+	}
 	arr+=(
 		-drive "file=$disk,if=none,id=nvmescratch,format=raw"
 		-device "nvme,serial=libersystem-nvme,drive=nvmescratch"
 		-drive "file=$second,if=none,id=nvmesecond,format=raw"
 		-device "nvme,serial=libersystem-nvme-2,drive=nvmesecond"
+		-device "ahci,id=sata"
+		-drive "file=$sata,if=none,id=satascratch,format=raw"
+		-device "ide-hd,bus=sata.0,drive=satascratch"
+		-device "sdhci-pci,id=sdhost"
+		-drive "file=$sd,if=none,id=sdcard,format=raw"
+		-device "sd-card,drive=sdcard"
+		-device "intel-hda,id=hdabus"
+		# THE CODEC NEEDS AN AUDIO BACKEND NAMED, and `snd0` is the one this harness already builds
+		# for virtio-sound - a wav file, a spice sink or none, depending on how the run was asked for.
+		# Without it QEMU refuses the codec outright and the guest never starts.
+		-device "hda-output,bus=hdabus.0,audiodev=snd0"
 	)
 }
 

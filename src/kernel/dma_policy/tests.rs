@@ -148,18 +148,32 @@ fn a_selected_entry_is_admitted_because_it_is_declared_for_the_device_and_not_be
 
 crate::tagged_test!(the_kernel_registry_is_the_manifest_migration_table, [Dma, Kernel], id = "kernel.dma_policy.the_kernel_registry_is_the_manifest_migration_table", covers = ["kernel", "manifest"]);
 fn the_kernel_registry_is_the_manifest_migration_table() {
-	// The generated table carries every driver the manifest stages, with the migration table's
-	// values: the network driver requires translation and every other row is the explicit trusted
-	// exception. A row that arrived unclassified cannot exist - the manifest refuses it - and this
-	// is the kernel side of the same fact.
+	// The generated table carries every driver the manifest stages, with the policy that driver
+	// DECLARES. A row that arrived unclassified cannot exist - the manifest refuses it - and this is
+	// the kernel side of the same fact.
+	//
+	// ALL THREE POLICIES ARE NOW IN USE, and this test used to say otherwise (corrected 2026-09-16).
+	// It asserted that the network driver requires translation and EVERY OTHER ROW is the trusted
+	// exception, which was a true description of the table on the day it was written and became a
+	// frozen list rather than a rule. `sdhci` is the first driver to declare `none`: its first slice
+	// moves every block through the controller's data port, so it never hands the controller a
+	// physical address, and `none` is exactly the policy P02M0172 built for that - bus mastering
+	// stays off and the binding cannot mint a DMA buffer at all. A driver that genuinely masters
+	// nothing is the case that policy exists to express, and the first one arriving should not fail
+	// a test for doing so.
 	let names = registry_names();
 	assert!(names.contains(&&b"virtio_net"[..]), "the network driver is in the table");
 	assert!(names.contains(&&b"virtio_blk"[..]));
 	assert!(names.contains(&&b"xhci"[..]));
 	assert_eq!(registry_policy(b"virtio_net"), Some(abi::DMA_POLICY_IOMMU_REQUIRED as u8));
+	assert_eq!(registry_policy(b"sdhci"), Some(abi::DMA_POLICY_NONE as u8), "the PIO card reader masters nothing and says so");
 	for name in names {
-		let expected = if name == b"virtio_net" { abi::DMA_POLICY_IOMMU_REQUIRED } else { abi::DMA_POLICY_TRUSTED_UNTRANSLATED };
-		assert_eq!(registry_policy(name), Some(expected as u8), "{} carries the migration table's value", core::str::from_utf8(name).unwrap());
+		let expected = match name {
+			b"virtio_net" => abi::DMA_POLICY_IOMMU_REQUIRED,
+			b"sdhci" => abi::DMA_POLICY_NONE,
+			_ => abi::DMA_POLICY_TRUSTED_UNTRANSLATED,
+		};
+		assert_eq!(registry_policy(name), Some(expected as u8), "{} carries the policy it declares", core::str::from_utf8(name).unwrap());
 	}
 	// The synthetic entries are NOT in the manifest's table.
 	assert!(!registry_names().contains(&TRUSTED));

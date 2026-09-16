@@ -34,9 +34,17 @@ const VIRTIO_MODERN_BASE: u16 = 0x1040;
 // kernel resolves nothing for still gets an inventory row carrying its standards identity and NO
 // resources, so a rule can match it and nothing can claim what it does not have. Resourcing the
 // whole bus would reverse that decision silently; adding a row states which family was decided on.
-const RESOURCED: &[(u8, u8, u8, u32)] = &[
-	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_USB, abi::PCI_PROG_IF_XHCI, abi::DEVICE_TYPE_XHCI),
-	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_NVM, abi::PCI_PROG_IF_NVME, abi::DEVICE_TYPE_NVME),
+// THE LAST FIELD IS WHICH BAR HOLDS THE REGISTER FILE, and it is here because the second family to
+// need this table disagreed with the first two. xHCI and NVMe both put their whole register file in
+// BAR 0, which made "resolve BAR 0" and "resolve the register file" the same sentence; AHCI's ABAR
+// is BAR 5. So the row carries the index and the resolver stays one function. SDHCI, HDA and the
+// OHCI/UHCI pair each name their own BAR too, and inherit this rather than discovering it again.
+const RESOURCED: &[(u8, u8, u8, u32, usize)] = &[
+	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_USB, abi::PCI_PROG_IF_XHCI, abi::DEVICE_TYPE_XHCI, 0),
+	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_NVM, abi::PCI_PROG_IF_NVME, abi::DEVICE_TYPE_NVME, 0),
+	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_SATA, abi::PCI_PROG_IF_AHCI, abi::DEVICE_TYPE_AHCI, 5),
+	(abi::PCI_CLASS_BASE_PERIPHERAL, abi::PCI_SUBCLASS_SD_HOST, abi::PCI_PROG_IF_SD_HOST, abi::DEVICE_TYPE_SDHCI, 0),
+	(abi::PCI_CLASS_MULTIMEDIA, abi::PCI_SUBCLASS_AUDIO_DEVICE, abi::PCI_PROG_IF_HDA, abi::DEVICE_TYPE_HDA, 0),
 ];
 
 // PCI status register bit 4: a capability list is present (pointer at offset 0x34).
@@ -188,8 +196,8 @@ impl PciDevice {
 	// classifies but resources nothing for. ONE QUESTION RATHER THAN ONE PER FAMILY: an `is_xhci`
 	// beside an `is_nvme` beside an `is_ahci` is a list every caller has to keep up with, and the
 	// table above is the list.
-	pub fn resourced_type(&self) -> Option<u32> {
-		RESOURCED.iter().find(|(class, subclass, prog_if, _)| self.class == *class && self.subclass == *subclass && self.prog_if == *prog_if).map(|(_, _, _, device_type)| *device_type)
+	pub fn resourced_type(&self) -> Option<(u32, usize)> {
+		RESOURCED.iter().find(|(class, subclass, prog_if, _, _)| self.class == *class && self.subclass == *subclass && self.prog_if == *prog_if).map(|(_, _, _, device_type, bar)| (*device_type, *bar))
 	}
 
 	// The virtio device type. Modern ids encode it as device_id - 0x1040; the
@@ -685,10 +693,10 @@ pub fn scan_virtio<A: ConfigAccess>() -> Vec<VirtioDevice> {
 // with no resolver lands. Filling `bar_phys: 0, bar_len: 0` into a resourced row instead would
 // produce an entry that claims a profile and hands out a window of nothing.
 fn resolve_endpoint<A: ConfigAccess>(d: &PciDevice) -> Option<ResourcedDevice> {
-	let device_type = d.resourced_type()?;
+	let (device_type, bar) = d.resourced_type()?;
 	A::assign_bars(d);
-	let bar_phys = bar_address::<A>(d, 0)?;
-	let bar_len = bar_size::<A>(d, 0)?;
+	let bar_phys = bar_address::<A>(d, bar)?;
+	let bar_len = bar_size::<A>(d, bar)?;
 	let (msix_cap, msix_table_phys) = resolve_msix::<A>(d);
 	Some(ResourcedDevice { pci: *d, device_type, bar_phys, bar_len, msix_cap, msix_table_phys })
 }

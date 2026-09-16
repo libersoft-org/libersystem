@@ -203,6 +203,251 @@ fn device_table_resources_the_nvme_controller() {
 	assert!((cap >> 37) & 1 != 0, "CAP.CSS should advertise the NVM command set");
 }
 
+tagged_test!(hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer, [Drivers, Pci, Slow], id = "kernel.hardware.hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer", covers = ["kernel", "bin.hda"]);
+fn hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer() {
+	use object::channel::{Channel, Message};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// THE OBSERVABLE EFFECT FOR AUDIO IS THAT THE HARDWARE TOOK THE BYTES, and nothing weaker will
+	// do. "The driver reached Online" is rejected by this tree's convention anyway, but for audio it
+	// would be especially empty: a driver that brings a controller up, builds a route through a
+	// codec that answered nothing and starts a stream over an empty buffer reports exactly the same
+	// thing as one that works, and plays silence.
+	//
+	// So this drives the driver as DeviceManager does, hands it one period over the same PCM contract
+	// `driver.virtio-snd` serves, and then reads the controller's OWN LINK POSITION COUNTER - the
+	// register the hardware advances as it consumes the buffer - and requires it to have moved.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/hda.lsexe")).expect("the hda.lsexe driver should be staged on the volume under drivers/");
+
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::DEVICE_TYPE_HDA {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the HD Audio controller");
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the hda driver should load");
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the HD Audio controller")).expect("the HD Audio controller is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, key.generation, 1).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	sched::run_until_idle();
+
+	// REACHING READY IS ITSELF A CLAIM ABOUT THE CODEC, because this driver refuses to report in
+	// without one: it fails `NoCodec` when no address answers its identity verb with a real vendor,
+	// and `NoRoute` when no pin complex reaches an audio output converter. So an offer here means a
+	// codec answered and a route was found, which is the half of the effect a position counter
+	// cannot show.
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the hda driver should report READY, which it only does with a codec routed");
+	let audio = offer_of(&offers, driver_protocol::provider::AUDIO).expect("the driver offers its PCM service").into_any_arc().downcast::<Channel>().expect("the audio channel is a channel");
+
+	// One period of the format AudioService produces: signed 16-bit stereo at 48 kHz. The content is
+	// a ramp rather than silence so that a buffer nobody wrote is distinguishable in a capture.
+	const PERIOD: usize = 4096;
+	let period: alloc::vec::Vec<u8> = (0..PERIOD).map(|i| (i as u8).wrapping_mul(3)).collect();
+	audio.send(Message::new(period, alloc::vec::Vec::new())).expect("the period should send");
+	sched::run_until_idle();
+
+	// THE CONTROLLER'S OWN COUNTER, read through a second mapping of the same registers. The stream
+	// descriptors start at 0x80 and are 0x20 apart; the output ones follow the input ones, which
+	// `GCAP` counts.
+	let base = crate::iommu::map_registers(bar_phys, bar_len);
+	let mut moved = 0u32;
+	for _ in 0..200 {
+		sched::run_until_idle();
+		let gcap = unsafe { ((base + 0x00) as *const u16).read_volatile() };
+		let inputs = ((gcap >> 8) & 0x0F) as u64;
+		let stream = base + 0x80 + inputs * 0x20;
+		moved = unsafe { ((stream + 0x04) as *const u32).read_volatile() };
+		if moved > 0 {
+			break;
+		}
+	}
+	assert!(moved > 0, "the controller's link position counter should advance as it consumes the buffer it was given");
+}
+
+tagged_test!(sdhci_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.sdhci_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.sdhci"]);
+fn sdhci_driver_serves_a_write_and_reads_it_back() {
+	use object::channel::{Channel, Message};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// THE THIRD STORAGE DRIVER AND THE SAME OBSERVABLE EFFECT, over a third command set and - unlike
+	// the two before it - over a path that masters NOTHING. This driver declares `dma = "none"`
+	// because its first slice is PIO: every block goes through the controller's data port under CPU
+	// reads and writes, so the controller is never handed a physical address. That makes this test
+	// the first end-to-end proof that a non-mastering driver can serve the block contract at all.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/sdhci.lsexe")).expect("the sdhci.lsexe driver should be staged on the volume under drivers/");
+
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::DEVICE_TYPE_SDHCI {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the SD host controller");
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the sdhci driver should load");
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the SD host controller")).expect("the SD host controller is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, key.generation, 1).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	sched::run_until_idle();
+
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the sdhci driver should report READY");
+	let blk = offer_of(&offers, driver_protocol::provider::BLOCK).expect("the driver offers the card's block service").into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	blk.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the capacity request should send");
+	sched::run_until_idle();
+	let cap_reply = blk.recv().expect("the capacity reply should arrive");
+	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
+	// Out of the card's CSD, which encodes it two entirely different ways depending on its version.
+	assert_eq!(reported.bytes, 64 * 1024 * 1024, "the card should report the attached medium's real size");
+	// ONE BLOCK PER REQUEST is what the PIO path offers, and it says so rather than letting a client
+	// ask for eight and receive one.
+	assert_eq!(reported.max_sectors, 1, "the simple path moves one block at a time and publishes that");
+
+	const SECTOR: usize = 512;
+	let pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8).wrapping_mul(11) ^ 0x3C).collect();
+	let source = object::memory_object::MemoryObject::create(SECTOR).expect("a source buffer");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(pattern.as_ptr(), (hhdm + phys) as *mut u8, SECTOR) };
+	}
+	const LBA: u64 = 23;
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the write request should send");
+	sched::run_until_idle();
+	let write_reply = blk.recv().expect("the write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the write should succeed");
+
+	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the read request should send");
+	sched::run_until_idle();
+	let read_reply = blk.recv().expect("the read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the read should succeed");
+	let buf_cap = read_reply.caps.first().expect("the read should grant a buffer");
+	let object = buf_cap.object();
+	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(memory, SECTOR), pattern, "the block read back should be the bytes that were written to it");
+
+	// AND A BLOCK COUNT THE SIMPLE PATH CANNOT MOVE IS REFUSED rather than quietly shortened, which
+	// is the failure a clamp would hide: a caller asking for four blocks and receiving one believes
+	// it has four.
+	let four = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 4 }.encode();
+	blk.send(Message::new(four.to_vec(), alloc::vec::Vec::new())).expect("the multi-block request should send");
+	sched::run_until_idle();
+	let refused = blk.recv().expect("the refusal should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "more than one block is refused, not shortened");
+	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+}
+
+tagged_test!(ahci_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.ahci_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.ahci"]);
+fn ahci_driver_serves_a_write_and_reads_it_back() {
+	use object::channel::{Channel, Message};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// THE SAME OBSERVABLE EFFECT AS THE NVMe ORACLE BELOW, over a different controller and a
+	// different command set: bytes written to a sector and read back out of it. "The driver reached
+	// Online" is not accepted here, and for AHCI it would be especially hollow - a controller comes
+	// up long before anything has been asked of a disk.
+	//
+	// TWO CONTROLLERS ARE PRESENT AND ONLY ONE IS SERVABLE, which this test has to handle rather
+	// than assume away: the q35 chipset carries its own SATA controller with a CD-ROM on it, and the
+	// driver refuses ATAPI by signature. So this walks every AHCI function the table holds and takes
+	// the first that reports READY, which is what DeviceManager does with the same two.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/ahci.lsexe")).expect("the ahci.lsexe driver should be staged on the volume under drivers/");
+
+	let mut controllers: alloc::vec::Vec<(abi::DeviceInfo, u64, u64, usize)> = alloc::vec::Vec::new();
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::DEVICE_TYPE_AHCI {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
+			controllers.push((info, entry.1, entry.2, i));
+		}
+	}
+	assert!(!controllers.is_empty(), "the device table should hold at least one AHCI controller, resolved through BAR 5");
+
+	// THE BOOTSTRAP END IS HELD FOR AS LONG AS THE DRIVER IS WANTED, which is the whole reason this
+	// is a `Vec` rather than a loop-local: dropping it closes the driver's bootstrap channel, the
+	// driver reads that as the manager going away, and it stops - so the block provider it had just
+	// published answered the first request with `PeerClosed`. The harness stands in for
+	// DeviceManager, and DeviceManager does not hang up on a driver it is still using.
+	let mut held: alloc::vec::Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
+	let mut served: Option<alloc::sync::Arc<Channel>> = None;
+	for (info, bar_phys, bar_len, index) in controllers {
+		let (kernel_ep, user_ep) = object::channel::Channel::create();
+		held.push(kernel_ep.clone());
+		loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the ahci driver should load");
+		let Ok(key) = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the AHCI controller")) else { continue };
+		send_bind(&kernel_ep, &info, key.generation, 1).expect("the BIND should send");
+		send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+		sched::run_until_idle();
+		if let Some(offers) = recv_offers(&kernel_ep, key.generation) {
+			served = offer_of(&offers, driver_protocol::provider::BLOCK).map(|cap| cap.into_any_arc().downcast::<Channel>().expect("the block channel is a channel"));
+			if served.is_some() {
+				break;
+			}
+		}
+	}
+	let blk = served.expect("one of the AHCI controllers has a SATA disk and its driver should publish a block provider for it");
+
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	blk.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the capacity request should send");
+	sched::run_until_idle();
+	let cap_reply = blk.recv().expect("the capacity reply should arrive");
+	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
+	// The number comes from IDENTIFY DEVICE's 48-bit sector count, not from anything this test said.
+	assert_eq!(reported.bytes, 8 * 1024 * 1024, "the disk should report the attached medium's real size");
+
+	const SECTOR: usize = 512;
+	let pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8).wrapping_mul(7) ^ 0x5A).collect();
+	let source = object::memory_object::MemoryObject::create(SECTOR).expect("a source buffer");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(pattern.as_ptr(), (hhdm + phys) as *mut u8, SECTOR) };
+	}
+	const LBA: u64 = 11;
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the write request should send");
+	sched::run_until_idle();
+	let write_reply = blk.recv().expect("the write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the write should succeed");
+
+	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the read request should send");
+	sched::run_until_idle();
+	let read_reply = blk.recv().expect("the read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the read should succeed");
+	let buf_cap = read_reply.caps.first().expect("the read should grant a buffer");
+	let object = buf_cap.object();
+	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(memory, SECTOR), pattern, "the sector read back should be the bytes that were written to it");
+
+	// A range past the last sector is REFUSED with the typed status, and the disk is not asked.
+	let past = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: 1 << 40, count: 1 }.encode();
+	blk.send(Message::new(past.to_vec(), alloc::vec::Vec::new())).expect("the out-of-range request should send");
+	sched::run_until_idle();
+	let refused = blk.recv().expect("the refusal should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "a range past the last sector is refused rather than clamped");
+	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+}
+
 tagged_test!(nvme_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.nvme_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.nvme"]);
 fn nvme_driver_serves_a_write_and_reads_it_back() {
 	use object::channel::{Channel, Message};

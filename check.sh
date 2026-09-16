@@ -163,6 +163,17 @@ declare -A GATES=(
 	# The gate that proves the gate can fail. Six deliberate defects, each required to be
 	# caught by the invariant that names it, and nine covers each required to be REFUTED.
 	["model-mutations"]="tools/check-model-mutations.sh"
+	# THE SAME QUESTION ASKED OF THE DRIVER DECISION MODULES, which the driver roadmap asks for by
+	# name: "deterministic malformed mutations", because a family with host tests has a count of
+	# tests and not yet any evidence of what they would notice. Ten deliberate defects - the queue
+	# length taken from a zero-based register, a completion believed on half its status, a transfer
+	# one page short, a command-issue bit read as success, a port bitmap read as a count, a card sized
+	# by the wrong CSD version, a capacity bit read before it is valid, a codec verb built with the
+	# wrong payload width, a format word written as the numbers it names, and the block wire's
+	# refusal collapsed into its device failure - each required to be caught by the test named for it.
+	# Every one of them is SILENT in production, which is why each has a test and why the test has to
+	# be seen failing. Runs on a copy; nothing here writes the working tree.
+	["driver-mutations"]="tools/check-driver-mutations.sh"
 	# The two trust profiles differ in the BINARY. The test key's private half is
 	# published on purpose, which is exactly why a release loader must contain none of it.
 	["trust-profile"]="tools/check-trust-profile.sh"

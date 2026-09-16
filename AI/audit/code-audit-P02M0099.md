@@ -1133,3 +1133,76 @@ one fix into a statement about the tree:
 
 So the defect class is closed across this tree's ring consumers rather than in the one driver where
 it was caught.
+
+## AHCI: the second consumer, which is what tells a generalisation from a rename (2026-09-16)
+
+THE POINT OF TAKING AHCI NEXT WAS NOT THE DRIVER. It was that `RESOURCED` - the plain-PCI resource
+profile the NVMe item owns - had exactly one consumer besides the xHCI row it was refactored out of,
+and a table with one row is a special case wearing a table's clothes.
+
+IT COST ONE ROW AND ONE FIELD. AHCI's register file is in BAR 5 rather than BAR 0, which xHCI and
+NVMe both use, so "resolve BAR 0" and "resolve the register file" had been the same sentence and were
+not. The row carries the index; `resolve_endpoint` gained nothing. Before the generalisation the same
+change would have been a resolver, three architecture shims and a loop in `device.rs`.
+
+THE MACHINE THEN ANSWERED A QUESTION NOBODY ASKED IT. The q35 chipset carries its own SATA controller
+at 00:1f.2 with a CD-ROM on port 2, so every boot binds this driver twice without the harness
+arranging it, and the ATAPI refusal path is exercised for free on every run:
+
+    driver.ahci: port 2 carries an ATAPI device, which this driver does not serve
+    driver.ahci: bring-up gave up at 00:1f.2 - no implemented port has a SATA disk on an active link
+
+AND THAT FOUND A DEFECT IN THE REPORTING. The failure was answered as retryable, so DeviceManager
+restarted a driver that had already given its final answer, and the boot log carried the same refusal
+twice for no reason. "Whether a second attempt could differ" is a different question from "what went
+wrong", and the manager acts on the first: a controller whose only device is ATAPI is
+`UnsupportedDevice`, while a resource shortage, a port that did not settle and a command that did not
+come back are states a second attempt can find differently. Worth noting that the NVMe driver has the
+same shape and has not been re-examined for it - its give-up points are all resource or timing ones,
+but that is a claim about the six arms rather than a check of them.
+
+ONE MISTAKE IN THE ORACLE, WORTH RECORDING BECAUSE IT IS A HARNESS TRAP RATHER THAN A DRIVER ONE. The
+test walks both controllers and keeps the one that reports READY, and it first held each bootstrap
+channel in a loop-local. Dropping it closes the driver's bootstrap end, the driver reads that as the
+manager going away and stops, and the block provider it had just published answered the first request
+with `PeerClosed`. The harness stands in for DeviceManager, and DeviceManager does not hang up on a
+driver it is still using.
+
+## HDA: not working, and what it cost to find that out precisely (2026-09-16)
+
+THE DRIVER IS STAGED AND FAILS CLEANLY. It resets the controller, resets the command ring's read
+pointer, reads the codec bitmap and gets its first verb answered - and then the next one is not
+answered. It reports `UnsupportedDevice`, the node fails once, the boot is unaffected and 404 tests
+pass with it in.
+
+THREE THINGS WERE WRONG AND ARE FIXED, and only one of them was the reason it fails:
+
+- THE COMMAND RING'S POINTER RESET IS A FOUR-STEP HANDSHAKE. The bit is written as one, and the
+  specification then requires software to READ IT BACK AS ONE - that read is the confirmation - and
+  only then write zero and read zero. Writing one and waiting for it to clear waits for something the
+  controller is specified never to do: the register sat at 0x8000 for ever. Fixed, and the failure
+  moved past it.
+- THE RING SIZE. Sixteen entries is an optional size; only 256 is required of every controller. A
+  controller that declines sixteen keeps what it had, and the driver then wraps at sixteen while the
+  controller wraps at 256 - which does not disagree until the rings have been used a little, so the
+  first response still arrives. Changed to 256. It changed nothing, so it was not the cause, and it
+  was wrong anyway.
+- A DIAGNOSTIC THAT LIED. The CORB pointer wait borrowed the reset failure's message and printed
+  GCTL's value beside it, which read 1 - a sentence that contradicted itself and sent the reader to
+  the wrong register. Every wait has its own arm now.
+
+AND ONE DEFECT THAT IS NOT ABOUT AUDIO, which is the finding worth carrying to every driver here.
+The waits were bounded in SPIN COUNTS. A spin is not a time: one iteration is an MMIO read, tens of
+nanoseconds on silicon and a trap into the hypervisor under emulation, three orders of magnitude
+apart. Ten million of them outlasted the two-second bind window, so the manager killed this driver
+for silence before it could say what it was waiting for - and outlasted the BOOT window too: nine of
+twenty-four services came up, which looked like a system-wide failure caused by adding one audio
+driver. The machine already has the unit. The timer is 100 Hz on every architecture, READY is due 200
+ticks after BIND, and the bind windows measured today put every driver on this machine inside 44. So
+bring-up takes one deadline in ticks and every wait shares it, and a bring-up in which everything
+times out still finishes in time to report.
+
+WHAT IS LEFT is the CORB/RIRB handshake after the first response. Its intermittence is the clue: one
+boot gets past the vendor verb to the node count and another does not, which is the same shape as the
+torn completion entry the NVMe driver turned out to have, and that one took three rounds of better
+diagnostics to see rather than one round of better reasoning.

@@ -1127,3 +1127,40 @@ What changed structurally:
 The equivalence of the incremental free map with a full volume walk is asserted
 after every mutation kind by the standing test
 `the_incremental_free_map_matches_a_full_rederivation`.
+
+## What one full-frame pass costs, measured (2026-09-16)
+
+THE SINGLE MOST USEFUL NUMBER THIS SUITE PRODUCES is not a scene's median. It is the probe
+`one-opaque-fullscreen`: one command, one solid opaque fill over the whole 640x480 frame, taken
+through the covered-run fast path that skips the backdrop read and the composite entirely.
+
+    one-opaque-fullscreen        14.55 ms      307,200 pixels, 47 ns each
+    one-translucent-fullscreen   24.30 ms      the same fill with the read and composite it needs
+    hundred-small-opaque         19.38 ms
+    hundred-small-translucent    20.09 ms
+    dot-per-tile                  0.08 ms      one pixel in each of eighty tiles
+
+FOURTEEN AND A HALF MILLISECONDS IS 87 PERCENT OF THE 16.7 ms CEILING that a 60 Hz scene is held to.
+So on this renderer that ceiling is a budget for ONE pass over the frame plus about two milliseconds,
+and a scene named for its rectangles, glyphs, images and clips spends roughly an eighth of its time
+on them. Anything aiming at that ceiling has to make the per-pixel pass cheaper; nothing else in
+the frame is big enough to matter.
+
+`dot-per-tile` at 0.08 ms is the other end of the same fact: the tiling work means a drawing that
+touches eighty pixels pays for eighty pixels, not for a frame. Every one of the four frozen scenes
+covers the whole frame, so none of them can see that, which is worth remembering about the suite.
+
+### A hypothesis about those 47 nanoseconds, tested and failed
+
+The transfer encode is the most expensive thing the store-back does per pixel - a square root and an
+interpolated table lookup per channel - and a solid fill hands it the same input for every pixel of a
+run. A one-entry memo per channel was added, bit-identical by construction because a memo returns
+exactly what the computation returned for the same input.
+
+    UI-basic   16.85 ms before   16.89 ms after
+
+Nothing. If the encode were the bulk of those 47 nanoseconds, a fullscreen solid fill would have
+collapsed; it did not, so the encode is not where the time is. The change was reverted rather than
+kept for the roughly two percent it may have moved on the two image-heavy scenes, which is inside
+this suite's run-to-run spread. RECORDED BECAUSE THE DISPROOF IS THE RESULT: the next attempt at
+that 47 nanoseconds starts knowing it is not the encode.

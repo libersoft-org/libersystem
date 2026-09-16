@@ -338,7 +338,11 @@ fn find_controller() -> Option<usize> {
 // are wider - which is the worst kind of working, because it makes the defect invisible in exactly
 // the profile the gate boots. The window is mapped at its direct-map address, uncached, so the
 // arithmetic everywhere else stays `hhdm + physical`.
-fn map_registers(physical: u64, len: u64) -> u64 {
+// VISIBLE TO THE TEST SUITES AS WELL AS TO THE BYPASS TRANSITION. An oracle that has to read a
+// controller's own counter - the HD Audio one reads the link position to prove the hardware consumed
+// the buffer it was given - needs exactly this and nothing more, and a second copy of it in the test
+// tree would be a second place for the cache policy to be got wrong.
+pub(crate) fn map_registers(physical: u64, len: u64) -> u64 {
 	use crate::arch::paging::{NO_CACHE, PRESENT, WRITABLE};
 	use crate::mem::frame::PAGE_SIZE;
 	let hhdm = crate::mem::hhdm_offset();

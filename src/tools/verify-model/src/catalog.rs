@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 123] = [
+const GATES: [(&str, &str); 124] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -379,6 +379,11 @@ const GATES: [(&str, &str); 123] = [
 	// The model's invariants proved capable of failing. Same subject as the model
 	// itself, because a mutation is a statement about the code the model describes.
 	("model-mutations", "kernel"),
+	// The DRIVER decision modules proved capable of failing: ten deliberate defects, each required to
+	// be caught by the host test named for it. Its subject is the drivers crate, because that is what
+	// the mutations are planted in and what a change to them is about - a family whose parser is
+	// edited should have to show that its tests would still notice.
+	("driver-mutations", "drivers"),
 	// Which keys a loader carries. Its subject is the loader, so a boot change
 	// selects it - and the two profiles differing only in a comment is the failure it exists for.
 	("trust-profile", "bin.libersystem-loader"),
