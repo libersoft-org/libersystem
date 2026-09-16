@@ -22,11 +22,22 @@ pub const VIRTIO_VENDOR: u16 = 0x1AF4;
 // Modern virtio-pci device ids are 0x1040 + the virtio device type.
 const VIRTIO_MODERN_BASE: u16 = 0x1040;
 
-// The PCI class triple of an xHCI USB host controller: Serial Bus Controller /
-// USB Controller / xHCI programming interface. Any vendor's controller matches.
-const CLASS_SERIAL_BUS: u8 = 0x0C;
-const SUBCLASS_USB: u8 = 0x03;
-const PROG_IF_XHCI: u8 = 0x30;
+// THE CLASS TRIPLES THIS KERNEL RESOLVES A REGISTER WINDOW FOR, and what it calls each.
+//
+// It was one function per family - `is_xhci`, `resolve_xhci`, `scan_xhci`, a shim in each of the
+// three architectures and a loop of its own in `device.rs` - which is six edits to add a second
+// family and is why there was only ever one. AHCI, SDHCI, HDA, EHCI, OHCI/UHCI and TPM are all
+// standard PCI functions whose whole identity is a class triple, and each of them needs exactly
+// what this table gives: BAR 0 and an MSI-X vector.
+//
+// IT IS A TABLE AND NOT "EVERY FUNCTION ON THE BUS", which is a deliberate line. A function this
+// kernel resolves nothing for still gets an inventory row carrying its standards identity and NO
+// resources, so a rule can match it and nothing can claim what it does not have. Resourcing the
+// whole bus would reverse that decision silently; adding a row states which family was decided on.
+const RESOURCED: &[(u8, u8, u8, u32)] = &[
+	(abi::PCI_CLASS_SERIAL_BUS, abi::PCI_SUBCLASS_USB, abi::PCI_PROG_IF_XHCI, abi::DEVICE_TYPE_XHCI),
+	(abi::PCI_CLASS_MASS_STORAGE, abi::PCI_SUBCLASS_NVM, abi::PCI_PROG_IF_NVME, abi::DEVICE_TYPE_NVME),
+];
 
 // PCI status register bit 4: a capability list is present (pointer at offset 0x34).
 const STATUS_CAP_LIST: u16 = 1 << 4;
@@ -173,10 +184,12 @@ impl PciDevice {
 		self.vendor == VIRTIO_VENDOR
 	}
 
-	// Whether this is an xHCI USB host controller (by its PCI class triple, so any
-	// vendor's controller matches - QEMU's qemu-xhci as well as real Intel/AMD parts).
-	pub fn is_xhci(&self) -> bool {
-		self.class == CLASS_SERIAL_BUS && self.subclass == SUBCLASS_USB && self.prog_if == PROG_IF_XHCI
+	// The device type this kernel resolves a register window under, or `None` for a function it
+	// classifies but resources nothing for. ONE QUESTION RATHER THAN ONE PER FAMILY: an `is_xhci`
+	// beside an `is_nvme` beside an `is_ahci` is a list every caller has to keep up with, and the
+	// table above is the list.
+	pub fn resourced_type(&self) -> Option<u32> {
+		RESOURCED.iter().find(|(class, subclass, prog_if, _)| self.class == *class && self.subclass == *subclass && self.prog_if == *prog_if).map(|(_, _, _, device_type)| *device_type)
 	}
 
 	// The virtio device type. Modern ids encode it as device_id - 0x1040; the
@@ -243,8 +256,11 @@ pub struct VirtioDevice {
 // runtime, and doorbell registers follow at offsets the driver reads from them), plus
 // its MSI-X capability for a per-device interrupt vector.
 #[derive(Clone, Copy)]
-pub struct XhciDevice {
+pub struct ResourcedDevice {
 	pub pci: PciDevice,
+	// Which family the class triple resolved to. It used to be implied by the struct's name, which
+	// worked while exactly one family had a resolver.
+	pub device_type: u32,
 	pub bar_phys: u64,
 	pub bar_len: u64,
 	pub msix_cap: u16,
@@ -658,25 +674,29 @@ pub fn scan_virtio<A: ConfigAccess>() -> Vec<VirtioDevice> {
 	scan::<A>().iter().filter_map(resolve_virtio::<A>).collect()
 }
 
-// Resolve an xHCI controller's MMIO window: BAR 0 holds the whole register file, so
-// its (assigned) base + probed size is the window a driver maps. `assign_bars` runs
-// first for ECAM platforms with no firmware. Returns None if the function is not an
-// xHCI controller or BAR 0 is not a memory BAR.
-fn resolve_xhci<A: ConfigAccess>(d: &PciDevice) -> Option<XhciDevice> {
-	if !d.is_xhci() {
-		return None;
-	}
+// Resolve one resourced function's MMIO window: BAR 0 holds the whole register file for every
+// family in the table above - the xHCI capability registers, the NVMe controller registers - so its
+// (assigned) base plus probed size is the window a driver maps. `assign_bars` runs first for ECAM
+// platforms with no firmware. Returns None if the class triple is not one this kernel resolves, or
+// if BAR 0 is not a memory BAR.
+//
+// THE MISSING BAR IS A REFUSAL AND NOT A ZERO. A function whose BAR 0 does not resolve is left to
+// the inventory pass, which gives it an identity row with no resources - the same place a family
+// with no resolver lands. Filling `bar_phys: 0, bar_len: 0` into a resourced row instead would
+// produce an entry that claims a profile and hands out a window of nothing.
+fn resolve_endpoint<A: ConfigAccess>(d: &PciDevice) -> Option<ResourcedDevice> {
+	let device_type = d.resourced_type()?;
 	A::assign_bars(d);
 	let bar_phys = bar_address::<A>(d, 0)?;
 	let bar_len = bar_size::<A>(d, 0)?;
 	let (msix_cap, msix_table_phys) = resolve_msix::<A>(d);
-	Some(XhciDevice { pci: *d, bar_phys, bar_len, msix_cap, msix_table_phys })
+	Some(ResourcedDevice { pci: *d, device_type, bar_phys, bar_len, msix_cap, msix_table_phys })
 }
 
-// Scan the bus and resolve every xHCI USB host controller's MMIO window.
-pub fn scan_xhci<A: ConfigAccess>() -> Vec<XhciDevice> {
+// Scan the bus and resolve the MMIO window of every function whose class triple this kernel knows.
+pub fn scan_resourced<A: ConfigAccess>() -> Vec<ResourcedDevice> {
 	// ALLOC-OK: bus enumeration, at boot, as above.
-	scan::<A>().iter().filter_map(resolve_xhci::<A>).collect()
+	scan::<A>().iter().filter_map(resolve_endpoint::<A>).collect()
 }
 
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10), which

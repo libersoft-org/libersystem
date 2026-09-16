@@ -68,8 +68,34 @@ compare_recorded() {
 		echo "capability-model: $name explored $states distinct states, and $MEASUREMENTS records $want_states" >&2
 		ok=1
 	fi
-	if [[ "$depth" != "$want_depth" ]]; then
-		echo "capability-model: $name reached depth $depth, and $MEASUREMENTS records $want_depth" >&2
+	# THE DEPTH IS A FLOOR AND NOT AN EQUALITY, and that is a measurement rather than a preference.
+	#
+	# TLC gives a state the level of the predecessor it was FIRST generated from, plus one. At one
+	# worker that predecessor is always the shallowest one, so the reported depth is the graph's
+	# DIAMETER exactly. At four it is whichever worker got there first, so a state can be recorded
+	# one level deeper than its true distance and the reported depth is an upper bound on the
+	# diameter - never below it, sometimes above.
+	#
+	# MEASURED, 2026-09-16, because two wrong guesses about a flaky gate is enough. Six runs of
+	# `handles` at four workers reported 30, 31, 30, 31, 30, 30, with the distinct state count
+	# IDENTICAL in all six; two runs at one worker reported 30 twice. Same specification, same
+	# configuration, same digests, same JAR. So the gate was failing this tree at random: it went red
+	# on one run today and green on the next with nothing changed in between, and a gate whose verdict
+	# is a property of the machine's thread scheduling is not gating anything.
+	#
+	# WHAT IS RECORDED IS THE DIAMETER, measured at one worker for all six configurations, and every
+	# one of them came out exactly as `MEASUREMENTS.md` already had it. So a run REPORTING MORE is
+	# the scheduler and a run reporting LESS is a smaller state graph, which is a real change and
+	# still fails here.
+	#
+	# NOTHING ELSE IS RELAXED, and it is worth saying which of the four checks was ever doing the
+	# work. The specification digests, the configuration digest and the distinct state count are
+	# still compared for EXACT equality, and the JAR is pinned by SHA-256 above. The model cannot
+	# change without the digests firing first; the depth was never the check that would catch it.
+	if [[ "$depth" -lt "$want_depth" ]]; then
+		echo "capability-model: $name reached depth $depth, and $MEASUREMENTS records a diameter of $want_depth" >&2
+		echo "capability-model:   a SHALLOWER graph is a different state graph. A deeper report is TLC's worker" >&2
+		echo "capability-model:   scheduling and is accepted; this is not that." >&2
 		ok=1
 	fi
 	if [[ "$have_cfg" != "$want_cfg" ]]; then

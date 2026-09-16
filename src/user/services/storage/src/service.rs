@@ -77,10 +77,10 @@ const TMP_VOLUME: &[u8] = b"tmp";
 // reply lacks the field.
 const SECTOR_SIZE: usize = 512;
 const MAX_SECTORS_FALLBACK: u32 = 8;
-const OP_READ: u32 = 0;
-const OP_WRITE: u32 = 1;
-const OP_CAPACITY: u32 = 2;
-const OP_FLUSH: u32 = 3;
+// The block wire comes from the crate that owns it rather than being written out here for the third
+// time; `volume::OP_*` below is a DIFFERENT protocol and keeps its own namespace, which is one more
+// reason the block opcodes should never have been bare constants in this file.
+use driver_protocol::block;
 
 // LiberFS layout on the disk: the filesystem starts at LBA 0 of its container.
 //
@@ -4259,14 +4259,13 @@ unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 // trailing per-request cap is read by `block_request_sectors`). `again`
 // when the driver (or its disk) cannot answer.
 fn block_capacity(block_client: u64) -> Result<u64, Error> {
-	let mut req: [u8; 16] = [0u8; 16];
-	req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
+	let req = block::Request { op: block::OP_CAPACITY, lba: 0, count: 0 }.encode();
 	if !send_blocking(block_client, &req, 0) {
 		return Err(Error::Again);
 	}
 	let mut rep: [u8; 16] = [0u8; 16];
 	match recv_blocking(block_client, &mut rep) {
-		Received::Message { len, handle } if len >= 12 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => Ok(u64::from_le_bytes([rep[4], rep[5], rep[6], rep[7], rep[8], rep[9], rep[10], rep[11]])),
+		Received::Message { len, handle } if handle == 0 => block::decode_capacity_bytes(&rep[..len]).ok_or(Error::Again),
 		_ => Err(Error::Again),
 	}
 }
@@ -4275,17 +4274,16 @@ fn block_capacity(block_client: u64) -> Result<u64, Error> {
 // trailing [max sectors u32] field. MAX_SECTORS_FALLBACK (one DMA page) for a
 // driver whose reply lacks the field, so an old driver still serves.
 fn block_request_sectors(block_client: u64) -> u32 {
-	let mut req: [u8; 16] = [0u8; 16];
-	req[..4].copy_from_slice(&OP_CAPACITY.to_le_bytes());
+	let req = block::Request { op: block::OP_CAPACITY, lba: 0, count: 0 }.encode();
 	if !send_blocking(block_client, &req, 0) {
 		return MAX_SECTORS_FALLBACK;
 	}
 	let mut rep: [u8; 16] = [0u8; 16];
 	match recv_blocking(block_client, &mut rep) {
-		Received::Message { len, handle } if len >= 16 && handle == 0 && u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0 => {
-			let max: u32 = u32::from_le_bytes([rep[12], rep[13], rep[14], rep[15]]);
-			if max == 0 { MAX_SECTORS_FALLBACK } else { max }
-		}
+		Received::Message { len, handle } if handle == 0 => match block::decode_capacity(&rep[..len]) {
+			Some(block::Capacity { max_sectors: 0, .. }) | None => MAX_SECTORS_FALLBACK,
+			Some(capacity) => capacity.max_sectors,
+		},
 		_ => MAX_SECTORS_FALLBACK,
 	}
 }
@@ -4295,14 +4293,13 @@ fn block_request_sectors(block_client: u64) -> u32 {
 // brackets its superblock commit with this barrier, so crash atomicity holds on a
 // disk with a volatile write cache.
 fn block_flush(block_client: u64) -> bool {
-	let mut req: [u8; 16] = [0u8; 16];
-	req[..4].copy_from_slice(&OP_FLUSH.to_le_bytes());
+	let req = block::Request { op: block::OP_FLUSH, lba: 0, count: 0 }.encode();
 	if !send_blocking(block_client, &req, 0) {
 		return false;
 	}
 	let mut rep: [u8; 16] = [0u8; 16];
 	match recv_blocking(block_client, &mut rep) {
-		Received::Message { len, handle } if len >= 4 && handle == 0 => u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0,
+		Received::Message { len, handle } if handle == 0 => block::decode_status(&rep[..len]) == Some(block::STATUS_OK),
 		_ => false,
 	}
 }
@@ -4313,19 +4310,24 @@ fn block_flush(block_client: u64) -> bool {
 // on success. `dst` must have room for count*512 bytes.
 unsafe fn block_read(block_client: u64, lba: u64, count: u32, dst: *mut u8) -> bool {
 	unsafe {
-		let mut req: [u8; 16] = [0u8; 16];
-		req[..4].copy_from_slice(&OP_READ.to_le_bytes());
-		req[4..12].copy_from_slice(&lba.to_le_bytes());
-		req[12..16].copy_from_slice(&count.to_le_bytes());
+		let req = block::Request { op: block::OP_READ, lba, count }.encode();
 		if !send_blocking(block_client, &req, 0) {
 			return false;
 		}
 		let mut rep: [u8; 16] = [0u8; 16];
 		let (status, handle): (u32, u64) = match recv_blocking(block_client, &mut rep) {
-			Received::Message { len, handle } if len >= 4 => (u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]), handle),
+			Received::Message { len, handle } => match block::decode_status(&rep[..len]) {
+				Some(status) => (status, handle),
+				None => {
+					if handle != 0 {
+						close(handle);
+					}
+					return false;
+				}
+			},
 			_ => return false,
 		};
-		if status != 0 || handle == 0 {
+		if status != block::STATUS_OK || handle == 0 {
 			if handle != 0 {
 				close(handle);
 			}
@@ -4372,17 +4374,14 @@ unsafe fn block_write(block_client: u64, lba: u64, count: u32, src: *const u8) -
 		if granted < 0 {
 			return false;
 		}
-		let mut req: [u8; 16] = [0u8; 16];
-		req[..4].copy_from_slice(&OP_WRITE.to_le_bytes());
-		req[4..12].copy_from_slice(&lba.to_le_bytes());
-		req[12..16].copy_from_slice(&count.to_le_bytes());
+		let req = block::Request { op: block::OP_WRITE, lba, count }.encode();
 		// send consumes the granted handle (transferred to the driver).
 		if !send_blocking(block_client, &req, granted as u64) {
 			return false;
 		}
 		let mut rep: [u8; 16] = [0u8; 16];
 		match recv_blocking(block_client, &mut rep) {
-			Received::Message { len, .. } if len >= 4 => u32::from_le_bytes([rep[0], rep[1], rep[2], rep[3]]) == 0,
+			Received::Message { len, .. } => block::decode_status(&rep[..len]) == Some(block::STATUS_OK),
 			_ => false,
 		}
 	}

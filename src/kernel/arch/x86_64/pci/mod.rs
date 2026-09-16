@@ -14,7 +14,7 @@ use crate::sync::SpinLock;
 
 // The PCI surface every backend re-exports (the HAL contract); not every type is
 // named directly in this backend's code.
-pub use common::{PciDevice, VirtioDevice, XhciDevice};
+pub use common::{PciDevice, ResourcedDevice, VirtioDevice};
 
 // The PCI configuration mechanism #1 ports.
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -102,8 +102,8 @@ pub fn scan_virtio() -> Vec<VirtioDevice> {
 }
 
 // Scan the bus and resolve every xHCI USB host controller's MMIO window.
-pub fn scan_xhci() -> Vec<XhciDevice> {
-	common::scan_xhci::<Access>()
+pub fn scan_resourced() -> Vec<ResourcedDevice> {
+	common::scan_resourced::<Access>()
 }
 
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10).

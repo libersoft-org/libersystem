@@ -19,8 +19,8 @@
 
 use crate::codec::Handles;
 use crate::generated::liber::base::v1::Error;
-use crate::generated::liber::display::v1::PresentationStats;
 use crate::generated::liber::display::v1::display_admin::{OP_BIND, Service, dispatch};
+use crate::generated::liber::display::v1::{PresentationStats, ScaleRatio};
 use std::cell::Cell;
 
 // The rights word the kernel reports for RIGHT_MANAGE; `abi::RIGHT_MANAGE` is `1 << 10` and the
@@ -80,6 +80,10 @@ impl Service for Recording {
 
 	fn set_visible(&mut self, _task: u64, _surface: u64) -> Result<(), Error> {
 		unimplemented!("no test in this module reaches set-visible")
+	}
+
+	fn set_scale(&mut self, _scale: ScaleRatio) -> Result<(), Error> {
+		unimplemented!("no test in this module reaches set-scale")
 	}
 }
 

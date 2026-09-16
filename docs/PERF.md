@@ -111,22 +111,111 @@ count are asserted against the numbers recorded in the tool before the clock sta
 simplification cannot quietly lower the workload and report the same milliseconds against an easier
 scene.
 
-| scene | commands | resources | prepare | replay median | replay p99 | ceiling |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| UI-basic | 252 | 153 | 1.1 ms | 29.2 ms | 39.1 ms | 16.7 ms |
-| UI-effects | 45 | 34 | 2.7 ms | 232.6 ms | 251.5 ms | 66.7 ms |
-| vector-stress | 240 | 241 | 7.1 ms | 89.2 ms | 108.7 ms | 66.7 ms |
-| image-stress | 25 | 3 | 42.8 ms | 375.5 ms | 395.0 ms | 16.7 ms |
+| scene | commands | resources | prepare | replay median | replay p99 | ceiling | verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| UI-basic | 252 | 153 | 1.0 ms | 16.4 - 17.0 ms | 16.6 ms | 16.7 ms | **on the line** |
+| UI-effects | 45 | 34 | 2.4 ms | 179 - 183 ms | 197 ms | 66.7 ms | 2.7x |
+| vector-stress | 240 | 241 | 6.9 ms | 75.4 - 76.8 ms | 76.4 ms | 66.7 ms | 1.13x |
+| image-stress | 25 | 3 | 38.9 ms | 344.7 ms | 348.0 ms | 16.7 ms | 20.7x |
 
-That row replaced this one on 2026-09-15, through four changes measured one at a time on the same
+**`UI-basic` SITS ON ITS CEILING, WHICH IS NOT THE SAME AS CLEARING IT, and a range is given rather
+than a single median because a single median here is a coin toss.** Seven consecutive runs measured
+16.36, 16.47, 16.70, 16.36, 16.66, 16.66 and 16.96 ms against a ceiling of 16.7: five met it and two
+did not. It was 46.1 ms when this work started, which is the part worth having; "met" is not.
+
+THE BUDGETS IN THE RUNNER STAY AT THE CEILINGS, deliberately. The item's rule is that a scene's frozen
+budget is its first accepted measurement OR its ceiling, whichever is LOWER - so accepting this one
+would freeze a number two runs in seven miss, and every later run would be testing the weather.
+
+**AND THE SAMPLING WAS NOT CHANGED, which is worth writing down because the temptation is obvious.**
+The runner discards five warmup frames and takes the median of thirty, and the run-to-run spread on
+this host is about four percent - enough to move `UI-basic` across its ceiling either way. Reporting
+the MINIMUM instead of the median would make it pass every time and would even be defensible in
+general, since interference only ever adds time. It was not done, and must not be done while a scene
+is sitting on its line: a measurement rule changed in the same breath as the verdict it decides is
+not a measurement rule, it is a way of getting the answer somebody wanted. If the sampling is ever
+reconsidered, it is reconsidered when nothing is balanced on it.
+
+### What the frame is made of, measured rather than reasoned about
+
+**THE FROZEN SCENES SAY WHETHER THE FLOOR IS MET AND NOT WHY IT IS NOT**, and three rounds of
+optimisation were guided by guessing at the answer. `SOFT2D_BENCH_PROBE=1 ./bench.sh --suite soft2d`
+runs scenes small enough to subtract from each other, at the same extent as the frozen four:
+
+| probe | replay | what it isolates |
+| --- | ---: | --- |
+| empty | 0.001 ms | a tile no command reaches is not replayed at all |
+| dot-per-tile | 0.081 ms | one pixel in every tile - see the damage note below; it was 17.0 ms |
+| one-opaque-fullscreen | 14.2 ms | the store plus a full-screen composite, with the decode skipped |
+| one-translucent-fullscreen | 23.2 ms | the same with the decode paid, so the difference is the DECODE |
+| hundred-small-opaque | 18.5 ms | a hundred commands over a fifth of the area |
+
+**A DAMAGE-LIMITED REDRAW NOW COSTS WHAT IT DRAWS.** A tile was decoded and re-encoded WHOLE, so a
+drawing that touched three pixels of it paid sixty-four rows of conversion for them; the round trip is
+now over the union of the bounds of the commands binned to that tile, which `prepare` already knows.
+The `dot-per-tile` probe - one pixel in each of eighty tiles - went from 17.0 ms to 0.081 ms, and the
+hundred-small scenes by about a sixth. IT DOES NOT MOVE THE FOUR FROZEN SCENES AT ALL, because every
+one of them covers the frame; it is here because a compositor updating one corner is the case the
+tiling exists for, and it was paying the whole frame's conversion to do it.
+
+A tile whose bin holds a LAYER, a layer end or a clip mask keeps its whole round trip: a layer
+composites over bounds that are a command FIELD rather than a binned bound, and a filter reaches past
+what it reads. Conservative, and it costs nothing on the drawings this is for.
+
+Read together: the decode is about 8 ms of a full-frame redraw, the encode about 9, and compositing
+307,200 pixels about 6. A hundred small commands cost MORE than one that covers the whole screen,
+which is the shape a user interface has and the reason the per-command path matters more than the
+per-pixel one.
+
+**AND THE TWO SCENES THAT ARE STILL OVER, TAKEN APART THE SAME WAY.** A frozen scene mixes a
+rasteriser, a shader and a sampler, and a verdict over the mixture says nothing about which to work
+on. Each of these is one full-screen draw of one kind, or the vector scene's own geometry with its
+paint swapped:
+
+| probe | replay | what it says |
+| --- | ---: | --- |
+| strokes-solid | 58.2 ms | the vector scene's rasteriser and composite, with a free paint |
+| strokes-gradient | 74.2 ms | the same geometry with its linear gradient, so the shader is 16 ms |
+| image-photo-bilinear | 82 ms | four texels per pixel |
+| image-photo-bicubic | 263 ms | sixteen, so a texel fetch is about 15 ms of a full-screen draw |
+| image-widegamut-bilinear | 90 ms | the same with a colour-space matrix |
+| image-yuv-bilinear | 172 ms | planes reconstructed and matrixed per texel; no prepared fetch |
+
+`vector-stress` CANNOT REACH ITS CEILING BY SHADER WORK: its geometry alone is 58.2 ms against 66.7,
+so even a free paint leaves 13% of headroom for everything else, and the remaining gradient cost is
+two divisions per pixel that cannot be turned into multiplications without changing the pixels. What
+is left is the exact-area accumulation itself over NEAR-HORIZONTAL edges - a stroke of a flat curve
+has outline edges that cross many columns of every row they touch, which is where that rasteriser is
+most expensive and is the algorithm rather than its constants.
+
+**THE LARGEST SINGLE FIND WAS A SOFTWARE SQUARE ROOT** (2026-09-15). `sqrt_f32` was four Newton
+iterations from a bit-level estimate - four serially dependent f32 DIVISIONS, a dozen cycles each and
+impossible to pipeline behind one another - and the encode table is indexed by the square root of its
+input, so it ran three times for EVERY PIXEL of every frame. Replacing it with `libm::sqrtf`, which
+lowers to the hardware instruction and is correctly rounded rather than approximate, took a
+full-screen opaque fill from 26.9 ms to 16.2 ms on its own. There were TWO copies of it: `render2d`
+had a private one whose documentation said "two Newton steps" while the loop ran four, on the
+flattening path, which is why `vector-stress`'s preparation fell from 7.7 ms to 6.7 ms. Both are now
+`graphics_core::composite::sqrt_f32` and there is one square root in the stack.
+
+That row replaced this one on 2026-09-15, through seven changes measured one at a time on the same
 host with the same fixtures:
 
-| scene | before | skipped decode | rectangle clips | f32 working space + solid span | narrowed rows | |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| UI-basic | 46.1 ms | 35.6 ms | 32.2 ms | 30.2 ms | 29.2 ms | 1.6x |
-| UI-effects | 336.1 ms | 322.7 ms | 325.1 ms | 225.3 ms | 232.6 ms | 1.4x |
-| vector-stress | 99.0 ms | 97.2 ms | 97.5 ms | 97.2 ms | 89.2 ms | 1.1x |
-| image-stress | 380.6 ms | 383.2 ms | 376.7 ms | 375.9 ms | 375.5 ms | 1.0x |
+| scene | before | after | | ceiling |
+| --- | ---: | ---: | ---: | ---: |
+| UI-basic | 46.1 ms | 16.8 ms | 2.7x | 16.7 ms |
+| UI-effects | 336.1 ms | 202.8 ms | 1.7x | 66.7 ms |
+| vector-stress | 99.0 ms | 75.8 ms | 1.3x | 66.7 ms |
+| image-stress | 380.6 ms | 353.3 ms | 1.1x | 16.7 ms |
+
+The four that removed WORK, then the three that made the remaining work cheaper:
+
+| scene | before | skipped decode | rectangle clips | f32 space + solid span | narrowed rows | hardware sqrt | one bounds check per run | one sqrt in the stack |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| UI-basic | 46.1 | 35.6 | 32.2 | 30.2 | 29.2 | 19.0 | 19.3 | 17.7 |
+| UI-effects | 336.1 | 322.7 | 325.1 | 225.3 | 232.6 | 209.8 | 211.1 | 211.4 |
+| vector-stress | 99.0 | 97.2 | 97.5 | 97.2 | 89.2 | 79.7 | 76.6 | 76.6 |
+| image-stress | 380.6 | 383.2 | 376.7 | 375.9 | 375.5 | 356.9 | 358.4 | 362.8 |
 
 - **A tile nothing reads the backdrop of is not decoded.** Every tile was read out of the target into
   the working space before it was replayed and written back afterwards; a tile that some command
@@ -158,11 +247,47 @@ host with the same fixtures:
   not zero and nothing at all where it is. `vector-stress` is where it shows, which is the scene
   made of thin outlines.
 
-**Where it still is not enough, in one number.** `UI-basic` composites about 470,000 pixels for
-29 ms, which is sixty-two nanoseconds each on a 2.6 GHz host - about a hundred and sixty cycles
-per pixel for an arithmetic that is a multiply and an add per channel. The remaining factor is not
-another term of this kind; it is the shape of the per-pixel path itself, and closing it is the body
-of work the milestone declines to call a tail of this item.
+- **One bounds check per RUN and not one per channel.** The row converters read each channel with
+  `get(index).copied().unwrap_or(0)` - four branches and a panic path per pixel - and the compiler
+  cannot remove them, because a chunk whose size is a runtime value could be shorter than index
+  three. The two four-byte orders every target in this tree presents are spelt out against
+  `chunks_exact(4)`, whose size the compiler knows; every other format still goes through the general
+  path unchanged. The tile round trip fell from 21.0 ms to 17.0 ms.
+
+- **A sampler prepares its own texel fetch.** `read_row`'s own documentation says "the row lookup is
+  the cost, not the pixel... doing that per pixel is most of the time a conversion spends" - and a
+  SAMPLER did exactly that per TEXEL, which a bilinear tap does four times and a bicubic sixteen
+  times for every pixel of an image draw. Each fetch re-derived the row's start from the origin and
+  the pitch, asked the storage enum for the minimum row bytes, took two bounds-checked slices and
+  matched the format again. A sampler is built once per image per frame, so all of it is the same
+  answer every time: a full-screen bilinear image draw went from 97 ms to 82 ms and a bicubic one
+  from 315 ms to 263 ms.
+- **A fully covered opaque run is a copy.** `Cs + Cb * (1 - as)` with `as = 1` is `Cs + Cb * 0`,
+  which for any finite backdrop is exactly `Cs` - so the backdrop read, the four multiplies of the
+  coverage scale and the eight of the blend all compute a number already in hand. That is the
+  INTERIOR of every filled shape; the edge, where coverage is partial, is unchanged. The conditions
+  are the ones that make it an identity and no wider, and the scan that checks the run's weights are
+  all one costs a pass and saves three.
+- **The dither row, and the blur's edge, asked once instead of per pixel.** `dither_offset` takes two
+  modulos and indexes a matrix, and `y` is constant for a row - so the row's eight offsets are taken
+  once. A blur tap asked whether it had fallen off the source, `2r + 1` times per pixel, and a pixel
+  at least `r` from either end cannot have: the interior runs without the test, in the same order,
+  which is what makes it the same number rather than a close one.
+- **The blur's second pass reads its column as a RUN.** It walked columns with `get(x, y)` per pixel,
+  recomputing local coordinates, a bounds check and an offset for each - twice, once each way - while
+  the first pass had used spans for its rows all along.
+
+**Where it still is not enough, and what it would take.** `UI-basic` is at its ceiling within one
+percent and `vector-stress` is 14% over; both are now dominated by the TILE ROUND TRIP - a decode and
+an encode of every pixel touched, about 17 ms of a 16.8 ms frame's worth of work, against 6 ms of
+actual compositing. That is a per-pixel transfer conversion with a table lookup in it, which is the
+thing that does not vectorise, and closing it means changing what the intermediate IS rather than
+finding another constant factor.
+
+`UI-effects` at 3.0x is a direct Gaussian: `2r + 1` taps of a four-channel multiply-add per pixel per
+pass, which for the sigma this scene uses is sixty. Every constant factor around it has now been
+taken out and the arithmetic is what remains; going faster means a box-blur approximation, and the
+profile specifies a Gaussian. `image-stress` at 21x is the fixture question the item itself raises.
 
 The row above replaced this one on 2026-09-14, when the rasteriser stopped sampling the vertical
 direction and started accumulating area. Same host, same fixtures, same flags:

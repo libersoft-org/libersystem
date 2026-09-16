@@ -653,6 +653,21 @@ pub const TRANSPORT_VIRTIO_PCI: u8 = 1;
 // are below 0x40), so one `device_type` field classifies every discovered device.
 pub const DEVICE_TYPE_XHCI: u32 = 0x100;
 
+// THE CLASS TRIPLES THEMSELVES, here rather than in whichever file asks first. A standard PCI
+// function's whole identity is `class / subclass / programming interface`, so the triple is the
+// device's NAME - and the NVMe one was three bare literals inside the IOMMU bypass transition while
+// the PCI resolver was about to spell it a second time. A number that means "NVMe" in two files is
+// two numbers that agree until one of them is edited.
+pub const PCI_CLASS_MASS_STORAGE: u8 = 0x01;
+pub const PCI_SUBCLASS_NVM: u8 = 0x08;
+pub const PCI_PROG_IF_NVME: u8 = 0x02;
+pub const PCI_CLASS_SERIAL_BUS: u8 = 0x0C;
+pub const PCI_SUBCLASS_USB: u8 = 0x03;
+pub const PCI_PROG_IF_XHCI: u8 = 0x30;
+// An NVM Express controller. 0x101 is taken by the unresolved row below, which was allocated before
+// a second resolved family existed; the numbers are a namespace and not an order.
+pub const DEVICE_TYPE_NVME: u32 = 0x102;
+
 // A FUNCTION THIS KERNEL RESOLVED NO PROFILE FOR, and that is a device type of its own rather than an
 // absence. Every PCI function is in the inventory; the ones outside the two resolvers carry their
 // standards identity - vendor, product, the class triple, the address - and no resources, so a rule
@@ -675,6 +690,7 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_INPUT => "virtio-input",
 		VIRTIO_TYPE_SOUND => "virtio-snd",
 		DEVICE_TYPE_XHCI => "xhci",
+		DEVICE_TYPE_NVME => "nvme",
 		DEVICE_TYPE_UNKNOWN => "unresolved-pci-function",
 		// A code this build does not classify. The NUMBER is kept, because a reader chasing an
 		// unrecognised device needs it and "unknown" alone sends them back to the source.
@@ -811,7 +827,27 @@ pub struct Framebuffer {
 	pub blue_shift: u8,
 	pub blue_size: u8,
 	pub _pad: [u8; 2],
+	/// THE MEMORY TYPE THE KERNEL MAPPED THIS SURFACE WITH, which nothing said before.
+	///
+	/// A CACHE POLICY THAT IS NOT STATED CANNOT BE CHECKED, and this one is a real choice with real
+	/// consequences: a linear aperture on a discrete card wants WRITE-COMBINING, where a read costs
+	/// an uncached round trip and a write is buffered, and ordinary RAM wants WRITE-BACK. Every
+	/// machine this system runs on is the second - in QEMU the surface IS ordinary RAM - and the
+	/// mapping said so by carrying no memory type at all, which is indistinguishable from not having
+	/// decided.
+	///
+	/// A CONSUMER USES IT TO DECIDE WHETHER TO READ. Compositing into a write-combining surface by
+	/// reading it back is the one access pattern that is orders of magnitude slower than it looks,
+	/// and a consumer that cannot ask has to assume the worse case or be wrong.
+	pub memory_type: u32,
 }
+
+/// The memory types `Framebuffer::memory_type` names. WRITE-BACK is what every target this system
+/// builds for maps a boot surface with today; the other two exist so that the day one does not, the
+/// answer is a value here rather than a second mapping path nobody can see from userspace.
+pub const FRAMEBUFFER_WRITE_BACK: u32 = 0;
+pub const FRAMEBUFFER_WRITE_COMBINING: u32 = 1;
+pub const FRAMEBUFFER_UNCACHED: u32 = 2;
 
 // The introspection view object_info_get returns for a handle: the identity (koid)
 // of the object behind it, its stable type code (ObjectType::code - Domain = 0,

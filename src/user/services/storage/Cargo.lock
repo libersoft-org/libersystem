@@ -63,6 +63,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-protocol"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "fat"
 version = "0.0.0"
 dependencies = [
@@ -236,6 +243,7 @@ dependencies = [
 name = "storage"
 version = "0.0.0"
 dependencies = [
+ "driver-protocol",
  "fat",
  "ipc-client",
  "iso9660",

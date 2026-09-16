@@ -30,6 +30,10 @@ pub mod hid;
 pub mod input;
 pub mod keys;
 pub mod net;
+// THE NVM EXPRESS DECISIONS, with no controller behind them: the register layouts, the completion
+// rules and the PRP arithmetic, which is where an NVMe driver is actually wrong and all of which a
+// host test can watch failing.
+pub mod nvme;
 pub mod port;
 pub mod serial_port;
 pub mod snd;

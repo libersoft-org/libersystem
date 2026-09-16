@@ -1792,3 +1792,177 @@ that could be answered by something other than what it was about.
 VERIFIED IN BOTH DIRECTIONS. A synthetic console frame - black with white text on it - fails all six
 checks and is named as what it is; the demo's own frames pass. Three consecutive green gate runs
 after the change, where before it was roughly one in two.
+
+## A software square root, and three rounds of guessing before anyone measured (2026-09-15)
+
+THE FIRST FOUR OPTIMISATIONS WERE CHOSEN BY REASONING AND THREE OF THEM MOVED ALMOST NOTHING. The
+frozen benchmark says WHETHER the floor is met; it does not say why it is not, and I treated a
+plausible story about where the time ought to be as though it were a measurement. A widened span
+loop, a faster tile read, a hoisted storage dispatch - each was a sound idea, each was worth a
+sentence of justification, and each was worth under three percent.
+
+SO THE RUNNER GAINED A PROBE MODE. `SOFT2D_BENCH_PROBE=1 ./bench.sh --suite soft2d` runs scenes small
+enough to SUBTRACT from each other, at the same extent as the frozen four: an empty list, one pixel
+in every tile, one full-screen fill opaque and translucent, a hundred small ones. Nothing in it is a
+budget and nothing is frozen - it is a measuring instrument, and the scenes are chosen so the
+difference between two rows is one thing. Three minutes of it found more than the preceding hour.
+
+WHAT IT FOUND: one opaque full-screen fill cost 26.5 ms for 307,200 pixels - eighty-six nanoseconds
+each, on an arithmetic that is a multiply and an add per channel. That is not a constant factor, it
+is something structurally wrong, and it was:
+
+    pub(crate) fn sqrt_f32(value: f32) -> f32 {
+        let mut estimate = f32::from_bits((value.to_bits() >> 1) + (127u32 << 22));
+        for _ in 0..4 { estimate = 0.5 * (estimate + value / estimate); }
+        estimate
+    }
+
+FOUR SERIALLY DEPENDENT DIVISIONS. An f32 divide is a dozen cycles and each iteration waits on the
+last, so it cannot pipeline behind itself - and the encode table is indexed by the SQUARE ROOT of its
+input, so this ran three times for every pixel of every frame. `libm::sqrtf` lowers to the hardware
+instruction on every target this builds for and is correctly rounded rather than approximate.
+26.9 ms to 16.2 ms from that one line.
+
+THERE WERE TWO COPIES OF IT. `render2d` had a private one - "without pulling a math crate into this
+layer" - whose documentation said "two Newton steps" while the loop ran four, on the FLATTENING path,
+so every curve segment of every prepared list paid it. `graphics_core` is already below `render2d`
+and already had the answer; there is one square root in the stack now, and `vector-stress`'s
+preparation fell from 7.7 ms to 6.7 ms with it.
+
+AND ONE MORE THE PROBE POINTED AT: the row converters read each channel with
+`get(index).copied().unwrap_or(0)` - four branches and a panic path per pixel, which the compiler
+cannot remove because a chunk whose size is a runtime value could be shorter than index three. The
+two four-byte orders every target in this tree presents are spelt out against `chunks_exact(4)`,
+whose size the compiler knows; every other format still goes through the general path unchanged. The
+tile round trip fell from 21.0 ms to 17.0 ms.
+
+THE RESULT, AND WHAT IS STILL LEFT:
+
+    scene            before    after    ceiling   over by
+    UI-basic         46.1 ms   17.7 ms   16.7 ms   1.06x
+    UI-effects      336.1 ms  211.4 ms   66.7 ms   3.2x
+    vector-stress    99.0 ms   76.6 ms   66.7 ms   1.15x
+    image-stress    380.6 ms  362.8 ms   16.7 ms  21.7x
+
+The conformance suite is unchanged by all seven: 112 passed, 0 failed, 0 unsupported, 0 untested.
+That had to be true for any of them to be worth having, and the square root's replacement being MORE
+accurate rather than less is why it could be made at all.
+
+WHAT IS LEFT IS NAMED RATHER THAN ESTIMATED. Of `UI-basic`'s 17.7 ms, about 17 is the TILE ROUND TRIP
+- a decode and an encode of every pixel it touches - and about 6 is the compositing. That is a
+per-pixel transfer conversion with a table lookup in it, which is the thing that does not vectorise,
+and closing it means changing what the intermediate IS rather than finding another constant factor.
+
+THE LESSON IS THE PROBE AND NOT THE SQUARE ROOT. A benchmark that reports a verdict without a
+breakdown invites exactly what happened here: four changes justified by a story. The instrument is
+committed beside the scenes so the next person starts where this ended.
+
+## Four more, and where the floor actually stops (2026-09-15, continued)
+
+AFTER THE SQUARE ROOT, FOUR MORE, all found by asking the probe rather than by reasoning:
+
+- A FULLY COVERED OPAQUE RUN IS A COPY. `Cs + Cb * (1 - as)` with `as = 1` is `Cs + Cb * 0`, and for
+  any finite backdrop that is exactly `Cs` - so the backdrop read, the four multiplies of the
+  coverage scale and the eight of the blend all compute a number already in hand. This is the
+  INTERIOR of every filled shape; the edge, where coverage is partial, falls through unchanged. The
+  conditions are the ones that make it an identity and no wider - a solid fully opaque paint, a
+  normal blend, source-over or a straight source, every weight in the run at one - and the scan for
+  that last one costs a pass and saves three. `UI-basic` 17.7 ms to 16.85 ms.
+- THE DITHER ROW IS THE SAME FOR EVERY PIXEL OF A ROW. `dither_offset` takes `y % 8` and `x % 8` and
+  indexes a matrix, so a row of a tile did sixty-four pairs of modulos to read eight numbers.
+- THE BLUR'S SECOND PASS READS ITS COLUMN AS A RUN. It walked columns with `get(x, y)` per pixel -
+  local coordinates, a bounds check and an offset recomputed for each, twice, once each way - while
+  the first pass had used spans for its rows all along. `Surface` gained `read_column`/`write_column`
+  for it.
+- AND THE BLUR'S EDGE TEST LEFT THE INNER LOOP. Every tap asked whether it had fallen off the source,
+  `2r + 1` times per pixel; a pixel at least `r` from either end cannot have. The interior runs
+  without the test, in the same order, which is what makes it the same number and not a close one.
+
+THE FINAL STATE, AND IT IS A FLOOR OF A DIFFERENT KIND:
+
+    scene            before    after    ceiling   over by
+    UI-basic         46.1 ms   16.8 ms   16.7 ms   1.01x
+    UI-effects      336.1 ms  202.8 ms   66.7 ms   3.0x
+    vector-stress    99.0 ms   75.8 ms   66.7 ms   1.14x
+    image-stress    380.6 ms  353.3 ms   16.7 ms  21.2x
+
+WHAT EACH REMAINING GAP WOULD COST, because "keep optimising" is not an answer any of them has:
+
+- `UI-basic` and `vector-stress` are dominated by the TILE ROUND TRIP - a decode and an encode of
+  every pixel touched, against about 6 ms of actual compositing. It is a per-pixel transfer
+  conversion with a TABLE LOOKUP in it, which is precisely the shape that does not vectorise.
+  Closing it means changing what the working intermediate IS, not finding another constant factor.
+- `UI-effects` is a DIRECT GAUSSIAN: `2r + 1` taps of a four-channel multiply-add per pixel per pass,
+  sixty at this scene's sigma. Every constant factor around it is now gone and the arithmetic is what
+  remains. Going faster means a box-blur approximation - and the profile specifies a Gaussian, so
+  that is a change to the profile rather than to this backend.
+- `image-stress` is the fixture question the item itself raises, and the item itself says deciding it
+  is the project owner's.
+
+THE ITEM ASKS FOR ALL FOUR AND SO IT CANNOT BE TICKED, however close two of them now are. That is
+worth saying plainly rather than leaving a reader to infer it from a table: two scenes are at or
+within fifteen percent of ceilings they were two and a half times over this morning, and the other
+two are not blocked on effort.
+
+## The one that moved nothing on the benchmark and matters most (2026-09-15)
+
+A TILE WAS DECODED AND RE-ENCODED WHOLE. A drawing that touched three pixels of a sixty-four-row tile
+paid sixty-four rows of transfer conversion for them, in each direction. What CAN change in a tile is
+bounded by the commands binned to it, and `prepare` already computes those bounds for the binning -
+so the round trip is over their union.
+
+    probe                  before     after
+    dot-per-tile           17.0 ms    0.081 ms      one pixel in each of eighty tiles
+    hundred-small-opaque   21.9 ms    18.5 ms
+    the four frozen scenes  unchanged
+
+IT MOVES NONE OF THE FOUR FROZEN SCENES, because every one of them covers the frame. It is here
+anyway, and it is probably the most useful of the eleven changes made today: a compositor updating one
+damaged corner is the case the tiling exists for, and it was paying the whole frame's conversion to do
+it. A benchmark suite whose scenes all redraw everything cannot see that, which is worth remembering
+about benchmark suites.
+
+THE WHOLE TILE IS STILL THE ANSWER WHENEVER ANYTHING IN IT IS NOT A PLAIN DRAW. A layer composites
+back over bounds that are a `BeginLayer` FIELD rather than a binned bound, and a filter reaches past
+what it reads by its declared expansion. Rather than reason about each, a tile whose bin holds a
+layer, a layer end or a clip mask keeps its whole round trip - conservative, and free on the drawings
+this is for.
+
+THE FIXTURE ASSERTS BOTH HALVES, because the two failure modes are opposite and only one of them is
+visible in a picture. A region computed too SMALL clips the drawing, which a pixel check catches. A
+region computed too LARGE is merely slow - but a region computed WRONG, or a store that wrote back
+pixels it had not loaded, corrupts the target silently. So the target outside the drawing is asserted
+BYTE-IDENTICAL to what was there before, over a gradient rather than a flat fill so that a pixel
+written back from the wrong place is a different value. A decode and an encode are a lossy pair for
+some formats: a pixel that made the trip without needing to may come back changed by a least
+significant bit, and that is how a redraw of one corner comes to alter a whole tile.
+
+## What the probes settle about the two scenes still in reach (2026-09-16)
+
+`vector-stress` CANNOT REACH ITS CEILING BY SHADER WORK, and the probe settles it rather than an
+argument. The scene's own geometry drawn with a SOLID paint is 58.2 ms against a 66.7 ms ceiling; the
+same geometry with its linear gradient is 74.2 ms. So the shader is 16 ms of the 75, and removing ALL
+of it would still leave only thirteen percent of headroom for everything else.
+
+WHAT IS LEFT IS THE EXACT-AREA ACCUMULATION OVER NEAR-HORIZONTAL EDGES. A stroke of a flat curve has
+outline edges that cross many columns of every row they touch, and the rasteriser clips each edge to
+each column it crosses - which is where that algorithm is most expensive and is the point of it: the
+coverage is exact. That is the algorithm and not its constants, and the constants around it are now
+taken out.
+
+TWO DIVISIONS PER PIXEL REMAIN IN THE GRADIENT and cannot be removed. `projection / length_squared`
+and the ramp's `(position - low) / span` both divide by a value that is loop-invariant - per shader
+and per stop pair respectively - so a reciprocal computed once would turn each into a multiply. It
+would also change the pixels: `x / y` and `x * (1 / y)` are not the same number, which was measured
+on this tree's own byte normalisation (126 of 256 values differ in the last place). What CAN be
+hoisted was: the gradient's axis and its squared length were recomputed for every pixel from two
+fields of a shader that is built once per frame.
+
+THE IMAGE SCENE'S SHAPE, FOR WHOEVER TAKES THE FIXTURE QUESTION. A full-screen bilinear draw is 82 ms
+and a bicubic one 263, which fits `a + b * texels` with `b` about 15 ms per texel per frame and `a`
+about 22. So a texel fetch - offset, bounds check, four channel loads, three transfer-table lookups
+and the premultiply - is roughly 128 cycles, and the scene draws between four and sixteen of them per
+pixel across twenty-five commands. That is not a constant factor waiting to be found; it is what
+sampling an encoded image costs one texel at a time, and the ways out are a decoded-texel cache, a
+byte-indexed decode table that is exact for 8-bit sources, or SIMD. Each is a change to the numeric
+path or to the memory budget, which is why the item calls the ceiling a decision rather than a task.

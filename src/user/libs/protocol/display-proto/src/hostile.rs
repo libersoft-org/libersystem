@@ -130,6 +130,10 @@ impl display_admin::Service for Refuser {
 	fn set_visible(&mut self, _task: u64, _surface: u64) -> Result<(), Error> {
 		Err(Error::Unsupported)
 	}
+
+	fn set_scale(&mut self, _scale: ScaleRatio) -> Result<(), Error> {
+		Err(Error::Unsupported)
+	}
 }
 
 impl display_stats::Service for Refuser {

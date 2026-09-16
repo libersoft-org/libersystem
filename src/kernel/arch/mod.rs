@@ -33,7 +33,7 @@
 //       tsc:        now, init, hz, cycles_to_ns   (the fine cycle clock)
 //       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync, write_bytes, read_byte
 //                   (`enable_rx_irq` is x86-only too, for the same reason: it arms an INTx line.)
-//       pci:        PciDevice / VirtioDevice / XhciDevice, scan, scan_virtio, scan_xhci,
+//       pci:        PciDevice / VirtioDevice / ResourcedDevice, scan, scan_virtio, scan_resourced,
 //                   set_intx_disabled, msix_enable
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel
 //       rtc:        read_unix                     random:   fill

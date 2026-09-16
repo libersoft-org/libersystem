@@ -1663,7 +1663,12 @@ fn open_device_events(gpu: u64) -> u64 {
 fn describe_framebuffer(scanout: &DeviceScanout) -> Option<(Framebuffer, u32, u32)> {
 	let layout = graphics_core::layout::ImageLayout::try_from(&scanout.layout).ok()?;
 	let masks = layout.storage.packed_masks()?;
-	let fb = Framebuffer { width: layout.extent.width, height: layout.extent.height, pitch: layout.pitch, bytes_per_pixel: masks.bytes_per_pixel as u32, red_shift: masks.red.shift, red_size: masks.red.bits, green_shift: masks.green.shift, green_size: masks.green.bits, blue_shift: masks.blue.shift, blue_size: masks.blue.bits, _pad: [0; 2] };
+	// A DEVICE SCANOUT IS A DMA BUFFER IN ORDINARY RAM, which is write-back. It is stated rather than
+	// left blank for the same reason the boot surface's is: this service COMPOSITES into the scanout,
+	// which reads it back, and that is the one access pattern a write-combining aperture makes orders
+	// of magnitude slower than it looks. A driver that ever hands over such an aperture has to say so
+	// here, and a consumer that cannot ask has to assume the worse case or be wrong.
+	let fb = Framebuffer { width: layout.extent.width, height: layout.extent.height, pitch: layout.pitch, bytes_per_pixel: masks.bytes_per_pixel as u32, red_shift: masks.red.shift, red_size: masks.red.bits, green_shift: masks.green.shift, green_size: masks.green.bits, blue_shift: masks.blue.shift, blue_size: masks.blue.bits, _pad: [0; 2], memory_type: rt::FRAMEBUFFER_WRITE_BACK };
 	// THE BACKING MUST HOLD WHAT THE LAYOUT DESCRIBES. A driver that hands over a shorter object
 	// than its own description is a mapping this service would read past.
 	if scanout.backing.len < layout.backend_access_span(true)? {

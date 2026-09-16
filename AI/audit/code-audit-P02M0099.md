@@ -816,3 +816,128 @@ IT IS ONE THIRD OF ONE OF THE THREE THINGS THE GOP ITEM'S PLAN NAMES, and the it
 descriptor MERGE is not done, the early display is still a syscall rather than a provider, and the
 cache policy is still unstated. What the plan is for is that none of those three has to be
 rediscovered - and that the loader's mask checking, which IS done, is not redone by whoever takes it.
+
+## The cache policy, and why the early display cannot be a provider yet (2026-09-15)
+
+THE POLICY IS A STATED FIELD NOW. `abi::Framebuffer` carries `memory_type`; the kernel sets
+`FRAMEBUFFER_WRITE_BACK` where it describes the boot surface, which is what `PRESENT | WRITABLE |
+NO_EXECUTE` with no memory-type bits actually IS on x86_64 and under this kernel's aarch64 MAIR, and
+DisplayService states the same for a device scanout, which is a DMA buffer in ordinary RAM. A cache
+policy that is not stated cannot be checked, and this one is a real choice: a linear aperture on a
+discrete card wants WRITE-COMBINING, where a read costs an uncached round trip.
+
+IT IS NOT A FIELD NOBODY READS. DisplayService COMPOSITES into the scanout, which reads it back, and
+that is precisely the access pattern a write-combining aperture makes orders of magnitude slower than
+it looks. A consumer that cannot ask has to assume the worse case or be wrong, and the fixture
+asserts the value on every machine in the harness - so the day the mapping and the statement disagree
+is the day a test fails rather than the day someone measures a mysterious slowdown.
+
+AND THE SECOND PART OF THE ITEM HAS A PREREQUISITE NOBODY OWNS, which looking at it found rather than
+assumed. Publishing the boot surface as an ordinary `ProviderKind::Display` needs a publisher that
+can HAND DisplayService the surface, and there is nothing to hand:
+
+- `SYS_FRAMEBUFFER_MAP` maps into the CALLER's address space and answers with a virtual address. It
+  cannot be transferred, and a second caller is refused by design - `try_claim` is what stops two
+  privileged callers both being given the display.
+- `MemoryObject::create_in` and `DmaBuffer::create_in` both ALLOCATE fresh physical pages. Neither
+  wraps an existing physical range.
+
+So there is no kernel object that carries the firmware's aperture across a channel. THAT IS A
+CAPABILITY DECISION AND NOT AN OVERSIGHT: a handle that maps arbitrary physical memory is exactly
+what a capability system must not hand out casually, so such an object would have to be minted by the
+kernel for one range it already owns and for nothing else - which is an object with its own rules
+about who may ask for it and how often. Whoever takes that part owns it first; it is not a refactor
+of what is already there, and the plan now says so rather than leaving the next implementer to
+discover it after starting.
+
+## And a second prerequisite, which correcting the first one found (2026-09-15)
+
+THE PLAN I WROTE THIS MORNING SAID PART 2 WAS "machinery this tree already has and already tests".
+That was an overclaim made from reading the shape of the thing rather than the code under it, and
+looking found a second prerequisite beside the first.
+
+EVERY PUBLICATION IN THE CATALOGUE IS KEYED TO A DEVICE CLAIM. `Catalogue::publish_all(binding,
+entry, offers)` takes a `BindingId` - a bus, a device, a function and a claim generation - and there
+is no other way in: a driver offers over the bootstrap channel of its own BINDING, and the manager
+files the offer under that binding. A boot framebuffer is not a device, has no claim and therefore
+has no binding, so there is no path by which a program holding it publishes a provider at all.
+
+SO PART 2 NEEDS TWO NEW MECHANISMS AND NOT ONE:
+
+1. A kernel object over an EXISTING physical range that can cross a channel - see the previous note.
+2. Either a device-less publication path, or the boot surface as a SYNTHETIC device node.
+
+Both are decisions about how this system's authority is shaped rather than refactors of what is
+there. The second is the more interesting one: "a provider is something a bound driver published" is
+load-bearing in the catalogue's design - it is what makes a withdrawal describable after the handle
+is gone, and what ties a provider's lifetime to a claim - so a device-less publication is not a hole
+to be filled but a second kind of thing the catalogue would have to carry.
+
+THE PLAN NOW SAYS SO, AND IT ALSO SAYS THE THREE PARTS ARE NOT THE SAME SIZE. Two of them were a day
+between them and are done; the third is two kernel-level mechanisms before a line of it can be
+written. An item whose parts look alike in a list and differ by an order of magnitude in the work is
+exactly what a written plan is for, and mine did not say it until it was checked.
+
+## The two acceptance conditions that read as a gate on every driver item were stale (2026-09-16)
+
+THE LEDGER AND THE HEAD OF THE SAME FILE COULD NOT BOTH BE TRUE. The head said "THE OTHER 21 ARE
+IMPLEMENTATION WORK AND ARE NOT BLOCKED"; the acceptance conditions below it said P02M0172's
+registry-policy mechanism "remains planned" and that "no driver item closes on a target until its
+window has been measured and recorded" with P02M0162's measurement open. Read together, every
+driver item was gated on two milestones. That is why the question "which of the twenty-one do I
+start" had no good answer: on the ledger's reading, none of them could finish.
+
+Both were checked against the tree rather than against their status lines:
+
+- P02M0172 is COMPLETE since 2026-09-10, six days after the ledger's 2026-09-08 recheck.
+  `abi::DMA_POLICY_NONE`, `DMA_POLICY_IOMMU_REQUIRED` and `DMA_POLICY_TRUSTED_UNTRANSLATED` are
+  declared, `kernel/dma_policy/` maps each to a `Policy` and enforces it at admission, and the suite
+  holds the mode/policy matrix, refusal by name, admission by declaration rather than rank, the
+  manifest migration table and the degraded-isolation record. The `none` policy the condition was
+  waiting for is a thing a driver declares.
+- P02M0162 is COMPLETE since 2026-09-09 and its M5 is closed. The condition described its
+  "300/400/4000 recovery constants"; M5 itself calls those obsolete and names 3,000 / 4,000 / 40,000
+  ticks as the current `boot_userspace` arguments, and the tree agrees at `main.rs`,
+  `arch/aarch64/boot.rs` and `arch/riscv64/boot.rs`. The measurement requirement survives the
+  correction and is restated as what it is: a step each driver item performs on each target, not a
+  wait on somebody else.
+
+## And my own blocker table from 2026-09-15 was wrong in four ways
+
+Correcting it is the point of writing it down. It said 43 open when the file holds 47 and has held 47
+since before the table was written. It filed the ACPI WDAT watchdog and USB DFU under "an AML
+interpreter": both are blocked on an unowned destination service, and WDAT's own text says it must
+never execute AML while the specification table calls it a static table with no AML, so that row
+named two items neither of which it described. It counted the destination-service cause at 9 when
+thirteen items state it. And it omitted two causes entirely - an I2C controller with a real fixture
+(IPMI SSIF, HID-over-I2C) and a display controller that can reach a bus (DDC/AUX) - so three blocked
+items appeared in no row.
+
+THE DEEPER MISTAKE WAS THE SHAPE RATHER THAN THE ARITHMETIC. Four rows summing to seventeen presented
+the causes as a partition, and they are not one: six items are blocked more than once, UCSI and the
+ACPI battery classes on three causes each. The corrected table answers "how many items does deciding
+THIS reach", which is the question an owner asks, and says in as many words that the column does not
+add up.
+
+## The block wire had three hand-written copies and NVMe would have made a fourth
+
+`OP_READ`, `OP_WRITE`, `OP_CAPACITY`, `OP_FLUSH` and the status codes were declared privately in
+`virtio_blk.rs`, in `usb_storage.rs` and in `services/storage/src/service.rs`, and all three took the
+sixteen request bytes apart index by index at the point of use. The roadmap's rule is that the wire
+belongs to the first implemented slice that publishes a block provider; nobody owned it because
+nobody extracted it. It is `driver_protocol::block` now, in the crate all three already share, with
+fourteen host tests over the LITERAL bytes rather than over a round trip that would pass against a
+wire nobody else speaks.
+
+WHAT THE EXTRACTION FOUND, which is the argument for doing it before the fourth copy and not after:
+the two servers disagree TODAY about what a refused request answers. `virtio-blk` replies
+`STATUS_INVALID`, the constant that exists so a caller can tell a request it got wrong from a device
+that failed one it got right; the USB path replies `STATUS_ERR` for the same refusal, so on that
+server the distinction does not reach the client. Neither is a typo - each is a faithful
+implementation of one end's own copy. It is RECORDED AND NOT REPAIRED in this change, because
+changing a reply code on a path this change does not test is the kind of edit that looks free.
+
+The compatibility rule was also a property of one client rather than of the protocol: StorageService
+accepted a twelve-byte capacity reply so that a server predating the per-request bound still reports
+a size, written as `len >= 12` inside the service. `CAPACITY_SIZE_LEN` and `decode_capacity_bytes`
+name it, and two tests hold it.

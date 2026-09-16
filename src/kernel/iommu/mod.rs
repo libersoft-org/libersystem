@@ -575,7 +575,7 @@ fn quiesce_other_endpoints(controller: usize) -> Result<(), Fault> {
 		if Some((function.bus, function.dev, function.func)) == keep {
 			continue;
 		}
-		if function.class == 0x01 && function.subclass == 0x08 && function.prog_if == 0x02 {
+		if function.class == abi::PCI_CLASS_MASS_STORAGE && function.subclass == abi::PCI_SUBCLASS_NVM && function.prog_if == abi::PCI_PROG_IF_NVME {
 			let confirmed = match crate::arch::pci::function_bar(function.bus, function.dev, function.func, 0) {
 				Some((base, len)) if len >= 0x1000 => quiesce_nvme(base, len),
 				_ => false,

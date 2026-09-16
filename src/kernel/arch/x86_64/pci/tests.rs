@@ -1,4 +1,4 @@
-use super::{scan, scan_xhci};
+use super::{scan, scan_resourced};
 
 crate::tagged_test!(pci_scan_finds_virtio_devices, [Pci, Drivers, ArchX86_64], id = "kernel.arch.x86_64.pci.pci_scan_finds_virtio_devices", covers = ["kernel"]);
 fn pci_scan_finds_virtio_devices() {
@@ -20,7 +20,10 @@ fn pci_scan_finds_the_xhci_controller() {
 	// kernel's PCI scan must find it by its class triple (0x0C/0x03/0x30) and resolve
 	// its MMIO window: a non-zero BAR 0 base and a probed BAR size (the sizing write-
 	// all-ones round-trip), plus an MSI-X capability for its interrupt vector.
-	let controllers = scan_xhci();
+	// FILTERED BY FAMILY, because the resolver is no longer one family's. Asserting MSI-X over
+	// everything `scan_resourced` returns would make this test's verdict depend on which other
+	// controllers the profile happens to attach, which is not what its name claims to check.
+	let controllers: alloc::vec::Vec<_> = scan_resourced().into_iter().filter(|c| c.device_type == abi::DEVICE_TYPE_XHCI).collect();
 	assert!(!controllers.is_empty(), "the PCI scan should find the QEMU xHCI controller");
 	for controller in &controllers {
 		assert!(controller.bar_phys != 0, "the xHCI BAR 0 should have a physical base");

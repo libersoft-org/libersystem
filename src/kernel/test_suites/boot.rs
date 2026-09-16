@@ -842,21 +842,33 @@ fn no_selected_root_refuses_a_valid_block_volume() {
 // this refuse a real boot surface fails here rather than on a blank screen.
 tagged_test!(a_boot_surface_states_its_element_size_in_whole_bytes, [Boot, Display], id = "kernel.boot.a_boot_surface_states_its_element_size_in_whole_bytes", covers = ["kernel"]);
 fn a_boot_surface_states_its_element_size_in_whole_bytes() {
-	assert_eq!(crate::element_bytes(32), Some(4), "the size every machine in the harness reports");
-	assert_eq!(crate::element_bytes(24), Some(3), "and a packed twenty-four-bit mode, which the loader also admits");
-	assert_eq!(crate::element_bytes(16), Some(2));
-	// REFUSED RATHER THAN ROUNDED. A surface whose element size this system cannot state is not one
-	// it can draw into, and the honest answer is what a machine with no video mode gets.
-	assert_eq!(crate::element_bytes(30), None, "a size that is not whole bytes is refused, not truncated to three");
-	assert_eq!(crate::element_bytes(1), None);
-	assert_eq!(crate::element_bytes(0), None, "and a zero is not a pixel at all");
+	let surface = |width: u32, height: u32, pitch: u32, bytes_per_pixel: u32| bootproto::Framebuffer { addr: 0x1000, width, height, pitch, bytes_per_pixel, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
 
-	// AND THE SURFACE THIS BOOT ACTUALLY HAS AGREES WITH ITS OWN PITCH. A pitch shorter than one row
-	// of the element size it claims is a descriptor whose two halves describe different surfaces.
+	// WHAT EVERY MACHINE IN THE HARNESS REPORTS, and a packed twenty-four-bit mode the loader also
+	// admits: both are surfaces this system can draw into.
+	assert!(crate::describable(&surface(640, 480, 2560, 4)), "thirty-two bits per pixel with an exact pitch");
+	assert!(crate::describable(&surface(640, 480, 2048, 3)), "and a packed twenty-four-bit mode");
+	assert!(crate::describable(&surface(640, 480, 4096, 4)), "a pitch with padding after the row is a pitch");
+
+	// A PITCH THAT DOES NOT HOLD A ROW IS THE ONE THAT MATTERS. It is not a smaller picture: every
+	// row after the first is read at the wrong offset, which is a diagonal smear rather than an
+	// image, and it is exactly what an element size converted in the wrong unit produces.
+	assert!(!crate::describable(&surface(640, 480, 2559, 4)), "a pitch one byte short of a row is refused");
+	assert!(!crate::describable(&surface(640, 480, 2560, 0)), "an element of no bytes is not a pixel");
+	assert!(!crate::describable(&surface(640, 480, 2560, 64)), "nor is one past any format this system has");
+	assert!(!crate::describable(&surface(0, 480, 2560, 4)), "and an empty extent is not a surface");
+	assert!(!crate::describable(&surface(640, 0, 2560, 4)));
+
+	// AND THE SURFACE THIS BOOT ACTUALLY HAS PASSES IT, so a change that made this refuse a real boot
+	// surface fails here rather than on a blank screen.
 	if let Some((address, geometry)) = crate::framebuffer_geometry() {
 		assert!(address != 0, "a present boot surface has an address");
-		assert!(geometry.bytes_per_pixel > 0, "and an element size");
 		let row = geometry.width as u64 * geometry.bytes_per_pixel as u64;
 		assert!(geometry.pitch as u64 >= row, "the pitch holds a whole row: {} < {row}", geometry.pitch);
+		// AND THE CACHE POLICY IS STATED AND IS THE ONE THE MAPPING USES. Every machine in this
+		// harness maps a boot surface write-back, because in QEMU it is ordinary RAM; a target that
+		// needed write-combining would say so HERE rather than in a second mapping path nobody can
+		// see from userspace, and this is what would catch the two disagreeing.
+		assert_eq!(geometry.memory_type, abi::FRAMEBUFFER_WRITE_BACK, "the boot surface is mapped write-back on every machine this harness runs");
 	}
 }

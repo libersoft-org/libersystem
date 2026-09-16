@@ -351,6 +351,7 @@ impl ResourceKind {
 // The decisions of `liber:device@1`'s `console-stream`, shared by the driver that serves it and the
 // program that consumes it. See the module: they are here because one rule in one place is what
 // stops two ends remembering a convention separately.
+pub mod block;
 pub mod console;
 
 pub mod provider {

@@ -660,7 +660,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	);
 
 	assert_layout!(
-		covered, Framebuffer, 24, 4,
+		covered, Framebuffer, 28, 4,
 		width => 0,
 		height => 4,
 		pitch => 8,
@@ -672,6 +672,10 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		blue_shift => 20,
 		blue_size => 21,
 		_pad => 22,
+		// THE CACHE POLICY, which takes the struct from 24 bytes to 28. It lands on the four-byte
+		// slot the two padding bytes above were already reserving the alignment for, so nothing
+		// before it moved.
+		memory_type => 24,
 	);
 
 	assert_layout!(covered, ObjectInfo, 32, 8, koid => 0, object_type => 8, rights => 16, generation => 20, size => 24);

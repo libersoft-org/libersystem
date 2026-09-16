@@ -129,7 +129,17 @@ pub struct Framebuffer {
 	pub width: u32,
 	pub height: u32,
 	pub pitch: u32,
-	pub bpp: u32,
+	/// THE ELEMENT SIZE IN BYTES, AND IT WAS IN BITS.
+	///
+	/// ONE DESCRIPTOR MEANT ONE UNIT, and there were two: this said `bpp` and the `abi::Framebuffer`
+	/// the kernel hands userspace says `bytes_per_pixel`, with `bpp / 8` written between them at both
+	/// of the kernel's call sites and checked at neither. Nothing truncated - every producer supplied
+	/// a multiple of eight - but this is a wire between two SEPARATELY BUILT artifacts, and a reader
+	/// that divides a number it did not produce is one loader version away from a stride a whole byte
+	/// short of the one firmware described. The conversion now happens once, in the loader, where the
+	/// masks the size is derived from are read; what crosses the wire is already the unit the kernel
+	/// uses.
+	pub bytes_per_pixel: u32,
 	pub red_shift: u8,
 	pub red_size: u8,
 	pub green_shift: u8,

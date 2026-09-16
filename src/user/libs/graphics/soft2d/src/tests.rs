@@ -1497,3 +1497,54 @@ fn a_tile_an_opaque_fill_covers_needs_no_backdrop_and_the_others_still_have_one(
 	draw(&list, &mut image);
 	assert_eq!(pixel(&image, tile - 1, 0), backdrop, "a corner the rotated rectangle does not reach still holds the backdrop");
 }
+
+#[test]
+// THE ROUND TRIP COVERS WHAT CAN CHANGE, AND EVERYTHING ELSE IS LEFT ALONE.
+//
+// A tile is decoded out of the target and encoded back into it, and for a drawing that touches three
+// pixels of a tile that is sixty-four rows of conversion for nothing. The region is bounded by the
+// commands binned to the tile - which `prepare` already knows - so the pixels outside it are neither
+// read nor written.
+//
+// WHAT COULD GO WRONG IS THE WHOLE POINT OF THE FIXTURE: a region computed too SMALL loses part of a
+// drawing, and a region computed too LARGE is only slow. So this asserts both halves - the drawing
+// arrives whole, and the target outside it is BYTE-IDENTICAL to what was there before, which is what
+// says the narrowed round trip is not silently re-encoding pixels it should not have touched.
+fn only_the_part_of_a_tile_that_can_change_makes_the_round_trip() {
+	let tile = crate::TILE_SIZE;
+	let mut image = target(tile, tile);
+	// A GRADIENT RATHER THAN A FLAT COLOUR, so a pixel written back from a different place in the
+	// tile is a different value and is caught.
+	for y in 0..tile {
+		let mut view = image.view_mut();
+		let row = view.row_mut(y).expect("a row");
+		for (x, pixel) in row.chunks_mut(4).enumerate() {
+			pixel.copy_from_slice(&[(x as u8).wrapping_mul(3), (y as u8).wrapping_mul(5), 0x40, 0xff]);
+		}
+	}
+	let before: Vec<[u8; 4]> = (0..tile).flat_map(|y| (0..tile).map(move |x| (x, y))).map(|(x, y)| pixel(&image, x, y)).collect();
+
+	// One small opaque rectangle in the middle of the tile.
+	let mut canvas = Canvas::new();
+	let (left, top, size) = (20.0f32, 24.0f32, 8.0f32);
+	canvas.fill_path(rect_path(RectF::new(left, top, size, size)), red(), FillRule::NonZero).expect("a fill");
+	draw(&canvas.finish().expect("a list"), &mut image);
+
+	// THE DRAWING ARRIVED WHOLE - a region computed too small would clip it.
+	assert_eq!(pixel(&image, 20, 24), [0xff, 0x00, 0x00, 0xff], "its first pixel");
+	assert_eq!(pixel(&image, 27, 31), [0xff, 0x00, 0x00, 0xff], "and its last");
+
+	// AND EVERYTHING OUTSIDE IT IS EXACTLY WHAT IT WAS. Not "close enough": the decode and the encode
+	// are a lossy pair for some formats, so a pixel that made the trip without needing to is a pixel
+	// that may come back different - which is how a redraw of one corner comes to change a whole
+	// tile by a least significant bit.
+	for y in 0..tile {
+		for x in 0..tile {
+			if (20..28).contains(&x) && (24..32).contains(&y) {
+				continue;
+			}
+			let expected = before[(y * tile + x) as usize];
+			assert_eq!(pixel(&image, x, y), expected, "the target outside the drawing is untouched at ({x}, {y})");
+		}
+	}
+}

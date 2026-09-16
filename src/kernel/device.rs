@@ -106,20 +106,22 @@ pub fn init() {
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		table.push(DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true });
 	}
-	for x in crate::arch::pci::scan_xhci() {
-		// The xHCI controller joins the same table: its whole register file lives in
-		// BAR 0, so the virtio structure offsets are zero and the driver reads the
-		// operational/runtime/doorbell offsets from the capability registers at the base.
+	for x in crate::arch::pci::scan_resourced() {
+		// Every resourced plain-PCI function joins the same table: its whole register file lives in
+		// BAR 0, so the virtio structure offsets are zero and the driver reads whatever its own
+		// specification puts at the base - the xHCI capability registers, the NVMe controller
+		// registers. WHICH family it is comes from the resolver rather than from this loop, which
+		// is what stopped this being one loop per family.
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true });
+		table.push(DeviceEntry { device_type: x.device_type as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true });
 	}
 	// AND EVERY OTHER FUNCTION ON THE BUS, so the inventory is the machine rather than the two
 	// families this kernel happens to resolve.
 	//
 	// `PCI_FUNCTIONS` held the full scan and its only reader was `SYS_PCI_INFO`, for `lspci`. The
 	// table below - which answers `SYS_DEVICE_COUNT`, supplies identity to the binder, and owns the
-	// claim slots - was filled by `scan_virtio()` and `scan_xhci()` alone. So a function outside those
+	// claim slots - was filled by `scan_virtio()` and `scan_resourced()` alone. So a function outside those
 	// two resolvers had no identity row anywhere the registry, a stable node, the binding catalogue or
 	// DeviceService look: it was visible through one diagnostic syscall and nowhere else.
 	//

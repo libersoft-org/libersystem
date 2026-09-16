@@ -30,6 +30,11 @@ rt = { path = "../../runtime/rt" }
 # the demo client speaks it, both via the proto codec + dispatch/client.
 proto = { path = "../../../proto" }
 
+# THE BLOCK WIRE THIS SERVICE IS THE CLIENT OF. It used to declare the four opcodes and assemble the
+# sixteen request bytes itself, which made three copies of one protocol counting the two drivers that
+# serve it. The crate depends only on `abi`, so this is the wire and nothing else.
+driver-protocol = { path = "../../libs/driver/protocol" }
+
 # The writable on-disk filesystem (LiberFS) StorageService mounts on the virtio-blk
 # disk for the persistent volume.
 liberfs = { path = "../../../fs/liberfs" }

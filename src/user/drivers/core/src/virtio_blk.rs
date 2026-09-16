@@ -30,20 +30,14 @@ const FEATURE_SIZE_MAX: u32 = 1 << 1;
 const FEATURE_SEG_MAX: u32 = 1 << 2;
 const FEATURE_FLUSH: u32 = 1 << 9;
 
-// Block-service request opcodes (the leading u32 of each request).
-const OP_READ: u32 = 0;
-const OP_WRITE: u32 = 1;
-const OP_CAPACITY: u32 = 2;
-const OP_FLUSH: u32 = 3;
-
-// Block-service reply status codes.
-const STATUS_OK: u32 = 0;
-const STATUS_ERR: u32 = 1;
-// A request refused before the device was asked: a count of zero or above what one request may
-// carry, a range past the last sector, or a write whose transferred object is not a readable memory
-// object at least as long as the request says (see `drivers::blk`). Typed apart from `STATUS_ERR`
-// so a caller can tell a request it got wrong from a device that failed one it got right.
-const STATUS_INVALID: u32 = 2;
+// THE BLOCK WIRE IS NOT DECLARED HERE ANY MORE. The four opcodes and the three statuses were
+// written out privately by this driver, by `driver.xhci` for its USB mass-storage path, and by
+// StorageService which is the client of both - three copies of one protocol, which is how the two
+// servers came to disagree about what a refused request answers. They are `driver_protocol::block`
+// now, in the crate every one of those already shares, with the frame layout host-tested against
+// the literal bytes this driver used to assemble by hand.
+use driver_protocol::block;
+use driver_protocol::block::{OP_CAPACITY, OP_FLUSH, OP_READ, OP_WRITE, STATUS_ERR, STATUS_INVALID, STATUS_OK};
 
 // The fixed control page: a 16-byte request header and the 1-byte status. The
 // data rides its own contiguous DMA span, grown to the largest request seen, so
@@ -290,14 +284,19 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 			let blk_server: u64 = serving.at(at);
 			match recv_blocking(blk_server, &mut req) {
 				Received::Message { len, handle } if len >= 16 => {
-					let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
-					let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
 					// AS SENT, NOT CLAMPED. The count used to be clamped into `1..=max_sectors`
 					// before anything looked at it, and the LBA was never checked at all - so a
 					// request past the end of the disk reached the device as written and an
 					// oversized one became a smaller one nobody asked for. Both are refused now,
-					// with `STATUS_INVALID`, and the device is not asked (DRV-002).
-					let count_sent: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
+					// with `STATUS_INVALID`, and the device is not asked (DRV-002). The shared
+					// decoder hands the count over UNADMITTED for exactly that reason.
+					let Some(block::Request { op, lba, count: count_sent }) = block::Request::decode(&req[..len]) else {
+						if handle != 0 {
+							close(handle);
+						}
+						reply_block(blk_server, STATUS_INVALID, 0);
+						continue;
+					};
 					let admitted = match op {
 						OP_READ | OP_WRITE => match drivers::blk::request_range(lba, count_sent, capacity_sectors, max_sectors) {
 							Ok(count) => Some(count),
@@ -433,16 +432,12 @@ unsafe fn serve_write(queue: &Queue, blk_server: u64, virt: u64, phys: u64, span
 
 // Send a block reply: [status u32 LE] carrying the handle `xfer` (0 = none).
 fn reply_block(blk_server: u64, status: u32, xfer: u64) {
-	send_blocking(blk_server, &status.to_le_bytes(), xfer);
+	send_blocking(blk_server, &block::reply(status), xfer);
 }
 
 // Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE],
 // no handle - the size of the disk plus the most sectors one request moves here, so
 // the StorageService sizes its requests to the driver instead of a shared constant.
 fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
-	let mut reply: [u8; 16] = [0u8; 16];
-	reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
-	reply[4..12].copy_from_slice(&bytes.to_le_bytes());
-	reply[12..16].copy_from_slice(&(max_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
-	send_blocking(blk_server, &reply, 0);
+	send_blocking(blk_server, &block::capacity_reply(bytes, max_sectors), 0);
 }

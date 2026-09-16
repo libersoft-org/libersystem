@@ -349,13 +349,21 @@ pub fn composite(operator: Operator, mode: BlendMode, source: Rgba, backdrop: Rg
 }
 
 /// A square root without a math crate in this layer: Newton from a bit-level estimate.
-pub(crate) fn sqrt_f32(value: f32) -> f32 {
+pub fn sqrt_f32(value: f32) -> f32 {
 	if !matches!(value.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
 		return 0.0;
 	}
-	let mut estimate = f32::from_bits((value.to_bits() >> 1) + (127u32 << 22));
-	for _ in 0..4 {
-		estimate = 0.5 * (estimate + value / estimate);
-	}
-	estimate
+	// `libm`'s AND NOT FOUR NEWTON ITERATIONS, which is what this was.
+	//
+	// THE OLD ONE WAS FOUR SERIALLY DEPENDENT DIVISIONS. `estimate = 0.5 * (estimate + value /
+	// estimate)`, four times, each waiting on the last - an f32 divide is a dozen cycles and cannot
+	// be pipelined behind itself. That is fine in a corner and ruinous on the path it was actually
+	// on: the encode table is indexed by the square root of its input, so EVERY CHANNEL OF EVERY
+	// PIXEL of every frame ran it three times. Measured on the probe that isolates the tile round
+	// trip, it was most of what a frame cost.
+	//
+	// AND IT IS MORE ACCURATE, not less: this is a correctly rounded square root where four
+	// iterations from a bit-twiddled seed are an approximation, and on every target this system
+	// builds for it lowers to the hardware instruction.
+	libm::sqrtf(value)
 }

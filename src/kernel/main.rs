@@ -320,31 +320,32 @@ fn init_framebuffer() {
 		return;
 	}
 	let fb = &bi.framebuffer;
-	let Some(bytes_per_pixel) = element_bytes(fb.bpp) else { return };
-	console::init(console::FbInfo { addr: fb.addr as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size });
+	if !describable(fb) {
+		return;
+	}
+	console::init(console::FbInfo { addr: fb.addr as *mut u8, width: fb.width as usize, height: fb.height as usize, pitch: fb.pitch as usize, bytes_per_pixel: fb.bytes_per_pixel as usize, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size });
 }
 
-// THE BOOT SURFACE'S ELEMENT SIZE IN BYTES, or `None` for one this system cannot describe.
+// WHETHER THE BOOT SURFACE THE LOADER DESCRIBED IS ONE THIS SYSTEM CAN DRAW INTO.
 //
-// THE TWO DESCRIPTORS DISAGREE ABOUT UNITS, which is why there is a conversion here at all: the
-// loader's `bootproto::Framebuffer` states the element size in BITS and the `abi::Framebuffer` the
-// kernel hands userspace states it in BYTES. It was `fb.bpp / 8` at both of this function's call
-// sites, unchecked.
+// THE KERNEL IS THIS DESCRIPTOR'S READER AND NOT ITS AUTHOR. `BootInfo` is a wire between two
+// SEPARATELY BUILT artifacts, so every number in it is firmware's or the loader's and none of it is
+// this build's. It used to be taken as given: the element size was divided by eight unchecked, and
+// the pitch was multiplied into a mapping without ever being compared to the row it claims to hold.
 //
-// NOTHING TRUNCATES TODAY AND THAT IS NOT THE POINT. Every producer supplies a multiple of eight -
-// the UEFI path derives the size from the channel masks and rounds UP to whole bytes, and the two
-// ramfb paths hard-code thirty-two - so the division is exact on every machine this system boots.
-// What was wrong is where the check was not: `BootInfo` is a wire between two SEPARATELY BUILT
-// artifacts, the kernel is its reader, and a reader that divides a number it did not produce without
-// asking whether the division is exact is one loader version away from a stride that is a whole byte
-// short of the one the firmware described - which is a diagonal smear rather than a picture, and
-// which no test on a matched pair would ever show.
+// WHAT IS ASKED IS WHAT THE GEOMETRY HAS TO SATISFY FOR A ROW TO MEAN ANYTHING: a non-zero extent, an
+// element size a pixel can actually be, and a pitch that holds a whole row of it. A pitch one byte
+// short of a row is not a smaller picture - it is every row after the first read at the wrong offset,
+// which is a diagonal smear.
 //
-// REFUSED RATHER THAN ROUNDED. A surface whose element size this system cannot state is not a
-// surface it can draw into, and the honest answer is the one a machine with no video mode gets:
-// serial only.
-fn element_bytes(bits: u32) -> Option<u32> {
-	(bits != 0 && bits % 8 == 0).then(|| bits / 8)
+// REFUSED RATHER THAN REPAIRED. A surface this cannot describe is answered the way a machine with no
+// video mode is answered: serial only.
+fn describable(fb: &bootproto::Framebuffer) -> bool {
+	if fb.width == 0 || fb.height == 0 || fb.bytes_per_pixel == 0 || fb.bytes_per_pixel > 16 {
+		return false;
+	}
+	let Some(row) = (fb.width as u64).checked_mul(fb.bytes_per_pixel as u64) else { return false };
+	fb.pitch as u64 >= row
 }
 
 // The boot framebuffer's virtual base + geometry, for the framebuffer_map syscall to
@@ -356,7 +357,16 @@ pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
 		return None;
 	}
 	let fb = &bi.framebuffer;
-	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: element_bytes(fb.bpp)?, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] };
+	if !describable(fb) {
+		return None;
+	}
+	// THE MEMORY TYPE `sys_framebuffer_map` WILL USE, stated where the geometry is. It maps
+	// `PRESENT | WRITABLE | NO_EXECUTE` with no memory-type bits, which is write-back on x86_64 and
+	// Normal write-back under this kernel's aarch64 MAIR - and correct on every machine this system
+	// runs on, because in QEMU a boot surface is ordinary RAM. What was missing was SAYING so: a
+	// cache policy that is not stated cannot be checked, and a consumer deciding whether it may read
+	// the surface back had nothing to ask.
+	let geom = abi::Framebuffer { width: fb.width, height: fb.height, pitch: fb.pitch, bytes_per_pixel: fb.bytes_per_pixel, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2], memory_type: abi::FRAMEBUFFER_WRITE_BACK };
 	Some((fb.addr, geom))
 }
 

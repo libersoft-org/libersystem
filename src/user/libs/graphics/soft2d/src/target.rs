@@ -106,14 +106,46 @@ impl Surface {
 	/// A RUN AND NOT A PIXEL AT A TIME, because the loop that composites a span is the hot loop of the
 	/// whole backend: fetching one pixel through its own offset computation per sample is most of the
 	/// cost of a fill, and it is the shape that stops the arithmetic being vectorised.
+	/// ONE BOUNDS CHECK FOR THE RUN AND NOT ONE PER PIXEL, which is the difference between a loop
+	/// the compiler can widen and a loop it cannot.
+	///
+	/// This asked `bytes.get(start..start + BYTES_PER_PIXEL)` for every pixel and matched on the
+	/// `Option`. That is a branch and a panic path inside the hot loop of the whole backend, it
+	/// recomputes the offset per pixel, and it stops the four channel loads being anything but four
+	/// scalar loads. Taking the whole run once and walking it with `chunks_exact` gives the compiler
+	/// a fixed-size window with no failure case in it - MEASURED, on the probe that isolates this:
+	/// one opaque full-screen fill.
 	pub fn read_span(&self, x: u32, y: u32, out: &mut [Rgba]) {
 		let Some(offset) = self.offset(x, y) else {
 			out.fill(Rgba::TRANSPARENT);
 			return;
 		};
 		let bytes = self.image.bytes();
+		let Some(run) = bytes.get(offset..offset + out.len() * BYTES_PER_PIXEL) else {
+			out.fill(Rgba::TRANSPARENT);
+			return;
+		};
+		for (slot, pixel) in out.iter_mut().zip(run.chunks_exact(BYTES_PER_PIXEL)) {
+			*slot = decode_half(pixel);
+		}
+	}
+
+	/// Read a VERTICAL run of pixels: the same idea as `read_span`, down a column.
+	///
+	/// WHY A COLUMN NEEDS ITS OWN: a separable blur's second pass walks columns, and it walked them
+	/// with `get(x, y)` per pixel - which recomputes the local coordinates, the bounds check and the
+	/// offset for every one of them. This surface's own documentation says what that costs: "a view
+	/// is CHECKED when it is built ... and is forty nanoseconds per PIXEL when a get builds one".
+	/// The first offset is computed once and the rest is the pitch, which is what a column IS.
+	pub fn read_column(&self, x: u32, y: u32, out: &mut [Rgba]) {
+		let Some(offset) = self.offset(x, y) else {
+			out.fill(Rgba::TRANSPARENT);
+			return;
+		};
+		let pitch = self.image.layout().pitch as usize;
+		let bytes = self.image.bytes();
 		for (index, slot) in out.iter_mut().enumerate() {
-			let start = offset + index * BYTES_PER_PIXEL;
+			let start = offset + index * pitch;
 			*slot = match bytes.get(start..start + BYTES_PER_PIXEL) {
 				Some(pixel) => decode_half(pixel),
 				None => Rgba::TRANSPARENT,
@@ -121,15 +153,26 @@ impl Surface {
 		}
 	}
 
-	/// Write a horizontal run of pixels.
-	pub fn write_span(&mut self, x: u32, y: u32, values: &[Rgba]) {
+	/// Write a vertical run of pixels - see `read_column`.
+	pub fn write_column(&mut self, x: u32, y: u32, values: &[Rgba]) {
 		let Some(offset) = self.offset(x, y) else { return };
+		let pitch = self.image.layout().pitch as usize;
 		let bytes = self.image.bytes_mut();
 		for (index, value) in values.iter().enumerate() {
-			let start = offset + index * BYTES_PER_PIXEL;
+			let start = offset + index * pitch;
 			if let Some(pixel) = bytes.get_mut(start..start + BYTES_PER_PIXEL) {
 				encode_half(pixel, *value);
 			}
+		}
+	}
+
+	/// Write a horizontal run of pixels. One bounds check for the run - see `read_span`.
+	pub fn write_span(&mut self, x: u32, y: u32, values: &[Rgba]) {
+		let Some(offset) = self.offset(x, y) else { return };
+		let bytes = self.image.bytes_mut();
+		let Some(run) = bytes.get_mut(offset..offset + values.len() * BYTES_PER_PIXEL) else { return };
+		for (value, pixel) in values.iter().zip(run.chunks_exact_mut(BYTES_PER_PIXEL)) {
+			encode_half(pixel, *value);
 		}
 	}
 
@@ -165,12 +208,7 @@ impl Surface {
 		}
 		for y in bounds.y..bounds.y.saturating_add(bounds.height) {
 			read_row(&source, bounds.x, y, &mut scratch[..width]);
-			for value in scratch[..width].iter_mut() {
-				*value = match table {
-					Some(table) => decoder.decode_tabled(table, *value),
-					None => decoder.decode(*value),
-				};
-			}
+			decoder.decode_row(table, &mut scratch[..width]);
 			self.write_span(bounds.x, y, &scratch[..width]);
 		}
 		Ok(())
@@ -190,13 +228,7 @@ impl Surface {
 		}
 		for y in bounds.y..bounds.y.saturating_add(bounds.height) {
 			self.read_span(bounds.x, y, &mut scratch[..width]);
-			for (index, value) in scratch[..width].iter_mut().enumerate() {
-				let x = bounds.x + index as u32;
-				*value = match table {
-					Some(table) => encoder.encode_tabled(table, *value, x, y),
-					None => encoder.encode(*value, x, y),
-				};
-			}
+			encoder.encode_row(table, &mut scratch[..width], bounds.x, y);
 			write_row(target, bounds.x, y, &scratch[..width]);
 		}
 		Ok(())

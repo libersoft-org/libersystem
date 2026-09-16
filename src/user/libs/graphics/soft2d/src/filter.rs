@@ -273,15 +273,32 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 		let offset = reach(&horizontal);
 		for y in top..top + bounds.height {
 			from.read_span(left, y, &mut spans.filter_input[..width]);
+			// THE INTERIOR HAS NO EDGE TO TEST FOR, and it is nearly all of the row. Every tap of
+			// every pixel asked whether it had fallen off the source - two comparisons and a branch
+			// inside a loop that runs `2 * radius + 1` times per pixel, which for the blur in a real
+			// scene is sixty times. A pixel at least `offset` from either end cannot have a tap
+			// outside, so the question is answered once for the whole run rather than per tap.
+			//
+			// OUTSIDE THE SOURCE IS TRANSPARENT AND NOT THE EDGE PIXEL, which is what the edges below
+			// still evaluate. A blur that clamped its edge would smear the border of a layer outward,
+			// which is visible as a bright rim around every shadow.
+			//
+			// THE ORDER OF THE ADDITIONS IS UNCHANGED - tap zero to tap last, for every pixel - which
+			// is what makes this the same number and not merely a close one.
+			let interior = (offset.max(0) as usize).min(width)..width.saturating_sub(offset.max(0) as usize).max((offset.max(0) as usize).min(width));
 			for x in 0..width {
 				let mut sum = Rgba::TRANSPARENT;
-				for (index, weight) in horizontal.iter().enumerate() {
-					let tap = x as i64 + index as i64 - offset;
-					// OUTSIDE THE SOURCE IS TRANSPARENT AND NOT THE EDGE PIXEL. A blur that clamped
-					// its edge would smear the border of a layer outward, which is visible as a bright
-					// rim around every shadow.
-					if tap >= 0 && (tap as usize) < width {
-						sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
+				if interior.contains(&x) {
+					let base = x - offset.max(0) as usize;
+					for (index, weight) in horizontal.iter().enumerate() {
+						sum = sum.plus(spans.filter_input[base + index].scaled(*weight));
+					}
+				} else {
+					for (index, weight) in horizontal.iter().enumerate() {
+						let tap = x as i64 + index as i64 - offset;
+						if tap >= 0 && (tap as usize) < width {
+							sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
+						}
 					}
 				}
 				spans.filter_output[x] = sum;
@@ -292,22 +309,31 @@ fn blur(from: &Surface, horizontal_pass: &mut Surface, into: &mut Surface, bound
 	if height > 0 && spans.filter_input.len() >= height {
 		let offset = reach(&vertical);
 		for x in left..left + bounds.width {
-			for (index, slot) in spans.filter_input[..height].iter_mut().enumerate() {
-				*slot = horizontal_pass.get(x, top + index as u32);
-			}
+			// THE COLUMN IS READ AND WRITTEN AS A RUN, which is what the first pass already did for
+			// its rows. Walking it with `get` and `set` recomputed the local coordinates, the bounds
+			// check and the byte offset for every pixel - twice, once each way - over the whole of
+			// the second pass of every blur in the frame.
+			horizontal_pass.read_column(x, top, &mut spans.filter_input[..height]);
+			// The same split as the first pass, for the same reason.
+			let interior = (offset.max(0) as usize).min(height)..height.saturating_sub(offset.max(0) as usize).max((offset.max(0) as usize).min(height));
 			for y in 0..height {
 				let mut sum = Rgba::TRANSPARENT;
-				for (index, weight) in vertical.iter().enumerate() {
-					let tap = y as i64 + index as i64 - offset;
-					if tap >= 0 && (tap as usize) < height {
-						sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
+				if interior.contains(&y) {
+					let base = y - offset.max(0) as usize;
+					for (index, weight) in vertical.iter().enumerate() {
+						sum = sum.plus(spans.filter_input[base + index].scaled(*weight));
+					}
+				} else {
+					for (index, weight) in vertical.iter().enumerate() {
+						let tap = y as i64 + index as i64 - offset;
+						if tap >= 0 && (tap as usize) < height {
+							sum = sum.plus(spans.filter_input[tap as usize].scaled(*weight));
+						}
 					}
 				}
 				spans.filter_output[y] = sum;
 			}
-			for (index, value) in spans.filter_output[..height].iter().enumerate() {
-				into.set(x, top + index as u32, *value);
-			}
+			into.write_column(x, top, &spans.filter_output[..height]);
 		}
 	}
 }

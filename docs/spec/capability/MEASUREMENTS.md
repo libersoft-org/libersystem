@@ -11,6 +11,53 @@ configuration is worth running, and they are properties of the machine that ran 
 "not captured" is the honest entry for a run that did not measure them, and inventing a plausible one
 would be exactly the kind of unchecked number the rest of this document exists to prevent.
 
+AND THE SEARCH DEPTH IS HELD AS A FLOOR RATHER THAN AN EQUALITY, which is the one place that
+sentence needed a correction (2026-09-16). The recorded number is the graph's DIAMETER. The gate runs
+at four workers and a four-worker search reports an upper bound on it, not the thing itself: TLC
+gives a state the level of the predecessor it was FIRST generated from, and with workers racing, that
+predecessor need not be the shallowest one. So the gate fails a run that comes out SHALLOWER than the
+diameter, which is a smaller state graph and a real change, and accepts one that comes out deeper,
+which is the scheduler. The distinct state count and all three digests are still compared for exact
+equality, and the model checker itself is pinned by SHA-256 - the model cannot change without a
+digest firing first, and the depth was never the check that would have caught it.
+
+### How that was established, and what it cost the tree before it was
+
+THE GATE WAS FAILING THIS TREE AT RANDOM. It went red on `handles` with "reached depth 31, and
+MEASUREMENTS.md records 30", and then green on the very next run with nothing changed between them -
+no edit to `Capability.tla`, to `Transfer.tla`, to any `.cfg`, or to `kernel/object/`.
+
+Measured rather than reasoned about, because the gate's own failure message asks for exactly that -
+"re-run, check what changed, and update MEASUREMENTS.md deliberately" - and because a flaky gate is
+the kind of thing it is tempting to explain instead of measure. Six runs of `handles` at four
+workers:
+
+| workers | 1 | 2 | 3 | 4 | 5 | 6 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| four | 30 | 31 | 30 | 31 | 30 | 30 |
+
+The distinct state count was 1,185,349 in every one of them, and in the two one-worker runs beside
+them, both of which reported 30. Same specification, same configuration, same digests, same JAR: one
+state graph, reported two ways.
+
+THEN ALL SIX CONFIGURATIONS WERE MEASURED AT ONE WORKER, because changing how one number is compared
+while five others are assumed is how the previous drift happened. Every diameter came out exactly as
+this document already recorded it, so nothing here was corrected - what was wrong was the comparison,
+not the record:
+
+| configuration | distinct states | diameter | at one worker |
+| --- | ---: | ---: | ---: |
+| `revoke-test-only` | 39272 | 26 | 6 s |
+| `spike` | 68244 | 28 | 8 s |
+| `handles` | 1185349 | 30 | 2 min 31 s |
+| `propagation` | 6343160 | 35 | 13 min 52 s |
+| `transactions-batch` | 11974842 | 31 | 24 min |
+| `transactions-single` | 24752058 | 43 | 50 min 43 s |
+
+WHICH IS ALSO WHY THE GATE DOES NOT SIMPLY RUN AT ONE WORKER and keep the equality. That column adds
+to an hour and a half against the four-worker run's twenty-four minutes, for a check that the state
+count and the digests already make redundant.
+
 ## `spike.cfg`
 
 The smallest configuration that can show a transfer racing a close: two processes, one transferable
@@ -209,9 +256,16 @@ would have become unaffordable.
 
 ## The gate budget
 
-`check.sh --gate capability-model` runs all six with four workers. Measured end to end: about two
-and a half minutes, of which `propagation` is half and `handles` most of the rest. Peak resident is
-`propagation`'s 2.4 GiB.
+`check.sh --gate capability-model` runs all six with four workers. Measured end to end on
+2026-09-16: 1442 s and 1452 s on two consecutive whole-gate runs, so about twenty-four minutes, of
+which `transactions-single` is more than half and `transactions-batch` most of the rest. Peak
+resident is `transactions-single`'s 13.2 GiB.
+
+CORRECTED 2026-09-16: this said "about two and a half minutes ... of which `propagation` is half and
+`handles` most of the rest", which is not the same order of magnitude as the six wall clocks in the
+tables above, and those tables already summed to roughly twenty-four minutes. Whoever had to decide
+whether this gate fits a workflow was reading a number ten times too small, in the one paragraph
+written to answer that question.
 
 A configuration that no longer fits this is a configuration to SPLIT rather than to shrink quietly:
 a reduced bound is a different result, and the counts above are what a later run is compared

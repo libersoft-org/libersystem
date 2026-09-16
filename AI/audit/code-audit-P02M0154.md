@@ -235,3 +235,39 @@ AUDITOR'S RE-AUDIT ON M0154 (2026-08-29T23:03:42Z):
 Current implementation rating: 10/10
 
 No material unresolved issue remains within M0154's scope. The current host capability-trace gate matched the reference replay and refused all 14 deliberate defects. Its newest guest trace is now correctly reported as stale relative to a later kernel build, rather than accepted as current evidence; a fresh QEMU trace was not produced in this re-audit because the shared runner was reserved by the concurrent audit. The current implementation and freshness check preserve the milestone's previously established live proof.
+
+## The `capability-model` gate was flaky, and the flake was in the comparison (2026-09-16)
+
+IT WENT RED AND THEN GREEN ON AN UNCHANGED TREE. `handles reached depth 31, and
+docs/spec/capability/MEASUREMENTS.md records 30` on one run; all six as recorded on the next, with no
+edit to `Capability.tla`, `Transfer.tla`, any `.cfg`, or `kernel/object/` in between.
+
+MEASURED RATHER THAN EXPLAINED, because the gate's own message asks for exactly that and because two
+wrong guesses about a different flake earlier the same day was enough. Six runs of `handles` at four
+workers reported 30, 31, 30, 31, 30, 30, with the distinct state count identical at 1,185,349 in every
+one; two runs at one worker reported 30 twice. One state graph, reported two ways.
+
+THE MECHANISM: TLC gives a state the level of the predecessor it was FIRST generated from, plus one.
+At one worker that predecessor is always the shallowest, so the reported depth is the diameter
+exactly. At four, workers race, and a state can be recorded one level deeper than its true distance.
+The reported depth is therefore an upper bound on the diameter, never below it.
+
+ALL SIX WERE THEN MEASURED AT ONE WORKER, because changing how one number is compared while five are
+assumed is how this document's earlier drift happened. Every diameter came out exactly as recorded -
+26, 28, 30, 35, 31, 43 - and so did every state count. The record was right; the comparison was wrong.
+
+THE FIX IS A FLOOR AND NOT A REMOVAL. A run that comes out SHALLOWER than the recorded diameter is a
+smaller state graph and still fails; a deeper one is the scheduler and is accepted. The distinct
+state count and the three digests keep exact equality, and the JAR stays pinned by SHA-256 - the
+model cannot change without a digest firing first, so the depth was never the check that would have
+caught a changed model.
+
+WHY NOT SIMPLY RUN AT ONE WORKER AND KEEP THE EQUALITY: the six one-worker runs took an hour and a
+half against the four-worker gate's twenty-four minutes, for a check the state count and the digests
+already make redundant.
+
+AND A SECOND STALE NUMBER FELL OUT OF IT. Both `MEASUREMENTS.md` and P02M0154 said the gate budget is
+"about two and a half minutes at four workers, of which `propagation` is half". Two consecutive
+whole-gate runs measured 1442 s and 1452 s, and the six per-configuration wall clocks in that
+document's own tables already summed to roughly that. The one paragraph written to tell a reader
+whether this gate fits their workflow was out by a factor of ten.

@@ -129,29 +129,86 @@ pub fn read_row(view: &ImageView<'_>, x: u32, y: u32, out: &mut [Rgba]) {
 		return;
 	};
 	let width = layout.storage.bytes_per_pixel() as usize;
-	for (index, slot) in out.iter_mut().enumerate() {
-		let start = (x as usize + index) * width;
-		*slot = match row.get(start..start + width) {
-			Some(pixel) => match layout.storage {
-				PixelStorage::Known(format) => read_known(format, pixel),
-				PixelStorage::PackedRgbUnorm(packed) => read_packed(packed, pixel),
-			},
-			None => Rgba::TRANSPARENT,
-		};
+	let start = (x as usize) * width;
+	// THE STORAGE IS MATCHED ONCE FOR THE ROW AND NOT ONCE PER PIXEL, and the run is bounds-checked
+	// once rather than per pixel.
+	//
+	// The loop used to ask `row.get(..)` and then match the storage enum for EVERY pixel - a branch,
+	// a panic path and a second dispatch inside `read_known`, on the path that converts a whole
+	// frame's worth of pixels twice per frame. A decision that is the same for every pixel of a row
+	// belongs outside the loop; what is left is a fixed-size window the compiler can widen.
+	let Some(run) = row.get(start..start + out.len() * width) else {
+		out.fill(Rgba::TRANSPARENT);
+		return;
+	};
+	// THE TWO FOUR-BYTE ORDERS ARE SPELT OUT, and every other format goes through the general path.
+	//
+	// WHY IT IS WORTH A SPECIAL CASE: `read_known` reads each channel with `get(index).copied()
+	// .unwrap_or(0)`, which is a bounds check and a branch PER CHANNEL - four per pixel - and the
+	// compiler cannot remove them, because `chunks_exact(width)` has a runtime chunk size and it
+	// cannot prove index three is inside it. `chunks_exact(4)` with a literal has a chunk size the
+	// compiler knows, so the checks go and the loop can be widened. These two are what every target
+	// in this tree actually presents; the general path below is unchanged and still answers for the
+	// rest.
+	match layout.storage {
+		PixelStorage::Known(PixelFormat::B8G8R8A8Unorm) if width == 4 => {
+			for (slot, pixel) in out.iter_mut().zip(run.chunks_exact(4)) {
+				*slot = Rgba::new(U8_NORMALISED[pixel[2] as usize], U8_NORMALISED[pixel[1] as usize], U8_NORMALISED[pixel[0] as usize], U8_NORMALISED[pixel[3] as usize]);
+			}
+		}
+		PixelStorage::Known(PixelFormat::R8G8B8A8Unorm) if width == 4 => {
+			for (slot, pixel) in out.iter_mut().zip(run.chunks_exact(4)) {
+				*slot = Rgba::new(U8_NORMALISED[pixel[0] as usize], U8_NORMALISED[pixel[1] as usize], U8_NORMALISED[pixel[2] as usize], U8_NORMALISED[pixel[3] as usize]);
+			}
+		}
+		PixelStorage::Known(format) => {
+			for (slot, pixel) in out.iter_mut().zip(run.chunks_exact(width)) {
+				*slot = read_known(format, pixel);
+			}
+		}
+		PixelStorage::PackedRgbUnorm(packed) => {
+			for (slot, pixel) in out.iter_mut().zip(run.chunks_exact(width)) {
+				*slot = read_packed(packed, pixel);
+			}
+		}
 	}
 }
 
-/// Write a horizontal run of pixels, finding the row once.
+/// Write a horizontal run of pixels, finding the row once. The storage is matched once - see
+/// `read_row`.
 pub fn write_row(view: &mut ImageViewMut<'_>, x: u32, y: u32, values: &[Rgba]) {
 	let layout = *view.layout();
 	let width = layout.storage.bytes_per_pixel() as usize;
+	let start = (x as usize) * width;
 	let Some(row) = view.row_mut(y) else { return };
-	for (index, value) in values.iter().enumerate() {
-		let start = (x as usize + index) * width;
-		let Some(pixel) = row.get_mut(start..start + width) else { continue };
-		match layout.storage {
-			PixelStorage::Known(format) => write_known(format, pixel, *value),
-			PixelStorage::PackedRgbUnorm(packed) => write_packed(packed, pixel, *value),
+	let Some(run) = row.get_mut(start..start + values.len() * width) else { return };
+	// The same two orders spelt out, for the reason `read_row` gives.
+	match layout.storage {
+		PixelStorage::Known(PixelFormat::B8G8R8A8Unorm) if width == 4 => {
+			for (value, pixel) in values.iter().zip(run.chunks_exact_mut(4)) {
+				pixel[0] = quantise_u8(value.blue);
+				pixel[1] = quantise_u8(value.green);
+				pixel[2] = quantise_u8(value.red);
+				pixel[3] = quantise_u8(value.alpha);
+			}
+		}
+		PixelStorage::Known(PixelFormat::R8G8B8A8Unorm) if width == 4 => {
+			for (value, pixel) in values.iter().zip(run.chunks_exact_mut(4)) {
+				pixel[0] = quantise_u8(value.red);
+				pixel[1] = quantise_u8(value.green);
+				pixel[2] = quantise_u8(value.blue);
+				pixel[3] = quantise_u8(value.alpha);
+			}
+		}
+		PixelStorage::Known(format) => {
+			for (value, pixel) in values.iter().zip(run.chunks_exact_mut(width)) {
+				write_known(format, pixel, *value);
+			}
+		}
+		PixelStorage::PackedRgbUnorm(packed) => {
+			for (value, pixel) in values.iter().zip(run.chunks_exact_mut(width)) {
+				write_packed(packed, pixel, *value);
+			}
 		}
 	}
 }
@@ -219,8 +276,36 @@ pub fn write_packed(packed: PackedRgbLayout, pixel: &mut [u8], value: Rgba) {
 	}
 }
 
+/// EVERY BYTE'S NORMALISED VALUE, computed once at build time instead of per channel per fetch.
+///
+/// `v as f32 / 255.0` IS A DIVISION, and Rust may not turn it into a multiply by the reciprocal
+/// because the two are not the same number - measured, 126 of the 256 values differ in the last
+/// place. So the division stayed, four of them per texel, on the path a BILINEAR sample walks four
+/// times and a BICUBIC one sixteen times for every pixel of an image draw.
+///
+/// A TABLE IS THE SAME NUMBER BY CONSTRUCTION. Each entry is `v as f32 / 255.0` evaluated by the
+/// same compiler that would have evaluated it at run time, so this is bit-identical and not an
+/// approximation - which is the only kind of change this path is allowed.
+const U8_NORMALISED: [f32; 256] = {
+	let mut table = [0.0f32; 256];
+	let mut index = 0usize;
+	while index < 256 {
+		table[index] = index as f32 / 255.0;
+		index += 1;
+	}
+	table
+};
+
+/// One packed pixel's channels, for a caller that has already found the bytes.
+///
+/// PUBLIC BECAUSE THE SAMPLER PREPARES ITS OWN FETCH: it computes the offset from constants it took
+/// once, which is the whole point, and then needs exactly this and nothing else.
+pub fn read_known_pixel(format: PixelFormat, pixel: &[u8]) -> Rgba {
+	read_known(format, pixel)
+}
+
 fn read_known(format: PixelFormat, pixel: &[u8]) -> Rgba {
-	let u8_at = |index: usize| pixel.get(index).copied().unwrap_or(0) as f32 / 255.0;
+	let u8_at = |index: usize| U8_NORMALISED[pixel.get(index).copied().unwrap_or(0) as usize];
 	let u16_at = |index: usize| {
 		let bytes = [pixel.get(index * 2).copied().unwrap_or(0), pixel.get(index * 2 + 1).copied().unwrap_or(0)];
 		u16::from_le_bytes(bytes)
@@ -539,6 +624,59 @@ impl Decoder {
 		self.decode_inner(raw, None)
 	}
 
+	/// A WHOLE RUN, WITH EVERY DECISION TAKEN ONCE.
+	///
+	/// `decode` answers for one pixel and every question it asks is the same for all of them: whether
+	/// the working space is linear, what the alpha mode is, whether there is a colour matrix, and
+	/// whether the table it was handed is for this transfer function. On a frame that decodes every
+	/// pixel of every tile it touches, that is a dozen branches per pixel to re-derive what the
+	/// encoder settled when it was built.
+	///
+	/// THE ANSWER IS IDENTICAL TO `decode` PIXEL FOR PIXEL, which is the property that matters: this
+	/// is the same arithmetic in the same order with the conditions lifted out, and the conformance
+	/// suite is what holds it to that.
+	pub fn decode_row(&self, table: Option<&TransferTable>, values: &mut [Rgba]) {
+		let tabled = match table {
+			Some(table) if table.transfer() == self.transfer => Some(table),
+			_ => None,
+		};
+		if !self.working_is_linear {
+			for value in values.iter_mut() {
+				*value = match self.alpha {
+					AlphaMode::Opaque => Rgba::new(value.red, value.green, value.blue, 1.0),
+					AlphaMode::Straight => Rgba::new(value.red * value.alpha, value.green * value.alpha, value.blue * value.alpha, value.alpha),
+					AlphaMode::Premultiplied => *value,
+				};
+			}
+			return;
+		}
+		let premultiplied = matches!(self.alpha, AlphaMode::Premultiplied);
+		for value in values.iter_mut() {
+			let raw = *value;
+			let mut straight = raw;
+			// AN OPAQUE PREMULTIPLIED PIXEL IS ALREADY STRAIGHT, and dividing it by one is three
+			// divisions per pixel to compute the number that was already there. The encoder has had
+			// this fast path since it was written - "the opaque case is the common one and needs no
+			// division at all" - and the decoder did not. Bit-identical, because dividing by exactly
+			// one is the identity and this skips only that case.
+			if premultiplied && raw.alpha > 0.0 && raw.alpha < 1.0 {
+				straight = Rgba::new(raw.red / raw.alpha, raw.green / raw.alpha, raw.blue / raw.alpha, raw.alpha);
+			}
+			let mut decoded = match tabled {
+				Some(table) => Rgba::new(table.decode(straight.red), table.decode(straight.green), table.decode(straight.blue), straight.alpha),
+				None => Rgba::new(color::decode(self.transfer, straight.red as f64) as f32, color::decode(self.transfer, straight.green as f64) as f32, color::decode(self.transfer, straight.blue as f64) as f32, straight.alpha),
+			};
+			if let Some(matrix) = &self.matrix {
+				let converted = color::multiply_vector(matrix, [decoded.red as f64, decoded.green as f64, decoded.blue as f64]);
+				decoded = Rgba::new(converted[0] as f32, converted[1] as f32, converted[2] as f32, decoded.alpha);
+			}
+			*value = match self.alpha {
+				AlphaMode::Opaque => Rgba::new(decoded.red, decoded.green, decoded.blue, 1.0),
+				AlphaMode::Straight | AlphaMode::Premultiplied => Rgba::new(decoded.red * decoded.alpha, decoded.green * decoded.alpha, decoded.blue * decoded.alpha, decoded.alpha),
+			};
+		}
+	}
+
 	fn decode_inner(&self, raw: Rgba, table: Option<&TransferTable>) -> Rgba {
 		let mut value = raw;
 		if self.working_is_linear {
@@ -550,13 +688,22 @@ impl Decoder {
 				value = Rgba::new(raw.red / raw.alpha, raw.green / raw.alpha, raw.blue / raw.alpha, raw.alpha);
 			}
 			let straight = value;
-			let decode = |channel: f32| match table {
-				Some(table) if table.transfer() == self.transfer => table.decode(channel),
-				_ => color::decode(self.transfer, channel as f64) as f32,
-			};
-			value.red = decode(straight.red);
-			value.green = decode(straight.green);
-			value.blue = decode(straight.blue);
+			// THE TABLE IS MATCHED ONCE AND NOT ONCE PER CHANNEL. This is the single-value decode a
+			// SAMPLER calls, four times per pixel for a bilinear tap and sixteen for a bicubic one,
+			// so three redundant comparisons of a transfer enum per texel is three per channel per
+			// texel of every image draw.
+			match table {
+				Some(table) if table.transfer() == self.transfer => {
+					value.red = table.decode(straight.red);
+					value.green = table.decode(straight.green);
+					value.blue = table.decode(straight.blue);
+				}
+				_ => {
+					value.red = color::decode(self.transfer, straight.red as f64) as f32;
+					value.green = color::decode(self.transfer, straight.green as f64) as f32;
+					value.blue = color::decode(self.transfer, straight.blue as f64) as f32;
+				}
+			}
 			if let Some(matrix) = &self.matrix {
 				let converted = color::multiply_vector(matrix, [value.red as f64, value.green as f64, value.blue as f64]);
 				value = Rgba::new(converted[0] as f32, converted[1] as f32, converted[2] as f32, value.alpha);
@@ -683,6 +830,64 @@ impl Encoder {
 
 	pub fn encode(&self, value: Rgba, x: u32, y: u32) -> Rgba {
 		self.encode_inner(value, x, y, None)
+	}
+
+	/// A WHOLE RUN, WITH EVERY DECISION TAKEN ONCE - see `Decoder::decode_row` for why.
+	///
+	/// `x` is the first pixel's column, because the DITHER PHASE is the target's own x and y: a
+	/// tile-relative phase makes the ordered pattern restart at every tile boundary, which is the
+	/// artefact that looks like a seam.
+	pub fn encode_row(&self, table: Option<&TransferTable>, values: &mut [Rgba], x: u32, y: u32) {
+		let tabled = match table {
+			Some(table) if table.transfer() == self.transfer => Some(table),
+			_ => None,
+		};
+		// THE DITHER ROW IS THE SAME FOR EVERY PIXEL OF THE ROW, and it was recomputed for each of
+		// them: `dither_offset` takes `y % 8` and `x % 8` and indexes a two-dimensional matrix, so a
+		// row of a tile did sixty-four pairs of modulos to read eight numbers. `y` is constant here,
+		// and `x` cycles with period eight - so the row's eight offsets are taken once and indexed.
+		let dither = self.steps.is_some().then(|| {
+			let row = graphics_profile::image::dither::MATRIX[(y % 8) as usize];
+			let mut offsets = [0.0f32; 8];
+			for (slot, cell) in offsets.iter_mut().zip(row.iter()) {
+				*slot = ((*cell as f32 + 0.5) / 64.0 - 0.5) * self.step;
+			}
+			offsets
+		});
+		for (index, value) in values.iter_mut().enumerate() {
+			let raw = *value;
+			let alpha = if raw.alpha.is_finite() { raw.alpha.clamp(0.0, 1.0) } else { 0.0 };
+			let mut colour = if alpha >= 1.0 {
+				Rgba::new(raw.red, raw.green, raw.blue, 1.0)
+			} else if alpha > 0.0 {
+				let scale = 1.0 / alpha;
+				Rgba::new(raw.red * scale, raw.green * scale, raw.blue * scale, alpha)
+			} else {
+				Rgba::new(0.0, 0.0, 0.0, 0.0)
+			};
+			if self.working_is_linear {
+				if self.tone_map && (colour.red > 1.0 || colour.green > 1.0 || colour.blue > 1.0) {
+					colour = tone_mapped(colour, self.luminance, self.tone_white);
+				}
+				if let Some(matrix) = &self.matrix {
+					let converted = color::multiply_vector(matrix, [colour.red as f64, colour.green as f64, colour.blue as f64]);
+					colour = Rgba::new(converted[0] as f32, converted[1] as f32, converted[2] as f32, colour.alpha);
+				}
+				colour = match tabled {
+					Some(table) => Rgba::new(table.encode(colour.red), table.encode(colour.green), table.encode(colour.blue), colour.alpha),
+					None => Rgba::new(color::encode(self.transfer, colour.red as f64) as f32, color::encode(self.transfer, colour.green as f64) as f32, color::encode(self.transfer, colour.blue as f64) as f32, colour.alpha),
+				};
+			}
+			if let Some(offsets) = &dither {
+				let offset = offsets[((x + index as u32) % 8) as usize];
+				colour = Rgba::new(colour.red + offset, colour.green + offset, colour.blue + offset, colour.alpha);
+			}
+			*value = match self.alpha {
+				AlphaMode::Premultiplied => Rgba::new(colour.red * alpha, colour.green * alpha, colour.blue * alpha, alpha),
+				AlphaMode::Opaque => Rgba::new(colour.red, colour.green, colour.blue, 1.0),
+				AlphaMode::Straight => colour,
+			};
+		}
 	}
 
 	fn encode_inner(&self, value: Rgba, x: u32, y: u32, table: Option<&TransferTable>) -> Rgba {

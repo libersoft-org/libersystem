@@ -62,12 +62,18 @@ const SCSI_SYNCHRONIZE_CACHE10: u8 = 0x35;
 // here as one aligned TRB), not a page unit.
 const SECTOR: u32 = 512;
 const TRB_DATA_MAX: u32 = 64 * 1024;
-const OP_READ: u32 = 0;
-const OP_WRITE: u32 = 1;
-const OP_CAPACITY: u32 = 2;
-const OP_FLUSH: u32 = 3;
-const STATUS_OK: u32 = 0;
-pub const STATUS_ERR: u32 = 1;
+// THE BLOCK WIRE COMES FROM THE CRATE THAT OWNS IT. This path and `driver.virtio-blk` serve the
+// same protocol to the same client and each used to declare it privately; `driver_protocol::block`
+// is the one declaration now.
+//
+// AND THE TWO SERVERS DISAGREE ABOUT ONE OF ITS VALUES, which is exactly what two copies of a rule
+// produce and is recorded here rather than changed under a path this change does not test: a refused
+// request is answered `STATUS_ERR` here and `STATUS_INVALID` by `virtio-blk`, so on this server the
+// client cannot tell a request it got wrong from a device that failed one it got right. The
+// constant it should use is imported and unused for now, which is why it is not in this list.
+use driver_protocol::block;
+pub use driver_protocol::block::STATUS_ERR;
+use driver_protocol::block::{OP_CAPACITY, OP_FLUSH, OP_READ, OP_WRITE, STATUS_OK};
 
 // A configured USB mass-storage device (Bulk-Only Transport): the bulk IN and OUT
 // endpoints' device context indices, addresses (for stall recovery) and transfer
@@ -365,9 +371,8 @@ unsafe fn bot_transfer(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: 
 // [status u32] - the same wire contract driver.virtio-blk serves.
 pub fn serve_block_request(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64, req: &[u8; 16], handle: u64) {
 	unsafe {
-		let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
-		let lba: u64 = u64::from_le_bytes([req[4], req[5], req[6], req[7], req[8], req[9], req[10], req[11]]);
-		let count: u32 = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
+		// Decoded once, by the shared decoder, rather than indexed sixteen times here.
+		let block::Request { op, lba, count } = block::Request::from_bytes(req);
 		// THE COUNT IS REFUSED AND NOT CLAMPED, and the range is checked against the medium. A clamp
 		// turns a wrong request into a wrong WRITE: the caller believes its bytes landed where it
 		// said, and they landed somewhere smaller. And the ten-byte command carries a THIRTY-TWO-BIT
@@ -548,18 +553,14 @@ fn read10_cb(opcode: u8, lba: u64, count: u32) -> [u8; 10] {
 
 // Send a block reply: [status u32 LE] carrying the handle `xfer` (0 = none).
 pub fn reply_block(blk_server: u64, status: u32, xfer: u64) {
-	let reply: [u8; 4] = status.to_le_bytes();
-	send_blocking(blk_server, &reply, xfer);
+	send_blocking(blk_server, &block::reply(status), xfer);
 }
 
 // Send a capacity reply: [status u32 LE][capacity bytes u64 LE][max sectors u32 LE],
 // no handle - the same wire contract driver.virtio-blk serves; the cap here is the
 // TRB data-stage bound.
 fn reply_capacity(blk_server: u64, bytes: u64, max_sectors: u64) {
-	let mut reply: [u8; 16] = [0u8; 16];
-	reply[..4].copy_from_slice(&STATUS_OK.to_le_bytes());
-	reply[4..12].copy_from_slice(&bytes.to_le_bytes());
-	reply[12..16].copy_from_slice(&(max_sectors.min(u32::MAX as u64) as u32).to_le_bytes());
+	let reply: [u8; 16] = block::capacity_reply(bytes, max_sectors);
 	send_blocking(blk_server, &reply, 0);
 }
 

@@ -146,6 +146,8 @@ pub struct SoftPrepared {
 	expansion: u32,
 	scratch_bytes: u64,
 	damage: Option<PixelRect>,
+	/// THE PART OF EACH TILE THE ROUND TRIP COVERS - see `tile_regions`.
+	regions: Vec<PixelRect>,
 	/// WHICH TILES NEED NO DECODE OF THE TARGET, one flag per tile - see `tiles_without_backdrop`.
 	/// Worked out here rather than per frame, because it is a function of the list and the target
 	/// and a prepared list is already bound to both.
@@ -393,6 +395,50 @@ fn covered(rect: RectF) -> PixelRect {
 /// WHAT HAPPENS BEFORE THE COVERING COMMAND DOES NOT MATTER. Commands earlier in the bin blend
 /// against scratch that holds the previous tile's pixels, and every one of those pixels is then
 /// overwritten - the covering fill reaches all of them, which is what "covers it completely" means.
+/// THE PART OF EACH TILE THAT CAN CHANGE, which is not always the whole of it.
+///
+/// A TILE IS DECODED AND RE-ENCODED WHOLE, and for a drawing of thin strokes that is sixty-four rows
+/// of conversion to change three pixels of each. What CAN change is bounded by the commands binned to
+/// the tile, and those bounds are already computed - so the round trip is over their union rather
+/// than over the tile. Pixels outside it are read from the target and written back unchanged, which
+/// is work with a known answer.
+///
+/// THE WHOLE TILE IS THE ANSWER WHENEVER ANYTHING IS NOT A PLAIN DRAW. A layer composites back over
+/// its own bounds, which are a `BeginLayer` field rather than a binned bound; a filter reaches past
+/// what it reads by its declared expansion; a clip mask is state. Rather than reason about each,
+/// a tile whose bin holds any of them keeps its whole round trip - conservative, and it costs
+/// nothing on the drawings this is for.
+fn tile_regions(tiling: &Tiling, bins: &Bins, steps: &[Step], bounds: &[Option<PixelRect>]) -> Vec<PixelRect> {
+	let mut answer: Vec<PixelRect> = Vec::with_capacity(tiling.count());
+	for index in 0..tiling.count() {
+		let tile = tiling.tile(index);
+		let mut region: Option<PixelRect> = None;
+		let mut whole = false;
+		for command in bins.commands(index) {
+			match steps.get(*command as usize) {
+				Some(Step::BeginLayer { .. } | Step::EndLayer | Step::PushClipMask { .. }) => {
+					whole = true;
+					break;
+				}
+				Some(_) => {
+					if let Some(bound) = bounds.get(*command as usize).copied().flatten() {
+						let clipped = bound.intersection(&tile);
+						if !clipped.is_empty() {
+							region = Some(match region {
+								Some(current) => union(current, clipped),
+								None => clipped,
+							});
+						}
+					}
+				}
+				None => {}
+			}
+		}
+		answer.push(if whole { tile } else { region.unwrap_or(tile).intersection(&tile) });
+	}
+	answer
+}
+
 fn tiles_without_backdrop(tiling: &Tiling, bins: &Bins, steps: &[Step], covers: &[Option<PixelRect>]) -> Vec<bool> {
 	let mut answer: Vec<bool> = Vec::with_capacity(tiling.count());
 	for index in 0..tiling.count() {
@@ -600,6 +646,7 @@ impl<'a> Backend for Soft2d<'a> {
 		let tiling = Tiling::new(target.extent, TILE_SIZE);
 		let bins = Bins::build(&tiling, &bounds);
 		let no_backdrop = tiles_without_backdrop(&tiling, &bins, &steps, &covers);
+		let regions = tile_regions(&tiling, &bins, &steps, &bounds);
 		let scratch_extent = (TILE_SIZE + expansion * 2, TILE_SIZE + expansion * 2);
 		// ONE SURFACE PER OPEN LAYER, one per filter node of the largest graph, one for the blur's
 		// second pass, and one for the tile itself.
@@ -626,7 +673,7 @@ impl<'a> Backend for Soft2d<'a> {
 		}
 
 		let damage = bounds.iter().flatten().copied().filter(|rect| !rect.is_empty()).reduce(union);
-		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop })
+		Ok(SoftPrepared { key: PreparedKey::of(list, target, (BACKEND_NAME, BACKEND_VERSION), self.cache.generation()), steps, bounds, bins, tiling, pyramids, images: resources.images.clone(), stops: resources.stops.clone(), filters: resources.filters.clone(), glyph_runs: resources.glyph_runs.clone(), working, target_transfer: target.color_space.transfer(), output: target.luminance, expansion, scratch_bytes, damage, no_backdrop, regions })
 	}
 
 	fn render(&mut self, prepared: &Self::Prepared, target: &mut ImageViewMut<'_>) -> Result<(), Error> {
@@ -703,8 +750,11 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 		// THE DECODE IS SKIPPED FOR A TILE SOMETHING OVERWRITES WHOLE. See `tiles_without_backdrop`:
 		// the scratch then still holds the previous tile's pixels, every one of which the covering
 		// command replaces, and the encode on the way out writes a full tile either way.
+		// THE ROUND TRIP IS OVER WHAT CAN CHANGE - see `tile_regions` - and the tile is the answer
+		// whenever anything in it is not a plain draw.
+		let region = prepared.regions.get(index).copied().unwrap_or(tile);
 		if !prepared.no_backdrop.get(index).copied().unwrap_or(false) {
-			surface.load(target, tile, prepared.working, table)?;
+			surface.load(target, region, prepared.working, table)?;
 		}
 		let mut clips = ClipStack::new();
 		clips.reset(tile);
@@ -900,7 +950,7 @@ fn replay(prepared: &SoftPrepared, target: &mut ImageViewMut<'_>, tile: PixelRec
 			pool.give(layer.surface);
 		}
 		clips.drain_into(masks);
-		surface.store(target, tile, prepared.working, prepared.output, table, &mut spans.filter_input)
+		surface.store(target, region, prepared.working, prepared.output, table, &mut spans.filter_input)
 	}
 }
 
@@ -986,6 +1036,23 @@ fn fill_edges(raster: &mut Rasteriser, spans: &mut Spans, edges: &crate::raster:
 					spans.source[offset] = shader.at(x as f32, y as f32);
 				}
 			}
+		}
+		// AN OPAQUE RUN AT FULL COVERAGE IS A COPY, and the whole composite is arithmetic that
+		// produces its own source.
+		//
+		// `Cs + Cb * (1 - as)` with `as = 1` is `Cs + Cb * 0`, which for any finite backdrop is
+		// exactly `Cs` - so the backdrop read, the four multiplies of the coverage scale and the
+		// eight of the blend all compute a number that is already in hand. This is the INTERIOR of
+		// every filled shape, which is most of the pixels a drawing has; the edge, where coverage is
+		// partial, falls through to the general path below and is unchanged.
+		//
+		// THE CONDITIONS ARE THE ONES THAT MAKE IT AN IDENTITY and no wider: a solid fully opaque
+		// paint, a normal blend, source-over or a straight source, and every weight in the run at
+		// one. The scan for that last one costs a pass over the run and saves three.
+		let covered = matches!(blend, BlendMode::Normal) && matches!(operator, Operator::SrcOver | Operator::Src) && matches!(shader, Shader::Solid(colour) if colour.alpha >= 1.0) && spans.weights[first - emitted..last - emitted].iter().all(|weight| *weight >= 1.0);
+		if covered {
+			into.write_span(bounds.x + first as u32, y, &spans.source[..length]);
+			return;
 		}
 		crate::span::scale_span(&mut spans.source[..length], &spans.weights[first - emitted..last - emitted]);
 		into.read_span(bounds.x + first as u32, y, &mut spans.destination[..length]);

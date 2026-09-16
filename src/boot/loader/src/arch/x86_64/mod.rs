@@ -382,7 +382,7 @@ fn locate_framebuffer(bs: *mut BootServices) -> FbResult {
 	if !g.present {
 		return FbResult { info: unsafe { core::mem::zeroed() }, phys: 0, size: 0, present: false };
 	}
-	let info = Framebuffer { addr: HHDM_OFFSET + g.phys, width: g.width, height: g.height, pitch: g.pitch, bpp: g.bpp, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size, _pad: [0; 2] };
+	let info = Framebuffer { addr: HHDM_OFFSET + g.phys, width: g.width, height: g.height, pitch: g.pitch, bytes_per_pixel: g.bpp / 8, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size, _pad: [0; 2] };
 	FbResult { info, phys: g.phys, size: g.size, present: true }
 }
 

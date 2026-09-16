@@ -72,6 +72,22 @@ impl Transform {
 		if !matches!(w.partial_cmp(&epsilon), Some(core::cmp::Ordering::Greater)) {
 			return None;
 		}
+		// AN AFFINE TRANSFORM DIVIDES BY EXACTLY ONE, and that is the identity in IEEE 754 - so this
+		// is the same two numbers and not an approximation of them. It is worth a branch because
+		// almost every transform in a drawing is affine and this is called PER PIXEL by every
+		// gradient and every image shader: two f32 divisions, which are a dozen cycles each and
+		// cannot start until `w` is finished.
+		//
+		// THE TEST IS ON `w` AND NOT ON THE MATRIX. `is_affine` asks whether the last row is
+		// `0, 0, 1`, which is sufficient and not necessary: a projective transform still yields
+		// `w == 1` along a whole line of its domain, and those points are free too.
+		//
+		// AND IT MOVED NO BENCHMARK SCENE MEASURABLY (2026-09-16), which is recorded so nobody
+		// measures it again expecting otherwise. The divides are real and are gone; they are simply
+		// not what those four scenes are waiting on.
+		if w == 1.0 {
+			return Some(PointF { x, y });
+		}
 		Some(PointF { x: x / w, y: y / w })
 	}
 
@@ -154,18 +170,16 @@ impl Transform {
 	}
 }
 
-/// A square root over `f32` without pulling a math crate into this layer: two Newton steps from a
-/// bit-level estimate, which is exact enough for a bounds estimate and is not used for anything a
-/// pixel depends on.
+/// ONE SQUARE ROOT FOR THE WHOLE STACK, which is `graphics_core`'s.
+///
+/// THIS WAS A SECOND COPY AND IT WAS THE SLOW KIND. Its own documentation said "two Newton steps from
+/// a bit-level estimate" and the loop ran FOUR - four serially dependent divisions, which is a dozen
+/// cycles each and cannot be pipelined behind itself. It is on the flattening path, so every curve
+/// segment of every prepared list paid it, and the reason given for having a private one - "without
+/// pulling a math crate into this layer" - costs nothing to honour: `graphics_core` is already below
+/// this layer and already has the answer.
 pub(crate) fn sqrt_f32(value: f32) -> f32 {
-	if !matches!(value.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
-		return 0.0;
-	}
-	let mut estimate = f32::from_bits((value.to_bits() >> 1) + (127u32 << 22));
-	for _ in 0..4 {
-		estimate = 0.5 * (estimate + value / estimate);
-	}
-	estimate
+	graphics_core::composite::sqrt_f32(value)
 }
 
 /// WHERE A STROKE'S WIDTH IS MEASURED.

@@ -78,7 +78,12 @@ pub enum Shader<'a> {
 	Linear {
 		ramp: Ramp,
 		from: PointF,
-		to: PointF,
+		/// THE AXIS AND ITS SQUARED LENGTH, TAKEN ONCE. They are `to - from` and its dot product with
+		/// itself - a function of two fields of this shader, and the shader is built once per frame -
+		/// and they were recomputed for every pixel the gradient covered: two subtractions, two
+		/// multiplies and an addition per pixel to produce the same three numbers.
+		axis: (f32, f32),
+		length_squared: f32,
 		spread: Spread,
 		inverse: Transform,
 	},
@@ -119,14 +124,12 @@ impl Shader<'_> {
 		match self {
 			Shader::Solid(colour) => *colour,
 			Shader::Nothing => Rgba::TRANSPARENT,
-			Shader::Linear { ramp, from, to, spread, inverse } => {
+			Shader::Linear { ramp, from, axis, length_squared, spread, inverse } => {
 				let Some(local) = inverse.map_point(point) else { return Rgba::TRANSPARENT };
-				let (dx, dy) = (to.x - from.x, to.y - from.y);
-				let length_squared = dx * dx + dy * dy;
-				if length_squared <= 0.0 {
+				if *length_squared <= 0.0 {
 					return ramp.at(1.0);
 				}
-				let projection = ((local.x - from.x) * dx + (local.y - from.y) * dy) / length_squared;
+				let projection = ((local.x - from.x) * axis.0 + (local.y - from.y) * axis.1) / length_squared;
 				ramp.at(spread_position(projection, *spread))
 			}
 			Shader::Radial { ramp, from, from_radius, to, to_radius, spread, inverse } => {
@@ -278,7 +281,10 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 	match paint {
 		Paint::Solid(color) => Shader::Solid(to_working(*color, working)),
 		Paint::Linear { from, to, stops: handle, spread, .. } => match stops.get(handle.0 as usize) {
-			Some(list) => Shader::Linear { ramp: Ramp::new(list, working), from: *from, to: *to, spread: *spread, inverse },
+			Some(list) => {
+				let axis = (to.x - from.x, to.y - from.y);
+				Shader::Linear { ramp: Ramp::new(list, working), from: *from, axis, length_squared: axis.0 * axis.0 + axis.1 * axis.1, spread: *spread, inverse }
+			}
 			None => Shader::Nothing,
 		},
 		Paint::Radial { from, from_radius, to, to_radius, stops: handle, spread, .. } => match stops.get(handle.0 as usize) {

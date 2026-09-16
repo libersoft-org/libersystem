@@ -73,6 +73,28 @@ pub struct Sampler<'a> {
 	/// THE TRANSFER FUNCTION AS A TABLE, when the caller has one. A power per channel per texel is
 	/// most of the cost of sampling an encoded image, and a bilinear tap reads four texels.
 	table: Option<&'a TransferTable>,
+	/// WHAT A PACKED TEXEL FETCH NEEDS, WORKED OUT ONCE. `None` for a planar source, which fetches
+	/// through its own reconstruction.
+	///
+	/// THE ROW LOOKUP IS THE COST AND THIS LAYER ALREADY KNEW IT. `read_row`'s own documentation says
+	/// "`row(y)` validates and computes the row's start and its visible length; doing that per pixel
+	/// is most of the time a conversion spends" - and a sampler did exactly that per TEXEL, which a
+	/// bilinear tap does four times and a bicubic sixteen times for every pixel it draws. Each one
+	/// re-derived the row's start from the origin and the pitch, asked the STORAGE ENUM for the
+	/// minimum row bytes, took two bounds-checked slices and matched the format again to read the
+	/// channels. A sampler is built once per image per frame; all of that is the same answer every
+	/// time.
+	packed: Option<Packed>,
+}
+
+/// The constants a packed fetch needs, so it is an offset and a read.
+#[derive(Clone, Copy)]
+struct Packed {
+	format: PixelFormat,
+	pitch: usize,
+	bytes_per_pixel: usize,
+	top_left: bool,
+	height: u32,
 }
 
 /// What a sampler is reading.
@@ -101,7 +123,14 @@ impl<'a> Sampler<'a> {
 			return Err(Error::UnknownFormat);
 		}
 		let decoder = Decoder::new(&view.layout().semantics, working)?;
-		Ok(Self { source: Source::Packed(view), decoder, spread, table })
+		let layout = *view.layout();
+		// A KNOWN FORMAT AND A DESCRIBABLE ROW, or no fast path at all - the general one below still
+		// answers for everything this cannot prepare for.
+		let packed = match (layout.storage, layout.storage.bytes_per_pixel(), layout.minimum_row_bytes()) {
+			(PixelStorage::Known(format), bytes_per_pixel, Some(_)) if bytes_per_pixel > 0 => Some(Packed { format, pitch: layout.pitch as usize, bytes_per_pixel: bytes_per_pixel as usize, top_left: matches!(layout.origin, RowOrigin::TopLeft), height: layout.extent.height }),
+			_ => None,
+		};
+		Ok(Self { source: Source::Packed(view), decoder, spread, table, packed })
 	}
 
 	/// A sampler over PLANES.
@@ -112,7 +141,7 @@ impl<'a> Sampler<'a> {
 	pub fn planar(view: crate::planar::MultiPlaneView<'a>, working: Working, spread: Spread, table: Option<&'a TransferTable>) -> Result<Self, Error> {
 		let semantics = ImageSemantics::Color { color_space: view.layout().color_space, alpha_mode: AlphaMode::Opaque };
 		let decoder = Decoder::new(&semantics, working)?;
-		Ok(Self { source: Source::Planar(view), decoder, spread, table })
+		Ok(Self { source: Source::Planar(view), decoder, spread, table, packed: None })
 	}
 
 	/// The extent this sampler reads, whatever its source is.
@@ -138,7 +167,15 @@ impl<'a> Sampler<'a> {
 			return Rgba::TRANSPARENT;
 		};
 		let raw = match &self.source {
-			Source::Packed(view) => read(view, x, y),
+			// THE PREPARED FETCH: one offset and one bounds check - see `Sampler::packed`.
+			Source::Packed(view) => match &self.packed {
+				Some(packed) => {
+					let row = if packed.top_left { y } else { packed.height.saturating_sub(1).saturating_sub(y) };
+					let start = row as usize * packed.pitch + x as usize * packed.bytes_per_pixel;
+					view.bytes().get(start..start + packed.bytes_per_pixel).map(|pixel| crate::pixel::read_known_pixel(packed.format, pixel))
+				}
+				None => read(view, x, y),
+			},
 			// RECONSTRUCT AND MATRIX FIRST, which produces the encoded RGB the decoder below takes -
 			// the same decoder, applying the same transfer function and the same primaries.
 			Source::Planar(view) => Some(view.encoded_rgb(x, y)),

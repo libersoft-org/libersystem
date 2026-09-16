@@ -122,6 +122,32 @@ impl ImageSource for Images {
 fn main() {
 	let check = std::env::args().any(|argument| argument == "--check");
 	let images = build_images();
+	if std::env::var("SOFT2D_BENCH_PROBE").is_ok() {
+		println!("probe\tcommands\tprepare_ms\treplay_median_ms");
+		for (name, list) in probes() {
+			let mut target = target();
+			let description = TargetDescription { extent: Extent2D::new(WIDTH, HEIGHT), format: PixelFormat::B8G8R8A8Unorm, color_space: ColorSpace::Srgb, scale: 1.0, luminance: OutputLuminance::UNKNOWN };
+			let mut backend = Soft2d::new().with_images(&images);
+			let started = Instant::now();
+			let prepared = backend.prepare(&list, &description).expect("a preparation");
+			let prepare_ms = started.elapsed().as_secs_f64() * 1_000.0;
+			let mut samples = Vec::with_capacity(SAMPLES);
+			for index in 0..WARMUP + SAMPLES {
+				let started = Instant::now();
+				{
+					let mut view = target.view_mut();
+					backend.render(&prepared, &mut view).expect("a frame");
+				}
+				let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+				if index >= WARMUP {
+					samples.push(elapsed);
+				}
+			}
+			samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+			println!("{name}\t{}\t{prepare_ms:.3}\t{:.3}", list.commands().len(), samples[samples.len() / 2]);
+		}
+		return;
+	}
 	println!("scene\tcommands\tresources\tprepare_ms\treplay_median_ms\treplay_p99_ms\tbudget_ms\tceiling_ms\tverdict");
 	let mut failed = false;
 	for scene in SCENES.iter() {
@@ -178,6 +204,115 @@ fn main() {
 		eprintln!("soft2d-bench: a scene is over its frozen budget");
 		std::process::exit(1);
 	}
+}
+
+/// WHERE THE TIME GOES, AS SCENES SMALL ENOUGH TO NAME. `SOFT2D_BENCH_PROBE=1` runs these instead of
+/// the frozen four.
+///
+/// THE FROZEN SCENES SAY WHETHER THE FLOOR IS MET AND NOT WHY IT IS NOT. Each of these isolates one
+/// term of the per-frame cost at the same extent, so the difference between two rows is one thing:
+/// an empty list is the tile round trip and nothing else, one opaque full-screen rectangle adds a
+/// composite that reads no backdrop, a gradient one adds a shader evaluated per pixel, and the small
+/// rectangles add the per-command overhead that a real interface is mostly made of. Nothing here is
+/// a budget and nothing here is frozen - this is a measuring instrument, and the scenes it measures
+/// are chosen to be subtracted from each other.
+fn probes() -> Vec<(&'static str, DrawList)> {
+	let mut out: Vec<(&'static str, DrawList)> = Vec::new();
+
+	let empty = Canvas::new().finish().expect("an empty list");
+	out.push(("empty", empty));
+
+	let mut canvas = Canvas::new();
+	rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.4, 1.0, ColorSpace::Srgb))).expect("a fill");
+	out.push(("one-opaque-fullscreen", canvas.finish().expect("a list")));
+
+	let mut canvas = Canvas::new();
+	rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.4, 0.5, ColorSpace::Srgb))).expect("a fill");
+	out.push(("one-translucent-fullscreen", canvas.finish().expect("a list")));
+
+	// A HUNDRED SMALL RECTANGLES, which is what a user interface is: the per-command cost times the
+	// number of commands, over an area that is a fraction of the frame.
+	let mut canvas = Canvas::new();
+	for index in 0..100u32 {
+		let x = 8.0 + ((index % 10) as f32) * 62.0;
+		let y = 8.0 + ((index / 10) as f32) * 46.0;
+		rect(&mut canvas, RectF::new(x, y, 54.0, 38.0), Paint::Solid(Color::new(0.8, 0.4, 0.2, 1.0, ColorSpace::Srgb))).expect("a fill");
+	}
+	out.push(("hundred-small-opaque", canvas.finish().expect("a list")));
+
+	// THE SAME HUNDRED, HALF TRANSPARENT, so the difference is the backdrop read and the blend.
+	let mut canvas = Canvas::new();
+	for index in 0..100u32 {
+		let x = 8.0 + ((index % 10) as f32) * 62.0;
+		let y = 8.0 + ((index / 10) as f32) * 46.0;
+		rect(&mut canvas, RectF::new(x, y, 54.0, 38.0), Paint::Solid(Color::new(0.8, 0.4, 0.2, 0.5, ColorSpace::Srgb))).expect("a fill");
+	}
+	out.push(("hundred-small-translucent", canvas.finish().expect("a list")));
+
+	// ONE PIXEL IN EVERY TILE, which pays the tile round trip for the whole frame and draws almost
+	// nothing. Subtracting it from a scene that covers the frame separates what the TILES cost from
+	// what the DRAWING costs, and the two have been guessed at long enough.
+	let mut canvas = Canvas::new();
+	for row in 0..(HEIGHT / 64 + 1) {
+		for column in 0..(WIDTH / 64 + 1) {
+			rect(&mut canvas, RectF::new((column * 64) as f32, (row * 64) as f32, 1.0, 1.0), Paint::Solid(Color::new(0.8, 0.4, 0.2, 1.0, ColorSpace::Srgb))).expect("a fill");
+		}
+	}
+	out.push(("dot-per-tile", canvas.finish().expect("a list")));
+
+	// THE IMAGE SCENE, TAKEN APART. It is twenty-one times its ceiling and the item calls that a
+	// fixture question; before agreeing, the four things it draws are measured one at a time, because
+	// the last time a scene was assumed to be inherently expensive the answer was a software square
+	// root. Each of these is one full-screen draw of one kind.
+	let photo = ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 };
+	let wide = ImageRecord { identity: 3, layout_generation: 1, content_generation: 1 };
+	let video = ImageRecord { identity: 4, layout_generation: 1, content_generation: 1 };
+	for (name, record, source, quality) in [
+		("image-photo-bilinear", photo, 512.0f32, ImageQuality::Bilinear),
+		("image-photo-mipmapped", photo, 512.0, ImageQuality::Mipmapped),
+		("image-photo-bicubic", photo, 512.0, ImageQuality::Bicubic),
+		("image-widegamut-bilinear", wide, 256.0, ImageQuality::Bilinear),
+		("image-yuv-bilinear", video, 320.0, ImageQuality::Bilinear),
+	] {
+		let mut canvas = Canvas::new();
+		canvas.draw_image(record, RectF::new(0.0, 0.0, source, source), RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), quality).expect("an image draw");
+		out.push((name, canvas.finish().expect("a list")));
+	}
+
+	// THE VECTOR SCENE, TAKEN APART. Its strokes are drawn with a LINEAR GRADIENT, so a frame pays a
+	// rasteriser and a per-pixel shader together and the frozen scene cannot say which. The same
+	// geometry is drawn with each paint: the difference between the two rows is the shader.
+	for (name, gradient) in [("strokes-solid", false), ("strokes-gradient", true)] {
+		let mut canvas = Canvas::new();
+		let paint = if gradient {
+			let stops = canvas
+				.resources()
+				.add_stops(vec![
+					GradientStop { offset: 0.0, color: Color::new(0.9, 0.2, 0.1, 1.0, ColorSpace::Srgb) },
+					GradientStop { offset: 0.5, color: Color::new(0.95, 0.8, 0.1, 1.0, ColorSpace::Srgb) },
+					GradientStop { offset: 1.0, color: Color::new(0.1, 0.4, 0.9, 1.0, ColorSpace::Srgb) },
+				])
+				.expect("stops");
+			Paint::Linear { from: PointF { x: 0.0, y: 0.0 }, to: PointF { x: WIDTH as f32, y: HEIGHT as f32 }, stops, spread: graphics_core::sample::Spread::Clamp, transform: Transform::IDENTITY }
+		} else {
+			Paint::Solid(Color::new(0.9, 0.2, 0.1, 1.0, ColorSpace::Srgb))
+		};
+		let style = StrokeStyle { width: 2.5, cap: Cap::Round, join: Join::Miter, miter_limit: 4.0, ..StrokeStyle::default() };
+		for index in 0..120 {
+			let phase = index as f32 * 0.11;
+			let mut builder = PathBuilder::new();
+			builder.move_to(PointF { x: 10.0 + phase * 4.0, y: 20.0 + (index % 20) as f32 * 22.0 }).expect("a move");
+			for segment in 0..6 {
+				let x = 10.0 + phase * 4.0 + segment as f32 * 100.0;
+				let y = 20.0 + (index % 20) as f32 * 22.0;
+				builder.cubic_to(PointF { x: x + 30.0, y: y - 40.0 }, PointF { x: x + 70.0, y: y + 40.0 }, PointF { x: x + 100.0, y }).expect("a curve");
+			}
+			canvas.stroke_path(builder.finish(), paint, style).expect("a stroke");
+		}
+		out.push((name, canvas.finish().expect("a list")));
+	}
+
+	out
 }
 
 fn resource_count(list: &DrawList) -> usize {
