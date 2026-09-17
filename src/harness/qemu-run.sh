@@ -689,9 +689,81 @@ qemu_attach_nvme() {
 	)
 }
 
+# THE HOST STREAM TRANSPORT, AND THE PROCESS ON THE OTHER END OF IT.
+#
+# vsock is the one device here whose peer is the HOST rather than a model inside QEMU, so an oracle
+# that only brings the device up proves nothing: there has to be something listening. `vsock-echo.py`
+# is it, and it is started beside QEMU and killed with it.
+#
+# THE PORT IS THE GUEST'S CONTEXT ID, which is not a cute trick but the only way two runs on one
+# machine do not collide. A host vsock port is global to the host - one listener per port, whoever
+# binds it first - while `/dev/vhost-vsock` already refuses a context id another guest holds. So the
+# id is the unique thing, the port follows it, and the guest needs no configuration at all to know
+# where to knock: it asks its own driver what context id the host gave it.
+VSOCK_ECHO_PID=""
+qemu_attach_vsock() {
+	local -n arr=$1
+	# Above the three reserved ids (0 hypervisor, 1 local, 2 host) and inside the u32 the wire
+	# carries. `$$` is the run identity here as it is everywhere else in this script.
+	VSOCK_CID=$((3 + ($$ % 60000)))
+	if [[ ! -c /dev/vhost-vsock ]]; then
+		echo "qemu-run: this host has no /dev/vhost-vsock, so no vsock device is attached" >&2
+		VSOCK_CID=""
+		return 0
+	fi
+	arr+=(-device "vhost-vsock-pci,id=vsock,guest-cid=$VSOCK_CID")
+}
+
+# THE PLAIN-PCI FAMILIES AND THE HOST STREAM TRANSPORT THE SUITE'S ORACLES NEED, on a machine that
+# is not x86_64.
+#
+# A DRIVER ITEM CLOSES ON A RUN ON THREE TARGETS, and that sentence is empty if two of the three
+# machines do not carry the device. NVMe, AHCI, SDHCI, HDA, virtio-scsi and virtio-vsock were wired
+# into the x86_64 machine when each driver was written and into neither of the others, so their
+# oracles could only ever fail there - which is exactly what the first three-target run said: "the
+# device table should hold at least one AHCI controller". Every one of them is a PCI function and
+# both other machines have a PCI bus.
+#
+# AFTER THE BOOT MEDIUM, AND THAT IS NOT TIDINESS. The riscv64 ESP is attached as an NVMe device on
+# purpose, because U-Boot's default boot order tries `nvme 0` first - so two scratch NVMe controllers
+# added AHEAD of it make `nvme 0` a blank disk with no partition table, and the machine falls through
+# to a TFTP boot that was never going to work. The order of these arguments is the order the firmware
+# enumerates.
+#
+# AND IT PASSES THE ARRAY'S NAME THROUGH RATHER THAN TAKING A NAMEREF OF ITS OWN. Both helpers below
+# declare `local -n arr=$1`, so a wrapper that also named its nameref `arr` and passed `arr` on makes
+# bash refuse the second binding as a CIRCULAR NAME REFERENCE - and it refuses it with a warning on
+# stderr and an empty array, not an error. Every device this function meant to attach went nowhere,
+# the machine came up without them, and the only trace was three warning lines in a run log nobody
+# reads when the suite is green. It was not green: `the device table should hold at least one AHCI
+# controller` was the same message as the harness not attaching it at all.
+qemu_attach_suite_devices() {
+	local into="$1"
+	local reduced="${2:-0}"
+	[[ "${TEST:-0}" == "1" && "$reduced" != "1" ]] || return 0
+	qemu_attach_nvme "$into"
+	qemu_attach_vsock "$into"
+}
+
+vsock_echo_start() {
+	[[ -n "${VSOCK_CID:-}" ]] || return 0
+	python3 "$HERE/vsock-echo.py" --port "$VSOCK_CID" >&2 &
+	VSOCK_ECHO_PID=$!
+	# The listener binds before it prints, and the guest cannot reach it before the kernel is up, so
+	# there is nothing here to wait for beyond the process existing.
+}
+
+vsock_echo_stop() {
+	[[ -n "$VSOCK_ECHO_PID" ]] || return 0
+	kill "$VSOCK_ECHO_PID" 2>/dev/null || true
+	wait "$VSOCK_ECHO_PID" 2>/dev/null || true
+	VSOCK_ECHO_PID=""
+}
+
 qemu_attach_xhci() {
 	local -n arr=$1
 	local usb_drive_id="${2:-}"
+	local with_net="${3:-}"
 	arr+=(
 		-device "qemu-xhci,id=usb"
 		-device "usb-hub,bus=usb.0,port=1"
@@ -700,6 +772,51 @@ qemu_attach_xhci() {
 	)
 	if [[ -n "$usb_drive_id" ]]; then
 		arr+=(-device "usb-storage,bus=usb.0,drive=$usb_drive_id,id=usbstick")
+	fi
+	# A CDC ETHERNET ADAPTER ON THE SAME HUB, for the suite only.
+	#
+	# `usb-net` is QEMU's CDC-ECM device: the two-interface shape the specification describes, with
+	# the data interface's endpoints on alternate setting one and a MAC published as a string
+	# descriptor. It is the only Ethernet-over-USB model this harness has, which is also why the NCM
+	# half of that driver is host tests and no binding path.
+	#
+	# TEST MODE ONLY, AND THAT IS A GATE'S REQUIREMENT RATHER THAN A PREFERENCE. An interactive
+	# machine with two NICs is a machine where which one NetworkService took is a question nothing
+	# interactive here needs answered - and, more importantly, the `dma-degraded` scenario requires
+	# the line "no network provider on this boot". `virtio_net` declares `iommu-required` and is
+	# refused on that boot; this adapter reaches the bus through a controller that declares
+	# `trusted-untranslated` and would be admitted, so attaching it there would give that machine a
+	# link and take the gate's subject away.
+	if [[ "$with_net" == "1" ]]; then
+		arr+=(
+			-netdev "user,id=usbnet"
+			-device "usb-net,bus=usb.0,port=1.3,netdev=usbnet"
+		)
+		# AND A UAS DEVICE, WHICH NOTHING BINDS YET AND WHICH IS THERE TO BE READ. The UAS item says
+		# the cheap check is to attach the device and read its pipe-usage and endpoint-companion
+		# descriptors BEFORE writing a transfer path, because whether this controller can drive it
+		# depends on whether it demands bulk streams. The probe's answer is in the milestone: on this
+		# machine it enumerates at SuperSpeed and its three data pipes each advertise sixteen
+		# streams.
+		#
+		# ON A ROOT PORT, AND NOT BEHIND THE HUB, BECAUSE THERE IS NO OTHER PLACE FOR IT. The
+		# obvious way to get the high-speed shape - one command at a time over four plain bulk pipes,
+		# which this controller could drive - is to put the device behind the hub; QEMU's `usb-hub`
+		# is a FULL-speed hub, and it refuses a high-or-super-speed device outright with a speed
+		# mismatch. So this harness has no high-speed path to a UAS device at all, which is itself
+		# part of the answer.
+		local uas="$QEMU_BUILD_DIR/uas-scratch.$$.img"
+		scratch_sweep "$QEMU_BUILD_DIR/uas-scratch" .img
+		rm -f "$uas"
+		if truncate -s 4M "$uas"; then
+			arr+=(
+				-drive "file=$uas,if=none,id=uasdisk,format=raw"
+				-device "usb-uas,bus=usb.0,port=4,id=uasbus"
+				-device "scsi-hd,bus=uasbus.0,drive=uasdisk"
+			)
+		else
+			echo "qemu-run: could not make this run's UAS medium at $uas - the device is not attached" >&2
+		fi
 	fi
 }
 
@@ -840,7 +957,22 @@ qemu_build_esp() {
 	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.$$.staged"
 	KERNEL_STRIP_TOOL=llvm-strip "$REPO_ROOT/src/tools/stage-kernel.sh" \
 		"$strip" "$kernel" "$STAGED_KERNEL"
-	local esp_mb=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$loader_efi")) / 1048576 + 16))
+	# EVERYTHING THAT GOES ON IT IS COUNTED, WHICH IS NOT WHAT THIS DID.
+	#
+	# The size was the kernel plus the loader plus sixteen megabytes of slack - and the ESP also
+	# carries the BOOTSTRAP SET and the volume ARCHIVE, neither of which was in the sum. That worked
+	# while those two were small and stopped working the day they were not: the aarch64 medium failed
+	# to assemble with `mcopy` saying "Disk full" and nothing else, one line after a manifest that had
+	# signed perfectly, with the bootstrap set at 4.8 MB and the archive at 11.6 MB against 16 MB of
+	# slack. A slack figure is not a bound on payload nobody added up.
+	local esp_payload=0
+	if [[ -d "$QEMU_BUILD_DIR/bootstrap-${arch}" ]]; then
+		esp_payload=$(du -sb "$QEMU_BUILD_DIR/bootstrap-${arch}" | cut -f1)
+	fi
+	if [[ -f "$QEMU_BUILD_DIR/volume-${arch}.pkg" ]]; then
+		esp_payload=$((esp_payload + $(stat -c%s "$QEMU_BUILD_DIR/volume-${arch}.pkg")))
+	fi
+	local esp_mb=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$loader_efi") + esp_payload) / 1048576 + 16))
 	rm -f "$ESP"
 	truncate -s "${esp_mb}M" "$ESP"
 	mformat -i "$ESP" ::
@@ -1764,7 +1896,7 @@ qemu_run_x86_64() {
 			}
 			qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
 		fi
-		qemu_attach_xhci qemu_args "$usb_storage_id"
+		qemu_attach_xhci qemu_args "$usb_storage_id" "${TEST:-0}"
 
 		# Keep media disks after USB in PCI discovery order, matching the historical
 		# runner and the volume/device inventory expected by the boot chain.
@@ -1844,6 +1976,9 @@ qemu_run_x86_64() {
 			qemu_append_audio qemu_args
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
 			qemu_attach_entropy qemu_args
+			# AND THE HOST STREAM TRANSPORT, whose other end is a process on this machine rather
+			# than a model inside QEMU - which is why it is attached here and started below.
+			qemu_attach_vsock qemu_args
 		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
@@ -1853,6 +1988,7 @@ qemu_run_x86_64() {
 		# most wanted: diagnosing a guest that resets needs `-d int,cpu_reset` on the run that
 		# reproduces it, and a test run is what reproduces it.
 		harness_hold
+		vsock_echo_start
 		if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
 			"$qemu_bin" "${qemu_args[@]}" ${QEMU_EXTRA:-} &
 			local qemu_pid=$!
@@ -1865,6 +2001,7 @@ qemu_run_x86_64() {
 			"$qemu_bin" "${qemu_args[@]}" ${QEMU_EXTRA:-}
 			local code=$?
 		fi
+		vsock_echo_stop
 		set -e
 		timing_event qemu end
 		# 33 is the debug-exit device reporting a passing suite (the guest wrote 0x10 to
@@ -2040,7 +2177,7 @@ qemu_run_aarch64() {
 			exit 1
 		}
 		qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
-		qemu_attach_xhci qemu_args vusb
+		qemu_attach_xhci qemu_args vusb "${TEST:-0}"
 	fi
 
 	# Test mode: enable Arm semihosting while retaining the selected serial backend.
@@ -2125,10 +2262,12 @@ qemu_run_aarch64() {
 		cp "$aavmf_vars" "$vars"
 		# ESP goes last so system volume enumerates ahead of it.
 		qemu_attach_virtio_blk qemu_args "$ESP" esp "$virtio_opts"
+		qemu_attach_suite_devices qemu_args "$reduced"
 		local -a independent=()
 		MACHINE_FOR_DUMP="$machine"
 		mapfile -t independent < <(dma_independent_dtb_args qemu-system-aarch64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
 		harness_hold
+		vsock_echo_start
 		exec "$qemu_bin" \
 			-machine "$machine" \
 			"${cpu_args[@]}" \
@@ -2209,6 +2348,7 @@ qemu_run_aarch64() {
 	bind_object kernel_bound "$kernel" kernel
 	bind_tool qemu_bin qemu-system-aarch64
 	harness_hold
+	vsock_echo_start
 	"$qemu_bin" \
 		-machine "$machine" \
 		"${cpu_args[@]}" \
@@ -2225,6 +2365,7 @@ qemu_run_aarch64() {
 		${QEMU_EXTRA:-} &
 	local qemu_pid=$!
 	wait "$qemu_pid" || qemu_status=$?
+	vsock_echo_stop
 	rm -f "$dtb_file" "${dtb_file%.dtb}.annotated.dtb"
 	trap - EXIT
 	exit "$qemu_status"
@@ -2341,7 +2482,7 @@ qemu_run_riscv64() {
 			exit 1
 		}
 		qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
-		qemu_attach_xhci qemu_args vusb
+		qemu_attach_xhci qemu_args vusb "${TEST:-0}"
 	fi
 
 	# Test mode: enable RISC-V semihosting while retaining the selected serial backend.
@@ -2431,10 +2572,12 @@ qemu_run_riscv64() {
 		bind_tool qemu_bin qemu-system-riscv64
 		# ESP is NVMe so U-Boot's default boot order tries nvme0 first.
 		qemu_args+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
+		qemu_attach_suite_devices qemu_args "$reduced"
 		local -a independent=()
 		MACHINE_FOR_DUMP="virt,aia=aplic-imsic"
 		mapfile -t independent < <(dma_independent_dtb_args qemu-system-riscv64 "${cpu_args[@]}" -smp "$smp" -m "$mem" "${qemu_args[@]}")
 		harness_hold
+		vsock_echo_start
 		exec "$qemu_bin" \
 			-machine "virt,aia=aplic-imsic" \
 			"${bridge_args[@]}" \
@@ -2509,6 +2652,7 @@ qemu_run_riscv64() {
 	[[ "$bios" == default ]] || bind_object bios_bound "$bios" "firmware BIOS"
 	bind_tool qemu_bin qemu-system-riscv64
 	harness_hold
+	vsock_echo_start
 	"$qemu_bin" \
 		-machine "virt,aia=aplic-imsic" \
 		"${bridge_args[@]}" \
@@ -2528,6 +2672,7 @@ qemu_run_riscv64() {
 		${QEMU_EXTRA:-} &
 	local qemu_pid=$!
 	wait "$qemu_pid" || qemu_status=$?
+	vsock_echo_stop
 	rm -f "$dtb_file" "${dtb_file%.dtb}.annotated.dtb"
 	trap - EXIT
 	exit "$qemu_status"

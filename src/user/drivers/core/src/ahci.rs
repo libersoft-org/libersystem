@@ -29,6 +29,7 @@ pub const PORT_CMD: u64 = 0x18; // command and status
 pub const PORT_TFD: u64 = 0x20; // task file data
 pub const PORT_SIG: u64 = 0x24; // signature
 pub const PORT_SSTS: u64 = 0x28; // SATA status
+pub const PORT_SCTL: u64 = 0x2C; // SATA control - where a port reset is asked for
 pub const PORT_SERR: u64 = 0x30; // SATA error
 pub const PORT_CI: u64 = 0x38; // command issue, one bit per slot
 

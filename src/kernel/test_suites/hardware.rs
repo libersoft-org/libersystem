@@ -203,6 +203,205 @@ fn device_table_resources_the_nvme_controller() {
 	assert!((cap >> 37) & 1 != 0, "CAP.CSS should advertise the NVM command set");
 }
 
+tagged_test!(virtio_scsi_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.virtio_scsi_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.virtio_scsi"]);
+fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
+	use object::channel::{Channel, Message};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// THE FIFTH DRIVER ON THE SAME BLOCK CONTRACT, over a fifth command set, and the first that
+	// reaches its medium through a SCSI TARGET rather than speaking to the medium directly. What that
+	// adds is the command set: the capacity comes from READ CAPACITY, whose answer is the LAST BLOCK
+	// rather than the count, and the address goes out big-endian, which is the opposite of every
+	// other wire here. Both are silent when wrong.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_scsi.lsexe")).expect("the virtio_scsi.lsexe driver should be staged on the volume under drivers/");
+
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::VIRTIO_TYPE_SCSI {
+			// A VIRTIO DEVICE CARRIES ITS STRUCTURE OFFSETS, which is what tells this transport apart
+			// from the plain-PCI ones: the driver reaches the common configuration, the notify window
+			// and the device-specific config through them rather than at the base.
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the virtio-scsi controller");
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the virtio-scsi driver should load");
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the virtio-scsi controller")).expect("the controller is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, key.generation, 1).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	sched::run_until_idle();
+
+	// REACHING READY IS ALREADY A CLAIM ABOUT THE TARGET: this driver refuses to report in until one
+	// answers TEST UNIT READY and then READ CAPACITY, retrying the power-on attention that every unit
+	// refuses its first command with.
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the virtio-scsi driver should report READY, which it only does with a target answering");
+	let blk = offer_of(&offers, driver_protocol::provider::BLOCK).expect("the driver offers the target's block service").into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	blk.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the capacity request should send");
+	sched::run_until_idle();
+	let cap_reply = blk.recv().expect("the capacity reply should arrive");
+	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
+	// Four mebibytes exactly. An off-by-one in the last-block arithmetic would be one block out, and
+	// the block past the end is the one the medium refuses - so it would surface as an I/O error on
+	// the last sector rather than as anything naming the capacity.
+	assert_eq!(reported.bytes, 4 * 1024 * 1024, "the target should report the attached medium's real size");
+
+	const SECTOR: usize = 512;
+	let pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8).wrapping_mul(13) ^ 0x6E).collect();
+	let source = object::memory_object::MemoryObject::create(SECTOR).expect("a source buffer");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(pattern.as_ptr(), (hhdm + phys) as *mut u8, SECTOR) };
+	}
+	// LBA 0x0102 rather than a single digit, so a command block whose address bytes went out in the
+	// wrong order names a DIFFERENT block rather than the same one.
+	const LBA: u64 = 0x0102;
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the write request should send");
+	sched::run_until_idle();
+	let write_reply = blk.recv().expect("the write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the write should succeed");
+
+	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the read request should send");
+	sched::run_until_idle();
+	let read_reply = blk.recv().expect("the read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the read should succeed");
+	let buf_cap = read_reply.caps.first().expect("the read should grant a buffer");
+	let object = buf_cap.object();
+	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(memory, SECTOR), pattern, "the block read back should be the bytes that were written to it");
+
+	let past = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: 1 << 40, count: 1 }.encode();
+	blk.send(Message::new(past.to_vec(), alloc::vec::Vec::new())).expect("the out-of-range request should send");
+	sched::run_until_idle();
+	let refused = blk.recv().expect("the refusal should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "a range past the last block is refused, and the ten-byte command's address is never truncated to reach it");
+	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+}
+
+tagged_test!(virtio_vsock_driver_echoes_bytes_off_the_host, [Drivers, Pci, Slow], id = "kernel.hardware.virtio_vsock_driver_echoes_bytes_off_the_host", covers = ["kernel", "bin.virtio_vsock"]);
+fn virtio_vsock_driver_echoes_bytes_off_the_host() {
+	use driver_protocol::stream;
+	use object::channel::{Channel, Message};
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+
+	// THE ONLY DRIVER HERE WHOSE PEER IS NOT INSIDE QEMU. Every other device on this machine is a
+	// model: the bytes a driver writes are answered by code in the emulator. vsock's other end is a
+	// PROCESS ON THE HOST, so this oracle is the only one in the suite that proves a round trip out
+	// of the machine entirely - the harness starts `vsock-echo.py`, and what comes back has been
+	// through the host kernel's vsock stack and a program that read it.
+	//
+	// THE PORT IS THE GUEST'S OWN CONTEXT ID, which is why the identity request below is not a
+	// diagnostic: a host vsock port is global to the host, so two runs on one machine would collide
+	// on any fixed number, while the context id is already unique because `/dev/vhost-vsock` refuses
+	// a duplicate. The guest is TOLD its id by the host, asks its driver for it, and knocks there.
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_vsock.lsexe")).expect("the virtio_vsock.lsexe driver should be staged on the volume under drivers/");
+
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::VIRTIO_TYPE_VSOCK {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the virtio-vsock device");
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the virtio-vsock driver should load");
+	let key = device::claim(index, &crate::tests::entry_for_device(index as u64).expect("the registry declares an entry for the virtio-vsock device")).expect("the device is taken, as DeviceManager takes it");
+	send_bind(&kernel_ep, &info, key.generation, 1).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	sched::run_until_idle();
+
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the virtio-vsock driver should report READY");
+	// PUBLISHED AS `local-stream` AND NOT AS `net`, which is the item's own requirement and is
+	// asserted here rather than left to the manifest: a host channel published under the kind every
+	// consumer of a link already asks for would be an ambient path around NetworkService, and this
+	// is the assertion that fails if someone later "simplifies" the two kinds into one.
+	let stream_channel = offer_of(&offers, driver_protocol::provider::LOCAL_STREAM).expect("the driver offers a local stream, and not a net link").into_any_arc().downcast::<Channel>().expect("the stream channel is a channel");
+
+	let ask = stream::Request { op: stream::OP_IDENTITY, arg: 0 }.encode();
+	stream_channel.send(Message::new(ask.to_vec(), alloc::vec::Vec::new())).expect("the identity request should send");
+	sched::run_until_idle();
+	let identity = stream_channel.recv().expect("the identity reply should arrive");
+	let (status, _, payload) = stream::decode_reply(&identity.bytes).expect("the identity reply should parse");
+	assert_eq!(status, stream::STATUS_OK, "the driver should know the context id the host gave it");
+	assert_eq!(payload.len(), stream::IDENTITY_LEN, "the identity answer carries the eight-byte context id");
+	let cid = u64::from_le_bytes(payload.try_into().unwrap());
+	assert!(cid > 2, "the host assigns a context id above the three reserved ones, and a driver reading the wrong config offset reports one of those");
+
+	// The host's echo listener is on the port named by this guest's context id.
+	let connect = stream::Request { op: stream::OP_CONNECT, arg: cid as u32 }.encode();
+	stream_channel.send(Message::new(connect.to_vec(), alloc::vec::Vec::new())).expect("the connect request should send");
+	sched::run_until_idle();
+	let opened = stream_channel.recv().expect("the connect reply should arrive");
+	let (status, _, _) = stream::decode_reply(&opened.bytes).expect("the connect reply should parse");
+	assert_eq!(status, stream::STATUS_OK, "the host's listener should answer the connection request");
+
+	// A PATTERN RATHER THAN A WORD, so a path that echoes a stale buffer, a zeroed one or the
+	// request header back would fail: every byte is a function of its own position.
+	let pattern: alloc::vec::Vec<u8> = (0..256usize).map(|i| (i as u8).wrapping_mul(29) ^ 0x5B).collect();
+	let mut send = stream::Request { op: stream::OP_SEND, arg: pattern.len() as u32 }.encode().to_vec();
+	send.extend_from_slice(&pattern);
+	stream_channel.send(Message::new(send, alloc::vec::Vec::new())).expect("the send request should send");
+	sched::run_until_idle();
+	let sent = stream_channel.recv().expect("the send reply should arrive");
+	let (status, moved, _) = stream::decode_reply(&sent.bytes).expect("the send reply should parse");
+	assert_eq!(status, stream::STATUS_OK, "the write should be accepted");
+	// The whole of it, which is a statement about CREDIT: the host advertises a buffer far larger
+	// than this, so a window computed the wrong way round - or not modularly - would either refuse
+	// the write or accept a fraction of it.
+	assert_eq!(moved as usize, pattern.len(), "the host's window admits this write whole");
+
+	// Read it back. The host echoes, so the bytes have crossed the device twice.
+	let mut got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..64 {
+		let ask = stream::Request { op: stream::OP_RECEIVE, arg: 4096 }.encode();
+		stream_channel.send(Message::new(ask.to_vec(), alloc::vec::Vec::new())).expect("the receive request should send");
+		sched::run_until_idle();
+		let answer = stream_channel.recv().expect("the receive reply should arrive");
+		let (status, _, payload) = stream::decode_reply(&answer.bytes).expect("the receive reply should parse");
+		assert_eq!(status, stream::STATUS_OK, "the connection should still be open while the echo is arriving");
+		got.extend_from_slice(payload);
+		if got.len() >= pattern.len() {
+			break;
+		}
+	}
+	assert_eq!(got, pattern, "what the host echoed back should be the bytes that were sent to it");
+
+	// AND A PORT NOTHING LISTENS ON IS REFUSED RATHER THAN HUNG. The host answers a connection to a
+	// closed port with a reset, and this is the difference between the driver reading that reset and
+	// the driver sitting on a deadline: a driver that ignored the reset would answer here too, but
+	// only after the connect budget ran out, and it would answer ERR rather than CLOSED.
+	let shutdown = stream::Request { op: stream::OP_SHUTDOWN, arg: stream::SHUTDOWN_READ | stream::SHUTDOWN_WRITE }.encode();
+	stream_channel.send(Message::new(shutdown.to_vec(), alloc::vec::Vec::new())).expect("the shutdown request should send");
+	sched::run_until_idle();
+	let closed = stream_channel.recv().expect("the shutdown reply should arrive");
+	let (status, _, _) = stream::decode_reply(&closed.bytes).expect("the shutdown reply should parse");
+	assert_eq!(status, stream::STATUS_OK, "closing a connection that is open should succeed");
+
+	let nowhere = stream::Request { op: stream::OP_CONNECT, arg: 1 }.encode();
+	stream_channel.send(Message::new(nowhere.to_vec(), alloc::vec::Vec::new())).expect("the second connect request should send");
+	sched::run_until_idle();
+	let refused = stream_channel.recv().expect("the refusal should arrive");
+	let (status, _, _) = stream::decode_reply(&refused.bytes).expect("the refusal should parse");
+	assert_eq!(status, stream::STATUS_CLOSED, "a port with no listener is refused by the host with a reset, which is not the same answer as a host that said nothing");
+}
+
 tagged_test!(hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer, [Drivers, Pci, Slow], id = "kernel.hardware.hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer", covers = ["kernel", "bin.hda"]);
 fn hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer() {
 	use object::channel::{Channel, Message};
@@ -467,13 +666,22 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	let (volume, _package) = scenario_packages().expect("boot modules should be present");
 	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/nvme.lsexe")).expect("the nvme.lsexe driver should be staged on the volume under drivers/");
 
+	// THE LAST NVMe CONTROLLER ON THE BUS, AND NOT THE FIRST, WHICH IS A THREE-TARGET FACT.
+	//
+	// On x86_64 and aarch64 every NVMe controller here is a blank scratch medium the harness attached
+	// for this test. On riscv64 the machine's BOOT MEDIUM is an NVMe device - the ESP is attached
+	// that way on purpose, because U-Boot's default boot order tries `nvme 0` first - so the FIRST
+	// controller is the disk this guest is running from. Taking it would mean claiming the live boot
+	// medium and asserting a capacity that belongs to an ESP.
+	//
+	// The harness attaches its scratch controllers AFTER the boot medium, so the last one is the
+	// smaller of the two it attached on every machine, and that is what this drives.
 	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_NVME {
 			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, transport: abi::TRANSPORT_PLAIN_PCI, vendor: d.vendor, product: d.product, _pad1: [0; 1], _pad2: [0; 4] }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
-			break;
 		}
 	}
 	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the NVMe controller");
@@ -497,7 +705,10 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	sched::run_until_idle();
 	let cap_reply = blk.recv().expect("the capacity reply should arrive");
 	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
-	assert_eq!(reported.bytes, 16 * 1024 * 1024, "the controller should report the attached medium's real size");
+	// EIGHT MEGABYTES, which is the SECOND scratch medium the harness attaches - the last NVMe
+	// controller on every one of the three machines. See the selection above for why it is the last
+	// and not the first.
+	assert_eq!(reported.bytes, 8 * 1024 * 1024, "the controller should report the attached medium's real size");
 	assert!(reported.max_sectors > 0, "and a per-request bound the client can size against");
 
 	// A PATTERN THAT IS NEITHER ZEROES NOR CONSTANT, because the medium starts blank: a read that
@@ -631,6 +842,63 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let usbq = offer_of(&offers, driver_protocol::provider::USB_BUS).expect("the driver offers its bus query channel").into_any_arc().downcast::<Channel>().expect("the query channel is a channel");
 	assert!(offer_of(&offers, driver_protocol::provider::POINTER).is_some(), "and its pointer-event channel, the raw stream a USB pointing device's reports feed");
 	assert!(offer_of(&offers, driver_protocol::provider::BLOCK).is_some(), "and the USB stick's block service, because this machine has one attached");
+	assert!(offer_of(&offers, driver_protocol::provider::NET).is_some(), "and the CDC Ethernet adapter's link, because this machine has one on the hub");
+
+	// THE CDC-ECM ADAPTER, PROVED BY A ROUND TRIP OFF THE HOST'S NETWORK STACK.
+	//
+	// A NIC is published as a FACTORY and its contract begins with the DRIVER speaking - it leads
+	// every connection with the MAC and the link MTU, because NetworkService cannot build a stack
+	// without them - so this mints a connection the way DeviceManager does rather than using the
+	// offered endpoint directly.
+	let net_token = offer_token_of(&offers, driver_protocol::provider::NET).expect("the adapter's publication carries a token");
+	let (host_end, driver_end) = object::channel::Channel::create();
+	send_connect(&kernel_ep, key.generation, net_token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let hello = host_end.recv().expect("the adapter should lead its connection with its MAC and the link MTU");
+	assert_eq!(&hello.bytes[..3], b"MAC", "the frame transport begins with the same eleven bytes virtio-net sends");
+	let mac: [u8; 6] = [hello.bytes[3], hello.bytes[4], hello.bytes[5], hello.bytes[6], hello.bytes[7], hello.bytes[8]];
+	assert!(mac != [0u8; 6] && mac[0] & 1 == 0, "the MAC read out of the device's string descriptor should be a real unicast address");
+	let mtu = u16::from_le_bytes([hello.bytes[9], hello.bytes[10]]);
+	assert!((576..=1500).contains(&mtu), "the link MTU comes from the device's own Ethernet functional descriptor, and 1500 is what this adapter reports");
+
+	// An ARP request for the host network's gateway. The far end is QEMU's user-mode stack, which
+	// answers it - so a reply coming back means the frame went out of the guest, through the
+	// adapter's bulk OUT endpoint, was understood as Ethernet, and the answer came back in on a
+	// standing bulk IN transfer. Nothing about that is provable by the driver reporting READY.
+	const GATEWAY: [u8; 4] = [10, 0, 2, 2];
+	const OURS: [u8; 4] = [10, 0, 2, 77];
+	let mut arp = alloc::vec::Vec::with_capacity(42);
+	arp.extend_from_slice(&[0xFF; 6]);
+	arp.extend_from_slice(&mac);
+	arp.extend_from_slice(&[0x08, 0x06]); // ARP
+	arp.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]); // Ethernet/IPv4, request
+	arp.extend_from_slice(&mac);
+	arp.extend_from_slice(&OURS);
+	arp.extend_from_slice(&[0u8; 6]);
+	arp.extend_from_slice(&GATEWAY);
+	host_end.send(Message::new(arp, alloc::vec::Vec::new())).expect("the ARP request should send");
+
+	// THE ANSWER IS WAITED FOR OVER SEVERAL PASSES, not asserted on the first. It has to cross the
+	// bulk OUT endpoint, the host's stack and a bulk IN completion, and the driver's loop only
+	// forwards what it has reaped - so this drives the scheduler until the reply is there or the
+	// budget is spent, and says which.
+	let mut reply_seen = false;
+	for _ in 0..64 {
+		sched::run_until_idle();
+		while let Ok(frame) = host_end.recv() {
+			// An ARP reply for the address that was asked about, from the gateway.
+			if frame.bytes.len() >= 42 && frame.bytes[12] == 0x08 && frame.bytes[13] == 0x06 && frame.bytes[21] == 0x02 && frame.bytes[28..32] == GATEWAY {
+				assert_eq!(&frame.bytes[38..42], &OURS, "the reply should be addressed to the protocol address that asked");
+				reply_seen = true;
+				break;
+			}
+		}
+		if reply_seen {
+			break;
+		}
+	}
+	assert!(reply_seen, "the host should answer the ARP request over the USB adapter, which is the round trip nothing about reaching READY proves");
+
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&1u16.to_le_bytes()); // OP_LIST
 	list.extend_from_slice(&1u32.to_le_bytes()); // correlation id
@@ -640,6 +908,48 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	assert!(inventory.bytes.len() >= 5 && inventory.bytes[4] == 1, "the inventory query should succeed");
 	let has = |needle: &[u8]| inventory.bytes.windows(needle.len()).any(|w| w == needle);
 	assert!(has(b"hub") && has(b"keyboard") && has(b"pointer") && has(b"storage"), "the inventory should name the hub, the keyboard, the tablet and the stick by role");
+	assert!(has(b"network"), "and the CDC Ethernet adapter, whose role is its own and not `device`");
+	assert!(has(b"uas"), "and the UAS target, which is a second storage device over a different transport");
+
+	// THE UAS TARGET, WHICH IS THE SECOND BLOCK PROVIDER AND NOT THE STICK'S.
+	//
+	// The controller publishes two of one kind - a Bulk-Only stick and a UAS disk are two devices
+	// speaking one command set over different pipes - so this asks for the SECOND, which is the case
+	// the catalogue's token exists for. What it proves is the four-pipe transport over BULK STREAMS:
+	// a command on one pipe, data on another, a status information unit on a third, joined by a tag,
+	// with the stream id selecting the ring the answers land on.
+	let uas = nth_offer_of(&offers, driver_protocol::provider::BLOCK, 1).expect("the driver offers the UAS target's block service as a second provider of that kind").into_any_arc().downcast::<Channel>().expect("the UAS block channel is a channel");
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	uas.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the UAS capacity request should send");
+	sched::run_until_idle();
+	let cap_reply = uas.recv().expect("the UAS capacity reply should arrive");
+	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the UAS capacity query should succeed and carry a size");
+	assert_eq!(reported.bytes, 4 * 1024 * 1024, "the UAS target should report the medium the harness attached");
+
+	const UAS_SECTOR: usize = 512;
+	const UAS_LBA: u64 = 0x0102;
+	let uas_pattern: alloc::vec::Vec<u8> = (0..UAS_SECTOR).map(|i| (i as u8).wrapping_mul(37) ^ 0xA5).collect();
+	let uas_source = object::memory_object::MemoryObject::create(UAS_SECTOR).expect("a source buffer");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = uas_source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(uas_pattern.as_ptr(), (hhdm + phys) as *mut u8, UAS_SECTOR) };
+	}
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: UAS_LBA, count: 1 }.encode();
+	uas.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(uas_source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the UAS write should send");
+	sched::run_until_idle();
+	let write_reply = uas.recv().expect("the UAS write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the write over the UAS pipes should succeed");
+
+	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: UAS_LBA, count: 1 }.encode();
+	uas.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the UAS read should send");
+	sched::run_until_idle();
+	let read_reply = uas.recv().expect("the UAS read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the read over the UAS pipes should succeed");
+	let uas_buf = read_reply.caps.first().expect("the UAS read should grant a buffer");
+	let uas_object = uas_buf.object();
+	let uas_memory = uas_object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(uas_memory, UAS_SECTOR), uas_pattern, "what the UAS target read back should be the bytes that were written to it");
 
 	// The stick's block provider: read sector 0 over it, the same [op u32][lba u64][count u32]
 	// contract driver.virtio-blk serves, and expect a success status plus a 512-byte shared buffer.

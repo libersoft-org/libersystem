@@ -231,7 +231,7 @@ fn separable(mode: BlendMode, backdrop: f32, source: f32) -> f32 {
 			if source <= 0.5 {
 				backdrop - (1.0 - 2.0 * source) * backdrop * (1.0 - backdrop)
 			} else {
-				let d = if backdrop <= 0.25 { ((16.0 * backdrop - 12.0) * backdrop + 4.0) * backdrop } else { sqrt_f32(backdrop) };
+				let d = if backdrop <= 0.25 { ((16.0 * backdrop - 12.0) * backdrop + 4.0) * backdrop } else { sqrt_inline(backdrop) };
 				backdrop + (2.0 * source - 1.0) * (d - backdrop)
 			}
 		}
@@ -348,8 +348,27 @@ pub fn composite(operator: Operator, mode: BlendMode, source: Rgba, backdrop: Rg
 	Rgba::new(source.red * source_factor + backdrop.red * backdrop_factor, source.green * source_factor + backdrop.green * backdrop_factor, source.blue * source_factor + backdrop.blue * backdrop_factor, source.alpha * source_factor + backdrop.alpha * backdrop_factor)
 }
 
-/// A square root without a math crate in this layer: Newton from a bit-level estimate.
+/// THE SHARED SQUARE ROOT, AS A CALL THAT CANNOT BE INLINED AWAY.
+///
+/// `#[inline(never)]` IS A LIBRARY-GRAPH DECISION AND NOT AN OPTIMISATION ONE. `render2d` is a
+/// separate shared library and this is the only thing it reads from here; left to the compiler,
+/// x86_64 and aarch64 inlined the call and riscv64 emitted a dynamic import, so ONE image failed to
+/// link with "import ... has no direct provider" while the other two were clean and a provider row
+/// declared to fix it would have failed the opposite check on those two. Forcing the call makes the
+/// three targets agree by construction. This crate's own hot paths do not pay for it: they call
+/// `sqrt_inline` below, which is the same body.
+#[inline(never)]
 pub fn sqrt_f32(value: f32) -> f32 {
+	sqrt_inline(value)
+}
+
+/// The same square root, inlinable, for this crate's own per-pixel paths.
+///
+/// THE ENCODE TABLE IS INDEXED BY IT, three times per pixel of every frame, which is what made the
+/// four-iteration Newton version it replaced most of what a frame cost. A call there would be a
+/// smaller regression than that one and still a regression measured work had removed.
+#[inline]
+pub(crate) fn sqrt_inline(value: f32) -> f32 {
 	if !matches!(value.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
 		return 0.0;
 	}

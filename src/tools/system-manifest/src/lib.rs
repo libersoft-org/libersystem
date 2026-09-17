@@ -177,6 +177,7 @@ pub enum ProviderKindName {
 	UsbBus,
 	Pointer,
 	ConsoleBytes,
+	LocalStream,
 }
 
 impl ProviderKindName {
@@ -193,6 +194,7 @@ impl ProviderKindName {
 			ProviderKindName::UsbBus => 6,
 			ProviderKindName::Pointer => 7,
 			ProviderKindName::ConsoleBytes => 8,
+			ProviderKindName::LocalStream => 9,
 		}
 	}
 }

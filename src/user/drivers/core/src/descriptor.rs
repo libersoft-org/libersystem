@@ -17,6 +17,16 @@
 // Reading past a record that is too short is a DIFFERENT fault from a record whose declared length
 // runs past the transfer, and only the second was ever noticed - so both are named here.
 
+// THE DESCRIPTOR TYPES EVERY WALK NAMES. They were constants inside the xHCI binary, where the
+// second consumer of a configuration descriptor could not reach them - which is how a class module
+// comes to spell `4` for an interface and `5` for an endpoint next to a module that spells them out.
+// They belong to the record format, so they live with the walk that reads it.
+pub const DT_DEVICE: u8 = 1;
+pub const DT_CONFIG: u8 = 2;
+pub const DT_STRING: u8 = 3;
+pub const DT_INTERFACE: u8 = 4;
+pub const DT_ENDPOINT: u8 = 5;
+
 // Why a descriptor transfer or one of its records cannot be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorFault {

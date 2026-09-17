@@ -516,6 +516,27 @@ impl Queue {
 	// against the chain that was posted (see `check_used_element`): the head descriptor, and no more
 	// bytes written than the chain offered for writing.
 	pub fn submit_checked(&self, bufs: &[(u64, u32, bool)]) -> Result<u32, UsedFault> {
+		// The ordinary bound: what the chain offered for WRITING, which is what a device that reports
+		// only its own writes may legitimately claim.
+		let writable: u32 = bufs.iter().filter(|buf| buf.2).fold(0u32, |total, buf| total.saturating_add(buf.1));
+		self.submit_bounded(bufs, writable)
+	}
+
+	// `submit_checked`, with the caller naming the bound.
+	//
+	// WHY A DEVICE'S USED LENGTH IS NOT ALWAYS ITS WRITES. The used element carries "how much of this
+	// chain the device used", and what a device counts there is part of ITS specification rather than
+	// of the ring's. Most of them count what they wrote, which is what the automatic bound above
+	// assumes. `virtio-scsi` counts the data AND the response, in both directions - so a read of
+	// eight bytes reports 8 + 108 and a write of a sector reports 512 + 108, and the automatic bound
+	// accepts the first and refuses the second. That asymmetry is what this entry point exists for.
+	//
+	// IT IS NOT AN ESCAPE HATCH FROM THE CHECK. The caller still states a bound and a device claiming
+	// more than it is still refused; what changes is that the bound is the one the device's own
+	// accounting makes correct, rather than one calibrated on a different device. A caller passing
+	// something larger than its chain has removed the check, which is why every use of this names the
+	// accounting it is describing.
+	pub fn submit_bounded(&self, bufs: &[(u64, u32, bool)], most_used: u32) -> Result<u32, UsedFault> {
 		unsafe {
 			let n = bufs.len();
 			if n == 0 || n > self.size as usize {
@@ -587,8 +608,7 @@ impl Queue {
 			let now = r16(used + 2);
 			check_used_advance(old_used, now, 1)?;
 			let elem = used + 4 + (old_used % self.size) as u64 * 8;
-			let writable: u32 = bufs.iter().filter(|buf| buf.2).fold(0u32, |total, buf| total.saturating_add(buf.1));
-			let (_, len) = check_used_element(r32(elem), r32(elem + 4), self.size, Some(0), writable)?;
+			let (_, len) = check_used_element(r32(elem), r32(elem + 4), self.size, Some(0), most_used)?;
 			Ok(len)
 		}
 	}

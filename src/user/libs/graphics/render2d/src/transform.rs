@@ -170,14 +170,24 @@ impl Transform {
 	}
 }
 
-/// ONE SQUARE ROOT FOR THE WHOLE STACK, which is `graphics_core`'s.
+/// ONE SQUARE ROOT IMPLEMENTATION FOR THE WHOLE STACK, AND THIS LAYER CARRIES ITS OWN COPY OF IT.
 ///
-/// THIS WAS A SECOND COPY AND IT WAS THE SLOW KIND. Its own documentation said "two Newton steps from
-/// a bit-level estimate" and the loop ran FOUR - four serially dependent divisions, which is a dozen
-/// cycles each and cannot be pipelined behind itself. It is on the flattening path, so every curve
-/// segment of every prepared list paid it, and the reason given for having a private one - "without
-/// pulling a math crate into this layer" - costs nothing to honour: `graphics_core` is already below
-/// this layer and already has the answer.
+/// THIS WAS A SECOND ALGORITHM AND IT WAS THE SLOW KIND. Its own documentation said "two Newton
+/// steps from a bit-level estimate" and the loop ran FOUR - four serially dependent divisions, a
+/// dozen cycles each and impossible to pipeline behind one another. It is on the flattening path, so
+/// every curve segment of every prepared list paid it. It is `libm`'s correctly rounded square root
+/// now, which is what `graphics_core` calls too: one ALGORITHM, and the same answer bit for bit,
+/// which is what the pixel-exact half of the conformance contract needs.
+///
+/// AND THE CALL CROSSES A LIBRARY BOUNDARY ON PURPOSE, WHICH TOOK TWO ATTEMPTS TO GET RIGHT.
+/// `render2d` is a shared library and this is the only thing it reads from `graphics_core`, so
+/// whether the boundary is crossed at all was left to the compiler: x86_64 and aarch64 inlined it
+/// and riscv64 emitted a dynamic import, and the riscv64 image failed to link with "import ... has
+/// no direct provider" while the other two were clean. Carrying `libm` here instead was tried and
+/// is worse: `soft2d` declares both this library and `graphics_core`, so every libm symbol then had
+/// two exporters and the build refused the ambiguity. The answer is on the other side -
+/// `graphics_core::composite::sqrt_f32` is `#[inline(never)]`, so all three targets emit the import
+/// and the provider row below is true on all three.
 pub(crate) fn sqrt_f32(value: f32) -> f32 {
 	graphics_core::composite::sqrt_f32(value)
 }

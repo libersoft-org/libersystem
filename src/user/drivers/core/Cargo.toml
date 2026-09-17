@@ -16,6 +16,14 @@ test = false
 bench = false
 
 [[bin]]
+# The virtio-vsock driver. Its packet header, credit window and connection state machine are
+# `src/vsock.rs`, which is part of the library and host-tested; this binary is the transport.
+name = "virtio_vsock"
+path = "src/virtio_vsock.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "virtio_blk"
 path = "src/virtio_blk.rs"
 test = false

@@ -266,9 +266,9 @@ fn send_resource(channel: &object::channel::Channel, kind: driver_protocol::Reso
 //
 // A frame carrying a generation that is not this binding's is DROPPED. There is one binding per test
 // here, so it can only come from a process that should no longer be speaking.
-fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<alloc::vec::Vec<(u16, alloc::sync::Arc<dyn object::KernelObject>)>> {
+fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<alloc::vec::Vec<(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)>> {
 	// ALLOC-OK: `#[cfg(test)]`, bounded by `MAX_INITIAL_OFFERS`.
-	let mut offers: alloc::vec::Vec<(u16, alloc::sync::Arc<dyn object::KernelObject>)> = alloc::vec::Vec::new();
+	let mut offers: alloc::vec::Vec<(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)> = alloc::vec::Vec::new();
 	loop {
 		let message = channel.recv().ok()?;
 		let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
@@ -277,12 +277,13 @@ fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<al
 		}
 		match header.opcode {
 			driver_protocol::Opcode::Offer => {
-				// The token is the publisher's own name for the publication and this harness has
-				// no use for it: it collects what a handshake offered and asks by KIND. The real
-				// manager keeps it, because a driver withdrawing one of two providers of one kind
-				// has no other way to say which.
-				if let (Ok((kind, _token, _name)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
-					offers.push((kind, cap.object()));
+				// THE TOKEN IS KEPT BESIDE THE KIND. It is the publisher's own name for the
+				// publication, and a harness standing in for DeviceManager needs it for the same
+				// reason the manager does: a `CONNECT` names WHICH publication the endpoint it
+				// carries is a connection to, and a provider whose contract begins with the driver
+				// speaking first - a NIC leading with its MAC - is only reachable that way.
+				if let (Ok((kind, token, _name)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
+					offers.push((kind, token, cap.object()));
 				}
 			}
 			driver_protocol::Opcode::Ready => return Some(offers),
@@ -293,8 +294,35 @@ fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<al
 }
 
 // The provider of one kind out of what a handshake offered.
-fn offer_of(offers: &[(u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
-	offers.iter().find(|(k, _)| *k == kind).map(|(_, object)| object.clone())
+fn offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+	offers.iter().find(|(k, _, _)| *k == kind).map(|(_, _, object)| object.clone())
+}
+
+// The nth provider of one kind out of what a handshake offered.
+//
+// A DRIVER MAY PUBLISH TWO OF ONE KIND and the catalogue's whole reason for carrying a token is that
+// they have to be told apart. The xHCI controller publishes two block providers - a Bulk-Only stick
+// and a UAS target, two devices with two transports - so a harness that asked for "the block one"
+// would be asking a question with two answers.
+#[allow(dead_code)]
+fn nth_offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16, index: usize) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+	offers.iter().filter(|(k, _, _)| *k == kind).map(|(_, _, object)| object.clone()).nth(index)
+}
+
+// The publisher-local token one kind was offered under, which a `CONNECT` has to name.
+#[allow(dead_code)]
+fn offer_token_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<u16> {
+	offers.iter().find(|(k, _, _)| *k == kind).map(|(_, token, _)| *token)
+}
+
+// Mint one connection to a driver's publication, the way DeviceManager mints one: a `CONNECT`
+// naming the publication's token and carrying the server end of a fresh channel. The driver serves
+// it beside every other consumer, and a provider that speaks first speaks on it.
+#[allow(dead_code)]
+fn send_connect(channel: &object::channel::Channel, generation: u64, token: u16, endpoint: alloc::sync::Arc<dyn object::KernelObject>) -> Result<(), &'static str> {
+	let mut payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
+	driver_protocol::encode_u16(token, &mut payload);
+	send_frame(channel, driver_protocol::Opcode::Connect, generation, &payload, Some(endpoint), object::rights::Rights::ALL)
 }
 
 // Create a ramdisk MemoryObject from `volume`, fill it, and hand it to a service's

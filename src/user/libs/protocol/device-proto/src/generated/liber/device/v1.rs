@@ -823,6 +823,13 @@ pub enum ProviderKind {
 	UsbBus = 6,
 	Pointer = 7,
 	ConsoleBytes = 8,
+	/// A BOUNDED LOCAL STREAM TRANSPORT, which virtio-vsock publishes. It is NOT `net`: a
+	/// consumer of `net` gets a link it can route, and a consumer of this gets connections to
+	/// one peer on one host, addressed by port, with no routing, no addressing and no policy of
+	/// its own. Separating them is the point rather than a tidiness: a driver that published a
+	/// host channel as `net` would make an ambient path around NetworkService out of a kind
+	/// every consumer already asks for.
+	LocalStream = 9,
 }
 
 impl ProviderKind {
@@ -873,6 +880,7 @@ impl ProviderKind {
 			6 => Some(ProviderKind::UsbBus),
 			7 => Some(ProviderKind::Pointer),
 			8 => Some(ProviderKind::ConsoleBytes),
+			9 => Some(ProviderKind::LocalStream),
 			_ => None,
 		}
 	}
@@ -3216,6 +3224,7 @@ impl ProviderKind {
 			ProviderKind::UsbBus => out.push_str("\"usb-bus\""),
 			ProviderKind::Pointer => out.push_str("\"pointer\""),
 			ProviderKind::ConsoleBytes => out.push_str("\"console-bytes\""),
+			ProviderKind::LocalStream => out.push_str("\"local-stream\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3228,6 +3237,7 @@ impl ProviderKind {
 			ProviderKind::UsbBus => out.push_str("usb-bus"),
 			ProviderKind::Pointer => out.push_str("pointer"),
 			ProviderKind::ConsoleBytes => out.push_str("console-bytes"),
+			ProviderKind::LocalStream => out.push_str("local-stream"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -3240,6 +3250,7 @@ impl ProviderKind {
 			ProviderKind::UsbBus => crate::codec::cbor::text(out, "usb-bus"),
 			ProviderKind::Pointer => crate::codec::cbor::text(out, "pointer"),
 			ProviderKind::ConsoleBytes => crate::codec::cbor::text(out, "console-bytes"),
+			ProviderKind::LocalStream => crate::codec::cbor::text(out, "local-stream"),
 		}
 	}
 }

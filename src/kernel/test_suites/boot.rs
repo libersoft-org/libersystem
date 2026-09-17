@@ -121,13 +121,19 @@ fn init_package_starts_system_manager() {
 
 	// THE NETWORK SERVICE IS ONLINE ON EVERY BOOT, WITH OR WITHOUT A LINK. `virtio_net` declares
 	// `iommu-required`, so on a boot whose DMA mode is `no-iommu` - the test row, and every
-	// device-tree boot until those ports gain a controller - the kernel refuses the claim by name
-	// and NetworkService finds no provider. It comes up anyway, without a link, answering every
-	// link-bound operation with a typed refusal: the time service, PermissionManager,
-	// ConsoleService, SystemGraphService and the shell all depend on it by manifest, so a
-	// NetworkService that failed its bootstrap was a machine with no shell, not a machine with no
-	// network. On an enforcing boot the driver is admitted and the same report means a live link;
-	// which of the two this boot is, the console says beside the DHCP line.
+	// device-tree boot until those ports gain a controller - the kernel refuses the claim by name.
+	// The service comes up either way, answering every link-bound operation with a typed refusal
+	// when it has no provider: the time service, PermissionManager, ConsoleService,
+	// SystemGraphService and the shell all depend on it by manifest, so a NetworkService that failed
+	// its bootstrap was a machine with no shell, not a machine with no network.
+	//
+	// WHETHER THIS BOOT HAS A LINK IS NO LONGER THE SAME QUESTION AS WHETHER `virtio_net` WAS
+	// ADMITTED, and the comment here used to say it was. The suite's machine carries a USB CDC
+	// Ethernet adapter on the controller's hub, and the controller declares `trusted-untranslated`
+	// like every other controller here - so it is admitted on the degraded boot the virtio NIC is
+	// refused on, and this boot comes up with a link over USB. The no-provider state still has a
+	// gate of its own: the `dma-degraded` scenario boots without the suite's devices and requires
+	// the "up without a link" line, which is why the adapter is attached in test mode only.
 	let online_reports: [&[u8]; 24] = [
 		b"LogService: online",
 		b"DeviceManager: online",
@@ -188,7 +194,28 @@ fn init_package_starts_system_manager() {
 	// A larger bound costs nothing when the chain is healthy, because the loop breaks as soon as
 	// every report has arrived. It only changes what happens when something is genuinely stuck, and
 	// there the suite's own no-progress watchdog is the backstop.
-	let give_up = arch::apic::ticks() + 4000;
+	//
+	// RAISED AGAIN, FROM 4000 TO 20000 (2026-09-17), AND THE EVIDENCE FOR IT WAS CHECKED TWICE
+	// BECAUSE THE FIRST READING WAS CONFOUNDED. Four thousand ticks is forty seconds, and on aarch64
+	// the DEVICE phase alone spends most of it: the first round binds five virtio-blk, the GPU, the
+	// sound device, the entropy source, the console and the xHCI controller AT ONCE, and under TCG
+	// that contention puts every one of them near the 200-tick bind window - measured at 179 and 184
+	// for two of them, and OVER it for the two heaviest, `virtio-gpu` and `virtio-snd`. Those two are
+	// timed out, retried, and bind in 100 and 18 ticks with the machine quiet: the SAME code, twice
+	// as fast alone, which is what makes this contention rather than a slow driver. The system
+	// recovers exactly as the lifecycle says it should; what ran out was this test's patience.
+	//
+	// WHAT WAS CONFOUNDED: the run that first suggested this number was also failing for a real
+	// defect - a `net` provider published with no adapter behind it, which wedged NetworkService
+	// waiting for a MAC that would never arrive. That was fixed, and the bound was then put BACK to
+	// 4000 to find out whether it had ever been needed. It had: the boot fails at 4000 and passes at
+	// 20000 with the defect gone. A bound raised on a misattributed measurement would have been a
+	// number nobody could defend, which is why it was measured again rather than kept.
+	//
+	// AND THE BIND WINDOW ITSELF IS NOT WIDENED HERE. It is P02M0162's contract and it is not this
+	// suite's to relax; what this line bounds is how long the suite waits for a chain that is still
+	// making progress. The assertion below is unchanged: every manifest service must report online.
+	let give_up = arch::apic::ticks() + 20000;
 	let mut passes: u32 = 0;
 	while arch::apic::ticks() < give_up {
 		// A BOUNDED DRAIN AND NOT AN UNBOUNDED ONE. `run_until_idle` sleeps to the nearest THREAD
@@ -217,7 +244,13 @@ fn init_package_starts_system_manager() {
 		}
 		arch::idle_halt();
 	}
-	crate::serial_println!("boot: this boot's DMA mode is {:?} - NetworkService reports online with a link only where virtio_net is admitted", crate::dma_policy::mode());
+	// WHICH PROVIDER GIVES THIS BOOT ITS LINK, WHICH IS NO LONGER ONE ANSWER. This line used to say
+	// "with a link only where virtio_net is admitted", and that stopped being true the moment a
+	// second publisher of the `net` kind existed: `virtio_net` declares `iommu-required` and is
+	// refused on a `no-iommu` boot, while the USB CDC adapter behind the xHCI controller reaches the
+	// bus through a controller that declares `trusted-untranslated` and is admitted. So a boot mode
+	// that leaves the virtio NIC refused can still have a link, over USB.
+	crate::serial_println!("boot: this boot's DMA mode is {:?} - a link exists where ANY admitted driver publishes the net kind, which on a refused-virtio_net boot is the USB CDC adapter", crate::dma_policy::mode());
 	let missing_reports = online_reports.iter().filter(|expected| !actual_online_reports.iter().any(|actual| actual.as_slice() == **expected)).collect::<alloc::vec::Vec<_>>();
 	assert_eq!(actual_online_reports.len(), online_reports.len(), "every manifest service must report online; missing={missing_reports:?}");
 	actual_online_reports.sort();

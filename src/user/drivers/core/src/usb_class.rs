@@ -32,6 +32,11 @@
 pub enum ClassKind {
 	Hid,
 	Storage,
+	Network,
+	/// USB Attached SCSI: the same command set as `Storage` over four pipes instead of two, and a
+	/// SEPARATE module because a controller may carry one of each - a Bulk-Only stick and a UAS
+	/// disk are two devices, two budgets and two block providers.
+	Uas,
 }
 
 /// One endpoint ring is one DMA page, which is the unit both class modules allocate in.
@@ -62,6 +67,25 @@ pub const HID_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES, in_flight
 /// What one mass-storage device costs: a bulk IN and a bulk OUT endpoint with their rings, the data
 /// buffer it may grow to, and one transfer in flight.
 pub const STORAGE_COST: Cost = Cost { endpoints: 2, dma_bytes: 2 * RING_BYTES + STORAGE_MAX_DATA_BYTES, in_flight: 1 };
+
+/// What one CDC network adapter costs: a bulk pair with their rings, a receive page and a transmit
+/// page, and one transfer in flight. The receive transfer is STANDING - one is outstanding whenever
+/// the adapter is bound - which is what the in-flight count is for.
+pub const NETWORK_COST: Cost = Cost { endpoints: 2, dma_bytes: 2 * RING_BYTES + 2 * 4096, in_flight: 1 };
+
+/// ONE NETWORK ADAPTER, for the reason the storage module admits one disk: a second NIC is a second
+/// link with its own MAC and its own stack above it, and this controller publishes one provider.
+/// Stated as a budget so a second adapter is REFUSED and says so, rather than being ignored.
+pub const NETWORK_LIMITS: Limits = Limits { devices: 1, endpoints: 2, dma_bytes: 2 * RING_BYTES + 2 * 4096, in_flight: 1 };
+
+/// What one UAS device costs: four pipes with their rings, a control page, a data page, and one
+/// command in flight - which is the slice this transport implements and the reason one stream is
+/// enough. The stream context arrays are a page each for the three answering pipes.
+pub const UAS_COST: Cost = Cost { endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 4096, in_flight: 1 };
+
+/// ONE UAS DEVICE, for the reason the storage module admits one disk: the transport is one command
+/// outstanding under one tag, and a second device would need a second of everything.
+pub const UAS_LIMITS: Limits = Limits { devices: 1, endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 4096, in_flight: 1 };
 
 /// The ceilings one class module may reach inside the controller's Domain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,17 +154,21 @@ pub struct Usage {
 pub struct Budget {
 	hid: Usage,
 	storage: Usage,
+	network: Usage,
+	uas: Usage,
 }
 
 impl Budget {
 	pub const fn new() -> Budget {
-		Budget { hid: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, storage: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 } }
+		Budget { hid: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, storage: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, network: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, uas: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 } }
 	}
 
 	pub const fn limits(kind: ClassKind) -> Limits {
 		match kind {
 			ClassKind::Hid => HID_LIMITS,
 			ClassKind::Storage => STORAGE_LIMITS,
+			ClassKind::Network => NETWORK_LIMITS,
+			ClassKind::Uas => UAS_LIMITS,
 		}
 	}
 
@@ -148,6 +176,8 @@ impl Budget {
 		match kind {
 			ClassKind::Hid => HID_COST,
 			ClassKind::Storage => STORAGE_COST,
+			ClassKind::Network => NETWORK_COST,
+			ClassKind::Uas => UAS_COST,
 		}
 	}
 
@@ -155,6 +185,8 @@ impl Budget {
 		match kind {
 			ClassKind::Hid => self.hid,
 			ClassKind::Storage => self.storage,
+			ClassKind::Network => self.network,
+			ClassKind::Uas => self.uas,
 		}
 	}
 
@@ -213,6 +245,11 @@ impl Budget {
 		match kind {
 			ClassKind::Hid => bytes <= RING_BYTES,
 			ClassKind::Storage => bytes <= STORAGE_MAX_DATA_BYTES,
+			// The network module's buffers are the two pages it was charged for and it never grows
+			// them: a frame that does not fit one is a frame this module refuses to move.
+			ClassKind::Network => bytes <= 4096,
+			// The UAS module's data buffer is the one page it was charged for and it never grows it.
+			ClassKind::Uas => bytes <= 4096,
 		}
 	}
 
@@ -220,6 +257,8 @@ impl Budget {
 		match kind {
 			ClassKind::Hid => &mut self.hid,
 			ClassKind::Storage => &mut self.storage,
+			ClassKind::Network => &mut self.network,
+			ClassKind::Uas => &mut self.uas,
 		}
 	}
 }

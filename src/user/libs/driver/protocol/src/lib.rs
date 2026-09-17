@@ -61,7 +61,16 @@ pub const MAX_PAYLOAD: usize = {
 // cannot be the registry's per-entry count either: that is a later milestone's, and this one has to
 // be implementable before it. So the bound is protocol-wide here and narrowed per entry later; an
 // offer past it is refused with its handle closed rather than accumulated.
-pub const MAX_INITIAL_OFFERS: usize = 4;
+//
+// RAISED FROM FOUR TO EIGHT (2026-09-17) BY A DRIVER THAT REACHED IT. The xHCI controller publishes
+// five: a block provider for a Bulk-Only stick, the bus inventory, the pointer stream, a network
+// link for a CDC adapter and a SECOND block provider for a UAS target. Four was not a considered
+// ceiling for that shape - it was the number the drivers of the day needed - and a controller is
+// precisely the kind of driver that grows publications, because each class module it carries is one.
+// Eight is the same kind of number with room for the next two, and the refusal at the bound is
+// unchanged: what made this expensive was not the bound but that hitting it was SILENT, which
+// `common::online` now says out loud.
+pub const MAX_INITIAL_OFFERS: usize = 8;
 
 // The ELF note every driver carries, read from the STAGED artifact before the device is claimed.
 //
@@ -353,6 +362,9 @@ impl ResourceKind {
 // stops two ends remembering a convention separately.
 pub mod block;
 pub mod console;
+// THE LOCAL STREAM WIRE a `local-stream` provider serves. Here for the reason the block wire is
+// here: a contract written inside its first driver is copied by its second.
+pub mod stream;
 
 pub mod provider {
 	pub const BLOCK: u16 = 1;
@@ -363,6 +375,11 @@ pub mod provider {
 	pub const USB_BUS: u16 = 6;
 	pub const POINTER: u16 = 7;
 	pub const CONSOLE_BYTES: u16 = 8;
+	// A BOUNDED LOCAL STREAM TRANSPORT - virtio-vsock's connections to the host, addressed by port.
+	// Deliberately its own kind and not NET: a consumer asking for a link that routes must not be
+	// handed a channel to one peer, and a host channel published as NET would be an ambient path
+	// around NetworkService reachable by every consumer that already asks for a link.
+	pub const LOCAL_STREAM: u16 = 9;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

@@ -47,6 +47,13 @@ const RECEIVED_FIS_OFFSET: u64 = COMMAND_LIST_LEN;
 // Bounded waits. A controller that never answers must not hold this process or its client.
 const COMMAND_SPINS: u64 = 200_000_000;
 const PORT_SPINS: u64 = 50_000_000;
+// HOW LONG A PORT IS GIVEN TO PRESENT ITS SIGNATURE after its link comes up, in the 100 Hz ticks
+// READY is measured in. A fraction of the bind window, so a port that never presents one still
+// leaves this driver time to say so.
+const SIGNATURE_TICKS: u64 = 20;
+// And how long the link is given to come up after a reset, which the specification measures in
+// milliseconds and this system measures in hundredths of a second.
+const RESET_TICKS: u64 = 100;
 
 unsafe fn r32(addr: u64) -> u32 {
 	unsafe { (addr as *const u32).read_volatile() }
@@ -291,6 +298,33 @@ impl Controller {
 	}
 }
 
+// Bring one port's link up from nothing: a COMRESET asked for in `PxSCTL.DET`, held, released, and
+// waited on. The command engine must already be stopped, which the caller does.
+//
+// THE HOLD IS A TIME AND NOT A SPIN COUNT. The specification asks for at least a millisecond with
+// `DET` at one, and a millisecond is a tenth of a tick here - so this holds for one whole tick,
+// which is the smallest unit this system can measure and is safely more than the minimum.
+unsafe fn reset_port(port: u64) {
+	unsafe {
+		// Keep the speed and power-management fields the platform set; only the detection field is
+		// this driver's to write.
+		let sctl = r32(port + ahci::PORT_SCTL) & !0x0F;
+		w32(port + ahci::PORT_SCTL, sctl | 1);
+		let mut hold = common::Deadline::ticks(1);
+		while hold.waiting() {}
+		w32(port + ahci::PORT_SCTL, sctl);
+		let mut link = common::Deadline::ticks(RESET_TICKS);
+		while link.waiting() {
+			if ahci::link_up(r32(port + ahci::PORT_SSTS)) {
+				break;
+			}
+		}
+		// THE RESET RECORDS ITS OWN ERRORS, and a port whose `PxSERR` still carries them refuses the
+		// first command with a fault that describes the reset rather than the command.
+		w32(port + ahci::PORT_SERR, 0xFFFF_FFFF);
+	}
+}
+
 // Stop a port's command engine and wait for it to be stopped.
 //
 // BOTH RUNNING BITS, because they stop separately. `PxCMD.ST` starts the command list and `FRE` the
@@ -399,8 +433,46 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 			if !stop_port(port) {
 				return Err(Bringup::PortStuck);
 			}
+			// THIS DRIVER RESETS THE PORT ITSELF RATHER THAN INHERITING SOMEBODY ELSE'S, and that
+			// is the defect only a run on a second machine could find.
+			//
+			// On x86_64 the firmware enumerates the AHCI controller before this driver ever sees it -
+			// the boot log lists a SATA device among its boot entries - so the link was already up
+			// and `PxSIG` already latched when the driver read them. On the aarch64 machine the
+			// firmware does not touch the controller at all, and the driver read a port whose link
+			// had never been brought up: "port 0 carries nothing", with a disk plainly attached and
+			// QEMU reporting it. An AHCI driver that only works after somebody else initialised the
+			// port is a driver that works on one machine.
+			//
+			// THE SEQUENCE IS THE SPECIFICATION'S, AND ITS FIRST STEP IS THE ONE THAT IS EASY TO
+			// MISS: `PxSIG` IS NOT A REGISTER THE HBA FILLS BY ITSELF. It is copied out of the
+			// device's first register FIS, and the HBA can only receive that FIS once the port has a
+			// FIS receive AREA and `PxCMD.FRE` is set. A port probed with the receive engine off
+			// reports a link that is up and a signature that is zero, for ever - which is exactly
+			// what "port 0 carries nothing" was. So the buffers are programmed BEFORE the reset,
+			// rather than after a port has been chosen.
+			//
+			// Then: ask for a COMRESET in `PxSCTL.DET`, hold it, release it, wait for the link,
+			// clear the errors the reset itself recorded, and only then believe the signature. Every
+			// wait is bounded in the 100 Hz ticks the bind window is measured in.
+			w64(port + ahci::PORT_CLB, structures.phys);
+			w64(port + ahci::PORT_FB, structures.phys + RECEIVED_FIS_OFFSET);
+			w32(port + ahci::PORT_CMD, r32(port + ahci::PORT_CMD) | ahci::CMD_FIS_RECEIVE_ENABLE);
+			if !ahci::link_up(r32(port + ahci::PORT_SSTS)) || matches!(ahci::attached(r32(port + ahci::PORT_SIG)), Attached::None) {
+				reset_port(port);
+			}
 			if !ahci::link_up(r32(port + ahci::PORT_SSTS)) {
 				continue;
+			}
+			// AND THE SIGNATURE APPEARS AFTER THE LINK RATHER THAN WITH IT. `PxSIG` is written when
+			// the device sends its first register FIS, which is a moment after `PxSSTS.DET` reaches
+			// three; a port still busy has not finished presenting itself.
+			let mut settle = common::Deadline::ticks(SIGNATURE_TICKS);
+			while settle.waiting() {
+				let busy = r32(port + ahci::PORT_TFD) & (ahci::TFD_BSY | ahci::TFD_DRQ) != 0;
+				if !busy && !matches!(ahci::attached(r32(port + ahci::PORT_SIG)), Attached::None) {
+					break;
+				}
 			}
 			match ahci::attached(r32(port + ahci::PORT_SIG)) {
 				Attached::Disk => {}
@@ -422,9 +494,9 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 				}
 			}
 			// ONE PORT, ONE BLOCK PROVIDER, for the same reason the NVMe driver serves one namespace:
-			// the binding unit is a PCI function and a port is not expressible in one.
-			w64(port + ahci::PORT_CLB, structures.phys);
-			w64(port + ahci::PORT_FB, structures.phys + RECEIVED_FIS_OFFSET);
+			// the binding unit is a PCI function and a port is not expressible in one. The buffers
+			// are already programmed above - the receive engine had to be running before the
+			// signature could appear - so what is left is to start the command engine.
 			start_port(port);
 			chosen = Some(port);
 			break;

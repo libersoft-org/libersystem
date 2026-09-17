@@ -17,6 +17,11 @@ extern crate alloc;
 // scatter-gather arithmetic and the capacity parse, which is where an AHCI driver is actually wrong.
 pub mod ahci;
 pub mod blk;
+// THE COMMUNICATIONS-CLASS DECISIONS, shared by the two network models that are the same descriptors
+// and different framing: where the interfaces and the bulk pair are, and - for NCM - what a transfer
+// block's datagram table may say before it is believed, which is where such a driver reads past a
+// buffer.
+pub mod cdc;
 pub mod common;
 // VIRTIO-SERIAL MULTIPORT AS PURE DECISIONS: which queues a port owns, what a control message means,
 // and what this driver refuses. Every input here is bytes the DEVICE chose, which is why it is a
@@ -50,8 +55,16 @@ pub mod scsi;
 pub mod sdhci;
 pub mod serial_port;
 pub mod snd;
+// THE USB ATTACHED SCSI INFORMATION UNITS: the same SCSI command set as the Bulk-Only path, carried
+// over four pipes joined by a tag instead of two strictly in order. The tag is where a UAS driver is
+// wrong, and it is big-endian in a transport that is little-endian everywhere else.
+pub mod uas;
 pub mod usb;
 // The in-controller class-module execution model: what a USB class driver IS in this system, and the
 // per-class budget that stops two of them inside one Domain from starving each other.
 pub mod usb_class;
 pub mod virtio;
+// THE VIRTIO-VSOCK DECISIONS: the packet header, the credit window and the connection state
+// machine. Credit is the part a vsock driver gets wrong, in both directions and silently, and it is
+// modular arithmetic on two counters the PEER moves - which is exactly what a host test can watch.
+pub mod vsock;

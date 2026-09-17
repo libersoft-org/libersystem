@@ -23,7 +23,9 @@
 extern crate alloc;
 
 mod usb_hid;
+mod usb_net;
 mod usb_storage;
+mod usb_uas;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -33,7 +35,9 @@ use proto::system::{Error as UsbError, UsbDevice as UsbEntry};
 use rt::*;
 
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, configure_hid, handle_hid_event, post_reports};
+use crate::usb_net::{Net, configure_network, handle_net_event, post_receive, transmit};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
+use crate::usb_uas::{Uas, configure_uas};
 use drivers::usb_class::ClassKind;
 use drivers::{common, keys};
 
@@ -278,6 +282,68 @@ impl Ring {
 	}
 }
 
+// ONE BULK ENDPOINT'S STREAM CONTEXT ARRAY, and what it is for.
+//
+// A bulk endpoint can carry SEVERAL INDEPENDENT TRANSFER RINGS, selected by a stream id the driver
+// writes into the doorbell beside the endpoint. The endpoint context then points at an ARRAY of
+// stream contexts rather than at a ring, and each entry names one ring. That is the whole mechanism,
+// and it exists here for one reason: a UAS device's status and data pipes DEMAND it - they advertise
+// streams in their endpoint companions, and a host that ignores them has no way to tell which
+// command an answer belongs to.
+//
+// ONE STREAM IS USED AND THE ARRAY IS FULL SIZE, which is not a shortcut but what the hardware
+// requires: the array's length is fixed by `MaxPStreams` in the endpoint context, and the device
+// chooses which entries it uses. This driver issues one command at a time under one tag, so it uses
+// stream 1 and leaves the rest of the array zeroed - an entry a device never selects is never read.
+struct Streams {
+	// The array's page, kept so it can be given back.
+	handle: u64,
+	virt: u64,
+	phys: u64,
+	// The one stream this driver drives.
+	ring: Ring,
+}
+
+// The stream context's type field: a primary transfer ring.
+const STREAM_CONTEXT_TYPE_PRIMARY: u64 = 1 << 1;
+// The stream this driver uses. Zero is reserved by the specification - it means "no stream" - for
+// the same reason the UAS tag reserves zero and NVMe reserves command id zero.
+const STREAM_ID: u32 = 1;
+
+impl Streams {
+	// Build the array and the one ring in it. `count` is the number of entries, which must be a
+	// power of two and is what `MaxPStreams` encodes.
+	unsafe fn new(count: u32) -> Option<Streams> {
+		unsafe {
+			let (handle, virt, phys) = dma_page()?;
+			// Sixteen bytes an entry, and the page bounds how many there can be.
+			if count as u64 * 16 > 4096 {
+				close(handle);
+				return None;
+			}
+			let ring = Ring::new()?;
+			let entry = virt + STREAM_ID as u64 * 16;
+			(entry as *mut u64).write_volatile(ring.phys | STREAM_CONTEXT_TYPE_PRIMARY | ring.cycle as u64);
+			((entry + 8) as *mut u64).write_volatile(0);
+			Some(Streams { handle, virt, phys, ring })
+		}
+	}
+
+	fn release(&mut self) {
+		self.ring.release();
+		if self.handle != 0 {
+			close(self.handle);
+			self.handle = 0;
+			self.virt = 0;
+		}
+	}
+}
+
+// `MaxPStreams` for an array of `count` entries: the field holds log2(count) - 1.
+fn max_primary_streams(count: u32) -> u32 {
+	(31 - count.leading_zeros()).saturating_sub(1)
+}
+
 // The controller with its register windows resolved and its rings built.
 struct Xhci {
 	// Operational, runtime-interrupter-0 and doorbell-array register bases.
@@ -306,6 +372,18 @@ struct Xhci {
 	// where their cost is counted - a module keeping its own count is a module that can forget to
 	// give something back.
 	budget: drivers::usb_class::Budget,
+	// THE NETWORK COMPLETION NOTHING MAY LOSE, which is the same shape as the port change above and
+	// was found the same way. A synchronous wait - a block transfer, a control request, a HID
+	// recovery - drains the event ring looking for ONE completion and offers everything else to the
+	// HID path, which does not answer for a network endpoint. So a frame that arrived during a disk
+	// read was dropped AND its standing receive transfer was never re-posted, which stops the link
+	// for good rather than losing one packet. The adapter's endpoint is recorded here when it binds,
+	// and a completion for it is stashed rather than discarded.
+	//
+	// ONE SLOT IS ENOUGH BY CONSTRUCTION: the network module's budget is one transfer in flight, and
+	// nothing re-posts until the stashed one is drained.
+	net_rx: Option<(u32, u32)>,
+	net_pending: Option<(u32, u32)>,
 }
 
 // One addressed USB device: its slot, root-hub port, route string (the hub-port
@@ -386,6 +464,8 @@ const KIND_HUB: u8 = 1;
 const KIND_KEYBOARD: u8 = 2;
 const KIND_STORAGE: u8 = 3;
 const KIND_POINTER: u8 = 4;
+const KIND_NETWORK: u8 = 5;
+const KIND_UAS: u8 = 6;
 
 // The addressed devices, by root port - the state hot-plug works against and the
 // inventory `usb.list` serves. An attach enumerates a root port only when no slot
@@ -472,11 +552,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut devices: u32 = 0;
 		let mut hids: Hids = Hids::new();
 		let mut storage: Option<(UsbDevice, Storage)> = None;
+		// THE ONE NETWORK ADAPTER THIS CONTROLLER SERVES, held the way the one disk is and for the
+		// same reason: it is a budget of one that REFUSES a second and says so, rather than a
+		// structure that silently cannot hold it.
+		let mut network: Option<(UsbDevice, Net)> = None;
+		// AND THE ONE UAS TARGET, which is a SECOND block provider and not a second disk behind the
+		// first: a Bulk-Only stick and a UAS disk are two devices with two transports, and a
+		// controller carrying both publishes two.
+		let mut uas: Option<(UsbDevice, Uas)> = None;
 		let mut slots: Slots = Slots::new();
 		let mut port: u32 = 1;
 		while port <= hc.ports {
 			if let Some(dev) = attach_port(&mut hc, port) {
-				register_device(&mut hc, dev, &mut slots, &mut devices, &mut hids, &mut storage);
+				register_device(&mut hc, dev, &mut slots, &mut devices, &mut hids, &mut storage, &mut network, &mut uas);
 			}
 			port += 1;
 		}
@@ -497,6 +585,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// serves over the same channel.
 		let (ptr_server, ptr_client): (u64, u64) = channel().unwrap_or_else(|| exit());
 		PTR_SINK.store(ptr_server, Ordering::Relaxed);
+		// the frame channel a CDC Ethernet adapter is served over: the SAME wire `virtio-net`
+		// publishes, so NetworkService consumes a USB NIC with no knowledge that it is one. Always
+		// created, like the block one, so an adapter plugged in later serves over it.
+		let (net_server, net_client): (u64, u64) = channel().unwrap_or_else(|| exit());
+		// the UAS target's block channel: a SECOND provider of the same kind, published under its own
+		// token so a consumer that asks for one is not handed the other's.
+		let (uas_server, uas_client): (u64, u64) = channel().unwrap_or_else(|| exit());
 		// report in, then serve the bus for the life of the system: HID reports,
 		// block requests, and runtime attach / detach.
 		// Assembled through a writer that cannot overrun rather than by indexing a fixed
@@ -527,11 +622,48 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if storage.is_some() {
 			report.push(b" (storage)");
 		}
+		if network.is_some() {
+			report.push(b" (network)");
+		}
+		if uas.is_some() {
+			report.push(b" (uas)");
+		}
 		// THREE PROVIDERS, ONE HANDSHAKE. They used to be three messages the manager told apart by
 		// their text - a report, then the literal `USBBUS`, then `POINTER` - which meant the
 		// manager was parsing strings to decide what a capability was for.
-		common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::BLOCK, blk_client), (driver_protocol::provider::USB_BUS, usbq_client), (driver_protocol::provider::POINTER, ptr_client)]);
-		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, blk_server, usbq_server, ptr_server, irq);
+		// A PROVIDER IS PUBLISHED WHEN ITS DEVICE IS THERE, AND THE TWO NEW ONES ARE NOT LIKE THE
+		// STICK'S. The mass-storage channel is published unconditionally and has been since it was
+		// written, because the block contract ANSWERS: a request with no disk behind it gets an
+		// error status, so an empty publication costs a consumer one refused request.
+		//
+		// A NETWORK LINK DOES NOT ANSWER. Its contract begins with the DRIVER speaking - the MAC and
+		// the link MTU, which NetworkService cannot build a stack without - so a `net` provider with
+		// no adapter behind it is a service that waits for a message nobody will send. That is not a
+		// theory: publishing it unconditionally wedged the aarch64 boot at seventeen of twenty-four
+		// services, with NetworkService first in the missing list, on a machine whose xHCI carries a
+		// keyboard and a disk and no adapter at all.
+		//
+		// The UAS target's block channel is conditional for a smaller reason and the same shape: an
+		// always-present second block provider is a second thing StorageService probes and assigns a
+		// boot role by, on every machine that has no UAS device.
+		// A ZERO HANDLE IS AN ENTRY THAT KEEPS ITS TOKEN AND IS NOT SENT - `online_named` skips it -
+		// which is what lets the absent ones be published LATER under the same token when a device
+		// arrives. The token is the position in this list, and a position that moved would rename a
+		// publication the manager is already holding.
+		common::online(
+			bootstrap,
+			&bind,
+			report.as_bytes(),
+			&[
+				(driver_protocol::provider::BLOCK, blk_client),
+				(driver_protocol::provider::USB_BUS, usbq_client),
+				(driver_protocol::provider::POINTER, ptr_client),
+				(driver_protocol::provider::NET, if network.is_some() { net_client } else { 0 }),
+				(driver_protocol::provider::BLOCK, if uas.is_some() { uas_client } else { 0 }),
+			],
+		);
+		let pending = Unpublished { net: if network.is_some() { 0 } else { net_client }, uas: if uas.is_some() { 0 } else { uas_client } };
+		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, network, uas, blk_server, usbq_server, ptr_server, net_server, uas_server, pending, irq);
 	}
 }
 
@@ -606,7 +738,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new() })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None })
 	}
 }
 
@@ -883,14 +1015,14 @@ fn initial_packet_size(speed: u32) -> u32 {
 // expanded (its ports enumerated, each downstream device landing back here
 // recursively), every HID device and the first mass-storage device are
 // configured and kept for the service loop, anything else is left addressed.
-fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
+fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>) {
 	unsafe {
 		report_device(&dev);
 		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE, device: None });
 		*devices += 1;
 		if dev.class == CLASS_HUB {
 			slots.set_kind(dev.slot, KIND_HUB);
-			expand_hub(hc, &mut dev, slots, devices, hids, storage);
+			expand_hub(hc, &mut dev, slots, devices, hids, storage, network, uas);
 			// A HUB STAYS ADDRESSED because its downstream devices reach the bus through it, so the
 			// inventory holds it until the port it is on goes away.
 			let slot = dev.slot;
@@ -912,7 +1044,28 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			let _ = hc.budget.admit(ClassKind::Storage);
 			slots.set_kind(dev.slot, KIND_STORAGE);
 			*storage = Some((dev, st));
+		} else if network.is_none()
+			&& admits(hc, ClassKind::Network, dev.class)
+			&& let Some(net) = configure_network(hc, &mut dev)
+		{
+			let _ = hc.budget.admit(ClassKind::Network);
+			slots.set_kind(dev.slot, KIND_NETWORK);
+			hc.net_rx = Some((dev.slot, net.receive_endpoint()));
+			*network = Some((dev, net));
+		} else if uas.is_none()
+			&& admits(hc, ClassKind::Uas, dev.class)
+			&& let Some(target) = configure_uas(hc, &mut dev)
+		{
+			let _ = hc.budget.admit(ClassKind::Uas);
+			slots.set_kind(dev.slot, KIND_UAS);
+			*uas = Some((dev, target));
 		} else {
+			// A DEVICE THIS CONTROLLER DOES NOT BIND IS STILL WORTH READING, and for UAS that
+			// reading is what the item asked for before anybody wrote its transport: whether the
+			// device demands bulk STREAMS. The probe binds nothing, it stays in the tree after the
+			// transport exists, and it is how a machine whose shape this driver cannot drive says so
+			// in one boot rather than in one implementation.
+			usb_uas::probe(hc, &mut dev);
 			// NOTHING ELSE HOLDS IT, so the inventory does. A device left addressed without being
 			// bound still owns a slot and three pages, and dropping it here is what leaked them.
 			let slot = dev.slot;
@@ -936,7 +1089,12 @@ fn admits(hc: &Xhci, kind: ClassKind, class: u8) -> bool {
 			// and saying "the keyboard budget is full" about a printer would be a lie.
 			if class_is_plausible(kind, class) {
 				print(b"driver.xhci: ");
-				print(if matches!(kind, ClassKind::Hid) { b"HID".as_slice() } else { b"storage".as_slice() });
+				print(match kind {
+					ClassKind::Hid => b"HID".as_slice(),
+					ClassKind::Storage => b"storage".as_slice(),
+					ClassKind::Network => b"network".as_slice(),
+					ClassKind::Uas => b"UAS".as_slice(),
+				});
 				print(b" module is full (");
 				print(refusal.describe());
 				print(b"), device left unbound\n");
@@ -952,6 +1110,10 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 	match kind {
 		ClassKind::Hid => class == 0 || class == 0x03,
 		ClassKind::Storage => class == 0 || class == 0x08,
+		// A CDC adapter declares the communications class at the DEVICE level - unlike HID and mass
+		// storage, which declare it per interface and leave zero here.
+		ClassKind::Network => class == 0 || class == drivers::cdc::CLASS_COMMUNICATIONS,
+		ClassKind::Uas => class == 0 || class == usb_uas::CLASS_MASS_STORAGE,
 	}
 }
 
@@ -960,7 +1122,7 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 // up, and bring up whatever is connected. Each addressed downstream device runs
 // through `register_device`, so a hub found downstream expands recursively and a
 // keyboard or disk behind any tier of hubs is configured like a root one.
-fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
+fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>) {
 	unsafe {
 		// no HID device is serving yet, so the control waits see no HID events.
 		let mut pending: Hids = Hids::new();
@@ -987,7 +1149,7 @@ fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &m
 		let mut port: u32 = 1;
 		while port <= ports.min(15) {
 			if let Some(dev) = attach_hub_port(hc, hub, port, shift) {
-				register_device(hc, dev, slots, devices, hids, storage);
+				register_device(hc, dev, slots, devices, hids, storage, network, uas);
 			}
 			port += 1;
 		}
@@ -1195,28 +1357,91 @@ fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 // unplugged one is torn down. The loop sleeps on the controller's MSI-X
 // interrupt and both channels at once, and the synchronous BOT waits service HID
 // events inline, so typing is never lost behind disk traffic.
-fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, pointer: u64, irq: u64) -> ! {
+#[allow(clippy::too_many_arguments)]
+// THE PUBLICATIONS THIS DRIVER STILL OWES, because their device was not there when it reported in.
+//
+// A `net` link and the UAS target's block channel are published only when their device exists - see
+// the note at the handshake - so a device plugged in later has a publication waiting to be made. A
+// zero means it has been published already, or that there was never anything to publish.
+struct Unpublished {
+	net: u64,
+	uas: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, mut network: Option<(UsbDevice, Net)>, mut uas: Option<(UsbDevice, Uas)>, blk_server: u64, usbq: u64, pointer: u64, net_server: u64, uas_server: u64, mut pending: Unpublished, irq: u64) -> ! {
 	unsafe {
 		post_reports(hc, &mut hids);
+		if let Some((dev, net)) = network.as_mut() {
+			post_receive(hc, dev, net);
+		}
 		let mut req: [u8; 16] = [0u8; 16];
+		// A RECEIVED FRAME'S BUFFER, HELD ACROSS THE LOOP rather than allocated per frame: this runs
+		// once per arriving packet on a busy link.
+		let mut frame: Vec<u8> = Vec::new();
+		// And the transmit side's, which a consumer's message is read into.
+		let mut outgoing: Vec<u8> = alloc::vec![0u8; 2048];
 		// These tokens are the positions in this binding's OFFER list. Keep the factory even
 		// with no consumers, so a later storage service or lsusb process can connect again.
-		let mut serving = common::Serving::from_offers(&[(0, blk_server), (1, usbq), (2, pointer)]);
+		let mut serving = common::Serving::from_offers(&[(0, blk_server), (1, usbq), (2, pointer), (3, net_server), (4, uas_server)]);
 		loop {
 			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
 				common::finish_stop(bootstrap, bind, device(), hc.halt());
 				exit();
 			};
 			PTR_SINK.store(serving.first_for(2), Ordering::Relaxed);
-			if matches!(ready, common::ProviderReady::Connected(_)) {
+			if let common::ProviderReady::Connected(at) = ready {
+				// EVERY CONNECTION STARTS WITH THE MAC AND THE MTU, including one made after a
+				// consumer restarted: NetworkService builds its stack from that message and refuses
+				// to start without it. A connection made while no adapter is bound gets nothing and
+				// is served when one arrives.
+				if serving.token_at(at) == 3
+					&& let Some((_, net)) = network.as_ref()
+					&& !send_blocking(serving.at(at), &net.hello(), 0)
+				{
+					let token = serving.close_at(at);
+					common::disconnected(bootstrap, bind, token);
+				}
 				continue;
 			}
 			// Drain hardware events whenever this loop wakes. Synchronous block operations still
 			// service HID events inline; consumer closure does not stop the controller.
 			let mut rescan: bool = false;
+			// THE STASHED COMPLETION FIRST, because it is older than anything still on the ring.
+			if let Some((status, control)) = hc.net_pending.take()
+				&& let Some((dev, net)) = network.as_mut()
+				&& handle_net_event(hc, dev, net, status, control, &mut frame)
+			{
+				for at in (0..serving.as_slice().len()).rev() {
+					if serving.token_at(at) != 3 {
+						continue;
+					}
+					if !send_blocking(serving.at(at), &frame, 0) {
+						let token = serving.close_at(at);
+						common::disconnected(bootstrap, bind, token);
+					}
+				}
+			}
 			while let Some((_p, status, control)) = take_event(hc) {
 				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
 					rescan = true;
+					continue;
+				}
+				// THE NETWORK EVENT IS OFFERED THE EVENT FIRST AND THE HID PATH SECOND, and each
+				// answers only for its own slot and endpoint - so an event for neither falls through
+				// both, which is what the HID path already did for a block transfer's completion.
+				if let Some((dev, net)) = network.as_mut()
+					&& handle_net_event(hc, dev, net, status, control, &mut frame)
+				{
+					for at in (0..serving.as_slice().len()).rev() {
+						if serving.token_at(at) != 3 {
+							continue;
+						}
+						if !send_blocking(serving.at(at), &frame, 0) {
+							let token = serving.close_at(at);
+							common::disconnected(bootstrap, bind, token);
+						}
+					}
 					continue;
 				}
 				handle_hid_event(hc, &mut hids, status, control);
@@ -1227,7 +1452,18 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			// synchronous wait - a block transfer that ran while a device was plugged in took the
 			// event off the ring, and without this the loop never learned of it.
 			if rescan || hc.ports_changed.take() {
-				reconcile_ports(hc, slots, &mut hids, &mut storage);
+				reconcile_ports(hc, slots, &mut hids, &mut storage, &mut network, &mut uas);
+				// AND A DEVICE THAT ARRIVED NOW GETS ITS PUBLICATION, under the token this driver's
+				// offer list reserved for it. `offer` is the post-READY half of the same handshake:
+				// the manager holds it live rather than waiting for a terminal frame.
+				if pending.net != 0 && network.is_some() {
+					if common::offer(bootstrap, bind, driver_protocol::provider::NET, 3, pending.net) {
+						pending.net = 0;
+					}
+				}
+				if pending.uas != 0 && uas.is_some() && common::offer(bootstrap, bind, driver_protocol::provider::BLOCK, 4, pending.uas) {
+					pending.uas = 0;
+				}
 			}
 			let common::ProviderReady::Consumer(at) = ready else { continue };
 			let server = serving.at(at);
@@ -1279,6 +1515,42 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 						PolledCaps::Closed => true,
 					}
 				}
+				3 => match try_recv(server, &mut outgoing) {
+					Polled::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						if let Some((dev, net)) = network.as_mut() {
+							transmit(hc, &mut hids, dev, net, &outgoing[..len]);
+						}
+						false
+					}
+					Polled::Empty => false,
+					Polled::Closed => true,
+				},
+				4 => match try_recv(server, &mut req) {
+					Polled::Message { len, handle } if len >= 16 => {
+						match uas.as_mut() {
+							Some((dev, target)) => usb_uas::serve_block_request(hc, &mut hids, dev, target, server, &req, handle),
+							None => {
+								if handle != 0 {
+									close(handle);
+								}
+								reply_block(server, STATUS_ERR, 0);
+							}
+						}
+						false
+					}
+					Polled::Message { handle, .. } => {
+						if handle != 0 {
+							close(handle);
+						}
+						reply_block(server, STATUS_ERR, 0);
+						false
+					}
+					Polled::Empty => false,
+					Polled::Closed => true,
+				},
 				// Pointer consumers receive events and send no requests. Drain unexpected input
 				// with its capabilities, and return the allowance when the peer closes.
 				_ => match try_recv_caps(server, &mut req) {
@@ -1334,6 +1606,8 @@ fn kind_name(kind: u8) -> &'static str {
 		KIND_KEYBOARD => "keyboard",
 		KIND_STORAGE => "storage",
 		KIND_POINTER => "pointer",
+		KIND_NETWORK => "network",
+		KIND_UAS => "uas",
 		_ => "device",
 	}
 }
@@ -1345,7 +1619,7 @@ fn kind_name(kind: u8) -> &'static str {
 // detach - every slot on that port is disabled (a hub takes its downstream devices
 // along) and the HID / storage state dropped, so vol://usb unmounts and a
 // replug enumerates cleanly.
-unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>) {
+unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>) {
 	unsafe {
 		let mut port: u32 = 1;
 		while port <= hc.ports {
@@ -1358,11 +1632,16 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 			if drivers::port::port_action(connected, known) == drivers::port::PortAction::Attach {
 				let mut devices: u32 = 0;
 				if let Some(dev) = attach_port(hc, port) {
-					register_device(hc, dev, slots, &mut devices, hids, storage);
+					register_device(hc, dev, slots, &mut devices, hids, storage, network, uas);
 				}
 				// a HID device configured by this attach starts serving: post its first
 				// report TRB (the boot-time ones are posted before the service loop).
 				post_reports(hc, hids);
+				// AND AN ADAPTER STARTS RECEIVING, for the same reason and with the same shape: its
+				// receive transfer is standing, so one has to be posted before anything arrives.
+				if let Some((dev, net)) = network.as_mut() {
+					post_receive(hc, dev, net);
+				}
 			} else if drivers::port::port_action(connected, known) == drivers::port::PortAction::Detach {
 				// acknowledge the disconnect and tear the port's devices down.
 				portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
@@ -1386,6 +1665,24 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 					dev.release(hc);
 					hc.budget.release(ClassKind::Storage);
 					*storage = None;
+				}
+				if let Some((dev, target)) = uas.as_mut()
+					&& dev.port == port
+				{
+					target.release();
+					dev.release(hc);
+					hc.budget.release(ClassKind::Uas);
+					*uas = None;
+				}
+				if let Some((dev, net)) = network.as_mut()
+					&& dev.port == port
+				{
+					net.release();
+					dev.release(hc);
+					hc.budget.release(ClassKind::Network);
+					hc.net_rx = None;
+					hc.net_pending = None;
+					*network = None;
 				}
 				while let Some(mut rec) = slots.take_port(port) {
 					match rec.device.take() {
@@ -1423,6 +1720,12 @@ fn wait_transfer_len(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Opt
 				let kind: u32 = control >> 10 & 0x3f;
 				if kind == TRB_EV_TRANSFER && control >> 24 == slot && (control >> 16 & 0x1f) == dci {
 					return Some((status >> 24, status & 0x00ff_ffff));
+				}
+				// A COMPLETION FOR THE ADAPTER'S RECEIVE ENDPOINT IS KEPT AND NOT OFFERED TO THE HID
+				// PATH, which does not answer for it. See `Xhci::net_pending`.
+				if kind == TRB_EV_TRANSFER && hc.net_rx == Some((control >> 24, control >> 16 & 0x1f)) && hc.net_pending.is_none() {
+					hc.net_pending = Some((status, control));
+					continue;
 				}
 				handle_hid_event(hc, hids, status, control);
 				continue;

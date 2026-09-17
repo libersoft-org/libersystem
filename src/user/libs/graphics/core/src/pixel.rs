@@ -578,7 +578,7 @@ impl TransferTable {
 		if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
 			return color::encode(self.transfer, value as f64) as f32;
 		}
-		let position = crate::composite::sqrt_f32(value) * ENCODE_ENTRIES as f32;
+		let position = crate::composite::sqrt_inline(value) * ENCODE_ENTRIES as f32;
 		let index = position as usize;
 		let fraction = position - index as f32;
 		let low = self.encode[index.min(ENCODE_ENTRIES)];

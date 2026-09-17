@@ -383,6 +383,7 @@ pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 		abi::VIRTIO_TYPE_RNG => "rng",
 		abi::VIRTIO_TYPE_GPU => "gpu",
 		abi::VIRTIO_TYPE_SOUND => "snd",
+		abi::VIRTIO_TYPE_VSOCK => "vsock",
 		_ => "other",
 	}
 }

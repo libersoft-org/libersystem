@@ -362,7 +362,7 @@ impl Pyramid {
 	/// count is BOUNDED, because the footprint of a pixel near the horizon is unbounded.
 	pub fn sample_anisotropic(&self, x: f32, y: f32, x_step: (f32, f32), y_step: (f32, f32), spread: Spread, maximum_taps: u32) -> Rgba {
 		let maximum_taps = maximum_taps.min(MAXIMUM_ANISOTROPIC_TAPS);
-		let length = |step: (f32, f32)| crate::composite::sqrt_f32(step.0 * step.0 + step.1 * step.1);
+		let length = |step: (f32, f32)| crate::composite::sqrt_inline(step.0 * step.0 + step.1 * step.1);
 		let (along_x, along_y) = (length(x_step), length(y_step));
 		let (major, minor, step) = if along_x >= along_y { (along_x, along_y, x_step) } else { (along_y, along_x, y_step) };
 		if !major.is_finite() || major <= 0.0 {

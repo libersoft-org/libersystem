@@ -5196,6 +5196,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::USB_BUS => proto::system::ProviderKind::UsbBus,
 		provider::POINTER => proto::system::ProviderKind::Pointer,
 		provider::CONSOLE_BYTES => proto::system::ProviderKind::ConsoleBytes,
+		provider::LOCAL_STREAM => proto::system::ProviderKind::LocalStream,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -5210,6 +5211,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::UsbBus => driver_protocol::provider::USB_BUS,
 		proto::system::ProviderKind::Pointer => driver_protocol::provider::POINTER,
 		proto::system::ProviderKind::ConsoleBytes => driver_protocol::provider::CONSOLE_BYTES,
+		proto::system::ProviderKind::LocalStream => driver_protocol::provider::LOCAL_STREAM,
 	}
 }
 
@@ -5759,6 +5761,7 @@ fn report_catalogue(catalogue: &Catalogue, phase: &[u8]) {
 		// pointer has been published since xHCI grew one.
 		(b"pointer", driver_protocol::provider::POINTER),
 		(b"console-bytes", driver_protocol::provider::CONSOLE_BYTES),
+		(b"local-stream", driver_protocol::provider::LOCAL_STREAM),
 	] {
 		let count = catalogue.count_of(kind);
 		if count == 0 || at + label.len() + 4 >= line.len() {

@@ -55,33 +55,8 @@ const CHANNELS: u8 = 2;
 // ticks, a fraction of that window, and every wait inside it shares one - which means a bring-up
 // where everything times out still finishes in time to SAY so, which is the whole point.
 const BRINGUP_TICKS: u64 = 60;
-// `clock()` is a syscall, so it is read once per this many iterations rather than per iteration. The
-// overshoot that allows is bounded by how long that many MMIO reads take, which is what the budget
-// above has room for.
-const CLOCK_EVERY: u64 = 64;
 
-// A deadline in monotonic ticks, checked cheaply.
-#[derive(Clone, Copy)]
-struct Deadline {
-	at: u64,
-	spins: u64,
-}
-
-impl Deadline {
-	fn ticks(budget: u64) -> Deadline {
-		Deadline { at: clock() + budget, spins: 0 }
-	}
-
-	// True while there is still time. Reads the clock once every `CLOCK_EVERY` calls.
-	fn waiting(&mut self) -> bool {
-		self.spins += 1;
-		if self.spins % CLOCK_EVERY != 0 {
-			return true;
-		}
-		clock() < self.at
-	}
-}
-
+use drivers::common::Deadline;
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
 }

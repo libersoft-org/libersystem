@@ -558,19 +558,32 @@ fn every_driver_declares_its_dma_policy_and_nothing_else_may() {
 
 #[test]
 fn the_production_manifest_classifies_every_staged_driver() {
-	// THE MIGRATION TABLE, ASSERTED. Every driver row the image stages carries a policy, and the one
-	// row whose buffers are migrated to the DMA-address contract is the one that requires
-	// translation - so a new driver cannot arrive unclassified, and `virtio_net` cannot quietly be
-	// reclassified to keep a degraded machine's network.
+	// THE MIGRATION TABLE, ASSERTED. Every driver row the image stages carries a policy it DECLARES -
+	// a row that arrived unclassified cannot exist, because the manifest refuses it - and
+	// `virtio_net` cannot quietly be reclassified to keep a degraded machine's network.
+	//
+	// ALL THREE POLICIES ARE IN USE, and this test used to say otherwise (corrected 2026-09-17, which
+	// is the same correction its kernel twin took a day earlier and this half did not). It asserted
+	// that the network driver requires translation and EVERY OTHER ROW is the trusted exception,
+	// which was a true description of the table on the day it was written and became a frozen list
+	// rather than a rule. `sdhci` is the first driver to declare `none`: its first slice moves every
+	// block through the controller's data port, so it never hands the controller a physical address,
+	// and bus mastering stays off. A driver that genuinely masters nothing is the case that policy
+	// exists to express, and the first one arriving should not fail a test for doing so.
 	let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
 	let manifest = Manifest::load_workspace(&workspace).expect("the production manifest must validate");
 	let drivers: Vec<(&str, DmaPolicy)> = manifest.programs.values().filter_map(|program| program.driver.as_ref().map(|driver| (program.name.as_str(), driver.dma))).collect();
 	assert!(!drivers.is_empty(), "the image stages drivers");
 	for (name, policy) in &drivers {
-		let expected = if *name == "virtio_net" { DmaPolicy::IommuRequired } else { DmaPolicy::TrustedUntranslated };
-		assert_eq!(*policy, expected, "{name} carries the migration table's value");
+		let expected = match *name {
+			"virtio_net" => DmaPolicy::IommuRequired,
+			"sdhci" => DmaPolicy::None,
+			_ => DmaPolicy::TrustedUntranslated,
+		};
+		assert_eq!(*policy, expected, "{name} carries the policy it declares");
 	}
 	assert!(drivers.iter().any(|(name, _)| *name == "virtio_net"), "the network driver is staged");
+	assert!(drivers.iter().any(|(name, policy)| *name == "sdhci" && *policy == DmaPolicy::None), "the PIO card reader masters nothing and says so");
 }
 
 #[test]

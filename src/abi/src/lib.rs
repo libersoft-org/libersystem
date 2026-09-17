@@ -585,6 +585,10 @@ pub const VIRTIO_TYPE_RNG: u32 = 4;
 pub const VIRTIO_TYPE_GPU: u32 = 16;
 pub const VIRTIO_TYPE_INPUT: u32 = 18;
 pub const VIRTIO_TYPE_SOUND: u32 = 25;
+// THE HOST STREAM TRANSPORT. Not a network device: a vsock connection reaches one peer - the host -
+// by context id and port, with no routing and no addressing of its own, which is why the driver
+// publishes `local-stream` and deliberately not `net`.
+pub const VIRTIO_TYPE_VSOCK: u32 = 19;
 
 // virtio-pci modern wire format, shared by the kernel's minimal boot driver and the
 // userspace drivers so the register offsets, status bits and ring flags have one
@@ -715,6 +719,7 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_GPU => "virtio-gpu",
 		VIRTIO_TYPE_INPUT => "virtio-input",
 		VIRTIO_TYPE_SOUND => "virtio-snd",
+		VIRTIO_TYPE_VSOCK => "virtio-vsock",
 		DEVICE_TYPE_XHCI => "xhci",
 		DEVICE_TYPE_NVME => "nvme",
 		DEVICE_TYPE_AHCI => "ahci",

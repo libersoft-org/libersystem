@@ -2560,6 +2560,15 @@ for spec in "$@"; do
 		# `powf` and a decoder's window is an `exp`; both crates carry the same vendored archive
 		# INTO their own library rather than importing it, because `libm` is not a provider anything
 		# else in this image links against.
+		#
+		# AND A THIRD CRATE MAY NOT SIMPLY JOIN THEM. `render2d` needs a square root and carrying the
+		# archive there too was tried: `soft2d` declares BOTH `graphics-core` and `render2d` as
+		# providers, so every libm symbol then had two exporters and the build refused the ambiguity
+		# by name - `import ...ceilf has duplicate providers graphics-core and render2d`. A vendored
+		# archive is a definition, and two definitions of one symbol in one closure is exactly what a
+		# provider graph exists to refuse. `render2d` imports `graphics_core::composite::sqrt_f32`
+		# instead, which is `#[inline(never)]` so that all three targets emit the import rather than
+		# two of them inlining it away.
 		libm_archive="$(newest_matching "$deps" 'liblibm-*.rlib')"
 		if [[ -z "$libm_archive" ]]; then
 			echo "build-shared: missing libm archive for $artifact.lslib" >&2

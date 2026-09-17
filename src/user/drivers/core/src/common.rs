@@ -356,6 +356,12 @@ pub fn hex2(byte: u8) -> [u8; 2] {
 pub fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16, u64)]) -> bool {
 	let mut named: [(u16, u64, &[u8]); proto::MAX_INITIAL_OFFERS] = [(0, 0, &[][..]); proto::MAX_INITIAL_OFFERS];
 	if offers.len() > named.len() {
+		// SAID, BECAUSE THE SILENT VERSION OF THIS COST AN AFTERNOON. A driver that offered one more
+		// than the protocol carries got `false` back, ignored it as every caller here does, and went
+		// on serving a machine where it had never reported READY - which reads as a driver that
+		// enumerated its whole bus and then hung. The bound is still the bound; what changed is that
+		// reaching it is a sentence rather than a return value.
+		print(b"driver: this driver offers more providers than one handshake carries - it will not report READY\n");
 		return false;
 	}
 	for (slot, &(kind, handle)) in named.iter_mut().zip(offers) {
@@ -958,6 +964,40 @@ impl<const N: usize> Bounded<N> {
 
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.bytes[..self.len]
+	}
+}
+
+// A DEADLINE IN MONOTONIC TICKS, CHECKED CHEAPLY, and the reason a driver waits in ticks at all.
+//
+// THE MACHINE ALREADY HAS THE UNIT. The timer runs at 100 Hz everywhere, READY is due 200 ticks
+// after BIND, and every driver on this machine binds inside 44. So a bring-up wait takes a budget in
+// ticks, a fraction of that window, and every wait inside one bring-up shares it - which means a
+// bring-up where everything times out still finishes in time to SAY so, which is the whole point. A
+// spin count cannot do that: it is a different amount of time on every machine and on every
+// architecture, and the two that were tried here collapsed a boot to nine services of twenty-four.
+#[derive(Clone, Copy)]
+pub struct Deadline {
+	at: u64,
+	spins: u64,
+}
+
+// `clock()` is a syscall, so it is read once per this many iterations rather than per iteration. The
+// overshoot that allows is bounded by how long that many MMIO reads take, which is what a budget
+// built on this has room for.
+const CLOCK_EVERY: u64 = 64;
+
+impl Deadline {
+	pub fn ticks(budget: u64) -> Deadline {
+		Deadline { at: clock() + budget, spins: 0 }
+	}
+
+	// True while there is still time. Reads the clock once every `CLOCK_EVERY` calls.
+	pub fn waiting(&mut self) -> bool {
+		self.spins += 1;
+		if self.spins % CLOCK_EVERY != 0 {
+			return true;
+		}
+		clock() < self.at
 	}
 }
 

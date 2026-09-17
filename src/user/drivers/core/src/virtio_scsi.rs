@@ -172,20 +172,25 @@ unsafe fn command(queue: &virtio::Queue, virt: u64, phys: u64, sense_size: u32, 
 
 		let request_len = (REQ_CDB + cdb_size as u64) as u32;
 		let response_len = (RESP_SENSE + sense_size as u64) as u32;
+		// THIS DEVICE COUNTS THE DATA AND THE RESPONSE, IN BOTH DIRECTIONS, which is the bound the
+		// chain is checked against. Measured: a read of eight bytes reports 8 + 108 and a write of a
+		// sector reports 512 + 108, so the ordinary bound - what the chain offered for WRITING -
+		// accepts the read and refuses the write, which is exactly what it did.
+		let most_used = response_len.saturating_add(data.map_or(0, |(_, len, _)| len));
 		// READABLE PARTS FIRST AND WRITABLE AFTER, which is the order virtio requires of a chain and
 		// which puts the data on the correct side depending on the direction.
 		let moved = match data {
 			Some((data_phys, data_len, to_device)) if to_device => {
 				let bufs = [(phys + REQ_OFF, request_len, false), (data_phys, data_len, false), (phys + RESP_OFF, response_len, true)];
-				queue.submit_checked(&bufs)
+				queue.submit_bounded(&bufs, most_used)
 			}
 			Some((data_phys, data_len, _)) => {
 				let bufs = [(phys + REQ_OFF, request_len, false), (phys + RESP_OFF, response_len, true), (data_phys, data_len, true)];
-				queue.submit_checked(&bufs)
+				queue.submit_bounded(&bufs, most_used)
 			}
 			None => {
 				let bufs = [(phys + REQ_OFF, request_len, false), (phys + RESP_OFF, response_len, true)];
-				queue.submit_checked(&bufs)
+				queue.submit_bounded(&bufs, most_used)
 			}
 		};
 		let moved = match moved {

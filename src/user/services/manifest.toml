@@ -2137,6 +2137,29 @@ match = [{ transport = "virtio-pci", virtio-type = 8 }]
 provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
 
+# THE HOST STREAM TRANSPORT, and the entry's `provides` line is the item's own requirement: it
+# publishes `local-stream` and NOT `net`. A host channel published as `net` would be an ambient path
+# around NetworkService reachable by everything that already asks for a link, and no amount of care
+# inside the driver would take that back.
+[[programs]]
+name = "virtio_vsock"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_vsock.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# It masters the bus like every other virtio driver here.
+dma = "trusted-untranslated"
+match = [{ transport = "virtio-pci", virtio-type = 19 }]
+# ONE CONSUMER. A vsock connection is a stream between two ends, and handing the same one to several
+# consumers would interleave their bytes with nothing to separate them again.
+provides = [{ kind = "local-stream", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
 [[programs]]
 name = "virtio_snd"
 owner = "drivers"
@@ -2203,9 +2226,16 @@ lifecycle = "controller"
 dma = "trusted-untranslated"
 match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x30 }]
 provides = [
-	{ kind = "block", most = 1 },
+	# TWO BLOCK PROVIDERS, because this controller can carry two disks with two transports: a
+	# Bulk-Only stick and a UAS target are different devices speaking the same command set over
+	# different pipes, and each publishes its own.
+	{ kind = "block", most = 2 },
 	{ kind = "usb-bus", most = 1 },
 	{ kind = "pointer", most = 1 },
+	# A CDC ETHERNET ADAPTER ON THE BUS IS A LINK LIKE ANY OTHER, published under the same kind
+	# `virtio-net` publishes so NetworkService consumes it without knowing it is USB. One, because
+	# this controller's network module admits one and refuses a second by name.
+	{ kind = "net", most = 1 },
 ]
 heartbeat-deadline = 100
 
@@ -4052,11 +4082,14 @@ name = "render2d"
 owner = "render2d"
 destination = "lib/graphics/render2d.lslib"
 features = []
-# EVERYTHING IT READS FROM THE LAYERS BELOW IT IS A CONSTANT OR A GENERIC, which is why this list is
-# short: the profile's limits are `const` and the image model's geometry is inlined, so the linked
-# library imports neither. A provider row that satisfied no import would be a claim about the build
-# that the build contradicts.
-providers = ["lsrt"]
+# NEARLY EVERYTHING IT READS FROM THE LAYERS BELOW IT IS A CONSTANT OR A GENERIC, which is why this
+# list is short: the profile's limits are `const` and the image model's geometry is inlined, so the
+# linked library imports neither. A provider row that satisfied no import would be a claim about the
+# build that the build contradicts - which is why `graphics-core` is here: this library imports
+# exactly one symbol from it, the stack's shared square root, and that function is `#[inline(never)]`
+# so the import exists on all three targets rather than on whichever one the compiler chose not to
+# inline it into.
+providers = ["graphics-core", "lsrt"]
 
 [[libraries]]
 name = "soft2d"

@@ -214,6 +214,85 @@ mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
 	"			(0xFF, 0xFF) => Sense::NotReadyYet," \
 	not_ready_covers_a_unit_spinning_up_and_one_with_no_medium_and_the_key_alone_cannot_tell
 
+# UAS: the tag is big-endian in a transport that is little-endian everywhere else. Swapped, it
+# matches no answer - and an answer matching nothing is indistinguishable from a device fault.
+mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \
+	"	iu[2] = (tag >> 8) as u8;
+	iu[3] = tag as u8;" \
+	"	iu[2] = tag as u8;
+	iu[3] = (tag >> 8) as u8;" \
+	the_tag_is_big_endian_in_a_transport_that_is_little_endian_everywhere_else
+
+# UAS: a residue larger than the request is a device describing a transfer that did not happen, and
+# subtracting it computes a negative length as an enormous positive one.
+mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \
+	"	if residue > requested {
+		return None;
+	}" \
+	"	if false {
+		return None;
+	}" \
+	a_residue_larger_than_the_request_is_refused_rather_than_subtracted
+
+# CDC: WHICH alternate setting of the data interface is selected. Setting zero carries no endpoints
+# at all - that is what the specification means by "not carrying traffic" - and a device may publish
+# several that do, in any order. Taking the first one SEEN rather than the lowest-numbered makes the
+# choice depend on the device's descriptor order, which is a difference that shows up on one vendor's
+# adapter and on no other.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"			if best.is_none_or(|(_, have, _, _, _, _)| alt < have) {" \
+	"			if best.is_none() {" \
+	the_lowest_numbered_setting_that_carries_a_pair_wins_whatever_order_they_appear_in
+
+# CDC: an NCM datagram names an offset and a length INTO THE BLOCK THE DEVICE SENT. Unchecked, the
+# length is a read past the buffer - which is the one defect in this family that is not a wrong
+# number but a wrong page.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"			if len == 0 || at as usize + len as usize > self.block_length {" \
+	"			if len == 0 {" \
+	a_datagram_running_past_the_block_is_refused
+
+# CDC: a datagram pointer may name the next one, and a device can point one at itself. Without the
+# bound the walk never ends, inside a driver, on bytes a device chose.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"			if self.visited > self.most {" \
+	"			if false {" \
+	a_pointer_chain_that_loops_ends_rather_than_spinning
+
+# vsock: the credit counters are free-running u32s and the window between them is MODULAR. A
+# subtraction that is not wrapping gives four gibibytes of window at the wrap and zero the other way
+# - the first sends into a buffer that is not there, the second stalls a healthy connection for ever.
+mutate "$DRIVERS" src/user/drivers/core/src/vsock.rs \
+	"	let in_flight = sent.wrapping_sub(fwd_cnt);" \
+	"	let in_flight = sent.saturating_sub(fwd_cnt);" \
+	the_window_survives_the_counters_wrapping
+
+# vsock: a peer claiming to have taken more than it was ever sent is claiming a window wider than its
+# own buffer. Trusting it is the overrun the item calls a hostile credit update.
+mutate "$DRIVERS" src/user/drivers/core/src/vsock.rs \
+	"	if in_flight > buf_alloc {
+		return None;
+	}" \
+	"	if false {
+		return None;
+	}" \
+	a_peer_claiming_more_than_it_was_sent_is_refused
+
+# vsock: a shutdown is DIRECTIONAL. Closing the whole connection on one direction loses every byte
+# this side still had to write, and the loss is silent at both ends.
+mutate "$DRIVERS" src/user/drivers/core/src/vsock.rs \
+	"			if peer_done && we_done { State::Closed } else { State::HalfClosed { peer_done, we_done } }" \
+	"			State::Closed" \
+	shutdown_is_directional_and_one_direction_is_not_a_close
+
+# The local stream wire: a send declares its own length, and the header is a claim another address
+# space made. Checked against the bound alone, a header claiming four kilobytes in a message that
+# carried eight bytes is admitted.
+mutate "$PROTOCOL" src/user/libs/driver/protocol/src/stream.rs \
+	"			if arg > MAX_PAYLOAD || arg as usize != payload.len() {" \
+	"			if arg > MAX_PAYLOAD {" \
+	a_send_claiming_more_than_it_carries_is_refused
+
 # The block wire, which four drivers and one service now share: `STATUS_INVALID` exists so a caller
 # can tell a request it got wrong from a device that failed one it got right.
 mutate "$PROTOCOL" src/user/libs/driver/protocol/src/block.rs \
