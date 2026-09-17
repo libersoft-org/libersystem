@@ -455,11 +455,19 @@ set +e
 	# the lock and here can change what boots.
 	#
 	# `TEST_TAGS`, `TEST_SELECTION` and `LIBER_NO_DT_PROFILE` are COMPILE-time and are already baked
+	# AND `TEST_TAGS` REACHES THE RUNNER AS WELL, which is a RUN-time use of a compile-time value and
+	# is deliberate. The suite's plain-PCI device set - NVMe, AHCI, SDHCI, HDA, virtio-scsi and the
+	# host stream transport - exists for oracles that are all tagged `slow`, and on the two emulated
+	# targets a machine carrying twelve devices is one where the heaviest driver misses its two-second
+	# bind window while eleven others are binding beside it. So the devices go on the bus for the runs
+	# whose tests need them and not for the runs that do not, and the runner has to be told which this
+	# is. See `qemu_attach_suite_devices`.
+	#
 	# into the copy, so they are not passed here. `TEST=1` is not: `qemu-run.sh` reads it at RUN time
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

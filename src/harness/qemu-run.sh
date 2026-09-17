@@ -741,6 +741,25 @@ qemu_attach_suite_devices() {
 	local into="$1"
 	local reduced="${2:-0}"
 	[[ "${TEST:-0}" == "1" && "$reduced" != "1" ]] || return 0
+	# ONLY FOR THE RUNS WHOSE TESTS NEED THEM, and that is a measurement rather than a preference.
+	#
+	# Every oracle these devices exist for is tagged `slow`, and the default suite does not run slow
+	# tests. On x86_64 attaching them always costs nothing. On the two emulated targets it costs the
+	# BOOT: a machine with twelve devices binding at once puts `virtio-gpu` - the heaviest bring-up
+	# here, four megabytes of framebuffer - past the two-second READY deadline on every one of its
+	# three attempts, so DisplayService starts without a provider and the five services behind it
+	# never start at all. Measured on aarch64: nineteen of twenty-four services, with `display: no
+	# framebuffer available` naming the cause.
+	#
+	# THE FIRST ATTEMPT'S DEADLINE IS NOT THIS HARNESS'S TO WIDEN - it is P02M0162's bind window - and
+	# it has not been: what changed on the other side is the patience of the RETRIES, which is the
+	# manager's own policy and sits beside the backoff between them. The devices are attached for
+	# every run whose tests assert on them, which is every run that is not narrowed to other tags.
+	# AN EMPTY TAG LIST IS "ALL TAGS" AND NOT "NO TAGS", which is the shape of the default run and is
+	# the case that made this condition wrong the first time: the full suite passes no tags at all and
+	# runs every oracle, so a gate written as "only when `slow` is asked for" left it without the
+	# devices its own tests assert on.
+	[[ -z "${TEST_TAGS:-}" || ",${TEST_TAGS}," == *,slow,* ]] || return 0
 	qemu_attach_nvme "$into"
 	qemu_attach_vsock "$into"
 }

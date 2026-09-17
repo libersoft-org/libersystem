@@ -178,9 +178,24 @@ impl Incident {
 
 	// The deadline ONE attempt's `READY` wait gets: the shorter of the per-attempt allowance and
 	// what is left of the incident once the teardown's share is set aside.
-	fn attempt_deadline(&self) -> u64 {
+	//
+	// AND A RETRY IS GIVEN MORE WALL CLOCK THAN THE FIRST ATTEMPT, which is a retry policy and not a
+	// relaxation of the first one. The deadline is WALL CLOCK on every target, and what a driver can
+	// get done inside two seconds depends on how many other drivers are doing the same thing beside
+	// it: on an emulated machine carrying twelve devices, the heaviest bring-up here - `virtio-gpu`,
+	// four megabytes of framebuffer - reported READY 330 ms past the deadline on its first attempt
+	// and 50 ms past it on its second, while eleven others were binding. Three attempts, each with
+	// the same two seconds, is three failures for a driver that was never hanging; DisplayService
+	// then starts with no provider and the five services behind it never start at all.
+	//
+	// THE FIRST ATTEMPT IS UNCHANGED, so a driver that genuinely hangs is still caught in two
+	// seconds and still reported as an incident. What doubles is the patience of the retries, beside
+	// `BACKOFF_TICKS`, which is the delay between them - the two halves of one policy this program
+	// already owns. The incident's own budget still bounds the whole of it, so a widened attempt can
+	// never outlive the window a boot has.
+	fn attempt_deadline(&self, attempt: u32) -> u64 {
 		let now: u64 = clock();
-		let by_attempt: u64 = now.saturating_add(READY_DEADLINE_TICKS);
+		let by_attempt: u64 = now.saturating_add(READY_DEADLINE_TICKS << attempt.min(2));
 		if self.deadline == 0 {
 			return by_attempt;
 		}
@@ -3735,7 +3750,7 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// declare several and "virtio_console bound it" does not say which applied - the pinned
 	// development console and the ordinary one are the same artifact under two rules.
 	node.matched_rule = node.candidates.get(node.candidate).and_then(|entry| entry.rules.iter().position(|rule| rule.matches(info))).unwrap_or(0) as u32;
-	node.ready_deadline = node.incident.attempt_deadline();
+	node.ready_deadline = node.incident.attempt_deadline(node.attempt);
 	node.bind_at = clock();
 	// `BIND` - the device, and the count of what follows. No capability travels with it.
 	let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];

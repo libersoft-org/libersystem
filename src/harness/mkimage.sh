@@ -482,7 +482,16 @@ make_iso() {
 
 # build a raw GPT disk image for a USB stick / SD card / hard disk
 make_img() {
-	local kernel="$1" size="${2:-64M}" final="$BUILD/$SLUG.img" out="$BUILD/$SLUG.img.$$.candidate"
+	# FROM `$output`, NOT COMPUTED AGAIN - the same rule `make_iso` states above, and this is the
+	# builder it was not applied to. The two derivations agreed while there was one image per format;
+	# they stopped agreeing when a DMA mode started carrying a SUFFIX. `./image.sh --dma-mode
+	# no-iommu` then looked for `libersystem-no-iommu.img`, this wrote `libersystem.img`, and the run
+	# ended with "no raw image at ..." having just reported that it wrote one - twice, because the
+	# cache missed on a file the builder never creates and rebuilt it every time.
+	local kernel="$1" size="${2:-64M}" final="$output" out="$output.$$.candidate"
+	# AND THE CANDIDATE IS REGISTERED FOR CLEANUP, which it also was not: a failed or interrupted
+	# disk build left its `.candidate` beside the image for the next person to wonder about.
+	CANDIDATES+=("$out")
 
 	mkdir -p "$BUILD"
 	rm -f "$out"
