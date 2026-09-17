@@ -193,6 +193,27 @@ mutate "$DRIVERS" src/user/drivers/core/src/hda.rs \
 	"	Some(base | (depth << 4) | channels as u16)" \
 	the_format_word_is_indices_and_not_the_numbers_it_names
 
+# SCSI: the block address is big-endian, which is the opposite of every other wire here. Written the
+# other way round it names a plausible address on the same medium and nothing refuses it.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"	cdb[2] = (lba >> 24) as u8;" \
+	"	cdb[2] = lba as u8;" \
+	a_block_address_is_big_endian_which_is_the_opposite_of_every_other_wire_here
+
+# SCSI: READ CAPACITY answers with the LAST BLOCK, not the count. Read as a count it makes a driver
+# read one block past the end of every medium it serves.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"	Ok(Capacity { blocks: last as u64 + 1, block_bytes })" \
+	"	Ok(Capacity { blocks: last as u64, block_bytes })" \
+	the_capacity_answer_is_the_last_block_and_not_the_count
+
+# SCSI: NOT READY covers a unit spinning up and one with no medium at all, and only the additional
+# code tells them apart. The key alone either retries for ever or gives up a second too early.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"			(0x04, 0x01) | (0x04, 0x02) | (0x04, 0x03) => Sense::NotReadyYet," \
+	"			(0xFF, 0xFF) => Sense::NotReadyYet," \
+	not_ready_covers_a_unit_spinning_up_and_one_with_no_medium_and_the_key_alone_cannot_tell
+
 # The block wire, which four drivers and one service now share: `STATUS_INVALID` exists so a caller
 # can tell a request it got wrong from a device that failed one it got right.
 mutate "$PROTOCOL" src/user/libs/driver/protocol/src/block.rs \

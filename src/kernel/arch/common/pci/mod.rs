@@ -215,6 +215,10 @@ impl PciDevice {
 			0x1000 => Some(abi::VIRTIO_TYPE_NET as u16),
 			0x1001 => Some(abi::VIRTIO_TYPE_BLOCK as u16),
 			0x1003 => Some(abi::VIRTIO_TYPE_CONSOLE as u16),
+			// QEMU presents `virtio-scsi-pci` as TRANSITIONAL by default, so the id a machine
+			// actually shows is this one rather than the modern 0x1048 - which is the whole reason
+			// this table exists beside the modern range above.
+			0x1004 => Some(abi::VIRTIO_TYPE_SCSI as u16),
 			0x1005 => Some(abi::VIRTIO_TYPE_RNG as u16),
 			_ => None,
 		}

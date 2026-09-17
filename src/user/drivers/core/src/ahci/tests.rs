@@ -158,3 +158,92 @@ fn a_longer_logical_sector_is_read_and_a_missing_declaration_means_512() {
 	words[106] = 0xFFFF;
 	assert_eq!(identify(&words).expect("still a disk").sector_bytes, 512);
 }
+
+// --------------------------------------------------------------------- a fake controller's port
+//
+// A PORT IS TWO REGISTERS THAT DISAGREE ON PURPOSE. `PxCI` says whether a slot is still issued and
+// `PxTFD` says what the device thought of it, and the whole trap of this interface is that the first
+// clears on COMPLETION rather than on success. A model of the port is the only way to ask what
+// happens over a sequence: a command issued, another issued behind it, one failing, and the error
+// latched until somebody reads it.
+struct FakePort {
+	// One bit per slot, as the register carries them.
+	issued: u32,
+	// The task file: status in the low byte, error in the next.
+	tfd: u32,
+}
+
+impl FakePort {
+	fn new() -> FakePort {
+		// A ready, idle port: DRDY set, nothing busy, no error.
+		FakePort { issued: 0, tfd: 0x50 }
+	}
+
+	fn issue(&mut self, slot: u32) {
+		self.issued |= 1 << slot;
+		// The device takes it: busy, and the previous error is gone.
+		self.tfd = 0x80;
+	}
+
+	// The device finishes a slot. `error` is the ATA error byte, or zero for success.
+	fn finish(&mut self, slot: u32, error: u8) {
+		self.issued &= !(1 << slot);
+		self.tfd = if error == 0 { 0x50 } else { 0x51 | ((error as u32) << 8) };
+	}
+}
+
+#[test]
+fn a_port_reports_pending_until_the_device_clears_the_slot() {
+	let mut port = FakePort::new();
+	port.issue(0);
+	assert_eq!(outcome(port.issued, 0, port.tfd), Outcome::Pending);
+	port.finish(0, 0);
+	assert_eq!(outcome(port.issued, 0, port.tfd), Outcome::Done);
+}
+
+#[test]
+fn a_failure_is_read_off_the_task_file_and_not_off_the_cleared_slot() {
+	// THE TRAP THIS INTERFACE SETS. The slot clears either way, so a driver watching only `PxCI`
+	// reports a bad sector as good data - and the error byte is the only place the difference is.
+	let mut port = FakePort::new();
+	port.issue(0);
+	port.finish(0, 0x40); // uncorrectable data error
+	assert_eq!(outcome(port.issued, 0, port.tfd), Outcome::Failed { status: 0x51, error: 0x40 });
+}
+
+#[test]
+fn one_slot_finishing_says_nothing_about_another_still_issued() {
+	// Two commands outstanding on one port: clearing one must not read as clearing the other, which
+	// is what a driver testing `PxCI != 0` rather than its own bit would do.
+	let mut port = FakePort::new();
+	port.issue(0);
+	port.issue(3);
+	port.finish(0, 0);
+	assert_eq!(outcome(port.issued, 0, port.tfd), Outcome::Done);
+	assert_eq!(outcome(port.issued, 3, port.tfd), Outcome::Pending, "the other slot is still issued");
+	port.finish(3, 0);
+	assert_eq!(outcome(port.issued, 3, port.tfd), Outcome::Done);
+}
+
+#[test]
+fn a_command_issued_after_a_failure_is_not_reported_as_the_failure_again() {
+	// The latched error is cleared when the next command is taken, so a driver that read the task
+	// file without reissuing would report every later command as the first one's failure.
+	let mut port = FakePort::new();
+	port.issue(0);
+	port.finish(0, 0x40);
+	assert!(matches!(outcome(port.issued, 0, port.tfd), Outcome::Failed { .. }));
+	port.issue(0);
+	assert_eq!(outcome(port.issued, 0, port.tfd), Outcome::Pending, "and the new command is simply outstanding");
+	port.finish(0, 0);
+	assert_eq!(outcome(port.issued, 0, port.tfd), Outcome::Done);
+}
+
+#[test]
+fn a_port_with_no_device_is_walked_past_rather_than_waited_on() {
+	// The enumeration half of the same sequence: a port that reports no device never gets a command,
+	// so `link_up` is what stops a driver issuing one and waiting out its whole timeout.
+	assert!(!link_up(0), "an empty port");
+	assert!(!link_up(0x0000_0201), "a detected device whose link is in partial power");
+	assert!(link_up(0x0000_0103), "and one that is actually there");
+}

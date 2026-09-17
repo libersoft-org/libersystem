@@ -8,6 +8,14 @@ build = "../../build.rs"
 description = "Userspace virtio drivers (blk, net, console, input)"
 
 [[bin]]
+# The virtio-scsi driver. The SCSI command set it speaks is `src/scsi.rs`, which it extracted from
+# the USB storage path and which that path now shares.
+name = "virtio_scsi"
+path = "src/virtio_scsi.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "virtio_blk"
 path = "src/virtio_blk.rs"
 test = false

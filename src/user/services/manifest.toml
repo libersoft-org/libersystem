@@ -2120,6 +2120,24 @@ match = [{ transport = "virtio-pci", virtio-type = 4 }]
 heartbeat-deadline = 100
 
 [[programs]]
+name = "virtio_scsi"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/virtio_scsi.lsexe"
+providers = []
+
+[programs.driver]
+lifecycle = "controller"
+# It masters the bus like every other virtio driver here.
+dma = "trusted-untranslated"
+# A virtio device is bound by its TYPE and not by a class triple: the transport is the identity.
+match = [{ transport = "virtio-pci", virtio-type = 8 }]
+provides = [{ kind = "block", most = 1, consumers = 4 }]
+heartbeat-deadline = 100
+
+[[programs]]
 name = "virtio_snd"
 owner = "drivers"
 role = "driver"

@@ -43,6 +43,10 @@ pub mod nvme;
 pub mod port;
 // THE SD PROTOCOL DECISIONS, kept independent of how the controller is attached exactly as the item
 // that owns them asks: no PCI, no ACPI, no device tree, so board glue stays outside the driver.
+// THE SCSI COMMAND AND SENSE CORE, owned by the first of its three consumers to be written and
+// consumed by the rest: one command set, several transports, one place that knows what its bytes
+// mean.
+pub mod scsi;
 pub mod sdhci;
 pub mod serial_port;
 pub mod snd;

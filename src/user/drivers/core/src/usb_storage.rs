@@ -42,12 +42,12 @@ const CSW_OFF: u64 = 32;
 const CBW_FLAG_IN: u8 = 0x80;
 
 // SCSI command opcodes (the transparent command set a USB stick speaks).
-const SCSI_TEST_UNIT_READY: u8 = 0x00;
-const SCSI_REQUEST_SENSE: u8 = 0x03;
-const SCSI_READ_CAPACITY10: u8 = 0x25;
-const SCSI_READ10: u8 = 0x28;
-const SCSI_WRITE10: u8 = 0x2a;
-const SCSI_SYNCHRONIZE_CACHE10: u8 = 0x35;
+// THE SCSI COMMAND SET COMES FROM THE CRATE THAT OWNS IT. It was six opcodes and two hand-built
+// command blocks in this file, which is where the roadmap says the SCSI core LIVED and why it said
+// the first driver to need it elsewhere must extract it AND move this path onto it in the same
+// change. An extraction that left this behind would have produced a second copy rather than a shared
+// one, which is exactly what the block wire's three copies cost before they were merged.
+use drivers::scsi;
 
 // One disk sector, and the block-service wire protocol this driver serves to a
 // StorageService instance - the same contract driver.virtio-blk serves: a request
@@ -225,7 +225,7 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 		let mut ready: bool = false;
 		let mut attempt: u32 = 0;
 		while attempt < 4 {
-			let turcb: [u8; 6] = [SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0];
+			let turcb = scsi::test_unit_ready();
 			if bot_command(hc, &mut hids, dev, &mut st, &turcb, 0, false) {
 				ready = true;
 				break;
@@ -237,7 +237,7 @@ pub unsafe fn configure_storage(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<St
 			return None;
 		}
 		// the block protocol serves 512-byte sectors; refuse a disk with another size.
-		let capcb: [u8; 10] = [SCSI_READ_CAPACITY10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+		let capcb = scsi::read_capacity10();
 		if !bot_command(hc, &mut hids, dev, &mut st, &capcb, 8, true) {
 			return None;
 		}
@@ -417,7 +417,7 @@ unsafe fn serve_read(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &m
 			reply_block(blk_server, STATUS_ERR, 0);
 			return;
 		}
-		let cb: [u8; 10] = read10_cb(SCSI_READ10, lba, count);
+		let cb = scsi::read_write10(false, lba as u32, count as u16);
 		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, bytes as u32, true);
 		if !ok {
 			read_sense(hc, hids, dev, st);
@@ -489,7 +489,7 @@ unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 			reply_block(blk_server, STATUS_ERR, 0);
 			return;
 		}
-		let cb: [u8; 10] = read10_cb(SCSI_WRITE10, lba, count);
+		let cb = scsi::read_write10(true, lba as u32, count as u16);
 		core::ptr::copy_nonoverlapping(src as *const u8, st.data_virt as *mut u8, bytes as usize);
 		let mut ok: bool = bot_command(hc, hids, dev, st, &cb, bytes as u32, false);
 		if !ok {
@@ -508,7 +508,7 @@ unsafe fn serve_write(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &
 fn read_sense(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage) -> [u8; 18] {
 	unsafe {
 		let mut out = [0u8; 18];
-		let sense: [u8; 6] = [SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0];
+		let sense = scsi::request_sense(scsi::SENSE_LEN as u8);
 		// A SENSE READ IS THE ONE TRANSFER A SHORT ANSWER IS AN ANSWER TO: a unit that returns twelve
 		// bytes of fixed-format sense has told us what happened.
 		let moved = bot_transfer(hc, hids, dev, st, &sense, 18, true, true).unwrap_or(0) as usize;
@@ -526,7 +526,7 @@ fn read_sense(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Stor
 // barrier still reports success. No data stage.
 fn serve_flush(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Storage, blk_server: u64) {
 	unsafe {
-		let cb: [u8; 10] = [SCSI_SYNCHRONIZE_CACHE10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+		let cb = scsi::synchronize_cache10();
 		let mut outcome = FlushOutcome::Committed;
 		if !bot_command(hc, hids, dev, st, &cb, 0, false) {
 			// The first failure may be a pending condition the unit was carrying; the sense read
@@ -544,11 +544,6 @@ fn serve_flush(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, st: &mut Sto
 		let ok = matches!(outcome, FlushOutcome::Committed | FlushOutcome::NoVolatileCache);
 		reply_block(blk_server, if ok { STATUS_OK } else { STATUS_ERR }, 0);
 	}
-}
-
-// Build a READ(10)/WRITE(10) command block: big-endian LBA and block count.
-fn read10_cb(opcode: u8, lba: u64, count: u32) -> [u8; 10] {
-	[opcode, 0, (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8, 0, (count >> 8) as u8, count as u8, 0]
 }
 
 // Send a block reply: [status u32 LE] carrying the handle `xfer` (0 = none).

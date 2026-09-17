@@ -578,6 +578,9 @@ pub const DMA_POLICY_TRUSTED_UNTRANSLATED: u32 = 2;
 pub const VIRTIO_TYPE_NET: u32 = 1;
 pub const VIRTIO_TYPE_BLOCK: u32 = 2;
 pub const VIRTIO_TYPE_CONSOLE: u32 = 3;
+// The SCSI host controller. It carries the SCSI command set to targets behind it, which is what a
+// machine with a real HBA looks like, rather than the tiny request format `virtio-blk` defines.
+pub const VIRTIO_TYPE_SCSI: u32 = 8;
 pub const VIRTIO_TYPE_RNG: u32 = 4;
 pub const VIRTIO_TYPE_GPU: u32 = 16;
 pub const VIRTIO_TYPE_INPUT: u32 = 18;
@@ -706,6 +709,7 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 	match device_type {
 		VIRTIO_TYPE_NET => "virtio-net",
 		VIRTIO_TYPE_BLOCK => "virtio-blk",
+		VIRTIO_TYPE_SCSI => "virtio-scsi",
 		VIRTIO_TYPE_CONSOLE => "virtio-console",
 		VIRTIO_TYPE_RNG => "virtio-rng",
 		VIRTIO_TYPE_GPU => "virtio-gpu",

@@ -135,3 +135,128 @@ fn a_ring_size_no_controller_expresses_is_refused() {
 	assert_eq!(ring_size_code(64), None, "a plausible size that the register cannot say");
 	assert_eq!(ring_size_code(0), None);
 }
+
+// ------------------------------------------------------- a fake controller's command and response
+//
+// THE PAIR WHERE THIS DRIVER ACTUALLY FAILED, and where the failure was invisible for four rounds.
+// A command ring and a response ring are not one ring twice: the driver owns the command ring's WRITE
+// pointer and reads the controller's, and the controller owns the response ring's write pointer and
+// the driver keeps its own read cursor. Every one of those four numbers can be off by one on its own,
+// and each produces a different plausible-looking stall.
+//
+// The model writes what a controller writes: it consumes commands up to the driver's write pointer,
+// posts one response each, and - the part that mattered - STOPS after `rintcnt` responses until the
+// status is acknowledged, which is exactly the behaviour that made a polling driver read its first
+// answer and then nothing at all.
+struct FakeCodecLink {
+	entries: u16,
+	// The command ring: what the driver has written, and what the controller has fetched.
+	corb_write: u16,
+	corb_read: u16,
+	// The response ring's write pointer, which the controller owns.
+	rirb_write: u16,
+	// How many responses it may post before it stalls, and how many it has posted since.
+	rintcnt: u16,
+	posted: u16,
+	stalled: bool,
+}
+
+impl FakeCodecLink {
+	fn new(entries: u16, rintcnt: u16) -> FakeCodecLink {
+		FakeCodecLink { entries, corb_write: 0, corb_read: 0, rirb_write: 0, rintcnt, posted: 0, stalled: false }
+	}
+
+	// The driver writes one command: it advances its own pointer first and rings afterwards.
+	fn submit(&mut self) {
+		self.corb_write = ring_next(self.corb_write, self.entries);
+	}
+
+	// The controller consumes what it can and answers each, stopping at its response bound.
+	fn run(&mut self) {
+		while self.corb_read != self.corb_write {
+			if self.posted == self.rintcnt {
+				self.stalled = true;
+				return;
+			}
+			self.corb_read = ring_next(self.corb_read, self.entries);
+			self.rirb_write = ring_next(self.rirb_write, self.entries);
+			self.posted += 1;
+		}
+	}
+
+	// The driver acknowledges the response status, which is what releases the stall.
+	fn acknowledge(&mut self) {
+		self.posted = 0;
+		self.stalled = false;
+	}
+}
+
+#[test]
+fn a_polling_driver_that_never_acknowledges_gets_one_answer_and_then_silence() {
+	// THE DEFECT THIS DRIVER HAD, as a property rather than an anecdote. `RINTCNT` at one is what an
+	// interrupt-driven driver wants; a polling one that never clears the response status then gets
+	// its first answer and nothing else, with the command ring's write pointer moving and the
+	// controller's read pointer standing still - which is exactly what the machine reported.
+	let mut link = FakeCodecLink::new(256, 1);
+	let mut read = 0u16;
+
+	link.submit();
+	link.run();
+	assert!(ring_has(link.rirb_write, read), "the first verb is answered");
+	read = ring_next(read, link.entries);
+
+	link.submit();
+	link.run();
+	assert!(link.stalled, "and the second is not even fetched");
+	assert_eq!(link.corb_read, 1, "the controller stopped one command behind");
+	assert_eq!(link.corb_write, 2, "while the driver had written two");
+	assert!(!ring_has(link.rirb_write, read), "so there is no second answer to read");
+}
+
+#[test]
+fn acknowledging_the_response_status_lets_the_command_ring_carry_on() {
+	// The repair, as the same property with the acknowledgement put back.
+	let mut link = FakeCodecLink::new(256, 1);
+	let mut read = 0u16;
+	for step in 0..8u16 {
+		link.submit();
+		link.run();
+		assert!(ring_has(link.rirb_write, read), "verb {step} should be answered");
+		read = ring_next(read, link.entries);
+		link.acknowledge();
+	}
+	assert_eq!(link.corb_read, link.corb_write, "the controller kept up with every command");
+}
+
+#[test]
+fn a_bound_high_enough_never_stalls_in_the_first_place() {
+	// The other half of the repair: a polling driver asks for the largest count the field holds, so
+	// the stall is not something it has to keep stepping out of.
+	let mut link = FakeCodecLink::new(256, 0xFF);
+	let mut read = 0u16;
+	for _ in 0..64 {
+		link.submit();
+		link.run();
+		assert!(!link.stalled);
+		assert!(ring_has(link.rirb_write, read));
+		read = ring_next(read, link.entries);
+	}
+}
+
+#[test]
+fn both_rings_wrap_together_over_a_full_pass_and_stay_in_step() {
+	// A ring of sixteen taken twice round, so both pointers wrap and the reader has to follow. An
+	// off-by-one in either direction shows up as a reader that is permanently one answer behind or
+	// one ahead - the first looks like a slow codec, the second like a codec answering the wrong verb.
+	const ENTRIES: u16 = 16;
+	let mut link = FakeCodecLink::new(ENTRIES, 0xFF);
+	let mut read = 0u16;
+	for step in 0..(ENTRIES * 2) {
+		link.submit();
+		link.run();
+		assert!(ring_has(link.rirb_write, read), "step {step} should have an answer waiting");
+		read = ring_next(read, ENTRIES);
+		assert!(!ring_has(link.rirb_write, read), "and exactly one, not two");
+	}
+	assert_eq!(read, link.rirb_write, "the reader ends where the controller does");
+}

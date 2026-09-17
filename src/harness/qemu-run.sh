@@ -643,6 +643,13 @@ qemu_attach_nvme() {
 	# THE SD MEDIUM IS SIZED TO A POWER OF TWO AND NOT TO TASTE. QEMU's `sd-card` refuses an image
 	# whose size is not one, which is the card specification rather than an implementation quirk, and
 	# a driver reading a CSD would have no way to express anything else.
+	local scsi="$QEMU_BUILD_DIR/scsi-scratch.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/scsi-scratch" .img
+	rm -f "$scsi"
+	truncate -s 4M "$scsi" || {
+		echo "qemu-run: could not make this run's SCSI medium at $scsi" >&2
+		return 1
+	}
 	local sd="$QEMU_BUILD_DIR/sd-scratch.$$.img"
 	scratch_sweep "$QEMU_BUILD_DIR/sd-scratch" .img
 	rm -f "$sd"
@@ -673,6 +680,12 @@ qemu_attach_nvme() {
 		# for virtio-sound - a wav file, a spice sink or none, depending on how the run was asked for.
 		# Without it QEMU refuses the codec outright and the guest never starts.
 		-device "hda-output,bus=hdabus.0,audiodev=snd0"
+		# AND A SCSI HOST CONTROLLER WITH A TARGET BEHIND IT, which is the shape a machine with a real
+		# HBA has: the driver speaks the SCSI command set to a target rather than a block device's own
+		# tiny request format, and the same block contract comes out of both.
+		-device "virtio-scsi-pci,id=scsibus"
+		-drive "file=$scsi,if=none,id=scsidisk,format=raw"
+		-device "scsi-hd,bus=scsibus.0,drive=scsidisk"
 	)
 }
 

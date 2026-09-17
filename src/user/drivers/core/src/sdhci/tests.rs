@@ -143,3 +143,114 @@ fn the_ocr_answer_is_asked_for_without_a_crc_check() {
 	// The ordinary short response is unchanged and still checked both ways.
 	assert_eq!(command_word(CMD_SEND_IF_COND, Response::Short, false) & ((1 << 3) | (1 << 4)), (1 << 3) | (1 << 4));
 }
+
+// ------------------------------------------------------------------ a fake controller's sequence
+//
+// AN SD COMMAND IS TWO EVENTS AND NOT ONE. The command completes, and then - for a command that moves
+// data - the transfer does, with the buffer becoming ready somewhere in between. A driver that waited
+// for the wrong one of those either reads a buffer the controller has not filled or reports success
+// while the card is still writing, and neither says anything at the time.
+struct FakeSlot {
+	status: u32,
+	// Whether the controller is still carrying a command or a transfer, which is what the inhibits
+	// report.
+	present: u32,
+}
+
+impl FakeSlot {
+	fn new() -> FakeSlot {
+		FakeSlot { status: 0, present: PRESENT_CARD_INSERTED | PRESENT_WRITE_PROTECT }
+	}
+
+	fn issue(&mut self, uses_data: bool) {
+		self.status = 0;
+		self.present |= PRESENT_CMD_INHIBIT;
+		if uses_data {
+			self.present |= PRESENT_DAT_INHIBIT;
+		}
+	}
+
+	fn command_done(&mut self) {
+		self.present &= !PRESENT_CMD_INHIBIT;
+		self.status |= INT_COMMAND_COMPLETE;
+	}
+
+	fn buffer_ready(&mut self, write: bool) {
+		self.status |= if write { INT_BUFFER_WRITE_READY } else { INT_BUFFER_READ_READY };
+	}
+
+	fn transfer_done(&mut self) {
+		self.present &= !PRESENT_DAT_INHIBIT;
+		self.status |= INT_TRANSFER_COMPLETE;
+	}
+
+	fn fail(&mut self, errors: u16) {
+		self.present &= !(PRESENT_CMD_INHIBIT | PRESENT_DAT_INHIBIT);
+		self.status |= INT_ERROR | ((errors as u32) << 16);
+	}
+}
+
+#[test]
+fn a_read_is_not_finished_when_its_buffer_becomes_ready() {
+	// The buffer being readable and the transfer being over are different moments, and reporting
+	// success at the first lets the next command start while the card is still working.
+	let mut slot = FakeSlot::new();
+	slot.issue(true);
+	let wanted = INT_COMMAND_COMPLETE | INT_BUFFER_READ_READY;
+	assert_eq!(completion(slot.status, wanted), Completion::Waiting);
+	slot.command_done();
+	assert_eq!(completion(slot.status, wanted), Completion::Waiting, "the command is done and the buffer is not");
+	slot.buffer_ready(false);
+	assert_eq!(completion(slot.status, wanted), Completion::Done, "now the driver may drain the port");
+	assert_eq!(completion(slot.status, INT_TRANSFER_COMPLETE), Completion::Waiting, "but the transfer is still running");
+	slot.transfer_done();
+	assert_eq!(completion(slot.status, INT_TRANSFER_COMPLETE), Completion::Done);
+}
+
+#[test]
+fn a_second_command_waits_for_the_line_it_actually_uses() {
+	// A command with no data may go while a transfer is still running; one that moves data may not.
+	// Waiting for both every time serialises the driver behind work it does not touch.
+	let mut slot = FakeSlot::new();
+	slot.issue(true);
+	slot.command_done();
+	assert_eq!(may_send(slot.present, false), Ok(()), "a command with no data may follow");
+	assert_eq!(may_send(slot.present, true), Err(Busy::Data), "one that moves data may not");
+	slot.transfer_done();
+	assert_eq!(may_send(slot.present, true), Ok(()));
+}
+
+#[test]
+fn an_error_ends_the_wait_even_though_the_completion_bits_never_arrive() {
+	// A driver that only tested for its wanted bits would spin out its whole timeout on a command
+	// the controller has already refused, and then report a timeout rather than the error.
+	let mut slot = FakeSlot::new();
+	slot.issue(true);
+	slot.fail(0x0010); // a command timeout error
+	assert_eq!(completion(slot.status, INT_COMMAND_COMPLETE | INT_BUFFER_READ_READY), Completion::Failed { errors: 0x0010 });
+	assert_eq!(may_send(slot.present, true), Ok(()), "and the controller has released both lines");
+}
+
+#[test]
+fn an_error_arriving_together_with_a_completion_is_still_an_error() {
+	// Some controllers raise both. Testing for completion first calls a failed transfer finished and
+	// returns whatever was in the buffer.
+	let mut slot = FakeSlot::new();
+	slot.issue(true);
+	slot.command_done();
+	slot.buffer_ready(false);
+	slot.fail(0x0002);
+	assert_eq!(completion(slot.status, INT_COMMAND_COMPLETE | INT_BUFFER_READ_READY), Completion::Failed { errors: 0x0002 });
+}
+
+#[test]
+fn a_write_to_a_protected_card_is_refused_before_the_command_is_built() {
+	// The card is present and readable; only the write is refused. A driver that treated the switch
+	// as a broken medium would stop serving reads it can perfectly well serve.
+	let mut slot = FakeSlot::new();
+	assert!(card_present(slot.present));
+	assert!(!write_protected(slot.present), "the switch is off in this fixture");
+	slot.present &= !PRESENT_WRITE_PROTECT;
+	assert!(card_present(slot.present), "still a card");
+	assert!(write_protected(slot.present), "and now a protected one");
+}
