@@ -139,6 +139,18 @@ mutate "$DRIVERS" src/user/drivers/core/src/nvme.rs \
 	if len <= first_page_holds {" \
 	an_unaligned_transfer_needs_a_page_more_than_its_length_suggests
 
+# NVMe: an entry whose phase arrived before the rest of it is not a completion. Collapsing it into
+# "somebody else's completion" is what made this driver's bring-up fail one boot in three, and the
+# rule lived in the driver where no test could reach it until it was moved here.
+mutate "$DRIVERS" src/user/drivers/core/src/nvme.rs \
+	"	if completion.command_id == NEVER_ISSUED {
+		return Reaped::Arriving;
+	}" \
+	"	if false {
+		return Reaped::Arriving;
+	}" \
+	a_phase_bit_that_arrived_before_its_entry_is_not_a_completion
+
 # AHCI: the command-issue bit clears on COMPLETION and not on success, so a driver watching only it
 # reports a bad sector as good data.
 mutate "$DRIVERS" src/user/drivers/core/src/ahci.rs \

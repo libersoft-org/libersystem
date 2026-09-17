@@ -277,20 +277,16 @@ impl Pair {
 			for (i, byte) in entry.iter_mut().enumerate() {
 				*byte = unsafe { r8(slot + i as u64) };
 			}
-			// AND AN ENTRY STILL READING AS COMMAND ID ZERO HAS NOT FINISHED ARRIVING. The phase bit
-			// became visible before the rest of the sixteen bytes did, which is what the measurement
-			// showed: `sq 0 head 0` with five commands outstanding, every field zero but the phase.
-			// This driver never issues id zero, so the entry cannot belong to anyone - it is not yet
-			// a completion, and the answer is to keep waiting rather than to give up on a command the
-			// controller has not answered yet.
-			if nvme::Completion::decode(&entry).command_id == 0 {
-				spins += 1;
-				if spins > COMPLETION_SPINS {
-					return Err(Fault::Timeout);
-				}
-				continue;
-			}
 			match nvme::reap(&entry, self.phase, command_id_wanted) {
+				// AN ENTRY WHOSE PHASE ARRIVED BEFORE THE REST OF IT. `drivers::nvme` owns that rule
+				// now, where a host test can watch it: it was written here, in the one place no test
+				// could reach, and it is the rule that ended an intermittent bring-up.
+				Reaped::Arriving => {
+					spins += 1;
+					if spins > COMPLETION_SPINS {
+						return Err(Fault::Timeout);
+					}
+				}
 				Reaped::Empty => {
 					spins += 1;
 					if spins > COMPLETION_SPINS {
@@ -389,8 +385,8 @@ impl Controller {
 	// responses - wait, or give up.
 	fn command_id(&mut self) -> u16 {
 		self.next_id = self.next_id.wrapping_add(1);
-		if self.next_id == 0 {
-			self.next_id = 1;
+		if self.next_id == nvme::NEVER_ISSUED {
+			self.next_id = nvme::NEVER_ISSUED.wrapping_add(1);
 		}
 		self.next_id
 	}

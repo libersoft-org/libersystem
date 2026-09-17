@@ -157,7 +157,22 @@ pub enum Reaped {
 	Mine { succeeded: bool, sq_head: u16 },
 	// A completion for a command id that is not outstanding.
 	Unexpected { command_id: u16 },
+	// THE PHASE BIT HAS ARRIVED AND THE REST OF THE ENTRY HAS NOT.
+	//
+	// A sixteen-byte write from a device is not atomic to its reader, so the bit that says "this entry
+	// is yours" can become visible while the id, the status and the queue head are still the zeroes
+	// the driver put there. This is told apart from `Unexpected` because the two want OPPOSITE
+	// responses - keep waiting, or stop using the queue - and collapsing them made this driver's
+	// bring-up fail roughly one boot in three.
+	Arriving,
 }
+
+// The command id this driver never issues, which is what makes a half-arrived entry recognisable.
+//
+// A RULE THE DRIVER KEEPS rather than a fact that happens to hold: the id counter skips it on wrap.
+// Without it, an entry whose phase landed first and a completion belonging to somebody else are the
+// same observation, and neither can be acted on.
+pub const NEVER_ISSUED: u16 = 0;
 
 // Read one completion slot. `expected_phase` flips every time the ring wraps, which is what tells a
 // new entry from the one that was in that slot last time around: the memory is never cleared, so
@@ -166,6 +181,12 @@ pub fn reap(entry: &[u8; CQ_ENTRY_LEN], expected_phase: bool, waiting_for: u16) 
 	let completion = Completion::decode(entry);
 	if completion.phase != expected_phase {
 		return Reaped::Empty;
+	}
+	// THE PHASE SAID YES AND THE ENTRY IS STILL EMPTY, which is a write that has not finished rather
+	// than an answer. Checked BEFORE the id is compared, because an id of zero would otherwise read as
+	// somebody else's completion and take the queue out of use over a race.
+	if completion.command_id == NEVER_ISSUED {
+		return Reaped::Arriving;
 	}
 	if completion.command_id != waiting_for {
 		return Reaped::Unexpected { command_id: completion.command_id };

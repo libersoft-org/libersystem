@@ -182,3 +182,164 @@ fn a_format_index_in_the_upper_half_is_refused_rather_than_read_from_the_wrong_e
 	assert_eq!(lba_format_index(3), Some(3));
 	assert_eq!(lba_format_index(0x1F), None, "bit 4 selects formats past the sixteen read here");
 }
+
+#[test]
+fn a_phase_bit_that_arrived_before_its_entry_is_not_a_completion() {
+	// THE WORST DEFECT THIS DRIVER HAD, and it lived in the driver where no host test could see it.
+	// A sixteen-byte write from a device is not atomic to its reader: the bit that says "this entry
+	// is yours" becomes visible while the id, the status and the queue head are still zero. Measured
+	// on a real controller, the entry read as `sq 0 head 0` with five commands outstanding - a
+	// completion that had answered nothing.
+	let mut torn = [0u8; CQ_ENTRY_LEN];
+	torn[14] = 1; // bit 16 of dword 3: the phase, and nothing else
+	assert_eq!(reap(&torn, true, 5), Reaped::Arriving);
+}
+
+#[test]
+fn arriving_and_unexpected_are_told_apart_because_they_want_opposite_answers() {
+	// One says keep waiting; the other says this driver and the controller disagree about what is
+	// outstanding, which is a reason to stop using the queue. Collapsing them made the bring-up fail
+	// roughly one boot in three, and "drain it and carry on" - the fix that treats both as stale -
+	// made it worse, because there was no right answer coming.
+	let torn = completion(NEVER_ISSUED, true, 0, 0, 0);
+	let other = completion(99, true, 0, 0, 2);
+	assert_eq!(reap(&torn, true, 5), Reaped::Arriving);
+	assert_eq!(reap(&other, true, 5), Reaped::Unexpected { command_id: 99 });
+	assert_ne!(reap(&torn, true, 5), reap(&other, true, 5));
+}
+
+#[test]
+fn a_half_arrived_entry_of_the_wrong_phase_is_still_simply_empty() {
+	// The phase is asked FIRST, so an entry from the previous pass around the ring is empty whatever
+	// else it holds - including an id of zero, which must not be reported as an arrival in a slot
+	// the controller has not touched this time round.
+	let mut stale = [0u8; CQ_ENTRY_LEN];
+	assert_eq!(reap(&stale, true, 5), Reaped::Empty, "zeroed memory on the first pass");
+	stale[14] = 1;
+	assert_eq!(reap(&stale, false, 5), Reaped::Empty, "and the same entry on the pass that is not expecting it");
+}
+
+#[test]
+fn the_id_this_driver_never_issues_is_the_one_that_makes_a_torn_entry_recognisable() {
+	// If zero were ever issued, an arriving entry and that command's own completion would be the
+	// same observation and neither could be acted on.
+	assert_eq!(NEVER_ISSUED, 0);
+	let real = completion(1, true, 0, 0, 1);
+	assert_eq!(reap(&real, true, 1), Reaped::Mine { succeeded: true, sq_head: 1 }, "the first id a driver may use is one");
+}
+
+// ------------------------------------------------------------------ a fake controller's ring
+//
+// THE INDIVIDUAL TESTS ABOVE ASK ABOUT ONE ENTRY. This asks about a RING: a controller filling slots
+// in order, wrapping, and flipping the phase as it goes, with a driver walking behind it. The
+// properties that only appear over a sequence - that the phase discipline survives a wrap, that a
+// stale entry from the previous pass is never mistaken for a fresh one, and that a reader which
+// stops sees the ring exactly as it left it - cannot be seen one entry at a time.
+//
+// It is a MODEL OF THE CONTROLLER'S HALF and not of the driver's: it writes what a controller writes
+// and nothing else, so what the assertions exercise is the decision layer against something that
+// behaves the way the hardware does.
+struct FakeRing {
+	slots: alloc::vec::Vec<[u8; CQ_ENTRY_LEN]>,
+	// The controller's own cursor, and the phase it is currently writing.
+	write: usize,
+	phase: bool,
+}
+
+impl FakeRing {
+	fn new(entries: usize) -> FakeRing {
+		// Zeroed, exactly as a driver hands it over: every slot reads phase 0 on the first pass.
+		FakeRing { slots: alloc::vec![[0u8; CQ_ENTRY_LEN]; entries], write: 0, phase: true }
+	}
+
+	// The controller posts one completion and advances, flipping its phase on the wrap.
+	fn post(&mut self, command_id: u16, status_code: u8, sq_head: u16) {
+		self.slots[self.write] = completion(command_id, self.phase, 0, status_code, sq_head);
+		self.write += 1;
+		if self.write == self.slots.len() {
+			self.write = 0;
+			self.phase = !self.phase;
+		}
+	}
+}
+
+#[test]
+fn a_reader_walking_behind_a_filling_ring_sees_every_completion_once_and_in_order() {
+	// Three times round a four-entry ring, so the phase flips three times and every slot is reused.
+	const ENTRIES: usize = 4;
+	let mut ring = FakeRing::new(ENTRIES);
+	let mut head = 0usize;
+	let mut phase = true;
+	for step in 0..(ENTRIES * 3) {
+		let id = (step as u16) + 1;
+		ring.post(id, 0, id);
+		match reap(&ring.slots[head], phase, id) {
+			Reaped::Mine { succeeded, sq_head } => {
+				assert!(succeeded, "step {step} should succeed");
+				assert_eq!(sq_head, id, "and carry its own head");
+			}
+			other => panic!("step {step} read {other:?} instead of its completion"),
+		}
+		head += 1;
+		if head == ENTRIES {
+			head = 0;
+			phase = !phase;
+		}
+	}
+}
+
+#[test]
+fn a_reader_that_stops_reads_the_slot_ahead_as_empty_and_not_as_last_time_round() {
+	// THE PROPERTY A WRAP EXISTS TO BREAK. After a full pass the slots all hold real completions from
+	// the previous round; the only thing that distinguishes "already read" from "new" is the phase,
+	// and a driver that lost track of it would replay the whole ring.
+	const ENTRIES: usize = 4;
+	let mut ring = FakeRing::new(ENTRIES);
+	for id in 1..=ENTRIES as u16 {
+		ring.post(id, 0, id);
+	}
+	// The reader has consumed all four and is back at slot zero, now expecting the opposite phase.
+	assert_eq!(reap(&ring.slots[0], false, 5), Reaped::Empty, "the first pass's entry is not the second pass's");
+	// And once the controller overwrites it, the same slot is a completion again.
+	ring.post(5, 0, 5);
+	assert_eq!(reap(&ring.slots[0], false, 5), Reaped::Mine { succeeded: true, sq_head: 5 });
+}
+
+#[test]
+fn a_controller_that_posts_nothing_leaves_every_slot_empty_for_ever() {
+	// The timeout case, at the decision layer: there is no state in which an untouched ring reports
+	// anything but `Empty`, so a driver's bound is the only thing that ends the wait - which is why
+	// it has to have one.
+	let ring = FakeRing::new(8);
+	for slot in &ring.slots {
+		assert_eq!(reap(slot, true, 1), Reaped::Empty);
+	}
+}
+
+#[test]
+fn a_failed_completion_in_the_middle_of_a_ring_does_not_disturb_the_ones_after_it() {
+	// Resource cleanup at this layer is the reader staying in step: a failure is consumed exactly
+	// like a success, because the entry has been written either way.
+	const ENTRIES: usize = 4;
+	let mut ring = FakeRing::new(ENTRIES);
+	ring.post(1, 0, 1);
+	ring.post(2, 0x0B, 2); // a failure
+	ring.post(3, 0, 3);
+	assert_eq!(reap(&ring.slots[0], true, 1), Reaped::Mine { succeeded: true, sq_head: 1 });
+	assert_eq!(reap(&ring.slots[1], true, 2), Reaped::Mine { succeeded: false, sq_head: 2 });
+	assert_eq!(reap(&ring.slots[2], true, 3), Reaped::Mine { succeeded: true, sq_head: 3 });
+}
+
+#[test]
+fn a_completion_arriving_for_a_command_the_reader_has_given_up_on_is_told_apart_from_a_torn_one() {
+	// The disconnect case: a command timed out, the driver moved on, and its answer turns up in the
+	// slot the next command was waiting at. That is a real completion for an abandoned id - the
+	// queue and the driver disagree - and it must not read as an entry still arriving, because one
+	// says stop and the other says wait.
+	let mut ring = FakeRing::new(4);
+	ring.post(7, 0, 7);
+	assert_eq!(reap(&ring.slots[0], true, 8), Reaped::Unexpected { command_id: 7 });
+	let mut torn = [0u8; CQ_ENTRY_LEN];
+	torn[14] = 1;
+	assert_eq!(reap(&torn, true, 8), Reaped::Arriving);
+}
