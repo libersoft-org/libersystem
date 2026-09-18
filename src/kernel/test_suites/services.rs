@@ -2665,6 +2665,86 @@ fn pty_hosts_a_program() {
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
 }
 
+tagged_test!(a_tty_a_job_left_raw_comes_back_cooked, [Service, Console, Shell], id = "kernel.services.a_tty_a_job_left_raw_comes_back_cooked", covers = ["kernel", "term", "bin.console_service"]);
+fn a_tty_a_job_left_raw_comes_back_cooked() {
+	use object::channel::{Channel, Message};
+	use object::privilege::{Privilege, PrivilegeKind};
+	use object::rights::Rights;
+
+	// THE MODE IS THE TERMINAL'S, AND A JOB ONLY BORROWS IT.
+	//
+	// An interactive full-screen tool asks for raw, and it used to be the tool's own job to ask for
+	// cooked again on the way out. A tool does not always GET a way out: Ctrl+C terminates it where
+	// it stands, and nothing in a terminated process runs. The terminal then stayed raw for the
+	// shell that came back to it - every keystroke delivered on its own, so each letter of the next
+	// command was read as a whole command line, and the session was unusable from the first key
+	// with nothing on screen to say why.
+	//
+	// So the test is the release of the tty, which is the one message that happens however the job
+	// ended: type in raw and see single bytes, release the tty, type again and see a whole line.
+	// A TEST THAT TYPES, rather than one that asks the console what mode it thinks it is in: the
+	// mode is not observable from outside, and what a person notices is the shape of what arrives.
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let console_elf = program_elf(&package, volume, b"console_service").expect("console_service in the package or volume");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (vt1_console, vt1_program) = Channel::create();
+	let (ctl_console, ctl_shell) = Channel::create();
+	let (dummy, _dummy_far) = Channel::create();
+	let _console_service = spawn_dynamic_test_process(sched::root_domain(), console_elf, boot_user);
+	// THE CONSOLE SINK, which the other console harnesses in this file do not need and this one
+	// cannot do without: `SYS_CONSOLE_ATTACH` is what makes this service the one the kernel hands
+	// keystrokes to, and a console that never attached has no input channel for the test to type
+	// into at all.
+	let sink: alloc::sync::Arc<dyn object::KernelObject> = Privilege::create(PrivilegeKind::ConsoleSink).expect("a console sink privilege");
+	send_cap(&boot_kernel, b"CONSOLESINK", sink, Rights::ALL).expect("CONSOLESINK bootstrap");
+	send_cap(&boot_kernel, b"CLIENT", vt1_console, Rights::ALL).expect("CLIENT bootstrap");
+	send_cap(&boot_kernel, b"CONTROL", ctl_console, Rights::ALL).expect("CONTROL bootstrap");
+	for tag in [&b"FSTORAGE"[..], &b"FLOG"[..], &b"FDEVICE"[..], &b"FPROCESS"[..], &b"FCONFIG"[..], &b"FTIME"[..], &b"FAUDIO"[..], &b"FSESSION"[..], &b"FPERM"[..], &b"FNET"[..]] {
+		send_cap(&boot_kernel, tag, dummy.clone(), Rights::ALL).expect("factory bootstrap");
+	}
+	// Headless: no DISPLAY and no POINTER. The line discipline is the same code on a VT with a grid
+	// and one without, and a display here would only add a scanout and a present handshake to a
+	// test about what a keystroke turns into.
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("READY bootstrap");
+	sched::run_until_idle();
+	let online = boot_kernel.recv().expect("ConsoleService online report");
+	assert_eq!(&online.bytes[..], b"ConsoleService: online", "ConsoleService reports in");
+
+	let type_serial = |bytes: &[u8]| {
+		for &byte in bytes {
+			assert!(crate::console_input::feed_serial(byte), "the attached console takes the keystroke");
+			sched::run_until_idle();
+		}
+	};
+	let read_program = || -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+		let mut out = alloc::vec::Vec::new();
+		while let Ok(message) = vt1_program.recv() {
+			out.push(message.bytes);
+		}
+		out
+	};
+
+	// Cooked is where a terminal starts, and the line arrives whole on Enter.
+	type_serial(b"ab\n");
+	assert_eq!(read_program(), alloc::vec![b"ab\n".to_vec()], "a cooked terminal delivers the edited line, once, on Enter");
+
+	// SET_MODE raw, unechoed - what `imgview`, `less` and `ps -i` ask for.
+	let mut raw: alloc::vec::Vec<u8> = b"SET_MODE".to_vec();
+	raw.push(1);
+	raw.push(0);
+	ctl_shell.send(Message::new(raw, alloc::vec::Vec::new())).expect("SET_MODE raw");
+	sched::run_until_idle();
+	type_serial(b"cd");
+	assert_eq!(read_program(), alloc::vec![b"c".to_vec(), b"d".to_vec()], "a raw terminal delivers each keystroke on its own");
+
+	// The job ends - however it ended - and the shell releases the tty.
+	ctl_shell.send(Message::new(b"CLEAR_FG".to_vec(), alloc::vec::Vec::new())).expect("CLEAR_FG");
+	sched::run_until_idle();
+	type_serial(b"ef\n");
+	assert_eq!(read_program(), alloc::vec![b"ef\n".to_vec()], "releasing the tty puts the line discipline back: the next line arrives whole again");
+}
+
 tagged_test!(the_console_answers_a_program_through_its_own_channel, [Service, Console, Display], id = "kernel.services.the_console_answers_a_program_through_its_own_channel", covers = ["kernel", "term", "bin.console_service"]);
 fn the_console_answers_a_program_through_its_own_channel() {
 	use object::channel::{Channel, Message};

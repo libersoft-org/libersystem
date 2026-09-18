@@ -1966,3 +1966,75 @@ pixel across twenty-five commands. That is not a constant factor waiting to be f
 sampling an encoded image costs one texel at a time, and the ways out are a decoded-texel cache, a
 byte-indexed decode table that is exact for 8-bit sources, or SIMD. Each is a change to the numeric
 path or to the memory budget, which is why the item calls the ceiling a decision rather than a task.
+
+---
+
+## IMPLEMENTER NOTE (2026-09-18): "imgview cannot be closed" was the TERMINAL, not the viewer
+
+REPORTED AS: `cd wallpapers; imgview logo.webp` shows the image, then Escape does nothing, Ctrl+C
+does nothing, and after roughly ten Ctrl+C and half a minute it goes away.
+
+MEASURED ON A LIVE x86_64 GUEST, with the whole key path instrumented at the kernel debug port
+(`debug_write`, not the console - a diagnostic that goes through ConsoleService cannot be trusted to
+report a fault in ConsoleService, and the first two instrumented runs deadlocked on exactly that).
+
+WHAT THE INSTRUMENTATION FOUND, in order:
+
+1. The raw-key path is intact end to end. `virtio_input` sends the HID usage to the key sink,
+   InputService's `record_key` runs, the focus proof validates, `subscribe-keys` returns a live
+   stream, and `handle_code` sees the Escape. Every hypothesis about a missing `KEYS` channel, a
+   stale `key_sink`, an unmapped keycode or a lost focus proof was wrong, and each was disproved by
+   a print rather than by reading.
+2. The viewer LEAVES ITS LOOP on Escape. What it could not do was finish: the teardown ran to
+   `set_stdin(0)` and then the whole console output path stalled, which is what made the first two
+   runs look like a hang inside `Surface::drop`.
+3. The stall was the instrumentation's own `eprint`. With the diagnostics moved off the console, the
+   surface close, the deferred `remove_surface`, the `CONSOLE` focus hand-back and the restore
+   present all completed, and the prompt came back.
+
+THE DEFECT IS WHAT HAPPENS ON THE PATH THE USER ACTUALLY TOOK. They type in the terminal, so their
+Escape and their Ctrl+C are BYTES on the serial line, not keyboard events:
+
+- Ctrl+C reaches `feed_tty`, which turns it into SIG_INT for the foreground job - ABOVE the raw/cooked
+  branch, so it works in raw mode too. `imgview` did not arm `catch_interrupt`, so SIG_INT terminated
+  it where it stood. Nothing in a terminated process runs: the raw, unechoed mode it had asked the
+  terminal for was never given back.
+- `CLEAR_FG` - the message the shell sends however the job ended - did not restore the line
+  discipline. So the shell came back to a RAW terminal and delivered every keystroke on its own:
+  `ls` answered "unknown command: l" and then "unknown command: s". That is the "nothing responds any
+  more", and it is also why more Ctrl+C looked like it eventually did something.
+
+FIXED IN THREE PLACES:
+
+- `console_service.rs`, `tty_fg_winsize`: releasing the tty puts `ld.cooked` and `ld.echo` back. The
+  release is the one event that happens whatever killed the job, which is why the restore belongs
+  there and not in each tool.
+- `imgview.rs`: `catch_interrupt()` plus an `interrupted()` poll on both sides of the wait, so Ctrl+C
+  leaves through the same teardown as `q`.
+- `imgview.rs`, `handle_serial_byte`: 0x03 and 0x04 exit. A terminal that is not holding the viewer
+  as a foreground job passes them through as bytes, and they fell to the catch-all.
+
+The two silent `return`s after `input_focus()` and `subscribe_keys()` now say which one refused; a
+viewer that could not take the keyboard was indistinguishable from one ignoring every key, and the
+two are fixed in different places.
+
+TESTS, AND EACH WAS DRIVEN BY A MUTATION BEFORE IT WAS BELIEVED:
+
+- `kernel.services.a_tty_a_job_left_raw_comes_back_cooked` - a headless ConsoleService with a minted
+  ConsoleSink privilege so the test can TYPE (`console_input::feed_serial`): cooked delivers the
+  line whole, raw delivers single bytes, and after `CLEAR_FG` the next line arrives whole again.
+  Removing the two restore lines fails it on the last assertion.
+- `imgview_interactions` gained `RawInterrupt` (0x03 as a byte) and `CaughtInterrupt` (the pending
+  flag plus a wake, exactly as the kernel drives a tty's Ctrl+C). Both assert the viewer CLOSES ITS
+  SURFACE, which is what says it left through the teardown. Removing `catch_interrupt()` fails the
+  second; removing the `0x03 | 0x04` arm fails the first.
+
+Guest evidence: 97 tests over `imgview,console,shell,service,network`, and by hand on a live guest
+the user's own sequence - `cd wallpapers`, `imgview logo.webp` - exits on keyboard Escape, on serial
+Escape and on Ctrl+C, with `echo` working normally afterwards in all three.
+
+ALSO FIXED, same report: `ping`. A timeout printed nothing on the CLI path ("timeouts are silent
+losses"), so a link where every probe times out produced one header and then apparent silence until
+the summary; it now prints `Request timeout for icmp_seq=N` as it happens. And a timeout rendered
+through the wire record as `"ttl": 0, "rtt-us": 0` - a measurement of zero rather than the absence of
+one - now renders `null`, which is what the statistics block already said.

@@ -203,6 +203,12 @@ fn handle_serial_byte(state: &mut SerialInput, escape_deadline: &mut u64, byte: 
 				ViewAction::None
 			}
 			b'q' => ViewAction::Exit,
+			// CTRL+C AND CTRL+D ARE WAYS OUT OF A FULL-SCREEN TOOL, and on this path they arrive as
+			// BYTES. A terminal with a foreground job turns them into signals itself, but one
+			// without that hold - a PTY, a job the tty never took - passes them through, and they
+			// fell to the catch-all below: the viewer read them and did nothing, which is a program
+			// that cannot be closed from the keyboard that started it.
+			0x03 | 0x04 => ViewAction::Exit,
 			b'+' | b'=' => {
 				if viewport.zoom_in(screen) {
 					ViewAction::Redraw
@@ -393,6 +399,14 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 
 fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 	unsafe {
+		// CTRL+C MUST REACH THE TEARDOWN BELOW, NOT SKIP IT.
+		//
+		// Unarmed, SIG_INT terminates the process where it stands: the tty is left in the raw,
+		// unechoed mode this viewer asked for, the surface is left for DisplayService to reap when
+		// the channel closes, and the key stream with it. Armed, the same Ctrl+C sets a flag this
+		// loop polls, and the viewer leaves the way `q` and Esc leave it - which is the only way
+		// the terminal it borrowed comes back the way it was borrowed.
+		catch_interrupt();
 		let display = surface::connect(display_channel);
 		// TWO IMAGES, which is the fewest a present queue will negotiate: a viewer redraws on a key
 		// and never several frames ahead, so a third would be memory it does not use.
@@ -415,10 +429,15 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		if !present_view(&surface, layout, target_len, &image, &viewport) {
 			return;
 		}
+		// SAYING WHY, because both of these used to return in silence: a viewer that could not take
+		// the keyboard looked exactly like one that had taken it and was ignoring every key, and the
+		// two are fixed in different places.
 		let Some(focus) = surface.input_focus().and_then(Result::ok) else {
+			eprint(b"imgview: the display did not grant input focus\n");
 			return;
 		};
 		let Some(key_stream) = surface::subscribe_keys(input_channel, focus) else {
+			eprint(b"imgview: the input service refused the focus proof\n");
 			return;
 		};
 		let stdin_channel = stdin();
@@ -436,6 +455,12 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		let mut next_repeat = clock().saturating_add(PAN_REPEAT_TICKS);
 		let mut exit_requested = false;
 		while !exit_requested {
+			// BEFORE THE WAIT AND AFTER IT, because the flag can be set on either side of a park:
+			// the signal wakes every thread, so the wait returns rather than holding a viewer that
+			// has already been asked to close.
+			if interrupted() {
+				break;
+			}
 			let repeat_pan = held & HELD_PAN != 0 && viewport.can_pan(screen);
 			let repeat_zoom = held & HELD_ZOOM != 0;
 			let repeat_deadline = if repeat_pan || repeat_zoom { next_repeat } else { 0 };
@@ -464,6 +489,9 @@ fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 					wait_any_periodic(&waits, deadline)
 				}
 			};
+			if interrupted() {
+				break;
+			}
 			if ready == ERR_TIMED_OUT {
 				let now = clock();
 				if serial_escape_deadline != 0 && now >= serial_escape_deadline {

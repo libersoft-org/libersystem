@@ -214,6 +214,45 @@ mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
 	"			(0xFF, 0xFF) => Sense::NotReadyYet," \
 	not_ready_covers_a_unit_spinning_up_and_one_with_no_medium_and_the_key_alone_cannot_tell
 
+# SCSI: the LUN list length counts BYTES and not units. Read as a count, a target with four units
+# reports four bytes of list, which does not hold one whole entry - so the driver serves none of them
+# and nothing anywhere contradicts the number.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"	let usable = claimed.min(arrived) / 8;" \
+	"	let usable = claimed.min(arrived / 8);" \
+	the_lun_list_length_counts_bytes_and_not_units
+
+# SCSI: the top two bits of an addressing field choose how the rest is read. Skipping them reads a
+# flat unit 0x0101 as peripheral unit 1 - which exists on most targets and answers, so the wrong
+# medium is served under the right name.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"		0b01 => Some((((field[0] & 0x3F) as u16) << 8) | field[1] as u16)," \
+	"		0b01 => Some(field[1] as u16)," \
+	the_addressing_method_decides_which_number_the_same_bytes_name
+
+# SCSI: the list length is the DEVICE'S CLAIM and not the answer's length. A target says "ask again
+# with more" by claiming a longer list, and a driver indexing by the claim reads past its own DMA
+# page - and publishes whatever the last command left there as a medium.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"	let usable = claimed.min(arrived) / 8;" \
+	"	let usable = claimed / 8;" \
+	a_list_longer_than_the_answer_is_clamped_to_what_arrived
+
+# SCSI: the MISSED flag is OR'd into the event word, not a value of it. Compared whole, a driver
+# stops recognising events the moment the device says it has already dropped some - which is exactly
+# when its picture of the bus is stale, and reads as a quiet driver on a busy bus.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"	let event = match word & 0x7FFF_FFFF {" \
+	"	let event = match word {" \
+	the_missed_flag_is_not_part_of_the_event_number
+
+# SCSI: one transport-reset event number covers a unit arriving, leaving and resetting itself, and
+# only the reason tells them apart. Acting on the number alone re-enumerates a unit that is gone.
+mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
+	"			2 => Event::Removed," \
+	"			2 => Event::Rescan," \
+	a_transport_reset_is_three_different_things_and_the_reason_says_which
+
 # UAS: the tag is big-endian in a transport that is little-endian everywhere else. Swapped, it
 # matches no answer - and an answer matching nothing is indistinguishable from a device fault.
 mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \

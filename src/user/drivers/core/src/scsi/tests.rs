@@ -3,6 +3,7 @@
 // block, and a sense key acted on without the code that qualifies it.
 
 use super::*;
+use alloc::vec::Vec;
 
 #[test]
 fn a_block_address_is_big_endian_which_is_the_opposite_of_every_other_wire_here() {
@@ -138,4 +139,151 @@ fn the_commands_that_carry_nothing_carry_nothing() {
 	assert_eq!(&synchronize_cache10()[7..9], &[0, 0]);
 	// And the sense request's allocation length is one byte, so what a caller asks for has to fit.
 	assert_eq!(request_sense(SENSE_LEN as u8)[4], SENSE_LEN as u8);
+}
+
+// A `REPORT LUNS` answer: the header, then one eight-byte addressing field per unit. Built here the
+// way a target builds it, so a test states the wire rather than a decoded shape.
+fn report_luns_answer(entries: &[[u8; 8]], claimed_bytes: u32) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(&claimed_bytes.to_be_bytes());
+	out.extend_from_slice(&[0u8; 4]);
+	for entry in entries {
+		out.extend_from_slice(entry);
+	}
+	out
+}
+
+#[test]
+fn the_lun_list_length_counts_bytes_and_not_units() {
+	// Read as a count, a target with four units reports four BYTES of list: the driver takes zero
+	// whole entries out of it and serves NONE of the four. The number is right there in the answer,
+	// which is why nothing downstream ever contradicts it.
+	let entries = [[0u8, 0, 0, 0, 0, 0, 0, 0], [0u8, 1, 0, 0, 0, 0, 0, 0], [0u8, 2, 0, 0, 0, 0, 0, 0], [0u8, 3, 0, 0, 0, 0, 0, 0]];
+	let answer = report_luns_answer(&entries, 32);
+	let mut out = [0u16; 8];
+	assert_eq!(luns(&answer, &mut out), 4, "four units, from a list thirty-two bytes long");
+	assert_eq!(&out[..4], &[0, 1, 2, 3]);
+
+	// AND THE MISREAD IS NOT MERELY FEWER UNITS: a claim of 4 is half an entry, which rounds down to
+	// none at all. A test asserting only "some units" would pass on the defect.
+	let misread = report_luns_answer(&entries, 4);
+	assert_eq!(luns(&misread, &mut out), 0, "a claim of four BYTES holds no whole entry");
+}
+
+#[test]
+fn a_list_longer_than_the_answer_is_clamped_to_what_arrived() {
+	// A target says "ask again with more" by claiming a list longer than the allocation it was
+	// given. The claim is the DEVICE'S, and a driver that indexed by it would read past the answer -
+	// which here is a buffer inside the driver's own DMA page, so what it would read is whatever the
+	// last command left behind and would publish as a medium.
+	let entries = [[0u8, 7, 0, 0, 0, 0, 0, 0]];
+	let answer = report_luns_answer(&entries, 8 * 64);
+	let mut out = [0u16; 8];
+	assert_eq!(luns(&answer, &mut out), 1, "one entry arrived, however many the target claims exist");
+	assert_eq!(out[0], 7);
+}
+
+#[test]
+fn the_addressing_method_decides_which_number_the_same_bytes_name() {
+	// 0x40, 0x01 is FLAT unit 1 and 0x00, 0x01 is PERIPHERAL unit 1 - but 0x41, 0x01 is flat unit
+	// 0x0101, and a driver reading the second byte alone calls it unit 1. Unit 1 usually exists and
+	// answers, so the wrong medium is served under the right name.
+	assert_eq!(lun_number(&[0x00, 0x01, 0, 0, 0, 0, 0, 0]), Some(1), "peripheral addressing, bus zero");
+	assert_eq!(lun_number(&[0x40, 0x01, 0, 0, 0, 0, 0, 0]), Some(1), "flat space, low byte only");
+	assert_eq!(lun_number(&[0x41, 0x01, 0, 0, 0, 0, 0, 0]), Some(0x0101), "flat space across both bytes");
+	// A peripheral field naming a bus other than zero is a unit behind ANOTHER bus, reached through
+	// that bus's own nexus rather than by dropping the bus number.
+	assert_eq!(lun_number(&[0x01, 0x05, 0, 0, 0, 0, 0, 0]), None, "peripheral addressing on bus one");
+	// Logical-unit addressing and the extended form, which is where the well-known units live.
+	assert_eq!(lun_number(&[0x80, 0x00, 0, 0, 0, 0, 0, 0]), None);
+	assert_eq!(lun_number(&[0xC1, 0x00, 0, 0, 0, 0, 0, 0]), None, "a well-known unit is not a medium");
+	// A second level names a unit BEHIND the one the first two bytes name.
+	assert_eq!(lun_number(&[0x00, 0x01, 0x40, 0x02, 0, 0, 0, 0]), None, "a second level is refused, not dropped");
+	assert_eq!(lun_number(&[0x00, 0x01, 0, 0, 0, 0, 0]), None, "and a field too short to be one");
+}
+
+#[test]
+fn a_unit_listed_twice_is_published_once() {
+	// Two providers over one medium, each able to write under the other. The duplicate is the
+	// target's to send and the driver's to drop.
+	let entries = [[0u8, 0, 0, 0, 0, 0, 0, 0], [0u8, 2, 0, 0, 0, 0, 0, 0], [0u8, 0, 0, 0, 0, 0, 0, 0], [0x40u8, 0x02, 0, 0, 0, 0, 0, 0]];
+	let answer = report_luns_answer(&entries, 32);
+	let mut out = [0u16; 8];
+	assert_eq!(luns(&answer, &mut out), 2, "two distinct units out of four entries");
+	assert_eq!(&out[..2], &[0, 2]);
+}
+
+#[test]
+fn the_report_luns_allocation_length_is_the_four_bytes_in_the_middle() {
+	// Every other command here carries its allocation in one or two bytes near the end; this one
+	// puts thirty-two bits at offset six, and a driver writing it where the ten-byte forms carry
+	// theirs asks for zero bytes and gets an empty list from a target with units on it.
+	let cdb = report_luns(264);
+	assert_eq!(cdb[0], REPORT_LUNS);
+	assert_eq!(cdb.len(), CDB12_LEN, "REPORT LUNS is defined at twelve bytes");
+	assert_eq!(&cdb[6..10], &264u32.to_be_bytes(), "big-endian, at offset six");
+	assert_eq!(cdb[2], 0, "select report zero: the units this nexus addresses, not the well-known ones");
+}
+
+#[test]
+fn an_answer_too_short_to_hold_a_header_names_no_units() {
+	let mut out = [0u16; 8];
+	assert_eq!(luns(&[0u8; 7], &mut out), 0);
+	assert_eq!(luns(&report_luns_answer(&[], 0), &mut out), 0, "a target with nothing on it");
+	// And a caller with nowhere to put them asks for none.
+	assert_eq!(luns(&report_luns_answer(&[[0u8; 8]], 8), &mut []), 0);
+}
+
+#[test]
+fn more_units_than_the_caller_can_hold_are_taken_up_to_its_bound() {
+	let entries = [[0u8, 0, 0, 0, 0, 0, 0, 0], [0u8, 1, 0, 0, 0, 0, 0, 0], [0u8, 2, 0, 0, 0, 0, 0, 0]];
+	let answer = report_luns_answer(&entries, 24);
+	let mut out = [0u16; 2];
+	assert_eq!(luns(&answer, &mut out), 2, "bounded by the caller's own array");
+	assert_eq!(out, [0, 1]);
+}
+
+// One event buffer, built the way the device writes it: the event word, the addressing field, the
+// reason word.
+fn event_buffer(word: u32, lun: [u8; 8], reason: u32) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(&word.to_le_bytes());
+	out.extend_from_slice(&lun);
+	out.extend_from_slice(&reason.to_le_bytes());
+	out
+}
+
+#[test]
+fn the_missed_flag_is_not_part_of_the_event_number() {
+	// The device ORs it in when it ran out of buffers and threw events away. A driver comparing the
+	// whole word stops recognising events exactly when its picture of the bus is known to be stale -
+	// so it goes quiet on a busy bus, which is the shape of a driver that is working.
+	let lun = virtio_lun(1, 0);
+	let plain = event_buffer(1, lun, 1);
+	assert_eq!(virtio_event(&plain), Some((Event::Rescan, lun, false)));
+
+	let after_overflow = event_buffer(0x8000_0001, lun, 1);
+	assert_eq!(virtio_event(&after_overflow), Some((Event::Rescan, lun, true)), "the same event, and the device says it dropped some");
+}
+
+#[test]
+fn a_transport_reset_is_three_different_things_and_the_reason_says_which() {
+	// One event number covers a unit arriving, a unit leaving and a unit resetting itself. Acting on
+	// the number alone treats a removal as an arrival: the driver re-enumerates a unit that is gone
+	// and publishes a provider over nothing.
+	let lun = virtio_lun(0, 3);
+	assert_eq!(virtio_event(&event_buffer(1, lun, 1)).map(|event| event.0), Some(Event::Rescan));
+	assert_eq!(virtio_event(&event_buffer(1, lun, 2)).map(|event| event.0), Some(Event::Removed));
+	assert_eq!(virtio_event(&event_buffer(1, lun, 3)).map(|event| event.0), Some(Event::HardReset));
+	assert_eq!(virtio_event(&event_buffer(1, lun, 99)).map(|event| event.0), Some(Event::Other), "a reason this core does not model");
+	// And the unit it is about travels with it, so a driver acts on one unit rather than all of them.
+	assert_eq!(virtio_event(&event_buffer(1, lun, 2)).map(|event| event.1), Some(lun));
+}
+
+#[test]
+fn an_empty_or_short_event_buffer_says_so() {
+	let lun = virtio_lun(0, 0);
+	assert_eq!(virtio_event(&event_buffer(0, lun, 0)).map(|event| event.0), Some(Event::None), "a buffer the device handed back untouched");
+	assert_eq!(virtio_event(&event_buffer(3, lun, 0)).map(|event| event.0), Some(Event::ParamChange));
+	assert_eq!(virtio_event(&[0u8; EVENT_LEN - 1]), None, "too short to hold one");
 }

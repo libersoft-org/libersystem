@@ -14,6 +14,10 @@ fn imgview_interactions() {
 	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::ZoomAndHold);
 	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::KeyEscape);
 	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::RawEscape);
+	// THE TWO SHAPES CTRL+C ARRIVES IN, and the viewer has to close its surface on both: a byte on
+	// the tty when the terminal is not holding it as a foreground job, and a signal when it is.
+	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::RawInterrupt);
+	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::CaughtInterrupt);
 }
 
 // The licoview and licoedit harnesses that stood here are gone, and their coverage moved to

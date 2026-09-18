@@ -1280,6 +1280,23 @@ fn tty_fg_winsize(vt: &mut Vt, msg: &[u8], handle: u64) -> bool {
 		if let Some(p) = vt.fg_proc.take() {
 			close(p);
 		}
+		// AND THE LINE DISCIPLINE COMES BACK WITH THE TERMINAL.
+		//
+		// A foreground job BORROWS the tty's mode - `SET_MODE` is how an interactive tool asks for
+		// raw, unechoed keys - and restoring it was left to the job itself, on its way out. A job
+		// that does not get a way out leaves it raw: Ctrl+C terminates it where it stands, and
+		// nothing in a terminated process runs. The terminal the shell came back to then delivered
+		// every keystroke on its own, so each letter of the next command was read as a whole
+		// command line - `ls` answered "unknown command: l" and then "unknown command: s" - and the
+		// session looked dead from the first key. It is not something the shell can repair either:
+		// it cannot know what the job asked for, and asking for cooked mode after every job would
+		// fight the job that is still running.
+		//
+		// The release of the tty is the right place, because it is the one event that happens
+		// however the job ends - a clean exit, a signal, or a crash. What a job borrows it gets
+		// back here, in the state a prompt needs.
+		vt.ld.cooked = true;
+		vt.ld.echo = true;
 	} else if msg.starts_with(b"SET_MODE") && msg.len() >= 10 {
 		// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED.
 		//

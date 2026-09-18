@@ -5925,6 +5925,11 @@ enum ImgviewExit {
 	KeyQ,
 	KeyEscape,
 	RawEscape,
+	// Ctrl+C as a BYTE on the tty, which is what arrives when the terminal is not holding the
+	// viewer as a foreground job - a pty, or a job the tty never took.
+	RawInterrupt,
+	// Ctrl+C as a SIGNAL, which is what a terminal that IS holding it sends.
+	CaughtInterrupt,
 	ZoomAndHold,
 }
 
@@ -6267,6 +6272,27 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 		}
 		ImgviewExit::RawEscape => {
 			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new())).expect("imgview raw escape");
+		}
+		ImgviewExit::RawInterrupt => {
+			stdout.send(Message::new(alloc::vec![0x03], alloc::vec::Vec::new())).expect("imgview raw interrupt");
+		}
+		ImgviewExit::CaughtInterrupt => {
+			// AN INTERRUPT IS AN EXIT TOO, AND IT HAS TO GO THROUGH THE TEARDOWN.
+			//
+			// Unarmed, SIG_INT terminates the process where it stands: the surface is never closed,
+			// the raw mode the viewer asked its terminal for is never given back, and the shell that
+			// comes back to that terminal reads every keystroke as its own command line. Armed, the
+			// same interrupt is a flag the viewer polls - and the close below, which every other
+			// exit in this harness also has to reach, is what says it left the way it leaves on `q`.
+			//
+			// The disposition is driven exactly as the kernel drives a tty's Ctrl+C: the pending
+			// flag plus a wake, because the viewer is asleep in `wait_any` and a flag nobody wakes
+			// it to read is not a signal.
+			assert!(process.is_int_caught(), "imgview arms itself to catch the interrupt rather than be killed by it");
+			process.set_int_pending();
+			for thread in process.live_threads() {
+				sched::wake_thread(&thread);
+			}
 		}
 		ImgviewExit::ZoomAndHold => {
 			let send_key = |code: u16, pressed: bool| {

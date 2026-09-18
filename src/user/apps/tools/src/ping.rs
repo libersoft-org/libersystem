@@ -159,7 +159,14 @@ fn ping(netsvc: u64, args: &[u8]) {
 					stats.add_reply(reply.rtt_us);
 				}
 				match format {
-					// CLI: one line per reply (timeouts are silent losses).
+					// CLI: ONE LINE PER PROBE, INCLUDING THE ONES THAT DID NOT COME BACK.
+					//
+					// A timeout used to print nothing at all - "timeouts are silent losses", which is
+					// what the common implementations do. On a link where EVERY probe times out that
+					// is a program which prints one header and then appears to hang: the user sees no
+					// progress, has no idea whether anything is being sent, and finds out only when
+					// they interrupt it and the summary appears. Reporting the loss as it happens is
+					// the difference between a tool that is working and a tool that looks wedged.
 					OutputFormat::Cli => match reply.status {
 						PingStatus::Reply => {
 							let mut line: String = String::new();
@@ -177,7 +184,11 @@ fn ping(netsvc: u64, args: &[u8]) {
 							let _ = write!(line, " icmp_seq={} Destination Host Unreachable\n", seq);
 							print(line.as_bytes());
 						}
-						PingStatus::Timeout => {}
+						PingStatus::Timeout => {
+							let mut line: String = String::new();
+							let _ = write!(line, "Request timeout for icmp_seq={}\n", seq);
+							print(line.as_bytes());
+						}
 					},
 					// JSON: collect the wire record for the final document.
 					OutputFormat::Json(_) => attempts.push((seq, reply)),
@@ -280,9 +291,20 @@ fn print_json(target: &[u8], ip: &[u8], attempts: &[(u32, PingReply)], stats: &S
 			out.push(',');
 		}
 		first = false;
-		// Reuse the wire record's JSON, prepending the client-side sequence number.
+		// A PROBE THAT NEVER CAME BACK HAS NO TIME, AND SAYS SO RATHER THAN SAYING ZERO.
+		//
+		// The wire record carries `ttl` and `rtt-us` as numbers, so a timeout rendered through it
+		// reads `"ttl": 0, "rtt-us": 0` - which is a MEASUREMENT of zero, not the absence of one, and
+		// a consumer averaging the column gets a number that never happened. `null` is what the
+		// statistics block already says when nothing was received, and this makes the per-probe rows
+		// agree with it.
 		let _ = write!(out, "{{\"icmp-seq\":{},", seq);
-		out.push_str(&reply.to_json()[1..]);
+		if reply.status == PingStatus::Timeout {
+			out.push_str("\"status\":\"timeout\",\"ttl\":null,\"rtt-us\":null}");
+		} else {
+			// Reuse the wire record's JSON, so the model stays the single source of truth.
+			out.push_str(&reply.to_json()[1..]);
+		}
 	}
 	out.push_str("],\"statistics\":{");
 	let _ = write!(out, "\"transmitted\":{},\"received\":{},\"packet-loss-pct\":{},\"time-ms\":{},\"rtt\":", stats.transmitted, stats.received, loss_pct, elapsed_ms);

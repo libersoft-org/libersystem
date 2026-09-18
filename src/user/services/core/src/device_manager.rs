@@ -3704,17 +3704,20 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// state one too many and the driver waits forever for a frame that is not coming.
 	//
 	// The interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci, virtio-gpu,
-	// dev-channel, virtio-console) each take their own per-device MSI-X vector, edge-triggered
+	// dev-channel, virtio-console, virtio-scsi) each take their own per-device MSI-X vector, edge-triggered
 	// with no INTx sharing. The gpu routes only its CONFIG vector to it and keeps its control
 	// queue polled; the dev channel is idle almost always and must block on its interrupt rather
 	// than poll, because a spinning driver starves the cooperative scheduler for the guest's
 	// whole life - and the console driver joined that list when its multiport ports became byte
 	// streams served to consumers, which is the same idle-then-burst shape on the same hardware.
+	// virtio-scsi joined it for its EVENT queue: a unit arriving or leaving is announced there and
+	// nowhere else, so without a vector the only way to notice is a thread polling for the guest's
+	// whole life over a disk that may never be plugged.
 	// The remaining polling drivers get none, so their device IRQs stay silent.
 	// RECORDED ON THE TRANSACTION AS THEY ARE TAKEN. The list used to be a local array, so a
 	// failure while acquiring a later entry - or while sending - reached `give_up` with the
 	// earlier ones held and nothing able to close them.
-	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel" || driver_name == b"virtio_console";
+	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel" || driver_name == b"virtio_console" || driver_name == b"virtio_scsi";
 	if use_msix {
 		let irq: i64 = device_msix_acquire(grant.claim);
 		if irq < 0 {

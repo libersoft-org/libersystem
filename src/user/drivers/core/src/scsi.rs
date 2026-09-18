@@ -22,6 +22,8 @@ pub const BLOCK_BYTES: u32 = 512;
 pub const CDB10_LEN: usize = 10;
 /// A six-byte one, for the commands that predate the longer form.
 pub const CDB6_LEN: usize = 6;
+/// A twelve-byte one, which is the length `REPORT LUNS` is defined at.
+pub const CDB12_LEN: usize = 12;
 /// Fixed-format sense data is eighteen bytes, and the descriptor format is longer; a driver asks for
 /// this many and is content with fewer.
 pub const SENSE_LEN: usize = 18;
@@ -34,6 +36,7 @@ pub const READ_CAPACITY10: u8 = 0x25;
 pub const READ10: u8 = 0x28;
 pub const WRITE10: u8 = 0x2A;
 pub const SYNCHRONIZE_CACHE10: u8 = 0x35;
+pub const REPORT_LUNS: u8 = 0xA0;
 
 /// A `TEST UNIT READY`, which carries nothing.
 pub fn test_unit_ready() -> [u8; CDB6_LEN] {
@@ -77,6 +80,87 @@ pub fn read_write10(write: bool, lba: u32, blocks: u16) -> [u8; CDB10_LEN] {
 	cdb[7] = (blocks >> 8) as u8;
 	cdb[8] = blocks as u8;
 	cdb
+}
+
+/// A `REPORT LUNS` asking for `len` bytes of list.
+///
+/// SELECT REPORT 0x00, which is the units addressable through this nexus and not the well-known ones.
+/// The allocation length is a THIRTY-TWO-BIT field in the middle of the command rather than the one
+/// or two bytes every other command here uses, and it counts BYTES of answer, not units.
+pub fn report_luns(len: u32) -> [u8; CDB12_LEN] {
+	let mut cdb = [0u8; CDB12_LEN];
+	cdb[0] = REPORT_LUNS;
+	cdb[6] = (len >> 24) as u8;
+	cdb[7] = (len >> 16) as u8;
+	cdb[8] = (len >> 8) as u8;
+	cdb[9] = len as u8;
+	cdb
+}
+
+/// The logical unit number one eight-byte addressing field names, or `None` when this core will not
+/// address it.
+///
+/// THE TOP TWO BITS CHOOSE HOW THE REST IS READ, and a driver that skips them reads a different
+/// number off the same eight bytes. Peripheral addressing puts the unit in the SECOND byte; flat
+/// space puts it across six bits of the first and all of the second - so a flat unit 0x0101 read as
+/// peripheral is unit 1, which exists on most targets and answers. The two forms are told apart
+/// only here.
+///
+/// LEVELS BEYOND THE FIRST ARE REFUSED RATHER THAN IGNORED. The field addresses a hierarchy four
+/// levels deep, and a device that answers with a second level is naming a unit BEHIND the one the
+/// first two bytes name. Reading the first level and dropping the rest addresses the wrong unit with
+/// a request that succeeds.
+pub fn lun_number(field: &[u8]) -> Option<u16> {
+	if field.len() < 8 || field[2..8].iter().any(|byte| *byte != 0) {
+		return None;
+	}
+	match field[0] >> 6 {
+		// Peripheral device addressing. The low six bits are the BUS, and this core addresses bus
+		// zero only: a unit behind another bus is reached through that bus's own nexus.
+		0b00 if field[0] & 0x3F == 0 => Some(field[1] as u16),
+		// Flat space addressing.
+		0b01 => Some((((field[0] & 0x3F) as u16) << 8) | field[1] as u16),
+		// Logical-unit addressing and the extended form, which includes the WELL-KNOWN units. None
+		// of them is a medium to serve blocks from.
+		_ => None,
+	}
+}
+
+/// Decode a `REPORT LUNS` answer into logical unit numbers, writing at most `out.len()` of them and
+/// answering how many were written.
+///
+/// THE FIRST FIELD COUNTS BYTES AND NOT UNITS, which is the mistake this function exists to make
+/// impossible: read as a count, a target with four units reports four BYTES of list and the driver
+/// serves none of them.
+///
+/// AND THE FIELD IS THE DEVICE'S CLAIM, NOT THE BUFFER'S LENGTH. A target may answer with a list
+/// longer than the allocation it was given - that is how it says "ask again with more" - so the
+/// claim is clamped to what actually arrived. Trusting it reads past the answer.
+pub fn luns(answer: &[u8], out: &mut [u16]) -> usize {
+	if answer.len() < 8 || out.is_empty() {
+		return 0;
+	}
+	let claimed = u32::from_be_bytes([answer[0], answer[1], answer[2], answer[3]]) as usize;
+	let arrived = answer.len() - 8;
+	// Rounded DOWN to whole entries: a truncated last entry is half an address.
+	let usable = claimed.min(arrived) / 8;
+	let mut written = 0usize;
+	for index in 0..usable {
+		if written == out.len() {
+			break;
+		}
+		let at = 8 + index * 8;
+		let Some(lun) = lun_number(&answer[at..at + 8]) else { continue };
+		// A TARGET MAY LIST THE SAME UNIT TWICE, and a driver that published a provider per entry
+		// would publish two for one medium - two block devices over one disk, each able to write
+		// under the other.
+		if out[..written].contains(&lun) {
+			continue;
+		}
+		out[written] = lun;
+		written += 1;
+	}
+	written
 }
 
 /// What a unit answered about its size.
@@ -191,6 +275,65 @@ pub fn virtio_lun(target: u8, lun: u16) -> [u8; 8] {
 	out[2] = 0x40 | ((lun >> 8) as u8 & 0x3F);
 	out[3] = lun as u8;
 	out
+}
+
+/// What the device reported on the virtio-scsi EVENT queue.
+///
+/// The event carries the addressing field of the unit it is about, so a driver acts on ONE unit
+/// rather than rebuilding everything it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Event {
+	/// The buffer came back with nothing in it.
+	None,
+	/// A unit appeared, or one that was there should be looked at again.
+	Rescan,
+	/// A unit went away. What was published for it no longer addresses anything.
+	Removed,
+	/// The unit reset itself: everything a driver had established with it is gone.
+	HardReset,
+	/// Something about the unit changed - its capacity, its medium - without it going away.
+	ParamChange,
+	/// An event this core does not model.
+	Other,
+}
+
+/// The virtio-scsi event buffer: an event word, the addressing field, and a reason word.
+pub const EVENT_LEN: usize = 16;
+
+/// Decode one event buffer into what happened, the unit it happened to, and whether the device had
+/// to DROP events before this one.
+///
+/// THE TOP BIT OF THE EVENT WORD IS NOT PART OF THE EVENT. `VIRTIO_SCSI_T_EVENTS_MISSED` is OR'd in
+/// when the device ran out of buffers and threw events away, so a driver comparing the whole word
+/// against the event numbers stops recognising events exactly when it has already missed some - the
+/// one moment its picture of the bus is known to be stale. It reads as a quiet driver on a busy bus.
+///
+/// AND "MISSED" IS RETURNED RATHER THAN SWALLOWED, because the only correct answer to it is a full
+/// re-enumeration: the events that say what changed are the ones that were dropped.
+pub fn virtio_event(buffer: &[u8]) -> Option<(Event, [u8; 8], bool)> {
+	if buffer.len() < EVENT_LEN {
+		return None;
+	}
+	let word = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+	let missed = word & 0x8000_0000 != 0;
+	let reason = u32::from_le_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]);
+	let mut lun = [0u8; 8];
+	lun.copy_from_slice(&buffer[4..12]);
+	let event = match word & 0x7FFF_FFFF {
+		0 => Event::None,
+		// A TRANSPORT RESET, and the REASON is what it is about: the same event number covers a unit
+		// arriving, a unit leaving and a unit resetting itself, and acting on the number alone
+		// treats a removal as an arrival.
+		1 => match reason {
+			1 => Event::Rescan,
+			2 => Event::Removed,
+			3 => Event::HardReset,
+			_ => Event::Other,
+		},
+		3 => Event::ParamChange,
+		_ => Event::Other,
+	};
+	Some((event, lun, missed))
 }
 
 /// What a virtio-scsi response's status byte and response code mean together.
