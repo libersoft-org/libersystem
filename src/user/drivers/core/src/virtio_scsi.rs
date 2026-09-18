@@ -67,8 +67,9 @@ const REQ_TASK_ATTR: u64 = 16;
 const REQ_CDB: u64 = 19;
 
 // The response header: the sense length, the residual, a status qualifier, the status, the response
-// code, and then the sense data padded to `sense_size`.
-const RESP_SENSE_LEN: u64 = 0;
+// code, and then the sense data padded to `sense_size`. The sense LENGTH is not read: this driver
+// asks `scsi::sense` to decode a fixed-length buffer, which bounds itself on what it was given
+// rather than on a length the device chose.
 const RESP_STATUS: u64 = 10;
 const RESP_RESPONSE: u64 = 11;
 const RESP_SENSE: u64 = 12;
@@ -458,7 +459,10 @@ unsafe fn find_units(queue: &virtio::Queue, virt: u64, phys: u64, sense_size: u3
 			// target puts its medium.
 			let mut numbers = [0u16; MAX_UNITS];
 			let mut count = 0usize;
-			let answer = (phys + ANSWER_OFF, ANSWER_LEN, true);
+			// FALSE IS "THE DEVICE WRITES IT". The flag is `to_device`, so an answer the driver is
+			// READING carries false - passing true builds an OUT chain, and the device reads the
+			// driver's empty buffer as a command parameter list and answers OVERRUN.
+			let answer = (phys + ANSWER_OFF, ANSWER_LEN, false);
 			core::ptr::write_bytes((virt + ANSWER_OFF) as *mut u8, 0, ANSWER_LEN as usize);
 			let listed = command(queue, virt, phys, sense_size, cdb_size, &probe, &scsi::report_luns(ANSWER_LEN), Some(answer));
 			if let Outcome::Silent = listed {
@@ -480,8 +484,26 @@ unsafe fn find_units(queue: &virtio::Queue, virt: u64, phys: u64, sense_size: u3
 					break;
 				}
 				let lun = scsi::virtio_lun(id as u8, number);
+				// EVERY UNIT REFUSES ITS FIRST COMMAND, NOT JUST THE ONE THE TARGET WAS PROBED AT.
+				//
+				// The power-on attention is per LOGICAL UNIT and clears by being read, so the probe
+				// above cleared unit zero's and nothing else's. Reading the capacity of a unit whose
+				// attention is still standing is refused once - and a walk that took that refusal as
+				// "no medium" enumerated exactly the unit it had already talked to and no other,
+				// which is a multi-unit driver that behaves exactly like a single-unit one.
+				let mut attention = READY_ATTEMPTS;
+				loop {
+					let probe = command(queue, virt, phys, sense_size, cdb_size, &lun, &scsi::test_unit_ready(), None);
+					if let Outcome::Silent = probe {
+						return found;
+					}
+					attention -= 1;
+					if probe.ok() || attention == 0 || !probe.retryable() || !deadline.waiting() {
+						break;
+					}
+				}
 				core::ptr::write_bytes((virt + ANSWER_OFF) as *mut u8, 0, 8);
-				let read = command(queue, virt, phys, sense_size, cdb_size, &lun, &scsi::read_capacity10(), Some((phys + ANSWER_OFF, 8, true)));
+				let read = command(queue, virt, phys, sense_size, cdb_size, &lun, &scsi::read_capacity10(), Some((phys + ANSWER_OFF, 8, false)));
 				if let Outcome::Silent = read {
 					return found;
 				}

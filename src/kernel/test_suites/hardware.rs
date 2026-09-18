@@ -242,7 +242,13 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 	// answers TEST UNIT READY and then READ CAPACITY, retrying the power-on attention that every unit
 	// refuses its first command with.
 	let offers = recv_offers(&kernel_ep, key.generation).expect("the virtio-scsi driver should report READY, which it only does with a target answering");
-	let blk = offer_of(&offers, driver_protocol::provider::BLOCK).expect("the driver offers the target's block service").into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+	// TWO UNITS BEHIND ONE TARGET, AND TWO PROVIDERS FOR THEM. A driver that took the first thing
+	// that answered served one disk on a machine that has two, which is what this bus is FOR: the
+	// transport exists beside `virtio-blk` because a real HBA has several units behind it.
+	let units: alloc::vec::Vec<alloc::sync::Arc<dyn object::KernelObject>> = offers.iter().filter(|(kind, _, _)| *kind == driver_protocol::provider::BLOCK).map(|(_, _, object)| object.clone()).collect();
+	assert_eq!(units.len(), 2, "the driver enumerates the units behind the target rather than taking the first that answers");
+	let blk = units[0].clone().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+	let second = units[1].clone().into_any_arc().downcast::<Channel>().expect("the second unit's block channel is a channel");
 
 	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
 	blk.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the capacity request should send");
@@ -287,6 +293,36 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 	let refused = blk.recv().expect("the refusal should arrive");
 	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "a range past the last block is refused, and the ten-byte command's address is never truncated to reach it");
 	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+
+	// THE SECOND UNIT IS A DIFFERENT MEDIUM AND NOT A SECOND VIEW OF THE FIRST. Two mebibytes against
+	// four: a driver that published one unit twice, or that addressed both providers at unit zero,
+	// answers this with the first medium's size - and a consumer writing to what it believes is the
+	// second disk would be writing to the first.
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	second.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the second unit's capacity request should send");
+	sched::run_until_idle();
+	let second_reply = second.recv().expect("the second unit's capacity reply should arrive");
+	let second_size = driver_protocol::block::decode_capacity(&second_reply.bytes).expect("the second unit reports a size");
+	assert_eq!(second_size.bytes, 2 * 1024 * 1024, "the second unit reports its OWN medium's size");
+
+	// AND WHAT IS NOT ON THE BLOCK WIRE DOES NOT REACH THE TARGET. The item this driver was written
+	// for says unsupported passthrough commands are not exposed to ordinary storage clients, and this
+	// is what keeps it: an opcode outside read/write/flush/capacity is ANSWERED rather than turned
+	// into a command descriptor block of the caller's choosing. A driver that forwarded one would let
+	// any consumer of a disk send FORMAT UNIT.
+	let passthrough = driver_protocol::block::Request { op: 0x4242, lba: 0, count: 1 }.encode();
+	blk.send(Message::new(passthrough.to_vec(), alloc::vec::Vec::new())).expect("the unknown opcode should send");
+	sched::run_until_idle();
+	let answer = blk.recv().expect("an answer to the unknown opcode should arrive");
+	assert!(matches!(driver_protocol::block::decode_status(&answer.bytes), Some(driver_protocol::block::STATUS_ERR) | Some(driver_protocol::block::STATUS_INVALID)), "an opcode this contract does not carry is refused, not translated into a SCSI command");
+	assert!(answer.caps.is_empty(), "and it grants nothing");
+
+	// The medium behind the first unit is still what it was: the passthrough refusal touched nothing.
+	let again = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	blk.send(Message::new(again.to_vec(), alloc::vec::Vec::new())).expect("the re-read should send");
+	sched::run_until_idle();
+	let again_reply = blk.recv().expect("the re-read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&again_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the unit still serves after refusing an opcode it does not carry");
 }
 
 tagged_test!(virtio_vsock_driver_echoes_bytes_off_the_host, [Drivers, Pci, Slow], id = "kernel.hardware.virtio_vsock_driver_echoes_bytes_off_the_host", covers = ["kernel", "bin.virtio_vsock"]);

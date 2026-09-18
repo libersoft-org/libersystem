@@ -650,6 +650,14 @@ qemu_attach_nvme() {
 		echo "qemu-run: could not make this run's SCSI medium at $scsi" >&2
 		return 1
 	}
+	# The second SCSI unit's medium: two mebibytes, so its capacity is not the first one's.
+	local scsi2="$QEMU_BUILD_DIR/scsi-second.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/scsi-second" .img
+	rm -f "$scsi2"
+	truncate -s 2M "$scsi2" || {
+		echo "qemu-run: could not make this run's second SCSI medium at $scsi2" >&2
+		exit 1
+	}
 	local sd="$QEMU_BUILD_DIR/sd-scratch.$$.img"
 	scratch_sweep "$QEMU_BUILD_DIR/sd-scratch" .img
 	rm -f "$sd"
@@ -683,9 +691,24 @@ qemu_attach_nvme() {
 		# AND A SCSI HOST CONTROLLER WITH A TARGET BEHIND IT, which is the shape a machine with a real
 		# HBA has: the driver speaks the SCSI command set to a target rather than a block device's own
 		# tiny request format, and the same block contract comes out of both.
-		-device "virtio-scsi-pci,id=scsibus"
+		# AND IT TAKES THE SAME VIRTIO OPTIONS AS EVERY OTHER VIRTIO DEVICE HERE, which it did not.
+		# Without `iommu_platform=on` the device does not negotiate ACCESS_PLATFORM, so it masters the
+		# bus with guest-physical addresses - and on the profile that puts a virtio-iommu in front of
+		# it those are read as addresses to TRANSLATE, which map to nothing. The device then completes
+		# no command at all: the driver polled its first one to the end of its budget, never answered
+		# its bind, and the manager reported a driver that "never sent an opcode". The suite profile
+		# runs without an IOMMU and never saw it.
+		-device "virtio-scsi-pci,id=scsibus,${virtio_opts:-disable-legacy=on}"
 		-drive "file=$scsi,if=none,id=scsidisk,format=raw"
-		-device "scsi-hd,bus=scsibus.0,drive=scsidisk"
+		-device "scsi-hd,bus=scsibus.0,channel=0,scsi-id=0,lun=0,drive=scsidisk"
+		# A SECOND UNIT BEHIND THE SAME TARGET, AND OF A DIFFERENT SIZE.
+		#
+		# One unit cannot tell a driver that enumerates units from one that takes the first thing that
+		# answers - and it cannot tell one that publishes them apart from one that publishes them all
+		# under the same name either. Two, with different capacities, make both questions answerable
+		# from outside: a consumer that asks for `t0l1` and is handed `t0l0` reads the wrong size.
+		-drive "file=$scsi2,if=none,id=scsidisk2,format=raw"
+		-device "scsi-hd,bus=scsibus.0,channel=0,scsi-id=0,lun=1,drive=scsidisk2"
 	)
 }
 
