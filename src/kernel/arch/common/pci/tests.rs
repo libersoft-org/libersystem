@@ -4,7 +4,7 @@
 // Driven through a synthetic `ConfigAccess`: the trait IS the bus, so a device with any BAR layout
 // can be stood up here - which is the only way to reach the layouts QEMU does not produce.
 
-use super::{ConfigAccess, PciDevice, assign_bars_ecam};
+use super::{ConfigAccess, PciDevice, SLOT_CAP_HOT_PLUG, SLOT_CAP_POWER_CONTROLLER, SLOT_CONTROL_ATTENTION_BUTTON_ENABLE, SLOT_CONTROL_HOT_PLUG_INTERRUPT_ENABLE, SLOT_CONTROL_POWER_INDICATOR, SLOT_CONTROL_POWER_INDICATOR_OFF, SLOT_CONTROL_POWER_INDICATOR_ON, SLOT_CONTROL_POWER_OFF, SLOT_CONTROL_PRESENCE_CHANGED_ENABLE, SLOT_STATUS_ATTENTION_BUTTON, SLOT_STATUS_PRESENCE_CHANGED, SLOT_STATUS_PRESENT, SlotEvent, assign_bars_ecam, resolve_slot, slot_acknowledge, slot_acknowledge_button, slot_arm, slot_event, slot_power_off, slot_power_on};
 use crate::sync::SpinLock;
 
 const WINDOW_BASE: u64 = 0x1000_0000;
@@ -22,10 +22,31 @@ struct Space {
 	// The rest of config space, byte-addressable, so a capability chain can be laid out here the
 	// way a device lays one out. Offsets 0x04 and 0x10..0x27 are answered from the fields above.
 	cfg: [u8; 256],
+	// EXTENDED config space: offsets 0x100..0x200, where every PCIe extended capability lives.
+	//
+	// A SEPARATE ARRAY AND NOT A LONGER ONE, because the two halves are reached by different
+	// MECHANISMS and a fixture that made them one would test a machine nobody has: the legacy port
+	// pair cannot address past 0xFF at all, so a backend that answered 0x104 out of a 4 kB array
+	// would be modelling an ECAM machine while claiming to be the other one.
+	ext: [u8; 256],
+	// Whether this fixture's mechanism can reach that half. The one thing a walk has to ask first.
+	ext_reach: bool,
+	// Which EXTENDED dwords are write-one-to-clear. The AER status registers are, and the whole
+	// point of reading one is that reading and clearing it are one operation - a fixture that stored
+	// the write would make the correct acknowledgement look like setting every bit.
+	ext_rw1c: [u16; 4],
+	// WHICH HALF-WORD IS WRITE-ONE-TO-CLEAR, or zero for none.
+	//
+	// A FIXTURE THAT STORES WHAT IT IS GIVEN CANNOT TEST AN RW1C REGISTER, and Slot Status is one:
+	// writing a ONE clears the bit. A fake that simply stored the write would make the correct
+	// acknowledgement look like SETTING the bit and the incorrect one - masking it out and writing
+	// back - look like clearing it, which is the defect exactly upside down. So the one behaviour
+	// these tests are about is modelled here rather than assumed away.
+	rw1c: u16,
 	next: u64,
 }
 
-static SPACE: SpinLock<Space> = SpinLock::new(Space { bar: [0; 6], mask: [0; 6], command: 0, cfg: [0; 256], next: WINDOW_BASE });
+static SPACE: SpinLock<Space> = SpinLock::new(Space { bar: [0; 6], mask: [0; 6], command: 0, cfg: [0; 256], ext: [0; 256], ext_reach: false, ext_rw1c: [0; 4], rw1c: 0, next: WINDOW_BASE });
 
 // Put a device on the fake bus: `bar` is what the firmware left in each slot, `mask` what each
 // slot answers a probe with.
@@ -35,6 +56,10 @@ fn stand_up(bar: [u32; 6], mask: [u32; 6]) {
 	space.mask = mask;
 	space.command = 0;
 	space.cfg = [0; 256];
+	space.ext = [0; 256];
+	space.ext_reach = false;
+	space.ext_rw1c = [0; 4];
+	space.rw1c = 0;
 	space.next = WINDOW_BASE;
 }
 
@@ -79,8 +104,26 @@ impl ConfigAccess for Fake {
 	const BUS_COUNT: u16 = 1;
 	const MMIO_WINDOW_END: u64 = WINDOW_END;
 
+	fn extended_reach() -> bool {
+		SPACE.lock().ext_reach
+	}
+
 	fn read32(_bus: u8, _dev: u8, _func: u8, off: u16) -> u32 {
 		let space = SPACE.lock();
+		// A MECHANISM THAT CANNOT REACH THIS HALF DOES NOT ANSWER NOTHING - it answers the register
+		// 0x100 bytes BELOW, because the address wraps in eight bits. That is the defect the reach
+		// question exists to prevent, and a fixture that answered zeros here would hide it.
+		if off >= 0x100 {
+			if !space.ext_reach {
+				let at = (off & 0xFC) as usize;
+				return u32::from_le_bytes([space.cfg[at], space.cfg[at + 1], space.cfg[at + 2], space.cfg[at + 3]]);
+			}
+			let at = (off as usize) - 0x100;
+			if at + 4 > space.ext.len() {
+				return u32::MAX;
+			}
+			return u32::from_le_bytes([space.ext[at], space.ext[at + 1], space.ext[at + 2], space.ext[at + 3]]);
+		}
 		match off {
 			0x04 => space.command,
 			0x10..=0x24 => space.bar[((off - 0x10) / 4) as usize],
@@ -94,6 +137,25 @@ impl ConfigAccess for Fake {
 
 	fn write32(_bus: u8, _dev: u8, _func: u8, off: u16, val: u32) {
 		let mut space = SPACE.lock();
+		if off >= 0x100 {
+			if !space.ext_reach {
+				return;
+			}
+			let at = (off as usize) - 0x100;
+			if at + 4 > space.ext.len() {
+				return;
+			}
+			let rw1c = space.ext_rw1c.contains(&(off & !3));
+			let mut bytes = val.to_le_bytes();
+			if rw1c {
+				// WRITE ONE TO CLEAR, over the whole dword: a one clears, a zero leaves it alone.
+				for i in 0..4 {
+					bytes[i] = space.ext[at + i] & !bytes[i];
+				}
+			}
+			space.ext[at..at + 4].copy_from_slice(&bytes);
+			return;
+		}
 		match off {
 			0x04 => space.command = val,
 			0x10..=0x24 => {
@@ -102,6 +164,23 @@ impl ConfigAccess for Fake {
 				// That is what makes a probe a probe, and what the kernel's restore relies on.
 				let mask = space.mask[index];
 				space.bar[index] = if val == 0xFFFF_FFFF { mask } else { val };
+			}
+			// THE REST OF CONFIG SPACE IS WRITABLE, which it was not - every write to a capability
+			// was dropped, so a test could read a chain a device laid out and never see what the
+			// kernel wrote back into one.
+			off if (off as usize) + 4 <= space.cfg.len() => {
+				let at = off as usize;
+				let rw1c = space.rw1c;
+				let mut bytes = val.to_le_bytes();
+				if rw1c != 0 && (rw1c & !3) == off {
+					// The addressed dword holds the write-one-to-clear half: a one CLEARS, a zero
+					// leaves the bit alone, and the other half of the dword is stored as written.
+					let half = (rw1c & 2) as usize;
+					for i in 0..2 {
+						bytes[half + i] = space.cfg[at + half + i] & !bytes[half + i];
+					}
+				}
+				space.cfg[at..at + 4].copy_from_slice(&bytes);
 			}
 			_ => {}
 		}
@@ -311,4 +390,516 @@ fn a_structure_that_runs_past_its_bar_is_not_claimed() {
 		Cap { cfg_type: VIRTIO_CAP_ISR, bar: 0, offset: 0x1FFF, length: 4 },
 	]);
 	assert!(super::resolve_virtio::<Fake>(&DEVICE).is_none(), "the ISR structure ends one byte past an 8 kB BAR");
+}
+
+// A PCI Express capability laid out the way a port lays one out: the capabilities word, then the
+// slot registers at their fixed offsets inside it.
+fn stand_up_pcie(port_type: u16, slot_implemented: bool, slot_caps: u32, slot_status: u16) {
+	let mut space = SPACE.lock();
+	space.command = (STATUS_CAP_LIST as u32) << 16;
+	space.cfg = [0; 256];
+	space.cfg[0x34] = 0x40;
+	let at = 0x40usize;
+	space.cfg[at] = 0x10; // PCI Express capability
+	space.cfg[at + 1] = 0; // end of the list
+	let caps: u16 = (port_type << 4) | if slot_implemented { 1 << 8 } else { 0 };
+	space.cfg[at + 2] = caps as u8;
+	space.cfg[at + 3] = (caps >> 8) as u8;
+	for (i, byte) in slot_caps.to_le_bytes().iter().enumerate() {
+		space.cfg[at + 0x14 + i] = *byte;
+	}
+	for (i, byte) in slot_status.to_le_bytes().iter().enumerate() {
+		space.cfg[at + 0x1A + i] = *byte;
+	}
+	space.rw1c = (at + 0x1A) as u16;
+}
+
+// Put a value into the slot's STATUS half without going through the write path.
+//
+// A TEST THAT WROTE IT THROUGH `write32` WOULD CLEAR IT, which is the whole point of the register:
+// the status half is RW1C, and the fake models that faithfully - so a write of the bits a device
+// arriving would set is a write that ACKNOWLEDGES them. What a fixture needs is to be the port for a
+// moment, and a port sets these bits itself.
+fn slot_status_is(slot_cap: u16, status: u16) {
+	let mut space = SPACE.lock();
+	for (i, byte) in status.to_le_bytes().iter().enumerate() {
+		space.cfg[slot_cap as usize + 0x1A + i] = *byte;
+	}
+}
+
+fn a_function() -> PciDevice {
+	// A ROOT PORT as the bus reports one: a bridge header, and the class triple a PCI-to-PCI bridge
+	// carries. What `resolve_slot` reads is the capability chain, not these - but standing up a
+	// plausible function is what stops a later reader taking the fixture for a shortcut.
+	PciDevice { bus: 0, dev: 0, func: 0, vendor: 0x8086, device_id: 0x3420, class: 0x06, subclass: 0x04, prog_if: 0x00, header_type: 0x01 }
+}
+
+crate::tagged_test!(slot_registers_are_only_slot_registers_on_a_port_that_has_a_slot, [Kernel, Pci], id = "kernel.arch.common.pci.slot_registers_are_only_slot_registers_on_a_port_that_has_a_slot", covers = ["kernel"]);
+fn slot_registers_are_only_slot_registers_on_a_port_that_has_a_slot() {
+	// THE CAPABILITY IS ON EVERY PCIe FUNCTION AND THE SLOT IS NOT. An endpoint carries the same
+	// capability at the same offsets, so a reader that goes straight to Slot Status reads an
+	// endpoint's reserved bytes and calls them a presence bit - a device that is always there, in a
+	// slot that does not exist.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | (7 << 19), 0);
+	assert_eq!(resolve_slot::<Fake>(&a_function()).map(|s| s.number), Some(7), "a root port with a slot, and the platform's own slot number");
+
+	// An endpoint (type 0) with the same bytes in the same places.
+	stand_up_pcie(0, true, SLOT_CAP_HOT_PLUG | (7 << 19), 0);
+	assert!(resolve_slot::<Fake>(&a_function()).is_none(), "an endpoint has no slot whatever those bytes say");
+
+	// A root port that does not implement one.
+	stand_up_pcie(4, false, SLOT_CAP_HOT_PLUG | (7 << 19), 0);
+	assert!(resolve_slot::<Fake>(&a_function()).is_none(), "`Slot Implemented` is the bit that makes the rest mean anything");
+
+	// A slot that cannot be hot-plugged will never report a change, so watching it is a loop that
+	// never ends and never fires.
+	stand_up_pcie(4, true, 7 << 19, 0);
+	assert!(resolve_slot::<Fake>(&a_function()).is_none(), "a slot with no hot-plug capability is not one to watch");
+
+	// A switch's downstream port carries them too.
+	stand_up_pcie(6, true, SLOT_CAP_HOT_PLUG | (3 << 19), 0);
+	assert_eq!(resolve_slot::<Fake>(&a_function()).map(|s| s.number), Some(3));
+}
+
+crate::tagged_test!(presence_and_the_change_are_two_questions_and_a_reader_needs_both, [Kernel, Pci], id = "kernel.arch.common.pci.presence_and_the_change_are_two_questions_and_a_reader_needs_both", covers = ["kernel"]);
+fn presence_and_the_change_are_two_questions_and_a_reader_needs_both() {
+	// The state says what is in the slot NOW; the change bit is STICKY and says it changed since
+	// somebody cleared it. A reader watching only the state never learns a device was swapped
+	// between two looks - the state is the same before and after - and one acting on the change bit
+	// alone knows something happened and not which of the two things it was.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENT);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Quiet, "a device sitting there is not an event");
+
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Arrived);
+
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENCE_CHANGED);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Departed, "changed, and nothing is there now");
+}
+
+crate::tagged_test!(the_change_bit_is_cleared_by_writing_a_one_and_the_control_half_survives_it, [Kernel, Pci], id = "kernel.arch.common.pci.the_change_bit_is_cleared_by_writing_a_one_and_the_control_half_survives_it", covers = ["kernel"]);
+fn the_change_bit_is_cleared_by_writing_a_one_and_the_control_half_survives_it() {
+	// RW1C IS THE OPPOSITE OF WHAT CLEARING A BIT USUALLY LOOKS LIKE. A reader that masks the bit out
+	// and writes the result back leaves it exactly as it was, and every later look reports the same
+	// change for ever - one plug read as thousands of arrivals, which looks like a device that keeps
+	// re-appearing rather than like a bug in the acknowledgement.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	// Slot Control and Slot Status share one dword, so arming must survive the acknowledgement.
+	slot_arm::<Fake>(&a_function(), slot);
+	let armed = Fake::read16(0, 0, 0, slot.cap + 0x18);
+	assert!(armed & SLOT_CONTROL_PRESENCE_CHANGED_ENABLE != 0 && armed & SLOT_CONTROL_HOT_PLUG_INTERRUPT_ENABLE != 0, "the slot was asked to report changes");
+	slot_acknowledge::<Fake>(&a_function(), slot);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Quiet, "the change is acknowledged and the next one is a new one");
+	assert!(Fake::read16(0, 0, 0, slot.cap + 0x1A) & SLOT_STATUS_PRESENT != 0, "and what is IN the slot is not something an acknowledgement changes");
+	assert_eq!(Fake::read16(0, 0, 0, slot.cap + 0x18), armed, "the control half of the shared dword survives the write");
+}
+
+crate::tagged_test!(an_armed_slot_is_a_powered_slot, [Kernel, Pci], id = "kernel.arch.common.pci.an_armed_slot_is_a_powered_slot", covers = ["kernel"]);
+fn an_armed_slot_is_a_powered_slot() {
+	// THE POWER IS THE HALF THAT IS EASY TO LEAVE OUT AND IMPOSSIBLE TO NOTICE.
+	//
+	// A slot with a power controller comes out of reset with the power OFF, and a port holding an
+	// unpowered slot presents nothing behind it: the presence bit stays clear, the change bit never
+	// sets, and the interrupt the arming just enabled never fires. Everything looks correct and
+	// nothing ever happens - which from an operator's side is a machine that ignores the disk they
+	// plugged into it. This is that case, and the first machine it was tried on behaved exactly so.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, 0);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	// The reset state this asserts against: power off, which is a ONE.
+	Fake::write32(0, 0, 0, slot.cap + 0x18, SLOT_CONTROL_POWER_OFF as u32);
+	slot_arm::<Fake>(&a_function(), slot);
+	let control = Fake::read16(0, 0, 0, slot.cap + 0x18);
+	assert!(control & SLOT_CONTROL_POWER_OFF == 0, "arming a slot with a power controller turns it ON - a zero is on");
+	assert_eq!(control & SLOT_CONTROL_POWER_INDICATOR, SLOT_CONTROL_POWER_INDICATOR_ON, "and says so on the indicator");
+	assert!(control & SLOT_CONTROL_ATTENTION_BUTTON_ENABLE != 0, "and asks to be told when somebody presses the button");
+}
+
+crate::tagged_test!(a_slot_with_no_power_controller_is_not_told_to_power_up, [Kernel, Pci], id = "kernel.arch.common.pci.a_slot_with_no_power_controller_is_not_told_to_power_up", covers = ["kernel"]);
+fn a_slot_with_no_power_controller_is_not_told_to_power_up() {
+	// A CAPABILITY THE SLOT DOES NOT HAVE IS NOT A BIT TO WRITE. `Power Controller Control` is
+	// defined only where `Power Controller Present` says so; writing it on a slot without one is
+	// writing a reserved bit, and what a port does with that is the port's business rather than
+	// something a kernel may assume.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, 0);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	Fake::write32(0, 0, 0, slot.cap + 0x18, SLOT_CONTROL_POWER_OFF as u32);
+	slot_arm::<Fake>(&a_function(), slot);
+	let control = Fake::read16(0, 0, 0, slot.cap + 0x18);
+	assert!(control & SLOT_CONTROL_POWER_OFF != 0, "the bit is left exactly as it was found");
+	assert!(control & SLOT_CONTROL_PRESENCE_CHANGED_ENABLE != 0, "and the arming that IS this slot's still happened");
+}
+
+crate::tagged_test!(the_attention_button_is_a_request_and_not_a_removal, [Kernel, Pci], id = "kernel.arch.common.pci.the_attention_button_is_a_request_and_not_a_removal", covers = ["kernel"]);
+fn the_attention_button_is_a_request_and_not_a_removal() {
+	// A MANAGED REMOVAL BEGINS WITH SOMEBODY ASKING, and the device is still there when they do.
+	//
+	// What the system owes in return is to stop the driver and let go of the resources BEFORE the
+	// slot goes down. A reader that took the button for a departure would report a device gone while
+	// its driver still held a mapping of it; one that ignored the button would only ever see the
+	// surprise removal it was supposed to prepare for.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, SLOT_STATUS_PRESENT | SLOT_STATUS_ATTENTION_BUTTON);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::RemovalRequested, "the button is the request");
+	assert!(Fake::read16(0, 0, 0, slot.cap + 0x1A) & SLOT_STATUS_PRESENT != 0, "and the device is still in the slot while it is being asked for");
+
+	// AND IT IS ITS OWN STICKY BIT. Acknowledging the button leaves the presence change alone, and
+	// acknowledging a presence change leaves the button alone - a request read on every poll is a
+	// driver asked to stop a hundred times a second.
+	slot_acknowledge_button::<Fake>(&a_function(), slot);
+	assert_eq!(slot_event::<Fake>(&a_function(), slot), SlotEvent::Quiet, "asked once");
+}
+
+crate::tagged_test!(powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value, [Kernel, Pci], id = "kernel.arch.common.pci.powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value", covers = ["kernel"]);
+fn powering_a_slot_down_says_off_on_the_indicator_and_not_the_reserved_value() {
+	// OFF IS THREE AND NOT ZERO, which is the specification's spelling and not an obvious one: the
+	// two indicator bits encode on, blink and off as 01, 10 and 11, and ZERO IS RESERVED. A port
+	// reads the indicator as part of deciding that the guest has finished with the slot, so writing
+	// the reserved value is a power-down request the port does not recognise - the slot goes dark and
+	// the device stays in it. That is exactly what the first live run did.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, SLOT_STATUS_PRESENT);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	slot_arm::<Fake>(&a_function(), slot);
+	slot_power_off::<Fake>(&a_function(), slot);
+	let control = Fake::read16(0, 0, 0, slot.cap + 0x18);
+	assert!(control & SLOT_CONTROL_POWER_OFF != 0, "the power controller is told to switch off - a one is off");
+	assert_eq!(control & SLOT_CONTROL_POWER_INDICATOR, SLOT_CONTROL_POWER_INDICATOR_OFF, "and the indicator says off, which is three");
+	assert!(Fake::read16(0, 0, 0, slot.cap + 0x1A) & SLOT_STATUS_PRESENT != 0, "and no sticky status bit was acknowledged on the way past");
+
+	// AND IT COMES BACK UP, because a slot left powered down after a removal is a slot that works
+	// exactly once.
+	slot_power_on::<Fake>(&a_function(), slot);
+	let control = Fake::read16(0, 0, 0, slot.cap + 0x18);
+	assert!(control & SLOT_CONTROL_POWER_OFF == 0);
+	assert_eq!(control & SLOT_CONTROL_POWER_INDICATOR, SLOT_CONTROL_POWER_INDICATOR_ON);
+}
+
+crate::tagged_test!(a_poll_answers_a_change_once_and_the_state_it_left_behind, [Kernel, Pci], id = "kernel.arch.common.pci.a_poll_answers_a_change_once_and_the_state_it_left_behind", covers = ["kernel"]);
+fn a_poll_answers_a_change_once_and_the_state_it_left_behind() {
+	// WHAT A POLL OWES ITS CALLER: each change answered ONCE, with the state at the moment of the
+	// change, and nothing at all when nothing moved. Every one of those is a way this is written
+	// wrong - a change re-reported is a device that binds a hundred times a second, and a change
+	// reported with the state read at some later moment is a device reported arriving after it left.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, 0);
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	let mut out = [super::SlotChange { bus: 0, dev: 0, func: 0, secondary: 0, what: SlotEvent::Quiet }; super::MAX_HOT_PLUG_PORTS];
+
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 0, "an armed slot with nothing in it reports nothing");
+
+	// A DEVICE ARRIVES: the change bit sets and the presence bit with it.
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 1, "the arrival is reported");
+	assert_eq!(out[0].what, SlotEvent::Arrived);
+	assert_eq!((out[0].bus, out[0].dev, out[0].func), (0, 0, 0), "and it names the port it happened at");
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 0, "and it is reported once - the poll acknowledged it");
+
+	// THE BUTTON IS A SECOND KIND OF NEWS about a slot whose state has not moved.
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_ATTENTION_BUTTON);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 1, "somebody asked for the device to be removed");
+	assert_eq!(out[0].what, SlotEvent::RemovalRequested);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 0, "asked once");
+
+	// AND A CHANGE THAT LEFT THE STATE WHERE IT WAS IS NOT NEWS. A device that came and went between
+	// two reads is a device that is not there now, and there is nothing for a caller to do about it.
+	slot_status_is(slot.cap, SLOT_STATUS_PRESENT | SLOT_STATUS_PRESENCE_CHANGED);
+	assert_eq!(super::poll_slots::<Fake>(&mut out), 0, "the slot holds what it held at the last answer");
+}
+
+crate::tagged_test!(a_port_with_no_interrupt_pin_is_not_bound_to_a_vector, [Kernel, Pci], id = "kernel.arch.common.pci.a_port_with_no_interrupt_pin_is_not_bound_to_a_vector", covers = ["kernel"]);
+fn a_port_with_no_interrupt_pin_is_not_bound_to_a_vector() {
+	// THE LINE AND THE PIN ARE TWO REGISTERS AND BOTH MATTER. A function with no interrupt PIN
+	// asserts nothing whatever its line says, and firmware leaves the line at `0xff` for a function
+	// it routed nowhere. Both are "this port will not tell you", and a handler registered on either
+	// is a handler on a vector nothing raises - which reads, from the outside, as a slot that works
+	// and a device that never arrives.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, 0);
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	let mut ports: [Option<super::HotPlugPort>; super::MAX_HOT_PLUG_PORTS] = [None; super::MAX_HOT_PLUG_PORTS];
+	assert_eq!(super::hot_plug_ports(&mut ports), 1, "the scan remembered the port");
+	let port = ports[0].expect("a port");
+
+	// No pin and no line: the reset state of the fixture.
+	assert_eq!(super::slot_interrupt_line::<Fake>(&port), None, "a port that names no pin raises nothing");
+
+	// A line with no pin is still nothing.
+	Fake::write32(0, 0, 0, 0x3c, 0x0b);
+	assert_eq!(super::slot_interrupt_line::<Fake>(&port), None, "a line without a pin is a line nothing asserts on");
+
+	// `0xff` is firmware's way of saying "routed nowhere", and it is not IRQ 255.
+	Fake::write32(0, 0, 0, 0x3c, 0x01ff);
+	assert_eq!(super::slot_interrupt_line::<Fake>(&port), None);
+
+	// And a real routing is answered.
+	Fake::write32(0, 0, 0, 0x3c, 0x010b);
+	assert_eq!(super::slot_interrupt_line::<Fake>(&port), Some(11));
+}
+
+crate::tagged_test!(powering_a_named_slot_finds_it_by_address_and_leaves_the_others_alone, [Kernel, Pci], id = "kernel.arch.common.pci.powering_a_named_slot_finds_it_by_address_and_leaves_the_others_alone", covers = ["kernel"]);
+fn powering_a_named_slot_finds_it_by_address_and_leaves_the_others_alone() {
+	// THE CALLER HAS AN ADDRESS AND NOT A SLOT. What completes a coordinated removal is a write to
+	// one port's Slot Control, and what the caller holds by then is the bus address it was told the
+	// request came from - so the lookup is by address, and an address that is not a hot-plug port is
+	// a write that must not happen.
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, SLOT_STATUS_PRESENT);
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	let armed = Fake::read16(0, 0, 0, slot.cap + 0x18);
+
+	super::set_slot_power::<Fake>(9, 9, 9, false);
+	assert_eq!(Fake::read16(0, 0, 0, slot.cap + 0x18), armed, "an address that is not a port of this machine writes nothing");
+
+	super::set_slot_power::<Fake>(0, 0, 0, false);
+	assert!(Fake::read16(0, 0, 0, slot.cap + 0x18) & SLOT_CONTROL_POWER_OFF != 0, "and the port that IS named is powered down");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Advanced Error Reporting and power-management events.
+// ---------------------------------------------------------------------------------------------
+
+// Lay an AER extended capability out at 0x100, with a stated status and severity.
+//
+// AT 0x100 BECAUSE THAT IS WHERE THE FIRST EXTENDED CAPABILITY IS - the offset is fixed by the
+// specification, and a fixture that put it elsewhere would be testing a walk that starts at the
+// wrong place.
+fn stand_up_aer(uncorrectable: u32, correctable: u32, severity: u32) {
+	let mut space = SPACE.lock();
+	space.ext = [0; 256];
+	space.ext_reach = true;
+	// Header: capability id in 15:0, version in 19:16, next offset in 31:20. Next is zero: the end.
+	let header: u32 = 0x0001 | (2 << 16);
+	space.ext[0..4].copy_from_slice(&header.to_le_bytes());
+	space.ext[0x04..0x08].copy_from_slice(&uncorrectable.to_le_bytes());
+	space.ext[0x0C..0x10].copy_from_slice(&severity.to_le_bytes());
+	space.ext[0x10..0x14].copy_from_slice(&correctable.to_le_bytes());
+	// The two STATUS registers are write-one-to-clear and the severity register is not: a reader
+	// that acknowledged the severity would rewrite the function's own policy.
+	space.ext_rw1c = [0x104, 0x110, 0, 0];
+}
+
+crate::tagged_test!(an_extended_capability_is_found_only_where_the_mechanism_can_reach_one, [Kernel, Pci], id = "kernel.arch.common.pci.an_extended_capability_is_found_only_where_the_mechanism_can_reach_one", covers = ["kernel"]);
+fn an_extended_capability_is_found_only_where_the_mechanism_can_reach_one() {
+	// THE LEGACY PORT PAIR CANNOT ADDRESS PAST 0xFF, AND THE FAILURE IS SILENT: the register number
+	// is eight bits, so a read at 0x104 answers the register at 0x04 - the command and status
+	// registers. A walk that started without asking would find a capability whose id is whatever
+	// those bytes happen to be, on every function of every machine.
+	stand_up([0; 6], [0; 6]);
+	stand_up_aer(0, 0, 0);
+	assert_eq!(super::find_extended_capability::<Fake>(0, 0, 0, 0x0001), Some(0x100), "a reachable capability is found where it is");
+
+	{
+		// A MARKER IN THE REGISTER 0x100 BYTES BELOW, so what the unreachable read answers is visible.
+		let mut space = SPACE.lock();
+		space.ext_reach = false;
+		space.cfg[0x00..0x04].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+	}
+	assert_eq!(super::find_extended_capability::<Fake>(0, 0, 0, 0x0001), None, "and a mechanism that cannot reach that half finds nothing rather than the vendor id");
+	// AND THIS IS WHY THE QUESTION HAS TO BE ASKED. The unreachable read does not answer nothing: the
+	// register number WRAPS in eight bits, so a read at 0x100 answers the register at 0x00 - which on
+	// a real function is the vendor and device id, and a walk that took it for a capability header
+	// would find one on every function of every machine.
+	assert_eq!(Fake::read32(0, 0, 0, 0x100), 0xdead_beef, "the unreachable read answers the register 0x100 bytes below rather than nothing");
+}
+
+crate::tagged_test!(a_malformed_extended_capability_list_stops_rather_than_spinning, [Kernel, Pci], id = "kernel.arch.common.pci.a_malformed_extended_capability_list_stops_rather_than_spinning", covers = ["kernel"]);
+fn a_malformed_extended_capability_list_stops_rather_than_spinning() {
+	// A LIST IS A DEVICE'S OWN DATA AND A DEVICE MAY BE BROKEN. Three shapes end a walk and none of
+	// them may end it by running forever: a header of all ones, which is what an absent function
+	// answers; a next pointer that goes BACKWARDS out of extended space; and one that points at
+	// itself.
+	stand_up([0; 6], [0; 6]);
+	stand_up_aer(0, 0, 0);
+	{
+		let mut space = SPACE.lock();
+		space.ext[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+	}
+	assert_eq!(super::find_extended_capability::<Fake>(0, 0, 0, 0x0001), None, "a header of all ones is the end of the list");
+
+	stand_up_aer(0, 0, 0);
+	{
+		// A next pointer at 0x40, which is INSIDE the legacy half: following it would read a
+		// capability of the other list and report it as an extended one.
+		let mut space = SPACE.lock();
+		let header: u32 = 0x00FF | (2 << 16) | (0x040 << 20);
+		space.ext[0..4].copy_from_slice(&header.to_le_bytes());
+	}
+	assert_eq!(super::find_extended_capability::<Fake>(0, 0, 0, 0x0001), None, "a next pointer below the extended half is refused rather than followed");
+
+	stand_up_aer(0, 0, 0);
+	{
+		// A header that points at itself. Bounded by the hop count, so this returns at all.
+		let mut space = SPACE.lock();
+		let header: u32 = 0x00FF | (2 << 16) | (0x100 << 20);
+		space.ext[0..4].copy_from_slice(&header.to_le_bytes());
+	}
+	assert_eq!(super::find_extended_capability::<Fake>(0, 0, 0, 0x0001), None, "and a list that points at itself stops instead of spinning");
+}
+
+crate::tagged_test!(an_error_record_is_read_and_cleared_in_one_pass, [Kernel, Pci], id = "kernel.arch.common.pci.an_error_record_is_read_and_cleared_in_one_pass", covers = ["kernel"]);
+fn an_error_record_is_read_and_cleared_in_one_pass() {
+	// READING AND CLEARING ARE ONE OPERATION, because the alternative is reporting the same error for
+	// ever: the status bits are sticky until somebody writes a one to them, so a reader that only
+	// read would turn one marginal link into an endless stream of identical records - and a machine
+	// whose log says the same thing a thousand times says nothing.
+	stand_up([0; 6], [0; 6]);
+	// A bad TLP (correctable, bit 6) and a completion timeout (uncorrectable, bit 14), with the
+	// timeout declared NON-fatal by this function.
+	stand_up_aer(1 << 14, 1 << 6, 0);
+	let record = super::take_error_record::<Fake>(0, 0, 0).expect("a function with an AER capability has a record");
+	assert_eq!(record.correctable, 1 << 6, "the correctable half is what the device set");
+	assert_eq!(record.uncorrectable, 1 << 14, "and so is the uncorrectable half");
+	assert!(!record.fatal, "and a bit the function declares non-fatal is not fatal");
+	assert_eq!(super::correctable_name(record.correctable), "a bad TLP", "the record says what happened");
+	assert_eq!(super::uncorrectable_name(record.uncorrectable), "a completion timeout");
+
+	// AND THE SECOND PASS IS QUIET, which is the half a reader without the write does not get.
+	let again = super::take_error_record::<Fake>(0, 0, 0).expect("the capability is still there");
+	assert!(again.is_quiet(), "the record was cleared as it was read: {again:?}");
+
+	// AND THE SEVERITY REGISTER IS NOT A STATUS REGISTER. Acknowledging it would rewrite the
+	// function's own policy about which errors are fatal, and the next real error would be reported
+	// under a severity nobody chose.
+	stand_up_aer(1 << 18, 0, 1 << 18);
+	let _ = super::take_error_record::<Fake>(0, 0, 0);
+	assert_eq!(Fake::read32(0, 0, 0, 0x100 + 0x0C), 1 << 18, "the severity register survives the acknowledgement");
+}
+
+crate::tagged_test!(severity_is_the_functions_own_and_decides_what_is_fatal, [Kernel, Pci], id = "kernel.arch.common.pci.severity_is_the_functions_own_and_decides_what_is_fatal", covers = ["kernel"]);
+fn severity_is_the_functions_own_and_decides_what_is_fatal() {
+	// THE SAME BIT IS FATAL ON ONE FUNCTION AND NOT ON ANOTHER, because severity is a register the
+	// FUNCTION carries rather than a property of the error. A kernel with a hard-coded list of fatal
+	// bits would quarantine a device its own hardware said was fine, and leave one alone that was
+	// not - and quarantining is the one action here that cannot be taken back.
+	stand_up([0; 6], [0; 6]);
+	stand_up_aer(1 << 18, 0, 0);
+	let lenient = super::take_error_record::<Fake>(0, 0, 0).expect("a record");
+	assert!(!lenient.fatal, "a malformed TLP the function declares non-fatal is not fatal");
+
+	stand_up_aer(1 << 18, 0, 1 << 18);
+	let strict = super::take_error_record::<Fake>(0, 0, 0).expect("a record");
+	assert!(strict.fatal, "and the same bit with the severity set IS");
+
+	// AND A SEVERITY BIT WITH NO STATUS BEHIND IT IS NOT AN ERROR AT ALL. A function declares every
+	// error it could have as fatal or not, all the time; what happened is the STATUS.
+	stand_up_aer(0, 1 << 6, u32::MAX);
+	let corrected = super::take_error_record::<Fake>(0, 0, 0).expect("a record");
+	assert!(!corrected.fatal, "a correctable error is not fatal however the severity register is set");
+	assert!(!corrected.is_quiet(), "and it is still a record");
+}
+
+crate::tagged_test!(a_function_that_left_the_bus_reports_no_record_rather_than_every_error_there_is, [Kernel, Pci], id = "kernel.arch.common.pci.a_function_that_left_the_bus_reports_no_record_rather_than_every_error_there_is", covers = ["kernel"]);
+fn a_function_that_left_the_bus_reports_no_record_rather_than_every_error_there_is() {
+	// AN ABSENT FUNCTION ANSWERS ALL ONES, and all ones in both status registers is EVERY error at
+	// once - which a reader that took it at face value would report as a catastrophic failure and
+	// then quarantine a device that is not there. What it is is a device that left the bus, and that
+	// is the departure path's question rather than this one's.
+	stand_up([0; 6], [0; 6]);
+	stand_up_aer(u32::MAX, u32::MAX, 0);
+	assert!(super::take_error_record::<Fake>(0, 0, 0).is_none(), "a function answering all ones has no record to report");
+
+	// AND ONE REGISTER OF ALL ONES IS STILL A RECORD, because a function CAN set many bits at once -
+	// what says it is gone is that the whole of config space answers the same thing.
+	stand_up_aer(u32::MAX, 0, u32::MAX);
+	let record = super::take_error_record::<Fake>(0, 0, 0).expect("a record");
+	assert!(record.fatal, "every uncorrectable error with every severity set is fatal");
+}
+
+crate::tagged_test!(a_power_event_names_its_requester_and_the_acknowledgement_does_not_write_it_back, [Kernel, Pci], id = "kernel.arch.common.pci.a_power_event_names_its_requester_and_the_acknowledgement_does_not_write_it_back", covers = ["kernel"]);
+fn a_power_event_names_its_requester_and_the_acknowledgement_does_not_write_it_back() {
+	// A PME SAYS WHICH FUNCTION ASKED TO BE WOKEN, and that is the whole of what a port can say: what
+	// a wake MEANS belongs to a power policy, and there is not one here. The requester id is in the
+	// same register as the status bit and is NOT writable, so the acknowledgement writes the status
+	// bit alone - writing the value that was read would put an id back into a field that does not
+	// take one, and on hardware that is a write of reserved bits.
+	stand_up([0; 6], [0; 6]);
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENT);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+	let port = super::HotPlugPort { bus: 0, dev: 0, func: 0, slot, occupied: true };
+	assert!(super::take_power_event::<Fake>(&port).is_none(), "a port nothing woke reports nothing");
+
+	// The port records a PME from 01:03.2, which is requester id 0x011a. THE STATUS BIT IS IN THE
+	// UPPER HALF-WORD and the requester in the lower, which is why the fixture's write-one-to-clear
+	// half is set to the upper one: on hardware the id is READ-ONLY and the bit is RW1C, in one
+	// register.
+	{
+		let mut space = SPACE.lock();
+		let at = (slot.cap + 0x20) as usize;
+		let status: u32 = (1 << 16) | 0x011a;
+		space.cfg[at..at + 4].copy_from_slice(&status.to_le_bytes());
+		space.rw1c = slot.cap + 0x20 + 2;
+	}
+	let event = super::take_power_event::<Fake>(&port).expect("the port reports the event");
+	assert_eq!(event.requester, 0x011a, "the event names the function that sent it");
+	assert_eq!((event.requester >> 8) as u8, 1, "which is bus 1");
+	assert_eq!(((event.requester >> 3) & 0x1F) as u8, 3, "device 3");
+	assert_eq!((event.requester & 0x7) as u8, 2, "function 2");
+
+	// THE ACKNOWLEDGEMENT WRITES THE STATUS BIT ALONE, which is the thing this test is about. A
+	// reader that wrote back the value it had just read would put the requester id into the lower
+	// half - a write of a field that does not take one, and on hardware a write of reserved bits - so
+	// what is checked is that the lower half of what was written is EMPTY.
+	let after = Fake::read32(0, 0, 0, slot.cap + 0x20);
+	assert_eq!(after & (1 << 16), 0, "the status bit was acknowledged");
+	assert_eq!(after & 0xFFFF, 0, "and the write carried no requester id, so it was the bit alone and not the value that was read");
+	assert!(super::take_power_event::<Fake>(&port).is_none(), "and a second look reports nothing");
+}
+
+crate::tagged_test!(a_sweep_reports_only_the_functions_that_said_something, [Kernel, Pci], id = "kernel.arch.common.pci.a_sweep_reports_only_the_functions_that_said_something", covers = ["kernel"]);
+fn a_sweep_reports_only_the_functions_that_said_something() {
+	// A SWEEP OVER A WORKING MACHINE FILLS NOTHING. A record whose every field is zero is a function
+	// that is fine, and a sweep that returned one per watched function would make finding the one
+	// that is not the caller's problem - which on a machine with sixteen reporters is most of them.
+	stand_up([0; 6], [0; 6]);
+	super::forget_error_reporters();
+	stand_up_aer(0, 0, 0);
+	assert!(super::note_error_reporter::<Fake>(0, 0, 0), "a function with an AER capability is watched");
+	// IDEMPOTENT, because a hot-plug slot's address is reused: a card plugged into one twice is the
+	// same bus, device and function, and a list that grew each time would fill up with one slot.
+	assert!(super::note_error_reporter::<Fake>(0, 0, 0), "and noting it twice is still true");
+
+	let quiet = super::ErrorRecord { bus: 0, dev: 0, func: 0, correctable: 0, uncorrectable: 0, fatal: false };
+	let mut out = [quiet; super::MAX_ERROR_REPORTERS];
+	assert_eq!(super::poll_errors::<Fake>(&mut out), 0, "a machine with nothing to report fills no records");
+
+	// AND A FUNCTION THAT SAID SOMETHING IS FILLED ONCE. The sweep clears as it reads, so the second
+	// pass over the same machine is quiet again - which is what stops one fault becoming a stream.
+	stand_up_aer(0, 1 << 8, 0);
+	assert_eq!(super::poll_errors::<Fake>(&mut out), 1, "the function that reported is filled");
+	assert_eq!(out[0].correctable, 1 << 8, "with what it reported");
+	assert_eq!(super::correctable_name(out[0].correctable), "a replay-number rollover");
+	assert_eq!(super::poll_errors::<Fake>(&mut out), 0, "and the next sweep is quiet, because the first cleared it");
+
+	// AND A FUNCTION WITH NO CAPABILITY IS NOT WATCHED AT ALL, which is what makes the sweep cheap on
+	// an ordinary machine: most functions carry none.
+	super::forget_error_reporters();
+	stand_up([0; 6], [0; 6]);
+	assert!(!super::note_error_reporter::<Fake>(0, 0, 0), "a function with no AER capability is not watched");
+	assert_eq!(super::poll_errors::<Fake>(&mut out), 0, "and a sweep over an empty list reports nothing");
+}
+
+crate::tagged_test!(a_power_event_sweep_reads_every_port_and_clears_what_it_read, [Kernel, Pci], id = "kernel.arch.common.pci.a_power_event_sweep_reads_every_port_and_clears_what_it_read", covers = ["kernel"]);
+fn a_power_event_sweep_reads_every_port_and_clears_what_it_read() {
+	// THE SWEEP IS OVER THE PORTS AND NOT OVER THE DEVICES, because a PME is a MESSAGE a function
+	// sends UPSTREAM: what records it is the root port above it, and the requester id is how the port
+	// says which function that was. A sweep over endpoints would find nothing and conclude nothing
+	// woke the machine.
+	stand_up([0; 6], [0; 6]);
+	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENT);
+	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
+	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
+
+	let mut out = [super::PowerEvent { bus: 0, dev: 0, func: 0, requester: 0 }; super::MAX_HOT_PLUG_PORTS];
+	assert_eq!(super::poll_power_events::<Fake>(&mut out), 0, "a machine nothing woke reports nothing");
+
+	{
+		let mut space = SPACE.lock();
+		let at = (slot.cap + 0x20) as usize;
+		let status: u32 = (1 << 16) | 0x0208;
+		space.cfg[at..at + 4].copy_from_slice(&status.to_le_bytes());
+		space.rw1c = slot.cap + 0x20 + 2;
+	}
+	assert_eq!(super::poll_power_events::<Fake>(&mut out), 1, "the port that recorded one reports it");
+	assert_eq!(out[0].requester, 0x0208, "and names the function that sent it");
+	assert_eq!(super::poll_power_events::<Fake>(&mut out), 0, "and the next sweep is quiet, because the first acknowledged it");
 }

@@ -406,6 +406,28 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//      machine with no IOMMU a DMA-capable one reaches memory the page tables were meant to
 		//      isolate.
 		let device_privilege: u64 = recv_tagged(bootstrap, &mut buf, b"DEVPRIV").unwrap_or(0);
+		// 1b3a. AND THE CHANNEL THE KERNEL REPORTS BUS CHANGES ON, registered here because it needs
+		//       the privilege that just arrived and because a device plugged in before this program
+		//       is watching is a device nothing binds. The kernel holds the sending end; this
+		//       program waits on the other with everything else it waits on.
+		let bus_events: u64 = match channel() {
+			Some((kernel_side, ours)) if device_privilege != 0 => {
+				if sys_is_err(syscall(abi::SYS_DEVICE_EVENTS, kernel_side, device_privilege, 0, 0)) {
+					print(b"DeviceManager: the kernel refused to report bus changes - a device plugged in later will not be bound\n");
+					close(kernel_side);
+					close(ours);
+					0
+				} else {
+					ours
+				}
+			}
+			Some((kernel_side, ours)) => {
+				close(kernel_side);
+				close(ours);
+				0
+			}
+			None => 0,
+		};
 		// 1b4. and the boot window: how long this boot is allowed to take, and when THIS boot's
 		//      window closes. Carries no capability. Zero for either is "not published", and this
 		//      program then bounds a bind by its per-attempt deadline alone - which is what it did
@@ -676,6 +698,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waiting[waiting_count] = client;
 				waiting_count += 1;
 			}
+			// THE KERNEL'S BUS NEWS, IN THE ONE WAIT. A second wait in front of this one is what the
+			// note above already refuses; an arrival is a message like any other and belongs here.
+			let bus_events_at: usize = waiting_count;
+			if bus_events != 0 {
+				waiting[waiting_count] = bus_events;
+				waiting_count += 1;
+			}
 			// The teardown handles go LAST, so everything before them keeps the index arithmetic the
 			// serving branches below rely on.
 			let teardowns_at: usize = waiting_count;
@@ -771,6 +800,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					#[cfg(feature = "development")]
 					if dev.bootstrap != 0 && at == dev_at {
 						dev.supervise(&mut buf, &mut catalogue_clients);
+						continue;
+					}
+					if bus_events != 0 && at == bus_events_at {
+						serve_bus_events(bus_events, &mut nodes, &catalogue, power, console_input, device_privilege, &mut recovery, &mut buf);
 						continue;
 					}
 					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
@@ -3023,9 +3056,29 @@ fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 	let now = clock();
 	expire_heartbeat(node, now);
 	expire_planned_stop(node, now);
+	// THE FRAMES FIRST AND THE DEADLINE AFTER THEM, WHICH IS THE ORDER THE TWO ACTUALLY HAPPENED IN.
+	//
+	// This checked the bind deadline BEFORE reading the channel, so on the pass where the deadline
+	// fell the timeout went into the queue AHEAD of an answer that was already sitting in the
+	// channel, unread. The queue is drained in order, so the timeout was acted on and the answer was
+	// then an event outside its binding phase - and the manager reported a driver that "never
+	// answered its bind at all" while holding, in its own buffer, the sentence it had answered with.
+	//
+	// A DEADLINE IS ABOUT SILENCE, AND THERE IS NO SILENCE WHEN THE ANSWER HAS ARRIVED. The incident
+	// this produced even carried the contradiction: `last opcode 5 4 tick(s) ago` - a terminal frame,
+	// four ticks before the timeout that said nothing had been said.
+	//
+	// Measured on the q35 chipset's built-in SATA controller, which carries only an ATAPI device:
+	// the AHCI driver refused it with `unsupported-device` on both attempts, and the boot spent two
+	// full bind windows waiting each time.
+	drain_frames(node, buf);
 	if driver_binding::handshake_expired(node.record.state, node.ready_deadline, clock()) {
 		node.push(BindingEvent::TimedOut { generation: node.id.generation });
 	}
+}
+
+// Queue a bounded batch of this binding's frames; any left stay readable for the next pass.
+fn drain_frames(node: &mut Node, buf: &mut [u8]) {
 	let Some(binding) = &node.binding else { return };
 	let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
 	for _ in 0..MAX_DRIVER_FRAMES_PER_PASS {
@@ -3134,7 +3187,19 @@ fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					refuse(&handles);
 					continue;
 				};
-				node.push(BindingEvent::Failed { generation, code });
+				// SAID WHERE THE FRAME IS READ, not only where it is reduced.
+				//
+				// A refusal that the queue or the state machine then drops left no trace anywhere,
+				// and the boot log's only word for it became the bind timeout that followed - which
+				// names a silence, from a driver that had answered.
+				print(b"DeviceManager: ");
+				print_driver_name(node.driver_name());
+				print(b" answered its bind with a refusal - ");
+				print(code.name());
+				if !node.push(BindingEvent::Failed { generation, code }) {
+					print(b" (and the binding's event queue would not take it)");
+				}
+				print(b"\n");
 			}
 			driver_protocol::Opcode::Pong => {
 				// Receipt is the observable deadline boundary: queued frames carry no trusted
@@ -3718,9 +3783,24 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	// failure while acquiring a later entry - or while sending - reached `give_up` with the
 	// earlier ones held and nothing able to close them.
 	let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel" || driver_name == b"virtio_console" || driver_name == b"virtio_scsi";
+	// WHICH RESOURCE REFUSED, SAID WHERE IT REFUSED.
+	//
+	// Every arm below ends as `resource-exhausted`, which the manager then prints for all of them -
+	// so a controller that lost an interrupt vector, one that could not be given a key sink and one
+	// the power service would not mint a connection for are one line of output with three meanings.
+	// On a machine where the xHCI controller did not bind, that word was the entire diagnosis and it
+	// named none of the four things it could have been.
+	let refused = |what: &[u8]| {
+		print(b"DeviceManager: ");
+		print(driver_name);
+		print(b" could not be given ");
+		print(what);
+		print(b"\n");
+	};
 	if use_msix {
 		let irq: i64 = device_msix_acquire(grant.claim);
 		if irq < 0 {
+			refused(b"an interrupt vector");
 			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 		}
 		txn.holds(driver_protocol::ResourceKind::Irq as u16, irq as u64);
@@ -3728,6 +3808,7 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 	if driver_name == b"virtio_input" || driver_name == b"xhci" {
 		let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
 		if sink < 0 {
+			refused(b"a key sink - the raw-key channel could not be duplicated");
 			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 		}
 		txn.holds(driver_protocol::ResourceKind::Keys as u16, sink as u64);
@@ -3735,13 +3816,17 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 		// duplicate of the root-Domain handle - which can kill every process on the machine -
 		// so that the Power key would work. What they get now can ask for a reboot and
 		// nothing else, on a channel nobody else answers on.
-		let Some(connection) = service_connect(power) else { return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left)) };
+		let Some(connection) = service_connect(power) else {
+			refused(b"a power connection - the power service minted none");
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+		};
 		txn.holds(driver_protocol::ResourceKind::SysPower as u16, connection);
 		// The capability that lets those keystrokes reach the console at all. A duplicate
 		// per driver, for the same reason as the power connection.
 		if console_input != 0 {
 			let feed: i64 = duplicate(console_input, RIGHT_TRANSFER);
 			if feed < 0 {
+				refused(b"a console feed - the console input channel could not be duplicated");
 				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 			}
 			txn.holds(driver_protocol::ResourceKind::Console as u16, feed as u64);
@@ -3832,7 +3917,23 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 		// A Copy event must leave scope before effects can see the admitted payload.
 		let decision = {
 			let Some(popped) = node.pop() else { break };
-			if let Some(teardown) = node.teardown.as_mut() {
+			// A TEARDOWN TAKES ITS OWN TWO CONFIRMATIONS AND NOTHING ELSE.
+			//
+			// This routed EVERY event to the outstanding teardown while one existed - and
+			// `Pending::note` consumes exactly two of them, `Exited` and `ClaimSettled`, discarding
+			// the rest. So a driver's terminal answer that arrived with a teardown outstanding was
+			// dropped on the floor: the node sat in `Binding` with the answer already given, ran to
+			// its bind deadline, and the manager reported that the driver "never answered its bind
+			// at all" - and then restarted it, because a code it never read could not tell it not to.
+			//
+			// Measured on the q35 chipset, whose built-in SATA controller carries only an ATAPI
+			// device: the AHCI driver read the ports, refused with `unsupported-device`, and the boot
+			// spent TWO full bind windows waiting for an answer it had been given twice. The generation
+			// filter in `pop` has already established that the event is about the binding this node
+			// holds NOW, which is the question routing was standing in for.
+			if let Some(teardown) = node.teardown.as_mut()
+				&& matches!(popped, BindingEvent::Exited { .. } | BindingEvent::ClaimSettled { .. })
+			{
 				teardown.pending.note(popped);
 				continue;
 			}
@@ -3959,7 +4060,11 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 				// device and will not drive it however many times it is asked.
 				print(b"DeviceManager: ");
 				print_driver_name(driver_name);
-				print(if code.retryable() { b" reported a retryable failure\n" } else { b" reported a permanent failure\n" });
+				print(if code.retryable() { b" reported a retryable failure - " } else { b" reported a permanent failure - " });
+				print(code.name());
+				print(b"\n");
+				// Measured on the q35 chipset, which carries a SATA controller with only an ATAPI
+				// device on it.
 			}
 			// A PLANNED STOP COMPLETING, which is not a failure and must not be recorded as one.
 			// The node carries the intent it was stopped WITH, and that is what decides where a
@@ -4418,6 +4523,179 @@ fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalog
 // Ask an online driver to stop because what it requires has gone. The same shape as the operator's
 // disable, including the withdrawal that comes first - see `stop_nodes_that_lost_a_dependency`,
 // which is the only caller and which owns the ORDER the withdrawals happen in.
+// THE BUS CHANGED SHAPE WHILE THE MACHINE WAS RUNNING, and this is what this program does about it.
+//
+// AN ARRIVAL AND A DEPARTURE ARE NOT SYMMETRIC, which is why they are not one branch with a flag.
+// An arrival is a new NODE with a candidate list to walk, exactly as a boot-time device is; a
+// departure is a binding that has to be ASKED TO STOP and then confirmed, because the driver holds a
+// claim and a mapping and neither is free until it says so. That asymmetry is the item's own
+// sentence - "coordinate safe driver stop before resource removal" - and it is why `Removed` is
+// reachable only from `Stopping`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &Catalogue, power: u64, console_input: u64, device_privilege: u64, recovery: &mut Recovery, buf: &mut [u8]) {
+	unsafe {
+		// DRAINED AND NOT READ ONCE. Two devices unplugged together are two messages, and a loop that
+		// took one per wake would leave the second sitting behind a channel that is readable - which
+		// is a wait that wakes immediately, forever, with one device still bound to nothing.
+		loop {
+			let Polled::Message { len, handle } = try_recv(events, buf) else { break };
+			if handle != 0 {
+				close(handle);
+			}
+			if len < 9 {
+				continue;
+			}
+			let kind = buf[0];
+			let index = u64::from_le_bytes(buf[1..9].try_into().unwrap_or([0; 8]));
+			match kind {
+				abi::DEVICE_EVENT_ARRIVED => admit_arrival(index, nodes, catalogue, power, console_input, device_privilege, recovery),
+				abi::DEVICE_EVENT_DEPARTED => begin_removal(index, nodes),
+				abi::DEVICE_EVENT_FAULTED => begin_quarantine(index, nodes),
+				_ => {}
+			}
+		}
+	}
+}
+
+// A device appeared: give it a node and start binding it.
+//
+// THE SAME PATH A BOOT DEVICE TAKES, and deliberately the same: one node, the candidate list the
+// catalogue's rules produce for its identity, and `start_candidate` to walk it. A second, shorter
+// path for a hot-plugged device would be a device that binds by different rules depending on when it
+// was plugged in - which is exactly the class of difference nobody finds until it matters.
+#[allow(clippy::too_many_arguments)]
+unsafe fn admit_arrival(index: u64, nodes: &mut Vec<Node>, catalogue: &Catalogue, power: u64, console_input: u64, device_privilege: u64, recovery: &mut Recovery) {
+	unsafe {
+		let mut info: DeviceInfo = DeviceInfo::default();
+		if !device_info(index, &mut info) {
+			print(b"DeviceManager: the kernel reported an arrival this program cannot read\n");
+			return;
+		}
+		// A NODE FOR THIS INDEX MAY ALREADY EXIST, because a slot is a slot: the row is refilled and
+		// the index is the one the departed device had. What that node holds is a finished binding,
+		// and what the new device needs is a new one - so the old node is replaced rather than
+		// revived, and its identity carries the claim generation the kernel just minted.
+		if let Some(at) = nodes.iter().position(|node| node.index == index) {
+			if !matches!(nodes[at].record.state, BindingState::Removed | BindingState::Unbound | BindingState::Failed | BindingState::Disabled) {
+				print(b"DeviceManager: a device arrived at an index whose binding has not finished; it is left alone\n");
+				return;
+			}
+			nodes.swap_remove(at);
+		}
+		let candidates = registry_candidates(&info);
+		if candidates.is_empty() {
+			print(b"DeviceManager: a device arrived that no rule in the catalogue matches\n");
+			return;
+		}
+		if nodes.len() >= MAX_NODES_IN_FLIGHT {
+			print(b"DeviceManager: a device arrived and this machine is already supervising as many bindings as it admits\n");
+			return;
+		}
+		let mut node = Node::new(index, &info, candidates);
+		print(b"DeviceManager: a device arrived on the bus and is being bound\n");
+		if recovery.state.len() <= index as usize {
+			recovery.state.resize(index as usize + 1, STATE_UNKNOWN);
+		}
+		start_candidate(&mut node, recovery.storage, recovery.key_producer, power, console_input, device_privilege, catalogue, &mut recovery.state);
+		nodes.push(node);
+	}
+}
+
+// A device left: ask its driver to stop, so the binding can land at `Removed`.
+//
+// A REMOVAL WHOSE TEARDOWN IS NOT CONFIRMED LANDS AT `Quarantined` AND NOT AT `Removed`, and that is
+// the rule rather than an accident of this function: `Removed` says the device is gone and nothing is
+// owed, which is the one thing an unconfirmed teardown cannot say. Nothing here decides that - the
+// teardown resolution does, from the intent recorded now.
+fn begin_removal(index: u64, nodes: &mut [Node]) {
+	let Some(at) = nodes.iter().position(|node| node.index == index) else {
+		// A DEVICE NOTHING WAS BOUND TO is not a problem: the inventory row is already off the bus,
+		// and there is no binding to take through a teardown.
+		return;
+	};
+	print(b"DeviceManager: ");
+	print_driver_name(nodes[at].driver_name());
+	print(b"'s device was removed from the bus; stopping it\n");
+	nodes[at].stop_intent = driver_binding::StopIntent::DeviceRemoved;
+	if nodes[at].binding.is_none() {
+		// NOTHING IS RUNNING, so there is nothing to ask and nothing to confirm. The binding has no
+		// resources outstanding, which is the one case `Removed` may be entered without a stop - and
+		// it is entered through `Stopping` all the same, because that is the only edge into it.
+		if nodes[at].record.move_to(BindingState::Stopping, None) && !nodes[at].record.move_to(BindingState::Removed, None) {
+			print(b"DeviceManager: an unbound device's removal could not be recorded\n");
+		}
+		return;
+	}
+	begin_device_removed_stop(&mut nodes[at]);
+}
+
+// A device reported a fatal error and the kernel has stopped it mastering the bus.
+//
+// THE SAME SHAPE AS A REMOVAL AND A DIFFERENT DESTINATION. The driver is asked to stop, because its
+// resources are still outstanding and it is the only thing that can release them - but where the
+// binding lands is `Quarantined` and not `Removed`, because the device has not gone anywhere: it is
+// still in the machine, still addressable, and no longer described by anything. A retry would bind
+// the same broken function, which is why the intent carries no attempts.
+fn begin_quarantine(index: u64, nodes: &mut [Node]) {
+	let Some(at) = nodes.iter().position(|node| node.index == index) else {
+		// A DEVICE NOTHING WAS BOUND TO needs no teardown: the kernel has already stopped it
+		// mastering the bus, and there is no binding whose state could say anything more.
+		return;
+	};
+	print(b"DeviceManager: ");
+	print_driver_name(nodes[at].driver_name());
+	print(b"'s device reported a fatal error; quarantining it\n");
+	nodes[at].stop_intent = driver_binding::StopIntent::DeviceFaulted;
+	if nodes[at].binding.is_none() {
+		// NOTHING IS RUNNING, so there is nothing to ask and nothing to confirm - and the binding
+		// still passes through `Stopping`, because that is the only edge into `Quarantined`.
+		if nodes[at].record.move_to(BindingState::Stopping, None) && !nodes[at].record.move_to(BindingState::Quarantined, None) {
+			print(b"DeviceManager: an unbound device's quarantine could not be recorded\n");
+		}
+		return;
+	}
+	begin_device_faulted_stop(&mut nodes[at]);
+}
+
+// The same shape as an operator's disable and a lost dependency: withdraw, enter `Stopping`, ask,
+// and bound the ask.
+fn begin_device_faulted_stop(node: &mut Node) {
+	let Some(binding) = &node.binding else { return };
+	let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
+	if !node.record.move_to(BindingState::Stopping, None) {
+		print(b"DeviceManager: a quarantine could not enter the teardown\n");
+		return;
+	}
+	if !send_frame(channel, driver_protocol::Opcode::Stop, generation, &[], 0, 0) {
+		// Its channel may already be gone - a driver whose device stopped answering often exits on
+		// its own - so the exit is what will end the binding, and `advance` resolves it against the
+		// intent.
+		print(b"DeviceManager: ");
+		print_driver_name(node.driver_name());
+		print(b" could not be asked to stop; its exit is what will end the binding\n");
+	}
+	node.stop_deadline = planned_stop_deadline(node);
+}
+
+// The same shape as an operator's disable and a lost dependency: withdraw, enter `Stopping`, ask,
+// and bound the ask.
+fn begin_device_removed_stop(node: &mut Node) {
+	let Some(binding) = &node.binding else { return };
+	let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
+	if !node.record.move_to(BindingState::Stopping, None) {
+		print(b"DeviceManager: a removal could not enter the teardown\n");
+		return;
+	}
+	if !send_frame(channel, driver_protocol::Opcode::Stop, generation, &[], 0, 0) {
+		// Its channel is already gone - which for a removed device is the likeliest case of all -
+		// so the exit is what will end the binding, and `advance` resolves it against the intent.
+		print(b"DeviceManager: ");
+		print_driver_name(node.driver_name());
+		print(b" could not be asked to stop; its exit is what will end the binding\n");
+	}
+	node.stop_deadline = planned_stop_deadline(node);
+}
+
 fn begin_dependency_stop(node: &mut Node, catalogue: &mut Catalogue) {
 	let Some(binding) = &node.binding else { return };
 	let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
@@ -5174,6 +5452,7 @@ fn binding_state_wire(state: BindingState) -> proto::system::BindingState {
 		BindingState::Failed => proto::system::BindingState::Failed,
 		BindingState::Quarantined => proto::system::BindingState::Quarantined,
 		BindingState::Disabled => proto::system::BindingState::Disabled,
+		BindingState::Removed => proto::system::BindingState::Removed,
 	}
 }
 
@@ -5215,6 +5494,7 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::POINTER => proto::system::ProviderKind::Pointer,
 		provider::CONSOLE_BYTES => proto::system::ProviderKind::ConsoleBytes,
 		provider::LOCAL_STREAM => proto::system::ProviderKind::LocalStream,
+		provider::TOUCH => proto::system::ProviderKind::Touch,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -5230,6 +5510,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::Pointer => driver_protocol::provider::POINTER,
 		proto::system::ProviderKind::ConsoleBytes => driver_protocol::provider::CONSOLE_BYTES,
 		proto::system::ProviderKind::LocalStream => driver_protocol::provider::LOCAL_STREAM,
+		proto::system::ProviderKind::Touch => driver_protocol::provider::TOUCH,
 	}
 }
 

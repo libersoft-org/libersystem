@@ -124,6 +124,24 @@ declare -A GATES=(
 	# colour glyph in its own palette. It boots its own guest unless one is up, and takes down only
 	# what it started.
 	["qemu-2d-demo"]="tools/check-qemu-2d-demo.sh"
+	# AND THE 3D ONE, which asks a different set of questions of a different kind of frame: that a lit
+	# object stands in front of a horizon in a bounded central region, that the ground's texture
+	# REPEATS, that the translucent panel is a mix rather than either of its operands, that the 2D
+	# overlay reached the same frame the 3D scene did, that two stated poses show what those poses
+	# must show, that two aspect ratios show the same scene, and that `q` gives the console back.
+	["qemu-3d-demo"]="tools/check-qemu-3d-demo.sh"
+	# A DEVICE PLUGGED INTO A LIVE MACHINE AND TAKEN OUT OF IT AGAIN, which is the only place the
+	# whole hot-plug path happens at once: a port asserts, the kernel reads the slot, the inventory
+	# grows a row, a driver binds - and a removal stops the driver and waits for its claim BEFORE the
+	# slot goes down. The gate reads those two lines in order, because a log that only counted them
+	# would pass for a surprise removal too.
+	["qemu-pcie-hotplug"]="tools/check-qemu-pcie-hotplug.sh"
+	# A PCIe FUNCTION REPORTING AN ERROR ON A LIVE MACHINE, which is the only place that path happens
+	# at all: hardware sets a status bit, the kernel reads it through the window ACPI described and
+	# says what happened, and a FATAL one stops the function mastering the bus and takes its binding to
+	# `Quarantined`. The injection is the point - nothing this system can be asked to do produces an
+	# error record, so the gate makes the hardware misbehave.
+	["qemu-pcie-aer"]="tools/check-qemu-pcie-aer.sh"
 	# THE SECOND PORT OF A VIRTIO-SERIAL DEVICE, proved by the port's OWN chardev: a generic port is
 	# opened through the control queue, so a driver without MULTIPORT cannot see it, open it or write
 	# to it. What the gate reads is the line on that port's capture and its absence from the

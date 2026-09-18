@@ -68,7 +68,7 @@ fn device_entry(i: u64) -> Option<DeviceEntry> {
 	}
 	// The address comes straight from the kernel table, which is what makes a row number
 	// resolvable to a device without asking any service. See `device-entry`.
-	Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32 })
+	Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, present: info.on_bus != 0, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32 })
 }
 
 // Map a kernel device-type code to the typed device type.

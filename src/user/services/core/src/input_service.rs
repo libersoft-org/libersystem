@@ -28,7 +28,7 @@ use keys::KeyState;
 use proto::codec::Handles;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
-use proto::system::{Error, KeyEvent, PointerEvent, ProviderKind, provider_catalogue};
+use proto::system::{ContactEvent, Error, KeyEvent, PointerEvent, ProviderKind, provider_catalogue};
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -45,6 +45,15 @@ const RING_CAP: usize = 32;
 // first five bytes are the minimum to map a cell position; the wheel byte is forwarded
 // to ConsoleService but not part of the typed snapshot.
 const RAW_LEN: usize = 5;
+// A raw contact from a touch driver: [id u8][tip u8][x u16 LE][y u16 LE]. ONE CONTACT PER MESSAGE
+// rather than a batch, because a batch needs a count and a count is a second thing that can disagree
+// with the bytes beside it - and the stream this service publishes is per contact anyway.
+const RAW_CONTACT_LEN: usize = 6;
+// How long the key-focus notice waits for ConsoleService to take it. Ten ticks is a tenth of a
+// second: far longer than a console that is running needs, and short enough that a console which is
+// not cannot hold this service - which DisplayService is synchronously waiting on. See
+// `notify_console`.
+const CONSOLE_NOTICE_TICKS: u64 = 10;
 
 // The recent pointer events, mapped to the text-cell grid - the bounded source a
 // `subscribe` stream snapshots.
@@ -54,10 +63,21 @@ struct Input {
 	focus_peer: u64,
 	kill_control: u64,
 	key_stream: Option<KeyStream>,
+	/// The live contact stream, and which contacts are still down on it - so focus loss can release
+	/// a finger the way it releases a held key, rather than leaving the next foreground application
+	/// to inherit one.
+	contact_stream: Option<ContactStream>,
+	contacts_down: Vec<u8>,
 	proof_nonce: u64,
 }
 
 struct KeyStream {
+	owner: u64,
+	producer: u64,
+	seq: u32,
+}
+
+struct ContactStream {
 	owner: u64,
 	producer: u64,
 	seq: u32,
@@ -88,7 +108,7 @@ impl AdminService for AdminCall<'_> {
 
 impl Input {
 	fn new(kill_control: u64) -> Input {
-		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, proof_nonce: 0 }
+		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, contact_stream: None, contacts_down: Vec::new(), proof_nonce: 0 }
 	}
 
 	// Record one mapped event, dropping the oldest once the ring is full.
@@ -145,7 +165,66 @@ impl Input {
 		}
 	}
 
+	// Deliver one contact to the live stream, answering whether it went.
+	//
+	// THE SAME NON-BLOCKING RULE THE KEY STREAM KEEPS: a consumer that stopped reading must not be
+	// able to stall this service, which DisplayService is synchronously waiting on for every focus
+	// change. A stream that will not take a contact is a stream whose consumer is gone.
+	fn send_contact(&mut self, event: ContactEvent) -> bool {
+		let Some(stream) = self.contact_stream.as_mut() else { return false };
+		let mut frame: [u8; 32] = [0; 32];
+		let mut frame_handles = Handles::new();
+		let sent: bool = match input::subscribe_contacts_frame(stream.seq, &event, &mut frame, &mut frame_handles) {
+			Some(len) => try_send_caps(stream.producer, &frame[..len], frame_handles.as_slice()),
+			None => false,
+		};
+		if sent {
+			stream.seq = stream.seq.wrapping_add(1);
+			true
+		} else {
+			for handle in frame_handles.as_slice() {
+				close(*handle);
+			}
+			let dead: ContactStream = self.contact_stream.take().unwrap();
+			close(dead.producer);
+			false
+		}
+	}
+
+	// Record one contact and pass it on, keeping track of which are still down.
+	//
+	// A CONTACT THAT LIFTS IS REPORTED AND THEN FORGOTTEN, and one that never lifts is what the
+	// release below exists for: a finger is held state exactly as a key is, and a foreground
+	// application that inherits one is a program that starts with a touch it never saw begin.
+	fn record_contact(&mut self, event: ContactEvent) {
+		if event.tip {
+			if !self.contacts_down.contains(&event.id) {
+				self.contacts_down.push(event.id);
+			}
+		} else if let Some(at) = self.contacts_down.iter().position(|id| *id == event.id) {
+			self.contacts_down.swap_remove(at);
+		}
+		self.send_contact(event);
+	}
+
+	fn close_contact_stream(&mut self, release_held: bool) {
+		if release_held {
+			// EVERY FINGER STILL DOWN IS LIFTED BEFORE THE STREAM GOES, which is the contact half of
+			// what `close_key_stream` does for keys.
+			for id in core::mem::take(&mut self.contacts_down) {
+				if !self.send_contact(ContactEvent { id, tip: false, x: 0, y: 0 }) {
+					break;
+				}
+			}
+		}
+		self.contacts_down.clear();
+		if let Some(stream) = self.contact_stream.take() {
+			close(stream.producer);
+		}
+	}
+
 	fn set_focus(&mut self, peer: u64) {
+		self.close_contact_stream(true);
 		self.close_key_stream(true);
 		if self.focus_peer != 0 {
 			close(self.focus_peer);
@@ -153,12 +232,35 @@ impl Input {
 		self.focus_peer = peer;
 	}
 
+	// Tell ConsoleService whether the graphical surface holds the keyboard.
+	//
+	// BOUNDED, AND THIS SERVICE IS THE ONE THAT MUST NEVER PARK.
+	//
+	// It used to be `send_blocking`, on a channel to ConsoleService - and this is called from inside
+	// the FOCUS handler, which DisplayService is sitting in `recv_blocking` waiting for the `OK` of.
+	// So the chain was: DisplayService waits for InputService, InputService waits for room in
+	// ConsoleService's queue, and ConsoleService is in the middle of a present that waits for
+	// DisplayService. Three services, each holding what the next one needs, and nothing in any of
+	// them wrong on its own.
+	//
+	// It surfaces at exactly one moment: the instant a full-screen program gives the display back.
+	// That is when the focus hand-back, the console's repaint and the surface teardown all happen at
+	// once - and what a person sees is a shell that printed its prompt and then answered nothing for
+	// seconds, on a machine where every service is running.
+	//
+	// A DEADLINE RATHER THAN A DROP, because the message decides whether the console feeds keystrokes
+	// to the shell while a surface owns them, and a dropped one leaves it wrong until the next focus
+	// change. The bound is short - the console is one wake away from draining this whenever it is not
+	// itself blocked - and the loss is reported rather than silent.
 	fn notify_console(&self, focused: bool, forward: u64) {
-		if forward != 0 {
-			let mut message: [u8; 9] = [0; 9];
-			message[..8].copy_from_slice(b"KEYFOCUS");
-			message[8] = focused as u8;
-			let _ = send_blocking(forward, &message, 0);
+		if forward == 0 {
+			return;
+		}
+		let mut message: [u8; 9] = [0; 9];
+		message[..8].copy_from_slice(b"KEYFOCUS");
+		message[8] = focused as u8;
+		if let SendOutcome::Stalled = send_deadline(forward, &message, 0, clock() + CONSOLE_NOTICE_TICKS) {
+			print(b"InputService: ConsoleService did not take the key-focus notice inside its deadline; the console keeps whatever focus it last heard\n");
 		}
 	}
 
@@ -189,6 +291,30 @@ impl input::Service for Input {
 		}
 		Vec::new()
 	}
+
+	// THE SAME STUB AS `subscribe_keys` AND FOR THE SAME REASON. The generated contract answers with
+	// a snapshot; these two are LIVE streams, served by `stream_subscribe_keys` and
+	// `stream_subscribe_contacts` off the serve loop, which is where the focus proof is spent. A
+	// caller reaching this arm handed a proof that is closed here rather than kept.
+	fn subscribe_contacts(&mut self, focus: u64) -> Vec<ContactEvent> {
+		if focus != 0 {
+			close(focus);
+		}
+		Vec::new()
+	}
+}
+
+// Map a raw contact from a touch driver, or None if it is not one.
+//
+// THE AXES PASS THROUGH UNSCALED, which is the difference from the pointer path above and is the
+// whole reason a touch surface is not published as a pointer: the driver already normalised them
+// across the surface, and this service's job is to carry that rather than to flatten it onto a
+// text-cell grid a finger moves within.
+fn contact_from(raw: &[u8]) -> Option<ContactEvent> {
+	if raw.len() < RAW_CONTACT_LEN {
+		return None;
+	}
+	Some(ContactEvent { id: raw[0], tip: raw[1] != 0, x: u16::from_le_bytes([raw[2], raw[3]]), y: u16::from_le_bytes([raw[4], raw[5]]) })
 }
 
 // Map a raw normalized pointer event to a text-cell PointerEvent, or None if it is
@@ -294,6 +420,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
 	let raw: u64 = take_published_pointer(catalogue, &ProviderKind::Input);
 	let raw2: u64 = take_published_pointer(catalogue, &ProviderKind::Pointer);
+	// A TOUCH SURFACE IS ITS OWN KIND, discovered the same way. A machine with none has none, which
+	// is what a zero handle already says.
+	let touch: u64 = take_published_pointer(catalogue, &ProviderKind::Touch);
 
 	// 2. report in to the supervisor that started us.
 	{
@@ -302,7 +431,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new(kill);
-	serve(service, admin, [raw, raw2], forward, keys, focus, &mut state);
+	serve(service, admin, [raw, raw2], touch, forward, keys, focus, &mut state);
 	exit();
 }
 
@@ -311,11 +440,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // one client request. Returns when the client side closes (no more clients). Once
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
-fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focus: u64, state: &mut Input) {
+#[allow(clippy::too_many_arguments)]
+fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, keys: u64, focus: u64, state: &mut Input) {
 	let mut req: [u8; 64] = [0u8; 64];
 	let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
 	let mut keys_open: bool = keys != 0;
+	let mut touch_open: bool = touch != 0;
 	let mut focus_open: bool = focus != 0;
 	loop {
 		let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 5);
@@ -324,6 +455,9 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focu
 		}
 		if keys_open {
 			waitset.push(keys);
+		}
+		if touch_open {
+			waitset.push(touch);
 		}
 		for (i, &raw) in raws.iter().enumerate() {
 			if open[i] {
@@ -370,6 +504,26 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focu
 			};
 			if acknowledged {
 				send_blocking(focus, b"OK", 0);
+			}
+			continue;
+		}
+		if touch_open && ready_handle == touch {
+			loop {
+				match try_recv(touch, &mut req) {
+					Polled::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						if let Some(contact) = contact_from(&req[..len]) {
+							state.record_contact(contact);
+						}
+					}
+					Polled::Empty => break,
+					Polled::Closed => {
+						touch_open = false;
+						break;
+					}
+				}
 			}
 			continue;
 		}
@@ -458,6 +612,8 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focu
 					stream_subscribe(client, &req[..len], state);
 				} else if op == input::OP_SUBSCRIBE_KEYS {
 					stream_subscribe_keys(client, &req[..len], &mut handle, state);
+				} else if op == input::OP_SUBSCRIBE_CONTACTS {
+					stream_subscribe_contacts(client, &req[..len], &mut handle, state);
 				} else if len >= 6 {
 					send_blocking(client, &req[2..6], 0);
 				}
@@ -466,6 +622,9 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u64, focu
 				}
 			}
 			Received::Closed => {
+				if state.contact_stream.as_ref().is_some_and(|stream| stream.owner == client) {
+					state.close_contact_stream(false);
+				}
 				if state.key_stream.as_ref().is_some_and(|stream| stream.owner == client) {
 					state.close_key_stream(false);
 				}
@@ -498,6 +657,34 @@ fn stream_subscribe_keys(service: u64, request: &[u8], request_handle: &mut u64,
 	};
 	if send_blocking(service, &corr.to_le_bytes(), consumer) {
 		state.key_stream = Some(KeyStream { owner: service, producer, seq: 0 });
+	} else {
+		close(producer);
+		close(consumer);
+	}
+}
+
+// The contact half of `stream_subscribe_keys`, on the same one-shot proof and with the same
+// refusal: a caller whose proof does not name the active surface gets the correlation id back and no
+// capability, which is a refusal it can tell from a service that is not there.
+fn stream_subscribe_contacts(service: u64, request: &[u8], request_handle: &mut u64, state: &mut Input) {
+	if request.len() != 10 || *request_handle == 0 {
+		return;
+	}
+	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+	let proof: u64 = core::mem::take(request_handle);
+	let valid: bool = state.validate_focus(proof);
+	close(proof);
+	if !valid {
+		send_blocking(service, &corr.to_le_bytes(), 0);
+		return;
+	}
+	state.close_contact_stream(true);
+	let (producer, consumer): (u64, u64) = match channel() {
+		Some(pair) => pair,
+		None => return,
+	};
+	if send_blocking(service, &corr.to_le_bytes(), consumer) {
+		state.contact_stream = Some(ContactStream { owner: service, producer, seq: 0 });
 	} else {
 		close(producer);
 		close(consumer);

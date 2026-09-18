@@ -52,6 +52,22 @@ pub enum BindingState {
 	// grants stay charged and out of circulation, because the alternative is handing back memory a
 	// device may still be writing to.
 	Quarantined,
+	// THE DEVICE IS GONE FROM THE BUS AND NOTHING IS OWED.
+	//
+	// TERMINAL AND REPLUGGABLE ARE NOT A CONTRADICTION, AND THE MODEL HAS TO SAY WHY. The slot
+	// outlives the device as a tombstone: `Removed` is terminal FOR THIS BINDING, and only a NEW
+	// ARRIVAL on that slot opens another - whose claim mints the next generation, so a message
+	// stamped with the old one is refused by arithmetic rather than by anyone remembering.
+	//
+	// AND IT IS NOT `Quarantined`, WHICH IS THE DISTINCTION THAT MAKES IT WORTH A STATE. A removal
+	// whose teardown was CONFIRMED says the device is gone and nothing is owed. One that was not
+	// says neither - the frames may still be live under a device that is no longer there to ask -
+	// and lands at `Quarantined` like every other unconfirmed teardown. Reaching `Removed` is a
+	// claim about the resources, not about the bus.
+	//
+	// A USB OR SD CHILD DISAPPEARING IS NOT ANY OF THIS: it withdraws a provider and its parent
+	// controller stays `Online`.
+	Removed,
 }
 
 impl BindingState {
@@ -68,6 +84,7 @@ impl BindingState {
 			BindingState::Backoff => b"backoff",
 			BindingState::Failed => b"failed",
 			BindingState::Quarantined => b"quarantined",
+			BindingState::Removed => b"removed from the bus",
 		}
 	}
 
@@ -133,6 +150,12 @@ impl BindingState {
 				| (BindingState::Stopping, BindingState::Backoff)
 				| (BindingState::Stopping, BindingState::Failed)
 				| (BindingState::Stopping, BindingState::Quarantined)
+				// THE REMOVAL EDGE, AND IT COMES ONLY FROM `Stopping`. A device that leaves the bus is
+				// stopped first - the item's own words are "coordinate safe driver stop before
+				// resource removal" - so there is no edge from `Online` or `Binding` straight to
+				// `Removed`: a binding whose driver was never told to stop has resources nobody has
+				// confirmed are free, which is `Quarantined`'s question and not this one's.
+				| (BindingState::Stopping, BindingState::Removed)
 				// A BIND THAT DISCOVERS THE DEVICE IS ALREADY QUARANTINED ADOPTS THAT, rather than
 				// inventing a failure of its own.
 				//
@@ -185,6 +208,15 @@ pub enum StopIntent {
 	DependencyLost,
 	// An operator disabled it. Where it lands is P02M0166's `Disabled`.
 	OperatorDisable,
+	// The DEVICE went away: a slot said so, and the driver is being stopped so its resources can be
+	// released before they are removed underneath it. Distinct from `Fault` because a fault leaves a
+	// device to try again on and this does not - there is nothing left to bind.
+	DeviceRemoved,
+	// The DEVICE reported a fatal error and is still in the machine. Distinct from `DeviceRemoved`
+	// because there is something left to bind to and it must not be bound to, and distinct from
+	// `Fault` because a retry would bind the same broken device again - so this one lands at
+	// `Quarantined` whether the teardown is confirmed or not, which is the only intent that does.
+	DeviceFaulted,
 	// The machine is going down. No further state is entered at all - the manager is going away, so
 	// there is no next binding to describe.
 	Shutdown,
@@ -202,6 +234,15 @@ impl StopIntent {
 			StopIntent::Fault => Some(if attempts_left { BindingState::Backoff } else { BindingState::Failed }),
 			StopIntent::DependencyLost => Some(BindingState::DependencyPending),
 			StopIntent::OperatorDisable => Some(BindingState::Disabled),
+			// NO ATTEMPTS ARE LEFT WHEN THE DEVICE IS GONE, whatever the budget says: a retry needs
+			// something to bind to. `attempts_left` is not read here for that reason.
+			StopIntent::DeviceRemoved => Some(BindingState::Removed),
+			// A CONFIRMED TEARDOWN OF A FAULTED DEVICE STILL LANDS AT `Quarantined`, which is what
+			// makes this intent different from every other one here. A confirmation says the DRIVER
+			// released its resources; it says nothing about the device, and the device is the thing
+			// that stopped being described by anything. Landing it at `Failed` would let a retry bind
+			// the same broken function, and landing it at `Removed` would say it is gone.
+			StopIntent::DeviceFaulted => Some(BindingState::Quarantined),
 			StopIntent::Shutdown => None,
 		}
 	}
@@ -211,6 +252,8 @@ impl StopIntent {
 			StopIntent::Fault => b"a fault",
 			StopIntent::DependencyLost => b"a dependency it declared went away",
 			StopIntent::OperatorDisable => b"an operator disabled it",
+			StopIntent::DeviceRemoved => b"the device was removed from the bus",
+			StopIntent::DeviceFaulted => b"the device reported a fatal error",
 			StopIntent::Shutdown => b"the machine is going down",
 		}
 	}

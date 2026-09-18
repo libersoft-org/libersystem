@@ -73,6 +73,12 @@ impl VertexLayout<'_> {
 		limits.admit("vertex streams", self.streams.len() as u64, limits.max_vertex_streams as u64)?;
 		limits.admit("vertex attributes", self.attributes.len() as u64, limits.max_vertex_attributes as u64)?;
 		for (index, attribute) in self.attributes.iter().enumerate() {
+			// ONE LOCATION, ONE VALUE. A stage reads `Binding::Attribute { location }` and there has
+			// to be a single answer to that; a layout offering two is refused with BOTH attributes'
+			// indices, because the second one is only half of what is wrong.
+			if let Some(first) = self.attributes[..index].iter().position(|earlier| earlier.location == attribute.location) {
+				return Err(Error::InvalidMesh { reason: MeshFault::LocationDeclaredTwice { location: attribute.location, attribute: index as u32, first: first as u32 } });
+			}
 			let Some(stream) = self.streams.get(attribute.stream as usize) else {
 				return Err(Error::InvalidMesh { reason: MeshFault::StreamTooShort { stream: attribute.stream, needs: 0, has: 0 } });
 			};

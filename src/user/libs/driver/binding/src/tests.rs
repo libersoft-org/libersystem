@@ -1806,3 +1806,60 @@ fn every_failure_between_the_claim_and_spawn_closes_the_mmio_handle() {
 		assert!(ledger.closed_once(0x11));
 	}
 }
+
+#[test]
+fn a_device_that_leaves_the_bus_is_removed_and_not_failed() {
+	// `Removed` says the device is GONE AND NOTHING IS OWED, which is a different fact from `Failed`
+	// - where the device is still there and something about the binding did not work - and from
+	// `Quarantined`, where nobody knows whether the resources are free.
+	// `assert!(matches!(..))` and not `assert_eq!`: `BindingState` deliberately has no `Debug` - its
+	// names are read by people, in a boot log - so a test compares rather than formats.
+	assert!(matches!(StopIntent::DeviceRemoved.confirmed_lands_at(true), Some(BindingState::Removed)));
+	// AND NO ATTEMPTS ARE LEFT WHEN THERE IS NOTHING TO BIND TO. A retry budget is about a device
+	// that is still on the bus; this intent is about one that is not, so the budget is not read.
+	assert!(matches!(StopIntent::DeviceRemoved.confirmed_lands_at(false), Some(BindingState::Removed)), "the attempt budget does not decide this one");
+	assert!(!matches!(StopIntent::Fault.confirmed_lands_at(true), Some(BindingState::Removed)), "a fault is not a removal");
+}
+
+#[test]
+fn a_removal_is_reached_only_through_a_stop() {
+	// The item's own words are "coordinate safe driver stop before resource removal". A binding whose
+	// driver was never told to stop has resources nobody has confirmed are free, which is
+	// `Quarantined`'s question rather than this one's.
+	assert!(BindingState::Stopping.may_move_to(BindingState::Removed));
+	assert!(!BindingState::Online.may_move_to(BindingState::Removed), "a live driver is stopped first");
+	assert!(!BindingState::Binding.may_move_to(BindingState::Removed));
+	assert!(!BindingState::Unbound.may_move_to(BindingState::Removed));
+	assert!(!BindingState::Backoff.may_move_to(BindingState::Removed));
+}
+
+#[test]
+fn removed_is_terminal_for_its_binding_and_a_new_arrival_is_a_new_one() {
+	// TERMINAL AND REPLUGGABLE ARE NOT A CONTRADICTION. The slot outlives the device as a tombstone:
+	// nothing leaves `Removed`, and a device plugged into that slot afterwards opens a NEW binding -
+	// whose claim mints the next generation, so a message stamped with the old one is refused by
+	// arithmetic rather than by anyone remembering.
+	for to in [
+		BindingState::Unbound,
+		BindingState::Binding,
+		BindingState::Online,
+		BindingState::Backoff,
+		BindingState::Failed,
+		BindingState::Stopping,
+		BindingState::DependencyPending,
+		BindingState::Disabled,
+		BindingState::Quarantined,
+	] {
+		assert!(!BindingState::Removed.may_move_to(to), "nothing leaves Removed, and {} is not an exception", core::str::from_utf8(to.name()).unwrap_or("?"));
+	}
+}
+
+#[test]
+fn an_unconfirmed_removal_is_quarantined_because_nobody_knows_what_is_owed() {
+	// The distinction that makes `Removed` worth a state at all. A CONFIRMED teardown under this
+	// intent says the resources are free; an unconfirmed one says nothing about them, and the frames
+	// may still be live under a device that is no longer there to ask. `confirmed_lands_at` is the
+	// only way to `Removed`, and an unconfirmed teardown never calls it.
+	assert!(BindingState::Stopping.may_move_to(BindingState::Quarantined), "which is where an unconfirmed teardown lands, whatever the intent was");
+	assert_eq!(StopIntent::DeviceRemoved.name(), b"the device was removed from the bus".as_slice());
+}

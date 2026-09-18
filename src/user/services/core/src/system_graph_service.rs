@@ -79,6 +79,11 @@ fn component_state(state: BindingState) -> ComponentState {
 		BindingState::Unbound | BindingState::DependencyPending => ComponentState::Pending,
 		// And one an operator turned off is STOPPED, which is what was asked for.
 		BindingState::Disabled => ComponentState::Stopped,
+		// A DEVICE THAT LEFT THE BUS IS STOPPED AND NOT FAILED. Nothing went wrong: the machine
+		// changed shape, its teardown was confirmed and nothing is owed. Rendering it `Failed` would
+		// put a red row on a graph for a disk somebody unplugged on purpose - and would make it
+		// indistinguishable from `Quarantined`, which is the one that IS a problem.
+		BindingState::Removed => ComponentState::Stopped,
 	}
 }
 

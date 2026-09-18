@@ -1491,7 +1491,7 @@ fn one_triangle_covers_exactly_the_pixels_its_edges_enclose() {
 	let mut colour = Colour::new(16, 16, 1, false);
 	let mut depth = DepthStencil::new(16, 16, 1, DepthFormat::Depth32F);
 	depth.clear(1.0, 0);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(16.0, 16.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(16.0, 16.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 
 	assert_eq!(stats.primitives, 1);
@@ -1520,11 +1520,57 @@ fn the_nearer_of_two_overlapping_triangles_wins_in_either_order() {
 		let mut colour = Colour::new(16, 16, 1, false);
 		let mut depth = DepthStencil::new(16, 16, 1, DepthFormat::Depth32F);
 		depth.clear(1.0, 0);
-		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(16.0, 16.0) };
+		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(16.0, 16.0), scissor: None };
 		frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 		// Whichever order they were submitted in, the surviving depth is the nearer one's.
 		assert!(matches!(depth.depth_at(2, 5, 0), render3d::depth::Stored::Float(value) if near(value, 0.2)), "the nearer triangle's depth survived");
 	}
+}
+
+#[test]
+// A SCISSOR REMOVES FRAGMENTS OUTSIDE A RECTANGLE AND CHANGES NOTHING ELSE. What makes it worth
+// having is the COST: a fragment outside it is never shaded, so it cannot discard and cannot be
+// counted - which is why this test asserts the fragment TOTAL as well as the picture. A scissor
+// implemented at the write would draw the same frame in the same time, and the thing it exists for
+// would be missing.
+fn a_scissor_removes_the_fragments_outside_it_and_shades_none_of_them() {
+	let quad = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0], [-1.0, -1.0, 0.5, 1.0], [1.0, 1.0, 0.5, 1.0], [-1.0, 1.0, 0.5, 1.0]], colours: vec![white(); 6], instance_offset: [0.0; 4] };
+	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 6, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let covered = |colour: &Colour| (0..32).flat_map(|y| (0..32).map(move |x| (x, y))).filter(|(x, y)| colour.at(*x, *y, 0).x > 0.5).count();
+
+	// The whole target first, so the scissored run has something to be a subset of.
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 32, 32).unwrap();
+	let mut colour = Colour::new(32, 32, 1, false);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
+	let whole = frame::execute(&mut prepared, &mut attachments, &quad).unwrap();
+	assert_eq!(covered(&colour), 32 * 32, "the quad covers the whole target");
+
+	// And the same draw under a scissor over the top-left quarter.
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 32, 32).unwrap();
+	let mut colour = Colour::new(32, 32, 1, false);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: Some(Scissor { x: 0, y: 0, width: 16, height: 16 }) };
+	let clipped = frame::execute(&mut prepared, &mut attachments, &quad).unwrap();
+	assert_eq!(covered(&colour), 16 * 16, "a scissor over a quarter of the target leaves a quarter drawn");
+	assert!(colour.at(1, 1, 0).x > 0.5, "inside the rectangle the quad is drawn");
+	assert!(colour.at(30, 30, 0).x < 0.5, "and outside it nothing is");
+	assert_eq!(clipped.fragments, whole.fragments / 4, "and the fragments outside it were never shaded: {} against {}", clipped.fragments, whole.fragments);
+
+	// A RECTANGLE REACHING PAST THE TARGET IS CLAMPED AND NOT AN OVERRUN. The recording boundary is
+	// where a scissor outside the viewport is refused; by the time a plan runs, the only thing left to
+	// do with one that reaches past the last pixel is to stop at it.
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 32, 32).unwrap();
+	let mut colour = Colour::new(32, 32, 1, false);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: Some(Scissor { x: -8, y: -8, width: 1000, height: 1000 }) };
+	frame::execute(&mut prepared, &mut attachments, &quad).unwrap();
+	assert_eq!(covered(&colour), 32 * 32, "a scissor larger than the target is the whole target");
+
+	// AND AN EMPTY RECTANGLE DRAWS NOTHING, rather than being read as "no scissor".
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![draw], 32, 32).unwrap();
+	let mut colour = Colour::new(32, 32, 1, false);
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: Some(Scissor { x: 4, y: 4, width: 0, height: 8 }) };
+	let nothing = frame::execute(&mut prepared, &mut attachments, &quad).unwrap();
+	assert_eq!(covered(&colour), 0, "a scissor with no width draws nothing");
+	assert_eq!(nothing.fragments, 0, "and shades nothing");
 }
 
 #[test]
@@ -1536,7 +1582,7 @@ fn an_instanced_draw_runs_its_vertex_stage_once_per_instance() {
 	let mesh = Mesh { positions: vec![[-0.9, -0.9, 0.5, 1.0], [-0.7, -0.9, 0.5, 1.0], [-0.9, -0.7, 0.5, 1.0]], colours: vec![white(), white(), white()], instance_offset: [0.5, 0.0, 0.0, 0.0] };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline(Topology::TriangleList)], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 3, first_instance: 0, base_vertex: 0, restart: false }], 64, 64).unwrap();
 	let mut colour = Colour::new(64, 64, 1, false);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(64.0, 64.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(64.0, 64.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 	assert_eq!(stats.primitives, 3, "one primitive per instance");
 
@@ -1580,7 +1626,7 @@ fn a_pass_writes_several_attachments_and_leaves_the_ones_its_shader_did_not() {
 
 	let mut targets = vec![Colour::new(16, 16, 1, false), Colour::new(16, 16, 1, true)];
 	targets[1].fill(Vec4::new(9.0, 0.0, 0.0, 1.0));
-	let mut attachments = Attachments { colour: &mut targets, depth_stencil: None, viewport: viewport(16.0, 16.0) };
+	let mut attachments = Attachments { colour: &mut targets, depth_stencil: None, viewport: viewport(16.0, 16.0), scissor: None };
 	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 	assert!(near(targets[0].at(2, 5, 0).x, 1.0), "the colour attachment");
 	assert!(near(targets[1].at(2, 5, 0).x, 77.0), "and the identity one");
@@ -1632,7 +1678,7 @@ fn a_second_frame_reuses_every_buffer_the_first_one_sized() {
 	let mut colour = Colour::new(32, 32, 1, false);
 
 	let once = |prepared: &mut crate::frame::Prepared, colour: &mut Colour| {
-		let mut attachments = Attachments { colour: core::slice::from_mut(colour), depth_stencil: None, viewport: viewport(32.0, 32.0) };
+		let mut attachments = Attachments { colour: core::slice::from_mut(colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 		frame::execute(prepared, &mut attachments, &mesh).unwrap()
 	};
 	let first = once(&mut prepared, &mut colour);
@@ -1665,7 +1711,7 @@ fn a_line_and_a_point_draw_through_the_same_plan_and_are_never_culled() {
 	state.state.cull = CullMode::Front;
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { pipeline: 0, topology: Topology::LineList, count: 2, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 	assert_eq!(stats.culled, 0, "a line has no winding for a cull mode to act on");
 	let lit = (0..32).filter(|x| (0..32).any(|y| colour.at(*x, y, 0).x > 0.5)).count();
@@ -1675,7 +1721,7 @@ fn a_line_and_a_point_draw_through_the_same_plan_and_are_never_culled() {
 	// rather than being approximately right.
 	let on_the_boundary = Mesh { positions: vec![[-0.9, 0.0, 0.5, 1.0], [0.9, 0.0, 0.5, 1.0]], colours: vec![white(), white()], instance_offset: [0.0; 4] };
 	let mut edge_case = Colour::new(32, 32, 1, false);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut edge_case), depth_stencil: None, viewport: viewport(32.0, 32.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut edge_case), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 	frame::execute(&mut prepared, &mut attachments, &on_the_boundary).unwrap();
 	assert_eq!((0..32).filter(|x| (0..32).any(|y| edge_case.at(*x, y, 0).x > 0.5)).count(), 0);
 
@@ -1685,7 +1731,7 @@ fn a_line_and_a_point_draw_through_the_same_plan_and_are_never_culled() {
 	let mesh = Mesh { positions: vec![[0.0, 0.0, 0.5, 1.0]], colours: vec![white()], instance_offset: [0.0; 4] };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![point_state], vec![Draw { pipeline: 0, topology: Topology::PointList, count: 1, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 	let lit: Vec<(u32, u32)> = (0..32).flat_map(|y| (0..32).map(move |x| (x, y))).filter(|(x, y)| colour.at(*x, *y, 0).x > 0.5).collect();
 	assert_eq!(lit.len(), 1, "one pixel: {lit:?}");
@@ -1717,7 +1763,7 @@ fn alpha_to_coverage_narrows_a_multisampled_draw_and_leaves_an_identity_alone() 
 	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [3.0, -1.0, 0.5, 1.0], [-1.0, 3.0, 0.5, 1.0]], colours: vec![[1.0, 1.0, 1.0, 0.5]; 3], instance_offset: [0.0; 4] };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false }], 8, 8).unwrap();
 	let mut colour = Colour::new(8, 8, 4, false);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(8.0, 8.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(8.0, 8.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 	// Four samples per pixel over 64 pixels, narrowed to half by the alpha.
 	assert_eq!(stats.samples_written, 128, "half of 256: {}", stats.samples_written);
@@ -1741,7 +1787,7 @@ fn hierarchical_depth_rejects_hidden_geometry_without_changing_the_picture() {
 	let mut colour = Colour::new(32, 32, 1, false);
 	let mut depth = DepthStencil::new(32, 32, 1, DepthFormat::Depth32F);
 	depth.clear(1.0, 0);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(32.0, 32.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: viewport(32.0, 32.0), scissor: None };
 	let stats = frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 
 	// The picture is the near triangle's, whatever the bound did.
@@ -1806,7 +1852,7 @@ fn a_warmed_frame_asks_the_allocator_for_nothing() {
 		// tests against the first frame's depths and draws nothing, which would make the measurement
 		// be about an empty frame.
 		depth.clear(1.0, 0);
-		let mut attachments = Attachments { colour: core::slice::from_mut(colour), depth_stencil: Some(depth), viewport: viewport(64.0, 64.0) };
+		let mut attachments = Attachments { colour: core::slice::from_mut(colour), depth_stencil: Some(depth), viewport: viewport(64.0, 64.0), scissor: None };
 		frame::execute(prepared, &mut attachments, &mesh).unwrap()
 	};
 
@@ -1926,7 +1972,7 @@ fn a_prepared_plan_reports_the_bytes_it_reserved() {
 	// After a frame it has grown once - the scratch that frame sized - and then it settles.
 	let mut colour = Colour::new(64, 64, 1, false);
 	let mut once = |prepared: &mut crate::frame::Prepared| {
-		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(64.0, 64.0) };
+		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(64.0, 64.0), scissor: None };
 		frame::execute(prepared, &mut attachments, &mesh).unwrap();
 	};
 	once(&mut small);
@@ -2193,7 +2239,7 @@ fn a_canary_attachment_beside_the_target_is_never_touched() {
 	let mut targets = vec![Colour::new(16, 16, 1, false), Colour::new(16, 16, 1, false)];
 	// The canary is filled with a value nothing in the frame produces.
 	targets[1].fill(Vec4::new(-1.0, -1.0, -1.0, -1.0));
-	let mut attachments = Attachments { colour: &mut targets, depth_stencil: None, viewport: viewport(16.0, 16.0) };
+	let mut attachments = Attachments { colour: &mut targets, depth_stencil: None, viewport: viewport(16.0, 16.0), scissor: None };
 	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 
 	// The target's every pixel was written, including its corners - the triangle covers it whole.
@@ -2317,7 +2363,7 @@ fn five_hundred_hostile_draws_are_each_answered_rather_than_crashing() {
 		let mut depth = DepthStencil::new(width, height, 1, DepthFormat::Depth32F);
 		depth.clear(1.0, 0);
 		let view = Viewport::new(noise.coordinate(), noise.coordinate(), (noise.below(64) + 1) as f32, (noise.below(64) + 1) as f32);
-		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: view };
+		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: Some(&mut depth), viewport: view, scissor: None };
 		match frame::execute(&mut prepared, &mut attachments, &mesh) {
 			Ok(stats) => {
 				drawn += 1;
@@ -2405,7 +2451,7 @@ fn a_frame_interpolates_each_qualifier_by_its_own_rule() {
 	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state], vec![draw], 32, 32).unwrap();
 	let mut colour = Colour::new(32, 32, 1, false);
-	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0) };
+	let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(32.0, 32.0), scissor: None };
 	frame::execute(&mut prepared, &mut attachments, &mesh).unwrap();
 
 	// A pixel well inside the triangle, away from every edge.

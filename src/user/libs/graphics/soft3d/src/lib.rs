@@ -28,7 +28,7 @@ pub mod value;
 
 pub use clip::{Clipped, MAX_CLIPPED_VERTICES, MAX_TRIANGLES_AFTER_CLIP, Vertex};
 pub use fixed::{MAX_RASTER_EXTENT, SUBPIXEL_BITS, Subpixel};
-pub use frame::{Attachments, Draw, Pipeline, Prepared, Source, Stats, execute as run, prepare};
+pub use frame::{Attachments, Draw, Pipeline, Prepared, Scissor, Source, Stats, execute as run, prepare};
 pub use geometry::{Indices, Primitive};
 pub use interpreter::{Fault, Outputs, Resources, execute};
 pub use pass::{Colour, DepthStencil, Fragment, Operations};

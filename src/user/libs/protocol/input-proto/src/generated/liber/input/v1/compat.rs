@@ -17,3 +17,11 @@ fn key_event_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(KeyEvent::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn contact_event_wire_is_stable() {
+	let sample = ContactEvent { id: 7, tip: true, x: 7, y: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 1, 7, 0, 7, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ContactEvent::decode(&bytes).unwrap(), sample);
+}

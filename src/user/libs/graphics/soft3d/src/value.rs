@@ -23,6 +23,13 @@ use render_shader::{ScalarType, Type};
 /// the geometry. Scalars, vectors and matrices are every value a shader computes; an ARRAY is a
 /// uniform a shader loads, which happens once rather than per pixel, so that is where the fallback
 /// belongs.
+///
+/// AND IT IS SIXTEEN RATHER THAN FOUR, WHICH WAS MEASURED AND REJECTED. A fragment stage computes
+/// scalars and vectors, so four words would hold every value it produces and would make a `Val` half
+/// the size; the benchmark said that was worth about six percent. What it would also do is push
+/// every `mat4` onto the heap, and a vertex stage reads two matrix uniforms per vertex - so the
+/// saving is bought with an allocation per vertex per frame, against a crate whose stated property
+/// is that a warmed frame asks the allocator for nothing. Six percent is not what that is worth.
 pub const INLINE_WORDS: usize = 16;
 
 /// Where a value's words live.
@@ -95,7 +102,7 @@ impl Val {
 		for (slot, value) in words[..count].iter_mut().zip(components) {
 			*slot = value.to_bits();
 		}
-		Self { kind: Type::Vector(ScalarType::F32, components.len() as u8), words: Words::Inline(words, count as u8) }
+		Self { kind: Type::Vector(ScalarType::F32, components.len() as u8), words: Words::from_slice(&words[..count]) }
 	}
 
 	/// A square matrix from its COLUMNS.
@@ -110,7 +117,7 @@ impl Val {
 				}
 			}
 		}
-		Self { kind: Type::Matrix(size), words: Words::Inline(words, count as u8) }
+		Self { kind: Type::Matrix(size), words: Words::from_slice(&words[..count]) }
 	}
 
 	/// The scalar type of every word.

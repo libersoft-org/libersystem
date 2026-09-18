@@ -661,6 +661,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "render-math"
+version = "0.0.0"
+
+[[package]]
+name = "render-shader"
+version = "0.0.0"
+dependencies = [
+ "graphics-profile",
+]
+
+[[package]]
 name = "render2d"
 version = "0.0.0"
 dependencies = [
@@ -679,6 +690,29 @@ dependencies = [
  "libm",
  "render2d",
  "soft2d",
+]
+
+[[package]]
+name = "render3d"
+version = "0.0.0"
+dependencies = [
+ "graphics-core",
+ "graphics-profile",
+ "render-math",
+]
+
+[[package]]
+name = "render3d-conformance"
+version = "0.0.0"
+dependencies = [
+ "graphics-core",
+ "graphics-profile",
+ "libm",
+ "render-math",
+ "render-shader",
+ "render3d",
+ "scene3d",
+ "soft3d",
 ]
 
 [[package]]
@@ -711,6 +745,15 @@ version = "0.0.0"
 dependencies = [
  "abi",
  "wire",
+]
+
+[[package]]
+name = "scene3d"
+version = "0.0.0"
+dependencies = [
+ "graphics-profile",
+ "render-math",
+ "render3d",
 ]
 
 [[package]]
@@ -783,6 +826,18 @@ dependencies = [
  "graphics-profile",
  "libm",
  "render2d",
+]
+
+[[package]]
+name = "soft3d"
+version = "0.0.0"
+dependencies = [
+ "graphics-core",
+ "graphics-profile",
+ "libm",
+ "render-math",
+ "render-shader",
+ "render3d",
 ]
 
 [[package]]
@@ -895,6 +950,7 @@ dependencies = [
  "font-shape",
  "graphics-app",
  "graphics-core",
+ "graphics-profile",
  "imgconv",
  "ipc-client",
  "keys",
@@ -912,8 +968,12 @@ dependencies = [
  "process-client",
  "process-client-provider",
  "proto",
+ "render-math",
+ "render-shader",
  "render2d",
  "render2d-conformance",
+ "render3d",
+ "render3d-conformance",
  "resources-client",
  "resources-client-provider",
  "rt",
@@ -923,6 +983,7 @@ dependencies = [
  "session-client",
  "session-client-provider",
  "soft2d",
+ "soft3d",
  "storage-proto",
  "surface",
  "text-layout",

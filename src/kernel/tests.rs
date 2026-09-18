@@ -5975,11 +5975,25 @@ struct SurfaceHost {
 	/// The service ends of everything minted for the client, held open for as long as it holds its
 	/// half: a peer that goes away turns the client's endpoint into a closed channel.
 	kept: alloc::vec::Vec<alloc::sync::Arc<object::channel::Channel>>,
+	/// The service end of the surface's event stream, or `None` while the client has not asked for
+	/// one. A CONFIGURATION CHANGE IS AN EVENT AND NOT A REPLY: a client learns that its surface
+	/// moved by being told, which is what makes a resize something this harness can DO rather than
+	/// something it can only answer questions about.
+	events: Option<alloc::sync::Arc<object::channel::Channel>>,
+	/// The service end of PRESENT_DONE, on which a present's RELEASE is sent.
+	///
+	/// A PACED CLIENT STOPS WITHOUT THIS. A frame loop may keep as many presents in flight as it has
+	/// images and no more, and what takes one out of flight is the release; a harness that accepted
+	/// presents and never released them let a client draw exactly as many frames as it had images and
+	/// then wait forever for a completion nobody was going to send.
+	done: Option<alloc::sync::Arc<object::channel::Channel>>,
+	/// How many events have been sent, which is the sequence number each frame carries.
+	event_seq: u32,
 }
 
 impl SurfaceHost {
 	fn new(display: alloc::sync::Arc<object::channel::Channel>, width: u32, height: u32) -> SurfaceHost {
-		SurfaceHost { display, surface: None, images: alloc::vec::Vec::new(), acquired: None, width, height, serial: 1, generation: 1, next_present: 1, presents: 0, last_whole: false, focus_proof: None, kept: alloc::vec::Vec::new() }
+		SurfaceHost { display, surface: None, images: alloc::vec::Vec::new(), acquired: None, width, height, serial: 1, generation: 1, next_present: 1, presents: 0, last_whole: false, focus_proof: None, kept: alloc::vec::Vec::new(), events: None, done: None, event_seq: 0 }
 	}
 
 	fn pitch(&self) -> u32 {
@@ -6034,6 +6048,36 @@ impl SurfaceHost {
 		Err(what)
 	}
 
+	/// MOVE THE SURFACE UNDER THE CLIENT, which is what a resize is from the client's side.
+	///
+	/// A NEW EXTENT IS A NEW GENERATION and every image of the old one is stale, so the slots are
+	/// emptied here: what the client must do is re-read the configuration, acknowledge it, ask for
+	/// the queue again and supply a new set of images. A harness that changed the extent and kept the
+	/// images would be testing a resize that no service performs.
+	fn reconfigure(&mut self, width: u32, height: u32) {
+		use display_proto::generated::liber::display::v1 as display_v1;
+		use display_v1::surface as surface_wire;
+		use object::channel::Message;
+		self.width = width;
+		self.height = height;
+		self.serial += 1;
+		self.generation += 1;
+		self.acquired = None;
+		for slot in &mut self.images {
+			*slot = None;
+		}
+		let Some(events) = self.events.clone() else { return };
+		let mut frame = [0u8; 256];
+		let mut handles = display_proto::codec::Handles::new();
+		let event = display_v1::SurfaceEvent::Configure(self.configuration());
+		let len = surface_wire::events_frame(self.event_seq, &event, &mut frame, &mut handles).expect("a configure event encodes");
+		self.event_seq += 1;
+		// A CLIENT THAT HAS ALREADY GONE IS NOT A HARNESS FAULT. The caller drives this from a loop
+		// that also watches the process, and the two can cross: the test's own assertions say whether
+		// leaving early was right, and a panic here would report the crossing instead of the reason.
+		let _ = events.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new()));
+	}
+
 	fn connection_call(&mut self, request: &object::channel::Message) -> Option<HostCall> {
 		use display_proto::codec::Reader;
 		use display_proto::generated::liber::display::v1 as display_v1;
@@ -6048,8 +6092,14 @@ impl SurfaceHost {
 			display_v1::display::OP_CREATE_SURFACE => {
 				let wanted = display_v1::SurfaceRequest::read(&mut reader).expect("a surface request decodes");
 				reader.finish().expect("and the request is the whole message");
-				// `(0, 0)` ASKS FOR THE SERVER'S PREFERRED SIZE, which here is the harness's grid.
-				assert_eq!((wanted.logical_extent.width, wanted.logical_extent.height), (0, 0), "the viewer asks for the native size");
+				// `(0, 0)` ASKS FOR THE SERVER'S PREFERRED SIZE, which here is the harness's grid; any
+				// other extent is a client that wants a size of its own, and this stands in for a
+				// service that gives it one. BOTH ARE REAL CLIENTS: a viewer sizes itself to what it
+				// is showing, and a demo is told what window to open.
+				if wanted.logical_extent.width != 0 && wanted.logical_extent.height != 0 {
+					self.width = wanted.logical_extent.width;
+					self.height = wanted.logical_extent.height;
+				}
 				// THE COUNT IS NEGOTIATED AND CLAMPED RATHER THAN REFUSED, and the answer says what
 				// was given - which is why `queue` reports it rather than the interface declaring it.
 				let images: u32 = wanted.images.clamp(2, 3);
@@ -6108,7 +6158,7 @@ impl SurfaceHost {
 				display_v1::PresentQueue { images: self.images.len() as u32, pitch: self.pitch(), generation: self.generation, producer: 0, done: 0 }.write(&mut writer).expect("a present queue encodes");
 				let (body, _handles) = writer.into_message();
 				self.kept.push(producer_service);
-				self.kept.push(done_service);
+				self.done = Some(done_service);
 				surface.send(Message::new(Self::ok_reply(corr, &body), alloc::vec![Capability::new(producer_client, Rights::ALL), Capability::new(done_client, Rights::ALL)])).expect("a queue reply");
 				None
 			}
@@ -6180,7 +6230,28 @@ impl SurfaceHost {
 				self.next_present = accepted + 1;
 				self.presents += 1;
 				surface.send(Message::new(Self::ok_reply(corr, &accepted.to_le_bytes()), alloc::vec::Vec::new())).expect("a present reply");
+				// AND THE IMAGE COMES BACK IMMEDIATELY, because this harness scans out nothing: the
+				// present is complete the moment it is accepted, and the release is what lets a paced
+				// client draw its next frame. The serial is the one just answered and the image is
+				// the one it consumed, which is what a client settles by.
+				if let Some(done) = self.done.clone() {
+					let mut release = accepted.to_le_bytes().to_vec();
+					release.extend_from_slice(&image.to_le_bytes());
+					done.send(Message::new(release, alloc::vec::Vec::new())).expect("a present release");
+				}
 				Some(HostCall::Presented)
+			}
+			surface_wire::OP_EVENTS => {
+				reader.finish().expect("an event subscription takes no argument");
+				let (kept, client) = Channel::create();
+				self.events = Some(kept);
+				// A STREAM IS NOT A `result<T, error>`, so its reply carries NO success tag: the
+				// correlation and then the stream's capability, and nothing else. A reply with the
+				// tag on it fails the client's `finish`, and what the generated client does then is
+				// DISCARD the handle and answer `None` - which is a subscription that looks like it
+				// worked and a client that never hears another word.
+				surface.send(Message::new(corr.to_le_bytes().to_vec(), alloc::vec![Capability::new(client, Rights::ALL)])).expect("an events reply");
+				None
 			}
 			surface_wire::OP_INPUT_FOCUS => {
 				reader.finish().expect("a focus proof takes no argument");

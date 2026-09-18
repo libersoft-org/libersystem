@@ -130,6 +130,10 @@ fn input_service_streams_pointer_events() {
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, raw_consumer).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
+	// AND THE TOUCH KIND, which this service asks for third. A subscription nobody answers is a
+	// service that never finishes its bootstrap - which reads as "no online report" and not as a
+	// missing device.
+	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the touch subscription with nothing");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
 	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
@@ -176,6 +180,115 @@ fn input_service_streams_pointer_events() {
 	assert_eq!(events[1], (0, 0, 0), "the corner event maps to column 0, row 0, no buttons");
 }
 
+tagged_test!(a_touch_surface_reports_contacts_and_not_a_cursor, [Service, Input, Display], id = "kernel.services.a_touch_surface_reports_contacts_and_not_a_cursor", covers = ["kernel", "bin.input_service"]);
+fn a_touch_surface_reports_contacts_and_not_a_cursor() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// A TOUCH SURFACE IS NOT A POINTER, AND THIS IS WHERE THAT STOPS BEING A SENTENCE.
+	//
+	// A consumer of `pointer` is handed ONE cursor - a position and a button mask - which is what a
+	// mouse and a stylus both are. A surface reports several contacts at once, each with an identity
+	// of its own that persists while the finger is down, and that identity is what makes a drag a
+	// drag rather than two touches at different places. Published as a pointer it would be flattened
+	// into whichever contact was decoded last.
+	//
+	// THE TEST STANDS IN FOR THE DRIVER, which is how every other input test here works: what a
+	// touch driver sends is six bytes per contact, and what comes out is the typed stream.
+	fn subscribe_contacts(client: &Channel, corr: u32, proof: alloc::sync::Arc<Channel>) -> Option<alloc::sync::Arc<Channel>> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&3u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(client, &request, proof, Rights::ALL).expect("contact subscription request");
+		sched::run_until_idle();
+		let reply = client.recv().expect("contact subscription reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr, "subscription echoes correlation id");
+		reply.caps.first().map(|cap| cap.object().into_any_arc().downcast::<Channel>().expect("contact stream is a channel"))
+	}
+	// One raw contact, the way a touch driver sends it: id, tip, then the two axes already normalised
+	// across the surface.
+	fn raw_contact(id: u8, tip: bool, x: u16, y: u16) -> alloc::vec::Vec<u8> {
+		let mut out = alloc::vec![id, tip as u8];
+		out.extend_from_slice(&x.to_le_bytes());
+		out.extend_from_slice(&y.to_le_bytes());
+		out
+	}
+
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let service_elf = program_elf(&package, volume, b"input_service").expect("input_service in the package or volume");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (service_server, service_client) = Channel::create();
+	let (_pointer_a, pointer_b) = Channel::create();
+	let (_console_focus, forward_b) = Channel::create();
+	let (_keys_driver, keys_input) = Channel::create();
+	let (focus_display, focus_input) = Channel::create();
+	let (kill_display, kill_input) = Channel::create();
+	// The touch driver's end, which this test holds and sends contacts on.
+	let (touch_driver, touch_input) = Channel::create();
+	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	send_cap(&boot_kernel, b"FORWARD", forward_b, Rights::ALL).expect("forward bootstrap");
+	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
+	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
+	send_cap(&boot_kernel, b"KILL", kill_input, Rights::ALL).expect("kill bootstrap");
+	let (_input_admin, admin) = Channel::create();
+	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	sched::run_until_idle();
+	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the pointer subscription");
+	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("no usb pointer");
+	// THE TOUCH KIND IS ITS OWN SUBSCRIPTION, which is what makes a surface discoverable without
+	// being published as a pointer.
+	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Touch, touch_input).expect("the touch subscription");
+	sched::run_until_idle();
+	let online = boot_kernel.recv().expect("InputService online report");
+	assert_eq!(&online.bytes[..], b"InputService: online");
+
+	// A contact stream is focus-gated exactly as the key stream is: a forged proof opens nothing.
+	let (forged, _forged_peer) = Channel::create();
+	assert!(subscribe_contacts(&service_client, 1, forged).is_none(), "a forged focus proof must be refused");
+
+	let (proof, registered) = Channel::create();
+	send_cap(&focus_display, b"SET", registered, Rights::ALL).expect("register focus peer");
+	let stream = subscribe_contacts(&service_client, 2, proof).expect("the active display proof opens the contact stream");
+	let ack = focus_display.recv().expect("focus acknowledgement");
+	assert_eq!(&ack.bytes[..], b"OK");
+
+	// TWO FINGERS AT ONCE, each keeping its own identity and its own position.
+	touch_driver.send(Message::new(raw_contact(7, true, 0x1000, 0x2000), alloc::vec::Vec::new())).expect("first finger down");
+	touch_driver.send(Message::new(raw_contact(9, true, 0xF000, 0x8000), alloc::vec::Vec::new())).expect("second finger down");
+	sched::run_until_idle();
+	let first = stream.recv().expect("the first contact");
+	let second = stream.recv().expect("the second contact");
+	// seq u32, then id u8, tip u8, x u16, y u16.
+	assert_eq!((first.bytes[4], first.bytes[5]), (7, 1), "the device's own identifier, and the finger is down");
+	assert_eq!(le_u16(&first.bytes, 6), 0x1000, "and its own position, unscaled");
+	assert_eq!((second.bytes[4], second.bytes[5]), (9, 1));
+	assert_eq!(le_u16(&second.bytes, 6), 0xF000, "the second finger is where IT is, not where the first was");
+
+	// ONE LIFTS AND THE OTHER DOES NOT.
+	touch_driver.send(Message::new(raw_contact(7, false, 0x1000, 0x2000), alloc::vec::Vec::new())).expect("first finger up");
+	sched::run_until_idle();
+	let lifted = stream.recv().expect("the lift");
+	assert_eq!((lifted.bytes[4], lifted.bytes[5]), (7, 0));
+
+	// FOCUS LOSS RELEASES THE FINGER THAT IS STILL DOWN, the way it releases a held key - so the
+	// next foreground application cannot inherit a touch it never saw begin.
+	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new())).expect("revoke focus");
+	sched::run_until_idle();
+	let clear_ack = focus_display.recv().expect("clear acknowledgement");
+	assert_eq!(&clear_ack.bytes[..], b"OK");
+	let released = stream.recv().expect("the contact still down is released");
+	assert_eq!((released.bytes[4], released.bytes[5]), (9, 0), "the finger that was still down is lifted, and the one that already lifted is not sent twice");
+	assert!(stream.recv().is_err(), "and the stream closes with the focus");
+
+	core::mem::drop(kill_display);
+}
+
 tagged_test!(input_service_streams_keys_only_with_display_focus, [Service, Input, Display], id = "kernel.services.input_service_streams_keys_only_with_display_focus", covers = ["kernel"]);
 fn input_service_streams_keys_only_with_display_focus() {
 	use object::channel::{Channel, Message};
@@ -218,6 +331,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&pointer_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
+	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the touch subscription with nothing");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("InputService online report");
 	assert_eq!(&online.bytes[..], b"InputService: online");

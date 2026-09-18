@@ -21,12 +21,15 @@ pub const CLASS_COMMUNICATIONS: u8 = 0x02;
 pub const CLASS_CDC_DATA: u8 = 0x0A;
 
 /// The two network models this module speaks, as interface subclasses.
+pub const SUBCLASS_ACM: u8 = 0x02;
 pub const SUBCLASS_ECM: u8 = 0x06;
 pub const SUBCLASS_NCM: u8 = 0x0D;
 
 /// Class-specific descriptor types and the functional subtypes inside them.
 pub const DT_CS_INTERFACE: u8 = 0x24;
 pub const FN_HEADER: u8 = 0x00;
+pub const FN_CALL_MANAGEMENT: u8 = 0x01;
+pub const FN_ACM: u8 = 0x02;
 pub const FN_UNION: u8 = 0x06;
 pub const FN_ETHERNET: u8 = 0x0F;
 pub const FN_NCM: u8 = 0x1A;
@@ -36,6 +39,9 @@ pub const FN_NCM: u8 = 0x1A;
 /// SET_ETHERNET_PACKET_FILTER IS NOT OPTIONAL IN PRACTICE. An ECM device comes up with its filter
 /// empty and forwards nothing; a driver that configures the alternate setting and waits is a driver
 /// whose link is up and silent, which looks exactly like a cable that is not plugged in.
+pub const REQ_SET_LINE_CODING: u8 = 0x20;
+pub const REQ_GET_LINE_CODING: u8 = 0x21;
+pub const REQ_SET_CONTROL_LINE_STATE: u8 = 0x22;
 pub const REQ_SET_ETHERNET_PACKET_FILTER: u8 = 0x43;
 pub const REQ_GET_NTB_PARAMETERS: u8 = 0x80;
 pub const REQ_SET_NTB_INPUT_SIZE: u8 = 0x86;
@@ -101,6 +107,25 @@ pub enum NotBindable {
 	Malformed,
 }
 
+/// Keep the LOWEST alternate setting that carried a whole bulk pair.
+///
+/// ONE COPY OF THE RULE, because there are two bindings that need it - the network models and ACM -
+/// and the rule is not obvious enough to be written twice: alternate zero of a CDC data interface is
+/// the specification's way of saying "not carrying traffic", so the endpoints appear only in a
+/// higher setting, and a device that offers several is offering larger buffers rather than different
+/// function. A driver that took the first setting it walked past would take whichever the device
+/// happened to list first.
+type Pair = (u8, u8, u8, u8, u16, u16);
+type Candidate = Option<(u8, u8, Option<(u8, u16)>, Option<(u8, u16)>)>;
+
+fn keep_lowest(candidate: &mut Candidate, best: &mut Option<Pair>) {
+	if let Some((iface, alt, Some((in_addr, in_mps)), Some((out_addr, out_mps)))) = candidate.take()
+		&& best.is_none_or(|(_, have, _, _, _, _)| alt < have)
+	{
+		*best = Some((iface, alt, in_addr, out_addr, in_mps, out_mps));
+	}
+}
+
 /// Read one configuration descriptor and decide what to bind.
 ///
 /// ONE PASS AND NO ASSUMED ORDER. The class descriptors, the data interface and its endpoints may
@@ -115,20 +140,10 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	let mut mac_string: Option<u8> = None;
 	let mut max_segment: u16 = 0;
 	// The data interface's candidate settings, as (interface, alternate, in, out, in mps, out mps).
-	let mut candidate: Option<(u8, u8, Option<(u8, u16)>, Option<(u8, u16)>)> = None;
-	let mut best: Option<(u8, u8, u8, u8, u16, u16)> = None;
+	let mut candidate: Candidate = None;
+	let mut best: Option<Pair> = None;
 	// Which interface the class descriptors that follow belong to.
 	let mut current_is_control = false;
-
-	let finish = |candidate: &mut Option<(u8, u8, Option<(u8, u16)>, Option<(u8, u16)>)>, best: &mut Option<(u8, u8, u8, u8, u16, u16)>| {
-		if let Some((iface, alt, Some((in_addr, in_mps)), Some((out_addr, out_mps)))) = candidate.take() {
-			// THE FIRST SETTING THAT CARRIES A PAIR WINS, and lower alternates are preferred because
-			// a device that offers several is offering larger buffers, not different function.
-			if best.is_none_or(|(_, have, _, _, _, _)| alt < have) {
-				*best = Some((iface, alt, in_addr, out_addr, in_mps, out_mps));
-			}
-		}
-	};
 
 	for record in walk.by_ref() {
 		match record.kind {
@@ -136,7 +151,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 				config_value = record.field(5).ok();
 			}
 			descriptor::DT_INTERFACE => {
-				finish(&mut candidate, &mut best);
+				keep_lowest(&mut candidate, &mut best);
 				let (Ok(number), Ok(alternate), Ok(class), Ok(subclass)) = (record.field(2), record.field(3), record.field(5), record.field(6)) else {
 					return Err(NotBindable::Malformed);
 				};
@@ -194,7 +209,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 			_ => {}
 		}
 	}
-	finish(&mut candidate, &mut best);
+	keep_lowest(&mut candidate, &mut best);
 	if walk.fault().is_some() {
 		return Err(NotBindable::Malformed);
 	}
@@ -219,6 +234,231 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 /// convention - so a string of any other length, or one with a character that is not hex, is a
 /// device that did not answer the question rather than one to guess at. Lower case is accepted
 /// because devices ship it and nothing is ambiguous about it.
+/// What an ACM adapter's configuration says, and where its parts are.
+///
+/// THE SAME THREE QUESTIONS THE NETWORK MODELS ASK, of a different subclass: which data interface
+/// the union names, which alternate setting its endpoints are in, and where the bulk pair is. What
+/// is new is the CAPABILITY BITMAP, because a serial adapter with no UART behind it is a perfectly
+/// good byte stream that refuses every line-coding request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AcmBinding {
+	pub config_value: u8,
+	/// The communications interface, which carries the class descriptors and the notification
+	/// endpoint.
+	pub control_interface: u8,
+	/// The data interface named by the union descriptor, and the setting its endpoints are in.
+	pub data_interface: u8,
+	pub data_alternate: u8,
+	pub bulk_in: u8,
+	pub bulk_out: u8,
+	pub bulk_in_packet: u16,
+	pub bulk_out_packet: u16,
+	/// The interrupt endpoint the device reports serial state on, or zero when it published none.
+	/// A device without one is still a byte stream; what it cannot do is say the carrier dropped.
+	pub notify_in: u8,
+	pub notify_packet: u16,
+	/// The ACM functional descriptor's capability bitmap, or zero when the device published no such
+	/// descriptor - which is itself an answer: it supports none of them.
+	pub capabilities: u8,
+}
+
+impl AcmBinding {
+	/// Whether this device implements `SET_LINE_CODING` / `GET_LINE_CODING` /
+	/// `SET_CONTROL_LINE_STATE`, which is bit 1 of the capability bitmap.
+	///
+	/// ASKED BEFORE THE REQUEST IS SENT, because the alternative is finding out from a STALL - and a
+	/// driver that reads a stall here as "this device is broken" discards a working byte stream. An
+	/// MCU link has no UART behind the USB and says so exactly this way.
+	pub fn supports_line_coding(self) -> bool {
+		self.capabilities & 0x02 != 0
+	}
+}
+
+/// The seven-byte line-coding structure, in the units the wire uses.
+///
+/// TWO CONVENTIONS SIDE BY SIDE, AND THAT IS THE TRAP. `data_bits` is a COUNT - five, six, seven,
+/// eight or sixteen - and `stop_bits` is an ENUMERATION in which 0 means ONE stop bit, 1 means one
+/// and a half and 2 means two. A driver that writes the number it means into both asks for one and a
+/// half stop bits when it means one: some devices refuse it and others accept it and frame every
+/// byte differently, which is a link that works until the first byte of the second frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LineCoding {
+	pub rate: u32,
+	pub stop_bits: StopBits,
+	pub parity: Parity,
+	pub data_bits: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StopBits {
+	One,
+	OneAndAHalf,
+	Two,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Parity {
+	None,
+	Odd,
+	Even,
+	Mark,
+	Space,
+}
+
+/// The length of the line-coding structure on the wire.
+pub const LINE_CODING_LEN: usize = 7;
+
+impl LineCoding {
+	/// 115200 8N1, which is what every one of these adapters is set to when nobody has said
+	/// otherwise, and what a device with no UART behind it ignores.
+	pub fn default_8n1() -> LineCoding {
+		LineCoding { rate: 115_200, stop_bits: StopBits::One, parity: Parity::None, data_bits: 8 }
+	}
+
+	/// Encode for `SET_LINE_CODING`. The rate is LITTLE-endian, unlike every SCSI field in this tree
+	/// and like every other USB one.
+	pub fn encode(self) -> [u8; LINE_CODING_LEN] {
+		let rate = self.rate.to_le_bytes();
+		let stop = match self.stop_bits {
+			StopBits::One => 0,
+			StopBits::OneAndAHalf => 1,
+			StopBits::Two => 2,
+		};
+		let parity = match self.parity {
+			Parity::None => 0,
+			Parity::Odd => 1,
+			Parity::Even => 2,
+			Parity::Mark => 3,
+			Parity::Space => 4,
+		};
+		[rate[0], rate[1], rate[2], rate[3], stop, parity, self.data_bits]
+	}
+
+	/// Decode a `GET_LINE_CODING` answer, or `None` when it is not one: too short, or a field
+	/// carrying a value the structure does not define.
+	///
+	/// A VALUE OUTSIDE THE ENUMERATION IS REFUSED RATHER THAN ROUNDED. Three stop bits is not a
+	/// setting, and reading it as "two, probably" is a driver deciding what a device meant.
+	pub fn decode(bytes: &[u8]) -> Option<LineCoding> {
+		if bytes.len() < LINE_CODING_LEN {
+			return None;
+		}
+		let rate = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+		let stop_bits = match bytes[4] {
+			0 => StopBits::One,
+			1 => StopBits::OneAndAHalf,
+			2 => StopBits::Two,
+			_ => return None,
+		};
+		let parity = match bytes[5] {
+			0 => Parity::None,
+			1 => Parity::Odd,
+			2 => Parity::Even,
+			3 => Parity::Mark,
+			4 => Parity::Space,
+			_ => return None,
+		};
+		if !matches!(bytes[6], 5 | 6 | 7 | 8 | 16) {
+			return None;
+		}
+		Some(LineCoding { rate, stop_bits, parity, data_bits: bytes[6] })
+	}
+}
+
+/// The `wValue` of `SET_CONTROL_LINE_STATE`: DTR is bit 0 and RTS is bit 1.
+///
+/// A BITMAP IN THE SETUP PACKET AND NOT A PAYLOAD. The request carries no data stage at all, so a
+/// driver that sends the two lines as bytes sends a transfer the device did not ask for and gets a
+/// stall for a request it could have made.
+pub fn control_lines(dtr: bool, rts: bool) -> u16 {
+	(dtr as u16) | ((rts as u16) << 1)
+}
+
+/// Read one configuration descriptor and decide what to bind as an ACM adapter.
+///
+/// ONE PASS AND NO ASSUMED ORDER, for the reason `bind` above states: several devices put the union
+/// descriptor after the interface it names.
+pub fn bind_acm(config: &[u8]) -> Result<AcmBinding, NotBindable> {
+	let mut walk = descriptor::Walk::new(config);
+	let mut config_value: Option<u8> = None;
+	let mut control_interface: Option<u8> = None;
+	let mut union_data: Option<u8> = None;
+	let mut capabilities: u8 = 0;
+	let mut notify: Option<(u8, u16)> = None;
+	let mut candidate: Candidate = None;
+	let mut best: Option<Pair> = None;
+	let mut current_is_control = false;
+
+	for record in walk.by_ref() {
+		match record.kind {
+			descriptor::DT_CONFIG => config_value = record.field(5).ok(),
+			descriptor::DT_INTERFACE => {
+				keep_lowest(&mut candidate, &mut best);
+				let (Ok(number), Ok(alternate), Ok(class), Ok(subclass)) = (record.field(2), record.field(3), record.field(5), record.field(6)) else {
+					return Err(NotBindable::Malformed);
+				};
+				current_is_control = false;
+				if class == CLASS_COMMUNICATIONS && subclass == SUBCLASS_ACM && control_interface.is_none() {
+					control_interface = Some(number);
+					current_is_control = true;
+				} else if class == CLASS_COMMUNICATIONS && Some(number) == control_interface {
+					current_is_control = true;
+				} else if class == CLASS_CDC_DATA {
+					candidate = Some((number, alternate, None, None));
+				}
+			}
+			DT_CS_INTERFACE if current_is_control => {
+				let Ok(subtype) = record.field(2) else { return Err(NotBindable::Malformed) };
+				match subtype {
+					// The subordinate interface at offset four is the data interface.
+					FN_UNION => union_data = record.field(4).ok(),
+					// The capability bitmap at offset three. A device that published no ACM
+					// descriptor supports none of them, which is what zero already says.
+					FN_ACM => capabilities = record.field(3).unwrap_or(0),
+					_ => {}
+				}
+			}
+			descriptor::DT_ENDPOINT => {
+				let (Ok(address), Ok(attributes), Ok(packet)) = (record.field(2), record.field(3), record.field16(4)) else {
+					return Err(NotBindable::Malformed);
+				};
+				// THE NOTIFICATION ENDPOINT BELONGS TO THE COMMUNICATIONS INTERFACE, and taking an
+				// interrupt endpoint from whichever interface carried one would take a HID
+				// function's on a composite adapter.
+				if current_is_control && attributes & 0x03 == 0x03 && address & 0x80 != 0 {
+					notify.get_or_insert((address, packet));
+					continue;
+				}
+				if let Some((_, _, ref mut ep_in, ref mut ep_out)) = candidate
+					&& attributes & 0x03 == 0x02
+				{
+					if address & 0x80 != 0 {
+						ep_in.get_or_insert((address, packet));
+					} else {
+						ep_out.get_or_insert((address, packet));
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	keep_lowest(&mut candidate, &mut best);
+	if walk.fault().is_some() {
+		return Err(NotBindable::Malformed);
+	}
+
+	let control_interface = control_interface.ok_or(NotBindable::NoNetworkInterface)?;
+	// THE UNION NAMES THE DATA INTERFACE, and "the next interface" is what binds the wrong function
+	// on a composite device.
+	let union_data = union_data.ok_or(NotBindable::NoUnion)?;
+	let (data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet) = best.ok_or(NotBindable::NoBulkPair)?;
+	if union_data != data_interface {
+		return Err(NotBindable::NoDataInterface);
+	}
+	let (notify_in, notify_packet) = notify.unwrap_or((0, 0));
+	Ok(AcmBinding { config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, notify_in, notify_packet, capabilities })
+}
+
 pub fn mac_from_string(bytes: &[u8]) -> Option<[u8; 6]> {
 	// A string descriptor is `bLength`, `bDescriptorType`, then UTF-16LE.
 	if bytes.len() < 2 || bytes[1] != 0x03 {

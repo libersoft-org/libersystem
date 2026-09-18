@@ -216,6 +216,14 @@ name = "test2d-sw"
 path = "src/test2d_sw.rs"
 
 [[bin]]
+name = "test3d-conformance-sw"
+path = "src/test3d_conformance.rs"
+
+[[bin]]
+name = "test3d-sw"
+path = "src/test3d_sw.rs"
+
+[[bin]]
 name = "graphics_probe"
 path = "src/graphics_probe.rs"
 
@@ -475,9 +483,20 @@ text-pipeline = { path = "../../libs/text/text-pipeline" }
 unicode-bidi = { path = "../../libs/text/unicode-bidi" }
 render2d = { path = "../../libs/graphics/render2d" }
 soft2d = { path = "../../libs/graphics/soft2d" }
+# AND THE 3D HALF OF THE SAME MODEL, for the one tool that drives it: a backend, the API it is driven
+# through, the shader IR its stages are built with and the matrix arithmetic its camera is.
+render3d = { path = "../../libs/graphics/render3d" }
+soft3d = { path = "../../libs/graphics/soft3d" }
+render-math = { path = "../../libs/graphics/render-math" }
+render-shader = { path = "../../libs/graphics/render-shader" }
+# THE IMAGE MODEL'S TWO ENUMS, and nothing else: a texture states what its numbers MEAN, and a
+# program that builds one has to be able to say "linear" and "colour". Both are fieldless, so the
+# compiler inlines them and the linked program imports nothing from the profile.
+graphics-profile = { path = "../../libs/graphics/profile" }
 # The conformance suite itself, which is a library so that the same scenes run as host tests on the
 # build machine and inside a guest on each architecture.
 render2d-conformance = { path = "../../libs/graphics/conformance2d" }
+render3d-conformance = { path = "../../libs/graphics/conformance3d" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }

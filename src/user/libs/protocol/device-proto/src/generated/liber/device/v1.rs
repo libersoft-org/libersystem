@@ -92,6 +92,14 @@ pub struct DeviceEntry {
 	pub bus: u32,
 	pub dev: u32,
 	pub func: u32,
+	/// WHETHER THE FUNCTION IS STILL ON THE BUS (added 2026-09-18).
+	///
+	/// A ROW OUTLIVES ITS DEVICE, and that is deliberate: an index is what a claim, a binding and
+	/// every message in flight are addressed by, so removing the row when a device is unplugged
+	/// would renumber every device after it. What changes instead is this flag - and without it, a
+	/// listing shows a disk somebody pulled out as though it were still there, which is the one
+	/// thing an operator asking "what is in this machine" must not be told.
+	pub present: bool,
 }
 
 impl DeviceEntry {
@@ -136,6 +144,7 @@ impl DeviceEntry {
 		w.u32(self.bus)?;
 		w.u32(self.dev)?;
 		w.u32(self.func)?;
+		w.boolean(self.present)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<DeviceEntry> {
@@ -145,7 +154,8 @@ impl DeviceEntry {
 		let bus = r.u32()?;
 		let dev = r.u32()?;
 		let func = r.u32()?;
-		Some(DeviceEntry { index, r#type, mmio_len, bus, dev, func })
+		let present = r.boolean()?;
+		Some(DeviceEntry { index, r#type, mmio_len, bus, dev, func, present })
 	}
 }
 
@@ -164,6 +174,18 @@ pub enum BindingState {
 	Failed = 6,
 	Quarantined = 7,
 	Disabled = 8,
+	/// The device left the bus and its teardown was CONFIRMED: it is gone and nothing is owed.
+	///
+	/// TERMINAL FOR THIS BINDING AND NOT FOR THE SLOT. The slot outlives the device as a
+	/// tombstone, and a device plugged into it afterwards opens a NEW binding whose claim mints
+	/// the next generation - so a message stamped with the old one is refused by arithmetic
+	/// rather than by anyone remembering.
+	///
+	/// NOT `quarantined`, WHICH IS THE DISTINCTION THAT MAKES IT WORTH RENDERING. A removal whose
+	/// teardown was not confirmed says nothing about the resources - the frames may still be live
+	/// under a device that is no longer there to ask - and lands at `quarantined` like every other
+	/// unconfirmed teardown. Reaching `removed` is a claim about the resources, not about the bus.
+	Removed = 9,
 }
 
 impl BindingState {
@@ -215,6 +237,7 @@ impl BindingState {
 			6 => Some(BindingState::Failed),
 			7 => Some(BindingState::Quarantined),
 			8 => Some(BindingState::Disabled),
+			9 => Some(BindingState::Removed),
 			_ => None,
 		}
 	}
@@ -830,6 +853,13 @@ pub enum ProviderKind {
 	/// host channel as `net` would make an ambient path around NetworkService out of a kind
 	/// every consumer already asks for.
 	LocalStream = 9,
+	/// A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `pointer` is handed ONE cursor: a
+	/// position and a button mask, which is what a mouse and a tablet stylus both are. A touch
+	/// surface reports SEVERAL CONTACTS AT ONCE, each with an identity of its own that persists
+	/// while the finger is down - and that identity is what makes a drag a drag rather than two
+	/// touches at different places. Published as `pointer`, a digitizer would be flattened into
+	/// whichever contact happened to be decoded last, which is the defect this whole item is about.
+	Touch = 10,
 }
 
 impl ProviderKind {
@@ -881,6 +911,7 @@ impl ProviderKind {
 			7 => Some(ProviderKind::Pointer),
 			8 => Some(ProviderKind::ConsoleBytes),
 			9 => Some(ProviderKind::LocalStream),
+			10 => Some(ProviderKind::Touch),
 			_ => None,
 		}
 	}
@@ -2909,6 +2940,13 @@ impl DeviceEntry {
 		out.push(',');
 		out.push_str("\"func\":");
 		let _ = write!(out, "{}", self.func);
+		out.push(',');
+		out.push_str("\"present\":");
+		if self.present {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -2930,10 +2968,17 @@ impl DeviceEntry {
 		out.push_str(", ");
 		out.push_str("func=");
 		let _ = write!(out, "{}", self.func);
+		out.push_str(", ");
+		out.push_str("present=");
+		if self.present {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::map(out, 7);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "type");
@@ -2946,6 +2991,8 @@ impl DeviceEntry {
 		crate::codec::cbor::uint(out, self.dev as u64);
 		crate::codec::cbor::text(out, "func");
 		crate::codec::cbor::uint(out, self.func as u64);
+		crate::codec::cbor::text(out, "present");
+		crate::codec::cbor::boolean(out, self.present);
 	}
 }
 
@@ -2976,6 +3023,7 @@ impl BindingState {
 			BindingState::Failed => out.push_str("\"failed\""),
 			BindingState::Quarantined => out.push_str("\"quarantined\""),
 			BindingState::Disabled => out.push_str("\"disabled\""),
+			BindingState::Removed => out.push_str("\"removed\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -2989,6 +3037,7 @@ impl BindingState {
 			BindingState::Failed => out.push_str("failed"),
 			BindingState::Quarantined => out.push_str("quarantined"),
 			BindingState::Disabled => out.push_str("disabled"),
+			BindingState::Removed => out.push_str("removed"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -3002,6 +3051,7 @@ impl BindingState {
 			BindingState::Failed => crate::codec::cbor::text(out, "failed"),
 			BindingState::Quarantined => crate::codec::cbor::text(out, "quarantined"),
 			BindingState::Disabled => crate::codec::cbor::text(out, "disabled"),
+			BindingState::Removed => crate::codec::cbor::text(out, "removed"),
 		}
 	}
 }
@@ -3225,6 +3275,7 @@ impl ProviderKind {
 			ProviderKind::Pointer => out.push_str("\"pointer\""),
 			ProviderKind::ConsoleBytes => out.push_str("\"console-bytes\""),
 			ProviderKind::LocalStream => out.push_str("\"local-stream\""),
+			ProviderKind::Touch => out.push_str("\"touch\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3238,6 +3289,7 @@ impl ProviderKind {
 			ProviderKind::Pointer => out.push_str("pointer"),
 			ProviderKind::ConsoleBytes => out.push_str("console-bytes"),
 			ProviderKind::LocalStream => out.push_str("local-stream"),
+			ProviderKind::Touch => out.push_str("touch"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -3251,6 +3303,7 @@ impl ProviderKind {
 			ProviderKind::Pointer => crate::codec::cbor::text(out, "pointer"),
 			ProviderKind::ConsoleBytes => crate::codec::cbor::text(out, "console-bytes"),
 			ProviderKind::LocalStream => crate::codec::cbor::text(out, "local-stream"),
+			ProviderKind::Touch => crate::codec::cbor::text(out, "touch"),
 		}
 	}
 }

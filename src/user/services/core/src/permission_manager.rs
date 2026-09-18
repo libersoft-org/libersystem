@@ -293,6 +293,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// would be authority it has no use for - and the demo is also the proof that a drawing
 		// application needs no more than this.
 		b"test2d-sw" => Some(granted("test2d-sw", alloc::vec![Capability::Display, Capability::InputKeys])),
+		// THE SAME TWO AND NOTHING ELSE. Every vertex the 3D demo draws it computes and every texture
+		// it uses it generates, so a rotating lit scene needs no volume, no font catalogue and no
+		// storage - which is a property to keep rather than an accident.
+		b"test3d-sw" => Some(granted("test3d-sw", alloc::vec![Capability::Display, Capability::InputKeys])),
 		b"licoview" => Some(granted("licoview", alloc::vec![Capability::Volumes, Capability::AppAssets])),
 		b"licoedit" => Some(granted("licoedit", alloc::vec![Capability::Volumes, Capability::AppAssets])),
 		// THE MANAGER GETS THE NARROW LAUNCH BROKER AND NOT PROCESS AUTHORITY. `Permission` lets it

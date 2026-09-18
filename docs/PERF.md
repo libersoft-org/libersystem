@@ -91,6 +91,123 @@ The rows are here so a guest run on those ports that looks stuck can be recognis
 Fourteen times and seventeen times the x86_64 figure, on a scene an eighth the area of the 640x480
 measurement above - which is the ratio to remember whenever a guest run on those ports looks stuck.
 
+## soft3d, the CPU 3D backend, stage by stage (2026-09-18)
+
+`./bench.sh --suite soft3d` on the host, release, with the frozen benchmark scene: 192 triangles and
+384 vertices at 640x480, arranged in a four-by-four grid that OVERLAPS on screen and whose nearest
+column crosses the near plane, so the clipper and the overdraw are real rather than fixtures built to
+look like them. Eight samples after two warm-up frames.
+
+THE STAGES ARE MEASURED BY DIFFERENCE AND NOT BY A CLOCK INSIDE THE LIBRARY. `soft3d` is `no_std` and
+has no clock; giving it one so a benchmark could read it would put a timer on every frame the system
+ever renders. What the benchmark does instead is run the SAME geometry through five pipelines that
+differ by exactly one stage each, and report the differences. The geometry row draws into a
+one-pixel attachment, so every primitive is still transformed, clipped and culled and there is
+nothing left to rasterise.
+
+| stage | cumulative | attributable to |
+| --- | ---: | --- |
+| geometry | 1.4 ms | transform, clip and cull |
+| raster | 145.0 ms | rasterisation, depth test, interpolation and attachment write |
+| shading | 778.7 ms | the lit fragment stage |
+| texturing | 1048.1 ms | two bilinear texture samples per fragment |
+| blending | 1049.0 ms | the blend equation |
+
+442,474 fragments a frame, 33 primitives clipped, 141 culled: **183 triangles/s and 421,791 shaded
+fragments/s**, which is 0.95 frames a second at this workload.
+
+### Where the fragment cost actually is, measured rather than reasoned about
+
+`soft3d-bench --interpreter` runs a fragment module against a stub with no rasteriser in front of it,
+which is the measurement that says whether a change to the interpreter did anything: a frame
+measurement moves by a few percent for a change that halved it.
+
+| module | statements | per run | per statement |
+| --- | ---: | ---: | ---: |
+| a constant colour | 4 | 137 ns | 34 ns |
+| the lit stage | 36 | 1511 ns | 42 ns |
+| the lit stage with two texture reads | 41 | 1726 ns | 42 ns |
+| 36 composes, which read four operands and compute NOTHING | 36 | 1837 ns | 51 ns |
+
+**The last row is the finding.** Thirty-six instructions that do no arithmetic at all cost MORE per
+instruction than the lit stage's, so essentially none of the time is the arithmetic: it is the value
+plumbing around it - reading operands out of the value table, building the `Val` an operation
+returns, returning it through a `Result`, and moving it into its slot. A four-component add is four
+multiplies and about two hundred and fifty bytes of memory traffic.
+
+### The three changes this measurement bought, and the one it rejected
+
+- **Operands are read by reference.** `read` returned an owned `Val` - a type plus sixteen inline
+  words, about ninety bytes - for every operand of every instruction of every fragment; the lit stage
+  read two per instruction over forty-odd instructions, which is seven kilobytes copied per FRAGMENT
+  and a type's clone run ninety times. Every arm either reads the value component-wise or copies it
+  into a fixed buffer, so a borrow serves them all; the two that genuinely need an owned value clone
+  at the one place they need it. **1521 ms to 1100 ms.**
+- **The perspective denominator is computed once per fragment.** It does not depend on the value
+  being interpolated, and a stage with four `vec4` varyings was computing the identical number
+  sixteen times - three multiplies, two adds and a finiteness test each. The DIVISION stays per
+  component, because `a / b` and `a * (1 / b)` are not the same `f32` and this crate's geometry half
+  is bit-exact by rule. Worth about a percent here and more on a stage with more varyings.
+- **Four-word inline values were measured and REJECTED.** A fragment stage computes scalars and
+  vectors, so four words would hold every value it produces and would halve a `Val`; the benchmark
+  said that was worth about six percent. What it would also do is push every `mat4` onto the heap,
+  and a vertex stage reads two matrix uniforms per vertex - so the saving is bought with an
+  allocation per vertex per frame, against a crate whose stated property is that a warmed frame asks
+  the allocator for nothing. Six percent is not what that is worth.
+
+Together: **1521 ms to 1049 ms, a factor of 1.45** on the same frozen scene.
+
+### What is left, and what it would take
+
+At 42 ns an IR statement the interpreter is about a hundred and twenty-five cycles per instruction,
+and the measurement above says those cycles are spent moving values rather than computing them. Two
+routes remain and neither is a tuning pass:
+
+- **A register file instead of a value table.** Every value's type is known statically from the
+  module, so the runtime does not need to carry one per value: a flat word arena with a precomputed
+  offset and width per slot would make an assignment a sixteen-byte copy and remove the type clones,
+  the `Option` and the drop glue entirely. This is a rewrite of the interpreter's core, and the
+  measurement above is what says it is the right one.
+- **More than one thread.** The backend is tile-based and single-threaded, and the tiles are
+  independent by construction. The parallelism has to come from outside a `no_std` library that has
+  no threads in it, which makes this an interface question before it is an optimisation.
+
+## The 3D demo, live, at three sizes (2026-09-18)
+
+`test3d-sw --frames N --no-input --report` inside a booted x86_64 guest under QEMU/KVM, release, with
+the scene rendered at the SURFACE's own size - which is what an application does, and what makes a
+measurement at a stated resolution mean anything. A demo that always rendered at one internal size
+and scaled would report the same 3D cost at every window size and call the difference a measurement.
+
+| surface and scene | frame | rate | fragments |
+| --- | ---: | ---: | ---: |
+| 320x240 | 343.2 ms | 2.9 fps | 70,169 |
+| 640x480 | 1184.5 ms | 0.8 fps | 280,592 |
+| 800x600 | 1790.5 ms | 0.5 fps | 438,614 |
+
+Per stage, at 640x480: the opaque scene 909.0 ms, the transparent pass 165.1 ms, the handover into
+the shared image 8.0 ms, the 2D overlay 43.8 ms, the present 38.6 ms. The shape is the same at every
+size: the 3D passes are about ninety percent of the frame, and everything the 2D half and the display
+path do together is under eight percent of it. THE PRESENT IS FLAT at all three sizes - 38 ms
+whatever the extent - which says what it is: the display's own pacing and not a copy whose cost grows
+with the picture.
+
+Memory is a function of the extent and is reported as one: two colour attachments at sixteen bytes a
+pixel, a depth-stencil at five, and the shared image the overlay composites into at four.
+
+| extent | colour | depth | scene image |
+| --- | ---: | ---: | ---: |
+| 320x240 | 2,400 kB | 375 kB | 300 kB |
+| 640x480 | 9,600 kB | 1,500 kB | 1,200 kB |
+| 800x600 | 15,000 kB | 2,343 kB | 1,875 kB |
+
+**THE 30 FPS FLOOR AT 640x480 IS NOT MET AND THIS IS THE MEASUREMENT THAT SAYS SO.** The frame is
+1185 ms where the floor is 33, which is a factor of thirty-six. The number is not a tuning gap: the
+benchmark above locates the cost in the shader interpreter's value plumbing, and closing a gap of
+that size needs the two structural changes it names - a register-file interpreter and parallel tile
+execution - rather than more measurement. Recording the number here, unmet, is what keeps the floor a
+floor.
+
 ## soft2d, the CPU 2D backend (2026-09-12)
 
 `./bench.sh --suite soft2d` records four frozen scenes at 640x480 and reports what a PREPARED

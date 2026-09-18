@@ -994,8 +994,24 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 	let (recorded_providers, recorded_slots) = recorded_tail.split_at(slot_start);
 	assert!(recorded_slots.iter().all(|line| line.starts_with("selection=")), "{} interleaves selection slots with providers", row.name);
 	assert!(recorded_slots.len() <= MAX_SELECTION_SLOTS, "{} declares more selection slots than the launch admits", row.name);
+	// THE ORDER IS PART OF WHAT IS COMPARED, and deliberately so. A launch reads the provider list as
+	// STRICTLY ASCENDING BY BYTES - that is what makes a duplicate impossible to express - so a
+	// record written in any other order is one no launch will read, whatever digests it carries.
+	// Sorting the recorded side before comparing it would turn this check into a set comparison and
+	// let exactly that record through: `render3d` written before `render-math` (`-` is 0x2d, `3` is
+	// 0x33) is a staged library every program needing it is refused for, with every provider present
+	// and every digest agreeing. The message below therefore names an out-of-order record as its own
+	// case, because the per-provider loop has nothing to report when the order is the only fault.
 	if recorded_providers != expected_providers.as_slice() {
 		let recorded: &[&str] = recorded_providers;
+		let mut recorded_sorted: Vec<&str> = recorded.to_vec();
+		recorded_sorted.sort_unstable();
+		if recorded_sorted == expected_providers.iter().map(String::as_str).collect::<Vec<&str>>() {
+			eprintln!("mkpackages: {}'s identity record lists the right providers in an order no launch will read", row.name);
+			eprintln!("mkpackages:   recorded: {}", recorded.join(" "));
+			eprintln!("mkpackages:   ascending by bytes: {}", recorded_sorted.join(" "));
+			panic!("{} identity provider order", row.name);
+		}
 		eprintln!("mkpackages: {} was built against providers that are not the ones staged beside it", row.name);
 		for provider in &row.providers {
 			let prefix = format!("provider={provider}:");

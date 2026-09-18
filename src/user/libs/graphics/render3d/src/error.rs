@@ -69,6 +69,10 @@ pub enum MeshFault {
 	TooFewVertices { topology: &'static str, needs: u32, has: u32 },
 	/// An attribute whose offset and size leave the stride.
 	AttributeOutsideStride { attribute: u32, offset: u32, size: u32, stride: u32 },
+	/// Two attributes at one location. A stage reads a location and gets ONE value, so a layout that
+	/// offers two is a description with two answers to one question - and which one a backend picks
+	/// is exactly the sort of thing two backends decide differently.
+	LocationDeclaredTwice { location: u32, attribute: u32, first: u32 },
 }
 
 /// Why two attachments cannot share a pass.

@@ -1323,6 +1323,47 @@ enum Destination {
 	V6([u8; 16]),
 }
 
+// THE SOURCE THIS HOST WOULD SEND A DESTINATION FROM, or `None` when it has none.
+//
+// Factored out because two callers need the same answer and a second copy is how they come to
+// disagree: the resolver's answer and an open's candidate list are the SAME question about the same
+// host, and a name that resolves to a destination this host cannot reach has to rank the same way in
+// both.
+fn own_source(destination: Destination, stack: &Stack) -> Option<addr_select::Source> {
+	match destination {
+		Destination::V4(_) => Some(addr_select::Source { address: addr_select::mapped_v4(stack.ip().0), interface_index: 0, interface_generation: 1, deprecated: false, prefix_len: 32 }),
+		Destination::V6(octets) => stack.ipv6_ref().and_then(|host| host.source_address(service_logic::ipv6::Address::new(octets))).map(|address| addr_select::Source { address: address.octets(), interface_index: 0, interface_generation: 1, deprecated: false, prefix_len: 64 }),
+	}
+}
+
+// RFC 6724 section 6 over a plain list of destinations: the order this host will try them in.
+//
+// THIS IS WHAT `resolve` OWED ITS CALLERS AND DID NOT PAY. The resolver asked for `AAAA` and then
+// `A` and returned them in that order, under a comment claiming the order was RFC 6724's - and the
+// module that implements RFC 6724 opens by saying that "IPv6 first" is NOT an algorithm. It has no
+// answer for a host whose only IPv6 address is a unique-local one and whose destination is a global
+// one: rule 5 wants the labels to match, they do not, and the IPv4 pair matches at label 4. So the
+// algorithm says IPv4 and the fixed order said IPv6.
+//
+// WHAT THAT COST, MEASURED ON A MACHINE THAT HAS THE SHAPE: a host behind a NAT that offers a
+// site-local IPv6 prefix and no route out of it. `ping google.com` took the first of the list, sent
+// every echo into the prefix, and reported a hundred percent loss - on a link where the IPv4 next to
+// it answered every time. Nothing in the output named the family, because nothing had chosen it.
+fn attempt_order_for(addresses: &[Destination], stack: &Stack) -> Vec<usize> {
+	let candidates: Vec<addr_select::Destination> = addresses
+		.iter()
+		.enumerate()
+		.map(|(index, &destination)| {
+			let wide: [u8; 16] = match destination {
+				Destination::V4(ip) => addr_select::mapped_v4(ip.0),
+				Destination::V6(octets) => octets,
+			};
+			addr_select::Destination { address: wide, source: own_source(destination, stack), supplied: index }
+		})
+		.collect();
+	addr_select::attempt_order(&candidates)
+}
+
 // The candidates a caller supplied, in the order this host will try them.
 //
 // THE ORDER IS RFC 6724'S AND IS DECIDED ONCE, AT ADMISSION. It is retained for this open: a
@@ -1367,10 +1408,8 @@ fn ordered_destinations(target: &OpenTarget, stack: &Stack) -> Result<Vec<Destin
 			// ranking by a source that will not be used answers a question nobody asked.
 			Some(Destination::V4(ip)) => Some(addr_select::Source { address: addr_select::mapped_v4(ip.0), interface_index: 0, interface_generation: 1, deprecated: false, prefix_len: 32 }),
 			Some(Destination::V6(octets)) => Some(addr_select::Source { address: octets, interface_index: 0, interface_generation: 1, deprecated: false, prefix_len: 64 }),
-			None => match destination {
-				Destination::V4(_) => Some(addr_select::Source { address: addr_select::mapped_v4(stack.ip().0), interface_index: 0, interface_generation: 1, deprecated: false, prefix_len: 32 }),
-				Destination::V6(octets) => stack.ipv6_ref().and_then(|host| host.source_address(service_logic::ipv6::Address::new(octets))).map(|address| addr_select::Source { address: address.octets(), interface_index: 0, interface_generation: 1, deprecated: false, prefix_len: 64 }),
-			},
+			// THE SAME DERIVATION `resolve` USES, from one place - see `own_source`.
+			None => own_source(destination, stack),
 		};
 		candidates.push(addr_select::Destination { address: wide, source, supplied: addresses.len() });
 		addresses.push(destination);
@@ -1694,13 +1733,26 @@ impl network::Service for Net<'_> {
 		let outcome = do_dns(name.as_bytes(), self.families, self.frames, self.stack, self.flight, self.rx, self.tx);
 		self.pending.release(PendingKind::Dns, self.client);
 		match outcome {
-			Ok(addresses) => Ok(addresses
-				.into_iter()
-				.map(|address| match address {
-					dns::Address::V4(octets) => wire_v4(Ipv4Addr(octets)),
-					dns::Address::V6(octets) => IpAddress::V6(WireIpv6::from_octets(octets)),
-				})
-				.collect()),
+			// ORDERED BEFORE IT LEAVES, because every caller of this takes the FIRST one. `ping`,
+			// `traceroute` and `resolve_target` all do, and each of them asks one question of one
+			// host: handing them the resolver's record order makes the family a property of what the
+			// name server happened to answer first rather than of what this host can reach.
+			Ok(addresses) => {
+				let destinations: Vec<Destination> = addresses
+					.iter()
+					.map(|address| match address {
+						dns::Address::V4(octets) => Destination::V4(Ipv4Addr(*octets)),
+						dns::Address::V6(octets) => Destination::V6(*octets),
+					})
+					.collect();
+				Ok(attempt_order_for(&destinations, self.stack)
+					.into_iter()
+					.map(|index| match destinations[index] {
+						Destination::V4(ip) => wire_v4(ip),
+						Destination::V6(octets) => IpAddress::V6(WireIpv6::from_octets(octets)),
+					})
+					.collect())
+			}
 			// THE CAUSES ARE KEPT APART, because a caller acts differently on each: a name that does
 			// not exist is not a server that is broken, and neither is a timeout.
 			Err(dns::Refusal::NameError) | Err(dns::Refusal::NoAddress) => Err(Error::NotFound),
@@ -2514,8 +2566,12 @@ fn do_dns(name: &[u8], families: Families, frames: u64, stack: &mut Stack, fligh
 	let normalized = dns::normalize(name);
 	let mut addresses: Vec<dns::Address> = Vec::new();
 	let mut refusal: Option<dns::Refusal> = None;
-	// AAAA FIRST, because RFC 6724's ordering puts a reachable IPv6 destination ahead of an IPv4 one
-	// and the list this returns is handed whole to one sequential open.
+	// BOTH RECORD TYPES ARE ASKED FOR, AND THE ORDER THEY ARE ASKED IN IS NOT THE ORDER THEY ARE
+	// RETURNED IN. This used to say AAAA came first "because RFC 6724's ordering puts a reachable
+	// IPv6 destination ahead of an IPv4 one", which is the claim the module implementing RFC 6724
+	// opens by refusing: "IPv6 first" is not an algorithm and has no answer for a host whose only
+	// IPv6 source is a unique-local address. The ranking happens in `resolve`, over both families at
+	// once, with this host's own sources - which is the only place that knows them.
 	let wanted: [(u16, bool); 2] = [(dns::TYPE_AAAA, families.includes_v6()), (dns::TYPE_A, families.includes_v4())];
 	for (qtype, included) in wanted {
 		if !included {

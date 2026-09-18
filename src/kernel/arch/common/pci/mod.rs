@@ -14,6 +14,7 @@
 // resolved device tables are handed to DeviceManager, which maps each BAR to a
 // userspace driver via a DeviceMemory capability.
 
+use crate::sync::SpinLock;
 use alloc::vec::Vec;
 
 // virtio's PCI vendor id (Red Hat / virtio).
@@ -55,6 +56,211 @@ const CAP_ID_VENDOR: u8 = 0x09;
 // Function Mask, bits 10:0 = table size - 1); Table Offset/BIR at +4 (bits 2:0 =
 // which BAR, bits 31:3 = byte offset into it).
 const MSIX_CAP_ID: u8 = 0x11;
+// The PCI Express capability, which is where a port's slot lives.
+const PCIE_CAP_ID: u8 = 0x10;
+// Bits 4..7 of the PCI Express Capabilities register: the port type. A slot belongs to a ROOT PORT
+// or to a switch's DOWNSTREAM port and to nothing else - an endpoint has the same capability and the
+// same offsets, and its bytes there are not a slot.
+const PCIE_TYPE_ROOT_PORT: u16 = 4;
+const PCIE_TYPE_DOWNSTREAM_PORT: u16 = 6;
+// Bit 8: this port implements a slot. WITHOUT IT THE SLOT REGISTERS ARE NOT SLOT REGISTERS, which is
+// the check a reader skips and then sees a device present in a slot that does not exist.
+const PCIE_SLOT_IMPLEMENTED: u16 = 1 << 8;
+// Slot Capabilities bit 5: the slot can be hot-plugged at all. One that cannot will never report a
+// change, so watching it is a loop that never ends and never fires.
+const SLOT_CAP_HOT_PLUG: u32 = 1 << 5;
+// Slot Status bit 6: what is in the slot NOW. Slot Status bit 3: that it CHANGED since this bit was
+// last cleared. Two different questions, and a reader needs both - see `SlotEvent`.
+const SLOT_STATUS_PRESENT: u16 = 1 << 6;
+const SLOT_STATUS_PRESENCE_CHANGED: u16 = 1 << 3;
+// THE ATTENTION BUTTON IS HOW A REMOVAL IS ASKED FOR, and it is the half that makes this
+// coordinated rather than a surprise. A managed removal does not begin with the device leaving: it
+// begins with somebody ASKING - a person pressing the button on the chassis, or an operator typing
+// the equivalent - and what the system owes in return is to stop the driver, let go of the
+// resources, and only then power the slot down. A port that tore the device out first would leave a
+// driver holding a mapping of something that is gone.
+const SLOT_STATUS_ATTENTION_BUTTON: u16 = 1 << 0;
+const SLOT_CONTROL_ATTENTION_BUTTON_ENABLE: u16 = 1 << 0;
+// Slot Control bit 3: report a presence change. Bit 5: report it as an interrupt rather than only in
+// the status register.
+const SLOT_CONTROL_PRESENCE_CHANGED_ENABLE: u16 = 1 << 3;
+const SLOT_CONTROL_HOT_PLUG_INTERRUPT_ENABLE: u16 = 1 << 5;
+// Whether the slot HAS a power controller, and the control bit that turns it on.
+//
+// A SLOT WHOSE POWER IS OFF REPORTS NOTHING, which is the whole reason this is here. `Power
+// Controller Control` is a one for OFF and a zero for ON - the inverted spelling is the
+// specification's - and a slot with a power controller comes out of reset with it OFF. A guest that
+// armed the presence-change interrupt and left the power off armed a slot that will never see a
+// device: the port holds it unpowered, so nothing behind it is presented and no change is reported.
+// A person plugging a disk into that machine watches nothing happen.
+const SLOT_CAP_POWER_CONTROLLER: u32 = 1 << 1;
+const SLOT_CONTROL_POWER_OFF: u16 = 1 << 10;
+// The Power Indicator's two bits, and the value that means ON. An indicator left at its reset value
+// says "the slot's state is unknown", which is what an operator's light would show.
+const SLOT_CONTROL_POWER_INDICATOR: u16 = 3 << 8;
+const SLOT_CONTROL_POWER_INDICATOR_ON: u16 = 1 << 8;
+// AND OFF IS THREE AND NOT ZERO, which is the specification's spelling and not an obvious one. The
+// two bits encode on, blink and off as 01, 10 and 11; ZERO IS RESERVED. A port reads the indicator
+// as part of deciding that the guest has finished with the slot, so writing the reserved value is a
+// power-down request a port does not recognise - the slot goes dark and the device stays in it.
+const SLOT_CONTROL_POWER_INDICATOR_OFF: u16 = 3 << 8;
+
+/// A hot-plug slot on a port: where its registers are, and which physical slot it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Slot {
+	/// The config-space offset of the PCI Express capability the slot registers hang off.
+	pub cap: u16,
+	/// The physical slot number the platform assigned, out of Slot Capabilities bits 19..31. It is
+	/// what a person reads off a chassis, and it is not the bus/device/function of anything.
+	pub number: u32,
+}
+
+/// What a slot's status says has happened to it.
+///
+/// TWO BITS AND TWO QUESTIONS, WHICH IS THE WHOLE OF WHY THIS IS A TYPE. `Presence Detect State`
+/// says what is in the slot NOW; `Presence Detect Changed` is a STICKY bit saying it changed since
+/// somebody last cleared it. A reader that watches only the state never learns that a device was
+/// swapped between two looks - the state is the same before and after - and one that acts on the
+/// changed bit alone knows something happened and not WHICH of the two things it was. The pair
+/// answers it; either alone does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SlotEvent {
+	/// Nothing has changed since the last acknowledgement.
+	Quiet,
+	/// A device is in the slot and the change bit says it arrived.
+	Arrived,
+	/// The slot is empty and the change bit says it left.
+	Departed,
+	/// Somebody asked for the device in this slot to be removed, and it is still there.
+	///
+	/// THE REQUEST IS NOT THE REMOVAL. What this reports is the beginning of a coordinated removal:
+	/// the driver has to be stopped and its resources released, and only then may the slot be powered
+	/// down - which is what lets the port take the device out.
+	RemovalRequested,
+}
+
+/// Resolve a port's hot-plug slot, or `None` when it has none.
+///
+/// A CAPABILITY EVERY PCIe FUNCTION HAS, AND SLOT REGISTERS ONLY SOME OF THEM DO. The PCI Express
+/// capability sits on endpoints too, at the same offsets, so reading Slot Status off whatever
+/// carries the capability reads an endpoint's reserved bytes and calls them a presence bit. Two
+/// things have to be true first: the port type is a root port or a switch's downstream port, and
+/// `Slot Implemented` is set. Then the slot has to be HOT-PLUG CAPABLE, because one that is not will
+/// never report a change however long anything watches it.
+pub fn resolve_slot<A: ConfigAccess>(d: &PciDevice) -> Option<Slot> {
+	if A::read16(d.bus, d.dev, d.func, 0x06) & STATUS_CAP_LIST == 0 {
+		return None;
+	}
+	let mut ptr: u16 = (A::read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
+	// Bounded like every other walk here: a malformed list must not spin.
+	for _ in 0..48 {
+		if ptr == 0 {
+			break;
+		}
+		let cap_id = A::read8(d.bus, d.dev, d.func, ptr);
+		let next = (A::read8(d.bus, d.dev, d.func, ptr + 1) & 0xFC) as u16;
+		if cap_id == PCIE_CAP_ID {
+			let caps = A::read16(d.bus, d.dev, d.func, ptr + 2);
+			let port_type = (caps >> 4) & 0x0F;
+			if (port_type != PCIE_TYPE_ROOT_PORT && port_type != PCIE_TYPE_DOWNSTREAM_PORT) || caps & PCIE_SLOT_IMPLEMENTED == 0 {
+				return None;
+			}
+			let slot_caps = A::read32(d.bus, d.dev, d.func, ptr + 0x14);
+			if slot_caps & SLOT_CAP_HOT_PLUG == 0 {
+				return None;
+			}
+			return Some(Slot { cap: ptr, number: slot_caps >> 19 });
+		}
+		ptr = next;
+	}
+	None
+}
+
+/// What this slot says has happened, WITHOUT changing anything.
+pub fn slot_event<A: ConfigAccess>(d: &PciDevice, slot: Slot) -> SlotEvent {
+	let status = A::read16(d.bus, d.dev, d.func, slot.cap + 0x1A);
+	// THE BUTTON IS READ BEFORE THE PRESENCE, because it is the earlier half of the same story: a
+	// removal is REQUESTED and then, once the system has let go, it happens. A reader that looked at
+	// presence first would answer `Quiet` for the request and only ever see the removal it was
+	// supposed to prepare for.
+	if status & SLOT_STATUS_ATTENTION_BUTTON != 0 {
+		return SlotEvent::RemovalRequested;
+	}
+	if status & SLOT_STATUS_PRESENCE_CHANGED == 0 {
+		return SlotEvent::Quiet;
+	}
+	if status & SLOT_STATUS_PRESENT != 0 { SlotEvent::Arrived } else { SlotEvent::Departed }
+}
+
+/// Power the slot down, which is how a guest says the removal may proceed.
+///
+/// THIS IS THE ACKNOWLEDGEMENT THAT MATTERS. The button said "may I", the driver has stopped and its
+/// claim is free, and this is the answer: the port may now take the device out. Writing it before the
+/// driver let go is the surprise removal this whole path exists to avoid.
+pub fn slot_power_off<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
+	let mut control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18);
+	control |= SLOT_CONTROL_POWER_OFF;
+	control = (control & !SLOT_CONTROL_POWER_INDICATOR) | SLOT_CONTROL_POWER_INDICATOR_OFF;
+	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control as u32);
+}
+
+/// Power the slot back up, so the next device plugged into it is seen.
+pub fn slot_power_on<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
+	let mut control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18);
+	control &= !SLOT_CONTROL_POWER_OFF;
+	control = (control & !SLOT_CONTROL_POWER_INDICATOR) | SLOT_CONTROL_POWER_INDICATOR_ON;
+	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control as u32);
+}
+
+/// Acknowledge the change this slot reported, so the next one is a new one.
+///
+/// WRITTEN AS A ONE AND NOT A ZERO. `Presence Detect Changed` is RW1C - write-one-to-clear - which
+/// is the opposite of what clearing a bit usually looks like: a reader that masks it out and writes
+/// the result back leaves the bit exactly as it was, and every later look reports the same change
+/// for ever. That is an event storm from one plug, and it reads as a device arriving thousands of
+/// times rather than as a bug in the acknowledgement.
+///
+/// AND THE OTHER STICKY BITS ARE NOT TOUCHED. Writing a one to a bit CLEARS it, so a write-back of
+/// the whole status register would acknowledge every event the slot had recorded, including the ones
+/// this caller never read.
+pub fn slot_acknowledge<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
+	// ONE DWORD, WRITTEN DELIBERATELY, because Slot Control and Slot Status share it and the two
+	// halves do not obey the same rule. The control half is ordinary and is written back as it was;
+	// the status half is RW1C and carries EXACTLY the bit being acknowledged, so every other sticky
+	// event the slot has recorded survives. A read-modify-write of the whole dword would write the
+	// status bits back as ones and acknowledge all of them, including ones nobody read.
+	let control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18) as u32;
+	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control | ((SLOT_STATUS_PRESENCE_CHANGED as u32) << 16));
+}
+
+/// Acknowledge the attention button, which is a separate sticky bit from the presence change.
+pub fn slot_acknowledge_button<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
+	let control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18) as u32;
+	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control | ((SLOT_STATUS_ATTENTION_BUTTON as u32) << 16));
+}
+
+/// Ask the slot to report presence changes, as an interrupt as well as in its status, and TURN IT ON.
+///
+/// THE POWER IS THE HALF THAT IS EASY TO LEAVE OUT AND IMPOSSIBLE TO NOTICE. A slot with a power
+/// controller comes out of reset with the power OFF, and a port holding an unpowered slot presents
+/// nothing behind it: the presence bit stays clear, the change bit never sets, and the interrupt
+/// this function just armed never fires. Everything looks correct and nothing ever happens - which
+/// from an operator's side is a machine that ignores the disk they plugged into it.
+pub fn slot_arm<A: ConfigAccess>(d: &PciDevice, slot: Slot) {
+	let has_power_controller = A::read32(d.bus, d.dev, d.func, slot.cap + 0x14) & SLOT_CAP_POWER_CONTROLLER != 0;
+	// AND THE STATUS HALF IS WRITTEN AS ZERO, which is how "change nothing" is spelled in an RW1C
+	// register. Writing back what was read there would clear every event the slot had recorded -
+	// this function's business is the control half, and the other half of the dword it has to write
+	// is not its to acknowledge.
+	let mut control = A::read16(d.bus, d.dev, d.func, slot.cap + 0x18);
+	control |= SLOT_CONTROL_PRESENCE_CHANGED_ENABLE | SLOT_CONTROL_HOT_PLUG_INTERRUPT_ENABLE | SLOT_CONTROL_ATTENTION_BUTTON_ENABLE;
+	if has_power_controller {
+		// A ZERO IS ON. See `SLOT_CONTROL_POWER_OFF`.
+		control &= !SLOT_CONTROL_POWER_OFF;
+		control = (control & !SLOT_CONTROL_POWER_INDICATOR) | SLOT_CONTROL_POWER_INDICATOR_ON;
+	}
+	A::write32(d.bus, d.dev, d.func, slot.cap + 0x18, control as u32);
+}
 
 // virtio capability cfg_type values (which structure the capability points at).
 const VIRTIO_CAP_COMMON: u8 = 1;
@@ -91,6 +297,18 @@ pub trait ConfigAccess {
 	// Only consulted by ECAM platforms that override `assign_bars`; 0 otherwise.
 	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	const MMIO_WINDOW_END: u64 = 0;
+
+	// Whether this mechanism can address EXTENDED config space - offsets at or past 0x100.
+	//
+	// AN ECAM WINDOW PUTS THE REGISTER IN THE ADDRESS and has twelve bits of it, so it reaches the
+	// whole four-kilobyte config space of a function; the legacy port pair carries eight bits of
+	// register number and cannot reach past 0xFF at all. Every PCIe extended capability - Advanced
+	// Error Reporting first among them - lives past that line, so a walk has to ask before it starts:
+	// on a mechanism that cannot reach them, a read at 0x100 answers the register at 0x00, and a walk
+	// would report the vendor id as a capability header.
+	fn extended_reach() -> bool {
+		true
+	}
 
 	// Read / write a 32-bit config-space dword for one bus/device/function.
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32;
@@ -326,7 +544,190 @@ pub fn scan<A: ConfigAccess>() -> Vec<PciDevice> {
 	for bus in 0..A::BUS_COUNT.min(A::MAX_BUS as u16 + 1) {
 		scan_bus::<A>(bus as u8, &mut seen, &mut out, 0);
 	}
+	arm_hot_plug_slots::<A>(&out);
+	note_error_reporters::<A>(&out);
 	out
+}
+
+// Which functions of this machine can report an error, remembered once so the poll costs nothing on
+// the ones that cannot.
+//
+// SAID ONCE, LIKE THE SLOTS, and for the same reason: a machine that reports errors at all is worth
+// knowing about before one happens, and a machine that reports none is worth knowing about too - it
+// means the silence later is the absence of a reporter and not the absence of a fault.
+fn note_error_reporters<A: ConfigAccess>(devices: &[PciDevice]) {
+	let first: bool = !REPORTERS_SAID.swap(true, core::sync::atomic::Ordering::AcqRel);
+	let mut found = 0;
+	for function in devices {
+		if note_error_reporter::<A>(function.bus, function.dev, function.func) {
+			found += 1;
+			if first {
+				crate::serial_println!("pci: {:02x}:{:02x}.{} reports errors", function.bus, function.dev, function.func);
+			}
+		}
+	}
+	if first && found == 0 {
+		crate::serial_println!("pci: no function on this machine reports errors{}", if A::extended_reach() { "" } else { " - extended config space is unreachable here" });
+	}
+}
+
+// Whether the error reporters have been said. The bus is scanned several times in a boot.
+static REPORTERS_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Whether the slots have been reported. The bus is scanned SEVERAL TIMES in a boot - the device
+// table, the virtio pass, and whatever asks later - and a machine does not have three hot-plug slots
+// because three passes found the same one.
+static SLOTS_REPORTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Arm every hot-plug slot this scan found, and say what is in each - once per boot.
+//
+// ARMED BECAUSE A SLOT NOBODY ASKED TO BE TOLD ABOUT REPORTS NOTHING, however long anything watches
+// it. SAID because an empty slot is invisible everywhere else: an operator who plugs a disk into one
+// needs to know the system was ever going to notice.
+//
+// AND ANY CHANGE ALREADY STANDING IS ACKNOWLEDGED, because it is about whatever happened before this
+// system booted. Left set, the first look after boot reports an arrival that is only the machine's
+// starting shape.
+/// The hot-plug ports this machine has, remembered at the scan that found them.
+///
+/// REMEMBERED AND NOT RESCANNED. A slot has to be READ to know what is in it, and the read has to
+/// happen whenever something might have changed - from an interrupt handler, among other places. A
+/// full bus walk there would allocate, would follow every bridge, and would do it while a device is
+/// half plugged in; what is needed is the handful of ports that carry a slot at all, which is what
+/// the scan already found.
+///
+/// A FIXED ARRAY BECAUSE THIS IS READ FROM AN INTERRUPT. Eight is more root ports than any machine
+/// this kernel boots on has, and a ninth is reported rather than silently ignored.
+pub const MAX_HOT_PLUG_PORTS: usize = 8;
+
+#[derive(Clone, Copy)]
+pub struct HotPlugPort {
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	pub slot: Slot,
+	/// What was in the slot the last time this was read, so a poll can tell a CHANGE from a state.
+	pub occupied: bool,
+}
+
+static PORTS: SpinLock<([Option<HotPlugPort>; MAX_HOT_PLUG_PORTS], usize)> = SpinLock::new(([None; MAX_HOT_PLUG_PORTS], 0));
+
+/// What a poll of the slots found, for a caller that acts on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SlotChange {
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	/// The bus behind the port, which is where an arrival appears.
+	pub secondary: u8,
+	pub what: SlotEvent,
+}
+
+/// Read every hot-plug slot, acknowledge what it reported, and answer what CHANGED.
+///
+/// THE CHANGE BIT AND THE STATE ARE BOTH READ, because neither is enough. The sticky change bit says
+/// something happened and not which of the two it was; the state says what is there NOW and cannot
+/// tell a swap from a silence. What this answers is the state at the moment of a change, against the
+/// state at the last one - so a device removed and replaced between two polls is one arrival, which
+/// is what the machine looks like from here.
+pub fn poll_slots<A: ConfigAccess>(out: &mut [SlotChange; MAX_HOT_PLUG_PORTS]) -> usize {
+	let mut found = 0;
+	let mut ports = PORTS.lock();
+	let count = ports.1;
+	for index in 0..count {
+		let Some(port) = ports.0[index] else { continue };
+		let function = PciDevice { bus: port.bus, dev: port.dev, func: port.func, vendor: 0, device_id: 0, class: 0, subclass: 0, prog_if: 0, header_type: 0 };
+		let event = slot_event::<A>(&function, port.slot);
+		match event {
+			SlotEvent::Quiet => continue,
+			SlotEvent::RemovalRequested => {
+				// ACKNOWLEDGED SO IT IS ASKED ONCE. The button is sticky like every other slot event,
+				// and a request read on every poll is a driver asked to stop a hundred times a
+				// second.
+				slot_acknowledge_button::<A>(&function, port.slot);
+				if !port.occupied {
+					// A BUTTON ON AN EMPTY SLOT is somebody asking for a device that is not there.
+					continue;
+				}
+			}
+			SlotEvent::Arrived | SlotEvent::Departed => {
+				slot_acknowledge::<A>(&function, port.slot);
+				let arrived = event == SlotEvent::Arrived;
+				if arrived == port.occupied {
+					// THE STATE DID NOT MOVE. A change bit with the same state on both sides of it is
+					// a device that came and went between two reads, and there is nothing for a
+					// caller to do about a device that is not there now.
+					continue;
+				}
+				ports.0[index] = Some(HotPlugPort { occupied: arrived, ..port });
+			}
+		}
+		out[found] = SlotChange { bus: port.bus, dev: port.dev, func: port.func, secondary: A::read8(port.bus, port.dev, port.func, BRIDGE_SECONDARY_BUS), what: event };
+		found += 1;
+	}
+	found
+}
+
+/// The legacy interrupt line a hot-plug port asserts on, or `None` where it has none.
+///
+/// THE LINE AND THE PIN ARE TWO REGISTERS AND BOTH MATTER. A function with no interrupt PIN asserts
+/// nothing whatever its line says, and firmware leaves the line at `0xff` for a function it routed
+/// nowhere - both are "this port will not tell you", and a handler registered on either would be a
+/// handler on a vector nothing raises.
+pub fn slot_interrupt_line<A: ConfigAccess>(port: &HotPlugPort) -> Option<u8> {
+	let dword = A::read32(port.bus, port.dev, port.func, 0x3c);
+	let line = dword as u8;
+	let pin = (dword >> 8) as u8;
+	(pin != 0 && line != 0xff).then_some(line)
+}
+
+/// Power the slot behind one named port off or on, for a caller that has coordinated a removal.
+pub fn set_slot_power<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
+	let ports = PORTS.lock();
+	for port in ports.0.iter().take(ports.1).flatten() {
+		if port.bus != bus || port.dev != dev || port.func != func {
+			continue;
+		}
+		let function = PciDevice { bus, dev, func, vendor: 0, device_id: 0, class: 0, subclass: 0, prog_if: 0, header_type: 0 };
+		if on {
+			slot_power_on::<A>(&function, port.slot);
+		} else {
+			slot_power_off::<A>(&function, port.slot);
+		}
+		return;
+	}
+}
+
+/// Every hot-plug port this machine has, for a caller that binds their interrupts.
+pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
+	let ports = PORTS.lock();
+	*out = ports.0;
+	ports.1
+}
+
+fn arm_hot_plug_slots<A: ConfigAccess>(devices: &[PciDevice]) {
+	let first: bool = !SLOTS_REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel);
+	let mut ports = PORTS.lock();
+	ports.1 = 0;
+	for function in devices {
+		let Some(slot) = resolve_slot::<A>(function) else { continue };
+		slot_arm::<A>(function, slot);
+		slot_acknowledge::<A>(function, slot);
+		let occupied = slot_event::<A>(function, slot) == SlotEvent::Arrived;
+		// REMEMBERED HERE AND NOWHERE ELSE, so a later read costs no bus walk. A ninth port is
+		// reported rather than dropped: a machine with more hot-plug ports than this array holds is
+		// a machine this kernel would watch part of, which is worse than one it says it cannot.
+		if ports.1 < MAX_HOT_PLUG_PORTS {
+			let at = ports.1;
+			ports.0[at] = Some(HotPlugPort { bus: function.bus, dev: function.dev, func: function.func, slot, occupied });
+			ports.1 += 1;
+		} else if first {
+			crate::serial_println!("pci: more than {MAX_HOT_PLUG_PORTS} hot-plug ports - {:02x}:{:02x}.{} is not watched", function.bus, function.dev, function.func);
+		}
+		if first {
+			crate::serial_println!("pci: {:02x}:{:02x}.{} carries hot-plug slot {} - {}", function.bus, function.dev, function.func, slot.number, if occupied { "occupied" } else { "empty" });
+		}
+	}
 }
 
 // The deepest chain of bridges this will follow. The PCI specification allows 256 buses in total,
@@ -682,6 +1083,17 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 }
 
 // Scan the bus and resolve every modern virtio device's MMIO layout.
+// One function's virtio layout, for a caller that has an address rather than a scan - which is what
+// a device plugged into a live machine is.
+pub fn resolve_virtio_function<A: ConfigAccess>(function: &PciDevice) -> Option<VirtioDevice> {
+	resolve_virtio::<A>(function)
+}
+
+// The same for a resourced function: one window, resolved from one address.
+pub fn resolve_endpoint_function<A: ConfigAccess>(function: &PciDevice) -> Option<ResourcedDevice> {
+	resolve_endpoint::<A>(function)
+}
+
 pub fn scan_virtio<A: ConfigAccess>() -> Vec<VirtioDevice> {
 	// ALLOC-OK: bus enumeration, at boot, before any userspace exists to reach it.
 	scan::<A>().iter().filter_map(resolve_virtio::<A>).collect()
@@ -793,6 +1205,285 @@ pub fn set_bus_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
 		let command = dword as u16;
 		(if on { command | CMD_BUS_MASTER } else { command & !CMD_BUS_MASTER }) as u32
 	});
+}
+
+// ---------------------------------------------------------------------------------------------
+// Advanced Error Reporting and power-management events.
+//
+// WHAT THIS IS FOR IS SAYING SO, AND NOT RECOVERING. A PCIe function records what went wrong on its
+// link in a standard register, and a machine with nobody reading it is a machine where a marginal
+// cable, a failing slot or a device that has started corrupting transactions is INVISIBLE: the
+// symptom is data that is occasionally wrong, and the evidence was there the whole time. So this
+// reads the record and says it.
+//
+// A FATAL ERROR QUARANTINES THE FUNCTION AND RESETS NOTHING. Recovery would mean a link retrain or a
+// secondary-bus reset, which reaches every function behind the port - so a disk that failed would
+// take a working network card with it, and a kernel doing that on its own is worse than the fault.
+// Refusing to use the function again is a decision this layer can make correctly; repairing it is
+// not.
+//
+// AND PME IS NOTICED AND NOT ACTED ON. What a wake MEANS belongs to a power policy that does not
+// exist here; what a port can say is that a function behind it asked to be woken, and which one.
+// ---------------------------------------------------------------------------------------------
+
+/// The PCI Express EXTENDED capability id of Advanced Error Reporting.
+const AER_EXT_CAP_ID: u16 = 0x0001;
+
+/// Where a function's extended capability list begins. Everything before this is the 256 bytes the
+/// legacy mechanism can reach.
+const EXT_CAP_FIRST: u16 = 0x100;
+
+/// A function's config space is four kilobytes, so a walk cannot pass this and a header at or past
+/// it is a malformed list rather than a capability.
+const EXT_CAP_LAST: u16 = 0x1000;
+
+/// AER register offsets from the capability header.
+const AER_UNCORRECTABLE_STATUS: u16 = 0x04;
+const AER_UNCORRECTABLE_SEVERITY: u16 = 0x0C;
+const AER_CORRECTABLE_STATUS: u16 = 0x10;
+
+/// The PCI Express capability's Root Control and Root Status, which exist on a ROOT PORT only - the
+/// same rule the slot registers follow, and for the same reason: an endpoint has the capability at
+/// the same offsets and its bytes there are not these.
+const PCIE_ROOT_STATUS: u16 = 0x20;
+/// Root Status bit 16: a PME message arrived. RW1C, like every other event bit here.
+const PCIE_ROOT_PME_STATUS: u32 = 1 << 16;
+/// Root Status bits 15:0: the requester id of the function that sent it - bus, device and function.
+const PCIE_ROOT_PME_REQUESTER: u32 = 0xFFFF;
+
+/// How many functions this kernel watches for errors.
+///
+/// A SMALL FIXED LIST, AND THE REASON IS THE POLL. Reading one function's AER status on x86_64 is a
+/// page remap and two reads; doing it for every function of every bus on every idle pass would be a
+/// machine spending its idle time on config space. A machine has a handful of functions that report
+/// errors at all - the root ports, and the endpoints whose firmware enabled it - and this is the list
+/// of them, filled where every function is already being looked at.
+pub const MAX_ERROR_REPORTERS: usize = 16;
+
+/// The functions with an AER capability, and where it is on each. Filled by `scan` and added to when
+/// a device arrives, so a hot-plugged card that reports errors is watched like any other.
+static ERROR_REPORTERS: SpinLock<([Option<(u8, u8, u8)>; MAX_ERROR_REPORTERS], usize)> = SpinLock::new(([None; MAX_ERROR_REPORTERS], 0));
+
+/// Remember a function if it carries an AER capability. Answers whether it does.
+///
+/// IDEMPOTENT, because a hot-plug slot's address is reused: a card plugged into the same slot twice
+/// is the same bus/device/function, and a list that grew each time would fill up with one slot.
+pub fn note_error_reporter<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> bool {
+	if find_extended_capability::<A>(bus, dev, func, AER_EXT_CAP_ID).is_none() {
+		return false;
+	}
+	let (mut table, mut count) = {
+		let held = ERROR_REPORTERS.lock();
+		(held.0, held.1)
+	};
+	if table.iter().take(count).flatten().any(|entry| *entry == (bus, dev, func)) {
+		return true;
+	}
+	if count >= MAX_ERROR_REPORTERS {
+		return false;
+	}
+	table[count] = Some((bus, dev, func));
+	count += 1;
+	*ERROR_REPORTERS.lock() = (table, count);
+	true
+}
+
+/// Forget every watched function, so a fixture can stand up its own machine.
+///
+/// TEST-ONLY. A running system's list grows at the scan and when a device arrives, and never shrinks:
+/// a function that reported errors once is one worth watching for the life of the boot, and a slot
+/// whose card was replaced is the same address. A fixture stands up a different machine per test.
+#[cfg(test)]
+pub fn forget_error_reporters() {
+	*ERROR_REPORTERS.lock() = ([None; MAX_ERROR_REPORTERS], 0);
+}
+
+/// Read and clear every watched function's error status, answering how many records were filled.
+///
+/// ONLY THE FUNCTIONS THAT SAID SOMETHING. A record whose every field is zero is a function that is
+/// working, and filling the caller's array with those would make finding the one that is not the
+/// caller's problem.
+pub fn poll_errors<A: ConfigAccess>(out: &mut [ErrorRecord; MAX_ERROR_REPORTERS]) -> usize {
+	let (table, count) = {
+		let held = ERROR_REPORTERS.lock();
+		(held.0, held.1)
+	};
+	let mut filled = 0;
+	for entry in table.iter().take(count).flatten() {
+		let (bus, dev, func) = *entry;
+		let Some(record) = take_error_record::<A>(bus, dev, func) else { continue };
+		if record.is_quiet() {
+			continue;
+		}
+		out[filled] = record;
+		filled += 1;
+		if filled == out.len() {
+			break;
+		}
+	}
+	filled
+}
+
+/// Read and clear every hot-plug port's PME status, answering how many events were filled.
+pub fn poll_power_events<A: ConfigAccess>(out: &mut [PowerEvent; MAX_HOT_PLUG_PORTS]) -> usize {
+	let (ports, count) = {
+		let held = PORTS.lock();
+		(held.0, held.1)
+	};
+	let mut filled = 0;
+	for port in ports.iter().take(count).flatten() {
+		let Some(event) = take_power_event::<A>(port) else { continue };
+		out[filled] = event;
+		filled += 1;
+		if filled == out.len() {
+			break;
+		}
+	}
+	filled
+}
+
+/// One function's error record, as it was read and cleared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ErrorRecord {
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	/// The correctable error status bits that were set. A CORRECTABLE ERROR IS NOT A FAILURE - the
+	/// hardware fixed it - but a rising count of them is a link about to stop working, which is the
+	/// only warning anybody gets.
+	pub correctable: u32,
+	/// The uncorrectable error status bits that were set.
+	pub uncorrectable: u32,
+	/// Whether any uncorrectable bit that was set is FATAL by the function's own severity register.
+	/// Severity is a property of the function and not of the bit, because a device may declare an
+	/// error non-fatal that another treats as fatal.
+	pub fatal: bool,
+}
+
+impl ErrorRecord {
+	/// Whether this record says anything at all. A function with no bits set is one that is working.
+	pub fn is_quiet(&self) -> bool {
+		self.correctable == 0 && self.uncorrectable == 0
+	}
+}
+
+/// A PME a root port received, and who sent it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PowerEvent {
+	/// The port that received it.
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	/// The requester id the port recorded: bus in 15:8, device in 7:3, function in 2:0.
+	pub requester: u16,
+}
+
+/// Find an EXTENDED capability on a function, or `None`.
+///
+/// BOUNDED, LIKE EVERY OTHER WALK HERE, and bounded twice: the offset may not leave the function's
+/// four kilobytes and the number of hops is capped, so a list that points at itself stops rather
+/// than spinning. A header of all ones or all zeros is the end - an absent capability reads as ones
+/// on a machine that answers reads of nothing, and as zeros on one that answers zeros.
+pub fn find_extended_capability<A: ConfigAccess>(bus: u8, dev: u8, func: u8, want: u16) -> Option<u16> {
+	if !A::extended_reach() {
+		return None;
+	}
+	let mut at = EXT_CAP_FIRST;
+	for _ in 0..64 {
+		if at < EXT_CAP_FIRST || at >= EXT_CAP_LAST || at & 3 != 0 {
+			return None;
+		}
+		let header = A::read32(bus, dev, func, at);
+		if header == 0 || header == u32::MAX {
+			return None;
+		}
+		if (header & 0xFFFF) as u16 == want {
+			return Some(at);
+		}
+		let next = ((header >> 20) & 0xFFF) as u16;
+		if next == 0 {
+			return None;
+		}
+		at = next;
+	}
+	None
+}
+
+/// Read and CLEAR one function's AER status, or `None` when it carries no AER capability.
+///
+/// READ AND CLEARED IN ONE OPERATION, because the alternative is reporting the same error for ever:
+/// the status bits are RW1C, so acknowledging them is writing back exactly the bits that were set.
+/// Writing anything else either acknowledges an error that arrived between the read and the write -
+/// losing it - or leaves a set bit alone and reports it again on the next pass, which turns one
+/// marginal link into an endless stream of identical records.
+pub fn take_error_record<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> Option<ErrorRecord> {
+	let cap = find_extended_capability::<A>(bus, dev, func, AER_EXT_CAP_ID)?;
+	let uncorrectable = A::read32(bus, dev, func, cap + AER_UNCORRECTABLE_STATUS);
+	let correctable = A::read32(bus, dev, func, cap + AER_CORRECTABLE_STATUS);
+	// AN ABSENT FUNCTION ANSWERS ALL ONES, and every bit set in both registers at once is a device
+	// that has left the bus rather than one reporting every error there is.
+	if uncorrectable == u32::MAX && correctable == u32::MAX {
+		return None;
+	}
+	let severity = A::read32(bus, dev, func, cap + AER_UNCORRECTABLE_SEVERITY);
+	if uncorrectable != 0 {
+		A::write32(bus, dev, func, cap + AER_UNCORRECTABLE_STATUS, uncorrectable);
+	}
+	if correctable != 0 {
+		A::write32(bus, dev, func, cap + AER_CORRECTABLE_STATUS, correctable);
+	}
+	Some(ErrorRecord { bus, dev, func, correctable, uncorrectable, fatal: uncorrectable & severity != 0 })
+}
+
+/// Read and clear a root port's PME status, or `None` when nothing woke it.
+pub fn take_power_event<A: ConfigAccess>(port: &HotPlugPort) -> Option<PowerEvent> {
+	let status = A::read32(port.bus, port.dev, port.func, port.slot.cap + PCIE_ROOT_STATUS);
+	if status == u32::MAX || status & PCIE_ROOT_PME_STATUS == 0 {
+		return None;
+	}
+	let requester = (status & PCIE_ROOT_PME_REQUESTER) as u16;
+	// RW1C, and the REQUESTER FIELD IS NOT WRITABLE - so the acknowledgement writes the status bit
+	// alone rather than the value that was read, which would put the requester id back into a
+	// register that does not take one.
+	A::write32(port.bus, port.dev, port.func, port.slot.cap + PCIE_ROOT_STATUS, PCIE_ROOT_PME_STATUS);
+	Some(PowerEvent { bus: port.bus, dev: port.dev, func: port.func, requester })
+}
+
+/// The name of the lowest set uncorrectable error bit, for a record that has one.
+///
+/// THE LOWEST AND NOT ALL OF THEM, because one fault sets several: a completion timeout sets its own
+/// bit and the "first error pointer" names it, and printing six names for one event reads as six
+/// faults. What a reader needs is the one that happened and the raw bits beside it.
+pub fn uncorrectable_name(bits: u32) -> &'static str {
+	match bits.trailing_zeros() {
+		4 => "a data-link protocol error",
+		5 => "a surprise link-down",
+		12 => "a poisoned TLP",
+		13 => "a flow-control protocol error",
+		14 => "a completion timeout",
+		15 => "a completer abort",
+		16 => "an unexpected completion",
+		17 => "a receiver overflow",
+		18 => "a malformed TLP",
+		19 => "an ECRC failure",
+		20 => "an unsupported request",
+		_ => "an error this kernel has no name for",
+	}
+}
+
+/// The same, for the correctable half.
+pub fn correctable_name(bits: u32) -> &'static str {
+	match bits.trailing_zeros() {
+		0 => "a receiver error",
+		6 => "a bad TLP",
+		7 => "a bad DLLP",
+		8 => "a replay-number rollover",
+		12 => "a replay timer timeout",
+		13 => "an advisory non-fatal error",
+		14 => "a corrected internal error",
+		15 => "a header-log overflow",
+		_ => "an error this kernel has no name for",
+	}
 }
 
 // One function's COMMAND register, read back.

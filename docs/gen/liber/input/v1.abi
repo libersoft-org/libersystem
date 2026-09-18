@@ -1,8 +1,10 @@
 package liber:input@1
 record pointer-event(col:u16,row:u16,buttons:u8)
 record key-event(code:u16,pressed:bool)
+record contact-event(id:u8,tip:bool,x:u16,y:u16)
 interface input
 method input.subscribe op=1 () -> stream<pointer-event>
 method input.subscribe-keys op=2 (focus:handle<channel>:rights=) -> stream<key-event>
+method input.subscribe-contacts op=3 (focus:handle<channel>:rights=) -> stream<contact-event>
 interface input-admin
 method input-admin.open-keys op=1 () -> result<handle<channel>, liber:base@1::error>

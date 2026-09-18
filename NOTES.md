@@ -1,6 +1,7 @@
 # Bugs / changes
 
 - network doesn't work - ping google.com is not responding
+- imgview has a bug - when pressing escape or CTRL+C, it does not exit immediately
 - aarch64 and riscv64 tests and builds take too long - find out what to do with it
 - why are drivers in drivers/core/ (is core directory necessary?)
 - when running the app from shell as "xxx.lsexe" and not just "xxx", it doesn't work

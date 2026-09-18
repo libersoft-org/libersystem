@@ -11,6 +11,10 @@ pub mod usage {
 	pub const KEYPAD_MINUS: u16 = 0x56;
 	pub const PLUS: u16 = 0x2e;
 	pub const KEYPAD_PLUS: u16 = 0x57;
+	/// The Keyboard/Keypad usage for `P`, which is `A` plus fifteen. NAMED HERE like every other key
+	/// a program in this tree binds: a caller that wrote `0x13` would be carrying a table entry in a
+	/// match arm, and the next reader would have to count the alphabet to check it.
+	pub const P: u16 = 0x13;
 	pub const Q: u16 = 0x14;
 	pub const R: u16 = 0x15;
 	pub const ESCAPE: u16 = 0x29;

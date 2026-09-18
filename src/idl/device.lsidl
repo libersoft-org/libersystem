@@ -33,6 +33,14 @@ record device-entry {
 	bus:      u32,
 	dev:      u32,
 	func:     u32,
+	/// WHETHER THE FUNCTION IS STILL ON THE BUS (added 2026-09-18).
+	///
+	/// A ROW OUTLIVES ITS DEVICE, and that is deliberate: an index is what a claim, a binding and
+	/// every message in flight are addressed by, so removing the row when a device is unplugged
+	/// would renumber every device after it. What changes instead is this flag - and without it, a
+	/// listing shows a disk somebody pulled out as though it were still there, which is the one
+	/// thing an operator asking "what is in this machine" must not be told.
+	present:  bool,
 }
 
 /// Where a device binding is. One vocabulary, defined once: `lsdev`, the System Graph and the boot
@@ -48,6 +56,18 @@ enum binding-state {
 	failed             = 6,
 	quarantined        = 7,
 	disabled           = 8,
+	/// The device left the bus and its teardown was CONFIRMED: it is gone and nothing is owed.
+	///
+	/// TERMINAL FOR THIS BINDING AND NOT FOR THE SLOT. The slot outlives the device as a
+	/// tombstone, and a device plugged into it afterwards opens a NEW binding whose claim mints
+	/// the next generation - so a message stamped with the old one is refused by arithmetic
+	/// rather than by anyone remembering.
+	///
+	/// NOT `quarantined`, WHICH IS THE DISTINCTION THAT MAKES IT WORTH RENDERING. A removal whose
+	/// teardown was not confirmed says nothing about the resources - the frames may still be live
+	/// under a device that is no longer there to ask - and lands at `quarantined` like every other
+	/// unconfirmed teardown. Reaching `removed` is a claim about the resources, not about the bus.
+	removed            = 9,
 }
 
 /// Why a binding is not up. A STATE and a CAUSE are not alternatives - "quarantined" and "hung" are
@@ -147,6 +167,13 @@ enum provider-kind {
 	/// host channel as `net` would make an ambient path around NetworkService out of a kind
 	/// every consumer already asks for.
 	local-stream  = 9,
+	/// A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `pointer` is handed ONE cursor: a
+	/// position and a button mask, which is what a mouse and a tablet stylus both are. A touch
+	/// surface reports SEVERAL CONTACTS AT ONCE, each with an identity of its own that persists
+	/// while the finger is down - and that identity is what makes a drag a drag rather than two
+	/// touches at different places. Published as `pointer`, a digitizer would be flattened into
+	/// whichever contact happened to be decoded last, which is the defect this whole item is about.
+	touch         = 10,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by

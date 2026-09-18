@@ -18,6 +18,7 @@ declare -A SUITES=(
 	["image-mutate"]="tools/image-mutate"
 	["lico"]="tools/lico-bench"
 	["soft2d"]="tools/soft2d-bench"
+	["soft3d"]="tools/soft3d-bench"
 )
 
 help() {
@@ -34,6 +35,7 @@ suites:
   audio         the staged MP3 decoder against real time - fails below it
   image         current image encode and decode profiles
   image-mutate  every image leaf and the central sniffer through deterministic hostile inputs
+  soft3d        the 3D backend's frozen scene, stage by stage - and the interpreter on its own
 
 examples:
   ./bench.sh --suite audio

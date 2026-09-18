@@ -13,6 +13,42 @@
 //! `flat` DOES NOT INTERPOLATE AT ALL. It is the provoking vertex's value, carried from before the
 //! clip.
 
+/// The part of a perspective-correct interpolation that is the same for every component.
+///
+/// ONE FRAGMENT HAS ONE OF THESE AND ANY NUMBER OF COMPONENTS. The weighting `w[i] * (1/w[i])` and
+/// its sum do not depend on the value being interpolated, and a fragment with four `vec4` varyings
+/// recomputed both sixteen times - three multiplies, two adds and a finiteness test each, for a
+/// result that was identical every time. The DIVISION stays per component: `numerator / denominator`
+/// and `numerator * (1 / denominator)` are not the same `f32`, and this crate's geometry half is
+/// bit-exact by rule.
+#[derive(Clone, Copy)]
+pub struct Perspective {
+	/// `weights[i] * inverse_w[i]`, in the operand order the per-component form used.
+	scaled: [f32; 3],
+	denominator: f32,
+	/// Whether the denominator is usable at all; see `smooth`'s own note.
+	usable: bool,
+}
+
+/// Compute what every component of one fragment shares.
+pub fn perspective(weights: [f32; 3], inverse_w: [f32; 3]) -> Perspective {
+	let scaled = [weights[0] * inverse_w[0], weights[1] * inverse_w[1], weights[2] * inverse_w[2]];
+	let denominator = scaled[0] + scaled[1] + scaled[2];
+	Perspective { scaled, denominator, usable: denominator != 0.0 && denominator.is_finite() }
+}
+
+/// Interpolate one `smooth` attribute against a shared denominator.
+///
+/// THE SAME ARITHMETIC IN THE SAME ORDER as the per-component form below, which is what makes this a
+/// removal of repeated work rather than a second interpolation rule.
+pub fn smooth_with(shared: &Perspective, values: [f32; 3]) -> f32 {
+	if !shared.usable {
+		return values[0];
+	}
+	let numerator = shared.scaled[0] * values[0] + shared.scaled[1] * values[1] + shared.scaled[2] * values[2];
+	numerator / shared.denominator
+}
+
 /// Interpolate one `smooth` attribute, perspective-correctly.
 ///
 /// `weights` are the screen-space barycentric coordinates and `inverse_w` is `1/w` per vertex, both

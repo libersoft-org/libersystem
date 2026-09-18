@@ -340,6 +340,13 @@ path = "user/libs/graphics/soft2d"
 owner = "render2d-conformance"
 path = "user/libs/graphics/conformance2d"
 
+# THE SAME, FOR THE TWO 3D PROFILES. One suite and not two, because the retained layer's decisions
+# are only meaningful above the command layer's - but two TALLIES inside it, because an
+# implementation may carry one and not the other and one number could not say which.
+[[sources]]
+owner = "render3d-conformance"
+path = "user/libs/graphics/conformance3d"
+
 # LINE LAYOUT ABOVE SHAPING: where the runs of a line sit, and where a caret lands. Separate from
 # the pipeline below because it decides GEOMETRY over the frozen run seam and reads no text at all,
 # which is what makes its decisions checkable on numbers a fixture states.
@@ -906,6 +913,46 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/test2d-conformance-sw.lsexe"
 providers = ["render2d-conformance", "lsrt"]
+
+# THE 3D CONFORMANCE RUN, on the same terms and for the same reason: no capability at all, because
+# every scene of the command half draws into memory it allocated itself and every scene of the
+# retained half asks the scene layer a question and reads the answer.
+[[programs]]
+name = "test3d-conformance-sw"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/test3d-conformance-sw.lsexe"
+providers = ["render3d-conformance", "lsrt"]
+
+# THE INTERACTIVE 3D DEMO, and the same two grants for the same reason: every texture in the scene is
+# generated procedurally and every shape is computed, so a rotating lit textured cube over a ground
+# plane needs no volume and no font catalogue.
+#
+# IT CARRIES NO SECOND RENDERER. `soft3d` is the backend, `render3d` the API it is driven through,
+# `scene3d` the scene above that, and `render2d`/`soft2d` composite the HUD over the rendered image -
+# which is the 2D/3D interop this demo exists to prove rather than a second copy of anything.
+[[programs]]
+name = "test3d-sw"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/test3d-sw.lsexe"
+providers = [
+	"graphics-app",
+	"graphics-core",
+	"render-math",
+	"render-shader",
+	"render2d",
+	"soft2d",
+	"soft3d",
+	"surface",
+	"input-proto",
+	"base-proto",
+	"lsrt",
+]
 
 # THE INTERACTIVE 2D DEMO. `display` and `input-keys` and nothing else: the scene is made of shapes
 # this program computes, images it generates and glyph forms it carries, so it needs no volume and no
@@ -4111,12 +4158,72 @@ destination = "lib/graphics/soft2d.lslib"
 features = []
 providers = ["font-contract", "graphics-core", "render2d", "lsrt"]
 
+# THE 3D STACK AS STAGED LIBRARIES, WHICH IT WAS NOT UNTIL SOMETHING CONSUMED IT.
+#
+# Each of these was a `[[sources]]` entry with a note saying it stages nothing "because no backend
+# implements it yet" - written when that was true. `soft3d` is that backend and `test3d-sw` is the
+# program that drives it, so the four of them are linked and staged like every other library here.
+#
+# AND AS LIBRARIES RATHER THAN STATIC CODE INSIDE THE DEMO, which is the item's own requirement:
+# "no static duplicate renderer or runtime". A renderer compiled into an application is a renderer
+# the next application compiles again, and two copies of a rasteriser are two answers to a
+# conformance question that is supposed to have one.
+[[libraries]]
+name = "render-math"
+owner = "render-math"
+destination = "lib/graphics/render-math.lslib"
+features = []
+providers = ["lsrt"]
+
+[[libraries]]
+name = "render-shader"
+owner = "render-shader"
+destination = "lib/graphics/render-shader.lslib"
+features = []
+# WHAT THE PROFILE GIVES IT IS CONSTANTS, which the compiler inlines - so a `graphics-profile` row
+# here would be a provider satisfying no import, which this build refuses by name.
+providers = ["lsrt"]
+
+[[libraries]]
+name = "render3d"
+owner = "render3d"
+destination = "lib/graphics/render3d.lslib"
+features = []
+# WHAT IT READS FROM THE LAYERS BELOW IS CONSTANTS AND GENERICS, which the compiler inlines - so the
+# linked library imports from neither the profile nor the image model, and a row for either would be
+# a provider satisfying no import, which this build refuses by name.
+providers = ["lsrt"]
+
+[[libraries]]
+name = "soft3d"
+owner = "soft3d"
+destination = "lib/graphics/soft3d.lslib"
+features = []
+providers = ["graphics-core", "render-math", "render-shader", "render3d", "lsrt"]
+
 [[libraries]]
 name = "render2d-conformance"
 owner = "render2d-conformance"
 destination = "lib/graphics/render2d-conformance.lslib"
 features = []
 providers = ["font-contract", "graphics-core", "render2d", "soft2d", "lsrt"]
+
+# THE RETAINED LAYER, STAGED ON ITS OWN TERMS. It is its own profile with its own hash, and a
+# consumer may want the command layer without it - so it is a library beside `render3d` rather than a
+# module inside it, and a program that does not build scene graphs does not carry one.
+[[libraries]]
+name = "scene3d"
+owner = "scene3d"
+destination = "lib/graphics/scene3d.lslib"
+features = []
+providers = ["render-math", "render3d", "lsrt"]
+
+[[libraries]]
+name = "render3d-conformance"
+owner = "render3d-conformance"
+destination = "lib/graphics/render3d-conformance.lslib"
+features = []
+providers = ["graphics-core", "render-math", "render-shader", "scene3d", "soft3d", "lsrt"]
 
 [[libraries]]
 name = "png"

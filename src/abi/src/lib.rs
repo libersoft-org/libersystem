@@ -479,6 +479,25 @@ pub const SYS_ENTROPY_HEALTH: u64 = 84;
 // open at the same value with its rights unchanged.
 pub const SYS_CHANNEL_SEND_CAPS_ATTENUATED: u64 = 85;
 
+// Register the channel the kernel reports BUS ARRIVALS AND DEPARTURES on, taking a DeviceManager
+// privilege because the caller is the one component that binds drivers.
+//
+// A NOTIFICATION AND NOT A POLL, and the same shape as `SYS_CONSOLE_ATTACH`: the kernel holds the
+// sending end and the caller waits on the other. Each message is a kind byte - `DEVICE_ARRIVED` or
+// `DEVICE_DEPARTED` - and the device index it is about, little-endian. The INVENTORY is the truth
+// and the event is the prompt: a manager that missed one and later has reason to look up that index
+// finds the same answer.
+pub const SYS_DEVICE_EVENTS: u64 = 86;
+
+// What a device event's first byte says.
+pub const DEVICE_EVENT_ARRIVED: u8 = 1;
+pub const DEVICE_EVENT_DEPARTED: u8 = 2;
+/// The device is still on the bus and must not be used: a fatal PCIe error was reported against it
+/// and the kernel has stopped it mastering the bus. Distinct from a departure because the address is
+/// still valid and nothing has been unplugged, and distinct from a driver fault because the DEVICE is
+/// what stopped being trustworthy.
+pub const DEVICE_EVENT_FAULTED: u8 = 3;
+
 // The largest submission `SYS_ENTROPY_ADD` will read in one call. A bound rather than a buffer size:
 // the credit is capped far below this anyway, so a larger call would be a larger copy for no more
 // credit - and an unbounded copy driven by a device interrupt is a kernel stall a driver can ask for.
@@ -836,11 +855,22 @@ pub struct DeviceInfo {
 	// it is - but the only way to write a quirk for a particular part, which is what they are for.
 	pub vendor: u16,
 	pub product: u16,
+	// WHETHER THE FUNCTION IS STILL ON THE BUS, which a boot-only inventory never had to say.
+	//
+	// A ROW OUTLIVES ITS DEVICE, and that is deliberate: an index is what a claim, a binding and
+	// every message in flight are addressed by, so removing the row would renumber every device
+	// after it. What changes when a device is unplugged is this byte - and without it, a listing
+	// shows a disk somebody pulled out as though it were still there, which is the one thing an
+	// operator asking "what is in this machine" must not be told.
+	//
+	// IT COSTS NO LAYOUT CHANGE: it takes the first of the four tail padding bytes, so every field
+	// offset, the size and the alignment are what they were.
+	pub on_bus: u8,
 	// `product` ends at 52 and the alignment is 8. Named rather than left implicit, for the reason
 	// `_pad0` is: this struct is copied to userspace with `size_of::<T>()` from a value built on the
 	// kernel stack, and Rust does not promise that padding in an otherwise initialised value is
 	// initialised.
-	pub _pad2: [u8; 4],
+	pub _pad2: [u8; 3],
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the

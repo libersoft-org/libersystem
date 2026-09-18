@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# EVERY ORDERING THIS SCRIPT PRODUCES IS A BYTE ORDERING.
+#
+# The identity record it writes lists providers in ascending order, and a launch READS that order:
+# `parse_identity` refuses a record whose provider lines are not strictly ascending, because that is
+# what makes a duplicate impossible to express. `sort` under a UTF-8 locale is not that ordering - it
+# folds punctuation away at the first level, so `render3d` sorts BEFORE `render-math` while the byte
+# comparison a launch performs puts `render-math` first (`-` is 0x2d, `3` is 0x33). A library built
+# against both was staged with a record no launch would read, and the program that needed it was
+# refused with every provider present and every digest agreeing.
+#
+# Every other producer of these records - `mkpackages`, `foreign-audit-link.py` - already sorts by
+# bytes, because that is what their languages' `sort` does. This makes the shell agree with them.
+export LC_ALL=C
+
 verbose="${LIBER_VERBOSE:-0}"
 if [[ "${1:-}" == "--verbose" ]]; then
 	verbose=1

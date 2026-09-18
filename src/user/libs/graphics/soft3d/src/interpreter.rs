@@ -202,7 +202,7 @@ impl Run<'_> {
 				Ok(Flow::Next)
 			}
 			Stmt::Store(output, value) => {
-				let value = self.read(*value)?;
+				let value = self.read(*value)?.clone();
 				self.store(*output, value);
 				Ok(Flow::Next)
 			}
@@ -258,11 +258,20 @@ impl Run<'_> {
 		}
 	}
 
-	fn read(&self, value: Value) -> Result<Val, Fault> {
-		self.values.get(value.0 as usize).and_then(|slot| slot.clone()).ok_or(Fault::Unassigned { value: value.0 })
+	/// BORROWED AND NOT CLONED, which is the difference between an interpreter that copies a value
+	/// per operand and one that reads it in place.
+	///
+	/// A `Val` is a type plus sixteen inline words - about eighty bytes - and a lit fragment stage
+	/// reads two of them per instruction over forty-odd instructions. Returning owned values copied
+	/// seven kilobytes per FRAGMENT and ran a type's clone ninety times, for values every arm below
+	/// either reads component-wise or copies into a fixed buffer anyway. The two arms that really do
+	/// need an owned value - a select that yields one of its operands, and a store - clone at the one
+	/// place they need it, and they run once each rather than per operand.
+	fn read(&self, value: Value) -> Result<&Val, Fault> {
+		self.values.get(value.0 as usize).and_then(|slot| slot.as_ref()).ok_or(Fault::Unassigned { value: value.0 })
 	}
 
-	fn operation(&mut self, op: &Op) -> Result<Val, Fault> {
+	fn operation(&self, op: &Op) -> Result<Val, Fault> {
 		match op {
 			Op::Const(constant) => Ok(match constant {
 				Constant::Bool(value) => Val::scalar_bool(*value),
@@ -300,7 +309,7 @@ impl Run<'_> {
 			}
 			Op::Unary(unary, value) => self.unary(*unary, self.read(*value)?),
 			Op::Binary(binary, left, right) => self.binary(*binary, self.read(*left)?, self.read(*right)?),
-			Op::Compare(kind, left, right) => Ok(Val::scalar_bool(compare(*kind, &self.read(*left)?, &self.read(*right)?))),
+			Op::Compare(kind, left, right) => Ok(Val::scalar_bool(compare(*kind, self.read(*left)?, self.read(*right)?))),
 			Op::Select { condition, on_true, on_false } => {
 				let condition = self.read(*condition)?;
 				let on_true = self.read(*on_true)?;
@@ -313,9 +322,9 @@ impl Run<'_> {
 					for (index, slot) in words[..count].iter_mut().enumerate() {
 						*slot = if condition.bool_at(index) { on_true.words()[index] } else { on_false.words()[index] };
 					}
-					return Ok(Val::new(on_true.kind, &words[..count]));
+					return Ok(Val::new(on_true.kind.clone(), &words[..count]));
 				}
-				Ok(if condition.bool_at(0) { on_true } else { on_false })
+				Ok(if condition.bool_at(0) { on_true.clone() } else { on_false.clone() })
 			}
 			Op::Transcendental(which, value, second) => {
 				let value = self.read(*value)?;
@@ -323,7 +332,7 @@ impl Run<'_> {
 					Some(other) => Some(self.read(*other)?),
 					None => None,
 				};
-				Ok(transcendental(*which, &value, second.as_ref()))
+				Ok(transcendental(*which, value, second))
 			}
 			Op::Clamp { value, low, high } => {
 				let value = self.read(*value)?;
@@ -336,9 +345,9 @@ impl Run<'_> {
 					// `min(max(v, low), high)` AND NOT `clamp`: the order is stated because with a
 					// NaN bound the two differ, and two backends that chose differently would
 					// produce different colours from the same shader.
-					*slot = f32::to_bits(at(&value, index).max(at(&low, index)).min(at(&high, index)));
+					*slot = f32::to_bits(at(value, index).max(at(low, index)).min(at(high, index)));
 				}
-				Ok(Val::new(value.kind, &words[..count]))
+				Ok(Val::new(value.kind.clone(), &words[..count]))
 			}
 			Op::Mix { from, to, at } => {
 				let from = self.read(*from)?;
@@ -351,7 +360,7 @@ impl Run<'_> {
 					// `(1-t)*a + t*b`, exact at both ends whatever the rounding.
 					*slot = f32::to_bits((1.0 - t) * from.f32_at(index) + t * to.f32_at(index));
 				}
-				Ok(Val::new(from.kind, &words[..count]))
+				Ok(Val::new(from.kind.clone(), &words[..count]))
 			}
 			Op::Index { array, index } => {
 				let array = self.read(*array)?;
@@ -369,7 +378,7 @@ impl Run<'_> {
 			Op::Sample { binding, coordinate } => {
 				let Binding::Texture { texture, sampler } = binding else { return Err(Fault::TypeMismatch) };
 				let coordinate = self.read(*coordinate)?;
-				self.resources.sample(*texture, *sampler, &coordinate).ok_or(Fault::SampleFailed)
+				self.resources.sample(*texture, *sampler, coordinate).ok_or(Fault::SampleFailed)
 			}
 		}
 	}
@@ -385,7 +394,7 @@ impl Run<'_> {
 		.ok_or(Fault::MissingBinding)
 	}
 
-	fn unary(&self, unary: UnaryOp, value: Val) -> Result<Val, Fault> {
+	fn unary(&self, unary: UnaryOp, value: &Val) -> Result<Val, Fault> {
 		let scalar = value.scalar_type();
 		let words: Inline = match unary {
 			UnaryOp::Negate => (0..value.len())
@@ -420,7 +429,7 @@ impl Run<'_> {
 				// A ZERO-LENGTH VECTOR NORMALISES TO ITSELF rather than to a NaN. The alternative
 				// puts a NaN into a lighting term, and one NaN makes a whole surface black.
 				if length == 0.0 || !length.is_finite() {
-					return Ok(value);
+					return Ok(value.clone());
 				}
 				(0..value.len()).map(|index| (value.f32_at(index) / length).to_bits()).collect()
 			}
@@ -453,7 +462,7 @@ impl Run<'_> {
 		Ok(Val::new(kind, &words))
 	}
 
-	fn binary(&self, binary: BinaryOp, left: Val, right: Val) -> Result<Val, Fault> {
+	fn binary(&self, binary: BinaryOp, left: &Val, right: &Val) -> Result<Val, Fault> {
 		match binary {
 			BinaryOp::Dot => {
 				let sum: f32 = (0..left.len().min(right.len())).map(|index| left.f32_at(index) * right.f32_at(index)).sum();
@@ -559,8 +568,8 @@ impl Run<'_> {
 				}
 			})
 			.collect();
-		let kind = if left.len() >= right.len() { left.kind } else { right.kind };
-		Ok(Val::new(kind, &words))
+		let kind = if left.len() >= right.len() { &left.kind } else { &right.kind };
+		Ok(Val::new(kind.clone(), &words))
 	}
 }
 

@@ -339,10 +339,25 @@ impl Drop for BranchGuard {
 	}
 }
 
-// The most holders of the Power key at once. Two keyboard drivers, the device manager that
-// launches them and one spare: a bound rather than a guess, because a service that minted a channel
-// per request would be one a caller could exhaust.
-const MAX_POWER_CLIENTS: usize = 4;
+// The most holders of the Power key at once, INCLUDING THE ROOT REQUEST CHANNEL, which sits in slot
+// zero and is what made the old number one short of what this machine asks for.
+//
+// THE ACCOUNTING, because the previous one said "two keyboard drivers, the device manager and one
+// spare" and the machine does not have that shape. DeviceManager hands a power connection to every
+// driver whose NAME is `virtio_input` or `xhci`, and a name is not an instance: an ordinary boot has
+// TWO virtio-input bindings - a keyboard and a pointer - and the pointer takes one too, because
+// nothing before bring-up says which of the two a virtio-input device will turn out to be. With the
+// root channel that is four, and the xHCI controller asked fifth.
+//
+// WHAT THAT COST: `xhci did not bind (resource-exhausted)`, which is the whole of what an operator
+// saw - one word, for a machine with no USB at all, on a boot where every other driver came up. The
+// refusal is a capability shortage inside this service and the word for it was the same word the
+// manager prints for a missing interrupt vector.
+//
+// Eight leaves room for a driver that is being restarted while its predecessor's connection has not
+// yet been reclaimed - the slot comes back when the peer closes, which is one wake later than the
+// replacement's request.
+const MAX_POWER_CLIENTS: usize = 8;
 
 // The kernel object id behind a handle, which is what a wait set names its members by.
 unsafe fn koid_of(handle: u64) -> u64 {
@@ -389,6 +404,11 @@ fn serve_power_once(power: u64, requests: u64, set: u64, connections: &mut [(u64
 						close(server);
 						close(client);
 					}
+					// AND IT SAYS SO. A caller that gets no capability knows it has no connection,
+					// but nobody watching the boot did: the driver that asked reported a resource
+					// shortage of its own and this service, which is where the shortage actually
+					// was, said nothing at all.
+					print(if slot.is_none() { b"SystemManager: every power connection is taken; this caller gets none\n".as_slice() } else { b"SystemManager: no channel for a power connection; this caller gets none\n".as_slice() });
 					send_blocking(requests, &[], 0);
 				}
 			}

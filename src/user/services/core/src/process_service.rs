@@ -313,11 +313,35 @@ impl Resolver {
 				return true;
 			}
 			if !graph_limits::can_visit(depth, self.modules.len(), self.visiting.iter().any(|visiting| visiting == name)) || !valid_library_name(name) {
+				// AND THIS ONE IS NAMED TOO, for the reason the closure below it is: a cycle, a
+				// closure deeper than the launch admits, one with more modules than it admits, and a
+				// name that is not a library name are four different things an operator would do
+				// four different things about, and all four were one silent `false`.
+				print(b"loader: ");
+				print(name.as_bytes());
+				print(b": is not a library name, or the closure is cyclic or larger than a launch admits\n");
 				return false;
 			}
 			self.visiting.push(String::from(name));
 			let module = (|| {
-				let stem = name.strip_suffix(".lslib")?;
+				// WHICH STEP REFUSED, SAID, AT EVERY ONE OF THEM. Each step below was a `?` that
+				// unwound into one bare "could not start", and this closure has eight of them: a
+				// name that is not a provider name, an install path nothing declares, a missing
+				// file, an image that does not parse, one that is not a shared object, one whose
+				// identity record this loader will not read, a missing dynamic section, and a
+				// dependency list it refuses. An operator can act on any of those and on none of
+				// "could not start".
+				let say = |why: &[u8]| {
+					print(b"loader: ");
+					print(name.as_bytes());
+					print(b": ");
+					print(why);
+					print(b"\n");
+				};
+				let Some(stem) = name.strip_suffix(".lslib") else {
+					say(b"is not a provider name");
+					return None;
+				};
 				// Name the provider that is missing. Everything below unwinds through `?` into a
 				// bare "could not start", which tells a caller nothing about WHICH library the
 				// image lacks - and a missing provider is the most likely reason a correctly
@@ -339,7 +363,17 @@ impl Resolver {
 				// The installed image is read first even when a generation will replace it, and
 				// that order is the whole of the rule: the digest a consumer's record names is
 				// this one, and compatibility is a statement about these two images.
-				let baseline = verify_identity(&bootproto::elf::Elf::parse(installed.bytes())?, "library", stem)?.digest;
+				let Some(installed_elf) = bootproto::elf::Elf::parse(installed.bytes()) else {
+					say(b"is not an ELF this loader can parse");
+					return None;
+				};
+				let Some(installed_identity) = verify_identity(&installed_elf, "library", stem) else {
+					say(b"carries no identity record this loader accepts");
+					return None;
+				};
+				let baseline = installed_identity.digest;
+				drop(installed_elf);
+				drop(installed_identity);
 				let image = match registry_generation(&mut self.registry, stem) {
 					// A generation may stand in for the installed provider only when the written
 					// rule says a process that has already resolved against the installed one
@@ -352,6 +386,7 @@ impl Resolver {
 						let compatible = bootproto::compat::decide(installed.bytes(), &shadow).is_compatible();
 						drop(installed);
 						if !compatible {
+							say(b"has a published generation that cannot stand in for the installed provider");
 							return None;
 						}
 						Image::Registry(shadow)
@@ -359,13 +394,26 @@ impl Resolver {
 					None => Image::Installed(installed),
 				};
 				let bytes = image.bytes();
-				let elf = bootproto::elf::Elf::parse(bytes)?;
+				let Some(elf) = bootproto::elf::Elf::parse(bytes) else {
+					say(b"is not an ELF this loader can parse");
+					return None;
+				};
 				if elf.image_type != bootproto::elf::ET_DYN {
+					say(b"is not a shared object");
 					return None;
 				}
-				let identity = verify_identity(&elf, "library", stem)?;
-				let dynamic = elf.dynamic_info()??;
-				let mut dependencies = dependencies(&elf, &dynamic)?;
+				let Some(identity) = verify_identity(&elf, "library", stem) else {
+					say(b"carries no identity record this loader accepts");
+					return None;
+				};
+				let Some(Some(dynamic)) = elf.dynamic_info() else {
+					say(b"has no dynamic section");
+					return None;
+				};
+				let Some(mut dependencies) = dependencies(&elf, &dynamic) else {
+					say(b"has a dependency list this loader refuses");
+					return None;
+				};
 				for dependency in &dependencies {
 					if !self.collect(dependency, depth + 1) {
 						return None;
@@ -380,8 +428,18 @@ impl Resolver {
 				//
 				// THE CONSUMER NEEDS NO `DT_NEEDED` ENTRY FOR IT, which is the point: it was built
 				// against a SET of candidates and not against one of them.
-				let bound = self.bind_slots(&identity, &mut dependencies, depth + 1)?;
+				let Some(bound) = self.bind_slots(&identity, &mut dependencies, depth + 1) else {
+					say(b"declares a selection slot no staged candidate fills");
+					return None;
+				};
 				if !identity_matches_dependencies(&identity, &dependencies, &self.modules, &bound) {
+					// NAMED, LIKE THE TWO ABOVE IT AND FOR THE SAME REASON. A provider whose own
+					// record does not match what is installed beside it is the second most likely
+					// reason a correctly built program will not start on an incorrectly built image,
+					// and it unwound through `?` into a bare refusal that named nothing.
+					print(b"loader: ");
+					print(name.as_bytes());
+					print(b": this provider was built against providers that are not the ones installed\n");
 					return None;
 				}
 				Some(Module { name: String::from(name), image, dependencies, baseline })
@@ -853,28 +911,52 @@ fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_ident
 		if storage == 0 {
 			return None;
 		}
+		// WHICH REFUSAL IT WAS, SAID.
+		//
+		// This file's own note two screens up says two refusals that looked the same from outside cost
+		// a reader the whole boot chain behind them. The same was true of the six below it: a program
+		// that does not start prints `the image at ... was refused` and nothing else, and the causes
+		// are a library that is not on the volume, a closure that does not resolve, an identity that
+		// does not match what was staged, a cycle, and three kernel refusals. An operator cannot act
+		// on any of them from that one line, and neither can the person who built the program.
+		let refused = |why: &[u8]| {
+			print(b"ProcessService: ");
+			print(why);
+			print(b"\n");
+		};
 		let mut resolver = Resolver { storage, registry, modules: Vec::new(), visiting: Vec::new() };
 		for dependency in &dependencies {
 			if !resolver.collect(dependency, 0) {
+				refused(b"a library this program needs is not on the volume, or its own closure does not resolve");
 				return None;
 			}
 		}
-		let Some(bound) = resolver.bind_slots(&identity, &mut dependencies, 0) else { return None };
+		let Some(bound) = resolver.bind_slots(&identity, &mut dependencies, 0) else {
+			refused(b"a selection slot this program declared has no candidate the volume can satisfy");
+			return None;
+		};
 		if !identity_matches_dependencies(&identity, &dependencies, &resolver.modules, &bound) {
+			refused(b"this program was built against providers that are not the ones on the volume");
 			return None;
 		}
-		let Some(order) = resolver.order() else { return None };
+		let Some(order) = resolver.order() else {
+			refused(b"the dependency closure has no load order - a cycle, or deeper than the loader admits");
+			return None;
+		};
 		let process = process_create(domain);
 		if process < 0 {
+			refused(b"the kernel would not create a process for it");
 			return None;
 		}
 		let process = process as u64;
 		if !resolver.load(process, &order) {
+			refused(b"a library in its closure could not be mapped into it");
 			close(process);
 			return None;
 		}
 		let entry = process_load_main(process, bytes);
 		if entry < 0 {
+			refused(b"the kernel refused its main image");
 			close(process);
 			return None;
 		}

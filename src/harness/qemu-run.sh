@@ -1970,6 +1970,29 @@ qemu_run_x86_64() {
 	# added behind them rather than in among them.
 	qemu_attach_nvme qemu_args
 
+	# AN EMPTY HOT-PLUG SLOT, WHICH IS A MACHINE SHAPE AND NOT A DEVICE.
+	#
+	# A `pcie-root-port` carries the PCI Express capability with a slot in it, so the kernel's scan
+	# finds one, arms it and says so - which is the only way an empty slot is visible at all. It is
+	# what `device_add` plugs into while the system is running, and it is therefore the fixture the
+	# hot-plug item's oracle needs.
+	#
+	# THE INTERACTIVE PROFILE ONLY, deliberately. The test profile's oracles find their devices by
+	# scanning and its bus addresses are what several of them print; adding a function there would
+	# renumber devices for a fixture no test asserts on yet. It goes in here, where a live boot
+	# exercises the slot path on a real machine shape, and joins the test profile with the oracle
+	# that drives it.
+	#
+	# AND NATIVE PCIe HOT-PLUG, EXPLICITLY, because q35's default is not it. QEMU's q35 machine
+	# defaults to ACPI-BASED hot-plug even for PCIe root ports: `device_add` attaches the function and
+	# signals the guest through an ACPI GPE rather than through the port's own Slot Status, so a
+	# kernel that reads the slot registers - which is what the PCI Express specification says a root
+	# port reports through - sees nothing at all. Everything looks correct on both sides and the
+	# device simply never arrives. Turning the ACPI path off is what makes the port behave the way its
+	# capability says it does.
+	qemu_args+=(-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off)
+	qemu_args+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
+
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
 	qemu_args+=("${DISPLAY_ARGS[@]}")

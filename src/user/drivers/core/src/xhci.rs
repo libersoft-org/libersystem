@@ -1094,6 +1094,7 @@ fn admits(hc: &Xhci, kind: ClassKind, class: u8) -> bool {
 					ClassKind::Storage => b"storage".as_slice(),
 					ClassKind::Network => b"network".as_slice(),
 					ClassKind::Uas => b"UAS".as_slice(),
+					ClassKind::Serial => b"serial".as_slice(),
 				});
 				print(b" module is full (");
 				print(refusal.describe());
@@ -1114,6 +1115,11 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 		// storage, which declare it per interface and leave zero here.
 		ClassKind::Network => class == 0 || class == drivers::cdc::CLASS_COMMUNICATIONS,
 		ClassKind::Uas => class == 0 || class == usb_uas::CLASS_MASS_STORAGE,
+		// A CDC-ACM adapter declares the communications class at the device level like the network
+		// models do. NOTHING BINDS THIS KIND YET - the decisions are in `drivers::cdc` and gated, and
+		// no CDC-ACM device model exists in this harness to bind against - so what this arm does is
+		// keep the refusal honest if one ever appears.
+		ClassKind::Serial => class == 0 || class == drivers::cdc::CLASS_COMMUNICATIONS,
 	}
 }
 

@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 124] = [
+const GATES: [(&str, &str); 127] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -353,6 +353,18 @@ const GATES: [(&str, &str); 124] = [
 	// as pixels - the half of that proof a log cannot make, because a renderer that draws nothing
 	// reports exactly what a renderer that draws everything reports.
 	("qemu-2d-demo", "bin.test2d-sw"),
+	// THE 3D DEMO ON A REAL SCREEN, for the same reason and against a different stack: a rasteriser
+	// whose depth test, texture addressing or blend equation is wrong reports exactly what a correct
+	// one reports, and the difference is in the pixels.
+	("qemu-3d-demo", "bin.test3d-sw"),
+	// A DEVICE PLUGGED INTO A LIVE MACHINE. Its subject is the kernel, because what it drives is the
+	// slot protocol, the writable inventory and the event that reaches the manager - three pieces
+	// that only ever happen together on a machine that is already running.
+	("qemu-pcie-hotplug", "kernel"),
+	// A FUNCTION REPORTING AN ERROR ON A LIVE MACHINE. Its subject is the kernel too: the window it
+	// reads extended config space through, the capability walk over it, and the quarantine that
+	// follows a fatal record are all the kernel's.
+	("qemu-pcie-aer", "kernel"),
 	// THE VIRTIO-SERIAL CONTROL QUEUE, whose subject is the driver that negotiates it: a generic port
 	// exists for a driver with MULTIPORT and for no other, so a change to this driver is what can
 	// break it.
@@ -742,10 +754,13 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 31] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 34] = [
 	"dma-mode-x86_64",
 	"virtio-multiport",
 	"qemu-2d-demo",
+	"qemu-3d-demo",
+	"qemu-pcie-hotplug",
+	"qemu-pcie-aer",
 	"iommu-ports",
 	"iommu-aarch64-direct-gicv2",
 	"iommu-aarch64-direct-gicv2-hostile",
@@ -880,6 +895,21 @@ impl Catalog {
 			// loop's pacing, so a change to any of them is a change this gate can catch.
 			if gate == "qemu-2d-demo" {
 				for component in ["render2d", "soft2d", "surface", "graphics-app"] {
+					covers.push(component.to_string());
+				}
+			}
+			// AND THE 3D STACK UNDER THE 3D DEMO, including the 2D half it composites its overlay
+			// with: one frame travels `render3d -> soft3d -> OwnedImage -> render2d -> soft2d`, so a
+			// change to any of them is a change these frames can catch.
+			// AND THE MANAGER THAT BINDS WHAT ARRIVES, which is the userspace half of the same path:
+			// the kernel says a device came, and what decides there is a driver for it is
+			// DeviceManager.
+			if gate == "qemu-pcie-hotplug" || gate == "qemu-pcie-aer" {
+				covers.push("bin.device_manager".to_string());
+				covers.push("driver-binding".to_string());
+			}
+			if gate == "qemu-3d-demo" {
+				for component in ["render3d", "soft3d", "render-shader", "render-math", "render2d", "soft2d", "surface", "graphics-app"] {
 					covers.push(component.to_string());
 				}
 			}

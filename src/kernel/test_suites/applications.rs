@@ -2143,3 +2143,231 @@ fn the_2d_profile_conforms_on_the_target() {
 	assert!(printed.iter().any(|line| line.contains("0 failed, 0 unsupported, 0 untested")), "nothing failed, nothing was refused and nothing is untested: {shown}");
 	assert!(printed.iter().any(|line| line == "test2d-conformance: conforms"), "the run conforms, and printed: {shown}");
 }
+
+tagged_test!(the_3d_profiles_conform_on_the_target, [Image, Process, Slow], id = "kernel.applications.the_3d_profiles_conform_on_the_target", covers = ["bin.test3d-conformance-sw", "render3d", "scene3d", "soft3d", "render-shader", "render-math", "kernel"]);
+// `Render3D Core Profile 1` AND `Scene3D Core Profile 1`, WALKED ENTRY BY ENTRY WHERE THE ARITHMETIC
+// ACTUALLY RUNS.
+//
+// THE HOST TESTS OF THE SAME SCENES ARE NOT THIS CLAIM. A host test runs on the machine that built
+// the image, once, with that machine's floating point; what "the profiles are implemented on all
+// three architectures" is about is the same rasteriser and the same scene-layer ordering running on
+// the target. The suite is a library for exactly this reason, and this runs the staged program that
+// is a few lines around it.
+//
+// IT HOLDS NOTHING. No display, no input, no volume: every scene of the command half draws into
+// memory it allocated itself and every scene of the retained half asks the scene layer a question -
+// so a failure here is about the profiles and not about a service that happened to be running.
+//
+// AND IT FAILS ON `Unsupported` AS WELL AS ON A WRONG ANSWER. A profile is a CLOSED list: a backend
+// that refuses a Profile 1 frame is not a backend with a gap, it is a backend that does not conform,
+// and the program reports the two apart so a reader can tell "this is wrong" from "this is missing".
+fn the_3d_profiles_conform_on_the_target() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let suite_elf = program_elf(&package, volume, b"test3d-conformance-sw").expect("test3d-conformance-sw in the package or volume");
+
+	let (boot_kernel, boot_user) = Channel::create();
+	let (console, program_console) = Channel::create();
+	let _suite = spawn_dynamic_test_process(sched::root_domain(), suite_elf, boot_user);
+	send_cap(&boot_kernel, b"STDOUT", program_console, Rights::ALL).expect("the suite's console");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	boot_kernel.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new())).expect("the suite's launch context");
+
+	// EVERY LINE IT PRINTS, and a bound on the waiting. A run that never answers is a failure with
+	// something to show rather than a suite that stops.
+	let mut printed: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	let mut idle = 0usize;
+	while idle < 4_000 {
+		// THE SUITE HAS TO BE GIVEN THE PROCESSOR. Nothing else here is pumping a service, so a loop
+		// that only polled its end of the channel would spin at the same priority as the program it
+		// is waiting for and read an empty channel for ever.
+		sched::run_until_idle();
+		match console.recv() {
+			Ok(message) => {
+				idle = 0;
+				for line in message.bytes.split(|byte| *byte == b'\n') {
+					if line.is_empty() {
+						continue;
+					}
+					printed.push(alloc::string::String::from_utf8_lossy(line).into_owned());
+				}
+				if printed.iter().any(|line| line.contains("conforms") || line.contains("DOES NOT CONFORM")) {
+					break;
+				}
+			}
+			Err(_) => idle += 1,
+		}
+	}
+
+	// THE FAILURES, IN THE RUN'S OWN LOG, one line each and named by feature - which is the whole
+	// difference between this and a screenshot comparison: a reader sees WHICH entry of which profile
+	// is not implemented rather than that something changed.
+	for line in printed.iter().filter(|line| !line.starts_with("test3d-conformance: pass ")) {
+		crate::serial_println!("  {line}");
+	}
+	let shown: alloc::string::String = printed.iter().filter(|line| !line.starts_with("test3d-conformance: pass ")).cloned().collect::<alloc::vec::Vec<_>>().join(" | ");
+	let passes = printed.iter().filter(|line| line.starts_with("test3d-conformance: pass ")).count();
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: start")), "the suite started, and printed: {shown}");
+	assert!(passes > 150, "every feature of both profiles has a scene and each one printed its own line: {passes} passed, {shown}");
+	// EACH PROFILE'S OWN COUNT, because an implementation may carry the command layer and not the
+	// retained one - and one number that mixed them could not say which conformed.
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: render3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "the command profile conforms entry by entry: {shown}");
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "and so does the retained one: {shown}");
+	assert!(printed.iter().any(|line| line == "test3d-conformance: conforms"), "the run conforms, and printed: {shown}");
+}
+
+tagged_test!(the_3d_demo_renders_a_lit_scene_and_survives_a_resize, [Display, Input, Process, Service, Image], id = "kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize", covers = ["bin.test3d-sw", "render3d", "soft3d", "render-shader", "render-math", "graphics-app", "surface"]);
+fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// A SMALL SCENE, BECAUSE THIS IS A CPU RASTERISER AND THIS IS A KERNEL TEST. Every fragment is a
+	// shader run, so the extent decides how long the test takes; sixty-four by forty-eight is three
+	// thousand fragments a frame, which is enough for a cube, a ground plane and a panel to overlap
+	// and few enough to run a dozen frames inside a bounded scheduler loop.
+	const WIDTH: u32 = 64;
+	const HEIGHT: u32 = 48;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let demo_elf = program_elf(&package, volume, b"test3d-sw").expect("test3d-sw in the package or volume");
+
+	// FIRST, THE DENIED CAPABILITY. A program that is handed no display must say so and leave, and a
+	// program that BLOCKED on a capability nobody is going to send would hang a launcher instead -
+	// which is a failure with no output at all, because it happens before the first line it prints.
+	{
+		let (bootstrap, child) = Channel::create();
+		let (stdout, child_stdout) = Channel::create();
+		let denied = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+		bootstrap.send(Message::new(launch_context(b"--no-input", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
+		// THE TAG WITH NO CAPABILITY ON IT, which is what a launch that was refused the grant sends.
+		bootstrap.send(Message::new(b"DISPLAY".to_vec(), alloc::vec::Vec::new())).expect("an empty display grant");
+		let mut said: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		for _ in 0..40_000u32 {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			while let Ok(message) = stdout.recv() {
+				said.extend_from_slice(&message.bytes);
+			}
+			if denied.is_terminated() {
+				break;
+			}
+		}
+		assert!(denied.is_terminated(), "a demo with no display leaves rather than waiting for one: {said:?}");
+		assert!(said.windows(21).any(|window| window == b"test3d-sw: no display"), "and says which capability it was refused: {said:?}");
+	}
+
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let (display, display_client) = Channel::create();
+	let (input, input_client) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	// NO FRAME LIMIT: this run ends on a KEY, which is the half a frame count cannot test.
+	//
+	// AND THE SCENE IS THE ANIMATED ONE AND NOT A FIXED POSE. What this test reads is that successive
+	// frames DIFFER, which is the whole of "it is animated"; `--pose` exists for the pixel checks
+	// that need a stated rotation, and using it here would make the two frames identical by
+	// construction and the assertion meaningless.
+	bootstrap.send(Message::new(launch_context(b"--width 64 --height 48", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
+	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("the demo's display");
+	send_cap(&bootstrap, b"INPUT_KEYS", input_client, Rights::ALL).expect("the demo's keyboard");
+
+	let mut host = SurfaceHost::new(display, WIDTH, HEIGHT);
+	let mut output: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let mut keys: Option<alloc::sync::Arc<Channel>> = None;
+	let mut subscribed = false;
+	// THE FRAMES THIS TEST READS, as bytes, sampled at the moment each present is accepted. Two of
+	// them at different animation steps is what "multiple DISTINCT presents" means: a demo that
+	// presented the same picture forever would satisfy a present counter and nothing else.
+	let mut first_frame: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let mut later_frame: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let mut presents_before_resize = 0usize;
+	let mut resized = false;
+	let mut asked_to_leave = false;
+	for _ in 0..400_000u32 {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		if host.poll() == Some(HostCall::Presented) {
+			if first_frame.is_empty() {
+				first_frame = read_from_object(&host.image(0), (WIDTH * HEIGHT * 4) as usize);
+			} else if later_frame.is_empty() && host.presents >= 3 {
+				later_frame = read_from_object(&host.image(0), (WIDTH * HEIGHT * 4) as usize);
+			}
+		}
+		while let Ok(message) = stdout.recv() {
+			output.extend_from_slice(&message.bytes);
+		}
+		// THE INPUT SERVICE'S HALF, STOOD IN FOR HERE. The demo subscribes with the one-shot focus
+		// proof its surface minted; what comes back is a stream, and key events arrive on it.
+		if !subscribed && let Ok(subscribe) = input.recv() {
+			assert_eq!(le_u16(&subscribe.bytes, 0), 2, "the demo subscribes to keys");
+			let (service_side, consumer) = Channel::create();
+			send_cap(&input, &le_u32(&subscribe.bytes, 2).to_le_bytes(), consumer, Rights::ALL).expect("the demo's key stream");
+			keys = Some(service_side);
+			subscribed = true;
+		}
+		// MOVE THE SURFACE UNDER IT ONCE IT HAS DRAWN. A changed extent is a new generation: every
+		// image is stale, the scene's own attachments are the wrong size, and what this checks is
+		// that the demo rebuilds BOTH and keeps drawing - with the camera and the animation where
+		// they were, which is what its report's frame count says.
+		if !resized && host.presents >= 4 && !later_frame.is_empty() {
+			presents_before_resize = host.presents;
+			host.reconfigure(WIDTH + 32, HEIGHT + 16);
+			resized = true;
+		}
+		// AND THEN ASK IT TO LEAVE, THROUGH THE KEY A PERSON PRESSES. `q` is one of the three exits
+		// the demo has and the only one that travels the focus capability end to end.
+		if resized
+			&& !asked_to_leave
+			&& host.presents >= presents_before_resize + 3
+			&& let Some(stream) = keys.as_ref()
+		{
+			// A frame is the sequence number, the usage and whether it went down. `0x14` is `q`.
+			stream.send(Message::new(alloc::vec![0, 0, 0, 0, 0x14, 0, 1], alloc::vec::Vec::new())).expect("the demo's quit key");
+			asked_to_leave = true;
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	while let Ok(message) = stdout.recv() {
+		output.extend_from_slice(&message.bytes);
+	}
+	for line in output.split(|byte| *byte == b'\n') {
+		if !line.is_empty() {
+			crate::serial_println!("  {}", alloc::string::String::from_utf8_lossy(line));
+		}
+	}
+	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
+
+	assert!(contains(b"test3d-sw: open"), "the demo opened its surface: {output:?}");
+	assert!(host.presents >= 6, "and presented repeatedly: {} present(s), {output:?}", host.presents);
+	// A SCENE AND NOT A CLEAR. The background is dark and the cube, the ground and the panel are not,
+	// so a frame with only one distinct colour in it is a frame nothing was drawn into.
+	let mut distinct = alloc::vec::Vec::new();
+	for pixel in first_frame.chunks_exact(4) {
+		if !distinct.iter().any(|seen| seen == &pixel) {
+			distinct.push(pixel);
+		}
+		if distinct.len() > 8 {
+			break;
+		}
+	}
+	assert!(distinct.len() > 8, "the first frame is a rendered scene rather than a cleared surface: {} distinct colour(s)", distinct.len());
+	// AND THE FRAMES DIFFER, which is the animation. The two were sampled at different steps of the
+	// same run, so a demo that drew once and presented the same bytes again would fail here.
+	assert!(!later_frame.is_empty(), "a later frame was sampled: {} present(s)", host.presents);
+	assert_ne!(first_frame, later_frame, "successive frames differ, so the scene is animated rather than drawn once");
+	// THE RESIZE, WHICH THE DEMO'S OWN REPORT COUNTS. A rebuild recreates the two prepared plans, the
+	// three attachments and the shared image; the camera and the spin are not in any of them.
+	assert!(resized, "the surface was moved under the demo");
+	assert!(contains(b"rebuilt=1"), "and the demo rebuilt for it exactly once: {output:?}");
+	// THE KEY, AND THE EXIT IT CAUSES. The stream came through the focus proof the surface minted,
+	// so this is the whole path and not a flag the demo set itself.
+	assert!(asked_to_leave, "the demo was asked to leave with a key");
+	assert!(process.is_terminated(), "and it left: {output:?}");
+	assert!(contains(b"test3d-sw: presented "), "reporting what it had drawn: {output:?}");
+}

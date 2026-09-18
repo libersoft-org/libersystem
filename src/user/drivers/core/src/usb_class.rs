@@ -37,6 +37,11 @@ pub enum ClassKind {
 	/// SEPARATE module because a controller may carry one of each - a Bulk-Only stick and a UAS
 	/// disk are two devices, two budgets and two block providers.
 	Uas,
+	/// A CDC-ACM serial adapter: a bulk pair carrying bytes, and a notification endpoint that says
+	/// what the line is doing. A SEPARATE module from `Network` although both are communications
+	/// class, because what comes out of them is different - a byte stream and a frame transport -
+	/// and a controller may carry one of each.
+	Serial,
 }
 
 /// One endpoint ring is one DMA page, which is the unit both class modules allocate in.
@@ -86,6 +91,17 @@ pub const UAS_COST: Cost = Cost { endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 
 /// ONE UAS DEVICE, for the reason the storage module admits one disk: the transport is one command
 /// outstanding under one tag, and a second device would need a second of everything.
 pub const UAS_LIMITS: Limits = Limits { devices: 1, endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 4096, in_flight: 1 };
+
+/// What one CDC-ACM adapter costs: the bulk pair and the notification endpoint with their rings, a
+/// receive page and a transmit page, and one standing receive in flight - the same shape as the
+/// network adapter, with one more endpoint and no frame buffer.
+pub const SERIAL_COST: Cost = Cost { endpoints: 3, dma_bytes: 3 * RING_BYTES + 2 * 4096, in_flight: 1 };
+
+/// TWO SERIAL ADAPTERS, and the number is the item's own requirement rather than a round figure:
+/// the item says "several simultaneous adapters", and two is what makes "several" a case the budget
+/// has a refusal for. Each publishes its own byte stream under its own name, so a consumer asking
+/// for a console stream cannot be handed whichever answered first.
+pub const SERIAL_LIMITS: Limits = Limits { devices: 2, endpoints: 6, dma_bytes: 2 * (3 * RING_BYTES + 2 * 4096), in_flight: 2 };
 
 /// The ceilings one class module may reach inside the controller's Domain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -156,11 +172,12 @@ pub struct Budget {
 	storage: Usage,
 	network: Usage,
 	uas: Usage,
+	serial: Usage,
 }
 
 impl Budget {
 	pub const fn new() -> Budget {
-		Budget { hid: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, storage: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, network: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, uas: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 } }
+		Budget { hid: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, storage: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, network: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, uas: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, serial: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 } }
 	}
 
 	pub const fn limits(kind: ClassKind) -> Limits {
@@ -169,6 +186,7 @@ impl Budget {
 			ClassKind::Storage => STORAGE_LIMITS,
 			ClassKind::Network => NETWORK_LIMITS,
 			ClassKind::Uas => UAS_LIMITS,
+			ClassKind::Serial => SERIAL_LIMITS,
 		}
 	}
 
@@ -178,6 +196,7 @@ impl Budget {
 			ClassKind::Storage => STORAGE_COST,
 			ClassKind::Network => NETWORK_COST,
 			ClassKind::Uas => UAS_COST,
+			ClassKind::Serial => SERIAL_COST,
 		}
 	}
 
@@ -187,6 +206,7 @@ impl Budget {
 			ClassKind::Storage => self.storage,
 			ClassKind::Network => self.network,
 			ClassKind::Uas => self.uas,
+			ClassKind::Serial => self.serial,
 		}
 	}
 
@@ -250,6 +270,7 @@ impl Budget {
 			ClassKind::Network => bytes <= 4096,
 			// The UAS module's data buffer is the one page it was charged for and it never grows it.
 			ClassKind::Uas => bytes <= 4096,
+			ClassKind::Serial => bytes <= 4096,
 		}
 	}
 
@@ -259,6 +280,7 @@ impl Budget {
 			ClassKind::Storage => &mut self.storage,
 			ClassKind::Network => &mut self.network,
 			ClassKind::Uas => &mut self.uas,
+			ClassKind::Serial => &mut self.serial,
 		}
 	}
 }

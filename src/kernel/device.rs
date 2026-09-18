@@ -231,6 +231,224 @@ pub fn count() -> usize {
 	DEVICES.lock().len()
 }
 
+/// The channel the kernel reports bus arrivals and departures on, or `None` until one is registered.
+///
+/// A NOTIFICATION AND NOT A POLL. The inventory was built once at boot and nothing could change it,
+/// so the manager that binds drivers read it once and never looked again; a device plugged into a
+/// live machine was a device nothing was ever going to hear about. What a manager needs is to be
+/// TOLD - it is asleep in a wait, and a poll fast enough to feel immediate is a poll that runs
+/// forever for the one moment a year it has something to report.
+static DEVICE_EVENTS: SpinLock<Option<alloc::sync::Arc<crate::object::channel::Channel>>> = SpinLock::new(None);
+
+/// What a device event says, which is two bytes and an index.
+pub const DEVICE_ARRIVED: u8 = 1;
+pub const DEVICE_DEPARTED: u8 = 2;
+/// The device is STILL THERE and must not be used. A fatal PCIe error was reported against it, and
+/// what that means is that the function's behaviour is no longer described by anything: it may have
+/// completed a transaction wrongly, or be about to. THIS IS NOT A DEPARTURE - the row stays on the
+/// bus and the address stays valid - and it is not a fault of the driver either, so it is its own
+/// event and its own stop intent rather than either of the two that already exist.
+#[cfg(not(test))]
+pub const DEVICE_FAULTED: u8 = 3;
+
+/// Register the channel the kernel reports bus changes on. Replaces any previous registration.
+pub fn attach_events(channel: alloc::sync::Arc<crate::object::channel::Channel>) {
+	*DEVICE_EVENTS.lock() = Some(channel);
+}
+
+/// Tell whoever is listening that a device index arrived or departed.
+///
+/// A DROPPED EVENT IS A DEVICE NOBODY BINDS, and it is still better than a kernel that aborts on a
+/// short heap: the send is fallible and so is the message, exactly as the console's input is. What
+/// makes this recoverable is that the INVENTORY is the truth and the event is the prompt - a manager
+/// that missed one and later has reason to look finds the same answer.
+fn report(kind: u8, index: usize) {
+	// ALLOC-OK: an `Option<Arc<Channel>>` out of the guard - a refcount bump, not a copy. Taken out
+	// of the lock because the send below must not run under it.
+	let channel = DEVICE_EVENTS.lock().clone();
+	let Some(channel) = channel else { return };
+	let mut bytes: Vec<u8> = Vec::new();
+	if bytes.try_reserve_exact(9).is_err() {
+		return;
+	}
+	bytes.push(kind);
+	bytes.extend_from_slice(&(index as u64).to_le_bytes());
+	let _ = channel.send(crate::object::channel::Message::new(bytes, Vec::new()));
+}
+
+/// A function has left the bus: take it off, and say which index it was.
+///
+/// THE ROW STAYS AND ITS INDEX STAYS WITH IT. Removing it would renumber every device after it, and
+/// an index is what a claim, a binding and every message in flight are addressed by - a renumbering
+/// is every one of those pointing at a different device. What changes is `on_bus`, which is what
+/// stops anything reaching config space it no longer has.
+pub fn depart(bus: u8, dev: u8, func: u8) -> Option<usize> {
+	let index = {
+		let mut table = DEVICES.lock();
+		let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func && entry.on_bus)?;
+		// THE BUS-MASTER BIT IS NOT TURNED OFF HERE, because there is nothing to turn it off IN: the
+		// function is gone and a config write goes to a bus that answers all ones. What the entry
+		// says now is that it is not on the bus, and `bus_master` refuses on that alone.
+		table[index].on_bus = false;
+		index
+	};
+	report(DEVICE_DEPARTED, index);
+	Some(index)
+}
+
+/// A function reported a fatal error: stop it being able to do anything, and say which index it was.
+///
+/// QUARANTINE AND NOT RECOVERY, which is this layer's own limit. Recovering a PCIe function means a
+/// link retrain or a secondary-bus reset, and a reset reaches every function behind the port - so a
+/// disk that failed would take a working network card down with it. What a kernel can do correctly is
+/// stop the function doing further damage and say so; repairing it is a decision with a policy behind
+/// it, and there is no policy here.
+///
+/// THE BUS-MASTER BIT IS THE TEETH. A function that reported a malformed TLP or a poisoned completion
+/// is a function that may still be writing into memory somebody owns, and it goes on doing that until
+/// it is told not to - so the quarantine clears bus mastering FIRST and reports afterwards. The row
+/// stays `on_bus`, because the device IS on the bus: what changed is that nothing may use it, and
+/// that is the binding's state to hold rather than the inventory's.
+#[cfg(not(test))]
+pub fn fault(bus: u8, dev: u8, func: u8) -> Option<usize> {
+	let index = {
+		let table = DEVICES.lock();
+		table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func && entry.on_bus)?
+	};
+	// OUTSIDE THE TABLE LOCK, because a config write is a bus transaction and the table's lock is
+	// taken from an interrupt handler.
+	crate::arch::pci::set_bus_master(bus, dev, func, false);
+	report(DEVICE_FAULTED, index);
+	Some(index)
+}
+
+/// A function has appeared on the bus: give it a row, and say which index it is.
+///
+/// IT REFILLS THE ROW THAT ADDRESS HAD if there is one, which is what makes a slot a slot: a device
+/// unplugged and plugged back in is a new binding on the same index, and the claim generation is
+/// what tells the two apart. A new address appends, and its claim slot appends with it.
+pub fn arrive(bus: u8, dev: u8, func: u8) -> Option<usize> {
+	let function = crate::arch::pci::probe_function(bus, dev, func)?;
+	// A BRIDGE IS NOT AN ENDPOINT, the same test `init` uses: there is nothing to bind to one.
+	if function.header_type & 0x7F != 0 {
+		return None;
+	}
+	let entry = resolve_entry(&function);
+	let index = {
+		let mut table = DEVICES.lock();
+		match table.iter().position(|row| row.bus == bus && row.dev == dev && row.func == func) {
+			Some(index) => {
+				table[index] = entry;
+				index
+			}
+			None => {
+				// ALLOC-OK: one row for one device that was plugged into this machine, which is a
+				// count the machine's operator chooses and not ring 3.
+				if table.try_reserve(1).is_err() {
+					return None;
+				}
+				table.push(entry);
+				table.len() - 1
+			}
+		}
+	};
+	// A DEVICE PLUGGED INTO A LIVE MACHINE REPORTS ERRORS LIKE ANY OTHER, and the list of functions
+	// that do was built at the boot scan - so one added afterwards would be the only function in the
+	// machine nobody watched. Answering `false` is ordinary: most functions carry no AER capability.
+	let _ = crate::arch::pci::note_error_reporter(bus, dev, func);
+	// A NEW BINDING NEEDS A FREE SLOT AND A GENERATION THAT HAS MOVED. `open_claim_slot` does both,
+	// so a message stamped with the departed device's generation is refused by arithmetic rather
+	// than by anyone remembering that the device was swapped.
+	open_claim_slot(index);
+	report(DEVICE_ARRIVED, index);
+	Some(index)
+}
+
+/// The slots whose removal was asked for and whose device something still holds.
+///
+/// A SMALL FIXED LIST, because a machine has a handful of hot-plug slots and a removal is a thing a
+/// person does. Nothing here allocates: this is read from an idle pass and written from one.
+static RETIRING: SpinLock<[Option<(usize, u8, u8, u8)>; 8]> = SpinLock::new([None; 8]);
+
+/// The generation a device index's claim slot currently stamps, for a caller that needs to see it
+/// move. A binding is told apart from the one before it by this number and by nothing else.
+///
+/// READ BY THE TEST THAT DRIVES A REPLUG, which is the one place the moving generation is the whole
+/// claim: nothing in a running system asks for it on its own, because every path that cares is
+/// already holding a `ClaimKey` with it inside.
+#[cfg(test)]
+pub fn claim_generation(index: usize) -> Option<u64> {
+	CLAIMS.lock().get(index).map(|claim| claim.generation)
+}
+
+/// Remember that a slot is waiting for its device to be let go of.
+pub fn request_slot_retirement(index: usize, bus: u8, dev: u8, func: u8) {
+	let mut retiring = RETIRING.lock();
+	if retiring.iter().flatten().any(|(at, ..)| *at == index) {
+		return;
+	}
+	if let Some(slot) = retiring.iter_mut().find(|slot| slot.is_none()) {
+		*slot = Some((index, bus, dev, func));
+	}
+}
+
+/// Every slot whose device nothing holds any more, taken off the list as it is answered.
+///
+/// THE CLAIM IS WHAT "HOLDS" MEANS. A driver has the device while its claim is not `Free`: it may
+/// have a mapping, an interrupt binding and an outstanding DMA, and the release is what says all
+/// three are finished. Powering the slot down before that is the surprise removal the whole
+/// coordination exists to avoid, and asking the driver instead would be asking the thing that is
+/// already being torn down.
+pub fn retire_requested_slots() -> Vec<(u8, u8, u8)> {
+	let mut done: Vec<(u8, u8, u8)> = Vec::new();
+	let mut retiring = RETIRING.lock();
+	let claims = CLAIMS.lock();
+	for slot in retiring.iter_mut() {
+		let Some((index, bus, dev, func)) = *slot else { continue };
+		let free = claims.get(index).is_none_or(|claim| claim.state == ClaimState::Free);
+		if !free {
+			continue;
+		}
+		// ALLOC-OK: at most eight entries, once per removal a person asked for.
+		if done.try_reserve(1).is_ok() {
+			done.push((bus, dev, func));
+			*slot = None;
+		}
+	}
+	done
+}
+
+/// Build the inventory row for one function, resolving whatever this kernel resolves for it.
+///
+/// THE SAME THREE ANSWERS `init` GIVES, in the same order: a virtio function's structure offsets, a
+/// resourced function's BAR window, or an identity row with no resources at all. A fourth answer
+/// here would be a device that binds differently depending on when it was plugged in.
+fn resolve_entry(function: &crate::arch::pci::PciDevice) -> DeviceEntry {
+	if let Some(v) = crate::arch::pci::resolve_virtio_function(function) {
+		return DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true };
+	}
+	if let Some(x) = crate::arch::pci::resolve_endpoint_function(function) {
+		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
+		return DeviceEntry { device_type: x.device_type as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true };
+	}
+	DeviceEntry { device_type: abi::DEVICE_TYPE_UNKNOWN as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: function.vendor, product: function.device_id, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: function.bus, dev: function.dev, func: function.func, class: function.class, subclass: function.subclass, prog_if: function.prog_if, on_bus: true }
+}
+
+/// Give an index a FREE claim slot with a generation that has moved past every message in flight.
+fn open_claim_slot(index: usize) {
+	let mut claims = CLAIMS.lock();
+	if index >= claims.len() {
+		// ALLOC-OK: one slot for one device, as above.
+		let wanted = index + 1 - claims.len();
+		if claims.try_reserve(wanted).is_err() {
+			return;
+		}
+		claims.resize_with(index + 1, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 });
+	}
+	let generation = claims[index].generation.wrapping_add(1);
+	claims[index] = ClaimSlot { state: ClaimState::Free, generation, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, entry: [0; abi::ENTRY_NAME_LEN], policy: 0 };
+}
+
 // The number of retained PCI functions.
 pub fn pci_count() -> usize {
 	PCI_FUNCTIONS.lock().len()

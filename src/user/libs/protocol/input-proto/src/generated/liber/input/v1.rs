@@ -127,6 +127,79 @@ impl KeyEvent {
 	}
 }
 
+/// One contact on a touch surface: which finger the device says it is, whether it is
+/// touching, and where.
+///
+/// NORMALISED AND NOT CELLS, which is the one place this package's events differ in
+/// shape - and the reason is in `pointer-event`'s own note. A console cursor IS a
+/// cell, so a pointer's canonical form is the grid. A finger is not: a cell is
+/// sixteen pixels wide, a touch moves within one, and an interface that can only say
+/// which cell a finger is in cannot express a drag at all. So the axes are the
+/// surface's own span, normalised to `0..=0xffff`, and a consumer that wants cells
+/// divides - which it can, where a consumer handed cells cannot multiply back.
+///
+/// THE IDENTIFIER IS THE DEVICE'S AND IT PERSISTS while the finger is down. It is
+/// what makes a drag a drag rather than two touches at different places, and it is
+/// the field a service that flattened contacts into a cursor would destroy first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContactEvent {
+	pub id: u8,
+	pub tip: bool,
+	pub x: u16,
+	pub y: u16,
+}
+
+impl ContactEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ContactEvent> {
+		let mut r = Reader::new(bytes);
+		let value = ContactEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ContactEvent> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ContactEvent::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(self.id)?;
+		w.boolean(self.tip)?;
+		w.u16(self.x)?;
+		w.u16(self.y)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ContactEvent> {
+		let id = r.u8()?;
+		let tip = r.boolean()?;
+		let x = r.u16()?;
+		let y = r.u16()?;
+		Some(ContactEvent { id, tip, x, y })
+	}
+}
+
 /// InputService: typed pointer/button events from the virtio-input pointer device,
 /// mapped to the text-cell grid. `subscribe` hands back a wait-drained event stream of
 /// the recent pointer events (the bounded-snapshot form; a continuously live
@@ -145,10 +218,17 @@ pub mod input {
 
 	pub const OP_SUBSCRIBE: u16 = 1;
 	pub const OP_SUBSCRIBE_KEYS: u16 = 2;
+	pub const OP_SUBSCRIBE_CONTACTS: u16 = 3;
 
 	pub trait Service {
 		fn subscribe(&mut self) -> Vec<PointerEvent>;
 		fn subscribe_keys(&mut self, focus: u64) -> Vec<KeyEvent>;
+		/// The live contact stream of a touch surface, granted on the same one-shot focus
+		/// proof `subscribe-keys` takes and for the same reason: a touch is input, and
+		/// input belongs to whoever owns the display. On focus loss the service releases
+		/// every contact still down before closing the stream, so a new foreground
+		/// application cannot inherit a finger.
+		fn subscribe_contacts(&mut self, focus: u64) -> Vec<ContactEvent>;
 	}
 
 	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
@@ -228,6 +308,47 @@ pub mod input {
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = KeyEvent::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	pub fn subscribe_contacts_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<ContactEvent>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let focus = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
+		r.finish()?;
+		request_handles.clear();
+		let items = service.subscribe_contacts(focus);
+		Some((corr, items))
+	}
+	pub fn subscribe_contacts_frame(seq: u32, item: &ContactEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn subscribe_contacts_read(msg: &[u8], frame_handles: &mut Handles) -> Option<ContactEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = ContactEvent::read(r)?;
 		reader.finish()?;
 		frame_handles.clear();
 		Some(value)
@@ -360,6 +481,33 @@ pub mod input {
 			}
 			Some(reply_handles.first())
 		}
+		pub fn subscribe_contacts(&mut self, focus: &u64) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUBSCRIBE_CONTACTS)?;
+			w.u32(corr)?;
+			w.set_handle(*focus)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -376,6 +524,14 @@ pub mod input {
 	fn channel_invoke_subscribe_keys(chan: u64, focus: &u64) -> Option<u64> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.subscribe_keys(focus)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_input_input_subscribe_contacts")]
+	fn channel_invoke_subscribe_contacts(chan: u64, focus: &u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.subscribe_contacts(focus)
 	}
 }
 
@@ -683,6 +839,73 @@ impl KeyEvent {
 		crate::codec::cbor::uint(out, self.code as u64);
 		crate::codec::cbor::text(out, "pressed");
 		crate::codec::cbor::boolean(out, self.pressed);
+	}
+}
+
+impl ContactEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"id\":");
+		let _ = write!(out, "{}", self.id);
+		out.push(',');
+		out.push_str("\"tip\":");
+		if self.tip {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"x\":");
+		let _ = write!(out, "{}", self.x);
+		out.push(',');
+		out.push_str("\"y\":");
+		let _ = write!(out, "{}", self.y);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("id=");
+		let _ = write!(out, "{}", self.id);
+		out.push_str(", ");
+		out.push_str("tip=");
+		if self.tip {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("x=");
+		let _ = write!(out, "{}", self.x);
+		out.push_str(", ");
+		out.push_str("y=");
+		let _ = write!(out, "{}", self.y);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::text(out, "id");
+		crate::codec::cbor::uint(out, self.id as u64);
+		crate::codec::cbor::text(out, "tip");
+		crate::codec::cbor::boolean(out, self.tip);
+		crate::codec::cbor::text(out, "x");
+		crate::codec::cbor::uint(out, self.x as u64);
+		crate::codec::cbor::text(out, "y");
+		crate::codec::cbor::uint(out, self.y as u64);
 	}
 }
 

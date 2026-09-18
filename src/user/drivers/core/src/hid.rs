@@ -16,9 +16,33 @@ use alloc::vec::Vec;
 // The usage pages decoded into events; every other page only advances the bit
 // cursor. Usages are handled page-extended (page << 16 | usage) throughout.
 const PAGE_GENERIC_DESKTOP: u16 = 0x01;
+/// Joysticks and flight controls report their axes here rather than on the desktop page.
+pub const PAGE_SIMULATION: u16 = 0x02;
+/// A gamepad's own page.
+pub const PAGE_GAME: u16 = 0x05;
 const PAGE_KEYBOARD: u16 = 0x07;
 const PAGE_BUTTON: u16 = 0x09;
 const PAGE_CONSUMER: u16 = 0x0c;
+/// Tablets and touch surfaces. A contact's identifier, its tip switch and its axes are all here.
+pub const PAGE_DIGITIZER: u16 = 0x0d;
+
+/// The digitizer usages that carry contact identity, which is what makes several fingers several
+/// contacts rather than one pointer that jumps between them.
+pub const USAGE_TIP_SWITCH: u16 = 0x42;
+pub const USAGE_CONTACT_IDENTIFIER: u16 = 0x51;
+pub const USAGE_CONTACT_COUNT: u16 = 0x54;
+
+/// The most collections a descriptor may nest before this parser refuses the rest of it.
+///
+/// A DEVICE-SUPPLIED DEPTH IS A LIMIT AND NOT A STYLE. `Collection` and `End Collection` are bytes
+/// the DEVICE chose, and a descriptor that opens them and never closes them nested without bound -
+/// nothing counted them at all. Eight is deeper than any real descriptor: a multi-touch digitizer is
+/// application, then one logical collection per contact, which is two.
+pub const MAX_COLLECTION_DEPTH: u8 = 8;
+
+/// The most `Push` items a descriptor may nest. The same unbounded growth from the same input: the
+/// global-state stack was a `Vec` a descriptor could fill.
+const MAX_PUSH_DEPTH: usize = 8;
 
 // The Generic-Desktop usages of a pointer's axes.
 const USAGE_X: u16 = 0x30;
@@ -62,9 +86,35 @@ struct Segment {
 	usage_max: u32,
 	logical_min: i32,
 	logical_max: i32,
+	/// How deep in the collection tree this field was declared. A multi-touch report expresses
+	/// contact identity by COLLECTION - each finger is its own, holding an identifier, a tip switch
+	/// and a pair of axes - so a parser that does not carry the depth cannot tell the second
+	/// finger's X from the first's.
+	depth: u8,
+	/// The unit word and its exponent, as the descriptor stated them. Zero is "no unit declared",
+	/// which is what most devices say and is different from declaring a dimensionless one.
+	unit: u32,
+	unit_exponent: i8,
 }
 
 impl Segment {
+	// Read field `i` of this segment out of `body`, in the signedness the DESCRIPTOR declared.
+	//
+	// A NON-NEGATIVE LOGICAL MINIMUM MEANS THE FIELD IS UNSIGNED, and reading it signed is a defect
+	// that hides behind the devices this tree has: an eight-bit absolute axis over `0..255` reports
+	// 0xF0 for a touch near the right-hand edge, and sign-extended that is MINUS SIXTEEN - which
+	// `scale` then clamps to zero, so the right-hand half of every such surface reads as the left
+	// edge. It stayed invisible because the pointer this harness attaches declares sixteen-bit axes
+	// over `0..0x7fff`, whose high bit is never set; the first eight-bit digitizer would have found
+	// it, on hardware, as a tablet whose right half does not work.
+	//
+	// The parser already makes this distinction for the logical MAXIMUM - `logical_max_raw` exists
+	// because a maximum that parses negative under a non-negative minimum was meant unsigned - and
+	// this is the same rule applied to the value the field actually carries.
+	fn reading(&self, body: &[u8], bit: u32) -> i32 {
+		if self.logical_min >= 0 { field(body, bit, self.size) as i32 } else { signed_field(body, bit, self.size) }
+	}
+
 	// The page-extended usage of variable field `i`: the explicit list first (its
 	// last entry repeating past the end), else the usage range.
 	fn usage_for(&self, i: u32) -> u32 {
@@ -84,6 +134,23 @@ impl Segment {
 // A parsed report descriptor: the decodable input segments, whether reports are
 // led by a report-id byte, and the widest input report in bytes (including that
 // byte) - the transfer length the driver posts.
+/// One contact on a touch surface: which finger the device says it is, whether it is touching, and
+/// where - the axes scaled into the same `0..=NORM_MAX` grid the pointer path uses.
+///
+/// THE IDENTIFIER IS THE DEVICE'S AND IT PERSISTS. It is what makes a drag a drag rather than two
+/// touches at different places, and it is the field a parser that flattens contacts destroys first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Contact {
+	pub id: u8,
+	pub tip: bool,
+	pub x: i32,
+	pub y: i32,
+}
+
+/// The most contacts this module decodes out of one report. Ten fingers is the bound every touch
+/// specification states, and it is what a caller's array costs.
+pub const MAX_CONTACTS: usize = 10;
+
 pub struct Layout {
 	segs: Vec<Segment>,
 	uses_ids: bool,
@@ -103,6 +170,10 @@ struct Globals {
 	size: u32,
 	count: u32,
 	id: u8,
+	/// The unit word and its exponent, which nothing read before. A tablet reports absolute
+	/// position IN A UNIT, and a consumer that cannot ask publishes counts as if they were pixels.
+	unit: u32,
+	unit_exponent: i8,
 }
 
 impl Layout {
@@ -175,6 +246,98 @@ impl Layout {
 		}
 	}
 
+	// Whether this device reports on the digitizer page at all - a tablet, a touch surface, or a
+	// pen. Asked before the contacts are read, so a device with none costs no walk.
+	pub fn has_digitizer(&self) -> bool {
+		self.segs.iter().any(|s| s.page == PAGE_DIGITIZER)
+	}
+
+	// The deepest collection this descriptor declared, which is what the depth bound is about.
+	pub fn collection_depth(&self) -> u8 {
+		self.segs.iter().map(|s| s.depth).max().unwrap_or(0)
+	}
+
+	// The unit and its exponent declared for a field, or `None` when the device declared none -
+	// which is what most of them say and is a different answer from declaring a dimensionless one.
+	pub fn unit_for(&self, page: u16, usage: u16) -> Option<(u32, i8)> {
+		let seg = self.segs.iter().find(|s| s.page == page && (0..s.count).any(|i| s.usage_for(i) & 0xffff == usage as u32))?;
+		if seg.unit == 0 { None } else { Some((seg.unit, seg.unit_exponent)) }
+	}
+
+	// Decode the contacts of report `id`, answering how many were written.
+	//
+	// A NEW CONTACT BEGINS AT EACH CONTACT IDENTIFIER, which is how a multi-touch report says where
+	// one finger's fields end and the next one's begin: the identifier, its tip switch and its pair
+	// of axes are declared together inside one collection, repeated per finger. A reader that took
+	// every X on the page would take the LAST finger's for all of them.
+	//
+	// AND CONTACT COUNT IS WHAT SAYS HOW MANY ARE REAL. A digitizer declares slots for every finger
+	// it can ever report and fills the unused ones with whatever was there before - so a reader that
+	// takes every declared slot reports phantom contacts, at stale positions, that nothing is
+	// touching. The count is a field in the same report and it is the answer.
+	pub fn contacts(&self, id: u8, body: &[u8], out: &mut [Contact]) -> usize {
+		if out.is_empty() {
+			return 0;
+		}
+		let mut written: usize = 0;
+		let mut open: Option<Contact> = None;
+		let mut count: Option<usize> = None;
+		// IN BIT ORDER AND NOT DECLARATION ORDER, because what groups a contact's fields is where
+		// they sit in the report, and a descriptor may declare the pieces in any order it likes.
+		let mut ordered: Vec<&Segment> = self.segs.iter().filter(|s| s.report_id == id && s.variable && matches!(s.page, PAGE_DIGITIZER | PAGE_GENERIC_DESKTOP)).collect();
+		ordered.sort_by_key(|s| s.bit_offset);
+		for seg in ordered {
+			for i in 0..seg.count {
+				let bit: u32 = seg.bit_offset + i * seg.size;
+				let usage: u16 = (seg.usage_for(i) & 0xffff) as u16;
+				if seg.page == PAGE_DIGITIZER {
+					match usage {
+						USAGE_CONTACT_COUNT => {
+							count = Some(field(body, bit, seg.size) as usize);
+							continue;
+						}
+						USAGE_CONTACT_IDENTIFIER => {
+							if let Some(done) = open.take()
+								&& written < out.len()
+							{
+								out[written] = done;
+								written += 1;
+							}
+							open = Some(Contact { id: field(body, bit, seg.size) as u8, tip: false, x: 0, y: 0 });
+							continue;
+						}
+						USAGE_TIP_SWITCH => {
+							if let Some(contact) = open.as_mut() {
+								contact.tip = field(body, bit, seg.size) != 0;
+							}
+							continue;
+						}
+						_ => continue,
+					}
+				}
+				let Some(contact) = open.as_mut() else { continue };
+				let axis: &mut i32 = match usage {
+					USAGE_X => &mut contact.x,
+					USAGE_Y => &mut contact.y,
+					_ => continue,
+				};
+				*axis = scale(seg.reading(body, bit), seg.logical_min, seg.logical_max);
+			}
+		}
+		if let Some(done) = open.take()
+			&& written < out.len()
+		{
+			out[written] = done;
+			written += 1;
+		}
+		// THE COUNT BOUNDS WHAT WAS DECODED AND DOES NOT EXTEND IT. A device claiming more contacts
+		// than its report carries slots for is describing fields that are not there.
+		match count {
+			Some(count) => written.min(count),
+			None => written,
+		}
+	}
+
 	// Fold the pointer fields of report `id` into the running pointer state: an
 	// absolute axis scales its logical range into 0..=NORM_MAX, a relative one
 	// accumulates clamped to it, wheel ticks accumulate into `wheel`, and the
@@ -209,9 +372,12 @@ impl Layout {
 					};
 					matched = true;
 					if seg.relative {
+						// A RELATIVE AXIS IS ALWAYS SIGNED whatever its logical minimum says, because
+						// what it carries is a DELTA and a delta with no sign is a mouse that only
+						// moves right.
 						*axis = (*axis + signed_field(body, bit, seg.size)).clamp(0, NORM_MAX);
 					} else {
-						*axis = scale(signed_field(body, bit, seg.size), seg.logical_min, seg.logical_max);
+						*axis = scale(seg.reading(body, bit), seg.logical_min, seg.logical_max);
 					}
 				}
 			}
@@ -223,6 +389,17 @@ impl Layout {
 // Parse a report descriptor into its decodable input layout. Unknown items and
 // pages cost only their declared bit width; a malformed stream parses as far as
 // it stays well-formed.
+/// Read a HID unit exponent, which is a FOUR-BIT SIGNED nibble and not a byte.
+///
+/// 0x0F IS MINUS ONE. The values run 0..7 for zero to seven and 8..15 for minus eight to minus one,
+/// so a driver reading the byte as unsigned scales a tablet's reported position by ten to the
+/// fifteenth instead of dividing it by ten. The number is small either way, which is what makes the
+/// mistake survive a glance.
+pub fn nibble_exponent(data: u32) -> i8 {
+	let nibble = (data & 0x0F) as i8;
+	if nibble > 7 { nibble - 16 } else { nibble }
+}
+
 pub fn parse(desc: &[u8]) -> Layout {
 	let mut segs: Vec<Segment> = Vec::new();
 	let mut g: Globals = Globals::default();
@@ -233,6 +410,11 @@ pub fn parse(desc: &[u8]) -> Layout {
 	// the input bit cursor of each report id, and the ids that overflowed.
 	let mut cursors: Vec<(u8, u32)> = Vec::new();
 	let mut uses_ids: bool = false;
+	// The collection nesting this walk is inside, and whether it ever went past the bound. A
+	// descriptor that nested too deep has its REMAINING fields dropped rather than the whole
+	// descriptor refused: what was declared before the runaway is still what the device said.
+	let mut depth: u8 = 0;
+	let mut over_nested: bool = false;
 	let mut i: usize = 0;
 	while i < desc.len() {
 		let prefix: u8 = desc[i];
@@ -264,10 +446,26 @@ pub fn parse(desc: &[u8]) -> Layout {
 			// main items: Input records a segment (and always advances the bit
 			// cursor); every main item resets the local state.
 			0 => {
-				if tag == 8 {
+				// COLLECTIONS ARE COUNTED NOW, AND THE DEPTH IS BOUNDED. `Collection` is tag 10 and
+				// `End Collection` is tag 12, and this parser passed over both - so the depth was
+				// not merely unused, it was unknown, and a descriptor that opens collections without
+				// closing them was refused by nothing. Both numbers come from the device.
+				if tag == 10 {
+					depth = depth.saturating_add(1);
+					if depth > MAX_COLLECTION_DEPTH {
+						over_nested = true;
+					}
+				} else if tag == 12 {
+					depth = depth.saturating_sub(1);
+				}
+				if tag == 8 && !over_nested {
 					let cursor: &mut u32 = cursor_for(&mut cursors, g.id);
 					let bits: u32 = g.size.saturating_mul(g.count);
-					let interesting: bool = matches!(g.page, PAGE_GENERIC_DESKTOP | PAGE_KEYBOARD | PAGE_BUTTON | PAGE_CONSUMER);
+					// THE PAGES A SEGMENT MAY BE ON, STATED. This was four, and every field on any other page was
+					// dropped BEFORE it was decoded - which is what flattening a tablet into a mouse
+					// actually is in this tree: not a lossy mapping downstream, but a filter upstream
+					// that never let the fields exist.
+					let interesting: bool = matches!(g.page, PAGE_GENERIC_DESKTOP | PAGE_SIMULATION | PAGE_GAME | PAGE_KEYBOARD | PAGE_BUTTON | PAGE_CONSUMER | PAGE_DIGITIZER);
 					// SATURATING, NOT `+`. The cursor itself saturates as a descriptor walks past the
 					// bound, so a plain addition here overflows on the very descriptor the check
 					// exists to refuse - which panics in a debug build and, in a release one, wraps
@@ -275,7 +473,7 @@ pub fn parse(desc: &[u8]) -> Layout {
 					let end: u32 = cursor.saturating_add(bits);
 					if data & INPUT_CONSTANT == 0 && interesting && g.size >= 1 && g.size <= 32 && end <= MAX_REPORT_BYTES * 8 {
 						let logical_max: i32 = if g.logical_min >= 0 && g.logical_max < g.logical_min { g.logical_max_raw as i32 } else { g.logical_max };
-						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max });
+						segs.push(Segment { report_id: g.id, bit_offset: *cursor, size: g.size, count: g.count, variable: data & INPUT_VARIABLE != 0, relative: data & INPUT_RELATIVE != 0, page: g.page, usages: core::mem::take(&mut usages), usage_min, usage_max, logical_min: g.logical_min, logical_max, depth, unit: g.unit, unit_exponent: g.unit_exponent });
 					}
 					*cursor = cursor.saturating_add(bits);
 				}
@@ -291,13 +489,24 @@ pub fn parse(desc: &[u8]) -> Layout {
 					g.logical_max = sdata;
 					g.logical_max_raw = data;
 				}
+				// The unit exponent is a FOUR-BIT SIGNED nibble, not a byte: 0x0F is -1 and not 15,
+				// and a driver reading it as unsigned scales a tablet's position by ten to the
+				// fifteenth.
+				5 => g.unit_exponent = nibble_exponent(data),
+				6 => g.unit = data,
 				7 => g.size = data,
 				8 => {
 					g.id = data as u8;
 					uses_ids = true;
 				}
 				9 => g.count = data,
-				10 => stack.push(g),
+				// BOUNDED, for the same reason the collection depth is: the stack was a `Vec` a
+				// descriptor could fill with `Push` items and nothing said how many.
+				10 => {
+					if stack.len() < MAX_PUSH_DEPTH {
+						stack.push(g);
+					}
+				}
 				11 => {
 					if let Some(saved) = stack.pop() {
 						g = saved;

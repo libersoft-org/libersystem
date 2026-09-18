@@ -78,11 +78,51 @@ pub struct Draw {
 	pub restart: bool,
 }
 
+/// A rectangle outside which a pass writes nothing.
+///
+/// A SCISSOR IS A RASTERISATION TEST AND NOT A WRITE MASK. A fragment outside the rectangle is never
+/// shaded at all, so it costs nothing, it cannot discard, and it cannot count towards the frame's
+/// fragment total. That is why it narrows the loop bounds below rather than guarding the write: a
+/// scissor implemented at the write would give the same picture and a different cost, and the cost
+/// is most of what a scissor is for.
+///
+/// IT IS IN PIXELS AND NOT IN SAMPLES, because it is a rectangle of the target and not of the
+/// coverage inside a pixel. A pixel is wholly in or wholly out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Scissor {
+	pub x: i32,
+	pub y: i32,
+	pub width: u32,
+	pub height: u32,
+}
+
 /// What a frame writes into.
 pub struct Attachments<'a> {
 	pub colour: &'a mut [Colour],
 	pub depth_stencil: Option<&'a mut DepthStencil>,
 	pub viewport: Viewport,
+	/// The pass's scissor, or the whole target. IT SITS BESIDE THE VIEWPORT because the two are one
+	/// state: a scissor is meaningful only inside the viewport that decides where fragments are, and
+	/// `CommandList::set_scissor` refuses one that reaches outside it.
+	pub scissor: Option<Scissor>,
+}
+
+/// The half-open pixel rectangle a pass may write, which is the scissor clamped to the target.
+///
+/// CLAMPED AND NOT REFUSED: the recording boundary is where a scissor outside the viewport is
+/// refused, and by the time a plan runs the only thing left to do with a rectangle that reaches past
+/// the last pixel is to stop at it. An empty rectangle stays empty, which draws nothing.
+fn writable(scissor: Option<Scissor>, width: u32, height: u32) -> (i64, i64, i64, i64) {
+	match scissor {
+		None => (0, 0, width as i64, height as i64),
+		Some(rect) => {
+			let x0 = (rect.x as i64).clamp(0, width as i64);
+			let y0 = (rect.y as i64).clamp(0, height as i64);
+			let x1 = (rect.x as i64 + rect.width as i64).clamp(x0, width as i64);
+			let y1 = (rect.y as i64 + rect.height as i64).clamp(y0, height as i64);
+			(x0, y0, x1, y1)
+		}
+	}
 }
 
 /// The scratch a frame reuses. CLEARED, NEVER REALLOCATED, which is what makes a steady-state frame
@@ -576,6 +616,7 @@ fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Sou
 fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	let setups = core::mem::take(&mut prepared.scratch.setups);
 	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
+	let keep = writable(attachments.scissor, width, height);
 	let mut outcome = Ok(());
 	'outer: for tile_y in 0..prepared.bins.down() {
 		for tile_x in 0..prepared.bins.across() {
@@ -597,10 +638,10 @@ fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source
 					}
 				}
 				let bounds = binned.setup.bounds;
-				let x0 = bounds.x0.max(area.x0);
-				let x1 = bounds.x1.min(area.x1);
-				let y0 = bounds.y0.max(area.y0);
-				let y1 = bounds.y1.min(area.y1);
+				let x0 = bounds.x0.max(area.x0).max(keep.0);
+				let x1 = bounds.x1.min(area.x1).min(keep.2);
+				let y0 = bounds.y0.max(area.y0).max(keep.1);
+				let y1 = bounds.y1.min(area.y1).min(keep.3);
 				for y in y0..y1 {
 					for x in x0..x1 {
 						let coverage = raster::coverage(&binned.setup, x, y, samples)?;
@@ -639,9 +680,13 @@ fn shade_pixel(attachments: &mut Attachments<'_>, source: &dyn Source, pipeline:
 	// INTERPOLATED INTO FIXED ARRAYS, not into vectors: a `Vec` per fragment is an allocation per
 	// fragment, which is several million of them in a frame.
 	let interpolate = |weights: [f32; 3]| -> (Varyings, Varyings) {
+		// THE PERSPECTIVE DENOMINATOR IS COMPUTED ONCE FOR THE FRAGMENT, not once per component: it
+		// does not depend on the value being interpolated, and a stage with four `vec4` varyings was
+		// computing the identical number sixteen times.
+		let shared = interp::perspective(weights, binned.setup.inverse_w);
 		let mut smooth = Varyings::EMPTY;
 		for index in 0..binned.smooth[0].len() {
-			smooth.push(interp::smooth(weights, binned.setup.inverse_w, [binned.smooth[0].as_slice()[index], binned.smooth[1].as_slice()[index], binned.smooth[2].as_slice()[index]]));
+			smooth.push(interp::smooth_with(&shared, [binned.smooth[0].as_slice()[index], binned.smooth[1].as_slice()[index], binned.smooth[2].as_slice()[index]]));
 		}
 		let mut screen_linear = Varyings::EMPTY;
 		for index in 0..binned.noperspective[0].len() {
@@ -800,11 +845,12 @@ fn stage_point(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source
 fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	let segments = core::mem::take(&mut prepared.scratch.segments);
 	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
+	let keep = writable(attachments.scissor, width, height);
 	for segment in &segments {
-		let x0 = (segment.from.0.pixel().min(segment.to.0.pixel()) - 1).max(0);
-		let x1 = (segment.from.0.pixel().max(segment.to.0.pixel()) + 2).min(width as i64);
-		let y0 = (segment.from.1.pixel().min(segment.to.1.pixel()) - 1).max(0);
-		let y1 = (segment.from.1.pixel().max(segment.to.1.pixel()) + 2).min(height as i64);
+		let x0 = (segment.from.0.pixel().min(segment.to.0.pixel()) - 1).max(keep.0);
+		let x1 = (segment.from.0.pixel().max(segment.to.0.pixel()) + 2).min(keep.2);
+		let y0 = (segment.from.1.pixel().min(segment.to.1.pixel()) - 1).max(keep.1);
+		let y1 = (segment.from.1.pixel().max(segment.to.1.pixel()) + 2).min(keep.3);
 		for y in y0..y1 {
 			for x in x0..x1 {
 				if !geometry::line_covers_pixel(segment.from, segment.to, x, y) {
@@ -855,6 +901,7 @@ fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sour
 	let points = core::mem::take(&mut prepared.scratch.points);
 	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
 	let positions = render3d::msaa::sample_positions(samples)?;
+	let keep = writable(attachments.scissor, width, height);
 	for dot in &points {
 		if dot.size == 0 {
 			continue;
@@ -862,8 +909,8 @@ fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sour
 		let half = dot.size as i64;
 		let centre_x = dot.centre.0.pixel();
 		let centre_y = dot.centre.1.pixel();
-		for y in (centre_y - half).max(0)..(centre_y + half + 1).min(height as i64) {
-			for x in (centre_x - half).max(0)..(centre_x + half + 1).min(width as i64) {
+		for y in (centre_y - half).max(keep.1)..(centre_y + half + 1).min(keep.3) {
+			for x in (centre_x - half).max(keep.0)..(centre_x + half + 1).min(keep.2) {
 				let mut coverage = 0;
 				for position in positions {
 					let sample = (crate::Subpixel(x * crate::fixed::SUBPIXEL_ONE + (position.x as f64 * crate::fixed::SUBPIXEL_ONE as f64) as i64), crate::Subpixel(y * crate::fixed::SUBPIXEL_ONE + (position.y as f64 * crate::fixed::SUBPIXEL_ONE as f64) as i64));

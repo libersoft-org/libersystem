@@ -16,7 +16,7 @@ use crate::arch::common::pci as common;
 
 // The PCI surface every backend re-exports (the HAL contract); not every type is named
 // directly in this backend's code.
-pub use common::{PciDevice, ResourcedDevice, VirtioDevice};
+pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
 static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -121,6 +121,49 @@ pub fn scan_resourced() -> Vec<ResourcedDevice> {
 	common::scan_resourced::<Access>()
 }
 
+// The identity of one function, or `None` where nothing is there - see
+// `arch::common::pci::probe_function`.
+pub fn probe_function(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
+	common::probe_function::<Access>(bus, dev, func)
+}
+
+// One function's virtio layout and one function's resourced window, for a device that arrived after
+// the boot scan - see `arch::common::pci::resolve_virtio_function`.
+pub fn resolve_virtio_function(function: &PciDevice) -> Option<VirtioDevice> {
+	common::resolve_virtio_function::<Access>(function)
+}
+
+pub fn resolve_endpoint_function(function: &PciDevice) -> Option<ResourcedDevice> {
+	common::resolve_endpoint_function::<Access>(function)
+}
+
+// Power one hot-plug slot off or on - see `arch::common::pci::set_slot_power`.
+// THE BOOT'S HOT-PLUG PATH ONLY, and so not compiled into a test build: the slot protocol's own
+// tests drive the shared module directly, over a fake config space, and the handler that reaches for
+// these wrappers is the boot's - which a test kernel does not have.
+#[cfg(not(test))]
+pub fn set_slot_power(bus: u8, dev: u8, func: u8, on: bool) {
+	common::set_slot_power::<Access>(bus, dev, func, on);
+}
+
+// Every hot-plug port this machine has - see `arch::common::pci::hot_plug_ports`.
+#[cfg(not(test))]
+pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
+	common::hot_plug_ports(out)
+}
+
+// Read every hot-plug slot and answer what changed - see `arch::common::pci::poll_slots`.
+#[cfg(not(test))]
+pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) -> usize {
+	common::poll_slots::<Access>(out)
+}
+
+// The legacy interrupt line a hot-plug port asserts on, or `None` where it has none.
+#[cfg(not(test))]
+pub fn slot_interrupt_line(port: &common::HotPlugPort) -> Option<u8> {
+	common::slot_interrupt_line::<Access>(port)
+}
+
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10).
 pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	common::set_intx_disabled::<Access>(bus, dev, func, disabled);
@@ -193,4 +236,36 @@ pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
 // The other half - see `common::msix_disable`. A released claim leaves the function unable to send.
 pub fn msix_disable(bus: u8, dev: u8, func: u8, cap: u16) {
 	common::msix_disable::<Access>(bus, dev, func, cap);
+}
+
+// What the bus reported about itself: every watched function's error record, read and CLEARED.
+#[cfg(not(test))]
+pub fn poll_errors(out: &mut [common::ErrorRecord; common::MAX_ERROR_REPORTERS]) -> usize {
+	common::poll_errors::<Access>(out)
+}
+
+// Every hot-plug port's power-management event, read and cleared.
+#[cfg(not(test))]
+pub fn poll_power_events(out: &mut [common::PowerEvent; common::MAX_HOT_PLUG_PORTS]) -> usize {
+	common::poll_power_events::<Access>(out)
+}
+
+// The names the two error halves go by, so a report says what happened rather than a bit number.
+#[cfg(not(test))]
+pub fn uncorrectable_name(bits: u32) -> &'static str {
+	common::uncorrectable_name(bits)
+}
+
+#[cfg(not(test))]
+pub fn correctable_name(bits: u32) -> &'static str {
+	common::correctable_name(bits)
+}
+
+// Watch a function for errors if it can report any, answering whether it can.
+//
+// CALLED WHERE A DEVICE ARRIVES as well as at the scan: a card plugged into a live machine reports
+// errors like any other, and a list built once at boot would watch every function except the ones
+// somebody put in afterwards.
+pub fn note_error_reporter(bus: u8, dev: u8, func: u8) -> bool {
+	common::note_error_reporter::<Access>(bus, dev, func)
 }

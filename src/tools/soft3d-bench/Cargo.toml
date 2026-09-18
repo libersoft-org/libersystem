@@ -1,0 +1,16 @@
+[package]
+name = "soft3d-bench"
+edition = "2024"
+description = "The headless soft3d performance floor: one frozen scene, measured stage by stage"
+
+[dependencies]
+graphics-core = { path = "../../user/libs/graphics/core" }
+graphics-profile = { path = "../../user/libs/graphics/profile" }
+render-math = { path = "../../user/libs/graphics/render-math" }
+render-shader = { path = "../../user/libs/graphics/render-shader" }
+render3d = { path = "../../user/libs/graphics/render3d" }
+soft3d = { path = "../../user/libs/graphics/soft3d" }
+
+# A WARNING IS AN ERROR HERE, as everywhere in this tree.
+[lints.rust]
+warnings = "deny"

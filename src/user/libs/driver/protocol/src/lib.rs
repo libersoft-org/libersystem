@@ -381,6 +381,12 @@ pub mod provider {
 	// around NetworkService reachable by every consumer that already asks for a link.
 	pub const LOCAL_STREAM: u16 = 9;
 
+	// A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `POINTER` is handed one cursor; a touch
+	// surface reports several contacts at once, each with an identity that persists while the finger
+	// is down. Published as a pointer, a digitizer is flattened into whichever contact was decoded
+	// last - which is the same class of loss `LOCAL_STREAM` exists to avoid against `NET`.
+	pub const TOUCH: u16 = 10;
+
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.
 	//

@@ -314,3 +314,126 @@ fn a_block_that_does_not_fit_is_refused_rather_than_truncated() {
 	let mut out = [0u8; 32];
 	assert_eq!(ncm_block(0, &frame, &mut out), None);
 }
+
+// An ACM configuration built the way QEMU's `usb-serial` builds one: a communications interface of
+// the ACM subclass carrying the header, call-management, ACM and union functional descriptors and an
+// interrupt endpoint, then a data interface with the bulk pair.
+//
+// A SECOND FUNCTION IN FRONT OF IT, because that is the case the union descriptor exists for: an
+// interface that is NOT the adapter's data interface sits between the two, so a driver that binds
+// "the interface after the communications one" binds the wrong one and takes a bulk pair another
+// function is using.
+fn acm_config(with_acm_descriptor: bool, capabilities: u8) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(&[9, descriptor::DT_CONFIG, 0, 0, 3, 7, 0, 0x80, 50]);
+	// interface 0: communications, ACM
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 1, CLASS_COMMUNICATIONS, SUBCLASS_ACM, 1, 0]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_HEADER, 0x10, 0x01]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_CALL_MANAGEMENT, 0x00, 2]);
+	if with_acm_descriptor {
+		out.extend_from_slice(&[4, DT_CS_INTERFACE, FN_ACM, capabilities]);
+	}
+	// The union names interface 2, NOT the interface that follows this one.
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_UNION, 0, 2]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x82, 0x03, 0x10, 0x00, 0xFF]);
+	// interface 1: another function entirely, with a bulk pair of its own.
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, 0, 2, 0xFF, 0xFF, 0xFF, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x83, 0x02, 0x00, 0x02, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x03, 0x02, 0x00, 0x02, 0]);
+	// interface 2: the adapter's data interface.
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 2, 0, 2, CLASS_CDC_DATA, 0, 0, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x81, 0x02, 0x00, 0x02, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x01, 0x02, 0x00, 0x02, 0]);
+	out[2] = out.len() as u8;
+	out[3] = (out.len() >> 8) as u8;
+	out
+}
+
+#[test]
+fn the_union_names_the_data_interface_and_the_next_one_is_not_it() {
+	// On a composite device the interface after the communications one belongs to something else,
+	// and binding it takes a bulk pair another function is using - which is not a refusal anywhere:
+	// both halves then read from endpoints the other is driving.
+	let binding = bind_acm(&acm_config(true, 0x02)).expect("a bindable ACM adapter");
+	assert_eq!(binding.control_interface, 0, "the communications interface");
+	assert_eq!(binding.data_interface, 2, "the interface the UNION names, not interface 1");
+	assert_eq!(binding.bulk_in, 0x81, "and its bulk pair, not the other function's 0x83");
+	assert_eq!(binding.bulk_out, 0x01);
+}
+
+#[test]
+fn the_notification_endpoint_is_the_communications_interfaces_own() {
+	// An interrupt endpoint taken from whichever interface carried one is a HID function's on a
+	// composite adapter - and what arrives on it is not a serial state.
+	let binding = bind_acm(&acm_config(true, 0x02)).expect("a bindable ACM adapter");
+	assert_eq!(binding.notify_in, 0x82);
+	assert_eq!(binding.notify_packet, 0x10);
+}
+
+#[test]
+fn a_device_with_no_acm_descriptor_supports_no_line_coding_and_is_still_a_byte_stream() {
+	// An MCU link has no UART behind the USB. It is a perfectly good byte stream that STALLS every
+	// line-coding request, and a driver that asks first never finds that out the hard way.
+	let binding = bind_acm(&acm_config(false, 0)).expect("a device with no ACM descriptor still binds");
+	assert_eq!(binding.capabilities, 0, "nothing published means nothing supported");
+	assert!(!binding.supports_line_coding());
+	let with = bind_acm(&acm_config(true, 0x02)).expect("a bindable ACM adapter");
+	assert!(with.supports_line_coding(), "bit one is the line-coding capability");
+	let other_bits = bind_acm(&acm_config(true, 0x0D)).expect("a bindable ACM adapter");
+	assert!(!other_bits.supports_line_coding(), "and the other capability bits are not it");
+}
+
+#[test]
+fn a_configuration_with_no_union_names_nothing_to_bind() {
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(&[9, descriptor::DT_CONFIG, 0, 0, 2, 7, 0, 0x80, 50]);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 0, CLASS_COMMUNICATIONS, SUBCLASS_ACM, 1, 0]);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, 0, 2, CLASS_CDC_DATA, 0, 0, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x81, 0x02, 0x00, 0x02, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x01, 0x02, 0x00, 0x02, 0]);
+	out[2] = out.len() as u8;
+	assert_eq!(bind_acm(&out), Err(NotBindable::NoUnion), "nothing says which data interface is the adapter's");
+}
+
+#[test]
+fn the_stop_bits_are_an_enumeration_and_the_data_bits_are_a_count() {
+	// TWO CONVENTIONS IN SEVEN BYTES. Writing the number you mean into the stop-bits byte asks for
+	// one and a HALF stop bits when you mean one - accepted by some devices, which then frame every
+	// byte differently, and that is a link that works until the first byte of the second frame.
+	let coding = LineCoding::default_8n1();
+	let wire = coding.encode();
+	assert_eq!(&wire[..4], &115_200u32.to_le_bytes(), "the rate is little-endian");
+	assert_eq!(wire[4], 0, "ONE stop bit is zero, not one");
+	assert_eq!(wire[5], 0, "no parity");
+	assert_eq!(wire[6], 8, "and the data bits are the count they say");
+	assert_eq!(LineCoding { rate: 9600, stop_bits: StopBits::Two, parity: Parity::Even, data_bits: 7 }.encode()[4], 2, "two stop bits is two");
+	assert_eq!(LineCoding { rate: 9600, stop_bits: StopBits::OneAndAHalf, parity: Parity::None, data_bits: 8 }.encode()[4], 1, "and one and a half is one");
+}
+
+#[test]
+fn a_line_coding_answer_outside_the_enumeration_is_refused_rather_than_rounded() {
+	// Three stop bits is not a setting, and reading it as "two, probably" is a driver deciding what
+	// a device meant.
+	let good = LineCoding::default_8n1().encode();
+	assert_eq!(LineCoding::decode(&good), Some(LineCoding::default_8n1()));
+	let mut stop = good;
+	stop[4] = 3;
+	assert_eq!(LineCoding::decode(&stop), None, "a stop-bits value the structure does not define");
+	let mut parity = good;
+	parity[5] = 9;
+	assert_eq!(LineCoding::decode(&parity), None);
+	let mut bits = good;
+	bits[6] = 9;
+	assert_eq!(LineCoding::decode(&bits), None, "nine data bits is not a width this structure carries");
+	assert_eq!(LineCoding::decode(&good[..LINE_CODING_LEN - 1]), None, "and an answer too short to be one");
+}
+
+#[test]
+fn the_control_lines_are_a_bitmap_in_the_setup_packet() {
+	// DTR is bit zero and RTS is bit one, and the request carries NO data stage: a driver that sends
+	// them as bytes sends a transfer the device did not ask for.
+	assert_eq!(control_lines(false, false), 0);
+	assert_eq!(control_lines(true, false), 1, "DTR is bit zero");
+	assert_eq!(control_lines(false, true), 2, "RTS is bit one");
+	assert_eq!(control_lines(true, true), 3);
+}

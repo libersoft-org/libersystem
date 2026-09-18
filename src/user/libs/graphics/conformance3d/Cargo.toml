@@ -1,0 +1,24 @@
+[package]
+name = "render3d-conformance"
+edition = "2024"
+description = "The Render3D and Scene3D Core Profile 1 conformance suites: one scene per profile feature, with a stated pass condition per scene"
+
+[dependencies]
+# The profiles themselves, which are what the suite walks: a feature added there with no scene here
+# is a gate failure rather than a feature nobody tested.
+graphics-profile = { path = "../profile" }
+graphics-core = { path = "../core" }
+render-math = { path = "../render-math" }
+render-shader = { path = "../render-shader" }
+render3d = { path = "../render3d" }
+# THE BACKEND UNDER TEST. One today; the suite is written against the API `render3d` freezes, so a
+# second backend is a different entry point and the same scenes.
+soft3d = { path = "../soft3d" }
+# The retained layer, whose own profile is the suite's second half.
+scene3d = { path = "../scene3d" }
+# A scene that states a transcendental expectation computes it rather than tabulating it, and
+# `no_std` has neither a power nor a square root.
+libm = "0.2"
+
+[lints.rust]
+warnings = "deny"

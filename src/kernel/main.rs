@@ -213,6 +213,10 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	// user mapping, so a 2 MiB identity page cannot shadow a 4 KiB user page.
 	arch::paging::remove_bootstrap_identity();
 	sched::init();
+	// WHERE EXTENDED CONFIG SPACE IS, BEFORE ANYTHING READS IT. See `init_extended_config`. A test
+	// build has no MCFG of its own to find and its PCI fixtures are fake, so it does not run this.
+	#[cfg(not(test))]
+	init_extended_config(bi);
 	device::init();
 	// THE BOOT'S DMA MODE, FROM THE LOADER'S HAND-OFF, BEFORE POLICY INIT. UEFI admission consumes
 	// the validated `BootInfo` extension and nothing else; on this port the loader relayed the
@@ -451,6 +455,7 @@ fn boot_main() {
 	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
 	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
 	arch::serial::enable_rx_irq();
+	arm_hot_plug_interrupts();
 	// THREE THOUSAND TICKS - THIRTY SECONDS - AND THE NUMBER IS A MEASUREMENT.
 	//
 	// It was 300, inherited from what `console_shell_loop` used to wait on this port before the wait
@@ -497,6 +502,15 @@ fn serial_console_pump() {
 	while let Some(byte) = arch::serial::read_byte() {
 		console_input::feed_serial(byte);
 	}
+	// AND WHATEVER A BURST LEFT WAITING. A console channel has a bounded queue, so input that arrives
+	// faster than the shell reads it is held in the kernel rather than dropped; this is the pass that
+	// empties it once the shell has caught up, and without it a held byte would wait for the next
+	// byte to arrive before being delivered.
+	console_input::drain();
+	// AND THE BUS, WHICH CHANGES SHAPE WHILE THE MACHINE RUNS. See `settle_hot_plug`.
+	settle_hot_plug();
+	// AND WHAT THE BUS REPORTED ABOUT ITSELF. See `settle_pci_faults`.
+	settle_pci_faults();
 }
 
 // Drive the interactive userspace shell. The boot chain has already started it as
@@ -1123,6 +1137,211 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		serial_println!("recovery: and SystemManager is gone with it (attempt {} of {})", attempt + 1, max_restarts + 1);
 	}
 	false
+}
+
+// ROUTE EVERY HOT-PLUG PORT'S INTERRUPT, so a device plugged into a live machine is NOTICED.
+//
+// THE PORT ASSERTS AND THE SLOT SAYS WHAT HAPPENED, which is why this is two steps and not one: a
+// root port raises its legacy INTx when a slot's status changes, and WHICH change it was is in the
+// slot's own registers. The handler below reads them; this is what makes it run.
+//
+// INTx AND NOT MSI, deliberately. Every other interrupt this kernel takes is per-device MSI-X,
+// because a driver owns the device and a shared line is a storm nobody can attribute. A root port
+// has no driver and no MSI-X table of its own to program, and its event rate is bounded by how fast
+// a person can plug things in - so the legacy line is the right one, and the interrupt-disable bit
+// this kernel sets on every endpoint is cleared here for exactly these functions.
+// WHERE EXTENDED CONFIG SPACE IS, ON THE ONE ARCHITECTURE THAT HAS TO BE TOLD.
+//
+// The other two ports reach config space through an ECAM window already and can read a function's
+// whole four kilobytes; x86_64 reaches it through the legacy port pair, which carries eight bits of
+// register number and stops at 0xFF. Every PCIe EXTENDED capability begins at 0x100 - Advanced Error
+// Reporting is the first of them - so surfacing an AER record here needs the memory-mapped window,
+// and where that window is is a thing only firmware knows: ACPI's MCFG table is where it says so.
+//
+// BEFORE ANY PROCESS ADDRESS SPACE EXISTS, which is why it is called here and not from the first
+// reader. The scratch mapping it makes has to sit in the kernel half every address space shares, and
+// a page-table chain materialised later reaches only the address space that made it.
+//
+// AND A MACHINE WITH NO MCFG IS NOT A FAILURE. It is a machine whose extended capabilities this
+// kernel cannot read, which is SAID once at boot - a reader that guessed a base would be reading
+// whatever the map holds there and reporting it as an error status.
+#[cfg(not(test))]
+fn init_extended_config(bi: &'static BootInfo) {
+	#[cfg(target_arch = "x86_64")]
+	{
+		if bi.rsdp == 0 {
+			serial_println!("pci: no ACPI RSDP, so no MCFG and no extended config space");
+			return;
+		}
+		let Some(mcfg) = smp::acpi_table(bi.rsdp, b"MCFG") else {
+			serial_println!("pci: the firmware published no MCFG, so extended config space is unavailable");
+			return;
+		};
+		// The 36-byte ACPI header, then eight reserved bytes, then 16-byte allocation entries.
+		const HEADER: usize = 36 + 8;
+		const ENTRY: usize = 16;
+		let mut at = HEADER;
+		while at + ENTRY <= mcfg.len() {
+			let entry = &mcfg[at..at + ENTRY];
+			let base = u64::from_le_bytes(entry[0..8].try_into().unwrap_or([0; 8]));
+			let segment = u16::from_le_bytes(entry[8..10].try_into().unwrap_or([0; 2]));
+			let (first, last) = (entry[10], entry[11]);
+			// SEGMENT ZERO AND NOTHING ELSE. A second segment is a second config space with its own
+			// bus numbering, and this kernel's device addresses carry no segment - so a window for
+			// one would be a window whose addresses mean something else.
+			if segment == 0 {
+				arch::pci::set_ecam_window(base, first, last);
+				return;
+			}
+			at += ENTRY;
+		}
+		serial_println!("pci: the MCFG table describes no segment 0, so extended config space is unavailable");
+	}
+	#[cfg(not(target_arch = "x86_64"))]
+	{
+		let _ = bi;
+	}
+}
+
+#[cfg(not(test))]
+fn arm_hot_plug_interrupts() {
+	#[cfg(target_arch = "x86_64")]
+	{
+		let mut ports: [Option<arch::pci::HotPlugPort>; arch::pci::MAX_HOT_PLUG_PORTS] = [None; arch::pci::MAX_HOT_PLUG_PORTS];
+		let count = arch::pci::hot_plug_ports(&mut ports);
+		for port in ports.iter().take(count).flatten() {
+			let Some(line) = arch::pci::slot_interrupt_line(port) else {
+				serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed to no interrupt - its slot is polled only", port.bus, port.dev, port.func);
+				continue;
+			};
+			arch::pci::set_intx_disabled(port.bus, port.dev, port.func, false);
+			arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + line as u32, hot_plug_interrupt);
+			arch::ioapic::route(line as u32, arch::interrupts::IRQ_BASE + line, smp::lapic_id(0));
+			serial_println!("pci: hot-plug port {:02x}:{:02x}.{} raises IRQ {line}", port.bus, port.dev, port.func);
+		}
+	}
+}
+
+// What the bus reported about itself: an error record, and a power-management event.
+//
+// POLLED AND NOT INTERRUPT-DRIVEN, AND THE REASON IS THAT THE BITS ARE STICKY. An AER status bit
+// stays set until somebody writes a one to it, so a record read a second late is the same record - a
+// missed interrupt costs latency and never evidence, which is not true of the slot's presence bits
+// next door. So this pays for itself on the pass the machine was going to take anyway.
+//
+// AND IT COSTS NOTHING ON A MACHINE THAT REPORTS NOTHING. The list of functions that can report an
+// error is fixed at the scan; a machine where none does polls an empty list.
+//
+// EVERY RECORD IS SAID, INCLUDING THE CORRECTABLE ONES. A corrected error is not a failure - the
+// hardware fixed it - but a link that corrects a rising number of them is a link about to stop
+// working, and the record is the only warning anybody gets. A machine that only reported the fatal
+// ones would report nothing until the disk went away.
+#[cfg(not(test))]
+fn settle_pci_faults() {
+	#[cfg(target_arch = "x86_64")]
+	{
+		let quiet = arch::pci::ErrorRecord { bus: 0, dev: 0, func: 0, correctable: 0, uncorrectable: 0, fatal: false };
+		let mut records = [quiet; arch::pci::MAX_ERROR_REPORTERS];
+		let count = arch::pci::poll_errors(&mut records);
+		for record in records.iter().take(count) {
+			if record.correctable != 0 {
+				serial_println!("pci: {:02x}:{:02x}.{} corrected {} ({:#010x})", record.bus, record.dev, record.func, arch::pci::correctable_name(record.correctable), record.correctable);
+			}
+			if record.uncorrectable == 0 {
+				continue;
+			}
+			serial_println!("pci: {:02x}:{:02x}.{} reported {} ({:#010x}){}", record.bus, record.dev, record.func, arch::pci::uncorrectable_name(record.uncorrectable), record.uncorrectable, if record.fatal { " - FATAL" } else { "" });
+			if !record.fatal {
+				continue;
+			}
+			// A FATAL ERROR QUARANTINES THE FUNCTION AND RESETS NOTHING. `device::fault` clears its
+			// bus mastering and tells whoever binds drivers; what it does NOT do is retrain the link
+			// or reset the secondary bus, because both reach every other function behind the port -
+			// so a disk that failed would take a working network card with it.
+			match device::fault(record.bus, record.dev, record.func) {
+				Some(index) => serial_println!("pci: device {index} is quarantined - it no longer masters the bus and nothing will bind it"),
+				None => serial_println!("pci: the function that reported it is not in this kernel's inventory, so there is nothing to quarantine"),
+			}
+		}
+
+		let mut events = [arch::pci::PowerEvent { bus: 0, dev: 0, func: 0, requester: 0 }; arch::pci::MAX_HOT_PLUG_PORTS];
+		let count = arch::pci::poll_power_events(&mut events);
+		for event in events.iter().take(count) {
+			// NOTICED AND NOT ACTED ON, which is this item's own scope: what a wake MEANS belongs to
+			// a power policy, and there is not one. What a port can say is that a function behind it
+			// asked to be woken and which one, and saying it is what makes the policy writable later.
+			serial_println!("pci: {:02x}:{:02x}.{} received a power-management event from {:02x}:{:02x}.{}", event.bus, event.dev, event.func, (event.requester >> 8) as u8, ((event.requester >> 3) & 0x1F) as u8, (event.requester & 0x7) as u8);
+		}
+	}
+}
+
+// A hot-plug port asserted: read every slot and act on what changed.
+//
+// EVERY SLOT AND NOT THE ONE THAT ASSERTED, because a legacy line is SHARED: two root ports on one
+// line are indistinguishable from here, and reading them all is both correct and cheap - there are
+// at most eight, and each is two config reads.
+#[cfg(not(test))]
+#[cfg(target_arch = "x86_64")]
+fn hot_plug_interrupt(_vector: u32) {
+	settle_hot_plug();
+}
+
+// The same work, from the idle hook.
+//
+// A FALLBACK AND NOT A DUPLICATE. A shared legacy line can be missed - two ports asserting together,
+// a level-triggered line one handler already cleared - and a device nobody noticed is the one failure
+// this whole path exists to prevent. The poll costs two config reads per port per idle pass and
+// reports nothing when nothing changed.
+#[cfg(not(test))]
+fn settle_hot_plug() {
+	#[cfg(target_arch = "x86_64")]
+	{
+		let mut changes = [arch::pci::SlotChange { bus: 0, dev: 0, func: 0, secondary: 0, what: arch::pci::SlotEvent::Quiet }; arch::pci::MAX_HOT_PLUG_PORTS];
+		let count = arch::pci::poll_slots(&mut changes);
+		for change in changes.iter().take(count) {
+			// A DEVICE APPEARS BEHIND THE PORT AND NOT AT IT. The port is a bridge; what was plugged in
+			// is function zero of device zero on the bus it forwards to, which is the address the slot's
+			// own secondary bus number names.
+			match change.what {
+				arch::pci::SlotEvent::Arrived => match device::arrive(change.secondary, 0, 0) {
+					Some(index) => serial_println!("pci: a device arrived in the slot behind {:02x}:{:02x}.{} - device {index}", change.bus, change.dev, change.func),
+					None => serial_println!("pci: something arrived in the slot behind {:02x}:{:02x}.{} and this kernel resolved nothing for it", change.bus, change.dev, change.func),
+				},
+				// THE REQUEST IS WHERE THE COORDINATION BEGINS. The device is still there and still
+				// mapped; what this does is take it OFF THE INVENTORY and tell whoever binds drivers,
+				// which is what starts the stop. The slot is powered down later, when nothing holds the
+				// device any more - see `retire_requested_slots`.
+				arch::pci::SlotEvent::RemovalRequested => match device::depart(change.secondary, 0, 0) {
+					Some(index) => {
+						device::request_slot_retirement(index, change.bus, change.dev, change.func);
+						serial_println!("pci: the removal of device {index} was requested at the slot behind {:02x}:{:02x}.{}", change.bus, change.dev, change.func);
+					}
+					None => {
+						// NOTHING IS BOUND TO IT, so there is nothing to coordinate with: the slot may go
+						// down now.
+						arch::pci::set_slot_power(change.bus, change.dev, change.func, false);
+						serial_println!("pci: the slot behind {:02x}:{:02x}.{} was asked to empty and nothing in this kernel's inventory held it", change.bus, change.dev, change.func);
+					}
+				},
+				arch::pci::SlotEvent::Departed => {
+					match device::depart(change.secondary, 0, 0) {
+						Some(index) => serial_println!("pci: device {index} left the slot behind {:02x}:{:02x}.{}", change.bus, change.dev, change.func),
+						None => serial_println!("pci: the slot behind {:02x}:{:02x}.{} is empty", change.bus, change.dev, change.func),
+					}
+					// AND THE SLOT COMES BACK UP, so the next device plugged into it is seen. A slot left
+					// powered down after a removal is a slot that works exactly once.
+					arch::pci::set_slot_power(change.bus, change.dev, change.func, true);
+				}
+				arch::pci::SlotEvent::Quiet => {}
+			}
+		}
+		// AND A REQUESTED REMOVAL IS COMPLETED WHEN NOTHING HOLDS THE DEVICE, which is the answer to the
+		// button and the one thing that must not be said early.
+		for (bus, dev, func) in device::retire_requested_slots() {
+			serial_println!("pci: nothing holds the device behind {bus:02x}:{dev:02x}.{func} any more - powering the slot down");
+			arch::pci::set_slot_power(bus, dev, func, false);
+		}
+	}
 }
 
 // Serial receive interrupt: drain the UART FIFO into the console input the moment

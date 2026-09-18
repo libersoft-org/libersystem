@@ -797,6 +797,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// THE 2D DEMO, which is an interactive foreground job for the same reason `imgview` is: it holds
 	// the terminal while it runs and gives it back on Esc.
 	(b"test2d-sw", Shape::InteractiveArgs),
+	(b"test3d-sw", Shape::InteractiveArgs),
 	(b"imgconv", Shape::Args),
 	(b"audioconv", Shape::Args),
 	(b"write", Shape::Args),

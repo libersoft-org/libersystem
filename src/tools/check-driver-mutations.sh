@@ -238,6 +238,81 @@ mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
 	"	let usable = claimed / 8;" \
 	a_list_longer_than_the_answer_is_clamped_to_what_arrived
 
+# HID: an absolute axis is read in the signedness its descriptor declared. Read signed, an eight-bit
+# axis over 0..255 reports minus sixteen for a touch near the right edge and clamps to the LEFT one -
+# so the right half of the surface reads as the left half, and nothing refuses anything.
+mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
+	"		if self.logical_min >= 0 { field(body, bit, self.size) as i32 } else { signed_field(body, bit, self.size) }" \
+	"		signed_field(body, bit, self.size)" \
+	an_absolute_axis_is_read_in_the_signedness_its_descriptor_declared
+
+# HID: a new contact begins at each contact identifier. Without that, every finger takes the LAST
+# one's position - one pointer that jumps rather than several fingers.
+mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
+	"							if let Some(done) = open.take()
+								&& written < out.len()" \
+	"							if let Some(done) = None::<Contact>
+								&& written < out.len()" \
+	each_contact_identifier_begins_a_contact_and_its_axes_are_its_own
+
+# HID: contact count says how many slots are real. A digitizer leaves the unused ones holding what
+# was there before, so taking every declared slot reports phantom fingers at stale positions.
+mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
+	"			Some(count) => written.min(count)," \
+	"			Some(_) => written," \
+	contact_count_bounds_what_is_reported_so_an_untouched_slot_is_not_a_phantom_finger
+
+# HID: the digitizer page survives the parse. It was one of the pages the filter dropped BEFORE
+# decoding, which is what flattening a tablet into a mouse is here.
+mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
+	"PAGE_CONSUMER | PAGE_DIGITIZER);" \
+	"PAGE_CONSUMER);" \
+	a_digitizer_is_not_flattened_into_a_mouse
+
+# HID: collection depth is counted and bounded. `Collection` is bytes the DEVICE chose, and a
+# descriptor that opens them without closing them nested without bound.
+mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
+	"					if depth > MAX_COLLECTION_DEPTH {" \
+	"					if false {" \
+	a_descriptor_that_never_closes_its_collections_is_bounded_rather_than_nesting_for_ever
+
+# HID: the unit exponent is a signed nibble. Read unsigned, a tablet's position is scaled by ten to
+# the fifteenth instead of divided by ten - and the number is small either way.
+mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
+	"	if nibble > 7 { nibble - 16 } else { nibble }" \
+	"	nibble" \
+	the_unit_exponent_is_a_signed_nibble_and_not_a_byte
+
+# CDC-ACM: the union names the data interface. Binding "the interface after the communications one"
+# takes a bulk pair another function is using on a composite device - and neither half refuses.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"	let (notify_in, notify_packet) = notify.unwrap_or((0, 0));" \
+	"	let (notify_in, notify_packet) = notify.unwrap_or((0, 0));
+	let data_interface = union_data + 1;" \
+	the_union_names_the_data_interface_and_the_next_one_is_not_it
+
+# CDC-ACM: ONE stop bit is encoded as ZERO. Writing the number you mean asks for one and a half,
+# which some devices accept and then frame every byte differently.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"			StopBits::One => 0," \
+	"			StopBits::One => 1," \
+	the_stop_bits_are_an_enumeration_and_the_data_bits_are_a_count
+
+# CDC-ACM: a stop-bits value the structure does not define is refused rather than rounded to the
+# nearest one it does.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"			2 => StopBits::Two,
+			_ => return None," \
+	"			_ => StopBits::Two," \
+	a_line_coding_answer_outside_the_enumeration_is_refused_rather_than_rounded
+
+# CDC-ACM: the line-coding capability is bit ONE of the bitmap. Read as any bit set, a device that
+# publishes only call management is asked for a line coding it stalls.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"		self.capabilities & 0x02 != 0" \
+	"		self.capabilities != 0" \
+	a_device_with_no_acm_descriptor_supports_no_line_coding_and_is_still_a_byte_stream
+
 # SCSI: the MISSED flag is OR'd into the event word, not a value of it. Compared whole, a driver
 # stops recognising events the moment the device says it has already dropped some - which is exactly
 # when its picture of the bus is stale, and reads as a quiet driver on a busy bus.
@@ -279,8 +354,8 @@ mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \
 # choice depend on the device's descriptor order, which is a difference that shows up on one vendor's
 # adapter and on no other.
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
-	"			if best.is_none_or(|(_, have, _, _, _, _)| alt < have) {" \
-	"			if best.is_none() {" \
+	"		&& best.is_none_or(|(_, have, _, _, _, _)| alt < have)" \
+	"		&& best.is_none()" \
 	the_lowest_numbered_setting_that_carries_a_pair_wins_whatever_order_they_appear_in
 
 # CDC: an NCM datagram names an offset and a length INTO THE BLOCK THE DEVICE SENT. Unchecked, the

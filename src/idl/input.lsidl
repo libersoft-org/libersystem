@@ -23,6 +23,27 @@ record key-event {
 	pressed: bool,
 }
 
+/// One contact on a touch surface: which finger the device says it is, whether it is
+/// touching, and where.
+///
+/// NORMALISED AND NOT CELLS, which is the one place this package's events differ in
+/// shape - and the reason is in `pointer-event`'s own note. A console cursor IS a
+/// cell, so a pointer's canonical form is the grid. A finger is not: a cell is
+/// sixteen pixels wide, a touch moves within one, and an interface that can only say
+/// which cell a finger is in cannot express a drag at all. So the axes are the
+/// surface's own span, normalised to `0..=0xffff`, and a consumer that wants cells
+/// divides - which it can, where a consumer handed cells cannot multiply back.
+///
+/// THE IDENTIFIER IS THE DEVICE'S AND IT PERSISTS while the finger is down. It is
+/// what makes a drag a drag rather than two touches at different places, and it is
+/// the field a service that flattened contacts into a cursor would destroy first.
+record contact-event {
+	id:  u8,
+	tip: bool,
+	x:   u16,
+	y:   u16,
+}
+
 /// InputService: typed pointer/button events from the virtio-input pointer device,
 /// mapped to the text-cell grid. `subscribe` hands back a wait-drained event stream of
 /// the recent pointer events (the bounded-snapshot form; a continuously live
@@ -36,6 +57,12 @@ record key-event {
 interface input {
 	@op(1) subscribe:      func() -> stream<pointer-event>;
 	@op(2) subscribe-keys: func(focus: handle<channel>) -> stream<key-event>;
+	/// The live contact stream of a touch surface, granted on the same one-shot focus
+	/// proof `subscribe-keys` takes and for the same reason: a touch is input, and
+	/// input belongs to whoever owns the display. On focus loss the service releases
+	/// every contact still down before closing the stream, so a new foreground
+	/// application cannot inherit a finger.
+	@op(3) subscribe-contacts: func(focus: handle<channel>) -> stream<contact-event>;
 }
 
 /// Privileged launcher boundary that mints a factory restricted to raw-key
