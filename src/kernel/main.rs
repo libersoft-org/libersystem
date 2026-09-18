@@ -214,8 +214,9 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	arch::paging::remove_bootstrap_identity();
 	sched::init();
 	// WHERE EXTENDED CONFIG SPACE IS, BEFORE ANYTHING READS IT. See `init_extended_config`. A test
-	// build has no MCFG of its own to find and its PCI fixtures are fake, so it does not run this.
-	#[cfg(not(test))]
+	// build has no MCFG of its own to find and its PCI fixtures are fake, so it does not run this;
+	// neither do the two ports that reach config space through a device-tree ECAM window already.
+	#[cfg(all(not(test), target_arch = "x86_64"))]
 	init_extended_config(bi);
 	device::init();
 	// THE BOOT'S DMA MODE, FROM THE LOADER'S HAND-OFF, BEFORE POLICY INIT. UEFI admission consumes
@@ -455,6 +456,9 @@ fn boot_main() {
 	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
 	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
 	arch::serial::enable_rx_irq();
+	// ONLY THIS PORT ARMS AN INTERRUPT. The slot protocol is config space and every backend polls it
+	// on the idle pass; what is x86_64's alone is routing a legacy line through an I/O APIC.
+	#[cfg(target_arch = "x86_64")]
 	arm_hot_plug_interrupts();
 	// THREE THOUSAND TICKS - THIRTY SECONDS - AND THE NUMBER IS A MEASUREMENT.
 	//
@@ -1165,9 +1169,8 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 // AND A MACHINE WITH NO MCFG IS NOT A FAILURE. It is a machine whose extended capabilities this
 // kernel cannot read, which is SAID once at boot - a reader that guessed a base would be reading
 // whatever the map holds there and reporting it as an error status.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 fn init_extended_config(bi: &'static BootInfo) {
-	#[cfg(target_arch = "x86_64")]
 	{
 		if bi.rsdp == 0 {
 			serial_println!("pci: no ACPI RSDP, so no MCFG and no extended config space");
@@ -1197,15 +1200,10 @@ fn init_extended_config(bi: &'static BootInfo) {
 		}
 		serial_println!("pci: the MCFG table describes no segment 0, so extended config space is unavailable");
 	}
-	#[cfg(not(target_arch = "x86_64"))]
-	{
-		let _ = bi;
-	}
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 fn arm_hot_plug_interrupts() {
-	#[cfg(target_arch = "x86_64")]
 	{
 		let mut ports: [Option<arch::pci::HotPlugPort>; arch::pci::MAX_HOT_PLUG_PORTS] = [None; arch::pci::MAX_HOT_PLUG_PORTS];
 		let count = arch::pci::hot_plug_ports(&mut ports);
@@ -1236,9 +1234,12 @@ fn arm_hot_plug_interrupts() {
 // hardware fixed it - but a link that corrects a rising number of them is a link about to stop
 // working, and the record is the only warning anybody gets. A machine that only reported the fatal
 // ones would report nothing until the disk went away.
+// AND IT RUNS ON EVERY PORT. Reading an error record is reading config space, which every backend
+// here does - the x86_64 one had to be taught to reach past 0xFF and the other two reach the whole
+// four kilobytes already. A machine whose errors are only noticed on one architecture is a machine
+// whose other two are the ones nobody would ever hear about.
 #[cfg(not(test))]
 fn settle_pci_faults() {
-	#[cfg(target_arch = "x86_64")]
 	{
 		let quiet = arch::pci::ErrorRecord { bus: 0, dev: 0, func: 0, correctable: 0, uncorrectable: 0, fatal: false };
 		let mut records = [quiet; arch::pci::MAX_ERROR_REPORTERS];
@@ -1292,9 +1293,12 @@ fn hot_plug_interrupt(_vector: u32) {
 // a level-triggered line one handler already cleared - and a device nobody noticed is the one failure
 // this whole path exists to prevent. The poll costs two config reads per port per idle pass and
 // reports nothing when nothing changed.
+// AND THE POLL IS WHAT THE OTHER TWO PORTS HAVE. Only the INTERRUPT is x86_64's - it is routed
+// through an I/O APIC, which the other two do not have - and the slot protocol itself is config
+// space and nothing else. So a device plugged into an emulated machine is noticed on the idle pass,
+// which is the same fallback an x86_64 port with no interrupt pin already takes.
 #[cfg(not(test))]
 fn settle_hot_plug() {
-	#[cfg(target_arch = "x86_64")]
 	{
 		let mut changes = [arch::pci::SlotChange { bus: 0, dev: 0, func: 0, secondary: 0, what: arch::pci::SlotEvent::Quiet }; arch::pci::MAX_HOT_PLUG_PORTS];
 		let count = arch::pci::poll_slots(&mut changes);

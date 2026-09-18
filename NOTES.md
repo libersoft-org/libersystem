@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- shutdown doesn't work, it just halts, but not turns off
 - network doesn't work - ping google.com is not responding
 - imgview has a bug - when pressing escape or CTRL+C, it does not exit immediately
 - aarch64 and riscv64 tests and builds take too long - find out what to do with it

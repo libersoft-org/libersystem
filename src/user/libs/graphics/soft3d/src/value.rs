@@ -79,6 +79,76 @@ impl Val {
 	}
 }
 
+/// A value AS THE REGISTER FILE HOLDS IT: its declared type and its words, borrowed in place.
+///
+/// THE TYPE IS THE MODULE'S AND NOT A COPY OF IT, which is the whole of why this exists. Every value
+/// a shader assigns has a type the module already states and which cannot change between runs, so a
+/// runtime carrying one per value copies that type once per instruction per fragment - and a `Val` is
+/// ninety bytes of which sixteen are exactly that. A `Reg` is two pointers and a length.
+#[derive(Clone, Copy)]
+pub struct Reg<'a> {
+	pub kind: &'a Type,
+	pub words: &'a [u32],
+}
+
+impl<'a> Reg<'a> {
+	pub const fn new(kind: &'a Type, words: &'a [u32]) -> Self {
+		Self { kind, words }
+	}
+
+	pub fn scalar_type(&self) -> ScalarType {
+		scalar_type_of(self.kind)
+	}
+
+	pub fn len(&self) -> usize {
+		self.words.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.words.is_empty()
+	}
+
+	pub fn f32_at(&self, index: usize) -> f32 {
+		f32::from_bits(self.words.get(index).copied().unwrap_or(0))
+	}
+
+	pub fn i32_at(&self, index: usize) -> i32 {
+		self.words.get(index).copied().unwrap_or(0) as i32
+	}
+
+	pub fn u32_at(&self, index: usize) -> u32 {
+		self.words.get(index).copied().unwrap_or(0)
+	}
+
+	pub fn bool_at(&self, index: usize) -> bool {
+		self.words.get(index).copied().unwrap_or(0) != 0
+	}
+
+	/// The first four components as `f32`, which is what the vector arithmetic reads.
+	pub fn to_f32(&self) -> [f32; 4] {
+		let mut out = [0.0; 4];
+		for (index, slot) in out.iter_mut().enumerate() {
+			*slot = self.f32_at(index);
+		}
+		out
+	}
+
+	/// An owned value, for the two places that genuinely need one: a stage OUTPUT, which the caller
+	/// keeps after the run, and a resource read that answers one.
+	pub fn to_val(&self) -> Val {
+		Val::new(self.kind.clone(), self.words)
+	}
+}
+
+/// The scalar a type is made of, WITHOUT BUILDING A VALUE to ask. An array answers its element's.
+pub fn scalar_type_of(kind: &Type) -> ScalarType {
+	match kind {
+		Type::Scalar(scalar) | Type::Vector(scalar, _) => *scalar,
+		Type::Matrix(_) => ScalarType::F32,
+		Type::Array(element, _) => scalar_type_of(element),
+	}
+}
+
 impl Val {
 	pub fn scalar_f32(value: f32) -> Self {
 		Self::new(Type::f32(), &[value.to_bits()])

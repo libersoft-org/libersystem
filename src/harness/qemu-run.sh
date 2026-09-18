@@ -782,7 +782,17 @@ qemu_attach_suite_devices() {
 	# the case that made this condition wrong the first time: the full suite passes no tags at all and
 	# runs every oracle, so a gate written as "only when `slow` is asked for" left it without the
 	# devices its own tests assert on.
-	[[ -z "${TEST_TAGS:-}" || ",${TEST_TAGS}," == *,slow,* ]] || return 0
+	#
+	# AND `slow` ALONE WAS STILL THE WRONG QUESTION, found by the first three-target run of the driver
+	# tags (2026-09-18). What this condition is a proxy for is "does this run assert on these
+	# devices", and the proxy has to name the tags those tests actually carry: the NVMe write-and-read
+	# and the vsock echo are `[Drivers, Pci, Slow]`, but `device_table_resources_the_nvme_controller`
+	# is `[Drivers, Pci]` with no `Slow` - so `--tags drivers` SELECTED it and did not bring its
+	# controller, and it failed with "0 found" on a machine that simply had none. It passes on x86_64
+	# under the same tags because that profile attaches NVMe unconditionally, which is exactly the
+	# kind of difference only a run on the other two ports shows.
+	local wanted=",${TEST_TAGS:-},"
+	[[ -z "${TEST_TAGS:-}" || "$wanted" == *,slow,* || "$wanted" == *,drivers,* || "$wanted" == *,pci,* ]] || return 0
 	qemu_attach_nvme "$into"
 	qemu_attach_vsock "$into"
 }

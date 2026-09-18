@@ -115,10 +115,17 @@ stated pass condition**, driven by the machine-readable registries rather than b
 remembered to write. A feature added to either profile with no scene is a FAILURE OF THE SUITE and is
 reported by name, which is what keeps the two in step.
 
-| profile | features | scenes | result |
-| --- | --- | --- | --- |
-| `Render3D Core Profile 1` | 89 | 89 | conforms |
-| `Scene3D Core Profile 1` | 71 | 71 | conforms |
+| profile | features | scenes | x86_64 | aarch64 | riscv64 |
+| --- | ---: | ---: | --- | --- | --- |
+| `Render3D Core Profile 1` | 89 | 89 | conforms | conforms | conforms |
+| `Scene3D Core Profile 1` | 71 | 71 | conforms | conforms | conforms |
+
+**The three columns are the claim and the first one alone is not.** A host suite runs on the machine
+that built the tree, once, with that machine's floating point; what "the profiles are implemented"
+is about is the same rasteriser arithmetic and the same scene-layer ordering running on each target.
+Nothing is compared between the ports either - each run states the same pass conditions and meets
+them on its own numbers, which is what makes agreement mean something rather than being a diff of two
+outputs from one build.
 
 **Nothing here is compared against a golden image.** A frame compared against a stored one fails for
 every reason at once and says nothing about which feature broke; worse, a baseline captured from this
@@ -240,15 +247,16 @@ rather than the floor lowered.
 
 | what | x86_64 | aarch64 | riscv64 |
 | --- | --- | --- | --- |
-| guest demo gate (presents, resize, key, denied capability) | pass | not run | not run |
+| guest demo gate (presents, resize, key, denied capability) | pass | pass | pass |
 | live pixel gate (`qemu-3d-demo`) | pass | not applicable | not applicable |
-| guest conformance run (`test3d-conformance-sw`) | conforms | not run | not run |
+| guest conformance run (`test3d-conformance-sw`) | conforms | conforms | conforms |
 
 THE HOST SUITES ARE NOT IN THAT TABLE, deliberately: they run on the machine that builds the tree and
-say nothing about a target. What would make a three-architecture claim is the GUEST row, and its other
-two cells are empty - the ports have not been run for this part. This table is what it is until they
-are, and "the profiles are implemented on all three architectures" is not a sentence this document
-says while two thirds of that row is blank.
+say nothing about a target. What carries the claim is the GUEST row, and it is full.
 
 The live pixel gate is x86_64 only by design: it drives a guest through the display and reads its
-framebuffer, and the other two ports are emulated at minutes per frame.
+framebuffer, and the other two ports are emulated at minutes per frame. What the emulated ports run
+instead is the governed guest test, which renders the same scene through the same stack into an
+attachment and asserts the same things about the pixels - it just does not go through a screen. The
+two runs took about thirty-four minutes each under TCG against ninety seconds under KVM, which is the
+factor that makes the pixel gate an x86_64 one.

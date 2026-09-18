@@ -107,14 +107,14 @@ nothing left to rasterise.
 
 | stage | cumulative | attributable to |
 | --- | ---: | --- |
-| geometry | 1.4 ms | transform, clip and cull |
-| raster | 145.0 ms | rasterisation, depth test, interpolation and attachment write |
-| shading | 778.7 ms | the lit fragment stage |
-| texturing | 1048.1 ms | two bilinear texture samples per fragment |
-| blending | 1049.0 ms | the blend equation |
+| geometry | 0.9 ms | transform, clip and cull |
+| raster | 144.8 ms | rasterisation, depth test, interpolation and attachment write |
+| shading | 661.1 ms | the lit fragment stage |
+| texturing | 945.3 ms | two bilinear texture samples per fragment |
+| blending | 948.4 ms | the blend equation |
 
-442,474 fragments a frame, 33 primitives clipped, 141 culled: **183 triangles/s and 421,791 shaded
-fragments/s**, which is 0.95 frames a second at this workload.
+442,474 fragments a frame, 33 primitives clipped, 141 culled: **202 triangles/s and 466,566 shaded
+fragments/s**, which is 1.05 frames a second at this workload.
 
 ### Where the fragment cost actually is, measured rather than reasoned about
 
@@ -124,10 +124,10 @@ measurement moves by a few percent for a change that halved it.
 
 | module | statements | per run | per statement |
 | --- | ---: | ---: | ---: |
-| a constant colour | 4 | 137 ns | 34 ns |
-| the lit stage | 36 | 1511 ns | 42 ns |
-| the lit stage with two texture reads | 41 | 1726 ns | 42 ns |
-| 36 composes, which read four operands and compute NOTHING | 36 | 1837 ns | 51 ns |
+| a constant colour | 4 | 139 ns | 35 ns |
+| the lit stage | 36 | 1249 ns | 35 ns |
+| the lit stage with two texture reads | 41 | 1448 ns | 35 ns |
+| 36 composes, which read four operands and compute NOTHING | 36 | 1500 ns | 42 ns |
 
 **The last row is the finding.** Thirty-six instructions that do no arithmetic at all cost MORE per
 instruction than the lit stage's, so essentially none of the time is the arithmetic: it is the value
@@ -157,20 +157,87 @@ multiplies and about two hundred and fifty bytes of memory traffic.
 
 Together: **1521 ms to 1049 ms, a factor of 1.45** on the same frozen scene.
 
+### Three more measured on 2026-09-18, of which two were rejected
+
+THE NOISE FLOOR ON THIS HOST IS ABOUT EIGHT PERCENT at this workload - four consecutive runs of the
+unchanged tree gave 1082, 1089, 1098 and 1182 ms - so a change is only a change when it moves the
+frame further than that, or moves an interpreter row, which is far quieter.
+
+- **The value table is stamped rather than cleared, and it did NOT move the frame.** Running a module
+  used to `clear` the table and `resize(n, None)`, which WRITES every slot: an `Option<Val>` is about
+  ninety bytes, so a forty-value module memset three and a half kilobytes before running a single
+  instruction - once per covered pixel, four hundred thousand times a frame. It is now a run counter
+  and a stamp per slot, so resetting is one increment. **1095 ms against a 1095 ms baseline**: the
+  per-run reset was not where the time was. The change is KEPT because it is strictly less work per
+  fragment and removes an `Option` from the hot path, and it is recorded here because the DISPROOF is
+  what narrows the search: the cost is inside the instruction loop and not around it.
+- **Building a value in one pass instead of two was measured and REJECTED.** `Words::from_slice` wrote
+  its sixteen words twice - once as zeros from `[0; 16]` and once as the value from `copy_from_slice` -
+  and building the array in a single `from_fn` pass should have halved that. It made things WORSE:
+  1173, 1174 and 1198 ms against a 1089 ms baseline, and the compose row went from 51 to 55 ns a
+  statement. A `copy_from_slice` of a few words is a call the compiler turns into a sized move, and
+  `from_fn` over sixteen indices is sixteen bounds-checked reads it did not.
+- **Moving the caller's buffer into the value was measured and REJECTED TOO, and it is the
+  interesting one.** Every arithmetic arm computes into a fixed sixteen-word buffer and then hands it
+  to `from_slice`, which copies it again; taking the array BY VALUE makes that a move. The compose row
+  improved from 53.7 to 43.0 ns a statement - a real 20 percent on the pure-plumbing case, the largest
+  single interpreter improvement measured since the borrow - and the FRAME got slower: 1142 to 1146 ms
+  against 1082 to 1089. The lit and textured rows moved the wrong way too, 43.9 to 45.8 and 43.6 to
+  46.3. Passing sixteen words by value forces a sixty-four-byte copy where a slice of four let the
+  compiler copy four, so it helps exactly the case that fills all sixteen and costs every case that
+  does not. **A change that improves the micro-benchmark and regresses the frame is a change that was
+  measured on the wrong thing.**
+
+### The register file, which is the fourth change and the largest since the borrow
+
+**1095 ms to 959 ms on the frame, and 44 to 35 nanoseconds a statement on the lit stage** - a fifth
+off the module the frame actually runs, and the interpreter rows moved together rather than one of
+them moving: 36 to 35 on a constant colour, 44 to 35 on the lit stage, 44 to 35 with two texture
+reads, 54 to 42 on the pure-plumbing composes.
+
+WHAT IT REPLACED. The value table was `Vec<Option<Val>>`, and a `Val` is a type plus sixteen inline
+words - about ninety bytes, with drop glue on two of its fields. Every instruction MOVED one out of
+the arithmetic, through a `Result`, and into its slot: a four-component add wrote four useful words
+and copied about two hundred bytes around them, once per instruction per COVERED PIXEL. The words are
+a flat arena now, sixteen a slot, and an operation writes the words it computed and nothing else -
+sixteen bytes for that add instead of two hundred.
+
+**AND THE TYPE IS STILL THERE, WHICH IS THE PART WORTH RECORDING.** The obvious form of this change -
+the one the milestone item names - is that a runtime need not carry a type per value at all, because
+`Module::types` already states one. THAT IS NOT TRUE OF THIS IR AS IT STANDS: the declaration is not
+authoritative. `render-shader`'s validator checks it in two specific places - that an indexed value is
+an array, that a condition is a boolean scalar - and nowhere checks that the declared type of a value
+matches what its operation produces. The interpreter has always used what the operation produced, so
+reading the declaration instead would change what a module with a mismatched declaration does, and
+would need a refusal the shader model does not have.
+
+That is the shader model's question and not a performance pass's, so the type is written once per
+assignment into a side table rather than being read from the module - which keeps the semantics
+identical and still removes the ninety-byte move, which was the bulk of it. Making the declaration
+authoritative is a separate change with a separate gate: it would need a type check over every
+assignment, and it would REFUSE modules that run today.
+
 ### What is left, and what it would take
 
-At 42 ns an IR statement the interpreter is about a hundred and twenty-five cycles per instruction,
-and the measurement above says those cycles are spent moving values rather than computing them. Two
-routes remain and neither is a tuning pass:
+At 35 ns an IR statement the interpreter is about a hundred cycles per instruction. The register file
+took the value MOVES out; what is left at that number is the per-instruction dispatch itself - a match
+over the operation, a bounds-and-stamp check per operand, and a component loop that is four iterations
+for a `vec4`. Three routes remain and none is a tuning pass:
 
-- **A register file instead of a value table.** Every value's type is known statically from the
-  module, so the runtime does not need to carry one per value: a flat word arena with a precomputed
-  offset and width per slot would make an assignment a sixteen-byte copy and remove the type clones,
-  the `Option` and the drop glue entirely. This is a rewrite of the interpreter's core, and the
-  measurement above is what says it is the right one.
 - **More than one thread.** The backend is tile-based and single-threaded, and the tiles are
-  independent by construction. The parallelism has to come from outside a `no_std` library that has
-  no threads in it, which makes this an interface question before it is an optimisation.
+  independent by construction. THIS IS THE ONLY ONE WITH THE FLOOR'S FACTOR IN IT: the gap is
+  twenty-nine times and the other two below are worth a fraction each. The parallelism has to come
+  from outside a `no_std` library that has no threads in it, which makes this an interface question
+  before it is an optimisation.
+- **A declared type that is authoritative.** See the section above: making `Module::types` the truth
+  would remove the per-assignment type write, and it needs a type check over every assignment plus a
+  refusal the shader model does not currently have. It is a change to the IR's contract with a
+  measurement attached, not the other way round.
+- **Fewer instructions rather than faster ones.** Nothing in this stack folds constants, removes a
+  dead assignment or fuses a multiply and an add in the IR before it runs. A lit stage is
+  thirty-six statements as written, and a shader compiler's ordinary first pass would make it fewer -
+  which is worth more per unit of work than making each one cheaper, and is a module-level pass that
+  can be checked against the interpreter it feeds.
 
 ## The 3D demo, live, at three sizes (2026-09-18)
 

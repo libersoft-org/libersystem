@@ -14,8 +14,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::common::pci as common;
 
-// The PCI surface every backend re-exports (the HAL contract); not every type is named
-// directly in this backend's code.
+// THE PCI SURFACE EVERY BACKEND RE-EXPORTS (the HAL contract), and not every type is named
+// directly in this backend's code. A TEST build names none of it at all: every shim that does is
+// `not(test)`, because what a kernel test drives is a fake config space and not this machine's.
+#[cfg_attr(test, allow(unused_imports))]
 pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
@@ -148,6 +150,10 @@ pub fn set_slot_power(bus: u8, dev: u8, func: u8, on: bool) {
 
 // Every hot-plug port this machine has - see `arch::common::pci::hot_plug_ports`.
 #[cfg(not(test))]
+// THE HAL CONTRACT IS THE SAME SURFACE ON EVERY BACKEND, and this half of it has no caller here:
+// arming a slot's interrupt routes a legacy line through an I/O APIC, which this port does not have.
+// The slot itself is polled on the idle pass like every other one.
+#[allow(dead_code)]
 pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
 	common::hot_plug_ports(out)
 }
@@ -160,6 +166,10 @@ pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) ->
 
 // The legacy interrupt line a hot-plug port asserts on, or `None` where it has none.
 #[cfg(not(test))]
+// THE HAL CONTRACT IS THE SAME SURFACE ON EVERY BACKEND, and this half of it has no caller here:
+// arming a slot's interrupt routes a legacy line through an I/O APIC, which this port does not have.
+// The slot itself is polled on the idle pass like every other one.
+#[allow(dead_code)]
 pub fn slot_interrupt_line(port: &common::HotPlugPort) -> Option<u8> {
 	common::slot_interrupt_line::<Access>(port)
 }
