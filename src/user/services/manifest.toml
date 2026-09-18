@@ -2134,7 +2134,20 @@ lifecycle = "controller"
 dma = "trusted-untranslated"
 # A virtio device is bound by its TYPE and not by a class triple: the transport is the identity.
 match = [{ transport = "virtio-pci", virtio-type = 8 }]
-provides = [{ kind = "block", most = 1, consumers = 4 }]
+# ONE BLOCK PROVIDER PER LOGICAL UNIT, WHICH IS WHY `most` IS NOT ONE.
+#
+# This is a SCSI host controller: one target may carry several logical units, and each is its own
+# medium with its own capacity. The driver enumerates them with `REPORT LUNS` and publishes one
+# provider per unit, under the unit's own name, so a consumer asking for a disk cannot be handed
+# whichever answered first.
+#
+# AND TWO RATHER THAN FOUR, BECAUSE `most` TIMES `consumers` IS A REAL BOUND. A driver serves at most
+# eight provider connections at once - that is the size of its serving set - and the manifest check
+# is what says so before a boot finds out. Each unit keeps the four consumers every other disk in
+# this tree declares, because a medium is probed by each StorageService instance that has to classify
+# it; taking that down to two to buy a third unit would trade a disk nobody can identify for a disk
+# nobody has. The driver's own `MAX_UNITS` is this same number and has to be.
+provides = [{ kind = "block", most = 2, consumers = 4 }]
 heartbeat-deadline = 100
 
 # THE HOST STREAM TRANSPORT, and the entry's `provides` line is the item's own requirement: it

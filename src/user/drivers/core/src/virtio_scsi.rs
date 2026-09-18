@@ -28,9 +28,14 @@ const QUEUE_EVENT: u16 = 1;
 const QUEUE_REQUEST: u16 = 2;
 
 // The most logical units this driver serves. Each one is a published block provider, a name to tell
-// it from the others and a slot in the serving set, and the handshake carries eight offers - so this
-// is what a BOUNDED driver takes of a bus that may report far more.
-const MAX_UNITS: usize = 4;
+// it from the others and a slot in the serving set.
+//
+// THIS NUMBER IS THE MANIFEST'S, AND THE TWO CANNOT DRIFT. The registry entry declares `most` block
+// providers with `consumers` connections each, a driver serves at most eight provider connections at
+// once, and the manager REFUSES the offer past `most` - which takes the driver down mid-bring-up,
+// as a boot that never reached its shell. Four units at the four consumers a disk needs is sixteen
+// connections and the manifest check refuses it; two units is what fits, and the entry says so.
+const MAX_UNITS: usize = 2;
 
 // The most targets walked, whatever the device says it has. `max_target` is the DEVICE'S number and
 // is 255 on the model this tree runs against: a driver that walked all of them would spend its whole
