@@ -1863,3 +1863,27 @@ fn an_unconfirmed_removal_is_quarantined_because_nobody_knows_what_is_owed() {
 	assert!(BindingState::Stopping.may_move_to(BindingState::Quarantined), "which is where an unconfirmed teardown lands, whatever the intent was");
 	assert_eq!(StopIntent::DeviceRemoved.name(), b"the device was removed from the bus".as_slice());
 }
+
+#[test]
+fn a_device_that_reported_a_fatal_error_is_quarantined_even_when_the_teardown_is_confirmed() {
+	// THE ONE INTENT WHOSE CONFIRMED TEARDOWN STILL LANDS AT `Quarantined`, and that is what makes it
+	// a separate intent rather than a spelling of `Fault`. A confirmation says the DRIVER released its
+	// resources; it says nothing about the DEVICE, and the device is the thing that stopped being
+	// described by anything - a function that reported a malformed TLP may have completed a
+	// transaction wrongly, or be about to.
+	assert!(matches!(StopIntent::DeviceFaulted.confirmed_lands_at(true), Some(BindingState::Quarantined)));
+	assert!(matches!(StopIntent::DeviceFaulted.confirmed_lands_at(false), Some(BindingState::Quarantined)), "the attempt budget does not decide this one either");
+
+	// AND IT IS NEITHER OF THE TWO IT COULD BE MISTAKEN FOR. `Failed` would let a retry bind the same
+	// broken function; `Removed` would say the device is gone, and it is still in the machine.
+	assert!(!matches!(StopIntent::DeviceFaulted.confirmed_lands_at(true), Some(BindingState::Failed)));
+	assert!(!matches!(StopIntent::DeviceFaulted.confirmed_lands_at(true), Some(BindingState::Removed)));
+	assert!(!matches!(StopIntent::Fault.confirmed_lands_at(true), Some(BindingState::Quarantined)), "an ordinary fault is not a quarantine");
+
+	// AND IT IS REACHED THROUGH `Stopping` LIKE EVERY OTHER TEARDOWN, because the driver still holds
+	// resources somebody has to release: the device being untrustworthy does not make its mappings
+	// disappear.
+	assert!(BindingState::Stopping.may_move_to(BindingState::Quarantined));
+	assert!(!BindingState::Online.may_move_to(BindingState::Quarantined), "a live driver is stopped first");
+	assert_eq!(StopIntent::DeviceFaulted.name(), b"the device reported a fatal error".as_slice());
+}
