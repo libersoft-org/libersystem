@@ -1742,3 +1742,73 @@ the second is inside the foreign substrate, which this session touched in no fil
 RECORDED RATHER THAN CHASED, for the same reason the earlier round gave: nothing under `src/` that
 this work changed is in that path, and a gate belonging to another milestone is that milestone's to
 close. What changed here is only that its stated precondition no longer hides the real failure.
+
+## UAS tagged concurrency and task management (2026-09-19)
+
+The item's two remaining open points were one piece of work, and its note said what was missing in
+one sentence: per-stream rings and a completion routed by stream. Both are in.
+
+THE TRANSPORT: `Streams` holds a ring per driven stream instead of one ring at stream 1 - two
+command tags and one task-management tag - with a data page and a control-page region per tag, and
+a bind that REFUSES a device advertising fewer entries than this driver drives rather than clamping.
+
+THE ROUTING: an xHCI Transfer Event carries no stream id, so the stream is read out of the TRB
+pointer - each ring is its own page, so the page the completed TRB lives in says which tag answered.
+
+THE SERVING: a block request is posted and left outstanding, and the loop that drains events answers
+the consumer that asked. Concurrency is ACROSS consumers because `driver_protocol::block` carries no
+correlation id, so replies on one channel must stay in order.
+
+TWO THINGS THE MACHINE TAUGHT AND REASONING DID NOT:
+- NOTHING IN THIS DRIVER IS WOKEN BY A COMPLETION. It has always polled the event ring. The first
+  asynchronous version posted two commands and slept holding both. Completions are reaped by
+  polling now, on a synchronous request's budget, servicing HID and network events on the way past.
+- FILLING MUST PRECEDE REAPING. With events drained before the next consumer was served, each
+  command finished before the next was posted: the suite passed and proved nothing. The serve arm
+  now takes every already-ready UAS consumer while a tag is free, then reaps.
+
+EVIDENCE: `2 UAS commands outstanding at once, each on its own tag` and `task management answered`,
+both printed by the driver on a live QEMU device, and both absent from the arrangements that do not
+do it. Two mutations, each killing the guest at 100 tests: every request on tag zero, and the
+management answer posted on the command stream.
+
+STILL OPEN: the three-target acceptance, which has to be measured AGAIN - the run of 2026-09-18 was
+against a one-tag transport that no longer exists.
+
+## HDA's second codec, and the defect one codec was hiding (2026-09-19)
+
+The harness had never attached two codecs, and with one on the link "take the first that answers"
+and "walk the codecs until one has a route" are the same code - so the open point could not be
+closed by reading the driver. `hda-micro` now sits beside `hda-duplex`.
+
+THE DRIVER TRIES EACH CODEC IN TURN, because a codec that answers its identity and then has no
+audio group, no output converter or no pin that can drive one is not a bring-up failure while
+another on the same link is fine. The refusal reported when none works is the LAST one's.
+
+AND THE DEFECT: `rirb_read` WAS RESET WHEN SWITCHING CODECS. The response ring is ONE ring shared by
+every codec, and that field is where the driver has read up to in it, compared against the
+controller's write pointer. Resetting it makes the driver re-read entries it has consumed and take
+an old answer for a new one. It was harmless for exactly as long as one codec was probed and the
+loop broke out of it. THE FIRST TWO-CODEC BOOT FAILED with `no pin complex reaches an audio output
+converter` - a widget walk reading stale answers - and that run is the mutation.
+
+EVIDENCE: `driver.hda: online (codec 0 of 2, converter 2)` on all three targets.
+
+## Two open points answered with a measurement instead of a guess (2026-09-19)
+
+SDHCI's UHS modes and eMMC commands, and HDA's unsolicited responses, were listed as work and none
+had been checked against the machine.
+
+- UHS: the driver now reads `CAPABILITIES_1` bits 0-2 and reports `no uhs offered`. A controller
+  with no faster mode and a driver that never asks for one look identical from outside; the line is
+  what tells them apart, on this machine and on any later one that does offer it.
+- eMMC: `-device help` lists `sd-card` and `sd-card-spi` and no eMMC part.
+- HDA unsolicited responses: `-device hda-duplex,help` offers `audiodev`, `cad`, `debug`, `mixer`
+  and `use-timer`. No jack presence and no runtime control of one, so the event cannot occur.
+- USB Audio capture: `-device usb-audio,help` offers an output backend and more output channels.
+
+## The ports, re-measured because the drivers changed (2026-09-19)
+
+`drivers,pci,slow,usb`: aarch64 100 tests in 1513 s, riscv64 102 in 1822 s. Both print what x86_64
+prints - `2 UAS commands outstanding at once, each on its own tag`, `task management answered`,
+`codec 0 of 2`, `no uhs offered`. UAS and HDA closed on it; 34 items done, 30 open.

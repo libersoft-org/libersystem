@@ -1296,6 +1296,21 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	assert!(has(b"network"), "and the CDC Ethernet adapter, whose role is its own and not `device`");
 	assert!(has(b"uas"), "and the UAS target, which is a second storage device over a different transport");
 
+	// AN ANSWER THAT DOES NOT COME BACK INSIDE THE SAME CALL. This transport leaves a request
+	// OUTSTANDING under its tag and the driver's own loop answers it when the completion arrives, so
+	// a reply is waited for rather than read. Bounded, and a bound that runs out still fails the
+	// test - what would be a weakening is dropping the assertion, not giving the device a chance to
+	// answer it.
+	fn await_reply(channel: &alloc::sync::Arc<Channel>, what: &str) -> Message {
+		for _ in 0..256 {
+			sched::run_until_idle();
+			if channel.peek_len().is_ok() {
+				break;
+			}
+		}
+		channel.recv().unwrap_or_else(|_| panic!("{what}"))
+	}
+
 	// THE UAS TARGET, WHICH IS THE SECOND BLOCK PROVIDER AND NOT THE STICK'S.
 	//
 	// The controller publishes two of one kind - a Bulk-Only stick and a UAS disk are two devices
@@ -1306,8 +1321,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let uas = nth_offer_of(&offers, driver_protocol::provider::BLOCK, 1).expect("the driver offers the UAS target's block service as a second provider of that kind").into_any_arc().downcast::<Channel>().expect("the UAS block channel is a channel");
 	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
 	uas.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the UAS capacity request should send");
-	sched::run_until_idle();
-	let cap_reply = uas.recv().expect("the UAS capacity reply should arrive");
+	let cap_reply = await_reply(&uas, "the UAS capacity reply should arrive");
 	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the UAS capacity query should succeed and carry a size");
 	assert_eq!(reported.bytes, 4 * 1024 * 1024, "the UAS target should report the medium the harness attached");
 
@@ -1322,19 +1336,53 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	}
 	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: UAS_LBA, count: 1 }.encode();
 	uas.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(uas_source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the UAS write should send");
-	sched::run_until_idle();
-	let write_reply = uas.recv().expect("the UAS write reply should arrive");
+	let write_reply = await_reply(&uas, "the UAS write reply should arrive");
 	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the write over the UAS pipes should succeed");
 
 	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: UAS_LBA, count: 1 }.encode();
 	uas.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the UAS read should send");
-	sched::run_until_idle();
-	let read_reply = uas.recv().expect("the UAS read reply should arrive");
+	let read_reply = await_reply(&uas, "the UAS read reply should arrive");
 	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the read over the UAS pipes should succeed");
 	let uas_buf = read_reply.caps.first().expect("the UAS read should grant a buffer");
 	let uas_object = uas_buf.object();
 	let uas_memory = uas_object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
 	assert_eq!(read_from_object(uas_memory, UAS_SECTOR), uas_pattern, "what the UAS target read back should be the bytes that were written to it");
+
+	// AND TWO REQUESTS IN FLIGHT AT ONCE, WHICH IS WHAT THE TAGS ARE FOR.
+	//
+	// A SECOND CONSUMER AND NOT A SECOND REQUEST ON THIS ONE, because `driver_protocol::block`
+	// carries no correlation id: two replies on ONE channel must arrive in the order the requests
+	// were made, and a tagged transport answers in whatever order the device finishes. So the
+	// concurrency this transport offers is ACROSS consumers, each with one outstanding request, and
+	// that is exactly what this mints - the same way DeviceManager mints one.
+	//
+	// BOTH REQUESTS GO OUT BEFORE EITHER REPLY IS READ. Sending one and waiting for it would pass
+	// against a driver that never had two tags outstanding in its life, which is the claim under
+	// test rather than something to assume.
+	let uas_token = offers.iter().filter(|(k, _, _)| *k == driver_protocol::provider::BLOCK).map(|(_, token, _)| *token).nth(1).expect("the UAS target's block publication has a token of its own");
+	let (second, second_driver_end) = Channel::create();
+	send_connect(&kernel_ep, key.generation, uas_token, second_driver_end).expect("a second consumer of the UAS target should connect");
+	sched::run_until_idle();
+
+	let first_read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: UAS_LBA, count: 1 }.encode();
+	let other_read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: UAS_LBA, count: 1 }.encode();
+	uas.send(Message::new(first_read.to_vec(), alloc::vec::Vec::new())).expect("the first concurrent read should send");
+	second.send(Message::new(other_read.to_vec(), alloc::vec::Vec::new())).expect("the second concurrent read should send");
+
+	let first_reply = await_reply(&uas, "the first consumer's concurrent read should be answered");
+	let second_reply = await_reply(&second, "the second consumer's concurrent read should be answered");
+	assert_eq!(driver_protocol::block::decode_status(&first_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the first consumer's read should succeed while another was outstanding");
+	assert_eq!(driver_protocol::block::decode_status(&second_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the second consumer's read should succeed while another was outstanding");
+
+	// EACH CONSUMER'S BUFFER IS ITS OWN, which is the half a shared data page would break: two
+	// commands in flight over one page is the second overwriting what the first is still moving,
+	// and both consumers would read the same bytes without either request having failed.
+	for (reply, who) in [(&first_reply, "the first consumer"), (&second_reply, "the second consumer")] {
+		let buffer = reply.caps.first().unwrap_or_else(|| panic!("{who}'s concurrent read should grant a buffer"));
+		let object = buffer.object();
+		let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().unwrap_or_else(|| panic!("{who}'s granted capability should be a buffer"));
+		assert_eq!(read_from_object(memory, UAS_SECTOR), uas_pattern, "{who} should read back the sector that was written, from a buffer of its own");
+	}
 
 	// The stick's block provider: read sector 0 over it, the same [op u32][lba u64][count u32]
 	// contract driver.virtio-blk serves, and expect a success status plus a 512-byte shared buffer.

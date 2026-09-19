@@ -171,6 +171,9 @@ struct Controller {
 	// The whole bring-up shares one deadline, so a chain of waits cannot add up past it.
 	deadline: Deadline,
 	codec: u8,
+	/// How many codecs answered their identity verb on this link. Reported because "one codec
+	/// answered" and "this driver looks at one codec" are different facts and the log said neither.
+	codecs: u8,
 	converter: u8,
 	stream: u64,
 	// The audio buffer, grown to twice the largest period seen.
@@ -190,7 +193,72 @@ struct Controller {
 	capture_half: u64,
 }
 
+/// What a bring-up found on one codec: the audio function group and the widgets the driver drives.
+struct Route {
+	group: u8,
+	converter: u8,
+	pin: u8,
+	adc: Option<u8>,
+	input_pin: Option<u8>,
+}
+
 impl Controller {
+	// The audio function group on THIS codec, and the output and capture routes inside it.
+	//
+	// EVERY REFUSAL IS THIS CODEC'S AND NOT THE LINK'S, which is what lets the caller try the next
+	// one: a codec with no audio group is a codec that does something else, and a codec with no pin
+	// that can drive a converter is one whose outputs are not wired here.
+	unsafe fn route(&mut self) -> Result<Route, Bringup> {
+		unsafe {
+			let (first_group, groups) = decisions::node_range(self.parameter(0, hda::PARAM_NODE_COUNT).ok_or(Bringup::Unanswered { node: 0, command: hda::PARAM_NODE_COUNT })?);
+			if groups > hda::MAX_NODES {
+				return Err(Bringup::TooManyNodes);
+			}
+			let mut audio_group: Option<u8> = None;
+			for offset in 0..groups {
+				let node = first_group + offset;
+				let kind = self.parameter(node, hda::PARAM_FUNCTION_TYPE).unwrap_or(0);
+				if kind & 0x7F == hda::FUNCTION_AUDIO {
+					audio_group = Some(node);
+					break;
+				}
+			}
+			let group = audio_group.ok_or(Bringup::NoAudioGroup)?;
+
+			let (first_widget, widgets) = decisions::node_range(self.parameter(group, hda::PARAM_NODE_COUNT).ok_or(Bringup::NoAudioGroup)?);
+			if widgets > hda::MAX_NODES {
+				return Err(Bringup::TooManyNodes);
+			}
+			// THE FIRST OUTPUT CONVERTER AND THE FIRST PIN THAT CAN DRIVE ONE, which is the bounded
+			// deterministic route the item asks for rather than a policy about jacks.
+			let mut converter: Option<u8> = None;
+			let mut pin: Option<u8> = None;
+			// AND THE SAME WALK FINDS THE CAPTURE ROUTE, which is the same shape with every question
+			// reversed: an audio INPUT converter and a pin that can be driven INTO. It is optional -
+			// a codec with no input is a machine with no microphone, not a bring-up failure.
+			let mut adc: Option<u8> = None;
+			let mut input_pin: Option<u8> = None;
+			for offset in 0..widgets {
+				let node = first_widget + offset;
+				let caps = self.parameter(node, hda::PARAM_WIDGET_CAPS).unwrap_or(0);
+				match decisions::widget_kind(caps) {
+					Widget::AudioOutput if converter.is_none() => converter = Some(node),
+					Widget::AudioInput if adc.is_none() => adc = Some(node),
+					Widget::PinComplex => {
+						let pin_caps = self.parameter(node, hda::PARAM_PIN_CAPS).unwrap_or(0);
+						if pin.is_none() && decisions::pin_can_output(pin_caps) {
+							pin = Some(node);
+						} else if input_pin.is_none() && decisions::pin_can_input(pin_caps) {
+							input_pin = Some(node);
+						}
+					}
+					_ => {}
+				}
+			}
+			Ok(Route { group, converter: converter.ok_or(Bringup::NoRoute)?, pin: pin.ok_or(Bringup::NoRoute)?, adc, input_pin })
+		}
+	}
+
 	// Send one verb and wait for its answer.
 	//
 	// THE RESPONSE RING'S WRITE POINTER IS THE LAST ENTRY WRITTEN, not the next slot, which is the
@@ -300,6 +368,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		report.push(&[b'0' + (bind.info.func % 10)]);
 		report.push(b", codec ");
 		report.decimal(controller.codec as u64);
+		// HOW MANY ANSWERED, BESIDE WHICH ONE IS DRIVEN. "codec 0" alone cannot distinguish a link
+		// with one codec from a link with three whose first one happened to work, and those are
+		// different machines to anybody reading the log after a device goes quiet.
+		if controller.codecs > 1 {
+			report.push(b" of ");
+			report.decimal(controller.codecs as u64);
+		}
 		report.push(b", converter ");
 		report.decimal(controller.converter as u64);
 		report.push(b")");
@@ -402,17 +477,28 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		let capture_stream = if inputs > 0 { base + hda::REG_STREAM_BASE } else { 0 };
 
 		let statests = r16(base + hda::REG_STATESTS);
-		let mut controller = Controller { base, device, corb_virt, rirb_virt, bdl_virt, bdl_phys, rirb_read: 0, deadline, codec: 0, converter: 0, stream, audio: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, period: 0, running: false, capture_stream, capture_bdl_virt, capture_bdl_phys, adc: None, capture: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, capturing: false, capture_half: 0 };
+		let mut controller = Controller { base, device, corb_virt, rirb_virt, bdl_virt, bdl_phys, rirb_read: 0, deadline, codec: 0, codecs: 0, converter: 0, stream, audio: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, period: 0, running: false, capture_stream, capture_bdl_virt, capture_bdl_phys, adc: None, capture: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, capturing: false, capture_half: 0 };
 
-		// The first codec that answers its identity verb with something that is not the absence.
-		let mut found = false;
+		// EVERY CODEC THAT ANSWERS, COUNTED FIRST. A link can carry several, and with one attached
+		// "take the first that answers" and "walk them until one has a route" are the same code -
+		// which is why this driver did the first and called it the second for as long as the harness
+		// presented one codec.
+		let mut answered: [u8; hda::MAX_CODECS] = [0; hda::MAX_CODECS];
+		let mut codecs: usize = 0;
 		for address in decisions::codecs_present(statests) {
+			// THE RIRB READ POINTER IS NOT RESET HERE, AND RESETTING IT WAS A LATENT DEFECT. The
+			// response ring is ONE ring shared by every codec on the link, and this pointer is where
+			// the driver has read up to in it - compared against the controller's write pointer. Putting
+			// it back to zero when switching codecs makes the driver re-read entries it has already
+			// consumed and take an old answer for a new one. It was harmless for exactly as long as one
+			// codec was probed and the loop broke out of it.
 			controller.codec = address;
-			controller.rirb_read = 0;
 			match controller.parameter(0, hda::PARAM_VENDOR_ID) {
 				Some(vendor) if decisions::codec_answered(vendor) => {
-					found = true;
-					break;
+					if codecs < answered.len() {
+						answered[codecs] = address;
+						codecs += 1;
+					}
 				}
 				// The codec is there and answered with the absence: try the next address.
 				Some(_) => continue,
@@ -421,61 +507,37 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 				None => return Err(Bringup::Unanswered { node: 0, command: hda::PARAM_VENDOR_ID }),
 			}
 		}
-		if !found {
+		if codecs == 0 {
 			// STATESTS IS THE HALF THAT DISTINGUISHES TWO DIFFERENT PROBLEMS. Zero means no codec
 			// announced itself on the link at all, which is a settle or a link question; non-zero
 			// means one did and then answered its identity with the absence, which is a verb
 			// question. The sentence is the same either way and the number is not.
 			return Err(Bringup::NoCodec { statests });
 		}
+		controller.codecs = codecs as u8;
 
-		// The audio function group, then the route inside it.
-		let (first_group, groups) = decisions::node_range(controller.parameter(0, hda::PARAM_NODE_COUNT).ok_or(Bringup::Unanswered { node: 0, command: hda::PARAM_NODE_COUNT })?);
-		if groups > hda::MAX_NODES {
-			return Err(Bringup::TooManyNodes);
-		}
-		let mut audio_group: Option<u8> = None;
-		for offset in 0..groups {
-			let node = first_group + offset;
-			let kind = controller.parameter(node, hda::PARAM_FUNCTION_TYPE).unwrap_or(0);
-			if kind & 0x7F == hda::FUNCTION_AUDIO {
-				audio_group = Some(node);
-				break;
-			}
-		}
-		let group = audio_group.ok_or(Bringup::NoAudioGroup)?;
-
-		let (first_widget, widgets) = decisions::node_range(controller.parameter(group, hda::PARAM_NODE_COUNT).ok_or(Bringup::NoAudioGroup)?);
-		if widgets > hda::MAX_NODES {
-			return Err(Bringup::TooManyNodes);
-		}
-		// THE FIRST OUTPUT CONVERTER AND THE FIRST PIN THAT CAN DRIVE ONE, which is the bounded
-		// deterministic route the item asks for rather than a policy about jacks.
-		let mut converter: Option<u8> = None;
-		let mut pin: Option<u8> = None;
-		// AND THE SAME WALK FINDS THE CAPTURE ROUTE, which is the same shape with every question
-		// reversed: an audio INPUT converter and a pin that can be driven INTO. It is optional -
-		// a codec with no input is a machine with no microphone, not a bring-up failure.
-		let mut adc: Option<u8> = None;
-		let mut input_pin: Option<u8> = None;
-		for offset in 0..widgets {
-			let node = first_widget + offset;
-			let caps = controller.parameter(node, hda::PARAM_WIDGET_CAPS).unwrap_or(0);
-			match decisions::widget_kind(caps) {
-				Widget::AudioOutput if converter.is_none() => converter = Some(node),
-				Widget::AudioInput if adc.is_none() => adc = Some(node),
-				Widget::PinComplex => {
-					let pin_caps = controller.parameter(node, hda::PARAM_PIN_CAPS).unwrap_or(0);
-					if pin.is_none() && decisions::pin_can_output(pin_caps) {
-						pin = Some(node);
-					} else if input_pin.is_none() && decisions::pin_can_input(pin_caps) {
-						input_pin = Some(node);
-					}
+		// AND THE ROUTE IS LOOKED FOR ON EACH OF THEM IN TURN. A codec that answers its identity and
+		// then has no audio group, or no converter, or no pin that can drive one, is not a bring-up
+		// failure while another codec on the same link is fine - it is the first of several, and
+		// stopping there is how a machine with a modem codec at address zero ends up with no sound.
+		let mut chosen: Option<(u8, Route)> = None;
+		let mut refusal = Bringup::NoRoute;
+		for &address in answered.iter().take(codecs) {
+			controller.codec = address;
+			match controller.route() {
+				Ok(route) => {
+					chosen = Some((address, route));
+					break;
 				}
-				_ => {}
+				// REMEMBERED AND NOT RETURNED. The last codec's reason is the one worth reporting
+				// when none of them worked, and returning the first would name a codec the driver
+				// went on to look past.
+				Err(why) => refusal = why,
 			}
 		}
-		let (converter, pin) = (converter.ok_or(Bringup::NoRoute)?, pin.ok_or(Bringup::NoRoute)?);
+		let Some((address, route)) = chosen else { return Err(refusal) };
+		controller.codec = address;
+		let Route { group, converter, pin, adc, input_pin } = route;
 		controller.converter = converter;
 
 		// Power both up, unmute the pin and its amplifier, and point the pin at the converter's

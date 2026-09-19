@@ -133,6 +133,10 @@ struct Controller {
 	// sector of the medium for every request, successfully, for ever.
 	high_capacity: bool,
 	read_only: bool,
+	/// Whether the host controller advertises any UHS-I mode. This driver runs at default speed, and
+	/// without this a reader cannot tell a controller that offers no faster mode from a driver that
+	/// never asks for one.
+	uhs: bool,
 }
 
 impl Controller {
@@ -429,6 +433,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		} else {
 			report.push(b", pio one block");
 		}
+		// AND WHETHER A FASTER MODE WAS EVEN ON OFFER. Saying "no UHS" costs one word and answers the
+		// question the item's open point asks: this driver runs the card at default speed, and on a
+		// controller advertising none of SDR50, SDR104 or DDR50 there is no faster mode to negotiate.
+		if !controller.uhs {
+			report.push(b", no uhs offered");
+		}
 		if controller.read_only {
 			report.push(b", read-only)");
 		} else {
@@ -514,7 +524,9 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		} else {
 			None
 		};
-		let controller = Controller { base, device, card: sdhci::Card { blocks: 0, block_bytes: BLOCK_BYTES }, adma, high_capacity: false, read_only: false };
+		// READ ONCE AT BRING-UP, beside the capabilities this driver already acts on.
+		let uhs = sdhci::uhs_offered(r32(base + sdhci::REG_CAPABILITIES_1));
+		let controller = Controller { base, device, card: sdhci::Card { blocks: 0, block_bytes: BLOCK_BYTES }, adma, high_capacity: false, read_only: false, uhs };
 
 		// The identification sequence.
 		controller.command(sdhci::CMD_GO_IDLE, Response::None, 0, false, sdhci::INT_COMMAND_COMPLETE).map_err(|_| Bringup::NoAnswer)?;
@@ -555,7 +567,7 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		}
 
 		let present = r32(base + sdhci::REG_PRESENT_STATE);
-		Ok(Controller { base, device, card, adma: controller.adma, high_capacity: ocr.high_capacity, read_only: sdhci::write_protected(present) })
+		Ok(Controller { base, device, card, adma: controller.adma, high_capacity: ocr.high_capacity, read_only: sdhci::write_protected(present), uhs: controller.uhs })
 	}
 }
 

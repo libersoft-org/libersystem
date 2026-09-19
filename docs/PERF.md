@@ -1569,6 +1569,22 @@ And the frozen four, two consecutive runs:
 | vector-stress | 7.57 / 7.08 ms | 67.02 / 66.55 ms | 66.7 ms | on the line |
 | image-stress | 48.99 / 49.60 ms | 189.51 / 189.70 ms | 16.7 ms | over 11.4x, was 19.7x |
 
+**AND vector-stress CROSSED THE LINE (2026-09-19).** The linear gradient's row decided
+`length_squared <= 0.0` once per PIXEL about a value that does not vary at all; it is decided once
+per row now, and the pixels are identical - the same `ramp.at(1.0)` the arm already produced.
+Measured both ways, three runs each, because a third of a millisecond on a scene sitting on its
+budget is exactly the size of claim that needs it:
+
+| form | runs | median | ceiling | verdict |
+| --- | ---: | ---: | ---: | --- |
+| the test inside the loop | 66.835 / 66.473 / 66.606 | 66.606 ms | 66.7 ms | one of three over |
+| the test hoisted out | 66.157 / 66.320 / 66.250 | 66.250 ms | 66.7 ms | three of three met |
+
+The margin is under one percent and the p99 still crosses, so this is a scene that clears its budget
+rather than one comfortably inside it. The other three are unmoved: `UI-basic` 12.2 met,
+`UI-effects` 156.4 against 66.7, `image-stress` 194.5 against 16.7. The floor asks for four and has
+two.
+
 **WHICH IMAGES PAY FOR IT IS A DECISION AND IT IS TWO PREDICATES.** `wants_pyramid` is unchanged and
 decides which images NEED a chain - only a `Mipmapped` draw cannot be served without one.
 `wants_decoded` decides which merely go FASTER with a decoded source: the ones the list samples

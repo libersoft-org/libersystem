@@ -31,6 +31,8 @@ pub const REG_SIGNAL_ENABLE: u64 = 0x38;
 pub const REG_ADMA_ERROR: u64 = 0x54; // 8-bit
 pub const REG_ADMA_ADDRESS: u64 = 0x58; // 64-bit
 pub const REG_CAPABILITIES: u64 = 0x40;
+/// The second capabilities word, which is where the UHS-I modes live.
+pub const REG_CAPABILITIES_1: u64 = 0x44;
 
 // `TRANSFER_MODE` bits.
 pub const TRANSFER_DMA_ENABLE: u16 = 1 << 0;
@@ -49,6 +51,22 @@ pub const HOST_CONTROL_DMA_ADMA2: u8 = 0b10 << 3;
 // `CAPABILITIES` bit 19: the controller supports ADMA2. A driver that programmed the descriptor
 // table on one that does not gets a command that never completes.
 pub const CAPABILITY_ADMA2: u32 = 1 << 19;
+
+/// The UHS-I modes a host controller advertises, in `CAPABILITIES_1` bits 0, 1 and 2: SDR50, SDR104
+/// and DDR50.
+///
+/// READ AND REPORTED RATHER THAN ASSUMED ABSENT. This driver runs the card at default speed, and
+/// whether that is a limitation of the driver or of the machine is a question the log could not
+/// answer: a controller that offers no UHS mode and a driver that never asks for one look identical
+/// from outside. The number says which.
+pub const UHS_SDR50: u32 = 1 << 0;
+pub const UHS_SDR104: u32 = 1 << 1;
+pub const UHS_DDR50: u32 = 1 << 2;
+
+/// Whether a host controller advertises any UHS-I mode at all.
+pub fn uhs_offered(capabilities_1: u32) -> bool {
+	capabilities_1 & (UHS_SDR50 | UHS_SDR104 | UHS_DDR50) != 0
+}
 
 // `PRESENT_STATE` bits.
 pub const PRESENT_CMD_INHIBIT: u32 = 1 << 0;

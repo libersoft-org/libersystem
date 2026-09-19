@@ -137,14 +137,19 @@ impl Shader<'_> {
 			Shader::Solid(colour) => out.fill(*colour),
 			Shader::Nothing => out.fill(Rgba::TRANSPARENT),
 			Shader::Linear { ramp, from, axis, length_squared, spread, inverse } => {
+				// A DEGENERATE GRADIENT IS DECIDED ONCE FOR THE ROW AND NOT ONCE PER PIXEL. Its
+				// length does not vary along a span - it does not vary at all - so the test inside
+				// the loop asked the same question of every pixel and answered it the same way. The
+				// pixels it produces are unchanged: this is the same `ramp.at(1.0)` the arm already
+				// gave them, decided before the loop rather than inside it.
+				if *length_squared <= 0.0 {
+					out.fill(ramp.at(1.0));
+					return;
+				}
 				for (offset, slot) in out.iter_mut().enumerate() {
 					let point = PointF { x: (x + offset as u32) as f32 + 0.5, y: y as f32 + 0.5 };
 					*slot = match inverse.map_point(point) {
 						None => Rgba::TRANSPARENT,
-						Some(local) if *length_squared <= 0.0 => {
-							let _ = local;
-							ramp.at(1.0)
-						}
 						Some(local) => {
 							let projection = ((local.x - from.x) * axis.0 + (local.y - from.y) * axis.1) / length_squared;
 							ramp.at(spread_position(projection, *spread))

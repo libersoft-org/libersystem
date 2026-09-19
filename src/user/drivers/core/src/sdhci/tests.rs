@@ -313,3 +313,21 @@ fn a_single_block_transfer_does_not_carry_the_stop_a_multi_block_one_needs() {
 	// And the PIO path asks for no DMA.
 	assert_eq!(transfer_mode(1, false, false) & TRANSFER_DMA_ENABLE, 0);
 }
+
+// A UHS-I MODE IS OFFERED OR IT IS NOT, AND EACH BIT SAYS SO ON ITS OWN.
+//
+// The reason this is a decision rather than a comparison at the call site: the three bits are three
+// DIFFERENT modes and any one of them means a faster mode exists to negotiate. A driver that
+// checked only SDR50 would report "no UHS" on a controller offering SDR104, which is the faster of
+// the two - and the report is the only thing distinguishing a controller with nothing to offer from
+// a driver that never asks.
+#[test]
+fn uhs_is_offered_when_any_mode_is_advertised_and_not_when_none_is() {
+	assert!(!uhs_offered(0));
+	// Each mode alone is enough.
+	assert!(uhs_offered(UHS_SDR50));
+	assert!(uhs_offered(UHS_SDR104));
+	assert!(uhs_offered(UHS_DDR50));
+	// And bits that are not these three are not UHS: a word full of other capabilities offers none.
+	assert!(!uhs_offered(!(UHS_SDR50 | UHS_SDR104 | UHS_DDR50)));
+}

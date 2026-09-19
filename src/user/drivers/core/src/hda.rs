@@ -164,6 +164,11 @@ pub fn codec_answered(vendor_id: u32) -> bool {
 /// than walked part way.
 pub const MAX_NODES: u8 = 64;
 
+/// How many codecs on one link this driver records. `STATESTS` has fifteen bits, so that is the
+/// most a link can announce; the bound here is what the driver keeps, and a link with more than
+/// this many is one whose extra codecs are not looked at rather than one that is refused.
+pub const MAX_CODECS: usize = 15;
+
 /// Whether a pin complex is capable of output, from its pin capabilities.
 pub fn pin_can_output(pin_caps: u32) -> bool {
 	pin_caps & (1 << 4) != 0

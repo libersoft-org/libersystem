@@ -294,28 +294,40 @@ impl Ring {
 // streams in their endpoint companions, and a host that ignores them has no way to tell which
 // command an answer belongs to.
 //
-// ONE STREAM IS USED AND THE ARRAY IS FULL SIZE, which is not a shortcut but what the hardware
-// requires: the array's length is fixed by `MaxPStreams` in the endpoint context, and the device
-// chooses which entries it uses. This driver issues one command at a time under one tag, so it uses
-// stream 1 and leaves the rest of the array zeroed - an entry a device never selects is never read.
+// THE ARRAY IS FULL SIZE AND SEVERAL OF ITS ENTRIES ARE DRIVEN, which is what a tagged transport
+// needs: the array's length is fixed by `MaxPStreams` in the endpoint context, the device chooses
+// which entries it uses, and a driver that builds one ring can only ever have one tag outstanding.
+// `DRIVEN_STREAMS` rings are built, at stream ids 1..=DRIVEN_STREAMS; the rest of the array stays
+// zeroed, and an entry a device never selects is never read.
+//
+// WHY MORE THAN ONE, MEASURED RATHER THAN ASSUMED: in UAS the TAG IS THE STREAM, so a device answers
+// each tag on that tag's stream. A task-management request carries a tag of its own - its header's
+// tag is the request's and the managed tag is the doomed command's, in a different field - so with
+// one ring its answer arrives on a stream nothing is waiting on, and the live device appears to say
+// nothing at all. That is the failure this array's second entry removes.
 struct Streams {
 	// The array's page, kept so it can be given back.
 	handle: u64,
 	virt: u64,
 	phys: u64,
-	// The one stream this driver drives.
-	ring: Ring,
+	// One ring per driven stream, indexed by stream id minus one.
+	rings: [Ring; DRIVEN_STREAMS as usize],
 }
 
 // The stream context's type field: a primary transfer ring.
 const STREAM_CONTEXT_TYPE_PRIMARY: u64 = 1 << 1;
-// The stream this driver uses. Zero is reserved by the specification - it means "no stream" - for
-// the same reason the UAS tag reserves zero and NVMe reserves command id zero.
+// The first stream this driver drives. Zero is reserved by the specification - it means "no
+// stream" - for the same reason the UAS tag reserves zero and NVMe reserves command id zero.
 const STREAM_ID: u32 = 1;
+// How many stream rings are built: the transport above drives two command tags and one
+// task-management tag, and every tag it issues needs a ring of its own. This is the number the UAS
+// module's `COMMAND_TAGS` is counted against - they are one arrangement written in two files, and
+// the bind refuses a device that advertises fewer entries than this.
+const DRIVEN_STREAMS: u32 = 3;
 
 impl Streams {
-	// Build the array and the one ring in it. `count` is the number of entries, which must be a
-	// power of two and is what `MaxPStreams` encodes.
+	// Build the array and the rings in it. `count` is the number of ENTRIES, which must be a power of
+	// two and is what `MaxPStreams` encodes; `DRIVEN_STREAMS` of them get a ring.
 	unsafe fn new(count: u32) -> Option<Streams> {
 		unsafe {
 			let (handle, virt, phys) = dma_page()?;
@@ -324,16 +336,64 @@ impl Streams {
 				close(handle);
 				return None;
 			}
-			let ring = Ring::new()?;
-			let entry = virt + STREAM_ID as u64 * 16;
-			(entry as *mut u64).write_volatile(ring.phys | STREAM_CONTEXT_TYPE_PRIMARY | ring.cycle as u64);
-			((entry + 8) as *mut u64).write_volatile(0);
-			Some(Streams { handle, virt, phys, ring })
+			// EVERY DRIVEN STREAM MUST HAVE AN ENTRY, and a device that advertises fewer entries than
+			// this driver drives would have it writing stream contexts past the array. Refused here
+			// rather than clamped, because a clamp silently gives back a transport with fewer tags than
+			// the caller was told it has.
+			if count <= DRIVEN_STREAMS {
+				close(handle);
+				return None;
+			}
+			let mut rings: [Ring; DRIVEN_STREAMS as usize] = [const { Ring { virt: 0, phys: 0, index: 0, cycle: 1, handle: 0 } }; DRIVEN_STREAMS as usize];
+			for slot in 0..DRIVEN_STREAMS as usize {
+				let Some(built) = Ring::new() else {
+					// A HALF-BUILT ARRAY GIVES ITS PAGES BACK. Returning here with rings already
+					// allocated would leak one page per attempt, which is the same defect this file
+					// already paid for once in `Ring::new` itself.
+					for ring in rings.iter_mut() {
+						ring.release();
+					}
+					close(handle);
+					return None;
+				};
+				rings[slot] = built;
+				let entry = virt + (STREAM_ID as u64 + slot as u64) * 16;
+				(entry as *mut u64).write_volatile(rings[slot].phys | STREAM_CONTEXT_TYPE_PRIMARY | rings[slot].cycle as u64);
+				((entry + 8) as *mut u64).write_volatile(0);
+			}
+			Some(Streams { handle, virt, phys, rings })
 		}
 	}
 
+	// The ring a stream id names, or none when this driver does not drive that stream.
+	//
+	// AN UNBUILT RING IS NOT A RING. The high-speed shape has no streams at all and is carried here
+	// as one plain ring in slot zero, so the other slots hold a zeroed `Ring` - and pushing to one
+	// of those would write a TRB at address zero. That is the difference between "this transport has
+	// no second tag" and "this transport has a second tag at null", and only the first is true.
+	fn ring(&mut self, stream: u32) -> Option<&mut Ring> {
+		let index = stream.checked_sub(STREAM_ID)? as usize;
+		self.rings.get_mut(index).filter(|ring| ring.virt != 0)
+	}
+
+	// WHICH STREAM A COMPLETION BELONGS TO, READ OUT OF ITS TRB POINTER. An xHCI Transfer Event
+	// carries no stream id - the fields are the pointer, the length, the completion code, the
+	// endpoint and the slot - so the only thing that says which of an endpoint's rings answered is
+	// where the TRB it points at lives. Each ring is one page, so the pointer falling inside a ring's
+	// page IS the routing.
+	fn stream_of(&self, pointer: u64) -> Option<u32> {
+		for (index, ring) in self.rings.iter().enumerate() {
+			if ring.phys != 0 && pointer >= ring.phys && pointer < ring.phys + RING_TRBS * 16 {
+				return Some(STREAM_ID + index as u32);
+			}
+		}
+		None
+	}
+
 	fn release(&mut self) {
-		self.ring.release();
+		for ring in self.rings.iter_mut() {
+			ring.release();
+		}
 		if self.handle != 0 {
 			close(self.handle);
 			self.handle = 0;
@@ -1429,6 +1489,7 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 		let mut outgoing: Vec<u8> = alloc::vec![0u8; 2048];
 		// These tokens are the positions in this binding's OFFER list. Keep the factory even
 		// with no consumers, so a later storage service or lsusb process can connect again.
+		let mut sibling = [0u8; 16];
 		let mut serving = common::Serving::from_offers(&[(0, blk_server), (1, usbq), (2, pointer), (3, net_server), (4, uas_server), (5, audio_server)]);
 		loop {
 			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
@@ -1453,6 +1514,12 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			// Drain hardware events whenever this loop wakes. Synchronous block operations still
 			// service HID events inline; consumer closure does not stop the controller.
 			let mut rescan: bool = false;
+			// AND A REQUEST THAT WILL NEVER BE ANSWERED GIVES ITS TAG BACK. A device that stops
+			// answering would otherwise hold a tag for ever and leave the consumer that asked waiting
+			// for ever, which is worse than an error: a caller can retry an error.
+			if let Some((_, target)) = uas.as_mut() {
+				usb_uas::expire(target);
+			}
 			// THE STASHED COMPLETION FIRST, because it is older than anything still on the ring.
 			if let Some((status, control)) = hc.net_pending.take()
 				&& let Some((dev, net)) = network.as_mut()
@@ -1468,9 +1535,18 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 					}
 				}
 			}
-			while let Some((_p, status, control)) = take_event(hc) {
+			while let Some((pointer, status, control)) = take_event(hc) {
 				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
 					rescan = true;
+					continue;
+				}
+				// A UAS REQUEST LEFT OUTSTANDING IS FINISHED HERE, which is what makes several of them
+				// possible at once: the consumer that asked is answered by the loop that drains events
+				// rather than by a caller standing over the transport, and the stream the completion came
+				// back on says which consumer that is.
+				if let Some((uas_dev, target)) = uas.as_mut()
+					&& usb_uas::absorb_event(target, uas_dev.slot, pointer, status, control)
+				{
 					continue;
 				}
 				// THE ADAPTER'S NOTIFICATION ENDPOINT, BEFORE ITS FRAME ONE. An interrupt endpoint
@@ -1614,7 +1690,29 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				4 => match try_recv(server, &mut req) {
 					Polled::Message { len, handle } if len >= 16 => {
 						match uas.as_mut() {
-							Some((dev, target)) => usb_uas::serve_block_request(hc, &mut hids, dev, target, server, &req, handle),
+							Some((dev, target)) => {
+								usb_uas::serve_block_request(hc, &mut hids, dev, target, server, &req, handle);
+								// FILL THE OTHER READY CONSUMERS BEFORE REAPING ANY OF THEM. The request above
+								// is left outstanding under its tag; answering it before looking at the next
+								// consumer would mean one command finishes before the next is posted, and two
+								// tags would never be in flight together however many the transport has - a
+								// queue depth of one in a tagged transport's clothes.
+								//
+								// ONLY CONSUMERS THAT ARE ALREADY READY, and only while a tag is free, so this
+								// waits for nobody: it takes what is already queued, up to the cap.
+								for other in 0..serving.as_slice().len() {
+									if other == at || serving.token_at(other) != 4 || !usb_uas::has_free_tag(target) {
+										continue;
+									}
+									let peer = serving.at(other);
+									if let Polled::Message { len, handle } = try_recv(peer, &mut sibling)
+										&& len >= 16
+									{
+										usb_uas::serve_block_request(hc, &mut hids, dev, target, peer, &sibling, handle);
+									}
+								}
+								usb_uas::reap(hc, &mut hids, dev, target);
+							}
 							None => {
 								if handle != 0 {
 									close(handle);

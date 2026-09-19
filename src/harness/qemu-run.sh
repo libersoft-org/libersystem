@@ -699,6 +699,11 @@ qemu_attach_nvme() {
 		# for virtio-sound - a wav file, a spice sink or none, depending on how the run was asked for.
 		# Without it QEMU refuses the codec outright and the guest never starts.
 		-device "hda-duplex,bus=hdabus.0,audiodev=snd0"
+		# A SECOND CODEC ON THE SAME LINK, which is the one thing the HDA item's remaining open point
+		# needs and which nothing here presented: with one codec, "take the first that answers" and
+		# "walk every codec until one has a route" are the same code, and a driver that stopped at a
+		# first codec with no usable pin would fail on a machine whose second one was fine.
+		-device "hda-micro,bus=hdabus.0,audiodev=snd0"
 		# AND A SCSI HOST CONTROLLER WITH A TARGET BEHIND IT, which is the shape a machine with a real
 		# HBA has: the driver speaks the SCSI command set to a target rather than a block device's own
 		# tiny request format, and the same block contract comes out of both.
