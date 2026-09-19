@@ -141,6 +141,43 @@ fn device_table_exposes_the_xhci_controller() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the xHCI register file should map to a valid address");
 }
 
+tagged_test!(the_machine_reports_a_hot_plug_slot_the_scan_found, [Drivers, Pci], id = "kernel.hardware.the_machine_reports_a_hot_plug_slot_the_scan_found", covers = ["kernel"]);
+fn the_machine_reports_a_hot_plug_slot_the_scan_found() {
+	// THE SLOT PATH HAD NO FIXTURE ON THE PROFILE THE ORACLES RUN ON, so everything about it was
+	// proved against a SYNTHETIC config space - `arch::common::pci::tests` stands one up and drives
+	// `resolve_slot`, `slot_arm` and the acknowledgement against it. That proves the decisions and
+	// says nothing about whether the scan on a real machine ever reaches a port at all.
+	//
+	// THE REASON IT WAS ABSENT WAS CHECKED AND IS SPENT. The harness note said adding a function to
+	// the test profile would renumber the bus addresses several oracles print. That is true of a
+	// function added AMONG them and false of one added after them: QEMU assigns an address to each
+	// device without one in the order the arguments appear. The port is appended last, and the
+	// driver oracles print the same addresses they did before it existed.
+	//
+	// WHAT THIS ASSERTS IS THE MACHINE'S SHAPE AND NOT A DEVICE. The port is empty; nothing binds to
+	// it. What would be wrong without this test is a scan that stopped before the port, a capability
+	// walk that missed the slot, or a fixture quietly dropped from the harness - each of which
+	// leaves the hot-plug path built, armed and pointed at nothing, which is indistinguishable from
+	// working until somebody plugs a disk in.
+	let mut ports = [None; arch::common::pci::MAX_HOT_PLUG_PORTS];
+	let found = arch::common::pci::hot_plug_ports(&mut ports);
+	assert!(found > 0, "the scan should find the hot-plug port the harness attaches to every test profile");
+	// THE HARNESS'S PORT IS LOOKED FOR AMONG THEM RATHER THAN AT ROW ZERO. A machine may carry more
+	// than one port - and this one does - so requiring the FIRST row to be the fixture's would be
+	// asserting an order nothing promises. What is asserted is that the port the harness attached is
+	// in the list: `slot=1`, and empty.
+	//
+	// THE NUMBER IS THE HARNESS'S AND NOT ANY NUMBER, because a reader that took the wrong dword out
+	// of the capability returns zero, and every port would pass a test that accepted whatever it
+	// found. THE EMPTINESS matters for the same reason from the other side: a port reporting a
+	// device present when nothing was plugged into it is a presence bit read out of an endpoint's
+	// reserved bytes.
+	let seen = ports.iter().take(found).flatten().map(|p| p.slot.number).fold(0u32, |acc, n| acc | 1 << (n.min(31)));
+	let fixture = ports.iter().take(found).flatten().find(|p| p.slot.number == 1);
+	let port = fixture.unwrap_or_else(|| panic!("the harness attaches a port with platform slot 1; {found} port(s) found, slot numbers as a bitmask: {seen:#x}"));
+	assert!(!port.occupied, "the harness attaches the port with nothing in it");
+}
+
 tagged_test!(device_table_resources_the_nvme_controller, [Drivers, Pci], id = "kernel.hardware.device_table_resources_the_nvme_controller", covers = ["kernel"]);
 fn device_table_resources_the_nvme_controller() {
 	use core::sync::atomic::{AtomicU64, Ordering};

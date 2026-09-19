@@ -820,6 +820,22 @@ qemu_attach_suite_devices() {
 	[[ -z "${TEST_TAGS:-}" || "$wanted" == *,slow,* || "$wanted" == *,drivers,* || "$wanted" == *,pci,* ]] || return 0
 	qemu_attach_nvme "$into"
 	qemu_attach_vsock "$into"
+	# AN EMPTY HOT-PLUG SLOT ON THE TEST PROFILE TOO, AND LAST OF ALL.
+	#
+	# The interactive profile has carried one for a while and the test profile did not, with the
+	# reason recorded beside it: adding a function would renumber the bus addresses several oracles
+	# print. THAT WAS TRUE OF A FUNCTION ADDED AMONG THEM AND IS NOT TRUE OF ONE ADDED AFTER THEM -
+	# QEMU assigns an address to each device without one in the order the arguments appear, so a port
+	# appended here takes the next free address and moves nothing. It was checked that way round
+	# rather than assumed: the driver oracles print their addresses and they are unchanged.
+	#
+	# WHY IT IS WORTH HAVING HERE. The slot path is built and armed on all three ports and has only
+	# ever had a slot to find on x86_64's interactive profile, so what the emulated ports showed was
+	# that the code runs and reports honestly - not that a slot was ever seen. An empty port is a
+	# machine SHAPE rather than a device: nothing binds to it, no oracle has to change, and the boot
+	# line that says the slot was found is the evidence that the scan reaches it on that machine.
+	local -n slot_into="$into"
+	slot_into+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
 }
 
 vsock_echo_start() {

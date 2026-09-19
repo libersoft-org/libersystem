@@ -612,6 +612,39 @@ pub struct HotPlugPort {
 
 static PORTS: SpinLock<([Option<HotPlugPort>; MAX_HOT_PLUG_PORTS], usize)> = SpinLock::new(([None; MAX_HOT_PLUG_PORTS], 0));
 
+/// Take the port table away and give it back, for a test that drives the slot machinery over a
+/// synthetic bus.
+///
+/// THIS IS REAL STATE AND THE TESTS WERE WRITING IT. `arm_hot_plug_slots` and `poll_slots` work
+/// through this static, so an in-guest test standing up a fake port left the RUNNING kernel holding
+/// it: the idle pass then polled a port at `00:00.0` with slot number zero that no machine had, and
+/// anything asking what hot-plug ports this machine has was answered with the fixture. It was found
+/// by an oracle that asks exactly that and failed on aarch64 and not on x86_64 - the same tests, a
+/// different order.
+///
+/// A GUARD RATHER THAN A RULE, because a restore somebody has to remember is the defect again. The
+/// value comes back when the guard drops, on every path out of the test including a panic.
+#[cfg(test)]
+pub(crate) struct HeldPorts(([Option<HotPlugPort>; MAX_HOT_PLUG_PORTS], usize), bool);
+
+#[cfg(test)]
+impl HeldPorts {
+	pub(crate) fn take() -> HeldPorts {
+		HeldPorts(*PORTS.lock(), SLOTS_REPORTED.load(core::sync::atomic::Ordering::Acquire))
+	}
+}
+
+#[cfg(test)]
+impl Drop for HeldPorts {
+	fn drop(&mut self) {
+		*PORTS.lock() = self.0;
+		// AND THE "HAVE THE SLOTS BEEN REPORTED" FLAG WITH IT, which `arm_hot_plug_slots` swaps: a
+		// test that left it set would silence the boot line on a later real scan, and one that left
+		// it clear would print the machine's slots a second time in the middle of a suite.
+		SLOTS_REPORTED.store(self.1, core::sync::atomic::Ordering::Release);
+	}
+}
+
 /// What a poll of the slots found, for a caller that acts on it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SlotChange {

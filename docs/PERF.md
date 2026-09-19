@@ -1569,6 +1569,25 @@ And the frozen four, two consecutive runs:
 | vector-stress | 7.57 / 7.08 ms | 67.02 / 66.55 ms | 66.7 ms | on the line |
 | image-stress | 48.99 / 49.60 ms | 189.51 / 189.70 ms | 16.7 ms | over 11.4x, was 19.7x |
 
+**AND THE 3D FRAME WENT 966 TO 934 ms ON THE THIRD AXIS OF A FLAT TEXTURE (2026-09-19).** `fetch`
+wrapped an address on all three axes per tap, and every texture in the scene, the conformance suite
+and the demo has depth one - where the caller only ever asks for `z = 0` and every wrap mode maps
+index zero inside an extent of one to zero. A third of the per-tap addressing computed a constant.
+
+| form | runs (ms/frame) | median | floor |
+| --- | ---: | ---: | ---: |
+| addressing all three axes | 966.3 / 991.3 / 944.3 | 966.3 ms | 33 ms |
+| skipping a flat z | 937.3 / 933.9 / 924.8 | 933.9 ms | 33 ms |
+
+The ranges barely overlap and the conformance suite is unchanged - `112 passed, 0 failed` and
+`160 passed, 0 failed`. It is still a factor of twenty-eight.
+
+**AND A ROUTE WAS REMOVED BY MEASUREMENT.** `soft3d`'s direct-mapped texel cache has NO consumer -
+the conformance harness, `test3d-sw` and the benchmark all call the uncached entry point. Wiring it
+into the benchmark moved the texturing stage from 289.6 to 288.1 ms, inside the spread, because the
+fixture's checkerboards are not the sRGB-without-a-chain case it was built for. The wiring was taken
+back out: a benchmark using a cache no renderer uses measures a path nobody takes.
+
 **AND vector-stress CROSSED THE LINE (2026-09-19).** The linear gradient's row decided
 `length_squared <= 0.0` once per PIXEL about a value that does not vary at all; it is decided once
 per row now, and the pixels are identical - the same `ramp.at(1.0)` the arm already produced.

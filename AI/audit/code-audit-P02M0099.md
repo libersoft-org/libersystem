@@ -1812,3 +1812,32 @@ had been checked against the machine.
 `drivers,pci,slow,usb`: aarch64 100 tests in 1513 s, riscv64 102 in 1822 s. Both print what x86_64
 prints - `2 UAS commands outstanding at once, each on its own tag`, `task management answered`,
 `codec 0 of 2`, `no uhs offered`. UAS and HDA closed on it; 34 items done, 30 open.
+
+## The hot-plug fixture, and four tests that were overwriting the kernel (2026-09-19)
+
+THE FIXTURE'S ABSENCE WAS HALF A STALE ASSUMPTION AND HALF A CIRCLE. The harness kept the
+`pcie-root-port` off the emulated test profiles because "adding a function would renumber the bus
+addresses several oracles print" and because "no test asserts on it yet". The first is true of a
+function added AMONG them and false of one added after them - QEMU assigns addresses in argument
+order - and the second was circular. The port is appended last now; the driver oracles print the
+same addresses as before (`ahci 00:0b.0`, `sdhci 00:0c.0`, `hda 00:0d.0`, `xhci 00:05.0`), and the
+aarch64 boot says `pci: 00:12.0 carries hot-plug slot 1 - empty` for the first time.
+
+THE ORACLE ASSERTS A MACHINE SHAPE: that the scan reaches a port, that the port with the harness's
+platform slot number is among those found, and that it is empty.
+
+AND IT FOUND A DEFECT ON ITS FIRST RUN. `arm_hot_plug_slots` and `poll_slots` work through one
+static, and four in-guest tests drive them over a synthetic bus - so after those tests the RUNNING
+kernel held their fake: a port at `00:00.0` with slot number zero. The idle pass polls that table.
+Nothing had ever asked it, so nothing had ever noticed; the tests assert on their own return values
+and pass either way. The oracle failed on aarch64 and passed on x86_64 - the same tests in a
+different order, which is the signature of shared state rather than of a machine.
+
+THE FIX IS A GUARD, NOT A RULE: `HeldPorts` snapshots the table and the slots-reported flag and puts
+both back on drop, including on a panic. With it the oracle passes on aarch64 where it failed, the
+guard being the only difference. On all three ports: x86_64 104, aarch64 79, riscv64 81, and both
+emulated boots print `carries hot-plug slot 1 - empty` where neither had printed it at all.
+
+STILL OPEN IN THAT ITEM: a slot CHANGING state and an error record read back on the emulated ports.
+Both need `device_add` against a live machine and a function with error reporting on, and the
+tooling for both is x86_64.

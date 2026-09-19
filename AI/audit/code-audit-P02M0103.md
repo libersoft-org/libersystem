@@ -2109,3 +2109,69 @@ AND ONE TIMING LESSON, because it cost an hour of suspicion. `imgconv_cross_volu
 with riscv64 agreeing at 1098 s. The code is identical; the first selection RUNS THE DRIVER TESTS,
 so `vol://system` is served by a bound block driver by the time the application tests reach it. A
 timing comparison across two runs is only a measurement when both selected the same work.
+
+## vector-stress crossed its ceiling, and the benchmark was not where anybody would look (2026-09-19)
+
+THE SCENE. `vector-stress` had sat ON its line for a day - 66.79, 66.84, 66.54, 66.97 against 66.7,
+one of four under - and the record said so rather than rounding it down. What was still inside the
+linear gradient's per-pixel loop was `length_squared <= 0.0`, asked of every pixel about a value
+that does not vary along a span or at all. It is decided once per row now and the pixels are
+identical: the same `ramp.at(1.0)` the arm already produced.
+
+MEASURED BOTH WAYS, THREE RUNS EACH, because a third of a millisecond on a scene sitting on its
+budget is exactly the size of claim that needs it:
+
+    the test inside the loop   66.835  66.473  66.606   one of three OVER
+    the test hoisted out       66.157  66.320  66.250   three of three MET
+
+The margin is under one percent and the p99 still crosses. Three of three under is a different fact
+from one of three and it is the one this scene now has; it is not the same as comfortable. THE FLOOR
+STILL ASKS FOR FOUR AND HAS TWO - `UI-effects` at 156.4 against 66.7 needs a box-blur approximation
+the profile forbids, and `image-stress` at 194.5 against 16.7 waits on the fixture question the item
+puts to the project owner.
+
+WHAT WAS NOT DONE AND WHY. The obvious faster gradient is incremental - the projection along a span
+is affine, so it could be one add per pixel - and that is a DIFFERENT computation whose float error
+accumulates along the row. This profile requires every path to agree with the scalar reference, so
+what is hoisted is the dispatch and an invariant test, never an operation.
+
+## And the benchmark this floor is defined by was undiscoverable (2026-09-19)
+
+`bench.sh` carried `soft2d` in its suite map and not in its help or `--list` - along with `lico`. So
+the one suite part `c`'s floor is measured by was the one the documented entry point did not
+mention. The help is built from the map now, a suite with no description is a hard error rather than
+a silent omission, and the guard is proven to refuse before it is trusted to print: it adds a suite
+with no description, requires the listing to fail, and takes it away again.
+
+## perf-anchor was red on the ORDER of the builds, not on the code (2026-09-19)
+
+`check.sh --gate perf-anchor` failed in one second with `guest exited without its case's final
+verdict`. Running that boot by hand names it: `./build.sh --arch x86_64` rebuilds the system volume
+signed for DMA mode `harness`, and the `development-trace` medium the gate boots is signed
+`enforcing-required`, so `mkimage` refuses the pair and the guest never starts. The fix is the
+command the tool prints. Green after it, on both halves - the anchor published to the harness
+profile and withheld from the interactive one.
+
+## The 3D frame, and a route removed rather than guessed at (2026-09-19)
+
+`fetch` wrapped an address on all three axes per tap. Every texture in the benchmark scene, the
+conformance suite and the demo has depth one, and there the caller only ever asks for `z = 0` -
+`sample_level` builds the second plane exclusively when `depth > 1` - and every wrap mode maps index
+zero inside an extent of one to zero. So a third of the per-tap addressing computed a constant.
+
+    addressing all three axes   966.3  991.3  944.3   median 966.3 ms
+    skipping a flat z           937.3  933.9  924.8   median 933.9 ms
+
+Three and three, because a three percent claim on a measurement with a forty-millisecond spread
+needs both sides; the ranges barely overlap. The conformance suite is unchanged at `112 passed,
+0 failed` and `160 passed, 0 failed`, which is what "the same answer, computed less often" has to
+mean. The floor is 33 ms, so this is a factor of twenty-eight rather than twenty-nine.
+
+AND THE TEXEL CACHE IS A ROUTE THAT WAS TRIED AND REMOVED. `soft3d` builds a direct-mapped cache
+whose own note says what it buys - an address computation per axis and a transfer decode per channel
+on an sRGB texture without a mip chain, which is a `pow`. NOTHING USES IT: the conformance harness,
+`test3d-sw` and the benchmark all call `texture::sample`, and `sample_cached`'s only consumers are
+its own tests. Wiring it into the benchmark moved the texturing stage from 289.6 to 288.1 ms -
+inside the spread - because the fixture's checkerboards are not that case. The wiring came back out,
+and what is recorded instead is the fact worth keeping: a cache exists for a cost every renderer
+here pays and none of them asks for it.

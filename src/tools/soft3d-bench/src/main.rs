@@ -224,6 +224,12 @@ impl Source for Frame {
 		}
 		let texture = self.textures.get(texture as usize)?;
 		let sampler = self.samplers.get(sampler as usize)?;
+		// NO TEXEL CACHE, DELIBERATELY, AND MEASURED BEFORE IT WAS DECIDED. `soft3d` builds one and
+		// nothing uses it - not the conformance harness, not the demo, not this - so a benchmark
+		// that used one would be measuring a path no renderer here takes. Wiring it in was tried:
+		// 288.1 ms against 289.6 for the texturing stage, which is inside the run-to-run spread.
+		// The cache's own note says what it buys - a transfer decode per channel on an sRGB texture
+		// without a mip chain - and this fixture's checkerboards are not that.
 		let texel = soft3d::texture::sample(texture, sampler, [coordinate.f32_at(0), coordinate.f32_at(1), 0.0], 0.0, true);
 		Some(Val::vector_f32(&texel))
 	}

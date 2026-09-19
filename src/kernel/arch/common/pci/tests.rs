@@ -582,6 +582,8 @@ fn a_poll_answers_a_change_once_and_the_state_it_left_behind() {
 	// wrong - a change re-reported is a device that binds a hundred times a second, and a change
 	// reported with the state read at some later moment is a device reported arriving after it left.
 	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, 0);
+	// THE KERNEL'S OWN PORT TABLE IS PUT BACK WHEN THIS DROPS - see `HeldPorts`.
+	let _ports = super::HeldPorts::take();
 	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
 	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
 	let mut out = [super::SlotChange { bus: 0, dev: 0, func: 0, secondary: 0, what: SlotEvent::Quiet }; super::MAX_HOT_PLUG_PORTS];
@@ -615,6 +617,8 @@ fn a_port_with_no_interrupt_pin_is_not_bound_to_a_vector() {
 	// is a handler on a vector nothing raises - which reads, from the outside, as a slot that works
 	// and a device that never arrives.
 	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, 0);
+	// THE KERNEL'S OWN PORT TABLE IS PUT BACK WHEN THIS DROPS - see `HeldPorts`.
+	let _ports = super::HeldPorts::take();
 	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
 	let mut ports: [Option<super::HotPlugPort>; super::MAX_HOT_PLUG_PORTS] = [None; super::MAX_HOT_PLUG_PORTS];
 	assert_eq!(super::hot_plug_ports(&mut ports), 1, "the scan remembered the port");
@@ -643,6 +647,8 @@ fn powering_a_named_slot_finds_it_by_address_and_leaves_the_others_alone() {
 	// request came from - so the lookup is by address, and an address that is not a hot-plug port is
 	// a write that must not happen.
 	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG | SLOT_CAP_POWER_CONTROLLER, SLOT_STATUS_PRESENT);
+	// THE KERNEL'S OWN PORT TABLE IS PUT BACK WHEN THIS DROPS - see `HeldPorts`.
+	let _ports = super::HeldPorts::take();
 	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
 	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
 	let armed = Fake::read16(0, 0, 0, slot.cap + 0x18);
@@ -886,6 +892,8 @@ fn a_power_event_sweep_reads_every_port_and_clears_what_it_read() {
 	// woke the machine.
 	stand_up([0; 6], [0; 6]);
 	stand_up_pcie(4, true, SLOT_CAP_HOT_PLUG, SLOT_STATUS_PRESENT);
+	// THE KERNEL'S OWN PORT TABLE IS PUT BACK WHEN THIS DROPS - see `HeldPorts`.
+	let _ports = super::HeldPorts::take();
 	super::arm_hot_plug_slots::<Fake>(&[a_function()]);
 	let slot = resolve_slot::<Fake>(&a_function()).expect("a slot");
 

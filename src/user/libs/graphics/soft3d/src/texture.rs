@@ -307,7 +307,19 @@ fn address(coordinate: f32, extent: u32, wrap: Wrap) -> Option<i64> {
 fn fetch(texture: &Texture, level: &Level, level_index: u32, x: i64, y: i64, z: i64, sampler: &Sampler, cache: &mut Option<&mut Cache>) -> Texel {
 	let Some(x) = address(x as f32, level.width, sampler.wrap_u) else { return sampler.border.texel() };
 	let Some(y) = address(y as f32, level.height, sampler.wrap_v) else { return sampler.border.texel() };
-	let Some(z) = address(z as f32, level.depth, sampler.wrap_w) else { return sampler.border.texel() };
+	// A FLAT TEXTURE HAS ONE PLANE AND ITS ADDRESS IS ZERO, so the third axis is not wrapped: the
+	// caller only ever asks for `z = 0` on a depth-one level - `sample_level` builds the second
+	// plane exclusively when `depth > 1` - and every wrap mode maps index zero inside an extent of
+	// one to zero. This is the same answer `address` returns, not a different one: what it removes
+	// is a third of the per-tap addressing on every 2D texture, which is all of them in this scene.
+	let z = if level.depth > 1 {
+		match address(z as f32, level.depth, sampler.wrap_w) {
+			Some(z) => z,
+			None => return sampler.border.texel(),
+		}
+	} else {
+		0
+	};
 	// THE KEY IS THE ADDRESS AFTER WRAPPING, so two coordinates that name the same texel through
 	// different wrap modes share one entry - which is the whole point of caching the fetch rather
 	// than the coordinate.
