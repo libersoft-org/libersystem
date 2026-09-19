@@ -425,12 +425,21 @@ fn a_requirement_nothing_in_the_image_produces_is_refused_when_the_registry_is_b
 	// whose extra consumers are minted and then hung up on, which a consumer reads as a connection
 	// that ended rather than one it was never going to get. The two numbers live in different
 	// crates - one host, one `no_std` - so nothing but this makes them agree.
-	let at_the_limit = driver("provides = [{ kind = \"block\", most = 2, consumers = 4 }]\n");
-	assert_eq!(errors(&at_the_limit), "", "eight is what a driver serves, and an entry declaring exactly that is not over it");
-	let past_it = driver("provides = [{ kind = \"block\", most = 3, consumers = 3 }]\n");
+	//
+	// AND THE NUMBERS BELOW ARE DERIVED FROM THE BOUND RATHER THAN SPELLED OUT, which is the whole
+	// point of a test whose subject is two constants agreeing: a version of this that wrote `8` in
+	// four places failed the day the bound moved to sixteen, and what it reported was its own
+	// arithmetic rather than a disagreement between the crates.
+	let limit = MAX_PROVIDER_CLIENTS;
+	let at_the_limit = driver(&format!("provides = [{{ kind = \"block\", most = {limit}, consumers = 1 }}]\n"));
+	assert_eq!(errors(&at_the_limit), "", "an entry declaring exactly what a driver serves is not over it");
+	let past_it = driver(&format!("provides = [{{ kind = \"block\", most = {}, consumers = 1 }}]\n", limit + 1));
 	assert!(errors(&past_it).contains("a driver serves at most"), "{}", errors(&past_it));
+	// AND IT IS THE PRODUCT AND NOT THE ROW COUNT: `most` publications of `consumers` each.
+	let product = driver(&format!("provides = [{{ kind = \"block\", most = 2, consumers = {} }}]\n", limit / 2 + 1));
+	assert!(errors(&product).contains("a driver serves at most"), "{}", errors(&product));
 	// AND IT IS THE SUM ACROSS KINDS, not one row at a time: they are all served out of one set.
-	let across_kinds = driver("provides = [{ kind = \"block\", most = 1, consumers = 5 }, { kind = \"usb-bus\", most = 1, consumers = 5 }]\n");
+	let across_kinds = driver(&format!("provides = [{{ kind = \"block\", most = 1, consumers = {} }}, {{ kind = \"usb-bus\", most = 1, consumers = {} }}]\n", limit, limit));
 	assert!(errors(&across_kinds).contains("a driver serves at most"), "{}", errors(&across_kinds));
 }
 
@@ -577,13 +586,16 @@ fn the_production_manifest_classifies_every_staged_driver() {
 	for (name, policy) in &drivers {
 		let expected = match *name {
 			"virtio_net" => DmaPolicy::IommuRequired,
-			"sdhci" => DmaPolicy::None,
+			// THE CARD READER MASTERS THE BUS NOW, since ADMA2 replaced the PIO transfer path: a
+			// descriptor table is memory the CONTROLLER reads, which is what `none` said it never
+			// did - and said by ENFORCEMENT, since a claim under that policy mints no DMA buffer.
+			"sdhci" => DmaPolicy::TrustedUntranslated,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");
 	}
 	assert!(drivers.iter().any(|(name, _)| *name == "virtio_net"), "the network driver is staged");
-	assert!(drivers.iter().any(|(name, policy)| *name == "sdhci" && *policy == DmaPolicy::None), "the PIO card reader masters nothing and says so");
+	assert!(drivers.iter().any(|(name, policy)| *name == "virtio_net" && *policy == DmaPolicy::IommuRequired), "the refusal demonstration is still the one entry that requires translation");
 }
 
 #[test]

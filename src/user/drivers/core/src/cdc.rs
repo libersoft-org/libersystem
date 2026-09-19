@@ -75,6 +75,9 @@ pub struct Binding {
 	/// The communications interface, which carries the class descriptors and the notification
 	/// endpoint.
 	pub control_interface: u8,
+	/// The notification endpoint's address, when the control interface publishes one. An adapter
+	/// that does not is one whose link state cannot be asked for.
+	pub notification: Option<u8>,
 	/// The data interface named by the union descriptor, and the setting its endpoints are in.
 	pub data_interface: u8,
 	pub data_alternate: u8,
@@ -136,6 +139,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	let mut config_value: Option<u8> = None;
 	let mut model: Option<Model> = None;
 	let mut control_interface: Option<u8> = None;
+	let mut notification: Option<u8> = None;
 	let mut union_data: Option<u8> = None;
 	let mut mac_string: Option<u8> = None;
 	let mut max_segment: u16 = 0;
@@ -191,6 +195,19 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 					_ => {}
 				}
 			}
+			// THE NOTIFICATION ENDPOINT, WHICH IS ON THE CONTROL INTERFACE AND NOT THE DATA ONE.
+			// It is how an adapter says its link came up or went down, and a driver that never
+			// looked for it cannot tell a cable nobody plugged in from a quiet network.
+			descriptor::DT_ENDPOINT if current_is_control && notification.is_none() => {
+				let (Ok(address), Ok(attributes)) = (record.field(2), record.field(3)) else {
+					return Err(NotBindable::Malformed);
+				};
+				// INTERRUPT AND IN. A control interface with a bulk endpoint on it is not this, and
+				// an OUT one is not something an adapter reports through.
+				if attributes & 0x03 == 0x03 && address & 0x80 != 0 {
+					notification = Some(address);
+				}
+			}
 			descriptor::DT_ENDPOINT => {
 				if let Some((_, _, ref mut ep_in, ref mut ep_out)) = candidate {
 					let (Ok(address), Ok(attributes), Ok(packet)) = (record.field(2), record.field(3), record.field16(4)) else {
@@ -225,7 +242,7 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 	if union_data != data_interface {
 		return Err(NotBindable::NoDataInterface);
 	}
-	Ok(Binding { model, config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, mac_string, max_segment })
+	Ok(Binding { model, config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, notification, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, mac_string, max_segment })
 }
 
 /// Decode the MAC address a device publishes as a string descriptor.
@@ -706,3 +723,53 @@ pub fn ncm_block(sequence: u16, frame: &[u8], out: &mut [u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests;
+
+/// What an adapter said on its notification endpoint.
+///
+/// THE LINK IS THE ONE THING A FRAME PIPE CANNOT SAY. A cable nobody plugged in and a quiet network
+/// look identical from the data endpoints - both are a receive transfer that never completes - and
+/// this is the only place an adapter distinguishes them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Notification {
+	/// The link came up or went down.
+	Link { up: bool },
+	/// The link's rates changed, in bits per second, downlink then uplink.
+	Speed { down: u32, up: u32 },
+	/// A notification this driver does not act on. ANSWERED AS ITSELF rather than as a link change:
+	/// a driver that read every notification as a link transition reports the link going down when
+	/// the adapter said something else entirely.
+	Other(u8),
+	/// Too short to be a notification at all.
+	Malformed,
+}
+
+/// The eight-byte header every notification carries.
+pub const NOTIFICATION_HEADER_LEN: usize = 8;
+pub const NOTIFY_NETWORK_CONNECTION: u8 = 0x00;
+pub const NOTIFY_CONNECTION_SPEED_CHANGE: u8 = 0x2A;
+
+/// Decode one notification.
+///
+/// THE LENGTH FIELD IS THE DEVICE'S CLAIM AND `bytes` IS WHAT ARRIVED. A speed change whose header
+/// promises eight bytes of rates in a transfer that carried two is not a slow link, it is a lie -
+/// and reading the rates out of it reads past what the controller wrote.
+pub fn notification(bytes: &[u8]) -> Notification {
+	if bytes.len() < NOTIFICATION_HEADER_LEN {
+		return Notification::Malformed;
+	}
+	let code = bytes[1];
+	let value = u16::from_le_bytes([bytes[2], bytes[3]]);
+	let length = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+	match code {
+		NOTIFY_NETWORK_CONNECTION => Notification::Link { up: value != 0 },
+		NOTIFY_CONNECTION_SPEED_CHANGE => {
+			if length < 8 || bytes.len() < NOTIFICATION_HEADER_LEN + 8 {
+				return Notification::Malformed;
+			}
+			let down = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+			let up = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+			Notification::Speed { down, up }
+		}
+		other => Notification::Other(other),
+	}
+}

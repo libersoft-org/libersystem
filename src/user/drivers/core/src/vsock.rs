@@ -116,6 +116,38 @@ pub fn may_send(buf_alloc: u32, fwd_cnt: u32, sent: u32) -> Option<u32> {
 	Some(buf_alloc - in_flight)
 }
 
+/// Which of this driver's local ports a packet names, as a slot in its stream table.
+///
+/// A LOCAL PORT IS `base + slot` BY CONSTRUCTION, so routing an arriving packet to the stream it
+/// belongs to is arithmetic rather than a search over open connections - and the port a packet
+/// carries is the ONLY thing that distinguishes two streams to the same host on the same context id.
+///
+/// AND A PORT OUTSIDE THE RANGE BELONGS TO NOBODY. Masking it into the range, which is what a driver
+/// indexing by `port % slots` would do, applies a stranger's bytes to whichever stream the remainder
+/// lands on; answering `None` is what lets the caller refuse the packet instead.
+pub fn slot_of(dst_port: u32, base: u32, slots: u32) -> Option<usize> {
+	let offset = dst_port.checked_sub(base)?;
+	(offset < slots).then_some(offset as usize)
+}
+
+/// The event queue's message: one little-endian `u32`.
+pub const EVENT_LEN: usize = 4;
+
+/// The transport was reset. Every connection this driver holds is gone, whatever its own state
+/// machine last recorded - the other end of all of them has been taken away underneath it.
+pub const EVENT_TRANSPORT_RESET: u32 = 0;
+
+/// What an event buffer says, or `None` for one that is too short.
+///
+/// THE NUMBER IS ANSWERED RATHER THAN INTERPRETED, and the caller decides which ones it acts on. A
+/// driver that treated anything it did not recognise as a reset would close every connection on a
+/// message the specification may give a meaning to later, which is the failure mode of reading a
+/// closed enumeration out of an open one.
+pub fn event(bytes: &[u8]) -> Option<u32> {
+	let head = bytes.get(..EVENT_LEN)?;
+	Some(u32::from_le_bytes([head[0], head[1], head[2], head[3]]))
+}
+
 /// Why a packet is not acted on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refusal {

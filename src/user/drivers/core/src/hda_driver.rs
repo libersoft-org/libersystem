@@ -19,6 +19,7 @@
 #![no_std]
 #![no_main]
 
+use driver_protocol::audio;
 use drivers::hda::{self, Widget};
 use drivers::{common, hda as decisions};
 use rt::*;
@@ -55,6 +56,10 @@ const CHANNELS: u8 = 2;
 // ticks, a fraction of that window, and every wait inside it shares one - which means a bring-up
 // where everything times out still finishes in time to SAY so, which is the whole point.
 const BRINGUP_TICKS: u64 = 60;
+// How long one captured period is waited for, in the 100 Hz ticks READY is measured in. A period is
+// about eleven milliseconds at this format, so this is far more than one and still bounded: a
+// controller that stops filling must not hold the consumer.
+const CAPTURE_TICKS: u64 = 50;
 
 use drivers::common::Deadline;
 unsafe fn r8(addr: u64) -> u8 {
@@ -172,6 +177,17 @@ struct Controller {
 	audio: Dma,
 	period: u64,
 	running: bool,
+	// THE CAPTURE SIDE, WHICH A CODEC NEED NOT HAVE. A machine with an output-only codec serves
+	// playback exactly as before and answers every capture command with a refusal - which is what
+	// the wire's empty reply means, and is why the refusal is a length rather than a status.
+	capture_stream: u64,
+	capture_bdl_virt: u64,
+	capture_bdl_phys: u64,
+	adc: Option<u8>,
+	capture: Dma,
+	capturing: bool,
+	// Which half of the capture buffer is the next one to hand over.
+	capture_half: u64,
 }
 
 impl Controller {
@@ -326,6 +342,10 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		let rirb_phys = rings.phys + PAGE;
 		let bdl_virt = rings.virt + 3 * PAGE;
 		let bdl_phys = rings.phys + 3 * PAGE;
+		// The third page of the region was unused; the capture stream's descriptor list goes there
+		// rather than in a second allocation.
+		let capture_bdl_virt = rings.virt + 2 * PAGE;
+		let capture_bdl_phys = rings.phys + 2 * PAGE;
 
 		let size = decisions::ring_size_code(RING_ENTRIES).ok_or(Bringup::NoDma)?;
 		w8(base + hda::REG_CORBCTL, 0);
@@ -376,9 +396,13 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 			return Err(Bringup::NoStream);
 		}
 		let stream = base + hda::REG_STREAM_BASE + inputs * hda::REG_STREAM_STRIDE;
+		// AND THE INPUT DESCRIPTORS ARE THE ONES BEFORE IT, which is the same trap read the other
+		// way round: input stream zero is descriptor zero, and a controller reporting none has no
+		// capture path whatever its codec says.
+		let capture_stream = if inputs > 0 { base + hda::REG_STREAM_BASE } else { 0 };
 
 		let statests = r16(base + hda::REG_STATESTS);
-		let mut controller = Controller { base, device, corb_virt, rirb_virt, bdl_virt, bdl_phys, rirb_read: 0, deadline, codec: 0, converter: 0, stream, audio: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, period: 0, running: false };
+		let mut controller = Controller { base, device, corb_virt, rirb_virt, bdl_virt, bdl_phys, rirb_read: 0, deadline, codec: 0, converter: 0, stream, audio: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, period: 0, running: false, capture_stream, capture_bdl_virt, capture_bdl_phys, adc: None, capture: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }, capturing: false, capture_half: 0 };
 
 		// The first codec that answers its identity verb with something that is not the absence.
 		let mut found = false;
@@ -429,15 +453,23 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		// deterministic route the item asks for rather than a policy about jacks.
 		let mut converter: Option<u8> = None;
 		let mut pin: Option<u8> = None;
+		// AND THE SAME WALK FINDS THE CAPTURE ROUTE, which is the same shape with every question
+		// reversed: an audio INPUT converter and a pin that can be driven INTO. It is optional -
+		// a codec with no input is a machine with no microphone, not a bring-up failure.
+		let mut adc: Option<u8> = None;
+		let mut input_pin: Option<u8> = None;
 		for offset in 0..widgets {
 			let node = first_widget + offset;
 			let caps = controller.parameter(node, hda::PARAM_WIDGET_CAPS).unwrap_or(0);
 			match decisions::widget_kind(caps) {
 				Widget::AudioOutput if converter.is_none() => converter = Some(node),
-				Widget::PinComplex if pin.is_none() => {
+				Widget::AudioInput if adc.is_none() => adc = Some(node),
+				Widget::PinComplex => {
 					let pin_caps = controller.parameter(node, hda::PARAM_PIN_CAPS).unwrap_or(0);
-					if decisions::pin_can_output(pin_caps) {
+					if pin.is_none() && decisions::pin_can_output(pin_caps) {
 						pin = Some(node);
+					} else if input_pin.is_none() && decisions::pin_can_input(pin_caps) {
+						input_pin = Some(node);
 					}
 				}
 				_ => {}
@@ -460,6 +492,24 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		// Stream 1, channel 0: the tag the stream descriptor below carries.
 		controller.verb(converter, hda::VERB_SET_STREAM_CHANNEL, 1 << 4, false);
 		w16(stream + hda::SD_FMT, format);
+
+		// THE CAPTURE ROUTE, ON STREAM TAG TWO. A tag is what ties a converter to a stream
+		// descriptor, and two converters sharing one tag is two streams into one buffer.
+		if let (Some(adc), Some(input_pin), true) = (adc, input_pin, controller.capture_stream != 0) {
+			for node in [adc, input_pin] {
+				controller.verb(node, hda::VERB_SET_POWER_STATE, 0, false);
+			}
+			// PIN CONTROL 0x20 IS *IN* ENABLE and 0x40 is OUT. Setting the output bit on a
+			// microphone pin drives the jack instead of listening to it.
+			controller.verb(input_pin, hda::VERB_SET_PIN_CONTROL, 0x20, false);
+			// The amplifier payload for an INPUT amp sets bit 14 where the output amp sets 15.
+			controller.verb(input_pin, hda::VERB_SET_AMP_GAIN, 0x7000 | 0x7F, true);
+			controller.verb(adc, hda::VERB_SET_AMP_GAIN, 0x7000 | 0x7F, true);
+			controller.verb(adc, hda::VERB_SET_STREAM_FORMAT, format as u32, true);
+			controller.verb(adc, hda::VERB_SET_STREAM_CHANNEL, 2 << 4, false);
+			w16(controller.capture_stream + hda::SD_FMT, format);
+			controller.adc = Some(adc);
+		}
 
 		Ok(controller)
 	}
@@ -525,7 +575,104 @@ unsafe fn stop(controller: &mut Controller) {
 	}
 }
 
-// Serve AudioService: one period a message, an empty message ends the stream.
+// Make the capture buffer hold two periods and point the input stream at it.
+//
+// THE DESCRIPTORS ASK FOR A COMPLETION STATUS, which the playback ones do not need: playback is
+// paced by the consumer handing over the next period, and capture is paced by the DEVICE filling
+// one. `SD_BUFFER_COMPLETE` is how "a period is ready" is asked without an interrupt.
+unsafe fn configure_capture(controller: &mut Controller, bytes: u64) -> bool {
+	unsafe {
+		if controller.capture.virt != 0 && controller.capture.bytes >= bytes * 2 {
+			return true;
+		}
+		if controller.capture.handle != 0 {
+			dma_buffer_unmap(controller.capture.handle);
+			close(controller.capture.handle);
+			controller.capture = Dma { handle: 0, virt: 0, phys: 0, bytes: 0 };
+		}
+		let Some(buffer) = dma(controller.device, (bytes * 2).next_multiple_of(PAGE)) else { return false };
+		zero(buffer.virt, buffer.bytes);
+		for half in 0..2u64 {
+			let entry = controller.capture_bdl_virt + half * hda::BDL_ENTRY_LEN as u64;
+			let at = buffer.phys + half * bytes;
+			w32(entry, at as u32);
+			w32(entry + 4, (at >> 32) as u32);
+			w32(entry + 8, bytes as u32);
+			w32(entry + 12, hda::BDL_INTERRUPT_ON_COMPLETION);
+		}
+		controller.capture = buffer;
+		w32(controller.capture_stream + hda::SD_BDLPL, controller.capture_bdl_phys as u32);
+		w32(controller.capture_stream + hda::SD_BDLPU, (controller.capture_bdl_phys >> 32) as u32);
+		w32(controller.capture_stream + hda::SD_CBL, (bytes * 2) as u32);
+		w16(controller.capture_stream + hda::SD_LVI, 1);
+		true
+	}
+}
+
+// Fill `out` with one captured period, or answer false.
+//
+// THE STREAM RUNS BETWEEN REQUESTS. Starting and stopping it per period would throw away the
+// samples that arrived while nobody was asking, which is a recording with holes in it wherever the
+// consumer was busy - and the consumer is what paces a capture stream least.
+unsafe fn capture_period(controller: &mut Controller, out: &mut [u8]) -> bool {
+	unsafe {
+		if controller.adc.is_none() || controller.capture_stream == 0 {
+			return false;
+		}
+		let bytes = out.len() as u64;
+		if !configure_capture(controller, bytes) {
+			return false;
+		}
+		if !controller.capturing {
+			// Clear whatever the last session left, then run with the tag the converter was told.
+			w8(controller.capture_stream + hda::SD_STS, hda::SD_BUFFER_COMPLETE);
+			w8(controller.capture_stream + hda::SD_CTL + 2, 2 << 4);
+			let ctl = r8(controller.capture_stream + hda::SD_CTL);
+			w8(controller.capture_stream + hda::SD_CTL, ctl | hda::SD_RUN);
+			controller.capturing = true;
+			controller.capture_half = 0;
+		}
+		// WAIT FOR A PERIOD RATHER THAN FOR A TIME. A deadline in ticks would be a guess about the
+		// sample rate; the completion bit is the device saying a descriptor finished.
+		let mut deadline = Deadline::ticks(CAPTURE_TICKS);
+		loop {
+			let status = r8(controller.capture_stream + hda::SD_STS);
+			if status & hda::SD_BUFFER_COMPLETE != 0 {
+				// STICKY AND WRITE-ONE-TO-CLEAR: a reader that only read would see the first
+				// period's completion for ever and hand back the same half every time.
+				w8(controller.capture_stream + hda::SD_STS, hda::SD_BUFFER_COMPLETE);
+				break;
+			}
+			if !deadline.waiting() {
+				return false;
+			}
+		}
+		core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+		let at = controller.capture.virt + controller.capture_half * bytes;
+		core::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), out.len());
+		controller.capture_half ^= 1;
+		true
+	}
+}
+
+unsafe fn stop_capture(controller: &mut Controller) {
+	unsafe {
+		if !controller.capturing {
+			return;
+		}
+		let ctl = r8(controller.capture_stream + hda::SD_CTL);
+		w8(controller.capture_stream + hda::SD_CTL, ctl & !hda::SD_RUN);
+		w8(controller.capture_stream + hda::SD_STS, hda::SD_BUFFER_COMPLETE);
+		controller.capturing = false;
+	}
+}
+
+// Serve AudioService over `driver_protocol::audio`.
+//
+// THE WIRE IS THE SHARED ONE NOW, AND IT WAS NOT BEFORE (2026-09-19). This driver read a length and
+// treated anything non-empty as a period, so the ONE-BYTE COMMANDS that the other server of this
+// same provider kind answers - `CMD_CAPTURE` and `CMD_CAPTURE_STOP` - were played as one-byte
+// periods. A consumer that asked this machine for a microphone got a click.
 unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller, service: u64) -> ! {
 	unsafe {
 		// The largest period AudioService is expected to hand over. A longer one is refused rather
@@ -535,13 +682,23 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 		loop {
 			if !common::serve_or_answer(bootstrap, bind, service) {
 				stop(controller);
+				stop_capture(controller);
 				common::finish_stop(bootstrap, bind, controller.device, true);
 				exit();
 			}
-			match recv_blocking(service, &mut period) {
-				Received::Message { len: 0, .. } => stop(controller),
-				Received::Message { len, .. } => {
+			let Received::Message { len, .. } = recv_blocking(service, &mut period) else {
+				stop(controller);
+				stop_capture(controller);
+				exit();
+			};
+			match audio::message(&period[..len]) {
+				audio::Message::EndPlayback => {
+					stop(controller);
+					send_blocking(service, audio::OK, 0);
+				}
+				audio::Message::Play => {
 					if !configure(controller, len as u64) {
+						send_blocking(service, audio::REFUSED, 0);
 						continue;
 					}
 					// Into the half the controller is not playing, then run.
@@ -550,10 +707,27 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 					core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
 					half ^= 1;
 					start(controller);
+					send_blocking(service, audio::OK, 0);
 				}
-				_ => {
-					stop(controller);
-					exit();
+				audio::Message::Capture => {
+					// A REFUSAL IS AN EMPTY REPLY, which is how "this codec has no input" reaches
+					// the consumer without a second message shape - and why it cannot be mistaken
+					// for samples: a period is never empty.
+					let mut filled = [0u8; audio::PERIOD_BYTES as usize];
+					if capture_period(controller, &mut filled) {
+						send_blocking(service, &filled, 0);
+					} else {
+						send_blocking(service, audio::REFUSED, 0);
+					}
+				}
+				audio::Message::EndCapture => {
+					stop_capture(controller);
+					send_blocking(service, audio::OK, 0);
+				}
+				// A LENGTH THIS WIRE HAS NO SHAPE FOR IS ANSWERED AND NOT PLAYED. Playing a short
+				// message as a period is part of a period played as though it were whole.
+				audio::Message::Unknown => {
+					send_blocking(service, audio::REFUSED, 0);
 				}
 			}
 		}

@@ -323,8 +323,18 @@ pub fn describe_state(out: &mut [u8; 64], name: &[u8], device: &Virtio, state: &
 // `driver.virtio-blk: online (00:02.0)iommu: 00:08.0 attached to domain 4` and then a bare newline,
 // which is two lines a reader cannot read and neither of them the line either component wrote. The
 // gap is what has to go; the terminator belongs to the line.
+// LONG ENOUGH FOR THE LONGEST REPORT A DRIVER BUILDS, which 96 was not. A driver assembles its
+// online line in a `Bounded<N>` of its own - virtio-scsi's is 160 and it has a 192 beside it - and
+// this copy is where the line is actually printed, so a report longer than this buffer is CUT and
+// nothing says so. It surfaced the moment a SCSI controller found three units:
+//
+//     driver.virtio-scsi: online (00:0e.0, 3 units: t0l0 8192 x 512 bytes, t0l1 4096 x 512 bytes, t1l
+//
+// which is an operator being told about two and a half disks. The truncation is still here, because
+// a driver that panicked while writing a report is a device that never came up - what changed is
+// that the bound is above every report this tree writes rather than below one of them.
 fn print_line(report: &[u8]) {
-	let mut out = [0u8; 96];
+	let mut out = [0u8; 256];
 	let n = report.len().min(out.len() - 1);
 	out[..n].copy_from_slice(&report[..n]);
 	out[n] = b'\n';
@@ -556,6 +566,38 @@ pub fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving) -
 	serve_any_or_answer_inner(bootstrap, bind, serving, true)
 }
 
+/// Receive one consumer's request, or drop the consumer that has gone.
+///
+/// THIS EXISTS BECAUSE THE RULE IS NOT OPTIONAL AND WAS FIVE TIMES OMITTED. `serve_any_or_answer`
+/// answers WHICH endpoint has work, and a closed one HAS work: `poll_ready` is a wait against the
+/// current instant, and a channel whose peer is gone returns from it at once - that is how a reader
+/// learns of the closure. So a caller that reads `Closed` and merely continues is handed the same
+/// dead endpoint on the next pass and on every pass after it.
+///
+/// AND IT IS WORSE THAN A SPIN. `serve_any_or_answer` answers with the FIRST ready index, so a
+/// departed consumer sitting at index zero is answered ahead of a live one at index one, for ever:
+/// the driver stops serving everybody rather than merely burning a core. Nothing reports it,
+/// either, because the manager's channel is drained first on every pass and the heartbeat is
+/// answered by a driver doing nothing else.
+///
+/// AND THE MANAGER HAS TO BE TOLD, which is the half a `close_at` alone still gets wrong. The
+/// `consumers` bound in the registry is on CONCURRENT consumers, and the manager only ever counts
+/// up until a `Disconnect` names the publication: without it a kind admitting one is refused for
+/// the rest of the boot the moment its first consumer closes.
+///
+/// `None` means this pass has nothing to serve - the consumer is gone and has been dropped and
+/// reported - and the caller continues its loop.
+pub fn recv_from_consumer(bootstrap: u64, bind: &Bind, serving: &mut Serving, at: usize, buf: &mut [u8]) -> Option<(usize, u64)> {
+	match recv_blocking(serving.at(at), buf) {
+		Received::Message { len, handle } => Some((len, handle)),
+		_ => {
+			let departed = serving.close_at(at);
+			disconnected(bootstrap, bind, departed);
+			None
+		}
+	}
+}
+
 pub enum ProviderReady {
 	Connected(usize),
 	Consumer(usize),
@@ -650,7 +692,19 @@ fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving,
 // accumulate. A bound, because a driver cannot grow an unbounded set of clients from frames a
 // manager sends - and one that is full refuses the endpoint by closing it, which the consumer reads
 // as a connection that ended rather than one that never answers.
-pub const MAX_PROVIDER_CLIENTS: usize = 8;
+//
+// SIXTEEN RATHER THAN EIGHT (2026-09-19), AND THE NUMBER HAS A CONSUMER. Eight was chosen when a
+// driver published ONE provider: four consumers for a disk left room for a second. A SCSI host
+// controller publishes one per LOGICAL UNIT, and units live behind several targets, so eight capped
+// virtio-scsi at two units - which is one target's worth on the machine this tree runs, and the
+// reason "more than one target" stayed open. Sixteen is four units at the four consumers every disk
+// here declares.
+//
+// WHAT IT COSTS IS THE SET ITSELF: four arrays of this length per serving driver, thirteen bytes an
+// entry, so the whole change is about a hundred bytes in each driver that serves consumers. What it
+// does NOT change is the shape - the set is still fixed, and a `CONNECT` past it is still refused by
+// closing the endpoint rather than queued.
+pub const MAX_PROVIDER_CLIENTS: usize = 16;
 
 pub struct Serving {
 	ends: [u64; MAX_PROVIDER_CLIENTS],

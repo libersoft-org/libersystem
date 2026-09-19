@@ -47,6 +47,53 @@ pub fn command_iu(tag: u16, lun: &[u8; 8], cdb_len: u8) -> [u8; COMMAND_IU_HEADE
 	iu
 }
 
+/// Task-management functions, from the UAS specification's own table.
+///
+/// ABORT TASK NAMES A TAG AND LOGICAL UNIT RESET NAMES A UNIT, which is why the two are not
+/// interchangeable escalation steps: the first asks the device to forget ONE command and leaves
+/// everything else outstanding, the second throws away every task on that unit including ones this
+/// driver is still waiting for.
+pub const TMF_ABORT_TASK: u8 = 0x01;
+pub const TMF_LOGICAL_UNIT_RESET: u8 = 0x0E;
+
+/// A task-management information unit is sixteen bytes.
+pub const TASK_MANAGEMENT_IU_LEN: usize = 16;
+
+/// Response codes a device answers a task-management request with.
+pub const RESPONSE_COMPLETE: u8 = 0x00;
+pub const RESPONSE_INVALID_IU: u8 = 0x02;
+pub const RESPONSE_NOT_SUPPORTED: u8 = 0x04;
+pub const RESPONSE_FAILED: u8 = 0x05;
+pub const RESPONSE_SUCCEEDED: u8 = 0x08;
+pub const RESPONSE_INCORRECT_LUN: u8 = 0x09;
+
+/// Whether a response code says the function was carried out.
+///
+/// TWO CODES MEAN YES AND THEY ARE NOT ADJACENT. `0x00` is "function complete" and `0x08` is
+/// "function succeeded"; a driver checking for zero alone treats a successful abort as a failure
+/// and escalates to a unit reset that throws away commands that were fine.
+pub fn task_done(code: u8) -> bool {
+	code == RESPONSE_COMPLETE || code == RESPONSE_SUCCEEDED
+}
+
+/// Build a task-management information unit.
+///
+/// THE TAG IS THIS REQUEST'S OWN AND THE MANAGED TAG IS THE ONE BEING ABORTED, in two different
+/// fields, both big-endian. A driver that put the doomed command's tag in the header would be
+/// asking the device to answer under a tag that is already outstanding - and then matching the
+/// answer against the wrong one.
+pub fn task_management_iu(tag: u16, function: u8, managed_tag: u16, lun: &[u8; 8]) -> [u8; TASK_MANAGEMENT_IU_LEN] {
+	let mut iu = [0u8; TASK_MANAGEMENT_IU_LEN];
+	iu[0] = IU_TASK_MANAGEMENT;
+	iu[2] = (tag >> 8) as u8;
+	iu[3] = tag as u8;
+	iu[4] = function;
+	iu[6] = (managed_tag >> 8) as u8;
+	iu[7] = managed_tag as u8;
+	iu[8..16].copy_from_slice(lun);
+	iu
+}
+
 /// What arrived on the status pipe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {

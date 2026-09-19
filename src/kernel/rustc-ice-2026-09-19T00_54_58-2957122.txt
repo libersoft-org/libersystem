@@ -1,0 +1,28 @@
+thread 'main' panicked at /rustc-dev/01dfd79246f1b2d5f146616deff08223a840a9ae/library/std/src/thread/lifecycle.rs:226:14:
+threads should not terminate unexpectedly
+stack backtrace:
+   0:     0x7efcdf6b8e9b - <std[59c6a60ba8e89306]::backtrace::Backtrace>::create
+   1:     0x7efcdf6b8de5 - <std[59c6a60ba8e89306]::backtrace::Backtrace>::force_capture
+   2:     0x7efcde4a74f8 - std[59c6a60ba8e89306]::panicking::update_hook::<alloc[8bd4a5f83aeff985]::boxed::Box<rustc_driver_impl[612172d3fffba438]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7efcdf6cca22 - std[59c6a60ba8e89306]::panicking::panic_with_hook
+   4:     0x7efcdf6aee12 - std[59c6a60ba8e89306]::panicking::panic_handler::{closure#0}
+   5:     0x7efcdf6a3339 - std[59c6a60ba8e89306]::sys::backtrace::__rust_end_short_backtrace::<std[59c6a60ba8e89306]::panicking::panic_handler::{closure#0}, !>
+   6:     0x7efcdf6b087d - __rustc[c8f31f49d175aaf6]::rust_begin_unwind
+   7:     0x7efcdc19777c - core[ed07a1efed088ad0]::panicking::panic_fmt
+   8:     0x7efcdd4b7fc4 - core[ed07a1efed088ad0]::option::expect_failed
+   9:     0x7efce0eb7c0a - rustc_driver_impl[612172d3fffba438]::run_compiler
+  10:     0x7efce0eaf476 - rustc_driver_impl[612172d3fffba438]::main
+  11:     0x55ee2fcb4173 - std[59c6a60ba8e89306]::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std[59c6a60ba8e89306]::process::ExitCode, std[59c6a60ba8e89306]::process::ExitCode>
+  12:     0x55ee2fcb4169 - <std[59c6a60ba8e89306]::rt::lang_start<std[59c6a60ba8e89306]::process::ExitCode>::{closure#0} as core[ed07a1efed088ad0]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  13:     0x7efce0ffc0cb - std[59c6a60ba8e89306]::rt::lang_start_internal
+  14:     0x55ee2fcf3397 - main
+  15:     0x7efcda635ca8 - __libc_start_call_main
+                               at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16
+  16:     0x7efcda635d65 - __libc_start_main_impl
+                               at ./csu/../csu/libc-start.c:360:3
+  17:     0x55ee2fcf32a6 - <unknown>
+  18:                0x0 - <unknown>
+
+
+rustc version: 1.98.0-nightly (01dfd7924 2026-06-15)
+platform: x86_64-unknown-linux-gnu

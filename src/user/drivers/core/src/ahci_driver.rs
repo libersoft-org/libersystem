@@ -24,8 +24,21 @@ use rt::*;
 
 const PAGE: u64 = 4096;
 
-// The slot this driver issues every command in. One at a time, so one slot.
-const SLOT: u32 = 0;
+// HOW MANY COMMANDS THIS DRIVER KEEPS IN FLIGHT, which is how many tags it uses.
+//
+// FOUR, BECAUSE FOUR IS WHAT A DISK HAS CONSUMERS. Every disk in this tree declares four, each
+// issuing its own requests, so four tags is one per consumer and a fifth is a tag no caller exists
+// for. The controller's own `CAP.NCS` is the other bound and the smaller of the two wins.
+//
+// AND A CONTROLLER THAT DOES NOT QUEUE USES TAG ZERO AND NOTHING ELSE. `CAP.SNCQ` is the question,
+// and a driver that issued a queued command to a controller without it gets an aborted command
+// rather than a refusal.
+const QUEUED_TAGS: usize = 4;
+
+// Where each tag's command table sits in the second page of the structures. A table is a 64-byte
+// command FIS, 16 ATAPI bytes, 48 reserved and then the scatter-gather list - 256 bytes at
+// `PRDT_ENTRIES` of eight - and a command table must be 128-byte aligned, which this stride is.
+const TABLE_STRIDE: u64 = 256;
 
 // The largest transfer one block request may move, before the disk's own limits.
 const TRANSFER_BOUND: u64 = 128 * 1024;
@@ -70,6 +83,7 @@ unsafe fn w64(addr: u64, v: u64) {
 }
 
 // A contiguous DMA region this driver owns.
+#[derive(Clone, Copy)]
 struct Dma {
 	handle: u64,
 	virt: u64,
@@ -151,14 +165,16 @@ enum Fault {
 struct Controller {
 	device: u64,
 	port: u64,
-	// The command list, the received-FIS area and the one command table.
+	// The command list, the received-FIS area and one command table per tag.
 	structures: Dma,
-	table_phys: u64,
-	table_virt: u64,
 	disk: ahci::Disk,
 	most_bytes: u64,
-	// The growable data span one request moves through.
-	data: Dma,
+	// Whether this controller queues. Read once from `CAP.SNCQ`.
+	queued: bool,
+	// The growable data span each tag moves its request through. ONE PER TAG AND NOT ONE SHARED:
+	// two commands in flight into one buffer is two transfers into the same memory, and the second
+	// to finish wins.
+	data: [Dma; QUEUED_TAGS],
 }
 
 impl Controller {
@@ -166,34 +182,48 @@ impl Controller {
 		(self.most_bytes / self.disk.sector_bytes as u64).max(1)
 	}
 
-	fn grow(&mut self, bytes: u64) -> bool {
-		if self.data.bytes >= bytes && self.data.virt != 0 {
+	fn table_virt(&self, tag: usize) -> u64 {
+		self.structures.virt + PAGE + tag as u64 * TABLE_STRIDE
+	}
+
+	fn table_phys(&self, tag: usize) -> u64 {
+		self.structures.phys + PAGE + tag as u64 * TABLE_STRIDE
+	}
+
+	fn grow(&mut self, tag: usize, bytes: u64) -> bool {
+		if self.data[tag].bytes >= bytes && self.data[tag].virt != 0 {
 			return true;
 		}
-		if self.data.handle != 0 {
-			dma_buffer_unmap(self.data.handle);
-			close(self.data.handle);
-			self.data = Dma { handle: 0, virt: 0, phys: 0, bytes: 0 };
+		if self.data[tag].handle != 0 {
+			dma_buffer_unmap(self.data[tag].handle);
+			close(self.data[tag].handle);
+			self.data[tag] = Dma { handle: 0, virt: 0, phys: 0, bytes: 0 };
 		}
 		match dma(self.device, bytes.next_multiple_of(PAGE)) {
 			Some(span) => {
-				self.data = span;
+				self.data[tag] = span;
 				true
 			}
 			None => false,
 		}
 	}
 
-	// Build one command in slot zero and issue it, then wait for it.
+	// Build one command in `tag`'s slot and issue it, WITHOUT waiting for it.
 	//
 	// THE COMMAND HEADER, THE COMMAND FIS AND THE SCATTER-GATHER LIST ARE ALL WRITTEN HERE, and the
 	// order matters only in that the header must name a table that is already built when the slot is
 	// issued - which is why the doorbell-equivalent, `PxCI`, is the last store.
-	unsafe fn command(&mut self, ata: u8, lba: u64, sectors: u32, bytes: u64, write: bool) -> Result<(), Fault> {
+	//
+	// A QUEUED COMMAND IS ISSUED IN THE SLOT WHOSE NUMBER IS ITS TAG, which AHCI requires: the two
+	// are one number, and `PxSACT` is set BEFORE `PxCI` because the controller reads them together
+	// and a slot issued before its active bit is a queued command with no tag.
+	unsafe fn issue(&mut self, tag: usize, ata: u8, lba: u64, sectors: u32, bytes: u64, write: bool) -> Result<(), Fault> {
 		unsafe {
+			let queued = matches!(ata, ahci::ATA_READ_FPDMA_QUEUED | ahci::ATA_WRITE_FPDMA_QUEUED);
+			let table = self.table_virt(tag);
 			// The command FIS: a register host-to-device frame, 20 bytes of the table's first 64.
-			zero(self.table_virt, CT_PRDT_OFFSET);
-			let fis = self.table_virt;
+			zero(table, CT_PRDT_OFFSET);
+			let fis = table;
 			(fis as *mut u8).write_volatile(0x27); // register host to device
 			((fis + 1) as *mut u8).write_volatile(0x80); // this frame carries a command
 			((fis + 2) as *mut u8).write_volatile(ata);
@@ -207,8 +237,19 @@ impl Controller {
 			((fis + 8) as *mut u8).write_volatile((lba >> 24) as u8);
 			((fis + 9) as *mut u8).write_volatile((lba >> 32) as u8);
 			((fis + 10) as *mut u8).write_volatile((lba >> 40) as u8);
-			((fis + 12) as *mut u8).write_volatile(sectors as u8);
-			((fis + 13) as *mut u8).write_volatile((sectors >> 8) as u8);
+			// THE QUEUED PAIR FILL FOUR OF THESE BYTES DIFFERENTLY, and `ahci::queued_fis` is where
+			// that mapping is written down and held by fixtures: the COUNT moves into the features
+			// bytes and the sector-count byte carries the TAG.
+			if queued {
+				let fields = ahci::queued_fis(sectors, tag as u32, false);
+				((fis + 3) as *mut u8).write_volatile(fields.features);
+				((fis + 11) as *mut u8).write_volatile(fields.features_exp);
+				((fis + 12) as *mut u8).write_volatile(fields.count);
+				((fis + 7) as *mut u8).write_volatile(fields.device);
+			} else {
+				((fis + 12) as *mut u8).write_volatile(sectors as u8);
+				((fis + 13) as *mut u8).write_volatile((sectors >> 8) as u8);
+			}
 
 			// The scatter-gather list, one entry per four mebibytes of a contiguous span.
 			let entries = if bytes == 0 {
@@ -220,9 +261,9 @@ impl Controller {
 				}
 			};
 			for index in 0..entries {
-				let entry = self.table_virt + CT_PRDT_OFFSET + (index as u64) * ahci::PRDT_ENTRY_LEN as u64;
+				let entry = table + CT_PRDT_OFFSET + (index as u64) * ahci::PRDT_ENTRY_LEN as u64;
 				let span = ahci::prdt_span(bytes, index);
-				let at = self.data.phys + (index as u64) * ahci::PRDT_MAX_BYTES as u64;
+				let at = self.data[tag].phys + (index as u64) * ahci::PRDT_MAX_BYTES as u64;
 				w64(entry, at);
 				w32(entry + 8, 0);
 				// The byte count is ZERO-BASED: writing the length straight in transfers one byte
@@ -230,30 +271,52 @@ impl Controller {
 				w32(entry + 12, ahci::prdt_count(span));
 			}
 
-			// The command header in slot zero: the FIS length in dwords, the write bit, and how many
-			// scatter-gather entries the table holds.
-			let header = self.structures.virt + (SLOT as u64) * 32;
+			// The command header in this tag's slot: the FIS length in dwords, the write bit, and how
+			// many scatter-gather entries the table holds.
+			let header = self.structures.virt + (tag as u64) * 32;
 			let dw0 = 5u32 | if write { 1 << 6 } else { 0 } | ((entries as u32) << 16);
 			w32(header, dw0);
 			w32(header + 4, 0);
-			w64(header + 8, self.table_phys);
+			w64(header + 8, self.table_phys(tag));
 
 			// Clear any error latched from before, or the task file check below reports somebody
-			// else's failure as this command's.
-			w32(self.port + ahci::PORT_SERR, r32(self.port + ahci::PORT_SERR));
-			w32(self.port + ahci::PORT_IS, r32(self.port + ahci::PORT_IS));
+			// else's failure as this command's. ONLY WHEN NOTHING ELSE IS OUTSTANDING: a queue with
+			// commands in it has a task file that belongs to them, and clearing it under them throws
+			// away the error that stopped the queue.
+			if r32(self.port + ahci::PORT_SACT) == 0 && r32(self.port + ahci::PORT_CI) == 0 {
+				w32(self.port + ahci::PORT_SERR, r32(self.port + ahci::PORT_SERR));
+				w32(self.port + ahci::PORT_IS, r32(self.port + ahci::PORT_IS));
+			}
 
 			// THE TABLE MUST BE VISIBLE BEFORE THE SLOT IS ISSUED. `write_volatile` stops the
 			// compiler reordering these and says nothing about the machine; the same fence the NVMe
 			// driver needs before its doorbell is needed here before `PxCI`.
 			core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-			w32(self.port + ahci::PORT_CI, 1 << SLOT);
+			if queued {
+				w32(self.port + ahci::PORT_SACT, 1 << tag);
+			}
+			w32(self.port + ahci::PORT_CI, 1 << tag);
+			Ok(())
+		}
+	}
 
+	// Where one tag's command has got to. `queued` picks which register answers, and the two are not
+	// interchangeable - see `ahci::queued_outcome`.
+	unsafe fn poll(&self, tag: usize, queued: bool) -> Outcome {
+		unsafe {
+			let tfd = r32(self.port + ahci::PORT_TFD);
+			if queued { ahci::queued_outcome(r32(self.port + ahci::PORT_SACT), tag as u32, tfd) } else { ahci::outcome(r32(self.port + ahci::PORT_CI), tag as u32, tfd) }
+		}
+	}
+
+	// Issue one command in tag zero and wait for it, which is what the paths with no caller to
+	// return to need: IDENTIFY at bring-up and the FLUSH a clean stop certifies.
+	unsafe fn command(&mut self, ata: u8, lba: u64, sectors: u32, bytes: u64, write: bool) -> Result<(), Fault> {
+		unsafe {
+			self.issue(0, ata, lba, sectors, bytes, write)?;
 			let mut spins: u64 = 0;
 			loop {
-				let ci = r32(self.port + ahci::PORT_CI);
-				let tfd = r32(self.port + ahci::PORT_TFD);
-				match ahci::outcome(ci, SLOT, tfd) {
+				match self.poll(0, false) {
 					Outcome::Pending => {
 						spins += 1;
 						if spins > COMMAND_SPINS {
@@ -404,7 +467,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		report.decimal(controller.disk.sectors);
 		report.push(b" x ");
 		report.decimal(controller.disk.sector_bytes as u64);
-		report.push(b" bytes)");
+		report.push(b" bytes");
+		// WHETHER THIS CONTROLLER QUEUES IS PART OF WHAT IT IS. Two machines with the same disk and
+		// different controllers serve a busy consumer set differently, and an operator reading a
+		// slow machine's log should not have to guess which one this is.
+		if controller.queued {
+			report.push(b", ncq ");
+			report.decimal(QUEUED_TAGS as u64);
+			report.push(b" tags");
+		} else {
+			report.push(b", one command at a time");
+		}
+		report.push(b")");
 		common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::BLOCK, blk_client)]);
 		serve(bootstrap, &bind, &mut controller, blk_server)
 	}
@@ -503,29 +577,55 @@ unsafe fn bring_up(base: u64, device: u64) -> Result<Controller, Bringup> {
 		}
 		let port = chosen.ok_or(Bringup::NoDisk)?;
 
-		let table_virt = structures.virt + PAGE;
-		let table_phys = structures.phys + PAGE;
-		let mut controller = Controller { device, port, structures, table_phys, table_virt, disk: ahci::Disk { sectors: 0, sector_bytes: 512 }, most_bytes: TRANSFER_BOUND, data: Dma { handle: 0, virt: 0, phys: 0, bytes: 0 } };
+		// THE TAGS THIS CONTROLLER ACTUALLY HAS. `CAP.NCS` is how many command slots a port carries,
+		// and a driver issuing a tag past it writes a header outside the command list.
+		let tags = (caps.slots as usize).min(QUEUED_TAGS);
+		let mut controller = Controller { device, port, structures, disk: ahci::Disk { sectors: 0, sector_bytes: 512 }, most_bytes: TRANSFER_BOUND, queued: caps.queued && tags > 1, data: [Dma { handle: 0, virt: 0, phys: 0, bytes: 0 }; QUEUED_TAGS] };
 
-		// IDENTIFY DEVICE answers into the data span, 512 bytes of it.
-		if !controller.grow(512) {
+		// IDENTIFY DEVICE answers into tag zero's data span, 512 bytes of it.
+		if !controller.grow(0, 512) {
 			return Err(Bringup::NoDma);
 		}
-		zero(controller.data.virt, 512);
+		zero(controller.data[0].virt, 512);
 		controller.named(ahci::ATA_IDENTIFY, 0, 0, 512, false).map_err(|_| Bringup::Identify)?;
 		let mut words = [0u16; 256];
 		for (index, word) in words.iter_mut().enumerate() {
-			*word = (controller.data.virt as *const u16).add(index).read_volatile();
+			*word = (controller.data[0].virt as *const u16).add(index).read_volatile();
 		}
 		controller.disk = ahci::identify(&words).map_err(|_| Bringup::Disk)?;
 		Ok(controller)
 	}
 }
 
+// ONE REQUEST WAITING ON ONE TAG.
+#[derive(Clone, Copy)]
+struct InFlight {
+	// The consumer to answer, or zero for a free tag.
+	owner: u64,
+	// A read hands back a buffer holding what the disk wrote; a write has already handed its bytes
+	// over and only needs a status.
+	read: bool,
+	bytes: u64,
+}
+
+const FREE: InFlight = InFlight { owner: 0, read: false, bytes: 0 };
+
+// What taking one consumer's request did.
+enum Took {
+	// It is on a tag and waiting for the disk.
+	Placed,
+	// It was answered without one - a capacity, a flush, a refusal - or there was nothing to take.
+	Answered,
+	// The consumer has gone and the serving set has closed over the hole, so THIS INDEX NOW HOLDS
+	// SOMEBODY ELSE and the caller must not step past it.
+	Departed,
+}
+
 unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller, blk_server: u64) -> ! {
 	unsafe {
 		let mut request = [0u8; block::REQUEST_LEN];
 		let mut serving = common::Serving::new(blk_server, 0);
+		let mut flight = [FREE; QUEUED_TAGS];
 		loop {
 			let Some(at) = common::serve_any_or_answer(bootstrap, bind, &mut serving) else {
 				let flushed = controller.flush().is_ok();
@@ -535,113 +635,265 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 				common::finish_stop(bootstrap, bind, controller.device, flushed);
 				exit();
 			};
-			let endpoint: u64 = serving.at(at);
-			let Received::Message { len, handle } = recv_blocking(endpoint, &mut request) else {
-				continue;
-			};
-			let Some(block::Request { op, lba, count }) = block::Request::decode(&request[..len]) else {
-				if handle != 0 {
-					close(handle);
-				}
-				reply(endpoint, block::STATUS_INVALID, 0);
-				continue;
-			};
-			// REFUSED AND NOT CLAMPED, and the disk is not asked.
-			if matches!(op, block::OP_READ | block::OP_WRITE) && blk::request_range(lba, count, controller.disk.sectors, controller.most_sectors()).is_err() {
-				if handle != 0 {
-					close(handle);
-				}
-				reply(endpoint, block::STATUS_INVALID, 0);
-				continue;
-			}
-			match op {
-				block::OP_READ => serve_read(controller, endpoint, lba, count),
-				block::OP_WRITE => serve_write(controller, endpoint, lba, count, handle),
-				block::OP_CAPACITY => {
-					let bytes = controller.disk.sectors * controller.disk.sector_bytes as u64;
-					send_blocking(endpoint, &block::capacity_reply(bytes, controller.most_sectors()), 0);
-				}
-				block::OP_FLUSH => {
-					let ok = controller.flush().is_ok();
-					reply(endpoint, if ok { block::STATUS_OK } else { block::STATUS_ERR }, 0);
-				}
-				_ => {
-					if handle != 0 {
-						close(handle);
+			take(bootstrap, bind, &mut serving, at, controller, &mut request, &mut flight);
+
+			// AND EVERY OTHER CONSUMER THAT ALREADY HAS A REQUEST WAITING, while tags remain.
+			//
+			// THIS IS WHAT THE QUEUE IS FOR, and it is the only place concurrency can come from: the
+			// block contract is one request and one reply per message, so a single consumer never
+			// has two in flight. A disk here has FOUR consumers, and when several of them ask at
+			// once a driver with one command slot serves them one after another while the disk sits
+			// idle between. `poll_ready` is a wait against the current instant, so a consumer with
+			// nothing waiting costs one syscall and is stepped over.
+			//
+			// A CONTROLLER THAT DOES NOT QUEUE COLLECTS NOTHING, because its second command would
+			// have to wait for the first anyway and collecting it early only delays its answer.
+			if controller.queued {
+				let mut scan = 0usize;
+				while scan < serving.as_slice().len() && flight.iter().any(|entry| entry.owner == 0) {
+					if !poll_ready(serving.at(scan)) {
+						scan += 1;
+						continue;
 					}
-					reply(endpoint, block::STATUS_ERR, 0);
+					match take(bootstrap, bind, &mut serving, scan, controller, &mut request, &mut flight) {
+						// The set closed over the hole with its last entry, so this index is a
+						// different consumer now and stepping past it would skip them.
+						Took::Departed => continue,
+						_ => scan += 1,
+					}
 				}
+			}
+			complete(controller, &mut flight);
+		}
+	}
+}
+
+// Take one consumer's request: answer it here if it needs no disk, or put it on a free tag.
+unsafe fn take(bootstrap: u64, bind: &common::Bind, serving: &mut common::Serving, at: usize, controller: &mut Controller, request: &mut [u8; block::REQUEST_LEN], flight: &mut [InFlight; QUEUED_TAGS]) -> Took {
+	unsafe {
+		let endpoint: u64 = serving.at(at);
+		// A CONSUMER THAT CLOSED IS ONE CLIENT LEAVING AND NOT THIS DRIVER'S END. The rule for
+		// dropping it and telling the manager is in `recv_from_consumer`, which says why.
+		let Some((len, handle)) = common::recv_from_consumer(bootstrap, bind, serving, at, request) else {
+			return Took::Departed;
+		};
+		let Some(block::Request { op, lba, count }) = block::Request::decode(&request[..len]) else {
+			if handle != 0 {
+				close(handle);
+			}
+			reply(endpoint, block::STATUS_INVALID, 0);
+			return Took::Answered;
+		};
+		// REFUSED AND NOT CLAMPED, and the disk is not asked.
+		if matches!(op, block::OP_READ | block::OP_WRITE) && blk::request_range(lba, count, controller.disk.sectors, controller.most_sectors()).is_err() {
+			if handle != 0 {
+				close(handle);
+			}
+			reply(endpoint, block::STATUS_INVALID, 0);
+			return Took::Answered;
+		}
+		match op {
+			block::OP_READ => place_read(controller, endpoint, lba, count, flight),
+			block::OP_WRITE => place_write(controller, endpoint, lba, count, handle, flight),
+			block::OP_CAPACITY => {
+				let bytes = controller.disk.sectors * controller.disk.sector_bytes as u64;
+				send_blocking(endpoint, &block::capacity_reply(bytes, controller.most_sectors()), 0);
+				Took::Answered
+			}
+			// A FLUSH IS NOT A QUEUED COMMAND AND MUST NOT MEET ONE. The specification forbids
+			// mixing queued and non-queued commands on a port, so this waits for whatever is on the
+			// tags before it issues - which at this point is nothing, because a batch is completed
+			// before the next one is collected.
+			block::OP_FLUSH => {
+				let ok = controller.flush().is_ok();
+				reply(endpoint, if ok { block::STATUS_OK } else { block::STATUS_ERR }, 0);
+				Took::Answered
+			}
+			_ => {
+				if handle != 0 {
+					close(handle);
+				}
+				reply(endpoint, block::STATUS_ERR, 0);
+				Took::Answered
 			}
 		}
 	}
 }
 
-fn reply(endpoint: u64, status: u32, transferred: u64) {
-	send_blocking(endpoint, &block::reply(status), transferred);
+fn free_tag(flight: &[InFlight; QUEUED_TAGS]) -> Option<usize> {
+	flight.iter().position(|entry| entry.owner == 0)
 }
 
-unsafe fn serve_read(controller: &mut Controller, endpoint: u64, lba: u64, count: u32) {
+unsafe fn place_read(controller: &mut Controller, endpoint: u64, lba: u64, count: u32, flight: &mut [InFlight; QUEUED_TAGS]) -> Took {
 	unsafe {
 		let bytes = count as u64 * controller.disk.sector_bytes as u64;
-		if !controller.grow(bytes) || controller.named(ahci::ATA_READ_DMA_EXT, lba, count, bytes, false).is_err() {
+		let Some(tag) = free_tag(flight) else {
 			reply(endpoint, block::STATUS_ERR, 0);
-			return;
-		}
-		let object: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, bytes, 0, 0, 0);
-		if sys_is_err(object) {
-			reply(endpoint, block::STATUS_ERR, 0);
-			return;
-		}
-		let Some(mapped) = map_object(object) else {
-			close(object);
-			reply(endpoint, block::STATUS_ERR, 0);
-			return;
+			return Took::Answered;
 		};
-		core::ptr::copy_nonoverlapping(controller.data.virt as *const u8, mapped as *mut u8, bytes as usize);
-		unmap_object(object);
-		let granted: i64 = duplicate(object, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
-		close(object);
-		if granted < 0 {
+		let ata = if controller.queued { ahci::ATA_READ_FPDMA_QUEUED } else { ahci::ATA_READ_DMA_EXT };
+		if !controller.grow(tag, bytes) || controller.issue(tag, ata, lba, count, bytes, false).is_err() {
 			reply(endpoint, block::STATUS_ERR, 0);
-			return;
+			return Took::Answered;
 		}
-		reply(endpoint, block::STATUS_OK, granted as u64);
+		flight[tag] = InFlight { owner: endpoint, read: true, bytes };
+		Took::Placed
 	}
 }
 
 // THE THREE-PART CONTRACT ON THE TRANSFERRED OBJECT IS CHECKED BEFORE IT IS MAPPED: a memory object,
 // readable through this handle, and at least as long as the request says.
-unsafe fn serve_write(controller: &mut Controller, endpoint: u64, lba: u64, count: u32, handle: u64) {
+unsafe fn place_write(controller: &mut Controller, endpoint: u64, lba: u64, count: u32, handle: u64, flight: &mut [InFlight; QUEUED_TAGS]) -> Took {
 	unsafe {
 		if handle == 0 {
 			reply(endpoint, block::STATUS_INVALID, 0);
-			return;
+			return Took::Answered;
 		}
 		let bytes = count as u64 * controller.disk.sector_bytes as u64;
 		let Some(info) = object_info(handle) else {
 			close(handle);
 			reply(endpoint, block::STATUS_INVALID, 0);
-			return;
+			return Took::Answered;
 		};
 		if blk::write_source(&info, bytes).is_err() {
 			close(handle);
 			reply(endpoint, block::STATUS_INVALID, 0);
-			return;
+			return Took::Answered;
 		}
-		if !controller.grow(bytes) {
+		let Some(tag) = free_tag(flight) else {
 			close(handle);
 			reply(endpoint, block::STATUS_ERR, 0);
-			return;
+			return Took::Answered;
+		};
+		if !controller.grow(tag, bytes) {
+			close(handle);
+			reply(endpoint, block::STATUS_ERR, 0);
+			return Took::Answered;
 		}
 		let Some(mapped) = map_object(handle) else {
 			close(handle);
 			reply(endpoint, block::STATUS_ERR, 0);
-			return;
+			return Took::Answered;
 		};
-		core::ptr::copy_nonoverlapping(mapped as *const u8, controller.data.virt as *mut u8, bytes as usize);
+		// THE BYTES ARE COPIED BEFORE THE COMMAND IS ISSUED, which is what lets the caller's object
+		// be unmapped and closed here rather than held until the disk is done with it.
+		core::ptr::copy_nonoverlapping(mapped as *const u8, controller.data[tag].virt as *mut u8, bytes as usize);
 		unmap_object(handle);
 		close(handle);
-		let ok = controller.named(ahci::ATA_WRITE_DMA_EXT, lba, count, bytes, true).is_ok();
-		reply(endpoint, if ok { block::STATUS_OK } else { block::STATUS_ERR }, 0);
+		let ata = if controller.queued { ahci::ATA_WRITE_FPDMA_QUEUED } else { ahci::ATA_WRITE_DMA_EXT };
+		if controller.issue(tag, ata, lba, count, bytes, true).is_err() {
+			reply(endpoint, block::STATUS_ERR, 0);
+			return Took::Answered;
+		}
+		flight[tag] = InFlight { owner: endpoint, read: false, bytes };
+		Took::Placed
 	}
+}
+
+// Wait for every tag this batch put on the disk and answer each consumer as its command finishes.
+//
+// EACH IS ANSWERED WHEN IT FINISHES AND NOT WHEN THE BATCH DOES, which is the difference the queue
+// buys: a short read behind a long one does not wait for it.
+//
+// AND A FAILURE STOPS THE WHOLE QUEUE, which is the half a non-queued driver never has to think
+// about. A queued command that fails sets `TFD.ERR` and the port stops accepting, so every other
+// outstanding tag is abandoned rather than failed on its own - `queued_outcome` answers `Failed` for
+// all of them, which is the truth, and the port is restarted so the next batch has somewhere to go.
+unsafe fn complete(controller: &mut Controller, flight: &mut [InFlight; QUEUED_TAGS]) {
+	unsafe {
+		if flight.iter().all(|entry| entry.owner == 0) {
+			return;
+		}
+		let queued = controller.queued;
+		let mut spins: u64 = 0;
+		let mut failed = false;
+		loop {
+			let mut waiting = false;
+			for tag in 0..QUEUED_TAGS {
+				if flight[tag].owner == 0 {
+					continue;
+				}
+				match controller.poll(tag, queued) {
+					Outcome::Pending => waiting = true,
+					Outcome::Done => {
+						// The data the controller wrote must be visible before it is read out.
+						core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+						finish(controller, tag, flight);
+					}
+					Outcome::Failed { status, error } => {
+						let mut line: common::Bounded<128> = common::Bounded::new();
+						line.push(b"driver.ahci: queued command on tag ");
+						line.decimal(tag as u64);
+						line.push(b" failed, status ");
+						line.push(&common::hex2(status));
+						line.push(b" error ");
+						line.push(&common::hex2(error));
+						line.push(b"\n");
+						print(line.as_bytes());
+						reply(flight[tag].owner, block::STATUS_ERR, 0);
+						flight[tag] = FREE;
+						failed = true;
+					}
+				}
+			}
+			if !waiting {
+				break;
+			}
+			spins += 1;
+			if spins > COMMAND_SPINS {
+				for tag in 0..QUEUED_TAGS {
+					if flight[tag].owner != 0 {
+						print(b"driver.ahci: a queued command never completed\n");
+						reply(flight[tag].owner, block::STATUS_ERR, 0);
+						flight[tag] = FREE;
+					}
+				}
+				failed = true;
+				break;
+			}
+		}
+		// A PORT THAT STOPPED HAS TO BE STARTED AGAIN, or every later batch times out against a
+		// controller that is no longer accepting anything.
+		if failed {
+			stop_port(controller.port);
+			w32(controller.port + ahci::PORT_SERR, r32(controller.port + ahci::PORT_SERR));
+			w32(controller.port + ahci::PORT_IS, r32(controller.port + ahci::PORT_IS));
+			start_port(controller.port);
+		}
+	}
+}
+
+// Answer one finished tag: a read hands back what the disk wrote, a write only its status.
+unsafe fn finish(controller: &mut Controller, tag: usize, flight: &mut [InFlight; QUEUED_TAGS]) {
+	unsafe {
+		let entry = flight[tag];
+		flight[tag] = FREE;
+		if !entry.read {
+			reply(entry.owner, block::STATUS_OK, 0);
+			return;
+		}
+		let object: u64 = syscall(SYS_MEMORY_OBJECT_CREATE, entry.bytes, 0, 0, 0);
+		if sys_is_err(object) {
+			reply(entry.owner, block::STATUS_ERR, 0);
+			return;
+		}
+		let Some(mapped) = map_object(object) else {
+			close(object);
+			reply(entry.owner, block::STATUS_ERR, 0);
+			return;
+		};
+		core::ptr::copy_nonoverlapping(controller.data[tag].virt as *const u8, mapped as *mut u8, entry.bytes as usize);
+		unmap_object(object);
+		let granted: i64 = duplicate(object, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+		close(object);
+		if granted < 0 {
+			reply(entry.owner, block::STATUS_ERR, 0);
+			return;
+		}
+		reply(entry.owner, block::STATUS_OK, granted as u64);
+	}
+}
+
+fn reply(endpoint: u64, status: u32, transferred: u64) {
+	send_blocking(endpoint, &block::reply(status), transferred);
 }

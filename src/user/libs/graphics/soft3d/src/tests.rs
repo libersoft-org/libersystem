@@ -1169,6 +1169,26 @@ fn mip_generation_is_a_box_filter_in_linear_light_and_odd_sizes_halve_by_floorin
 	texture::generate_mips(&mut encoded);
 	assert_eq!(encoded.transfer, Transfer::Linear);
 	assert!((encoded.levels[1].at(0, 0, 0)[0] - 0.2140).abs() < 1e-3, "the box averaged decoded values: {}", encoded.levels[1].at(0, 0, 0)[0]);
+	// AND LEVEL ZERO IS DECODED TOO, which is the half a chain check does not reach: every level
+	// below it is built from decoded light, so a top level left in the source's own encoding while
+	// the texture says `Linear` is read as light by every magnified fragment - more than twice the
+	// value, and a step between level zero and level one that no filter put there.
+	assert!((encoded.levels[0].at(0, 0, 0)[0] - 0.2140).abs() < 1e-3, "the top level is the decoded one: {}", encoded.levels[0].at(0, 0, 0)[0]);
+	assert!(encoded.premultiplied, "and it says so, or the next fetch decodes it again");
+
+	// AND A SOURCE THAT WAS NOT PREMULTIPLIED IS, because that is the other half of what the chain
+	// declares: `linear` premultiplies on the way in, so every level including the top carries
+	// colour already multiplied by its alpha.
+	let mut straight = Texture { id: 5, kind: Kind::Dim2, levels: vec![Level::new(2, 2, 1)], transfer: Transfer::Linear, semantics: Semantics::Color, premultiplied: false };
+	for y in 0..2 {
+		for x in 0..2 {
+			straight.levels[0].set(x, y, 0, [0.8, 0.8, 0.8, 0.5]);
+		}
+	}
+	texture::generate_mips(&mut straight);
+	assert!(straight.premultiplied);
+	assert!(near(straight.levels[0].at(0, 0, 0)[0], 0.4), "the top level is premultiplied: {}", straight.levels[0].at(0, 0, 0)[0]);
+	assert!(near(straight.levels[1].at(0, 0, 0)[0], 0.4), "and so is the level under it: {}", straight.levels[1].at(0, 0, 0)[0]);
 }
 
 #[test]

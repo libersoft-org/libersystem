@@ -42,6 +42,11 @@ pub enum ClassKind {
 	/// class, because what comes out of them is different - a byte stream and a frame transport -
 	/// and a controller may carry one of each.
 	Serial,
+	/// A USB Audio Class sink: one ISOCHRONOUS endpoint, which is a transfer type no other class
+	/// here uses - the bus reserves bandwidth for it and delivers late rather than not at all, and
+	/// nothing retries. That is why it is its own budget: what it reserves is not a buffer, it is
+	/// time on the bus.
+	Audio,
 }
 
 /// One endpoint ring is one DMA page, which is the unit both class modules allocate in.
@@ -73,15 +78,20 @@ pub const HID_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES, in_flight
 /// buffer it may grow to, and one transfer in flight.
 pub const STORAGE_COST: Cost = Cost { endpoints: 2, dma_bytes: 2 * RING_BYTES + STORAGE_MAX_DATA_BYTES, in_flight: 1 };
 
-/// What one CDC network adapter costs: a bulk pair with their rings, a receive page and a transmit
-/// page, and one transfer in flight. The receive transfer is STANDING - one is outstanding whenever
-/// the adapter is bound - which is what the in-flight count is for.
-pub const NETWORK_COST: Cost = Cost { endpoints: 2, dma_bytes: 2 * RING_BYTES + 2 * 4096, in_flight: 1 };
+/// What one CDC network adapter costs: a bulk pair AND THE NOTIFICATION ENDPOINT with their rings, a
+/// receive page, a transmit page and a notification page, and two transfers in flight. BOTH the
+/// receive and the notification transfers are STANDING - one of each is outstanding whenever the
+/// adapter is bound - which is what the in-flight count is for.
+///
+/// THE THIRD ENDPOINT IS NOT OPTIONAL IN THE BUDGET even though it is optional on the device: a
+/// budget that charged for it only when an adapter had one would admit an adapter it could not
+/// afford, and find out at the endpoint that was not there.
+pub const NETWORK_COST: Cost = Cost { endpoints: 3, dma_bytes: 3 * RING_BYTES + 3 * 4096, in_flight: 2 };
 
 /// ONE NETWORK ADAPTER, for the reason the storage module admits one disk: a second NIC is a second
 /// link with its own MAC and its own stack above it, and this controller publishes one provider.
 /// Stated as a budget so a second adapter is REFUSED and says so, rather than being ignored.
-pub const NETWORK_LIMITS: Limits = Limits { devices: 1, endpoints: 2, dma_bytes: 2 * RING_BYTES + 2 * 4096, in_flight: 1 };
+pub const NETWORK_LIMITS: Limits = Limits { devices: 1, endpoints: 3, dma_bytes: 3 * RING_BYTES + 3 * 4096, in_flight: 2 };
 
 /// What one UAS device costs: four pipes with their rings, a control page, a data page, and one
 /// command in flight - which is the slice this transport implements and the reason one stream is
@@ -91,6 +101,16 @@ pub const UAS_COST: Cost = Cost { endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 
 /// ONE UAS DEVICE, for the reason the storage module admits one disk: the transport is one command
 /// outstanding under one tag, and a second device would need a second of everything.
 pub const UAS_LIMITS: Limits = Limits { devices: 1, endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 4096, in_flight: 1 };
+
+/// What one audio sink costs: ONE isochronous endpoint with its ring, and the period buffer it
+/// streams from. Two periods in flight, because a sink with one is a sink that goes silent between
+/// the transfer completing and the next one being posted - which is the click this buffer exists to
+/// avoid and the reason the count is not one.
+pub const AUDIO_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES + 4096, in_flight: 2 };
+
+/// ONE AUDIO SINK, for the reason the network module admits one adapter: AudioService drives one
+/// device, and a second would publish a provider nobody opens.
+pub const AUDIO_LIMITS: Limits = Limits { devices: 1, endpoints: 1, dma_bytes: RING_BYTES + 4096, in_flight: 2 };
 
 /// What one CDC-ACM adapter costs: the bulk pair and the notification endpoint with their rings, a
 /// receive page and a transmit page, and one standing receive in flight - the same shape as the
@@ -173,11 +193,12 @@ pub struct Budget {
 	network: Usage,
 	uas: Usage,
 	serial: Usage,
+	audio: Usage,
 }
 
 impl Budget {
 	pub const fn new() -> Budget {
-		Budget { hid: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, storage: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, network: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, uas: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, serial: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 } }
+		Budget { hid: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, storage: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, network: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, uas: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, serial: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 }, audio: Usage { devices: 0, endpoints: 0, dma_bytes: 0, in_flight: 0 } }
 	}
 
 	pub const fn limits(kind: ClassKind) -> Limits {
@@ -187,6 +208,7 @@ impl Budget {
 			ClassKind::Network => NETWORK_LIMITS,
 			ClassKind::Uas => UAS_LIMITS,
 			ClassKind::Serial => SERIAL_LIMITS,
+			ClassKind::Audio => AUDIO_LIMITS,
 		}
 	}
 
@@ -197,6 +219,7 @@ impl Budget {
 			ClassKind::Network => NETWORK_COST,
 			ClassKind::Uas => UAS_COST,
 			ClassKind::Serial => SERIAL_COST,
+			ClassKind::Audio => AUDIO_COST,
 		}
 	}
 
@@ -207,6 +230,7 @@ impl Budget {
 			ClassKind::Network => self.network,
 			ClassKind::Uas => self.uas,
 			ClassKind::Serial => self.serial,
+			ClassKind::Audio => self.audio,
 		}
 	}
 
@@ -271,6 +295,7 @@ impl Budget {
 			// The UAS module's data buffer is the one page it was charged for and it never grows it.
 			ClassKind::Uas => bytes <= 4096,
 			ClassKind::Serial => bytes <= 4096,
+			ClassKind::Audio => bytes <= 4096,
 		}
 	}
 
@@ -281,6 +306,7 @@ impl Budget {
 			ClassKind::Network => &mut self.network,
 			ClassKind::Uas => &mut self.uas,
 			ClassKind::Serial => &mut self.serial,
+			ClassKind::Audio => &mut self.audio,
 		}
 	}
 }

@@ -152,25 +152,32 @@ fn the_kernel_registry_is_the_manifest_migration_table() {
 	// DECLARES. A row that arrived unclassified cannot exist - the manifest refuses it - and this is
 	// the kernel side of the same fact.
 	//
-	// ALL THREE POLICIES ARE NOW IN USE, and this test used to say otherwise (corrected 2026-09-16).
-	// It asserted that the network driver requires translation and EVERY OTHER ROW is the trusted
-	// exception, which was a true description of the table on the day it was written and became a
-	// frozen list rather than a rule. `sdhci` is the first driver to declare `none`: its first slice
-	// moves every block through the controller's data port, so it never hands the controller a
-	// physical address, and `none` is exactly the policy P02M0172 built for that - bus mastering
-	// stays off and the binding cannot mint a DMA buffer at all. A driver that genuinely masters
-	// nothing is the case that policy exists to express, and the first one arriving should not fail
-	// a test for doing so.
+	// ALL THREE POLICIES WERE IN USE AND NOW TWO ARE, and the reason is worth more than the list
+	// (corrected 2026-09-16, corrected again 2026-09-19). `sdhci` was the first and only driver to
+	// declare `none` - its first slice moved every block through the controller's data port, so it
+	// never handed the controller a physical address. ADMA2 took that away: a descriptor table is
+	// memory the CONTROLLER reads, so the entry declares `trusted-untranslated` now and the registry
+	// has no `none` row at all.
+	//
+	// THAT DOES NOT LEAVE THE POLICY UNTESTED, WHICH IS THE QUESTION AN EMPTY ROW RAISES. What
+	// `none` means is held by `every_mode_and_policy_combination_answers_as_the_matrix_says`, which
+	// covers all three against every DMA mode and needs no driver to declare one - and its
+	// ENFORCEMENT was demonstrated by the change that removed the row: the first ADMA build was
+	// refused a descriptor table with "no memory for the descriptor table", because a claim under
+	// `none` mints no DMA buffer at all. A policy proven by a refusal it caused is better evidence
+	// than a declaration nobody exercises.
+	//
+	// SO WHAT THIS ASSERTS IS THE RULE AND NOT THE LIST: every row carries what its entry declares,
+	// and the one entry that requires translation is the refusal demonstration.
 	let names = registry_names();
 	assert!(names.contains(&&b"virtio_net"[..]), "the network driver is in the table");
 	assert!(names.contains(&&b"virtio_blk"[..]));
 	assert!(names.contains(&&b"xhci"[..]));
 	assert_eq!(registry_policy(b"virtio_net"), Some(abi::DMA_POLICY_IOMMU_REQUIRED as u8));
-	assert_eq!(registry_policy(b"sdhci"), Some(abi::DMA_POLICY_NONE as u8), "the PIO card reader masters nothing and says so");
+	assert_eq!(registry_policy(b"sdhci"), Some(abi::DMA_POLICY_TRUSTED_UNTRANSLATED as u8), "the card reader masters the bus since ADMA2 replaced its PIO path");
 	for name in names {
 		let expected = match name {
 			b"virtio_net" => abi::DMA_POLICY_IOMMU_REQUIRED,
-			b"sdhci" => abi::DMA_POLICY_NONE,
 			_ => abi::DMA_POLICY_TRUSTED_UNTRANSLATED,
 		};
 		assert_eq!(registry_policy(name), Some(expected as u8), "{} carries the policy it declares", core::str::from_utf8(name).unwrap());

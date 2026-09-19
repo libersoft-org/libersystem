@@ -230,6 +230,38 @@ fn probes() -> Vec<(&'static str, DrawList)> {
 	rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.4, 0.5, ColorSpace::Srgb))).expect("a fill");
 	out.push(("one-translucent-fullscreen", canvas.finish().expect("a list")));
 
+	// THE SAME FILL AS FOUR RECTANGLES, EACH A QUARTER OF THE FRAME. Same pixels, same colour, same
+	// covered path - and four times the per-command and per-edge work. Subtracting the one-rectangle
+	// row from this one says what a COMMAND costs against what a PIXEL costs, which is the question
+	// every hypothesis about the forty-seven nanoseconds has needed and none has had an answer to.
+	let mut canvas = Canvas::new();
+	let (half_w, half_h) = (WIDTH as f32 / 2.0, HEIGHT as f32 / 2.0);
+	for (x, y) in [(0.0, 0.0), (half_w, 0.0), (0.0, half_h), (half_w, half_h)] {
+		rect(&mut canvas, RectF::new(x, y, half_w, half_h), Paint::Solid(Color::new(0.2, 0.3, 0.4, 1.0, ColorSpace::Srgb))).expect("a fill");
+	}
+	out.push(("four-opaque-quarters", canvas.finish().expect("a list")));
+
+	// THE SAME PIXELS AGAIN, AS ONE RECTANGLE DRAWN FOUR TIMES over the whole frame. Four times the
+	// pixels and four times the commands, against the row above which is four times the commands and
+	// the SAME pixels: the pair separates the two terms rather than leaving them multiplied together.
+	let mut canvas = Canvas::new();
+	for _ in 0..4 {
+		rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.4, 1.0, ColorSpace::Srgb))).expect("a fill");
+	}
+	out.push(("four-opaque-fullscreen", canvas.finish().expect("a list")));
+
+	// THE TOP HALF OF EVERY TILE, which touches every tile the full-screen fill touches and dirties
+	// half of each. IF THE FLUSH IS BOUNDED BY THE DIRTY RECTANGLE this costs about half of the
+	// full-screen row; if it is bounded by the TILE it costs the same, and those are different
+	// defects with different fixes. One rectangle per tile row, full width, half a tile tall.
+	let mut canvas = Canvas::new();
+	let mut top = 0u32;
+	while top < HEIGHT {
+		rect(&mut canvas, RectF::new(0.0, top as f32, WIDTH as f32, 32.0), Paint::Solid(Color::new(0.2, 0.3, 0.4, 1.0, ColorSpace::Srgb))).expect("a fill");
+		top += 64;
+	}
+	out.push(("half-of-every-tile", canvas.finish().expect("a list")));
+
 	// A HUNDRED SMALL RECTANGLES, which is what a user interface is: the per-command cost times the
 	// number of commands, over an area that is a fraction of the frame.
 	let mut canvas = Canvas::new();

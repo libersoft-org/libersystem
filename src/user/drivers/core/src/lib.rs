@@ -58,6 +58,7 @@ pub mod snd;
 // THE USB ATTACHED SCSI INFORMATION UNITS: the same SCSI command set as the Bulk-Only path, carried
 // over four pipes joined by a tag instead of two strictly in order. The tag is where a UAS driver is
 // wrong, and it is big-endian in a transport that is little-endian everywhere else.
+pub mod uac;
 pub mod uas;
 pub mod usb;
 // The in-controller class-module execution model: what a USB class driver IS in this system, and the

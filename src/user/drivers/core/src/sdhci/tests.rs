@@ -254,3 +254,62 @@ fn a_write_to_a_protected_card_is_refused_before_the_command_is_built() {
 	assert!(card_present(slot.present), "still a card");
 	assert!(write_protected(slot.present), "and now a protected one");
 }
+
+#[test]
+fn a_descriptor_carries_its_length_literally_and_marks_the_end() {
+	let one = adma_descriptor(0x1234_5678, 512, false);
+	assert_eq!(u16::from_le_bytes([one[0], one[1]]), ADMA_VALID | ADMA_ACT_TRAN, "valid and a transfer, and not the end");
+	assert_eq!(u16::from_le_bytes([one[2], one[3]]), 512, "the length is the length");
+	assert_eq!(u32::from_le_bytes([one[4], one[5], one[6], one[7]]), 0x1234_5678);
+
+	let last = adma_descriptor(0, 512, true);
+	assert_eq!(u16::from_le_bytes([last[0], last[1]]) & ADMA_END, ADMA_END, "the last one says so, or the controller reads what follows the table as another descriptor");
+
+	// AND THE BOUND KEEPS EVERY LENGTH LITERAL. The field is sixteen bits and ZERO means 65536, so
+	// a descriptor carrying the full range would have to be written as zero - which is also how an
+	// empty one is written. The bound is below the range for exactly that reason.
+	assert!(ADMA_MAX_BYTES < 65536);
+	assert_eq!(ADMA_MAX_BYTES % BLOCK_BYTES, 0, "and it is a whole number of blocks");
+	let full = adma_descriptor(0, ADMA_MAX_BYTES, true);
+	assert_ne!(u16::from_le_bytes([full[2], full[3]]), 0, "the largest span this driver asks for is not written as zero");
+}
+
+#[test]
+fn a_span_is_split_into_as_many_descriptors_as_it_needs() {
+	assert_eq!(adma_entries(512, 8), Ok(1));
+	assert_eq!(adma_entries(ADMA_MAX_BYTES as u64, 8), Ok(1), "exactly one descriptor's worth is one descriptor");
+	assert_eq!(adma_entries(ADMA_MAX_BYTES as u64 + 512, 8), Ok(2), "and one block more is two");
+	assert_eq!(adma_entries(0, 8), Err(Undescribable::Empty));
+	assert_eq!(adma_entries(ADMA_MAX_BYTES as u64 * 9, 8), Err(Undescribable::TooManyEntries), "a span past the table is refused rather than truncated");
+
+	// THE SPANS SUM TO THE WHOLE, which is what says nothing is dropped at the split.
+	let bytes = ADMA_MAX_BYTES as u64 + 1024;
+	let entries = adma_entries(bytes, 8).unwrap();
+	let total: u64 = (0..entries).map(|index| adma_span(bytes, index) as u64).sum();
+	assert_eq!(total, bytes);
+	assert_eq!(adma_span(bytes, 0), ADMA_MAX_BYTES);
+	assert_eq!(adma_span(bytes, 1), 1024);
+	assert_eq!(adma_span(bytes, 2), 0, "past the end is nothing, not a wrap");
+}
+
+#[test]
+fn a_single_block_transfer_does_not_carry_the_stop_a_multi_block_one_needs() {
+	// AUTO CMD12 AFTER ONE BLOCK IS A STOP FOR A TRANSMISSION THAT ALREADY ENDED, and the card
+	// reports an illegal command - so this is not "set it always and be safe".
+	let single = transfer_mode(1, false, true);
+	assert_eq!(single & TRANSFER_AUTO_CMD12, 0);
+	assert_eq!(single & TRANSFER_MULTI_BLOCK, 0);
+	assert_eq!(single & TRANSFER_READ, TRANSFER_READ);
+	assert_eq!(single & TRANSFER_DMA_ENABLE, TRANSFER_DMA_ENABLE);
+	assert_eq!(single & TRANSFER_BLOCK_COUNT_ENABLE, TRANSFER_BLOCK_COUNT_ENABLE);
+
+	// AND WITHOUT IT A MULTI-BLOCK READ NEVER ENDS.
+	let many = transfer_mode(8, false, true);
+	assert_eq!(many & TRANSFER_AUTO_CMD12, TRANSFER_AUTO_CMD12);
+	assert_eq!(many & TRANSFER_MULTI_BLOCK, TRANSFER_MULTI_BLOCK);
+
+	// A write is the same word without the direction bit.
+	assert_eq!(transfer_mode(8, true, true) & TRANSFER_READ, 0);
+	// And the PIO path asks for no DMA.
+	assert_eq!(transfer_mode(1, false, false) & TRANSFER_DMA_ENABLE, 0);
+}

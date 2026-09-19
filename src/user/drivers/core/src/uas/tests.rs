@@ -96,3 +96,52 @@ fn a_residue_larger_than_the_request_is_refused_rather_than_subtracted() {
 	assert_eq!(moved(512, 100), Some(412));
 	assert_eq!(moved(512, 513), None, "and more left over than was asked for is not a transfer");
 }
+
+#[test]
+fn a_task_management_unit_carries_two_tags_in_two_places() {
+	let lun = [0u8; 8];
+	let iu = task_management_iu(0x1234, TMF_ABORT_TASK, 0x5678, &lun);
+	assert_eq!(iu.len(), TASK_MANAGEMENT_IU_LEN);
+	assert_eq!(iu[0], IU_TASK_MANAGEMENT, "and not a command unit, which the device would execute");
+	// THIS REQUEST'S OWN TAG, big-endian, in the header.
+	assert_eq!(u16::from_be_bytes([iu[2], iu[3]]), 0x1234);
+	assert_eq!(iu[4], TMF_ABORT_TASK);
+	// AND THE DOOMED COMMAND'S TAG SOMEWHERE ELSE. Putting it in the header would ask the device to
+	// answer under a tag that is already outstanding.
+	assert_eq!(u16::from_be_bytes([iu[6], iu[7]]), 0x5678);
+	assert_eq!(&iu[8..16], &lun);
+
+	// A unit reset names no task: the function is the difference, not a missing field.
+	let reset = task_management_iu(1, TMF_LOGICAL_UNIT_RESET, 0, &lun);
+	assert_eq!(reset[4], TMF_LOGICAL_UNIT_RESET);
+	assert_ne!(TMF_ABORT_TASK, TMF_LOGICAL_UNIT_RESET);
+}
+
+#[test]
+fn two_response_codes_mean_the_function_was_carried_out() {
+	// 0x00 IS "COMPLETE" AND 0x08 IS "SUCCEEDED", and they are not adjacent - a driver checking for
+	// zero alone reads a successful abort as a failure and escalates to a unit reset, which throws
+	// away commands that were fine.
+	assert!(task_done(RESPONSE_COMPLETE));
+	assert!(task_done(RESPONSE_SUCCEEDED));
+	assert!(!task_done(RESPONSE_INVALID_IU));
+	assert!(!task_done(RESPONSE_NOT_SUPPORTED));
+	assert!(!task_done(RESPONSE_FAILED));
+	assert!(!task_done(RESPONSE_INCORRECT_LUN));
+	// And an unassigned code is not a yes.
+	assert!(!task_done(0x7F));
+}
+
+#[test]
+fn a_response_unit_is_read_as_a_response_and_not_as_a_status() {
+	// Both arrive on the status pipe. A response read as a sense unit would be a command's status
+	// that no command asked for.
+	let mut iu = [0u8; 8];
+	iu[0] = IU_RESPONSE;
+	iu[2] = 0x00;
+	iu[3] = 0x09;
+	iu[3 + 1] = 0;
+	// The response code sits at offset 3 of the response's own payload; what matters here is that
+	// the KIND is read first.
+	assert!(matches!(answer(&iu), Answer::Response { tag: 9, .. }));
+}

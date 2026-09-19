@@ -99,8 +99,14 @@ while [[ $# -gt 0 ]]; do
 		shift 2
 		;;
 	--list-tags)
+		# THE HYPHEN IS PART OF THE NAME. This class was `[a-z0-9_]+` and stopped at the first
+		# hyphen, so the list advertised four names the kernel refuses - `arch`, `capability`,
+		# `permission`, `volume` - and hid eleven it accepts, `volume-layout` among them. Four of
+		# the eleven truncated onto a DIFFERENT real tag, which is why the output looked complete
+		# and `--tags permission` answered `unknown tag 'permission'` from the kernel that this
+		# very list had recommended. `check-test-tags.sh` compares the two sides now.
 		sed -n '/^define_test_tags! {/,/^}/p' "$SRC_DIR/kernel/tests.rs" |
-			grep -oP '=> "\K[a-z0-9_]+' | sort -u | tr '\n' ' '
+			grep -oP '=> "\K[a-z0-9_-]+' | sort -u | tr '\n' ' '
 		echo
 		exit 0
 		;;

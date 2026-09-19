@@ -1803,10 +1803,20 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-# The first slice is PIO, so this driver moves every block through the controller's data port and
-# never masters the bus. `none` is what that declares, and it is the policy the registry mechanism
-# exists for: bus mastering stays OFF and the binding cannot mint a DMA buffer at all.
-dma = "none"
+# ADMA2, SO THIS DRIVER MASTERS THE BUS - AND THE DECLARATION IT USED TO CARRY IS WHY THAT IS A
+# DECISION AND NOT AN EDIT.
+#
+# It was `none` while the transfer path was PIO: every block went through the controller's data port
+# and the registry mechanism kept bus mastering OFF, so the binding could not mint a DMA buffer at
+# all. That is not documentation - it is enforcement, and it is what refused the first ADMA build's
+# descriptor table with "no memory for the descriptor table" rather than letting a driver declaring
+# `none` quietly master the bus.
+#
+# The cost is the one the threat model already records for every other storage driver here: with no
+# translating controller in the path, a DMA-mastering driver is a TCB member for memory safety. What
+# is bought is the one-block-per-request bound going away - a consumer reading a hundred and twenty
+# eight kilobytes asked for 256 requests and now asks for one.
+dma = "trusted-untranslated"
 # An SD host controller is a BASE SYSTEM PERIPHERAL rather than a mass-storage controller: the class
 # says what the silicon is, not what it carries.
 match = [{ transport = "plain-pci", pci-class = 0x08, pci-subclass = 0x05, pci-interface = 0x01 }]
@@ -2188,13 +2198,19 @@ match = [{ transport = "virtio-pci", virtio-type = 8 }]
 # provider per unit, under the unit's own name, so a consumer asking for a disk cannot be handed
 # whichever answered first.
 #
-# AND TWO RATHER THAN FOUR, BECAUSE `most` TIMES `consumers` IS A REAL BOUND. A driver serves at most
-# eight provider connections at once - that is the size of its serving set - and the manifest check
-# is what says so before a boot finds out. Each unit keeps the four consumers every other disk in
-# this tree declares, because a medium is probed by each StorageService instance that has to classify
-# it; taking that down to two to buy a third unit would trade a disk nobody can identify for a disk
-# nobody has. The driver's own `MAX_UNITS` is this same number and has to be.
-provides = [{ kind = "block", most = 2, consumers = 4 }]
+# AND `most` TIMES `consumers` IS A REAL BOUND: a driver serves at most `MAX_PROVIDER_CLIENTS`
+# provider connections at once - that is the size of its serving set - and the manifest check is what
+# says so before a boot finds out. Each unit keeps the four consumers every other disk in this tree
+# declares, because a medium is probed by each StorageService instance that has to classify it;
+# taking that down to two to buy more units would trade a disk nobody can identify for a disk nobody
+# has. The driver's own `MAX_UNITS` is this same number and has to be.
+#
+# FOUR RATHER THAN TWO (2026-09-19). Two was the serving set's number and not this controller's: a
+# machine whose FIRST target carries two logical units filled the table before the walk reached a
+# second target, which is why "more than one target" stayed open against an item that asks for
+# targets in the plural. The serving set is sixteen now, which is these four units at four consumers
+# each, and the walk has somewhere to put what it already looked for.
+provides = [{ kind = "block", most = 4, consumers = 4 }]
 heartbeat-deadline = 100
 
 # THE HOST STREAM TRANSPORT, and the entry's `provides` line is the item's own requirement: it
@@ -2215,9 +2231,12 @@ lifecycle = "controller"
 # It masters the bus like every other virtio driver here.
 dma = "trusted-untranslated"
 match = [{ transport = "virtio-pci", virtio-type = 19 }]
-# ONE CONSUMER. A vsock connection is a stream between two ends, and handing the same one to several
-# consumers would interleave their bytes with nothing to separate them again.
-provides = [{ kind = "local-stream", most = 1, consumers = 1 }]
+# ONE CONSUMER EACH, AND FOUR OF THEM. A vsock connection is a stream between two ends, and handing
+# the SAME one to several consumers would interleave their bytes with nothing to separate them again
+# - which is why `consumers` is one and stays one. What four buys is four INDEPENDENT streams, each
+# with its own local port, its own credit and its own staging buffer, which is what the item's
+# "connection limits" asks for: a bound kept by a table rather than a bound of one.
+provides = [{ kind = "local-stream", most = 4, consumers = 1 }]
 heartbeat-deadline = 100
 
 [[programs]]
@@ -2296,6 +2315,10 @@ provides = [
 	# `virtio-net` publishes so NetworkService consumes it without knowing it is USB. One, because
 	# this controller's network module admits one and refuses a second by name.
 	{ kind = "net", most = 1 },
+	# AN AUDIO SINK ON THE BUS IS A PCM DESTINATION LIKE ANY OTHER, published under the same kind
+	# `virtio-snd` and `hda` publish, so AudioService consumes it without knowing it is USB. One,
+	# for the reason the network module admits one: the service drives one device.
+	{ kind = "audio", most = 1 },
 ]
 heartbeat-deadline = 100
 

@@ -136,3 +136,32 @@ fn the_host_disappearing_is_a_reset_on_every_open_connection() {
 	assert_eq!(advance(State::Open, OP_RST, 0), State::Closed);
 	assert_eq!(advance(State::HalfClosed { peer_done: true, we_done: false }, OP_RST, 0), State::Closed);
 }
+
+#[test]
+fn a_local_port_names_its_slot_and_a_port_outside_the_range_names_nobody() {
+	assert_eq!(slot_of(1024, 1024, 4), Some(0));
+	assert_eq!(slot_of(1027, 1024, 4), Some(3));
+	// THE TWO ENDS OF THE RANGE, because both are where an off-by-one lives: one below the base is
+	// not slot zero and one past the last is not the last.
+	assert_eq!(slot_of(1023, 1024, 4), None);
+	assert_eq!(slot_of(1028, 1024, 4), None);
+	// AND A PORT A REMAINDER WOULD ADMIT. `1032 % 4` is 0, so a driver indexing by the remainder
+	// would hand this stranger's packet to the first stream.
+	assert_eq!(slot_of(1032, 1024, 4), None);
+	// A port below the base does not wrap into the range either: the subtraction is checked, so a
+	// port of zero against a base of 1024 is nobody rather than a slot near four billion.
+	assert_eq!(slot_of(0, 1024, 4), None);
+	assert_eq!(slot_of(u32::MAX, 1024, 4), None);
+}
+
+#[test]
+fn an_event_is_a_number_and_a_short_one_is_not_an_event() {
+	assert_eq!(event(&0u32.to_le_bytes()), Some(EVENT_TRANSPORT_RESET));
+	assert_eq!(event(&7u32.to_le_bytes()), Some(7), "an event this driver does not act on is still read, not guessed at");
+	// The device writes four bytes; a shorter used length is a completion that did not carry one.
+	assert_eq!(event(&[0u8; EVENT_LEN - 1]), None);
+	assert_eq!(event(&[]), None);
+	// A LONGER BUFFER IS THE FIRST FOUR BYTES and not a refusal: the slot is whatever was posted,
+	// and the device reports how much of it it wrote.
+	assert_eq!(event(&[1, 0, 0, 0, 0xFF, 0xFF]), Some(1));
+}

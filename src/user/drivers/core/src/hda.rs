@@ -169,6 +169,25 @@ pub fn pin_can_output(pin_caps: u32) -> bool {
 	pin_caps & (1 << 4) != 0
 }
 
+/// Whether a pin complex is capable of INPUT, which is the adjacent bit and not the same one.
+///
+/// FOUR AND FIVE, AND THEY ARE NOT INTERCHANGEABLE. A driver that looked for output capability when
+/// it wanted a microphone routes the speaker jack into the capture converter: the stream runs, the
+/// controller reports no error, and every period comes back silent - which reads as a codec with no
+/// microphone rather than as a route built backwards.
+pub fn pin_can_input(pin_caps: u32) -> bool {
+	pin_caps & (1 << 5) != 0
+}
+
+/// `SD_STS` bit 2: a buffer descriptor with its interrupt-on-completion flag finished.
+///
+/// STICKY AND WRITE-ONE-TO-CLEAR, like every other change bit here. A reader that only reads sees
+/// the first period's completion for ever and never notices the second.
+pub const SD_BUFFER_COMPLETE: u8 = 1 << 2;
+
+/// A buffer descriptor's flag word: raise the completion status when this entry finishes.
+pub const BDL_INTERRUPT_ON_COMPLETION: u32 = 1 << 0;
+
 /// The stream format word.
 ///
 /// EVERY FIELD IS AN INDEX RATHER THAN THE NUMBER IT NAMES. The channel count is zero-based, the

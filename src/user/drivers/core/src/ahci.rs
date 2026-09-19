@@ -31,6 +31,7 @@ pub const PORT_SIG: u64 = 0x24; // signature
 pub const PORT_SSTS: u64 = 0x28; // SATA status
 pub const PORT_SCTL: u64 = 0x2C; // SATA control - where a port reset is asked for
 pub const PORT_SERR: u64 = 0x30; // SATA error
+pub const PORT_SACT: u64 = 0x34; // SATA active: one bit per OUTSTANDING queued command
 pub const PORT_CI: u64 = 0x38; // command issue, one bit per slot
 
 // `PxCMD` bits.
@@ -47,6 +48,10 @@ pub const TFD_BSY: u32 = 1 << 7;
 // ATA commands this driver sends.
 pub const ATA_READ_DMA_EXT: u8 = 0x25;
 pub const ATA_WRITE_DMA_EXT: u8 = 0x35;
+// THE QUEUED PAIR, which are not the same commands with a tag bolted on: their FIELDS MEAN
+// DIFFERENT THINGS. See `queued_fis`.
+pub const ATA_READ_FPDMA_QUEUED: u8 = 0x60;
+pub const ATA_WRITE_FPDMA_QUEUED: u8 = 0x61;
 pub const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
 pub const ATA_IDENTIFY: u8 = 0xEC;
 
@@ -133,6 +138,8 @@ pub struct Capabilities {
 	pub ports: u32,
 	/// Whether it can address memory above four gibibytes.
 	pub sixty_four_bit: bool,
+	/// Whether the controller supports native command queuing.
+	pub queued: bool,
 }
 
 impl Capabilities {
@@ -144,6 +151,8 @@ impl Capabilities {
 			ports: (cap & 0x1F) + 1,
 			// CAP.S64A is bit 31.
 			sixty_four_bit: cap & (1 << 31) != 0,
+			// CAP.SNCQ is bit 30.
+			queued: cap & (1 << 30) != 0,
 		}
 	}
 
@@ -182,6 +191,60 @@ pub fn outcome(ci: u32, slot: u32, tfd: u32) -> Outcome {
 	}
 	if tfd & TFD_ERR != 0 {
 		return Outcome::Failed { status: (tfd & 0xFF) as u8, error: ((tfd >> 8) & 0xFF) as u8 };
+	}
+	Outcome::Done
+}
+
+/// The four fields a queued command FIS carries that an ordinary one carries differently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QueuedFis {
+	/// FIS byte 3 - the low byte of the SECTOR COUNT, not a feature.
+	pub features: u8,
+	/// FIS byte 11 - the high byte of the sector count.
+	pub features_exp: u8,
+	/// FIS byte 12 - the TAG, in bits 7:3, and nothing in bits 2:0.
+	pub count: u8,
+	/// FIS byte 7 - LBA mode, and FUA when the caller asked for it.
+	pub device: u8,
+}
+
+/// The field mapping of a queued command, which is where a first NCQ driver is wrong.
+///
+/// THE SECTOR COUNT MOVES INTO THE FEATURES FIELD AND THE TAG TAKES ITS PLACE. `READ DMA EXT` puts
+/// the block count in the sector-count field and nothing in features; `READ FPDMA QUEUED` puts the
+/// COUNT in features and features_exp, and the sector-count field carries the tag SHIFTED LEFT BY
+/// THREE. A driver that filled these the ordinary way asks for tag 0 of a transfer whose length is
+/// zero - which on most controllers means the maximum - and writes 65,536 sectors' worth of somebody
+/// else's disk into a buffer sized for eight.
+///
+/// AND THE TAG IS NOT THE SLOT NUMBER BY ACCIDENT. AHCI requires the queued command to be issued in
+/// the command slot whose number EQUALS its tag, so the two are one number and this function takes
+/// it once.
+///
+/// BIT 6 OF THE DEVICE REGISTER IS ALWAYS SET, as for every other command here: it is what says the
+/// address is a block number. FUA is bit 7 and is the caller's.
+pub fn queued_fis(sectors: u32, tag: u32, fua: bool) -> QueuedFis {
+	QueuedFis { features: sectors as u8, features_exp: (sectors >> 8) as u8, count: ((tag & 0x1F) << 3) as u8, device: (1 << 6) | if fua { 1 << 7 } else { 0 } }
+}
+
+/// How a QUEUED command ended, read from `PxSACT`, `PxCI` and the task file.
+///
+/// A QUEUED COMMAND IS OUTSTANDING WHILE ITS BIT IS SET IN `PxSACT`, AND NOT IN `PxCI`. The
+/// controller clears `PxCI` when it has SENT the command to the device, which for a queued command
+/// happens immediately and means nothing about the data - so a driver watching `PxCI` reports every
+/// queued read complete the moment it was issued, and hands back a buffer the disk has not written.
+/// `PxSACT` is what the device clears, through the Set Device Bits FIS, when the transfer is done.
+///
+/// AND AN ERROR STOPS THE WHOLE QUEUE, which is the other half a non-queued driver does not have to
+/// think about: a failed queued command sets `TFD.ERR` and the port stops accepting, so every other
+/// outstanding tag is abandoned rather than failed individually. This answers `Failed` for the tag
+/// asked about, and the caller's business is that the rest are gone too.
+pub fn queued_outcome(sact: u32, slot: u32, tfd: u32) -> Outcome {
+	if tfd & TFD_ERR != 0 {
+		return Outcome::Failed { status: (tfd & 0xFF) as u8, error: ((tfd >> 8) & 0xFF) as u8 };
+	}
+	if sact & (1 << slot) != 0 {
+		return Outcome::Pending;
 	}
 	Outcome::Done
 }

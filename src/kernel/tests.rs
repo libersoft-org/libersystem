@@ -2654,6 +2654,23 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 // Read `len` bytes out of a MemoryObject's frames through the HHDM (the reverse of
 // copy_into_object). The object need not be mapped: its physical frames are read
 // directly.
+// The mirror of `read_from_object`, and it has to be a mirror: a memory object of more than one page
+// is a LIST OF FRAMES that need not be contiguous, so filling one through its first frame writes
+// past that frame into whatever physically follows it.
+#[allow(dead_code)]
+fn write_to_object(object: &object::memory_object::MemoryObject, bytes: &[u8]) {
+	let hhdm = mem::hhdm_offset();
+	let page = mem::frame::PAGE_SIZE as usize;
+	for (i, &phys) in object.frames().iter().enumerate() {
+		let start = i * page;
+		if start >= bytes.len() {
+			break;
+		}
+		let end = core::cmp::min(start + page, bytes.len());
+		unsafe { core::ptr::copy_nonoverlapping(bytes[start..end].as_ptr(), (hhdm + phys) as *mut u8, end - start) };
+	}
+}
+
 fn read_from_object(object: &object::memory_object::MemoryObject, len: usize) -> alloc::vec::Vec<u8> {
 	let hhdm = mem::hhdm_offset();
 	let page = mem::frame::PAGE_SIZE as usize;

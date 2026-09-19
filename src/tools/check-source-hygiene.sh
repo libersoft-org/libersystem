@@ -301,6 +301,41 @@ if git grep --untracked -nE '^[^/*]*[^/*[:space:]].*from_raw_parts(_mut)?\(\s*[0
 	exit 1
 fi
 
+# A DRIVER THAT SERVES CONSUMERS HAS TO DROP THE ONE THAT LEFT.
+#
+# Five drivers were written without it - `virtio-scsi`, `nvme`, `ahci`, `sdhci` and `virtio-vsock`,
+# the five newest - and every older one has it, which is what says a rule written only inside the
+# code that got it right will be missed again. So it is checked rather than remembered.
+#
+# WHY IT MATTERS MORE THAN IT LOOKS. A closed endpoint is a READY one: the kernel's channel
+# readiness is `!inbox.is_empty() || is_peer_closed()`, because that is how a reader learns of a
+# closure at all. `serve_any_or_answer` answers with the FIRST ready index, so a departed consumer
+# sitting ahead of a live one is answered on every pass for ever - the driver stops serving
+# everybody, rather than merely burning a core - and the manager's channel is drained first on every
+# pass, so the heartbeat keeps being answered and nothing reports it.
+#
+# THE RULE IS PRESENCE AND NOT SHAPE, deliberately. The drivers that got it right do not agree on
+# the shape: `xhci` closes at four sites, `virtio-input` decides on `PolledCaps::Closed`,
+# `virtio-net` on `Received::Closed` inside a `ProviderReady` match. What they share is that
+# somewhere they hand the endpoint back. `recv_from_consumer` is the one-copy way to do it and a
+# driver's own `close_at` is the other; a driver that serves a set and does neither is the defect.
+if [[ "$mode" != --history ]]; then
+	missing=""
+	while IFS= read -r file; do
+		[[ "$file" == */common.rs ]] && continue
+		# COMMENT LINES DO NOT COUNT, and the first version of this rule passed on one: the drivers
+		# that call the helper also NAME it in the comment above the call, so a check that matched
+		# anywhere approved a driver whose call had been taken out. Same leading-content class the
+		# literal-address rule above uses.
+		git grep -qE '^[^/*]*[^/*[:space:]].*(close_at|recv_from_consumer)' -- "$file" || missing+="$file"$'\n'
+	done < <(git grep -lE 'serve_any_or_answer|wait_providers_or_answer' -- 'src/user/drivers/*.rs')
+	if [[ -n "$missing" ]]; then
+		echo "source-hygiene: a driver serves consumers and never drops one that left - a closed endpoint reads as ready for ever:" >&2
+		printf '%s' "$missing" >&2
+		exit 1
+	fi
+fi
+
 if [[ "$mode" == --history ]]; then
 	historical="$(git rev-list --objects HEAD | awk 'NF > 1 {sub(/^[^ ]+ /, ""); print}' | grep -E "$path_pattern" | sort -u || true)"
 	if [[ -n "$historical" ]]; then

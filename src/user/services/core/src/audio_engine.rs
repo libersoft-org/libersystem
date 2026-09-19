@@ -25,7 +25,10 @@ use proto::system::{ProviderInfo, ProviderKind, provider_catalogue};
 use rt::*;
 
 const PERIOD_FRAMES: usize = 512;
-const PERIOD_BYTES: usize = PERIOD_FRAMES * 4;
+// The same number the wire states, and checked against it rather than restated: a service padding to
+// a different period than the driver negotiated sends a length no server has a shape for.
+const PERIOD_BYTES: usize = driver_protocol::audio::PERIOD_BYTES as usize;
+const _: () = assert!(PERIOD_BYTES == PERIOD_FRAMES * 4);
 const MAX_QUEUED_FRAMES: usize = 4_096;
 const MAX_STREAMS: usize = 16;
 // One recorder at a time, and it is a hardware limit rather than a policy: there is one input
@@ -35,8 +38,10 @@ const MAX_CAPTURES: usize = 1;
 // The driver's one-byte commands. Declared here as well as there because the two ends of a protocol
 // with three message shapes should each state what they send - see the block beside `CMD_CAPTURE`
 // in driver.virtio-snd for the whole of it.
-const CMD_CAPTURE: u8 = 1;
-const CMD_CAPTURE_STOP: u8 = 2;
+// THE THIRD COPY, AND IT IS THE CONSUMER'S (2026-09-19). Both servers of this provider kind and the
+// one consumer each spelled these out; they are `driver_protocol::audio` now, which is also where
+// the three message shapes are enumerated.
+use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP};
 const MAX_TONES: usize = 8;
 const AMP: i16 = 6_000;
 const REQUEST_MAX: usize = 128;

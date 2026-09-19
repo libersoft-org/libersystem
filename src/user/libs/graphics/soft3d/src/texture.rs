@@ -649,7 +649,8 @@ pub fn generate_mips(texture: &mut Texture) {
 		return;
 	}
 	// The chain is generated from the decoded top level, so every level is in the same space.
-	let mut source = Level { width: texture.levels[0].width, height: texture.levels[0].height, depth: texture.levels[0].depth, texels: texture.levels[0].texels.iter().map(|texel| texture.linear(*texel)).collect() };
+	let decoded = Level { width: texture.levels[0].width, height: texture.levels[0].height, depth: texture.levels[0].depth, texels: texture.levels[0].texels.iter().map(|texel| texture.linear(*texel)).collect() };
+	let mut source = decoded.clone();
 	texture.levels.truncate(1);
 	while source.width > 1 || source.height > 1 || (texture.kind == Kind::Dim3 && source.depth > 1) {
 		let width = (source.width / 2).max(1);
@@ -692,6 +693,9 @@ pub fn generate_mips(texture: &mut Texture) {
 	// the next fetch would decode them a second time.
 	texture.transfer = Transfer::Linear;
 	texture.premultiplied = true;
-	// And the top level is replaced with its decoded form, so the chain is uniform.
-	texture.levels[0] = Level { width: texture.levels[0].width, height: texture.levels[0].height, depth: texture.levels[0].depth, texels: texture.levels[0].texels.clone() };
+	// AND THE TOP LEVEL IS REPLACED WITH ITS DECODED FORM, so the chain is uniform. Leaving the
+	// source's own encoding there while the texture says `Linear` is the worst of both: a magnified
+	// fragment reads level zero and gets the ENCODED number as though it were light, which on sRGB
+	// is more than twice the value the level below it would have given.
+	texture.levels[0] = decoded;
 }

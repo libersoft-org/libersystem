@@ -28,7 +28,27 @@ pub const REG_SOFTWARE_RESET: u64 = 0x2F; // 8-bit
 pub const REG_INT_STATUS: u64 = 0x30;
 pub const REG_INT_ENABLE: u64 = 0x34;
 pub const REG_SIGNAL_ENABLE: u64 = 0x38;
+pub const REG_ADMA_ERROR: u64 = 0x54; // 8-bit
+pub const REG_ADMA_ADDRESS: u64 = 0x58; // 64-bit
 pub const REG_CAPABILITIES: u64 = 0x40;
+
+// `TRANSFER_MODE` bits.
+pub const TRANSFER_DMA_ENABLE: u16 = 1 << 0;
+pub const TRANSFER_BLOCK_COUNT_ENABLE: u16 = 1 << 1;
+// Auto CMD12 is bits 3:2 = 01. WITHOUT IT A MULTI-BLOCK TRANSFER NEVER ENDS: the card keeps
+// streaming until it is told to stop, and a driver that forgot has a card that answers nothing
+// afterwards because it is still sending.
+pub const TRANSFER_AUTO_CMD12: u16 = 1 << 2;
+pub const TRANSFER_READ: u16 = 1 << 4;
+pub const TRANSFER_MULTI_BLOCK: u16 = 1 << 5;
+
+// `HOST_CONTROL` DMA select, bits 4:3. Zero is SDMA, which is not this.
+pub const HOST_CONTROL_DMA_MASK: u8 = 0b11 << 3;
+pub const HOST_CONTROL_DMA_ADMA2: u8 = 0b10 << 3;
+
+// `CAPABILITIES` bit 19: the controller supports ADMA2. A driver that programmed the descriptor
+// table on one that does not gets a command that never completes.
+pub const CAPABILITY_ADMA2: u32 = 1 << 19;
 
 // `PRESENT_STATE` bits.
 pub const PRESENT_CMD_INHIBIT: u32 = 1 << 0;
@@ -67,7 +87,9 @@ pub const CMD_SEND_IF_COND: u8 = 8;
 pub const CMD_SEND_CSD: u8 = 9;
 pub const CMD_SET_BLOCKLEN: u8 = 16;
 pub const CMD_READ_SINGLE_BLOCK: u8 = 17;
+pub const CMD_READ_MULTIPLE_BLOCK: u8 = 18;
 pub const CMD_WRITE_BLOCK: u8 = 24;
+pub const CMD_WRITE_MULTIPLE_BLOCK: u8 = 25;
 pub const CMD_APP_CMD: u8 = 55;
 pub const ACMD_SD_SEND_OP_COND: u8 = 41;
 
@@ -200,6 +222,88 @@ pub struct Ocr {
 pub fn ocr(value: u32) -> Ocr {
 	let ready = value & (1 << 31) != 0;
 	Ocr { ready, high_capacity: ready && value & (1 << 30) != 0 }
+}
+
+/// One ADMA2 descriptor: two attribute bytes, two length bytes, four address bytes.
+pub const ADMA_DESCRIPTOR_LEN: usize = 8;
+
+// The attribute bits. `Act` is bits 5:4 - 00 is a no-op, 10 transfers, 11 links to another table.
+pub const ADMA_VALID: u16 = 1 << 0;
+pub const ADMA_END: u16 = 1 << 1;
+pub const ADMA_ACT_TRAN: u16 = 0b10 << 4;
+
+/// The most bytes ONE descriptor carries.
+///
+/// THE LENGTH FIELD IS SIXTEEN BITS AND ZERO MEANS 65536, which is the rule this bound exists to
+/// avoid having to use: a driver writing a plain 65536 writes zero, and one writing zero for an
+/// EMPTY span asks for the maximum. Splitting at 65024 - the largest multiple of a 512-byte block
+/// below the field's range - keeps every length a number the field can hold literally, and keeps
+/// each descriptor a whole number of blocks.
+pub const ADMA_MAX_BYTES: u32 = 65024;
+
+/// Why a span cannot be described as ADMA2 descriptors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Undescribable {
+	/// Zero bytes is not a transfer.
+	Empty,
+	/// More descriptors than the table this driver allocates can hold.
+	TooManyEntries,
+	/// The span does not fit the 32-bit address the descriptor carries.
+	AboveFourGigabytes,
+}
+
+/// How many descriptors a contiguous span of `bytes` needs.
+pub fn adma_entries(bytes: u64, most: usize) -> Result<usize, Undescribable> {
+	if bytes == 0 {
+		return Err(Undescribable::Empty);
+	}
+	let entries = bytes.div_ceil(ADMA_MAX_BYTES as u64) as usize;
+	if entries > most {
+		return Err(Undescribable::TooManyEntries);
+	}
+	Ok(entries)
+}
+
+/// How many bytes the descriptor at `index` carries, out of a contiguous span of `bytes`.
+pub fn adma_span(bytes: u64, index: usize) -> u32 {
+	let taken = index as u64 * ADMA_MAX_BYTES as u64;
+	(bytes.saturating_sub(taken)).min(ADMA_MAX_BYTES as u64) as u32
+}
+
+/// Build one descriptor, for a 32-bit address.
+///
+/// THE LAST ONE IS MARKED AND THE OTHERS ARE NOT. A table whose end is not marked is a controller
+/// reading whatever follows it as another descriptor - which is the memory after this driver's
+/// table, interpreted as addresses to transfer into.
+pub fn adma_descriptor(address: u32, bytes: u32, last: bool) -> [u8; ADMA_DESCRIPTOR_LEN] {
+	let attributes = ADMA_VALID | ADMA_ACT_TRAN | if last { ADMA_END } else { 0 };
+	let length = (bytes & 0xFFFF) as u16;
+	let mut out = [0u8; ADMA_DESCRIPTOR_LEN];
+	out[0..2].copy_from_slice(&attributes.to_le_bytes());
+	out[2..4].copy_from_slice(&length.to_le_bytes());
+	out[4..8].copy_from_slice(&address.to_le_bytes());
+	out
+}
+
+/// The transfer-mode word for a data transfer of `blocks` blocks.
+///
+/// AUTO CMD12 IS PART OF A MULTI-BLOCK TRANSFER AND NOT AN OPTION. A multi-block read streams until
+/// the card is told to stop, so a driver that omits the stop has a card still sending when the next
+/// command arrives - which reads as a controller that has stopped answering rather than as a missing
+/// stop. A SINGLE-block transfer must NOT carry it: CMD12 after a single block is a stop for a
+/// transmission that already ended, and the card reports an illegal command.
+pub fn transfer_mode(blocks: u32, write: bool, dma: bool) -> u16 {
+	let mut mode = TRANSFER_BLOCK_COUNT_ENABLE;
+	if dma {
+		mode |= TRANSFER_DMA_ENABLE;
+	}
+	if !write {
+		mode |= TRANSFER_READ;
+	}
+	if blocks > 1 {
+		mode |= TRANSFER_MULTI_BLOCK | TRANSFER_AUTO_CMD12;
+	}
+	mode
 }
 
 /// The address to put in a read or write command, for a card of this kind.

@@ -698,7 +698,9 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, controller: &mut Controller
 				exit();
 			};
 			let endpoint: u64 = serving.at(at);
-			let Received::Message { len, handle } = recv_blocking(endpoint, &mut request) else {
+			// A CONSUMER THAT CLOSED IS ONE CLIENT LEAVING AND NOT THIS DRIVER'S END. The rule for
+			// dropping it and telling the manager is in `recv_from_consumer`, which says why.
+			let Some((len, handle)) = common::recv_from_consumer(bootstrap, bind, &mut serving, at, &mut request) else {
 				continue;
 			};
 			let Some(block::Request { op, lba, count }) = block::Request::decode(&request[..len]) else {

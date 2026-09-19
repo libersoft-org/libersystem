@@ -2038,3 +2038,74 @@ losses"), so a link where every probe times out produced one header and then app
 the summary; it now prints `Request timeout for icmp_seq=N` as it happens. And a timeout rendered
 through the wire record as `"ttl": 0, "rtt-us": 0` - a measurement of zero rather than the absence of
 one - now renders `null`, which is what the statistics block already said.
+
+---
+
+## 2026-09-19 - the decoded source, and a mip chain whose top level was not decoded
+
+TWO CHANGES, ONE PERFORMANCE AND ONE CORRECTNESS, both in the graphics stack.
+
+**1. soft2d samples a decoded source for `Bilinear` and `Bicubic`.** The earlier probes had located
+the largest single term in the whole 2D suite: a transfer decode PER TAP, 139 of bicubic's 254 ms.
+`Pyramid` already held its levels in canonical premultiplied linear float and a `Mipmapped` draw
+already sampled that, so the move was to extend the copy to the two magnifying qualities. What made
+it a decision rather than a patch is `max_prepared_scratch_bytes`: a decoded level zero is sixteen
+bytes a texel against a sixty-four megabyte profile limit.
+
+- `wants_decoded(list, image)` beside `wants_pyramid`: the images this list samples `Bilinear` or
+  `Bicubic`. The pyramid build runs in two passes, required first.
+- An optional copy is GIVEN BACK, newest first, until the prepared total is under the ceiling. A
+  list that fitted before this existed still fits. An optional copy that will not allocate is a
+  `continue`, not an error; a required one that will not allocate is still `Err`.
+- `paint.rs` builds its `Sampler` over `pyramid.level(0)` when the quality is not `Mipmapped`.
+- `pixel.rs` gained an identity-decode shortcut, because the copy is read back through the same
+  decoder and the canonical format needs none of it.
+- An optional copy is LEVEL ZERO ALONE: `Pyramid::base_from_sampler` / `base_with`, with
+  `from_sampler` now the chain built on top of the base. A magnifying draw reads level zero and
+  nothing else, so the halvings were 12.6 ms of UI-effects' preparation and a third of its bytes for
+  a level no draw touches.
+
+Measured: bicubic 256.4 -> 135.5 ms, bilinear 73.9 -> 48.8, YUV 164.7 -> 55.0, wide gamut 86.4 ->
+49.5, and the mipmapped control 74.0 -> 74.0 unmoved. image-stress 329.75 -> 189.6 ms, UI-effects
+176.99 -> 150.9. Numbers and the trade are in `docs/PERF.md`.
+
+**2. `soft3d::texture::generate_mips` left its top level encoded.** The function decodes the top
+level, builds every level below it from that decoded light, then sets `transfer = Linear` and
+`premultiplied = true`. The last statement was meant to store the decoded top level back and instead
+assigned `levels[0]` to itself - the decoded copy was the loop's initial `source` and was overwritten
+on the first iteration.
+
+The consequence is not a crash and not a missing feature: a MAGNIFIED fragment reads level zero and
+gets an sRGB number treated as light. `0.5` reads as `0.5` where the chain's own answer is `0.214`.
+Every minified fragment is correct, so the texture has a step between level zero and level one at
+exactly the distance where the two meet. A straight-alpha source was not premultiplied either.
+
+WHY THE TEST DID NOT CATCH IT: `mip_generation_is_a_box_filter_in_linear_light_and_odd_sizes_halve_by_flooring`
+asserted the declared transfer and that level ONE averaged decoded values - both of which the defect
+satisfies. It now pins level zero too, plus a straight-alpha case over both levels. Driven by
+mutation: restoring the self-assignment fails on `0.5` against `0.214`.
+
+Host suites after both: graphics-core 28, soft2d 28, soft3d 81, render2d 33, render3d 61,
+conformance2d and conformance3d green.
+
+## The two suites on the two emulated ports (2026-09-19)
+
+The decoded-source fix above is inside the mip chain, and a mip chain is exactly the kind of code
+that can be right on the target it was written on and wrong on another. So both conformance suites
+were run on all three ports after it, with `--tags image,slow`: aarch64 34 tests in 2097 s, riscv64
+34 in 2489 s, against an x86_64 run of the same suites the same day.
+
+THE THREE PORTS DO NOT MERELY PASS - THEY REPORT THE SAME COUNTS:
+
+    test2d-conformance   112 passed, 0 failed, 0 unsupported, 0 untested   conforms
+    test3d-conformance   render3d 89, scene3d 71, 160 total, all zero      conforms
+
+`0 untested` per registry rather than as one total is the coverage half of part `h`, and per-registry
+is what stops a suite that stopped exercising one of them hiding inside the other's count. The 2D and
+3D demos and `imgview` ran beside them on both emulated ports and passed.
+
+AND ONE TIMING LESSON, because it cost an hour of suspicion. `imgconv_cross_volume` reads 94 s in a
+`drivers,pci,slow,storage,usb,network,service` run on aarch64 and 1351 s in this `image,slow` one,
+with riscv64 agreeing at 1098 s. The code is identical; the first selection RUNS THE DRIVER TESTS,
+so `vol://system` is served by a bound block driver by the time the application tests reach it. A
+timing comparison across two runs is only a measurement when both selected the same work.

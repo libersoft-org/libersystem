@@ -242,13 +242,20 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 	// answers TEST UNIT READY and then READ CAPACITY, retrying the power-on attention that every unit
 	// refuses its first command with.
 	let offers = recv_offers(&kernel_ep, key.generation).expect("the virtio-scsi driver should report READY, which it only does with a target answering");
-	// TWO UNITS BEHIND ONE TARGET, AND TWO PROVIDERS FOR THEM. A driver that took the first thing
-	// that answered served one disk on a machine that has two, which is what this bus is FOR: the
-	// transport exists beside `virtio-blk` because a real HBA has several units behind it.
+	// THREE UNITS ACROSS TWO TARGETS, AND A PROVIDER FOR EACH. A driver that took the first thing
+	// that answered served one disk on a machine that has three, which is what this bus is FOR: the
+	// transport exists beside `virtio-blk` because a real HBA has several units behind several
+	// targets.
+	//
+	// AND THE THIRD IS THE ONE THAT SAYS THE WALK IS A WALK. Two units behind ONE target cannot tell
+	// a driver that asks every target from one that stops at the first that answers - both find
+	// everything there is. The third lives behind target 1, so it is reachable only by asking again
+	// after the first target has already filled two of the table's slots.
 	let units: alloc::vec::Vec<alloc::sync::Arc<dyn object::KernelObject>> = offers.iter().filter(|(kind, _, _)| *kind == driver_protocol::provider::BLOCK).map(|(_, _, object)| object.clone()).collect();
-	assert_eq!(units.len(), 2, "the driver enumerates the units behind the target rather than taking the first that answers");
+	assert_eq!(units.len(), 3, "the driver enumerates the units behind every target it walks rather than taking the first that answers or stopping at the first target");
 	let blk = units[0].clone().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
 	let second = units[1].clone().into_any_arc().downcast::<Channel>().expect("the second unit's block channel is a channel");
+	let third = units[2].clone().into_any_arc().downcast::<Channel>().expect("the third unit's block channel is a channel");
 
 	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
 	blk.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the capacity request should send");
@@ -305,6 +312,41 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 	let second_size = driver_protocol::block::decode_capacity(&second_reply.bytes).expect("the second unit reports a size");
 	assert_eq!(second_size.bytes, 2 * 1024 * 1024, "the second unit reports its OWN medium's size");
 
+	// AND THE UNIT BEHIND THE SECOND TARGET IS A THIRD MEDIUM. One mebibyte against four and two:
+	// the size is how this tells which medium it was handed, and a driver that walked one target and
+	// then published its last unit twice would answer here with two mebibytes.
+	let capacity = driver_protocol::block::Request { op: driver_protocol::block::OP_CAPACITY, lba: 0, count: 0 }.encode();
+	third.send(Message::new(capacity.to_vec(), alloc::vec::Vec::new())).expect("the third unit's capacity request should send");
+	sched::run_until_idle();
+	let third_reply = third.recv().expect("the third unit's capacity reply should arrive");
+	let third_size = driver_protocol::block::decode_capacity(&third_reply.bytes).expect("the third unit reports a size");
+	assert_eq!(third_size.bytes, 1024 * 1024, "the unit behind the SECOND target reports its own medium's size, which is what says the walk reached it");
+
+	// AND IT IS A MEDIUM AND NOT A NAME. A capacity can be answered by a driver that addressed the
+	// wrong unit and got lucky; a write that comes back is the medium itself.
+	let far_pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8).wrapping_mul(37) ^ 0xC3).collect();
+	let far_source = object::memory_object::MemoryObject::create(SECTOR).expect("a source buffer for the far target");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = far_source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(far_pattern.as_ptr(), (hhdm + phys) as *mut u8, SECTOR) };
+	}
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: LBA, count: 1 }.encode();
+	third.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(far_source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the far target's write should send");
+	sched::run_until_idle();
+	let write_reply = third.recv().expect("the far target's write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "a unit behind the second target takes a write");
+	let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	third.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the far target's read should send");
+	sched::run_until_idle();
+	let read_reply = third.recv().expect("the far target's read reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "and gives it back");
+	let buf_cap = read_reply.caps.first().expect("the far target's read should grant a buffer");
+	let object = buf_cap.object();
+	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+	assert_eq!(read_from_object(memory, SECTOR), far_pattern, "what comes back from the second target's unit is what was written to IT, and not the first target's block at the same address");
+	assert_ne!(far_pattern, pattern, "the two patterns differ, or reading one target's block out of the other would pass");
+
 	// AND WHAT IS NOT ON THE BLOCK WIRE DOES NOT REACH THE TARGET. The item this driver was written
 	// for says unsupported passthrough commands are not exposed to ordinary storage clients, and this
 	// is what keeps it: an opcode outside read/write/flush/capacity is ANSWERED rather than turned
@@ -323,6 +365,33 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 	sched::run_until_idle();
 	let again_reply = blk.recv().expect("the re-read reply should arrive");
 	assert_eq!(driver_protocol::block::decode_status(&again_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the unit still serves after refusing an opcode it does not carry");
+}
+
+// One request to a `local-stream` provider and its reply, with the scheduler run in between.
+#[allow(dead_code)]
+fn stream_round(channel: &object::channel::Channel, request: alloc::vec::Vec<u8>) -> (u32, u32, alloc::vec::Vec<u8>) {
+	channel.send(object::channel::Message::new(request, alloc::vec::Vec::new())).expect("the stream request should send");
+	sched::run_until_idle();
+	let reply = channel.recv().expect("the stream reply should arrive");
+	let (status, arg, payload) = driver_protocol::stream::decode_reply(&reply.bytes).expect("the stream reply should parse");
+	(status, arg, payload.to_vec())
+}
+
+// Read from one stream until it has answered `wanted` bytes or stops answering.
+#[allow(dead_code)]
+fn stream_drain(channel: &object::channel::Channel, wanted: usize) -> alloc::vec::Vec<u8> {
+	let mut got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..64 {
+		let (status, _, payload) = stream_round(channel, driver_protocol::stream::Request { op: driver_protocol::stream::OP_RECEIVE, arg: 4096 }.encode().to_vec());
+		if status != driver_protocol::stream::STATUS_OK {
+			break;
+		}
+		got.extend_from_slice(&payload);
+		if got.len() >= wanted {
+			break;
+		}
+	}
+	got
 }
 
 tagged_test!(virtio_vsock_driver_echoes_bytes_off_the_host, [Drivers, Pci, Slow], id = "kernel.hardware.virtio_vsock_driver_echoes_bytes_off_the_host", covers = ["kernel", "bin.virtio_vsock"]);
@@ -436,6 +505,85 @@ fn virtio_vsock_driver_echoes_bytes_off_the_host() {
 	let refused = stream_channel.recv().expect("the refusal should arrive");
 	let (status, _, _) = stream::decode_reply(&refused.bytes).expect("the refusal should parse");
 	assert_eq!(status, stream::STATUS_CLOSED, "a port with no listener is refused by the host with a reset, which is not the same answer as a host that said nothing");
+
+	// AND TWO CONSUMERS GET TWO STREAMS, WHICH IS WHAT THE TABLE IS FOR.
+	//
+	// ONE RING CARRIES BOTH. Every packet of every stream arrives in the same receive queue,
+	// interleaved in whatever order the host sent them, and the only field that tells them apart is
+	// the LOCAL PORT this driver assigned - so a driver holding one connection's worth of state
+	// hands whichever bytes arrived last to whoever asks next.
+	//
+	// BOTH ARE WRITTEN BEFORE EITHER IS READ, deliberately: send-read-send-read would pass a driver
+	// with one staging buffer, because there would never be two streams' bytes in it at once. And
+	// the two patterns DIFFER, or neither assertion would say anything.
+	let token = offer_token_of(&offers, driver_protocol::provider::LOCAL_STREAM).expect("the stream publication carries a token");
+	let (second, driver_end) = object::channel::Channel::create();
+	send_connect(&kernel_ep, key.generation, token, driver_end).expect("the second CONNECT should send");
+	sched::run_until_idle();
+
+	let to_echo = stream::Request { op: stream::OP_CONNECT, arg: cid as u32 }.encode().to_vec();
+	let (status, _, _) = stream_round(&stream_channel, to_echo.clone());
+	assert_eq!(status, stream::STATUS_OK, "the first consumer reconnects after its own shutdown, which is an ordinary reconnect and not a second stream");
+	let (status, _, _) = stream_round(&second, to_echo);
+	assert_eq!(status, stream::STATUS_OK, "and the second consumer gets a stream of its own rather than being refused by a driver that holds one");
+
+	let first_pattern: alloc::vec::Vec<u8> = (0..192usize).map(|i| (i as u8).wrapping_mul(13) ^ 0xA7).collect();
+	let second_pattern: alloc::vec::Vec<u8> = (0..192usize).map(|i| (i as u8).wrapping_mul(31) ^ 0x1D).collect();
+	assert_ne!(first_pattern, second_pattern, "the two patterns differ, or reading one back out of the other's stream would pass");
+	for (channel, pattern) in [(&*stream_channel, &first_pattern), (&*second, &second_pattern)] {
+		let mut request = stream::Request { op: stream::OP_SEND, arg: pattern.len() as u32 }.encode().to_vec();
+		request.extend_from_slice(pattern);
+		let (status, moved, _) = stream_round(channel, request);
+		assert_eq!(status, stream::STATUS_OK, "each stream accepts its own write");
+		assert_eq!(moved as usize, pattern.len(), "and each carries its own credit, so neither write is shortened by the other's window");
+	}
+	let first_back = stream_drain(&stream_channel, first_pattern.len());
+	let second_back = stream_drain(&second, second_pattern.len());
+	assert_eq!(first_back, first_pattern, "the first stream reads back what was written to IT, and not what the other stream's peer echoed");
+	assert_eq!(second_back, second_pattern, "and so does the second, which one staging buffer between them cannot do");
+
+	// AND A CONSUMER THAT LEAVES DOES NOT TAKE THE OTHERS WITH IT.
+	//
+	// A CLOSED ENDPOINT IS A READY ONE. `Channel::ready` is `!inbox.is_empty() || is_peer_closed()`,
+	// which is how a reader learns of a closure at all, and `serve_any_or_answer` answers with the
+	// FIRST ready index - so a driver that reads `Closed` and merely continues is handed the
+	// departed consumer at index zero on every pass and NEVER REACHES the live one behind it. That
+	// is not a spin that wastes a core: it is a driver that has silently stopped serving everybody,
+	// with its heartbeat still answered because the control channel is drained first on every pass.
+	// THE FIRST CONSUMER GOES, AND BOTH OF ITS REFERENCES HAVE TO: the peer is held weakly, so the
+	// endpoint reads as closed only once the LAST strong reference is gone, and the handshake kept
+	// one beside the one this test downcast.
+	drop(stream_channel);
+	drop(offers);
+	sched::run_until_idle();
+	let ask = stream::Request { op: stream::OP_IDENTITY, arg: 0 }.encode();
+	second.send(Message::new(ask.to_vec(), alloc::vec::Vec::new())).expect("the second consumer's request should send");
+	sched::run_until_idle();
+	// AND THE MUTATION'S SIGNATURE IS A TIMEOUT AND NOT AN ASSERTION, which is worth knowing before
+	// somebody loosens this for looking flaky: a driver that keeps the departed endpoint never goes
+	// idle, so `run_until_idle` above does not return and the suite dies on its wall clock instead
+	// of on the line below. That is the defect's real shape - a driver that has stopped serving.
+	let served = second.recv().expect("the driver should serve the consumer that stayed - a driver holding a departed endpoint ahead of it never reaches this one");
+	let (status, _, payload) = stream::decode_reply(&served.bytes).expect("the second consumer's reply should parse");
+	assert_eq!(status, stream::STATUS_OK, "the consumer that stayed is served");
+	assert_eq!(u64::from_le_bytes(payload.try_into().unwrap()), cid, "and by the same driver, which knows the same context id");
+
+	// AND THE MANAGER IS TOLD, which is the half a driver that only dropped the endpoint still gets
+	// wrong. The `consumers` bound counts CONCURRENT consumers and the count only ever rises until a
+	// `Disconnect` names the publication, so without this a kind admitting one is refused for the
+	// rest of the boot the moment its first consumer closes.
+	let mut reported = false;
+	while let Ok(message) = kernel_ep.recv() {
+		let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
+		if header.generation != key.generation || !matches!(header.opcode, driver_protocol::Opcode::Disconnect) {
+			continue;
+		}
+		let payload = header.payload(&message.bytes);
+		if payload.len() == driver_protocol::U16_PAYLOAD_LEN && u16::from_le_bytes([payload[0], payload[1]]) == token {
+			reported = true;
+		}
+	}
+	assert!(reported, "the driver reports the departure under the publication's own token, which is what gives the consumer's place back");
 }
 
 tagged_test!(hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer, [Drivers, Pci, Slow], id = "kernel.hardware.hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer", covers = ["kernel", "bin.hda"]);
@@ -482,12 +630,20 @@ fn hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer() {
 	let offers = recv_offers(&kernel_ep, key.generation).expect("the hda driver should report READY, which it only does with a codec routed");
 	let audio = offer_of(&offers, driver_protocol::provider::AUDIO).expect("the driver offers its PCM service").into_any_arc().downcast::<Channel>().expect("the audio channel is a channel");
 
-	// One period of the format AudioService produces: signed 16-bit stereo at 48 kHz. The content is
-	// a ramp rather than silence so that a buffer nobody wrote is distinguishable in a capture.
-	const PERIOD: usize = 4096;
+	// ONE PERIOD, AND EXACTLY ONE PERIOD'S WORTH OF BYTES. The wire's shapes are told apart by
+	// LENGTH - a period is `PERIOD_BYTES`, an empty message ends the stream, one byte is a command -
+	// so a test sending a different number is not sending a period at all. The content is a ramp
+	// rather than silence so a buffer nobody wrote is distinguishable.
+	const PERIOD: usize = driver_protocol::audio::PERIOD_BYTES as usize;
 	let period: alloc::vec::Vec<u8> = (0..PERIOD).map(|i| (i as u8).wrapping_mul(3)).collect();
 	audio.send(Message::new(period, alloc::vec::Vec::new())).expect("the period should send");
 	sched::run_until_idle();
+	// AND A PERIOD IS ANSWERED, which this driver did not do at all before. AudioService marks the
+	// driver PENDING when it hands a period over and sends the next one only when the reply comes -
+	// so a server that never replied played exactly one period per boot and then went quiet, with
+	// nothing anywhere reporting it.
+	let played = audio.recv().expect("a period is answered");
+	assert_eq!(played.bytes, driver_protocol::audio::OK, "a period that was taken is answered OK");
 
 	// THE CONTROLLER'S OWN COUNTER, read through a second mapping of the same registers. The stream
 	// descriptors start at 0x80 and are 0x20 apart; the output ones follow the input ones, which
@@ -505,6 +661,55 @@ fn hda_driver_routes_a_codec_and_the_controller_consumes_a_buffer() {
 		}
 	}
 	assert!(moved > 0, "the controller's link position counter should advance as it consumes the buffer it was given");
+
+	// AND THE SAME PROVIDER ANSWERS A CAPTURE, which is the other half of the item's own sentence -
+	// "expose playback AND capture through the same PCM contract". The codec on this machine is a
+	// duplex one, so a refusal here is a route that was not built rather than a machine with no
+	// microphone.
+	//
+	// A REFUSAL IS AN EMPTY REPLY AND A PERIOD IS NEVER EMPTY, which is how the two are told apart
+	// without a status field - so this asserts the LENGTH and not a code.
+	audio.send(Message::new(alloc::vec![driver_protocol::audio::CMD_CAPTURE], alloc::vec::Vec::new())).expect("the capture command should send");
+	for _ in 0..200 {
+		sched::run_until_idle();
+		if audio.peek_len().is_ok() {
+			break;
+		}
+	}
+	let captured = audio.recv().expect("the capture command is answered");
+	assert_eq!(captured.bytes.len(), PERIOD, "a captured period is one period, and an empty answer would be the refusal this codec has no reason to give");
+
+	// AND THE CONTROLLER MOVED THE BYTES, which the length alone does not say: a driver that
+	// answered with its own zeroed buffer would answer with exactly this many bytes. The INPUT
+	// stream descriptors are the ones BEFORE the output ones, so input stream zero is descriptor
+	// zero - the same arithmetic as above, read from the other end.
+	//
+	// THE CONTENT IS NOT ASSERTED AND THE REASON IS THE FIXTURE: this harness gives the codec an
+	// audio backend with no source behind it, so what a duplex codec captures is silence. What can
+	// be asserted is that the DEVICE filled the buffer rather than the driver handing back its own,
+	// and the link position is where the device says so.
+	//
+	// AND WHAT THIS CANNOT SEE IS SAID RATHER THAN LEFT TO BE ASSUMED. Telling the input pin to
+	// DRIVE instead of to listen - the one bit that decides which way a jack faces - passes every
+	// assertion here, because QEMU's codec model runs the stream either way. On real silicon that
+	// is a microphone that records nothing. What the fixture does reach is the route existing at
+	// all: dropping the capture converter fails this with 0 against 2048.
+	let mut recorded = 0u32;
+	for _ in 0..200 {
+		sched::run_until_idle();
+		recorded = unsafe { ((base + 0x80 + 0x04) as *const u32).read_volatile() };
+		if recorded > 0 {
+			break;
+		}
+	}
+	assert!(recorded > 0, "the input stream's link position should advance as the controller fills the capture buffer");
+
+	// AND THE STREAM STOPS WHEN IT IS TOLD TO. A capture stream left running fills a buffer nobody
+	// reads for the life of the machine.
+	audio.send(Message::new(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP], alloc::vec::Vec::new())).expect("the capture stop should send");
+	sched::run_until_idle();
+	let stopped = audio.recv().expect("the capture stop is answered");
+	assert_eq!(stopped.bytes, driver_protocol::audio::OK, "ending a capture stream is acknowledged");
 }
 
 tagged_test!(sdhci_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.sdhci_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.sdhci"]);
@@ -549,9 +754,13 @@ fn sdhci_driver_serves_a_write_and_reads_it_back() {
 	let reported = driver_protocol::block::decode_capacity(&cap_reply.bytes).expect("the capacity query should succeed and carry a size");
 	// Out of the card's CSD, which encodes it two entirely different ways depending on its version.
 	assert_eq!(reported.bytes, 64 * 1024 * 1024, "the card should report the attached medium's real size");
-	// ONE BLOCK PER REQUEST is what the PIO path offers, and it says so rather than letting a client
-	// ask for eight and receive one.
-	assert_eq!(reported.max_sectors, 1, "the simple path moves one block at a time and publishes that");
+	// THE BOUND IS THE PATH'S AND THE DRIVER PUBLISHES IT rather than letting a client ask for eight
+	// and receive one. On a controller advertising ADMA2 it is the descriptor span; on one without,
+	// the PIO path's single block. QEMU's `sdhci-pci` advertises ADMA2, so this machine sees the
+	// first - and the assertion is the RELATIONSHIP rather than either number, because a driver that
+	// published a bound it could not move would pass a check on the number alone.
+	assert!(reported.max_sectors >= 1, "a bound of zero is not a bound");
+	let bound = reported.max_sectors;
 
 	const SECTOR: usize = 512;
 	let pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8).wrapping_mul(11) ^ 0x3C).collect();
@@ -578,15 +787,71 @@ fn sdhci_driver_serves_a_write_and_reads_it_back() {
 	let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
 	assert_eq!(read_from_object(memory, SECTOR), pattern, "the block read back should be the bytes that were written to it");
 
-	// AND A BLOCK COUNT THE SIMPLE PATH CANNOT MOVE IS REFUSED rather than quietly shortened, which
-	// is the failure a clamp would hide: a caller asking for four blocks and receiving one believes
-	// it has four.
-	let four = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 4 }.encode();
-	blk.send(Message::new(four.to_vec(), alloc::vec::Vec::new())).expect("the multi-block request should send");
+	// AND A BLOCK COUNT PAST THE BOUND IS REFUSED rather than quietly shortened, which is the failure
+	// a clamp would hide: a caller asking for more blocks and receiving fewer believes it has more.
+	let past = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: bound as u32 + 1 }.encode();
+	blk.send(Message::new(past.to_vec(), alloc::vec::Vec::new())).expect("the over-bound request should send");
 	sched::run_until_idle();
 	let refused = blk.recv().expect("the refusal should arrive");
-	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "more than one block is refused, not shortened");
+	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "more blocks than the bound is refused, not shortened");
 	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+
+	// AND THE BOUND IS A NUMBER THE DRIVER CAN ACTUALLY MOVE, which is the half publishing it does
+	// not prove. FOUR BLOCKS IN ONE REQUEST over a card whose PIO path moves one: the descriptors
+	// are built here, the multi-block command carries its stop, and every block has to come back in
+	// the right ORDER - a table whose entries were built from the wrong offsets returns the same
+	// block four times, or the right bytes shuffled.
+	// A SPAN THAT NEEDS MORE THAN ONE DESCRIPTOR, which four blocks does not: 128 blocks is 64 KiB
+	// against a descriptor's own 65024-byte bound, so the table has TWO entries and the second's
+	// address is the first's plus its length. A four-block version of this test passed with every
+	// descriptor pointing at the start of the span, because there was only ever one.
+	const WIDE_BLOCKS: u32 = 128;
+	if bound >= WIDE_BLOCKS {
+		const SPAN: usize = SECTOR * WIDE_BLOCKS as usize;
+		let wide: alloc::vec::Vec<u8> = (0..SPAN).map(|i| (i as u8).wrapping_mul(23) ^ ((i / SECTOR) as u8).wrapping_mul(97)).collect();
+		let wide_source = object::memory_object::MemoryObject::create(SPAN).expect("a multi-block source buffer");
+		// THROUGH EVERY FRAME AND NOT THE FIRST: an object this size is a list of frames that need
+		// not be contiguous.
+		write_to_object(&wide_source, &wide);
+		const WIDE_LBA: u64 = 64;
+		let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: WIDE_LBA, count: WIDE_BLOCKS }.encode();
+		blk.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(wide_source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the multi-descriptor write should send");
+		sched::run_until_idle();
+		let write_reply = blk.recv().expect("the multi-descriptor write reply should arrive");
+		assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "a span spread over two descriptors should be written");
+
+		// AND A SECOND SPAN IS WRITTEN BEFORE THE FIRST IS READ BACK, which is not belt and braces:
+		// the driver moves these bytes through a BOUNCE SPAN it owns, and that span still holds the
+		// write's contents afterwards. A read whose descriptors do not actually fetch every byte
+		// would find the right answer already sitting there - which is exactly what a first version
+		// of this test did, passing a driver whose descriptors all named the same address. Filling
+		// the span with something else first is what makes the read prove it read.
+		let other: alloc::vec::Vec<u8> = wide.iter().map(|byte| !byte).collect();
+		let other_source = object::memory_object::MemoryObject::create(SPAN).expect("a second multi-block source buffer");
+		write_to_object(&other_source, &other);
+		let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: WIDE_LBA + WIDE_BLOCKS as u64, count: WIDE_BLOCKS }.encode();
+		blk.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(other_source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the second span's write should send");
+		sched::run_until_idle();
+		let other_reply = blk.recv().expect("the second span's write reply should arrive");
+		assert_eq!(driver_protocol::block::decode_status(&other_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the second span should be written");
+
+		let read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: WIDE_LBA, count: WIDE_BLOCKS }.encode();
+		blk.send(Message::new(read.to_vec(), alloc::vec::Vec::new())).expect("the multi-descriptor read should send");
+		sched::run_until_idle();
+		let read_reply = blk.recv().expect("the multi-descriptor read reply should arrive");
+		assert_eq!(driver_protocol::block::decode_status(&read_reply.bytes), Some(driver_protocol::block::STATUS_OK), "and read back");
+		let buf_cap = read_reply.caps.first().expect("the multi-descriptor read should grant a buffer");
+		let object = buf_cap.object();
+		let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+		assert_eq!(read_from_object(memory, SPAN), wide, "every descriptor's span comes back whole and in order - a table whose entries all name the same address returns the first one repeated");
+		// AND THE SINGLE-BLOCK PATH STILL WORKS AFTER A MULTI-BLOCK ONE, which is what says the stop
+		// that ends a multi-block transfer was sent: a card still streaming answers nothing.
+		let after = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+		blk.send(Message::new(after.to_vec(), alloc::vec::Vec::new())).expect("the single-block read should send");
+		sched::run_until_idle();
+		let after_reply = blk.recv().expect("the card should still answer after a multi-block transfer");
+		assert_eq!(driver_protocol::block::decode_status(&after_reply.bytes), Some(driver_protocol::block::STATUS_OK), "a card left streaming would answer nothing here");
+	}
 }
 
 tagged_test!(ahci_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.ahci_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.ahci"]);
@@ -624,6 +889,9 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 	// DeviceManager, and DeviceManager does not hang up on a driver it is still using.
 	let mut held: alloc::vec::Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
 	let mut served: Option<alloc::sync::Arc<Channel>> = None;
+	// The bootstrap end and token of whichever controller answered, so a SECOND consumer can be
+	// minted the way DeviceManager mints one.
+	let mut serving_from: Option<(alloc::sync::Arc<Channel>, u64, u16)> = None;
 	for (info, bar_phys, bar_len, index) in controllers {
 		let (kernel_ep, user_ep) = object::channel::Channel::create();
 		held.push(kernel_ep.clone());
@@ -635,6 +903,8 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 		if let Some(offers) = recv_offers(&kernel_ep, key.generation) {
 			served = offer_of(&offers, driver_protocol::provider::BLOCK).map(|cap| cap.into_any_arc().downcast::<Channel>().expect("the block channel is a channel"));
 			if served.is_some() {
+				let token = offer_token_of(&offers, driver_protocol::provider::BLOCK).expect("the block publication carries a token");
+				serving_from = Some((kernel_ep.clone(), key.generation, token));
 				break;
 			}
 		}
@@ -681,6 +951,54 @@ fn ahci_driver_serves_a_write_and_reads_it_back() {
 	let refused = blk.recv().expect("the refusal should arrive");
 	assert_eq!(driver_protocol::block::decode_status(&refused.bytes), Some(driver_protocol::block::STATUS_INVALID), "a range past the last sector is refused rather than clamped");
 	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
+
+	// TWO CONSUMERS WITH REQUESTS OUTSTANDING AT ONCE, WHICH IS WHAT THE QUEUE IS FOR.
+	//
+	// The block contract is one request and one reply per message, so a single consumer never has
+	// two in flight - a disk's concurrency can only come from its four consumers asking together.
+	// This mints a second the way DeviceManager does, puts a read from EACH on the wire before
+	// either reply is read, and requires each to come back with ITS OWN sector.
+	//
+	// WHAT IT CATCHES is the defect a tagged driver introduces: two commands in flight sharing one
+	// data span, or two answers going to the wrong consumers. Both sectors are written first, with
+	// patterns that differ, so either crossing is a wrong array rather than a wrong status.
+	let (kernel_ep, generation, token) = serving_from.expect("the controller that answered was recorded");
+	let (second, driver_end) = object::channel::Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the second CONNECT should send");
+	sched::run_until_idle();
+
+	const FAR_LBA: u64 = 23;
+	let far_pattern: alloc::vec::Vec<u8> = (0..SECTOR).map(|i| (i as u8).wrapping_mul(29) ^ 0x3C).collect();
+	assert_ne!(far_pattern, pattern, "the two sectors differ, or reading one out of the other would pass");
+	let far_source = object::memory_object::MemoryObject::create(SECTOR).expect("a second source buffer");
+	{
+		let hhdm = mem::hhdm_offset();
+		let phys = far_source.frames()[0];
+		unsafe { core::ptr::copy_nonoverlapping(far_pattern.as_ptr(), (hhdm + phys) as *mut u8, SECTOR) };
+	}
+	let write = driver_protocol::block::Request { op: driver_protocol::block::OP_WRITE, lba: FAR_LBA, count: 1 }.encode();
+	second.send(Message::new(write.to_vec(), alloc::vec![object::handle::Capability::new(far_source.clone() as alloc::sync::Arc<dyn object::KernelObject>, Rights::ALL)])).expect("the second consumer's write should send");
+	sched::run_until_idle();
+	let write_reply = second.recv().expect("the second consumer's write reply should arrive");
+	assert_eq!(driver_protocol::block::decode_status(&write_reply.bytes), Some(driver_protocol::block::STATUS_OK), "the second consumer's write should succeed");
+
+	// BOTH READS GO OUT BEFORE EITHER REPLY IS TAKEN. A driver collecting a batch has both on tags
+	// at once; one serving them in turn answers the same two messages, and either way each answer
+	// must carry its own sector.
+	let near = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: LBA, count: 1 }.encode();
+	let far = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: FAR_LBA, count: 1 }.encode();
+	blk.send(Message::new(near.to_vec(), alloc::vec::Vec::new())).expect("the first consumer's read should send");
+	second.send(Message::new(far.to_vec(), alloc::vec::Vec::new())).expect("the second consumer's read should send");
+	sched::run_until_idle();
+
+	for (channel, expected, whose) in [(&*blk, &pattern, "the first"), (&*second, &far_pattern, "the second")] {
+		let reply = channel.recv().expect("both consumers should be answered");
+		assert_eq!(driver_protocol::block::decode_status(&reply.bytes), Some(driver_protocol::block::STATUS_OK), "{whose} consumer's read should succeed while the other was outstanding");
+		let buf_cap = reply.caps.first().expect("the read should grant a buffer");
+		let object = buf_cap.object();
+		let memory = object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
+		assert_eq!(read_from_object(memory, SECTOR), *expected, "{whose} consumer reads ITS OWN sector, not the one the other asked for");
+	}
 }
 
 tagged_test!(nvme_driver_serves_a_write_and_reads_it_back, [Drivers, Pci, Slow], id = "kernel.hardware.nvme_driver_serves_a_write_and_reads_it_back", covers = ["kernel", "bin.nvme"]);
@@ -934,6 +1252,37 @@ fn xhci_driver_enumerates_the_usb_bus() {
 		}
 	}
 	assert!(reply_seen, "the host should answer the ARP request over the USB adapter, which is the round trip nothing about reaching READY proves");
+
+	// AND THE AUDIO SINK ON THE SAME BUS TAKES A PERIOD, which is the only ISOCHRONOUS transfer this
+	// controller does: the bus reserves bandwidth for one and delivers late rather than not at all,
+	// so there is no retry and no stall to clear - a driver that got the endpoint type, the
+	// interval or the packet split wrong gets a completion code that is none of the two this
+	// answers `OK` for.
+	//
+	// AND `OK` IS THE CONTROLLER'S OWN STATEMENT AND NOT THE DRIVER'S. The driver answers it only
+	// after the transfer event for the last packet of the period has arrived, so a sink that
+	// answered without moving anything could not answer at all.
+	let audio_token = offer_token_of(&offers, driver_protocol::provider::AUDIO).expect("a controller with an audio sink on it publishes one");
+	let (sink, driver_end) = object::channel::Channel::create();
+	send_connect(&kernel_ep, key.generation, audio_token, driver_end).expect("the audio CONNECT should send");
+	sched::run_until_idle();
+	let period: alloc::vec::Vec<u8> = (0..driver_protocol::audio::PERIOD_BYTES as usize).map(|i| (i as u8).wrapping_mul(17)).collect();
+	sink.send(Message::new(period, alloc::vec::Vec::new())).expect("the period should send");
+	for _ in 0..64 {
+		sched::run_until_idle();
+		if sink.peek_len().is_ok() {
+			break;
+		}
+	}
+	let played = sink.recv().expect("the audio sink answers a period");
+	assert_eq!(played.bytes, driver_protocol::audio::OK, "the controller took the period - an empty reply is this wire's refusal");
+
+	// AND A LENGTH THIS WIRE HAS NO SHAPE FOR IS REFUSED rather than played as a short period,
+	// which is what the enumeration in `driver_protocol::audio` is for.
+	sink.send(Message::new(alloc::vec![0u8; 7], alloc::vec::Vec::new())).expect("the malformed message should send");
+	sched::run_until_idle();
+	let refused = sink.recv().expect("even a refusal is answered");
+	assert!(refused.bytes.is_empty(), "a refusal is an empty reply, which cannot be mistaken for samples");
 
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&1u16.to_le_bytes()); // OP_LIST

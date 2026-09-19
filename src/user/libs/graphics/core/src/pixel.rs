@@ -678,6 +678,21 @@ impl Decoder {
 	}
 
 	fn decode_inner(&self, raw: Rgba, table: Option<&TransferTable>) -> Rgba {
+		// A SOURCE THAT IS ALREADY THE WORKING FORMAT IS DECODED BY DOING NOTHING, and saying so is
+		// worth a branch because of WHO asks: a pyramid's level zero is exactly this - linear light,
+		// premultiplied, no primaries to convert - and a bicubic tap reads one sixteen times a pixel.
+		// Without this the identity is computed the long way: divide three channels by alpha, call a
+		// transfer function that returns its argument, through `f64` and back, then multiply the three
+		// channels by alpha again.
+		//
+		// AND IT IS THE SAME NUMBER, which is what makes it a shortcut rather than a second answer.
+		// The divide and the multiply exist because "a transfer function is not linear" - the comment
+		// below says so - and they round-trip a value through `x / a * a` when there is no transfer to
+		// correct for. Skipping the pair returns `raw` itself, which is the value that round trip is
+		// approximating.
+		if self.working_is_linear && matches!(self.transfer, graphics_profile::image::Transfer::Linear) && self.matrix.is_none() && matches!(self.alpha, AlphaMode::Premultiplied) {
+			return raw;
+		}
 		let mut value = raw;
 		if self.working_is_linear {
 			// THE TRANSFER FUNCTION IS APPLIED TO THE COLOUR AND NOT TO THE COLOUR TIMES ALPHA, so a

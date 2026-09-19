@@ -651,6 +651,13 @@ qemu_attach_nvme() {
 		return 1
 	}
 	# The second SCSI unit's medium: two mebibytes, so its capacity is not the first one's.
+	local scsi3="$QEMU_BUILD_DIR/scsi-third.$$.img"
+	scratch_sweep "$QEMU_BUILD_DIR/scsi-third" .img
+	rm -f "$scsi3"
+	truncate -s 1M "$scsi3" || {
+		echo "qemu-run: could not make this run's third SCSI medium at $scsi3" >&2
+		return 1
+	}
 	local scsi2="$QEMU_BUILD_DIR/scsi-second.$$.img"
 	scratch_sweep "$QEMU_BUILD_DIR/scsi-second" .img
 	rm -f "$scsi2"
@@ -679,7 +686,11 @@ qemu_attach_nvme() {
 		-device "nvme,serial=libersystem-nvme-2,drive=nvmesecond"
 		-device "ahci,id=sata"
 		-drive "file=$sata,if=none,id=satascratch,format=raw"
-		-device "ide-hd,bus=sata.0,drive=satascratch"
+		# NAMED SO THE MONITOR CAN ADDRESS IT, WHICH IS ALL THE NAME IS FOR TODAY. A port losing or
+		# gaining its device is the one thing the AHCI item excludes, and the reason is now measured
+		# rather than assumed: `device_del satadisk` on this QEMU answers "Bus 'sata.0' does not
+		# support hotplugging". The name costs nothing and is what a later attempt would need first.
+		-device "ide-hd,bus=sata.0,drive=satascratch,id=satadisk"
 		-device "sdhci-pci,id=sdhost"
 		-drive "file=$sd,if=none,id=sdcard,format=raw"
 		-device "sd-card,drive=sdcard"
@@ -687,7 +698,7 @@ qemu_attach_nvme() {
 		# THE CODEC NEEDS AN AUDIO BACKEND NAMED, and `snd0` is the one this harness already builds
 		# for virtio-sound - a wav file, a spice sink or none, depending on how the run was asked for.
 		# Without it QEMU refuses the codec outright and the guest never starts.
-		-device "hda-output,bus=hdabus.0,audiodev=snd0"
+		-device "hda-duplex,bus=hdabus.0,audiodev=snd0"
 		# AND A SCSI HOST CONTROLLER WITH A TARGET BEHIND IT, which is the shape a machine with a real
 		# HBA has: the driver speaks the SCSI command set to a target rather than a block device's own
 		# tiny request format, and the same block contract comes out of both.
@@ -709,6 +720,15 @@ qemu_attach_nvme() {
 		# from outside: a consumer that asks for `t0l1` and is handed `t0l0` reads the wrong size.
 		-drive "file=$scsi2,if=none,id=scsidisk2,format=raw"
 		-device "scsi-hd,bus=scsibus.0,channel=0,scsi-id=0,lun=1,drive=scsidisk2"
+		# A UNIT BEHIND A SECOND TARGET, AND OF A THIRD SIZE.
+		#
+		# TWO LUNS ON ONE TARGET CANNOT TELL A DRIVER THAT WALKS TARGETS FROM ONE THAT STOPS AT THE
+		# FIRST THAT ANSWERS: both find everything there is. The walk only becomes observable when
+		# something is behind a target the driver has to ask for AFTER the first one has already
+		# filled its answer - so this unit is on scsi-id 1, and its capacity differs from both of
+		# the others because the size is how the oracle tells which medium it was handed.
+		-drive "file=$scsi3,if=none,id=scsidisk3,format=raw"
+		-device "scsi-hd,bus=scsibus.0,channel=0,scsi-id=1,lun=0,drive=scsidisk3"
 	)
 }
 
@@ -863,6 +883,9 @@ qemu_attach_xhci() {
 		if truncate -s 4M "$uas"; then
 			arr+=(
 				-drive "file=$uas,if=none,id=uasdisk,format=raw"
+				# AN AUDIO SINK ON THE BUS, which is the only ISOCHRONOUS device in this harness - the one
+				# transfer type the xHCI driver had no code for until the audio class needed it.
+				-device "usb-audio,bus=usb.0,port=1.4,audiodev=snd0"
 				-device "usb-uas,bus=usb.0,port=4,id=uasbus"
 				-device "scsi-hd,bus=uasbus.0,drive=uasdisk"
 			)

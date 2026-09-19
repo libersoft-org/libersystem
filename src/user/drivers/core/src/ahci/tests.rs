@@ -247,3 +247,54 @@ fn a_port_with_no_device_is_walked_past_rather_than_waited_on() {
 	assert!(!link_up(0x0000_0201), "a detected device whose link is in partial power");
 	assert!(link_up(0x0000_0103), "and one that is actually there");
 }
+
+#[test]
+fn a_queued_command_puts_the_count_in_features_and_the_tag_where_the_count_was() {
+	// THE CLASSIC NCQ DEFECT, held against the field layout rather than against a round trip. Eight
+	// sectors under tag 3.
+	let fis = queued_fis(8, 3, false);
+	assert_eq!(fis.features, 8, "the low byte of the COUNT is the features field");
+	assert_eq!(fis.features_exp, 0, "and its high byte is features_exp");
+	assert_eq!(fis.count, 3 << 3, "the sector-count field carries the TAG, shifted left by three");
+	assert_eq!(fis.device, 1 << 6, "LBA mode, and no FUA unless asked");
+
+	// A COUNT THAT NEEDS BOTH BYTES, because a driver that wrote only the low one asks for a
+	// different transfer and the disk agrees to it.
+	let wide = queued_fis(0x0140, 0, false);
+	assert_eq!((wide.features, wide.features_exp), (0x40, 0x01), "a count over 255 uses both bytes");
+
+	// THE TAG'S THREE LOW BITS ARE RESERVED AND STAY ZERO. A driver writing the tag unshifted asks
+	// for tag 0 with reserved bits set.
+	assert_eq!(queued_fis(1, 31, false).count, 31 << 3);
+	assert_eq!(queued_fis(1, 31, false).count & 0x07, 0, "the low three bits are reserved");
+
+	assert_eq!(queued_fis(1, 0, true).device, (1 << 6) | (1 << 7), "FUA is the device register's bit 7");
+}
+
+#[test]
+fn a_queued_command_is_outstanding_in_sact_and_not_in_ci() {
+	// WHAT `PxCI` SAYS ABOUT A QUEUED COMMAND IS "IT WAS SENT", which is true the moment it is
+	// issued. A driver reading completion out of it hands back a buffer the disk has not written.
+	assert_eq!(queued_outcome(1 << 2, 2, 0), Outcome::Pending, "the tag's bit is set in SACT, so it is still running");
+	assert_eq!(queued_outcome(0, 2, 0), Outcome::Done, "the device cleared it through a Set Device Bits FIS");
+	// Another tag's bit says nothing about this one.
+	assert_eq!(queued_outcome(1 << 5, 2, 0), Outcome::Done);
+
+	// AN ERROR IS READ BEFORE THE BIT, because a failed queued command stops the whole queue: the
+	// port halts and the remaining tags are abandoned rather than completing. A driver that checked
+	// SACT first would call this one pending for ever.
+	let tfd = TFD_ERR | 0x51 | (0x40 << 8);
+	assert_eq!(queued_outcome(1 << 2, 2, tfd), Outcome::Failed { status: 0x51, error: 0x40 });
+	assert_eq!(queued_outcome(0, 2, tfd), Outcome::Failed { status: 0x51, error: 0x40 }, "and a cleared bit does not turn a failure into a success");
+}
+
+#[test]
+fn the_capability_register_says_whether_the_controller_queues() {
+	// CAP.SNCQ is bit 30, beside S64A at 31 - the two are adjacent, so a driver that read the wrong
+	// one refuses a 64-bit controller or queues on one that cannot.
+	assert!(Capabilities::decode(1 << 30).queued);
+	assert!(!Capabilities::decode(1 << 30).sixty_four_bit);
+	assert!(!Capabilities::decode(1 << 31).queued);
+	assert!(Capabilities::decode(1 << 31).sixty_four_bit);
+	assert!(!Capabilities::decode(0).queued);
+}

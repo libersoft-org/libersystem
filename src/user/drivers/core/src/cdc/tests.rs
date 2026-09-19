@@ -437,3 +437,43 @@ fn the_control_lines_are_a_bitmap_in_the_setup_packet() {
 	assert_eq!(control_lines(false, true), 2, "RTS is bit one");
 	assert_eq!(control_lines(true, true), 3);
 }
+
+#[test]
+fn a_network_connection_notification_says_which_way_the_link_went() {
+	let up = [0xA1, NOTIFY_NETWORK_CONNECTION, 1, 0, 0, 0, 0, 0];
+	let down = [0xA1, NOTIFY_NETWORK_CONNECTION, 0, 0, 0, 0, 0, 0];
+	assert_eq!(notification(&up), Notification::Link { up: true });
+	assert_eq!(notification(&down), Notification::Link { up: false });
+	// ANY NON-ZERO VALUE IS CONNECTED, which is what the specification says and not what a driver
+	// comparing against one would do.
+	assert_eq!(notification(&[0xA1, NOTIFY_NETWORK_CONNECTION, 2, 0, 0, 0, 0, 0]), Notification::Link { up: true });
+}
+
+#[test]
+fn a_notification_this_driver_does_not_act_on_is_not_a_link_change() {
+	// A driver that read every notification as a link transition reports the link going down when
+	// the adapter said something else entirely - `RESPONSE_AVAILABLE`, for one.
+	assert_eq!(notification(&[0xA1, 0x01, 0, 0, 0, 0, 0, 0]), Notification::Other(0x01));
+	assert_eq!(notification(&[0xA1, 0x20, 0, 0, 0, 0, 0, 0]), Notification::Other(0x20));
+}
+
+#[test]
+fn a_speed_change_shorter_than_it_claims_is_refused() {
+	let mut whole = [0u8; NOTIFICATION_HEADER_LEN + 8];
+	whole[1] = NOTIFY_CONNECTION_SPEED_CHANGE;
+	whole[6] = 8;
+	whole[8..12].copy_from_slice(&100_000_000u32.to_le_bytes());
+	whole[12..16].copy_from_slice(&10_000_000u32.to_le_bytes());
+	assert_eq!(notification(&whole), Notification::Speed { down: 100_000_000, up: 10_000_000 });
+
+	// THE LENGTH FIELD IS THE DEVICE'S CLAIM AND THE SLICE IS WHAT ARRIVED. A header promising
+	// eight bytes of rates in a transfer that carried none is not a slow link - reading them would
+	// read past what the controller wrote.
+	assert_eq!(notification(&whole[..NOTIFICATION_HEADER_LEN]), Notification::Malformed);
+	let mut lying = whole;
+	lying[6] = 2;
+	assert_eq!(notification(&lying), Notification::Malformed, "and a claim shorter than the field itself is not a shorter answer");
+
+	assert_eq!(notification(&[0u8; NOTIFICATION_HEADER_LEN - 1]), Notification::Malformed);
+	assert_eq!(notification(&[]), Notification::Malformed);
+}

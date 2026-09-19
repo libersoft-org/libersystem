@@ -366,6 +366,10 @@ pub mod console;
 // here: a contract written inside its first driver is copied by its second.
 pub mod stream;
 
+// THE AUDIO WIRE an `audio` provider serves, here for the same reason and one worse: it was not
+// copied at all, so the two servers of that provider kind spoke different protocols.
+pub mod audio;
+
 pub mod provider {
 	pub const BLOCK: u16 = 1;
 	pub const NET: u16 = 2;

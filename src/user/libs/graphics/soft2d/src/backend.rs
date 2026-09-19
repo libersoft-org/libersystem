@@ -613,27 +613,48 @@ impl<'a> Backend for Soft2d<'a> {
 		// pyramid is an allocation and a pyramid per frame is the allocation this design exists to
 		// remove.
 		let mut pyramids: Vec<(u32, Pyramid)> = Vec::new();
-		for (index, record) in resources.images.iter().enumerate() {
-			if !wants_pyramid(list, index as u32) {
-				continue;
-			}
-			let planar_space = self.images.planes(record.identity).map(|view| view.layout().color_space);
-			let packed_space = self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space());
-			let Some(space) = planar_space.or(packed_space) else { continue };
-			self.ensure_table(space.transfer());
-			let table = Self::table_for(&self.tables, space.transfer());
-			// A PLANAR SOURCE GETS ITS PYRAMID FROM THE SAME SAMPLER the drawing will use, so its
-			// levels are the same decoded light rather than a second reconstruction.
-			let built = match self.images.planes(record.identity) {
-				Some(view) => graphics_core::sample::Sampler::planar(view, working, graphics_core::sample::Spread::Clamp, table).and_then(|sampler| Pyramid::from_sampler(&sampler, working)),
-				None => {
-					let Some(view) = self.images.image(record.identity) else { continue };
-					Pyramid::build_with(&view, working, table)
+		// REQUIRED FIRST AND OPTIONAL AFTER, and the split is what keeps this from refusing a frame
+		// that used to draw. A mipmapped draw NEEDS its pyramid - there is no other way to sample it -
+		// and a bilinear or bicubic one merely goes faster with one. The optional ones are built here
+		// and GIVEN BACK BELOW if the prepared-scratch budget turns out not to have room, because a
+		// frame that used to draw must not start failing over an optimisation.
+		let mut optional: Vec<bool> = Vec::new();
+		for pass in 0..2u8 {
+			for (index, record) in resources.images.iter().enumerate() {
+				let required = wants_pyramid(list, index as u32);
+				if pass == 0 && !required {
+					continue;
 				}
-			};
-			match built {
-				Ok(pyramid) => pyramids.push((index as u32, pyramid)),
-				Err(error) => return Err(crate::target::from_core(error)),
+				if pass == 1 && (required || !wants_decoded(list, index as u32)) {
+					continue;
+				}
+				let planar_space = self.images.planes(record.identity).map(|view| view.layout().color_space);
+				let packed_space = self.images.image(record.identity).and_then(|view| view.layout().semantics.color_space());
+				let Some(space) = planar_space.or(packed_space) else { continue };
+				self.ensure_table(space.transfer());
+				let table = Self::table_for(&self.tables, space.transfer());
+				// A PLANAR SOURCE GETS ITS PYRAMID FROM THE SAME SAMPLER the drawing will use, so its
+				// levels are the same decoded light rather than a second reconstruction.
+				// A REQUIRED PYRAMID IS THE WHOLE CHAIN AND AN OPTIONAL ONE IS LEVEL ZERO. Bilinear and
+				// bicubic read the source at its own resolution, so the halvings under it would be
+				// prepare time and prepared memory that no draw touches.
+				let built = match self.images.planes(record.identity) {
+					Some(view) => graphics_core::sample::Sampler::planar(view, working, graphics_core::sample::Spread::Clamp, table).and_then(|sampler| if required { Pyramid::from_sampler(&sampler, working) } else { Pyramid::base_from_sampler(&sampler, working) }),
+					None => {
+						let Some(view) = self.images.image(record.identity) else { continue };
+						if required { Pyramid::build_with(&view, working, table) } else { Pyramid::base_with(&view, working, table) }
+					}
+				};
+				match built {
+					Ok(pyramid) => {
+						pyramids.push((index as u32, pyramid));
+						optional.push(pass == 1);
+					}
+					// AN OPTIONAL ONE THAT WILL NOT BUILD IS NOT AN ERROR, for the same reason it is given
+					// back below: the image samples the way it always did.
+					Err(error) if pass == 0 => return Err(crate::target::from_core(error)),
+					Err(_) => continue,
+				}
 			}
 		}
 
@@ -664,8 +685,17 @@ impl<'a> Backend for Soft2d<'a> {
 			self.tile = Some(Tile::new(TILE_SIZE));
 		}
 
-		let scratch_bytes = self.pool.scratch_bytes() + self.masks.scratch_bytes() + self.raster.scratch_bytes() + self.spans.scratch_bytes() + bins.scratch_bytes() + self.tile.as_ref().map(|tile| tile.scratch_bytes()).unwrap_or(0) + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>();
+		let fixed = self.pool.scratch_bytes() + self.masks.scratch_bytes() + self.raster.scratch_bytes() + self.spans.scratch_bytes() + bins.scratch_bytes() + self.tile.as_ref().map(|tile| tile.scratch_bytes()).unwrap_or(0);
 		let ceiling = graphics_profile::RENDER2D_PROFILE_1_MIN_LIMITS.max_prepared_scratch_bytes;
+		// THE OPTIONAL COPIES ARE GIVEN BACK BEFORE ANYTHING IS REFUSED, newest first. Each is a
+		// decoded source that only makes an image sample faster, so dropping one costs time and
+		// nothing else - and a frame that fitted before this optimisation existed still fits.
+		while fixed + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>() > ceiling {
+			let Some(last) = optional.iter().rposition(|entry| *entry) else { break };
+			pyramids.remove(last);
+			optional.remove(last);
+		}
+		let scratch_bytes = fixed + pyramids.iter().map(|(_, pyramid)| pyramid_bytes(pyramid)).sum::<u64>();
 		if scratch_bytes > ceiling {
 			// A FRAME THAT CANNOT FIT SAYS SO BEFORE IT STARTS DRAWING. Discovering it halfway through
 			// a filter chain leaves a half-drawn frame, which is worse than an honest refusal.
@@ -1028,15 +1058,7 @@ fn fill_edges(raster: &mut Rasteriser, spans: &mut Spans, edges: &crate::raster:
 		// shader enum inside the hot loop - which is both the arithmetic and the reason the loop
 		// cannot be vectorised. Filling the run is the same answer with the decision taken once.
 		// It matters because a solid is most of what a user interface is made of.
-		match shader {
-			Shader::Solid(colour) => spans.source[..length].fill(*colour),
-			_ => {
-				for offset in 0..length {
-					let x = bounds.x + (first + offset) as u32;
-					spans.source[offset] = shader.at(x as f32, y as f32);
-				}
-			}
-		}
+		shader.row(bounds.x + first as u32, y, &mut spans.source[..length]);
 		// AN OPAQUE RUN AT FULL COVERAGE IS A COPY, and the whole composite is arithmetic that
 		// produces its own source.
 		//
@@ -1286,9 +1308,25 @@ fn glyph_run_bounds(resources: &render2d::list::ResourceTable, handle: u32, tran
 }
 
 fn wants_pyramid(list: &DrawList, image: u32) -> bool {
+	sampled_as(list, image, |quality| matches!(quality, ImageQuality::Mipmapped))
+}
+
+/// Whether an image is sampled with a MULTI-TAP filter, which is what makes a decoded copy of it
+/// worth the memory.
+///
+/// THE DECODE IS PER TAP AND THE TAPS OVERLAP. A bicubic pixel takes sixteen texels and decodes the
+/// transfer function on every one of them - and its neighbour decodes most of the same texels again.
+/// Measured on the benchmark's photo: **139 of the 254 milliseconds a full-screen bicubic draw costs
+/// are that decode**, which is the largest single term in this backend. A pyramid's level zero is the
+/// source already decoded into the working format, so sampling it removes the whole term.
+fn wants_decoded(list: &DrawList, image: u32) -> bool {
+	sampled_as(list, image, |quality| matches!(quality, ImageQuality::Bilinear | ImageQuality::Bicubic))
+}
+
+fn sampled_as(list: &DrawList, image: u32, wanted: impl Fn(&ImageQuality) -> bool) -> bool {
 	list.commands().iter().any(|command| match command {
-		Command::DrawImage { image: handle, quality, .. } => handle.0 == image && matches!(quality, ImageQuality::Mipmapped),
-		Command::FillPath { paint: Paint::Image { image: handle, quality, .. }, .. } | Command::StrokePath { paint: Paint::Image { image: handle, quality, .. }, .. } | Command::DrawGlyphRun { paint: Paint::Image { image: handle, quality, .. }, .. } => handle.0 == image && matches!(quality, ImageQuality::Mipmapped),
+		Command::DrawImage { image: handle, quality, .. } => handle.0 == image && wanted(quality),
+		Command::FillPath { paint: Paint::Image { image: handle, quality, .. }, .. } | Command::StrokePath { paint: Paint::Image { image: handle, quality, .. }, .. } | Command::DrawGlyphRun { paint: Paint::Image { image: handle, quality, .. }, .. } => handle.0 == image && wanted(quality),
 		_ => false,
 	})
 }

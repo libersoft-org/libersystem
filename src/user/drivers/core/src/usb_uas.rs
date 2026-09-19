@@ -474,6 +474,10 @@ unsafe fn command(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, device: &
 		};
 		let Some(outcome) = wait_for_status(hc, hids, dev.slot, device.dci_status, data_dci, deadline) else {
 			print(b"driver.xhci: the UAS status pipe answered nothing inside the budget\n");
+			// THE DEVICE IS STILL EXECUTING THE COMMAND AND THIS ONLY TELLS THE CONTROLLER TO
+			// FORGET THE TRANSFER, which is what a task-management ABORT TASK would fix and cannot
+			// here - see the note on this driver's item. The tag is the STREAM in this transport,
+			// and an abort needs a tag of its own.
 			recover(hc, hids, dev, device);
 			return Err(scsi::Sense::Failed);
 		};

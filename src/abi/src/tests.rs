@@ -159,6 +159,11 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_ENTROPY_ADD, 83),
 	(SYS_ENTROPY_HEALTH, 84),
 	(SYS_CHANNEL_SEND_CAPS_ATTENUATED, 85),
+	// THE DEVICE EVENT CHANNEL, which is how a device arriving on or leaving a hot-plug slot reaches
+	// DeviceManager. It is a REGISTRATION and not a poll: the manager is asleep in its one wait, and
+	// a poll fast enough to feel immediate is a poll that runs forever for the one moment a year it
+	// has something to report.
+	(SYS_DEVICE_EVENTS, 86),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -656,7 +661,12 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		// it. They take the struct from 48 bytes to 56.
 		vendor => 48,
 		product => 50,
-		_pad2 => 52,
+		// WHETHER THE FUNCTION IS STILL ON THE BUS, which the hot-plug work added and which a
+		// listing needs: a row for a disk somebody pulled out, shown as though it were still there,
+		// is the one thing an operator asking what is in this machine must not be told. It took one
+		// of the four tail bytes, so nothing before it moved and the struct is still 56.
+		on_bus => 52,
+		_pad2 => 53,
 	);
 
 	assert_layout!(

@@ -43,11 +43,26 @@ const LANG_EN_US: u16 = 0x0409;
 const FRAME_BYTES: usize = 2048;
 
 /// A bound CDC network adapter.
+// The notification endpoint's ring and the page it delivers into.
+struct Notify {
+	dci: u32,
+	ring: Ring,
+	virt: u64,
+	phys: u64,
+	posted: bool,
+	// What the adapter last said its link was, so a repeat is not reported as a transition.
+	up: Option<bool>,
+}
+
 pub struct Net {
 	dci_in: u32,
 	dci_out: u32,
 	ring_in: Ring,
 	ring_out: Ring,
+	// THE NOTIFICATION ENDPOINT, WHEN THE ADAPTER HAS ONE. It is the only place a link transition
+	// is announced: from the data endpoints, a cable nobody plugged in and a quiet network are the
+	// same thing - a receive transfer that never completes.
+	note: Option<Notify>,
 	// The receive page, which a standing IN transfer fills, and the transmit page.
 	rx_virt: u64,
 	rx_phys: u64,
@@ -66,6 +81,9 @@ impl Net {
 	pub fn release(&mut self) {
 		self.ring_in.release();
 		self.ring_out.release();
+		if let Some(note) = self.note.as_mut() {
+			note.ring.release();
+		}
 		for handle in [&mut self.rx_handle, &mut self.tx_handle] {
 			if *handle != 0 {
 				close(*handle);
@@ -76,6 +94,11 @@ impl Net {
 
 	/// The device-context index of the receive endpoint, so the controller can recognise a
 	/// completion for it during a synchronous wait and keep it rather than discarding it.
+	/// The notification endpoint's device-context index, for an event that arrived on it.
+	pub fn notify_endpoint(&self) -> Option<u32> {
+		self.note.as_ref().map(|note| note.dci)
+	}
+
 	pub fn receive_endpoint(&self) -> u32 {
 		self.dci_in
 	}
@@ -202,13 +225,35 @@ pub unsafe fn configure_network(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ne
 		let dci_out: u32 = (bound.bulk_out & 0x0f) as u32 * 2;
 		let ring_in: Ring = Ring::new()?;
 		let ring_out: Ring = Ring::new()?;
+		// AN ADAPTER WITHOUT ONE IS BOUND EXACTLY AS BEFORE, which is why every part of this is an
+		// option rather than a requirement: a device that publishes no notification endpoint is one
+		// whose link state cannot be asked for, not one this driver refuses.
+		let note_dci: Option<u32> = bound.notification.map(|address| (address & 0x0f) as u32 * 2 + 1);
+		let note_ring: Option<Ring> = match note_dci {
+			Some(_) => Some(Ring::new()?),
+			None => None,
+		};
+		let note_page = match note_dci {
+			Some(_) => dma_page(),
+			None => None,
+		};
 		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
-		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out);
-		let entries: u32 = dci_in.max(dci_out);
+		let note_bit = note_dci.map_or(0, |dci| 1u32 << dci);
+		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out | note_bit);
+		let entries: u32 = dci_in.max(dci_out).max(note_dci.unwrap_or(0));
 		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
 		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20 | dev.route);
 		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
-		for &(dci, mps, ep_type, ring) in &[(dci_in, bound.bulk_in_packet as u32, 6u32, &ring_in), (dci_out, bound.bulk_out_packet as u32, 2u32, &ring_out)] {
+		// ENDPOINT TYPE SEVEN IS INTERRUPT IN, where six is bulk IN and two is bulk OUT. A driver
+		// that configured the notification endpoint as bulk asks the controller for a pipe the
+		// device does not have, and the configure command is refused for the whole adapter.
+		let mut contexts: [(u32, u32, u32, &Ring); 3] = [(dci_in, bound.bulk_in_packet as u32, 6u32, &ring_in), (dci_out, bound.bulk_out_packet as u32, 2u32, &ring_out), (dci_in, 0, 6, &ring_in)];
+		let mut context_count = 2usize;
+		if let (Some(dci), Some(ring)) = (note_dci, note_ring.as_ref()) {
+			contexts[2] = (dci, NOTIFY_BYTES as u32, 7u32, ring);
+			context_count = 3;
+		}
+		for &(dci, mps, ep_type, ring) in &contexts[..context_count] {
 			let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
 			((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
 			((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
@@ -237,6 +282,21 @@ pub unsafe fn configure_network(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ne
 			return None;
 		}
 
+		// WHETHER THIS ADAPTER CAN BE ASKED ABOUT ITS LINK AT ALL, said once. An adapter with no
+		// notification endpoint is one whose link state nothing can report; one with it is where a
+		// link transition would come from.
+		match bound.notification {
+			Some(address) => {
+				let mut line = *b"driver.xhci: the CDC adapter publishes a notification endpoint at 00\n";
+				let digits = b"0123456789abcdef";
+				let at = line.len() - 3;
+				line[at] = digits[(address >> 4) as usize];
+				line[at + 1] = digits[(address & 0x0F) as usize];
+				print(&line);
+			}
+			None => print(b"driver.xhci: the CDC adapter publishes no notification endpoint - its link state cannot be asked for\n"),
+		}
+
 		let (rx_handle, rx_virt, rx_phys) = dma_page()?;
 		let (tx_handle, tx_virt, tx_phys) = dma_page()?;
 		// THE DEVICE'S OWN SEGMENT SIZE, LESS THE HEADER, IS THE MTU - and a device that published
@@ -246,7 +306,61 @@ pub unsafe fn configure_network(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ne
 			0 | 1..=14 => 1500,
 			segment => (segment - 14).min(FRAME_BYTES as u16 - 14),
 		};
-		Some(Net { dci_in, dci_out, ring_in, ring_out, rx_virt, rx_phys, rx_handle, tx_virt, tx_phys, tx_handle, posted: false, mac, mtu })
+		let note = match (note_dci, note_ring, note_page) {
+			(Some(dci), Some(ring), Some((_, virt, phys))) => Some(Notify { dci, ring, virt, phys, posted: false, up: None }),
+			_ => None,
+		};
+		Some(Net { dci_in, dci_out, ring_in, ring_out, note, rx_virt, rx_phys, rx_handle, tx_virt, tx_phys, tx_handle, posted: false, mac, mtu })
+	}
+}
+
+/// The largest notification this driver reads: the eight-byte header and a speed change's rates.
+const NOTIFY_BYTES: usize = cdc::NOTIFICATION_HEADER_LEN + 8;
+
+/// The same number, for the caller that turns a transfer event's RESIDUAL length into how many
+/// bytes arrived. A residual is what was NOT transferred.
+pub const NOTIFY_WINDOW: usize = NOTIFY_BYTES;
+
+/// Post the standing notification transfer, if none is outstanding.
+///
+/// A QUEUE NOTHING DRAINS IS A QUEUE THAT FILLS. An interrupt endpoint the driver configured and
+/// never read from is one the device eventually stops being able to write to, so this is posted
+/// beside the receive transfer rather than only when somebody asks about the link.
+pub fn post_notification(hc: &Xhci, dev: &UsbDevice, net: &mut Net) {
+	unsafe {
+		let Some(note) = net.note.as_mut() else { return };
+		if note.posted {
+			return;
+		}
+		note.ring.push(note.phys, NOTIFY_BYTES as u32, TRB_NORMAL << 10 | TRB_IOC);
+		w32(hc.db + dev.slot as u64 * 4, note.dci);
+		note.posted = true;
+	}
+}
+
+/// Read one notification the adapter delivered, and say when its link CHANGED.
+///
+/// A REPEAT IS NOT A TRANSITION. An adapter that says "connected" twice has not reconnected, and a
+/// driver reporting both would have a log that reads like a flapping cable.
+pub fn handle_notification(net: &mut Net, arrived: usize) -> Option<cdc::Notification> {
+	unsafe {
+		let note = net.note.as_mut()?;
+		note.posted = false;
+		let mut bytes = [0u8; NOTIFY_BYTES];
+		let take = arrived.min(NOTIFY_BYTES);
+		for (index, byte) in bytes[..take].iter_mut().enumerate() {
+			*byte = ((note.virt + index as u64) as *const u8).read_volatile();
+		}
+		match cdc::notification(&bytes[..take]) {
+			cdc::Notification::Link { up } => {
+				if note.up == Some(up) {
+					return None;
+				}
+				note.up = Some(up);
+				Some(cdc::Notification::Link { up })
+			}
+			other => Some(other),
+		}
 	}
 }
 

@@ -31,11 +31,15 @@ const QUEUE_REQUEST: u16 = 2;
 // it from the others and a slot in the serving set.
 //
 // THIS NUMBER IS THE MANIFEST'S, AND THE TWO CANNOT DRIFT. The registry entry declares `most` block
-// providers with `consumers` connections each, a driver serves at most eight provider connections at
-// once, and the manager REFUSES the offer past `most` - which takes the driver down mid-bring-up,
-// as a boot that never reached its shell. Four units at the four consumers a disk needs is sixteen
-// connections and the manifest check refuses it; two units is what fits, and the entry says so.
-const MAX_UNITS: usize = 2;
+// providers with `consumers` connections each, and the manager REFUSES the offer past `most` -
+// which takes the driver down mid-bring-up, as a boot that never reached its shell.
+//
+// FOUR NOW, AND THE SERVING SET WAS WHAT MADE IT TWO (2026-09-19). Four units at the four consumers
+// a disk needs is sixteen connections, which is exactly what `MAX_PROVIDER_CLIENTS` was raised to
+// and why: at two units this driver could not reach a SECOND TARGET on any machine whose first
+// target carries two logical units, which is the machine this tree runs. The walk below has always
+// asked every target; it simply had nowhere to put what it found.
+const MAX_UNITS: usize = 4;
 
 // The most targets walked, whatever the device says it has. `max_target` is the DEVICE'S number and
 // is 255 on the model this tree runs against: a driver that walked all of them would spend its whole
@@ -619,7 +623,9 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, queue: &virtio::Queue, mut 
 			};
 			let token = serving.token_at(at) as usize;
 			let endpoint = serving.at(at);
-			let Received::Message { len, handle } = recv_blocking(endpoint, &mut request) else {
+			// A CONSUMER THAT CLOSED IS ONE CLIENT LEAVING AND NOT THIS DRIVER'S END. The rule for
+			// dropping it and telling the manager is in `recv_from_consumer`, which says why.
+			let Some((len, handle)) = common::recv_from_consumer(bootstrap, bind, &mut serving, at, &mut request) else {
 				continue;
 			};
 			let Some(block::Request { op, lba, count }) = block::Request::decode(&request[..len]) else {

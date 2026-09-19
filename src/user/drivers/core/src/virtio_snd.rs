@@ -65,14 +65,13 @@ const RXQ: u16 = 3;
 //
 // One byte is unambiguous because AudioService pads every playback period to exactly PERIOD_BYTES -
 // the driver's own SET_PARAMS negotiated that size, so a period of any other length was never a
-// shape this protocol had.
-const CMD_CAPTURE: u8 = 1;
-const CMD_CAPTURE_STOP: u8 = 2;
-
-// One PCM period: 512 stereo signed-16-bit frames = 2048 bytes (~10.6 ms at 48 kHz).
-// AudioService always sends exactly this many bytes per period (padding the last
-// with silence), so a submitted period always matches the negotiated period size.
-const PERIOD_BYTES: u32 = 2048;
+// shape this protocol had. It is stated in `driver_protocol::audio` now, with the shapes as an
+// enumeration, so the next server of this kind reads it rather than inferring it from here.
+// THE WIRE IS `driver_protocol::audio` AND NOT THIS FILE'S ANY MORE (2026-09-19). It was three
+// constants and a comment here, which is how the SECOND server of this provider kind came to speak
+// a different protocol: a one-byte message meant "hand me a captured period" to this driver and
+// "play this one byte" to `hda`.
+use driver_protocol::audio::{CMD_CAPTURE, CMD_CAPTURE_STOP, PERIOD_BYTES};
 // The device-side ring holds several periods, so playback does not underrun while
 // we synthesize and submit the next one.
 const BUFFER_BYTES: u32 = PERIOD_BYTES * 8;

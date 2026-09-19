@@ -1206,3 +1206,539 @@ WHAT IS LEFT is the CORB/RIRB handshake after the first response. Its intermitte
 boot gets past the vendor verb to the node count and another does not, which is the same shape as the
 torn completion entry the NVMe driver turned out to have, and that one took three rounds of better
 diagnostics to see rather than one round of better reasoning.
+
+---
+
+## 2026-09-19 - five drivers stopped serving when a consumer left
+
+FOUND BY READING, not by a failing test, while planning the vsock connection table. `virtio_vsock`'s
+serve loop had `let Received::Message { .. } = recv_blocking(endpoint, ..) else { continue };` where
+every older driver in the tree has `close_at` + `disconnected`. A scan of `src/user/` found the same
+`else { continue }` in exactly five files - `virtio_scsi`, `ahci_driver`, `virtio_vsock`,
+`nvme_driver`, `sdhci_driver` - and nowhere else. They are the five newest drivers.
+
+THE MECHANISM, CONFIRMED FROM BOTH ENDS RATHER THAN ASSUMED:
+- `rt::poll_ready(handle)` is `wait(handle, clock().max(1)) == 0`, and a kernel channel's readiness
+  is `!self.inbox.lock().is_empty() || self.is_peer_closed()` - the peer is held as a `Weak`, so it
+  reads closed once the last strong reference goes. A CLOSED ENDPOINT IS A READY ONE, deliberately:
+  it is how a reader learns of the closure.
+- `serve_any_or_answer_inner` returns the FIRST ready index. So the departed consumer is answered
+  ahead of every live one, on every pass. The driver does not merely spin - it never reaches the
+  consumers that stayed.
+- The control channel is drained FIRST on every pass, so the heartbeat is answered throughout. A
+  watchdog cannot tell this driver from a working one.
+- `DeviceManager`'s `BindingEvent::Disconnected` is what refunds a place against the registry's
+  `consumers` bound, and its own comment says the count "only rose" without it.
+
+THE FIX IS ONE COPY: `common::recv_from_consumer(bootstrap, bind, serving, at, buf)` answers the
+request or drops and reports the consumer, and all five call it. Five independent omissions is the
+argument against leaving the rule written only inside the drivers that got it right.
+
+THE ORACLE IS IN `kernel.hardware.virtio_vsock_driver_echoes_bytes_off_the_host`: mint a second
+consumer with `send_connect` the way DeviceManager does, drop BOTH references to the first (the
+handshake keeps one beside the downcast, and the peer is weak), then require the second to be
+answered and a `Disconnect` frame naming the publication's token to have arrived.
+
+MUTATION: replacing the helper's body with a bare `None` makes the suite TIME OUT rather than fail an
+assertion - the driver never goes idle, so `sched::run_until_idle()` does not return. Recorded in the
+test beside the assertion, because a timeout is what somebody later calls flaky.
+
+Guest evidence: `./test.sh --tags drivers,pci,slow --arch x86_64` - 103 passed, with all five drivers
+online in the same boot; the same run times out at 300 s with the mutation in.
+
+AND A GATE, because five independent omissions is the evidence. `source-hygiene` now refuses a file
+under `src/user/drivers` that calls `serve_any_or_answer` or `wait_providers_or_answer` and never
+calls `close_at` or `recv_from_consumer`. PRESENCE AND NOT SHAPE, deliberately: the six drivers that
+got it right do not agree on the shape, and a rule written against one of them would flag the others.
+
+THE FIRST VERSION OF THE RULE PASSED ON A COMMENT. Each fixed driver names `recv_from_consumer` in
+the comment above the call, so a match that looked anywhere in the file approved a driver whose CALL
+had been removed - which is the "passes by not being understood" failure this script warns about
+elsewhere. It uses the same leading-content class as the literal-address rule now, and was proven to
+refuse before being trusted to approve: with the nvme call renamed the gate exits 1 and names the
+file; restored, it is clean.
+
+Guest evidence after the gate: `./test.sh --tags drivers,pci,slow,storage,filesystem,usb` - 152
+passed; `./check.sh --gate source-hygiene` clean.
+
+---
+
+## 2026-09-19 - virtio-vsock: a connection table and the event queue
+
+THE TWO THINGS THE ITEM NAMED AS OPEN. `virtio_vsock` served one connection and configured its event
+queue without ever posting to it.
+
+**THE TABLE.** `MOST_STREAMS = 4`, each a `Stream { owner, connection, staging }`, and the manifest
+declares four `local-stream` publications of one consumer each. `consumers` stays ONE deliberately -
+the entry's own reason, that two consumers sharing a stream interleave their bytes - and what four
+buys is four independent streams.
+
+TWO LOOKUPS THAT ARE NOT THE SAME LOOKUP, which is where this would have gone wrong:
+- BY PORT, for an arriving packet. `vsock::slot_of(dst_port, base, slots)` - a stream's local port is
+  `base + slot` by construction. `checked_sub` then a range test, so a port below the base does not
+  wrap into the table and one above it is not masked in. Host-tested at both ends of the range, plus
+  a port a remainder WOULD have admitted (1032 against four slots).
+- BY ENDPOINT VALUE, for a consumer's request. NOT by the `Serving` index: `close_at` fills the hole
+  with the last entry, so an index names a different consumer as soon as any other one leaves.
+
+RECONNECT: refused while this consumer's own stream is OPEN (the wire cannot say which of two a
+later SEND is for), allowed once it has CLOSED, and the slot is reset so no bytes from the previous
+connection are readable through the new one.
+
+A CONSUMER'S DEPARTURE RESETS ITS STREAM AND FREES THE SLOT, or "connection limits" would mean four
+connections per boot rather than four at a time.
+
+AN OVERRUN IS PER STREAM. `drain` answers a BITMASK, because one `OP_RECEIVE` routinely drains
+packets belonging to other streams - the stream that overran is reset there, and only an overrun on
+the caller's own stream becomes its answer.
+
+**THE EVENT QUEUE.** Four slots of one `u32`. A transport reset is a statement about the transport
+that no connection's state machine can make for itself, so it is read before a consumer's request is
+answered - the only moment its answer differs. An unrecognised event is re-posted, not acted on. A
+device with no event queue, or no buffer for one, serves its streams as before and says so.
+
+**THE ORACLE.** Both streams are written before either is read; send-read-send-read would pass a
+one-buffer driver. Two different patterns, each read back on its own stream. The host's log carries
+connections from ports 1024 and 1025, which is the table handing out distinct ports.
+
+MUTATION: `slot_of(..).map(|_| 0)` - every packet to slot zero - fails at the second consumer's
+connect, `left: 1 right: 0`, because that stream's response landed on the first and it timed out in
+`Connecting`.
+
+A BUILD NOTE WORTH KEEPING: the kernel's in-guest tests are not `cfg(test)`. Helpers added beside
+them need `#[allow(dead_code)]` and FULLY QUALIFIED paths - `driver_protocol::stream::`,
+`object::channel::Message` - because the imports the test bodies use are inside those bodies. The
+build error is five `cannot find` lines and the run log shows only "5 previous errors"; the detail
+comes from `TEST=1 TEST_TAGS=... cargo build --target x86_64-unknown-none --tests` in `src/kernel`.
+
+---
+
+## 2026-09-19 - virtio-scsi reaches a second target, and what was actually in the way
+
+THE DRIVER WAS NOT THE PROBLEM. `find_units` has walked `0..=max_target` since it was written; it
+stopped early because `MAX_UNITS` was two and the first target on this machine carries two logical
+units, so the table was full before the walk asked target 1.
+
+AND `MAX_UNITS` WAS TWO BECAUSE `MAX_PROVIDER_CLIENTS` WAS EIGHT. Four units at four consumers is
+sixteen connections; the manifest check refuses `most * consumers` past the serving set. Eight was
+sized when a driver published ONE provider - four consumers for a disk, room for a second - and a
+SCSI HBA publishes one per unit across several targets, which is a consumer that number never had.
+
+RAISED TO SIXTEEN in both copies (`drivers::common` and `system-manifest`, which a check holds in
+step). Cost: four arrays of that length in `Serving`, thirteen bytes an entry, ~100 bytes per serving
+driver. `MAX_INITIAL_OFFERS` is eight and four publications fit it. The shape is unchanged - fixed
+set, a `CONNECT` past it still refused by closing the endpoint.
+
+THE FIXTURE IS THE HALF THAT MAKES IT OBSERVABLE. Two units behind ONE target cannot distinguish a
+driver that walks targets from one that stops at the first - both find everything there is. The
+harness now attaches a third medium at `scsi-id=1,lun=0`, 1 MB against the existing 4 MB and 2 MB,
+because capacity is how the oracle tells which medium it was handed. The oracle asserts three units,
+the third unit's own capacity, and a write-then-read on it with a pattern that differs from the first
+target's.
+
+MUTATION: `let last = ...min(0)` - the walk stops at target 0 - fails with `left: 2 right: 3`.
+
+ALSO FOUND, BY THE THIRD UNIT NOT FITTING: `common::print_line` copies every driver's online report
+into a 96-byte buffer while drivers build those reports in `Bounded<160>` and `Bounded<192>`. The
+guest printed `... t0l1 4096 x 512 bytes, t1l` and stopped - an operator told about two and a half
+disks, with nothing saying the line was cut. The buffer is 256 now. Truncation itself stays: a driver
+that panicked writing a report is a device that never came up.
+
+Guest evidence: `./test.sh --tags drivers,pci,slow,storage` - 152 passed, with
+`driver.virtio-scsi: online (00:0e.0, 3 units: t0l0 8192 x 512 bytes, t0l1 4096 x 512 bytes, t1l0 2048 x 512 bytes)`.
+
+---
+
+## 2026-09-19 - AHCI: NCQ, and the concurrency without which it is ceremony
+
+NCQ ALONE WOULD HAVE BEEN A MECHANISM NOTHING EXECUTES, which this milestone refuses in as many
+words beside NCM and CDC-ACM. A queued command that is the only one in flight costs what an unqueued
+one costs. So the question was where a second command comes from, and the answer was already in the
+registry: the block contract is one request and one reply per message, so a single consumer never
+has two outstanding - but every disk here declares FOUR CONSUMERS, and nothing used that.
+
+THE SHAPE IS A BATCH, chosen over an asynchronous loop deliberately. Holding commands outstanding
+across `serve_any_or_answer` means the driver blocks indefinitely with the disk working, so it would
+have needed either an interrupt (AHCI's is not granted to this driver) or a poll that runs while
+idle - the thing this tree warns about beside two other drivers. A batch never leaves a tag
+outstanding across a blocking wait: block for the first request, ask every other consumer whether one
+is ALREADY waiting (`poll_ready` is a wait against the current instant), issue each on its own tag,
+then complete and answer each as its own command finishes.
+
+PER-TAG RESOURCES, not one shared span: two commands in flight into one buffer is two transfers into
+the same memory and the second to finish wins. Four tags (`min(CAP.NCS, 4)`), each with a 256-byte
+command table in the second structures page and its own growable data span.
+
+THE THREE DECISIONS ARE IN `drivers::ahci` WITH FIXTURES, because each is a way a first NCQ driver is
+wrong:
+- `queued_fis`: the COUNT goes to features/features_exp and the sector-count byte carries the TAG
+  shifted left by three. Filled the ordinary way it asks for tag 0 of a zero-length transfer, which
+  most controllers read as the maximum.
+- `queued_outcome`: outstanding is `PxSACT`, not `PxCI`. `PxCI` clears when the command was SENT.
+- The error is read BEFORE the active bit, because a failed queued command halts the port and
+  abandons every other tag - they are all answered failed, and the port is stopped, cleared, started.
+
+`Capabilities` gained `queued` from CAP.SNCQ (bit 30, ADJACENT to S64A at 31 - a fixture pins that
+the two are not confused).
+
+THE ORACLE: mint a second consumer with `send_connect`, write two sectors with different patterns,
+then put a read from EACH on the wire before taking either reply, and require each to get its own.
+
+MUTATIONS AND THEIR SIGNATURES:
+- every request on tag zero -> `both consumers should be answered: Empty`.
+- a queued completion read out of `PxCI` -> the suite HANGS rather than failing an assertion. Worth
+  knowing before somebody calls it flaky.
+
+Live evidence: `driver.ahci: online (00:0b.0, 16384 x 512 bytes, ncq 4 tags)` - QEMU advertises
+CAP.SNCQ, so the pre-existing write-then-read oracle now runs over `READ/WRITE FPDMA QUEUED` and is
+what says the field mapping holds on a controller rather than only against fixtures.
+
+Guest evidence: `./test.sh --tags drivers,pci,slow,storage` - 152 passed. Host: drivers crate 231.
+
+---
+
+## 2026-09-19 - SDHCI ADMA2, and the 32-bit address nobody can ask for
+
+ADMA2 lifts the one-block-per-request bound the PIO path publishes: 256 blocks in one request
+instead of one, with the bound published in the capacity reply and a request past it refused rather
+than shortened.
+
+THE REGISTRY REFUSED IT FIRST, CORRECTLY. The entry declared `dma = "none"` for the PIO slice, and a
+claim under that policy mints no DMA buffer - so the first build reported "no memory for the
+descriptor table" rather than quietly mastering the bus. Changed to `trusted-untranslated`, at the
+cost the threat model already records.
+
+CORE DECISIONS WITH FIXTURES: the length field is 16 bits and ZERO MEANS 65536 (so the bound is
+65024, a whole number of blocks below the range, and every length is literal); Auto CMD12 belongs to
+a multi-block transfer and must NOT be set for a single one; the last descriptor is marked.
+
+**THE INTERMITTENT FAILURE IS THE FINDING.** The suite passed on `drivers,pci,slow` and failed on
+`drivers,pci,slow,storage`, at the SINGLE-block write - which the descriptor arithmetic cannot
+reach, so the first instinct (my mutation broke it) was wrong. Found by making the driver say what it
+could not say, in three rounds:
+1. a fault line on the ADMA completion - nothing printed, so the failure was earlier;
+2. the same on every `command()` give-up point - still nothing, so it was earlier still;
+3. the remaining silent `STATUS_ERR` paths - and then
+   `command 24 reported an error - int 02008001, adma-err 01`.
+
+Interrupt bit 25 is ADMA error; ADMA error state `01` is FETCH DESCRIPTOR. An ADMA2 descriptor
+carries a 32-BIT address, QEMU's controller claims no 64-bit bus, and the allocator had placed the
+descriptor table above 4 GiB - so the truncated low half named something else. Which span landed
+where depended on what had allocated first in that boot, which is what made it look like flakiness.
+
+Both spans are checked now; a driver that cannot address its own descriptors keeps PIO and says so -
+the same refusal `ahci::Capabilities::usable` makes before binding.
+
+**THE GAP, NAMED FOR AN OWNER:** nothing here can ask for memory a 32-bit device can address.
+`SYS_DMA_BUFFER_CREATE(size, device)` and `frame::allocate_contiguous(pages)` carry no address
+limit. That is a memory-ABI change rather than a driver's, so it is recorded and not invented inside
+this item; until then ADMA2 is taken when the allocator obliges and PIO serves when it does not.
+
+**AND THE FIRST VERSION OF THE ORACLE PASSED A BROKEN DRIVER.** Four blocks fit ONE descriptor, so
+"every descriptor names the same address" was a no-op. Raised to 128 blocks (two descriptors) - and
+it STILL passed, because the driver's bounce span still held the write's bytes, so a read that never
+fetched found the right answer sitting there. A second span written in between fixed it: the
+mutation now fails on the array.
+
+Guest evidence: `drivers,pci,slow` 103 passed with `adma2 256 blocks`; `drivers,pci,slow,storage`
+152 passed with the 32-bit refusal firing and the PIO path serving. Host: drivers crate 234.
+
+---
+
+## 2026-09-19 - HDA capture, and a provider kind whose two servers spoke different protocols
+
+THE ITEM ASKS FOR CAPTURE "THROUGH THE SAME PCM CONTRACT AS virtio-snd", and the contract was three
+constants and a comment inside `virtio_snd.rs`. `hda` - the second server of `ProviderKind::Audio` -
+had never read it. Two consequences, neither visible from either driver on its own:
+
+1. A ONE-BYTE MESSAGE WAS A COMMAND TO ONE SERVER AND A ONE-BYTE PERIOD TO THE OTHER. A consumer
+   asking an HDA machine for a microphone got a click.
+2. `hda` NEVER REPLIED TO A PERIOD. `audio_engine` sets `driver_pending = Period` on send and only
+   sends the next one from `driver_ready`, so an HDA machine played ONE PERIOD PER BOOT and then went
+   quiet - and a driver waiting for a message nobody will send looks exactly like an idle one.
+
+EXTRACTED TO `driver_protocol::audio`, beside `block` and `stream` and for the reason that section
+gives, except this one was not copied but ignored. The shapes are an ENUMERATION (`message()`):
+`PERIOD_BYTES` is Play, empty is EndPlayback, one byte is Capture/EndCapture, everything else is
+Unknown and refused. Both servers and `audio_engine` read it; `audio_engine` keeps a `const _: () =
+assert!` tying its frame count to the wire's period.
+
+CAPTURE IS THE OUTPUT ROUTE REVERSED: `Widget::AudioInput`, `pin_can_input` (capability bit 5, beside
+output's 4), stream tag 2, pin control 0x20 (IN) where playback writes 0x40 (OUT), input amp payload
+0x7000 where output writes 0xB000. Input stream descriptors are the ones BEFORE the output ones, so
+input stream zero is descriptor zero. The stream runs between requests and periods come from
+alternate halves on `SD_STS` bit 2, sticky and write-one-to-clear.
+
+A codec with no input refuses with the wire's empty reply - which cannot be mistaken for samples,
+because a period is never empty.
+
+FIXTURE: `hda-output` -> `hda-duplex`. ORACLE: a period is ANSWERED (the reply that never existed),
+a capture returns a whole period rather than the refusal, and the INPUT stream's link position
+advances - the device saying it filled the buffer rather than the driver handing back its own zeros.
+
+MUTATIONS: dropping the capture converter fails with `left: 0 right: 2048`. AND ONE THAT DOES NOT
+FAIL, recorded in the test: setting the input pin to DRIVE instead of LISTEN passes everything,
+because QEMU's codec model runs the stream either way. On real silicon that is a microphone that
+records nothing - the fixture's limit, not the assertion's.
+
+Host: driver-protocol 66, drivers 235. Guest: `drivers,pci,slow,storage` 152 passed.
+
+### An unreproduced UB-check panic, recorded so it is not lost (2026-09-19)
+
+One run of `--tags drivers,pci,slow,storage,usb,network,service` failed inside
+`kernel.applications.a_command_word_on_its_own_runs_the_command` with
+
+    panicked at core/src/slice/iter.rs:100:78:
+    unsafe precondition(s) violated: ptr::add requires that the address calculation does not overflow
+
+The immediately preceding run of the same selection, and the immediately following one, both passed
+201 tests - so it is intermittent and it is NOT a regression from the audio work in this session (the
+same test ran and progressed further in a run predating those changes).
+
+IT IS WRITTEN DOWN RATHER THAN DISMISSED because a UB precondition check is not a flake: something
+built a slice iterator over a pointer whose arithmetic overflows, and it did so once in three runs.
+The panic is inside the core library, so the frame that built the slice is not in the message and
+there is no backtrace to chase it with from here. What a next attempt needs first is a way to get one
+- the check fires in the kernel's own test process, so the fault path already has the registers.
+
+---
+
+## 2026-09-19 - CDC-ECM: the notification endpoint, and what "one adapter by budget" really was
+
+THE ENDPOINT WAS MEASURED BEFORE IT WAS WRITTEN FOR. The parser gained the control interface's
+interrupt IN endpoint and a log line saying whether the adapter publishes one; the live device
+answers `0x81`. Only then was anything built to consume it - and QEMU turned out to SEND a
+`NETWORK_CONNECTION` notification, which the guess "QEMU's ECM model has no source of notifications"
+would have got wrong.
+
+CLAIMED AS A THIRD PIPE: endpoint type 7 (interrupt IN) where 6 is bulk IN and 2 is bulk OUT, its own
+ring and page, transfer standing beside the receive one. `usb_class::NETWORK_COST` charges three
+endpoints, three rings and three pages whether the device has one or not - a budget that charged for
+what a device happened to publish would admit an adapter it could not afford.
+
+DECISIONS IN `drivers::cdc` WITH FIXTURES: any non-zero wValue is connected (not `== 1`); an
+unrecognised notification is `Other(code)` and not a link change; a speed change whose header claims
+eight bytes of rates in a transfer that carried none is `Malformed`, because reading them reads past
+what the controller wrote. Repeat suppression lives in the driver: a second "connected" is not a
+transition.
+
+LIVE: `driver.xhci: the CDC adapter reports its link is up` on every binding boot; 201 passed across
+`drivers,pci,slow,storage,usb,network,service`.
+
+TWO MUTATIONS THAT DO NOT FAIL, recorded because silence about them is worse than the gap:
+configuring the notification endpoint as BULK still binds and still delivers, because QEMU's xHCI
+model does not enforce the type; and nothing ever reports the link going DOWN, so the transition is
+exercised one way only.
+
+**AND THE "ONE ADAPTER, BY BUDGET" NOTE WAS WRONG ABOUT THE CAUSE.** The budget is the symptom.
+`network_service.rs` opens the FIRST `net` provider and closes the subscription - "this service takes
+one NIC at bootstrap and does not follow a replacement - its whole stack is built on the link it
+opened". A second adapter would publish a provider nobody opens. Two links is a NetworkService item.
+
+---
+
+## 2026-09-19 - UAS: task management and tagged concurrency are one piece, and the measurement says why
+
+The item's note had these as two open points. They are one.
+
+WRITTEN AND WIRED FIRST, THEN MEASURED: `uas::task_management_iu` and `uas::task_done` with
+fixtures, and an `abort_task` on the command timeout path. The live device answered NOTHING -
+`the UAS device did not answer a task-management request` - which a probe at bring-up confirmed was
+not about the timeout path being unreachable.
+
+THE REASON IS `const TAG: u16 = STREAM_ID as u16` AND A DOORBELL THAT ALWAYS RINGS `STREAM_ID`. The
+status transfer is posted on one stream; a task-management request must carry a tag distinct from
+every outstanding task's, and the device answers on the stream matching THAT tag - where nothing is
+posted. A second tag is a second stream, and a second stream is tagged concurrency.
+
+SO THE DRIVER WIRING WAS TAKEN BACK OUT rather than left as a path that cannot answer, and the
+timeout path now SAYS what it actually does: clearing an endpoint halt tells the controller to forget
+a transfer, and the device is still executing the command.
+
+THE DECISIONS STAY, with fixtures, because they are what the next attempt needs first and they are
+held rather than assumed: the request's own tag in the header and the managed tag in its own field
+(both big-endian), and `task_done` being TWO non-adjacent codes - 0x00 "complete" and 0x08
+"succeeded" - so a successful abort is not read as a failure and escalated into a unit reset.
+
+Host: drivers 241. Guest: `drivers,pci,slow,usb` 103 passed.
+
+---
+
+## 2026-09-19 - USB Audio Class: an isochronous transport, and a class on top of it
+
+THE ITEM'S REAL SIZE WAS THE TRANSPORT. This xHCI driver had no isochronous transfer type at all -
+measured before the plan was written, not assumed: its TRB constants were Normal, Setup, Data,
+Status, Link and the command types, and all four existing classes ride bulk, interrupt or control.
+
+WHAT THE TRANSPORT NEEDED: the Isoch TRB (type 5) and isochronous endpoint types (1 OUT, 5 IN);
+`Start Isoch ASAP` rather than a frame id; error count ZERO in the endpoint context, because an
+isochronous endpoint that retried delivers last interval's audio in this one; the interval as an
+EXPONENT OF MICROFRAMES where the descriptor states FRAMES (one frame is eight, so the descriptor's
+number gives a schedule eight times too fast); and one transfer descriptor per service interval -
+the wire's 2048-byte period is eleven transfers against this device's 192-byte packet, the last one
+short.
+
+`drivers::uac` HOLDS THE DECISIONS WITH FIXTURES: a 24-bit little-endian sample rate (a four-byte
+read swallows the next rate's low byte); `bSamFreqType == 0` is a RANGE, not an empty list; the
+format must match exactly INCLUDING the subframe size (16 bits in a 4-byte subframe is the same
+samples in twice the bytes); and only bits 1:0 of the endpoint attributes are the transfer type -
+QEMU's device sets the synchronisation bits, so a whole-byte comparison fails on the real fixture.
+
+FORMAT IS A REFUSAL, NOT A CONVERSION. 48 kHz stereo 16-bit or nothing.
+
+INTEGRATION: `ClassKind::Audio` with its own budget (one isochronous endpoint, two in flight -
+a sink with one goes silent between the transfer completing and the next being posted); the
+publication is offered only when a sink is bound, because this wire's refusal is an empty reply and
+a service could not tell "no device" from "the device said no"; `usb-audio` on the hub at port 1.4,
+because the root ports were full.
+
+**AND ONE BUG I INTRODUCED AND THE SUITE CAUGHT IMMEDIATELY**, worth recording because of its shape:
+adding the audio release to the detach path broke the BRACE NESTING, so the slot teardown and the
+"port detached" print moved inside `if audio.is_some()` and ran for EVERY port. The guest printed
+five detaches right after coming online and the CDC round trip failed. A structural edit that
+compiles is not a structural edit that is right.
+
+ORACLE: a period is answered `OK` only after the transfer event for its last packet, so a sink that
+answered without moving anything could not answer. MUTATION: a Normal TRB in place of the Isoch one
+fails it, empty against `OK`.
+
+BIND WINDOW, READ WITH CARE: 97, 164 and 181 ticks across three runs of the SAME build against an
+allowance of 200. The number is dominated by host load, not by the seventh device.
+
+Host: drivers 247, driver-protocol 66. Guest: 201 passed across
+`drivers,pci,slow,storage,usb,network,service,filesystem`.
+
+---
+
+## 2026-09-19 - the ABI snapshots were stale, and the gate that catches it had not been run
+
+`./check.sh --gate host-tests` failed on two crates. `system-manifest`'s two were mine - the
+provider budget moved from 8 to 16 and SDHCI's DMA policy from `none` to `trusted-untranslated`, and
+both were spelled out as literals in assertions. `abi`'s two were NOT mine and were in the committed
+tree: `SYS_DEVICE_EVENTS = 86` added with `SYSCALLS` still ending at 85, and `DeviceInfo::on_bus`
+inserted so `_pad2` moved 52 -> 53 against a layout snapshot asserting 52. Both are the PCIe hot-plug
+work of 2026-09-18.
+
+THE GUARDS WORKED AND THE RUN WAS MISSING. The syscall snapshot's own comment records the previous
+occurrence (`SYS_DEVICE_QUIESCED`) and the completeness check added because of it - and that check is
+exactly what reported this one. A build and a guest suite both pass over a stale snapshot, because
+neither compiles that crate's tests; only `host-tests` does.
+
+AND THE MANIFEST TEST WAS REWRITTEN RATHER THAN RENUMBERED. Its subject is two constants in two
+crates agreeing, and it had `8` written into four assertions - so the day the bound moved it failed
+on its own arithmetic rather than on a disagreement. It derives every case from
+`MAX_PROVIDER_CLIENTS` now, including a new one for the PRODUCT (`most * consumers`) that the literal
+version could not express once the numbers changed.
+
+107 host suites pass.
+
+### A full-suite-only console failure, reproduced and not attributed (2026-09-19)
+
+`./test.sh --arch x86_64` with NO tags - the full 449-test suite - fails deterministically in
+`kernel.services.a_tty_a_job_left_raw_comes_back_cooked`: the program receives `xab\n` where the
+test typed `ab\n`, and the console's echo in the log is `xab`. A stray `x` is in the kernel console
+input before the test types anything.
+
+WHAT WAS ESTABLISHED:
+- It is DETERMINISTIC in the full suite (three runs).
+- It PASSES in every scoped selection tried, including `service,console,shell` (99 tests),
+  `service,console,shell,imgview` (99), `service,console,shell,input,mouse,text,display,image` (100)
+  and `service,console,shell,drivers,pci,slow,storage,usb,network` (201) - the last of which carries
+  every driver, device and harness change from this session.
+- NOTHING IN THE TEST SUITES FEEDS AN `x` TO THE CONSOLE. `console_input::feed_serial` has exactly
+  one caller in the suites, inside this test's own helper; the kernel's other callers feed `\n`.
+- The serial receive path is not the source: `read_byte` checks `data_ready()` before reading.
+- The code it fails in - `console_service`, `term`, `test_suites/services.rs` - is untouched by this
+  session's work.
+
+SO IT IS RECORDED RATHER THAN GUESSED AT. What a next attempt needs is the suite that carries the
+contaminating test, and the bisection is by TAG - noting that the tag filter requires EVERY tag a
+test declares to be selected, which is why adding `drivers,pci` alone does not run a
+`[Drivers, Pci, Slow]` test.
+
+AND ONE SMALL THING FOUND WHILE BISECTING: `./test.sh --list-tags` prints `permission`, and the
+kernel's own filter answers `test filter error: unknown tag 'permission'` for it. The list and the
+filter disagree about at least that one name.
+
+## The tag filter reads the other way round, and the list is truncated (2026-09-19)
+
+CORRECTION TO THE PARAGRAPH ABOVE. It says "the tag filter requires EVERY tag a test declares to be
+selected". It does not. `src/kernel/tests.rs` selects a test when ANY of its tags was requested, or
+when the test is a smoke test. What is all-shaped is a VETO over exactly two tags: a test carrying
+`slow` or `stress` is excluded unless that tag is requested by name. So the observation that
+`drivers,pci` alone does not run a `[Drivers, Pci, Slow]` test is right and the reason given for it
+was wrong - the missing tag is `slow`, and adding it is enough. Bisection by tag is available.
+
+AND THE `permission` MISMATCH HAS A CAUSE. `./test.sh --list-tags` greps the tag table out of the
+kernel source with a character class that stops at a hyphen, so every hyphenated tag is printed
+truncated. It advertises four names that are not tags - `arch`, `capability`, `permission`, `volume`
+- and hides eleven that are: `arch-aarch64`, `arch-riscv64`, `arch-x86_64`, `audio-service`,
+`capability-tcb`, `dynamic-reject`, `lico-load`, `permission-service`, `process-service`,
+`volume-layout`, `volume-scope`. Four of the eleven truncate onto a different REAL tag - `audio`,
+`dynamic`, `lico`, `process` - so the output looks complete. `volume-layout` is the selector for the
+booted-system test below, and it is one of the eleven.
+
+## The booted-system test's log says the volume is empty, and the volume is not (2026-09-19)
+
+`kernel.boot.init_package_starts_system_manager` (`[Boot, Service, VolumeLayout]`) fails
+intermittently on x86_64 and failed both aarch64 runs of 2026-09-19, always with `every manifest
+service must report online`, 9 of 24.
+
+WHAT THE LOG CLAIMS: `ProcessService: no artifact at vol://system/libexec/resource_manager.lsexe`
+and six more, plus `DeviceManager: <driver> is named by the registry and not on the volume` for
+eleven driver kinds.
+
+WHAT IS TRUE: the x86_64 runs at 07:26, 07:31 and 07:38 on 2026-09-19 boot one medium,
+`sha256 5010eb2e...`, against one system volume image. Only the middle one reports anything missing;
+the other two report `wasi_host.lsexe` alone, which is deliberate. Reading the names out of
+`.build/boot/system-volume-x86_64.img` finds every one of the eighteen.
+
+THE MECHANISM: `storage: vol://system mounted through its block provider` precedes the first "no
+artifact" by two hundred lines. Between them, all four `virtio-blk` instances and then
+`virtio-console`, `virtio-scsi`, `virtio-snd`, `virtio-vsock`, `xhci`, both `nvme`, `ahci`, `sdhci`
+and `hda` hit `stopped answering its control path inside the deadline its registry entry declares`
+and `went away holding published providers; they are withdrawn`. The MOUNT outlives the provider
+under it, and every lookup through the surviving mount answers NOT PRESENT.
+
+SO THERE ARE TWO THINGS HERE AND NEITHER IS A DRIVER:
+- StorageService answers `not present` where the honest answer is `the provider under this mount was
+  withdrawn`. That is what sent this session looking at the build twice.
+- Nothing remounts after the manager restarts the driver (`restarting virtio-blk` is four lines on),
+  so a recoverable transient ends the boot.
+
+THE TRIGGER IS CONTENTION AND IT IS MEASURED: bind windows of 126 to 177 ticks in the failing boot
+against 7 to 87 in a passing one of the same medium. The cascade predates this session and tracks
+the device count - nine drivers on 2026-08-27, thirteen on 2026-09-16, sixteen on 2026-09-19 - over
+a span in which the harness gained a third SCSI target, an IDE disk, a duplex HDA codec and a USB
+audio function. Widening the deadline would weaken the criterion that caught it.
+
+AND THE GATE THAT EXISTS DOES NOT COVER IT. `check.sh --gate test-tags` proves that every tag a
+`tagged_test!` uses is declared in `define_test_tags!`, and it self-tests by refusing three injected
+defects before it approves anything. What it does not compare is the list the HARNESS advertises
+against the set the kernel parses, which is the only place these two can disagree - and they do.
+The fix is two parts: the character class in `test.sh`'s `--list-tags`, and a rule in that gate that
+reads both sides and requires them equal. Held until the port runs finish, because `test.sh` and
+`src/harness/` are inputs to the build digest and an edit during a run invalidates it.
+
+FIXED (2026-09-19). `test.sh --list-tags` takes the hyphen, and `check-test-tags.sh` compares the
+declared wire names against what the harness prints, refusing when they differ and naming both
+directions. Proven to refuse on three fixtures before it approves - a truncated name, an advertised
+name the kernel does not have, and an agreeing pair in a different order - and then the original
+defect was reintroduced and the gate refused it with the exact four-and-eleven split above.
+
+## The foreign-facilities gate moved one step and is still not this work's (2026-09-19)
+
+The note above from 2026-09-13 records `foreign-facilities-guest` as red because `abiprobe` is not
+staged, and puts it with the foreign static substrate rather than with this milestone. Running the
+whole gate set at the end of this session reproduced it, and the gate names its own precondition:
+`LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`.
+
+THAT PRECONDITION IS NOW MET AND THE FAILURE MOVED. `.build/image/x86_64-unknown-none/libexec/
+abiprobe` exists after the development build, the gate gets past the staging check, boots the guest,
+runs the probe - and reports `abiprobe printed nothing at all`. So the state it was in ("not built
+into the image") and the state it is in now ("in the image and silent") are different failures, and
+the second is inside the foreign substrate, which this session touched in no file.
+
+RECORDED RATHER THAN CHASED, for the same reason the earlier round gave: nothing under `src/` that
+this work changed is in that path, and a gate belonging to another milestone is that milestone's to
+close. What changed here is only that its stated precondition no longer hides the real failure.

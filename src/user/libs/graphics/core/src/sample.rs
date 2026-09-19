@@ -258,17 +258,26 @@ impl Pyramid {
 		Self::from_sampler(&sampler, working)
 	}
 
-	/// Build from any sampler, which is what lets a PLANAR source have a pyramid without a second
-	/// filtering path: the levels are decoded light either way.
-	pub fn from_sampler(sampler: &Sampler<'_>, working: Working) -> Result<Self, Error> {
+	/// Build LEVEL ZERO ALONE, decoding the base through a prepared table.
+	pub fn base_with(base: &ImageView<'_>, working: Working, table: Option<&TransferTable>) -> Result<Self, Error> {
+		let sampler = Sampler::with_table(ImageView::new(*base.layout(), base.bytes())?, working, Spread::Clamp, table)?;
+		Self::base_from_sampler(&sampler, working)
+	}
+
+	/// LEVEL ZERO ALONE: the source decoded into the working format, with no chain under it.
+	///
+	/// A MAGNIFYING DRAW READS LEVEL ZERO AND NOTHING ELSE. Bilinear and bicubic sampling take the
+	/// source at its own resolution, so the halvings below it would be prepare time and prepared
+	/// memory that nothing reads - minification is their only reader, and `Mipmapped` is the quality
+	/// that asks for it.
+	pub fn base_from_sampler(sampler: &Sampler<'_>, working: Working) -> Result<Self, Error> {
 		working.validate()?;
-		let space = working.space();
-		let mut extent = sampler.extent();
+		let extent = sampler.extent();
 		let mut levels: Vec<OwnedImage> = Vec::new();
 		// LEVEL ZERO IS THE SOURCE IN THE WORKING FORMAT, so every level after it is filtered from
 		// decoded light rather than from the source's own encoding - and so one sampling path serves
 		// every level, including the base.
-		let mut base_level = OwnedImage::new(pyramid_layout(extent, space)?)?;
+		let mut base_level = OwnedImage::new(pyramid_layout(extent, working.space())?)?;
 		{
 			let mut target = base_level.view_mut();
 			for y in 0..extent.height {
@@ -278,6 +287,16 @@ impl Pyramid {
 			}
 		}
 		levels.push(base_level);
+		Ok(Self { levels })
+	}
+
+	/// Build from any sampler, which is what lets a PLANAR source have a pyramid without a second
+	/// filtering path: the levels are decoded light either way.
+	pub fn from_sampler(sampler: &Sampler<'_>, working: Working) -> Result<Self, Error> {
+		let mut pyramid = Self::base_from_sampler(sampler, working)?;
+		let space = working.space();
+		let mut extent = sampler.extent();
+		let levels = &mut pyramid.levels;
 		while extent.width > 1 || extent.height > 1 {
 			let next = crate::geom::Extent2D { width: (extent.width / 2).max(1), height: (extent.height / 2).max(1) };
 			let mut level = OwnedImage::new(pyramid_layout(next, space)?)?;
@@ -318,7 +337,7 @@ impl Pyramid {
 				break;
 			}
 		}
-		Ok(Self { levels })
+		Ok(pyramid)
 	}
 
 	pub fn levels(&self) -> usize {

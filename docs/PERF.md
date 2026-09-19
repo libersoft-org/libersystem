@@ -222,22 +222,32 @@ assignment, and it would REFUSE modules that run today.
 At 35 ns an IR statement the interpreter is about a hundred cycles per instruction. The register file
 took the value MOVES out; what is left at that number is the per-instruction dispatch itself - a match
 over the operation, a bounds-and-stamp check per operand, and a component loop that is four iterations
-for a `vec4`. Three routes remain and none is a tuning pass:
+for a `vec4`. TWO routes remain - a third was measured and removed, below - and neither is a tuning
+pass:
 
 - **More than one thread.** The backend is tile-based and single-threaded, and the tiles are
   independent by construction. THIS IS THE ONLY ONE WITH THE FLOOR'S FACTOR IN IT: the gap is
   twenty-nine times and the other two below are worth a fraction each. The parallelism has to come
   from outside a `no_std` library that has no threads in it, which makes this an interface question
   before it is an optimisation.
-- **A declared type that is authoritative.** See the section above: making `Module::types` the truth
-  would remove the per-assignment type write, and it needs a type check over every assignment plus a
-  refusal the shader model does not currently have. It is a change to the IR's contract with a
-  measurement attached, not the other way round.
 - **Fewer instructions rather than faster ones.** Nothing in this stack folds constants, removes a
-  dead assignment or fuses a multiply and an add in the IR before it runs. A lit stage is
-  thirty-six statements as written, and a shader compiler's ordinary first pass would make it fewer -
-  which is worth more per unit of work than making each one cheaper, and is a module-level pass that
-  can be checked against the interpreter it feeds.
+  dead assignment or fuses a multiply and an add in the IR before it runs. NOT WORTH ANYTHING ON THIS
+  SCENE, and the reason is worth writing down: the benchmark's lit stage has no dead assignment and no
+  operation whose operands are all constant, so a folding pass would remove nothing from it. It is
+  still the right pass for shaders written by a generator rather than by hand, and it would be checked
+  against the interpreter it feeds - but it is not what is between this backend and the floor.
+
+**AND ONE OF THE THREE WAS MEASURED AND REMOVED FROM THE LIST (2026-09-19).** "A declared type that is
+authoritative" was the obvious next route: `Module::types` states a type per value, so the
+per-assignment type write looked like pure waste. It was probed by taking the type from the
+declaration instead of writing one - correct on every module in the suite, which is itself the finding
+that every declaration in this tree agrees with what its operation produces - and measured:
+**960 ms against 959, and 34.8 nanoseconds a statement against 34.8.** Nothing. Only the
+pure-plumbing compose row moved, 41.7 to 37.7, and the frame does not run that module.
+
+So the route would have bought a type-inference pass and a refusal the shader model does not have, for
+zero on the thing being optimised. It is off the list, and what that leaves is the one route with the
+factor in it.
 
 ## The 3D demo, live, at three sizes (2026-09-18)
 
@@ -330,9 +340,16 @@ runs scenes small enough to subtract from each other, at the same extent as the 
 | --- | ---: | --- |
 | empty | 0.001 ms | a tile no command reaches is not replayed at all |
 | dot-per-tile | 0.081 ms | one pixel in every tile - see the damage note below; it was 17.0 ms |
-| one-opaque-fullscreen | 14.2 ms | the store plus a full-screen composite, with the decode skipped |
-| one-translucent-fullscreen | 23.2 ms | the same with the decode paid, so the difference is the DECODE |
-| hundred-small-opaque | 18.5 ms | a hundred commands over a fifth of the area |
+| one-opaque-fullscreen | 10.4 ms | the store plus a full-screen composite, with the decode skipped |
+| four-opaque-quarters | 11.6 ms | the SAME pixels as four commands, so the difference is a COMMAND |
+| four-opaque-fullscreen | 14.9 ms | four times the PIXELS at four commands, so the difference is a pixel |
+| half-of-every-tile | 9.6 ms | every tile touched and half of each dirtied |
+| one-translucent-fullscreen | 19.8 ms | the same with the decode paid, so the difference is the DECODE |
+| hundred-small-opaque | 16.0 ms | a hundred commands over a fifth of the area |
+
+THE MIDDLE THREE WERE ADDED ON 2026-09-19 and they are the ones that answered the question below: the
+first row varies the commands at a fixed pixel count and the second varies the pixels at a fixed
+command count, which is what separates two terms that had only ever been measured multiplied together.
 
 **A DAMAGE-LIMITED REDRAW NOW COSTS WHAT IT DRAWS.** A tile was decoded and re-encoded WHOLE, so a
 drawing that touched three pixels of it paid sixty-four rows of conversion for them; the round trip is
@@ -1348,3 +1365,240 @@ collapsed; it did not, so the encode is not where the time is. The change was re
 kept for the roughly two percent it may have moved on the two image-heavy scenes, which is inside
 this suite's run-to-run spread. RECORDED BECAUSE THE DISPROOF IS THE RESULT: the next attempt at
 that 47 nanoseconds starts knowing it is not the encode.
+
+### Those 47 nanoseconds were `Tile::store`, and UI-basic now meets its ceiling (2026-09-19)
+
+The number was never a pixel's drawing cost. Three probes were added to vary the command count and the
+pixel count SEPARATELY instead of leaving them multiplied together:
+
+    probe                      commands    pixels     time
+    dot-per-tile                     88        88    0.09 ms
+    half-of-every-tile                8   153,600   11.71 ms
+    one-opaque-fullscreen             1   307,200   14.29 ms
+    four-opaque-quarters              4   307,200   15.43 ms
+    four-opaque-fullscreen            4 1,228,800   18.60 ms
+
+**Four times the pixels costs 4.3 ms more - 4.7 nanoseconds a pixel, not 47.** A command is about a
+microsecond: eighty-eight of them draw in nine hundredths of a millisecond. That left about thirteen
+of the 14.3 milliseconds in neither term, and emptying `Tile::store`'s loop found them: **14.29 ms
+became 1.34**. Ninety-one percent of a solid full-screen fill was the way OUT of the tile.
+
+**And what it was doing is the defect.** `Tile::store` encoded one pixel at a time through
+`encode_tabled`, taking every decision the encode makes - the transfer, whether there is a table, the
+premultiply, the dither - once per pixel instead of once per row. `Encoder::encode_row` exists for
+exactly that, says so in its own comment, and `Surface::store` beside it has always used it; this path
+had the same loop written out by hand. The dither phase is the target's own x and y either way, which
+is why the run form takes the row's first column.
+
+| scene | before | after | ceiling | |
+| --- | ---: | ---: | ---: | --- |
+| UI-basic | 16.85 ms | **12.80 ms** | 16.7 ms | **met** |
+| UI-effects | 184.85 ms | 179.11 ms | 66.7 ms | over 2.68x |
+| vector-stress | 78.29 ms | 73.57 ms | 66.7 ms | over 1.10x |
+| image-stress | 345.03 ms | 340.54 ms | 16.7 ms | over 20.4x |
+
+UI-basic is the first of the four to meet its ceiling, and vector-stress is within ten percent of its
+own. The 112-scene 2D conformance suite passes unchanged.
+
+**And `Tile::load` had the same loop, which is the other half of the round trip.** It decoded one pixel
+at a time through `decode_tabled`, asking whether there is a usable table and whether the working
+space is linear once for every pixel instead of once for the row; `Decoder::decode_row` takes both
+decisions at the top and is what the other surface type has always called. The frozen four barely
+notice - they are held by other things - but the probes that actually PAY the decode do:
+`one-translucent-fullscreen` 19.76 to 17.80 ms and `hundred-small-translucent` 16.62 to 15.15, about
+ten percent each.
+
+An encode memo, a faster square root and a cheaper store-back were all changes to the four point seven
+nanoseconds. None of them was in `Tile::store`, which is why none of them moved anything.
+
+**Two probes along the way were invalid and are recorded as such.** `Surface::load` and
+`Surface::store` were emptied first and changed nothing, which read as two clean eliminations.
+`replay` does not call them - it works on a `Tile`, and `target.rs` carries two types with a
+`load`/`store` pair each. An experiment that measures a function nothing calls answers about nothing,
+and it answers confidently.
+
+### The same defect one layer up: the shader was dispatched per pixel (2026-09-19)
+
+The span loop asked `Shader::at(x, y)` for every pixel of every non-solid run, and `at` matches on the
+shader - the arm, the spread, the ramp, the transform's shape - once for each of them. The solid arm
+beside it already avoided exactly this and said why: a match inside the hot loop is both the
+arithmetic and what stops the loop being specialised at all. `Shader::row` takes the decision once.
+
+    scene            before     after    ceiling
+    vector-stress    73.42 ms  67.61 ms   66.7 ms   over 1.01x
+    UI-effects      183.51 ms 174.82 ms   66.7 ms   over 2.62x
+    image-stress    340.22 ms 333.34 ms   16.7 ms   over 20.0x
+
+**vector-stress is now one percent over its ceiling**, from ten percent this morning, and it is stable
+there: three runs gave 67.45, 67.87 and 67.61 ms.
+
+THE ARITHMETIC IS UNCHANGED, PIXEL FOR PIXEL, and that is a constraint rather than a note. A gradient's
+position is a linear function of `x`, so it could be advanced by a constant along the row whenever the
+paint's transform is affine - which is most of them. That is NOT done: accumulating a step rounds
+differently from evaluating the expression, and the 112-scene conformance suite compares these pixels
+exactly. What was removed is the dispatch, not a multiply.
+
+AND THE LAST ONE PERCENT WAS LEFT, deliberately. `spread_position` and `Ramp::at` still take their own
+decisions per pixel, and hoisting those means either duplicating the loop once per spread mode or
+duplicating the ramp's arithmetic in a second place - which is the thing that makes two implementations
+drift apart, for one percent of one scene. The composite path was checked for the same defect and does
+not have it: `composite_span` decides once and has a vectorised source-over run.
+
+### The image shader, and a projective multiply that was computed twice (2026-09-19)
+
+The same hoist for `Shader::Image`, which matched its `(pyramid, quality)` pair per pixel to choose
+between two quite different bodies - an anisotropic walk over a pyramid, or a single sample. And one
+exact removal beside it: `footprint` mapped the device point through the paint's inverse transform to
+find `here`, which is the IDENTICAL expression the caller had just evaluated to find the texel, so a
+mipmapped pixel paid FOUR projective multiplies where it needs three. The caller passes it now.
+
+    probe                    before     after
+    image-photo-bilinear    78.52 ms  73.90 ms
+    image-photo-mipmapped   75.97 ms  71.38 ms
+    image-photo-bicubic    257.43 ms 256.23 ms
+    image-yuv-bilinear     162.68 ms 161.36 ms
+
+**And the four frozen scenes now stand at:**
+
+| scene | this morning | now | ceiling | |
+| --- | ---: | ---: | ---: | --- |
+| UI-basic | 16.85 ms | **12.44 ms** | 16.7 ms | **met** |
+| vector-stress | 78.29 ms | 66.5-67.0 ms | 66.7 ms | **at the line** |
+| UI-effects | 184.85 ms | 176.99 ms | 66.7 ms | over 2.65x |
+| image-stress | 345.03 ms | 329.75 ms | 16.7 ms | over 19.7x |
+
+**vector-stress is AT its ceiling and not under it.** Four consecutive runs gave 66.79, 66.84, 66.54
+and 66.97 against 66.7 - one of the four under. This file's own rule about not freezing a number two
+runs in seven would miss applies to calling it met: it is at the line, which is a different fact and
+the one worth recording.
+
+The two that are far out are held by things neither the tile round trip nor the shader dispatch
+reaches: UI-effects by layers and filters, image-stress by the sampling itself - bicubic alone is 256
+of its 330 milliseconds. Each needs its own probe before anything is changed.
+
+### Where the two that are far out actually spend it (2026-09-19)
+
+Both were measured the same way - empty the suspect, run the scene - before anything was changed, and
+neither turned out to have the shape the first four did.
+
+**UI-effects has no dominant term.** The layer composite is the obvious suspect: it walks the layer
+pixel by pixel through `get`, `get`, `set` on a `&mut dyn Raster`, which is three virtual calls and a
+clip-stack walk per pixel, with the opacity clamped again each time. Emptying it moves the scene from
+177.0 to 172.8 ms - **four milliseconds of a hundred and seventy-seven.** Emptying the BLUR instead
+moves it to 128.1, so the filter is about forty-nine of them, twenty-eight percent. The remaining
+hundred and twenty-eight are spread across the forty-five commands and the tiles they touch. A hoist
+does not reach a scene shaped like that, and the layer composite would have been a rewrite for two
+percent.
+
+**And the blur is already the careful version.** Separable, read and written a run at a time in both
+passes, with the interior split from the edges so the fall-off-the-end test is answered once per pixel
+rather than once per tap - and the tap order preserved deliberately, which is what makes it the same
+number rather than a close one. What is left in it is the convolution: two passes of sixty taps over
+four channels for a large sigma is the algorithm, and the usual way to go faster - three box blurs -
+computes a DIFFERENT picture. That is a question about the profile's tolerance for a blur and not an
+optimisation.
+
+**image-stress is the sampler.** `image-photo-bicubic` alone is 256 of the scene's 330 milliseconds,
+at sixteen taps a pixel; `image-yuv-bilinear` is another 161 in its own probe. The dispatch hoist and
+the duplicate projective multiply were worth about six percent there, which is what was available
+without touching the sampling itself.
+
+SO NEITHER OF THE TWO IS CLOSABLE BY THE MOVE THAT CLOSED THE OTHERS, and that is the finding. What
+they need is stated rather than guessed at: for UI-effects, a reason the hundred and twenty-eight
+milliseconds outside the filter are what they are, which no probe here separates yet; for
+image-stress, a faster bicubic and a faster YUV path, both of which are arithmetic per tap rather than
+decisions per pixel.
+
+### image-stress is a per-TAP transfer decode, and the fix is a memory decision (2026-09-19)
+
+`Sampler::texel` was emptied, then its decode alone was emptied, which splits the image paths into
+three terms:
+
+    probe                     whole    no decode    no texel at all
+    image-photo-bicubic     254.2 ms    115.2 ms          44.9 ms
+    image-photo-bilinear     73.9 ms     40.5 ms          27.7 ms
+    image-yuv-bilinear      161.4 ms    114.1 ms          27.8 ms
+
+**The decode is 139 of bicubic's 254 milliseconds** - the single largest term in the whole 2D suite -
+and the fetch is another 70. A bicubic pixel takes sixteen taps and decodes the transfer function on
+every one of them, from sRGB to linear, for texels its neighbours decoded again a moment later.
+
+**AND THE FIX IS ALREADY IN THE FILE, FOR ONE CASE.** `Pyramid` holds its levels "in the canonical
+premultiplied linear float format" and is built in `prepare`; a mipmapped draw samples that and costs
+71 ms where the bicubic draw of the same image costs 254. Extending it - decoding the source once for
+bilinear and bicubic too - is the same move, and the decoded value would be bit-identical because it
+is the same decoder, the same table and the same order: decode each texel, then weight it.
+
+**IT IS NOT DONE HERE BECAUSE IT IS A MEMORY DECISION AND NOT AN OPTIMISATION.** `wants_pyramid`
+exists precisely to decide which images pay for a decoded copy, level zero is sixteen bytes a texel,
+and `max_prepared_scratch_bytes` is a profile limit. Trading replay time for prepared memory is the
+right trade by this file's own measurement rules - the ceiling is on prepared replay and preparation
+is reported separately - but which images pay it is the item's choice to make, not a patch's.
+
+For the record of what it would be worth: removing the per-tap decode entirely would take bicubic from
+254 to 115 ms and the YUV path from 161 to 114, which is most of `image-stress`'s 330. It would still
+not be 16.7.
+
+### The decoded source: the per-tap decode is gone, and what it cost (2026-09-19)
+
+The section above said the decode was 139 of bicubic's 254 milliseconds, that removing it would take
+bicubic to 115 and the YUV path to 114, and that the reason it was not done is that WHICH images pay
+for a decoded copy is a decision rather than a patch. The decision is made and written down below;
+this is what it measured.
+
+| probe | before | after |
+| --- | ---: | ---: |
+| image-photo-bicubic | 256.4 ms | 135.5 ms |
+| image-photo-bilinear | 73.9 ms | 48.8 ms |
+| image-yuv-bilinear | 164.7 ms | 55.0 ms |
+| image-widegamut-bilinear | 86.4 ms | 49.5 ms |
+| image-photo-mipmapped | 74.0 ms | 74.0 ms |
+
+The last row is the control: a mipmapped draw ALREADY sampled a decoded copy and did not move, which
+is what says the other four moved for the reason claimed. The three bilinear probes now cost within
+six milliseconds of each other whatever their source encoding is - sRGB, Rec. 2020 and a three-plane
+YUV - because after the copy they are all the same canonical format, and the decoder that made them
+different ran once per texel instead of once per tap.
+
+And the frozen four, two consecutive runs:
+
+| scene | prepare | replay median | ceiling | verdict |
+| --- | ---: | ---: | ---: | --- |
+| UI-basic | 1.14 / 0.74 ms | 11.93 / 11.81 ms | 16.7 ms | met |
+| UI-effects | 20.98 / 20.81 ms | 152.10 / 149.81 ms | 66.7 ms | over 2.28x, was 2.65x |
+| vector-stress | 7.57 / 7.08 ms | 67.02 / 66.55 ms | 66.7 ms | on the line |
+| image-stress | 48.99 / 49.60 ms | 189.51 / 189.70 ms | 16.7 ms | over 11.4x, was 19.7x |
+
+**WHICH IMAGES PAY FOR IT IS A DECISION AND IT IS TWO PREDICATES.** `wants_pyramid` is unchanged and
+decides which images NEED a chain - only a `Mipmapped` draw cannot be served without one.
+`wants_decoded` decides which merely go FASTER with a decoded source: the ones the list samples
+`Bilinear` or `Bicubic`. The first kind is required, the second is optional, and they are built in
+that order.
+
+**AN OPTIONAL COPY IS GIVEN BACK RATHER THAN REFUSING A FRAME.** `max_prepared_scratch_bytes` is a
+profile limit and a decoded level zero is sixteen bytes a texel, so a list that fitted before this
+existed must still fit: the optional copies are dropped newest-first until the prepared total is
+under the ceiling, and only then is a frame that still does not fit refused. An optional copy that
+will not ALLOCATE is not an error either - the image samples the way it always did, one decode per
+tap.
+
+**AND AN OPTIONAL COPY IS LEVEL ZERO ALONE.** A bilinear or bicubic draw reads level zero and nothing
+else; the halvings under it are prepare time and prepared memory no draw touches. Building the whole
+chain for them cost 12.6 ms of UI-effects' preparation and a third of the bytes, for nothing:
+`Pyramid::base_from_sampler` is the level-zero constructor and `from_sampler` is now the chain built
+on top of it, so the two callers ask for exactly what they read.
+
+    UI-effects prepare    2.4 ms  ->  33.5 ms  ->  20.9 ms
+    image-stress prepare 38.8 ms  ->  53.5 ms  ->  49.3 ms
+                         before      whole       level zero
+                                     chain       alone
+
+**IT TRADES REPLAY TIME FOR PREPARE TIME AND PREPARED MEMORY**, which is the trade this file's rules
+ask for rather than one it tolerates: the ceiling is on prepared REPLAY, preparation happens once for
+a drawing that is replayed, and both are measured and reported separately above.
+
+WHAT IS LEFT IN THE TWO SCENES THAT MISS. image-stress is now the fetch and the arithmetic the
+earlier probes separated out - 70 ms and 45 of the old bicubic's 254 - plus what a sixteen-byte texel
+costs to walk compared with a four-byte one, which is the price of the copy showing up on the other
+side. UI-effects is where it was: the blur is 49 ms of it and the remaining hundred and twenty-eight
+are spread over forty-five commands, with no dominant term and no probe here separating one.

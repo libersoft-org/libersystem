@@ -59,8 +59,12 @@ static LOOSE: u8 = 0;
 if [[ "${1:-}" == "--root" ]]; then
 	ROOT="$2"
 	shift 2
+	# The fixture tree has no harness in it, and the real `test.sh` reads the real tree rather than
+	# this one - so the harness rule below is checked once, in the real path, with its own fixtures.
+	CHECK_HARNESS_LIST=0
 else
 	ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+	CHECK_HARNESS_LIST=1
 	self_test || exit 1
 fi
 ROOT_TESTS="$ROOT/kernel/tests.rs"
@@ -141,4 +145,50 @@ if [[ "$descriptors" -eq 0 ]]; then
 	echo "test tag check: no tagged tests found" >&2
 	exit 1
 fi
-echo "test tag check: $descriptors kernel tests use canonical tagged descriptors"
+
+# THE LIST THE HARNESS ADVERTISES IS THE LIST THE KERNEL PARSES, and nothing compared them.
+#
+# `./test.sh --list-tags` exists so a caller can discover what `--tags` accepts, and it reads THIS
+# table. It read it with a character class that stopped at a hyphen, so it advertised four names the
+# kernel refuses - `arch`, `capability`, `permission`, `volume` - and hid eleven it accepts, among
+# them `volume-layout`, which is the only way to select the booted-system test on its own. FOUR OF
+# THE ELEVEN TRUNCATED ONTO A DIFFERENT REAL TAG - `audio`, `dynamic`, `lico`, `process` - so the
+# output looked complete, and `--tags permission` answered `unknown tag 'permission'` from the
+# kernel that the harness had just recommended it.
+#
+# Nothing above can catch that. Those checks prove every tag a test USES is declared here; this is
+# the only one about what a caller is TOLD, and the two sides are exactly where they can drift.
+tag_lists_agree() {
+	[[ "$(printf '%s\n' $1 | sort -u)" == "$(printf '%s\n' $2 | sort -u)" ]]
+}
+if [[ "$CHECK_HARNESS_LIST" == 1 ]]; then
+	# PROVEN TO REFUSE BEFORE IT IS ALLOWED TO APPROVE, like the fixtures at the top of this file:
+	# a truncated name and an extra one, which are the two ways these lists can differ, and then an
+	# agreeing pair in a different order so the rule is not passing by refusing everything.
+	if tag_lists_agree "a b-c" "a b"; then
+		echo "test tag check: SELF-TEST FAILED - a truncated tag was accepted as agreement" >&2
+		exit 1
+	fi
+	if tag_lists_agree "a b-c" "a b-c d"; then
+		echo "test tag check: SELF-TEST FAILED - an advertised name the kernel does not have was accepted" >&2
+		exit 1
+	fi
+	if ! tag_lists_agree "a b-c" "b-c a"; then
+		echo "test tag check: SELF-TEST FAILED - two lists that agree were reported as differing" >&2
+		exit 1
+	fi
+	declared_wire="$(sed -n '/^define_test_tags! {/,/^}/p' "$ROOT_TESTS" | sed -n 's/^[[:space:]]*[A-Za-z0-9_]* => "\([^"]*\)".*/\1/p')"
+	# Its verdict line goes to stderr and is this gate's noise, not its output; a run that fails
+	# instead of printing is caught by the comparison below, which an empty list cannot pass.
+	printed_wire="$(bash "$ROOT/../test.sh" --list-tags 2>/dev/null || true)"
+	if ! tag_lists_agree "$declared_wire" "$printed_wire"; then
+		echo "test tag check: ./test.sh --list-tags and the kernel's tag table disagree" >&2
+		echo "  advertised and refused by the kernel: $(comm -13 <(printf '%s\n' $declared_wire | sort -u) <(printf '%s\n' $printed_wire | sort -u) | tr '\n' ' ')" >&2
+		echo "  accepted by the kernel and not shown: $(comm -23 <(printf '%s\n' $declared_wire | sort -u) <(printf '%s\n' $printed_wire | sort -u) | tr '\n' ' ')" >&2
+		exit 1
+	fi
+	wire_count="$(printf '%s\n' $declared_wire | sort -u | grep -c .)"
+	echo "test tag check: $descriptors kernel tests use canonical tagged descriptors, and --list-tags advertises the $wire_count tags the kernel parses"
+else
+	echo "test tag check: $descriptors kernel tests use canonical tagged descriptors"
+fi

@@ -260,3 +260,18 @@ fn both_rings_wrap_together_over_a_full_pass_and_stay_in_step() {
 	}
 	assert_eq!(read, link.rirb_write, "the reader ends where the controller does");
 }
+
+#[test]
+fn input_and_output_capability_are_different_bits() {
+	// BIT 4 IS OUTPUT AND BIT 5 IS INPUT, and a driver that confused them routes the speaker jack
+	// into the capture converter - which runs, reports nothing wrong, and returns silence.
+	assert!(pin_can_output(1 << 4));
+	assert!(!pin_can_input(1 << 4));
+	assert!(pin_can_input(1 << 5));
+	assert!(!pin_can_output(1 << 5));
+	// A pin that does both says so in both bits.
+	assert!(pin_can_output((1 << 4) | (1 << 5)));
+	assert!(pin_can_input((1 << 4) | (1 << 5)));
+	assert!(!pin_can_output(0));
+	assert!(!pin_can_input(0));
+}

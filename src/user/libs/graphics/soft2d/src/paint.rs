@@ -119,6 +119,90 @@ pub enum Shader<'a> {
 
 impl Shader<'_> {
 	/// The paint's colour at a device point, PREMULTIPLIED in the working space.
+	/// Evaluate a whole RUN of one row, which is how the span loop asks.
+	///
+	/// THE DECISION IS TAKEN ONCE AND NOT PER PIXEL. `at` matches on the shader for every pixel of
+	/// every run - the arm, the spread, the ramp, the transform's own shape - and the span loop calls
+	/// it in exactly the place the solid arm beside it already avoids that, for exactly the reason
+	/// stated there: a match inside the hot loop is both the arithmetic and what stops the loop being
+	/// specialised at all.
+	///
+	/// THE ARITHMETIC IS UNCHANGED, PIXEL FOR PIXEL. A gradient's position could be advanced by a
+	/// constant along the row whenever the paint's transform is affine - it is a linear function of
+	/// `x` - and that is NOT done here: accumulating a step rounds differently from evaluating the
+	/// expression, so it would move pixels the conformance suite compares exactly. What this removes
+	/// is the dispatch, not a multiply.
+	pub fn row(&self, x: u32, y: u32, out: &mut [Rgba]) {
+		match self {
+			Shader::Solid(colour) => out.fill(*colour),
+			Shader::Nothing => out.fill(Rgba::TRANSPARENT),
+			Shader::Linear { ramp, from, axis, length_squared, spread, inverse } => {
+				for (offset, slot) in out.iter_mut().enumerate() {
+					let point = PointF { x: (x + offset as u32) as f32 + 0.5, y: y as f32 + 0.5 };
+					*slot = match inverse.map_point(point) {
+						None => Rgba::TRANSPARENT,
+						Some(local) if *length_squared <= 0.0 => {
+							let _ = local;
+							ramp.at(1.0)
+						}
+						Some(local) => {
+							let projection = ((local.x - from.x) * axis.0 + (local.y - from.y) * axis.1) / length_squared;
+							ramp.at(spread_position(projection, *spread))
+						}
+					};
+				}
+			}
+			Shader::Radial { ramp, from, from_radius, to, to_radius, spread, inverse } => {
+				for (offset, slot) in out.iter_mut().enumerate() {
+					let point = PointF { x: (x + offset as u32) as f32 + 0.5, y: y as f32 + 0.5 };
+					*slot = match inverse.map_point(point) {
+						None => Rgba::TRANSPARENT,
+						Some(local) => match radial_position(local, *from, *from_radius, *to, *to_radius) {
+							Some(position) => ramp.at(spread_position(position, *spread)),
+							None => Rgba::TRANSPARENT,
+						},
+					};
+				}
+			}
+			// AN IMAGE MATCHES ITS QUALITY ONCE. That match was per pixel and it decides between two
+			// quite different bodies - an anisotropic walk over a pyramid, or a single sample - so it
+			// is the one arm where hoisting is worth the second loop. The bodies below are the same
+			// expressions `at` evaluates.
+			Shader::Image { sampler, pyramid, quality, spread, inverse, source } => match (pyramid, quality) {
+				(Some(pyramid), Quality::Mipmapped) => {
+					for (offset, slot) in out.iter_mut().enumerate() {
+						let point = PointF { x: (x + offset as u32) as f32 + 0.5, y: y as f32 + 0.5 };
+						let Some(unwrapped) = inverse.map_point(point) else {
+							*slot = Rgba::TRANSPARENT;
+							continue;
+						};
+						let texel = wrap_into(*source, unwrapped, *spread);
+						let (x_step, y_step) = footprint(inverse, point, unwrapped);
+						*slot = pyramid.sample_anisotropic(texel.x, texel.y, x_step, y_step, *spread, 16);
+					}
+				}
+				_ => {
+					for (offset, slot) in out.iter_mut().enumerate() {
+						let point = PointF { x: (x + offset as u32) as f32 + 0.5, y: y as f32 + 0.5 };
+						let Some(unwrapped) = inverse.map_point(point) else {
+							*slot = Rgba::TRANSPARENT;
+							continue;
+						};
+						let texel = wrap_into(*source, unwrapped, *spread);
+						*slot = sampler.sample(texel.x, texel.y, *quality);
+					}
+				}
+			},
+			// EVERY OTHER ARM KEEPS THE PER-PIXEL FORM, because what a conic does per pixel - an
+			// arctangent - is far larger than the dispatch this hoists.
+			_ => {
+				for (offset, slot) in out.iter_mut().enumerate() {
+					*slot = self.at((x + offset as u32) as f32, y as f32);
+				}
+			}
+		}
+	}
+
 	pub fn at(&self, x: f32, y: f32) -> Rgba {
 		let point = PointF { x: x + 0.5, y: y + 0.5 };
 		match self {
@@ -161,7 +245,8 @@ impl Shader<'_> {
 				// THE INVERSE MAPS A DEVICE PIXEL BACK INTO THE IMAGE'S OWN TEXEL COORDINATES, which
 				// is what the paint's transform is stated in - so the source rectangle is already
 				// accounted for by that transform rather than added again here.
-				let Some(texel) = inverse.map_point(point) else { return Rgba::TRANSPARENT };
+				let Some(unwrapped) = inverse.map_point(point) else { return Rgba::TRANSPARENT };
+				let texel = unwrapped;
 				// THE SPREAD APPLIES TO THE SOURCE RECTANGLE AND NOT TO THE WHOLE IMAGE, which is what
 				// makes a sprite from an atlas tileable: repeating the image would bring in whatever
 				// its neighbours in the atlas are.
@@ -172,7 +257,7 @@ impl Shader<'_> {
 						// is what decides both the level of detail and the anisotropy - and taking it
 						// from the transform's scale alone is what makes a perspective floor shimmer
 						// in the distance.
-						let (x_step, y_step) = footprint(inverse, point);
+						let (x_step, y_step) = footprint(inverse, point, unwrapped);
 						pyramid.sample_anisotropic(texel.x, texel.y, x_step, y_step, *spread, 16)
 					}
 					_ => sampler.sample(texel.x, texel.y, *quality),
@@ -201,12 +286,16 @@ fn wrap_into(source: RectF, texel: PointF, spread: Spread) -> PointF {
 }
 
 /// How far one device pixel moves in texel space, on each axis.
-fn footprint(inverse: &Transform, point: PointF) -> ((f32, f32), (f32, f32)) {
-	let here = inverse.map_point(point);
+///
+/// `here` IS PASSED IN AND NOT MAPPED AGAIN. The caller has just computed `inverse.map_point(point)`
+/// to find the texel; this used to compute the identical expression a second time, so a mipmapped
+/// image pixel paid FOUR projective multiplies where it needs three. Same numbers - it is the same
+/// expression on the same inputs - and one fewer of them.
+fn footprint(inverse: &Transform, point: PointF, here: PointF) -> ((f32, f32), (f32, f32)) {
 	let right = inverse.map_point(PointF { x: point.x + 1.0, y: point.y });
 	let down = inverse.map_point(PointF { x: point.x, y: point.y + 1.0 });
-	match (here, right, down) {
-		(Some(here), Some(right), Some(down)) => ((right.x - here.x, right.y - here.y), (down.x - here.x, down.y - here.y)),
+	match (right, down) {
+		(Some(right), Some(down)) => ((right.x - here.x, right.y - here.y), (down.x - here.x, down.y - here.y)),
 		_ => ((1.0, 0.0), (0.0, 1.0)),
 	}
 }
@@ -299,17 +388,40 @@ pub fn shader<'a>(paint: &Paint, transform: &Transform, working: Working, stops:
 		// `NV12` has no single-plane view to fall back to, and converting one here would be the
 		// full-frame conversion per frame that the multi-plane model exists to remove.
 		Paint::Image { image, source, quality, spread, .. } if images.planes(image.0).is_some() => match images.planes(image.0) {
-			Some((view, pyramid, table)) => match Sampler::planar(view, working, *spread, table) {
-				Ok(sampler) => Shader::Image { sampler, pyramid, quality: *quality, spread: *spread, inverse, source: *source },
-				Err(_) => Shader::Nothing,
-			},
+			Some((view, pyramid, table)) => {
+				// THE SAME DECODED LEVEL ZERO AS A PACKED SOURCE, and a planar one has more to gain:
+				// its per-tap work is a plane reconstruction and a colour matrix as well as a transfer
+				// function, and level zero holds the result of all three.
+				let decoded = match (pyramid, quality) {
+					(Some(pyramid), quality) if !matches!(quality, Quality::Mipmapped) => pyramid.level(0).and_then(|level| Sampler::new(level, working, *spread).ok()),
+					_ => None,
+				};
+				match decoded.map_or_else(|| Sampler::planar(view, working, *spread, table).ok(), Some) {
+					Some(sampler) => Shader::Image { sampler, pyramid, quality: *quality, spread: *spread, inverse, source: *source },
+					None => Shader::Nothing,
+				}
+			}
 			None => Shader::Nothing,
 		},
 		Paint::Image { image, source, quality, spread, .. } => match images.lookup(image.0) {
-			Some((view, pyramid, table)) => match Sampler::with_table(view, working, *spread, table) {
-				Ok(sampler) => Shader::Image { sampler, pyramid, quality: *quality, spread: *spread, inverse, source: *source },
-				Err(_) => Shader::Nothing,
-			},
+			Some((view, pyramid, table)) => {
+				// A DECODED SOURCE IS SAMPLED INSTEAD OF THE ENCODED ONE WHEN THERE IS ONE, and it is
+				// the same picture: a pyramid's level zero IS the source in the working format, built
+				// by decoding each texel through this same decoder and table, so a tap reads the value
+				// the encoded path would have computed for it. What changes is that it was computed
+				// ONCE rather than once per tap of every pixel that reaches it.
+				//
+				// NOT FOR A MIPMAPPED DRAW, which samples the pyramid itself a few lines below and
+				// needs the level of detail rather than level zero.
+				let decoded = match (pyramid, quality) {
+					(Some(pyramid), quality) if !matches!(quality, Quality::Mipmapped) => pyramid.level(0).and_then(|level| Sampler::new(level, working, *spread).ok()),
+					_ => None,
+				};
+				match decoded.map_or_else(|| Sampler::with_table(view, working, *spread, table).ok(), Some) {
+					Some(sampler) => Shader::Image { sampler, pyramid, quality: *quality, spread: *spread, inverse, source: *source },
+					None => Shader::Nothing,
+				}
+			}
 			None => Shader::Nothing,
 		},
 	}
