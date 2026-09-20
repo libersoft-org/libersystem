@@ -287,7 +287,8 @@ floor.
 
 ## soft2d, the CPU 2D backend (2026-09-12)
 
-`./bench.sh --suite soft2d` records four frozen scenes at 640x480 and reports what a PREPARED
+`./bench.sh --suite soft2d` records five frozen scenes at 640x480 - four until 2026-09-19, when
+`image-stress` split into `image-resample` and `image-convert` - and reports what a PREPARED
 replay costs. It needs no surface, no DisplayService, no guest and no application: each scene is a
 bounded `DrawList` recorded once and replayed into an `OwnedImage`, which is what makes the number a
 person can get in a second on a host rather than a boot away.
@@ -1599,10 +1600,26 @@ budget is exactly the size of claim that needs it:
 | the test inside the loop | 66.835 / 66.473 / 66.606 | 66.606 ms | 66.7 ms | one of three over |
 | the test hoisted out | 66.157 / 66.320 / 66.250 | 66.250 ms | 66.7 ms | three of three met |
 
-The margin is under one percent and the p99 still crosses, so this is a scene that clears its budget
-rather than one comfortably inside it. The other three are unmoved: `UI-basic` 12.2 met,
-`UI-effects` 156.4 against 66.7, `image-stress` 194.5 against 16.7. The floor asks for four and has
-two.
+**AND `image-stress` IS TWO SCENES (2026-09-19), on the project owner's answer to the question this
+floor put to them.** The split is where the scene's own comments already drew it: resampling over one
+source with source and target in the same space, and colour conversion whose full-frame draws put
+three hundred thousand pixels through a transfer function and a matrix.
+
+| scene | median | ceiling | over |
+| --- | ---: | ---: | ---: |
+| image-resample | 80.6 ms | 16.7 ms | 4.8x |
+| image-convert | 127.1 ms | 16.7 ms | 7.6x |
+
+The single number was 11.4x and said which half was slow only by accident of how the two were
+summed. The frozen counts came with them - 11 commands over 1 resource and 14 over 2, summing to the
+25 and 3 the one scene recorded.
+
+**CORRECTED THE SAME DAY: IT IS NOT MET.** Six later runs of the same binary read 67.13, 67.09,
+67.46, 67.69, 67.24 and 67.41 - every one over 66.7. What changed between the two sets is not the
+gradient, which is exact and conformance-proved: the suite gained a fifth scene, and this scene moves
+by more than half a percent when anything else in the process does. The hoist is worth about 0.35 ms
+measured back to back; the scene's sensitivity to its neighbours is larger. `vector-stress` is STILL
+AT ITS LINE. The floor asks for four scenes and has one - `UI-basic` at 11.8 against 16.7.
 
 **WHICH IMAGES PAY FOR IT IS A DECISION AND IT IS TWO PREDICATES.** `wants_pyramid` is unchanged and
 decides which images NEED a chain - only a `Mipmapped` draw cannot be served without one.

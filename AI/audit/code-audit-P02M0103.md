@@ -2175,3 +2175,24 @@ its own tests. Wiring it into the benchmark moved the texturing stage from 289.6
 inside the spread - because the fixture's checkerboards are not that case. The wiring came back out,
 and what is recorded instead is the fact worth keeping: a cache exists for a cost every renderer
 here pays and none of them asks for it.
+
+## image-stress was two scenes, and an over-claim of mine was corrected (2026-09-19)
+
+THE OWNER ANSWERED THE QUESTION THE ITEM PUT TO THEM: two scenes, not a different ceiling. The split
+follows the lines the scene's own comments already drew - `image-resample` is eight downscales and
+three quality upscales over one source with source and target in the same space; `image-convert` is
+twelve wide-gamut tiles, a full-frame wide-gamut draw and a full-frame YUV draw from planes.
+
+    image-resample    80.6 ms   16.7 ms   4.8x
+    image-convert    127.1 ms   16.7 ms   7.6x
+
+The single number was 11.4x and said which half was slow only by accident of how they were summed.
+Frozen counts split with them: 11/1 and 14/2, summing to the 25/3 the one scene had.
+
+AND A CORRECTION TO MY OWN RECORD FROM EARLIER THE SAME DAY. I wrote that the linear-gradient hoist
+made `vector-stress` "met" on three runs under 66.7. Six later runs of the same binary read 67.13,
+67.09, 67.46, 67.69, 67.24 and 67.41 - all over. The difference is not the gradient, which is exact
+and conformance-proved: the suite gained a fifth scene in between, and this scene moves by more than
+the half a percent the change buys whenever anything else in the process moves. The hoist is real;
+the verdict was not. `vector-stress` is still AT its line, which is what this file said before I
+claimed otherwise.

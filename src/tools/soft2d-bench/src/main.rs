@@ -56,12 +56,27 @@ struct Scene {
 	resources: usize,
 }
 
-/// The four scenes, with the frozen counts a fixture is checked against.
-const SCENES: [Scene; 4] = [
+/// The scenes, with the frozen counts a fixture is checked against.
+///
+/// `image-stress` WAS ONE SCENE AND IS TWO (2026-09-19), on the project owner's answer to the
+/// question the milestone put to them: it mixed two workloads that have nothing to do with each
+/// other and reported one number for both. RESAMPLING is what a pyramid and the three filters cost -
+/// eight large downscales and an upscale at each quality, over one source, source space and target
+/// space the same. COLOUR CONVERSION is what a wide-gamut source into an sRGB target and a YUV
+/// source from its planes cost, and two of its three kinds of draw cover the WHOLE FRAME. One number
+/// over the two says which of them is slow only by accident of how they were summed.
+const SCENES: [Scene; 5] = [
 	Scene { name: "UI-basic", ceiling_ms: 16.7, budget_ms: 16.7, commands: 252, resources: 153 },
 	Scene { name: "UI-effects", ceiling_ms: 66.7, budget_ms: 66.7, commands: 45, resources: 34 },
 	Scene { name: "vector-stress", ceiling_ms: 66.7, budget_ms: 66.7, commands: 240, resources: 241 },
-	Scene { name: "image-stress", ceiling_ms: 16.7, budget_ms: 16.7, commands: 25, resources: 3 },
+	// BOTH CEILINGS ARE INHERITED FROM THE SCENE THESE CAME OUT OF AND NEITHER IS A NEW ANSWER. The
+	// owner was asked whether a video scene's ceiling is 60 Hz at this content or whether the scene
+	// is two scenes, and answered the second; that settles the split and leaves the first question
+	// open for `image-convert`, which is the half that draws two full frames through a transfer
+	// function and a matrix. `image-resample` at 16.7 is not in doubt - UI imagery at UI sizes is a
+	// per-frame cost.
+	Scene { name: "image-resample", ceiling_ms: 16.7, budget_ms: 16.7, commands: 11, resources: 1 },
+	Scene { name: "image-convert", ceiling_ms: 16.7, budget_ms: 16.7, commands: 14, resources: 2 },
 ];
 
 /// The images the scenes reference, under their recorded identities.
@@ -155,7 +170,8 @@ fn main() {
 			"UI-basic" => ui_basic(),
 			"UI-effects" => ui_effects(),
 			"vector-stress" => vector_stress(),
-			_ => image_stress(),
+			"image-resample" => image_resample(),
+			_ => image_convert(),
 		}
 		.expect("a fixture this program records");
 		// THE FROZEN SHAPE IS CHECKED BEFORE THE CLOCK STARTS. A fixture that lost half its commands
@@ -492,10 +508,13 @@ fn vector_stress() -> Result<DrawList, Error> {
 }
 
 /// SCALING AND COLOUR CONVERSION, which is the scene whose cost is the sampler and the pipeline.
-fn image_stress() -> Result<DrawList, Error> {
+/// RESAMPLING ALONE: what a pyramid and the three filters cost, over one source and at UI sizes.
+///
+/// Every draw here is a RESAMPLE and none is a colour conversion, which is the point of the split:
+/// source space and target space are the same, so what this measures is filtering and nothing else.
+fn image_resample() -> Result<DrawList, Error> {
 	let mut canvas = Canvas::new();
 	let photo = ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 };
-	let wide = ImageRecord { identity: 3, layout_generation: 1, content_generation: 1 };
 	// A LARGE DOWNSCALE, which is what the pyramid is for.
 	for index in 0..8 {
 		let x = (index % 4) as f32 * 160.0;
@@ -506,7 +525,20 @@ fn image_stress() -> Result<DrawList, Error> {
 	for (index, quality) in [ImageQuality::Nearest, ImageQuality::Bilinear, ImageQuality::Bicubic].into_iter().enumerate() {
 		canvas.draw_image(photo, RectF::new(0.0, 0.0, 64.0, 64.0), RectF::new(index as f32 * 200.0, 250.0, 190.0, 190.0), quality)?;
 	}
-	// AND A WIDE-GAMUT SOURCE INTO AN sRGB TARGET, which is the conversion half of the scene.
+	canvas.finish()
+}
+
+/// COLOUR CONVERSION ALONE: a wide-gamut source into an sRGB target, and a YUV source from its
+/// planes.
+///
+/// TWO OF ITS THREE KINDS OF DRAW COVER THE WHOLE FRAME, which is what makes this a different
+/// workload rather than more of the one above: a full-frame conversion is three hundred thousand
+/// pixels through a transfer function and a matrix, and the resampling scene's largest draw is a
+/// fifth of that.
+fn image_convert() -> Result<DrawList, Error> {
+	let mut canvas = Canvas::new();
+	let wide = ImageRecord { identity: 3, layout_generation: 1, content_generation: 1 };
+	// A WIDE-GAMUT SOURCE INTO AN sRGB TARGET, at tile sizes.
 	for index in 0..12 {
 		let x = (index % 6) as f32 * 106.0;
 		let y = 250.0 + (index / 6) as f32 * 110.0;
