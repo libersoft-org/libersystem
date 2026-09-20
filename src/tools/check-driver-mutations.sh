@@ -153,10 +153,37 @@ mutate "$DRIVERS" src/user/drivers/core/src/nvme.rs \
 
 # AHCI: the command-issue bit clears on COMPLETION and not on success, so a driver watching only it
 # reports a bad sector as good data.
+#
+# THE ANCHOR CARRIES THE LINE ABOVE IT BECAUSE THE TEST ALONE IS NO LONGER UNIQUE. NCQ brought a
+# second completion rule - `queued_outcome`, which reads `PxSACT` where this reads `PxCI` - and the
+# error test is written the same way in both. A one-line anchor then matched twice and this gate
+# refused rather than planting the defect in an arbitrary one of them, which is the right refusal and
+# is how the ambiguity was noticed at all.
 mutate "$DRIVERS" src/user/drivers/core/src/ahci.rs \
-	"	if tfd & TFD_ERR != 0 {" \
-	"	if false {" \
+	"	if ci & (1 << slot) != 0 {
+		return Outcome::Pending;
+	}
+	if tfd & TFD_ERR != 0 {" \
+	"	if ci & (1 << slot) != 0 {
+		return Outcome::Pending;
+	}
+	if false {" \
 	a_cleared_slot_is_not_the_same_as_a_successful_command
+
+# AHCI NCQ: a queued tag is outstanding while its bit is SET in `PxSACT`, which is the opposite
+# register and the opposite sense from the single-command path's `PxCI`.
+#
+# A DRIVER THAT READ IT THE OTHER WAY ROUND WOULD ANSWER A READ BEFORE THE DEVICE HAD WRITTEN A BYTE.
+# The mutation takes the test out, so every tag reads as complete the moment it is looked at - which
+# is exactly what the oracle's batch of concurrent commands is there to catch.
+mutate "$DRIVERS" src/user/drivers/core/src/ahci.rs \
+	"	if sact & (1 << slot) != 0 {
+		return Outcome::Pending;
+	}" \
+	"	if false {
+		return Outcome::Pending;
+	}" \
+	a_queued_tag_is_outstanding_while_its_sact_bit_is_set
 
 # AHCI: the port bitmap is not a port count, and walking the count reads registers of ports that are
 # not there.
@@ -330,12 +357,31 @@ mutate "$DRIVERS" src/user/drivers/core/src/scsi.rs \
 
 # UAS: the tag is big-endian in a transport that is little-endian everywhere else. Swapped, it
 # matches no answer - and an answer matching nothing is indistinguishable from a device fault.
+#
+# THE ANCHOR CARRIES THE UNIT'S TYPE BYTE, because task management brought a second information unit
+# that writes its tag exactly the same way - which is the point of the tag rules and is also what
+# made a two-line anchor match twice. The gate refused rather than planting the defect in whichever
+# one it found first, which is the right refusal.
 mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \
-	"	iu[2] = (tag >> 8) as u8;
+	"	iu[0] = IU_COMMAND;
+	iu[2] = (tag >> 8) as u8;
 	iu[3] = tag as u8;" \
-	"	iu[2] = tag as u8;
+	"	iu[0] = IU_COMMAND;
+	iu[2] = tag as u8;
 	iu[3] = (tag >> 8) as u8;" \
 	the_tag_is_big_endian_in_a_transport_that_is_little_endian_everywhere_else
+
+# UAS: a task-management request carries its OWN tag in the header and the DOOMED command's tag in a
+# separate field, and a driver that put the managed tag in the header would ask the device to answer
+# under a tag already outstanding - so the answer would match the command being aborted.
+mutate "$DRIVERS" src/user/drivers/core/src/uas.rs \
+	"	iu[0] = IU_TASK_MANAGEMENT;
+	iu[2] = (tag >> 8) as u8;
+	iu[3] = tag as u8;" \
+	"	iu[0] = IU_TASK_MANAGEMENT;
+	iu[2] = (managed_tag >> 8) as u8;
+	iu[3] = managed_tag as u8;" \
+	a_task_management_header_carries_the_requests_own_tag_and_not_the_doomed_ones
 
 # UAS: a residue larger than the request is a device describing a transfer that did not happen, and
 # subtracting it computes a negative length as an enormous positive one.

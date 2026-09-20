@@ -1841,3 +1841,27 @@ emulated boots print `carries hot-plug slot 1 - empty` where neither had printed
 STILL OPEN IN THAT ITEM: a slot CHANGING state and an error record read back on the emulated ports.
 Both need `device_add` against a live machine and a function with error reporting on, and the
 tooling for both is x86_64.
+
+## The driver-mutation gate was red, and the cause was this milestone's own new code (2026-09-19)
+
+DRV-016 asks for tests over unsafe device logic and its record said "the strategy is working". That
+is a claim, and the thing that checks it is `check.sh --gate driver-mutations`: a planted defect per
+decision, each named for the test that must catch it.
+
+IT WAS FAILING. Not because a mutation survived - because two ANCHORS had stopped being unique. A
+defect is located by a line of source, and the recent work duplicated two of them: NCQ's
+`queued_outcome` writes its error test exactly like the single-command path's, and
+`task_management_iu` writes its tag exactly like `command_iu`. The gate refused rather than planting
+the defect in whichever site it found first, which is the right refusal - and it is the only reason
+this was visible, since nobody had run the gate since that code landed.
+
+BOTH ANCHORS NOW CARRY THE LINE THAT TELLS THEM APART, and the two new decisions got mutations of
+their own: a queued tag is outstanding while its `PxSACT` bit is SET (the opposite register and
+sense from `PxCI`), and a task-management header carries the REQUEST'S tag rather than the doomed
+command's. Both are caught by the tests written for them.
+
+AND THE COVERAGE QUESTION WAS ANSWERED WHILE LOOKING: every decision module in the crate has a
+fixture. The only file without one is `dev_channel.rs`, a transport program's entry point whose
+logic lives in the shared `serial_port` module, which does.
+
+40 of 40 planted defects caught.
