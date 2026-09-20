@@ -502,3 +502,196 @@ fn a_table_somebody_else_validated_is_adopted_as_it_is() {
 	let table = Table::new(&other).expect("a table");
 	assert_eq!(Fadt::from_table(table).err(), Some(Error::Signature));
 }
+
+/// A MADT under construction: the header, the local controller address and the flags word, then one
+/// entry per call.
+struct MadtBuilder {
+	entries: Vec<u8>,
+}
+
+impl MadtBuilder {
+	fn new() -> Self {
+		Self { entries: Vec::new() }
+	}
+
+	/// One Interrupt Source Override, written the way firmware writes it.
+	fn isa_override(mut self, source: u8, gsi: u32, flags: u16) -> Self {
+		self.entries.push(2);
+		self.entries.push(10);
+		self.entries.push(0);
+		self.entries.push(source);
+		self.entries.extend_from_slice(&gsi.to_le_bytes());
+		self.entries.extend_from_slice(&flags.to_le_bytes());
+		self
+	}
+
+	/// An entry of some other type, so a walk has to step over something before it finds what it is
+	/// looking for. A Local APIC entry is type 0 and eight bytes.
+	fn local_apic(mut self, apic_id: u8) -> Self {
+		self.entries.extend_from_slice(&[0, 8, apic_id, apic_id, 1, 0, 0, 0]);
+		self
+	}
+
+	/// An entry whose declared length is a number the caller chose, for the truncation fixtures.
+	fn raw(mut self, kind: u8, declared: u8, payload: &[u8]) -> Self {
+		self.entries.push(kind);
+		self.entries.push(declared);
+		self.entries.extend_from_slice(payload);
+		self
+	}
+
+	fn finish(self) -> Vec<u8> {
+		let mut builder = Builder::new(b"APIC", 5, 44 + self.entries.len());
+		builder.bytes[44..].copy_from_slice(&self.entries);
+		builder.finish()
+	}
+}
+
+/// THE OVERRIDE'S FLAGS ARE TWO FIELDS AND NOT ONE, which is the mistake a reader makes when it
+/// masks the low nibble: polarity is bits 1:0 and trigger is bits 3:2, so the SCI's usual
+/// active-low level flags word is 0b1111 and reads as a single value of fifteen.
+#[test]
+fn an_override_states_its_polarity_and_its_trigger_separately() {
+	// 0b1111: active low (3) in bits 1:0, level (3) in bits 3:2 - what q35's firmware writes for the
+	// SCI, and what an ISA line does NOT default to.
+	let bytes = MadtBuilder::new().local_apic(0).isa_override(9, 9, 0b1111).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	let entry = madt.isa_override(9).expect("the SCI override");
+	assert_eq!(entry.gsi, 9);
+	assert_eq!(entry.polarity, Polarity::ActiveLow);
+	assert_eq!(entry.trigger, Trigger::Level);
+}
+
+/// THE REDIRECTION HALF, which is the one every reader remembers: the PC timer is ISA IRQ 0 and
+/// arrives at Global System Interrupt 2.
+#[test]
+fn an_override_can_move_a_source_to_a_different_global_interrupt() {
+	let bytes = MadtBuilder::new().isa_override(0, 2, 0).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	let entry = madt.isa_override(0).expect("the timer override");
+	assert_eq!(entry.gsi, 2);
+	// ZERO IS "CONFORMS TO THE BUS" AND IS KEPT AS THAT. Collapsing it into edge/active-high here
+	// would answer a question about the ISA bus while reading a table about an interrupt.
+	assert_eq!(entry.polarity, Polarity::Bus);
+	assert_eq!(entry.trigger, Trigger::Bus);
+}
+
+/// A SOURCE WITH NO OVERRIDE IS `None` AND NOT A DEFAULT. The caller has to be able to tell "the
+/// firmware said nothing about this line" from "the firmware said it is ordinary", because the
+/// second is a statement and the first is an absence - and only the caller knows which bus the
+/// source is on.
+#[test]
+fn a_source_the_table_does_not_mention_has_no_override() {
+	let bytes = MadtBuilder::new().local_apic(0).isa_override(0, 2, 0).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	assert_eq!(madt.isa_override(9), None);
+}
+
+/// AN OVERRIDE ON ANOTHER BUS IS NOT AN ISA OVERRIDE. Bus zero is the only value the standard
+/// defines, so a table naming another one is firmware this reader does not understand - and
+/// answering with its entry would configure an ISA line from a statement about something else.
+#[test]
+fn an_override_on_another_bus_does_not_answer_for_isa() {
+	let mut builder = MadtBuilder::new();
+	builder.entries.extend_from_slice(&[2, 10, 1, 9, 9, 0, 0, 0, 0b1111, 0]);
+	let bytes = builder.finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	assert_eq!(madt.isa_override(9), None);
+	assert_eq!(madt.overrides().count(), 1);
+}
+
+/// AN ENTRY TOO SHORT FOR THE FIELDS IT WOULD BE READ FOR IS NOT ONE. An override declaring eight
+/// bytes has no flags word; a walk that read one anyway would take the first two bytes of the NEXT
+/// entry as the polarity and the trigger of this one.
+#[test]
+fn an_override_shorter_than_its_own_fields_is_skipped_rather_than_read_into_the_next_entry() {
+	let bytes = MadtBuilder::new().raw(2, 8, &[0, 9, 9, 0, 0, 0]).isa_override(5, 5, 0b1111).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	assert_eq!(madt.isa_override(9), None);
+	assert_eq!(madt.isa_override(5).map(|entry| entry.trigger), Some(Trigger::Level));
+}
+
+/// A LENGTH THAT DOES NOT ADVANCE ENDS THE WALK. Zero would make the iterator return the same entry
+/// forever, which on a boot path is a machine that stops rather than a table that is refused.
+#[test]
+fn an_entry_declaring_no_length_ends_the_walk_instead_of_repeating_it() {
+	let bytes = MadtBuilder::new().raw(2, 0, &[0, 9, 9, 0, 0, 0, 0b1111, 0]).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	assert_eq!(madt.overrides().count(), 0);
+}
+
+/// A LENGTH RUNNING PAST THE DECLARED END ENDS IT TOO, and for the reason every walk in this crate
+/// stops at the declared length: a checksum-valid table can still be structurally wrong.
+#[test]
+fn an_entry_claiming_more_bytes_than_the_table_holds_ends_the_walk() {
+	let bytes = MadtBuilder::new().raw(2, 40, &[0, 9, 9, 0, 0, 0, 0b1111, 0]).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	assert_eq!(madt.overrides().count(), 0);
+}
+
+/// THE TABLE HAS TO BE THE ONE THAT WAS ASKED FOR. A FADT handed to the MADT reader is refused by
+/// signature rather than walked from offset 44, which in a FADT is the middle of its fixed fields.
+#[test]
+fn another_table_is_refused_by_its_signature() {
+	let bytes = Builder::fadt(6, REV6_LEN).u16(FADT_SCI_INT, 9).finish();
+	assert_eq!(Madt::new(&bytes).err(), Some(Error::Signature));
+}
+
+/// THE FIRST MATCH WINS, so firmware that lists a source twice gets a deterministic answer rather
+/// than one that depends on how far the walk went.
+#[test]
+fn a_source_listed_twice_answers_with_the_first_entry() {
+	let bytes = MadtBuilder::new().isa_override(9, 9, 0b1111).isa_override(9, 20, 0).finish();
+	let madt = Madt::new(&bytes).expect("a MADT");
+	assert_eq!(madt.isa_override(9).map(|entry| entry.gsi), Some(9));
+}
+
+/// THE ENABLE REGISTER IS HALF A BLOCK PAST THE STATUS REGISTER, which is the one piece of
+/// arithmetic a PM1 consumer gets wrong - and getting it wrong ACKNOWLEDGES events where it meant to
+/// arm them, which is silent. q35's block is four bytes at 0x0600, so its enable register is 0x0602.
+#[test]
+fn an_event_blocks_enable_register_is_half_a_block_past_its_status_register() {
+	let bytes = Builder::fadt(6, REV6_LEN).u32(FADT_PM1A_EVT, 0x0600).u8(FADT_PM1_EVT_LEN, 4).gas(FADT_X_PM1A_EVT, 1, 32, 0, 2, 0x0600).finish();
+	let fadt = Fadt::new(&bytes).expect("a FADT");
+	let event = fadt.pm1a_event().expect("the event block");
+	assert_eq!(event.io_port(), Some(0x0600));
+	assert_eq!(event.enable_port(), Some(0x0602));
+}
+
+/// A LENGTH THAT IS NOT TWO REGISTERS IS REFUSED RATHER THAN HALVED. One byte has no second half;
+/// an odd length halved by flooring puts the enable register one byte INSIDE the status register,
+/// where the write lands on the wrong bits of the wrong thing.
+#[test]
+fn an_event_block_that_is_not_two_registers_has_no_enable_register() {
+	for declared in [0u8, 1, 3, 5] {
+		let bytes = Builder::fadt(6, REV6_LEN).u32(FADT_PM1A_EVT, 0x0600).u8(FADT_PM1_EVT_LEN, declared).gas(FADT_X_PM1A_EVT, 1, (declared as u32 * 8).min(255) as u8, 0, 2, 0x0600).finish();
+		let fadt = Fadt::new(&bytes).expect("a FADT");
+		let Some(event) = fadt.pm1a_event() else { continue };
+		assert_eq!(event.enable_port(), None, "a block of {declared} byte(s) is not two registers");
+	}
+}
+
+/// A BLOCK IN ANOTHER ADDRESS SPACE IS NOT A PORT. The standard allows these blocks in system
+/// memory; a consumer that took the low sixteen bits of a physical address as a port number would be
+/// writing to a real port belonging to something else.
+#[test]
+fn a_block_that_is_not_a_system_io_register_answers_with_no_port() {
+	let bytes = Builder::fadt(6, REV6_LEN).u32(FADT_PM1A_EVT, 0x0600).u8(FADT_PM1_EVT_LEN, 4).gas(FADT_X_PM1A_EVT, 0, 32, 0, 3, 0xfed0_0000).finish();
+	let fadt = Fadt::new(&bytes).expect("a FADT");
+	let event = fadt.pm1a_event().expect("the event block");
+	assert_eq!(event.gas.space, AddressSpace::SystemMemory);
+	assert_eq!(event.io_port(), None);
+	assert_eq!(event.enable_port(), None);
+}
+
+/// AND A PORT ADDRESS THAT DOES NOT FIT SIXTEEN BITS IS NOT A PORT EITHER, whatever the address
+/// space says. A firmware declaring a system-I/O register above 0xffff has declared something this
+/// architecture cannot address, and truncating it names a different register.
+#[test]
+fn a_system_io_address_that_does_not_fit_a_port_is_refused() {
+	let bytes = Builder::fadt(6, REV6_LEN).u32(FADT_PM1A_EVT, 0x0600).u8(FADT_PM1_EVT_LEN, 4).gas(FADT_X_PM1A_EVT, 1, 32, 0, 2, 0x1_0000).finish();
+	let fadt = Fadt::new(&bytes).expect("a FADT");
+	let event = fadt.pm1a_event().expect("the event block");
+	assert_eq!(event.io_port(), None);
+	assert_eq!(event.enable_port(), None);
+}

@@ -1,0 +1,43 @@
+# THE POWER BUTTON ON THE CHASSIS, WHICH NOTHING INSIDE THE GUEST CAN PRESS.
+#
+# This is the fixture the ACPI fixed-hardware item said it needed and did not have: "a QEMU machine
+# whose PM1a event can be raised on demand". `system_powerdown` on the monitor is exactly that - it
+# sets PWRBTN_STS in the PM1a status register and raises the SCI - and until a scenario could send a
+# monitor command there was no way to ask for it.
+#
+# WHAT IT ASSERTS IS THE WHOLE CHAIN AND NOT THE END OF IT. The kernel has to have read the FADT,
+# routed the SCI through the I/O APIC as a level-triggered active-low line, entered ACPI mode,
+# armed PWRBTN_EN, and then decoded and acknowledged the status bit - and every one of those is
+# silent when wrong. A machine that did none of them boots identically and answers this command by
+# doing nothing at all.
+#
+# THE VACUITY GUARD IS THAT THE LINE ONLY EXISTS AFTER A PRESS. Nothing prints it at boot: it is
+# written by the handler, from the interrupt, with the status bit in hand.
+#
+# TWO ASSERTIONS AND NOT ONE, BECAUSE THEY BELONG TO DIFFERENT HALVES. The kernel's line says the
+# SCI arrived and was decoded; DeviceManager's says the typed event reached a consumer that acted on
+# it. A gate with only the second cannot tell "the interrupt never came" from "it came and nothing
+# was done with it", and those are two defects with two owners.
+version = 1
+name = "power button"
+description = "The chassis power button raises an SCI the kernel decodes, acknowledges and reports."
+timeout = 300
+
+[[step]]
+do = "prompt"
+timeout = 120
+
+[[step]]
+do = "monitor"
+command = "system_powerdown"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "acpi: the power button was pressed"
+timeout = 60
+
+[[step]]
+do = "expect"
+contains = "DeviceManager: the power button was pressed"
+timeout = 60

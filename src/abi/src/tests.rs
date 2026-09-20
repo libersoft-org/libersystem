@@ -164,6 +164,10 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// a poll fast enough to feel immediate is a poll that runs forever for the one moment a year it
 	// has something to report.
 	(SYS_DEVICE_EVENTS, 86),
+	// THE PLATFORM EVENT CHANNEL, the same registration for the events that are not a device: the
+	// power and sleep buttons, decoded by the kernel from the ACPI PM1 event block because the line
+	// they arrive on cannot be handed to a driver.
+	(SYS_PLATFORM_EVENTS, 87),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.

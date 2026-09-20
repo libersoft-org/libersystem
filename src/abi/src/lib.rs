@@ -489,6 +489,29 @@ pub const SYS_CHANNEL_SEND_CAPS_ATTENUATED: u64 = 85;
 // finds the same answer.
 pub const SYS_DEVICE_EVENTS: u64 = 86;
 
+// Register the channel the kernel reports FIXED-HARDWARE PLATFORM EVENTS on - today the power and
+// sleep buttons, decoded from the ACPI PM1 event block.
+//
+// THE KERNEL DECODES AND THE HOLDER ACTS, and the split is forced rather than chosen. The buttons
+// arrive on a shared, level-triggered interrupt whose status register must be acknowledged inside
+// the handler or the machine makes no further progress, and that register lives in an address space
+// the public driver resource vocabulary has no object for. So the kernel is already holding the
+// register when the event is decoded; what is left to hand on is the EVENT.
+//
+// IT TAKES THE SAME PRIVILEGE AS `SYS_DEVICE_EVENTS` AND THAT IS THE DECISION. A fifth privilege
+// kind would name a narrower authority, and it would be narrower than nothing: the holder of this
+// one already receives every arrival and departure on the bus and may take any device's BAR out of
+// the kernel. Learning that somebody pressed the power button is strictly less than what it can
+// already do, so a separate capability would add a name without adding a boundary.
+//
+// Each message is ONE BYTE: the kind. A press has no payload, and the two buttons are separate
+// kinds rather than one with a flag, because this system can act on exactly one of them.
+pub const SYS_PLATFORM_EVENTS: u64 = 87;
+
+// What a platform event's one byte says.
+pub const PLATFORM_EVENT_POWER_BUTTON: u8 = 1;
+pub const PLATFORM_EVENT_SLEEP_BUTTON: u8 = 2;
+
 // What a device event's first byte says.
 pub const DEVICE_EVENT_ARRIVED: u8 = 1;
 pub const DEVICE_EVENT_DEPARTED: u8 = 2;

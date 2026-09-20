@@ -192,6 +192,12 @@ declare -A GATES=(
 	# Every one of them is SILENT in production, which is why each has a test and why the test has to
 	# be seen failing. Runs on a copy; nothing here writes the working tree.
 	["driver-mutations"]="tools/check-driver-mutations.sh"
+	# THE ONE WAIT, ENFORCED. DeviceManager's supervisor loop carries a note saying why it must hold
+	# exactly one wait, and five places broke it: a blocking receive or a blocking send with no
+	# deadline, on a peer that can go quiet, stops the supervisor dead - no catalogue, no device
+	# policy, no bus events, no teardowns, no chassis events. A call that genuinely must wait says so
+	# with a marker and a reason; everything else is refused.
+	["supervisor-waits"]="tools/check-supervisor-waits.sh"
 	# The two trust profiles differ in the BINARY. The test key's private half is
 	# published on purpose, which is exactly why a release loader must contain none of it.
 	["trust-profile"]="tools/check-trust-profile.sh"

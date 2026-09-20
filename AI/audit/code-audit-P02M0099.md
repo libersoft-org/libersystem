@@ -1865,3 +1865,316 @@ fixture. The only file without one is `dev_channel.rs`, a transport program's en
 logic lives in the shared `serial_port` module, which does.
 
 40 of 40 planted defects caught.
+
+## The emulated ports had no framebuffer at all, so a path nobody could run stayed unrun (2026-09-19)
+
+The GOP item carried "NOT YET VERIFIED ON THE TWO EMULATED PORTS ... they are unrun, and the final
+tri-architecture pass is what confirms them". The pass happened and confirmed nothing: both emulated
+TEST profiles boot with no display device, so every run printed `no GOP framebuffer (serial-only boot
+log)` and the descriptor code was never reached.
+
+A `ramfb` on those profiles is what changed it, and it is the cheapest thing that could: firmware
+finds it, the loader builds the descriptor, nothing binds to it. Deliberately not `virtio-gpu` - that
+is the heaviest bring-up here and once put itself past the two-second READY deadline under TCG,
+taking DisplayService and five services with it. ramfb has no bring-up to be late for.
+
+AND THE TWO PORTS TOOK THE TWO HALVES OF THE ITEM'S OWN TITLE:
+
+    aarch64   loader: GOP framebuffer found
+    riscv64   loader: no GOP framebuffer ... / riscv64: ramfb framebuffer 1280x800 at 0x80e5e000
+
+The riscv64 one is the more valuable: the simple-framebuffer path is what a machine without UEFI
+takes and no boot anywhere ran it. Suites green - aarch64 79, riscv64 81.
+
+THE LESSON IS ABOUT THE CLAIM AND NOT THE CODE: "the final tri-architecture pass confirms them" was
+false the day it was written, because a pass cannot exercise a path the profile gives no device for.
+A fixture was the missing half, not a run.
+
+## The scenario runner reaches all three ports; the development boot does not (2026-09-19)
+
+Two gates - `qemu-pcie-hotplug` and `qemu-pcie-aer` - were recorded as x86_64-only because they
+drive the persistent instance through `lab.sh monitor`, and the persistent instance is x86_64's. A
+SCENARIO runs cold on all three, which is what `scenario-cold` exists for, and the scenario
+vocabulary had fifteen step kinds and no way to reach the monitor: a scenario could type at the
+guest and move its pointer, and could not change the MACHINE.
+
+A `monitor` step is the whole of what was missing. Its ANSWER is the failure rather than its exit
+status, because this monitor reports in prose - `device_del` on a bus that cannot do it answers
+`Bus 'sata.0' does not support hotplugging` and looks like success to anything checking acceptance.
+One command per step, a newline refused, so a failing step can say which command failed.
+
+AND THEN THE EMULATED RUN FOUND SOMETHING BIGGER. A cold aarch64 development boot never serves its
+control channel, and the log gives the reason in the words the booted-system test uses: ten drivers
+missed their control-path deadline, seven had their providers withdrawn, and every service then
+failed with `no artifact at vol://system/libexec/...`. The volume mounted and lost what was under it.
+
+SO "THE TOOLING IS x86_64-ONLY" WAS A SYMPTOM. The runner is not x86_64's; the development profile's
+BOOT is what does not survive on the emulated ports, because it brings up the most devices at once
+on the slowest machine - which is the condition the cascade needs. One defect explains both the
+intermittent boot-test failure and why scenarios have never run on aarch64 or riscv64.
+
+TWO FIXTURE MISTAKES OF MINE, BOTH THE SAME SHAPE. The HDA second codec and the ramfb both went into
+a code path shared with a profile they were not meant for: the codec broke `qemu-pcie-hotplug` on
+the interactive machine, and ramfb collided with that profile's own ramfb outright
+(`duplicate fw_cfg file name`). Both are behind a `TEST` guard now. A fixture one profile needs is
+attached by that profile.
+
+## The ACPI SCI, and three "device models" that are not (2026-09-20)
+
+THE WALLS GET CHECKED, NOT QUOTED. Three items in group 3 - CDC-ACM, the HID expansion and USB
+Audio's capture half - each said what they need is "a device model to write, not a driver", and I had
+read all three as an implementer's dead end. Running the commands instead: this QEMU registers
+`usb-host` AND `usb-redir`, so what a guest can see is not the set of models QEMU implements;
+`dummy_hcd`, `libcomposite`, `usb_f_acm`, `usb_f_hid`, `usb_f_uac1` and `usb_f_uac2` are all built
+for the RUNNING kernel; and `modprobe dummy_hcd` succeeds on this machine and produces
+`/sys/class/udc/dummy_udc.0`. A configfs gadget binds to that and `usb-host` hands it to the guest.
+`usb_f_hid` takes an arbitrary report descriptor, which is precisely the multi-touch collection and
+the gamepad the HID item has no model for.
+
+SO THE WALL IS REAL AND IT IS A DIFFERENT WALL. It is not code that must be written; it is the
+harness loading kernel modules into the DEVELOPER'S kernel and building a gadget as root, on every
+run. That is a decision about a test suite's blast radius and it is the project owner's - an
+implementer who quietly taught `test.sh` to modprobe things would have taken it for them. It is
+question 4 in the head of the milestone now. The probe was undone: the gadget tree removed and every
+module unloaded, so the machine is as it was.
+
+THE SAME METHOD PAID AGAIN ON ACPI. The fixed-hardware event item named its own missing fixture - "a
+QEMU machine whose PM1a event can be raised on demand" - and that fixture had arrived without anybody
+noticing: `system_powerdown` on the monitor IS a PM1a event, and the `monitor` scenario step written
+for PCIe hot-plug is what can send it. One item's tool closed another item's gate.
+
+AND THE I/O APIC WAS ROUTING TWO OF ITS THREE LINES AS THE WRONG KIND. `route` wrote the ISA
+defaults - edge-triggered, active-high - for every caller. That is right for the 16550's legacy line
+and wrong for a PCI INTx pin, which is level-triggered and active-low by the bus specification. The
+hot-plug path's own comment already named the consequence without connecting it to the cause: "a
+level-triggered line one handler already cleared" is a line whose EDGE nobody saw, and the poll
+beside it is the fallback that has been covering for it. Both are level, active-low now; the
+condition a level entry needs - the source cleared inside the handler, before the EOI - is what
+`poll_slots` already does with the slot's sticky bits.
+
+## The SCI landed, and the userspace half did not answer on the first two runs (2026-09-20)
+
+THE KERNEL HALF WORKED ON THE FIRST BOOT:
+`acpi: SCI is GSI 9 (level, active-low) on vector 41` and
+`acpi: power and sleep buttons armed on PM1 status 0x0600, enable 0x0602` - the FADT read, the MADT
+override applied, the half-block arithmetic right - and `system_powerdown` on the monitor produced
+`platform: event 1 arrived before anything was listening`, which is the handler decoding and
+acknowledging a real PM1a event, in an interrupt, with the status bit in hand.
+
+THE USERSPACE REGISTRATION PRINTED NOTHING - not its success line, not either of its failure lines -
+and a first theory about WHY was wrong and is recorded here because it was nearly written into the
+milestone as a fact. The theory was that `.build/cargo/development`, which holds an eighteen-hour-old
+`device_manager`, is what the guest boots. It is not: that directory belongs to
+`check-development-build.sh`, a gate that COMPILES the other configuration and boots nothing. The
+guest's programs come from `.build/cargo/user` by way of `.build/boot/bootstrap-<arch>`, and both of
+those did carry the new code. Two builds were run on the strength of the wrong theory before
+`grep -rn cargo/development --include=*.sh` said who writes that directory, which is the question
+that should have been asked first.
+
+WHAT DID COME OUT OF IT AND IS WORTH KEEPING is a diagnostic decision. The bus-event registration
+this one was modelled on is SILENT in two of its three failure arms - no channel, no privilege - so
+a DeviceManager that failed to register would leave a power button that does nothing and a log with
+nothing in it about why. The platform registration says which of the three happened, every time.
+
+## An interrupt handler may not send on a channel (2026-09-20)
+
+THE SYMPTOM WAS A MACHINE THAT PRINTED THE EVENT AND THEN DID NOTHING. With a listener attached,
+`system_powerdown` produced `acpi: the power button was pressed` and the press never came out the
+other end: DeviceManager's registration had succeeded (both sides say so in the boot log), the send
+reported no error, the consumer's drain - which runs before every park, not only when the wait names
+the handle - found nothing, and every arm of its handler is instrumented and none of them spoke.
+
+THE DISCRIMINATING OBSERVATION WAS THE RUN THAT WORKED. With NO listener attached the same handler
+returned cleanly and the guest carried on; with one attached the guest made no further progress, the
+shell never answered again and the harness reported `teardown did not complete`. The only code the
+listener adds is `Channel::send`, which takes the peer's inbox lock and then `sched::wake_object`.
+Both are locks an ordinary thread can be holding at the instant a hardware interrupt arrives - and
+this interrupt arrives on a SHARED line at an arbitrary instruction boundary.
+
+SO THE HANDLER RECORDS AND THE IDLE PASS DELIVERS. `platform_event::report` is called from the
+interrupt and now does exactly one thing: set a bit in an atomic. `platform_event::deliver` is
+called from the BSP's idle pass, beside `settle_hot_plug` and `console_input::drain`, and does the
+allocation and the send. The latch semantics are unchanged and are now the same mechanism as the
+delivery: PENDING is both.
+
+AND THE SAME SHAPE IS NEXT DOOR. `device::report` - the bus arrival and departure channel - does the
+identical allocate-and-send, and `settle_hot_plug` calls it from BOTH the interrupt and the idle
+hook. The idle path is what has been doing the work; the interrupt path has the same hazard this one
+had, and the poll beside it is what has been covering for it. That is worth its own look by whoever
+owns the hot-plug item, and it is written here rather than fixed in passing.
+
+## Nine runs on one delivery, and what each one removed (2026-09-20)
+
+THE ACPI MECHANISM PASSED ON THE FIRST BOOT AND THE CONSUMER HAS NOT PASSED IN NINE. Recording the
+shape of that, because the method is the point and the ending is not tidy.
+
+WHAT EACH RUN REMOVED FROM THE SEARCH, in order:
+  1. The kernel half works: FADT, MADT override, level/active-low routing, ACPI mode, PWRBTN armed,
+     the interrupt decoded and acknowledged - `acpi: the power button was pressed`, 201 ms after the
+     monitor command.
+  2. "The consumer's binary is stale" - checked with `strings` against the string just added, twice,
+     and wrong both times. A theory about `.build/cargo/development` was wrong too: that directory
+     belongs to a gate that compiles and boots nothing. Asking `grep -rn cargo/development
+     --include=*.sh` who writes it would have cost one command and saved two builds.
+  3. "The registration failed silently" - it did not; both sides print it now, which took a boot to
+     learn and is kept.
+  4. "The send was refused" - it was not; a refused send has its own line and never appears.
+  5. "The handler wedges the machine" - it DID, and that was a real defect: `Channel::send` from an
+     interrupt handler takes locks an ordinary thread can hold. The delivery moved to the idle pass.
+     The symptom that proved it: with a listener attached the guest made no further progress, with
+     none attached the same handler returned cleanly.
+  6. "The channel is wired wrongly" - a probe sent through that same channel arrived and was decoded
+     by the consumer's own handler. That removes the naming of the two ends, the privilege, the
+     handle and the message shape in one run.
+  7. "The consumer is asleep on a wake that never came" - instrumented, its loop made thousands of
+     passes over that channel in one run.
+
+SO WHAT IS LEFT IS THE SENTENCE NOBODY WANTS: the kernel enqueues a message on a channel, reports
+success, and the consumer polling that same channel thousands of times does not see it. Every
+cheaper explanation has been measured away. Writing a cause into the milestone now would be writing
+a guess, and that is the one thing this tree's files are not for.
+
+THAT EXPERIMENT WAS RUN AND IT REMOVED THE LAST TWO GUESSES. The kernel prints the koid of the
+endpoint it holds and the consumer prints both of its handles' koids: the kernel holds 65, the
+consumer gave 65 and kept 66, and the send at press time is on 65 with `peer closed false` and its
+OWN inbox not readable. So the two objects are the two halves of one pair, the peer is alive, and the
+message went to the peer rather than back to the sender. The message is in the consumer's own
+channel's inbox and the consumer does not take it.
+
+AND THE LAST MEASUREMENT SAYS WHY, WITHOUT SAYING WHAT CAUSES IT. Counting the consumer's drain
+calls: with a diagnostic printing every sixteenth call the loop spun thousands of times - but the
+printing was itself the cause, because each print makes the console channel readable and wakes the
+loop. Without it, the drain runs during bring-up and NOT AGAIN after the press, over sixty seconds
+of waiting, with a deadline in its wait that should have brought it back every second. So the
+consumer is parked somewhere its own deadline does not reach, and the only place in that loop with
+no deadline is the blocking receive on the supervisor channel.
+
+TWO MORE RUNS REMOVED THE TWO REMAINING CANDIDATES AND THE ITEM IS STILL OPEN.
+
+FIRST: the blocking receive was real and is fixed, and it was not the cause. `recv_blocking` is a
+SECOND WAIT in front of the one wait - on `ERR_WOULD_BLOCK` it calls `wait(channel, 0)`, one handle
+and no deadline - which is exactly what the note forty lines above that loop forbids in its own
+words. It is a non-blocking take now, and an empty read is a pass rather than a park. The boot is
+unchanged and the press still does not arrive.
+
+SECOND: the channel does not answer `Closed`. `try_recv`'s error arm mapped every negative result
+onto `Closed` and the loop broke on it SILENTLY, which was a real hole; a closed channel is reported
+now and the handle is given up rather than polled for ever. It never fires.
+
+SO EVERY BRANCH ON THE CONSUMER SIDE IS INSTRUMENTED AND ALL OF THEM ARE SILENT: the drain is called
+before every park and in the wake branch, an empty message speaks, an unknown kind speaks, a closed
+channel speaks, a refused power connection speaks. The kernel says the message was handed over, on
+the right object, with the peer alive and its own inbox empty. Eighteen runs, and the one thing that
+would explain it - the consumer not reaching those lines - is contradicted by the same code path
+having drained a probe earlier in the same boot.
+
+WHAT I AM NOT DOING IS GUESSING PAST THAT. The kernel half of this work is proved and is worth
+having on its own; the consumer half is written down with every measurement that constrains it, and
+the next person starts from a much smaller search than I did.
+
+AND THE DIAGNOSTIC LESSON IS THE GENERAL ONE. Four of these runs went to distinguishing states a log
+could not tell apart: "it never arrived", "it arrived and could not be delivered", "it was delivered
+and nothing was done". Each silent arm - `let _ = send(...)`, a `None => 0` with no print, a `_ => {}`
+in a match on a wire value, a report printed only in the failure case - cost a six-minute boot. They
+all speak now, and that is not instrumentation to be taken out afterwards; it is what the code
+should have said in the first place.
+
+## The nineteenth run, which moved the question to another module (2026-09-20)
+
+`Channel::peer_koid` exists now, and the delivery line names BOTH ENDS:
+
+    platform: event 1 handed on, from object 65 to Some(66)
+    DeviceManager: ... polling koid 66
+
+THE SAME OBJECT, AT BOTH ENDS, AT THE SAME MOMENT. The message goes into endpoint 66's inbox under
+that inbox's own lock; `send` returns `Ok`; the process holding endpoint 66 polls it thousands of
+times over sixty seconds and `try_recv` answers `Empty` every time - which it does only when
+`peek_identified` found nothing queued. The two other answers that path can give each have a line of
+their own now and neither ever appears.
+
+AND AN EARLIER MESSAGE BETWEEN THOSE SAME TWO ENDPOINTS ARRIVED, in the same boot, decoded by the
+consumer's own handler. So the pairing, the handle, the privilege, the rights and the message shape
+are all proved by construction; what differs between the delivery that works and the one that does
+not is WHEN it was sent and FROM WHAT CONTEXT.
+
+THAT IS A QUESTION ABOUT `object::channel` AND NOT ABOUT A POWER BUTTON, and it is where this
+investigation ends rather than where it fails. The diagnostic that answers it in one boot is the one
+that was missing all along and is now permanent: a delivery line that says which object a message
+left and which one it reached. "It was sent" is not an answer when it does not arrive.
+
+## Five waits with no end, in one supervisor loop (2026-09-20)
+
+COUNTING THE LOOP'S PASSES IS WHAT BROKE IT OPEN. The drain on the platform channel runs before
+every park, so counting its calls counts the loop. Logarithmically, through `debug_write` so console
+takeover cannot swallow it:
+
+    drains 1, 2, 4, 8, 16, 32 ... and then nothing, ever
+
+The last pulse lands in the middle of bring-up. After it the loop makes no further pass - through a
+chassis power button press sixty seconds later that the kernel had enqueued, on the right object,
+and said so. DeviceManager was not slow and not asleep on a lost wake: it was PARKED, in a blocking
+IPC call, with everything it supervises behind it.
+
+AND THE FIRST TWO COUNTS WERE MEASURED WRONG, WHICH IS WORTH THE NOTE. An earlier version of the
+same counter used `print`, which routes to ConsoleService the moment a program has a stdout - so
+from display takeover onwards the counts went to a virtual terminal and the log showed one line. I
+concluded from that single line that the loop had stopped, and separately that a hot spin existed
+when the printing itself was causing it. Two wrong conclusions from one instrument that changed
+destination halfway through the run.
+
+**FIVE PLACES IN ONE LOOP WAIT WITH NO END, AND THE LOOP'S OWN NOTE FORBIDS ALL OF THEM.** Forty
+lines above it: "One wait, so a catalogue query cannot delay a supervisor message and a supervisor
+message cannot delay a query." Found, in the order they fire:
+
+  1. THE SUPERVISOR MESSAGE. `recv_blocking(bootstrap, ...)` on the fall-through.
+  2. THE DEVELOPMENT AGENT. `dev.supervise` was `recv_blocking` on the agent's bootstrap - the agent
+     speaks during bring-up and then goes quiet.
+  3. THE PROVIDER CATALOGUE. `serve_catalogue_once` opened with `recv_caps_blocking` on ONE client.
+  4. THE DEVICE POLICY. `serve_policy_once`, the same line.
+  5. AND THE DRIVER SENDS. `send_frame` used `send_blocking`, which waits for ROOM with no deadline,
+     and the loop sends a heartbeat to every bound driver on every pass. One driver that stops
+     reading parks the supervisor.
+
+EACH FIX MOVED THE WALL LATER, which is how the count of them became visible at all: the last pulse
+went from line 209 to 222 to 223 as the earlier ones were removed. A single instance would have been
+a defect; five is a property of the file, and the property is that its stated rule was never enforced
+anywhere.
+
+WHAT EACH BECAME. A receive that would block is a PASS - the handle is in `waiting` like every other,
+so going round is what puts it back under the one wait. A reply that would block retires the client,
+which is what this loop already does with a closed one. A driver send waits a bounded second and
+then answers `false`, which is what the heartbeat is for.
+
+AND ONE CHANGE WAS REVERTED FOR A REASON WORTH KEEPING. Adding a function to `rt` broke the build:
+`abiprobe` and `vkprobe` embed the hash of the `icdprobe` they admit, and they are staged rather
+than rebuilt, so ANY change to the shared runtime leaves the staged tree holding "a selection
+candidate no consumer was built against". The bounded send lives in DeviceManager and uses only what
+`rt` already exports.
+
+## And the rule became a gate (2026-09-20)
+
+FIVE INSTANCES OF ONE MISTAKE IN ONE FILE, NONE VISIBLE TO ANYTHING, IS NOT A DEFECT TO FIX QUIETLY.
+`src/tools/check-supervisor-waits.sh` refuses any blocking receive or blocking send inside
+DeviceManager's supervisor loop, and it proves it refuses before it approves - it plants one after
+the loop's own anchor comment and requires itself to reject it. Registered as
+`./check.sh --gate supervisor-waits`.
+
+THE MARKER IS A DECISION AND NOT AN ESCAPE HATCH. A call that genuinely must wait carries
+`SUPERVISOR-WAIT-OK:` with a reason, anywhere in the comment block directly above it - which is how
+this tree writes reasons, and requiring the marker on the last line would either compress every
+reason into one sentence or separate it from its call.
+
+AND THE GATE TURNED THE REST OF THE HUNT INTO A LIST. Thirteen calls, each of which then had to be
+DECIDED rather than found:
+  - three sends to a driver being launched: bounded, like the heartbeat. A driver that never starts
+    reading must not park the program that started it.
+  - nine sends to the supervisor: they keep their wait and say why. The supervisor drove that
+    handshake and is waiting for exactly those answers, so the peer that could stall the send is the
+    peer that asked for it.
+  - one attenuated driver send: keeps its wait. Moving a capability is once per driver per
+    transition, not once per pass, and a transfer that gave up half way is harder to be right about
+    than one that waits.
+
+WHICH IS THE ANSWER TO "IS THE SIXTH INSTANCE STILL OUT THERE". Inside this loop, no: every call is
+now either bounded or a written-down decision, and the gate keeps it that way. Whether the loop then
+reaches the press is a measurement and not a deduction, and it is the next run.

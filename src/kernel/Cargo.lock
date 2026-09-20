@@ -7,6 +7,10 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "acpi"
+version = "0.0.0"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -236,6 +240,7 @@ name = "kernel"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "acpi",
  "aiff",
  "bmp",
  "bootproto",

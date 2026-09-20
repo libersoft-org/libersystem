@@ -25,6 +25,12 @@ driver-protocol = { path = "../user/libs/driver/protocol" }
 # threshold, and what it will not conclude from one paravirtual source. Outside the kernel for the
 # reason `driver-binding` is: the kernel is not host-testable and these are decisions.
 entropy = { path = "../user/libs/entropy" }
+# THE FIXED ACPI DESCRIPTION TABLE AND THE MADT'S INTERRUPT OVERRIDES, for the same reason as the
+# three above: which register the power button's status bit is in, and whether the SCI is a level or
+# an edge, are decisions a firmware states and a reader can get wrong - and a kernel is the one place
+# in this tree where a fixture cannot be planted. The parsing is host-tested over tables no firmware
+# would write; the kernel takes the answers.
+acpi = { path = "../acpi" }
 # THE BINDING MATCHER, so the kernel validates a claim's registry entry against the concrete device
 # with the SAME host-tested predicate DeviceManager selects with. A second copy of the rule here is
 # a second thing to keep in step, and the one that is not tested is the one that drifts.

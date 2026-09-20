@@ -1,0 +1,44 @@
+# A DEVICE PLUGGED INTO A LIVE MACHINE, ON ANY ARCHITECTURE.
+#
+# The gate that proves this already exists and boots the PERSISTENT instance, which exists for
+# x86_64 alone - so the hot-plug path on aarch64 and riscv64 had a slot, an armed interrupt and a
+# kernel that reports both, and nothing anywhere that could make a device arrive in one. Every run
+# of the driver suites on those ports showed the port being FOUND and never a slot CHANGING STATE.
+#
+# A scenario runs cold on all three, which is what `scenario-cold` is for, and the `monitor` step is
+# what lets one reach the machine rather than what runs on it.
+#
+# WHAT IT ASSERTS, IN THE ORDER THE HARDWARE DOES IT. `device_add` puts a function behind the root
+# port; the port's Slot Status changes; the kernel's poll or its interrupt sees it, adds the device
+# to the inventory and says so. That is the whole arrival path, and none of its three halves can be
+# checked from inside the guest.
+#
+# THE DEVICE IS A `virtio-serial-pci`, which is what the x86_64 gate plugs in for the same reason:
+# it needs no backing drive, so the scenario adds a FUNCTION and nothing else. What is under test is
+# the slot and the arrival, not whatever the arrival turns out to be.
+version = 1
+name = "pcie hotplug"
+description = "A device plugged into a live machine's hot-plug slot is seen, bound and reported."
+timeout = 300
+
+[[step]]
+do = "prompt"
+timeout = 120
+
+# THE VACUITY GUARD IS THE MONITOR STEP ITSELF AND NOT A SEPARATE ASSERTION, which is what trying
+# the separate one taught: `expect` watches the console FORWARD from where the scenario attached, and
+# the line that says this machine has a slot is printed during boot, long before that. A step
+# asserting it failed on a machine that had one.
+#
+# `device_add` NAMING `hotplug0` CANNOT SUCCEED WITHOUT THE PORT: on a machine whose fixture was
+# dropped the monitor answers that no such bus exists, and the step fails on the answer. So the
+# guard is in the command rather than beside it.
+[[step]]
+do = "monitor"
+command = "device_add virtio-serial-pci,bus=hotplug0,id=liberhp"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "a device arrived in the slot behind"
+timeout = 60

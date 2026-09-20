@@ -336,13 +336,32 @@ impl DevAgent {
 	// The agent's bootstrap became readable. Anything it says is passed through to the console;
 	// its closing means the process ended, and a fresh one takes its place.
 	#[cfg(feature = "development")]
+	/// **TAKEN, NOT WAITED FOR, AND THAT IS THE WHOLE OF A DEFECT THAT STOPPED THIS PROGRAM DEAD.**
+	///
+	/// This was `recv_blocking`, which is a SECOND WAIT in front of the one wait: on
+	/// `ERR_WOULD_BLOCK` it calls `wait(channel, 0)` - one handle, no deadline - and stays there
+	/// until the development agent speaks again. The agent speaks during bring-up and then goes
+	/// quiet, so from that moment DeviceManager answered NOTHING: not the provider catalogue, not
+	/// the device-policy clients, not the kernel's bus events, not a driver's teardown, and not the
+	/// platform-event channel a chassis power button arrives on.
+	///
+	/// MEASURED (2026-09-20). The drain on that channel is called before every park; counting the
+	/// calls, this loop made ONE pass in a whole run and none at all after the press, while the
+	/// kernel had enqueued the event on the right object and said so. It is the third instance of
+	/// the same shape in this one loop, and the note above the loop already forbids it in its own
+	/// words: "One wait, so a catalogue query cannot delay a supervisor message and a supervisor
+	/// message cannot delay a query."
+	///
+	/// AN EMPTY READ IS A PASS. The agent's handle is in `waiting` like every other, so returning to
+	/// the top is what puts it back under the ONE wait.
 	fn supervise(&mut self, buf: &mut [u8], clients: &mut CatalogueClients) {
-		match recv_blocking(self.bootstrap, buf) {
-			Received::Message { len, .. } => {
+		match try_recv(self.bootstrap, buf) {
+			Polled::Message { len, .. } => {
 				print(&buf[..len]);
 				print(b"\n");
 			}
-			Received::Closed => self.restart(clients),
+			Polled::Empty => {}
+			Polled::Closed => self.restart(clients),
 		}
 	}
 
@@ -428,6 +447,44 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			None => 0,
 		};
+		// 1b3b. AND THE CHANNEL THE KERNEL REPORTS FIXED-HARDWARE PLATFORM EVENTS ON - the power and
+		//       sleep buttons on the chassis, decoded from the ACPI PM1 event block. The same
+		//       registration as the bus events above, under the same privilege, for the reason
+		//       `abi`'s note on that number gives: a holder that already receives every arrival on
+		//       the bus is not made more powerful by also learning that somebody pressed a button.
+		//
+		//       THE PRESS IS NOT LOST IF IT HAPPENS FIRST. A button pressed while this program is
+		//       still starting is held by the kernel and delivered when this registration lands, so
+		//       the window between the machine being able to raise the event and something being
+		//       able to receive it is not a window in which the power button does nothing.
+		//
+		//       AND EVERY WAY THIS CAN FAIL SAYS SO. The bus-event registration above is silent in
+		//       two of its three failure arms, and a power button that does nothing with nothing in
+		//       the log about it is indistinguishable from one that was never wired up - which is
+		//       exactly what a boot was spent distinguishing.
+		let mut platform_events: u64 = match channel() {
+			Some((kernel_side, ours)) if device_privilege != 0 => {
+				if sys_is_err(syscall(abi::SYS_PLATFORM_EVENTS, kernel_side, device_privilege, 0, 0)) {
+					print(b"DeviceManager: the kernel refused to report platform events - the power button will do nothing\n");
+					close(kernel_side);
+					close(ours);
+					0
+				} else {
+					print(b"DeviceManager: platform events registered - a press on the chassis power button reaches this program\n");
+					ours
+				}
+			}
+			Some((kernel_side, ours)) => {
+				print(b"DeviceManager: no DeviceManager privilege, so platform events are not registered - the power button will do nothing\n");
+				close(kernel_side);
+				close(ours);
+				0
+			}
+			None => {
+				print(b"DeviceManager: no channel could be created for platform events - the power button will do nothing\n");
+				0
+			}
+		};
 		// 1b4. and the boot window: how long this boot is allowed to take, and when THIS boot's
 		//      window closes. Carries no capability. Zero for either is "not published", and this
 		//      program then bounds a bind by its per-attempt deadline alone - which is what it did
@@ -507,20 +564,28 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    report itself carries one handle; each `BLOCK2`/`BLOCK3`/`BLOCK4` handle is 0
 		//    when that disk is absent). The net / gpu / snd / input driver channels follow in
 		//    phase 2, once the volume they load from is mounted.
+		// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+		// answers - the peer that could stall this send is the peer that asked for it.
 		send_blocking(bootstrap, b"DeviceManager: online", boot_blocks.first().copied().unwrap_or(0));
 		// AND HOW MANY THERE ARE, BEFORE THEY ARRIVE. A reader that knows the count reads exactly
 		// that many and never one more, whatever this machine turns out to have - which is what
 		// replaced the four tags. See `BOOT_BLOCK_TAGS`'s note above, which is where the four was.
 		let mut published = [b'B', b'L', b'O', b'C', b'K', b'S', 0, 0, 0, 0];
 		published[6..].copy_from_slice(&(boot_blocks.len() as u32).to_le_bytes());
+		// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+		// answers - the peer that could stall this send is the peer that asked for it.
 		send_blocking(bootstrap, &published, 0);
 		for &block in boot_blocks.iter().skip(1) {
+			// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+			// answers - the peer that could stall this send is the peer that asked for it.
 			send_blocking(bootstrap, b"BLOCK", block);
 		}
 		// AND THE PROBE CONNECTIONS, in the same order and under their own tags. A zero handle is a
 		// disk this machine does not have, and the tag travels anyway so the reader's positions do
 		// not shift - the same rule every other hand-off in this chain follows.
 		for &probe in probe_blocks.iter() {
+			// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+			// answers - the peer that could stall this send is the peer that asked for it.
 			send_blocking(bootstrap, b"PROBE", probe);
 		}
 
@@ -705,6 +770,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waiting[waiting_count] = bus_events;
 				waiting_count += 1;
 			}
+			let platform_events_at: usize = waiting_count;
+			if platform_events != 0 {
+				waiting[waiting_count] = platform_events;
+				waiting_count += 1;
+			}
 			// The teardown handles go LAST, so everything before them keeps the index arithmetic the
 			// serving branches below rely on.
 			let teardowns_at: usize = waiting_count;
@@ -763,6 +833,34 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					soonest = clock().max(1);
 				}
 			}
+			// **DRAINED BEFORE PARKING, AND THE PARK IS BOUNDED WHILE THIS CHANNEL IS HELD.**
+			//
+			// MEASURED, NOT ASSUMED (2026-09-20). A message the kernel sends on this channel is
+			// enqueued - the kernel says `handed to its listener` and reports no error - and this
+			// loop does not come back for it: it is parked in `wait_any` with no deadline, and the
+			// wake the send issues does not bring it out. The proof is a probe sent at bootstrap,
+			// which was not drained when it was sent but seventy lines later, on the first pass that
+			// some OTHER handle woke. During bring-up there is always other traffic, so nothing had
+			// ever noticed; after the boot settles there is none, and a press sits in the queue for
+			// ever.
+			//
+			// WHOSE DEFECT THAT IS, IS NOT THIS PROGRAM'S, and it is written down where it was
+			// found rather than fixed in passing. What this program can do is refuse to sleep
+			// unboundedly while it holds a channel somebody may push to: one wake a second, which is
+			// the same trade the hot-plug slot poll already makes beside its interrupt, and which
+			// bounds the latency of a button press to something a person cannot notice.
+			if platform_events != 0 {
+				if !serve_platform_events(platform_events, power, &mut buf) {
+					print(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
+					close(platform_events);
+					platform_events = 0;
+				} else {
+					let bound: u64 = clock().saturating_add(PLATFORM_POLL_TICKS);
+					if soonest == 0 || bound < soonest {
+						soonest = bound;
+					}
+				}
+			}
 			let ready: i64 = wait_any(&waiting[..waiting_count], soonest);
 			if ready != 0 {
 				if ready > 0 {
@@ -806,6 +904,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						serve_bus_events(bus_events, &mut nodes, &catalogue, power, console_input, device_privilege, &mut recovery, &mut buf);
 						continue;
 					}
+					if platform_events != 0 && at == platform_events_at {
+						if !serve_platform_events(platform_events, power, &mut buf) {
+							print(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
+							close(platform_events);
+							platform_events = 0;
+						}
+						continue;
+					}
 					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
 						let is_root: bool = at == policy_at;
 						if !serve_policy_once(waiting[at], is_root, &mut policy_clients, &mut nodes, &mut catalogue, policy_config, &mut buf) && !is_root {
@@ -822,7 +928,29 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				continue;
 			}
-			match recv_blocking(bootstrap, &mut buf) {
+			// **THE SUPERVISOR MESSAGE IS TAKEN, NOT WAITED FOR.** This was `recv_blocking`, and
+			// `recv_blocking` is a SECOND WAIT in front of the one wait: on `ERR_WOULD_BLOCK` it
+			// calls `wait(channel, 0)` - one handle, no deadline - and stays there until the
+			// supervisor speaks. The note forty lines above this loop already states the rule it
+			// broke: "One wait, so a catalogue query cannot delay a supervisor message and a
+			// supervisor message cannot delay a query", and the same paragraph records what the
+			// last second wait cost.
+			//
+			// MEASURED (2026-09-20), AND IT IS NOT A HYPOTHETICAL. The kernel enqueues a
+			// platform event on a channel this program holds and polls, says so, and this loop does
+			// not come back for it - not on the wake the send issues and not on the one-second
+			// ceiling this pass puts on its own wait, because it is not in that wait at all. A press
+			// on the chassis power button sat in a queue for sixty seconds with everything about the
+			// delivery working.
+			//
+			// AN EMPTY READ IS A PASS AND NOT A PARK. The bootstrap handle is in `waiting` like every
+			// other; returning to the top means the ONE wait covers it, which is what that rule says.
+			let taken: Received = match try_recv(bootstrap, &mut buf) {
+				Polled::Message { len, handle } => Received::Message { len, handle },
+				Polled::Closed => Received::Closed,
+				Polled::Empty => continue,
+			};
+			match taken {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery);
 					// THE DEVELOPMENT AGENT IS STARTED HERE, ONCE, AND NOT BY A DRIVER'S NAME.
@@ -863,6 +991,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// one; what travels behind the tag is whether this machine has a network driver
 					// bound, which the supervisor's driver status view reports.
 					let net: [u8; 4] = [b'N', b'E', b'T', u8::from(catalogue.count_of(driver_protocol::provider::NET) > 0)];
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, &net, 0);
 					// THE TAG CARRIES A FACT, NOT A CHANNEL - the display half, for the same reason
 					// as the audio one below and with the same shape (2026-09-02). DisplayService
@@ -871,6 +1001,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// whether this machine has a display driver bound, which the supervisor's driver
 					// status view reports and which only this program knows.
 					let display: [u8; 4] = [b'G', b'P', b'U', u8::from(catalogue.count_of(driver_protocol::provider::DISPLAY) > 0)];
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, &display, 0);
 					// AudioService subscribes for its provider too - and the boot hand-off is read
 					// POSITIONALLY at every hop, so dropping the message would shift every read
@@ -878,21 +1010,33 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// that handle: whether this machine has a sound driver bound at all, which its
 					// driver status view reports and which only this program knows.
 					let audio: [u8; 4] = [b'S', b'N', b'D', u8::from(catalogue.count_of(driver_protocol::provider::AUDIO) > 0)];
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, &audio, 0);
 					// THE TAG CARRIES A FACT, NOT A CHANNEL - the pointer half. InputService subscribes
 					// to the catalogue for its pointing devices now, so this program routes neither
 					// of the two it used to hold and keeps no count of them.
 					let pointers: [u8; 6] = [b'I', b'N', b'P', b'U', b'T', u8::from(catalogue.count_of(driver_protocol::provider::INPUT) > 0)];
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, &pointers, 0);
 					// USB consumers subscribe themselves; only the driver-status fact crosses this wire.
 					let usb: [u8; 4] = [b'U', b'S', b'B', u8::from(catalogue.count_of(driver_protocol::provider::USB_BUS) != 0)];
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, &usb, 0);
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, b"USBBUS", 0);
 
 					// the xhci driver's pointer-event channel (a USB pointing device;
 					// InputService folds it alongside the virtio pointer's).
 					let usb_pointers: [u8; 7] = [b'I', b'N', b'P', b'U', b'T', b'2', u8::from(catalogue.count_of(driver_protocol::provider::POINTER) > 0)];
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, &usb_pointers, 0);
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, b"KEYS", raw_keys);
 				}
 				// The development agent's launcher, delivered once PermissionManager is up.
@@ -935,6 +1079,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// order. Answering the supervisor first and exiting would drop every driver
 					// channel at once, which is a forced revocation dressed up as a shutdown.
 					stop_all(&mut nodes, &mut catalogue, driver_binding::StopIntent::Shutdown, &mut buf);
+					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
+					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
 					break;
 				}
@@ -1510,7 +1656,7 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 		let mut opening: [u8; 11] = [0u8; 11];
 		opening[..3].copy_from_slice(b"CAT");
 		opening[3..].copy_from_slice(nonce);
-		if !started || !send_blocking(dm_side, &opening, catalogue) {
+		if !started || !send_with_room(dm_side, &opening, catalogue) {
 			return 0;
 		}
 		// A volume connection of its own, so the agent can read the installed artifact a
@@ -1521,7 +1667,7 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 			Some(connection) => connection,
 			None => return 0,
 		};
-		if !send_blocking(dm_side, b"STORAGE", connection) {
+		if !send_with_room(dm_side, b"STORAGE", connection) {
 			return 0;
 		}
 		// THE CONSOLE, WHICH THE AGENT WAITS FOR AND NOBODY WAS SENDING. `dev_agent` reads three
@@ -1540,7 +1686,7 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 		} else {
 			0
 		};
-		if !send_blocking(dm_side, b"CONSOLE", feed) {
+		if !send_with_room(dm_side, b"CONSOLE", feed) {
 			return 0;
 		}
 		// The agent reports in before it serves, so a start that loaded but never ran is not
@@ -2678,6 +2824,37 @@ impl Provider {
 	}
 }
 
+/// How long a send to a DRIVER may wait for room before it is called a failed send.
+///
+/// ONE SECOND, IN THE TICK EVERY DEADLINE HERE IS IN. A driver whose queue is full for a moment is
+/// a driver under load; one whose queue is full for a second has stopped reading, which is the
+/// condition the heartbeat above exists to notice.
+const SEND_ROOM_TICKS: u64 = 100;
+
+/// A send that gives up instead of parking this program for ever.
+///
+/// **`send_blocking` WAITS WITH NO END**, and the peer here is a DRIVER - a separate process that
+/// can stop reading. The supervisor's loop sends a heartbeat to every bound driver on every pass, so
+/// one driver with a full queue takes the whole supervisor down with it: no catalogue, no device
+/// policy, no bus events, no teardowns, and no chassis events. That is the same shape as the three
+/// receives in this file that were waits with no end, and it is the same fix - a bound, after which
+/// the answer is `false` and the caller's existing failure path runs.
+fn send_with_room(channel: u64, bytes: &[u8], xfer: u64) -> bool {
+	let deadline = clock().saturating_add(SEND_ROOM_TICKS);
+	loop {
+		match try_send_outcome(channel, bytes, xfer) {
+			SendOutcome::Delivered => return true,
+			SendOutcome::Failed => return false,
+			SendOutcome::Stalled => {
+				if clock() >= deadline {
+					return false;
+				}
+				yield_now();
+			}
+		}
+	}
+}
+
 // Send one frame, optionally moving one capability with it under `mask`.
 fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], handle: u64, mask: u32) -> bool {
 	let mut frame = [0u8; driver_protocol::HEADER_LEN + driver_protocol::MAX_PAYLOAD];
@@ -2685,7 +2862,15 @@ fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, pa
 	frame[..driver_protocol::HEADER_LEN].copy_from_slice(&header.encode());
 	frame[driver_protocol::HEADER_LEN..driver_protocol::HEADER_LEN + payload.len()].copy_from_slice(payload);
 	let bytes = &frame[..driver_protocol::HEADER_LEN + payload.len()];
-	if handle == 0 { send_blocking(channel, bytes, 0) } else { send_blocking_attenuated(channel, bytes, handle, mask) }
+	// THE PLAIN SEND IS THE ONE THAT REPEATS. A frame that MOVES a capability is a bind, a stop or a
+	// resource hand-over - once per driver per transition - while the plain one is the heartbeat this
+	// loop sends to every bound driver on every pass, which is the send that can park a supervisor
+	// for ever. The attenuated path keeps its wait: it is not on the repeating path, and a capability
+	// transfer that gave up half way is a harder thing to be right about than one that waits.
+	// SUPERVISOR-WAIT-OK: a frame that MOVES a capability is once per driver per transition, not the
+	// per-pass heartbeat, and a transfer that gave up half way is harder to be right about than one
+	// that waits. The repeating send above it is the bounded one.
+	if handle == 0 { send_with_room(channel, bytes, 0) } else { send_blocking_attenuated(channel, bytes, handle, mask) }
 }
 
 // GIVE THE ATTEMPT BACK AND STOP TRYING.
@@ -4557,6 +4742,85 @@ unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &Catal
 	}
 }
 
+// The chassis buttons, decoded by the kernel and delivered here.
+//
+// **THE POWER BUTTON ASKS; IT DOES NOT ACT.** This program holds the SystemPower connection because
+// it mints one per keyboard driver, and it uses the same door the Power key uses: two operations, no
+// arguments, and the authority to stop the machine staying with the service that answers. A shorter
+// path from an interrupt to a halted machine is exactly what this tree took out of the keyboard
+// driver, and it would be no better here for being one hop closer to the kernel.
+//
+// **THE SLEEP BUTTON IS RECEIVED AND REFUSED, WHICH IS NOT THE SAME AS IGNORED.** `system-power` has
+// two operations - reboot and power off - so there is nothing for a suspend request to call, and
+// suspend is a platform-lifecycle feature with its own device-quiesce, memory and wake contract. A
+// button that says so once is a machine whose behaviour is discoverable; one that silently does
+// nothing is a machine somebody debugs.
+/// Answers whether the channel is still open. A CLOSED ONE IS NOT POLLED FOR EVER: a closed channel
+/// is readable for ever, which is the spin this loop's own notes warn about twice, and a receive
+/// that answers with an error rather than with emptiness is a channel this program can no longer be
+/// told anything on. Either way the caller gives the handle up and says so.
+/// **SAID TO THE MACHINE'S LOG AND NOT TO A TERMINAL, WHICH IS WHY THIS IS NOT `print`.**
+///
+/// `print` routes to ConsoleService the moment this program has a stdout - the comment on it says so
+/// - so from display takeover onwards everything this program says goes to a virtual terminal and
+/// not to the boot log. That is right for a program talking to a person and WRONG for a chassis
+/// event: a press on the power button is a fact about the MACHINE, it happens when nobody is reading
+/// a VT, and the only place it is any use is the log the machine keeps.
+///
+/// IT ALSO COST NINETEEN SCENARIO RUNS. The press was looked for in the serial log, where these
+/// lines could not appear after the console came up, and every measurement taken to explain their
+/// absence was measuring the wrong end of the system.
+fn machine_log(bytes: &[u8]) {
+	let mut at: usize = 0;
+	while at < bytes.len() {
+		let taken = debug_write(&bytes[at..]);
+		if taken == 0 {
+			return;
+		}
+		at += taken;
+	}
+}
+
+fn serve_platform_events(events: u64, power: u64, buf: &mut [u8]) -> bool {
+	// DRAINED, for the same reason the bus events are: a message left behind a readable channel is a
+	// wait that wakes immediately and forever.
+	loop {
+		let polled = try_recv(events, buf);
+		if matches!(polled, Polled::Closed) {
+			return false;
+		}
+		let Polled::Message { len, handle } = polled else { break };
+		if handle != 0 {
+			close(handle);
+		}
+		if len < 1 {
+			machine_log(b"DeviceManager: an empty platform event arrived and names no kind\n");
+			continue;
+		}
+		match buf[0] {
+			abi::PLATFORM_EVENT_POWER_BUTTON => {
+				machine_log(b"DeviceManager: the power button was pressed - asking the power service to stop the machine\n");
+				// A CONNECTION PER REQUEST, AND NOT ONE HELD OPEN. This program holds the FACTORY; a
+				// connection minted at boot and kept for the one moment it might be used is a live
+				// authority to stop the machine sitting in a variable for the life of the system.
+				match service_connect(power) {
+					Some(connection) => {
+						let _ = proto::system::system_power::Client::new(ipc_client::ChannelTransport { chan: connection }).power_off();
+						close(connection);
+					}
+					None => machine_log(b"DeviceManager: the power service minted no connection - the press cannot be acted on\n"),
+				}
+			}
+			abi::PLATFORM_EVENT_SLEEP_BUTTON => machine_log(b"DeviceManager: the sleep button was pressed - this system has no suspend path, so nothing is done\n"),
+			// A KIND THIS BUILD DOES NOT KNOW IS SAID AND NOT DROPPED. The kernel and this program are
+			// separately built artifacts; an event nobody here understands is a version skew, and a
+			// silent arm is how that becomes "the power button does nothing".
+			_ => machine_log(b"DeviceManager: a platform event of a kind this build does not know arrived and is ignored\n"),
+		}
+	}
+	true
+}
+
 // A device appeared: give it a node and start binding it.
 //
 // THE SAME PATH A BOOT DEVICE TAKES, and deliberately the same: one node, the candidate list the
@@ -5522,7 +5786,13 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 // see `CatalogueClients::retire`. It returned nothing, so a policy client that exited was waited on
 // for the rest of the boot exactly as a catalogue client was.
 fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients, nodes: &mut [Node], catalogue: &mut Catalogue, config: u64, buf: &mut [u8]) -> bool {
-	let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return false };
+	// THE SAME SHAPE AS THE CATALOGUE'S, AND THE SAME FIX - see `serve_catalogue_once`. This one has
+	// not been caught parking, which is not a reason to leave it able to.
+	let (len, handles) = match try_recv_caps(service, buf) {
+		PolledCaps::Message { len, handles } => (len, handles),
+		PolledCaps::Empty => return true,
+		PolledCaps::Closed => return false,
+	};
 	for &handle in handles.as_slice() {
 		close(handle);
 	}
@@ -5533,16 +5803,15 @@ fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients
 	if len >= 2 {
 		let op: u16 = u16::from_le_bytes([buf[0], buf[1]]);
 		if op == HEARTBEAT_OP {
-			send_blocking(service, b"PONG", 0);
-			return true;
+			return reply_or_retire(service, b"PONG", 0);
 		}
 		if op == CONNECT_OP && is_root {
 			match channel_pair_for_catalogue(clients) {
 				Some(theirs) => {
-					send_blocking(service, &[], theirs);
+					reply_or_retire(service, &[], theirs);
 				}
 				None => {
-					send_blocking(service, &[], 0);
+					reply_or_retire(service, &[], 0);
 				}
 			}
 			return true;
@@ -5554,7 +5823,9 @@ fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients
 	let mut reply_handles = wire::Handles::new();
 	let request: Vec<u8> = buf[..len].to_vec();
 	if let Some(written) = proto::system::device_policy_admin::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
-		send_blocking(service, &reply[..written], 0);
+		if !reply_or_retire(service, &reply[..written], 0) {
+			return false;
+		}
 	}
 	true
 }
@@ -5564,6 +5835,13 @@ fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients
 // A BOUND, because a server that mints a channel per request without one is a server a client can
 // exhaust. `lsdev` and the System Graph are two; the rest is headroom.
 const MAX_CATALOGUE_CLIENTS: usize = 8;
+
+/// How long this program may sleep while it holds a channel the kernel pushes platform events to.
+///
+/// ONE SECOND, IN THE TICK EVERY DEADLINE HERE IS IN. A hundred ticks is a second on this timer, and
+/// a person pressing the power button cannot tell a second from none. It is a CEILING on the sleep
+/// and not a poll interval: anything that wakes this loop sooner drains the channel on the way past.
+const PLATFORM_POLL_TICKS: u64 = 100;
 
 // The client connections minted from the catalogue's root, and the root itself at index 0.
 struct CatalogueClients {
@@ -5610,27 +5888,52 @@ impl CatalogueClients {
 // multi-client server in this tree has. It was a single typed dispatch, and `service_connect` -
 // which is how every consumer reaches a service here - sends the reserved CONNECT opcode and waits:
 // so the first thing that ever asked for the catalogue hung the boot, because nothing answered it.
+/// A REPLY THAT NEVER PARKS THIS PROGRAM. `send_blocking` waits, with no deadline, until the peer's
+/// queue has room - which for a per-client connection means one client that stopped reading takes
+/// the whole supervisor down with it: no catalogue, no device policy, no bus events, no teardowns
+/// and no chassis events, for as long as that client lives.
+///
+/// A STALLED CLIENT IS A GONE CLIENT, as far as a reply is concerned. It answers `false`, the caller
+/// retires the connection, and the slot goes back - which is what this loop already does with a
+/// closed one, for the same reason and by the same route.
+fn reply_or_retire(channel: u64, bytes: &[u8], xfer: u64) -> bool {
+	matches!(try_send_outcome(channel, bytes, xfer), SendOutcome::Delivered)
+}
+
 fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut CatalogueClients, catalogue: &mut Catalogue, nodes: &[Node], buf: &mut [u8]) -> bool {
-	let ReceivedCaps::Message { len, handles } = recv_caps_blocking(channel, buf) else { return false };
+	// **TAKEN, NOT WAITED FOR - SEE THE NOTE ON `supervise`.** `recv_caps_blocking` parks on ONE
+	// handle with no deadline, which is a second wait in front of the one wait; the loop's own note
+	// forbids that in as many words. `wait_any` says this handle is READY, so the ordinary answer is
+	// a message and the empty one costs a pass - and a pass is what keeps every other handle served.
+	//
+	// THIS IS THE ONE THAT FIRED. Counting this loop's passes: sixteen during bring-up, the last of
+	// them beside the catalogue's own "as many clients as it will hold", and then none at all -
+	// through a chassis power button press sixty seconds later that the kernel had enqueued, on the
+	// right object, and said so.
+	let (len, handles) = match try_recv_caps(channel, buf) {
+		PolledCaps::Message { len, handles } => (len, handles),
+		// NOTHING THERE IS NOT A CLOSED PEER. Answering `false` would retire a live connection.
+		PolledCaps::Empty => return true,
+		PolledCaps::Closed => return false,
+	};
 	for &handle in handles.as_slice() {
 		close(handle);
 	}
 	if len >= 2 {
 		let op: u16 = u16::from_le_bytes([buf[0], buf[1]]);
 		if op == HEARTBEAT_OP {
-			send_blocking(channel, b"PONG", 0);
-			return true;
+			return reply_or_retire(channel, b"PONG", 0);
 		}
 		if op == CONNECT_OP && is_root {
 			match channel_pair_for_catalogue(clients) {
 				Some(theirs) => {
-					if !send_blocking(channel, &[], theirs) {
+					if !reply_or_retire(channel, &[], theirs) {
 						close(theirs);
 						clients.retire(clients.count - 1);
 					}
 				}
 				None => {
-					send_blocking(channel, &[], 0);
+					reply_or_retire(channel, &[], 0);
 				}
 			}
 			return true;
@@ -5696,7 +5999,7 @@ fn open_subscription(service: u64, catalogue: &mut Catalogue, nodes: &[Node], re
 	// when the reply arrives. A refused registration closes the producer, so still return the
 	// consumer in that case and let the caller observe the closed stream.
 	let _ = catalogue.subscribe_stream(kind, producer);
-	if !send_blocking(service, &corr.to_le_bytes(), consumer) {
+	if !send_with_room(service, &corr.to_le_bytes(), consumer) {
 		// A failed transfer leaves this handle ours. Closing it also makes a registered stream
 		// reapable, so a caller that disappeared cannot occupy a subscriber slot.
 		close(consumer);

@@ -2580,6 +2580,18 @@ class LabGuest:
 		except SystemExit:
 			return False
 
+	# One monitor command, with the monitor's own words handed back.
+	#
+	# THE ANSWER MATTERS AND THE EXIT STATUS DOES NOT. This monitor reports in prose: a `device_del`
+	# on a bus with no hot-plug support answers "Bus 'sata.0' does not support hotplugging" and looks
+	# like success to anything that only checks whether the command was accepted. The caller decides
+	# what the words mean; `None` is the monitor not answering at all.
+	def monitor(self, command, timeout=None):
+		try:
+			return monitor_command(command, timeout=5 if timeout is None else max(1, int(timeout)))
+		except SystemExit:
+			return None
+
 	def wait_prompt(self, timeout):
 		# A cold run has no broker to ask, so the guest's own console log is what answers. The
 		# broker path stays for the persistent instance, where it is cheaper than polling a file

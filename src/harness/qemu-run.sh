@@ -699,11 +699,23 @@ qemu_attach_nvme() {
 		# for virtio-sound - a wav file, a spice sink or none, depending on how the run was asked for.
 		# Without it QEMU refuses the codec outright and the guest never starts.
 		-device "hda-duplex,bus=hdabus.0,audiodev=snd0"
-		# A SECOND CODEC ON THE SAME LINK, which is the one thing the HDA item's remaining open point
-		# needs and which nothing here presented: with one codec, "take the first that answers" and
-		# "walk every codec until one has a route" are the same code, and a driver that stopped at a
-		# first codec with no usable pin would fail on a machine whose second one was fine.
-		-device "hda-micro,bus=hdabus.0,audiodev=snd0"
+	)
+	# A SECOND CODEC ON THE SAME LINK, AND ONLY WHERE AN ORACLE LOOKS AT IT.
+	#
+	# With one codec, "take the first that answers" and "walk the codecs until one has a route" are
+	# the same code, so the HDA item's remaining open point could not be closed by reading the driver.
+	# The oracle that needs it is an in-guest test, so the fixture belongs to the TEST profile.
+	#
+	# NOT ON THE INTERACTIVE PROFILE, AND THAT IS MEASURED RATHER THAN TIDINESS. This function is
+	# shared with the profile `lab.sh` boots, and adding the codec there made
+	# `check.sh --gate qemu-pcie-hotplug` fail with "the slot took a device once and not twice - it
+	# was left powered down". Taking it back out made the gate pass again, so the extra function on
+	# that machine is what moved it - which is the same lesson the hot-plug port taught when it was
+	# appended last rather than inserted among the others.
+	if [[ "${TEST:-0}" == "1" ]]; then
+		arr+=(-device "hda-micro,bus=hdabus.0,audiodev=snd0")
+	fi
+	arr+=(
 		# AND A SCSI HOST CONTROLLER WITH A TARGET BEHIND IT, which is the shape a machine with a real
 		# HBA has: the driver speaks the SCSI command set to a target rather than a block device's own
 		# tiny request format, and the same block contract comes out of both.
@@ -2275,6 +2287,27 @@ qemu_run_aarch64() {
 		qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
 	fi
 
+	# A BOOT FRAMEBUFFER ON THE EMULATED TEST PROFILE, WHICH IT HAS NEVER HAD.
+	#
+	# Both emulated boots print `no GOP framebuffer (serial-only boot log)`, so the loader's
+	# simple-framebuffer descriptor path - the one the GOP item calls "read and arithmetic but UNRUN
+	# on these two ports" - is never executed there however many times the suites pass. `ramfb` is the
+	# cheapest thing that could change that: firmware finds it and the loader builds the descriptor.
+	#
+	# IT IS NOT `virtio-gpu`, DELIBERATELY. This profile leaves the GPU out because its bring-up is
+	# the heaviest here and put itself past the two-second READY deadline under TCG, taking
+	# DisplayService and five services behind it down. ramfb has no bring-up to be late for: it is a
+	# range firmware describes, which is the whole reason the boot path being tested exists.
+	#
+	# AND ONLY FOR THE TEST PROFILE, because the interactive one attaches its own ramfb and QEMU
+	# refuses the pair outright: `-device ramfb: duplicate fw_cfg file name: vgaroms/vgabios-ramfb.bin`,
+	# which takes the guest down before it serves anything. This is the SECOND time a fixture added to
+	# a shared path landed on a machine it was not meant for - the HDA codec was the first - and the
+	# rule both taught is the same: a fixture one profile needs is attached by that profile.
+	if [[ "${TEST:-0}" == "1" ]]; then
+		qemu_args+=(-device "ramfb")
+	fi
+
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
 	if [[ "$reduced" != "1" ]]; then
 		qemu_prepare_usb_image "$media_suffix"
@@ -2578,6 +2611,27 @@ qemu_run_riscv64() {
 	# THE ONE ENDPOINT THE DISPLAY PHASE IS ABOUT, on the reduced machine.
 	if [[ "$dma_display" == "1" ]]; then
 		qemu_args+=(-device "virtio-gpu-pci,$virtio_opts")
+	fi
+
+	# A BOOT FRAMEBUFFER ON THE EMULATED TEST PROFILE, WHICH IT HAS NEVER HAD.
+	#
+	# Both emulated boots print `no GOP framebuffer (serial-only boot log)`, so the loader's
+	# simple-framebuffer descriptor path - the one the GOP item calls "read and arithmetic but UNRUN
+	# on these two ports" - is never executed there however many times the suites pass. `ramfb` is the
+	# cheapest thing that could change that: firmware finds it and the loader builds the descriptor.
+	#
+	# IT IS NOT `virtio-gpu`, DELIBERATELY. This profile leaves the GPU out because its bring-up is
+	# the heaviest here and put itself past the two-second READY deadline under TCG, taking
+	# DisplayService and five services behind it down. ramfb has no bring-up to be late for: it is a
+	# range firmware describes, which is the whole reason the boot path being tested exists.
+	#
+	# AND ONLY FOR THE TEST PROFILE, because the interactive one attaches its own ramfb and QEMU
+	# refuses the pair outright: `-device ramfb: duplicate fw_cfg file name: vgaroms/vgabios-ramfb.bin`,
+	# which takes the guest down before it serves anything. This is the SECOND time a fixture added to
+	# a shared path landed on a machine it was not meant for - the HDA codec was the first - and the
+	# rule both taught is the same: a fixture one profile needs is attached by that profile.
+	if [[ "${TEST:-0}" == "1" ]]; then
+		qemu_args+=(-device "ramfb")
 	fi
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.

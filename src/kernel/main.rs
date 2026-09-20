@@ -30,6 +30,8 @@ mod memlayout;
 mod object;
 mod panic;
 mod pkg;
+// Fixed-hardware platform events (the power button), and the channel they are delivered on.
+mod platform_event;
 mod product;
 mod sched;
 mod smp;
@@ -454,12 +456,17 @@ fn boot_main() {
 	// receive interrupt, so a typed byte reaches the shell at once rather than on the next
 	// tick-quantized poll. The other two ports poll their UART and arrange nothing here.
 	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
-	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
+	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0), arch::ioapic::Kind::IsaEdge);
 	arch::serial::enable_rx_irq();
 	// ONLY THIS PORT ARMS AN INTERRUPT. The slot protocol is config space and every backend polls it
 	// on the idle pass; what is x86_64's alone is routing a legacy line through an I/O APIC.
 	#[cfg(target_arch = "x86_64")]
 	arm_hot_plug_interrupts();
+	// AND THE SAME IS TRUE OF THE ACPI SCI, for the same reason and one more: a device-tree machine
+	// describes its power button as a node with its own interrupt, which is a different mechanism
+	// with a different owner. This is the FIXED-HARDWARE path and it exists on x86 alone.
+	#[cfg(target_arch = "x86_64")]
+	arch::sci::init(boot_info().rsdp);
 	// THREE THOUSAND TICKS - THIRTY SECONDS - AND THE NUMBER IS A MEASUREMENT.
 	//
 	// It was 300, inherited from what `console_shell_loop` used to wait on this port before the wait
@@ -515,6 +522,10 @@ fn serial_console_pump() {
 	settle_hot_plug();
 	// AND WHAT THE BUS REPORTED ABOUT ITSELF. See `settle_pci_faults`.
 	settle_pci_faults();
+	// AND THE CHASSIS BUTTONS, WHOSE HANDLER DELIBERATELY DOES NOTHING BUT SET A BIT. Sending on a
+	// channel takes locks an ordinary thread can be holding when a hardware interrupt arrives, so
+	// the ACPI SCI handler records the press and this pass delivers it. See `platform_event`.
+	platform_event::deliver();
 }
 
 // Drive the interactive userspace shell. The boot chain has already started it as
@@ -1214,7 +1225,13 @@ fn arm_hot_plug_interrupts() {
 			};
 			arch::pci::set_intx_disabled(port.bus, port.dev, port.func, false);
 			arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + line as u32, hot_plug_interrupt);
-			arch::ioapic::route(line as u32, arch::interrupts::IRQ_BASE + line, smp::lapic_id(0));
+			// LEVEL-TRIGGERED AND ACTIVE-LOW, WHICH IS WHAT AN INTx PIN IS. This routed the ISA
+			// defaults, and the comment on `settle_hot_plug` already named the consequence without
+			// connecting it to the cause: "a level-triggered line one handler already cleared" is a
+			// line whose EDGE nobody saw. Every event this path reports is acknowledged inside the
+			// handler - `poll_slots` writes the slot's sticky bits back before it returns - so the
+			// source is clear before the EOI, which is the condition a level entry needs.
+			arch::ioapic::route(line as u32, arch::interrupts::IRQ_BASE + line, smp::lapic_id(0), arch::ioapic::Kind::LevelLow);
 			serial_println!("pci: hot-plug port {:02x}:{:02x}.{} raises IRQ {line}", port.bus, port.dev, port.func);
 		}
 	}

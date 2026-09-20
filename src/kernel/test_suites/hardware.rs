@@ -2154,3 +2154,52 @@ fn a_slot_is_powered_down_only_once_nothing_holds_the_device() {
 	// A REQUEST FOR A SLOT NOBODY ASKED ABOUT IS NOT AN ANSWER.
 	assert!(device::retire_requested_slots().is_empty());
 }
+
+tagged_test!(a_platform_event_raised_before_anything_listens_is_held_and_delivered_once, [Kernel], id = "kernel.hardware.a_platform_event_raised_before_anything_listens_is_held_and_delivered_once", covers = ["kernel"]);
+fn a_platform_event_raised_before_anything_listens_is_held_and_delivered_once() {
+	// THE WINDOW THIS IS ABOUT IS REAL AND IT IS SECONDS LONG. The kernel arms the power button in
+	// its boot tail; the program that receives the event registers its channel some way into
+	// userspace bring-up. A press in between is a press on a machine whose power button appears not
+	// to work, with nothing anywhere saying why - so it is LATCHED, and this is the test that it is.
+	//
+	// THE LATCH IS DRAINED FIRST, because this suite runs on a machine whose real buttons nobody is
+	// pressing but whose latch is shared state: a test that assumed it started empty would pass or
+	// fail on what ran before it.
+	crate::platform_event::drain_for_test();
+
+	crate::platform_event::report(crate::platform_event::POWER_BUTTON);
+	let (kernel_side, ours) = crate::object::channel::Channel::create();
+	crate::platform_event::attach(kernel_side);
+	// THE DELIVERY IS THE IDLE PASS'S AND NOT THE ATTACH'S, which is what keeps a channel send out
+	// of the interrupt handler that recorded the press.
+	crate::platform_event::deliver();
+	let held = ours.recv().expect("the press made before the attach should arrive on it");
+	assert_eq!(held.bytes, alloc::vec![crate::platform_event::POWER_BUTTON], "and it should be the kind that was raised");
+
+	// AND ONCE. A latch that were merely READ rather than taken would deliver the same press to
+	// whoever attached next - a restarted receiver would power the machine off on a button nobody
+	// touched.
+	let (second_kernel_side, second) = crate::object::channel::Channel::create();
+	crate::platform_event::attach(second_kernel_side);
+	crate::platform_event::deliver();
+	assert!(second.recv().is_err(), "the latch was emptied by the first delivery, so a second listener inherits no press");
+
+	// AFTER AN ATTACH THE PRESS GOES STRAIGHT THROUGH, which is the ordinary case and the one the
+	// latch must not swallow.
+	crate::platform_event::report(crate::platform_event::SLEEP_BUTTON);
+	crate::platform_event::deliver();
+	let direct = second.recv().expect("a press after the attach should be delivered on the next pass");
+	assert_eq!(direct.bytes, alloc::vec![crate::platform_event::SLEEP_BUTTON], "and the two buttons are different kinds rather than one with a flag");
+
+	// TWO PRESSES BEFORE ANYBODY LISTENS ARE ONE INSTRUCTION. Nothing is listening once this drops
+	// its listener, and pressing twice must not queue two shutdowns for the next receiver.
+	crate::platform_event::drain_for_test();
+	crate::platform_event::report(crate::platform_event::POWER_BUTTON);
+	crate::platform_event::report(crate::platform_event::POWER_BUTTON);
+	let (third_kernel_side, third) = crate::object::channel::Channel::create();
+	crate::platform_event::attach(third_kernel_side);
+	crate::platform_event::deliver();
+	assert!(third.recv().is_ok(), "the press is delivered");
+	assert!(third.recv().is_err(), "and twice pressed is once delivered - a bitmap and not a count");
+	crate::platform_event::drain_for_test();
+}

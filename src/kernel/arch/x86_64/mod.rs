@@ -14,6 +14,15 @@ mod pit;
 mod port;
 pub mod random;
 pub mod rtc;
+// ACPI fixed-hardware event delivery: the SCI, the PM1 event block and what arrives on them.
+//
+// NOT IN A TEST BUILD, for the same reason `ioapic::route` is not: this routes a real redirection
+// entry on the machine the suite is running on, and there is nothing here a test build could ask it
+// that would not mean reprogramming an interrupt controller underneath the suite. The DECISIONS this
+// module is made of are elsewhere on purpose - which table field says what, in the host-tested
+// `acpi` crate, and what happens to an event nobody is listening for, in `platform_event`.
+#[cfg(not(test))]
+pub mod sci;
 pub mod serial;
 pub mod syscall;
 pub mod tsc;

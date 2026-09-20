@@ -234,6 +234,16 @@ STEP_FIELDS = {
 	# Send a pointer event through the emulated tablet. `x` and `y` are fractions of the screen,
 	# absolute because the device is a tablet; `button` and `action` press, release or click.
 	'pointer': {'required': (), 'optional': ('x', 'y', 'button', 'action', 'timeout')},
+	# ONE QEMU MONITOR COMMAND, which is the only way to change the MACHINE rather than what runs
+	# on it. Plugging a device into a live slot, injecting a PCIe error, taking a disk away: none of
+	# those is something the guest can be asked to do, and a scenario that cannot reach the monitor
+	# cannot exercise any of them.
+	#
+	# WHY IT BELONGS HERE AND NOT ONLY IN `lab.sh monitor`. That subcommand drives the PERSISTENT
+	# instance, which exists for x86_64 alone - so every gate written on it is an x86_64 gate, and
+	# the hot-plug and AER paths on aarch64 and riscv64 had no way to be driven at all. A scenario
+	# runs cold on all three, which is what `scenario-cold` is for.
+	'monitor': {'required': ('command',), 'optional': ('timeout',)},
 	# Assert the terminal was put back: each name in `expect` is one thing an interactive
 	# program turns on and has to turn off again. Asserted against the raw console bytes,
 	# because restoration is escape sequences and nothing else.
@@ -370,6 +380,14 @@ def validate_step(step, index, path):
 					raise ScenarioError(f'{where} (key): {name!r} is not a key this runner knows')
 		elif lab.text_keys(step['text'], step.get('enter', True)) is None:
 			raise ScenarioError(f'{where} (key): text has a character with no key mapping')
+	if kind == 'monitor':
+		if not isinstance(step['command'], str) or not step['command'].strip():
+			raise ScenarioError(f'{where} (monitor): command must be a non-empty string')
+		# A COMMAND PER STEP AND NOT A SCRIPT. The monitor takes one line at a time and answers one
+		# at a time, so two joined by a newline would have the second's answer read as the first's -
+		# and a step that cannot tell which command failed is a step that cannot fail usefully.
+		if '\n' in step['command']:
+			raise ScenarioError(f'{where} (monitor): one command per step; a newline would make the second answer read as the first')
 	if kind == 'pointer':
 		for axis in ('x', 'y'):
 			if axis in step and not (isinstance(step[axis], (int, float)) and not isinstance(step[axis], bool) and 0.0 <= step[axis] <= 1.0):
@@ -646,6 +664,16 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'pointer':
 		if not lab.send_pointer(step.get('x'), step.get('y'), step.get('button'), step.get('action', 'click'), limit):
 			raise ScenarioError(f'{where}: the emulated tablet refused the event')
+	elif kind == 'monitor':
+		# THE MONITOR'S OWN ANSWER IS THE FAILURE, because it reports in prose rather than by exit
+		# status: `device_del` on a bus that cannot do it answers "Bus 'sata.0' does not support
+		# hotplugging" and succeeds as far as any caller can see. The answer is handed back so the
+		# step can say what the machine said, and an `Error` in it fails the step.
+		answer = lab.monitor(step['command'], limit)
+		if answer is None:
+			raise ScenarioError(f'{where}: the monitor refused the command')
+		if 'Error' in answer or 'error:' in answer:
+			raise ScenarioError(f'{where}: the monitor answered - {answer.strip()}')
 	elif kind == 'restored':
 		# In the order named, not merely all present. Order is the property that matters: a
 		# terminal handed back with the alternate screen left before the cursor was shown, or

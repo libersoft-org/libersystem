@@ -352,6 +352,42 @@ THE MIDDLE THREE WERE ADDED ON 2026-09-19 and they are the ones that answered th
 first row varies the commands at a fixed pixel count and the second varies the pixels at a fixed
 command count, which is what separates two terms that had only ever been measured multiplied together.
 
+**AND THE FIVE IMAGE PROBES BESIDE THEM ARE WHAT PUTS A NUMBER UNDER THE TWO IMAGE SCENES'
+CEILINGS (re-measured 2026-09-20).** One full-screen image draw, one probe each:
+
+| probe | replay |
+| --- | ---: |
+| image-photo-bilinear | 47.7 ms |
+| image-photo-mipmapped | 72.5 ms |
+| image-photo-bicubic | 134.4 ms |
+| image-widegamut-bilinear | 49.5 ms |
+| image-yuv-bilinear | 54.7 ms |
+
+**THE PER-PIXEL FLOOR IS 33 NANOSECONDS AND THE CEILING IS 54, AND THAT SETTLES A QUESTION THIS FILE
+HAS BEEN CARRYING.** `one-opaque-fullscreen` is 10.125 ms over 307,200 pixels - one command, a solid
+opaque colour, the backdrop decode already skipped - which is 33 ns for a pixel this backend does
+almost nothing to. A 16.7 ms ceiling over the same frame is 54 ns per pixel FOR EVERYTHING.
+
+SO `image-convert` CANNOT REACH ITS CEILING AT THIS FLOOR, whatever its sampler costs. It draws the
+frame over twice: a full-screen mipmapped wide-gamut draw at 72.5 ms and a full-screen YUV bilinear
+one at 54.7 ms, each measured alone and each already including that frame's single output encode. Two
+of those is 127 ms of work against a 16.7 ms budget, and the twelve tile-sized draws are on top. The
+same arithmetic puts `image-resample` out of reach: its eight downscales and three upscales cover
+about 1.7 frames.
+
+**AND THE FLOOR IS THE OUTPUT ENCODE.** What a covered pixel pays on the way out of the tile, in
+`Encoder::encode_row` and `write_row`: an unpremultiply, THREE `TransferTable::encode` calls - each a
+square root, two table reads and a lerp - a dither add, a re-premultiply and four quantisations. The
+three square roots alone are most of the 33 ns.
+
+WHY THAT IS NOT A TUNING PASS. A fused linear-float-to-encoded-byte table would remove the square
+root, the lerp and the quantisation together, and it would CHANGE THE PIXELS: the conformance suite
+compares output exactly, and the dither path adds its offset in encoded space between the encode and
+the quantisation. So it is a change to what this backend produces, decided against the conformance
+registry, and not something to slip into a performance pass. It is named here because it is the
+lever, and because the two image scenes' ceilings are a question for the project owner that now has
+a measurement under it rather than an estimate.
+
 **A DAMAGE-LIMITED REDRAW NOW COSTS WHAT IT DRAWS.** A tile was decoded and re-encoded WHOLE, so a
 drawing that touched three pixels of it paid sixty-four rows of conversion for them; the round trip is
 now over the union of the bounds of the commands binned to that tile, which `prepare` already knows.

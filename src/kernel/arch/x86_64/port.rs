@@ -39,6 +39,16 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
 	}
 }
 
+// Read a word (16 bits) from an I/O port.
+#[inline]
+pub(crate) unsafe fn inw(port: u16) -> u16 {
+	unsafe {
+		let value: u16;
+		asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack, preserves_flags));
+		value
+	}
+}
+
 // Read a long (32 bits) from an I/O port.
 #[inline]
 pub(crate) unsafe fn inl(port: u16) -> u32 {

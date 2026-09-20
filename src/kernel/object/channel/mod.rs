@@ -209,6 +209,15 @@ impl Channel {
 		self.peer.lock().as_ref().and_then(|w| w.upgrade())
 	}
 
+	/// The identity of the endpoint a send through this one reaches, or `None` once it is gone.
+	///
+	/// FOR SAYING WHICH OBJECT A MESSAGE WENT TO. A channel's two ends are ordinary objects with
+	/// ordinary identities, and a delivery that cannot be traced to one of them is a delivery nobody
+	/// can reason about - which is a state this tree has been in once, for a day.
+	pub fn peer_koid(&self) -> Option<u64> {
+		self.peer().map(|peer| peer.header.koid())
+	}
+
 	// True once the peer endpoint has been closed.
 	pub fn is_peer_closed(&self) -> bool {
 		self.peer().is_none()

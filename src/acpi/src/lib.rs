@@ -406,6 +406,46 @@ pub struct Block {
 }
 
 impl Block {
+	/// THE ENABLE REGISTER OF AN EVENT BLOCK, which is HALF A BLOCK PAST THE STATUS REGISTER.
+	///
+	/// A PM1 event block is TWO REGISTERS AND THE FADT DECLARES THEIR TOTAL: status is the lower half
+	/// and enable the upper half. That one piece of arithmetic is the whole of this function, and it
+	/// is here rather than in the consumer because of what getting it wrong does - writing the enable
+	/// bits into the STATUS register ACKNOWLEDGES events instead of arming them, which changes
+	/// nothing a reader can see and leaves a machine whose power button does nothing.
+	///
+	/// A DECLARED LENGTH THAT IS NOT TWO REGISTERS IS REFUSED RATHER THAN HALVED. One byte has no
+	/// second half at all, and an odd length cannot be halved into two registers of the same width -
+	/// taking the floor would put the enable register one byte INSIDE the status register. Zero is
+	/// the absent case and is refused with them.
+	///
+	/// IT ANSWERS FOR SYSTEM-I/O BLOCKS ONLY, because a port is sixteen bits and the address of an
+	/// event block in any other space is not one. A caller with a memory-mapped block computes its
+	/// own offset from the same rule.
+	pub fn enable_port(&self) -> Option<u16> {
+		if self.gas.space != AddressSpace::SystemIo {
+			return None;
+		}
+		if self.declared_bytes < 2 || self.declared_bytes % 2 != 0 {
+			return None;
+		}
+		let base = u16::try_from(self.gas.address).ok()?;
+		base.checked_add(self.declared_bytes as u16 / 2)
+	}
+
+	/// The system-I/O port a block sits at, or `None` for a block in another address space.
+	///
+	/// THE STANDARD ALLOWS THESE BLOCKS IN SYSTEM MEMORY and every machine this reader runs on puts
+	/// them in port I/O. A consumer that treated an address as a port because it expected one would
+	/// be writing to a port numbered by the low sixteen bits of a physical address, which is a real
+	/// port belonging to something else.
+	pub fn io_port(&self) -> Option<u16> {
+		if self.gas.space != AddressSpace::SystemIo {
+			return None;
+		}
+		u16::try_from(self.gas.address).ok()
+	}
+
 	/// Whether the extended form's width and the legacy length say the same thing.
 	///
 	/// A FIRMWARE WHOSE TWO DESCRIPTIONS DISAGREE IS A REAL DEFECT and the consumer is the one that
@@ -763,6 +803,153 @@ impl<'a> Fadt<'a> {
 		let bit_width = (declared_bytes as u32 * 8).min(u8::MAX as u32) as u8;
 		let gas = Gas { space: AddressSpace::SystemIo, bit_width, bit_offset: 0, access: AccessSize::Undefined, address: address as u64 };
 		Some(Block { gas, declared_bytes, source: BlockSource::Legacy })
+	}
+}
+
+/// How an interrupt line is asserted, as the MADT's flags word states it.
+///
+/// THE "CONFORMS TO THE BUS" VALUE IS KEPT AND NOT RESOLVED HERE. Zero means "whatever this source's
+/// bus specifies", and what that is depends on the bus: an ISA line is edge-triggered and
+/// active-high, a PCI line is level-triggered and active-low. A reader that collapsed zero into one
+/// of those would be answering a question about a BUS while reading a table about an INTERRUPT, and
+/// the caller is the one that knows which bus its source is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Polarity {
+	/// Conforms to the specification of the bus the source is on.
+	Bus,
+	ActiveHigh,
+	ActiveLow,
+	/// The reserved encoding, kept rather than mapped onto one of the two real ones.
+	Reserved,
+}
+
+/// How an interrupt line is delivered, as the MADT's flags word states it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Trigger {
+	/// Conforms to the specification of the bus the source is on.
+	Bus,
+	Edge,
+	Level,
+	/// The reserved encoding, kept rather than mapped onto one of the two real ones.
+	Reserved,
+}
+
+/// One MADT Interrupt Source Override: an ISA source that does NOT arrive at the Global System
+/// Interrupt of the same number, or that does not arrive the way its bus would say.
+///
+/// BOTH HALVES MATTER AND FIRMWARE USES BOTH. The classic PC remaps the timer - ISA IRQ 0 arrives
+/// at GSI 2 - which is the redirection half; and QEMU's q35 leaves the SCI at its own number and
+/// overrides only its POLARITY AND TRIGGER, because an ISA line defaults to edge-triggered
+/// active-high and the SCI is neither. A reader that took only the GSI would route the SCI to the
+/// right pin and configure it as the wrong kind of line, which on a level source means it is
+/// delivered once and then never again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InterruptOverride {
+	/// The bus the source is on. Zero is ISA and is the only value the standard defines.
+	pub bus: u8,
+	/// The source's number on that bus - an ISA IRQ, for bus zero.
+	pub source: u8,
+	/// The Global System Interrupt it actually arrives at.
+	pub gsi: u32,
+	pub polarity: Polarity,
+	pub trigger: Trigger,
+}
+
+/// The Multiple APIC Description Table, read for the entries this system acts on.
+///
+/// WHAT IT IS FOR HERE IS THE OVERRIDES AND NOT THE PROCESSORS. The kernel already walks this table
+/// for local APIC ids in its own boot path, where it runs before there is anything to test with; the
+/// entries below are DECISIONS about how a line is configured, and a decision belongs where a fixture
+/// can plant the mistake. A caller wanting the processors keeps its own walk.
+#[derive(Clone, Copy)]
+pub struct Madt<'a> {
+	table: Table<'a>,
+}
+
+/// The MADT's entries begin after the 36-byte header, a 4-byte local controller address and a
+/// 4-byte flags word.
+const MADT_ENTRIES: usize = 44;
+
+/// An Interrupt Source Override entry is type 2 and ten bytes.
+const MADT_OVERRIDE: u8 = 2;
+const MADT_OVERRIDE_LEN: usize = 10;
+
+impl<'a> Madt<'a> {
+	/// Validate the bytes as an `APIC` table.
+	pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
+		Ok(Self { table: Table::with_signature(bytes, b"APIC")? })
+	}
+
+	pub fn table(&self) -> &Table<'a> {
+		&self.table
+	}
+
+	/// The override for `source` on the ISA bus, or `None` when the firmware states none.
+	///
+	/// `None` IS AN ANSWER AND NOT A FAILURE. A source with no override arrives at the Global System
+	/// Interrupt of its own number, configured the way its bus specifies - which is what the standard
+	/// says in as many words, and is why the absence has to be distinguishable from a table this
+	/// reader could not walk.
+	///
+	/// THE FIRST MATCH WINS. A table listing the same source twice is firmware disagreeing with
+	/// itself, and taking the last would mean the answer depended on how far the walk got.
+	pub fn isa_override(&self, source: u8) -> Option<InterruptOverride> {
+		self.overrides().find(|entry| entry.bus == 0 && entry.source == source)
+	}
+
+	/// Every Interrupt Source Override the table carries, in the order the firmware wrote them.
+	///
+	/// AN ENTRY THAT DOES NOT FIT INSIDE THE TABLE ENDS THE WALK. A length of zero would not advance
+	/// and a length running past the declared end is a structure this table does not contain; both
+	/// are firmware that is structurally wrong under a checksum that passed, which is the case a
+	/// boot path has nobody to complain to about.
+	pub fn overrides(&self) -> impl Iterator<Item = InterruptOverride> + '_ {
+		let mut offset = MADT_ENTRIES;
+		core::iter::from_fn(move || {
+			loop {
+				let kind = self.table.u8_at(offset)?;
+				let len = self.table.u8_at(offset + 1)? as usize;
+				if len < 2 || offset.checked_add(len)? > self.table.len() {
+					return None;
+				}
+				let here = offset;
+				offset += len;
+				// THE DECLARED LENGTH HAS TO COVER THE ENTRY, not merely fit in the table. An
+				// override declaring eight bytes has no flags word, and reading one out of the next
+				// entry is how a walk answers a question about the wrong structure.
+				if kind == MADT_OVERRIDE && len >= MADT_OVERRIDE_LEN {
+					let bus = self.table.u8_at(here + 2)?;
+					let source = self.table.u8_at(here + 3)?;
+					let gsi = self.table.u32_at(here + 4)?;
+					let flags = self.table.u16_at(here + 8)?;
+					return Some(InterruptOverride { bus, source, gsi, polarity: polarity_of(flags), trigger: trigger_of(flags) });
+				}
+			}
+		})
+	}
+}
+
+/// Bits 1:0 of an MPS INTI flags word.
+fn polarity_of(flags: u16) -> Polarity {
+	match flags & 0b11 {
+		0 => Polarity::Bus,
+		1 => Polarity::ActiveHigh,
+		3 => Polarity::ActiveLow,
+		_ => Polarity::Reserved,
+	}
+}
+
+/// Bits 3:2 of an MPS INTI flags word.
+///
+/// THE SHIFT IS TWO AND THE MASK IS TWO BITS, which is the mistake this function exists to make once.
+/// A reader masking the whole low nibble reads polarity and trigger together as one number, and
+/// every override that states both comes back as a value neither enumeration has.
+fn trigger_of(flags: u16) -> Trigger {
+	match (flags >> 2) & 0b11 {
+		0 => Trigger::Bus,
+		1 => Trigger::Edge,
+		3 => Trigger::Level,
+		_ => Trigger::Reserved,
 	}
 }
 
