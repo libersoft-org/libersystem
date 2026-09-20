@@ -2103,8 +2103,16 @@ qemu_run_x86_64() {
 		# the whole inverted used-ring path run exactly as they would with a microphone. What it
 		# cannot prove is the sample values, which is why the recording test asserts that what it got
 		# IS silence - a path returning stale playback data or uninitialised memory fails that.
+		# THE BACKEND IS DEFINED FOR EVERY MACHINE THAT NAMES IT, AND A DMA FIXTURE NAMES IT.
+		#
+		# This sat inside the branch below with the sound CARD, and the HDA controller attached by
+		# `qemu_attach_nvme` names `snd0` on every x86_64 machine this runner builds - so a fixture
+		# run got a codec with no backend behind it and QEMU refused to start at all: `audiodev
+		# 'snd0' not found`, before a single instruction of the guest. An `-audiodev` is a backend
+		# definition and no device; defining it costs a fixture nothing and keeps the machine
+		# self-consistent whatever else is left out of it.
+		qemu_append_audio qemu_args
 		if [[ "$dma_fixture" != "1" ]]; then
-			qemu_append_audio qemu_args
 			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
 			qemu_attach_entropy qemu_args
 			# AND THE HOST STREAM TRANSPORT, whose other end is a process on this machine rather

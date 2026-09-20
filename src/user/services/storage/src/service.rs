@@ -372,7 +372,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			match live_volume(handle) {
 				Some(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME })),
-				None => exit(),
+				// SAID BEFORE IT GOES. This service exiting is how "the machine has no system
+				// volume" is expressed, and an exit with nothing in the log is indistinguishable
+				// from a crash - which is where a boot that dies here sends its reader.
+				None => {
+					print(b"storage: the system volume could not be built from the handed-over image; this service is exiting and nothing will serve vol://system\n");
+					exit()
+				}
 			}
 		}
 		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"RAMVOL" => match LiberMemFs::mount(MemPolicy::Reserved, mem_capacity(&buf[6..len])) {
@@ -3240,28 +3246,74 @@ impl BlockDevice for ImageDevice {
 // Sized from the image rather than from the scratch sizes the other memory volumes carry: a live
 // session's system volume holds what the medium shipped, plus room to work in.
 fn live_volume(handle: u64) -> Option<LiberMemFs> {
-	let image = unsafe { read_buffer(&Buffer { handle, len: object_info(handle)?.size }) }?;
+	// **EVERY WAY THIS CAN FAIL SAYS WHICH WAY IT WAS.** Six `?`s returned `None` in silence and the
+	// caller answers `None` with `exit()`, so a system volume that could not be built took the
+	// storage service down with NOTHING anywhere about it: the boot then failed several services
+	// later, at `no artifact at vol://system/libexec/...`, which sends whoever reads it to the
+	// volume's contents rather than to the volume that was never built.
+	let Some(info) = object_info(handle) else {
+		print(b"storage: vol://system NOT built: the handed-over image object cannot be measured\n");
+		return None;
+	};
+	let Some(image) = (unsafe { read_buffer(&Buffer { handle, len: info.size }) }) else {
+		print(b"storage: vol://system NOT built: the handed-over image could not be read into memory\n");
+		return None;
+	};
 	// Sized from what the image HOLDS, not from how big the image is: a compressed source expands,
 	// names cost, and a buffer keeps the capacity it grew to. Guessing from the image size is how
 	// a copy runs out of room half way through.
 	// A truncated or foreign image is simply not a live volume here - this path builds one from a
 	// staged image and has nothing to format, so the reason is not actionable.
-	let mut source = LiberFs::mount(ImageDevice { bytes: image }).ok()?;
+	// AND WHICH REFUSAL IT WAS. "It does not mount" covers a truncated image, a foreign one and a
+	// machine that could not hold the volume's free maps, and those send a reader to three different
+	// places - the first two to the image, the third to the memory the boot had left.
+	let mut source = match LiberFs::mount(ImageDevice { bytes: image }) {
+		Ok(mounted) => mounted,
+		Err(reason) => {
+			print(match reason {
+				MountError::NoMemory => b"storage: vol://system NOT built: this machine could not hold the handed-over image's free maps - the image is fine; the memory was not there\n".as_slice(),
+				MountError::Unformatted => b"storage: vol://system NOT built: the handed-over image is not a LiberFS volume at all\n".as_slice(),
+				MountError::Unsupported => b"storage: vol://system NOT built: the handed-over image was written by a newer or different LiberFS build\n".as_slice(),
+				MountError::DeviceTooSmall => b"storage: vol://system NOT built: the handed-over image is shorter than the volume it claims\n".as_slice(),
+				MountError::Io => b"storage: vol://system NOT built: the handed-over image could not be read through\n".as_slice(),
+				_ => b"storage: vol://system NOT built: the handed-over image's superblocks are damaged\n".as_slice(),
+			});
+			return None;
+		}
+	};
 	// Checked throughout, matching `measure` itself. Corrupt metadata that measures near the top
 	// of the address space would otherwise panic in debug and WRAP in release - and a wrapped
 	// total sizes the volume far too small, which is the worst of the three outcomes because it
 	// looks like a successful mount.
-	let wanted = match measure(&mut source, b"", 0) {
-		Some(bytes) => bytes.checked_add(bytes / 4)?.checked_add(4 * 1024 * 1024)?,
-		None => return None,
+	let wanted = match measure(&mut source, b"", 0).and_then(|bytes| bytes.checked_add(bytes / 4)).and_then(|bytes| bytes.checked_add(4 * 1024 * 1024)) {
+		Some(bytes) => bytes,
+		None => {
+			print(b"storage: vol://system NOT built: the image's contents could not be measured\n");
+			return None;
+		}
 	};
-	let mut live = LiberMemFs::mount(MemPolicy::Capped, wanted).ok()?;
+	let Ok(mut live) = LiberMemFs::mount(MemPolicy::Capped, wanted) else {
+		print(b"storage: vol://system NOT built: this machine could not hold a writable copy of the image\n");
+		return None;
+	};
 	// Every failure stops the import. A live system that comes up missing executables because a
 	// write was refused half way through is worse than one that refuses to come up: the first is
 	// discovered by whoever needed the missing file.
-	let copied = copy_tree(&mut source, &mut live, b"", 0)?;
-	print(b"storage: vol://system is a live copy in memory (the medium is never written)\n");
-	let _ = copied;
+	let Some(copied) = copy_tree(&mut source, &mut live, b"", 0) else {
+		print(b"storage: vol://system NOT built: the copy into memory stopped part way, so nothing is served rather than half a system\n");
+		return None;
+	};
+	// **AND WHAT IT WAS COPIED FROM.** The count was computed and thrown away, so a live volume built
+	// from an image holding nothing announced itself in exactly the words a working one uses. It is
+	// the image's TOP-LEVEL entries, which is what `copy_tree` answers - two on a healthy system, and
+	// saying which number is healthy is half of what the line is for: a reading of it as a file count
+	// sent this measurement down a wrong path for a run.
+	let mut number = [0u8; 20];
+	let digits = decimal(copied as u64, &mut number);
+	print(b"storage: vol://system is a live copy in memory (the medium is never written), from an image of ");
+	print(&number[..digits]);
+	print(b" top-level entr");
+	print(if copied == 1 { b"y\n".as_slice() } else { b"ies\n".as_slice() });
 	Some(live)
 }
 
@@ -4208,6 +4260,27 @@ unsafe fn map_buffer(data: &Buffer) -> Option<MappedBuffer> {
 // Copy the bytes behind a zero-copy `data` buffer out into a Vec and release the
 // transferred buffer handle. Always consumes the handle. Returns None on failure or
 // if the claimed length exceeds the transferred object's real size.
+// A count, as digits, for the lines that carry one. No formatter exists on this path and a line that
+// says "holding some entries" is not worth printing.
+fn decimal(value: u64, out: &mut [u8; 20]) -> usize {
+	if value == 0 {
+		out[0] = b'0';
+		return 1;
+	}
+	let mut digits = [0u8; 20];
+	let mut at: usize = 0;
+	let mut rest = value;
+	while rest > 0 && at < digits.len() {
+		digits[at] = b'0' + (rest % 10) as u8;
+		rest /= 10;
+		at += 1;
+	}
+	for index in 0..at {
+		out[index] = digits[at - 1 - index];
+	}
+	at
+}
+
 unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 	unsafe {
 		if data.handle == 0 {

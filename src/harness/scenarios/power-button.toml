@@ -20,6 +20,12 @@
 # was done with it", and those are two defects with two owners.
 version = 1
 name = "power button"
+# AND IT ENDS WITH THE MACHINE OFF, WHICH IS THE ASSERTION AND NOT AN ACCIDENT. The last step waits
+# for the consumer to say it is acting on the press; what it acts on is `power_off`. Every other
+# scenario gives its scope back by driving the guest afterwards - a keystroke, a prompt, a reset -
+# and there is nothing here to drive. The teardown asserts the opposite instead: that nothing
+# answers any more.
+ends = "powered-off"
 description = "The chassis power button raises an SCI the kernel decodes, acknowledges and reports."
 timeout = 300
 

@@ -218,6 +218,17 @@ impl Channel {
 		self.peer().map(|peer| peer.header.koid())
 	}
 
+	/// How many messages this endpoint has handed its peer that the peer has not taken yet, or `None`
+	/// once the peer is gone.
+	///
+	/// FOR TELLING "IT WAS DELIVERED AND NOBODY READ IT" FROM "IT NEVER ARRIVED" AND FROM "IT WAS READ
+	/// AND ACTED ON". A sender that can only report that its own send succeeded leaves those three as
+	/// one answer, and a machine whose chassis button appears dead is exactly where that costs a day -
+	/// see `platform_event::check_unread`.
+	pub fn peer_unread(&self) -> Option<usize> {
+		self.peer().map(|peer| peer.inbox.lock().len())
+	}
+
 	// True once the peer endpoint has been closed.
 	pub fn is_peer_closed(&self) -> bool {
 		self.peer().is_none()

@@ -58,7 +58,17 @@ mod arch {
     pub mod interrupts { pub fn msi_quarantined_for_device(_: u32) -> u32 { 0 } }
 }
 mod dma_policy {
-    pub fn admit(_: u16, _: u8, _: u8, _: u8) -> dma::BindDecision { dma::BindDecision::Translated }
+    pub fn admit_decision(_: u16, _: u8, _: u8, _: u8) -> dma::BindDecision { dma::BindDecision::Translated }
+    // WHAT A CLAIM IS ALLOWED TO DO, which `claim` asks before it lets a device master the bus. It
+    // took a device type and three PCI bytes; it takes the ENTRY NAME and the whole discovered
+    // identity now, and answers the policy code the entry declares beside its admission. The fixture
+    // admits everything as TRANSLATED because what it is about is the attach and completion path
+    // behind that answer - the decision itself has its own fixtures.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Admission { Translated, DegradedUntranslated, NonMastering }
+    pub fn admit(_entry: &[u8; abi::ENTRY_NAME_LEN], _device: &crate::driver_binding::Discovered, _device_type: u16) -> Result<(Admission, u8), ()> {
+        Ok((Admission::Translated, 0))
+    }
 }
 struct SpinLock<T>(Mutex<T>);
 impl<T> SpinLock<T> {
@@ -85,22 +95,39 @@ mod iommu {
     pub use super::{attach_for, attachment_quarantined, map_device_buffer, unmap_for_device};
     pub fn translating() -> bool { true }
 }
+mod driver_binding {
+    // The device identity the policy decides on. One struct, by value, with the fields `claim`
+    // fills in - the crate it comes from is userspace and is not a dependency of this fixture.
+    pub struct Discovered { pub transport: u8, pub virtio_type: u32, pub class: u8, pub subclass: u8, pub prog_if: u8, pub vendor: u16, pub product: u16, pub bus: u8, pub dev: u8, pub func: u8 }
+}
+// THE ENTRY EVERY CLAIM IN THIS FIXTURE IS MADE UNDER. A claim names the manifest entry it is
+// admitted against, and what these regressions are about is what happens AFTER that answer, so
+// one name serves all of them.
+pub const ENTRY: [u8; abi::ENTRY_NAME_LEN] = [0; abi::ENTRY_NAME_LEN];
 mod device {
     use super::{SpinLock, Ordering, AtomicUsize};
-    struct Entry { device_type: u16, bus: u8, dev: u8, func: u8, on_bus: bool }
+    use crate::{driver_binding, dma_policy};
+    // THE FIELDS `claim` READS TODAY. This stub carried five and the production function it is
+    // compiled against builds a `Discovered` out of eleven, so the fixture stopped compiling the
+    // moment the device identity grew - which is the whole of what this checker had been
+    // reporting as a failure.
+    struct Entry { device_type: u16, transport: u8, vendor: u16, product: u16, class: u8, subclass: u8, prog_if: u8, bus: u8, dev: u8, func: u8, on_bus: bool }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ClaimState { Free, Claimed, Releasing, Quarantined }
     #[derive(Debug, PartialEq, Eq)]
     pub enum ClaimError { NoSuchDevice, AlreadyClaimed, Quarantined, Retired, Refused }
-    struct Slot { state: ClaimState, generation: u64, retired: bool, msi_quarantined_at_claim: u32,
+    // AND THE TWO A CLAIM RECORDS ABOUT ITSELF: the entry name it was admitted under and the DMA
+    // policy that entry declares, both written by `claim` and both absent here.
+    struct Slot { state: ClaimState, generation: u64, retired: bool, entry: [u8; abi::ENTRY_NAME_LEN], policy: u8, msi_quarantined_at_claim: u32,
         mmio_unconfirmed_at_claim: u32, mmio_unconfirmed: u32 }
     static DEVICES: SpinLock<Vec<Entry>> = SpinLock::new(Vec::new());
     static CLAIMS: SpinLock<Vec<Slot>> = SpinLock::new(Vec::new());
     pub static MASTERED: AtomicUsize = AtomicUsize::new(0);
     fn bus_master(_: &Entry, enabled: bool) { if enabled { MASTERED.fetch_add(1, Ordering::SeqCst); } }
     pub fn setup_claim() {
-        *DEVICES.lock() = vec![Entry { device_type: 1, bus: 0, dev: 0, func: 7, on_bus: true }];
+        *DEVICES.lock() = vec![Entry { device_type: 1, transport: 0, vendor: 0x1af4, product: 0x1041, class: 2, subclass: 0, prog_if: 0, bus: 0, dev: 0, func: 7, on_bus: true }];
         *CLAIMS.lock() = vec![Slot { state: ClaimState::Free, generation: 0, retired: false,
+            entry: [0; abi::ENTRY_NAME_LEN], policy: 0,
             msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, mmio_unconfirmed: 0 }];
         MASTERED.store(0, Ordering::SeqCst);
     }
@@ -201,7 +228,7 @@ fn an_unanswered_attach_keeps_its_claim_and_domain_quarantined() {
     *CONTROLLER.lock() = Some(Controller { ledger: dma::Iommu::new(dma::fake::Fake::new(), 8) });
     device::setup_claim();
     with(|controller| controller.iommu().backend_mut_for_test().inject(dma::fake::Injection::Attach, Fault::Unconfirmed));
-    assert_eq!(device::claim(0), Err(device::ClaimError::Quarantined));
+    assert_eq!(device::claim(0, &ENTRY), Err(device::ClaimError::Quarantined));
     assert_eq!(device::state(), (device::ClaimState::Quarantined, 1));
     assert_eq!(device::MASTERED.load(Ordering::SeqCst), 0);
     assert_eq!(domain_of(0), None, "an unresolved endpoint is never published as translated");
@@ -213,7 +240,7 @@ fn an_unanswered_attach_keeps_its_claim_and_domain_quarantined() {
         assert_eq!(controller.iommu().destroy_domain(retained), Err(Fault::Unconfirmed));
     });
     let calls = with(|controller| controller.iommu().backend().calls().len());
-    assert_eq!(device::claim(0), Err(device::ClaimError::Quarantined));
+    assert_eq!(device::claim(0, &ENTRY), Err(device::ClaimError::Quarantined));
     assert!(!attach_for(0, 0, 0, 7, 2));
     assert_eq!(with(|controller| controller.iommu().backend().calls().len()), calls, "retry touches no hardware while ownership is uncertain");
 }
@@ -224,13 +251,13 @@ fn a_confirmed_attach_refusal_keeps_the_claim_free_for_retry() {
     *CONTROLLER.lock() = Some(Controller { ledger: dma::Iommu::new(dma::fake::Fake::new(), 8) });
     device::setup_claim();
     with(|controller| controller.iommu().backend_mut_for_test().inject(dma::fake::Injection::Attach, Fault::NoSpace));
-    assert_eq!(device::claim(0), Err(device::ClaimError::Refused));
+    assert_eq!(device::claim(0, &ENTRY), Err(device::ClaimError::Refused));
     assert_eq!(device::state(), (device::ClaimState::Free, 0));
     assert_eq!(device::MASTERED.load(Ordering::SeqCst), 0);
     assert_eq!(domain_of(0), None);
     assert_eq!(retained_domain_of(0), None);
     assert_eq!(with(|controller| controller.iommu().generation_of(dma::DomainId(1))), Some(None));
-    assert!(device::claim(0).is_ok(), "confirmed refusal leaves no quarantine that blocks retry");
+    assert!(device::claim(0, &ENTRY).is_ok(), "confirmed refusal leaves no quarantine that blocks retry");
     assert_eq!(device::state(), (device::ClaimState::Claimed, 1));
     assert_eq!(device::MASTERED.load(Ordering::SeqCst), 1);
 }

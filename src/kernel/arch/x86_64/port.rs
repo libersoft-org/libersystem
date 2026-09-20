@@ -40,6 +40,11 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
 }
 
 // Read a word (16 bits) from an I/O port.
+//
+// NOT IN A TEST BUILD: its one caller is the ACPI SCI path, which programs a real PM1 register block
+// and is `cfg(not(test))` for that reason. Warnings are errors here, so an unused `inw` stops the
+// test kernel compiling and takes `test.sh` with it.
+#[cfg(not(test))]
 #[inline]
 pub(crate) unsafe fn inw(port: u16) -> u16 {
 	unsafe {

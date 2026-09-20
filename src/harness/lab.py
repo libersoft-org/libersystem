@@ -2914,6 +2914,23 @@ def cmd_scenario_cold(args):
 	try:
 		if run_child(build_command(target), build_timeout, cwd=SRC, env=env).returncode != 0:
 			die(f'the {target} system did not build')
+		# **AND THE BOOTABLE VOLUME, WHICH THE BUILD ABOVE DOES NOT WRITE.**
+		#
+		# `mkimage` lays `system-volume-bootable-x86_64.img` into the medium this run boots, and only
+		# a volume step asked for the KERNEL ON THE VOLUME produces it - `build.sh` on its own
+		# refreshes `system-volume-x86_64.img`, which is a different file. So a cold run booted
+		# whatever that volume happened to be: measured 2026-09-20 at two and a half hours old and of
+		# the SHIPPING configuration, which has no development agent in it at all. The guest then
+		# served no control channel, and this runner waited out its thirty-minute deadline reporting
+		# a handshake that could never arrive, on a tree where everything it was waiting for had been
+		# built minutes earlier.
+		#
+		# x86_64 ONLY, because it is the only target whose medium carries this volume; the
+		# device-tree runners build their own ESP.
+		if target == 'x86_64':
+			volume = [BUILD_SH, '--arch', 'x86_64', '--kernel-on-volume', '--dma-mode', 'enforcing-required', '--part', 'volume']
+			if run_child(volume, build_timeout, cwd=SRC, env=env).returncode != 0:
+				die('the x86_64 bootable volume did not build')
 	except ChildTimeout as expired:
 		die(f'the {target} build did not finish within {build_timeout} s ({expired})')
 	triple = {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}[target]

@@ -38,10 +38,17 @@ const MASKED: u32 = 1 << 16;
 // once and then never again until it deasserts. On a shared line - which INTx is by design, and the
 // SCI is by definition - the second device to assert while the first is still asserted produces no
 // edge at all, and its interrupt does not exist.
+// NOT IN A TEST BUILD, for the same reason `route` is not: they exist to be written into a
+// redirection entry, `route` is the only thing that writes one, and a test build has no I/O APIC to
+// program. Without this the test kernel does not compile at all - warnings are errors here - and
+// `test.sh` cannot run, which is a worse failure than the dead code it is complaining about.
+#[cfg(not(test))]
 const ACTIVE_LOW: u32 = 1 << 13;
+#[cfg(not(test))]
 const LEVEL_TRIGGERED: u32 = 1 << 15;
 
 /// How a line is asserted and delivered, which the caller knows and this module does not.
+#[cfg(not(test))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
 	/// The ISA convention: edge-triggered, active-high. The 16550's legacy line.
@@ -50,6 +57,7 @@ pub enum Kind {
 	LevelLow,
 }
 
+#[cfg(not(test))]
 impl Kind {
 	fn bits(self) -> u32 {
 		match self {

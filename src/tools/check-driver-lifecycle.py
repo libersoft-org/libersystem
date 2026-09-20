@@ -54,7 +54,10 @@ fn try_recv_caps(channel: u64, buf: &mut [u8]) -> PolledCaps {
     })
 }
 struct Offers;
-impl Offers { fn push(&mut self, _: u16, _: u16, _: u64) -> bool { panic!("control fixture is not an offer"); } }
+impl Offers { fn push(&mut self, _: u16, _: u16, _: &[u8], _: u64) -> bool { panic!("control fixture is not an offer"); } }
+// The bind window the manager reports is printed through this, and a fixture that omitted it could
+// not compile the function that does.
+fn decimal(value: u64, out: &mut [u8; 20]) -> usize { let text = value.to_string(); let bytes = text.as_bytes(); out[..bytes.len()].copy_from_slice(bytes); bytes.len() }
 struct Binding { channel: u64 }
 struct Incident { teardown_reserve: u64 }
 impl Incident { fn open() -> Self { Self { teardown_reserve: 20 } } }
@@ -70,7 +73,7 @@ struct Node {
     last_opcode: u16, last_frame_at: u64, beat: Heartbeat, offers: Offers, incident: Incident,
     candidates: Vec<&'static Entry>, candidate: usize, running: Option<usize>, preferred: Option<usize>,
     disabled_by_policy: bool, retry_pending: bool, restart_requested: bool, retry_once: bool,
-    retry_at: u64, selection_pending: bool,
+    retry_at: u64, selection_pending: bool, bind_at: u64,
 }
 impl Node {
     fn new(channel: u64, entry: &'static Entry) -> Self {
@@ -80,7 +83,7 @@ impl Node {
             last_opcode: 0, last_frame_at: 0, beat: Heartbeat::default(), offers: Offers, incident: Incident::open(),
             candidates: vec![entry], candidate: 0, running: Some(0), preferred: None,
             disabled_by_policy: false, retry_pending: false, restart_requested: false, retry_once: false,
-            retry_at: 0, selection_pending: false }
+            retry_at: 0, selection_pending: false, bind_at: 0 }
     }
     fn push(&mut self, event: BindingEvent) -> bool { self.queue.push(event) }
     fn driver_name(&self) -> &'static [u8] { b"fixture" }
@@ -113,7 +116,12 @@ fn frame(generation: u64) -> Vec<u8> {
 }
 #[test]
 fn ready_receipt_deadline() {
-    for (clocks, timely) in [([99, 99, 99], true), ([99, 99, 100], false), ([99, 99, 101], false), ([101, 101, 101], false)] {
+    // THE RECEIPT DECIDES, AND THIS TABLE USED TO SAY THE OPPOSITE. `drain_channel` reads the
+    // channel BEFORE it tests the deadline, and says why in its own note: a deadline is about
+    // SILENCE, and there is no silence when the answer has already arrived. So a READY taken at 99
+    // against a deadline of 100 is timely however late the pass that queues the expiry behind it is;
+    // one taken AT the deadline is not. The third case is the whole point of the rule.
+    for (clocks, timely) in [([99, 99, 99], true), ([99, 99, 101], true), ([100, 100, 100], false), ([101, 101, 101], false)] {
         let mut node = Node::new(1, &OTHER);
         CLOCKS.with_borrow_mut(|values| *values = clocks.into());
         FRAMES.with_borrow_mut(|frames| *frames = [frame(1)].into());
@@ -258,7 +266,11 @@ fn unrelated_frames_do_not_answer_the_outstanding_ping() {
 }
 #[test]
 fn first_reply_uses_receipt_deadline_even_without_tick() {
-    for (clocks, timely) in [([14, 14, 14, 16], true), ([14, 14, 15, 16], false), ([14, 14, 16, 16], false), ([16, 16, 16, 16], false)] {
+    // THE SAME RULE ON THE HEARTBEAT'S SIDE, and the same correction: a PONG taken at 14 against a
+    // beat that expires at 15 answers the ping, whatever the clock says on the pass that reads it -
+    // which is what "even without tick" in this test's name means. A pong taken at 16 is an answer
+    // to nothing: the silence had already run its course.
+    for (clocks, timely) in [([14, 14, 14, 16], true), ([14, 14, 16, 16], true), ([16, 16, 16, 16], false)] {
         let mut node = supervised(1);
         CLOCKS.with_borrow_mut(|times| *times = clocks.into());
         FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
@@ -268,14 +280,27 @@ fn first_reply_uses_receipt_deadline_even_without_tick() {
         assert_eq!(wake, if timely { 19 } else { 0 });
     }
 }
+// A RECEIPT THAT CROSSES THE DEADLINE ADMITS THE EXPIRY, AND IT OWNS THE LAST QUEUE SLOT.
+//
+// This read `[14, 14, 16]` and asserted that a new expiry beats a LATE REPLY to the last slot -
+// which `drain_channel` deliberately stopped doing: it reads the channel before it tests the
+// deadline, because a deadline is about SILENCE and there is no silence when the answer is already
+// in the buffer. Its own note carries the measurement, on a q35 controller whose driver answered
+// twice and was declared silent twice.
+//
+// WHAT IS GUARDED HERE IS THE OTHER HALF OF THAT RULE, and it needs the clocks to make the crossing
+// real: the pass opens at 14 with the beat still live, and the frame is TAKEN at 16, after it
+// expired. `expire_heartbeat` runs on the receipt - not on the time the pass opened - so the expiry
+// is queued from the frame's own arrival and takes the one free slot ahead of the reply behind it.
+// A driver whose answer arrives after the silence has run its course does not undo the silence.
 #[test]
 fn direct_intake_prioritizes_new_expiry_before_traffic() {
     let mut node = supervised(1);
     for _ in 1..driver_binding::MAX_NODE_EVENTS { node.push(BindingEvent::Ponged { generation: 1, sequence: 2 }); }
-    CLOCKS.with_borrow_mut(|times| *times = [14, 14, 16].into());
+    CLOCKS.with_borrow_mut(|times| *times = [14, 16, 16].into());
     FRAMES.with_borrow_mut(|frames| frames.push_back(pong(1)));
     unsafe { drain_channel(&mut node, &mut [0; 128]); }
-    assert_eq!(consume(&mut node), 1, "new expiry owns the last queue slot before a late reply");
+    assert_eq!(consume(&mut node), 1, "a receipt that crossed the deadline owns the last queue slot");
     assert!(node.record.state == BindingState::Stopping);
     assert_eq!(node.beat.wake_at(), 0);
 }
@@ -334,7 +359,9 @@ fn disable_orders_dependency_closure() {
 
 
 def fixture(source: str, beat: str | None = None) -> str:
-    functions = ["fn expire_heartbeat(", "unsafe fn drain_channel(", "unsafe fn tick_heartbeats(", "unsafe fn expire_planned_stop(", "unsafe fn planned_stop_deadline(", "unsafe fn apply_policy(", "unsafe fn begin_operator_stop(", "unsafe fn begin_dependency_stop(", "unsafe fn stop_nodes_that_lost_a_dependency(", "fn stoppable_on_a_lost_dependency(", "fn requirements_met(", "fn dependency_depths("]
+    # THE ANCHORS LOST THEIR `unsafe` WITH THE SOURCE (P02M0178 removed propagated unsafe from the
+    # runtime wrappers), and the call below lost a tab with the block that wrapped it.
+    functions = ["fn expire_heartbeat(", "fn drain_channel(", "fn drain_frames(", "fn tick_heartbeats(", "fn expire_planned_stop(", "fn planned_stop_deadline(", "fn apply_policy(", "fn begin_operator_stop(", "fn begin_dependency_stop(", "fn stop_nodes_that_lost_a_dependency(", "fn stoppable_on_a_lost_dependency(", "fn requirements_met(", "fn dependency_depths("]
     bound = next(line for line in source.splitlines() if line.startswith("const MAX_DRIVER_FRAMES_PER_PASS:"))
     if beat is None:
         beat = (ROOT / "src/user/libs/driver/binding/src/lib.rs").read_text()
@@ -345,7 +372,7 @@ def fixture(source: str, beat: str | None = None) -> str:
 def main() -> None:
     source = (ROOT / "src/user/services/core/src/device_manager.rs").read_text()
     receipt = "driver_binding::handshake_expired(node.record.state, node.ready_deadline, node.last_frame_at)"
-    order = "\t\t\tstop_nodes_that_lost_a_dependency(nodes, catalogue);"
+    order = "\t\tstop_nodes_that_lost_a_dependency(nodes, catalogue);"
     assert source.count(receipt) == 1 and source.count(order) == 1
     drain = "for _ in 0..MAX_DRIVER_FRAMES_PER_PASS {"
     expiry = "if node.push(BindingEvent::Wedged { generation }) {"
@@ -365,7 +392,7 @@ def main() -> None:
         ("decoder accepts stale generation", source.replace("header.generation != generation", "false", 1), beat, "unrelated_frames_do_not_answer_the_outstanding_ping"),
         ("reply accepts wrong sequence", source, beat.replace("sequence != self.sequence", "false", 1), "unrelated_frames_do_not_answer_the_outstanding_ping"),
         ("crossing receipt misses expiry admission", source.replace(fresh, "", 1), beat, "direct_intake_prioritizes_new_expiry_before_traffic"),
-        ("timer keeps pre-drain time", source.replace(item(source, "unsafe fn tick_heartbeats("), item(source, "unsafe fn tick_heartbeats(").replace("let now: u64 = clock();", "", 1).replace("for node in nodes.iter_mut() {", "for node in nodes.iter_mut() { let now: u64 = clock();", 1)), beat, "timer_refreshes_time_after_bounded_intake"),
+        ("timer keeps pre-drain time", source.replace(item(source, "fn tick_heartbeats("), item(source, "fn tick_heartbeats(").replace("let now: u64 = clock();", "", 1).replace("for node in nodes.iter_mut() {", "for node in nodes.iter_mut() { let now: u64 = clock();", 1)), beat, "timer_refreshes_time_after_bounded_intake"),
         ("old heartbeat faults planned stop", source.replace(pending, "", 1), beat, "old_heartbeat_cannot_expire_a_planned_stop"),
     ]
     with tempfile.TemporaryDirectory(prefix="driver-lifecycle-") as directory:

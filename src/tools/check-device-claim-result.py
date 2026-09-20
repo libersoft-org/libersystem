@@ -55,9 +55,9 @@ fn domain_kill(handle:u64) { RT.with_borrow_mut(|rt|rt.effects.push(("domain",ha
 fn device_claim_snapshot(_:u64,_:u64)->Option<DeviceClaimSnapshot> {
     RT.with_borrow_mut(|rt|rt.snapshots.pop_front().expect("unexpected extra snapshot"))
 }
-fn device_claim(_:u64,_:u64)->Result<ClaimGrant,i64> { RT.with_borrow_mut(|rt| {
+fn device_claim(_:u64,_:u64,_:&[u8])->Result<ClaimGrant,i64> { RT.with_borrow_mut(|rt| {
     rt.claims+=1;
-    if rt.errno<0 { Err(rt.errno) } else { Ok(ClaimGrant { key:ClaimKey { device_index:0,_pad:0,generation:9 },memory:20,claim:21 }) }
+    if rt.errno<0 { Err(rt.errno) } else { Ok(ClaimGrant { key:ClaimKey { device_index:0,_pad:0,generation:9 },memory:20,claim:21,entry:[0;ENTRY_NAME_LEN],policy:0,_pad:0 }) }
 }) }
 struct Offers;
 impl Offers { fn new()->Self {Self} fn close_all(&mut self) {} }
@@ -184,15 +184,18 @@ fn releasing_claim_is_parked_and_a_successful_grant_is_owned() {
 
 def fixture(source):
     types = ['struct Node {', 'struct Binding {', 'struct Attempt {', 'struct Teardown {', 'enum ClaimReadiness {', 'enum BindStart {', 'enum Step {', 'struct PolicyDecision {', 'enum PolicySlot {']
-    functions = ['impl driver_binding::Closes for Syscalls', 'unsafe fn give_up_retryable(', 'unsafe fn give_up_with_budget(', 'unsafe fn resolve_teardown(', 'unsafe fn observe_claim(', 'unsafe fn observe_claim_snapshot(', 'fn bind_start_of(', 'unsafe fn may_try_again(', 'unsafe fn start_candidate(', 'fn decide_policy(']
+    # THE ANCHORS LOST THEIR `unsafe` WITH THE SOURCE (P02M0178 removed propagated unsafe from the
+    # runtime wrappers), and the two guards below lost a tab with the block that wrapped them. What
+    # each names is unchanged. `start_candidate` is still unsafe and still spelled that way.
+    functions = ['impl driver_binding::Closes for Syscalls', 'fn give_up_retryable(', 'fn give_up_with_budget(', 'fn resolve_teardown(', 'fn observe_claim(', 'fn observe_claim_snapshot(', 'fn bind_start_of(', 'fn may_try_again(', 'unsafe fn start_candidate(', 'fn decide_policy(']
     methods = ['fn new(index: u64, info:', 'fn has_bind_allowance(', 'fn admit_bind_attempt(', 'fn refund_unclaimed_attempt(', 'fn claim_admitted(']
-    begin = source.index('let mut txn = Attempt::new();', source.index('unsafe fn begin_bind('))
+    begin = source.index('let mut txn = Attempt::new();', source.index('fn begin_bind('))
     end = source.index('let (dm_side, driver_side):', begin)
-    advance = item(source, 'unsafe fn advance(')
+    advance = item(source, 'fn advance(')
     settlement = item(advance, 'if node.teardown.is_some() {')
     return (FIXTURE.replace('PRODUCTION_TYPES', '\n'.join(item(source, name) for name in types))
             .replace('NODE_METHODS', '\n'.join(item(source, name) for name in methods))
-            .replace('BEGIN_TEARDOWN', item(source, 'unsafe fn begin_teardown(&mut self'))
+            .replace('BEGIN_TEARDOWN', item(source, 'fn begin_teardown(&mut self'))
             .replace('PRODUCTION_FUNCTIONS', '\n'.join(item(source, name) for name in functions))
             .replace('CLAIM_STAGE', source[begin:end])
             .replace('SETTLEMENT', settlement))
@@ -204,12 +207,12 @@ def main():
     old = 'Some(snapshot) if snapshot.state == CLAIM_STATE_QUARANTINED => {'
     assert source.count(old) == 1
     variants.append(('unobserved claim refusal', source.replace(old, 'Some(snapshot) if false => {', 1), 'claim result must adopt kernel quarantine'))
-    guard = '\t\tif node.record.state == BindingState::Quarantined {\n\t\t\treturn Some(BindingState::Quarantined);\n\t\t}'
+    guard = '\tif node.record.state == BindingState::Quarantined {\n\t\treturn Some(BindingState::Quarantined);\n\t}'
     assert source.count(guard) == 1
     # Remove the actual production fix: the real state machine refuses the demotion,
     # but the attempted invalid transition still violates terminal settlement.
     variants.append(('empty ledger attempts quarantine demotion', source.replace(guard, '', 1), 'quarantine must not attempt another transition'))
-    generation = '\t\t\t\tnode.record.generation = snapshot.generation;\n\t\t\t\tnode.id = node.id.rebound(snapshot.generation);'
+    generation = '\t\t\tnode.record.generation = snapshot.generation;\n\t\t\tnode.id = node.id.rebound(snapshot.generation);'
     assert source.count(generation) == 1
     variants.append(('lost attempted generation', source.replace(generation, '', 1), 'adopt actual attempted generation'))
     with tempfile.TemporaryDirectory(prefix='liber-claim-result-') as directory:

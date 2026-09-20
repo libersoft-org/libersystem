@@ -73,6 +73,14 @@ pub fn attach(channel: alloc::sync::Arc<crate::object::channel::Channel>) {
 ///
 /// A BITMAP AND NOT A COUNT. Two presses of the power button before the delivery pass are one
 /// instruction to power off, not two; what must not be lost is that it was pressed at all.
+///
+/// **WHERE IT IS REACHED FROM, SAID IN A CFG RATHER THAN SUPPRESSED.** One caller is `arch::sci`,
+/// which is x86_64's ACPI SCI handler - the only source of fixed-hardware events any port has today
+/// - and the other is the hardware suite, which raises one directly to prove the latch. On the two
+/// device-tree ports a shipping kernel therefore reaches this from nowhere, and a `dead_code`
+/// warning there is CORRECT: it says this system has no fixed-hardware event source on them yet.
+/// The day one arrives - a PSCI or SBI event, a GPIO button - its port adds itself here.
+#[cfg(any(target_arch = "x86_64", test))]
 pub fn report(kind: u8) {
 	PENDING.fetch_or(bit(kind), core::sync::atomic::Ordering::AcqRel);
 }
@@ -88,7 +96,57 @@ pub fn report(kind: u8) {
 /// A FAILED SEND IS NOT PUT BACK. The listener exists and its queue is full or its end has closed,
 /// which is a listener that is not reading rather than one that is not there; latching would deliver
 /// the press to whoever attached next, minutes later, as if the button had just been pressed.
+/// A delivered event nothing has taken yet: which kind, and the tick its consumer stops getting the
+/// benefit of the doubt.
+static UNREAD: SpinLock<Option<(u8, u64)>> = SpinLock::new(None);
+static UNREAD_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// How long a listener has to take an event before this says that it did not.
+///
+/// A PERSON'S PATIENCE AND NOT A PROTOCOL DEADLINE. Nothing is retried when it passes and nothing is
+/// cancelled: an event still queued three seconds after it was handed on is an event whose consumer
+/// is not reading it, and the one useful thing to do about that is SAY SO - once, with what every
+/// blocked thread in the machine was waiting on at the time.
+const UNREAD_TICKS: u64 = 300;
+
+/// "It was delivered" and "it was acted on" are two answers, and this is what stops them looking
+/// like one in the log.
+///
+/// DRIVEN BY THE IDLE PASS, like the delivery itself: `deliver` calls it before it looks at its own
+/// latch, so a pass with nothing to deliver still checks what the last delivery did.
+fn check_unread() {
+	let due: Option<u8> = {
+		let mut slot = UNREAD.lock();
+		match *slot {
+			Some((kind, at)) if crate::arch::apic::ticks() >= at => {
+				*slot = None;
+				Some(kind)
+			}
+			_ => None,
+		}
+	};
+	let Some(kind) = due else { return };
+	// ALLOC-OK: a refcount bump out of the guard, so nothing below runs under the lock.
+	let Some(channel) = LISTENER.lock().clone() else { return };
+	let Some(queued) = channel.peer_unread() else { return };
+	if queued == 0 {
+		return;
+	}
+	// SAID ONCE. A consumer that is not reading is not reading, and a line per idle pass would bury
+	// the boot log it is meant to be read in.
+	if !UNREAD_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) {
+		crate::serial_println!("platform: event {kind} reached its listener and NOBODY READ IT - {queued} message(s) still queued {UNREAD_TICKS} tick(s) later, so the button works and its consumer does not");
+		// NOT IN THE TEST KERNEL, WHICH DOES NOT CARRY IT. `dump_blocked` is `cfg(not(test))` because
+		// its one other caller is the panic handler the test build replaces - and a symbol a second
+		// compilation does not have turns this line into a build failure of the whole test kernel.
+		#[cfg(not(test))]
+		crate::sched::dump_blocked("a platform event nobody read");
+	}
+}
+
 pub fn deliver() {
+	// WHAT THE LAST DELIVERY CAME TO, BEFORE THIS ONE'S LATCH IS EVEN READ. See `check_unread`.
+	check_unread();
 	let latched = PENDING.load(core::sync::atomic::Ordering::Acquire);
 	if latched == 0 {
 		return;
@@ -121,7 +179,11 @@ pub fn deliver() {
 			// NAMED AT BOTH ENDS, BECAUSE "IT WAS SENT" IS NOT AN ANSWER WHEN IT DOES NOT ARRIVE. This
 			// line said only that the send succeeded, and a day went into establishing what it now
 			// states in eight characters: which object the message left and which object it reached.
-			Ok(()) => crate::serial_println!("platform: event {kind} handed on, from object {} to {:?}", crate::object::KernelObject::header(&*channel).koid(), channel.peer_koid()),
+			Ok(()) => {
+				crate::serial_println!("platform: event {kind} handed on, from object {} to {:?}", crate::object::KernelObject::header(&*channel).koid(), channel.peer_koid());
+				// AND WHEN TO COME BACK AND SEE WHETHER IT WAS ANY USE. See `check_unread`.
+				*UNREAD.lock() = Some((kind, crate::arch::apic::ticks().saturating_add(UNREAD_TICKS)));
+			}
 			Err(error) => crate::serial_println!("platform: event {kind} could not be delivered to its listener ({error:?})"),
 		}
 	}
@@ -134,5 +196,7 @@ static HELD_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 pub(crate) fn drain_for_test() -> u32 {
 	*LISTENER.lock() = None;
 	HELD_SAID.store(false, core::sync::atomic::Ordering::Relaxed);
+	UNREAD_SAID.store(false, core::sync::atomic::Ordering::Relaxed);
+	*UNREAD.lock() = None;
 	PENDING.swap(0, core::sync::atomic::Ordering::AcqRel)
 }

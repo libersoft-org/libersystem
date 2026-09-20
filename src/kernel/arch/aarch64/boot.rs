@@ -1040,6 +1040,10 @@ fn publish_embedded_boot_info() {
 	// The adopted mode travels on for reporting; it is not where admission got it - see
 	// `crate::adopt_dma_mode`, which ran before the first device was admitted.
 	let (dma_mode, dma_provenance) = crate::adopted_dma_mode_words();
+	// ALLOC-OK: ONE `BootInfo`, IN EARLY BOOT, BEFORE ANY RING-3 PROGRAM EXISTS. This runs on the
+	// boot path that builds the structure the rest of the kernel reads; there is no userspace yet
+	// to reach it, no caller to refuse, and nothing to fall back to if it failed - a machine that
+	// cannot allocate its own boot description has not started.
 	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_HVC, rsdp: 0, smp_trampoline: 0, dtb: 0, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] }, dma_mode, dma_provenance }));
 	crate::publish_boot_info(bi);
 }

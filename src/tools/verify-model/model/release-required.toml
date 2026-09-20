@@ -124,6 +124,7 @@ keys = [
 	"gate.milestone-index / host / host / default",
 	"gate.model-mutations / host / host / default",
 	"gate.driver-mutations / host / host / default",
+	"gate.supervisor-waits / host / host / default",
 	"gate.no-fixed-provider-slots / host / host / default",
 	"gate.no-suppression / host / host / default",
 	"gate.numa-profile-aarch64 / host / host / default",

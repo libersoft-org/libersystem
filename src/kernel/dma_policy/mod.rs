@@ -116,6 +116,8 @@ pub fn entry_matching(device: &driver_binding::Discovered) -> Option<[u8; abi::E
 // agree.
 #[cfg(test)]
 pub fn registry_names() -> Vec<&'static [u8]> {
+	// ALLOC-OK: a `#[cfg(test)]` helper for the fixture that proves the table and the manifest agree.
+	// It is not in a shipping kernel at all, so no ring-3 caller can reach it.
 	DMA_REGISTRY.iter().map(|entry| entry.name).collect()
 }
 

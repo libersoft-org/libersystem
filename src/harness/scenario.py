@@ -303,9 +303,19 @@ def load(path):
 def validate(document, path):
 	if not isinstance(document, dict):
 		raise ScenarioError(f'{path}: not a table')
-	unknown = set(document) - {'version', 'name', 'description', 'timeout', 'step'}
+	unknown = set(document) - {'version', 'name', 'description', 'timeout', 'step', 'ends'}
 	if unknown:
 		raise ScenarioError(f'{path}: unknown keys {sorted(unknown)}')
+	# HOW THIS SCENARIO IS EXPECTED TO END, for the one subject whose success is a machine that is
+	# no longer there. The teardown gives a scope back by driving the guest - a keystroke, a prompt,
+	# a reset, a question about what is still held - and every one of those needs something to
+	# answer. A scenario that asks the chassis to stop the machine, and whose assertion is that it
+	# WAS stopped, has nothing to answer afterwards: it would report "teardown did not complete" on
+	# the run where everything worked. `ends = "powered-off"` says so once, and the teardown then
+	# asserts the opposite thing: that nothing answers.
+	ends = document.get('ends')
+	if ends is not None and ends != 'powered-off':
+		raise ScenarioError(f'{path}: ends must be "powered-off" when it is given, not {ends!r}')
 	version = document.get('version')
 	if version != SCENARIO_VERSION:
 		raise ScenarioError(f'{path}: version {version!r}, this runner understands {SCENARIO_VERSION}')
@@ -460,6 +470,24 @@ class Guest:
 		return self.lab.serial_size()
 
 
+
+# How many RAW bytes carry the first `kept` bytes of the ANSI-stripped stream.
+#
+# The oracles search stripped text and the cursor counts raw bytes, so a step that wants to stop
+# exactly where its match ended has to convert between the two. Walking the escape sequences is the
+# whole conversion: everything outside them survives `strip_ansi` one byte for one byte.
+def raw_span(raw, kept):
+	consumed = 0
+	at = 0
+	for escape in lab_module.ANSI.finditer(raw):
+		plain = escape.start() - at
+		if consumed + plain >= kept:
+			return at + (kept - consumed)
+		consumed += plain
+		at = escape.end()
+	return at + (kept - consumed)
+
+
 def run(document, lab, verbose=False):
 	lab_module.timing_event('scenario', f"start:{document.get('name', 'unnamed')}")
 	guest = Guest(lab)
@@ -512,7 +540,7 @@ def run(document, lab, verbose=False):
 		interrupted = error
 	# Exactly once, whatever happened above, and it must not be able to replace the primary result.
 	try:
-		left = teardown(lab, verbose, baseline, first_run)
+		left = teardown(lab, verbose, baseline, first_run, document.get('ends'))
 	except BaseException as error:  # noqa: BLE001 - a broken teardown is a finding, not an exit
 		left = [f'teardown raised {type(error).__name__}: {error}']
 	if interrupted is not None:
@@ -544,11 +572,20 @@ def run(document, lab, verbose=False):
 # because the steps were attempted is how a run comes to leave state behind quietly; the guest
 # is asked afterwards what it is actually holding. Returns the list of things that could not be
 # given back, empty when the instance is as the next run needs to find it.
-def teardown(lab, verbose=False, baseline=None, first_run=True):
+def teardown(lab, verbose=False, baseline=None, first_run=True, ends=None):
 	lab_module.timing_event('scenario', 'steps-end')
 	lab_module.timing_event('scenario', 'cleanup-start')
 	notes = []
 	left = []
+	# A MACHINE THAT IS OFF GIVES ITS SCOPE BACK BY BEING OFF, and there is nothing else to ask it.
+	# Everything below drives the guest, and a scenario that declared this end has just asserted
+	# that there is no guest - so the check is the opposite one: if anything still answers, the
+	# machine that was supposed to stop did not.
+	if ends == 'powered-off':
+		lab_module.timing_event('scenario', 'cleanup-end')
+		if lab.wait_prompt(2):
+			return ['the machine answered a prompt after it was asked to power off']
+		return []
 	# ASSIGNED BEFORE THE `try`, all three. `free` was not, and it is read after the handler below:
 	# any failure before the `teardown_state` call - a `stop_launch` that raised, terminal recovery,
 	# the reset - was caught as intended and then the next line read an uninitialized local. Python
@@ -704,17 +741,26 @@ def run_step(step, guest, lab, limit, index):
 		if not lab.wait_prompt(int(limit)):
 			raise ScenarioError(f'{where}: no shell prompt within {int(limit)} s')
 	elif kind == 'expect':
-		wanted = step['contains']
+		wanted = step['contains'].encode()
 		end = time.monotonic() + limit
 		while True:
-			text, at = guest.read_since(guest.at)
-			if wanted in text:
-				guest.at = at
+			raw = guest.raw_since(guest.at)
+			found = lab_module.strip_ansi(raw).find(wanted)
+			if found >= 0:
+				# **THE CURSOR STOPS AT THE END OF THE MATCH, NOT AT THE END OF THE READ.**
+				#
+				# It used to take everything the read returned, so a step that matched its line
+				# SWALLOWED whatever had arrived behind it - and two lines written in the same
+				# instant are exactly that case. The chassis power button is two assertions on two
+				# lines a millisecond apart: the kernel's, then the consumer's. The first step read
+				# both, matched the first and consumed the second, and the second step then waited
+				# out its whole timeout for a line that had already gone past.
+				guest.at += raw_span(raw, found + len(wanted))
 				return
 			if time.monotonic() >= end:
 				break
 			time.sleep(0.2)
-		raise ScenarioError(f'{where}: {wanted!r} did not appear within {int(limit)} s')
+		raise ScenarioError(f'{where}: {step["contains"]!r} did not appear within {int(limit)} s')
 	elif kind == 'refused':
 		status = lab.launch_status(step['program'], step.get('args', ''), step.get('cwd', 'vol://system'), int(limit))
 		if status == 0:

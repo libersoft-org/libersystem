@@ -551,6 +551,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut probe_blocks: Vec<u64> = Vec::new();
 		let mut raw_keys: u64 = 0;
 		// What a post-`Online` restart needs, filled in by phase two. See `Recovery`.
+		#[cfg(feature = "development")]
+		machine_log(b"DeviceManager: PROBE this is a development build\n");
 		let mut recovery: Recovery = Recovery::none();
 		// What this program holds on behalf of the development agent: its bootstrap, so the
 		// launcher can be handed to it once PermissionManager exists - which is after this
@@ -646,7 +648,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// some unrelated message to arrive before anything tried again.
 				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at && recovery.armed() {
 					nodes[at].retry_at = 0;
-					start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+					start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 				}
 				// AND A PLANNED STOP THAT RAN OUT OF ITS SLICE IS FORCED, AND SAYS SO (added
 				// 2026-09-04). M3: the deadline that expires forces the revocation and never claims
@@ -665,7 +667,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if nodes[at].restart_requested && recovery.armed() {
 					nodes[at].restart_requested = false;
 					if nodes[at].binding.is_none() && nodes[at].teardown.is_none() {
-						start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+						start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 					}
 				}
 				// THE ANSWER IS ACTED ON. This discarded the `Step`, so a driver that crashed after
@@ -677,7 +679,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// so a node whose backoff has not passed is simply skipped this time - which is
 					// what "one node's delay is not every node's" means in the loop that has others.
 					Step::Again if recovery.armed() && clock() >= nodes[at].retry_at => {
-						start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+						start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 					}
 					Step::NextCandidate if recovery.armed() => {
 						spend_candidate(&mut nodes[at]);
@@ -688,7 +690,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
-							start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+							start_candidate(&mut nodes[at], recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 						}
 					}
 					_ => {}
@@ -849,19 +851,32 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// unboundedly while it holds a channel somebody may push to: one wake a second, which is
 			// the same trade the hot-plug slot poll already makes beside its interrupt, and which
 			// bounds the latency of a button press to something a person cannot notice.
+			// **AND A HOUSEKEEPING WAKE IS NOT PENDING PROGRESS, WHICH THE KERNEL HAS TO BE TOLD.**
+			//
+			// A plain `wait_any` deadline counts as work in flight: `sched::min_deadline` skips PERIODIC
+			// waiters and nothing else, and `run_until_idle` sleeps to the nearest deadline it returns.
+			// A supervisor that re-arms a one-second deadline for ever therefore keeps that loop going for
+			// ever - which is the same trap the console loop's note describes, and why ConsoleService polls
+			// its framebuffer with `wait_any_periodic`.
+			//
+			// ONLY WHEN THE POLL IS THE ONLY REASON TO WAKE, though. A retry, a stop deadline or a teardown
+			// IS work in flight and has to stay visible as such; when one of those is pending this wait is
+			// an ordinary one whose deadline the poll may only shorten.
+			let mut housekeeping: bool = false;
 			if platform_events != 0 {
 				if !serve_platform_events(platform_events, power, &mut buf) {
-					print(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
+					machine_log(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
 					close(platform_events);
 					platform_events = 0;
 				} else {
 					let bound: u64 = clock().saturating_add(PLATFORM_POLL_TICKS);
+					housekeeping = soonest == 0;
 					if soonest == 0 || bound < soonest {
 						soonest = bound;
 					}
 				}
 			}
-			let ready: i64 = wait_any(&waiting[..waiting_count], soonest);
+			let ready: i64 = if housekeeping { wait_any_periodic(&waiting[..waiting_count], soonest) } else { wait_any(&waiting[..waiting_count], soonest) };
 			if ready != 0 {
 				if ready > 0 {
 					let at: usize = ready as usize;
@@ -906,7 +921,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					}
 					if platform_events != 0 && at == platform_events_at {
 						if !serve_platform_events(platform_events, power, &mut buf) {
-							print(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
+							machine_log(b"DeviceManager: the platform-event channel is closed - the power button will do nothing\n");
 							close(platform_events);
 							platform_events = 0;
 						}
@@ -952,7 +967,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			};
 			match taken {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery);
+					launch_volume_drivers(handle, Some(archive), &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery);
 					// THE DEVELOPMENT AGENT IS STARTED HERE, ONCE, AND NOT BY A DRIVER'S NAME.
 					//
 					// It used to be started from `route_offers`, the moment a binding whose artifact
@@ -1290,7 +1305,7 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery) {
+fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1342,7 +1357,7 @@ fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Ve
 		// opened falls through to the next one in the loop below, exactly as it did when this was
 		// sequential.
 		for at in first_node..nodes.len() {
-			start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+			start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 		}
 		while pump(nodes, first_node, catalogue, buf) {
 			// WHAT ARRIVED AND WHAT WENT AWAY - see `settle_dependencies`. A node it wakes asks for
@@ -1352,13 +1367,13 @@ fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Ve
 			for at in first_node..nodes.len() {
 				if nodes[at].restart_requested && nodes[at].binding.is_none() && nodes[at].teardown.is_none() {
 					nodes[at].restart_requested = false;
-					start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+					start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 				}
 				// AND THE OTHER REASON A NODE IS WAITING TO BE LOOKED AT AGAIN - see
 				// `Node::waiting_for_claim`. The same re-read phase one performs, reached through
 				// the ordinary candidate path because this phase has the volume to read from.
 				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at {
-					start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+					start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 				}
 			}
 			for at in first_node..nodes.len() {
@@ -1375,7 +1390,7 @@ fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Ve
 						if clock() < nodes[at].retry_at {
 							continue;
 						}
-						start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+						start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 					}
 					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
 					// last is gone - which the rollback has just guaranteed. Every rejection is
@@ -1393,7 +1408,7 @@ fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Ve
 						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
-							start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+							start_candidate(&mut nodes[at], storage, boot_package, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 						}
 					}
 					Step::Done | Step::Resting => {}
@@ -1402,7 +1417,14 @@ fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Ve
 		}
 		// KEPT, NOT CLOSED - see `Recovery`. A driver that crashes after coming online is rebound by
 		// the standing loop, and an input driver's key sink is minted from this end.
-		*recovery = Recovery { storage, key_producer, state: core::mem::take(&mut state) };
+		*recovery = Recovery {
+			storage,
+			key_producer,
+			// KEPT FOR THE REBIND THAT CANNOT READ THE VOLUME - see `Recovery`.
+			package_bytes: boot_package.map_or(0, |bytes| bytes.as_ptr() as u64),
+			package_len: boot_package.map_or(0, <[u8]>::len),
+			state: core::mem::take(&mut state),
+		};
 		report_state(&state);
 		report_catalogue(catalogue, b"after every device");
 	}
@@ -1431,7 +1453,7 @@ fn print_driver_name(name: &[u8]) {
 // duration of one syscall - not, as it was, for the whole handshake. That is what makes a dozen
 // devices coming up at once cost one mapping at a time rather than a dozen.
 #[allow(clippy::too_many_arguments)]
-unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
+unsafe fn start_candidate(node: &mut Node, storage: u64, package: Option<&[u8]>, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
 	unsafe {
 		// A STORED DISABLE PARKS THE NODE; IT DOES NOT SPEND A CANDIDATE.
 		//
@@ -1493,7 +1515,36 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 			if !gate_on_requirements(node, entry, catalogue) {
 				return;
 			}
+			// **AND THE INIT PACKAGE IS TRIED WHEN THE VOLUME CANNOT ANSWER.**
+			//
+			// A rebind reads the artifact off the system volume, which is right for every driver
+			// except the one that SERVES it: that provider going down takes the volume with it, and
+			// the bytes needed to bring it back are on the volume that is gone. Phase one started
+			// exactly these drivers from the init package, for the same reason a rebind needs it -
+			// no volume is mounted then either - so the fallback is not a second source of truth,
+			// it is the FIRST one, used again.
+			//
+			// Measured on all three architectures (2026-09-21): one missed heartbeat ended with four
+			// `restarting virtio-blk`, four `is named by the registry and not on the volume`, and
+			// `0 of 0 device(s) online` on a disk the machine had been reading a second earlier.
+			// KEYED BY ARTIFACT, WHICH IS WHAT A PACKAGE HOLDS. The volume is read by the entry's
+			// NAME and the package by its ARTIFACT - phase one uses the second, and a fallback that
+			// used the first looked the driver up under a key no archive has.
+			let from_package: Option<&[u8]> = package.and_then(|archive| Package::parse(archive)).and_then(|parsed| parsed.lookup(entry.artifact));
 			let Some((file, mapped, size)) = read_driver(storage, driver_name) else {
+				if let Some(elf) = from_package {
+					print(b"DeviceManager: ");
+					print_driver_name(driver_name);
+					print(b" is not readable on the volume; starting it from the init package this boot came up on\n");
+					let info = node.info;
+					let started = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege);
+					if matches!(started, BindStart::Opened | BindStart::WaitingForTheClaim) || node.teardown.is_some() {
+						return;
+					}
+					node.candidate += 1;
+					node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
+					continue;
+				}
 				// The registry names an artifact the volume does not have. That is the image
 				// disagreeing with itself, not a driver that ran and failed, and the two are worth
 				// telling apart: one is a packaging fault and the other is a bug.
@@ -1631,7 +1682,14 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
 		let (file, mapped, size): (u64, u64, usize) = match loaded {
 			Some(t) => t,
-			None => return 0,
+			// EVERY WAY THIS CAN FAIL SAYS WHICH WAY IT WAS. Six arms returned 0 in silence, and a
+			// guest whose control channel is never served looks identical from the outside for all
+			// six - which is a scenario runner waiting half an hour on a handshake with nothing in
+			// the log about why it will never come.
+			None => {
+				print(b"DeviceManager: no dev_agent artifact on this volume; the control channel will carry nothing\n");
+				return 0;
+			}
 		};
 		let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 		// The agent gets a bootstrap of its own and a PROVIDER-CATALOGUE connection transferred
@@ -1643,6 +1701,7 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 		let (dm_side, agent_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => {
+				print(b"DeviceManager: no channel for the development agent's bootstrap; it is not started\n");
 				unmap_object(file);
 				close(file);
 				return 0;
@@ -1656,7 +1715,12 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 		let mut opening: [u8; 11] = [0u8; 11];
 		opening[..3].copy_from_slice(b"CAT");
 		opening[3..].copy_from_slice(nonce);
-		if !started || !send_with_room(dm_side, &opening, catalogue) {
+		if !started {
+			print(b"DeviceManager: the development agent did not spawn; the control channel will carry nothing\n");
+			return 0;
+		}
+		if !send_with_room(dm_side, &opening, catalogue) {
+			print(b"DeviceManager: the development agent took no catalogue connection inside the send bound; it is abandoned\n");
 			return 0;
 		}
 		// A volume connection of its own, so the agent can read the installed artifact a
@@ -1665,9 +1729,13 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 		// readers on one endpoint would take each other's replies.
 		let connection: u64 = match service_connect(storage) {
 			Some(connection) => connection,
-			None => return 0,
+			None => {
+				print(b"DeviceManager: the storage service minted no connection for the development agent; it is abandoned\n");
+				return 0;
+			}
 		};
 		if !send_with_room(dm_side, b"STORAGE", connection) {
+			print(b"DeviceManager: the development agent took no volume connection inside the send bound; it is abandoned\n");
 			return 0;
 		}
 		// THE CONSOLE, WHICH THE AGENT WAITS FOR AND NOBODY WAS SENDING. `dev_agent` reads three
@@ -1687,6 +1755,7 @@ unsafe fn start_dev_agent(storage: u64, catalogue: u64, console_input: u64, nonc
 			0
 		};
 		if !send_with_room(dm_side, b"CONSOLE", feed) {
+			print(b"DeviceManager: the development agent took no console feed inside the send bound; it is abandoned\n");
 			return 0;
 		}
 		// The agent reports in before it serves, so a start that loaded but never ran is not
@@ -1833,12 +1902,36 @@ impl Binding {
 struct Recovery {
 	storage: u64,
 	key_producer: u64,
+	// **THE INIT PACKAGE, KEPT FOR THE ONE REBIND THAT CANNOT READ THE VOLUME.**
+	//
+	// A rebind reads the driver's artifact off the system volume, which is right for every driver
+	// except the one that SERVES that volume: when its provider goes down the volume goes with it,
+	// and the artifact needed to bring the provider back is on the volume that is gone. Measured on
+	// all three architectures (2026-09-21): a single missed heartbeat ends with four
+	// `restarting virtio-blk`, four `is named by the registry and not on the volume`, and
+	// `0 of 0 device(s) online` on a disk the machine was reading a second earlier.
+	//
+	// Phase one launches those drivers from the init PACKAGE, for exactly the reason a rebind needs
+	// it: no volume is mounted yet. The bytes are already in memory and already verified; what was
+	// missing is that nothing held on to them.
+	package_bytes: u64,
+	package_len: usize,
 	state: Vec<u8>,
 }
 
 impl Recovery {
 	fn none() -> Self {
-		Self { storage: 0, key_producer: 0, state: Vec::new() }
+		Self { storage: 0, key_producer: 0, package_bytes: 0, package_len: 0, state: Vec::new() }
+	}
+
+	/// The init package's archive, when this program still holds it.
+	fn package(&self) -> Option<&'static [u8]> {
+		if self.package_bytes == 0 || self.package_len == 0 {
+			return None;
+		}
+		// SAFETY: the archive is the bootstrap's own mapping, made before phase one and never
+		// unmapped - the same bytes `launch_boot_drivers` read every boot driver out of.
+		Some(unsafe { core::slice::from_raw_parts(self.package_bytes as *const u8, self.package_len) })
 	}
 
 	fn armed(&self) -> bool {
@@ -4759,7 +4852,32 @@ unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &Catal
 /// is readable for ever, which is the spin this loop's own notes warn about twice, and a receive
 /// that answers with an error rather than with emptiness is a channel this program can no longer be
 /// told anything on. Either way the caller gives the handle up and says so.
-/// **SAID TO THE MACHINE'S LOG AND NOT TO A TERMINAL, WHICH IS WHY THIS IS NOT `print`.**
+//// **`print` FOR A PROGRAM THAT MAY NOT PARK, WHICH IS WHY IT IS DEFINED HERE AND NOT TAKEN FROM
+/// `rt`.** `use rt::*` is a glob import and an item defined here wins over it, so every `print` in
+/// this file is this one.
+///
+/// `rt::print` SENDS ON A CHANNEL AND WAITS FOR ROOM. Its body is `if out != 0 && send_blocking(out,
+/// bytes, 0)`, and `send_blocking` is a wait with NO END. That is the shape the supervisor loop
+/// below refuses in as many words, and the gate that enforces the rule reads call NAMES - so a park
+/// one call deeper than `print(` was invisible to it and to every reading of this file.
+///
+/// AND IT IS WHAT "THE POWER BUTTON DOES NOTHING" WAS. This program's stdout is a console channel
+/// handed to it at start-up; from display takeover onwards the reader of that channel is a virtual
+/// terminal nobody is draining. The supervisor's next line then parks the loop with everything about
+/// it alive - the process, its handles, and a chassis event sitting in a queue the next pass would
+/// have drained.
+///
+/// SO A LINE IS SENT IF IT FITS AND WRITTEN TO THE MACHINE LOG IF IT DOES NOT. Nothing is lost and
+/// nothing waits: a full console costs the line its terminal, not this program its liveness.
+fn print(bytes: &[u8]) {
+	let out: u64 = stdout();
+	if out != 0 && matches!(try_send_outcome(out, bytes, 0), SendOutcome::Delivered) {
+		return;
+	}
+	machine_log(bytes);
+}
+
+// **SAID TO THE MACHINE'S LOG AND NOT TO A TERMINAL, WHICH IS WHY THIS IS NOT `print`.**
 ///
 /// `print` routes to ConsoleService the moment this program has a stdout - the comment on it says so
 /// - so from display takeover onwards everything this program says goes to a virtual terminal and
@@ -4771,15 +4889,38 @@ unsafe fn serve_bus_events(events: u64, nodes: &mut Vec<Node>, catalogue: &Catal
 /// lines could not appear after the console came up, and every measurement taken to explain their
 /// absence was measuring the wrong end of the system.
 fn machine_log(bytes: &[u8]) {
+	// **A FULL RING IS NOT A REASON TO LOSE A MACHINE FACT.** `debug_write` answers how many bytes
+	// the kernel's serial transmit ring accepted, and during a boot burst that is regularly ZERO -
+	// the ring drains on the idle pass, and a service writing from a thread that is not idling can
+	// meet it full. This gave up on the first zero, so a line written at the wrong moment vanished
+	// with nothing anywhere to say it had been written.
+	//
+	// BOUNDED, because this is still a log write on a program that may not park: yield and try
+	// again, up to a number of attempts a drain cannot plausibly need, then give up. Draining is the
+	// idle pass's job and a yield is what gets it there.
 	let mut at: usize = 0;
+	let mut attempts: u32 = 0;
 	while at < bytes.len() {
 		let taken = debug_write(&bytes[at..]);
 		if taken == 0 {
-			return;
+			attempts += 1;
+			if attempts >= MACHINE_LOG_ATTEMPTS {
+				return;
+			}
+			yield_now();
+			continue;
 		}
+		attempts = 0;
 		at += taken;
 	}
 }
+
+/// How many yields a machine-log write may spend waiting for the serial ring to drain.
+///
+/// A HUNDRED, MEASURED AGAINST WHAT IT IS WAITING FOR: the ring is drained by the idle pass, so one
+/// yield is usually enough and a hundred is a boot burst's worth. It is a ceiling and not a budget -
+/// a write that fits leaves on the first attempt.
+const MACHINE_LOG_ATTEMPTS: u32 = 100;
 
 fn serve_platform_events(events: u64, power: u64, buf: &mut [u8]) -> bool {
 	// DRAINED, for the same reason the bus events are: a message left behind a readable channel is a
@@ -4860,7 +5001,7 @@ unsafe fn admit_arrival(index: u64, nodes: &mut Vec<Node>, catalogue: &Catalogue
 		if recovery.state.len() <= index as usize {
 			recovery.state.resize(index as usize + 1, STATE_UNKNOWN);
 		}
-		start_candidate(&mut node, recovery.storage, recovery.key_producer, power, console_input, device_privilege, catalogue, &mut recovery.state);
+		start_candidate(&mut node, recovery.storage, recovery.package(), recovery.key_producer, power, console_input, device_privilege, catalogue, &mut recovery.state);
 		nodes.push(node);
 	}
 }

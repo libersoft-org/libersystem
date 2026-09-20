@@ -3552,6 +3552,12 @@ dependencies = [
 	"console_service",
 	"audio_service",
 	"input_service",
+	# THE ORDER THE LADDER ALREADY DEPENDS ON, SAID OUT LOUD. It reads DisplayService's observation
+	# root out of what the supervisor kept, which is only there if the display service came up first
+	# - so the graph has always been ordered behind it and nothing declared that. The role behind it
+	# stays OPTIONAL, which is the other half: a machine whose display service did not come up hands
+	# a zero and the graph still runs.
+	"display_service",
 	"permission_manager",
 	"resource_manager",
 ]
@@ -3581,6 +3587,18 @@ presence = "optional"
 tag = "SUPERVISOR"
 kind = "serve-root"
 provider = "self"
+
+# DISPLAYSERVICE'S OBSERVATION ROOT, which the ladder has sent since the graph learned to report what
+# the display path holds - and which this declaration did not carry, so the two sides of the same
+# hand-off disagreed about a role that was really being passed. Optional for the same reason the
+# ladder guards it: a machine whose display service never came up hands a zero here.
+[[services.roles]]
+tag = "DISPLAY"
+kind = "client"
+provider = "display_service"
+source = "STATS"
+interface = "liber:display@1/display-stats"
+presence = "optional"
 
 [[services.roles]]
 tag = "SERVE"

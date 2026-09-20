@@ -37,7 +37,10 @@ LOOP_ANCHOR='4. stand until ServiceManager drives phase 2'
 check_file() {
 	local path="$1"
 	local start
-	start="$(grep -n "$LOOP_ANCHOR" "$path" | head -n 1 | cut -d: -f1 || true)"
+	# ONE PROCESS AND NO PIPE. `grep | head` under `pipefail` reads a MATCH as a failed pipeline -
+	# `head` leaves and `grep` takes the SIGPIPE - which is the rule `source-hygiene` enforces and
+	# which this script broke on its first day.
+	start="$(awk -v needle="$LOOP_ANCHOR" 'index($0, needle) { print NR; exit }' "$path")"
 	if [[ -z "$start" ]]; then
 		echo "supervisor-waits: cannot find the supervisor loop in $path - its anchor comment moved, and this gate is measuring nothing" >&2
 		return 2

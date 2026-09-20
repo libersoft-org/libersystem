@@ -138,7 +138,22 @@ pub fn idle_halt() {
 // 8042 keyboard-controller reset line; on real hardware one of these resets the
 // CPU, and QEMU treats either as a machine reset (unless QEMU was started with
 // -no-reboot, in which case it exits instead). Halts if both are ignored.
+// **AND THE LAST WORDS GO OUT BEFORE THE MACHINE DOES.**
+//
+// `serial::write_bytes` ENQUEUES once the ring is serviced asynchronously - `drain_tx` on the idle
+// pass is what puts bytes on the wire - so everything said in the moments before a reset or a
+// power-off is sitting in that ring when the machine stops, and is never transmitted. The log then
+// ends mid-shutdown and an ORDERLY power-off reads exactly like a crash.
+//
+// MEASURED (2026-09-20), AND IT COST THE CHASSIS POWER BUTTON ITS PROOF. DeviceManager takes the
+// press, says so, and asks the power service to stop the machine; the machine stopped, the scenario
+// looked for the line that says the press was acted on, and the line was still in the ring. Six
+// scenario runs and a day of measurement went on the delivery path, which was working throughout.
+//
+// `exit_qemu` has flushed for exactly this reason since the tests needed their report to arrive. The
+// two paths a real machine takes needed it just as much.
 pub fn reset() -> ! {
+	serial::flush_sync();
 	unsafe {
 		// 0xCF9: set SYS_RST, then pulse RST_CPU|SYS_RST (the rising edge resets).
 		outb(0xcf9, 0x02);
@@ -158,6 +173,8 @@ pub fn reset() -> ! {
 // register. QEMU's q35 (ICH9) decodes it at 0x604, i440fx (PIIX4) at 0xB004; 0x600
 // is written too as a harmless fallback. (Real-hardware ACPI comes later.)
 pub fn poweroff() -> ! {
+	// THE SAME FLUSH AS `reset`, AND THE NOTE ON IT SAYS WHY.
+	serial::flush_sync();
 	unsafe {
 		outw(0x604, 0x2000);
 		outw(0xb004, 0x2000);

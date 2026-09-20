@@ -35,10 +35,15 @@ caps = dict(re.findall(r'pub const (CAP_\w+): &\[u8\] = b"(\w+)";', open(rt_path
 SENDERS = r"send_blocking|send_privilege|send_caps|send_shell_cap|send_power|send_factory|serve_root"
 STEP = re.compile(rf"\b(?:{SENDERS})\(\s*manager_side\s*,\s*([^,]+?)\s*,|\bfor\s+\w+\s+in\s+\[([^\]]+)\]|\b(bootstrap_\w+)\(|\b(send_ready)\(")
 
+# `unsafe` IS NO LONGER PART OF THESE SIGNATURES (P02M0178 removed propagated unsafe from the
+# runtime wrappers), and a body map keyed on it came out EMPTY - so every service whose ladder is one
+# helper call compared an empty sequence against its declared roles and was reported as a
+# disagreement. The boundary is a top-level `fn`, with or without the two prefixes.
+FUNCTION = r"^(?:pub(?:\(super\))? )?(?:unsafe )?fn "
 bodies = {}
-for match in re.finditer(r"^(?:pub\(super\) )?unsafe fn (\w+)\(", source, re.M):
+for match in re.finditer(FUNCTION + r"(\w+)\(", source, re.M):
 	name = match.group(1)
-	following = re.search(r"^(?:pub\(super\) )?unsafe fn ", source[match.end() :], re.M)
+	following = re.search(FUNCTION, source[match.end() :], re.M)
 	end = match.end() + (following.start() if following else len(source) - match.end())
 	bodies[name] = source[match.start() : end]
 
@@ -114,7 +119,10 @@ for service, sequence in sorted(ladder.items()):
 # endpoints and then fail - which looks like a crash-loop rather than a wiring mistake. So they are
 # compared here, where the rest of this milestone's two-sided facts are compared.
 supervisor = open(os.path.join(root, "user", "services", "core", "src", "service_manager.rs"), encoding="utf-8").read()
-relaunch = re.search(r"unsafe fn relaunch_service\(.*?\n\t\t\};", supervisor, re.S)
+# THE ANCHOR LOST ITS `unsafe` WITH THE SOURCE (P02M0178 removed propagated unsafe from the
+# runtime wrappers). What it reads is unchanged: the table that joins a manifest name to the
+# broker root a relaunch has to replace.
+relaunch = re.search(r"fn relaunch_service\(.*?\n\t\t\};", supervisor, re.S)
 if not relaunch:
 	print("check-bootstrap-plan: cannot find relaunch_service's broker-root table", file=sys.stderr)
 	sys.exit(1)

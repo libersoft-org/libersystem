@@ -125,6 +125,9 @@ pub fn feed_serial(byte: u8) -> bool {
 /// are waiting would arrive BEFORE them, which is a command line with its characters rearranged - and
 /// the ordering is the whole of what an input path owes.
 fn enqueue(serial: bool, byte: u8) -> bool {
+	// ALLOC-OK: `Pending` is a FIXED-CAPACITY ring - `entries[PENDING_BYTES]` - and its `push`
+	// answers `false` when the ring is full rather than growing. Nothing here allocates; what the
+	// scanner matched is the word.
 	let accepted = PENDING.lock().push(serial, byte);
 	drain();
 	accepted

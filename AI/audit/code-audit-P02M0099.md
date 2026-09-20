@@ -2178,3 +2178,554 @@ DECIDED rather than found:
 WHICH IS THE ANSWER TO "IS THE SIXTH INSTANCE STILL OUT THERE". Inside this loop, no: every call is
 now either bounded or a written-down decision, and the gate keeps it that way. Whether the loop then
 reaches the press is a measurement and not a deduction, and it is the next run.
+
+## The gates found the one thing I had not checked (2026-09-20)
+
+RUNNING THE x86_64 GATES FOUND EXACTLY ONE DEFECT OF MINE, AND IT WAS THE ONE THE SCENARIO COULD NOT
+SEE. `check.sh --gate implementation-mutations` failed with
+`could not compile kernel (bin "kernel" test) due to 5 previous errors`, and all five are mine:
+`ioapic::Kind`, its two redirection-entry bit constants, `Kind::bits` and `port::inw`. Every one is
+reachable only from `route` or from `arch::sci`, and BOTH are `#[cfg(not(test))]` - so in the test
+build they are dead code, and warnings are errors here.
+
+**THE TEST KERNEL IS A SECOND COMPILATION AND `./build.sh --part kernel` IS NOT IT.** I built the
+shipping kernel a dozen times, it said `RESULT ok` every time, and the kernel `test.sh` runs did not
+compile at all. That is a worse failure than the dead code being complained about: the whole in-guest
+suite cannot run. It is fixed by giving each symbol the same `cfg(not(test))` its only caller has,
+which is what `route` already carried and what I did not follow through.
+
+AND IT IS WHY THE SWEEP WAS WORTH THE HOURS. Twenty-eight scenario runs proved the ACPI path and
+could not have found this, because a scenario boots the shipping kernel. The check is seconds:
+`cd src/kernel && TEST=1 TEST_TAGS="" cargo build --tests`.
+
+### What the rest of the red was
+
+Every other failure in the x86_64 sweep is one of three things, and none is a regression:
+
+  - PRE-EXISTING, PROVED RATHER THAN ASSUMED. `bootstrap-plan` anchors on `service_manager.rs`,
+    which the commit does not touch. `dma-mode-carrier` reports on `check-run-verdict.sh`, likewise.
+    `guest-verdict` fails because `virtio-multiport` is missing from the P02M0177 inventory, and
+    that gate was added by somebody else. `driver-event-dispatch` fails IDENTICALLY when pointed at
+    the pre-commit source with `--source`, which is the cleanest proof available.
+  - ORDERING ARTEFACTS OF MY OWN BUILDS, which is the shape this tree already records twice.
+    `capability-trace` wants a trace newer than the kernel beside it; `development-gate` wants the
+    shipping volume and found the development one; `foreign-facilities-guest` and
+    `foreign-loader-guest` want the development staging and found the shipping one. The last two and
+    `development-gate` cannot be satisfied at the same time, which is the same fact as
+    "check.sh cannot go green in a single pass".
+  - OUT OF SCOPE FOR AN x86_64 RUN. `dma-mode-ports` and `iommu-ports` need an aarch64 build; my
+    filter let them through because their scripts only MENTION the other ports.
+
+AND `driver-event-dispatch` WAS IMPROVED ON THE WAY PAST. Two of its anchors named `unsafe fn
+advance(` and `unsafe fn open_subscription(`, neither of which has existed in either version of the
+file - so the gate answered "substring not found" and checked nothing. With the anchors corrected it
+reaches its real assertion and says which one fails, which is the difference between a gate that is
+red and a gate that is mute.
+
+## A wait with no end found by reading, which was NOT this symptom's cause (2026-09-20)
+
+**THE HEADING ON THIS SECTION SAID "the eighth defect" AND THAT WAS WRONG, WHICH IS CORRECTED HERE
+RATHER THAN QUIETLY EDITED AWAY.** The measurement that settled the power button came afterwards and
+is in its own section below: the consumer half was working, and what hid it was the serial ring. The
+defect described here is real, was found by reading `rt`, and is fixed - but nothing measured says it
+is what kept the press from coming out, and the run that proved the chain already had this fix in it.
+
+**`rt::print` IS A WAIT WITH NO END, AND THE SUPERVISOR CALLS IT ON EVERY PATH.** Its body is `if out
+!= 0 && send_blocking(out, bytes, 0)`: once this program has a stdout - a console channel handed to
+it at start-up - every line it prints is a blocking send on a channel whose reader is a virtual
+terminal. From display takeover onwards nothing drains that terminal, so the first line the
+supervisor prints after takeover parks the whole loop, for ever, with the process alive and its
+handles open. That is the shape the boot log shows: the last DeviceManager line sits directly after
+`ConsoleService: a frame reached the display`, and then nothing at all - no chassis event, no
+catalogue answer, no teardown - while the kernel says the press was handed on and the queue holds it.
+
+The gate this file added, `check-supervisor-waits.sh`, reads call NAMES. `print(` is not one of them,
+so a park one call deeper was invisible to it and to every reading of the loop. What it costs is a
+supervisor that can be stopped by a terminal nobody is draining; what it cost HERE is nothing that
+was measured.
+
+FIXED BY DEFINING `print` IN THE PROGRAM. `use rt::*` is a glob import and an item defined in the
+file wins over it, so one definition covers all two hundred call sites: send the line if the console
+has room, write it to the machine log if it does not. Nothing is lost and nothing waits.
+
+**AND A SECOND DEFECT IN THE SAME AREA, WHICH WAS THIS SESSION'S OWN.** The bounded park added for the
+platform channel used plain `wait_any`. `sched::min_deadline` skips PERIODIC waiters and nothing else,
+so a supervisor that re-arms a one-second deadline for ever keeps `run_until_idle` going for ever -
+the trap the console loop's note describes, and why ConsoleService polls with `wait_any_periodic`. The
+park is now periodic WHEN THE POLL IS THE ONLY REASON TO WAKE, and an ordinary wait whenever a retry,
+a stop deadline or a teardown is pending: those are work in flight and have to stay visible as such.
+
+**AND THE TWO NOTICES ABOUT THE PLATFORM CHANNEL NOW GO TO THE MACHINE LOG** rather than through
+`print`, for the reason `machine_log` already states: a chassis event is a fact about the machine and
+belongs in the machine's log, not on a terminal nobody is reading.
+
+**THE KERNEL NOW SAYS WHEN A DELIVERY WAS NO USE.** `Channel::peer_unread` answers how many messages
+an endpoint has handed its peer that the peer has not taken, and `platform_event::check_unread` reads
+it three seconds after a delivery: if the event is still queued it says so once and dumps every
+blocked thread with the koid it waits on. "It never arrived", "it arrived and nobody read it" and "it
+arrived and was acted on" were one answer in the log, and that is what a day went into telling apart.
+
+## Four verification checkers were reading a source shape that has not existed since P02M0178 (2026-09-20)
+
+`check.sh --gate driver-event-dispatch` runs five checkers. Commit ca97d317 removed propagated
+`unsafe` from the runtime wrappers, which deleted an `unsafe { ... }` block from several DeviceManager
+functions - so every anchor that named `unsafe fn X(` stopped matching, and every anchor that counted
+TABS was one level too deep. The gate has been failing on its FIRST anchor ever since, which is why
+nothing behind that anchor was ever reached.
+
+Re-aimed, with the reason recorded beside each: `check-driver-event-dispatch.py`,
+`check-device-manager-progress.py`, `check-device-claim-result.py` and `check-driver-lifecycle.py`.
+Their extracted fixtures also needed the source's later shape: a provider carries a NAME, a claim
+names its ENTRY and the grant carries the kernel's stamp, an offer carries the provider name, the
+node records `bind_at`, and the bounded subscription reply is `send_with_room`. Each of those now
+compiles against today's source, and the mutation batteries behind them reject their mutants again:
+`device-manager-progress` (8 mutants), `device-claim-result` (3 mutants) both pass.
+
+**AND THE THREE LIFECYCLE TESTS WERE ASSERTING A CONTRACT THE SOURCE HAD REPLACED.**
+`ready_receipt_deadline`, `first_reply_uses_receipt_deadline_even_without_tick` and
+`direct_intake_prioritizes_new_expiry_before_traffic` all encode "the deadline is tested before the
+channel is read". `drain_channel` deliberately stopped working that way and says why in its own note,
+with the measurement behind it: a deadline is about SILENCE, and there is no silence when the answer
+is already in the buffer - measured on a q35 controller whose AHCI driver answered twice and was
+declared silent twice, costing two full bind windows. The tests never failed over it because the gate
+had already been broken by the `unsafe` removal, so they had not run since.
+
+Re-aimed at the contract that IS in the source, with the reasoning beside each: a READY taken at 99
+against a deadline of 100 is timely however late the pass behind it is; one taken AT the deadline is
+not. The same on the heartbeat's side for a PONG. And the third keeps the OTHER half of the rule -
+a receipt that CROSSES the deadline admits the expiry from the frame's own arrival and takes the last
+queue slot ahead of the reply - which needed clocks that make the crossing real (`[14, 16, 16]`,
+where the pass opens live and the frame is taken expired). All thirteen pass and all eleven mutants
+are rejected, including `crossing receipt misses expiry admission`, which the weaker form of that
+test would have accepted.
+
+**WHAT IS STILL OPEN IN THAT GATE AND IS NOT CLAIMED: `check-dev-channel-control.py`.** It models a
+`dev_channel.rs` with `heartbeat`, `send_to_agent`, `rx.take_used` and a `pending_bytes` hand-off;
+the driver was rewritten on 2026-09-15 and now holds two functions, `pump` and `ended`. Every anchor
+in that checker names something that no longer exists, so its whole mutation battery - fifteen
+variants - describes a program this tree does not contain. Rebuilding it is deriving an oracle
+against a driver from scratch, which is its own task and not a repair; it is the last thing between
+`driver-event-dispatch` and green, and the five checkers in front of it now pass.
+
+## THE DEFECT THAT WAS ACTUALLY IT: the machine's last words never leave the ring (2026-09-20)
+
+**`arch::poweroff` AND `arch::reset` STOPPED THE MACHINE WITH THE SERIAL RING FULL.** Once
+`serial::enable_async` is on, `write_bytes` ENQUEUES - `drain_tx`, on the idle pass, is what puts
+bytes on the wire - so everything said in the moments before an orderly shutdown was still in that
+ring when the machine stopped, and was never transmitted. A clean power-off then ends its log
+mid-sentence and reads exactly like a crash.
+
+**AND IT IS WHAT THE CHASSIS POWER BUTTON WAS MISSING ALL ALONG.** The consumer half was working:
+DeviceManager took the event, said so through the machine log, and asked the power service to stop
+the machine. The machine stopped - which is the proof, once one knows to read it that way - and the
+line that says the press was acted on died in the ring with it. TWO RUNS, ONE DIFFERENCE. Both booted a guest outside the scenario harness - no handshake, nothing
+that could tear it down - and pressed the button through the QEMU monitor. The first, on a build that
+already had every other fix from this hunt, ended with `platform: event 1 handed on` and a machine
+that was gone when it was looked at again: the press WAS acted on, because nothing else in this
+machine turns a guest off. The second, on the same tree plus the flush, ends:
+
+    acpi: the power button was pressed
+    platform: event 1 handed on, from object 65 to Some(66)
+    DeviceManager: the power button was pressed - asking the power service to stop the machine
+
+and then the machine is off. The flush is the whole difference between those two logs.
+
+`exit_qemu` has flushed for this exact reason since the test report needed to arrive; the two paths a
+real machine takes did not. Both call `serial::flush_sync()` now. The other two ports write
+synchronously - their `flush_sync` and `drain_tx` are empty - so they have nothing to lose here, and
+nothing about them was changed on an unmeasured architecture.
+
+WHAT THIS RETIRES: the hypotheses this hunt accumulated about the delivery path - a wake that does
+not arrive, a park in `wait_any`, a queue nobody drains - were all measuring a mechanism that worked.
+What was broken was the LOG, in the last hundred milliseconds of the machine's life. The two things
+kept from that work stand on their own: `print` in a supervisor must not park (that one WAS a real
+wait with no end), and the kernel now says when a delivered event goes unread.
+
+## Three defects between a working power button and the gate that proves it (2026-09-20)
+
+`lab.sh scenario-cold` could not drive a cold guest at all: it waited out its handshake deadline on
+every scenario, so the power button's own oracle - and the hot-plug one - could not run. Three
+separate things were wrong, and all three are fixed. The scenario now passes in 2.6 s, and the
+hot-plug scenario still passes beside it.
+
+**1. A COLD RUN BOOTED A VOLUME ITS OWN BUILD NEVER WROTE.** `mkimage` lays
+`system-volume-bootable-x86_64.img` into the medium, and only a volume step asked for the KERNEL ON
+THE VOLUME produces that file; `build.sh` on its own refreshes `system-volume-x86_64.img`, which is a
+different file with a similar name. So the guest booted whatever that volume last happened to be -
+measured here at two and a half hours old and of the SHIPPING configuration, which contains no
+development agent at all. DeviceManager's development path then found nothing to start, the guest
+served no control channel, and the runner waited thirty minutes for a handshake that could never
+arrive, on a tree where everything it was waiting for had been built minutes before. `cmd_scenario_cold`
+builds that volume now, for x86_64 only, because it is the only target whose medium carries it.
+
+THAT ALSO EXPLAINS AN EARLIER DEAD END IN THIS FILE. Six DeviceManager diagnostics added to the
+development-agent path, and an unconditional probe placed after `launch_volume_drivers` returned,
+all "vanished". They did not vanish: the binary carrying them was never booted. The measurement that
+settled it was the ISO's own digest, identical across two runs whose DeviceManager differed.
+
+**2. `expect` SWALLOWED THE LINE THE NEXT STEP WAS WAITING FOR.** It advanced the cursor to the end
+of everything it had READ rather than to the end of its MATCH, and this scenario is two assertions on
+two lines written in the same instant: the kernel's, then the consumer's. The first step read both,
+matched the first and consumed the second; the second step then waited out its whole timeout for a
+line that had already gone past. The cursor stops at the end of the match now, which needed a small
+conversion - the oracles search ANSI-stripped text and the cursor counts raw bytes.
+
+**3. A MACHINE THAT POWERS ITSELF OFF HAD NO WAY TO SAY SO.** The teardown gives a scope back by
+DRIVING the guest - a keystroke, a prompt, a reset, a question about what is still held - and this
+scenario's success is a machine that is no longer there. It reported `the scenario passed but its
+scope was not restored` on the run where everything worked. A scenario declares `ends = "powered-off"`
+now, and the teardown asserts the opposite thing: that nothing answers any more.
+
+## A fixture machine QEMU refused to start at all (2026-09-20)
+
+`check.sh --gate qemu-virtio-iommu-x86_64` died in eight seconds with `-device
+hda-duplex,bus=hdabus.0,audiodev=snd0: audiodev 'snd0' not found` - before a single guest
+instruction. The x86_64 runner attaches an HDA controller and codec to EVERY machine it builds, from
+`qemu_attach_nvme`, and names `snd0` on them; the `-audiodev` that DEFINES `snd0` sat inside
+`if [[ "$dma_fixture" != "1" ]]` beside the sound CARD. So every DMA-fixture machine carried a codec
+with no backend behind it, which QEMU refuses outright.
+
+An `-audiodev` is a backend definition and not a device: defining it costs a fixture nothing. It is
+appended for every x86_64 machine now, and the sound card stays inside the branch. The gate passes in
+638 s - the controller leaves bypass, five hostile cases are refused by the hardware, an ordinary
+endpoint passes real traffic, and the default machine is the isolated one.
+
+The other two ports were checked and need nothing: the only device naming `snd0` there is the
+virtio-sound card, which is attached in the same branch as its backend.
+
+## And the full x86_64 suite reproduces a failure this file already carries (2026-09-20)
+
+`./test.sh --arch x86_64` with no tags fails in `kernel.services.a_tty_a_job_left_raw_comes_back_cooked`
+with `xab\n` where the test typed `ab\n` - byte for byte the failure recorded on 2026-09-19 as a
+full-suite-only order dependence that no scoped selection reproduces. Nothing in this session's work
+touches the console input path, and the reproduction is identical, so it stays what it was: open,
+reproducible, and not attributed. The run also refreshed the capability trace, which is what
+`capability-trace` wanted: that gate passes now.
+
+## `bootstrap-plan` was reading a source shape that has not existed since P02M0178, and behind it were two real disagreements (2026-09-20)
+
+The gate compares two sides of the same fact: the hand-written bootstrap ladder and the role plan the
+manifest declares. It could not read either. `check-bootstrap-plan.py` anchors `relaunch_service` on
+`unsafe fn` and splits `bootstrap.rs` into function bodies on the same prefix - and P02M0178 removed
+propagated `unsafe` from the runtime wrappers, so the body map came out EMPTY. Every service whose
+ladder is one helper call then compared an empty sequence against its declared roles. Both anchors
+now read a top-level `fn` with or without its prefixes.
+
+WITH THE GATE READING AGAIN, TWO DISAGREEMENTS WERE UNDER IT:
+
+**The graph service is handed a role its manifest does not declare.** `bootstrap_system_graph_service`
+sends `DISPLAY` - DisplayService's observation root, minted as a client - between `SUPERVISOR` and
+`SERVE`, and `system_graph_service.rs` reads that tag. Only the declaration was missing, so it is
+added: a client of `display_service`'s `STATS` root, interface `liber:display@1/display-stats`,
+optional for the same reason the ladder guards it. The two sides agree now.
+
+**And `font_catalogue` is declared `restart = "transparent"` by a supervisor that cannot restart it.**
+`relaunch_service` re-runs exactly three bootstraps - config, device and graph - because the broker
+holds a root for each. There is no font root: the catalogue's `SERVE` and `ADMIN` roots go to
+PermissionManager at bootstrap and nothing re-delivers them. So the manifest promises a transparent
+restart that would spend a restart budget, reap the endpoints and fail, which is the exact shape this
+gate's own note says it exists to prevent.
+
+THE FIX IS NOT A ONE-LINER IN EITHER DIRECTION, AND THAT IS WHY IT IS RECORDED RATHER THAN DONE.
+Making the mechanism cover it means a broker root for fonts AND a path that re-delivers a restarted
+catalogue's roots to PermissionManager - which is a question about how a restarted provider's roots
+reach the component that hands them out, not about fonts. Making the declaration honest instead means
+retracting a property a service was given deliberately. This one belongs to whoever owns the
+supervisor's restart contract; what this session did was make the gate able to see it.
+
+## The gate accounting at the end of this session (2026-09-20)
+
+TWENTY-THREE gates were run individually and pass: `implementation-mutations` (on a retry - the
+mutant kernel met the machine's known intermittent `rustc` failure on the first), `virtio-multiport`,
+`source-history-hygiene`, `targeted-cache`, `provider-media-order`, `verify-model`, `source-hygiene`,
+`supervisor-waits`, `no-fixed-provider-slots`, `boot-harness`, `development-build`, `capability-trace`,
+`qemu-virtio-iommu-x86_64`, `dma-mode-carrier`, `run-verdict`, `milestone-index`,
+`declared-interfaces`, `provider-routing`, `guest-verdict`, `kernel-allocations`, plus the two
+scenarios (`power button`, `pcie hotplug`) and `test.sh --arch x86_64 --tags boot`.
+
+EIGHT OF THOSE WERE RED WHEN THIS SESSION FOUND THEM, and each is recorded above with what was wrong.
+Four were this session's own regressions, four were older: an image that had not been rebuilt, a
+trace older than the kernel beside it, a fixture machine QEMU refused to start, four verification
+checkers reading a source shape that has not existed since P02M0178, an inventory missing five guest
+gates, and four allocation sites the scanner could not tell from real ones.
+
+WHAT IS STILL RED, AND WHY EACH ONE IS NOT CLAIMED:
+  - `driver-event-dispatch`: five of its six checkers pass now; `check-dev-channel-control.py` models
+    a `dev_channel.rs` rewritten on 2026-09-15 and its fifteen mutants name functions that no longer
+    exist. That is deriving an oracle, not repairing one.
+  - `bootstrap-plan`: one real disagreement left - `font_catalogue` is declared transparently
+    restartable by a supervisor that cannot restart it. Both directions are decisions; see above.
+  - `virtio-iommu-protocol`: `check-iommu-completions.py`'s fixture no longer compiles against the
+    kernel's own types - `dma_policy::Admission` moved, `Entry::class`, `Slot::entry` and
+    `Slot::policy` are gone, and four calls changed arity. The same staleness class, a bigger repair.
+  - `no-suppression`: twenty-two lint suppressions, in the kernel's tests and in all three
+    architectures' PCI files. Answering them honestly means building aarch64 and riscv64 to see what
+    the warnings become, which is the one thing this session may not do until everything else is done.
+  - `development-gate`, `foreign-facilities-guest`, `foreign-loader-guest`, `development-lifecycle`:
+    each needs a staging state the others exclude, which is the ordering artefact this tree already
+    documents rather than a defect.
+  - `dma-mode-ports`, `iommu-ports`, `qemu-numa`: aarch64 and riscv64, deferred by the standing rule.
+  - `./test.sh --arch x86_64` with no tags reproduces the recorded full-suite-only tty order
+    dependence, unchanged and still not attributed.
+
+## The slow-architecture run, which is what it was for (2026-09-20)
+
+**IT FOUND A BUILD FAILURE OF THIS SESSION'S OWN IN ITS FIRST FOUR MINUTES.** `platform_event::report`
+is called by x86_64's ACPI SCI handler and by the hardware suite, and by nothing else - so on the two
+device-tree ports a shipping kernel reaches it from nowhere and `--deny=warnings` refused the build.
+It is scoped now to where it is called from, `#[cfg(any(target_arch = "x86_64", test))]`, with the
+note that says what a dead-code warning there would MEAN: that this system has no fixed-hardware
+event source on those ports yet, and the day one arrives its port adds itself. Both ports build
+(aarch64 after one retry - the machine's known intermittent `rustc` SIGILL - and riscv64 clean).
+
+**AND THEN BOTH PORT SUITES, RUN WHOLE: aarch64 271 tests in 3151 s and riscv64 273 in 3725 s, each
+with ONE FAILURE and the same one** - `kernel.boot.init_package_starts_system_manager`, the
+end-to-end boot chain. Nine of twenty-four
+services report online and the other fifteen never start, every one of them at `ProcessService: no
+artifact at vol://system/libexec/...`. The riscv64 boot tag fails identically. The x86_64 boot tag
+passes.
+
+WHAT THE NEW STORAGE DIAGNOSTICS SAID, AND WHERE THEY LED:
+  - In the full aarch64 suite, one instance hit `vol://system NOT built: the handed-over image does
+    not mount as a LiberFS volume`, which is the silent `exit()` this session made speak. The refusal
+    is named by kind now - a short image, a foreign one and a machine that could not hold the
+    volume's free maps send a reader to three different places.
+  - In the BOOT TAG on both ports the live volume is built fine, and the test still fails. The line
+    that answers why is the mount that precedes it: `vol://system mounted through its block provider`
+    - a DISK - followed by several refusals of other disks. The port's test machine presents a
+    formatted scratch disk, that disk becomes `vol://system`, and the handed-over live image never
+    gets to be the system volume. x86_64 ends the same sequence with `is a live copy in memory`.
+
+SO THE FINDING IS: NOT that the ports cannot boot - their driver suites pass, 271 tests here - but
+that the end-to-end chain test has never been green on them. **The reason is one line further down
+and is recorded in its own section below: the system volume the port machine attaches carries no
+kernel, so the loader rejects it as a root.** The reading in this paragraph - that it was medium
+SELECTION, the question `provider-media-order` asks - was this session's own and is retired by the
+loader's own line.
+
+AND ONE MEASUREMENT CORRECTED ITSELF BEFORE IT BECAME A CONCLUSION. The count `copy_tree` returns is
+TOP-LEVEL entries, not files; two is what a healthy system volume has. Reading it as a file count
+made an empty volume out of a full one for one run, until the same line was read on x86_64 - where
+the test passes and the number is also two. The line says `top-level` now, which is the half of it
+that was missing.
+
+## Why the boot chain fails on both ports, in the loader's own words (2026-09-20)
+
+The diagnosis took four log lines the loader prints about itself:
+
+    loader: bootstrap set verified against a SIGNED etc/boot.manifest2 on the system volume
+    loader: system volume found but it has no kernel; using the boot volume
+    loader: bootstrap set assembled from the boot medium (the system volume did not answer)
+
+The port runner attaches a system disk built from `system-volume-<arch>.img`, which `build.sh`'s
+volume step writes WITHOUT a kernel on it - the kernel goes on the volume only when a build is asked
+for it, and that is what produces `system-volume-bootable-<arch>.img`. So the loader finds a system
+volume, verifies its manifest, rejects it as a root because it carries no kernel, and falls back to
+the boot medium. The running system then reads a `vol://system` that holds neither `libexec/` nor
+`drivers/`, which is what `no artifact at vol://system/libexec/...` and `virtio-blk is named by the
+registry and not on the volume` are saying, fifteen services later.
+
+IT IS THE SAME FAMILY AS THE COLD-SCENARIO DEFECT ON x86_64 recorded above: a guest booting a volume
+that a DIFFERENT build step produces, so the volume it boots and the system it was built from are
+two different things. There the runner never built it; here the runner builds the wrong one of two
+artifacts whose names differ by one word.
+
+WHAT IT IS NOT: it is not the medium-SELECTION question `provider-media-order` asks - that reading
+was this session's own, and the loader's line retires it. The disk the storage service mounts is the
+one the machine attaches; what is wrong is what is ON it.
+
+## Two probes that narrow the port boot-chain failure, and the one they leave (2026-09-20)
+
+**PROBE 1 - THE PORTS' BOOT MEDIUM NAMES NO SYSTEM VOLUME.** Running the riscv64 boot tag with the
+system disk detached made the loader say it in one line: `the boot medium names no system volume;
+using the first LiberFS volume found`. The x86_64 media are assembled by `mkimage`, whose
+`resolve_volume_pairing` puts the volume's UUID into the signed manifest and calls a medium that
+carries a volume with no pairing a BUILD ERROR. The ports' ESP is assembled by `qemu_build_esp`,
+which stages and signs the volume package but names no pairing - so on those machines the root is
+whichever LiberFS volume the firmware enumerates first.
+
+**PROBE 2 - AND DETACHING THE DISK IS NOT THE FIX.** With no system disk the `no artifact at
+vol://system/...` failures disappear entirely - so the live root built from the medium's volume
+package does hold the system - but only FOUR of twenty-four services come online instead of nine:
+the services that need a writable system volume have nowhere to put it. The two probes together say
+the defect is in WHICH volume the running system treats as its root, not in what any one volume
+holds.
+
+WHAT IS LEFT IS ONE EXPERIMENT AND ONE DECISION, AND NEITHER IS A GUESS:
+  - THE EXPERIMENT: `ProcessService` looks up `vol://system/libexec/...` and is refused, while other
+    tests in the same suite read and write `vol://system` successfully. Those are two different
+    clients of the same name. Instrumenting which volume each one resolves - the live copy from the
+    medium or the attached disk - is what separates "the root selection is wrong" from "the root is
+    right and the lookup is wrong", and nothing measured so far separates them.
+  - THE DECISION: the loader records `ROOT_BLOCK` only in the branch where the system volume answered
+    with a BOOTSTRAP SET. A volume that is selected and carries no kernel drops its bootstrap set -
+    deliberately, "the halves are chosen together or not at all" - and with it the root selection,
+    leaving `ROOT_NONE`. Whether a kernel-less volume should still be NAMED as this boot's root is a
+    question about the boot contract, and it belongs to whoever owns that rule rather than to an
+    implementer who found the machine it shows up on.
+
+## The port boot-chain failure, measured to its last link (2026-09-20)
+
+Four instruments were added, each answering the question the previous one left, and together they
+walk the whole chain. Every one of them is a line this tree wanted anyway.
+
+  1. **WHICH BACKING SERVES `vol://system`.** Both a live copy and a disk announce themselves while a
+     boot mounts candidates, so a log carrying both says nothing about which one clients talk to.
+     The answer, on the ports AND on x86_64, is the same: the boot test's own storage serves the
+     DISK. That retired the "the ports choose the wrong medium" reading.
+  2. **WHICH DISK.** The line carries the volume's uuid now. It is `951b8cd9d5…`, byte for byte the
+     uuid `build.sh` wrote beside the image it made in that same run. The right disk, mounted, with
+     the programs on it - and it is served at log line 130, a hundred and thirty-nine lines before
+     anyone asks for a file, so it is not a race either.
+  3. **WHAT THE VOLUME HOLDS WHEN A LOOKUP MISSES.** `ProcessService`'s "no artifact at ..." now says
+     what the volume answers for the directory - and for its ROOT, because a root that lists while
+     `libexec` does not is a wrong volume, and a root that is refused as well is something else.
+  4. **AND WHICH REFUSAL IT IS.** `denied` would be a scope; `not found` is not.
+
+THE ANSWER IS `[root: refused, not found] [libexec: refused, not found]`. The volume that
+`ProcessService` is holding a client to does not have a root. It is not the one StorageService serves
+under that name, which by then has been serving the right disk for a hundred lines. So the defect is
+in the CLIENT `ProcessService` is given at bootstrap on the port profile, and in nothing downstream
+of it: not the medium, not the disk, not the selection, not the timing, not the lookup.
+
+THAT IS ONE QUESTION, IN ONE PLACE, WITH EVERYTHING AROUND IT MEASURED: which volume client the port
+boot chain hands `ProcessService`, and why it is not the one that answers to `vol://system`. It is
+left there deliberately - a hand-off in the boot chain is a contract between three programs, and this
+session has already recorded two places where guessing at one cost a day.
+
+## AND IT IS NOT A PORT DEFECT AT ALL: a race the x86_64 margin hides (2026-09-20)
+
+The instruments that walked the chain also flipped it. With TWO `print` lines added where the system
+volume is constructed - naming which backing serves `vol://system` - the x86_64 boot tag FAILED with
+the ports' exact signature: `no artifact at vol://system/libexec/...`, ten services online, the rest
+never started. Removing those two lines made it pass again in 52 s. One variable, both directions,
+three runs.
+
+So the end-to-end boot chain's hand-off of `ProcessService`'s volume client is TIMING-SENSITIVE, by a
+margin two log writes can spend. The device-tree ports do not have a defect of their own here: they
+are ten to twenty times slower under TCG and lose the same race every time, which is why it looked
+like theirs.
+
+WHAT THAT CHANGES ABOUT THE FINDING:
+  - The instruments are gone from the tree. They answered their question and their cost is the
+    defect's own trigger, which makes them the one kind of diagnostic that cannot stay.
+  - What is left is one race in one hand-off, reproducible ON x86_64 by adding two prints to
+    `live_volume`'s callers - which is a far better reproduction than a fifty-minute emulated suite.
+  - The earlier sections above reason about mediums, pairings, kernels on volumes and root
+    selections. Every measurement in them stands; the CONCLUSION each drew - that the ports choose
+    or carry the wrong thing - does not. The uuid line settled that: the volume served is the one
+    the build made, mounted before anyone asks for a file.
+
+THE NEXT STEP IS NAMED AND IS ON x86_64: put those two prints back, reproduce in under a minute, and
+find which of the two clients `ProcessService` ends up holding. Nothing in this needs an emulated
+port or an hour.
+
+## The last link: the volume answers `Io` (2026-09-21)
+
+Four more probe cycles on riscv64 - each one a build and a five-minute boot tag - walked the refusal
+down to a single error code. `ProcessService`'s client lists `vol://system/libexec` and the volume
+answers **`Error::Io`**.
+
+That is not any of the things the earlier sections reasoned about. The name resolves - so the client
+is talking to the right volume, and the "its volume has no root" reading two sections above is
+RETIRED: it came from a probe of my own that called `list("libexec")` without the `vol://` scheme,
+which the path parser answers `NotFound` to before it ever looks at a volume. A probe that cannot
+distinguish its own malformed argument from the answer it is hunting is not a measurement, and this
+one produced a confident wrong conclusion before the source of `list_dir_name` retired it.
+
+SO WHAT IS LEFT IS: reading the system volume's directory THROUGH ITS BLOCK PROVIDER fails with an
+I/O error at the moment the services are launched, while the same volume mounted cleanly a hundred
+log lines earlier - its partition table and both superblocks were read over that same provider's
+request channel, which is a line the storage service prints precisely to prove the provider served.
+
+AND THAT REFRAMES THE PRINT EXPERIMENT ONE LAST TIME. x86_64 has TWO volumes answering to
+`vol://system` in that test - a memory-backed live copy and the disk - and it passes when the live
+copy is the one `ProcessService` holds. Two log lines were enough to change which. So the race is
+real and the Io is real, and the second is what the first exposes: a client that ends up on the
+DISK-backed volume meets a provider that has stopped answering.
+
+THE NEXT PERSON'S FIRST QUESTION IS WHICH, AND THE LOGS ALREADY SUGGEST IT: the boot test is a
+lifecycle drill that stops and restarts drivers, and `virtio-blk` is among them. A volume whose block
+driver went down under it would answer exactly this. That is one grep away from being certain and it
+is not a guess this file will carry.
+
+## And the cause, with the correlation measured on three architectures (2026-09-21)
+
+One grep settled it. `DeviceManager: virtio-blk stopped answering its control path inside the deadline
+its registry entry declares` - and the count of that line against the count of `no artifact at
+vol://system/...` across four runs:
+
+    run                                   control-path timeouts   services that could not load
+    x86_64, boot tag, passing                        0                       0
+    x86_64, boot tag, + two log lines               16                       7
+    riscv64, boot tag                                4                       7
+    aarch64, full suite                             10                       7
+
+**SO THE CHAIN IS: a driver misses its control-path deadline -> DeviceManager tears it down -> the
+system volume's block provider goes with it -> every read of that volume answers `Io` ->
+`ProcessService` cannot load the fifteen services that live on it.** The deadline is
+`heartbeat-deadline = 100` in the driver's registry entry - one second at this timer - and it is
+declared per entry.
+
+THAT IS WHY TWO LOG LINES WERE ENOUGH. They cost the boot a fraction of the same second. An emulated
+port under TCG spends it by default, which is why both ports lose every time and x86_64 loses only
+when something takes a slice of it away.
+
+WHAT IS NOT DECIDED, AND IS NOT AN IMPLEMENTER'S TO DECIDE: whether a one-second control-path deadline
+is right and the driver is at fault for missing it under load, or whether the deadline is a
+reference-host number that an emulated target cannot meet - which is the same shape as the test
+budgets in `test-kernel.sh`, each raised on a measurement and each with its own note. What IS decided
+by the measurement above is that the two are one defect and not three, that it is not the ports', and
+that it reproduces on x86_64 in under a minute.
+
+EVERY PROBE FROM THIS HUNT IS OUT OF THE TREE. The two that named the backing served `vol://system`
+are the defect's own trigger; the one in `ProcessService` made an RPC on a shared client in an error
+path. What stays is what was right on its own terms: the storage service's refusals are named by kind,
+its silent `exit()` speaks, and `machine_log` no longer drops a line when the ring is full.
+
+## And it is not this session's bounded send (2026-09-21)
+
+The obvious suspect was checked and cleared. This session made the supervisor's per-pass heartbeat
+send bounded - `send_with_room`, one second - where it had been a wait with no end, so a send that
+gave up could have looked like a driver going silent. It cannot: the caller records the two outcomes
+apart, `beat.asked(now)` for a ping that went and `beat.unsendable(now)` for one that did not, and
+`unsendable` pushes the due time forward by a whole deadline rather than counting against the driver.
+A ping that could not be sent costs the driver nothing.
+
+So the timeouts are what the line says: a ping WAS sent and the answer did not come back through the
+supervisor's loop within the deadline. The margin is one second, and it has to cover the send, the
+driver's answer, and the supervisor reading it on a pass that is also doing the boot's logging - which
+is why two log lines elsewhere in the system were enough to spend it.
+
+WHICH LEAVES THE DECISION IN A SHARPER FORM THAN "IS A SECOND ENOUGH": a heartbeat miss tears the
+driver down, and when that driver is the system volume's block provider, a liveness hiccup becomes a
+machine that cannot load its own services. Whether a provider the ROOT depends on may be torn down on
+a heartbeat alone is a lifecycle question, and it is the one worth answering first - the deadline is
+only how often it gets asked.
+
+## The circle the teardown closes (2026-09-21)
+
+The logs finish the story on their own. After the heartbeat misses, DeviceManager does exactly what
+the lifecycle says: it restarts the drivers. Four `restarting virtio-blk`, then virtio-gpu,
+virtio-snd, virtio-rng, virtio-console, xhci, nvme - and every one of them answers:
+
+    DeviceManager: virtio-blk is named by the registry and not on the volume; trying the next candidate
+    ...
+    DeviceManager: 0 of 0 device(s) online
+
+A REBIND READS THE DRIVER'S ARTIFACT OFF THE SYSTEM VOLUME - `Recovery` holds a storage client for
+exactly that, and says so in its own comment. For every driver except one that is right. For the
+driver that SERVES the system volume it is a circle: the provider goes down, the volume goes with it,
+and the artifact needed to bring the provider back is on the volume that is gone. The restart cannot
+succeed, and the machine ends with `0 of 0 device(s) online` on a disk it was reading a second
+earlier.
+
+THAT IS THE SAME SHAPE AS THE BOOT: phase one launches the boot drivers from the init PACKAGE
+precisely because no volume is mounted yet. A rebind of one of those drivers needs the same source
+for the same reason, and takes the other one.
+
+SO THE DECISION AT THE TOP HAS A SECOND HALF THAT IS NOT A DECISION AT ALL. Whether a heartbeat miss
+may tear down the root's provider is a lifecycle question for whoever owns it. That a boot driver
+cannot be restarted from the volume it provides is not a question: it is a circularity, it is
+reachable from a single missed deadline, and the bytes that would break it are the ones phase one
+already used.

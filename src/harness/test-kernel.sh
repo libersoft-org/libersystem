@@ -107,7 +107,11 @@ aarch64)
 	# measured cost plus its fifth BEFORE a sweep spent an hour finding out at the wall. That is the
 	# whole point of the rule: 60m was 3600 s against a 3606 s floor, six seconds short, and a run
 	# that ends at the wall reports a TIMEOUT that reads exactly like a hang.
-	FULL_TIMEOUT=70m
+	# 80m FROM 2026-09-20, AND THE RULE ASKED FOR IT AGAIN. The suite grew once more - this round
+	# added a kernel test for the ACPI fixed-hardware event latch - and `verify-model check` reported
+	# 70m as 4200 s against a measured 3643 s plus its fifth, which is 4372: a hundred and seventy
+	# seconds short. 80m clears that with room for the next few tests rather than exactly one.
+	FULL_TIMEOUT=80m
 	# 45m, NOT 15m, AND THE STALL WINDOW WITH IT. Measured 2026-08-26 on a quiet machine (load 0.9):
 	# `kernel.applications.imgconv_governed_working_set_is_measured` alone takes 1206 s on this
 	# target at one core. Both bounds were 15m, so that single test could not pass either of them -

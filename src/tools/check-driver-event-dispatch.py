@@ -35,17 +35,24 @@ def compact(source):
 
 def check(source):
     source = code(source)
-    start = source.index('unsafe fn advance(')
+    start = source.index('fn advance(')
     advance, _ = block(source, source.index('{', start))
     normalized = compact(advance)
-    expected = 'unsafe{loop{letdecision={'
+    expected = 'loop{letdecision={'
     if not normalized.startswith(expected):
         raise ValueError("advance must enter one unconditional scoped dispatch before its effects")
     decision_at = advance.index('let decision =')
     dispatch, end = block(advance, advance.index('{', decision_at))
+    # THE REDIRECT TAKES THE TWO CONFIRMATIONS A TEARDOWN CONSUMES AND NOTHING ELSE (39acd6d9), and
+    # this expectation was left at the shape before it. `Pending::note` reads `Exited` and
+    # `ClaimSettled` and discards the rest, so routing EVERY event at an outstanding teardown dropped
+    # a driver's terminal answer on the floor - the node then ran to its bind deadline and was
+    # restarted over a code it had already been given. The rule here is unchanged: one pop, the
+    # redirect, then the reducer.
     if compact(dispatch) != (
         'letSome(popped)=node.pop()else{break};'
-        'ifletSome(teardown)=node.teardown.as_mut(){'
+        'ifletSome(teardown)=node.teardown.as_mut()'
+        '&&matches!(popped,BindingEvent::Exited{..}|BindingEvent::ClaimSettled{..}){'
         'teardown.pending.note(popped);continue;}'
         'driver_binding::reduce_event(node.record.state,popped)'
     ):
@@ -89,39 +96,43 @@ def check(source):
         raise ValueError("production disk probing must use the tested probe derivation")
     if 'driver_binding::next_handoff_slot(&self.entries,|provider|provider.kind==kind&&provider.handle!=0,|provider|provider.id)' not in compact(source):
         raise ValueError("production role handoff must use its own tested derivation")
-    start = source.index('unsafe fn open_subscription(')
+    start = source.index('fn open_subscription(')
     subscription, _ = block(source, source.index('{', start))
     if not compact(subscription).endswith(
         'letdepth=catalogue.count_of(kind).saturating_add(64)asu64;'
         'letSome((producer,consumer))=channel_with_depth(depth)else{return};'
         'let_=catalogue.subscribe_stream(kind,producer);'
-        'if!send_blocking(service,&corr.to_le_bytes(),consumer){'
-        'close(consumer);catalogue.reap_dead_subscribers();}}'
+        'if!send_with_room(service,&corr.to_le_bytes(),consumer){'
+        'close(consumer);catalogue.reap_dead_subscribers();}'
     ):
         raise ValueError("queue the subscription snapshot before its reply, preserve closed-stream replies, and close failed transfers")
 
 
 def rejected_mutations(source):
-    start = source.index('\t\t\tlet decision = {', source.index('unsafe fn advance('))
+    start = source.index('\t\tlet decision = {', source.index('fn advance('))
     # Operate on exact source spans separately: stripping comments changes offsets.
-    prefix_end = source.index('\t\t\tmatch event {', start)
+    prefix_end = source.index('\t\tmatch event {', start)
     prefix = source[start:prefix_end]
     call = 'driver_binding::reduce_event(node.record.state, popped)'
-    raw = '\t\t\tlet Some(event) = node.pop() else { break };\n'
+    raw = '\t\tlet Some(event) = node.pop() else { break };\n'
     mutations = {
         'deleted dispatch': source.replace(prefix, raw, 1),
         'dispatch inside one arm': source.replace(prefix, raw, 1).replace('BindingEvent::Ready { .. } => {\n', 'BindingEvent::Ready { .. } => {\n let _ = driver_binding::reduce_event(node.record.state, event);\n', 1),
-        'discarded result and raw-event bypass': source.replace(prefix, raw + '\t\t\tlet _ = driver_binding::reduce_event(node.record.state, event);\n', 1),
+        'discarded result and raw-event bypass': source.replace(prefix, raw + '\t\tlet _ = driver_binding::reduce_event(node.record.state, event);\n', 1),
         'arm-local state predicate': source.replace('BindingEvent::TimedOut { .. } => {\n', 'BindingEvent::TimedOut { .. } => {\n if !node.record.state.accepts_terminal_frame() { continue; }\n', 1),
         'arm-local transition': source.replace('node.record.move_to(next, cause)', 'node.record.move_to(BindingState::Online, cause)', 1),
     }
-    snapshot = '\t\tlet _ = catalogue.subscribe_stream(kind, producer);\n'
+    snapshot = '\tlet _ = catalogue.subscribe_stream(kind, producer);\n'
     assert source.count(snapshot) == 1
-    reply_at = source.index('\t\tif !send_blocking(service, &corr.to_le_bytes(), consumer) {')
+    # THE SEND IS BOUNDED NOW AND THE ANCHOR MOVED WITH IT (2026-09-20). DeviceManager's supervisor
+    # loop must not wait with no end on a peer it does not control - one client that stops reading
+    # took the whole supervisor down with it - so `send_blocking` became `send_with_room`. The
+    # mutation this anchors is about the ORDER of the snapshot and the reply, which is unchanged.
+    reply_at = source.index('\tif !send_with_room(service, &corr.to_le_bytes(), consumer) {')
     _, reply_end = block(source, source.index('{', reply_at))
     reply = source[reply_at:reply_end] + '\n'
     mutations['subscription reply before snapshot'] = source.replace(snapshot, '', 1).replace(reply, reply + snapshot, 1)
-    mutations['refused subscription never replies'] = source.replace(snapshot, '\t\tif !catalogue.subscribe_stream(kind, producer) { return; }\n', 1)
+    mutations['refused subscription never replies'] = source.replace(snapshot, '\tif !catalogue.subscribe_stream(kind, producer) { return; }\n', 1)
     assert call in prefix
     with tempfile.TemporaryDirectory(prefix='liber-dispatch-wiring-') as directory:
         for number, (name, mutant) in enumerate(mutations.items(), 1):

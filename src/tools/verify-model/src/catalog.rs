@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 127] = [
+const GATES: [(&str, &str); 128] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -396,6 +396,12 @@ const GATES: [(&str, &str); 127] = [
 	// the mutations are planted in and what a change to them is about - a family whose parser is
 	// edited should have to show that its tests would still notice.
 	("driver-mutations", "drivers"),
+	// THE ONE WAIT, ENFORCED. DeviceManager's supervisor loop must hold exactly one wait - its own
+	// note says so - and five places broke it: a blocking receive or a blocking send with no
+	// deadline, on a peer that can go quiet, stops the supervisor dead and everything it supervises
+	// with it. Its subject is the services crate, because that is where the loop is and what a
+	// change to it is about; the check is source-level and costs milliseconds.
+	("supervisor-waits", "services"),
 	// Which keys a loader carries. Its subject is the loader, so a boot change
 	// selects it - and the two profiles differing only in a comment is the failure it exists for.
 	("trust-profile", "bin.libersystem-loader"),

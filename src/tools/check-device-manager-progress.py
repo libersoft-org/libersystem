@@ -21,6 +21,8 @@ def item(source: str, start: str) -> str:
 
 FIXTURE = r'''
 #![allow(dead_code, unused_unsafe, unused_variables)]
+// THE EXTRACTED HELPERS NAME `alloc` DIRECTLY, because the program they come from is `no_std`.
+extern crate alloc;
 use std::{cell::RefCell, collections::HashMap};
 use driver_binding::{BindingEvent, BindingId, BindingRecord, BindingState, FailureCause, ProviderId};
 mod abi { pub const MAX_WAIT_HANDLES: usize = 256; pub const ERR_TIMED_OUT: i64 = -1; }
@@ -53,17 +55,19 @@ fn try_send_caps(producer: u64, _: &[u8], _: &[u64]) -> bool { RT.with_borrow_mu
     if *count == *depth { return false; } *count += 1; true
 }) }
 fn send_blocking(_: u64, _: &[u8], consumer: u64) -> bool { RT.with_borrow_mut(|rt| rt.delivered = consumer); true }
+fn send_with_room(_: u64, _: &[u8], consumer: u64) -> bool { RT.with_borrow_mut(|rt| rt.delivered = consumer); true }
 enum PolledCaps { Empty, Closed }
 fn try_recv_caps(_: u64, _: &mut [u8]) -> PolledCaps { PolledCaps::Empty }
 mod wire { pub struct Handles; impl Handles { pub fn new() -> Self { Self } pub fn as_slice(&self) -> &[u64] { &[] } } }
 mod proto { pub mod system {
-    pub struct ProviderInfo { pub kind: u16, pub bus: u32, pub dev: u32, pub func: u32, pub binding_generation: u64, pub slot: u32, pub provider_generation: u32, pub live: bool }
+    pub struct ProviderInfo { pub kind: u16, pub bus: u32, pub dev: u32, pub func: u32, pub binding_generation: u64, pub slot: u32, pub provider_generation: u32, pub live: bool, pub name: alloc::string::String }
     pub mod provider_catalogue {
         pub fn subscribe_frame(_: u32, _: &super::ProviderInfo, _: &mut [u8], _: &mut crate::wire::Handles) -> Option<usize> { Some(1) }
         pub fn subscribe_open(_: &mut crate::CatalogueView, _: &[u8], _: &mut crate::wire::Handles) -> Option<(u32, ())> { Some((7, ())) }
     }
 } }
 struct Provider { id: ProviderId, kind: u16 }
+impl Provider { fn name(&self) -> &[u8] { b"fixture" } }
 struct Subscriber { producer: u64, kind: u16, seq: u32 }
 struct Catalogue { entries: Vec<Option<Provider>>, subscribers: [Option<Subscriber>; MAX_SUBSCRIBERS] }
 impl Catalogue { fn new() -> Self { Self { entries: Vec::new(), subscribers: [const { None }; MAX_SUBSCRIBERS] } } }
@@ -203,7 +207,9 @@ fn main() { unsafe {
 
 
 def source_fixture(source: str) -> str:
-    boot = item(source, "unsafe fn launch_boot_drivers(")
+    # EVERY ANCHOR HERE LOST ITS `unsafe` WITH THE SOURCE (P02M0178 removed propagated unsafe from
+    # the runtime wrappers). What each anchor names and why is unchanged; only the spelling moved.
+    boot = item(source, "fn launch_boot_drivers(")
     loop_start = boot.index("while pump(")
     first = boot.index("for at in first_node..nodes.len()", loop_start)
     retry = item(boot[first:], "for at in first_node..nodes.len()")
@@ -214,8 +220,8 @@ def source_fixture(source: str) -> str:
     maximum = re.search(r"const CHANNEL_QUEUE_MAX: usize = (\d+)", kernel)[1]
     fixture = FIXTURE.replace("IN_FLIGHT", item(source, "fn in_flight(&self)")).replace("RETRY_LOOPS", retry)
     fixture = fixture.replace("DEFAULT_DEPTH", default).replace("MAX_DEPTH", maximum)
-    functions = ["unsafe fn pump(", "fn requirements_met(", "unsafe fn gate_on_requirements(", "unsafe fn open_subscription(", "unsafe fn send_provider_frame(", "fn provider_info_wire("]
-    methods = ["unsafe fn subscribe_stream(", "unsafe fn reap_dead_subscribers(", "unsafe fn announce(", "fn count_of("]
+    functions = ["fn pump(", "fn requirements_met(", "fn gate_on_requirements(", "fn open_subscription(", "fn send_provider_frame(", "fn provider_info_wire("]
+    methods = ["fn subscribe_stream(", "fn reap_dead_subscribers(", "fn announce(", "fn count_of("]
     return fixture + "\n".join(item(source, name) for name in functions) + "\nimpl Catalogue {\n" + "\n".join(item(source, name) for name in methods) + "\n}\n"
 
 

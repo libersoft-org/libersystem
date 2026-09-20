@@ -64,8 +64,19 @@ fn send_frame(_: u64, opcode: driver_protocol::Opcode, _: u64, payload: &[u8], s
     }); true
 }
 fn try_send_caps(_: u64, _: &[u8], _: &[u64]) -> bool { true }
-enum PolledCaps { Empty, Closed }
-fn try_recv_caps(_: u64, _: &mut [u8]) -> PolledCaps { PolledCaps::Empty }
+// THE CATALOGUE TAKES ITS REQUEST NOW RATHER THAN WAITING FOR IT (2026-09-20). `serve_catalogue_once`
+// used `recv_caps_blocking`, which is a second wait in front of the supervisor's one wait - one
+// client that stops reading parked the whole program - so it polls. This stub answers the same
+// request the blocking one did, so the fixtures below drive the same code with the same bytes.
+enum PolledCaps { Message { len: usize, handles: wire::Handles }, Empty, Closed }
+fn try_recv_caps(_: u64, out: &mut [u8]) -> PolledCaps { RT.with_borrow(|rt| {
+    out[..rt.request.len()].copy_from_slice(&rt.request);
+    PolledCaps::Message { len: rt.request.len(), handles: wire::Handles::new() }
+}) }
+// A REPLY THAT NEVER PARKS THE SUPERVISOR. It answers exactly what the blocking send it replaced
+// answered, `fail_reply` included - that flag is how the fixtures drive an undelivered reply, and a
+// stub that always succeeded would make the retire-and-leak assertions pass without being tested.
+fn reply_or_retire(handle: u64, bytes: &[u8], transfer: u64) -> bool { send_blocking(handle, bytes, transfer) }
 enum ReceivedCaps { Message { len: usize, handles: wire::Handles }, Closed }
 fn recv_caps_blocking(_: u64, out: &mut [u8]) -> ReceivedCaps { RT.with_borrow(|rt| {
     out[..rt.request.len()].copy_from_slice(&rt.request);

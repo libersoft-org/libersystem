@@ -78,13 +78,17 @@ class FakeLab:
 
 
 class ImageCommandTest(unittest.TestCase):
+	# AND THE MODE THE MEDIUM IS SIGNED FOR, which both of these left out. A lab image is signed
+	# `harness` - no DMA mode of its own - so the same image boots the translated machine and the
+	# `--no-iommu` one, taking the mode from the harness carrier each time. The flag was added to
+	# `image_command` and these two expectations were not, so this suite has been failing on it.
 	def test_ordinary_images_use_the_production_strip_default(self):
-		self.assertEqual(lab.image_command(), [lab.IMAGE_SH, '--format', 'iso'])
+		self.assertEqual(lab.image_command(), [lab.IMAGE_SH, '--format', 'iso', '--dma-mode', 'harness'])
 
 	def test_development_images_request_the_complete_kernel(self):
 		self.assertEqual(
 			lab.image_command('none'),
-			[lab.IMAGE_SH, '--format', 'iso', '--strip', 'none'],
+			[lab.IMAGE_SH, '--format', 'iso', '--dma-mode', 'harness', '--strip', 'none'],
 		)
 
 
