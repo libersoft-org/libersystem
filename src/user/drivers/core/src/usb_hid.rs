@@ -91,6 +91,12 @@ impl Hids {
 // reaped - the service loop or a wait deep inside a disk transfer.
 pub static PTR_SINK: AtomicU64 = AtomicU64::new(0);
 pub static KEY_SINK: AtomicU64 = AtomicU64::new(0);
+/// WHERE CONTACTS GO, AND IT IS NOT THE POINTER SINK.
+///
+/// A consumer of `POINTER` is handed ONE cursor, and a surface published as one would be flattened
+/// into whichever contact was decoded last - which is a two-finger gesture arriving as a cursor that
+/// teleports. `ProviderKind::Touch` sits beside it for that reason, and this is the end of it.
+pub static TOUCH_SINK: AtomicU64 = AtomicU64::new(0);
 
 // Configure the device's HID function, if it has one: read the configuration
 // descriptor, find a HID interface (any subclass - keyboards, pointing devices
@@ -323,6 +329,37 @@ unsafe fn feed_hid_report(h: &mut Hid, report: &[u8]) {
 		h.x = x;
 		h.y = y;
 		h.buttons = buttons;
+	}
+	// AND THE CONTACTS, WHICH ARE NOT A POINTER AND ARE NOT DIFFED.
+	//
+	// A key is a state that CHANGED and a pointer is a position that MOVED, so both are compared
+	// against the previous report. A contact is neither: what a touch report carries is who is down
+	// and where, and a finger held still is still down. Diffing them would make a stationary finger
+	// disappear and its lift arrive as nothing.
+	//
+	// ONE MESSAGE PER CONTACT, which is the shape InputService's own note asks for: a frame carrying
+	// several would need a count beside the bytes, and the stream it publishes is per contact anyway.
+	//
+	// ASKED ONLY OF A DEVICE THAT HAS THE PAGE, so a keyboard and a mouse cost no walk at all.
+	if layout.has_digitizer() {
+		let sink: u64 = TOUCH_SINK.load(Ordering::Relaxed);
+		if sink != 0 {
+			let mut contacts: [hid::Contact; hid::MAX_CONTACTS] = [hid::Contact { id: 0, tip: false, x: 0, y: 0 }; hid::MAX_CONTACTS];
+			let found: usize = layout.contacts(id, body, &mut contacts);
+			for contact in contacts.iter().take(found) {
+				// `[id u8][tip u8][x u16 LE][y u16 LE]` - see `input_service`, which states this
+				// shape where it reads it.
+				let mut msg: [u8; 6] = [0u8; 6];
+				msg[0] = contact.id;
+				msg[1] = contact.tip as u8;
+				msg[2..4].copy_from_slice(&(contact.x.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+				msg[4..6].copy_from_slice(&(contact.y.clamp(0, u16::MAX as i32) as u16).to_le_bytes());
+				// NON-BLOCKING, like the pointer beside it: a consumer that is not reading must not
+				// hold the controller's event loop, and a dropped contact is a frame of a gesture
+				// rather than a state nothing can recover.
+				let _ = try_send(sink, &msg, 0);
+			}
+		}
 	}
 	// One place for the tail rule, with one test: see `hid::remember`.
 	hid::remember(&mut prevs[prev_i].1, body);

@@ -405,6 +405,16 @@ pub mod provider {
 	// the reverse-DNS form the virtio-serial specification uses for a port name, so the development
 	// channel's publication and a device-named port cannot collide by accident.
 	pub const DEV_CHANNEL_NAME: &[u8] = b"org.libersystem.dev";
+
+	// AND THE NAME A USB SERIAL ADAPTER'S PORT IS PUBLISHED UNDER, for the same reason and a third
+	// publisher. A machine can carry the development channel, a multiport virtio-serial device and a
+	// CDC-ACM adapter at once, all three speaking `console-stream` at the same version - so the kind
+	// cannot select and neither can the handshake. A consumer that wants the ADAPTER asks for this.
+	//
+	// AND IT IS NOT THE DEVELOPMENT CHANNEL'S NAME WITH A SUFFIX. The development channel is a port
+	// this system opens for itself; a serial adapter is somebody's hardware, and a consumer that
+	// confused the two would be attaching a diagnostic agent to whatever is plugged into a USB port.
+	pub const USB_SERIAL_NAME: &[u8] = b"org.libersystem.usb.serial";
 }
 
 // WHAT A DRIVER CAN HONESTLY KNOW ABOUT ITSELF.

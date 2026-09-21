@@ -22,11 +22,12 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use graphics_profile::{RENDER3D_CORE_PROFILE_1, Render3DFeature, SCENE3D_CORE_PROFILE_1, Scene3DFeature};
+use graphics_profile::{ExtendedFeature, RENDER3D_CORE_PROFILE_1, Render3DFeature, SCENE3D_CORE_PROFILE_1, SCENE3D_EXTENDED_PROFILE_1, Scene3DFeature};
 
 #[macro_use]
 mod harness;
 mod depth;
+pub mod extended;
 mod formats;
 mod geometry;
 mod msaa;
@@ -58,6 +59,16 @@ pub struct Case {
 /// not say which.
 pub struct SceneCase {
 	pub feature: Scene3DFeature,
+	pub scene: fn() -> Outcome,
+}
+
+/// The same, for `Scene3D Extended Profile 1`.
+///
+/// A THIRD CASE TYPE FOR A THIRD CLOSED LIST WITH A THIRD HASH. Extended is OPTIONAL as a whole: an
+/// implementation conforms to the two core profiles while supporting none of it, so its tally is
+/// reported separately and a run that does not claim it is not failed for the absence.
+pub struct ExtendedCase {
+	pub feature: ExtendedFeature,
 	pub scene: fn() -> Outcome,
 }
 
@@ -103,28 +114,44 @@ impl Tally {
 pub struct Summary {
 	pub render3d: Tally,
 	pub scene3d: Tally,
+	/// `Scene3D Extended Profile 1`, which is OPTIONAL as a whole - see `complete`.
+	pub extended: Tally,
 }
 
 impl Summary {
-	/// A run passes only when every feature of BOTH profiles has a scene and every scene passes.
+	/// A run passes only when every feature of both CORE profiles has a scene and every scene
+	/// passes.
+	///
+	/// EXTENDED IS NOT IN THIS ANSWER, because the profile is optional as a whole: a conforming
+	/// implementation may support none of it, and folding it in here would make "conforms" mean
+	/// something the profile does not say. `complete_with_extended` is the claim for a layer that
+	/// says it carries the part.
 	pub fn complete(&self) -> bool {
 		self.render3d.complete() && self.scene3d.complete()
 	}
 
+	/// The same claim for a layer that says it carries `Scene3D Extended Profile 1` as well.
+	///
+	/// ENTIRELY OR NOT AT ALL, which is the part's own rule: a layer claiming Extended claims every
+	/// entry of it, so a single untested or refused feature is a claim that does not hold.
+	pub fn complete_with_extended(&self) -> bool {
+		self.complete() && self.extended.complete()
+	}
+
 	pub fn passed(&self) -> usize {
-		self.render3d.passed + self.scene3d.passed
+		self.render3d.passed + self.scene3d.passed + self.extended.passed
 	}
 
 	pub fn failed(&self) -> usize {
-		self.render3d.failed + self.scene3d.failed
+		self.render3d.failed + self.scene3d.failed + self.extended.failed
 	}
 
 	pub fn unsupported(&self) -> usize {
-		self.render3d.unsupported + self.scene3d.unsupported
+		self.render3d.unsupported + self.scene3d.unsupported + self.extended.unsupported
 	}
 
 	pub fn untested(&self) -> usize {
-		self.render3d.untested.len() + self.scene3d.untested.len()
+		self.render3d.untested.len() + self.scene3d.untested.len() + self.extended.untested.len()
 	}
 }
 
@@ -136,6 +163,11 @@ pub fn entry(feature: Render3DFeature) -> Option<&'static graphics_profile::Prof
 /// The same, in the retained layer's profile.
 pub fn scene_entry(feature: Scene3DFeature) -> Option<&'static graphics_profile::ProfileEntry<Scene3DFeature>> {
 	SCENE3D_CORE_PROFILE_1.iter().find(|entry| entry.feature == feature)
+}
+
+/// The same, in the extended profile.
+pub fn extended_entry(feature: ExtendedFeature) -> Option<&'static graphics_profile::ProfileEntry<ExtendedFeature>> {
+	SCENE3D_EXTENDED_PROFILE_1.iter().find(|entry| entry.feature == feature)
 }
 
 /// Run every scene of both profiles, reporting each as it finishes.
@@ -174,6 +206,19 @@ pub fn run(mut report: impl FnMut(&'static str, &'static str, &Verdict)) -> Summ
 	for entry in SCENE3D_CORE_PROFILE_1 {
 		if !SCENE_CASES.iter().any(|case| case.feature == entry.feature) {
 			summary.scene3d.untested.push(entry.name);
+		}
+	}
+	for case in EXTENDED_CASES {
+		let Some(entry) = extended_entry(case.feature) else {
+			summary.extended.failed += 1;
+			continue;
+		};
+		let verdict = tally(&mut summary.extended, case.scene);
+		report(entry.name, entry.group, &verdict);
+	}
+	for entry in SCENE3D_EXTENDED_PROFILE_1 {
+		if !EXTENDED_CASES.iter().any(|case| case.feature == entry.feature) {
+			summary.extended.untested.push(entry.name);
 		}
 	}
 	summary
@@ -364,3 +409,70 @@ pub const SCENE_CASES: &[SceneCase] = &[
 
 #[cfg(test)]
 mod tests;
+
+/// Every scene of the extended profile, by the feature it covers.
+///
+/// SIXTY ENTRIES FOR SIXTY FEATURES, and the walk above reports any the list misses. A feature added
+/// to the profile with no scene here is a failure of this suite, which is what keeps the two in step.
+pub const EXTENDED_CASES: &[ExtendedCase] = &[
+	ExtendedCase { feature: ExtendedFeature::MaterialPbrMetallicRoughness, scene: extended::material::material_pbr_metallic_roughness },
+	ExtendedCase { feature: ExtendedFeature::NormalDistributionGgx, scene: extended::material::normal_distribution_ggx },
+	ExtendedCase { feature: ExtendedFeature::VisibilitySmithHeightCorrelated, scene: extended::material::visibility_smith_height_correlated },
+	ExtendedCase { feature: ExtendedFeature::FresnelSchlick, scene: extended::material::fresnel_schlick },
+	ExtendedCase { feature: ExtendedFeature::DiffuseLambert, scene: extended::material::diffuse_lambert },
+	ExtendedCase { feature: ExtendedFeature::EnergyConservingDiffuse, scene: extended::material::energy_conserving_diffuse },
+	ExtendedCase { feature: ExtendedFeature::PerceptualRoughnessRemap, scene: extended::material::perceptual_roughness_remap },
+	ExtendedCase { feature: ExtendedFeature::MinimumRoughnessClamp, scene: extended::material::minimum_roughness_clamp },
+	ExtendedCase { feature: ExtendedFeature::DielectricF0Constant, scene: extended::material::dielectric_f0_constant },
+	ExtendedCase { feature: ExtendedFeature::ClampedDotProducts, scene: extended::material::clamped_dot_products },
+	ExtendedCase { feature: ExtendedFeature::DirectTermComposition, scene: extended::material::direct_term_composition },
+	ExtendedCase { feature: ExtendedFeature::SplitSumApproximation, scene: extended::environment::split_sum_approximation },
+	ExtendedCase { feature: ExtendedFeature::GgxPrefilteredEnvironment, scene: extended::environment::ggx_prefiltered_environment },
+	ExtendedCase { feature: ExtendedFeature::PrefilterLevelRule, scene: extended::environment::prefilter_level_rule },
+	ExtendedCase { feature: ExtendedFeature::BrdfIntegrationTable, scene: extended::environment::brdf_integration_table },
+	ExtendedCase { feature: ExtendedFeature::IrradianceTerm, scene: extended::environment::irradiance_term },
+	ExtendedCase { feature: ExtendedFeature::ShadowMapDepth32F, scene: extended::shadows::shadow_map_depth32_f },
+	ExtendedCase { feature: ExtendedFeature::ShadowDepthBias, scene: extended::shadows::shadow_depth_bias },
+	ExtendedCase { feature: ExtendedFeature::PercentageCloserFilter3x3, scene: extended::shadows::percentage_closer_filter_3x3 },
+	ExtendedCase { feature: ExtendedFeature::CascadedShadowMaps, scene: extended::shadows::cascaded_shadow_maps },
+	ExtendedCase { feature: ExtendedFeature::CascadeSplitBlend, scene: extended::shadows::cascade_split_blend },
+	ExtendedCase { feature: ExtendedFeature::PerFragmentCascadeSelection, scene: extended::shadows::per_fragment_cascade_selection },
+	ExtendedCase { feature: ExtendedFeature::CascadeTransitionBlend, scene: extended::shadows::cascade_transition_blend },
+	ExtendedCase { feature: ExtendedFeature::UnshadowedBeyondLastCascade, scene: extended::shadows::unshadowed_beyond_last_cascade },
+	ExtendedCase { feature: ExtendedFeature::CascadeCountRefusal, scene: extended::shadows::cascade_count_refusal },
+	ExtendedCase { feature: ExtendedFeature::PointLightCubeShadow, scene: extended::shadows::point_light_cube_shadow },
+	ExtendedCase { feature: ExtendedFeature::BloomSoftKnee, scene: extended::postprocess::bloom_soft_knee },
+	ExtendedCase { feature: ExtendedFeature::BloomPyramid, scene: extended::postprocess::bloom_pyramid },
+	ExtendedCase { feature: ExtendedFeature::Rec709Luminance, scene: extended::postprocess::rec709_luminance },
+	ExtendedCase { feature: ExtendedFeature::ToneMapExtendedReinhard, scene: extended::postprocess::tone_map_extended_reinhard },
+	ExtendedCase { feature: ExtendedFeature::FogExponentialSquared, scene: extended::postprocess::fog_exponential_squared },
+	ExtendedCase { feature: ExtendedFeature::FixedPostprocessOrder, scene: extended::postprocess::fixed_postprocess_order },
+	ExtendedCase { feature: ExtendedFeature::LinearBlendSkinning, scene: extended::animation::linear_blend_skinning },
+	ExtendedCase { feature: ExtendedFeature::FourInfluencesPerVertex, scene: extended::animation::four_influences_per_vertex },
+	ExtendedCase { feature: ExtendedFeature::WeightNormalisationAtLoad, scene: extended::animation::weight_normalisation_at_load },
+	ExtendedCase { feature: ExtendedFeature::JointInverseBindComposition, scene: extended::animation::joint_inverse_bind_composition },
+	ExtendedCase { feature: ExtendedFeature::MorphTargets, scene: extended::animation::morph_targets },
+	ExtendedCase { feature: ExtendedFeature::MorphBeforeSkinning, scene: extended::animation::morph_before_skinning },
+	ExtendedCase { feature: ExtendedFeature::LinearTranslationScaleKeys, scene: extended::animation::linear_translation_scale_keys },
+	ExtendedCase { feature: ExtendedFeature::SphericalLinearRotationKeys, scene: extended::animation::spherical_linear_rotation_keys },
+	ExtendedCase { feature: ExtendedFeature::ShorterArcRotation, scene: extended::animation::shorter_arc_rotation },
+	ExtendedCase { feature: ExtendedFeature::RootMotionExtraction, scene: extended::animation::root_motion_extraction },
+	ExtendedCase { feature: ExtendedFeature::LoopSeamRefusal, scene: extended::animation::loop_seam_refusal },
+	ExtendedCase { feature: ExtendedFeature::StepInterpolation, scene: extended::animation::step_interpolation },
+	ExtendedCase { feature: ExtendedFeature::CubicHermiteInterpolation, scene: extended::animation::cubic_hermite_interpolation },
+	ExtendedCase { feature: ExtendedFeature::CubicTangentsPerSecond, scene: extended::animation::cubic_tangents_per_second },
+	ExtendedCase { feature: ExtendedFeature::ClampEnding, scene: extended::animation::clamp_ending },
+	ExtendedCase { feature: ExtendedFeature::PingPongEnding, scene: extended::animation::ping_pong_ending },
+	ExtendedCase { feature: ExtendedFeature::PoseBlending, scene: extended::animation::pose_blending },
+	ExtendedCase { feature: ExtendedFeature::BlendKeepsUndrivenTargets, scene: extended::animation::blend_keeps_undriven_targets },
+	ExtendedCase { feature: ExtendedFeature::BlendedRootMotion, scene: extended::animation::blended_root_motion },
+	ExtendedCase { feature: ExtendedFeature::MorphWeightTracks, scene: extended::animation::morph_weight_tracks },
+	ExtendedCase { feature: ExtendedFeature::ScreenCoverageLod, scene: extended::detail::screen_coverage_lod },
+	ExtendedCase { feature: ExtendedFeature::LodThresholdLadder, scene: extended::detail::lod_threshold_ladder },
+	ExtendedCase { feature: ExtendedFeature::LodHysteresis, scene: extended::detail::lod_hysteresis },
+	ExtendedCase { feature: ExtendedFeature::LastLodBeyondLadder, scene: extended::detail::last_lod_beyond_ladder },
+	ExtendedCase { feature: ExtendedFeature::LodCullBelowCoverage, scene: extended::detail::lod_cull_below_coverage },
+	ExtendedCase { feature: ExtendedFeature::DynamicBoundsAfterDeformation, scene: extended::detail::dynamic_bounds_after_deformation },
+	ExtendedCase { feature: ExtendedFeature::ExtendedLimits, scene: extended::limits::extended_limits },
+	ExtendedCase { feature: ExtendedFeature::ExtendedLimitRefusal, scene: extended::limits::extended_limit_refusal },
+];

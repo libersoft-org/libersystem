@@ -18,4 +18,14 @@ fn every_scene_passes_and_every_feature_has_one() {
 	assert!(summary.render3d.untested.is_empty(), "Render3D features with no scene: {:?}", summary.render3d.untested);
 	assert!(summary.scene3d.untested.is_empty(), "Scene3D features with no scene: {:?}", summary.scene3d.untested);
 	assert!(summary.complete(), "{summary:?}");
+
+	// AND THE EXTENDED PROFILE, WHICH THIS LAYER CLAIMS. It is optional as a whole - `complete()`
+	// above deliberately leaves it out, because an implementation conforms to the two core profiles
+	// while supporting none of it - so the claim that this one carries it is made here, separately
+	// and on purpose.
+	assert!(summary.extended.untested.is_empty(), "Extended features with no scene: {:?}", summary.extended.untested);
+	assert!(summary.complete_with_extended(), "this layer claims Scene3D Extended Profile 1: {summary:?}");
+	// ENTIRELY OR NOT AT ALL: one case per entry, neither more nor fewer. A case for a feature the
+	// profile does not have would be a scene measuring an extension while reporting Profile 1.
+	assert_eq!(super::EXTENDED_CASES.len(), graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len(), "one scene per entry: {} cases against {} features", super::EXTENDED_CASES.len(), graphics_profile::SCENE3D_EXTENDED_PROFILE_1.len());
 }

@@ -2595,11 +2595,21 @@ fn a_process_may_manage_itself_but_not_load_code_into_itself() {
 			assert!(!syscall::sys_is_err(thread), "a self handle carries the authority to create a thread");
 			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, thread, 0, 0, 0) as i64, 0, "the thread was never started and its handle is given back");
 
-			// AND A SELF HANDLE ATTENUATED BELOW MANAGE IS NOT ONE, which is what says the check
-			// above is reading the rights rather than the object.
-			let weaker = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, me, object::rights::Rights::WAIT.bits() as u64, 0, 0);
-			assert!(!syscall::sys_is_err(weaker));
+			// AND THE CHECK ABOVE IS READING THE RIGHTS AND NOT THE OBJECT, proved on the CHILD
+			// handle because that one carries `Rights::ALL` and can therefore be attenuated. The
+			// same object, one right short, creates nothing.
+			let weaker = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, child, object::rights::Rights::WAIT.bits() as u64, 0, 0);
+			assert!(!syscall::sys_is_err(weaker), "a handle carrying DUPLICATE can be attenuated");
 			assert_eq!(arch::syscall::invoke(syscall::SYS_THREAD_CREATE, weaker, entry, memlayout::USER_STACK_TOP, 0) as i64, syscall::ERR_ACCESS_DENIED, "the same object without MANAGE creates nothing");
+
+			// AND THE SELF HANDLE CANNOT BE DUPLICATED, WHICH IS A PROPERTY AND NOT AN OVERSIGHT.
+			//
+			// It carries MANAGE and nothing else - no DUPLICATE, no TRANSFER - so it can neither be
+			// attenuated into a weaker copy nor sent down a channel. The authority to make threads
+			// in a process stays with the process that asked for it and cannot be lent, which is
+			// what keeps "may a process manage ITSELF" from quietly becoming "may a process hand
+			// somebody else authority over it".
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, me, object::rights::Rights::MANAGE.bits() as u64, 0, 0) as i64, syscall::ERR_ACCESS_DENIED, "a self handle cannot be copied, so it cannot be lent");
 
 			for handle in [me, again, weaker, child] {
 				assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
@@ -2610,4 +2620,49 @@ fn a_process_may_manage_itself_but_not_load_code_into_itself() {
 	sched::spawn(body, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the self-handle thread ran to completion");
+}
+
+tagged_test!(input_that_arrived_with_no_console_is_not_the_next_console_s_input, [Kernel, Console, Channel], id = "kernel.console.input_that_arrived_with_no_console_is_not_the_next_console_s_input", covers = ["kernel"]);
+fn input_that_arrived_with_no_console_is_not_the_next_console_s_input() {
+	use object::channel::Channel;
+
+	// A KEYSTROKE IS TYPED AT SOMETHING, and what it is typed at is the console attached when it
+	// arrived. The kernel's input ring held every byte whatever the console's state: `feed_serial`
+	// pushed unconditionally, `drain` returned at its first line with nothing registered, and the
+	// byte waited for whoever attached next.
+	//
+	// It was found two suites away from here. A test of the privilege gate types one `x` into a
+	// console nobody had attached, purely to prove the capability check lets it through; two hundred
+	// tests later the terminal test attached a real ConsoleService, typed `ab\n`, and was handed
+	// `xab\n`. The terminal was right and its input was not.
+	//
+	// Both halves are asserted, because closing one leaves the other: a byte fed with NOTHING
+	// registered, and a byte fed to a registration whose peer has gone - which is what every console
+	// leaves behind when the process holding the far end exits.
+
+	// Nothing registered yet is not guaranteed here - earlier tests attach - so the state this test
+	// needs is made rather than assumed: a console that is registered and then abandoned.
+	let (dead_far, dead_near) = Channel::create();
+	crate::console_input::attach(dead_far);
+	drop(dead_near);
+	assert!(!crate::console_input::shell_listening(), "a registration whose peer has gone is not a listener");
+	assert!(!crate::console_input::feed_serial(b'x'), "a byte typed at a console that has gone is refused, not kept");
+	assert!(!crate::console_input::feed(b'y'), "and the same on the keyboard path");
+
+	// AND THE NEXT CONSOLE STARTS EMPTY. This is the attach half: bytes that a live console never
+	// took do not cross the boundary to its replacement.
+	let (live_far, live_near) = Channel::create();
+	crate::console_input::attach(live_far);
+	assert!(crate::console_input::shell_listening(), "the fresh console is the listener now");
+	assert!(crate::console_input::feed_serial(b'a'), "a byte typed at a live console is taken");
+	crate::console_input::drain();
+
+	// One serial byte, delivered as the marker and the byte, and NOTHING in front of it.
+	let first = live_near.recv().expect("the console receives what was typed at it");
+	assert_eq!(&first.bytes[..], &[crate::console_input::SERIAL_INPUT_MARKER, b'a'][..], "the fresh console is handed its own first byte, not the previous console's leftovers");
+	assert!(live_near.recv().is_err(), "and nothing else is waiting behind it");
+
+	// AND THIS TEST LEAVES NO CONSOLE BEHIND EITHER, by the same rule it is asserting.
+	drop(live_near);
+	assert!(!crate::console_input::shell_listening(), "the stand-in goes away with the test");
 }

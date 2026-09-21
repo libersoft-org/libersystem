@@ -111,7 +111,25 @@ aarch64)
 	# added a kernel test for the ACPI fixed-hardware event latch - and `verify-model check` reported
 	# 70m as 4200 s against a measured 3643 s plus its fifth, which is 4372: a hundred and seventy
 	# seconds short. 80m clears that with room for the next few tests rather than exactly one.
-	FULL_TIMEOUT=80m
+	#
+	# 120m FROM 2026-09-21, AND THIS ONE IS A DIRECT MEASUREMENT RATHER THAN THE MODEL'S ESTIMATE.
+	#
+	# 80m had never been met by a run that reached the end of this suite. Every aarch64 run that
+	# fitted inside it had stopped early: one at a failing test, which ended the suite at 4472 s with
+	# sixty-three tests still to go, and the next - with that test fixed - at the wall itself, 4811 s
+	# in and still inside `xhci_driver_enumerates_the_usb_bus`. A budget nothing has ever completed
+	# under is not a measured budget; it is a number that had only ever been compared against runs
+	# that gave up before the end.
+	#
+	# THE FIRST COMPLETE RUN: 427 tests in 5065 s, which is already 265 s over the old wall. A fifth
+	# on top is 6078 s, and 120m (7200 s) is that measurement times 1.42 - room for the next several
+	# tests rather than exactly one, which is what every raise in this block was asked for.
+	#
+	# `verify-model check` did NOT catch this, and that is worth saying where the number lives: its
+	# estimate for a full aarch64 suite is below what a full aarch64 suite actually costs, so the
+	# comparison passed while the wall was short. The model is a regression over history and a
+	# stopwatch is not; when the two disagree, the run that reached the last test wins.
+	FULL_TIMEOUT=120m
 	# 45m, NOT 15m, AND THE STALL WINDOW WITH IT. Measured 2026-08-26 on a quiet machine (load 0.9):
 	# `kernel.applications.imgconv_governed_working_set_is_measured` alone takes 1206 s on this
 	# target at one core. Both bounds were 15m, so that single test could not pass either of them -
@@ -132,7 +150,17 @@ riscv64)
 	# number is no longer alone: `verify-model check` compares it against the model's measured cost
 	# for this target and fails when the budget falls under it, which is what stops the next drift
 	# from being discovered forty-five minutes into a sweep.
-	FULL_TIMEOUT=90m
+	#
+	# 140m FROM 2026-09-21, MEASURED THE SAME WAY AS aarch64 ABOVE: 430 tests in 6005 s, which is
+	# 605 s past the old wall. A fifth on top is 7206 s and 140m (8400 s) is the measurement times
+	# 1.40. `verify-model check` had already called 90m short here - 5400 s against 5424 s, twenty-
+	# four seconds - but from an estimate of 4520 s, which is 1485 s under what the suite costs. It
+	# was right about the direction and wrong about the size.
+	#
+	# BOTH FIGURES WERE TAKEN WITH THE TWO EMULATED SUITES RUNNING BESIDE EACH OTHER on an otherwise
+	# quiet host, which is the pessimistic side to be wrong on: a solo run is a little cheaper than
+	# what these numbers say, so the headroom is real rather than borrowed from an idle machine.
+	FULL_TIMEOUT=140m
 	# The same reasoning as aarch64 above, with this target's own numbers: the imgconv test costs
 	# 589 s here and the slowest test seen in a passing run 696 s. That fits inside 15m, which is
 	# why this port passed while aarch64 did not - a margin of three minutes, which is not a margin.
@@ -330,7 +358,7 @@ STAGED_TEST_KERNEL="$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.elf"
 	# THE BUILT BINARY'S PATH, ASKED FOR RATHER THAN GUESSED. `--message-format=json` names the
 	# executable cargo produced; the last `compiler-artifact` line carrying one for the `kernel`
 	# target is this selection's test binary.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
 	built="$(
 		python3 - "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" <<'PYEOF'
 import json, sys
@@ -408,7 +436,7 @@ source "$ROOT/tools/evidence.sh"
 SUITE_OUTCOME=failed
 publish_suite_evidence() {
 	evidence_active || return 0
-	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" ]] || return 0
+	[[ "$BUILD_ONLY" != "1" && -z "$TAGS" && -z "${TEST_SELECTION:-}" && -z "${LIBER_NO_DT_PROFILE:-}" && -z "${USB_GADGET:-}" ]] || return 0
 	local discharges medium
 	discharges="$(mktemp)"
 	grep -ahoE '^kernel\.[a-z_.0-9]+\.\.\.[[:space:]]*\[ok\]' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | sed -E 's/\.\.\..*$//' | sort -u | sed "s| *\$| / $ARCH / test-guest / test|" >"$discharges" || true
@@ -426,7 +454,23 @@ publish_suite_evidence() {
 # the handler before the removal and LEAKED this run's staged kernel into `.build/state`, where the
 # next run's inventory sees a kernel nobody is running. The evidence is worth reporting and it is not
 # worth the cleanup.
-trap 'publish_suite_evidence || true; rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KERNEL.tmp.$$" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
+# AND THE GADGET GOES WITH THEM, WHICH IS WHY IT IS THIS SCRIPT'S AND NOT THE RUNNER'S.
+# `qemu-run.sh` EXECS QEMU, so no trap it installs can ever fire; whatever this harness builds in the
+# developer's kernel has to be taken apart by something that OUTLIVES the guest, and this is that
+# something. Named first in the handler so a failure anywhere later cannot leave a gadget bound - the
+# permission that allows this at all is conditional on the host being left as it was found.
+usb_gadget_teardown() {
+	[[ -n "${USB_GADGET:-}" ]] || return 0
+	# THE ECHO FIRST, because it holds the tty the gadget owns: a teardown that removed the gadget
+	# under a process still reading it leaves that process on a device that is gone.
+	if [[ -n "${SERIAL_ECHO_PID:-}" ]]; then
+		kill "$SERIAL_ECHO_PID" 2>/dev/null || true
+		wait "$SERIAL_ECHO_PID" 2>/dev/null || true
+		SERIAL_ECHO_PID=""
+	fi
+	"$ROOT/harness/usb-gadget.sh" teardown || true
+}
+trap 'usb_gadget_teardown; publish_suite_evidence || true; rm -f "$STAGED_TEST_KERNEL" "$STAGED_TEST_KERNEL.sha256" "$STAGED_TEST_KERNEL.tmp.$$" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
 
 # Inventory discovery needs only the descriptor-bearing executable in Cargo's target directory.
 # Build-only never starts the watchdog or runner: a cold inventory needs no volume or medium.
@@ -438,6 +482,37 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
 	exit 0
 fi
 
+# THE DEVICE THIS HARNESS BUILDS ITSELF, when a run asks for one.
+#
+# QEMU models fifteen USB devices and none of them is a CDC-ACM port, a multi-touch digitiser, a
+# gamepad or an audio capture endpoint - so four driver items read as "a device model to write". They
+# are not: Linux can BE a USB device, and `usb-gadget.sh` builds one and hands back the
+# vendor:product `usb-host` is pointed at. What it costs is a permission, and the rules that
+# permission carries are enforced in that script rather than here.
+#
+# SET UP BEFORE THE GUEST AND TORN DOWN BY THE EXIT TRAP ABOVE, so every way out of this script -
+# the verdict, a signal, a timeout, `set -e` - gives the host back what it started with.
+if [[ -n "${USB_GADGET:-}" ]]; then
+	if USB_GADGET_ID="$("$ROOT/harness/usb-gadget.sh" setup "$USB_GADGET")"; then
+		export USB_GADGET_ID
+		echo "[test-$ARCH] USB gadget $USB_GADGET presents $USB_GADGET_ID"
+		# AND SOMETHING ON THE OTHER END OF IT, for the one kind that carries a byte stream. A
+		# driver that binds an adapter and reports a state is not a driver that moves bytes, and
+		# this is the process the guest's bytes come back from. The gadget side of a CDC-ACM
+		# device is an ordinary tty on this host.
+		if [[ "$USB_GADGET" == "acm" ]]; then
+			python3 "$ROOT/harness/serial-echo.py" >&2 &
+			SERIAL_ECHO_PID=$!
+		fi
+	else
+		# REFUSED RATHER THAN FORCED, and the run goes on without it: the tests that wanted the
+		# gadget report unavailable, which is a state this harness already has, and the ones that
+		# did not are unaffected. A setup that could not complete is never a reason to escalate.
+		echo "[test-$ARCH] the USB gadget could not be built; the tests that need it are unavailable" >&2
+		unset USB_GADGET
+	fi
+fi
+
 set +e
 (
 	cd "$ROOT/kernel"
@@ -446,6 +521,11 @@ set +e
 	# kernel is rebuilt for a different selection, which is why the runner refuses an unknown ID
 	# rather than skipping it.
 	# `LIBER_NO_DT_PROFILE` IS COMPILE-TIME, so it is passed HERE and not to the runner.
+	# `USB_GADGET` IS COMPILE-TIME FOR THE SAME REASON AND A DIFFERENT ONE. The oracle that moves
+	# bytes through a CDC-ACM adapter has no device unless this run built one, and a test with no
+	# device must say so rather than pass quietly - so the kernel is told at COMPILE time which
+	# gadget, if any, is on the other side. `USB_GADGET_ID` below is the vendor:product `usb-host`
+	# is pointed at and is the runner's; this is the kind, and is the test's.
 	#
 	# It authorises the named no-device-tree profile on the two device-tree ports: without it a boot
 	# that publishes no tree gets a named refusal instead of QEMU `virt`'s controller addresses. It had
@@ -471,7 +551,7 @@ set +e
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 TEST_TAGS="$TAGS" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

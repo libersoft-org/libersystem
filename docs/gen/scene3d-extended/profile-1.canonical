@@ -9,6 +9,15 @@ pbr-constant=the roughness remapping answer=`a = roughness^2`, and the material'
 pbr-constant=the dielectric F0 answer=0.04 for every dielectric. A per-material specular level is Extended-of-Extended; one constant covers every non-metal a scene actually has
 pbr-constant=clamping answer=every dot product in the equations above is clamped to [0, 1] before use, and `dot(N,V)` is clamped to at least 1e-4 so the visibility term cannot divide by zero at a grazing angle
 pbr-constant=the colour space answer=LINEAR throughout, as in the core profile
+pbr-material=the base colour under `metallic` answer=ONE input with two meanings, mixed by `metallic`: at 0 it is the diffuse albedo and the surface's F0 is the dielectric 0.04; at 1 it IS the metal's F0 and there is no diffuse term at all. That is what `(1 - metallic)` on the diffuse and `mix(vec3(0.04), base_colour, metallic)` on F0 say between them, and stating it here is what stops an implementation keeping a dim diffuse term on a metal
+pbr-material=occlusion answer=applied as `mix(1, sampled, strength)` to the AMBIENT and ENVIRONMENT terms ONLY, and never to direct light. Ambient occlusion is a statement about how much of the sky a point can see; applying it to a light the scene placed would darken a surface that light demonstrably reaches, which is a shadow the scene did not ask for and cannot remove
+pbr-material=emissive answer=LINEAR RADIANCE, added after the direct and environment terms, unattenuated and untouched by occlusion or by shadow. An emissive surface is a SOURCE and not a receiver, so nothing that describes how much light reaches it applies
+pbr-material=the normal map convention answer=TANGENT SPACE WITH +Y UP, the OpenGL convention, sampled as `2 * texel - 1`. The tangent frame is right-handed and the bitangent is `cross(normal, tangent) * tangent.w`, with `w` either +1 or -1 as glTF stores it. Stated because the other convention inverts every crevice into a bump: the surface still looks lit, and it looks lit from the wrong side
+pbr-material=a missing tangent answer=the normal map is NOT APPLIED, and the material draws with its interpolated normal. Deriving a tangent from screen-space derivatives is the common alternative and produces a frame that depends on the rasteriser's derivative rule, which is a different picture per backend for a mesh whose author simply did not export tangents
+pbr-material=the colour space of each map answer=base colour and emissive are `Color` and ARE transfer-decoded to linear; metallic-roughness, normal and occlusion are `Data` and are NEVER decoded. This is the one rule that costs nothing to get wrong and changes every pixel: decoding a normal map bends every normal toward the surface, and decoding a roughness map makes a whole material glossier
+pbr-material=the metallic-roughness packing answer=glTF's: ROUGHNESS in the green channel and METALLIC in the blue, with red and alpha ignored. Two channels of one texture rather than two textures, and naming which is which because a renderer that swapped them would produce a rough metal wherever the author wrote a smooth dielectric
+pbr-material=the alpha modes answer=`Opaque`, `Mask` and `Blend`, which are the core profile's three under glTF's names. `Mask` discards STRICTLY BELOW its threshold, so a threshold of zero discards nothing; the threshold is the material's own and is not a global
+pbr-material=a double-sided surface answer=flips the interpolated normal on a back-facing fragment BEFORE anything else reads it - the normal map, the lighting and the environment lookup all see the flipped one. Flipping after shading would light the leaf's underside as though it were its top
 environment=the split-sum approximation answer=the environment term is `prefiltered(R, roughness) * (F0 * brdf.x + brdf.y)`, where `brdf` is looked up by `(dot(N,V), roughness)`. Both halves are stated because a prefilter built for one lookup table is wrong with another
 environment=the prefilter answer=a cube map whose mip level i is the GGX-importance-sampled radiance at `roughness = i / (levels - 1)`, with 1024 samples per texel and the source sampled at a mip chosen by the sample's own solid angle - which is what removes the fireflies a naive prefilter has
 environment=the number of levels answer=as many as the cube's size allows down to 8x8; below that the filter is wider than the face and the result is the average of the whole environment anyway
@@ -34,13 +43,96 @@ animation=morph targets answer=additive displacement, up to `max_morph_targets` 
 animation=interpolation answer=linear for translation and scale, SPHERICAL LINEAR for rotation, along the shorter arc. Interpolating quaternions linearly and normalising is the cheaper alternative and produces a different, visibly uneven, rotation speed
 animation=the root-motion policy answer=CHOSEN RATHER THAN REQUIRED: root motion is EXTRACTED by default - the root joint's translation is removed from the pose and handed to the application as a delta - and a clip may declare that it keeps it. Extraction by default because an application that does not ask for root motion should not have its character drift
 animation=looping answer=a clip declares whether it loops, and a looping clip's last keyframe must equal its first within the conformance threshold or the clip is REFUSED at load rather than popping once a cycle
+animation-playback=the interpolation modes answer=STEP, LINEAR and CUBIC, declared PER TRACK. A clip mixes them freely: a visibility flag wants step, a slide wants linear, and a bounce wants cubic, and forcing one mode on a whole clip is what makes an author fake the others with extra keys
+animation-playback=what STEP does answer=holds the PREVIOUS key's value until the next key's time is REACHED, and the value AT a key is that key's own. So a step track changes exactly at its keyframes and nowhere else, which is what a discrete channel means
+animation-playback=the cubic form answer=HERMITE, with an IN and an OUT tangent stored per key: `p(t) = (2t^3 - 3t^2 + 1) * v_k + (t^3 - 2t^2 + t) * dt * out_k + (-2t^3 + 3t^2) * v_(k+1) + (t^3 - t^2) * dt * in_(k+1)`, where `t` is the position within the span and `dt` is the span in seconds. Hermite rather than Catmull-Rom or Bezier because the tangents are AUTHORED rather than derived - a derived tangent changes when a neighbouring key moves, which makes editing one key alter a curve three keys away
+animation-playback=the units of a cubic tangent answer=the value's units PER SECOND, and SCALED BY THE SPAN inside the equation. What that buys is INVARIANCE TO KEY DENSITY: a slope of one unit per second means the same thing however far apart the neighbouring keys are, so INSERTING a key between two existing ones - at the value and slope the curve already has there - reproduces the same curve. Stored per span instead, every stored tangent either side of the new key would have to be rewritten to keep the shape, which makes adding a key an edit to the whole track
+animation-playback=a cubic ROTATION track answer=interpolated on the quaternion's four components and then NORMALISED - NOT slerped. This is not a contradiction of the linear rule above, which refuses normalised-linear: a cubic through four control points has no spherical form at all, so the choice there is between a component-wise cubic and no cubic. Stated because a reader who has just read the linear rule would expect the same refusal
+animation-playback=the end behaviour answer=CLAMP, LOOP or PING-PONG, declared per clip. Clamp holds the first key before the clip and the last after it; loop wraps and its seam must close, as the rule above requires; ping-pong plays forward then backward with a period of TWICE the duration
+animation-playback=ping-pong's turning frames answer=VISITED ONCE PER PERIOD AND NOT TWICE. The turn happens AT the end key rather than after it, so the last frame is not held for two frames while the direction changes - which is a visible stutter at both ends, once a cycle, for the life of the clip. A ping-pong clip needs no closed seam, because its ends meet themselves
+animation-playback=blending two clips answer=a WEIGHTED BLEND OF THEIR SAMPLED POSES, per target, with the weights summing to one: translation and scale interpolate linearly, rotation SPHERICALLY along the shorter arc, exactly as within one clip. A cross-fade is this with the weight moving from one clip to the other over time, so there is one rule rather than two
+animation-playback=a target only one clip drives answer=taken from that clip UNCHANGED, at full value. The other clip says NOTHING about that joint, which is not the same as saying it should be at rest - scaling it by its clip's weight would pull the joint toward the origin as the blend moves away, which is a limb collapsing rather than a blend
+animation-playback=root motion under a blend answer=the same weighted sum of the two deltas. A cross-fade from a walk to a run then produces a speed BETWEEN them, where adding the two deltas would produce a character briefly moving faster than either clip ever asks for
+animation-playback=morph-weight tracks answer=a track may drive ONE morph target's weight as a scalar, under the same three interpolation modes. The weights are NOT normalised across targets, because morph targets are ADDITIVE - normalising them would make a second expression undo half of the first, which is the same reason the displacement rule gives
+level-of-detail=the selection metric answer=SCREEN COVERAGE: the drawable's world bounding sphere's projected radius as a fraction of HALF THE VIEWPORT HEIGHT - `coverage = radius / (distance * tan(fov_y / 2))` under perspective, and `coverage = radius / half_height` under an orthographic camera. Not raw distance, which selects a different level at the same apparent size when the field of view or the viewport changes; coverage is the thing a person actually sees
+level-of-detail=the ladder answer=a mesh declares its levels most detailed first, each with the coverage AT OR BELOW WHICH it takes over, and the list must be strictly DESCENDING or the mesh is REFUSED at load. The first level has no threshold: it is what is drawn above the second's
+level-of-detail=the default ladder answer=0.5, 0.25, 0.125 and 0.0625 for a mesh that declares levels without thresholds - each step a halving of coverage, so a level draws roughly a quarter of the pixels of the one before it
+level-of-detail=hysteresis answer=10 per cent of the threshold, applied to the level held LAST FRAME: a drawable already at level i leaves it only once coverage passes the boundary by more than a tenth of it. Without it a drawable sitting exactly on a threshold swaps mesh every frame, which reads as flicker rather than as detail
+level-of-detail=the first frame answer=no previous level, so the ladder is read directly with no hysteresis. A drawable that appears already small starts small rather than starting detailed and stepping down in view
+level-of-detail=below the last threshold answer=the LAST level keeps being drawn. A mesh may additionally declare a coverage below which it is not drawn at all, and the default is that there is none - vanishing is a decision a scene makes, not one a threshold ladder makes for it
+level-of-detail=a mesh with one level answer=always that level, and its thresholds are not consulted. This is what makes the feature free for the meshes that do not use it
+level-of-detail=which bounds the coverage uses answer=the drawable's CURRENT world bounding sphere - recomputed after morphing and skinning, not the rest pose's. A character that raises an arm grows its bounds, and a coverage taken from the rest pose would step down a level while the arm is still on screen
+level-of-detail=whether the level is observable answer=YES, and this is the difference from culling: the chosen level is readable per drawable, so an application and a conformance scene can assert which mesh was drawn rather than inferring it from pixels
 min-limit=max_shadow_cascades minimum=4 why=four is what covers a walkable view distance at a usable texel density
 min-limit=max_shadow_maps minimum=8 why=one cascaded directional light and a few local ones
 min-limit=max_skeleton_joints minimum=128 why=a humanoid with fingers
 min-limit=max_morph_targets minimum=32 why=a facial rig's expressions
 min-limit=max_animation_tracks minimum=256 why=two joints' worth of curves per joint on the skeleton above
 min-limit=environment_prefilter_levels minimum=6 why=a 256-texel face down to 8, which is where the filter stops meaning anything
+min-limit=max_lod_levels minimum=4 why=the default ladder is four halvings of coverage, from full size down to a sixteenth of the pixels
+feature=MaterialPbrMetallicRoughness group=material owner=Scene3D
+feature=NormalDistributionGgx group=material owner=Scene3D
+feature=VisibilitySmithHeightCorrelated group=material owner=Scene3D
+feature=FresnelSchlick group=material owner=Scene3D
+feature=DiffuseLambert group=material owner=Scene3D
+feature=EnergyConservingDiffuse group=material owner=Scene3D
+feature=PerceptualRoughnessRemap group=material owner=Scene3D
+feature=MinimumRoughnessClamp group=material owner=Scene3D
+feature=DielectricF0Constant group=material owner=Scene3D
+feature=ClampedDotProducts group=material owner=Scene3D
+feature=DirectTermComposition group=material owner=Scene3D
+feature=SplitSumApproximation group=environment owner=Scene3D
+feature=GgxPrefilteredEnvironment group=environment owner=Scene3D
+feature=PrefilterLevelRule group=environment owner=Scene3D
+feature=BrdfIntegrationTable group=environment owner=Scene3D
+feature=IrradianceTerm group=environment owner=Scene3D
+feature=ShadowMapDepth32F group=shadows owner=Scene3D
+feature=ShadowDepthBias group=shadows owner=Scene3D
+feature=PercentageCloserFilter3x3 group=shadows owner=Scene3D
+feature=CascadedShadowMaps group=shadows owner=Scene3D
+feature=CascadeSplitBlend group=shadows owner=Scene3D
+feature=PerFragmentCascadeSelection group=shadows owner=Scene3D
+feature=CascadeTransitionBlend group=shadows owner=Scene3D
+feature=UnshadowedBeyondLastCascade group=shadows owner=Scene3D
+feature=CascadeCountRefusal group=shadows owner=Scene3D
+feature=PointLightCubeShadow group=shadows owner=Scene3D
+feature=BloomSoftKnee group=postprocess owner=Scene3D
+feature=BloomPyramid group=postprocess owner=Scene3D
+feature=Rec709Luminance group=postprocess owner=Scene3D
+feature=ToneMapExtendedReinhard group=postprocess owner=Scene3D
+feature=FogExponentialSquared group=postprocess owner=Scene3D
+feature=FixedPostprocessOrder group=postprocess owner=Scene3D
+feature=LinearBlendSkinning group=animation owner=Scene3D
+feature=FourInfluencesPerVertex group=animation owner=Scene3D
+feature=WeightNormalisationAtLoad group=animation owner=Scene3D
+feature=JointInverseBindComposition group=animation owner=Scene3D
+feature=MorphTargets group=animation owner=Scene3D
+feature=MorphBeforeSkinning group=animation owner=Scene3D
+feature=LinearTranslationScaleKeys group=animation owner=Scene3D
+feature=SphericalLinearRotationKeys group=animation owner=Scene3D
+feature=ShorterArcRotation group=animation owner=Scene3D
+feature=RootMotionExtraction group=animation owner=Scene3D
+feature=LoopSeamRefusal group=animation owner=Scene3D
+feature=StepInterpolation group=animation owner=Scene3D
+feature=CubicHermiteInterpolation group=animation owner=Scene3D
+feature=CubicTangentsPerSecond group=animation owner=Scene3D
+feature=ClampEnding group=animation owner=Scene3D
+feature=PingPongEnding group=animation owner=Scene3D
+feature=PoseBlending group=animation owner=Scene3D
+feature=BlendKeepsUndrivenTargets group=animation owner=Scene3D
+feature=BlendedRootMotion group=animation owner=Scene3D
+feature=MorphWeightTracks group=animation owner=Scene3D
+feature=ScreenCoverageLod group=detail owner=Scene3D
+feature=LodThresholdLadder group=detail owner=Scene3D
+feature=LodHysteresis group=detail owner=Scene3D
+feature=LastLodBeyondLadder group=detail owner=Scene3D
+feature=LodCullBelowCoverage group=detail owner=Scene3D
+feature=DynamicBoundsAfterDeformation group=detail owner=Scene3D
+feature=ExtendedLimits group=limits owner=Scene3D
+feature=ExtendedLimitRefusal group=limits owner=Scene3D
 threshold=a physically based direct term tolerance=<= 4/255 per channel in the named comparison space why=wider than the core material because the term is a product of four functions each with its own rounding, and narrower than anything a different NDF would produce - which is what the tolerance has to distinguish
 threshold=an environment lookup tolerance=<= 8/255 per channel, with the prefilter and the BRDF table generated by this profile's own rules why=the prefilter is an importance-sampled integral, and its residual noise is the largest term in the comparison
 threshold=a shadow test tolerance=<= 1 of the 9 percentage-closer taps may differ at a fragment, and <= 0.1 per cent of the fragments in a frame may differ at all why=the tap positions are fixed but the depth comparison is at the edge of the bias, so a single tap can flip; a frame where many flip is a different bias rather than a rounding difference
 threshold=a tone-mapped and bloomed frame tolerance=<= 2/255 per channel after the shared tone-map operator, with bloom compared before encoding why=the operator is the shared one, so the tolerance is the shared one; the bloom pyramid's own error is bounded by the filter tolerance above
+threshold=a sampled pose tolerance=<= 1e-5 per component for translation and scale, and `1 - |dot(a, b)| <= 1e-5` for rotation - the absolute dot because `q` and `-q` are one rotation and a comparison that missed it would report a quarter turn where there is none why=the interpolation is fixed by this profile - linear for translation and scale, spherical linear along the shorter arc for rotation - so nothing is left for two implementations to differ about except rounding. A wider tolerance would admit a renderer that interpolated quaternions linearly and normalised, which is the cheaper alternative this profile refuses BECAUSE it produces a visibly uneven rotation speed
+threshold=a clip's loop seam tolerance=THE SAME NUMBERS, and they are a REFUSAL rather than a comparison: a looping clip whose last keyframe differs from its first by more than that is refused at load why=the same number for the same reason - an authoring tool writes the two keys from one value, so what separates them is a float round-trip and nothing else. Refusing at load rather than tolerating at draw is what stops a character popping once a cycle for the life of the asset

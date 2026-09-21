@@ -207,8 +207,17 @@ impl Layout {
 	}
 
 	// Whether any segment decodes into an event the system consumes.
+	// Whether this descriptor carries anything a driver above it can act on.
+	//
+	// A DIGITIZER IS ONE OF THEM, and it was not in this list. Most touch surfaces report their axes
+	// on the GENERIC DESKTOP page, so `has_pointer` happens to be true of them and they were
+	// admitted by accident rather than by this rule; one that reports its axes on the digitizer page
+	// - which the specification allows and some devices do - was addressed, configured, had its
+	// report descriptor read, and was then refused here with no word at all. Found by reading this
+	// function rather than by a device failing, which is why it is written as a gap and not as a
+	// measurement.
 	pub fn is_useful(&self) -> bool {
-		self.has_keyboard() || self.has_pointer() || self.has_consumer()
+		self.has_keyboard() || self.has_pointer() || self.has_consumer() || self.has_digitizer()
 	}
 
 	// Diff the keyboard- and Consumer-page fields of report `id` between two

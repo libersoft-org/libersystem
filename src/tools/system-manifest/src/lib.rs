@@ -178,6 +178,9 @@ pub enum ProviderKindName {
 	Pointer,
 	ConsoleBytes,
 	LocalStream,
+	/// A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `Pointer` is handed one cursor; a
+	/// surface published as one would be flattened into whichever contact was decoded last.
+	Touch,
 }
 
 impl ProviderKindName {
@@ -195,6 +198,7 @@ impl ProviderKindName {
 			ProviderKindName::Pointer => 7,
 			ProviderKindName::ConsoleBytes => 8,
 			ProviderKindName::LocalStream => 9,
+			ProviderKindName::Touch => 10,
 		}
 	}
 }

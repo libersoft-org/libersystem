@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
-"""Exercise the development driver's actual busy-work, TX-wait and adoption control paths."""
+"""Exercise the serial port's transmit wait, its receive pool and its stream backpressure.
+
+WHAT THIS MODELS AND WHY IT MOVED. It used to model `dev_channel.rs`, which on 2026-09-15 stopped
+being a program with control paths of its own: the driver is a thirty-line transport now, and every
+decision this gate exists to protect - when a stalled transmit gives up, whether the manager's
+channel is answered while it waits, how many receive buffers one pass may take, what a stalled
+stream send does - moved into `drivers::serial_port`, which BOTH console drivers share. A checker
+still pointed at the old file was asserting against a program that no longer exists.
+
+WHAT IT PROTECTS. Each of these is a line whose absence is invisible in every ordinary run and fatal
+in the one that matters: a driver that stops answering its supervisor while a consumer is slow is a
+driver a watchdog kills for somebody else's slowness; a transmit wait that omits the supervisor's
+handle sleeps through the stop it was sent; an unbounded receive loop is a driver a host can hold in
+one pass for as long as it keeps writing; a buffer taken and not re-posted is a ring that shrinks by
+one every interrupt until the port is deaf.
+
+AND THE ORACLE IS THE PRODUCTION SOURCE, not a copy of it. The functions below are extracted from
+`serial_port.rs` at run time and compiled against fakes, so a change to the real file is a change to
+what is tested - and each mutation plants one real regression and requires a NAMED test to fail,
+which is what keeps the battery from passing because the fixture stopped compiling.
+"""
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import subprocess
@@ -12,419 +32,434 @@ spec.loader.exec_module(progress)
 item = progress.item
 
 FIXTURE = r'''
-#![allow(dead_code, unused_unsafe)]
+#![allow(dead_code, unused_unsafe, unused_variables)]
 extern crate alloc;
 use alloc::vec::Vec;
-use std::{cell::{Cell, RefCell}, collections::VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+
 thread_local! {
-    static NOW: Cell<u64> = const { Cell::new(10) };
-    static SENDS: Cell<usize> = const { Cell::new(0) };
-    static DELIVERIES: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
-    static ATTEMPTS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
-    static REPOSTS: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
-    static MODE: Cell<u8> = const { Cell::new(0) };
-    static RX_READS: Cell<usize> = const { Cell::new(0) };
-    static TX_READS: Cell<usize> = const { Cell::new(0) };
-    static CONTROL_READS: Cell<usize> = const { Cell::new(0) };
-    static WAITS: Cell<usize> = const { Cell::new(0) };
-    static TX_DONE: Cell<bool> = const { Cell::new(false) };
-    static QUIET: Cell<bool> = const { Cell::new(true) };
-    static FRAMES: RefCell<VecDeque<(Vec<u8>, u64)>> = RefCell::new(VecDeque::new());
-    static EFFECTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    static NOW: Cell<u64> = const { Cell::new(0) };
+    // How many times the manager's channel was answered, and what it answered.
+    static PINGS: Cell<usize> = const { Cell::new(0) };
+    static PING_ALIVE: Cell<bool> = const { Cell::new(true) };
+    // Every wait this pass made: the handles it named and the deadline it named.
+    static WAITS: RefCell<Vec<(Vec<u64>, u64)>> = const { RefCell::new(Vec::new()) };
+    static PERIODIC: RefCell<Vec<(Vec<u64>, u64)>> = const { RefCell::new(Vec::new()) };
+    // What the stream took, and what it was told each time.
+    static DELIVERED: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static SEND_SCRIPT: RefCell<VecDeque<u8>> = const { RefCell::new(VecDeque::new()) };
     static CLOSED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    // The receive ring: what the device hands back, what goes back on it, and how often it is told.
+    static USED: RefCell<VecDeque<(u16, u32)>> = const { RefCell::new(VecDeque::new()) };
+    static ENDLESS: Cell<bool> = const { Cell::new(false) };
+    static POSTED: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+    static NOTIFIES: Cell<usize> = const { Cell::new(0) };
+    // The transmit side.
+    static SUBMITS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static TX_RETURNS_AT: Cell<usize> = const { Cell::new(usize::MAX) };
+    static ISR_READS: Cell<usize> = const { Cell::new(0) };
+    static ACKS: Cell<usize> = const { Cell::new(0) };
+    static RX_BACKING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static TX_BACKING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
-#[derive(Debug)] struct DriverExit;
-fn exit() -> ! { std::panic::panic_any(DriverExit) }
-fn print(_: &[u8]) {}
-fn clock() -> u64 { NOW.get() }
-fn close(handle: u64) { CLOSED.with_borrow_mut(|closed| closed.push(handle)); EFFECTS.with_borrow_mut(|effects| effects.push("close")); }
-fn interrupt_ack(_: u64) {}
-fn device_quiesced(device: u64) { assert_eq!(device, 7); EFFECTS.with_borrow_mut(|effects| effects.push("quiesced")); }
-RUNTIME_FUNCTIONS
-const SYS_CHANNEL_SEND: u64 = abi::SYS_CHANNEL_SEND;
-const SYS_WAIT_ANY: u64 = abi::SYS_WAIT_ANY;
-const SYS_WAIT: u64 = abi::SYS_WAIT;
-const WAIT_PERIODIC: u64 = abi::WAIT_PERIODIC;
-const WAIT_WRITABLE: u64 = abi::WAIT_WRITABLE;
-const ERR_WOULD_BLOCK: i64 = abi::ERR_WOULD_BLOCK;
+
+const BOOTSTRAP: u64 = 9;
+const IRQ: u64 = 8;
+const STREAM: u64 = 10;
+
 const ERR_TIMED_OUT: i64 = abi::ERR_TIMED_OUT;
-fn yield_now() { panic!("blocking send did not service control"); }
-unsafe fn syscall(op: u64, a: u64, b: u64, c: u64, d: u64) -> u64 {
-    if op == SYS_CHANNEL_SEND {
-        let payload = unsafe { core::slice::from_raw_parts(b as *const u8, c as usize) }.to_vec();
-        SENDS.set(SENDS.get() + 1);
-        assert!(SENDS.get() < 32, "retry loop failed to service control");
-        ATTEMPTS.with_borrow_mut(|attempts| attempts.push(payload.clone()));
-        assert_eq!(d, 0);
-        if MODE.get() >= 10 {
-            assert_eq!(a, 10, "pending old-session payload cannot be replayed to replacement");
-            if MODE.get() == 16 {
-                FRAMES.with_borrow_mut(|frames| frames.push_back((b"BYTES".to_vec(), 55)));
-                return abi::ERR_INVALID as u64;
-            }
-            if MODE.get() != 12 || SENDS.get() <= 3 { return ERR_WOULD_BLOCK as u64; }
+const ERR_PEER_CLOSED: i64 = abi::ERR_PEER_CLOSED;
+
+// THE DEADLINE A STALLED TRANSMIT IS ALLOWED TO REACH, and the count that turns an unbounded one
+// into a failing test rather than a hung runner. A mutant that removes the production bound would
+// otherwise spin in `Port::write` for ever and the battery would report a timeout instead of the
+// assertion it planted.
+const WAIT_CEILING: usize = 4096;
+
+fn clock() -> u64 { NOW.get() }
+
+fn close(handle: u64) { CLOSED.with_borrow_mut(|closed| closed.push(handle)); }
+
+fn interrupt_ack(_: u64) { ACKS.set(ACKS.get() + 1); }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Error { Invalid, Closed, Again, Io, Exhausted, Unsupported }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SendOutcome { Delivered, Stalled, Failed }
+
+// The consumer's end, scripted: 0 delivers, 1 stalls, 2 fails. An exhausted script delivers, so a
+// test that only cares about the first few answers does not have to spell out the rest.
+fn try_send_outcome(handle: u64, payload: &[u8], _: u64) -> SendOutcome {
+    assert_eq!(handle, STREAM, "a chunk goes down the stream this session granted and nowhere else");
+    match SEND_SCRIPT.with_borrow_mut(|script| script.pop_front()).unwrap_or(0) {
+        1 => SendOutcome::Stalled,
+        2 => SendOutcome::Failed,
+        _ => {
+            DELIVERED.with_borrow_mut(|delivered| delivered.push(payload.to_vec()));
+            SendOutcome::Delivered
         }
-        DELIVERIES.with_borrow_mut(|deliveries| deliveries.push(payload));
-        return 0;
     }
-    if op == SYS_WAIT {
-        assert_eq!(a, 10); assert_eq!(b, 0); assert_eq!(c, WAIT_WRITABLE);
-        FRAMES.with_borrow_mut(|frames| frames.push_back((frame(driver_protocol::Opcode::Stop, 1), 0)));
-        assert!(EFFECTS.with_borrow(|effects| effects.contains(&"stopped")), "unlimited data writable wait hides pending STOP");
-        return 0;
-    }
-    assert_eq!(op, SYS_WAIT_ANY);
-    assert_eq!(unsafe { core::slice::from_raw_parts(a as *const u64, b as usize) }, &[9]);
-    assert_eq!(c, NOW.get() + 1, "idle backpressure must use a finite retry wake");
-    assert_eq!(d, WAIT_PERIODIC, "retry wake must permit scheduler settling");
-    WAITS.set(WAITS.get() + 1);
-    assert!(WAITS.get() < 8, "control was not serviced during repeated backpressure");
-    NOW.set(c);
-    if MODE.get() == 15 { return abi::ERR_INVALID as u64; }
-    FRAMES.with_borrow_mut(|frames| {
-        if WAITS.get() == 1 {
-            frames.push_back((frame(driver_protocol::Opcode::Ping, 0), 0));
-            frames.push_back((frame(driver_protocol::Opcode::Stop, 0), 0));
-            frames.push_back((frame(driver_protocol::Opcode::Ping, 1), 0));
-        }
-        if WAITS.get() == 3 {
-            match MODE.get() {
-                10 | 11 => frames.push_back((frame(driver_protocol::Opcode::Stop, 1), 0)),
-                14 => frames.push_back((b"BYTES".to_vec(), 55)),
-                _ => {},
-            }
-        }
-    });
-    if WAITS.get() == 2 { abi::ERR_TIMED_OUT as u64 } else { 0 }
 }
+
+fn send_blocking(handle: u64, payload: &[u8], _: u64) -> bool {
+    // PRESENT SO A MUTANT CAN REACH IT, and it fails the moment it is: a send with no end is the
+    // regression this file's whole first half exists to refuse.
+    let _ = (handle, payload);
+    panic!("a blocking send on a consumer path parks the driver");
+}
+
 fn wait_any(handles: &[u64], deadline: u64) -> i64 {
-    WAITS.set(WAITS.get() + 1);
-    assert!(WAITS.get() < 8, "control was never serviced after its wake");
-    if MODE.get() == 7 {
-        assert!(handles.contains(&9));
-        2
-    } else if matches!(MODE.get(), 3 | 6) {
-        assert_eq!(handles, &[8, 9], "TX ownership wait must include bootstrap");
-        assert_eq!(deadline, 3010, "the existing transport timeout stays intact");
-        FRAMES.with_borrow_mut(|frames| {
-            frames.push_back((frame(driver_protocol::Opcode::Ping, 1), 0));
-            if MODE.get() == 3 {
-                frames.push_back((frame(driver_protocol::Opcode::Stop, 1), 0));
-            } else {
-                frames.push_back((b"BYTES".to_vec(), 55));
-                TX_DONE.set(true);
-            }
-        });
-        1
-    } else if MODE.get() == 5 {
-        assert!(handles.contains(&55), "the replacement channel must become the data wait target");
-        1
-    } else {
-        panic!("the control fixture should finish before waiting");
+    WAITS.with_borrow_mut(|waits| waits.push((handles.to_vec(), deadline)));
+    assert!(WAITS.with_borrow(Vec::len) < WAIT_CEILING, "the transmit wait never gave up");
+    // Time passes, which is what lets a bounded wait reach its deadline and an unbounded one run
+    // into the ceiling above.
+    NOW.set(NOW.get() + 1);
+    0
+}
+
+fn wait_any_periodic(handles: &[u64], deadline: u64) -> i64 {
+    PERIODIC.with_borrow_mut(|waits| waits.push((handles.to_vec(), deadline)));
+    assert!(PERIODIC.with_borrow(Vec::len) < WAIT_CEILING, "the stream retry never gave up");
+    NOW.set(deadline);
+    ERR_TIMED_OUT
+}
+
+// The supervisor's channel, answered from inside both waits. `false` is a binding that has ended.
+mod common {
+    pub struct Bind { pub generation: u64 }
+    pub fn answer_ping(bootstrap: u64, _: &Bind) -> bool {
+        assert_eq!(bootstrap, super::BOOTSTRAP);
+        super::PINGS.set(super::PINGS.get() + 1);
+        super::PING_ALIVE.get()
     }
 }
-enum Polled { Message { len: usize, handle: u64 }, Empty, Closed }
-fn try_recv(channel: u64, bytes: &mut [u8]) -> Polled {
-    if channel == 9 {
-        if MODE.get() == 13 && WAITS.get() >= 3 { return Polled::Closed; }
-        CONTROL_READS.set(CONTROL_READS.get() + 1);
-        assert!(CONTROL_READS.get() < 1024, "control loop did not return");
-        let ready = matches!(MODE.get(), 1 | 7) && RX_READS.get() >= RX_SLOTS as usize
-            || MODE.get() == 2 && RX_READS.get() >= 2 && TX_READS.get() >= RX_SLOTS as usize;
-        let message = FRAMES.with_borrow_mut(VecDeque::pop_front)
-            .or_else(|| ready.then(|| (frame(driver_protocol::Opcode::Stop, 1), 0)));
-        if let Some((frame, handle)) = message {
-            bytes[..frame.len()].copy_from_slice(&frame);
-            return Polled::Message { len: frame.len(), handle };
-        }
-    } else if matches!(MODE.get(), 5 | 14 | 16) {
-        if channel == 10 { return Polled::Closed; }
-        assert_eq!(channel, 55);
-        EFFECTS.with_borrow_mut(|effects| effects.push("replacement"));
-        FRAMES.with_borrow_mut(|frames| frames.push_back((frame(driver_protocol::Opcode::Stop, 1), 0)));
-        bytes[0] = 42;
-        return Polled::Message { len: 1, handle: 0 };
-    } else if matches!(MODE.get(), 2 | 11) {
-        TX_READS.set(TX_READS.get() + 1);
-        assert!(TX_READS.get() < 1024, "agent intake never yielded to the next pass");
-        bytes[0] = 42;
-        return Polled::Message { len: 1, handle: 0 };
-    }
-    Polled::Empty
+
+// The device's two queues, as much of them as these paths touch.
+struct Virtio;
+
+impl Virtio {
+    fn read_isr(&self) -> u32 { ISR_READS.set(ISR_READS.get() + 1); 0 }
 }
-struct Virtio { capability: u64 }
-impl Virtio { fn read_isr(&self) -> u8 { 0 } }
-struct Queue { capability: u64, rx: bool }
+
+struct Queue { rx: bool }
+
 impl Queue {
     fn take_used(&mut self) -> Option<(u16, u32)> {
-        if self.rx {
-            RX_READS.set(RX_READS.get() + 1);
-            assert!(RX_READS.get() < 1024, "receive ring never yielded to control");
-            return match MODE.get() {
-                1 => Some((0, 1)),
-                4 | 7 => Some((0, 0)),
-                10 | 14 | 16 if RX_READS.get() == 1 => Some((0, 1)),
-                14 | 16 if RX_READS.get() == 2 => Some((1, 1)),
-                _ => None
-            };
+        if self.rx && ENDLESS.get() {
+            // A HOST THAT KEEPS WRITING. The production loop is bounded by the pool size and stops;
+            // an unbounded one runs until the ceiling below turns it into a failed assertion.
+            let taken = POSTED.with_borrow(Vec::len);
+            assert!(taken < WAIT_CEILING, "the receive loop is unbounded");
+            return Some(((taken % RX_SLOTS as usize) as u16, 4));
         }
-        TX_DONE.replace(false).then_some((0, 1))
+        if self.rx {
+            return USED.with_borrow_mut(|used| used.pop_front());
+        }
+        let done = SUBMITS.with_borrow(Vec::len) > 0 && WAITS.with_borrow(Vec::len) >= TX_RETURNS_AT.get();
+        if done && TX_RETURNS_AT.get() != usize::MAX { TX_RETURNS_AT.set(usize::MAX); Some((0, 0)) } else { None }
     }
-    fn post_recv(&mut self, id: u16, _: u64, _: u32) {
-        if matches!(MODE.get(), 10 | 14) { assert!(WAITS.get() >= 3, "held RX descriptor reposted while delivery remains pending"); }
-        REPOSTS.with_borrow_mut(|reposts| reposts.push(id));
-    }
-    fn notify(&self) {}
-    fn submit_async(&mut self, _: &[(u64, u32, bool)]) -> bool {
-        EFFECTS.with_borrow_mut(|effects| effects.push("submit"));
-        TX_DONE.set(true);
-        MODE.get() != 11
-    }
-}
-fn frame(opcode: driver_protocol::Opcode, generation: u64) -> Vec<u8> {
-    let payload = if opcode == driver_protocol::Opcode::Ping { 17u32.to_le_bytes().to_vec() } else { Vec::new() };
-    let mut frame = driver_protocol::Header { version: driver_protocol::VERSION, opcode, generation, payload_len: payload.len() as u32 }.encode().to_vec();
-    frame.extend_from_slice(&payload);
-    frame
-}
-mod common {
-    use super::*;
-    use driver_protocol as proto;
-    static STOP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    pub struct Bind { pub generation: u64 }
-    pub fn pong(_: u64, _: &Bind, sequence: u32) -> bool {
-        assert_eq!(sequence, 17);
-        EFFECTS.with_borrow_mut(|effects| effects.push("pong"));
+
+    fn post_recv(&mut self, id: u16, _: u64, _: u32) { POSTED.with_borrow_mut(|posted| posted.push(id)); }
+
+    fn notify(&mut self) { NOTIFIES.set(NOTIFIES.get() + 1); }
+
+    fn submit_async(&mut self, parts: &[(u64, u32, bool)]) -> bool {
+        let (_, len, _) = parts[0];
+        let bytes = TX_BACKING.with_borrow(|backing| backing[..len as usize].to_vec());
+        SUBMITS.with_borrow_mut(|submits| submits.push(bytes));
         true
     }
-    pub fn quiesce_virtio() -> bool {
-        EFFECTS.with_borrow_mut(|effects| effects.push("reset"));
-        QUIET.get()
+}
+
+// The one frame encoder these paths use, stubbed to the shape they depend on: a header carrying the
+// sequence number, then the bytes.
+mod console_stream {
+    pub fn receive_frame(seq: u32, item: &super::ConsoleChunk, out: &mut [u8], _: &mut super::Handles) -> Option<usize> {
+        let total = 4 + item.bytes.len();
+        if total > out.len() { return None }
+        out[..4].copy_from_slice(&seq.to_le_bytes());
+        out[4..total].copy_from_slice(&item.bytes);
+        Some(total)
     }
-    fn send_frame(_: u64, opcode: proto::Opcode, generation: u64, _: &[u8]) -> bool {
-        assert_eq!(opcode, proto::Opcode::Stopped);
-        assert_eq!(generation, 1);
-        EFFECTS.with_borrow_mut(|effects| effects.push("stopped"));
-        true
-    }
-    COMMON_FUNCTIONS
+}
+
+struct ConsoleChunk { bytes: Vec<u8> }
+
+struct Handles;
+
+impl Handles {
+    fn new() -> Self { Handles }
+}
+
+EXTRACTED
+
+fn reset() {
+    NOW.set(0);
+    PINGS.set(0);
+    PING_ALIVE.set(true);
+    WAITS.with_borrow_mut(Vec::clear);
+    PERIODIC.with_borrow_mut(Vec::clear);
+    DELIVERED.with_borrow_mut(Vec::clear);
+    SEND_SCRIPT.with_borrow_mut(VecDeque::clear);
+    CLOSED.with_borrow_mut(Vec::clear);
+    USED.with_borrow_mut(VecDeque::clear);
+    ENDLESS.set(false);
+    POSTED.with_borrow_mut(Vec::clear);
+    NOTIFIES.set(0);
+    SUBMITS.with_borrow_mut(Vec::clear);
+    TX_RETURNS_AT.set(usize::MAX);
+    ISR_READS.set(0);
+    ACKS.set(0);
+    RX_BACKING.with_borrow_mut(|backing| { backing.clear(); backing.resize(RX_SLOTS as usize * RX_SLOT as usize, b'x'); });
+    TX_BACKING.with_borrow_mut(|backing| { backing.clear(); backing.resize(MAX_WRITE, 0); });
+}
+
+fn rx_virt() -> u64 { RX_BACKING.with_borrow(|backing| backing.as_ptr() as u64) }
+
+fn tx_virt() -> u64 { TX_BACKING.with_borrow(|backing| backing.as_ptr() as u64) }
+
+fn attached() -> Attachment {
+    let mut state = Attachment::default();
+    state.attached = true;
+    state.stream = STREAM;
+    state
 }
 '''
 
 TESTS = r'''
-#[cfg(test)] mod tests {
+#[cfg(test)]
+mod tests {
     use super::*;
-    fn reset(mode: u8) {
-        MODE.set(mode); NOW.set(10); SENDS.set(0); DELIVERIES.with_borrow_mut(Vec::clear); ATTEMPTS.with_borrow_mut(Vec::clear); REPOSTS.with_borrow_mut(Vec::clear); RX_READS.set(0); TX_READS.set(0); CONTROL_READS.set(0); WAITS.set(0);
-        TX_DONE.set(false); QUIET.set(true);
-        FRAMES.with_borrow_mut(VecDeque::clear); EFFECTS.with_borrow_mut(Vec::clear); CLOSED.with_borrow_mut(Vec::clear);
+
+    const BIND: common::Bind = common::Bind { generation: 1 };
+
+    fn port(device: &Virtio) -> Port<'_> {
+        Port { device, irq: IRQ, tx: Queue { rx: false }, virt: tx_virt(), phys: 0x1000, busy: false }
     }
-    fn expect_exit(action: impl FnOnce()) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action));
-        assert!(result.is_err_and(|error| error.is::<DriverExit>()), "the driver must observe control and exit, not hit the starvation guard");
-    }
-    fn stopped() {
-        let effects = EFFECTS.with_borrow(Clone::clone);
-        let reset = effects.iter().position(|&effect| effect == "reset").expect("transport reset");
-        assert_eq!(&effects[reset..], &["reset", "quiesced", "stopped"]);
-    }
-    fn run_pump(mode: u8) {
-        reset(mode);
-        if mode == 5 { FRAMES.with_borrow_mut(|frames| frames.push_back((b"BYTES".to_vec(), 55))); }
-        let device = Virtio { capability: 7 };
-        let mut tx = Queue { capability: 7, rx: false };
-        let mut rx = Queue { capability: 7, rx: true };
-        let mut memory = vec![0u8; MAX_FRAME];
-        let receive = vec![0u8; RX_SLOTS as usize * RX_SLOT as usize];
-        let mut port = Port { device: &device, irq: 8, tx: &mut tx, virt: memory.as_mut_ptr() as u64, phys: 1, busy: false, pending_bytes: 0 };
-        expect_exit(|| unsafe { pump(&device, &common::Bind { generation: 1 }, 8, 9, 10, &mut rx, &mut port, receive.as_ptr() as u64, &[1; RX_SLOTS as usize]) });
-        stopped();
-    }
-    #[test] fn receive_backpressure_services_ping_and_stop() {
-        run_pump(10);
-        assert_eq!(WAITS.get(), 3);
-        assert_eq!(SENDS.get(), 3);
-        assert_eq!(EFFECTS.with_borrow(Clone::clone), ["pong", "reset", "quiesced", "stopped"]);
-        assert!(DELIVERIES.with_borrow(Vec::is_empty));
-        assert!(REPOSTS.with_borrow(Vec::is_empty), "STOP cancels delivery without reposting held RX");
-    }
-    #[test] fn failure_notice_backpressure_services_ping_and_stop() {
-        run_pump(11);
-        assert_eq!(WAITS.get(), 3);
-        assert!(ATTEMPTS.with_borrow(|attempts| attempts.len() == 3 && attempts.iter().all(Vec::is_empty)));
-        assert!(EFFECTS.with_borrow(|effects| effects.contains(&"pong")));
-        assert!(DELIVERIES.with_borrow(Vec::is_empty));
-    }
-    #[test] fn capacity_recovery_delivers_once_in_payload_order() {
-        reset(12);
-        let mut pending = 0;
-        for payload in [b"first".as_slice(), b"second", b"third"] {
-            assert!(unsafe { send_to_agent(&common::Bind { generation: 1 }, 9, 7, &mut pending, 10, payload) });
+
+    // A HOST THAT STOPPED READING HOLDS THE BUFFER, AND THE DRIVER GOES ON ANSWERING ITS SUPERVISOR.
+    //
+    // Three facts in one place because they are the same failure seen from three sides: the wait
+    // must name the supervisor's handle, the supervisor must be answered on every pass, and the
+    // whole thing must end at a deadline rather than when the host feels like reading.
+    #[test]
+    fn a_stalled_transmit_answers_control_waits_on_bootstrap_and_gives_up() {
+        reset();
+        let device = Virtio;
+        let mut port = port(&device);
+        assert!(unsafe { port.send_now(b"first") }, "the first write takes the buffer");
+        let outcome = unsafe { port.write(b"second", &BIND, BOOTSTRAP) };
+        assert_eq!(outcome, Err(Error::Again), "a buffer the device never gave back is `again`, not a lie");
+        let waits = WAITS.with_borrow(Clone::clone);
+        assert!(!waits.is_empty(), "it waited rather than spinning");
+        for (handles, deadline) in &waits {
+            assert!(handles.contains(&BOOTSTRAP), "every transmit wait names the supervisor's channel");
+            assert!(handles.contains(&IRQ), "and the device's own interrupt");
+            assert_eq!(*deadline, TX_DRAIN_TICKS, "bounded by the transport deadline and not by the host");
         }
-        assert_eq!(WAITS.get(), 3);
-        assert_eq!(DELIVERIES.with_borrow(Clone::clone), [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]);
-        assert_eq!(ATTEMPTS.with_borrow(|attempts| attempts[..4].to_vec()), vec![b"first".to_vec(); 4]);
-        assert_eq!(EFFECTS.with_borrow(Clone::clone), ["pong"]);
+        assert!(PINGS.get() >= waits.len(), "the supervisor is answered on every pass of the wait");
     }
-    #[test] fn bootstrap_closure_and_invalid_wait_terminate_without_adoption() {
-        for mode in [13, 15] {
-            reset(mode);
-            expect_exit(|| { unsafe { send_to_agent(&common::Bind { generation: 1 }, 9, 7, &mut 0, 10, b"held"); } });
-            assert!(CLOSED.with_borrow(Vec::is_empty));
-            assert!(DELIVERIES.with_borrow(Vec::is_empty));
+
+    // AND A BINDING THAT ENDED ENDS THE WRITE. The supervisor answering `false` is a stop or a
+    // closed channel, and a driver that kept waiting for a buffer after that is one nothing can
+    // reclaim.
+    #[test]
+    fn a_transmit_wait_ends_when_the_binding_does() {
+        reset();
+        PING_ALIVE.set(false);
+        let device = Virtio;
+        let mut port = port(&device);
+        assert!(unsafe { port.send_now(b"first") });
+        assert_eq!(unsafe { port.write(b"second", &BIND, BOOTSTRAP) }, Err(Error::Closed));
+        assert!(WAITS.with_borrow(Vec::is_empty), "it never reached the wait");
+    }
+
+    // AND A BUFFER THE DEVICE GIVES BACK IS THE END OF THE WAIT, which is what says the loop is
+    // waiting for the completion rather than counting to a number.
+    #[test]
+    fn a_returned_buffer_completes_the_write() {
+        reset();
+        TX_RETURNS_AT.set(2);
+        let device = Virtio;
+        let mut port = port(&device);
+        assert!(unsafe { port.send_now(b"first") });
+        assert_eq!(unsafe { port.write(b"second", &BIND, BOOTSTRAP) }, Ok(6));
+        assert_eq!(SUBMITS.with_borrow(|s| s.len()), 2, "both writes reached the ring");
+        assert_eq!(SUBMITS.with_borrow(|s| s[1].clone()), b"second".to_vec());
+    }
+
+    // A CONSUMER THAT IS MERELY SLOW IS WAITED FOR, AND THE SUPERVISOR IS ANSWERED WHILE WAITING.
+    #[test]
+    fn stream_backpressure_answers_control_and_retries_until_capacity() {
+        reset();
+        let mut state = attached();
+        SEND_SCRIPT.with_borrow_mut(|script| { script.push_back(1); script.push_back(1); script.push_back(0); });
+        let mut frame = alloc::vec![0u8; 64];
+        send_chunk(&BIND, BOOTSTRAP, &mut state, b"hello", &mut frame);
+        assert_eq!(DELIVERED.with_borrow(Vec::len), 1, "the chunk went once, after the stall cleared");
+        assert_eq!(PERIODIC.with_borrow(Vec::len), 2, "one bounded retry wake per stall");
+        for (handles, deadline) in PERIODIC.with_borrow(Clone::clone) {
+            assert_eq!(handles, alloc::vec![BOOTSTRAP], "the retry wake is on the supervisor's channel");
+            assert!(deadline > 0, "and it is a deadline, not a wait with no end");
         }
+        assert!(PINGS.get() >= 3, "the supervisor is answered before every attempt");
     }
-    #[test] fn stalled_handoff_discards_pending_payload_and_old_receive_pool() {
-        run_pump(14);
-        assert_eq!(CLOSED.with_borrow(Clone::clone), [10]);
-        assert_eq!(SENDS.get(), 3, "old payload is not retried after replacement handoff");
-        assert!(DELIVERIES.with_borrow(Vec::is_empty));
-        assert_eq!(REPOSTS.with_borrow(Clone::clone), [1, 0], "queued old pool discarded before held descriptor returns");
-    }
-    #[test] fn terminal_send_failure_adopts_without_replay() {
-        run_pump(16);
-        assert_eq!(CLOSED.with_borrow(Clone::clone), [10]);
-        assert_eq!(SENDS.get(), 1);
-        assert!(DELIVERIES.with_borrow(Vec::is_empty));
-        assert_eq!(REPOSTS.with_borrow(Clone::clone), [1, 0]);
-    }
-    #[test] fn stalled_stop_refuses_failed_quiescence() {
-        reset(10); QUIET.set(false);
-        expect_exit(|| { unsafe { send_to_agent(&common::Bind { generation: 1 }, 9, 7, &mut 0, 10, b"held"); } });
-        assert_eq!(EFFECTS.with_borrow(Clone::clone), ["pong", "reset"]);
-    }
-    #[test] fn empty_receive_completions_still_yield_to_control() { run_pump(7); assert_eq!(RX_READS.get(), RX_SLOTS as usize); }
-    #[test] fn replenished_receive_still_services_control() { run_pump(1); assert_eq!(RX_READS.get(), RX_SLOTS as usize); }
-    #[test] fn replenished_agent_returns_to_receive_and_control() { run_pump(2); assert!(RX_READS.get() >= 2); assert!(TX_READS.get() <= 2 * RX_SLOTS as usize); }
-    #[test] fn stalled_transmit_services_bootstrap_before_buffer_reuse() {
-        reset(3);
-        let device = Virtio { capability: 7 };
-        let mut tx = Queue { capability: 7, rx: false };
-        let mut memory = vec![0u8; MAX_FRAME];
-        let mut port = Port { device: &device, irq: 8, tx: &mut tx, virt: memory.as_mut_ptr() as u64, phys: 1, busy: true, pending_bytes: 0 };
-        expect_exit(|| { unsafe { port.write(b"pending", &common::Bind { generation: 1 }, 9); } });
-        assert_eq!(WAITS.get(), 1);
-        assert_eq!(EFFECTS.with_borrow(Clone::clone), ["pong", "reset", "quiesced", "stopped"]);
-        assert!(port.busy, "an uncompleted descriptor was not reused");
-    }
-    #[test] fn adoption_stop_uses_the_latched_quiescence_path() {
-        for quiet in [true, false] {
-            reset(4); QUIET.set(quiet);
-            FRAMES.with_borrow_mut(|frames| frames.push_back((frame(driver_protocol::Opcode::Stop, 1), 0)));
-            let device = Virtio { capability: 7 };
-            let mut rx = Queue { capability: 7, rx: true };
-            expect_exit(|| { unsafe { adopt(&device, &common::Bind { generation: 1 }, 8, 9, 10, &mut 0, &mut rx, &[1; RX_SLOTS as usize]); } });
-            if quiet { stopped(); } else { assert_eq!(EFFECTS.with_borrow(Clone::clone), ["close", "reset"]); }
-        }
-    }
-    #[test] fn stale_stop_preserves_the_replacement_bytes_handoff() {
-        reset(0);
-        FRAMES.with_borrow_mut(|frames| {
-            frames.push_back((frame(driver_protocol::Opcode::Stop, 0), 0));
-            frames.push_back((b"BYTES".to_vec(), 55));
-        });
-        let device = Virtio { capability: 7 };
-        let mut rx = Queue { capability: 7, rx: true };
-        assert_eq!(unsafe { adopt(&device, &common::Bind { generation: 1 }, 8, 9, 10, &mut 0, &mut rx, &[1; RX_SLOTS as usize]) }, 55);
-        assert_eq!(EFFECTS.with_borrow(Clone::clone), ["close"]);
-    }
-    #[test] fn ready_handoff_survives_control_before_old_channel_closure() {
-        run_pump(5);
-        assert!(EFFECTS.with_borrow(|effects| effects.contains(&"replacement")));
-        assert_eq!(CLOSED.with_borrow(Clone::clone), [10]);
-    }
-    #[test] fn handoff_during_transmit_wait_is_owned_until_adoption() {
-        reset(6);
-        let device = Virtio { capability: 7 };
-        let mut tx = Queue { capability: 7, rx: false };
-        let mut rx = Queue { capability: 7, rx: true };
-        let mut memory = vec![0u8; MAX_FRAME];
-        let mut port = Port { device: &device, irq: 8, tx: &mut tx, virt: memory.as_mut_ptr() as u64, phys: 1, busy: true, pending_bytes: 0 };
-        assert!(unsafe { port.write(b"pending", &common::Bind { generation: 1 }, 9) });
-        assert_eq!(port.pending_bytes, 55);
+
+    // A TIMED-OUT RETRY IS NOT AN ERROR. It is the deadline this loop asked for arriving, and a
+    // driver that treated it as one would drop a chunk every time a consumer was a tick slow.
+    #[test]
+    fn a_retry_that_times_out_keeps_the_session() {
+        reset();
+        let mut state = attached();
+        SEND_SCRIPT.with_borrow_mut(|script| { for _ in 0..3 { script.push_back(1) } script.push_back(0); });
+        let mut frame = alloc::vec![0u8; 64];
+        send_chunk(&BIND, BOOTSTRAP, &mut state, b"hello", &mut frame);
+        assert_eq!(DELIVERED.with_borrow(Vec::len), 1, "every one of those wakes timed out and the chunk still went");
+        assert_eq!(state.stream, STREAM, "and the session is intact");
         assert!(CLOSED.with_borrow(Vec::is_empty));
-        assert_eq!(unsafe { adopt(&device, &common::Bind { generation: 1 }, 8, 9, 10, &mut port.pending_bytes, &mut rx, &[1; RX_SLOTS as usize]) }, 55);
-        assert_eq!(port.pending_bytes, 0);
-        assert_eq!(CLOSED.with_borrow(Clone::clone), [10]);
     }
-    #[test] fn pending_handoff_discards_the_previous_receive_pool() {
-        reset(4);
-        let device = Virtio { capability: 7 };
-        let mut rx = Queue { capability: 7, rx: true };
-        let mut pending = 55;
-        assert_eq!(unsafe { adopt(&device, &common::Bind { generation: 1 }, 8, 9, 10, &mut pending, &mut rx, &[1; RX_SLOTS as usize]) }, 55);
-        assert_eq!(RX_READS.get(), RX_SLOTS as usize, "old-session bytes are discarded before the retained handoff");
-        assert_eq!(pending, 0);
-        assert_eq!(CLOSED.with_borrow(Clone::clone), [10]);
+
+    // A CONSUMER THAT HAS GONE ENDS THE ATTACHMENT, because there is nobody left to read what the
+    // port produces - and the endpoint is given back rather than held for the life of the driver.
+    #[test]
+    fn a_failed_send_ends_the_attachment() {
+        reset();
+        let mut state = attached();
+        SEND_SCRIPT.with_borrow_mut(|script| script.push_back(2));
+        let mut frame = alloc::vec![0u8; 64];
+        send_chunk(&BIND, BOOTSTRAP, &mut state, b"hello", &mut frame);
+        assert_eq!(state.stream, 0, "the stream is let go");
+        assert_eq!(CLOSED.with_borrow(Clone::clone), alloc::vec![STREAM]);
+        assert!(DELIVERED.with_borrow(Vec::is_empty));
+    }
+
+    // ONE PASS TAKES AT MOST THE POOL, which is what stops a host that keeps writing from holding
+    // this driver in one call for as long as it likes.
+    #[test]
+    fn the_receive_pass_is_bounded_by_the_pool() {
+        reset();
+        ENDLESS.set(true);
+        let mut state = attached();
+        let mut rx = Queue { rx: true };
+        let phys = [0u64; RX_SLOTS as usize];
+        let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
+        assert!(drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert_eq!(POSTED.with_borrow(Vec::len), RX_SLOTS as usize, "one pass takes the pool and stops");
+    }
+
+    // AND EVERY BUFFER IT TAKES GOES BACK ON THE RING, once, with the device told once at the end.
+    // A ring that loses a buffer per interrupt is a port that goes deaf after eight of them.
+    #[test]
+    fn every_taken_buffer_is_re_posted_and_the_device_told_once() {
+        reset();
+        let mut state = attached();
+        let mut rx = Queue { rx: true };
+        USED.with_borrow_mut(|used| { for id in 0..3u16 { used.push_back((id, 4)) } });
+        let phys = [0u64; RX_SLOTS as usize];
+        let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
+        assert!(drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert_eq!(POSTED.with_borrow(Clone::clone), alloc::vec![0u16, 1, 2]);
+        assert_eq!(NOTIFIES.get(), 1, "the device is told once for the pass and not once per buffer");
+        assert_eq!(DELIVERED.with_borrow(Vec::len), 3, "and each one's bytes reached the consumer");
+    }
+
+    // A PASS THAT TOOK NOTHING TELLS THE DEVICE NOTHING AND SAYS SO, which is what lets the pump
+    // park instead of looping.
+    #[test]
+    fn an_empty_receive_pass_notifies_nothing() {
+        reset();
+        let mut state = attached();
+        let mut rx = Queue { rx: true };
+        let phys = [0u64; RX_SLOTS as usize];
+        let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
+        assert!(!drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert_eq!(NOTIFIES.get(), 0);
+        assert!(POSTED.with_borrow(Vec::is_empty));
+    }
+
+    // BYTES WITH NOBODY TO TAKE THEM ARE DISCARDED AND THE BUFFER IS RECYCLED. Both halves: the
+    // bytes belong to a session nobody holds, and eight buffers is all the device has.
+    #[test]
+    fn bytes_with_no_consumer_are_discarded_and_the_buffer_recycled() {
+        reset();
+        let mut state = Attachment::default();
+        let mut rx = Queue { rx: true };
+        USED.with_borrow_mut(|used| { for id in 0..2u16 { used.push_back((id, 4)) } });
+        let phys = [0u64; RX_SLOTS as usize];
+        let mut frame = alloc::vec![0u8; RX_SLOT as usize + 32];
+        assert!(drain_receive(&BIND, BOOTSTRAP, &mut rx, rx_virt(), &phys, &mut state, &mut frame));
+        assert!(DELIVERED.with_borrow(Vec::is_empty), "there is nobody to hand them to");
+        assert_eq!(POSTED.with_borrow(Clone::clone), alloc::vec![0u16, 1], "and the ring keeps its buffers");
     }
 }
 '''
 
 
-def fixture(source: str, common: str) -> str:
-    functions = ["struct Port<'a>", "impl Port<'_>", "unsafe fn heartbeat(", "unsafe fn send_to_agent(", "unsafe fn pump(", "unsafe fn adopt("]
-    constants = '\n'.join(line for line in source.splitlines() if line.startswith(('const RX_', 'const MAX_FRAME:', 'const TX_DRAIN_TICKS:')))
-    common_functions = '\n'.join(item(common, start) for start in ['pub fn latch_stop(', 'pub unsafe fn finish_stop(', 'pub unsafe fn stopped('])
-    runtime = (ROOT / 'src/user/runtime/rt/src/lib.rs').read_text()
-    wrappers = '\n'.join(item(runtime, start) for start in ['pub enum SendOutcome {', 'pub unsafe fn try_send_outcome(', 'pub unsafe fn wait_any_periodic(', 'pub unsafe fn send_blocking(', 'pub unsafe fn wait_writable('])
-    return FIXTURE.replace('RUNTIME_FUNCTIONS', wrappers).replace('COMMON_FUNCTIONS', common_functions) + constants + '\n' + '\n'.join(item(source, start) for start in functions) + TESTS
+def fixture(source: str) -> str:
+    constants = '\n'.join(line for line in source.splitlines() if line.startswith(('pub const RX_', 'pub const MAX_WRITE:', 'pub const TX_DRAIN_TICKS:')))
+    # `Attachment` IS TAKEN WITH ITS DERIVE, because `reset` calls `Attachment::default()` and a
+    # struct extracted from the line below the attribute is one that no longer has it.
+    items = ['pub struct Port<'"'"'a>', 'impl Port<'"'"'_>', '#[derive(Default)]\npub struct Attachment', 'impl Attachment', 'fn drain_receive(', 'fn send_chunk(']
+    body = '\n'.join(item(source, start) for start in items)
+    return FIXTURE.replace('EXTRACTED', constants + '\n' + body) + TESTS
 
 
 def main() -> None:
-    source = (ROOT / 'src/user/drivers/core/src/dev_channel.rs').read_text()
-    common = (ROOT / 'src/user/drivers/core/src/common.rs').read_text()
-    control = '\t\t\tif !heartbeat(bind, bootstrap, rx.capability, &mut port.pending_bytes) {\n\t\t\t\texit();\n\t\t\t}'
-    rx = 'for _ in 0..RX_SLOTS {\n\t\t\t\tlet Some((id, len)) = rx.take_used() else { break };'
-    tx = 'for _ in 0..RX_SLOTS {\n\t\t\t\tmatch try_recv(bytes, &mut outbound) {'
-    wait = 'wait_any(&[self.irq, bootstrap], limit)'
-    tx_control = 'if !heartbeat(bind, bootstrap, self.device.capability, &mut self.pending_bytes) {\n\t\t\t\t\texit();\n\t\t\t\t}'
-    adopt_rx = 'for _ in 0..RX_SLOTS {\n\t\t\t\tlet Some((id, _)) = rx.take_used() else { break };'
-    handoff = '*pending_bytes = handle;'
-    adopt_stop = 'driver_protocol::Opcode::Stop => {\n\t\t\t\t\t\t\t\t\tcommon::latch_stop();\n\t\t\t\t\t\t\t\t\tcommon::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());\n\t\t\t\t\t\t\t\t\texit();\n\t\t\t\t\t\t\t\t}'
-    for needle in [control, rx, tx, wait, tx_control, adopt_stop, adopt_rx, handoff]:
-        assert source.count(needle) == 1, needle
-    send_control = 'if !heartbeat(bind, bootstrap, capability, pending_bytes) {\n\t\t\t\texit();\n\t\t\t}'
-    send = 'send_to_agent(bind, bootstrap, rx.capability, &mut port.pending_bytes, bytes, chunk)'
-    notice = 'send_to_agent(bind, bootstrap, rx.capability, &mut port.pending_bytes, bytes, &[])'
-    periodic = 'wait_any_periodic(&[bootstrap], clock().saturating_add(1))'
-    assert source.count(send_control) == 1 and source.count(periodic) == 1
+    source = (ROOT / 'src/user/drivers/core/src/serial_port.rs').read_text()
+
+    # THE ANCHORS, CHECKED BEFORE ANYTHING IS MUTATED. A mutation that silently matched nothing is a
+    # battery reporting that production passed its own tests, which it always does.
+    tx_control = 'if !common::answer_ping(bootstrap, bind) {\n\t\t\t\t\treturn Err(Error::Closed);\n\t\t\t\t}'
+    tx_bound = 'if clock() >= limit {\n\t\t\t\t\treturn Err(Error::Again);\n\t\t\t\t}'
+    tx_wait = 'wait_any(&[self.irq, bootstrap], limit)'
+    send_control = 'if !common::answer_ping(bootstrap, bind) {\n\t\t\treturn;\n\t\t}'
+    send_wait = 'wait_any_periodic(&[bootstrap], clock().saturating_add(1))'
+    send_timeout = 'if ready < 0 && ready != ERR_TIMED_OUT {'
+    send_failed = 'SendOutcome::Failed => {\n\t\t\t\tclose(state.stream);\n\t\t\t\tstate.stream = 0;\n\t\t\t\treturn;\n\t\t\t}'
+    rx_bound = 'for _ in 0..RX_SLOTS {\n\t\tlet Some((id, len)) = rx.take_used() else { break };'
+    # THE ONE INSIDE `drain_receive` AND NOT THE ONE THAT FILLS THE POOL AT OPEN. Both lines are
+    # identical; what tells them apart is what follows, and a mutation that hit the wrong one would
+    # be testing a path no interrupt ever takes.
+    rx_repost = 'rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);\n\t\tworked = true;'
+    rx_notify = 'if worked {\n\t\trx.notify();\n\t}'
+    for needle in [tx_control, tx_bound, tx_wait, send_control, send_wait, send_timeout, send_failed, rx_bound, rx_repost, rx_notify]:
+        if source.count(needle) != 1:
+            raise SystemExit(f'dev-channel-control: the anchor below is not in `serial_port.rs` exactly once - it was found {source.count(needle)} times:\n{needle}')
+
     variants = [
-        ('receive uses blocking send', source.replace(send, 'send_blocking(bytes, chunk, 0)', 1), 'receive_backpressure_services_ping_and_stop'),
-        ('failure notice uses blocking send', source.replace(notice, 'send_blocking(bytes, &[], 0)', 1), 'failure_notice_backpressure_services_ping_and_stop'),
-        ('send retries omit control', source.replace(send_control, '', 1), 'receive_backpressure_services_ping_and_stop'),
-        ('send retry spins without wait', source.replace(periodic, '0', 1), 'receive_backpressure_services_ping_and_stop'),
-        ('periodic timeout ends the session', source.replace('ready < 0 && ready != ERR_TIMED_OUT', 'ready < 0', 1), 'capacity_recovery_delivers_once_in_payload_order'),
-        ('send retry waits forever', source.replace(periodic, 'wait_any_periodic(&[bootstrap], 0)', 1), 'capacity_recovery_delivers_once_in_payload_order'),
         ('production', source, None),
-        ('control only after idle work', source.replace(control, '', 1), 'empty_receive_completions_still_yield_to_control'),
-        ('unbounded receive pool', source.replace(rx, 'while let Some((id, len)) = rx.take_used() {', 1), 'empty_receive_completions_still_yield_to_control'),
-        ('unbounded agent intake', source.replace(tx, 'loop {\n\t\t\t\tmatch try_recv(bytes, &mut outbound) {', 1), 'replenished_agent_returns_to_receive_and_control'),
-        ('TX wait omits bootstrap', source.replace(wait, 'wait_any(&[self.irq], limit)', 1), 'stalled_transmit_services_bootstrap_before_buffer_reuse'),
-        ('TX wait ignores control', source.replace(tx_control, '', 1), 'stalled_transmit_services_bootstrap_before_buffer_reuse'),
-        ('adoption ignores STOP', source.replace(adopt_stop, 'driver_protocol::Opcode::Stop => {}', 1), 'adoption_stop_uses_the_latched_quiescence_path'),
-        ('adoption STOP is not latched', source.replace(adopt_stop, adopt_stop.replace('common::latch_stop();', ''), 1), 'adoption_stop_uses_the_latched_quiescence_path'),
-        ('unbounded adoption receive pool', source.replace(adopt_rx, 'while let Some((id, _)) = rx.take_used() {', 1), 'adoption_stop_uses_the_latched_quiescence_path'),
-        ('early control discards handoff', source.replace(handoff, 'close(handle);', 1), 'ready_handoff_survives_control_before_old_channel_closure'),
-        ('TX control discards handoff', source.replace(handoff, 'close(handle);', 1), 'handoff_during_transmit_wait_is_owned_until_adoption'),
-        ('retained handoff bypasses old receive discard', source.replace('close(dead);', 'close(dead); if *pending_bytes != 0 { return core::mem::take(pending_bytes); }', 1), 'pending_handoff_discards_the_previous_receive_pool'),
+        ('transmit wait ignores control', source.replace(tx_control, '', 1), 'a_stalled_transmit_answers_control_waits_on_bootstrap_and_gives_up'),
+        ('transmit wait omits bootstrap', source.replace(tx_wait, 'wait_any(&[self.irq], limit)', 1), 'a_stalled_transmit_answers_control_waits_on_bootstrap_and_gives_up'),
+        ('transmit wait is unbounded', source.replace(tx_bound, '', 1), 'a_stalled_transmit_answers_control_waits_on_bootstrap_and_gives_up'),
+        ('a stalled write claims success', source.replace('return Err(Error::Again);', 'return Ok(0);', 1), 'a_stalled_transmit_answers_control_waits_on_bootstrap_and_gives_up'),
+        ('stream retries omit control', source.replace(send_control, '', 1), 'stream_backpressure_answers_control_and_retries_until_capacity'),
+        ('stream retry spins without waiting', source.replace(send_wait, '0', 1), 'stream_backpressure_answers_control_and_retries_until_capacity'),
+        ('a retry timeout ends the session', source.replace(send_timeout, 'if ready < 0 {', 1), 'a_retry_that_times_out_keeps_the_session'),
+        ('a failed send leaks the stream', source.replace(send_failed, 'SendOutcome::Failed => {\n\t\t\t\tstate.stream = 0;\n\t\t\t\treturn;\n\t\t\t}', 1), 'a_failed_send_ends_the_attachment'),
+        ('the receive pass is unbounded', source.replace(rx_bound, 'while let Some((id, len)) = rx.take_used() {', 1), 'the_receive_pass_is_bounded_by_the_pool'),
+        ('a taken buffer is not re-posted', source.replace(rx_repost, '', 1), 'every_taken_buffer_is_re_posted_and_the_device_told_once'),
+        ('the device is told once per buffer', source.replace(rx_notify, '', 1).replace(rx_repost, rx_repost + '\n\t\trx.notify();', 1), 'every_taken_buffer_is_re_posted_and_the_device_told_once'),
     ]
+
     with tempfile.TemporaryDirectory(prefix='dev-channel-control-') as directory:
         root = Path(directory)
         (root / 'src').mkdir()
-        (root / 'Cargo.toml').write_text('[package]\nname="dev-channel-control"\nversion="0.1.0"\nedition="2024"\n[dependencies]\ndriver-protocol={path="' + str(ROOT / 'src/user/libs/driver/protocol') + '"}\nabi={path="' + str(ROOT / 'src/abi') + '"}\n')
+        (root / 'Cargo.toml').write_text('[package]\nname="dev-channel-control"\nversion="0.1.0"\nedition="2024"\n[dependencies]\nabi={path="' + str(ROOT / 'src/abi') + '"}\ndriver-protocol={path="' + str(ROOT / 'src/user/libs/driver/protocol') + '"}\n')
         for name, variant, test in variants:
-            (root / 'src/lib.rs').write_text(fixture(variant, common))
+            (root / 'src/lib.rs').write_text(fixture(variant))
             command = ['cargo', 'test', '--offline', '--manifest-path', str(root / 'Cargo.toml'), '--target-dir', str(root / 'target'), '--lib']
             if test:
                 command.append(test)
             command.extend(['--', '--test-threads=1'])
-            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
             if test:
                 if result.returncode != 101 or f'tests::{test} ... FAILED' not in result.stdout:
-                    raise SystemExit(f'{name}: expected the named assertion failure:\n{result.stdout}\n{result.stderr}')
+                    raise SystemExit(f'dev-channel-control: {name}: expected the named assertion to fail, not a build failure:\n{result.stdout}\n{result.stderr}')
             elif result.returncode:
-                raise SystemExit(f'{name}: {result.stdout}\n{result.stderr}')
-            print(f'dev-channel-control: {name} {"rejected" if test else "passed (16 tests)"}')
+                raise SystemExit(f'dev-channel-control: {name}:\n{result.stdout}\n{result.stderr}')
+            print(f'dev-channel-control: {name} {"rejected" if test else "passed"}')
 
 
 if __name__ == '__main__':

@@ -2196,3 +2196,564 @@ and conformance-proved: the suite gained a fifth scene in between, and this scen
 the half a percent the change buys whenever anything else in the process moves. The hoist is real;
 the verdict was not. `vector-stress` is still AT its line, which is what this file said before I
 claimed otherwise.
+
+## `f-ext`'s first deliverable: the closed feature list, and the LOD rules that had none
+
+THE PART WAS ACTIVATED AND ITS FIRST DEBT WAS NOT AN IMPLEMENTATION. `f-ext`'s header says it carries
+a CLOSED ENUMERATED feature list on the same terms as the 2D and 3D profiles, and it carried
+equations and no list. Every other item of the part says "a test per feature", and until now that
+phrase had nothing to range over: a rule is prose a reader checks, a feature is a name a generator
+can range over, and the conformance suite, the capability report and the backend checklist are all
+built over the second kind.
+
+WHAT WAS ADDED, in `src/user/libs/graphics/profile/src/scene3d_extended.rs`:
+
+  - `ExtendedFeature`, 52 variants in seven groups - material 11, environment 6, shadows 10,
+    postprocess 6, animation 11, detail 6, limits 2 - and `SCENE3D_EXTENDED_PROFILE_1` over them
+    through the same `profile!` macro the other three lists use, so the name of a feature is the
+    variant's own spelling rather than a second string beside it.
+  - `SCENE3D_EXTENDED_GROUPS`, `in_extended_profile_1` and `entry_by_name`, matching `scene3d.rs`.
+
+EVERY VARIANT COMES FROM A RULE THAT WAS ALREADY FROZEN, with one exception, and the exception is the
+defect this part was flagged for.
+
+LEVEL OF DETAIL HAD NO STATED RULE ANYWHERE. The item asks for "LOD selection with STATED
+THRESHOLDS" and `SCENE3D_EXTENDED_1.md` stated none - no coverage, no distance, no hysteresis - so
+that half of the item could only ever have been implemented against an invented rule. A feature with
+no stated rule cannot go in a closed list, so `LEVEL_OF_DETAIL_RULES` was written: nine answers
+covering the selection metric (screen coverage, not raw distance, because distance selects a
+different level at the same apparent size when the field of view or the viewport changes), the
+threshold ladder and its refusal when not descending, the default ladder, hysteresis at a tenth of
+the threshold against the level held last frame, the first frame with no previous level, what
+happens below the last threshold, a mesh with one level, WHICH bounds the coverage is taken from
+(the current ones, after morphing and skinning - a rest-pose coverage steps a raised arm down a
+level while it is still on screen), and that the chosen level is READABLE, which is the difference
+from culling: culling must not change the picture and a level of detail is chosen to.
+
+They are CHOSEN RATHER THAN REQUIRED, on the same terms the root-motion rule already uses, and
+`s-3d-ext`'s own criterion asks exactly this: "the choices its own rows leave open have one answer
+each".
+
+AND THE HASH MOVED, WHICH IS THE POINT RATHER THAN A SIDE EFFECT. `198e9d18...` became `ef2117e5...`.
+The part's header says its first item is an amendment to a frozen normative specification and that
+the ordering rules exist to stop an implementer doing that QUIETLY; this is the loud version. The
+closed list is hashed with the equations - a list that could change without moving the hash would be
+a second statement of the profile that nothing holds to the first.
+
+A SEVENTH LIMIT CAME WITH IT. `max_lod_levels`, minimum 4, in the registry and enforced in
+`scene3d::Limits` beside the six. The field comment there used to say the six were the six the freeze
+named and that adding a seventh to a frozen document was the ordering defect `s-3d-ext` prevents;
+that comment is now true in a different way and says so. `max_transparent_items` is STILL left out,
+and for the reason that comment already gave: a transparent item is a drawable and `max_drawables`
+bounds it. Moving a frozen hash is for a rule the profile is missing, not for a second name over a
+bound that already exists.
+
+HELD BY FIVE NEW FIXTURES in the profile crate (73 pass, was 68):
+
+  - the list is closed: no name twice, no feature twice, no unknown group, no empty group.
+  - EVERY entry is `Scene3D`-owned, which is a claim rather than a default. The closed-list helper
+    the two core profiles share asserts that SOMETHING is backend-owned; that is right there and
+    wrong here, because Extended adds no rasteriser capability at all. Shadows are a depth target
+    and comparison sampling, the environment is a cube map with mips, bloom is a render-target
+    pyramid and skinning is arithmetic in a vertex stage - every one already in `Render3D Core
+    Profile 1`. If that stops being true the fix is to add the capability to the 3D profile, where a
+    backend checklist will demand a handler for it.
+  - no Extended name collides with a Render2D, Render3D or Scene3D core name, which is the
+    disjointness `profile-doc` relies on to route a `@covers` claim to exactly one profile, and
+    every entry looks up to itself by name.
+  - every rule section has features and every feature group has rules, which is the join that stops
+    the list becoming a second, drifting statement of the same profile.
+  - the level-of-detail rules answer the four questions two implementations would otherwise differ
+    on, named one by one so a later edit cannot drop one and leave the feature stated in the list
+    and unstated in the profile.
+
+`profile-doc --check` reports the generated documents match every profile; the scene3d crate's own
+57 fixtures pass with the seventh limit joined by name.
+
+WHAT THIS DOES NOT DO is implement any of the 52. It makes them nameable, which is what every
+remaining item of the part needs before it can claim to cover one.
+
+## `f-ext`: level of detail, skinning, morph targets and animation
+
+THREE MODULES IN `scene3d`, each with the rules it implements written above it and a fixture per
+rule. They are the deformation and detail halves of the part; PBR, environment lighting, shadows and
+post-processing are not in this pass.
+
+`detail.rs` - LEVEL OF DETAIL. `Ladder` (finest level plus strictly descending coarser ones),
+`Detail::{Level, Vanished}`, `coverage_perspective`, `coverage_orthographic`.
+
+  - The finest level CARRIES NO THRESHOLD and the type says so rather than a comment: `Ladder` holds
+    `finest: u32` beside `coarser: Vec<Level>`. A ladder whose first entry had a threshold would
+    carry a number nothing reads, and a number nothing reads is one an author sets and then wonders
+    why it did nothing.
+  - A ladder that does not strictly descend is REFUSED at load and not sorted. Sorting draws a scene
+    the author did not write and hides the error for ever. Equal thresholds are refused too: the
+    second level could never be selected, which is a level somebody wrote that nothing will draw.
+  - Hysteresis is applied to the level ACTUALLY HELD rather than to the one the ladder would pick,
+    so the widened band belongs to the current level. A big jump still lands where the ladder says:
+    hysteresis decides WHETHER the level is left, not where it goes, so an object that moves far in
+    one frame does not step down one level per frame.
+  - The eye at the sphere's centre answers `INFINITY` rather than dividing by zero. Worth naming: a
+    NaN there compares false against every threshold and selects the finest level ANYWAY - by
+    accident rather than by decision, which is the kind of correct-looking behaviour that survives
+    until the day the comparison order changes.
+  - The vanishing coverage gets the same tenth, because it is a threshold like any other and a
+    drawable sitting on it would otherwise blink. `select` therefore takes the whole previous
+    `Detail` rather than a level index, so "was it drawn last frame" is answerable.
+
+`deform.rs` - SKINNING AND MORPH TARGETS. `Influences` (normalised on construction), `Pose`
+(`joint_world * inverse_bind`, composed once per frame), `MorphTarget`, `morphed`, `check_targets`,
+`deformed_bounds`.
+
+  - There is no such thing as an unnormalised `Influences`: the type normalises in `new` and refuses
+    a set that sums to zero. A vertex with no joint stays at the origin while the mesh moves, which
+    reads as a tear in the geometry and gets traced to the renderer before the exporter.
+  - A joint index past the skeleton contributes nothing and its weight goes with it, rather than the
+    whole frame being refused. One bad index in one vertex of one asset should not be a frame that
+    does not draw, and the remaining weights are renormalised so what is left is the pose the other
+    joints give.
+  - `check_targets` runs once for the whole set rather than per vertex, because discovering a short
+    target at vertex 4,000 leaves the first 3,999 already displaced.
+  - `deformed_bounds` is where MORPH THEN SKIN lives, in one place, so the order is not open-coded
+    wherever bounds are wanted. It is the join to the level-of-detail rule: the fixture holds a
+    character whose raised arm grows the bound, and the grown bound selecting the finer level.
+
+`animate.rs` - CLIPS. `Clip`, `Track`, `Channel`, `Key`, `Sampled`, `SampledPose`.
+
+  - Named `SampledPose` and deliberately not `Pose`, which in this crate is the skeleton's composed
+    matrices. The two are a stage apart and one name for both would be the kind of collision a
+    reader resolves by guessing.
+  - Linear for translation and scale, `Quat::slerp` for rotation - which already chooses the sign,
+    so the shorter arc is the crate's and not a second implementation of it. The fixture holds the
+    measurable consequence: a 10 degree turn written with its end quaternion negated interpolates
+    to 5 degrees at the midpoint and not to 175.
+  - Root motion is EXTRACTED unless the clip declares it keeps it, and a clip that keeps it gets a
+    zero delta rather than the motion twice.
+  - A looping clip's seam is checked at load. Rotations are compared by the ABSOLUTE dot, so `q` and
+    `-q` close the loop: they are one rotation, and a comparison that missed it would refuse a clip
+    for a full turn the author never wrote.
+  - Keyframe times must STRICTLY ascend: two keys at one time make the value at that instant depend
+    on which one the sampler found first.
+
+AND A SECOND AMENDMENT, FOR THE SAME REASON AS THE FIRST. The looping rule says a seam must close
+"within the conformance threshold" and the threshold table had no row for a pose - the same shape of
+gap as the missing LOD thresholds. Two rows were added to `thresholds.rs`: "a sampled pose" and "a
+clip's loop seam", both `<= 1e-5` per component with `1 - |dot| <= 1e-5` for rotation. The "why"
+states what the tolerance has to distinguish: a wider one would admit a renderer that interpolated
+quaternions linearly and normalised, which is the cheaper alternative this profile refuses BECAUSE
+it produces a visibly uneven rotation speed. The hash moved again, `ef2117e5` to `570ab514`.
+
+ONE `no_std` DEFECT FOUND BY THE BUILD AND NOT BY THE TESTS. `Clip::at` wrapped a looping time with
+`%`, which on `f32` lowers to `fmodf` - a libm call this tree provides no library for, so
+`build-shared` reported "library scene3d import fmodf has no direct provider". The host tests had
+passed: `cargo test` builds against `std`, and the missing symbol only exists on the target. It is
+now a truncation through `i64`, which is the same operation `fmodf` performs, a couple of
+instructions, and SATURATES rather than wrapping on a time larger than an `i64` holds.
+
+24 new fixtures, 57 to 81 in the crate, all passing.
+
+## `f-ext`: the physically based material
+
+`pbr.rs` IN `scene3d`, WITH THE PROFILE'S OWN EQUATIONS AND NOTHING ELSE. `PbrMaterial` carries the
+factors, `PbrSurface` the sampled texels, and `shade` computes the direct term the profile writes:
+GGX, Smith height-correlated visibility, Schlick Fresnel, Lambert diffuse multiplied by `(1 - F)`
+and `(1 - metallic)`, summed in the order and with the `dot(N,L)` placement the profile states -
+which is exactly what published implementations differ about.
+
+IT IS A SEPARATE TYPE AND NOT A FIFTH `MaterialKind`. The core profile's material list is four
+entries and adding a fifth to that enum would change what `Scene3D Core Profile 1` means. Extended
+is additive, so the PBR material lives beside the core one and a scene that never claimed the part
+never constructs it.
+
+A THIRD AMENDMENT, FOR THE THIRD TIME FOR THE SAME REASON. The item enumerates what this profile has
+to pick - "the metallic workflow's base-colour interpretation, how occlusion is applied, the units of
+emissive, tangent-space handedness and the normal-map convention, ... and the colour space of EVERY
+map" - and the frozen registry picked the equations and none of that. Without them a conformance
+scene has no single expected answer and, in the item's own words, "the material is only a name". So
+`PBR_MATERIAL_RULES` was written, nine answers, and the hash moved a third time (`570ab514` to
+`5827421c`). Each answer is a thing two implementations would otherwise decide separately:
+
+  - the base colour has TWO meanings mixed by `metallic` - diffuse albedo at 0, the metal's F0 at 1 -
+    and a metal has no diffuse term at all.
+  - occlusion reaches the AMBIENT and environment terms only. Applying it to direct light would
+    darken a surface a placed light demonstrably reaches, which is a shadow the scene cannot remove.
+  - emissive is linear radiance added last, unattenuated, untouched by occlusion or shadow. A source
+    is not a receiver.
+  - the normal map is tangent space, +Y UP, bitangent `cross(normal, tangent) * tangent.w`. The other
+    convention inverts every crevice into a bump - the surface still looks lit, and lit from the
+    wrong side.
+  - a MISSING TANGENT means the normal map is not applied. Deriving one from screen-space
+    derivatives makes the frame depend on the rasteriser's derivative rule, so a mesh whose author
+    did not export tangents would look different on each backend.
+  - base colour and emissive are `Color` and decoded; metallic-roughness, normal and occlusion are
+    `Data` and never are. The one rule that costs nothing to get wrong and changes every pixel.
+  - glTF's packing: roughness in green, metallic in blue, red and alpha ignored.
+  - `Opaque` / `Mask` / `Blend`, with `Mask` discarding STRICTLY below its own threshold.
+  - a double-sided surface flips its normal BEFORE anything reads it, so the normal map and the
+    lighting both see the flipped one.
+
+THE RESULT IS NOT CLAMPED TO 1, and that is a decision the core material does not take: `material.rs`
+saturates in linear light because its output is a display value. The post-processing rules put tone
+mapping LAST, after bloom and fog, precisely because both are defined on linear radiance - a
+material that clamped its own output would throw away everything bloom exists to spread before bloom
+ever saw it. A NaN is still refused, because one NaN pixel spreads through a bloom pyramid into the
+whole frame.
+
+`render_math::sqrt` IS NOW PUBLIC. It was `pub(crate)` while every caller was a vector length; the
+Smith term takes the square root of two scalars. The alternative was a second Newton iteration in
+the scene layer, which is the one thing a shared maths crate exists to prevent - and a second
+implementation would also be a second set of fixtures, drifting at the last bit.
+
+TEN FIXTURES, EVERY EXPECTED VALUE COMPUTED BY HAND FROM THE EQUATIONS. The head-on dielectric is
+worked out in full in the test - `D = 1 / (pi * a^2) = 5.0929582`, `V = 0.25`, `F = F0 = 0.04`,
+diffuse `0.96 / pi`, total `0.3565071` - and the three terms are also asserted separately, so a
+failure says WHICH of the four moved rather than only that the sum did.
+
+AND ONE FIXTURE OF MINE WAS WRONG BEFORE IT WAS RIGHT. I asserted that a dielectric shades BRIGHTER
+than a metal of the same base colour, reasoning that it carries a diffuse term the metal does not.
+It shades darker: the metal's F0 IS its base colour, 0.5 in green against a dielectric's 0.04, so
+the metal's specular alone is three times the dielectric's whole answer. A test that compared
+magnitudes would have passed for a renderer that had the two the wrong way round. Both are now
+computed from the profile and asserted by value, with the decomposition written beside them.
+
+34 new fixtures in the crate, 57 to 91.
+
+## `f-ext`: environment lighting, shadows and post-processing
+
+THREE MORE MODULES, AND THE PART'S SEVEN FEATURE GROUPS NOW ALL HAVE ONE. 55 fixtures in the crate
+for the Extended work, 57 to 112 in all.
+
+`environment.rs` - THE SPLIT SUM, BOTH HALVES, FROM THE SAME TERMS THE DIRECT LIGHTING USES. The
+profile says the BRDF table is "generated by the same GGX and Smith terms above" and that is meant
+literally: `brdf_integration` calls `pbr::visibility_smith`, not the second Smith with its own `k`
+that the usual image-based-lighting derivation substitutes. Two Smith terms in one renderer is two
+materials - one for its lights and one for its sky.
+
+  - MEASURED AND ASSERTED: the table is exactly `(1.0, 4.1e-17)` at a smooth surface head-on, which
+    is what the equations give when the lobe is a delta along the normal. `A` falls to 0.307 at
+    roughness 1, and `B` rises to 0.140 at `dot(N,V)` = 0.1 against 0.022 at 0.5 - roughness takes
+    energy out and grazing puts it into the bias, and neither number is a tuning constant.
+  - THE WHITE FURNACE: a sky of uniform radiance 1 delivers an irradiance of exactly `pi` to a
+    surface of any orientation. Measured 3.1416056 at the pole and 3.1416214 on the diagonal. It is
+    the one test that catches a wrong band factor, a wrong basis normalisation and a missing solid
+    angle all at once, and the residual is the quadrature's rather than the convolution's.
+  - PREFILTERING A UNIFORM ENVIRONMENT RETURNS IT UNCHANGED at every roughness and direction, which
+    is the prefilter's own furnace: a wrong weight, a missing normalisation or a sample left out of
+    the divisor all show up there and in no single image.
+  - NO `acos` ANYWHERE in the importance sample. The usual derivation writes `theta = acos(sqrt(..))`
+    and then takes its sine and cosine again; the cosine IS that square root. In a `no_std` crate
+    that is not tidiness - an inverse cosine is a series whose error would enter all 1024 samples.
+  - `prefilter_levels(256)` is 6, which is exactly the profile's `environment_prefilter_levels`
+    minimum, and the fixture asserts the code and the limit agree rather than both being 6 by
+    coincidence.
+
+`shadow.rs` - THE BIAS WHERE THE 3D PROFILE PUTS IT. The depth-bias equation is the 3D profile's
+own, `offset = constant * r + slope * m` with `r = 2^(exponent(z) - 23)`, and the bias is applied in
+the SHADOW PASS rather than subtracted in the lighting pass. Having both arrangements would bias
+twice, which is why the module says which one it is.
+
+  - COMPARE THEN FILTER, and the fixture holds what the other order costs: a receiver at 0.5 against
+    a map where three of nine taps are behind it is lit three ninths, while filtering first averages
+    to 0.367, compares once, and calls the whole footprint shadowed. That difference is a halo
+    around every silhouette.
+  - THE CASCADE SPLITS ARE WORKED OUT BY HAND in the fixture - 14.456, 30.25, 53.436, 100 for near 1
+    and far 100 at lambda 0.5 - and the lambda ends are asserted to BE the two schemes, so a wrong
+    blend cannot hide in the middle.
+  - THE LAST SPLIT IS FORCED TO THE FAR PLANE EXACTLY. The blend of two schemes that both end at
+    `far` ends a few bits away from it in `f32`, and a fragment at the far plane must not fall off
+    the end of the last cascade because of a rounding difference.
+  - A TIE IN THE CUBE-FACE MAJOR AXIS GOES TO THE EARLIER AXIS, so a direction exactly on a face
+    edge picks one face rather than depending on which comparison the compiler evaluated first.
+
+`postprocess.rs` - AND THE ONE FINDING IN THIS PASS THAT IS NOT ABOUT NEW CODE. See below.
+
+  - The bloom knee's quadratic is `(L - T + K)^2 / (4K)`, which is zero with zero slope at `T - K`
+    and equals `L - T` with unit slope at `T + K` - so the curve AND its derivative are continuous
+    across the knee, which is what "and a quadratic between" has to mean for two implementations to
+    agree. Hand-checked at 0.5, 1.0 and 1.5.
+  - Both pyramid kernels partition unity, and the fixture asserts a constant field survives both. A
+    mistyped weight, a missing tap and a wrong divisor all show up there.
+  - Fog is `exp(-(density * distance)^2)`, hand-checked at `exp(-1)` and `exp(-4)`.
+
+## THE 2D TONE MAP HAS A 47 PER CENT STEP AT DIFFUSE WHITE
+
+FOUND BY WRITING THE 3D ONE, and it is in `graphics-core`, not in anything this pass wrote.
+
+`pixel.rs`'s `tone_mapped` passes a luminance at or below 1 through UNCHANGED and applies extended
+Reinhard above it. The curve is not the identity at 1 - it is `1 * (1 + 1/16) / 2` = 0.53125 - so
+the two branches do not meet. Computed from the code:
+
+    L = 0.9990   operator 0.530953   the 2D path 0.999000
+    L = 1.0000   operator 0.531250   the 2D path 1.000000
+    L = 1.0001   operator 0.531280   the 2D path 0.531280
+
+A pixel at a luminance of 1.0001 is scaled to 53 per cent of its value and its neighbour at 1.0000
+is not. That boundary runs through the middle of every lit surface in an HDR source, and what it
+produces is a hard edge wherever luminance crosses diffuse white.
+
+WHAT THE GUARD LOOKS LIKE IT WAS FOR: mapping only the highlights and leaving the rest alone. That
+is a legitimate choice, and it needs a curve that IS the identity at its knee. Extended Reinhard is
+not one. The guard and the curve are from two different designs.
+
+NOTHING PINS THE BEHAVIOUR. There is no fixture over `tone_mapped`'s values anywhere in
+`graphics-core`'s 856 test lines - only over `tone_map_white`, which is the constant rather than the
+curve. The image-colour profile names the operator and the white point and says nothing about a
+threshold, so the guard is the implementation's and not the profile's.
+
+WHAT THIS PASS DID ABOUT IT: `scene3d::postprocess::tone_map` implements the operator the profile
+NAMES, over the whole range and continuous, and says in its own comment why it has no such guard and
+that the divergence is recorded here. It was not copied into the new code, and the 2D path was not
+changed either - changing it changes every image that path produces, which is a decision about
+output and not a defect fix an implementer takes while writing something else. The two now disagree
+below a luminance of 1, and reconciling them is the open question.
+
+## `exp`, `ln` AND `powf` IN `render-math`
+
+NEEDED BY TWO OF THE RULES ABOVE AND BY NOTHING BEFORE THEM: a logarithmic cascade split at an
+arbitrary cascade count, and exponential-squared fog. Neither is expressible with the square root
+the crate already had - `x^(i/n)` is a chain of square roots only when `n` is a power of two, and
+`max_shadow_cascades` is a minimum rather than a fixed four.
+
+Written the way `sqrt` and `sin_cos` already were, for the reason that module states: this crate is
+a layer that cannot take `libm` without putting it in every consumer.
+
+  - `ln` decomposes `x = m * 2^e` from the bits, folds `m` about `sqrt(2)` so the series argument
+    `|s| <= 0.1716`, and takes six odd terms of `2 * atanh(s)`. A SUBNORMAL IS SCALED INTO RANGE
+    FIRST, because its stored exponent is zero and its mantissa is not the number's - reading the
+    bits as a normal would answer for a different value entirely.
+  - `exp` reduces by `k * ln(2)` with round-to-nearest so `|r| <= 0.347`, nine Taylor terms, and
+    builds `2^k` from the exponent field. It SATURATES at the format's boundary rather than
+    producing a denormal, which is what a fog factor at a distance of a million wants.
+  - `powf` is `exp(y * ln(x))` with the two limits that are not: a power of zero is one for every
+    base and a base of zero is zero for every positive power. Both are the limits and both are what
+    a caller means; through the logarithm they are a NaN and an infinity.
+
+Three fixtures against `f64` across twelve orders of magnitude, including a round trip through both
+- which catches a wrong `ln(2)` in either, since they would have to be wrong by the same amount in
+opposite directions to pass it - and `powf(x, 0.5)` against the Newton `sqrt` beside it.
+
+## `f-ext`: the four playback modes the item asked for and the profile did not state
+
+FOURTH AMENDMENT, FOURTH TIME FOR THE SAME REASON. The animation item names "step, linear and cubic
+interpolation; loop, clamp and ping-pong; cross-fade and blending between several clips" and
+morph-weight tracks. `ANIMATION_RULES` fixed the interpolation as linear and spherical-linear and
+the ends as looping or not, and said nothing about the rest. `ANIMATION_PLAYBACK_RULES` now answers
+eleven questions, and nine features joined the closed list with them. The hash moved to `869c0d3f`.
+
+WHAT EACH ANSWER HAD TO DECIDE, because an implementation would otherwise decide it alone:
+
+  - THE MODE IS PER TRACK AND NOT PER CLIP. A visibility flag wants step, a slide wants linear and a
+    bounce wants cubic; one mode for a whole clip is what makes an author fake the others with extra
+    keys, and a faked curve is one nothing can retime.
+  - THE CUBIC IS HERMITE WITH AUTHORED TANGENTS, not Catmull-Rom. A derived tangent changes when a
+    NEIGHBOURING key moves, so editing one key alters a curve three keys away and an author cannot
+    fix a bounce without breaking the landing.
+  - A CUBIC ROTATION IS COMPONENT-WISE AND THEN NORMALISED, NOT SLERPED - and the rule says why that
+    is not a contradiction of the linear rule, which refuses exactly that for the linear case. A
+    cubic through four control points has no spherical form at all, so the choice there is between a
+    component-wise cubic and no cubic. A reader who had just read the linear rule would expect the
+    same refusal, which is why it is written down rather than left to be inferred.
+  - PING-PONG'S TURNING FRAMES ARE VISITED ONCE PER PERIOD. Holding the last frame for two frames
+    while the direction changes is a stutter at both ends, once a cycle, for the life of the clip.
+    A ping-pong needs no closed seam, because its ends meet themselves.
+  - A TARGET ONLY ONE CLIP DRIVES IS TAKEN FROM IT UNCHANGED, at full value. The other clip says
+    NOTHING about that joint, which is not the same as saying it should be at rest; scaling it by
+    its clip's weight would pull the joint toward the origin as the blend moves away, which is a
+    limb collapsing rather than a blend.
+  - ROOT MOTION UNDER A BLEND IS THE SAME WEIGHTED SUM. Adding the two deltas would make a character
+    cross-fading from a walk to a run briefly move faster than either clip ever asks for.
+  - MORPH WEIGHTS ARE NOT NORMALISED ACROSS TARGETS, for the reason the displacement rule already
+    gives: they are additive, and normalising them would make a second expression undo half of the
+    first.
+
+AND I CORRECTED MY OWN RULE BEFORE ANYTHING WAS BUILT ON IT. I first justified per-second cubic
+tangents by saying that per-span ones would make a retimed clip change SHAPE rather than speed. That
+is backwards: with per-second tangents a longer span DOES reach further, which is the whole point of
+a velocity. What per-second buys is INVARIANCE TO KEY DENSITY - a slope of one unit per second means
+the same however far apart the neighbouring keys are, so inserting a key at the value and slope the
+curve already has there reproduces the same curve, where per-span tangents either side would have to
+be rewritten. The rule now says that, and the fixture asserts the behaviour the corrected reason
+predicts: the same out-tangent over half the span reaches half as far.
+
+THE MODULE WAS RESTRUCTURED RATHER THAN EXTENDED. `Curve<T>` is now `Step | Linear | Cubic` with
+`CubicKey` carrying the two tangents, because a cubic key IS a different thing from a linear one and
+a single key type with tangents nobody reads is a trap an author falls into. `Track` addresses a
+`Target::Joint` or a `Target::Morph` rather than carrying a bare joint index that would have had to
+mean two things. A private `Interpolate` trait carries `blend`, `hermite`, `finite` and `seam` for
+`Vec3`, `Quat` and `f32`, so the span walk, the end-holding and the tangent scaling are written ONCE
+- three copies of them would be three places for an off-by-one at the last key.
+
+AND ONE THING I WROTE AND THEN CAUGHT: the first version of the loop-seam check had a `seam` helper
+that returned `0.0` unconditionally, which would have made the check pass for every clip. It was a
+placeholder left behind while working out how to compare three different value types with one
+function. The answer is the trait method above - a distance for a translation, a magnitude for a
+scalar, `1 - |dot|` for a rotation - and the existing fixture for the open seam would have failed
+had it shipped, which is what it is for.
+
+117 fixtures in the crate, 57 before this part started.
+
+## `f-ext`: the wiring into `Scene`
+
+THE MODULES WERE REACHABLE AND NOTHING REACHED THEM, which is the state the three items above each
+recorded as their own remaining work. Two joins close most of it.
+
+THE LEVEL OF DETAIL IS SELECTED PER DRAWABLE PER VIEW, and the split between the two is the design
+decision rather than a detail. `Drawable` carries the LADDER, because a ladder belongs to the mesh
+and is the same everywhere. `detail::ViewDetail` carries the LEVEL HELD LAST FRAME, one per view,
+because coverage is a function of where the camera is: two cameras looking at one scene pick
+different levels for one drawable, and a single cached level on the drawable would make each view's
+hysteresis overwrite the other's. That is a flicker which appears only once a second view exists and
+which is traced to anything but the cache, so the type makes it impossible instead.
+
+`detail::select` MIRRORS `queue::build`: `&mut Scene`, calls `update` itself, walks the drawables. It
+reads the CAMERA'S SHAPE OUT OF THE PROJECTION MATRIX and not out of the fields the camera was built
+from, for the same reason `cull` extracts its planes that way - a camera may carry a projection its
+constructors cannot describe, and a coverage computed from a remembered field of view would be a
+coverage for a different camera than the one the vertices go through. Column-major, row 1 of column
+1 is `cot(fov/2)` or `1 / half_height`, and row 3 of column 3 tells the two apart: zero when the
+projection divides by `w`, one when it does not.
+
+A DRAWABLE WITH NO BOUNDS KEEPS ITS FINEST LEVEL rather than being given one at random. The core
+profile already says an unbounded drawable is never culled; handing it a coarse mesh would be the
+same disappearance by another route.
+
+`animate::apply` DRIVES NODES THROUGH A `Skeleton`, because a clip talks about JOINTS and a scene is
+made of NODES and the two numberings are not the same one - assuming `joint == node` is what stops
+one clip driving two characters built at different times.
+
+AND A CHANNEL THE CLIP DOES NOT DRIVE IS LEFT ALONE, which is the property that function exists for.
+Writing an identity into it would make a clip that only ROTATES a wrist also move that wrist to the
+origin and scale it to nothing; the clip would look correct in isolation and destroy any pose it was
+blended into. A joint the skeleton does not map is REFUSED rather than skipped: animating part of a
+character and leaving the rest in its bind pose reads as a broken rig rather than as a mismatched
+pair of asset and clip.
+
+TWO OF MY OWN FIXTURES WERE WRONG BEFORE THEY WERE RIGHT, AND BY THE SAME NUMBER. I computed the
+coverage of a drawable whose local box runs from (-1,-1,-1) to (1,1,1) as though its bounding sphere
+had a radius of 1. It is `sqrt(3)` = 1.7320508 - the sphere has to contain the box's CORNERS, which
+is the core profile's own derivation and the number a reader most easily assumes wrong. Both
+fixtures now state the radius in their working, and the orthographic one picks a half-height of
+`2 * sqrt(3)` so its coverage lands on 0.5 exactly, which also holds the profile's "AT OR BELOW": a
+coverage equal to a threshold belongs to the level that threshold names.
+
+121 fixtures in `scene3d`, 57 before this part started. Every graphics crate passes: profile 73,
+render-math 22, render3d 61, soft3d 81, render-shader 20, core 28, soft2d 28, render2d 33.
+
+## `f-ext`: the conformance suite now walks the Extended profile
+
+THE LAST THING EVERY ITEM OF THE PART WAS WAITING ON. `conformance3d` walked the two core profiles
+and the Extended list was not among them, so "a test per feature" - which every item of the part
+says - was held by `scene3d`'s own fixtures. That is a weaker claim than the part asks for: a
+fixture proves THIS implementation does what the rule says, and a conformance case is what proves a
+SECOND one does the same.
+
+SIXTY SCENES IN SEVEN MODULES, one per entry, with `EXTENDED_CASES` walked by the same `run` the
+core halves use and the same untested-feature check behind it: a feature added to the profile with
+no scene is a failure of the suite.
+
+A THIRD TALLY AND NOT A THIRD SET OF NUMBERS IN THE FIRST TWO. `Summary::complete()` deliberately
+leaves Extended out, because the profile is OPTIONAL AS A WHOLE and folding it in would make
+"conforms" mean something the profile does not say. `complete_with_extended()` is the separate claim
+for a layer that says it carries the part, and the guest program prints the two on separate lines -
+so a reader can tell a core-conforming implementation WITHOUT the part from one that claims it and
+fails it.
+
+AND A DEFECT IN MY OWN CLOSED LIST, FOUND BY WRITING THE SCENE FOR IT. The list had
+`IrradianceCubeMap` AND `IrradianceSphericalHarmonics` as two entries. The profile says the
+irradiance term is a cosine-convolved cube map and that "nine spherical-harmonic coefficients are
+the PERMITTED ALTERNATIVE" - so two entries demand BOTH, which is a stricter claim than the profile
+makes and one no conforming implementation would satisfy. They are now one entry, `IrradianceTerm`,
+whose scene checks the ANSWER - a uniform sky delivering `pi` to every orientation - rather than
+which of the two forms produced it. The enum says so where the entry is.
+
+`shadow::MAP_FORMAT` WAS ADDED FOR THE SAME REASON. `ShadowMapDepth32F` was a feature whose rule
+lived only in prose; there was nothing for a scene to read. The constant is
+`render3d::DepthFormat::Depth32F`, so the scene checks the format the module actually names rather
+than a sentence about it.
+
+THE WHOLE SUITE PASSES ON THE HOST: 60 extended scenes beside the 89 render3d and 71 scene3d ones,
+0 failed, 0 unsupported, 0 untested, and one case per entry asserted by count so neither list can
+drift past the other.
+
+## Part `e` is closed, and part `i`'s remaining route was computed rather than attempted
+
+`e` HAD ONE OPEN ITEM AND TWO REASONS FOR IT, AND BOTH ARE GONE. The first was the approval, which
+arrived on 2026-09-21. The second was written when it was true - "the shader model, the strict-float
+rules and the rest of this part are untouched" - and the two items carrying them are now `[x]`, the
+second closed on 2026-09-18 when `soft3d` and the conformance suite gave its third half somewhere to
+live.
+
+THE LIST WAS CHECKED AGAINST THE ITEM'S OWN ENUMERATION GROUP BY GROUP rather than assumed, because
+a list that exists is not the same as a list that says what the item asks for. 89 entries in nine
+groups, and the nine are the nine the item names: resources 8, geometry 16, pipeline 10, passes 9,
+depth 15, msaa 6, sampling 15, formats 7, readback 3. Two group counts do not match a naive reading
+of the prose and both are deliberate: "MSAA resolve" is counted once under `msaa` rather than twice
+under `passes`, and the depth formats sit in `depth` rather than being repeated in `formats`.
+
+BOTH CLAUSES OF THE CRITERION ARE ENFORCED AND NOT STATED. "A conforming backend implements every
+entry" is `Tally::complete` requiring `untested` empty; "`Unsupported` is reserved for post-profile
+extensions" is the same function requiring `unsupported` zero, so a backend REFUSING something in
+Profile 1 does not conform rather than having a gap. `soft3d` answers all 89.
+
+## THE 3D FLOOR: WHAT PARALLEL TILES CAN BUY, COMPUTED BEFORE BUILDING THEM
+
+ITEM `i` NAMED PARALLEL TILE EXECUTION AS THE REMAINING ROUTE AND `SYS_PROCESS_SELF` UNBLOCKED IT.
+Before writing a threaded rasteriser I computed what it can reach, from the measurement already in
+`docs/PERF.md` rather than from a guess - and the answer changes what the item is waiting for.
+
+THE STAGE TABLE IS CUMULATIVE AND THE SPLIT IT IMPLIES IS STARK: geometry 0.9 ms, everything else
+933.0. Transform, clip and cull run before the tile loop; rasterisation, depth, interpolation, the
+fragment stage, texturing and blending run inside it. Tiles are independent - disjoint pixels,
+disjoint hierarchical-depth state, which I checked in `shade_bins` rather than assumed - so the
+parallel fraction is 99.9 per cent and the frame is `0.9 + 933.0 / workers`:
+
+    workers   frame       against 33.3 ms
+    1         933.9 ms    28.0x over
+    4         234.2 ms     7.0x
+    8         117.5 ms     3.5x
+    16         59.2 ms     1.8x
+    30         32.0 ms    UNDER, and the first count that is
+
+THIRTY, AND THAT IS THE OPTIMISTIC END: perfect scaling, balanced tiles, no synchronisation cost, no
+memory-bandwidth saturation - none of which a software rasteriser writing a 640x480 attachment gets.
+
+PER FRAGMENT IT IS SHARPER AND HARDER TO ARGUE WITH. 442,474 shaded fragments over 933.0 ms is
+2,109 ns a fragment; the floor allows 73. The interpreter table says where it goes: the lit stage
+with two texture reads is 41 IR statements at 35 ns each, 1,448 ns - more than two thirds of the
+fragment before the rasteriser, the depth test or the blend is counted. One core at 73 ns would need
+the shader stage under 2 ns a statement, a handful of machine instructions per IR statement. That is
+not a tuned interpreter; it is a JIT, which the shader-model item explicitly deferred.
+
+SO THE FLOOR HAS TWO ROUTES AND NEITHER IS "KEEP OPTIMISING": about thirty cores for one 640x480
+frame, or a compiled fragment stage. Both are decisions rather than effort - the first is a
+statement about what a frame may cost in machine and the second is the deferred JIT - and stating
+which is which is what the item's own discipline asks for: "this box stays open with a measurement
+under it rather than a plan".
+
+WHAT I DID NOT DO, AND WHY IT IS RECORDED HERE RATHER THAN DONE. A threaded tile loop is real work
+and would give four times on the documented host, so it is not wasted - but it is also a delicate
+refactor of the most correctness-critical code in the renderer (one `Machine` and one `Stats` per
+worker, the attachments split by tile-row bands, the hierarchical-depth state partitioned with
+them), and the arithmetic above says it closes no box on the documented host. Building it first and
+discovering that afterwards would have been the same conclusion at a much higher price.
+
+## The Extended profile is proved in a booted guest, not only on the host
+
+`kernel.applications.the_3d_profiles_conform_on_the_target` now asserts all three profiles:
+`render3d 89`, `scene3d 71` and `scene3d-extended 60`, each with 0 failed, 0 unsupported and 0
+untested, 220 scenes in all. That is the half a host fixture cannot give - the equations are exact
+and their expected values come from the profile, so what a guest run adds is that the ARITHMETIC
+AGREES THERE: the same GGX, the same Smith, the same white furnace, on the target's floating point
+rather than on the machine that built the tree.
+
+THE EXTENDED CLAIM IS ASSERTED SEPARATELY FROM "conforms", because it is a separate claim: the
+profile is optional as a whole, so a layer carrying neither would still conform.
+
+AND TWO MISTAKES OF MINE IN THE SAME FIFTEEN MINUTES, BOTH WORTH RECORDING BECAUSE BOTH ARE THE SAME
+SHAPE. The first: the guest test's read loop breaks on a line containing "conforms", so the verdict
+I added AFTER that line was never read, and the test failed saying the program had not printed
+something it had. The break is now on the program's LAST line and says why. The second: my first fix
+matched on text and landed in the 2D conformance test, which has a character-for-character identical
+loop - so I quietly broke a passing test while trying to fix a failing one, and the failing one did
+not move. The second attempt located the 3D occurrence by position after restoring the 2D one, and
+both tests pass together, which is why they were run together rather than one at a time.

@@ -17,8 +17,18 @@ use crate::arch::common::pci as common;
 // THE PCI SURFACE EVERY BACKEND RE-EXPORTS (the HAL contract), and not every type is named
 // directly in this backend's code. A TEST build names none of it at all: every shim that does is
 // `not(test)`, because what a kernel test drives is a fake config space and not this machine's.
+//
+// AND IT IS TWO LISTS, WHICH IS THE SHAPE x86_64 ALREADY HAD AND THIS PORT DID NOT. The BUS types
+// are named by the kernel's own portable code - `device::resolve_entry` takes a
+// `crate::arch::pci::PciDevice` - and by this module's own scan shims, none of which is `not(test)`;
+// putting them behind the cfg made the TEST build of this port stop compiling the day the cfg was
+// added, while the production build stayed fine throughout. That is exactly the class of breakage a
+// second build exists to catch, and it went unseen because the test kernel had not been built for
+// this port since. The HOT-PLUG half is genuinely `not(test)`: every shim that reads a slot event or
+// an error record is, because what a kernel test drives is a fake config space.
 #[cfg(not(test))]
-pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
+pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PowerEvent, SlotChange, SlotEvent};
+pub use common::{PciDevice, ResourcedDevice, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
 static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);

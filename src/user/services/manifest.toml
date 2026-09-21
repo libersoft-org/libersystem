@@ -2319,6 +2319,13 @@ provides = [
 	# `virtio-snd` and `hda` publish, so AudioService consumes it without knowing it is USB. One,
 	# for the reason the network module admits one: the service drives one device.
 	{ kind = "audio", most = 1 },
+	# A BYTE STREAM, published under the same kind the virtio console port publishes, so a consumer
+	# takes a USB serial adapter without knowing it is one. One, for the reason the network module
+	# admits one: the class budget refuses a second and says so.
+	{ kind = "console-bytes", most = 1 },
+	# AND A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `pointer` is handed one cursor, and
+	# a surface published as one would be flattened into whichever contact was decoded last.
+	{ kind = "touch", most = 1 },
 ]
 heartbeat-deadline = 100
 

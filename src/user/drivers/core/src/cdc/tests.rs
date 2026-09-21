@@ -324,10 +324,15 @@ fn a_block_that_does_not_fit_is_refused_rather_than_truncated() {
 // "the interface after the communications one" binds the wrong one and takes a bulk pair another
 // function is using.
 fn acm_config(with_acm_descriptor: bool, capabilities: u8) -> Vec<u8> {
+	// PROTOCOL ONE IS THE AT-COMMAND SET, which is what an ordinary modem-shaped ACM port declares.
+	acm_config_protocol(with_acm_descriptor, capabilities, 1)
+}
+
+fn acm_config_protocol(with_acm_descriptor: bool, capabilities: u8, protocol: u8) -> Vec<u8> {
 	let mut out: Vec<u8> = Vec::new();
 	out.extend_from_slice(&[9, descriptor::DT_CONFIG, 0, 0, 3, 7, 0, 0x80, 50]);
 	// interface 0: communications, ACM
-	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 1, CLASS_COMMUNICATIONS, SUBCLASS_ACM, 1, 0]);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 1, CLASS_COMMUNICATIONS, SUBCLASS_ACM, protocol, 0]);
 	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_HEADER, 0x10, 0x01]);
 	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_CALL_MANAGEMENT, 0x00, 2]);
 	if with_acm_descriptor {
@@ -476,4 +481,22 @@ fn a_speed_change_shorter_than_it_claims_is_refused() {
 
 	assert_eq!(notification(&[0u8; NOTIFICATION_HEADER_LEN - 1]), Notification::Malformed);
 	assert_eq!(notification(&[]), Notification::Malformed);
+}
+
+// AN ETHERNET ADAPTER WEARING A SERIAL PORT'S IDENTITY IS NOT A SERIAL PORT.
+//
+// RNDIS declares class 2, subclass 2 - the same two bytes an ACM port declares - and a VENDOR
+// protocol. Measured on QEMU's own `usb-net`, whose default mode is RNDIS: a binding that read only
+// the class and the subclass took the device, and the boot reported no network provider at all with
+// nothing anywhere saying why. The refusal is `NoNetworkInterface`, which is this decoder's "there
+// is no interface here I bind" and is what lets the network models be offered it next.
+#[test]
+fn an_acm_shaped_rndis_control_interface_is_not_a_serial_port() {
+	assert_eq!(bind_acm(&acm_config_protocol(true, 0x02, PROTOCOL_VENDOR)), Err(NotBindable::NoNetworkInterface));
+	// AND EVERY PROTOCOL THE SUBCLASS ITSELF DEFINES STILL BINDS, which is what makes the line above
+	// a statement about the vendor value rather than about protocols in general. Zero is "no class
+	// protocol" - an MCU link with no command set at all - and one is the AT commands a modem takes.
+	for protocol in [0u8, 1, 2, 6] {
+		assert!(bind_acm(&acm_config_protocol(true, 0x02, protocol)).is_ok(), "protocol {protocol} is one this subclass defines");
+	}
 }

@@ -878,6 +878,19 @@ qemu_attach_xhci() {
 	if [[ -n "$usb_drive_id" ]]; then
 		arr+=(-device "usb-storage,bus=usb.0,drive=$usb_drive_id,id=usbstick")
 	fi
+	# A DEVICE THIS HARNESS BUILT IN THE HOST'S OWN KERNEL, when a run asked for one.
+	#
+	# `USB_GADGET_ID` is `vendorid:productid` and is set by `test-kernel.sh`, which owns the gadget's
+	# whole lifetime: this script EXECS QEMU, so a teardown here could never run. What arrives here
+	# is therefore just an address, and an empty one means no run asked.
+	#
+	# ON THE HIGHEST PORT AND NOWHERE ELSE, which is what keeps every existing oracle unmoved. QEMU
+	# assigns addresses in argument order, so a device inserted among the others renumbers the bus
+	# the driver oracles print; appended last, it changes nothing for a run that did not ask for it -
+	# and no gate sets `USB_GADGET`, so today that is every run.
+	if [[ -n "${USB_GADGET_ID:-}" ]]; then
+		arr+=(-device "usb-host,bus=usb.0,port=1.6,vendorid=0x${USB_GADGET_ID%%:*},productid=0x${USB_GADGET_ID##*:}")
+	fi
 	# A CDC ETHERNET ADAPTER ON THE SAME HUB, for the suite only.
 	#
 	# `usb-net` is QEMU's CDC-ECM device: the two-interface shape the specification describes, with

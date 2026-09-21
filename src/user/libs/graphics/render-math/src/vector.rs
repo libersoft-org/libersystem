@@ -157,7 +157,13 @@ impl Vec2 {
 /// `libm` as a dependency without putting it in every consumer. Six iterations from a bit-trick seed
 /// reach the last representable `f32` for every finite non-negative input this crate produces, which
 /// the fixtures check against `f64::sqrt` over a spread of magnitudes.
-pub(crate) fn sqrt(value: f32) -> f32 {
+///
+/// PUBLIC SINCE `Scene3D Extended 1` NEEDED A SCALAR ONE. It was `pub(crate)` while every caller was
+/// a vector length; the physically based material's Smith visibility term takes the square root of
+/// two scalars, and the alternative to exporting this was a second Newton iteration in the scene
+/// layer - which is the one thing a shared maths crate exists to prevent. A second implementation
+/// would also be a second set of fixtures, and the two would drift at the last bit.
+pub fn sqrt(value: f32) -> f32 {
 	if value.is_nan() || value < 0.0 {
 		return f32::NAN;
 	}
@@ -174,4 +180,127 @@ pub(crate) fn sqrt(value: f32) -> f32 {
 		round += 1;
 	}
 	guess
+}
+
+/// The natural logarithm, without `std` and without `libm`.
+///
+/// THE SAME REASON AS `sqrt`: this crate is a layer that cannot take `libm` as a dependency without
+/// putting it in every consumer, and `f32::ln` is behind `std`. It arrived when `Scene3D Extended 1`
+/// needed a logarithmic cascade split and an exponential fog, neither of which is expressible with
+/// square roots at an arbitrary cascade count.
+///
+/// THE DECOMPOSITION IS EXACT AND THE SERIES IS SHORT. `x = m * 2^e` with the mantissa taken
+/// straight out of the bits, then `m` is folded into `[sqrt(2)/2, sqrt(2))` so the series argument
+/// `s = (m - 1) / (m + 1)` has `|s| <= 0.1716`. Six odd terms of `2 * atanh(s)` then reach the last
+/// representable `f32` - the next term is below `1e-9` of the result - which is what the fixtures
+/// check against `f64::ln` across twelve orders of magnitude.
+pub fn ln(value: f32) -> f32 {
+	if value.is_nan() || value < 0.0 {
+		return f32::NAN;
+	}
+	if value == 0.0 {
+		return f32::NEG_INFINITY;
+	}
+	if value == f32::INFINITY {
+		return value;
+	}
+	const LN_2: f32 = core::f32::consts::LN_2;
+	let bits = value.to_bits();
+	// A SUBNORMAL IS SCALED INTO THE NORMAL RANGE FIRST, because its stored exponent is zero and the
+	// mantissa is not the number's - reading it as a normal would answer for a different value.
+	if bits < 0x0080_0000 {
+		return ln(value * 16_777_216.0) - 24.0 * LN_2;
+	}
+	let mut exponent = ((bits >> 23) as i32) - 127;
+	let mut mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+	// FOLDED ABOUT `sqrt(2)`, which halves the series argument and so quarters the term count.
+	if mantissa > core::f32::consts::SQRT_2 {
+		mantissa *= 0.5;
+		exponent += 1;
+	}
+	let s = (mantissa - 1.0) / (mantissa + 1.0);
+	let s2 = s * s;
+	let mut term = s;
+	let mut sum = s;
+	let mut odd = 3.0f32;
+	let mut round = 0;
+	while round < 5 {
+		term *= s2;
+		sum += term / odd;
+		odd += 2.0;
+		round += 1;
+	}
+	2.0 * sum + exponent as f32 * LN_2
+}
+
+/// `e` to a power, without `std` and without `libm`.
+///
+/// `x = k * ln(2) + r` WITH `|r| <= ln(2) / 2`, so `exp(x) = 2^k * exp(r)` and the Taylor series for
+/// `exp(r)` needs nine terms to fall below `1e-11` of the result. The `2^k` is built from the
+/// exponent bits rather than multiplied up, so it is exact and costs nothing.
+///
+/// IT SATURATES RATHER THAN PRODUCING A DENORMAL OR AN INFINITY BY ACCIDENT: an argument past the
+/// `f32` range answers `0` or `INFINITY` at the boundary the format has, which is what a fog factor
+/// or a tone-map operator wants from a distance of a million.
+pub fn exp(value: f32) -> f32 {
+	if value.is_nan() {
+		return f32::NAN;
+	}
+	if value > 88.72 {
+		return f32::INFINITY;
+	}
+	if value < -103.0 {
+		return 0.0;
+	}
+	const LN_2: f32 = core::f32::consts::LN_2;
+	// ROUND TO NEAREST, so the remainder stays inside half a `ln(2)` and the series argument is
+	// never larger than 0.347 - truncating instead would double it and cost three more terms.
+	let k = (value / LN_2 + if value >= 0.0 { 0.5 } else { -0.5 }) as i32;
+	let r = value - k as f32 * LN_2;
+	let mut term = 1.0f32;
+	let mut sum = 1.0f32;
+	let mut index = 1u32;
+	while index <= 9 {
+		term *= r / index as f32;
+		sum += term;
+		index += 1;
+	}
+	// `2^k` FROM THE EXPONENT FIELD. A `k` outside the normal range is folded in two steps rather
+	// than answered wrongly: the bounds above keep the total in range, and this keeps each step in
+	// it too.
+	let scale = |power: i32| -> f32 {
+		let biased = power + 127;
+		if biased <= 0 {
+			0.0
+		} else if biased >= 255 {
+			f32::INFINITY
+		} else {
+			f32::from_bits((biased as u32) << 23)
+		}
+	};
+	if k > 127 || k < -126 {
+		let half = k / 2;
+		return sum * scale(half) * scale(k - half);
+	}
+	sum * scale(k)
+}
+
+/// `x` to an arbitrary real power, for the one caller that needs it: a logarithmic cascade split at
+/// a cascade count that is not a power of two.
+///
+/// `x^y = exp(y * ln(x))` AND NOTHING CLEVERER, with the two special cases that are not that: a
+/// power of zero is one for every base, and a base of zero is zero for every positive power. Both
+/// are the limits and both are what a caller means; computing them through the logarithm would give
+/// a NaN and an infinity.
+pub fn powf(base: f32, exponent: f32) -> f32 {
+	if exponent == 0.0 {
+		return 1.0;
+	}
+	if base == 0.0 {
+		return if exponent > 0.0 { 0.0 } else { f32::INFINITY };
+	}
+	if base < 0.0 {
+		return f32::NAN;
+	}
+	exp(exponent * ln(base))
 }

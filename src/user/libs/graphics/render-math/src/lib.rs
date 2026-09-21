@@ -51,7 +51,7 @@ pub mod winding;
 pub use camera::{Viewport, look_at_rh, orthographic_rh_zo, perspective_infinite_rh_zo, perspective_rh_zo, window_from_ndc};
 pub use matrix::{Mat3, Mat4};
 pub use quaternion::Quat;
-pub use vector::{Vec2, Vec3, Vec4};
+pub use vector::{Vec2, Vec3, Vec4, exp, ln, powf, sqrt};
 pub use winding::{Facing, facing};
 
 /// What this crate refuses, and why each one is a refusal rather than a value.

@@ -182,12 +182,18 @@ fn is_msi(vector: u32) -> bool {
 // over a vector it chose, so neither can index a table by one.
 static WIRED: crate::arch::common::wired::Wired<8> = crate::arch::common::wired::Wired::new();
 
+/// `not(test)` ON THE TYPE AND THE REGISTRATION, AND NOT ON THE DISPATCH, which is the honest
+/// split: the interrupt path calls `dispatch_wired` on every event and is compiled in every build,
+/// while the only thing that REGISTERS a handler is the boot's arming pass.
+///
 /// What answers one of this kernel's own wired lines: told the INTID it was raised for, because one
 /// function answers for every port on a shared line.
+#[cfg(not(test))]
 pub type HandlerFn = crate::arch::common::wired::Handler;
 
 /// Answer `intid` with `handler` from now on. `false` when this kernel already answers as many
 /// wired lines as it carries rows for, which the caller reports rather than swallows.
+#[cfg(not(test))]
 pub fn register(intid: u32, handler: HandlerFn) -> bool {
 	WIRED.register(intid, handler)
 }

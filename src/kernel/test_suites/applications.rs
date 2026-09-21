@@ -2193,7 +2193,12 @@ fn the_3d_profiles_conform_on_the_target() {
 					}
 					printed.push(alloc::string::String::from_utf8_lossy(line).into_owned());
 				}
-				if printed.iter().any(|line| line.contains("conforms") || line.contains("DOES NOT CONFORM")) {
+				// THE BREAK IS ON THE PROGRAM'S LAST LINE AND NOT ON ITS FIRST VERDICT. It used to
+				// fire on "conforms", which stopped the read before the line AFTER it - so adding a
+				// second verdict silently made it unreadable, and the test failed claiming the program
+				// had not printed something it had. The extended claim is now last, and both of its
+				// forms carry the profile's name.
+				if printed.iter().any(|line| line.contains("Scene3D Extended Profile 1")) {
 					break;
 				}
 			}
@@ -2210,12 +2215,22 @@ fn the_3d_profiles_conform_on_the_target() {
 	let shown: alloc::string::String = printed.iter().filter(|line| !line.starts_with("test3d-conformance: pass ")).cloned().collect::<alloc::vec::Vec<_>>().join(" | ");
 	let passes = printed.iter().filter(|line| line.starts_with("test3d-conformance: pass ")).count();
 	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: start")), "the suite started, and printed: {shown}");
-	assert!(passes > 150, "every feature of both profiles has a scene and each one printed its own line: {passes} passed, {shown}");
+	assert!(passes > 210, "every feature of all three profiles has a scene and each one printed its own line: {passes} passed, {shown}");
 	// EACH PROFILE'S OWN COUNT, because an implementation may carry the command layer and not the
 	// retained one - and one number that mixed them could not say which conformed.
 	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: render3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "the command profile conforms entry by entry: {shown}");
 	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d ") && line.contains("0 failed, 0 unsupported, 0 untested")), "and so does the retained one: {shown}");
 	assert!(printed.iter().any(|line| line == "test3d-conformance: conforms"), "the run conforms, and printed: {shown}");
+	// AND THE EXTENDED PROFILE, ON THE TARGET. This is the half a host fixture cannot give: the
+	// equations are exact and their expected values come from the profile, so what a guest run adds
+	// is that the ARITHMETIC AGREES HERE - the same GGX, the same Smith, the same white furnace, on
+	// this architecture's floating point rather than on the one that built the tree.
+	//
+	// IT IS ASSERTED SEPARATELY FROM "conforms" BECAUSE IT IS A SEPARATE CLAIM: `Scene3D Extended
+	// Profile 1` is optional as a whole, so a layer that carried neither would still conform. This
+	// one carries it, and that is what is checked.
+	assert!(printed.iter().any(|line| line.starts_with("test3d-conformance: scene3d-extended ") && line.contains("0 failed, 0 unsupported, 0 untested")), "the extended profile conforms entry by entry: {shown}");
+	assert!(printed.iter().any(|line| line == "test3d-conformance: and carries Scene3D Extended Profile 1"), "and the run says so: {shown}");
 }
 
 tagged_test!(the_3d_demo_renders_a_lit_scene_and_survives_a_resize, [Display, Input, Process, Service, Image], id = "kernel.applications.the_3d_demo_renders_a_lit_scene_and_survives_a_resize", covers = ["bin.test3d-sw", "render3d", "soft3d", "render-shader", "render-math", "graphics-app", "surface"]);

@@ -86,12 +86,73 @@ pub struct Limits {
 	pub max_lights_per_drawable: u32,
 	pub max_materials: u32,
 	pub max_cameras: u32,
+	/// THE EXTENDED PROFILE'S LIMITS, AND ZERO MEANS THIS SCENE DOES NOT CLAIM IT.
+	///
+	/// `Scene3D Extended Profile 1` is a SEPARATELY ACTIVATED part with its own closed list and its
+	/// own hash, and its own rule: a build claims it entirely or not at all. Zero is what "not at
+	/// all" looks like from here - every Extended operation is refused against it by the same
+	/// `LimitExceeded` every core one uses, so a scene that never asked for the part cannot acquire
+	/// half of it by accident.
+	///
+	/// THE SEVEN ARE THE SEVEN THE FREEZE NAMES, AND THE SEVENTH ARRIVED BY AMENDMENT.
+	///
+	/// Six of them were frozen with the document. `max_lod_levels` joined them when the part was
+	/// activated and its first deliverable - the closed enumerated feature list - was written: level
+	/// of detail had no stated rule anywhere in the profile, so the item asking for "LOD selection
+	/// with stated thresholds" could only have been implemented against an invented one. The rules
+	/// and the limit went in together, the specification hash moved, and the amendment is recorded
+	/// where the part is. That is the loud version of the act the next paragraph refuses quietly.
+	///
+	/// `max_transparent_items` is STILL not among them although this part's item text mentions it,
+	/// and that is deliberate rather than an omission: a transparent item IS a drawable, which
+	/// `max_drawables` already bounds. Moving a frozen hash is for a rule the profile is missing,
+	/// not for a second name over a bound that already exists.
+	pub max_shadow_cascades: u32,
+	pub max_shadow_maps: u32,
+	pub max_skeleton_joints: u32,
+	pub max_morph_targets: u32,
+	pub max_animation_tracks: u32,
+	pub environment_prefilter_levels: u32,
+	pub max_lod_levels: u32,
 }
 
 impl Limits {
 	/// The profile's minimums, as a scene that only just conforms. THE FLOOR AND NOT A
 	/// RECOMMENDATION - a fixture holds each field against the frozen list by name.
-	pub const PROFILE_MINIMUM: Self = Self { max_nodes: 65_536, max_hierarchy_depth: 64, max_drawables: 16_384, max_instances_per_drawable: 4_096, max_lights: 256, max_lights_per_drawable: 8, max_materials: 4_096, max_cameras: 8 };
+	pub const PROFILE_MINIMUM: Self = Self {
+		max_nodes: 65_536,
+		max_hierarchy_depth: 64,
+		max_drawables: 16_384,
+		max_instances_per_drawable: 4_096,
+		max_lights: 256,
+		max_lights_per_drawable: 8,
+		max_materials: 4_096,
+		max_cameras: 8,
+		// CORE CLAIMS NOTHING EXTENDED, which is what these zeros say - see the field notes above.
+		max_shadow_cascades: 0,
+		max_shadow_maps: 0,
+		max_skeleton_joints: 0,
+		max_morph_targets: 0,
+		max_animation_tracks: 0,
+		environment_prefilter_levels: 0,
+		max_lod_levels: 0,
+	};
+
+	/// The same scene claiming `Scene3D Extended Profile 1` as well, at that profile's own floor.
+	///
+	/// THE CORE MINIMUMS ARE UNCHANGED BY IT. Extended is additive: a build that claims it still
+	/// admits exactly what a core-conforming one does, and the seven numbers below are the extra
+	/// things it now admits rather than a different scene.
+	pub const EXTENDED_MINIMUM: Self = Self { max_shadow_cascades: 4, max_shadow_maps: 8, max_skeleton_joints: 128, max_morph_targets: 32, max_animation_tracks: 256, environment_prefilter_levels: 6, max_lod_levels: 4, ..Self::PROFILE_MINIMUM };
+
+	/// Whether this scene claims the Extended profile - which it does only by admitting ALL of it.
+	///
+	/// ENTIRELY OR NOT AT ALL IS THE PART'S OWN RULE, and a scene carrying four of the seven limits
+	/// is exactly what that rule refuses: an application would find shadows and no skinning, with
+	/// nothing anywhere saying which half it had.
+	pub fn claims_extended(&self) -> bool {
+		self.max_shadow_cascades > 0 && self.max_shadow_maps > 0 && self.max_skeleton_joints > 0 && self.max_morph_targets > 0 && self.max_animation_tracks > 0 && self.environment_prefilter_levels > 0 && self.max_lod_levels > 0
+	}
 
 	/// The value the profile's own name refers to, so a fixture can compare the two lists by name
 	/// rather than by position.
@@ -105,6 +166,13 @@ impl Limits {
 			"max_lights_per_drawable" => self.max_lights_per_drawable,
 			"max_materials" => self.max_materials,
 			"max_cameras" => self.max_cameras,
+			"max_shadow_cascades" => self.max_shadow_cascades,
+			"max_shadow_maps" => self.max_shadow_maps,
+			"max_skeleton_joints" => self.max_skeleton_joints,
+			"max_morph_targets" => self.max_morph_targets,
+			"max_animation_tracks" => self.max_animation_tracks,
+			"environment_prefilter_levels" => self.environment_prefilter_levels,
+			"max_lod_levels" => self.max_lod_levels,
 			_ => return None,
 		})
 	}
@@ -266,12 +334,21 @@ pub struct Drawable {
 	/// The per-instance stream. EMPTY means one instance at the node's own world transform, which is
 	/// the same command with a count of one rather than a second path.
 	pub instances: Vec<Instance>,
+	/// `Scene3D Extended Profile 1`'s level-of-detail ladder, or `None` for a drawable that has one
+	/// mesh and never consults a threshold.
+	///
+	/// THE LADDER IS HERE AND THE CHOSEN LEVEL IS NOT, and that is the whole of why the two are
+	/// apart: a ladder belongs to the MESH and is the same in every view, while the level chosen
+	/// from it belongs to a VIEW - two cameras looking at one scene pick different levels for the
+	/// same drawable, and a single cached level on the drawable would make the second view flicker
+	/// against the first. The level lives in `detail::ViewDetail`, one per view.
+	pub lod: Option<crate::detail::Ladder>,
 	id: DrawableId,
 }
 
 impl Drawable {
 	pub fn new(node: u32, mesh: u32, material: u32) -> Self {
-		Self { node, mesh, material, bounds: None, visibility: u32::MAX, instances: Vec::new(), id: 0 }
+		Self { node, mesh, material, bounds: None, visibility: u32::MAX, instances: Vec::new(), lod: None, id: 0 }
 	}
 
 	pub fn with_bounds(self, bounds: Aabb) -> Self {
@@ -284,6 +361,11 @@ impl Drawable {
 
 	pub fn with_instances(self, instances: Vec<Instance>) -> Self {
 		Self { instances, ..self }
+	}
+
+	/// Give this drawable a level-of-detail ladder.
+	pub fn with_lod(self, lod: crate::detail::Ladder) -> Self {
+		Self { lod: Some(lod), ..self }
 	}
 
 	/// Set the picking identity the application wants this drawable to answer with.

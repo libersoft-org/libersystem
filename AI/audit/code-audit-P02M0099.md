@@ -2806,3 +2806,296 @@ are: cfg the pair to x86_64 (which says the HAL surface is NOT the same shape on
 against what its own comment states it is for), give the ports a caller (a feature), or delete the
 shims (the same statement as the first). That is a HAL-contract decision, it is one decision covering
 all six, and it is the only thing between this gate and green.
+
+## `bootstrap-plan` is red over one manifest row, and the remaining half is a decision (2026-09-21)
+
+The gate compares the manifest's `restart = "transparent"` set against what `relaunch_service` can
+actually re-run, and the two disagree by exactly one name:
+
+    font_catalogue: the manifest says `transparent` but relaunch_service cannot re-run its bootstrap
+    ladder ['config_service', 'device_service', 'system_graph_service']
+    plan   ['config_service', 'device_service', 'font_catalogue', 'system_graph_service']
+
+WHAT `transparent` MEANS HERE, from the supervisor's own definition: the service is restarted per
+the ladder AND ITS CLIENTS RE-RESOLVE THROUGH THE BROKER. Both halves, and the second is what makes
+it transparent rather than merely restartable. The manifest row argues the first half correctly -
+the catalogue holds nothing but what the font directory says, so a fresh instance is in the same
+place - but that is an argument about `state_class`, not about clients.
+
+MOST OF THE SECOND HALF IS ALREADY THERE, which is worth knowing before anyone reads this as a large
+job. PermissionManager already re-resolves its ordinary font connection: `Capability::FontCatalogue
+=> (&mut clients.font, CAP_FONT)` goes through `connect_or_resolve(held, clients.broker, name)`,
+which is the same path `config` and `device` take. What is missing on that side is four small
+joins - a `font` root on `Broker`, `CAP_FONT` in `permission_manager`'s grant row, `CAP_FONT` in
+`service_of_cap`, and the root in `serve_resolve`'s match - plus a `font_catalogue` arm in
+`relaunch_service` whose bootstrap sends FONTDIR and ADMIN before SERVE, because that program's
+bootstrap is positional.
+
+AND THE PART THAT IS NOT AN IMPLEMENTATION IS THE ADMIN FACE. `CAP_FONTADMIN` is `take_end_of` at
+boot - the admin root is MOVED to PermissionManager, which grants it to `lsfont` - and there is no
+re-resolution for it. After a restart that handle names an instance that has ended, and nothing says
+so. Making it survive means letting an ADMIN root be re-resolved through the broker, and that is a
+statement about where administrative authority may be handed out from rather than a missing branch.
+So the two honest answers are:
+
+  a. Resolve the admin face through the broker as well, and say in the grant set why an admin root
+     may travel that way. The rest of the work is the five joins above.
+  b. Leave the admin face outside the restart, and have the manifest say what is true: the
+     ordinary face is transparent and the admin face is not - which today's two-value `restart`
+     column cannot express, so it would need a third state or a second column.
+
+NEITHER IS TAKEN HERE. Both are defensible, the choice is about authority rather than about
+mechanism, and the gate is red in the meantime - which is the correct state for a claim the system
+cannot yet honour.
+
+AND ONE THING THE GATE'S OWNERS SHOULD SEE: the two milestones that own `bootstrap-plan` are both
+marked complete in the index and neither carries an open item, while the gate they own is failing.
+The `milestone-index` gate checks the other direction - a `[x]` over a document with open tasks -
+and there is no check that a completed milestone's gate still passes.
+
+## The kernel's input ring kept bytes for a console that had not attached yet
+
+FOUND BY THE FULL aarch64 SUITE, and it is a real defect rather than a test artefact. The terminal
+test `kernel.services.a_tty_a_job_left_raw_comes_back_cooked` types `ab\n` into a fresh
+ConsoleService and asserts the cooked line comes back whole. In the full suite it was handed
+`xab\n`. It passes alone on aarch64 (99s) and it passes on x86_64, which is why it had never been
+seen: the `x` comes from a different suite entirely.
+
+WHERE THE `x` CAME FROM. `kernel.object.the_console_and_display_syscalls_refuse_a_caller_without_the_capability`
+types one `x` through `SYS_CONSOLE_FEED` to prove that the capability check lets a properly
+privileged caller past the gate. Its own comment says the byte is harmless because "with no console
+attached it answers WOULD_BLOCK" - and that was not what the code did.
+
+`console_input::enqueue` pushed every byte into the pending ring whatever the console's state, then
+called `drain`, which returns at its first line when nothing is registered. So the byte sat in the
+ring. Two hundred tests later the terminal test attached a console, and the ring was emptied into it
+oldest-first, which put a character in front of the line the test had typed.
+
+The second half is the same shape and was found reading the first: a registration whose peer has
+gone is never removed, so `drain` reaches `channel.send`, the send fails, and the comment there says
+the byte "STAYS at the front either way". It stays there until the next attach, and then it is
+delivered to the next console. Every boot test that installs a stand-in console and drops its end
+leaves the input path in exactly that state.
+
+WHAT IT WOULD HAVE COST IN PRODUCTION, not in the suite: after a SystemManager crash the recovery
+console's first line begins with whatever the previous shell had not read. That is input crossing a
+session boundary - a keystroke is typed AT something, and what it was typed at is the console that
+was attached when it arrived.
+
+THE FIX, in `src/kernel/console_input.rs`, is two lines of policy and one shared question:
+
+  - `listener()` answers "is there a console that could take a byte right now", which is registered
+    AND with its peer alive. `shell_listening`, `enqueue` and `drain` all ask it, so the three
+    cannot drift apart.
+  - `enqueue` refuses a byte when there is no listener instead of keeping it. This restores the
+    return value the function has always documented - "false if no shell is attached or its endpoint
+    has closed" - which is the condition `supervise` reads to end its boot round, and which
+    `sys_console_feed` turns into `ERR_WOULD_BLOCK`. The object test's comment is now true.
+  - `attach` clears the ring. What the previous console never took is not this one's input.
+
+NOTHING RELIED ON THE OLD BEHAVIOUR. Type-ahead before a console exists is not a feature anything
+uses: `guest-console.py` waits for `shell attached` before it types, the kernel's own first-prompt
+nudge is fed only once `shell_listening()` is true, and `supervise` reads the serial line only while
+listening. The pump at `main.rs` drained the UART unconditionally, and those bytes are now dropped
+at the door, which is what a machine with no terminal does with a keystroke.
+
+PINNED BY `kernel.console.input_that_arrived_with_no_console_is_not_the_next_console_s_input`, which
+asserts both halves - a byte fed with nothing registered and a byte fed to a dead registration - and
+then that a freshly attached console is handed its own first byte and nothing else. It leaves no
+console behind, by the rule it is asserting.
+
+## The emulated suites' wall clocks had never been met by a run that finished
+
+FOUND IMMEDIATELY AFTER THE FIX ABOVE, and it is the reason that fix looked at first like a
+regression. With the terminal test repaired, the aarch64 suite ran past the point where it used to
+stop and ended at the wall instead: TIMEOUT after 80m, 4811 s in, still inside
+`xhci_driver_enumerates_the_usb_bus`.
+
+THE RUN WAS NOT SLOWER. Measured test by test against the previous run, the same tests to the same
+point cost 3620 s before and 3745 s after - 3.5 %, which is ordinary machine noise. What changed is
+that the previous run STOPPED EARLY: it failed at the terminal test with sixty-three tests still to
+go, and a suite that ends at test 394 fits inside a wall that a suite of 457 does not.
+
+So 80m had never been met by an aarch64 run that reached the last test. Both kinds of run that
+fitted inside it had given up first - one at a failing assertion, one at the wall - and a budget
+nothing has ever completed under is not a measured budget.
+
+MEASURED, both emulated suites run beside each other on an otherwise quiet host:
+
+    aarch64   427 tests   5065 s   (old wall 4800 s)
+    riscv64   430 tests   6005 s   (old wall 5400 s)
+    x86_64    439 tests    271 s   under KVM, for scale
+
+Set from those: aarch64 120m (measurement x 1.42), riscv64 140m (x 1.40). Both clear the file's own
+rule of a fifth over the measurement with room for the next several tests rather than exactly one.
+Taking the figures under concurrency is the pessimistic side to be wrong on - a solo run is cheaper
+than these numbers say, so the headroom is real.
+
+AND THE CHECK THAT EXISTS FOR THIS DID NOT CATCH IT. `verify-model check` compares each
+`FULL_TIMEOUT` against a modelled full-suite cost. It called riscv64 short by twenty-four seconds
+(5400 against a required 5424) and said nothing about aarch64 - because its estimates, 4520 s for
+riscv64 and less for aarch64, are well under what the suites actually cost. The model is a
+regression over history; when it and a stopwatch disagree, the run that reached the last test wins.
+The slowest single test is 1309 s on aarch64 and 1057 s on riscv64, both comfortably inside the
+2400 s per-test stall window, so nothing there needed moving.
+
+## The CDC-ACM oracle: bytes go out of the machine and come back
+
+THE ITEM'S REMAINING HALF WAS "A DECISION RATHER THAN AN AFTERNOON", AND THE DECISION WAS BASED ON
+SOMETHING THAT WAS NOT TRUE. The note said a kernel test could not drive `console-stream` because it
+is a generated IDL and "the kernel links `driver-protocol` and four `*-proto` crates but not
+`proto`". `console-stream` is generated into `device-proto`, which is line 48 of the kernel's
+`Cargo.toml` and has been for as long as the audio suites have needed a provider catalogue. There
+was no dependency to add.
+
+NOR IS THE CLIENT BEHIND THE FEATURE GATE. `channel-client-impl` guards the CHANNEL TRANSPORT -
+three items calling the userspace runtime's syscalls - and not the generic `Client<T>`, whose
+`attach`, `write` and `receive` encode and decode through the generated codec for any `T`
+implementing `wire::Transport`. That trait's own comment says what was missing and that it was
+expected: "the userspace impl sends on a channel and blocks for the reply; TESTS USE AN IN-MEMORY
+LOOPBACK".
+
+SO THE ORACLE IS WRITTEN AND IT PASSES: `usb-cdc-acm: 9 byte(s) out and the same 9 back`. The bytes
+go from the test, through `console-stream`, through the driver's bulk OUT endpoint, out of the
+machine through `usb-host` into `dummy_hcd`, into the gadget's tty, into `serial-echo.py`, and all
+the way back. It is the second oracle in this tree whose peer is outside the machine.
+
+WHAT THE TEST IS MADE OF:
+
+  - `bind_xhci_controller`, EXTRACTED rather than copied. Finding the controller, minting its MMIO
+    and MSI-X, claiming the device and sending the four-resource `BIND` is sixty lines that say
+    nothing about what either oracle is for, and a second copy is a second place for the handshake
+    to drift when a resource is added. The existing enumeration test uses it and still passes.
+  - A `Transport` over a kernel channel, which is what the trait asked for. It also NUMBERS THE
+    CAPABILITIES A REPLY CARRIES, because `receive`'s reply hands over the inbound stream and the
+    decoder refuses a reply that does not carry exactly one handle: a handle is an index into
+    something, and in a kernel test the transport is the table.
+  - `USB_GADGET` PASSED AT COMPILE TIME, like `TEST_TAGS` and `LIBER_NO_DT_PROFILE`. Without a
+    gadget there is no device, and the test says so in the log and returns rather than passing
+    quietly - a run that says nothing is how a test that stopped testing anything goes unnoticed.
+  - A WALL-CLOCK WAIT AND NOT AN ITERATION COUNT. `run_until_idle` returns the moment the run queue
+    is empty, so a loop counted in passes spins twenty thousand times in a few milliseconds and
+    gives up long before a process on the HOST has read a tty and written back. Every other driver
+    oracle here PULLS and is paced by its own round trip; `console-stream` PUSHES its inbound
+    frames, so the budget has to be the clock.
+
+AND THE DEFECT THAT ACTUALLY STOPPED IT WAS ON THE HOST, FOUND BY MEASURING RATHER THAN BY READING.
+The guest's write reported nine bytes taken and `transmit` is SYNCHRONOUS - it rings the doorbell
+and waits for the completion - so the controller had accepted the transfer. The host echoed nothing.
+The bisection: `/dev/ttyACM0` exists beside `/dev/ttyGS0` because `dummy_hcd` gives this machine BOTH
+ends of the cable and Linux's own `cdc_acm` binds the host side; writing to one and reading the other
+proved the cable carries bytes; and watching `/dev/ttyACM0` during a run showed it DISAPPEARING the
+moment QEMU starts, which is `usb-host` detaching the kernel driver exactly as it should.
+
+So the passthrough was right and the ECHO PROCESS WAS HOLDING THE WRONG DESCRIPTOR. The harness
+starts it beside the gadget, which is before QEMU - so it opened the port while LINUX was still the
+host, and a few seconds later the function was torn down and brought back up under a new one. A
+descriptor held across that sees nothing afterwards. `serial-echo.py` now REOPENS the port while
+nothing has arrived and keeps it once something has, and it says on stderr what it echoed as it
+happens rather than only in a `finally` a killed process never reaches - which is what told the two
+halves apart in the first place.
+
+## And the oracle found a driver defect, which is what an oracle is for
+
+IT PASSED ONCE AND THEN FAILED THREE TIMES IN A ROW, with the host reporting `echoed 9 byte(s)`
+every time. So the bytes left the machine, the host echoed them, and the guest saw none - which is a
+different failure from the one the item had been waiting on and a much better one to have found.
+
+THE FIRST HALF IS IN `wait_transfer_len`, AND THE SHAPE WAS ALREADY IN THE FILE. That function is
+the synchronous wait a control or bulk transfer does: it drains the event ring until the completion
+it wants appears. It has an exception that KEEPS a completion belonging to the NETWORK adapter's
+receive endpoint, and the comment beside `Xhci::net_rx` says exactly why:
+
+    a frame that arrived during a disk read was dropped AND its standing receive transfer was never
+    re-posted, which stops the link for good rather than losing one packet
+
+THE SERIAL ADAPTER HAD NO SUCH EXCEPTION, so its completion fell through to `handle_hid_event` and
+was discarded - and `Serial::posted` stayed true, so nothing re-posted either. One lost chunk was a
+stream that never carried another.
+
+AND THE TIMING IS NOT A RARE INTERLEAVING, IT IS THE ORDINARY ONE. `transmit` rings the doorbell and
+WAITS for its own completion; the echo of a nine-byte write on a loopback is already coming back
+while that wait is running. So the serial receive's completion lands inside `wait_transfer_len`
+almost every time, which is why the failure was three in four rather than one in a hundred.
+
+FIXED THE SAME WAY THE NETWORK PATH WAS: `serial_rx` records the endpoint when the adapter binds,
+`serial_pending` keeps one completion, the service loop drains it before anything still on the ring,
+and both are cleared when the adapter goes away - because a stashed completion for a device that has
+gone names a slot the next one will be given, and draining it then would deliver one adapter's bytes
+on another's stream.
+
+THE SECOND HALF WAS THE TEST'S OWN, AND IT IS A PROPERTY OF THE CONTRACT RATHER THAN A BUG IN IT.
+`Session::deliver` DROPS a chunk when nothing holds the stream, which is the right answer: a stream
+nobody opened has no consumer, and buffering for one that may never arrive is how a driver grows an
+unbounded queue. The consequence is an ORDER - a consumer opens its inbound stream BEFORE it writes -
+and the oracle had it the other way round, so the echo arrived in the window between the write and
+the `receive`. On a link this fast that window is where the echo always is.
+
+THE ORACLE NOW READS: attach, receive, write, read. Four consecutive runs, four passes, where the
+same test with the same driver was one in four before either half was fixed.
+
+## And a third thing the oracle found, which was in this file rather than in a driver
+
+`the xHCI controller is taken, as DeviceManager takes it: AlreadyClaimed`.
+
+THE CLAIM OUTLIVES THE DRIVER PROCESS, AND THIS FILE SAID SO WITHOUT NOTICING WHAT IT MEANT. The
+enumeration oracle's own comment reads "Bus mastering goes off when the driver process dies and the
+transferred capability dies with it; the CLAIM ends with this test kernel" - which was true while
+exactly one test ever took this controller. The moment a second one does, it is answered
+`AlreadyClaimed` and cannot bind at all: the first test's claim is still current, and terminating
+its driver does not give the device back.
+
+So both oracles now end with `driver.terminate()` and then `device::release_claim(key)`, and THE
+ORDER IS NOT A PREFERENCE. Releasing turns off bus mastering and MSI-X on the function, so a driver
+still running would be one whose device had stopped answering under it; taking the process away
+first makes the release the end of something rather than the middle of it.
+
+WORTH SAYING PLAINLY: this was not a defect the suite could have reported before, because nothing
+had ever asked for the controller twice. Adding a second oracle on one device is what turned a
+sentence in a comment into a failure, and the sentence is now a release.
+
+## The development profile cannot be staged on this machine, and the reason is the toolchain
+
+THE PCIe HOT-PLUG ITEM'S LAST CLAIM IS A COLD SCENARIO ON THE EMULATED PORTS, and the final long
+pass is where it was to be made. It cannot be, and what stops it is not the code.
+
+`lab.sh scenario-cold` builds with the DEVELOPMENT profile, which it must: it drives the guest over
+the same control protocol the persistent instance uses, and an ordinary build stages none of that.
+The development profile also stages two QUARANTINE artifacts, `abiprobe` and `vkprobe`, and both
+carry an identity record naming the ICD candidate they were linked against:
+
+    build-shared: vkprobe admits icdprobe at 02c8a011..., and the staged icdprobe is 4c080817...
+
+BISECTED RATHER THAN GUESSED AT, and the first two answers were both wrong:
+
+  1. "A stale staged tree", which is what the message's own advice says - "clear it and build again".
+     Cleared and rebuilt on aarch64: SAME FAILURE, same two digests.
+  2. "Arch-specific, because x86_64 has been building all session". Ran the same scenario on x86_64:
+     SAME FAILURE, with x86_64's own pair of digests. The ordinary profile passes there because it
+     does not stage these two at all, which is why nothing had noticed.
+  3. Cleared `.build/image/x86_64-unknown-none` entirely and built it in ONE development-profile
+     pass: SAME FAILURE. So it is not a half-built tree either.
+
+WHAT THE DIGEST ACTUALLY COVERS IS THE ANSWER. `staged_identity_digest` hashes the descriptor of
+`.note.liber.identity`, and that record names the TOOLCHAIN:
+
+    compiler=Debian clang version 19.1.7 (3+b1)
+    compiler-sha256=0a3c5593...
+    linker=LLD 21.1.8 (...)
+    archiver=Debian LLVM version 19.1.7
+
+So `icdprobe`'s identity moves when the host's clang, lld or llvm-ar does. `abiprobe` and `vkprobe`
+are `producer = "audit"` - they are NOT built from this tree, they are artifacts produced elsewhere
+and staged - and they record the digest of the icdprobe THAT machine built. This machine's clang is
+not that machine's clang, so the two can never agree, and nothing in this tree can make them: the
+consumers cannot be rebuilt here.
+
+IT IS NOT MINE AND THE CHECK IS RIGHT. `icdprobe.c` is C and untouched by this session's work; the
+mechanism is the toolchain in the note, which no source change of mine reaches. And the check is
+doing exactly what it exists for - a consumer admitting a candidate it was not built against is a
+selection that would resolve to something the consumer never saw.
+
+SO THE ITEM'S LAST CLAIM IS BLOCKED ON REPRODUCING THE AUDIT ARTIFACTS AGAINST THIS TOOLCHAIN, which
+is a thing the audit environment does and this tree cannot. Recorded here rather than worked around:
+the alternative would be to weaken the check or to stage a consumer whose selection record is a lie,
+and both are worse than an item that stays open with its reason written down.

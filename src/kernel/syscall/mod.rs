@@ -2038,6 +2038,12 @@ fn sys_process_create(domain_handle: u64) -> i64 {
 // itself needs exactly the authority that was missing, and the smaller set is the one that can be
 // widened later if something real asks.
 //
+// AND MANAGE ALONE MEANS THIS HANDLE CANNOT BE LENT, which is a property rather than a side effect.
+// Without DUPLICATE it cannot be attenuated into a weaker copy; without TRANSFER it cannot be sent
+// down a channel. So the authority to make threads in a process stays with the process that asked
+// for it, and "may a process manage ITSELF" does not quietly become "may a process hand somebody
+// else authority over it" - which it would the moment one of these handles could travel.
+//
 // AND THE AUTHORITY IS ALREADY BOUNDED. MANAGE here is the authority to create threads for ever,
 // which `PROP_THREAD_LIMIT` bounds - and a process cannot raise its own limit, because raising it
 // is `SYS_OBJECT_PROPERTY_SET` on a handle it does not hold. The loading half of MANAGE is refused

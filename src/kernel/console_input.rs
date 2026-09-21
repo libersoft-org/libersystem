@@ -90,31 +90,65 @@ impl Pending {
 			self.len -= 1;
 		}
 	}
+
+	/// Forget everything waiting, without touching the storage. Used when the console changes: see
+	/// `attach`. Cheap on purpose - the entries are left where they are and only the window moves,
+	/// because this runs with interrupts masked.
+	fn clear(&mut self) {
+		self.head = 0;
+		self.len = 0;
+	}
 }
 
 static PENDING: SpinLock<Pending> = SpinLock::new(Pending::new());
 
 // Register the channel the kernel feeds console input to (set by
 // SYS_CONSOLE_ATTACH). Replaces any previous registration.
+//
+// AND WHAT THE PREVIOUS CONSOLE NEVER TOOK IS NOT THIS ONE'S INPUT. A byte is typed AT something:
+// the console that was attached when it arrived. Carrying a backlog across an attach delivers it to
+// a component that was not running when the key was pressed - after a SystemManager crash, the
+// recovery console's first line would begin with whatever the old shell had not read yet.
+//
+// The two locks are taken in the order the delivery path takes them - the console first - so an
+// interrupt arriving mid-swap finds either the old console or the new one, never the new
+// registration beside the old console's leftovers.
 pub fn attach(channel: Arc<Channel>) {
-	*CONSOLE.lock() = Some(channel);
+	let mut console = CONSOLE.lock();
+	PENDING.lock().clear();
+	*console = Some(channel);
 }
 
-// Send one input byte to the attached shell. Returns false if no shell is attached
-// or its endpoint has closed (it exited).
 // Whether a shell is attached and still listening (its peer endpoint is alive). False once the
 // shell exits and drops its end. Asked by `supervise`, which is what decides a boot round is over.
 pub fn shell_listening() -> bool {
-	match &*CONSOLE.lock() {
-		Some(channel) => !channel.is_peer_closed(),
-		None => false,
-	}
+	listener().is_some()
 }
 
+/// The console that could take a byte right now: registered, and with its peer still there.
+///
+/// A REGISTRATION IS NOT A LISTENER. `attach` replaces the entry and nothing ever removes it, so the
+/// last console to attach stays registered long after the process holding the other end has gone -
+/// and a channel whose peer is closed refuses every send. Asking both questions at once is what lets
+/// the input path tell "nobody is listening" from "the listener is busy", which are the two cases
+/// `enqueue` has to answer differently.
+fn listener() -> Option<Arc<Channel>> {
+	// ALLOC-OK: this clones an `Arc`, which is a refcount bump - taken out of the lock because the
+	// send in `drain` must not run under it.
+	let console = CONSOLE.lock();
+	let channel = console.as_ref()?;
+	(!channel.is_peer_closed()).then(|| channel.clone())
+}
+
+// Take one input byte for the attached console: a keystroke from the framebuffer path. Returns
+// false if no console is attached, if its endpoint has closed (it exited), or if the kernel is
+// already holding all the input it will hold.
 pub fn feed(byte: u8) -> bool {
 	enqueue(false, byte)
 }
 
+// The same, for a byte off the serial line: it is delivered with `SERIAL_INPUT_MARKER` in front so
+// the console can tell the two paths apart.
 pub fn feed_serial(byte: u8) -> bool {
 	enqueue(true, byte)
 }
@@ -125,6 +159,21 @@ pub fn feed_serial(byte: u8) -> bool {
 /// are waiting would arrive BEFORE them, which is a command line with its characters rearranged - and
 /// the ordering is the whole of what an input path owes.
 fn enqueue(serial: bool, byte: u8) -> bool {
+	// NOBODY IS LISTENING, SO THE BYTE IS NOT KEPT FOR WHOEVER LISTENS NEXT.
+	//
+	// This is what the return value has always claimed - "false if no shell is attached or its
+	// endpoint has closed", which is the condition `supervise` reads to end its boot round - and it
+	// was not what the code did: every byte went into the ring whatever the console's state, `drain`
+	// returned at its first line with nothing registered, and the byte waited there indefinitely for
+	// the next attach. What that cost: a kernel test that types one character into a console nobody
+	// had attached left it in the ring for two hundred tests, and the first line of the terminal test
+	// that attached one next began with a character it had not typed.
+	//
+	// A byte that arrives with no console is dropped at the door, which is what a machine with no
+	// terminal does with a keystroke.
+	if listener().is_none() {
+		return false;
+	}
 	// ALLOC-OK: `Pending` is a FIXED-CAPACITY ring - `entries[PENDING_BYTES]` - and its `push`
 	// answers `false` when the ring is full rather than growing. Nothing here allocates; what the
 	// scanner matched is the word.
@@ -139,9 +188,7 @@ fn enqueue(serial: bool, byte: u8) -> bool {
 /// immediately; the second is what empties the ring once the shell has read what it was given, which
 /// is the half that makes a burst arrive at all rather than merely arrive in order.
 pub fn drain() {
-	// ALLOC-OK: the guard holds an `Option<Arc<Channel>>`, so this is a refcount bump and not a
-	// copy - taken out of the lock because the send below must not run under it.
-	let Some(channel) = CONSOLE.lock().clone() else { return };
+	let Some(channel) = listener() else { return };
 	loop {
 		let Some((serial, byte)) = PENDING.lock().front() else { return };
 		// A short heap drops the byte, which is what a full queue already does here.

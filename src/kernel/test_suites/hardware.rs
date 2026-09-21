@@ -1141,26 +1141,17 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 	assert!(refused.caps.is_empty(), "a refused read grants no buffer");
 }
 
-tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], id = "kernel.hardware.xhci_driver_enumerates_the_usb_bus", covers = ["kernel", "bin.xhci"]);
-fn xhci_driver_enumerates_the_usb_bus() {
-	use object::channel::{Channel, Message};
+/// Bring the xHCI controller up the way DeviceManager does, and hand back the bootstrap
+/// channel, the claim generation and the driver's whole publication.
+///
+/// WRITTEN ONCE BECAUSE TWO ORACLES NEED IT. Finding the controller, minting its MMIO and its
+/// MSI-X, claiming the device and sending the four-resource `BIND` is sixty lines that say
+/// nothing about what either test is for - and a second copy of them is a second place for the
+/// handshake to drift when a resource is added to it.
+fn bind_xhci_controller() -> (alloc::sync::Arc<object::channel::Channel>, u64, alloc::vec::Vec<(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)>, alloc::sync::Arc<object::process::Process>, abi::ClaimKey) {
 	use object::device_memory::DeviceMemory;
 	use object::rights::Rights;
 
-	// The userspace xhci driver, driven the way DeviceManager drives it: spawn its
-	// staged ELF (it lives on the system volume under drivers/, not in the init
-	// package) with a bootstrap channel, hand it "DEVICE" + the controller's
-	// DeviceInfo + a DeviceMemory capability to its register file, "IRQ" + its
-	// MSI-X Interrupt capability and "KEYS" + a raw keyboard sink, then wait for
-	// its report - all three handoffs, in that order. The driver resets the
-	// controller, builds the command and event rings, enumerates the root-hub
-	// ports, addresses each connected device and reads its device descriptor - QEMU
-	// hangs a hub with a USB keyboard and a USB tablet behind it and a mass-storage
-	// stick off the controller (see qemu-run.sh), so four devices must come back
-	// addressed: the hub (expanded through its class requests and route strings),
-	// the keyboard and the tablet behind it (their HID interfaces configured and
-	// their report descriptors parsed, which the report's keyboard and pointer
-	// markers prove), and the stick (its Bulk-Only transport brought up).
 	let (volume, _package) = scenario_packages().expect("boot modules should be present");
 	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/xhci.lsexe")).expect("the xhci.lsexe driver should be staged on the volume under drivers/");
 
@@ -1192,7 +1183,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	arch::pci::msix_enable(bus, dev, func, msix_cap);
 
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the xhci driver should load");
+	let driver = loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the xhci driver should load");
 	let mut msg = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
 	msg.extend_from_slice(b"DEVICE");
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
@@ -1225,6 +1216,29 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// was for was decided by parsing a string the driver chose - and the human report was the
 	// message the harness asserted on, which made changing a boot line's wording able to break this.
 	let offers = recv_offers(&kernel_ep, key.generation).expect("the xhci driver should report READY");
+	(kernel_ep, key.generation, offers, driver, key)
+}
+
+tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], id = "kernel.hardware.xhci_driver_enumerates_the_usb_bus", covers = ["kernel", "bin.xhci"]);
+fn xhci_driver_enumerates_the_usb_bus() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// The userspace xhci driver, driven the way DeviceManager drives it: spawn its
+	// staged ELF (it lives on the system volume under drivers/, not in the init
+	// package) with a bootstrap channel, hand it "DEVICE" + the controller's
+	// DeviceInfo + a DeviceMemory capability to its register file, "IRQ" + its
+	// MSI-X Interrupt capability and "KEYS" + a raw keyboard sink, then wait for
+	// its report - all three handoffs, in that order. The driver resets the
+	// controller, builds the command and event rings, enumerates the root-hub
+	// ports, addresses each connected device and reads its device descriptor - QEMU
+	// hangs a hub with a USB keyboard and a USB tablet behind it and a mass-storage
+	// stick off the controller (see qemu-run.sh), so four devices must come back
+	// addressed: the hub (expanded through its class requests and route strings),
+	// the keyboard and the tablet behind it (their HID interfaces configured and
+	// their report descriptors parsed, which the report's keyboard and pointer
+	// markers prove), and the stick (its Bulk-Only transport brought up).
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
 	// The bus query channel: drive one raw `usb.list` request over it ([op u16][correlation u32],
 	// the generated wire header) and expect a successful reply naming all four devices' roles - the
 	// live inventory `lsusb` reads.
@@ -1241,7 +1255,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// offered endpoint directly.
 	let net_token = offer_token_of(&offers, driver_protocol::provider::NET).expect("the adapter's publication carries a token");
 	let (host_end, driver_end) = object::channel::Channel::create();
-	send_connect(&kernel_ep, key.generation, net_token, driver_end).expect("the CONNECT should send");
+	send_connect(&kernel_ep, generation, net_token, driver_end).expect("the CONNECT should send");
 	sched::run_until_idle();
 	let hello = host_end.recv().expect("the adapter should lead its connection with its MAC and the link MTU");
 	assert_eq!(&hello.bytes[..3], b"MAC", "the frame transport begins with the same eleven bytes virtio-net sends");
@@ -1299,7 +1313,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// answered without moving anything could not answer at all.
 	let audio_token = offer_token_of(&offers, driver_protocol::provider::AUDIO).expect("a controller with an audio sink on it publishes one");
 	let (sink, driver_end) = object::channel::Channel::create();
-	send_connect(&kernel_ep, key.generation, audio_token, driver_end).expect("the audio CONNECT should send");
+	send_connect(&kernel_ep, generation, audio_token, driver_end).expect("the audio CONNECT should send");
 	sched::run_until_idle();
 	let period: alloc::vec::Vec<u8> = (0..driver_protocol::audio::PERIOD_BYTES as usize).map(|i| (i as u8).wrapping_mul(17)).collect();
 	sink.send(Message::new(period, alloc::vec::Vec::new())).expect("the period should send");
@@ -1396,7 +1410,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// test rather than something to assume.
 	let uas_token = offers.iter().filter(|(k, _, _)| *k == driver_protocol::provider::BLOCK).map(|(_, token, _)| *token).nth(1).expect("the UAS target's block publication has a token of its own");
 	let (second, second_driver_end) = Channel::create();
-	send_connect(&kernel_ep, key.generation, uas_token, second_driver_end).expect("a second consumer of the UAS target should connect");
+	send_connect(&kernel_ep, generation, uas_token, second_driver_end).expect("a second consumer of the UAS target should connect");
 	sched::run_until_idle();
 
 	let first_read = driver_protocol::block::Request { op: driver_protocol::block::OP_READ, lba: UAS_LBA, count: 1 }.encode();
@@ -1483,6 +1497,20 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let file = file_object.as_any().downcast_ref::<object::memory_object::MemoryObject>().expect("the granted capability should be a buffer");
 	let expected = volume_file(volume2, b"hello.txt").expect("hello.txt should be in the volume package");
 	assert_eq!(read_from_object(file, size), expected, "vol://usb should serve the seeded file's bytes");
+	// AND THE DEVICE IS GIVEN BACK WITH THE TEST, DRIVER FIRST AND CLAIM AFTER.
+	//
+	// A driver process left running holds the controller and keeps servicing it, so a second oracle
+	// on this bus spawns another beside it and the two share the device. And the CLAIM outlives the
+	// process: this file used to say "the CLAIM ends with this test kernel", which was true while
+	// exactly one test ever took this controller - the moment a second one does, it is answered
+	// `AlreadyClaimed` and cannot bind at all.
+	//
+	// THE ORDER IS NOT A PREFERENCE. Releasing the claim turns off bus mastering and MSI-X on the
+	// function, so a driver still running would be one whose device has stopped answering; taking
+	// the process away first is what makes the release the end of something rather than the middle.
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
 }
 
 // A PHYSICAL ADDRESS IS ANSWERABLE ONLY FOR A BUFFER SOME DEVICE WAS NAMED FOR, in both directions.
@@ -2200,4 +2228,182 @@ fn a_platform_event_raised_before_anything_listens_is_held_and_delivered_once() 
 	assert!(third.recv().is_ok(), "the press is delivered");
 	assert!(third.recv().is_err(), "and twice pressed is once delivered - a bitmap and not a count");
 	crate::platform_event::drain_for_test();
+}
+
+tagged_test!(usb_cdc_acm_carries_bytes_to_the_host_and_back, [Drivers, Usb, Slow], id = "kernel.hardware.usb_cdc_acm_carries_bytes_to_the_host_and_back", covers = ["kernel", "drivers", "device-proto"]);
+fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
+	use device_proto::codec as wire;
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::{Channel, Message};
+
+	// THE ONE ORACLE IN THIS SUITE WHOSE DEVICE THE HARNESS BUILT. QEMU models fifteen USB devices
+	// and none of them is a CDC-ACM port, which is why this item read for a long time as "a device
+	// model to write". It is not: Linux can BE a USB device, `usb-gadget.sh` builds one out of
+	// `dummy_hcd` and `usb_f_acm`, and `usb-host` hands it to the guest. The gadget side of it is an
+	// ordinary tty on the host, and `serial-echo.py` sits on that tty echoing raw bytes - so what
+	// comes back here has been out through the controller, through the host's USB gadget stack, into
+	// a process that read it, and all the way back.
+	//
+	// GATED AT COMPILE TIME, on the same terms as `TEST_TAGS` and `LIBER_NO_DT_PROFILE`: the gadget
+	// is built only when a run asks for it, because building one modprobes into the developer's own
+	// kernel and that is not something every test run should do. Without it there is no device to
+	// bind and this states so rather than passing quietly - a run that says nothing is how a test
+	// that stopped testing anything goes unnoticed.
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "acm" {
+		crate::serial_println!("usb-cdc-acm: NOT RUN - no CDC-ACM gadget on this run; build one with USB_GADGET=acm");
+		return;
+	}
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+
+	// THE PROVIDER IS A `console-stream` FACTORY, so a connection is MINTED the way DeviceManager
+	// mints one rather than the offered endpoint being used directly - the same shape the CDC
+	// Ethernet adapter's link uses beside it.
+	let token = offer_token_of(&offers, driver_protocol::provider::CONSOLE_BYTES).expect("the driver publishes the CDC-ACM adapter's byte stream, because this run attached one");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+
+	// THE TRANSPORT THE GENERATED CLIENT CALLS OVER.
+	//
+	// `console-stream` IS A GENERATED IDL AND THIS TEST DOES NOT SECOND-GUESS IT. The op numbers,
+	// the record layouts and their bounds all come from `device-proto`, which this kernel already
+	// links for the provider-catalogue harnesses; what is written here is the six lines of transport
+	// the trait's own comment says a test supplies - "the userspace impl sends on a channel and
+	// blocks for the reply; tests use an in-memory loopback". The channel-backed transport is behind
+	// `channel-client-impl` because it calls the userspace runtime's syscalls; the generic `Client`
+	// is not, and a kernel channel is what this one sends on.
+	struct OverChannel<'a> {
+		channel: &'a Channel,
+		/// What a reply handed over, by the number this transport gave it.
+		///
+		/// A HANDLE IS AN INDEX INTO SOMETHING, and in a program it is the process's table. A kernel
+		/// test has no table - a capability arrives as the object itself - so this transport is the
+		/// table: it numbers what it receives from one upwards and hands the number to the decoder,
+		/// which is the same contract from the generated client's side.
+		received: alloc::vec::Vec<(u64, alloc::sync::Arc<dyn object::KernelObject>)>,
+	}
+
+	impl OverChannel<'_> {
+		fn take(&mut self, handle: u64) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+			let at = self.received.iter().position(|(number, _)| *number == handle)?;
+			Some(self.received.remove(at).1)
+		}
+	}
+
+	impl wire::Transport for OverChannel<'_> {
+		fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut wire::Handles, _deadline: u64) -> Result<alloc::vec::Vec<u8>, wire::TransportError> {
+			// `console-stream` TRANSFERS NOTHING ON A REQUEST, so one that arrived with a handle
+			// would be a schema this transport does not implement rather than one it may quietly
+			// drop. Its `receive` REPLY does transfer one - the inbound stream - which is why the
+			// reply half below is not the same no-op.
+			if !request_handles.is_empty() {
+				return Err(wire::TransportError::Malformed);
+			}
+			self.channel.send(Message::new(request.to_vec(), alloc::vec::Vec::new())).map_err(|_| wire::TransportError::PeerClosed)?;
+			// THE DRIVER HAS TO BE GIVEN THE PROCESSOR, and the wait is BOUNDED: a reply that never
+			// comes is a driver that did not answer, which is a failure this oracle should report
+			// rather than a hang the suite's watchdog reports for it.
+			for _ in 0..20_000u32 {
+				sched::run_until_idle();
+				if let Ok(message) = self.channel.recv() {
+					for capability in message.caps {
+						let number = self.received.len() as u64 + 1;
+						if reply_handles.push(number).is_none() {
+							return Err(wire::TransportError::Malformed);
+						}
+						self.received.push((number, capability.object()));
+					}
+					return Ok(message.bytes);
+				}
+			}
+			Err(wire::TransportError::TimedOut)
+		}
+
+		fn discard_handles(&mut self, handles: &[u64]) {
+			// DROPPED AND NOT IGNORED. The trait refuses a default body precisely so a transport
+			// cannot leak a capability from a reply nobody decoded, and this one owns what it
+			// received - so releasing it is removing it from the table above.
+			for handle in handles {
+				let _ = self.take(*handle);
+			}
+		}
+	}
+
+	let mut client = device::console_stream::Client::new(OverChannel { channel: &host_end, received: alloc::vec::Vec::new() });
+
+	// 1. ATTACH, which is where the version is agreed and the bounds come back. Every other
+	//    operation on a connection that has not attached is refused, so this is not a formality.
+	let sent: &[u8] = b"liber-acm";
+	let attachment = client.attach(&1).expect("the adapter answered the attach").expect("the adapter speaks version 1 of console-stream");
+	assert_eq!(attachment.version, 1, "the provider answers with the version asked for and not a negotiation of its own");
+	assert!(attachment.max_frame > 0, "an attachment states the largest frame it takes and delivers, got {}", attachment.max_frame);
+	assert!(sent.len() <= attachment.max_frame as usize, "and this oracle's probe fits inside it");
+
+	// 2. RECEIVE BEFORE WRITE, AND THE ORDER IS THE POINT.
+	//
+	//    `Session::deliver` DROPS a chunk when nothing holds the stream, which is the right answer -
+	//    a stream nobody opened has no consumer, and buffering for one that may never arrive is how
+	//    a driver grows an unbounded queue. The consequence is this order: a consumer that wrote
+	//    first and opened its inbound stream afterwards would lose whatever came back in between,
+	//    and on a link this fast that is the ORDINARY case rather than a rare one - the echo of a
+	//    nine-byte write is already on its way while the write's own completion is being waited for.
+	//
+	//    It cost three runs out of four to find, with the driver's own defect underneath it.
+	let stream = client.receive().expect("the adapter answered the receive").expect("the inbound stream opened");
+
+	// 3. WRITE, WHICH IS THE HALF THAT LEAVES THE MACHINE. The bytes go down the bulk OUT endpoint,
+	//    through the host's gadget stack, and arrive on `/dev/ttyGS0` where `serial-echo.py` has
+	//    them.
+	//
+	//    RAW AND WITH NO NEWLINE, because the echo is raw: a tty in its default line discipline
+	//    would wait for a line to end, and what this contract carries is BYTES.
+	let written = client.write(sent).expect("the adapter answered the write").expect("the write was accepted");
+	assert_eq!(written as usize, sent.len(), "every byte offered was taken, got {written}");
+
+	// 4. AND THE ECHO, WHICH ARRIVES AS FRAMES ON THE STREAM the receive above handed over.
+	let mut transport = client.into_transport();
+	let stream = transport.take(stream).expect("the receive reply handed over the stream it opened").into_any_arc().downcast::<Channel>().expect("and the stream is a channel");
+
+	// THE WAIT IS IN TICKS AND NOT IN ITERATIONS, WHICH IS WHAT THIS ORACLE'S PEER BEING OUTSIDE THE
+	// MACHINE COSTS. `run_until_idle` returns the moment the run queue is empty, so a loop counted in
+	// passes spins twenty thousand times in a few milliseconds and gives up long before a process on
+	// the HOST has read a tty and written it back. Every other driver oracle here pulls - it sends a
+	// request and reads the reply, and the round trip is its own pacing - but `console-stream`
+	// PUSHES its inbound frames, so there is nothing to pull on and the budget has to be wall clock.
+	//
+	// A tick is not a unit of work, so the emulated ports get the same budget in ticks and far more
+	// of them in instructions, which is the direction that is safe to be wrong in.
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 500;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 500 * 13;
+	let give_up = arch::apic::ticks() + patience;
+	let mut back: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	while back.len() < sent.len() && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		if let Ok(message) = stream.recv() {
+			let mut handles = wire::Handles::new();
+			if let Some(chunk) = device::console_stream::receive_read(&message.bytes, &mut handles) {
+				back.extend_from_slice(&chunk.bytes);
+			}
+		}
+	}
+	assert_eq!(&back[..], sent, "what the host echoed came back byte for byte");
+	crate::serial_println!("usb-cdc-acm: {} byte(s) out and the same {} back", sent.len(), back.len());
+	// AND THE DEVICE IS GIVEN BACK WITH THE TEST, DRIVER FIRST AND CLAIM AFTER.
+	//
+	// A driver process left running holds the controller and keeps servicing it, so a second oracle
+	// on this bus spawns another beside it and the two share the device. And the CLAIM outlives the
+	// process: this file used to say "the CLAIM ends with this test kernel", which was true while
+	// exactly one test ever took this controller - the moment a second one does, it is answered
+	// `AlreadyClaimed` and cannot bind at all.
+	//
+	// THE ORDER IS NOT A PREFERENCE. Releasing the claim turns off bus mastering and MSI-X on the
+	// function, so a driver still running would be one whose device has stopped answering; taking
+	// the process away first is what makes the release the end of something rather than the middle.
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
 }

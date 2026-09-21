@@ -22,6 +22,18 @@ pub const CLASS_CDC_DATA: u8 = 0x0A;
 
 /// The two network models this module speaks, as interface subclasses.
 pub const SUBCLASS_ACM: u8 = 0x02;
+/// A VENDOR PROTOCOL UNDER THE ACM SUBCLASS, WHICH IS WHAT RNDIS IS.
+///
+/// Microsoft's Remote NDIS puts an ETHERNET ADAPTER behind class 2, subclass 2 and protocol 0xFF -
+/// the same class and subclass a serial port declares - so the two bytes that used to decide this
+/// name a network card as well as a modem. Measured on QEMU's own `usb-net`, whose default mode is
+/// RNDIS: the serial binding accepted it, took the device, and the boot reported no network provider
+/// at all with nothing anywhere saying why.
+///
+/// SO THE PROTOCOL IS PART OF THE ANSWER. An ACM serial port declares no protocol, or one of the
+/// command sets the subclass defines; a vendor protocol under this subclass is a device speaking
+/// something else entirely through an ACM-shaped control interface.
+pub const PROTOCOL_VENDOR: u8 = 0xff;
 pub const SUBCLASS_ECM: u8 = 0x06;
 pub const SUBCLASS_NCM: u8 = 0x0D;
 
@@ -411,11 +423,14 @@ pub fn bind_acm(config: &[u8]) -> Result<AcmBinding, NotBindable> {
 			descriptor::DT_CONFIG => config_value = record.field(5).ok(),
 			descriptor::DT_INTERFACE => {
 				keep_lowest(&mut candidate, &mut best);
-				let (Ok(number), Ok(alternate), Ok(class), Ok(subclass)) = (record.field(2), record.field(3), record.field(5), record.field(6)) else {
+				let (Ok(number), Ok(alternate), Ok(class), Ok(subclass), Ok(protocol)) = (record.field(2), record.field(3), record.field(5), record.field(6), record.field(7)) else {
 					return Err(NotBindable::Malformed);
 				};
 				current_is_control = false;
-				if class == CLASS_COMMUNICATIONS && subclass == SUBCLASS_ACM && control_interface.is_none() {
+				// THE PROTOCOL IS PART OF THE ANSWER - see `PROTOCOL_VENDOR`. Class and subclass
+				// alone accept RNDIS, which is an Ethernet adapter wearing a serial port's
+				// identity.
+				if class == CLASS_COMMUNICATIONS && subclass == SUBCLASS_ACM && protocol != PROTOCOL_VENDOR && control_interface.is_none() {
 					control_interface = Some(number);
 					current_is_control = true;
 				} else if class == CLASS_COMMUNICATIONS && Some(number) == control_interface {

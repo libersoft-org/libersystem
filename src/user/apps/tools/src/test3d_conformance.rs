@@ -60,9 +60,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	for name in &summary.scene3d.untested {
 		print(format!("test3d-conformance: UNTESTED scene3d/{name}\n").as_bytes());
 	}
+	for name in &summary.extended.untested {
+		print(format!("test3d-conformance: UNTESTED scene3d-extended/{name}\n").as_bytes());
+	}
 	print(format!("test3d-conformance: render3d {} passed, {} failed, {} unsupported, {} untested\n", summary.render3d.passed, summary.render3d.failed, summary.render3d.unsupported, summary.render3d.untested.len()).as_bytes());
 	print(format!("test3d-conformance: scene3d {} passed, {} failed, {} unsupported, {} untested\n", summary.scene3d.passed, summary.scene3d.failed, summary.scene3d.unsupported, summary.scene3d.untested.len()).as_bytes());
+	print(format!("test3d-conformance: scene3d-extended {} passed, {} failed, {} unsupported, {} untested\n", summary.extended.passed, summary.extended.failed, summary.extended.unsupported, summary.extended.untested.len()).as_bytes());
 	print(format!("test3d-conformance: {} passed, {} failed, {} unsupported, {} untested\n", summary.passed(), summary.failed(), summary.unsupported(), summary.untested()).as_bytes());
+	// THE TWO CLAIMS ARE PRINTED SEPARATELY BECAUSE THEY ARE TWO CLAIMS. `Scene3D Extended Profile 1`
+	// is optional as a whole, so "conforms" is about the two CORE profiles; a layer that carries the
+	// extended part says so on its own line, and a reader can tell a core-conforming implementation
+	// without the part from one that claims it and fails it.
 	print(if summary.complete() { b"test3d-conformance: conforms\n".as_slice() } else { b"test3d-conformance: DOES NOT CONFORM\n".as_slice() });
+	print(if summary.complete_with_extended() { b"test3d-conformance: and carries Scene3D Extended Profile 1\n".as_slice() } else { b"test3d-conformance: DOES NOT CARRY Scene3D Extended Profile 1\n".as_slice() });
 	exit()
 }

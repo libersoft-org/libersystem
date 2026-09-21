@@ -1334,3 +1334,102 @@ fn a_version_changes_with_the_semantics_and_not_with_the_prose() {
 	// visibly short of what the rule says.
 	assert!(gate.answer.contains("document") && gate.answer.contains("manifest") && gate.answer.contains("coverage table"));
 }
+
+#[test]
+// THE EXTENDED PROFILE IS A CLOSED LIST TOO, and it is the one the part that owns it could not have
+// without this check: `f-ext`'s header says it carries a closed enumerated feature list, and for
+// most of this milestone's life it carried equations and no list at all. A rule is prose a reader
+// checks; a feature is a name a generator can range over, and "a test per feature" - which every
+// item of that part says - had nothing to range over until the list existed.
+fn the_extended_profile_is_a_closed_list_with_unique_names_and_known_groups() {
+	for (index, entry) in SCENE3D_EXTENDED_PROFILE_1.iter().enumerate() {
+		assert!(SCENE3D_EXTENDED_GROUPS.contains(&entry.group), "scene3d-extended: {} is documented under an unknown group {}", entry.name, entry.group);
+		for other in &SCENE3D_EXTENDED_PROFILE_1[index + 1..] {
+			assert_ne!(entry.name, other.name, "scene3d-extended: the profile names {} twice", entry.name);
+			assert_ne!(entry.feature, other.feature, "scene3d-extended: the profile carries {:?} twice", entry.feature);
+		}
+	}
+	for group in SCENE3D_EXTENDED_GROUPS {
+		assert!(SCENE3D_EXTENDED_PROFILE_1.iter().any(|entry| entry.group == *group), "scene3d-extended: the group {group} has no features");
+	}
+}
+
+#[test]
+// AND EVERY ONE OF THEM IS SCENE-LAYER OWNED, WHICH IS A CLAIM ABOUT THE PROFILE AND NOT A DEFAULT.
+//
+// The closed-list helper the two core profiles share asserts that SOMETHING is backend-owned, and
+// that assertion is right there and wrong here. Extended adds no rasteriser capability: shadows are
+// a depth target and comparison sampling, the environment is a cube map with mips, bloom is a render
+// target pyramid, and skinning is arithmetic in a vertex stage - every one of them already in
+// `Render3D Core Profile 1`. The whole of Extended is composed out of what the core backend already
+// has, which is why a backend can be conformant and a scene layer can then choose to claim this.
+//
+// If that ever stops being true the fix is to add the capability to the 3D profile, where a backend
+// checklist will demand a handler for it - not to mark a scene-layer decision as backend-owned here.
+fn every_extended_feature_is_owned_by_the_scene_layer() {
+	for entry in SCENE3D_EXTENDED_PROFILE_1 {
+		assert_eq!(entry.owner, FeatureOwner::Scene3D, "scene3d-extended: {} is owned by {:?}, but Extended adds no backend capability", entry.name, entry.owner);
+	}
+}
+
+#[test]
+// A NAME BELONGS TO EXACTLY ONE PROFILE. `profile-doc` routes a `@covers` claim to a profile by
+// asking each one whether it knows the name, and treats a name no profile knows as outside them all.
+// Two profiles answering yes to one name would route the claim to both, so the same test would be
+// counted as covering two different features - and the disjointness the generator relies on is
+// asserted nowhere else for this list.
+fn extended_feature_names_collide_with_no_other_profile() {
+	use crate::scene3d_extended::entry_by_name;
+
+	for entry in SCENE3D_EXTENDED_PROFILE_1 {
+		assert!(crate::render2d::entry_by_name(entry.name).is_none(), "scene3d-extended: {} is also a Render2D feature", entry.name);
+		assert!(crate::render3d::entry_by_name(entry.name).is_none(), "scene3d-extended: {} is also a Render3D feature", entry.name);
+		assert!(crate::scene3d::entry_by_name(entry.name).is_none(), "scene3d-extended: {} is also a Scene3D core feature", entry.name);
+		// AND THE LOOKUP THE GENERATOR USES ANSWERS FOR EVERY ENTRY, by the name the entry itself
+		// carries - which `profile!` takes from the variant, so this catches a hand-written name.
+		assert_eq!(entry_by_name(entry.name).map(|found| found.feature), Some(entry.feature), "scene3d-extended: {} does not look up to itself", entry.name);
+	}
+}
+
+#[test]
+// EVERY RULE SECTION HAS FEATURES AND EVERY FEATURE GROUP HAS RULES. This is the join that stops the
+// list becoming a second, drifting statement of the same profile: a rule set nothing enumerates is a
+// requirement no conformance suite will ever range over, and a feature group with no rules behind it
+// is a name with nothing stating what it means.
+fn the_extended_groups_and_the_extended_rules_cover_each_other() {
+	use crate::scene3d_extended::{ANIMATION_PLAYBACK_RULES, ANIMATION_RULES, ENVIRONMENT_RULES, LEVEL_OF_DETAIL_RULES, PBR_CONSTANTS, PBR_MATERIAL_RULES, PBR_TERMS, POSTPROCESS_RULES, SCENE3D_EXTENDED_1_MIN_LIMITS};
+
+	let populated: [(&str, usize); 7] = [
+		("material", PBR_TERMS.len() + PBR_CONSTANTS.len() + PBR_MATERIAL_RULES.len()),
+		("environment", ENVIRONMENT_RULES.len()),
+		("shadows", crate::scene3d_extended::SHADOW_RULES.len()),
+		("postprocess", POSTPROCESS_RULES.len()),
+		("animation", ANIMATION_RULES.len() + ANIMATION_PLAYBACK_RULES.len()),
+		("detail", LEVEL_OF_DETAIL_RULES.len()),
+		("limits", SCENE3D_EXTENDED_1_MIN_LIMITS.len()),
+	];
+	assert_eq!(populated.len(), SCENE3D_EXTENDED_GROUPS.len(), "every documented group must be joined to the rules behind it");
+	for (group, rules) in populated {
+		assert!(SCENE3D_EXTENDED_GROUPS.contains(&group), "{group} is joined to rules but is not a documented group");
+		assert!(rules > 0, "{group} has no rules stating what its features mean");
+		assert!(SCENE3D_EXTENDED_PROFILE_1.iter().any(|entry| entry.group == group), "{group} has rules and no features");
+	}
+}
+
+#[test]
+// THE LEVEL-OF-DETAIL RULES EXIST AT ALL, which is the gap this part was flagged for. The frozen
+// document stated no LOD threshold anywhere - no coverage, no distance, no hysteresis - so the item
+// asking for "LOD selection with STATED THRESHOLDS" could be implemented only against an invented
+// rule. Each rule below answers one question an implementation would otherwise answer for itself,
+// and this test names them so a later edit cannot quietly drop one and leave the feature stated in
+// the list and unstated in the profile.
+fn level_of_detail_answers_the_four_questions_two_implementations_would_differ_on() {
+	use crate::scene3d_extended::LEVEL_OF_DETAIL_RULES;
+
+	for question in ["the selection metric", "the ladder", "hysteresis", "which bounds the coverage uses"] {
+		assert!(LEVEL_OF_DETAIL_RULES.iter().any(|rule| rule.question == question), "the level-of-detail rules must answer '{question}'");
+	}
+	for rule in LEVEL_OF_DETAIL_RULES {
+		assert!(!rule.answer.trim().is_empty(), "'{}' is a question with no answer", rule.question);
+	}
+}

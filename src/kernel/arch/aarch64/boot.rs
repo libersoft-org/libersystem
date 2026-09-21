@@ -1078,9 +1078,30 @@ fn run_system_manager() {
 	// nothing watched. Four hundred rounds is the budget this machine needs; the rest is policy and
 	// lives in one place.
 	// TEN TIMES WHAT IT WAS, for the reason x86_64's call site records: the window was never
-	// exercised, because the settle drain never returned to consult it. The ratio to x86_64 is
-	// unchanged - this target has always been given a third more than that one - so what moved is
-	// the one number that was measured. Emulated boots on this port are slower than that ratio
-	// suggests and this budget is not measured; it is the old calibration carried across.
-	crate::boot_userspace(4000);
+	// exercised, because the settle drain never returned to consult it. The ratio to x86_64 was
+	// unchanged for a while - this target had always been given a third more than that one - and
+	// the note here said so plainly: "this budget is not measured; it is the old calibration
+	// carried across".
+	//
+	// **IT IS MEASURED NOW (2026-09-21), AND A THIRD MORE THAN x86_64 WAS AN ORDER OF MAGNITUDE
+	// SHORT.** A full suite on this port with twelve devices on the bus ends with seven drivers at
+	// `did not bind (hung)` - `virtio-gpu`, `virtio-snd`, `virtio-rng`, `virtio-scsi`,
+	// `virtio-vsock`, `virtio-console` and `xhci` - and fifteen of twenty-four services never
+	// starting behind them. Every one of those drivers PRINTS ITS OWN `online` LINE in the same
+	// log: they were not hanging, they were late, and the manager had already given up.
+	//
+	// WHAT BOUNDS THEM IS THIS NUMBER AND NOT THE PER-ATTEMPT DEADLINE. `Incident::open` takes a
+	// share of the boot window and `attempt_deadline` returns an instant already past once that
+	// share is spent, so the doubling a retry gets - which was added for exactly this symptom on
+	// this port - buys nothing when the window underneath it is gone.
+	//
+	// AND THE SIBLING PORT SAYS WHAT THE NUMBER SHOULD BE. riscv64 is the other TCG target, it
+	// settles at a comparable rate - the two full suites are 3151 s and 3725 s for the same test
+	// count - and its call site passes FORTY thousand. The two were set in one commit and neither
+	// was measured; this is the one that the measurement reaches.
+	//
+	// WHAT WOULD FALSIFY IT: a run on this port that still ends with those seven drivers late. The
+	// window would then not be what bounds them, and the next place to look is the per-attempt
+	// deadline rather than the budget above it.
+	crate::boot_userspace(40000);
 }

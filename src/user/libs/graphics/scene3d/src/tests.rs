@@ -1239,3 +1239,1634 @@ fn the_equations_are_evaluated_in_linear_light_and_nothing_here_encodes() {
 	let textured = crate::material::shade(&lambert, &surface.with_texture(Vec4::new(0.5, 0.5, 0.5, 1.0)), Vec3::new(0.0, 0.0, 1.0), Vec3::ZERO, &[half]).unwrap();
 	assert!(near(textured.x, 0.125), "{}", textured.x);
 }
+
+// ---------------------------------------------------------------------------------------------
+// `Scene3D Extended Profile 1`'s limits, on the same terms as the core ones above.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+// THE EXTENDED LIMITS ARE THAT PROFILE'S, BY NAME - and the profile is frozen, so this fixture is
+// what stops the two drifting in either direction: a limit the document names and this layer does
+// not enforce, or one enforced that the document never promised.
+fn every_extended_limit_the_profile_names_is_one_this_layer_enforces() {
+	let limits = Limits::EXTENDED_MINIMUM;
+	for entry in graphics_profile::scene3d_extended::SCENE3D_EXTENDED_1_MIN_LIMITS {
+		let held = limits.by_name(entry.name).unwrap_or_else(|| panic!("the Extended profile names `{}` and this layer has no such limit", entry.name));
+		assert_eq!(held, entry.minimum, "`{}` must be the Extended profile's floor", entry.name);
+	}
+	for name in ["max_shadow_cascades", "max_shadow_maps", "max_skeleton_joints", "max_morph_targets", "max_animation_tracks", "environment_prefilter_levels", "max_lod_levels"] {
+		assert!(graphics_profile::scene3d_extended::SCENE3D_EXTENDED_1_MIN_LIMITS.iter().any(|entry| entry.name == name), "`{name}` is enforced but the Extended profile does not name it");
+	}
+}
+
+#[test]
+// AND EXTENDED IS ADDITIVE: claiming it changes nothing a core-conforming scene already admitted.
+// A part that quietly raised or lowered a core floor would be a second profile wearing the first
+// one's name.
+fn claiming_the_extended_profile_moves_no_core_limit() {
+	let core = Limits::PROFILE_MINIMUM;
+	let extended = Limits::EXTENDED_MINIMUM;
+	for entry in graphics_profile::scene3d::SCENE3D_PROFILE_1_MIN_LIMITS {
+		assert_eq!(extended.by_name(entry.name), core.by_name(entry.name), "`{}` is a core limit and Extended does not move it", entry.name);
+	}
+}
+
+#[test]
+// ENTIRELY OR NOT AT ALL, which is the part's own rule. A core scene claims none of it, an Extended
+// one claims all of it, and a scene carrying some of the six claims nothing - because an
+// application finding shadows and no skinning, with nothing saying which half it had, is exactly
+// what that rule refuses.
+fn the_extended_profile_is_claimed_whole_or_not_at_all() {
+	assert!(!Limits::PROFILE_MINIMUM.claims_extended(), "a core scene claims no part of Extended");
+	assert!(Limits::EXTENDED_MINIMUM.claims_extended(), "and an Extended one claims all of it");
+	// Every single omission is a scene that claims nothing, checked one field at a time rather than
+	// on one example - a predicate that had dropped a term would pass the example and fail here.
+	for name in ["max_shadow_cascades", "max_shadow_maps", "max_skeleton_joints", "max_morph_targets", "max_animation_tracks", "environment_prefilter_levels", "max_lod_levels"] {
+		let mut partial = Limits::EXTENDED_MINIMUM;
+		match name {
+			"max_shadow_cascades" => partial.max_shadow_cascades = 0,
+			"max_shadow_maps" => partial.max_shadow_maps = 0,
+			"max_skeleton_joints" => partial.max_skeleton_joints = 0,
+			"max_morph_targets" => partial.max_morph_targets = 0,
+			"max_animation_tracks" => partial.max_animation_tracks = 0,
+			_ => partial.environment_prefilter_levels = 0,
+		}
+		assert!(!partial.claims_extended(), "a scene missing `{name}` claims no Extended profile");
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Level of detail: `Scene3D Extended Profile 1`'s `detail` group. One fixture per rule, with the
+// coverages worked out by hand from the definition.
+// ---------------------------------------------------------------------------------------------
+
+/// A scene claiming Extended, which is the only kind that may build a ladder at all.
+fn extended() -> Limits {
+	Limits::EXTENDED_MINIMUM
+}
+
+#[test]
+// COVERAGE IS THE PROJECTED RADIUS OVER HALF THE VIEWPORT HEIGHT, and the number a person can
+// reason about falls out of it: a sphere exactly filling the frame vertically covers 1.
+//
+// WORKED BY HAND. A 90 degree vertical field of view gives `tan(45 deg) = 1`, so a unit sphere ten
+// units from the eye covers `1 / (10 * 1)` = 0.1; the same sphere at five units covers 0.2, and at
+// one unit it covers 1 - which is the sphere touching the top and bottom of the frame.
+fn coverage_is_the_projected_radius_as_a_fraction_of_half_the_frame() {
+	let eye = Vec3::new(0.0, 0.0, 0.0);
+	let tan_half = 1.0f32;
+	for (distance, expected) in [(10.0f32, 0.1f32), (5.0, 0.2), (1.0, 1.0), (20.0, 0.05)] {
+		let sphere = Sphere::new(Vec3::new(0.0, 0.0, -distance), 1.0);
+		let coverage = detail::coverage_perspective(&sphere, eye, tan_half).expect("a well-formed coverage");
+		assert!((coverage - expected).abs() < 1e-6, "a unit sphere at {distance} covers {expected}, got {coverage}");
+	}
+	// AND A NARROWER FIELD OF VIEW COVERS MORE AT THE SAME DISTANCE, which is the whole reason the
+	// metric is not distance: the same object at the same place is bigger on screen when the camera
+	// zooms in, and a distance-based ladder would keep drawing the coarse mesh.
+	let sphere = Sphere::new(Vec3::new(0.0, 0.0, -10.0), 1.0);
+	let wide = detail::coverage_perspective(&sphere, eye, 1.0).expect("wide");
+	let narrow = detail::coverage_perspective(&sphere, eye, 0.5).expect("narrow");
+	assert!(narrow > wide, "zooming in raises coverage: {narrow} must exceed {wide}");
+	assert!((narrow - 0.2).abs() < 1e-6, "tan(fov/2) halved doubles the coverage, got {narrow}");
+}
+
+#[test]
+// AN ORTHOGRAPHIC CAMERA HAS NO DISTANCE TERM AT ALL, which is not a special case but the same
+// formula: the projection is the half-height, and moving the object does not change its size.
+fn orthographic_coverage_does_not_move_with_the_object() {
+	for depth in [-1.0f32, -50.0, -1000.0] {
+		let sphere = Sphere::new(Vec3::new(0.0, 0.0, depth), 2.0);
+		let coverage = detail::coverage_orthographic(&sphere, 8.0).expect("a well-formed coverage");
+		assert!((coverage - 0.25).abs() < 1e-6, "a radius of 2 in a half-height of 8 covers 0.25 at every depth, got {coverage} at {depth}");
+	}
+}
+
+#[test]
+// THE EYE INSIDE THE SPHERE IS THE FINEST LEVEL AND NOT A DIVISION BY ZERO. A camera standing inside
+// a drawable is what walking into a room is, and the arithmetic for it divides by a distance of
+// zero - which without this answer is an infinity or a NaN, and a NaN compares false against every
+// threshold and silently selects the FINEST level anyway by accident rather than by decision.
+fn the_eye_at_the_centre_covers_everything_and_a_point_covers_nothing() {
+	let eye = Vec3::new(3.0, 4.0, 5.0);
+	let around = Sphere::new(eye, 2.0);
+	assert_eq!(detail::coverage_perspective(&around, eye, 1.0).expect("inside"), f32::INFINITY);
+	let point = Sphere::new(eye, 0.0);
+	assert_eq!(detail::coverage_perspective(&point, eye, 1.0).expect("a point"), 0.0);
+	// AND A DEGENERATE CAMERA IS REFUSED RATHER THAN ANSWERED. A field of view of zero is not a
+	// camera that sees nothing; it is a projection with no inverse, and answering it would put a
+	// number nobody can check into a ladder.
+	assert!(matches!(detail::coverage_perspective(&around, eye, 0.0), Err(Error::Degenerate { .. })));
+	assert!(matches!(detail::coverage_orthographic(&around, 0.0), Err(Error::Degenerate { .. })));
+	let broken = Sphere::new(Vec3::new(f32::NAN, 0.0, 0.0), 1.0);
+	assert!(matches!(detail::coverage_perspective(&broken, eye, 1.0), Err(Error::Degenerate { .. })));
+}
+
+#[test]
+// THE LADDER IS READ MOST DETAILED FIRST AND EACH LEVEL TAKES OVER AT OR BELOW ITS THRESHOLD.
+// The defaults halve: 0.5, 0.25, 0.125, 0.0625, so each level draws roughly a quarter of the pixels
+// of the one above it.
+fn the_default_ladder_halves_and_each_level_takes_over_at_its_own_threshold() {
+	let ladder = Ladder::with_default_thresholds(&[10, 11, 12, 13], &extended()).expect("four levels");
+	assert_eq!(ladder.levels(), 4);
+	assert_eq!(ladder.threshold(0), None, "the finest level has no threshold");
+	assert_eq!(ladder.threshold(1), Some(0.5));
+	assert_eq!(ladder.threshold(2), Some(0.25));
+	assert_eq!(ladder.threshold(3), Some(0.125));
+	// AT OR BELOW, so the threshold itself belongs to the coarser level. Stated in the profile, and
+	// a boundary that belonged to neither would leave a coverage with no level at all.
+	for (coverage, level, mesh) in [(0.9f32, 0u32, 10u32), (0.5, 1, 11), (0.3, 1, 11), (0.25, 2, 12), (0.126, 2, 12), (0.125, 3, 13), (0.001, 3, 13)] {
+		let chosen = ladder.select(coverage, None);
+		assert_eq!(chosen, Detail::Level(level), "coverage {coverage} is level {level}");
+		assert_eq!(ladder.mesh_of(chosen), Some(mesh), "level {level} draws mesh {mesh}");
+	}
+}
+
+#[test]
+// A MESH WITH ONE LEVEL NEVER CONSULTS A THRESHOLD, which is what makes the feature free for the
+// meshes that do not use it.
+fn one_level_is_always_that_level() {
+	let ladder = Ladder::single(7);
+	assert_eq!(ladder.levels(), 1);
+	for coverage in [1000.0f32, 1.0, 0.001, 0.0] {
+		assert_eq!(ladder.select(coverage, None), Detail::Level(0));
+		assert_eq!(ladder.mesh_of(Detail::Level(0)), Some(7));
+	}
+}
+
+#[test]
+// A LADDER THAT DOES NOT DESCEND IS REFUSED AT LOAD AND NOT SORTED. Sorting would draw a scene the
+// author did not write and would hide the authoring error for ever; refusing it happens where a mesh
+// is built rather than where it is drawn.
+fn a_ladder_that_does_not_descend_is_refused_rather_than_sorted() {
+	let limits = extended();
+	let rising = vec![Level { mesh: 1, threshold: 0.25 }, Level { mesh: 2, threshold: 0.5 }];
+	assert!(matches!(Ladder::new(0, rising, &limits), Err(Error::Degenerate { .. })));
+	// EQUAL IS NOT DESCENDING EITHER: two levels with one threshold means the second can never be
+	// selected, which is a level an author wrote and nothing will ever draw.
+	let flat = vec![Level { mesh: 1, threshold: 0.25 }, Level { mesh: 2, threshold: 0.25 }];
+	assert!(matches!(Ladder::new(0, flat, &limits), Err(Error::Degenerate { .. })));
+	let broken = vec![Level { mesh: 1, threshold: f32::NAN }];
+	assert!(matches!(Ladder::new(0, broken, &limits), Err(Error::Degenerate { .. })));
+	// AND THE PROFILE'S LIMIT IS A LIMIT. `max_lod_levels` is 4 at the Extended floor, so a fifth is
+	// refused by name rather than silently dropped.
+	let five: Vec<u32> = vec![0, 1, 2, 3, 4];
+	assert!(matches!(Ladder::with_default_thresholds(&five, &limits), Err(Error::LimitExceeded { limit: "max_lod_levels", ceiling: 4, asked: 5 })));
+	// AND A SCENE THAT NEVER CLAIMED EXTENDED CANNOT BUILD A LADDER AT ALL, because its limit is
+	// zero - which is what "entirely or not at all" looks like from inside this module.
+	assert!(matches!(Ladder::with_default_thresholds(&[0, 1], &Limits::PROFILE_MINIMUM), Err(Error::LimitExceeded { limit: "max_lod_levels", ceiling: 0, asked: 2 })));
+	// `Ladder::single` IS THE EXCEPTION AND IS NOT AN EXTENDED FEATURE. One level is "draw this
+	// mesh", which is what the core layer already does; it takes no limits because there is nothing
+	// for a limit to bound, and a core scene reaches it without claiming anything.
+	assert_eq!(Ladder::single(0).levels(), 1);
+}
+
+#[test]
+// HYSTERESIS IS WHY A DRAWABLE SITTING ON A THRESHOLD DOES NOT FLICKER, and it is applied to the
+// level HELD rather than to the one the ladder would pick.
+//
+// WORKED BY HAND against the ladder 0.5 / 0.25. Holding level 0, the boundary to level 1 is 0.5 and
+// the widened one is 0.45: a coverage of 0.48 is below the threshold and stays at level 0, and 0.44
+// finally moves. Holding level 1, the boundary back to level 0 is 0.5 widened to 0.55: 0.52 is above
+// the raw threshold and stays at level 1, and 0.58 moves back. So between 0.45 and 0.55 the answer
+// depends on what was drawn last frame, which is exactly the band a flickering drawable lived in.
+fn a_drawable_on_a_threshold_holds_the_level_it_drew_last_frame() {
+	let ladder = Ladder::with_default_thresholds(&[0, 1, 2], &extended()).expect("three levels");
+	assert_eq!(ladder.select(0.48, Some(Detail::Level(0))), Detail::Level(0), "0.48 is inside the widened band, so level 0 is held");
+	assert_eq!(ladder.select(0.44, Some(Detail::Level(0))), Detail::Level(1), "0.44 is past it, so the level is left");
+	assert_eq!(ladder.select(0.52, Some(Detail::Level(1))), Detail::Level(1), "0.52 is inside the band from the other side");
+	assert_eq!(ladder.select(0.58, Some(Detail::Level(1))), Detail::Level(0), "0.58 is past it, so it comes back");
+	// AND THE FIRST FRAME HAS NO BAND AT ALL: a drawable that appears already small starts small,
+	// rather than starting detailed and stepping down in view.
+	assert_eq!(ladder.select(0.48, None), Detail::Level(1), "with no previous frame the ladder is read directly");
+	assert_eq!(ladder.select(0.52, None), Detail::Level(0));
+	// A BIG JUMP STILL LANDS WHERE THE LADDER SAYS. Hysteresis decides WHETHER the level is left, not
+	// where it goes: an object that moves far in one frame does not step down one level per frame.
+	assert_eq!(ladder.select(0.01, Some(Detail::Level(0))), Detail::Level(2), "leaving level 0 lands at the level the coverage names");
+}
+
+#[test]
+// BELOW THE LAST THRESHOLD THE LAST LEVEL KEEPS BEING DRAWN. A ladder that ran out and drew nothing
+// would delete distant geometry for a reason the author never wrote.
+fn below_the_last_threshold_the_coarsest_level_keeps_being_drawn() {
+	let ladder = Ladder::with_default_thresholds(&[0, 1], &extended()).expect("two levels");
+	for coverage in [0.4f32, 0.01, 1e-6, 0.0] {
+		assert_eq!(ladder.select(coverage, None), Detail::Level(1), "coverage {coverage} still draws the coarsest level");
+	}
+}
+
+#[test]
+// UNLESS THE MESH DECLARED A COVERAGE IT VANISHES AT, which is a decision a scene makes about its own
+// content rather than one the ladder makes for it. VANISHED IS NOT CULLED: the drawable is on screen
+// and the scene chose not to draw it, and the two are told apart by the answer rather than inferred.
+fn a_mesh_may_declare_a_coverage_below_which_it_is_not_drawn() {
+	let ladder = Ladder::with_default_thresholds(&[0, 1], &extended()).expect("two levels").vanishing_below(0.01).expect("a vanishing coverage");
+	assert_eq!(ladder.select(0.02, None), Detail::Level(1));
+	assert_eq!(ladder.select(0.005, None), Detail::Vanished);
+	assert_eq!(ladder.mesh_of(Detail::Vanished), None, "a vanished drawable draws no mesh");
+	// AND THE SAME TENTH GUARDS IT, because the vanishing coverage is a threshold like any other:
+	// 0.0095 is below 0.01 and a drawn drawable holds on; 0.0105 is above it and a vanished one
+	// stays away.
+	assert_eq!(ladder.select(0.0095, Some(Detail::Level(1))), Detail::Level(1), "a drawn drawable holds inside the band");
+	assert_eq!(ladder.select(0.0085, Some(Detail::Level(1))), Detail::Vanished, "past it, it goes");
+	assert_eq!(ladder.select(0.0105, Some(Detail::Vanished)), Detail::Vanished, "a vanished drawable holds inside the band");
+	assert_eq!(ladder.select(0.0115, Some(Detail::Vanished)), Detail::Level(1), "past it, it comes back");
+	// A DEFAULT LADDER HAS NO VANISHING COVERAGE, and a degenerate one is refused.
+	assert!(matches!(Ladder::single(0).vanishing_below(0.0), Err(Error::Degenerate { .. })));
+}
+
+#[test]
+// THE COVERAGE COMES FROM THE BOUNDS THE DRAWABLE HAS NOW, which is the rule the deformation work
+// joins to: a character that raises an arm GROWS its bounding sphere, and a coverage taken from the
+// rest pose would step that arm down a level while it is still on screen.
+//
+// The module takes a `Sphere` rather than a mesh exactly so a rest-pose bound cannot be passed by
+// accident; this fixture holds the consequence, which is that the larger sphere selects the finer
+// level at the same camera.
+fn a_grown_bound_selects_a_finer_level_than_the_rest_pose_would() {
+	let ladder = Ladder::with_default_thresholds(&[0, 1, 2], &extended()).expect("three levels");
+	let eye = Vec3::new(0.0, 0.0, 0.0);
+	let at = Vec3::new(0.0, 0.0, -10.0);
+	// A rest pose of radius 2.4 at ten units under a 90 degree field of view covers 0.24, which is
+	// just under the 0.25 threshold and is therefore level 2. The same character with an arm up has
+	// a radius of 2.6 and covers 0.26, which is above it and is level 1.
+	let rest = Sphere::new(at, 2.4);
+	let posed = Sphere::new(at, 2.6);
+	let rest_coverage = detail::coverage_perspective(&rest, eye, 1.0).expect("rest");
+	let posed_coverage = detail::coverage_perspective(&posed, eye, 1.0).expect("posed");
+	assert!(rest_coverage < 0.25 && posed_coverage > 0.25, "the fixture straddles the threshold: {rest_coverage} and {posed_coverage}");
+	assert_eq!(ladder.select(rest_coverage, None), Detail::Level(2));
+	assert_eq!(ladder.select(posed_coverage, None), Detail::Level(1), "the pose the drawable is actually in chooses the level");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Skinning and morph targets: `Scene3D Extended Profile 1`'s `animation` group, the deformation
+// half. Every value is worked out by hand from the rule rather than from this implementation.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+// WEIGHTS ARE NORMALISED WHEN THE INFLUENCES ARE BUILT, NOT WHEN THE VERTEX IS DRAWN. An exporter
+// that wrote 2, 2, 0, 0 meant half and half, and the correction happens once for the life of the
+// asset rather than on every vertex of every frame.
+fn skinning_weights_are_normalised_at_load() {
+	let influences = Influences::new([0, 1, 0, 0], [2.0, 2.0, 0.0, 0.0]).expect("two even influences");
+	assert_eq!(influences.weights(), &[0.5, 0.5, 0.0, 0.0]);
+	let lopsided = Influences::new([3, 4, 5, 6], [0.3, 0.1, 0.1, 0.0]).expect("three influences");
+	let total: f32 = lopsided.weights().iter().sum();
+	assert!((total - 1.0).abs() < 1e-6, "the weights sum to one, got {total}");
+	assert!((lopsided.weights()[0] - 0.6).abs() < 1e-6, "0.3 of 0.5 is 0.6, got {}", lopsided.weights()[0]);
+	// A RIGID VERTEX IS ONE INFLUENCE AND CANNOT FAIL, which is the common case.
+	assert_eq!(Influences::rigid(9).weights(), &[1.0, 0.0, 0.0, 0.0]);
+	assert_eq!(Influences::rigid(9).joints()[0], 9);
+	// AND A SET THAT CANNOT BE NORMALISED IS REFUSED RATHER THAN REPAIRED: weights summing to zero
+	// name no joint, and a vertex with no joint stays at the origin while the mesh moves, which
+	// reads as a tear in the geometry.
+	assert!(matches!(Influences::new([0, 1, 2, 3], [0.0; 4]), Err(Error::Degenerate { .. })));
+	assert!(matches!(Influences::new([0, 1, 2, 3], [-1.0, 1.0, 0.0, 0.0]), Err(Error::Degenerate { .. })));
+	assert!(matches!(Influences::new([0, 1, 2, 3], [f32::NAN, 1.0, 0.0, 0.0]), Err(Error::Degenerate { .. })));
+}
+
+#[test]
+// THE JOINT MATRIX IS `joint_world * inverse_bind`, composed once per frame per skeleton.
+//
+// WORKED BY HAND. A joint whose bind pose is a translation of +5 along x has an inverse bind of -5;
+// if its world transform this frame is also +5, the composition is the identity and a vertex
+// authored at the bind pose does not move. Move the joint to +8 and the same vertex moves by +3,
+// which is the joint's motion SINCE the bind and not its position.
+fn a_pose_carries_a_vertex_by_the_joint_s_motion_since_the_bind() {
+	let bind = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
+	let inverse_bind = bind.inverse().expect("an invertible bind");
+	let at_rest = Pose::compose(&[bind], &[inverse_bind], &extended()).expect("a one-joint pose");
+	let vertex = Vec3::new(5.0, 1.0, 0.0);
+	let unmoved = at_rest.skin_point(vertex, &Influences::rigid(0));
+	assert!(unmoved.sub(vertex).length() < 1e-5, "at the bind pose a vertex does not move, got {unmoved:?}");
+
+	let moved_joint = Mat4::from_translation(Vec3::new(8.0, 0.0, 0.0));
+	let posed = Pose::compose(&[moved_joint], &[inverse_bind], &extended()).expect("a moved pose");
+	let moved = posed.skin_point(vertex, &Influences::rigid(0));
+	assert!(moved.sub(Vec3::new(8.0, 1.0, 0.0)).length() < 1e-5, "the vertex moves by the joint's +3, got {moved:?}");
+
+	// TWO JOINTS AT HALF WEIGHT PUT THE VERTEX HALFWAY, which is what linear blend skinning is: the
+	// weighted sum of the point through each joint, not a blend of the joints themselves.
+	let still = Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0));
+	let both = Pose::compose(&[moved_joint, still], &[inverse_bind, inverse_bind], &extended()).expect("two joints");
+	let blended = both.skin_point(vertex, &Influences::new([0, 1, 0, 0], [0.5, 0.5, 0.0, 0.0]).expect("half and half"));
+	assert!(blended.sub(Vec3::new(6.5, 1.0, 0.0)).length() < 1e-5, "half of +3 and half of nothing is +1.5, got {blended:?}");
+}
+
+#[test]
+// A SKELETON IS REFUSED RATHER THAN TRUNCATED when it does not match its bind pose, and the
+// profile's joint limit is a limit.
+fn a_skeleton_that_does_not_match_its_bind_pose_is_refused() {
+	let identity = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0));
+	assert!(matches!(Pose::compose(&[identity, identity], &[identity], &extended()), Err(Error::Degenerate { .. })));
+	let broken = Mat4::from_translation(Vec3::new(f32::NAN, 0.0, 0.0));
+	assert!(matches!(Pose::compose(&[broken], &[identity], &extended()), Err(Error::Degenerate { .. })));
+	// `max_skeleton_joints` IS 128 AT THE EXTENDED FLOOR.
+	let many: Vec<Mat4> = core::iter::repeat(identity).take(129).collect();
+	assert!(matches!(Pose::compose(&many, &many, &extended()), Err(Error::LimitExceeded { limit: "max_skeleton_joints", ceiling: 128, asked: 129 })));
+	// AND A CORE SCENE HAS NO SKELETON AT ALL, because it never claimed the part.
+	assert!(matches!(Pose::compose(&[identity], &[identity], &Limits::PROFILE_MINIMUM), Err(Error::LimitExceeded { limit: "max_skeleton_joints", ceiling: 0, asked: 1 })));
+}
+
+#[test]
+// MORPH TARGETS ARE ADDITIVE, which is why two at once do both rather than blending between them: a
+// raised brow and a smile displace different vertices and applying both should do both.
+fn morph_targets_add_rather_than_blend() {
+	let base = Vec3::new(1.0, 2.0, 3.0);
+	let up = [Vec3::new(0.0, 1.0, 0.0)];
+	let across = [Vec3::new(1.0, 0.0, 0.0)];
+	let both = [MorphTarget { displacement: &up, weight: 1.0 }, MorphTarget { displacement: &across, weight: 1.0 }];
+	assert_eq!(deform::morphed(base, 0, &both), Vec3::new(2.0, 3.0, 3.0), "both displacements are applied");
+	let half = [MorphTarget { displacement: &up, weight: 0.5 }, MorphTarget { displacement: &across, weight: 0.5 }];
+	assert_eq!(deform::morphed(base, 0, &half), Vec3::new(1.5, 2.5, 3.0), "half of each, and not a blend between them");
+	// A WEIGHT OF ZERO IS NOT APPLIED AND COSTS NOTHING.
+	let none = [MorphTarget { displacement: &up, weight: 0.0 }];
+	assert_eq!(deform::morphed(base, 0, &none), base);
+	assert_eq!(deform::morphed(base, 0, &[]), base);
+}
+
+#[test]
+// A MORPH TARGET SHORTER THAN THE MESH IS AN ASSET DEFECT AND THE WHOLE SET IS REFUSED, because
+// discovering it at vertex 4,000 leaves the first 3,999 already displaced.
+fn a_short_or_overlong_morph_set_is_refused_before_any_of_it_is_applied() {
+	let limits = extended();
+	let short = [Vec3::new(0.0, 0.0, 0.0)];
+	assert!(matches!(deform::check_targets(2, &[MorphTarget { displacement: &short, weight: 1.0 }], &limits), Err(Error::Degenerate { .. })));
+	assert!(deform::check_targets(1, &[MorphTarget { displacement: &short, weight: 1.0 }], &limits).is_ok());
+	assert!(matches!(deform::check_targets(1, &[MorphTarget { displacement: &short, weight: f32::INFINITY }], &limits), Err(Error::Degenerate { .. })));
+	// `max_morph_targets` IS 32 AT THE EXTENDED FLOOR.
+	let many: Vec<MorphTarget<'_>> = core::iter::repeat(MorphTarget { displacement: &short, weight: 0.0 }).take(33).collect();
+	assert!(matches!(deform::check_targets(1, &many, &limits), Err(Error::LimitExceeded { limit: "max_morph_targets", ceiling: 32, asked: 33 })));
+}
+
+#[test]
+// THE ORDER IS MORPH THEN SKIN, AND IT IS OBSERVABLE. A morph applied after skinning would displace
+// along a rest-pose direction while the vertex is somewhere else, which moves it out of the pose.
+//
+// WORKED BY HAND. The joint rotates a quarter turn about z, so a rest-pose +x becomes +y. A vertex
+// at (1,0,0) with a morph target displacing it by (1,0,0) is at (2,0,0) before skinning and lands at
+// (0,2,0). Skinning first would put it at (0,1,0) and then add (1,0,0) for (1,1,0) - a different
+// place, and the one a reader of the rule would not expect.
+fn a_morph_is_applied_in_the_rest_pose_and_carried_by_the_skin() {
+	let quarter_turn = Mat4::from_linear(&Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), core::f32::consts::FRAC_PI_2).expect("a unit axis").to_mat3(), Vec3::new(0.0, 0.0, 0.0));
+	let identity = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0));
+	let pose = Pose::compose(&[quarter_turn], &[identity], &extended()).expect("a rotating joint");
+	let base = [Vec3::new(1.0, 0.0, 0.0)];
+	let displacement = [Vec3::new(1.0, 0.0, 0.0)];
+	let targets = [MorphTarget { displacement: &displacement, weight: 1.0 }];
+	let influences = [Influences::rigid(0)];
+	let bounds = deform::deformed_bounds(&base, &targets, &influences, &pose, &extended()).expect("deformed bounds");
+	let centre = bounds.centre();
+	assert!(centre.sub(Vec3::new(0.0, 2.0, 0.0)).length() < 1e-5, "morph then skin puts the vertex at (0,2,0), got {centre:?}");
+}
+
+#[test]
+// THE BOUNDS ARE THE POSE'S AND NOT THE REST POSE'S, which is the join to the level-of-detail rule:
+// a character that raises an arm grows, and every question asked of its bounds is asked of the pose
+// on screen.
+//
+// WORKED BY HAND. Two vertices at x = 0 and x = 1, the second bound to a joint that lifts it by 3.
+// The rest pose spans y from 0 to 0; the posed one spans 0 to 3, so the deformed box is taller by
+// exactly the joint's motion - and the sphere around it is larger, which is what selects the finer
+// level of detail.
+fn deformed_bounds_grow_with_the_pose_and_feed_the_level_of_detail() {
+	let identity = Mat4::from_translation(Vec3::new(0.0, 0.0, 0.0));
+	let lifted = Mat4::from_translation(Vec3::new(0.0, 3.0, 0.0));
+	let pose = Pose::compose(&[identity, lifted], &[identity, identity], &extended()).expect("two joints");
+	let base = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)];
+	let influences = [Influences::rigid(0), Influences::rigid(1)];
+	let bounds = deform::deformed_bounds(&base, &[], &influences, &pose, &extended()).expect("deformed bounds");
+	assert_eq!(bounds.minimum, Vec3::new(0.0, 0.0, 0.0));
+	assert_eq!(bounds.maximum, Vec3::new(1.0, 3.0, 0.0));
+	let rest = Aabb::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0));
+	assert!(bounds.bounding_sphere().radius > rest.bounding_sphere().radius, "the posed bound is larger than the rest pose's");
+
+	// AND A MESH WITH NOTHING IN IT HAS NO BOUNDS, rather than an inverted box that would contain
+	// everything or nothing depending on who asked.
+	assert!(matches!(deform::deformed_bounds(&[], &[], &[], &pose, &extended()), Err(Error::Degenerate { .. })));
+	assert!(matches!(deform::deformed_bounds(&base, &[], &influences[..1], &pose, &extended()), Err(Error::Degenerate { .. })));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Animation: the rest of `Scene3D Extended Profile 1`'s `animation` group - interpolation, the
+// shorter arc, root motion and the loop seam.
+// ---------------------------------------------------------------------------------------------
+
+fn linear<T: Copy>(keys: &[(f32, T)]) -> Curve<T> {
+	Curve::Linear(keys.iter().map(|(time, value)| Key { time: *time, value: *value }).collect())
+}
+
+fn translation_track(joint: u16, keys: &[(f32, Vec3)]) -> Track {
+	Track { target: Target::Joint(joint), channel: Channel::Translation(linear(keys)) }
+}
+
+fn rotation_track(joint: u16, keys: &[(f32, Quat)]) -> Track {
+	Track { target: Target::Joint(joint), channel: Channel::Rotation(linear(keys)) }
+}
+
+fn turn(radians: f32) -> Quat {
+	Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), radians).expect("a unit axis")
+}
+
+#[test]
+// TRANSLATION AND SCALE ARE LINEAR, and the value at the midpoint of a span is the midpoint of its
+// two keys - which is what "linear" has to mean for two implementations to agree.
+fn translation_and_scale_interpolate_linearly() {
+	let track = translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (2.0, Vec3::new(4.0, 8.0, 0.0))]);
+	let clip = Clip::new(vec![track], 2.0, Ending::Clamp, 0, true, &extended()).expect("a one-track clip");
+	for (time, expected) in [(0.0f32, Vec3::new(0.0, 0.0, 0.0)), (0.5, Vec3::new(1.0, 2.0, 0.0)), (1.0, Vec3::new(2.0, 4.0, 0.0)), (2.0, Vec3::new(4.0, 8.0, 0.0))] {
+		let sampled = clip.sample(time).joint(0).copied().expect("the joint is driven");
+		let value = sampled.translation.expect("a translation");
+		assert!(value.sub(expected).length() < 1e-6, "at {time} the value is {expected:?}, got {value:?}");
+	}
+	// BEFORE THE FIRST KEY AND AFTER THE LAST, THE END VALUE HOLDS rather than being extrapolated:
+	// extrapolation puts a joint somewhere the author never authored.
+	let clamped = clip.sample(-5.0).joint(0).copied().expect("driven").translation.expect("a translation");
+	assert!(clamped.length() < 1e-6, "before the clip the first key holds, got {clamped:?}");
+}
+
+#[test]
+// ROTATION IS SPHERICAL LINEAR AND NOT COMPONENT-WISE, which is a measurable difference and not a
+// preference: at the midpoint of a 90 degree turn, slerp gives exactly 45 degrees, while a
+// normalised linear blend gives a different angle - the error that makes a turn crawl at its ends.
+//
+// WORKED BY HAND. Rotating (1,0,0) by the midpoint of a quarter turn about z must land on
+// (cos 45, sin 45, 0), which is (0.7071, 0.7071, 0).
+fn rotation_interpolates_along_the_arc_and_not_through_the_chord() {
+	let track = rotation_track(0, &[(0.0, turn(0.0)), (1.0, turn(core::f32::consts::FRAC_PI_2))]);
+	let clip = Clip::new(vec![track], 1.0, Ending::Clamp, 0, true, &extended()).expect("a rotation clip");
+	let half = clip.sample(0.5).joint(0).copied().expect("driven").rotation.expect("a rotation");
+	let spun = half.rotate(Vec3::new(1.0, 0.0, 0.0));
+	let root_half = core::f32::consts::FRAC_1_SQRT_2;
+	assert!(spun.sub(Vec3::new(root_half, root_half, 0.0)).length() < 1e-4, "the midpoint of a quarter turn is 45 degrees, got {spun:?}");
+	// AND THE ANGLE ADVANCES EVENLY, which is the property a normalised linear blend does not have:
+	// a quarter of the way through is a quarter of the angle.
+	let quarter = clip.sample(0.25).joint(0).copied().expect("driven").rotation.expect("a rotation");
+	let at_quarter = quarter.rotate(Vec3::new(1.0, 0.0, 0.0));
+	let eighth = core::f32::consts::FRAC_PI_8;
+	let expected = Vec3::new(cosine(eighth), sine(eighth), 0.0);
+	assert!(at_quarter.sub(expected).length() < 1e-4, "a quarter of the way is a quarter of the angle, got {at_quarter:?}");
+}
+
+#[test]
+// THE SHORTER ARC, which is what makes `q` and `-q` the same rotation rather than two.
+//
+// WORKED BY HAND. A turn of 10 degrees written with its end quaternion negated describes the same
+// rotation; interpolated towards the negated form without choosing the sign it takes the long way
+// round - 350 degrees instead of 10 - and the midpoint lands at 175 degrees rather than at 5.
+fn a_rotation_takes_the_shorter_arc_between_two_keys() {
+	let ten = 10.0f32.to_radians();
+	let end = turn(ten);
+	let negated = Quat::from_components(-end.x, -end.y, -end.z, -end.w).expect("a unit quaternion");
+	let track = rotation_track(0, &[(0.0, turn(0.0)), (1.0, negated)]);
+	let clip = Clip::new(vec![track], 1.0, Ending::Clamp, 0, true, &extended()).expect("a rotation clip");
+	let half = clip.sample(0.5).joint(0).copied().expect("driven").rotation.expect("a rotation");
+	let spun = half.rotate(Vec3::new(1.0, 0.0, 0.0));
+	let five = 5.0f32.to_radians();
+	let expected = Vec3::new(cosine(five), sine(five), 0.0);
+	assert!(spun.sub(expected).length() < 1e-4, "the shorter arc puts the midpoint at 5 degrees, got {spun:?}");
+}
+
+#[test]
+// ROOT MOTION IS EXTRACTED BY DEFAULT: the root's translation leaves the pose and is handed back as
+// a delta, so an application that never asked for it gets a character walking on the spot rather
+// than one drifting out of the world.
+fn root_motion_is_extracted_unless_the_clip_keeps_it() {
+	let walk = [(0.0f32, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(0.0, 0.0, -2.0))];
+	let tracks = vec![translation_track(0, &walk), translation_track(1, &[(0.0, Vec3::new(1.0, 0.0, 0.0)), (1.0, Vec3::new(1.0, 0.0, 0.0))])];
+	let extracting = Clip::new(tracks.clone(), 1.0, Ending::Clamp, 0, false, &extended()).expect("an extracting clip");
+	let pose = extracting.sample(0.5);
+	assert!(pose.joint(0).expect("the root is driven").translation.is_none(), "the root's translation left the pose");
+	assert!(pose.root_delta().sub(Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6, "and came back as the delta, got {:?}", pose.root_delta());
+	// A NON-ROOT JOINT IS UNTOUCHED, which is what makes this extraction rather than a filter.
+	assert!(pose.joint(1).expect("driven").translation.expect("kept").sub(Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6);
+
+	// AND A CLIP MAY DECLARE THAT IT KEEPS IT, which is the case where the animation IS the motion.
+	let keeping = Clip::new(tracks, 1.0, Ending::Clamp, 0, true, &extended()).expect("a keeping clip");
+	let kept = keeping.sample(0.5);
+	assert!(kept.joint(0).expect("driven").translation.expect("kept").sub(Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6, "the motion stayed in the pose");
+	assert_eq!(kept.root_delta(), Vec3::new(0.0, 0.0, 0.0), "and is not handed back as well, which would apply it twice");
+}
+
+#[test]
+// A LOOPING CLIP WHOSE SEAM DOES NOT CLOSE IS REFUSED AT LOAD, because a seam that does not close
+// pops once a cycle for the life of the asset and is found by watching rather than by testing.
+fn a_looping_clip_whose_ends_disagree_is_refused() {
+	let limits = extended();
+	let closed = vec![translation_track(0, &[(0.0, Vec3::new(1.0, 0.0, 0.0)), (1.0, Vec3::new(2.0, 0.0, 0.0)), (2.0, Vec3::new(1.0, 0.0, 0.0))])];
+	assert!(Clip::new(closed, 2.0, Ending::Loop, 0, true, &limits).is_ok(), "a clip that returns to its first key loops");
+	let open = vec![translation_track(0, &[(0.0, Vec3::new(1.0, 0.0, 0.0)), (2.0, Vec3::new(2.0, 0.0, 0.0))])];
+	assert!(matches!(Clip::new(open.clone(), 2.0, Ending::Loop, 0, true, &limits), Err(Error::Degenerate { .. })));
+	// THE SAME CLIP IS FINE AS A ONE-SHOT, which is what makes this a property of looping rather
+	// than of the keys.
+	assert!(Clip::new(open, 2.0, Ending::Clamp, 0, true, &limits).is_ok());
+
+	// A ROTATION SEAM IS COMPARED BY THE ABSOLUTE DOT, so `q` and `-q` close the loop: they are one
+	// rotation, and a comparison that missed it would report a full turn where the author wrote
+	// none.
+	let start = turn(0.3);
+	let negated = Quat::from_components(-start.x, -start.y, -start.z, -start.w).expect("a unit quaternion");
+	let mirrored = vec![rotation_track(0, &[(0.0, start), (1.0, turn(1.0)), (2.0, negated)])];
+	assert!(Clip::new(mirrored, 2.0, Ending::Loop, 0, true, &limits).is_ok(), "the same rotation written with the other sign closes the loop");
+	let genuinely_open = vec![rotation_track(0, &[(0.0, turn(0.0)), (2.0, turn(1.0))])];
+	assert!(matches!(Clip::new(genuinely_open, 2.0, Ending::Loop, 0, true, &limits), Err(Error::Degenerate { .. })));
+}
+
+#[test]
+// A LOOPING CLIP WRAPS AND A ONE-SHOT CLAMPS. Both are decisions: a one-shot that wrapped would
+// restart a death animation, and a loop that clamped would freeze on its last frame.
+fn a_loop_wraps_and_a_one_shot_clamps() {
+	let keys = vec![translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (2.0, Vec3::new(0.0, 0.0, 0.0))])];
+	let looping = Clip::new(keys.clone(), 2.0, Ending::Loop, 0, true, &extended()).expect("a loop");
+	assert!((looping.at(2.5) - 0.5).abs() < 1e-6, "2.5 into a 2 second loop is 0.5");
+	assert!((looping.at(-0.5) - 1.5).abs() < 1e-6, "and a negative time wraps forwards, not backwards past zero");
+	let once = Clip::new(keys, 2.0, Ending::Clamp, 0, true, &extended()).expect("a one-shot");
+	assert!((once.at(2.5) - 2.0).abs() < 1e-6, "a one-shot holds its last frame");
+	assert!((once.at(-0.5) - 0.0).abs() < 1e-6);
+}
+
+#[test]
+// KEYFRAME TIMES ASCEND, LIE INSIDE THE CLIP, AND A TRACK HAS SOME. Each refusal is one that would
+// otherwise be a picture: two keys at one time make the value depend on which the sampler found
+// first, and a key past the duration is one nothing will ever reach.
+fn a_malformed_track_is_refused_rather_than_sampled() {
+	let limits = extended();
+	let out_of_order = vec![translation_track(0, &[(1.0, Vec3::new(0.0, 0.0, 0.0)), (0.5, Vec3::new(1.0, 0.0, 0.0))])];
+	assert!(matches!(Clip::new(out_of_order, 2.0, Ending::Clamp, 0, true, &limits), Err(Error::Degenerate { .. })));
+	let coincident = vec![translation_track(0, &[(1.0, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(1.0, 0.0, 0.0))])];
+	assert!(matches!(Clip::new(coincident, 2.0, Ending::Clamp, 0, true, &limits), Err(Error::Degenerate { .. })));
+	let past_the_end = vec![translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (3.0, Vec3::new(1.0, 0.0, 0.0))])];
+	assert!(matches!(Clip::new(past_the_end, 2.0, Ending::Clamp, 0, true, &limits), Err(Error::Degenerate { .. })));
+	let empty = vec![Track { target: Target::Joint(0), channel: Channel::Translation(Curve::Linear(Vec::new())) }];
+	assert!(matches!(Clip::new(empty, 2.0, Ending::Clamp, 0, true, &limits), Err(Error::Degenerate { .. })));
+	assert!(matches!(Clip::new(Vec::new(), 0.0, Ending::Clamp, 0, true, &limits), Err(Error::Degenerate { .. })));
+	// `max_animation_tracks` IS 256 AT THE EXTENDED FLOOR, and a core scene has none at all.
+	let many: Vec<Track> = (0..257).map(|joint| translation_track(joint as u16, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(0.0, 0.0, 0.0))])).collect();
+	assert!(matches!(Clip::new(many, 1.0, Ending::Clamp, 0, true, &limits), Err(Error::LimitExceeded { limit: "max_animation_tracks", ceiling: 256, asked: 257 })));
+}
+
+/// `sin` and `cos` for the fixtures above, from the crate the profile already uses for them - so a
+/// hand-computed expectation is checked against the same reduction the implementation uses rather
+/// than against a second one written here.
+fn sine(radians: f32) -> f32 {
+	turn(radians).rotate(Vec3::new(1.0, 0.0, 0.0)).y
+}
+
+fn cosine(radians: f32) -> f32 {
+	turn(radians).rotate(Vec3::new(1.0, 0.0, 0.0)).x
+}
+
+// ---------------------------------------------------------------------------------------------
+// The physically based material: `Scene3D Extended Profile 1`'s `material` group. Every expected
+// value is computed by hand from the profile's own equations, so an implementation that changes the
+// arithmetic and keeps the equations passes, and one that changes an equation fails.
+// ---------------------------------------------------------------------------------------------
+
+/// A head-on fragment: normal, view and light all along +z, which is where the equations are
+/// simplest to evaluate by hand.
+fn head_on() -> (PbrSurface, Vec3, Vec<Incident>) {
+	let surface = PbrSurface::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+	let eye = Vec3::new(0.0, 0.0, 1.0);
+	let lights = vec![Incident { to_light: Vec3::new(0.0, 0.0, 1.0), radiance: Vec3::new(1.0, 1.0, 1.0) }];
+	(surface, eye, lights)
+}
+
+#[test]
+// THE WHOLE DIRECT TERM, WORKED BY HAND. Head-on, roughness 0.5, a white dielectric.
+//
+//   a = roughness^2 = 0.25, a^2 = 0.0625
+//   D  = a^2 / (pi * (1 * (a^2 - 1) + 1)^2) = a^2 / (pi * a^4) = 1 / (pi * 0.0625) = 5.0929582
+//   V  = 0.5 / (1 * sqrt(0.9375 + 0.0625) + 1 * sqrt(0.9375 + 0.0625)) = 0.5 / 2 = 0.25
+//   F  = F0 + (1 - F0) * (1 - 1)^5 = F0 = 0.04
+//   diffuse  = (1 - 0) * 1 / pi * (1 - 0.04) = 0.96 / pi = 0.3055775
+//   specular = D * V * F = 5.0929582 * 0.25 * 0.04 = 0.0509296
+//   colour   = (0.3055775 + 0.0509296) * 1 * 1 = 0.3565071
+fn the_direct_term_is_the_product_the_profile_writes() {
+	let (surface, eye, lights) = head_on();
+	let material = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5);
+	let colour = pbr::shade(&material, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("nothing is discarded");
+	assert!((colour.x - 0.3565071).abs() < 1e-5, "the direct term is 0.3565071, got {}", colour.x);
+	assert_eq!(colour.w, 1.0, "lighting never changes coverage");
+
+	// AND THE TERMS THEMSELVES, so a failure above says WHICH of the four moved.
+	assert!((pbr::distribution_ggx(1.0, 0.25) - 5.0929582).abs() < 1e-4, "GGX at the peak is 1 / (pi * a^2)");
+	assert!((pbr::visibility_smith(1.0, 1.0, 0.25) - 0.25).abs() < 1e-6, "Smith head-on is 0.25");
+	let f0 = Vec3::new(0.04, 0.04, 0.04);
+	assert!((pbr::fresnel_schlick(1.0, f0).x - 0.04).abs() < 1e-6, "Fresnel along the half vector is F0 itself");
+	assert!((pbr::fresnel_schlick(0.0, f0).x - 1.0).abs() < 1e-6, "and at grazing incidence it is 1, whatever F0 was");
+}
+
+#[test]
+// A METAL HAS NO DIFFUSE TERM AND ITS BASE COLOUR IS ITS F0, which is what `metallic` selects
+// between and what stops a renderer keeping a dim diffuse glow on gold.
+//
+// WORKED BY HAND. Head-on with `D * V` = 5.0929582 * 0.25 = 1.2732395, and F = base colour, so the
+// answer is the base colour times 1.2732395 exactly.
+fn a_metal_reflects_its_base_colour_and_has_no_diffuse() {
+	let (surface, eye, lights) = head_on();
+	let gold = PbrMaterial::new(Vec4::new(1.0, 0.5, 0.25, 1.0), 1.0, 0.5);
+	let colour = pbr::shade(&gold, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("nothing is discarded");
+	for (channel, base) in [(colour.x, 1.0f32), (colour.y, 0.5), (colour.z, 0.25)] {
+		let expected = base * 1.2732395;
+		assert!((channel - expected).abs() < 1e-4, "a metal reflects {expected}, got {channel}");
+	}
+	// A DIELECTRIC OF THE SAME COLOUR IS A DIFFERENT MATERIAL, and the difference is NOT that one is
+	// darker. The metal is BRIGHTER here, because its F0 is the base colour itself (0.5 in green)
+	// against a dielectric's 0.04 - so a test that only compared magnitudes would pass for a
+	// renderer that had the two the wrong way round. What distinguishes them is the SHAPE of the
+	// sum, so both are computed from the profile:
+	//
+	//   metal green      = F * D * V                        = 0.5  * 1.2732395 = 0.6366197
+	//   dielectric green = base * (1 - F) / pi + F * D * V
+	//                    = 0.5 * 0.96 / pi + 0.04 * 1.2732395
+	//                    = 0.1527887      + 0.0509296       = 0.2037183
+	//
+	// The metal's whole answer is its specular term; the dielectric's is three quarters diffuse.
+	let plastic = PbrMaterial::new(Vec4::new(1.0, 0.5, 0.25, 1.0), 0.0, 0.5);
+	let dielectric = pbr::shade(&plastic, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((dielectric.y - 0.2037183).abs() < 1e-5, "the dielectric's green is diffuse plus specular, got {}", dielectric.y);
+	let dielectric_specular = 0.04 * 1.2732395;
+	assert!(dielectric.y - dielectric_specular > 0.15, "and most of it is the diffuse term the metal does not have at all");
+}
+
+#[test]
+// THE ROUGHNESS MINIMUM IS CLAMPED ON THE PERCEPTUAL VALUE, BEFORE `a = roughness^2`. A roughness of
+// zero makes `D` a delta function: an infinite highlight at one pixel and a NaN in a filtered
+// environment lookup.
+fn a_roughness_of_zero_is_the_profile_s_minimum_and_not_a_delta_function() {
+	let (surface, eye, lights) = head_on();
+	let mirror = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.0);
+	let floor = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, pbr::MIN_ROUGHNESS);
+	let clamped = pbr::shade(&mirror, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	let stated = pbr::shade(&floor, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!(clamped.x.is_finite(), "a roughness of zero is finite, got {}", clamped.x);
+	assert!((clamped.x - stated.x).abs() < 1e-5, "and is exactly the profile's minimum, {} against {}", clamped.x, stated.x);
+	// THE REMAPPING IS PERCEPTUAL AND IS NOT THE IDENTITY. A renderer that fed the perceptual value
+	// straight into `D` goes from mirror to matte in the first quarter of the slider, so 0.5 and its
+	// square must not shade the same.
+	let half = pbr::shade(&PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 1.0, 0.5), &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	let squared = pbr::shade(&PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 1.0, 0.25), &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((half.x - squared.x).abs() > 1e-3, "roughness is remapped, so 0.5 and 0.25 are different materials");
+}
+
+#[test]
+// EVERY DOT PRODUCT IS CLAMPED, AND `dot(N,V)` NEVER REACHES ZERO. A light behind the surface
+// contributes nothing rather than a negative amount, and a grazing view does not divide by zero -
+// which without the clamp is a silhouette of NaN pixels around every sphere.
+fn a_light_behind_the_surface_contributes_nothing_and_a_grazing_view_is_finite() {
+	let surface = PbrSurface::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
+	let material = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5);
+	let behind = vec![Incident { to_light: Vec3::new(0.0, 0.0, -1.0), radiance: Vec3::new(10.0, 10.0, 10.0) }];
+	let colour = pbr::shade(&material, &surface, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, 0.0), &behind).expect("shaded");
+	assert_eq!(colour.x, 0.0, "a light behind the surface adds nothing");
+	// EXACTLY EDGE ON: the view is perpendicular to the normal, so `dot(N,V)` is zero before the
+	// clamp and the visibility term would divide by zero.
+	let grazing = vec![Incident { to_light: Vec3::new(0.0, 0.0, 1.0), radiance: Vec3::new(1.0, 1.0, 1.0) }];
+	let edge = pbr::shade(&material, &surface, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0), &grazing).expect("shaded");
+	assert!(edge.x.is_finite(), "a grazing view is finite, got {}", edge.x);
+	assert!((1.0 - pbr::MIN_N_DOT_V) < 1.0, "the clamp is below one so it only bites at grazing angles");
+}
+
+#[test]
+// OCCLUSION REACHES THE AMBIENT TERM AND NOTHING ELSE. It says how much of the sky a point can see;
+// applying it to a light the scene placed would darken a surface that light demonstrably reaches.
+fn occlusion_darkens_the_ambient_and_never_the_direct_light() {
+	let (surface, eye, lights) = head_on();
+	let ambient = Vec3::new(0.5, 0.5, 0.5);
+	let material = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5);
+	let open = pbr::shade(&material, &surface, eye, ambient, &lights).expect("shaded");
+	let occluded = pbr::shade(&material, &surface.with_occlusion(0.0), eye, ambient, &lights).expect("shaded");
+	assert!((open.x - occluded.x - 0.5).abs() < 1e-5, "the whole ambient 0.5 is removed and nothing else, got {} and {}", open.x, occluded.x);
+	// AND WITH NO LIGHT AT ALL, FULL OCCLUSION LEAVES NOTHING.
+	let dark = pbr::shade(&material, &surface.with_occlusion(0.0), eye, ambient, &[]).expect("shaded");
+	assert!(dark.x.abs() < 1e-6, "a fully occluded surface with no direct light is black, got {}", dark.x);
+	// `strength` IS HOW MUCH OF THE MAP IS APPLIED: at zero the map does nothing at all.
+	let ignored = PbrMaterial { occlusion_strength: 0.0, ..material };
+	let unaffected = pbr::shade(&ignored, &surface.with_occlusion(0.0), eye, ambient, &lights).expect("shaded");
+	assert!((unaffected.x - open.x).abs() < 1e-6, "a strength of zero ignores the map");
+}
+
+#[test]
+// EMISSIVE IS A SOURCE AND NOT A RECEIVER: added after everything, unattenuated, and untouched by
+// occlusion. A renderer that occluded it would darken a glowing panel because of the wall behind it.
+fn emissive_is_added_last_and_is_not_occluded() {
+	let surface = PbrSurface::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)).with_occlusion(0.0);
+	let material = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5).with_emissive(Vec3::new(2.0, 0.0, 0.0));
+	let colour = pbr::shade(&material, &surface, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.5, 0.5, 0.5), &[]).expect("shaded");
+	assert!((colour.x - 2.0).abs() < 1e-6, "the emissive arrives whole through full occlusion, got {}", colour.x);
+	// AND IT IS NOT CLAMPED TO ONE, because tone mapping is LAST: a material that clamped its own
+	// output would throw away everything bloom exists to spread before bloom ever saw it.
+	assert!(colour.x > 1.0, "the result is linear radiance and not a display value");
+}
+
+#[test]
+// glTF's PACKING: ROUGHNESS IN GREEN, METALLIC IN BLUE. A renderer that swapped them produces a
+// rough metal wherever the author wrote a smooth dielectric, which is the whole surface and not a
+// subtle difference.
+fn the_metallic_roughness_map_is_read_green_then_blue() {
+	let (surface, eye, lights) = head_on();
+	let material = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 1.0, 1.0);
+	// Green 0.5, blue 1: a half-rough metal. Its answer must equal the same material with the
+	// factors carrying those numbers and an identity map.
+	let mapped = pbr::shade(&material, &surface.with_metallic_roughness(Vec3::new(0.0, 0.5, 1.0)), eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	let factored = pbr::shade(&PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 1.0, 0.5), &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((mapped.x - factored.x).abs() < 1e-5, "green is roughness, got {} against {}", mapped.x, factored.x);
+	// AND SWAPPING THE TWO CHANNELS IS A DIFFERENT MATERIAL, which is what makes the naming matter.
+	let swapped = pbr::shade(&material, &surface.with_metallic_roughness(Vec3::new(0.0, 1.0, 0.5)), eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((swapped.x - mapped.x).abs() > 1e-3, "reading blue as roughness is a visibly different surface");
+	// THE RED AND ALPHA CHANNELS ARE IGNORED.
+	let noisy = pbr::shade(&material, &surface.with_metallic_roughness(Vec3::new(0.9, 0.5, 1.0)), eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((noisy.x - mapped.x).abs() < 1e-6, "red is ignored");
+}
+
+#[test]
+// A MISSING TANGENT MEANS NO NORMAL MAP, which is a decision and not an omission: deriving one from
+// screen-space derivatives makes the frame depend on the rasteriser's derivative rule, so a mesh
+// whose author did not export tangents would look different on each backend.
+fn the_normal_map_needs_a_tangent_and_uses_the_plus_y_up_convention() {
+	let (flat, eye, lights) = head_on();
+	let material = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5);
+	let plain = pbr::shade(&material, &flat, eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	// A map with no tangent changes nothing at all.
+	let tilted_texel = Vec3::new(0.6, 0.0, 0.8);
+	let no_tangent = pbr::shade(&material, &flat.with_normal_map(tilted_texel), eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((no_tangent.x - plain.x).abs() < 1e-6, "with no tangent the normal map is not applied");
+	// WITH A TANGENT, A FLAT TEXEL IS THE IDENTITY - which is what makes an unused normal map free.
+	let with_tangent = flat.with_tangent(Vec3::new(1.0, 0.0, 0.0), 1.0);
+	let flat_texel = pbr::shade(&material, &with_tangent.with_normal_map(Vec3::new(0.0, 0.0, 1.0)), eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!((flat_texel.x - plain.x).abs() < 1e-6, "a flat normal map leaves the normal alone");
+	// AND A TILTED ONE TURNS THE SURFACE AWAY FROM A HEAD-ON LIGHT, so it shades darker.
+	let tilted = pbr::shade(&material, &with_tangent.with_normal_map(tilted_texel), eye, Vec3::new(0.0, 0.0, 0.0), &lights).expect("shaded");
+	assert!(tilted.x < plain.x, "a tilted normal faces away from the light: {} against {}", tilted.x, plain.x);
+	// THE HANDEDNESS IS glTF's `w` AND IT IS OBSERVABLE: the same texel with the bitangent mirrored
+	// tilts the surface the other way, which is the +Y-down convention this profile refuses.
+	let up = with_tangent.with_normal_map(Vec3::new(0.0, 0.6, 0.8));
+	let down = flat.with_tangent(Vec3::new(1.0, 0.0, 0.0), -1.0).with_normal_map(Vec3::new(0.0, 0.6, 0.8));
+	let side_light = vec![Incident { to_light: Vec3::new(0.0, 0.6, 0.8).normalise().expect("unit"), radiance: Vec3::new(1.0, 1.0, 1.0) }];
+	let toward = pbr::shade(&material, &up, eye, Vec3::new(0.0, 0.0, 0.0), &side_light).expect("shaded");
+	let away = pbr::shade(&material, &down, eye, Vec3::new(0.0, 0.0, 0.0), &side_light).expect("shaded");
+	assert!(toward.x > away.x, "the handedness decides which way the crevice faces: {} against {}", toward.x, away.x);
+}
+
+#[test]
+// A DOUBLE-SIDED SURFACE FLIPS ITS NORMAL BEFORE ANYTHING ELSE READS IT, so the lighting sees the
+// flipped one. Flipping after shading would light a leaf's underside as though it were its top.
+fn a_double_sided_back_face_is_lit_by_the_light_it_actually_faces() {
+	let surface = PbrSurface::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)).back_facing();
+	let eye = Vec3::new(0.0, 0.0, -1.0);
+	let behind = vec![Incident { to_light: Vec3::new(0.0, 0.0, -1.0), radiance: Vec3::new(1.0, 1.0, 1.0) }];
+	let one_sided = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5);
+	let two_sided = one_sided.two_sided();
+	let unflipped = pbr::shade(&one_sided, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &behind).expect("shaded");
+	let flipped = pbr::shade(&two_sided, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &behind).expect("shaded");
+	assert_eq!(unflipped.x, 0.0, "without the flag the back face faces away from its own light");
+	assert!(flipped.x > 0.0, "with it the back face is lit, got {}", flipped.x);
+	assert!((flipped.x - 0.3565071).abs() < 1e-5, "and by exactly the head-on amount, got {}", flipped.x);
+}
+
+#[test]
+// `Mask` DISCARDS STRICTLY BELOW ITS THRESHOLD, so a threshold of zero discards nothing - the core
+// profile's rule under glTF's name for it. A DISCARDED FRAGMENT IS NOT A TRANSPARENT ONE: it writes
+// no depth and no picking identity, which is why the answer is `None` rather than a zero alpha.
+fn an_alpha_masked_fragment_below_the_threshold_is_discarded_rather_than_shaded() {
+	let (surface, eye, lights) = head_on();
+	let masked = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 0.4), 0.0, 0.5).with_blending(Blending::AlphaMask { threshold: 0.5 });
+	assert!(pbr::shade(&masked, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).is_none(), "0.4 is below 0.5 and is discarded");
+	let kept = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 0.5), 0.0, 0.5).with_blending(Blending::AlphaMask { threshold: 0.5 });
+	assert!(pbr::shade(&kept, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).is_some(), "0.5 is not below 0.5 and is kept");
+	let none = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 0.0), 0.0, 0.5).with_blending(Blending::AlphaMask { threshold: 0.0 });
+	assert!(pbr::shade(&none, &surface, eye, Vec3::new(0.0, 0.0, 0.0), &lights).is_some(), "a threshold of zero discards nothing");
+	// AND THE BASE-COLOUR MAP'S ALPHA COUNTS: the test is on the product, not on the factor.
+	let mapped = PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5).with_blending(Blending::AlphaMask { threshold: 0.5 });
+	let cut = PbrSurface { base_colour_texel: Vec4::new(1.0, 1.0, 1.0, 0.2), ..surface };
+	assert!(pbr::shade(&mapped, &cut, eye, Vec3::new(0.0, 0.0, 0.0), &lights).is_none(), "the map's alpha is part of the product the threshold tests");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Environment lighting: `Scene3D Extended Profile 1`'s `environment` group. The split sum's two
+// halves, the prefilter's shape, and the irradiance term.
+// ---------------------------------------------------------------------------------------------
+
+/// A sphere of directions with equal solid angles, for integrating an environment by hand.
+///
+/// THE GOLDEN-ANGLE SPIRAL, because a latitude-longitude grid concentrates points at the poles and
+/// would weight the top of the sky more heavily than the sides - which is exactly the error the
+/// `solid_angle` argument exists to prevent, so a fixture built on one could not detect it.
+fn sphere_directions(count: u32) -> Vec<Vec3> {
+	let golden = core::f32::consts::PI * (3.0 - render_math::sqrt(5.0));
+	(0..count)
+		.map(|index| {
+			let z = 1.0 - 2.0 * (index as f32 + 0.5) / count as f32;
+			let radius = render_math::sqrt((1.0 - z * z).max(0.0));
+			let (sine, cosine) = render_math::quaternion::sin_cos(golden * index as f32);
+			Vec3::new(radius * cosine, radius * sine, z)
+		})
+		.collect()
+}
+
+#[test]
+// THE WHITE FURNACE. A sky of uniform radiance 1 delivers an irradiance of exactly `pi` to a surface
+// of ANY orientation - the integral of `cos(theta)` over a hemisphere - and it is the one test that
+// catches a wrong band factor, a wrong basis normalisation and a missing solid angle all at once.
+//
+// MEASURED: 3.1416056 at the pole and 3.1416214 on the diagonal, against `pi` = 3.1415927. The
+// residual is the quadrature's and not the convolution's.
+fn a_uniform_sky_delivers_pi_to_every_orientation() {
+	let count = 4096u32;
+	let solid_angle = 4.0 * core::f32::consts::PI / count as f32;
+	let mut sky = Irradiance::new();
+	for direction in sphere_directions(count) {
+		sky.add(direction, Vec3::new(1.0, 1.0, 1.0), solid_angle);
+	}
+	for normal in [Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.577, 0.577, 0.577)] {
+		let irradiance = sky.evaluate(normal);
+		assert!((irradiance.x - core::f32::consts::PI).abs() < 1e-3, "a uniform sky gives pi at {normal:?}, got {}", irradiance.x);
+		assert!((irradiance.x - irradiance.z).abs() < 1e-6, "and the three channels agree");
+	}
+	// THE ZEROTH COEFFICIENT IS THE ONE THE CONSTANT LANDS IN: `Y00 * 4pi` = 3.5449.
+	let zeroth = sky.coefficient(0).expect("nine coefficients");
+	assert!((zeroth.x - 3.544_908).abs() < 1e-3, "the constant lands in L00, got {}", zeroth.x);
+	// AND THE RESULT IS IRRADIANCE AND NOT AN EXIT RADIANCE: a Lambertian surface's contribution is
+	// `albedo * E / pi`, the same `1 / pi` the direct diffuse carries, so a white surface under this
+	// sky reflects radiance 1 rather than pi.
+	let reflected = sky.evaluate(Vec3::new(0.0, 0.0, 1.0)).scale(1.0 / core::f32::consts::PI);
+	assert!((reflected.x - 1.0).abs() < 1e-3, "a white Lambertian surface under a unit sky reflects 1, got {}", reflected.x);
+}
+
+#[test]
+// A DIRECTIONAL SKY IS BRIGHTEST WHERE IT POINTS. The furnace above cannot tell a correct linear
+// band from a missing one, because a constant has no linear band at all.
+fn irradiance_follows_the_direction_the_light_comes_from() {
+	let count = 4096u32;
+	let solid_angle = 4.0 * core::f32::consts::PI / count as f32;
+	let mut sky = Irradiance::new();
+	for direction in sphere_directions(count) {
+		// Bright above, dark below.
+		let radiance = if direction.z > 0.0 { Vec3::new(1.0, 1.0, 1.0) } else { Vec3::new(0.0, 0.0, 0.0) };
+		sky.add(direction, radiance, solid_angle);
+	}
+	let up = sky.evaluate(Vec3::new(0.0, 0.0, 1.0)).x;
+	let side = sky.evaluate(Vec3::new(1.0, 0.0, 0.0)).x;
+	let down = sky.evaluate(Vec3::new(0.0, 0.0, -1.0)).x;
+	assert!(up > side && side > down, "a surface facing the bright half is brightest: {up}, {side}, {down}");
+	assert!(down >= 0.0, "and nothing goes negative, got {down}");
+	// A HEMISPHERE OF RADIANCE 1 FACING THE NORMAL IS THE FURNACE'S ANSWER: `pi`. The three-band
+	// truncation undershoots it slightly, which is the approximation the profile's threshold admits.
+	assert!((up - core::f32::consts::PI).abs() < 0.2, "facing the bright hemisphere is near pi, got {up}");
+}
+
+#[test]
+// THE BRDF TABLE AT A SMOOTH SURFACE HEAD-ON IS EXACTLY `(1, 0)`: the lobe is a delta along the
+// normal, so `dot(V,H)` is 1, Schlick's fifth power is zero, and the whole integral is the
+// visibility term at normal incidence times four, which is one.
+//
+// MEASURED: `(1.0, 4.1e-17)`.
+fn the_brdf_table_is_one_and_zero_at_a_smooth_surface_head_on() {
+	let (scale, bias) = environment::brdf_integration(1.0, pbr::MIN_ROUGHNESS, environment::PREFILTER_SAMPLES);
+	assert!((scale - 1.0).abs() < 1e-3, "a smooth surface head-on scales F0 by one, got {scale}");
+	assert!(bias.abs() < 1e-3, "and adds nothing, got {bias}");
+	// AND THE TABLE IS WHAT MAKES ONE PREFILTER SERVE EVERY F0: with `(1, 0)` the environment term
+	// is the prefiltered radiance times F0 and nothing else.
+	let f0 = Vec3::new(0.2, 0.4, 0.6);
+	let prefiltered = Vec3::new(2.0, 2.0, 2.0);
+	let term = environment::environment_term(f0, prefiltered, (1.0, 0.0));
+	assert!(term.sub(f0.scale(2.0)).length() < 1e-6, "the split sum is `prefiltered * (F0 * A + B)`, got {term:?}");
+}
+
+#[test]
+// ROUGHNESS TAKES ENERGY OUT AND GRAZING PUTS IT INTO THE BIAS, which is the shape the two channels
+// exist to carry. Neither is a tuning constant: both fall out of the profile's own GGX and Smith.
+//
+// MEASURED at 1024 samples: head-on, `A` falls from 1.000 at the minimum roughness to 0.307 at 1.0;
+// at `dot(N,V)` = 0.1 and roughness 0.5, `B` rises to 0.140 against 0.022 at `dot(N,V)` = 0.5.
+fn the_brdf_table_loses_energy_with_roughness_and_gains_bias_at_grazing() {
+	let samples = environment::PREFILTER_SAMPLES;
+	let smooth = environment::brdf_integration(1.0, pbr::MIN_ROUGHNESS, samples);
+	let rough = environment::brdf_integration(1.0, 1.0, samples);
+	assert!(rough.0 < smooth.0, "a rougher surface reflects less of F0: {} against {}", rough.0, smooth.0);
+	assert!((rough.0 - 0.307).abs() < 0.02, "and by the amount the profile's terms give, got {}", rough.0);
+
+	let grazing = environment::brdf_integration(0.1, 0.5, samples);
+	let facing = environment::brdf_integration(0.5, 0.5, samples);
+	assert!(grazing.1 > facing.1, "Fresnel rises at grazing, so the bias does: {} against {}", grazing.1, facing.1);
+	assert!((grazing.1 - 0.140).abs() < 0.02, "by the amount the profile's terms give, got {}", grazing.1);
+
+	// ENERGY IS NOT CREATED ANYWHERE IN THE TABLE, which is the invariant that holds over the whole
+	// of it rather than at the four points above.
+	for step in 0..8u32 {
+		let n_dot_v = (step as f32 + 0.5) / 8.0;
+		for rough_step in 0..8u32 {
+			let roughness = (rough_step as f32 + 0.5) / 8.0;
+			let (scale, bias) = environment::brdf_integration(n_dot_v, roughness, 256);
+			assert!(scale >= 0.0 && bias >= 0.0, "neither channel goes negative at ({n_dot_v}, {roughness})");
+			assert!(scale + bias <= 1.0 + 1e-3, "and a surface reflects no more than it receives at ({n_dot_v}, {roughness}): {scale} + {bias}");
+		}
+	}
+}
+
+#[test]
+// THE PREFILTER DESCENDS TO 8x8 AND NO FURTHER, because below that the filter is wider than the face
+// and the result is the average of the whole environment anyway. A 256-texel face therefore has
+// SIX levels, which is exactly the profile's `environment_prefilter_levels` minimum.
+fn the_prefilter_has_the_levels_the_profile_guarantees() {
+	assert_eq!(environment::prefilter_levels(256), 6, "256 down to 8 is six levels");
+	assert_eq!(environment::prefilter_levels(8), 1, "a face already at the floor has one");
+	assert_eq!(environment::prefilter_levels(4), 0, "and one below it has none");
+	assert_eq!(environment::prefilter_levels(256), Limits::EXTENDED_MINIMUM.environment_prefilter_levels, "the code and the profile's limit agree");
+	// LEVEL `i` HOLDS `roughness = i / (levels - 1)`: the first is a mirror and the last is fully
+	// rough, with the steps evenly spaced in the PERCEPTUAL value.
+	assert_eq!(environment::prefilter_roughness(0, 6), 0.0);
+	assert_eq!(environment::prefilter_roughness(5, 6), 1.0);
+	assert!((environment::prefilter_roughness(3, 6) - 0.6).abs() < 1e-6);
+	assert_eq!(environment::prefilter_roughness(0, 1), 0.0, "a single level is a mirror and not a division by zero");
+}
+
+#[test]
+// PREFILTERING A CONSTANT ENVIRONMENT RETURNS THAT CONSTANT, at every roughness and in every
+// direction. It is the prefilter's own white furnace: any correctly weighted average of one value
+// is that value, so a wrong weight, a missing normalisation or a sample left out of the divisor all
+// show up here and nowhere else in a single image.
+fn prefiltering_a_uniform_environment_returns_it_unchanged() {
+	let sky = Vec3::new(2.0, 3.0, 4.0);
+	for roughness in [0.0f32, 0.25, 0.5, 1.0] {
+		for direction in [Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.577, 0.577, 0.577)] {
+			let filtered = environment::prefilter_direction(direction, roughness, 256, |_, _| sky);
+			assert!(filtered.sub(sky).length() < 1e-4, "a uniform sky prefilters to itself at roughness {roughness}, got {filtered:?}");
+		}
+	}
+	// AND THE SAMPLE'S OWN SOLID ANGLE REACHES THE SOURCE, which is what the profile requires so a
+	// bright texel the lobe barely touches is taken from a coarser mip rather than becoming a
+	// firefly. A rougher lobe spreads its samples, so each covers more.
+	let mut widest_at_mirror = 0.0f32;
+	let _ = environment::prefilter_direction(Vec3::new(0.0, 0.0, 1.0), 0.05, 256, |_, solid_angle| {
+		if solid_angle > widest_at_mirror {
+			widest_at_mirror = solid_angle;
+		}
+		sky
+	});
+	let mut widest_at_rough = 0.0f32;
+	let _ = environment::prefilter_direction(Vec3::new(0.0, 0.0, 1.0), 1.0, 256, |_, solid_angle| {
+		if solid_angle > widest_at_rough {
+			widest_at_rough = solid_angle;
+		}
+		sky
+	});
+	assert!(widest_at_rough > widest_at_mirror, "a rough lobe's samples cover more sky: {widest_at_rough} against {widest_at_mirror}");
+}
+
+#[test]
+// THE IMPORTANCE SAMPLE IS THE NORMAL AT THE CENTRE OF THE LOBE AND SPREADS WITH ROUGHNESS, and the
+// basis around the normal is orthonormal even where the usual cross product degenerates.
+fn the_ggx_importance_sample_is_centred_on_the_normal_and_spreads_with_roughness() {
+	let normal = Vec3::new(0.0, 0.0, 1.0);
+	// `u2 = 0` is the centre of the distribution: `cos(theta)` is exactly 1 whatever the roughness.
+	for roughness in [0.05f32, 0.5, 1.0] {
+		let centre = environment::importance_sample_ggx((0.0, 0.0), roughness * roughness, normal);
+		assert!(centre.sub(normal).length() < 1e-5, "the first sample is the normal itself, got {centre:?}");
+	}
+	// AND A ROUGHER LOBE REACHES FURTHER FROM IT.
+	let near = environment::importance_sample_ggx((0.0, 0.9), 0.05 * 0.05, normal).z;
+	let far = environment::importance_sample_ggx((0.0, 0.9), 1.0, normal).z;
+	assert!(far < near, "a rough lobe tilts further from the normal: {far} against {near}");
+	// THE BASIS IS ORTHONORMAL EVEN AT THE POLES, where crossing with `+z` gives a zero vector - a
+	// NaN after normalisation, and a black texel at exactly one direction per cube face.
+	for axis in [Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 0.0)] {
+		let (tangent, bitangent) = environment::orthonormal_basis(axis);
+		assert!(tangent.is_finite() && bitangent.is_finite(), "the basis at {axis:?} is finite");
+		assert!(tangent.dot(axis).abs() < 1e-5, "the tangent is perpendicular to the normal at {axis:?}");
+		assert!(bitangent.dot(axis).abs() < 1e-5, "and so is the bitangent");
+		assert!((tangent.length() - 1.0).abs() < 1e-5 && (bitangent.length() - 1.0).abs() < 1e-5, "and both are unit at {axis:?}");
+	}
+}
+
+#[test]
+// HAMMERSLEY IS THE SEQUENCE THIS IMPLEMENTATION USES AND NOT ONE THE PROFILE REQUIRES. The
+// profile's tolerance for an environment lookup says as much - the prefilter's residual noise is the
+// largest term in the comparison - so a conforming renderer may use another. What this fixture holds
+// is that ours is the sequence it claims to be.
+fn the_sample_sequence_is_hammersley_and_stays_inside_the_unit_square() {
+	assert_eq!(environment::hammersley(0, 1024), (0.0, 0.0), "the first point is the origin");
+	// The radical inverse in base 2: index 1 reverses to the top bit, which is a half.
+	assert!((environment::hammersley(1, 1024).1 - 0.5).abs() < 1e-6);
+	assert!((environment::hammersley(2, 1024).1 - 0.25).abs() < 1e-6);
+	assert!((environment::hammersley(3, 1024).1 - 0.75).abs() < 1e-6);
+	for index in 0..1024u32 {
+		let (first, second) = environment::hammersley(index, 1024);
+		assert!((0.0..1.0).contains(&first) && (0.0..1.0).contains(&second), "sample {index} is inside the unit square: {first}, {second}");
+	}
+	assert_eq!(environment::hammersley(0, 0), (0.0, 0.0), "and a count of zero is answered rather than divided by");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shadows: `Scene3D Extended Profile 1`'s `shadows` group. The bias, the filter and the cascades.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+// THE BIAS IS RELATIVE TO THE DEPTH'S OWN PRECISION, which is what `r = 2^(exponent(z) - 23)` in the
+// 3D profile's equation means. A constant bias in absolute units is far too small near the camera
+// and far too large at the far plane, and a scene tuned at one distance acnes at the other.
+fn the_depth_bias_scales_with_the_float_s_own_step() {
+	// At a depth of 1 the exponent is 0, so the step is `2^-23`.
+	let step_at_one = shadow::representable_step(1.0);
+	assert!((step_at_one - (2.0f32).powi(-23)).abs() < 1e-12, "the step at 1.0 is 2^-23, got {step_at_one}");
+	// At 1024 the exponent is 10, so the step is 2^-13 - a thousand times larger, which is exactly
+	// the ratio a fixed bias gets wrong.
+	let step_far = shadow::representable_step(1024.0);
+	assert!((step_far / step_at_one - 1024.0).abs() < 1.0, "the step grows with the depth, got a ratio of {}", step_far / step_at_one);
+	assert_eq!(shadow::representable_step(f32::NAN), 0.0, "a non-finite depth has no step");
+	assert!(shadow::representable_step(0.0) > 0.0, "and zero has the smallest one rather than none");
+
+	// THE SLOPE TERM IS WHAT GROWS ON A SURFACE SEEN EDGE-ON TO THE LIGHT, where one texel spans a
+	// long way along the surface and acne appears first.
+	let flat = shadow::depth_bias(1.0, 0.0);
+	let steep = shadow::depth_bias(1.0, 0.001);
+	assert!(steep > flat, "a sloped surface gets more bias: {steep} against {flat}");
+	assert!((steep - (shadow::BIAS_CONSTANT * step_at_one + shadow::BIAS_SLOPE * 0.001)).abs() < 1e-9, "and by the profile's equation exactly, got {steep}");
+	// CLAMPED, BECAUSE A SLOPE CAN BE ENORMOUS: a polygon almost parallel to the light has an
+	// unbounded derivative, and an unbounded bias detaches the shadow from what casts it.
+	assert_eq!(shadow::depth_bias(1.0, 1000.0), shadow::BIAS_CLAMP, "the bias is bounded whatever the slope");
+}
+
+#[test]
+// COMPARE THEN FILTER, NOT FILTER THEN COMPARE. Averaging nine depths and comparing once gives a
+// wrong answer at every depth discontinuity - the mean of a near and a far occluder is a depth
+// neither of them has - and the difference is a halo around every silhouette.
+//
+// WORKED BY HAND. A receiver at 0.5 against a map where four of the nine taps hold 0.9 (behind it,
+// so lit) and five hold 0.1 (in front, so shadowed) is lit in four ninths. Filtering first would
+// average to 0.456, compare once, and call the whole footprint SHADOWED.
+fn the_percentage_closer_filter_compares_before_it_averages() {
+	let lit = shadow::percentage_closer(0.5, (0.1, 0.1), (0.5, 0.5), |u, _| if u > 0.5 { 0.9 } else { 0.1 });
+	assert!((lit - 3.0 / 9.0).abs() < 1e-6, "three of the nine taps are behind the receiver, got {lit}");
+	// The naive order: the mean of those nine depths is below the receiver, so a single comparison
+	// would answer zero - a different picture, not a rounding difference.
+	let mean = (3.0 * 0.9 + 6.0 * 0.1) / 9.0;
+	assert!(mean < 0.5, "and filtering first would have called the whole footprint shadowed");
+
+	// EQUAL WEIGHTS, so the answer is one of ten values and a tap at the corner counts as much as
+	// the one at the centre.
+	let all_lit = shadow::percentage_closer(0.0, (0.1, 0.1), (0.5, 0.5), |_, _| 1.0);
+	let none = shadow::percentage_closer(1.0, (0.1, 0.1), (0.5, 0.5), |_, _| 0.0);
+	assert_eq!(all_lit, 1.0);
+	assert_eq!(none, 0.0);
+	let corner_only = shadow::percentage_closer(0.5, (0.1, 0.1), (0.5, 0.5), |u, v| if u < 0.45 && v < 0.45 { 0.9 } else { 0.1 });
+	assert!((corner_only - 1.0 / 9.0).abs() < 1e-6, "one corner tap is one ninth, got {corner_only}");
+	// AND `LessOrEqual`, the 3D profile's own order: a surface at exactly its own depth in the map
+	// is LIT, which is what keeps a caster from shadowing itself.
+	assert_eq!(shadow::percentage_closer(0.5, (0.1, 0.1), (0.5, 0.5), |_, _| 0.5), 1.0, "equal depth is lit");
+}
+
+#[test]
+// THE SPLITS ARE A BLEND OF THE UNIFORM AND LOGARITHMIC SCHEMES AT LAMBDA 0.5. Logarithmic alone
+// puts almost every texel near the camera; uniform alone wastes the near cascades on geometry that
+// occupies few pixels. The profile fixes the blend rather than the scheme.
+//
+// WORKED BY HAND for near 1, far 100, four cascades:
+//   logarithmic at i/n:  100^0.25 = 3.1623, 100^0.5 = 10, 100^0.75 = 31.623, 100
+//   uniform at i/n:      1 + 99 * 0.25 = 25.75, 50.5, 75.25, 100
+//   blended at 0.5:      14.456, 30.25, 53.436, 100
+fn the_cascade_splits_blend_the_uniform_and_logarithmic_schemes() {
+	let splits = shadow::split_distances(1.0, 100.0, 4, shadow::CASCADE_SPLIT_LAMBDA, &extended()).expect("four cascades");
+	assert_eq!(splits.len(), 4);
+	for (index, expected) in [(0usize, 14.456f32), (1, 30.25), (2, 53.436), (3, 100.0)] {
+		assert!((splits[index] - expected).abs() < 0.05, "split {index} is {expected}, got {}", splits[index]);
+	}
+	// THE LAST SPLIT IS THE FAR PLANE EXACTLY, so a fragment at the far plane does not fall off the
+	// end of the last cascade by a few bits.
+	assert_eq!(splits[3], 100.0);
+	// AND THE SPLITS ASCEND, which is what makes `cascade_for`'s first-match walk correct.
+	for pair in splits.windows(2) {
+		assert!(pair[1] > pair[0], "the splits ascend: {pair:?}");
+	}
+	// LAMBDA PICKS BETWEEN THE TWO SCHEMES AND THE ENDS ARE THE SCHEMES THEMSELVES.
+	let uniform = shadow::split_distances(1.0, 100.0, 4, 0.0, &extended()).expect("uniform");
+	assert!((uniform[0] - 25.75).abs() < 0.01, "lambda 0 is the uniform scheme, got {}", uniform[0]);
+	let logarithmic = shadow::split_distances(1.0, 100.0, 4, 1.0, &extended()).expect("logarithmic");
+	assert!((logarithmic[0] - 3.1623).abs() < 0.01, "lambda 1 is the logarithmic one, got {}", logarithmic[0]);
+}
+
+#[test]
+// A SCENE THAT ASKS FOR MORE CASCADES THAN THE PROFILE ADMITS IS REFUSED RATHER THAN SILENTLY GIVEN
+// FEWER, which is the profile's own word for it: a scene that asked for six and got four would
+// render with a far distance it did not choose.
+fn a_cascade_count_past_the_limit_is_refused_by_name() {
+	let limits = extended();
+	assert!(matches!(shadow::split_distances(1.0, 100.0, 5, 0.5, &limits), Err(Error::LimitExceeded { limit: "max_shadow_cascades", ceiling: 4, asked: 5 })));
+	assert!(matches!(shadow::split_distances(1.0, 100.0, 0, 0.5, &limits), Err(Error::Degenerate { .. })));
+	assert!(matches!(shadow::split_distances(0.0, 100.0, 4, 0.5, &limits), Err(Error::Degenerate { .. })));
+	assert!(matches!(shadow::split_distances(100.0, 100.0, 4, 0.5, &limits), Err(Error::Degenerate { .. })));
+	assert!(matches!(shadow::split_distances(1.0, 100.0, 4, 1.5, &limits), Err(Error::Degenerate { .. })));
+	// AND A CORE SCENE HAS NO CASCADES AT ALL, because it never claimed the part.
+	assert!(matches!(shadow::split_distances(1.0, 100.0, 1, 0.5, &Limits::PROFILE_MINIMUM), Err(Error::LimitExceeded { limit: "max_shadow_cascades", ceiling: 0, asked: 1 })));
+}
+
+#[test]
+// THE CASCADE IS CHOSEN BY THE FRAGMENT'S OWN VIEW-SPACE DEPTH, and WHAT IS BEYOND THE LAST ONE IS
+// UNSHADOWED. Extending the last cascade to infinity makes its texels useless everywhere; saying
+// where the shadows stop lets a scene choose its far distance.
+fn a_fragment_beyond_the_last_cascade_is_unshadowed() {
+	let splits = shadow::split_distances(1.0, 100.0, 4, 0.5, &extended()).expect("four cascades");
+	assert_eq!(shadow::cascade_for(2.0, &splits), Some(0), "near geometry is in the first cascade");
+	assert_eq!(shadow::cascade_for(20.0, &splits), Some(1));
+	assert_eq!(shadow::cascade_for(40.0, &splits), Some(2));
+	assert_eq!(shadow::cascade_for(90.0, &splits), Some(3));
+	assert_eq!(shadow::cascade_for(100.0, &splits), Some(3), "the far plane itself is still in the last cascade");
+	assert_eq!(shadow::cascade_for(100.1, &splits), None, "and past it there is no cascade, which means unshadowed");
+	assert_eq!(shadow::cascade_for(f32::NAN, &splits), None);
+}
+
+#[test]
+// THE SEAM BETWEEN CASCADES IS A GRADIENT OVER THE LAST TENTH OF EACH RANGE. Without it the
+// resolution change is a visible edge across the ground at a fixed distance from the camera, which
+// moves with the camera and reads as a fault in the world rather than as a shadow technique.
+//
+// WORKED BY HAND. Cascade 0 runs from the near plane at 1 to 14.456, a range of 13.456; its last
+// tenth begins at 14.456 - 1.3456 = 13.110. So 13.0 is wholly inside, 13.783 is halfway through the
+// transition, and 14.456 is wholly in the next.
+fn the_transition_between_cascades_is_a_blend_and_not_a_line() {
+	let near = 1.0f32;
+	let splits = shadow::split_distances(near, 100.0, 4, 0.5, &extended()).expect("four cascades");
+	assert_eq!(shadow::cascade_blend(13.0, near, &splits, 0), 0.0, "before the last tenth there is no blend");
+	let halfway = shadow::cascade_blend(13.783, near, &splits, 0);
+	assert!((halfway - 0.5).abs() < 0.02, "halfway through the transition is 0.5, got {halfway}");
+	assert!((shadow::cascade_blend(14.456, near, &splits, 0) - 1.0).abs() < 1e-3, "at the split it is wholly the next cascade");
+	// THE LAST CASCADE BLENDS INTO NOTHING, because what is beyond it is unshadowed rather than
+	// another map - and fading into no shadow is what unshadowed already looks like.
+	assert_eq!(shadow::cascade_blend(99.9, near, &splits, 3), 0.0, "the last cascade has nothing to blend into");
+	assert_eq!(shadow::cascade_blend(50.0, near, &splits, 9), 0.0, "and a cascade that does not exist blends nothing");
+}
+
+#[test]
+// A POINT LIGHT'S SHADOW IS A CUBE, ITS FACE CHOSEN BY THE MAJOR AXIS, in the 3D profile's index
+// order - so a cube built for any other system loads without a flip.
+fn a_point_light_s_cube_face_is_the_major_axis() {
+	for (direction, face) in [
+		(Vec3::new(2.0, 1.0, 1.0), CubeFace::PositiveX),
+		(Vec3::new(-2.0, 1.0, 1.0), CubeFace::NegativeX),
+		(Vec3::new(1.0, 2.0, 1.0), CubeFace::PositiveY),
+		(Vec3::new(1.0, -2.0, 1.0), CubeFace::NegativeY),
+		(Vec3::new(1.0, 1.0, 2.0), CubeFace::PositiveZ),
+		(Vec3::new(1.0, 1.0, -2.0), CubeFace::NegativeZ),
+	] {
+		assert_eq!(shadow::cube_face(direction), Some(face), "{direction:?} falls on {face:?}");
+	}
+	// A TIE GOES TO THE EARLIER AXIS, so a direction exactly on a face edge picks one face rather
+	// than depending on which comparison the compiler evaluated first.
+	assert_eq!(shadow::cube_face(Vec3::new(1.0, 1.0, 0.0)), Some(CubeFace::PositiveX));
+	assert_eq!(shadow::cube_face(Vec3::new(0.0, 1.0, 1.0)), Some(CubeFace::PositiveY));
+	// AND A DIRECTION THAT IS NOT ONE IS ANSWERED RATHER THAN GUESSED AT.
+	assert_eq!(shadow::cube_face(Vec3::new(0.0, 0.0, 0.0)), None);
+	assert_eq!(shadow::cube_face(Vec3::new(f32::NAN, 0.0, 0.0)), None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// HDR and post-processing: `Scene3D Extended Profile 1`'s `postprocess` group.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+// THE LUMINANCE IS THE IMAGE-COLOUR PROFILE'S OWN TRIPLE, and its coefficients sum to exactly one -
+// which is what makes white have a luminance of one and is the cheapest check that none of the
+// three has been mistyped.
+fn the_luminance_is_linear_rec_709_and_white_is_one() {
+	let sum = postprocess::LUMINANCE_REC709.x + postprocess::LUMINANCE_REC709.y + postprocess::LUMINANCE_REC709.z;
+	assert!((sum - 1.0).abs() < 1e-6, "the coefficients sum to one, got {sum}");
+	assert!((postprocess::luminance(Vec3::new(1.0, 1.0, 1.0)) - 1.0).abs() < 1e-6);
+	assert!((postprocess::luminance(Vec3::new(0.0, 1.0, 0.0)) - 0.7152).abs() < 1e-6, "green carries most of it");
+	assert_eq!(postprocess::luminance(Vec3::new(0.0, 0.0, 0.0)), 0.0);
+}
+
+#[test]
+// EXTENDED REINHARD MAPS THE PROFILE'S WHITE TO EXACTLY ONE, which is the property that makes
+// `WHITE` mean what its name says: the luminance the operator sends to display white.
+//
+// WORKED BY HAND at `WHITE` = 4: `4 * (1 + 4/16) / (1 + 4)` = `4 * 1.25 / 5` = 1.
+fn the_tone_map_sends_the_profile_s_white_to_one_and_leaves_the_rest_alone() {
+	let white = postprocess::tone_map_white();
+	assert_eq!(white, 4.0, "the white point comes from the image-colour profile");
+	let at_white = postprocess::tone_map(Vec3::new(white, white, white));
+	assert!((at_white.x - 1.0).abs() < 1e-5, "the white point maps to one, got {}", at_white.x);
+	// THE WHOLE RANGE IS COMPRESSED AND NOT ONLY THE HIGHLIGHTS. The curve is 0.53125 at a
+	// luminance of 1, which is the operator's own value there - `1 * (1 + 1/16) / 2` - and applying
+	// it to everything is what a global operator is for.
+	let at_one = postprocess::tone_map(Vec3::new(1.0, 1.0, 1.0));
+	assert!((at_one.x - 0.53125).abs() < 1e-5, "the curve at one is 0.53125, got {}", at_one.x);
+	assert_eq!(postprocess::tone_map(Vec3::new(0.0, 0.0, 0.0)), Vec3::new(0.0, 0.0, 0.0), "black stays black");
+	// AND THERE IS NO STEP ANYWHERE, which is what a guard that mapped only above 1 would introduce:
+	// `graphics-core`'s 2D path has one, and it reads 1.000000 at a luminance of 1.0 and 0.531280 at
+	// 1.0001 - a 47 per cent drop across a boundary running through the middle of every lit surface.
+	let below = postprocess::tone_map(Vec3::new(0.9999, 0.9999, 0.9999)).x;
+	let above = postprocess::tone_map(Vec3::new(1.0001, 1.0001, 1.0001)).x;
+	assert!((above - below).abs() < 1e-3, "the curve is continuous at one: {below} then {above}");
+	// AND IT IS MONOTONIC, so a brighter input is never a darker output.
+	let mut previous = 0.0f32;
+	for step in 0..64u32 {
+		let value = step as f32 * 0.5;
+		let mapped = postprocess::tone_map(Vec3::new(value, value, value)).x;
+		assert!(mapped >= previous - 1e-6, "the curve does not go backwards at {value}: {mapped} after {previous}");
+		previous = mapped;
+	}
+	// ON LUMINANCE AND NOT PER CHANNEL: the hue survives, so the ratio between channels is the same
+	// after mapping as before. A per-channel curve shifts it most on saturated colours.
+	let saturated = Vec3::new(8.0, 2.0, 1.0);
+	let mapped = postprocess::tone_map(saturated);
+	assert!((mapped.x / mapped.y - saturated.x / saturated.y).abs() < 1e-4, "the hue is unchanged, got {mapped:?}");
+	// A NaN FALLS THROUGH UNMAPPED rather than being scaled by a NaN ratio, which would spread one
+	// bad pixel across the whole frame at the next downsample.
+	assert!(postprocess::tone_map(Vec3::new(f32::NAN, 0.0, 0.0)).x.is_nan());
+}
+
+#[test]
+// THE BLOOM KNEE IS SOFT, AND ITS QUADRATIC JOINS SMOOTHLY AT BOTH ENDS. A hard threshold makes a
+// specular glint drifting across a surface cross it in one frame and bloom at full strength, which
+// reads as a flash rather than as a highlight.
+//
+// WORKED BY HAND with threshold 1 and knee 0.5. The quadratic is `(L - 0.5)^2 / 2`:
+//   at L = 0.5  it is 0, with zero slope - so it joins the nothing below it
+//   at L = 1.0  it is 0.125
+//   at L = 1.5  it is 0.5, which is exactly `L - 1` - so it joins the excess above it
+fn the_bloom_threshold_is_a_knee_that_joins_at_both_ends() {
+	let grey = |light: f32| Vec3::new(light, light, light);
+	assert_eq!(postprocess::bloom_prefilter(grey(0.4)), Vec3::new(0.0, 0.0, 0.0), "below the knee nothing blooms");
+	assert_eq!(postprocess::bloom_prefilter(grey(0.5)), Vec3::new(0.0, 0.0, 0.0), "and the knee starts at zero");
+	let at_one = postprocess::bloom_prefilter(grey(1.0)).x;
+	assert!((at_one - 0.125).abs() < 1e-5, "at the threshold the quadratic gives 0.125, got {at_one}");
+	let at_knee_end = postprocess::bloom_prefilter(grey(1.5)).x;
+	assert!((at_knee_end - 0.5).abs() < 1e-5, "at the far end it is the excess itself, got {at_knee_end}");
+	// THE TWO BRANCHES MEET, which is what the knee is for: a thousandth more light either side of
+	// the join changes the answer by a thousandth rather than by a step.
+	let just_below = postprocess::bloom_prefilter(grey(1.499)).x;
+	let just_past = postprocess::bloom_prefilter(grey(1.501)).x;
+	assert!((just_past - just_below).abs() < 3e-3, "the branches join: {just_below} then {just_past}");
+	let far_above = postprocess::bloom_prefilter(grey(10.0)).x;
+	assert!((far_above - 9.0).abs() < 1e-4, "above the knee the whole excess blooms, got {far_above}");
+	// THE HUE SURVIVES: the excess is a fraction of the luminance and scales all three channels,
+	// rather than each channel being thresholded on its own.
+	let coloured = Vec3::new(4.0, 1.0, 0.5);
+	let bloomed = postprocess::bloom_prefilter(coloured);
+	assert!((bloomed.x / bloomed.y - coloured.x / coloured.y).abs() < 1e-4, "the bloom keeps the colour's hue");
+	assert_eq!(postprocess::bloom_prefilter(Vec3::new(f32::NAN, 0.0, 0.0)), Vec3::new(0.0, 0.0, 0.0), "a NaN contributes nothing");
+}
+
+#[test]
+// BOTH PYRAMID KERNELS PARTITION UNITY, which is the invariant that catches a mistyped weight, a
+// missing tap and a wrong divisor at once: a constant field must downsample and upsample to itself,
+// or the bloom brightens or darkens every frame it is added to.
+fn the_bloom_kernels_preserve_a_constant() {
+	let constant = Vec3::new(0.25, 0.5, 0.75);
+	let down = postprocess::downsample_13((0.5, 0.5), (0.01, 0.01), |_, _| constant);
+	assert!(down.sub(constant).length() < 1e-6, "the 13-tap downsample preserves a constant, got {down:?}");
+	let up = postprocess::upsample_tent_9((0.5, 0.5), (0.01, 0.01), |_, _| constant);
+	assert!(up.sub(constant).length() < 1e-6, "and so does the 9-tap tent, got {up:?}");
+	// THE TENT IS WEIGHTED TOWARD ITS CENTRE, which is what makes it a tent rather than a box: a
+	// single bright centre texel contributes four sixteenths and a corner one sixteenth.
+	let centre_only = postprocess::upsample_tent_9((0.5, 0.5), (0.1, 0.1), |x, y| if (x - 0.5).abs() < 0.01 && (y - 0.5).abs() < 0.01 { Vec3::new(16.0, 16.0, 16.0) } else { Vec3::new(0.0, 0.0, 0.0) });
+	assert!((centre_only.x - 4.0).abs() < 1e-5, "the centre carries four sixteenths, got {}", centre_only.x);
+	let corner_only = postprocess::upsample_tent_9((0.5, 0.5), (0.1, 0.1), |x, y| if x < 0.45 && y < 0.45 { Vec3::new(16.0, 16.0, 16.0) } else { Vec3::new(0.0, 0.0, 0.0) });
+	assert!((corner_only.x - 1.0).abs() < 1e-5, "and a corner one sixteenth, got {}", corner_only.x);
+	// THE PYRAMID IS SIX LEVELS AND IS ADDED BACK AT THE PROFILE'S WEIGHT.
+	assert_eq!(postprocess::BLOOM_LEVELS, 6);
+	let combined = postprocess::combine(Vec3::new(1.0, 1.0, 1.0), Vec3::new(10.0, 0.0, 0.0), postprocess::BLOOM_WEIGHT);
+	assert!((combined.x - 1.4).abs() < 1e-5, "0.04 of ten is 0.4, got {}", combined.x);
+}
+
+#[test]
+// FOG IS EXPONENTIAL-SQUARED, WHICH HAS NO VISIBLE START PLANE. A linear fog begins abruptly at a
+// distance the author picked, and that edge sweeps across the world as the camera moves.
+//
+// WORKED BY HAND. `f = exp(-(density * distance)^2)`: at `density * distance` = 1 the surviving
+// fraction is `exp(-1)` = 0.36788, and at 2 it is `exp(-4)` = 0.018316.
+fn fog_is_exponential_squared_and_has_no_start_plane() {
+	let surface = Vec3::new(1.0, 1.0, 1.0);
+	let grey = Vec3::new(0.0, 0.0, 0.0);
+	assert_eq!(postprocess::fog(surface, grey, 0.1, 0.0), surface, "at the camera there is no fog");
+	let at_one = postprocess::fog(surface, grey, 1.0, 1.0).x;
+	assert!((at_one - 0.367_879).abs() < 1e-4, "one unit of optical depth leaves exp(-1), got {at_one}");
+	let at_two = postprocess::fog(surface, grey, 1.0, 2.0).x;
+	assert!((at_two - 0.018_316).abs() < 1e-4, "two units leave exp(-4), got {at_two}");
+	// THE SQUARE IS WHAT MAKES THE NEAR FIELD FLAT: at a tenth of the way the surface is still
+	// almost untouched, which a linear fog would already have dimmed by a tenth.
+	let near = postprocess::fog(surface, grey, 1.0, 0.1).x;
+	assert!(near > 0.99, "the near field is flat, got {near}");
+	// AND IT MIXES TOWARD THE FOG'S OWN COLOUR RATHER THAN TOWARD BLACK.
+	let white_fog = postprocess::fog(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 1.0, 10.0);
+	assert!(white_fog.x > 0.99, "far away everything is the fog colour, got {}", white_fog.x);
+	assert_eq!(postprocess::fog(surface, grey, 0.0, 100.0), surface, "a density of zero is no fog at all");
+	assert_eq!(postprocess::fog(surface, grey, f32::NAN, 1.0), surface, "and a degenerate density is ignored rather than answered");
+}
+
+#[test]
+// TONE MAPPING IS LAST. `resolve` is the profile's order in one place, and the fixture holds the
+// consequence rather than the ordering: a bright bloom added to a frame is compressed by the curve,
+// which is what it is for - tone mapping first would compress the frame and then add an untouched
+// bloom on top of it, which can exceed one and clip.
+fn the_chain_tone_maps_after_the_bloom_is_added() {
+	let scene = Vec3::new(3.0, 3.0, 3.0);
+	let bloom = Vec3::new(20.0, 20.0, 20.0);
+	let resolved = postprocess::resolve(scene, bloom, postprocess::BLOOM_WEIGHT);
+	// 3 + 0.04 * 20 = 3.8, and `3.8 * (1 + 3.8/16) / (1 + 3.8)` = 0.9796875.
+	assert!((resolved.x - 0.979_687).abs() < 1e-4, "the sum is tone-mapped, got {}", resolved.x);
+
+	// THE OTHER ORDER IS A DIFFERENT PICTURE, and by more than rounding. With a bright pyramid:
+	//   profile's order:  tone_map(3 + 0.04 * 200) = tone_map(11) = 11 * 1.6875 / 12   = 1.546875
+	//   mapped first:     tone_map(3) + 0.04 * tone_map(200)
+	//                   = 0.890625 + 0.04 * 13.432836                                  = 1.427938
+	// The second compresses the highlight before spreading it, which is exactly what bloom exists
+	// to do and exactly what the profile's order protects.
+	let bright = Vec3::new(200.0, 200.0, 200.0);
+	let right_way = postprocess::resolve(scene, bright, postprocess::BLOOM_WEIGHT);
+	let wrong_way = postprocess::combine(postprocess::tone_map(scene), postprocess::tone_map(bright), postprocess::BLOOM_WEIGHT);
+	assert!((right_way.x - 1.546_875).abs() < 1e-3, "the profile's order gives 1.546875, got {}", right_way.x);
+	assert!((wrong_way.x - 1.427_938).abs() < 1e-3, "and the other gives 1.427938, got {}", wrong_way.x);
+	assert!(right_way.x - wrong_way.x > 0.1, "which is a different picture and not a rounding difference");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Playing a clip: the interpolation modes, the endings, and blending two clips.
+// ---------------------------------------------------------------------------------------------
+
+fn step_track(joint: u16, keys: &[(f32, Vec3)]) -> Track {
+	Track { target: Target::Joint(joint), channel: Channel::Translation(Curve::Step(keys.iter().map(|(time, value)| Key { time: *time, value: *value }).collect())) }
+}
+
+fn cubic_track(joint: u16, keys: &[(f32, f32, f32, f32)]) -> Track {
+	// `(time, value, in, out)` on the x axis, which is where the arithmetic is easiest to check.
+	let keys = keys.iter().map(|(time, value, into, out)| CubicKey { time: *time, value: Vec3::new(*value, 0.0, 0.0), in_tangent: Vec3::new(*into, 0.0, 0.0), out_tangent: Vec3::new(*out, 0.0, 0.0) }).collect();
+	Track { target: Target::Joint(joint), channel: Channel::Translation(Curve::Cubic(keys)) }
+}
+
+fn driven(clip: &Clip, time: f32, joint: u16) -> Vec3 {
+	clip.sample(time).joint(joint).expect("the joint is driven").translation.expect("a translation")
+}
+
+#[test]
+// STEP HOLDS THE PREVIOUS KEY UNTIL THE NEXT KEY'S TIME IS REACHED, and the value AT a key is that
+// key's own - so a step track changes exactly at its keyframes and nowhere else, which is what a
+// discrete channel means. A visibility flag interpolated linearly is half-visible for half a second.
+fn a_step_track_changes_only_at_its_keyframes() {
+	let track = step_track(0, &[(0.0, Vec3::new(1.0, 0.0, 0.0)), (2.0, Vec3::new(5.0, 0.0, 0.0))]);
+	let clip = Clip::new(vec![track], 2.0, Ending::Clamp, 0, true, &extended()).expect("a step clip");
+	for time in [0.0f32, 0.5, 1.0, 1.9999] {
+		assert_eq!(driven(&clip, time, 0).x, 1.0, "at {time} the previous key still holds");
+	}
+	assert_eq!(driven(&clip, 2.0, 0).x, 5.0, "and at the next key it is that key's own value");
+	assert_eq!(driven(&clip, 5.0, 0).x, 5.0, "past the end the last key holds");
+}
+
+#[test]
+// THE CUBIC IS HERMITE WITH AUTHORED TANGENTS, and its shape is not the linear one.
+//
+// WORKED BY HAND. Keys at 0 and 1, values 0 and 1, both tangents zero: the Hermite basis collapses
+// to `3t^2 - 2t^3`, so at a quarter of the way it is `3 * 0.0625 - 2 * 0.015625` = 0.15625 - where
+// a linear track would be at 0.25.
+fn a_cubic_track_follows_its_tangents_and_not_the_chord() {
+	let flat_ends = cubic_track(0, &[(0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 0.0, 0.0)]);
+	let clip = Clip::new(vec![flat_ends], 1.0, Ending::Clamp, 0, true, &extended()).expect("a cubic clip");
+	assert!((driven(&clip, 0.25, 0).x - 0.15625).abs() < 1e-5, "at a quarter the cubic is 0.15625, got {}", driven(&clip, 0.25, 0).x);
+	assert!((driven(&clip, 0.5, 0).x - 0.5).abs() < 1e-5, "and at the midpoint it is 0.5, where the chord also is");
+	assert_eq!(driven(&clip, 0.0, 0).x, 0.0, "it passes through its keys");
+	assert_eq!(driven(&clip, 1.0, 0).x, 1.0);
+
+	// THE TANGENTS ARE PER SECOND AND SCALED BY THE SPAN, which is what makes a slope mean the same
+	// thing however far apart the keys are.
+	//
+	// WORKED BY HAND. Keys at 0 and 2, both values 0, the first with an OUT tangent of 1 and the
+	// second with an IN tangent of 0. At the halfway point `t = 0.5` the only non-zero basis term is
+	// `(t^3 - 2t^2 + t) * span * out` = `(0.125 - 0.5 + 0.5) * 2 * 1` = 0.25.
+	let leaning = cubic_track(0, &[(0.0, 0.0, 0.0, 1.0), (2.0, 0.0, 0.0, 0.0)]);
+	let wide = Clip::new(vec![leaning], 2.0, Ending::Clamp, 0, true, &extended()).expect("a cubic clip");
+	assert!((driven(&wide, 1.0, 0).x - 0.25).abs() < 1e-5, "the span scales the tangent, got {}", driven(&wide, 1.0, 0).x);
+	// AND THE SAME SLOPE OVER HALF THE SPAN REACHES HALF AS FAR, which is what "per second" means:
+	// a velocity of one unit a second carries further when it is given longer, and that is the
+	// behaviour a per-span tangent would not have.
+	let narrow_track = cubic_track(0, &[(0.0, 0.0, 0.0, 1.0), (1.0, 0.0, 0.0, 0.0)]);
+	let narrow = Clip::new(vec![narrow_track], 1.0, Ending::Clamp, 0, true, &extended()).expect("a cubic clip");
+	assert!((driven(&narrow, 0.5, 0).x - 0.125).abs() < 1e-5, "half the span reaches half as far, got {}", driven(&narrow, 0.5, 0).x);
+}
+
+#[test]
+// PING-PONG PLAYS FORWARD THEN BACKWARD WITH A PERIOD OF TWICE THE DURATION, and its turning frames
+// are VISITED ONCE PER PERIOD AND NOT TWICE. A turn that held the last frame for two frames stutters
+// at both ends, once a cycle, for the life of the clip.
+fn ping_pong_turns_at_its_end_keys_rather_than_holding_them() {
+	let keys = vec![translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (2.0, Vec3::new(2.0, 0.0, 0.0))])];
+	let clip = Clip::new(keys, 2.0, Ending::PingPong, 0, true, &extended()).expect("a ping-pong clip");
+	for (time, expected) in [(0.0f32, 0.0f32), (1.0, 1.0), (2.0, 2.0), (2.5, 1.5), (3.0, 1.0), (4.0, 0.0), (4.5, 0.5)] {
+		assert!((clip.at(time) - expected).abs() < 1e-5, "ping-pong at {time} is {expected}, got {}", clip.at(time));
+	}
+	// THE TURN IS AT THE END KEY: just before and just after the turn the clip is at the same place,
+	// which is what makes the frame appear once rather than being held across two.
+	let before = clip.at(2.0 - 1e-3);
+	let after = clip.at(2.0 + 1e-3);
+	assert!((before - after).abs() < 1e-5, "the turn is symmetric about the end key: {before} then {after}");
+	assert!(before < 2.0 && after < 2.0, "and neither side sits ON it, so it is one frame and not two");
+	// A PING-PONG NEEDS NO CLOSED SEAM, because its ends meet themselves - the same keys that a
+	// looping clip would be refused for.
+	let open = vec![translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (2.0, Vec3::new(9.0, 0.0, 0.0))])];
+	assert!(Clip::new(open.clone(), 2.0, Ending::PingPong, 0, true, &extended()).is_ok(), "a ping-pong may end anywhere");
+	assert!(matches!(Clip::new(open, 2.0, Ending::Loop, 0, true, &extended()), Err(Error::Degenerate { .. })), "and the same clip as a loop is refused");
+}
+
+#[test]
+// A CROSS-FADE IS A WEIGHTED BLEND OF TWO SAMPLED POSES, and a target only one of them drives is
+// taken from it UNCHANGED. Scaling that joint by its clip's weight would pull it toward the origin
+// as the blend moves away, which is a limb collapsing rather than a blend.
+fn blending_two_poses_mixes_what_both_drive_and_keeps_what_only_one_does() {
+	let walk = vec![
+		translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(0.0, 0.0, -2.0))]),
+		translation_track(1, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(10.0, 0.0, 0.0))]),
+	];
+	let run = vec![
+		translation_track(0, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(0.0, 0.0, -6.0))]),
+		translation_track(2, &[(0.0, Vec3::new(0.0, 0.0, 0.0)), (1.0, Vec3::new(4.0, 0.0, 0.0))]),
+	];
+	let walking = Clip::new(walk, 1.0, Ending::Clamp, 0, false, &extended()).expect("a walk").sample(1.0);
+	let running = Clip::new(run, 1.0, Ending::Clamp, 0, false, &extended()).expect("a run").sample(1.0);
+
+	let quarter = blend(&walking, &running, 0.25);
+	// ROOT MOTION IS THE SAME WEIGHTED SUM: a quarter of the way from -2 to -6 is -3, and NOT the
+	// sum of the two, which would make the character briefly outrun both clips.
+	assert!((quarter.root_delta().z + 3.0).abs() < 1e-5, "the blended speed is between the two, got {:?}", quarter.root_delta());
+	// A JOINT ONLY THE WALK DRIVES ARRIVES WHOLE.
+	let only_walk = quarter.joint(1).expect("driven by the walk").translation.expect("a translation");
+	assert!((only_walk.x - 10.0).abs() < 1e-5, "a joint only one pose drives is unchanged, got {only_walk:?}");
+	// AND SO DOES ONE ONLY THE RUN DRIVES.
+	let only_run = quarter.joint(2).expect("driven by the run").translation.expect("a translation");
+	assert!((only_run.x - 4.0).abs() < 1e-5, "from either side, got {only_run:?}");
+	// THE ENDS ARE THE TWO POSES THEMSELVES, which is what makes a cross-fade one rule rather than
+	// three: the weight moving from zero to one is the whole of it.
+	assert!((blend(&walking, &running, 0.0).root_delta().z + 2.0).abs() < 1e-5);
+	assert!((blend(&walking, &running, 1.0).root_delta().z + 6.0).abs() < 1e-5);
+	// A ROTATION BLENDS SPHERICALLY, exactly as within one clip.
+	let turning = Clip::new(vec![rotation_track(3, &[(0.0, turn(0.0)), (1.0, turn(0.0))])], 1.0, Ending::Clamp, 0, true, &extended()).expect("still").sample(0.0);
+	let turned = Clip::new(vec![rotation_track(3, &[(0.0, turn(core::f32::consts::FRAC_PI_2)), (1.0, turn(core::f32::consts::FRAC_PI_2))])], 1.0, Ending::Clamp, 0, true, &extended()).expect("turned").sample(0.0);
+	let half = blend(&turning, &turned, 0.5).joint(3).expect("driven").rotation.expect("a rotation");
+	let spun = half.rotate(Vec3::new(1.0, 0.0, 0.0));
+	let root_half = core::f32::consts::FRAC_1_SQRT_2;
+	assert!(spun.sub(Vec3::new(root_half, root_half, 0.0)).length() < 1e-4, "half a quarter turn is 45 degrees, got {spun:?}");
+}
+
+#[test]
+// A MORPH-WEIGHT TRACK DRIVES ONE TARGET'S WEIGHT, under the same three interpolation modes, and
+// the weights are NOT normalised across targets - because morph targets are ADDITIVE, and
+// normalising them would make a second expression undo half of the first.
+fn a_morph_weight_track_drives_one_target_and_is_not_normalised() {
+	let tracks = vec![
+		Track { target: Target::Morph(3), channel: Channel::MorphWeight(Curve::Linear(vec![Key { time: 0.0, value: 0.0 }, Key { time: 1.0, value: 1.0 }])) },
+		Track { target: Target::Morph(7), channel: Channel::MorphWeight(Curve::Linear(vec![Key { time: 0.0, value: 1.0 }, Key { time: 1.0, value: 1.0 }])) },
+	];
+	let clip = Clip::new(tracks, 1.0, Ending::Clamp, 0, true, &extended()).expect("a morph clip");
+	let pose = clip.sample(0.5);
+	assert!((pose.morph(3).expect("target 3 is driven") - 0.5).abs() < 1e-6, "a linear weight is halfway");
+	assert!((pose.morph(7).expect("target 7 is driven") - 1.0).abs() < 1e-6, "and the other is untouched by it");
+	// NOT NORMALISED: the two together sum to 1.5, and that is the point - both expressions are
+	// applied, and a normalising blend would make the second undo half of the first.
+	let total: f32 = pose.morphs().map(|(_, weight)| weight).sum();
+	assert!((total - 1.5).abs() < 1e-6, "the weights are additive and sum to what they sum to, got {total}");
+	assert_eq!(pose.morph(9), None, "a target nothing drives says nothing");
+	// A MORPH TRACK DOES NOT APPEAR AS A JOINT, which is what the separate target kinds are for.
+	assert!(pose.joint(3).is_none(), "a morph target is not a joint");
+	// AND `max_animation_tracks` COUNTS THEM like any other track.
+	assert_eq!(clip.tracks(), 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The wiring: the scene selecting levels of detail, and a clip driving its nodes.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+// THE SCENE SELECTS A LEVEL PER DRAWABLE PER VIEW, and the two views do not fight. A single cached
+// level on the drawable would make each view's hysteresis overwrite the other's - a flicker that
+// appears only once a second view exists and is traced to anything but the cache.
+//
+// WORKED BY HAND, AND THE RADIUS IS THE TRAP. A local box from (-1,-1,-1) to (1,1,1) has a bounding
+// SPHERE of radius `sqrt(3)` = 1.7320508 and not 1 - the sphere has to contain the box's corners,
+// which is the core profile's own derivation and the number a reader most easily assumes wrong.
+//
+// So under a 90 degree vertical field of view, where `tan(fov/2)` is 1:
+//   at ten units:  1.7320508 / 10 = 0.17320508, which is at or below the second threshold of 0.25
+//                  and above the third of 0.125 - level 2
+//   at one unit:   1.7320508, which is above the first threshold of 0.5 - level 0
+fn two_views_of_one_scene_choose_their_own_levels_and_keep_them_apart() {
+	let mut scene = Scene::new(extended());
+	let node = scene.add_node(Node::identity()).expect("a node");
+	let material = scene.add_material(Material::new(MaterialKind::Unlit, GraphicsPipeline(0), 0)).expect("a material");
+	let ladder = Ladder::with_default_thresholds(&[10, 11, 12, 13], &extended()).expect("four levels");
+	let bounds = Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+	let drawable = scene.add_drawable(Drawable::new(node, 10, material).with_bounds(bounds).with_lod(ladder)).expect("a drawable");
+
+	let far_node = scene.add_node(Node::identity().with_translation(Vec3::new(0.0, 0.0, 10.0))).expect("a camera node");
+	let near_node = scene.add_node(Node::identity().with_translation(Vec3::new(0.0, 0.0, 1.0))).expect("a camera node");
+	let quarter_turn = core::f32::consts::FRAC_PI_2;
+	let far = Camera::perspective(far_node, quarter_turn, 1.0, 0.1, 100.0, u32::MAX).expect("a camera");
+	let near = Camera::perspective(near_node, quarter_turn, 1.0, 0.1, 100.0, u32::MAX).expect("a camera");
+
+	let mut from_far = ViewDetail::new();
+	let mut from_near = ViewDetail::new();
+	detail::select(&mut scene, &far, &mut from_far).expect("a selection");
+	detail::select(&mut scene, &near, &mut from_near).expect("a selection");
+	assert_eq!(from_far.of(drawable), Some(Detail::Level(2)), "ten units away is the third level down");
+	assert_eq!(from_near.of(drawable), Some(Detail::Level(0)), "one unit away is the finest");
+
+	// AND EACH VIEW HOLDS ITS OWN LEVEL ACROSS FRAMES: running the far view again does not read the
+	// near view's memory, which is what a shared cache would have made it do.
+	detail::select(&mut scene, &far, &mut from_far).expect("a second frame");
+	assert_eq!(from_far.of(drawable), Some(Detail::Level(2)), "the far view is unmoved by the near one");
+	assert_eq!(from_far.len(), 1, "one drawable, one remembered level");
+	from_far.clear();
+	assert!(from_far.is_empty(), "and a view can forget what it saw");
+}
+
+#[test]
+// A DRAWABLE WITH NO LADDER IS NOT TOUCHED AT ALL, which is what makes the feature free for the
+// meshes that do not use it; and one with no BOUNDS keeps its finest level rather than being given
+// one at random - the core profile already says an unbounded drawable is never culled, and giving
+// it a coarse mesh would be the same disappearance by another route.
+fn a_drawable_with_no_ladder_or_no_bounds_is_left_alone() {
+	let mut scene = Scene::new(extended());
+	let node = scene.add_node(Node::identity()).expect("a node");
+	let material = scene.add_material(Material::new(MaterialKind::Unlit, GraphicsPipeline(0), 0)).expect("a material");
+	let plain = scene.add_drawable(Drawable::new(node, 1, material)).expect("no ladder");
+	let unbounded = scene.add_drawable(Drawable::new(node, 2, material).with_lod(Ladder::with_default_thresholds(&[2, 3], &extended()).expect("two levels"))).expect("a ladder and no bounds");
+	let camera_node = scene.add_node(Node::identity().with_translation(Vec3::new(0.0, 0.0, 50.0))).expect("a camera node");
+	let camera = Camera::perspective(camera_node, core::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0, u32::MAX).expect("a camera");
+
+	let mut view = ViewDetail::new();
+	detail::select(&mut scene, &camera, &mut view).expect("a selection");
+	assert_eq!(view.of(plain), None, "a drawable with no ladder is never asked about");
+	assert_eq!(view.of(unbounded), Some(Detail::Level(0)), "and one with no bounds keeps its finest level");
+}
+
+#[test]
+// AN ORTHOGRAPHIC CAMERA IS TOLD APART BY ITS OWN MATRIX and not by a flag: row 3 of column 3 is
+// zero when the projection divides by `w` and one when it does not. The camera's shape is read out
+// of the projection for the same reason `cull` extracts its planes that way - a camera may carry a
+// projection its constructors cannot describe.
+fn the_coverage_reads_the_camera_s_shape_out_of_its_projection() {
+	let mut scene = Scene::new(extended());
+	let node = scene.add_node(Node::identity()).expect("a node");
+	let material = scene.add_material(Material::new(MaterialKind::Unlit, GraphicsPipeline(0), 0)).expect("a material");
+	let ladder = Ladder::with_default_thresholds(&[1, 2, 3, 4], &extended()).expect("four levels");
+	let bounds = Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+	let drawable = scene.add_drawable(Drawable::new(node, 1, material).with_bounds(bounds).with_lod(ladder)).expect("a drawable");
+	let camera_node = scene.add_node(Node::identity().with_translation(Vec3::new(0.0, 0.0, 500.0))).expect("a camera node");
+
+	// THE SAME `sqrt(3)` RADIUS, in an orthographic half-height of `2 * sqrt(3)` = 3.4641016, covers
+	// EXACTLY 0.5 at every distance - so a camera five hundred units away still draws level 1, where
+	// a distance-based ladder would have sent it to the coarsest. The half-height is chosen to land
+	// on the first threshold, which also holds the profile's "AT OR BELOW": 0.5 belongs to the level
+	// the threshold names rather than to the one above it.
+	let half_height = 2.0 * render_math::sqrt(3.0);
+	let flat = Camera::orthographic(camera_node, half_height, half_height, 0.1, 1000.0, u32::MAX).expect("an orthographic camera");
+	let mut view = ViewDetail::new();
+	detail::select(&mut scene, &flat, &mut view).expect("a selection");
+	assert_eq!(view.of(drawable), Some(Detail::Level(1)), "0.5 is at the first threshold, which belongs to the level below it");
+
+	// THE SAME SPHERE AT THE SAME PLACE UNDER A PERSPECTIVE CAMERA IS TINY, which is the difference
+	// the matrix carries and a flag would have had to carry beside it.
+	let deep = Camera::perspective(camera_node, core::f32::consts::FRAC_PI_2, 1.0, 0.1, 1000.0, u32::MAX).expect("a camera");
+	let mut other = ViewDetail::new();
+	detail::select(&mut scene, &deep, &mut other).expect("a selection");
+	assert_eq!(other.of(drawable), Some(Detail::Level(3)), "five hundred units away is the coarsest level");
+}
+
+#[test]
+// A CLIP DRIVES ITS NODES THROUGH A SKELETON, because a clip talks about JOINTS and a scene is made
+// of NODES - and the two numberings are not the same one.
+//
+// AND A CHANNEL THE CLIP DOES NOT DRIVE IS LEFT ALONE. This is the property the function exists for:
+// writing an identity into it would make a clip that only rotates a wrist also move that wrist to
+// the origin, and the clip would look correct in isolation and destroy any pose it was blended into.
+fn a_clip_drives_the_nodes_its_skeleton_names_and_touches_nothing_else() {
+	let mut scene = Scene::new(extended());
+	let root = scene.add_node(Node::identity()).expect("a node");
+	let wrist = scene.add_node(Node::identity().with_parent(root).with_translation(Vec3::new(5.0, 0.0, 0.0)).with_scale(Vec3::new(2.0, 2.0, 2.0))).expect("a node");
+	let skeleton = Skeleton::new(vec![root, wrist], &extended()).expect("a two-joint skeleton");
+
+	// A clip that ROTATES joint 1 and says nothing about its translation or scale.
+	let spin = vec![rotation_track(1, &[(0.0, turn(0.0)), (1.0, turn(core::f32::consts::FRAC_PI_2))])];
+	let clip = Clip::new(spin, 1.0, Ending::Clamp, 0, true, &extended()).expect("a clip");
+	animate::apply(&mut scene, &skeleton, &clip.sample(1.0)).expect("the pose applies");
+
+	let posed = scene.nodes()[wrist as usize];
+	assert!(posed.translation().sub(Vec3::new(5.0, 0.0, 0.0)).length() < 1e-6, "the translation the clip never mentioned is untouched, got {:?}", posed.translation());
+	assert!(posed.scale().sub(Vec3::new(2.0, 2.0, 2.0)).length() < 1e-6, "and so is the scale, got {:?}", posed.scale());
+	let spun = posed.rotation().rotate(Vec3::new(1.0, 0.0, 0.0));
+	assert!(spun.sub(Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4, "and the rotation it did drive is a quarter turn, got {spun:?}");
+
+	// AND THE WORLD TRANSFORM FOLLOWS, which is what makes this a scene change rather than a
+	// bookkeeping one: the wrist's parent still carries it.
+	scene.update();
+	let world = scene.transforms()[wrist as usize];
+	assert!(world.translation().sub(Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5, "the posed node's world transform is refreshed");
+
+	// A JOINT THE SKELETON DOES NOT MAP IS REFUSED rather than skipped: a clip naming a joint the
+	// rig does not have is an asset mismatch, and animating part of a character and leaving the rest
+	// in its bind pose reads as a broken rig rather than as a mismatched pair.
+	let stray = vec![rotation_track(7, &[(0.0, turn(0.0)), (1.0, turn(0.5))])];
+	let wrong = Clip::new(stray, 1.0, Ending::Clamp, 0, true, &extended()).expect("a clip");
+	assert!(matches!(animate::apply(&mut scene, &skeleton, &wrong.sample(0.5)), Err(Error::Degenerate { .. })));
+	// AND A SKELETON IS BOUNDED BY THE PROFILE'S JOINT LIMIT like everything else.
+	let many: Vec<u32> = (0..129).map(|_| root).collect();
+	assert!(matches!(Skeleton::new(many, &extended()), Err(Error::LimitExceeded { limit: "max_skeleton_joints", ceiling: 128, asked: 129 })));
+	assert!(matches!(Skeleton::new(Vec::new(), &extended()), Err(Error::Degenerate { .. })));
+}

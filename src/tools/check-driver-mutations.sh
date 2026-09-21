@@ -333,6 +333,15 @@ mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
 	"			_ => StopBits::Two," \
 	a_line_coding_answer_outside_the_enumeration_is_refused_rather_than_rounded
 
+# CDC-ACM: the PROTOCOL is part of what names a serial port. RNDIS is class 2, subclass 2 and a
+# VENDOR protocol - the same two bytes an ACM port declares - so a binding that reads only the class
+# and the subclass takes an Ethernet adapter and the boot loses its network provider with nothing
+# saying why. Measured on QEMU's own `usb-net`, which is RNDIS by default.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"&& protocol != PROTOCOL_VENDOR " \
+	"" \
+	an_acm_shaped_rndis_control_interface_is_not_a_serial_port
+
 # CDC-ACM: the line-coding capability is bit ONE of the bitmap. Read as any bit set, a device that
 # publishes only call management is asked for a line coding it stalls.
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \

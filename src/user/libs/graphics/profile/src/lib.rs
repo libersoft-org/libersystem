@@ -92,6 +92,7 @@ pub use limits::{RENDER2D_PROFILE_1_MIN_LIMITS, Render2DLimits};
 pub use render2d::{RENDER2D_CORE_PROFILE_1, RENDER2D_GROUPS, Render2DFeature};
 pub use render3d::{RENDER3D_CORE_PROFILE_1, RENDER3D_GROUPS, Render3DFeature};
 pub use scene3d::{SCENE3D_CORE_PROFILE_1, SCENE3D_GROUPS, Scene3DFeature};
+pub use scene3d_extended::{ExtendedFeature, SCENE3D_EXTENDED_GROUPS, SCENE3D_EXTENDED_PROFILE_1};
 
 #[cfg(test)]
 mod tests;

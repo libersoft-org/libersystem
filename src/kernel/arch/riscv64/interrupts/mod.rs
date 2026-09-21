@@ -46,6 +46,9 @@ fn eid_slot(eid: u32) -> Option<usize> {
 // swizzle onto four APLIC sources and any two can land on one; the handler answers by looking at
 // every slot rather than at the one it hopes asserted, so giving each source its own identity would
 // buy nothing and spend the identities drivers need.
+// `not(test)` like the registration below and the controller it targets: the only thing that names
+// this identity is the boot's arming pass.
+#[cfg(not(test))]
 pub const WIRED_EID: u32 = 63;
 
 // THE KERNEL'S OWN WIRED LINES, WHICH ARE NOT DRIVER BINDINGS. See `arch::common::wired`, and
@@ -53,11 +56,17 @@ pub const WIRED_EID: u32 = 63;
 // the interrupt.
 static WIRED: crate::arch::common::wired::Wired<8> = crate::arch::common::wired::Wired::new();
 
+/// `not(test)` ON THE TYPE AND THE REGISTRATION, AND NOT ON THE DISPATCH, which is the honest
+/// split: the interrupt path calls `dispatch_wired` on every event and is compiled in every build,
+/// while the only thing that REGISTERS a handler is the boot's arming pass.
+///
 /// What answers one of this kernel's own wired lines: told the identity it was raised for.
+#[cfg(not(test))]
 pub type HandlerFn = crate::arch::common::wired::Handler;
 
 /// Answer `eid` with `handler` from now on. `false` when this kernel already answers as many wired
 /// lines as it carries rows for, which the caller reports rather than swallows.
+#[cfg(not(test))]
 pub fn register(eid: u32, handler: HandlerFn) -> bool {
 	WIRED.register(eid, handler)
 }

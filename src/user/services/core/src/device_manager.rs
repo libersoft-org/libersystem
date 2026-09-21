@@ -115,6 +115,34 @@ const TICKS_PER_SECOND: u64 = rt::TICKS_PER_SECOND;
 //
 const READY_DEADLINE_TICKS: u64 = 2 * TICKS_PER_SECOND;
 
+// THE BOOT WINDOW THE FASTEST PORT DECLARES, which is what every other port's window is read
+// against. x86_64 passes three thousand ticks; the two emulated ones pass forty thousand.
+const BASELINE_BOOT_WINDOW: u64 = 3 * TICKS_PER_SECOND * 10;
+
+// HOW MANY TIMES SLOWER THIS MACHINE IS THAN THE ONE THE DEADLINES WERE WRITTEN FOR.
+//
+// A TICK IS NOT A UNIT OF WORK, and every deadline in this file is written in ticks. Two seconds of
+// WALL CLOCK is a generous allowance for a driver to report READY on hardware and a fraction of one
+// on a port that emulates every instruction - so a driver that is not slow at all misses it, is torn
+// down, and takes the services behind it with it. Measured on both emulated ports: six drivers on
+// riscv64 and seven on aarch64 ended their first attempt late while EACH PRINTED ITS OWN `online`
+// LINE in the same log.
+//
+// AND THE PORT ALREADY SAYS HOW SLOW IT IS. The kernel hands this program a boot window that each
+// port sets for itself - three thousand ticks on x86_64 against forty thousand on the two emulated
+// ones - which is exactly a statement of how much wall clock that machine needs to do a boot's worth
+// of work. Reading the deadlines against it costs no new number, no probe and no calibration pass.
+//
+// ONE, NOT ZERO, FOR A SUPERVISOR THAT WAS HANDED NO WINDOW: an old kernel publishes none, and this
+// program then behaves exactly as it did before a window existed.
+fn machine_scale() -> u64 {
+	let window: u64 = BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
+	if window == 0 {
+		return 1;
+	}
+	(window / BASELINE_BOOT_WINDOW).max(1)
+}
+
 // The delays between automatic attempts: 100 ms, then 200 ms. Two of them, because three attempts
 // have two gaps. A backoff that would end after the incident deadline is not entered at all.
 const BACKOFF_TICKS: [u64; 2] = [TICKS_PER_SECOND / 10, TICKS_PER_SECOND / 5];
@@ -195,7 +223,11 @@ impl Incident {
 	// never outlive the window a boot has.
 	fn attempt_deadline(&self, attempt: u32) -> u64 {
 		let now: u64 = clock();
-		let by_attempt: u64 = now.saturating_add(READY_DEADLINE_TICKS << attempt.min(2));
+		// SCALED BY THE MACHINE AND THEN DOUBLED BY THE ATTEMPT, in that order and for two different
+		// reasons: the scale is about how long this hardware takes to do the same work, and the
+		// doubling is about a retry deserving more patience than a first try. The incident's own
+		// budget still bounds the product, so neither can outlive the window a boot has.
+		let by_attempt: u64 = now.saturating_add(READY_DEADLINE_TICKS.saturating_mul(machine_scale()) << attempt.min(2));
 		if self.deadline == 0 {
 			return by_attempt;
 		}
@@ -4293,17 +4325,41 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 				// so a driver missing a beat a second reports six times in a minute instead of
 				// sixty, and the first one is never the one that got rate-limited.
 				//
-				// `boot_critical` IS THE MANIFEST'S OWN WORD FOR IT, and nothing new: it already
-				// means "the volume cannot be mounted without this driver", which is exactly the
-				// set whose teardown removes the ground the recovery stands on.
-				if node.entry().is_some_and(|entry| entry.boot_critical) {
+				// **AND IT IS EVERY DRIVER, NOT ONLY THE VOLUME'S (2026-09-21).** This was narrowed
+				// to `boot_critical` when it was written, on the reasoning that the volume's own
+				// provider is the one whose teardown removes the ground the recovery stands on.
+				// That reasoning was right about the volume and wrong about the set: the manifest
+				// marks exactly ONE entry `boot-critical`, `virtio_blk`, so the narrowing protected
+				// one driver and left every other one on the old path.
+				//
+				// MEASURED ON aarch64, A FULL BOOT: `virtio-gpu` and `xhci` each reported READY -
+				// the manager's own `bind window virtio_gpu = 164 tick(s) from BIND to READY` can
+				// only be printed for a driver that did - then missed a one-second ping while
+				// eleven other drivers were binding, were torn down, spent their retry budget and
+				// ended `the node is failed`. Behind them: DisplayService's console chain and the
+				// USB volume route, which is four of the twenty-four services.
+				//
+				// AND A TICK IS NOT A UNIT OF WORK, which is the whole of why this happens here and
+				// not on x86_64. `heartbeat-deadline = 100` is one second of WALL CLOCK; on a port
+				// that emulates every instruction, one second of wall clock during bring-up is a
+				// fraction of the work it is on hardware. The driver is not slow to answer, the
+				// machine is slow to run it.
+				//
+				// WHAT THIS COSTS, SAID PLAINLY: the watchdog no longer KILLS. A driver that is
+				// genuinely wedged stays bound, and what happens instead is that it is pinged for
+				// ever and its misses are counted and reported - at the first and at every
+				// doubling. That is a real loss and it is the answer the owner gave: mark it, do
+				// not kill it. What is NOT lost is the observation; what is lost is the automatic
+				// recovery, which on this evidence was recovering drivers that had nothing wrong
+				// with them and killing the boot to do it.
+				{
 					let missed: u32 = node.beat.resume(clock(), driver_protocol::heartbeat_period(node.beat.deadline()));
 					if missed.is_power_of_two() {
 						let mut count = [0u8; 20];
 						let written = decimal(missed as u64, &mut count);
 						print(b"DeviceManager: ");
 						print_driver_name(driver_name);
-						print(b" is the provider this volume stands on; it is marked suspect and left running, and it is still asked - ");
+						print(b" is marked suspect and left running, and it is still asked - ");
 						print(&count[..written]);
 						print(b" deadline(s) missed so far\n");
 					}

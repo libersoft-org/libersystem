@@ -460,6 +460,10 @@ pub enum Trigger {
 	/// A GICv2m MSI: the device WRITES, and there is nothing left asserted afterwards.
 	Edge,
 	/// A PCI INTx line: the device holds it asserted until something tells it to stop.
+	///
+	/// `not(test)` for the reason the whole arming pass is: the only source this kernel configures
+	/// as level is a hot-plug slot's INTx, and a test build arms no slots.
+	#[cfg(not(test))]
 	Level,
 }
 

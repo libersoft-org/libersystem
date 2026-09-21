@@ -170,16 +170,44 @@ impl Attachment {
 	}
 }
 
+/// PUTTING BYTES ON A WIRE, which is the ONE thing the contract above needs and the only thing that
+/// differs between the transports that serve it.
+///
+/// WHY THERE IS A TRAIT HERE AT ALL. Everything else in this file - the attachment, the session, the
+/// stream grant, the backpressure, the frame the chunks go out in - is about the CONTRACT and is the
+/// same whatever moves the bytes. What is not the same is the transport: a virtio port owns a queue
+/// and a descriptor, and a USB CDC-ACM adapter owns a bulk pair on a controller's ring. Two copies
+/// of a serve loop is how the two come to disagree about what `again` means, and `console-stream`
+/// has exactly one definition of that.
+///
+/// AND THE BOUND IS THE IMPLEMENTOR'S. Each transport decides how long it waits for room and what it
+/// does while waiting; what the contract fixes is that the answer is one of these, and that `Again`
+/// means NOTHING was written and the bytes may be offered again.
+pub trait Wire {
+	/// Write bytes to the port and say what happened.
+	///
+	/// # Safety
+	/// The implementor's buffers and rings are the driver's for the life of the process; a caller
+	/// that no longer owns them must not call this.
+	unsafe fn write(&mut self, payload: &[u8], bind: &common::Bind, bootstrap: u64) -> Result<u32, Error>;
+}
+
+impl Wire for Port<'_> {
+	unsafe fn write(&mut self, payload: &[u8], bind: &common::Bind, bootstrap: u64) -> Result<u32, Error> {
+		unsafe { Port::write(self, payload, bind, bootstrap) }
+	}
+}
+
 // The service, which is the port seen through the contract. It borrows rather than owns: the port is
 // the driver's and outlives every consumer that ever attaches to it.
-pub struct Console<'a, 'b> {
-	port: &'a mut Port<'b>,
+pub struct Console<'a, W: Wire> {
+	port: &'a mut W,
 	bind: &'a common::Bind,
 	bootstrap: u64,
 	state: &'a mut Attachment,
 }
 
-impl console_stream::Service for Console<'_, '_> {
+impl<W: Wire> console_stream::Service for Console<'_, W> {
 	fn attach(&mut self, version: u32) -> Result<ConsoleAttachment, Error> {
 		match driver_protocol::console::attach(version, CONTRACT_VERSION, MAX_WRITE as u32) {
 			driver_protocol::console::Attach::Speak { version, max_frame } => {
@@ -203,7 +231,7 @@ impl console_stream::Service for Console<'_, '_> {
 		}
 		// SAFETY: the port's transmit buffer and its queue are this driver's for the life of the
 		// process; `write` is unsafe because it copies into that mapping and submits a descriptor.
-		unsafe { self.port.write(&bytes, self.bind, self.bootstrap) }
+		unsafe { Wire::write(self.port, &bytes, self.bind, self.bootstrap) }
 	}
 
 	fn receive(&mut self) -> Result<Vec<ConsoleChunk>, Error> {
@@ -232,7 +260,7 @@ impl console_stream::Service for Console<'_, '_> {
 // interrupt that announced newly arrived bytes; draining first means the loop never blocks while
 // work is already queued, whichever wait observed it.
 
-fn serve_once(serving: &mut common::Serving, index: usize, state: &mut Attachment, port: &mut Port, bind: &common::Bind, bootstrap: u64, request: &mut [u8], reply: &mut [u8]) -> bool {
+fn serve_once<W: Wire>(serving: &mut common::Serving, index: usize, state: &mut Attachment, port: &mut W, bind: &common::Bind, bootstrap: u64, request: &mut [u8], reply: &mut [u8]) -> bool {
 	let end: u64 = serving.at(index);
 	let (len, handle): (usize, u64) = match recv_blocking(end, request) {
 		Received::Message { len, handle } => (len, handle),
@@ -251,7 +279,7 @@ fn serve_once(serving: &mut common::Serving, index: usize, state: &mut Attachmen
 	}
 	let mut request_handles: Handles = Handles::new();
 	let mut reply_handles: Handles = Handles::new();
-	let mut console: Console = Console { port, bind, bootstrap, state };
+	let mut console: Console<W> = Console { port, bind, bootstrap, state };
 	let Some(written) = console_stream::dispatch(&mut console, &request[..len], &mut request_handles, reply, &mut reply_handles) else {
 		// A request this contract does not define, or one whose reply would not fit. Neither is
 		// answerable, and answering the NEXT request on this connection with this one's reply is
@@ -263,11 +291,11 @@ fn serve_once(serving: &mut common::Serving, index: usize, state: &mut Attachmen
 
 // `receive`, whose reply carries the stream endpoint. The service mints the pair - it is the one
 // that knows whether this consumer may have one - and this hands it over.
-fn serve_receive(end: u64, state: &mut Attachment, port: &mut Port, bind: &common::Bind, bootstrap: u64, request: &[u8], reply: &mut [u8]) -> bool {
+fn serve_receive<W: Wire>(end: u64, state: &mut Attachment, port: &mut W, bind: &common::Bind, bootstrap: u64, request: &[u8], reply: &mut [u8]) -> bool {
 	let mut request_handles: Handles = Handles::new();
 	let granted: u64;
 	let outcome: Option<(u32, Result<Vec<ConsoleChunk>, Error>)> = {
-		let mut console: Console = Console { port, bind, bootstrap, state };
+		let mut console: Console<W> = Console { port, bind, bootstrap, state };
 		console_stream::receive_open(&mut console, request, &mut request_handles)
 	};
 	let Some((corr, result)) = outcome else { return false };
@@ -446,6 +474,54 @@ impl<'a> Stream<'a> {
 	// Serve one request from the consumer on `index`. False means that consumer is gone.
 	pub fn serve(&mut self, serving: &mut common::Serving, index: usize, bind: &common::Bind, bootstrap: u64, buffers: &mut Buffers) -> bool {
 		serve_once(serving, index, &mut self.state, &mut self.port, bind, bootstrap, &mut buffers.request, &mut buffers.reply)
+	}
+}
+
+/// ONE ATTACHED CONSUMER AND THE CONTRACT PLUMBING TO SERVE IT, for a port whose transport is not a
+/// virtio queue.
+///
+/// `Stream` IS THE VIRTIO SHAPE and owns more than this: two queues, a receive pool and the
+/// descriptor bookkeeping behind them. A controller that owns its own rings - a USB CDC-ACM adapter
+/// on an xHCI transfer ring - already has all of that and needs only the half that is about
+/// `console-stream`: the attachment, the grant, the serve loop and the backpressure. Splitting it
+/// here rather than copying it is what keeps the two transports from growing two answers to "what
+/// does `again` mean".
+#[derive(Default)]
+pub struct Session {
+	state: Attachment,
+}
+
+impl Session {
+	pub fn new() -> Session {
+		Session::default()
+	}
+
+	/// Serve one request from the consumer on `index`. False means that consumer is gone.
+	pub fn serve<W: Wire>(&mut self, serving: &mut common::Serving, index: usize, port: &mut W, bind: &common::Bind, bootstrap: u64, buffers: &mut Buffers) -> bool {
+		serve_once(serving, index, &mut self.state, port, bind, bootstrap, &mut buffers.request, &mut buffers.reply)
+	}
+
+	/// Hand bytes the transport received to the attached consumer.
+	///
+	/// BYTES WITH NOBODY TO TAKE THEM ARE DISCARDED, for the reason `drain_receive` states: they
+	/// belong to a session nobody is holding, and a transport that stopped taking them instead would
+	/// leave the device with nowhere to put what a host is still writing.
+	pub fn deliver(&mut self, bind: &common::Bind, bootstrap: u64, chunk: &[u8], buffers: &mut Buffers) {
+		if chunk.is_empty() || self.state.stream == 0 {
+			return;
+		}
+		send_chunk(bind, bootstrap, &mut self.state, chunk, &mut buffers.frame);
+	}
+
+	/// Whether a consumer is attached and holding a stream, for a transport deciding whether a
+	/// receive is worth posting.
+	pub fn listening(&self) -> bool {
+		self.state.stream != 0
+	}
+
+	/// This consumer is over - see `Attachment::reset`.
+	pub fn reset(&mut self) {
+		self.state.reset();
 	}
 }
 

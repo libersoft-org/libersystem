@@ -328,3 +328,67 @@ fn an_infinite_far_plane_is_the_limit_of_a_finite_one() {
 	assert!(camera::perspective_infinite_rh_zo(core::f32::consts::FRAC_PI_2, 0.0, 0.5).is_err());
 	assert!(camera::perspective_infinite_rh_zo(f32::NAN, 1.0, 0.5).is_err());
 }
+
+#[test]
+// `ln` AGAINST `f64::ln`, ACROSS TWELVE ORDERS OF MAGNITUDE. A logarithm wrong in the sixth digit is
+// a cascade split in the wrong place, which is a shadow map at the wrong resolution over a band of
+// the view - visible as a seam and traced to anything but the logarithm.
+fn the_natural_logarithm_matches_the_definition() {
+	for value in [1.0e-6f64, 1.0e-3, 0.1, 0.5, 0.9999, 1.0, 1.0001, 1.5, 2.0, core::f64::consts::E, 10.0, 100.0, 1000.0, 65536.0, 1.0e6] {
+		let ours = vector::ln(value as f32) as f64;
+		let theirs = value.ln();
+		assert!((ours - theirs).abs() <= 1e-5 * theirs.abs().max(1.0), "ln({value}) is {ours} and should be {theirs}");
+	}
+	assert_eq!(vector::ln(1.0), 0.0, "the logarithm of one is exactly zero");
+	assert_eq!(vector::ln(0.0), f32::NEG_INFINITY);
+	assert!(vector::ln(-1.0).is_nan(), "a negative has no real logarithm");
+	assert_eq!(vector::ln(f32::INFINITY), f32::INFINITY);
+	// A SUBNORMAL IS SCALED INTO RANGE FIRST. Its stored exponent is zero and its mantissa is not
+	// the number's, so reading the bits as a normal would answer for a different value entirely.
+	let subnormal = f32::from_bits(1);
+	assert!((vector::ln(subnormal) as f64 - (subnormal as f64).ln()).abs() < 1e-3, "a subnormal is answered for itself");
+}
+
+#[test]
+// `exp` AGAINST `f64::exp`, INCLUDING THE ENDS. The fog equation is `exp(-(density * distance)^2)`,
+// so the arguments a scene actually produces are large and negative, and the answer there has to be
+// a clean zero rather than a denormal that costs a hundred cycles a pixel.
+fn the_exponential_matches_the_definition_and_saturates_cleanly() {
+	for value in [-20.0f64, -5.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0, 20.0, 50.0, 80.0] {
+		let ours = vector::exp(value as f32) as f64;
+		let theirs = value.exp();
+		assert!((ours - theirs).abs() <= 1e-5 * theirs.abs().max(1.0e-6), "exp({value}) is {ours} and should be {theirs}");
+	}
+	assert_eq!(vector::exp(0.0), 1.0, "e to the nothing is exactly one");
+	assert_eq!(vector::exp(1000.0), f32::INFINITY, "past the format's range it saturates");
+	assert_eq!(vector::exp(-1000.0), 0.0, "and at the other end it is a clean zero");
+	assert!(vector::exp(f32::NAN).is_nan());
+	// ROUND TRIP, which catches a wrong `ln(2)` in either function: they would have to be wrong by
+	// the same amount in opposite directions to pass this.
+	for value in [0.25f32, 1.0, 7.5, 1000.0] {
+		let round_trip = vector::exp(vector::ln(value));
+		assert!((round_trip - value).abs() <= 1e-4 * value, "exp(ln({value})) is {round_trip}");
+	}
+}
+
+#[test]
+// `powf` IS `exp(y * ln(x))` WITH THE TWO LIMITS THAT ARE NOT. A power of zero is one for every base
+// and a base of zero is zero for every positive power; computing either through the logarithm gives
+// a NaN and an infinity, and both are what a caller actually means.
+fn a_real_power_matches_the_definition_and_answers_its_limits() {
+	for (base, exponent) in [(2.0f64, 10.0f64), (2.0, 0.5), (10.0, -2.0), (1.5, 3.0), (100.0, 0.25), (0.5, 8.0)] {
+		let ours = vector::powf(base as f32, exponent as f32) as f64;
+		let theirs = base.powf(exponent);
+		assert!((ours - theirs).abs() <= 1e-4 * theirs.abs().max(1.0), "{base}^{exponent} is {ours} and should be {theirs}");
+	}
+	assert_eq!(vector::powf(0.0, 0.0), 1.0, "anything to the nothing is one, including nothing");
+	assert_eq!(vector::powf(1.0e30, 0.0), 1.0);
+	assert_eq!(vector::powf(0.0, 2.0), 0.0);
+	assert_eq!(vector::powf(0.0, -2.0), f32::INFINITY);
+	assert!(vector::powf(-2.0, 0.5).is_nan(), "a negative base has no real root here");
+	// THE SQUARE ROOT BY EITHER ROUTE AGREES, which is the cheapest check that the two series are
+	// consistent with the Newton iteration beside them.
+	for value in [2.0f32, 7.0, 1000.0] {
+		assert!((vector::powf(value, 0.5) - vector::sqrt(value)).abs() <= 1e-3 * value.max(1.0), "the two routes to a square root agree at {value}");
+	}
+}

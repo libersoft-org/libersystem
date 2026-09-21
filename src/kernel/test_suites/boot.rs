@@ -215,7 +215,27 @@ fn init_package_starts_system_manager() {
 	// AND THE BIND WINDOW ITSELF IS NOT WIDENED HERE. It is P02M0162's contract and it is not this
 	// suite's to relax; what this line bounds is how long the suite waits for a chain that is still
 	// making progress. The assertion below is unchanged: every manifest service must report online.
-	let give_up = arch::apic::ticks() + 20000;
+	// AND THE SAME NUMBER IS NOT THE SAME PATIENCE ON EVERY PORT (2026-09-21). These are GUEST ticks,
+	// so twenty thousand is two hundred seconds of guest time wherever it runs - and on a target that
+	// emulates every instruction, two hundred seconds of guest time is a boot that has done far less
+	// work than the same figure buys on hardware. Measured on riscv64: the chain reached thirteen of
+	// twenty-four services and WAS STILL CLIMBING when this bound fell - five at five hundred passes,
+	// six at two thousand, thirteen at the end - with ZERO driver incidents in the whole log, which
+	// is what says it was slow rather than stuck.
+	//
+	// WHAT THIS BOUND IS FOR, in its own words above: how long the suite waits for a chain that is
+	// STILL MAKING PROGRESS. A number that cuts off a progressing chain is not measuring patience,
+	// it is measuring the emulator.
+	//
+	// AND THE ASSERTION BELOW IS UNCHANGED, which is the whole guard against this being a way to make
+	// a failure go away: every manifest service must still report online. A chain that stops making
+	// progress fails exactly as it did, just later - and "later" on these ports is still inside the
+	// suite's own timeout.
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 20000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 20000 * 13;
+	let give_up = arch::apic::ticks() + patience;
 	let mut passes: u32 = 0;
 	while arch::apic::ticks() < give_up {
 		// A BOUNDED DRAIN AND NOT AN UNBOUNDED ONE. `run_until_idle` sleeps to the nearest THREAD

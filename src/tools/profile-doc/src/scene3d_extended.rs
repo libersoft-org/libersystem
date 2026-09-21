@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use graphics_profile::scene3d_extended::{ANIMATION_RULES, ENVIRONMENT_RULES, PBR_CONSTANTS, PBR_TERMS, POSTPROCESS_RULES, SCENE3D_EXTENDED_1_MIN_LIMITS, SHADOW_RULES};
+use graphics_profile::scene3d_extended::{ANIMATION_PLAYBACK_RULES, ANIMATION_RULES, ENVIRONMENT_RULES, LEVEL_OF_DETAIL_RULES, PBR_CONSTANTS, PBR_MATERIAL_RULES, PBR_TERMS, POSTPROCESS_RULES, SCENE3D_EXTENDED_1_MIN_LIMITS, SCENE3D_EXTENDED_GROUPS, SCENE3D_EXTENDED_PROFILE_1, SHADOW_RULES};
 
 /// The canonical machine-readable form the hash is taken over.
 pub fn canonical() -> String {
@@ -17,10 +17,13 @@ pub fn canonical() -> String {
 	}
 	for (section, rules) in [
 		("pbr-constant", PBR_CONSTANTS),
+		("pbr-material", PBR_MATERIAL_RULES),
 		("environment", ENVIRONMENT_RULES),
 		("shadow", SHADOW_RULES),
 		("postprocess", POSTPROCESS_RULES),
 		("animation", ANIMATION_RULES),
+		("animation-playback", ANIMATION_PLAYBACK_RULES),
+		("level-of-detail", LEVEL_OF_DETAIL_RULES),
 	] {
 		for rule in rules {
 			let _ = writeln!(out, "{section}={} answer={}", rule.question, rule.answer);
@@ -28,6 +31,12 @@ pub fn canonical() -> String {
 	}
 	for limit in SCENE3D_EXTENDED_1_MIN_LIMITS {
 		let _ = writeln!(out, "min-limit={} minimum={} why={}", limit.name, limit.minimum, limit.why);
+	}
+	// THE CLOSED LIST IS PART OF THE PROFILE, so it is part of the hash. A list that could change
+	// without moving the hash would be a second statement of the profile that nothing holds to the
+	// first, which is the whole reason the hash exists.
+	for entry in SCENE3D_EXTENDED_PROFILE_1 {
+		let _ = writeln!(out, "feature={} group={} owner={:?}", entry.name, entry.group, entry.owner);
 	}
 	out.push_str(&crate::thresholds::canonical_for("scene3d-extended", false));
 	out
@@ -57,10 +66,13 @@ pub fn document(hash: &str) -> String {
 	let _ = writeln!(out);
 
 	for (title, rules) in [
+		("The material's inputs", PBR_MATERIAL_RULES),
 		("Environment lighting", ENVIRONMENT_RULES),
 		("Shadows", SHADOW_RULES),
 		("Post-processing", POSTPROCESS_RULES),
 		("Skinning, morphing and animation", ANIMATION_RULES),
+		("Playing a clip", ANIMATION_PLAYBACK_RULES),
+		("Level of detail", LEVEL_OF_DETAIL_RULES),
 	] {
 		let _ = writeln!(out, "## {title}\n");
 		let _ = writeln!(out, "| question | answer |");
@@ -76,6 +88,20 @@ pub fn document(hash: &str) -> String {
 	let _ = writeln!(out, "| --- | ---: | --- |");
 	for limit in SCENE3D_EXTENDED_1_MIN_LIMITS {
 		let _ = writeln!(out, "| `{}` | {} | {} |", limit.name, limit.minimum, limit.why);
+	}
+	let _ = writeln!(out);
+
+	let _ = writeln!(out, "## The closed feature list\n");
+	let _ = writeln!(out, "The rules above say what an implementation must COMPUTE. This list says what it must HAVE, and");
+	let _ = writeln!(out, "it is what a conformance suite, a capability report and a backend checklist range over. Claiming");
+	let _ = writeln!(out, "`Scene3D Extended 1` means every entry; the profile is optional as a whole and not feature by");
+	let _ = writeln!(out, "feature.\n");
+	for group in SCENE3D_EXTENDED_GROUPS {
+		let _ = writeln!(out, "**{group}**\n");
+		for entry in SCENE3D_EXTENDED_PROFILE_1.iter().filter(|entry| entry.group == *group) {
+			let _ = writeln!(out, "- `{}`", entry.name);
+		}
+		let _ = writeln!(out);
 	}
 	out.push_str(&crate::thresholds::chapter("scene3d-extended", false));
 	out
