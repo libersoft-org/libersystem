@@ -707,10 +707,11 @@ pub fn poll_slots<A: ConfigAccess>(out: &mut [SlotChange; MAX_HOT_PLUG_PORTS]) -
 /// nothing whatever its line says, and firmware leaves the line at `0xff` for a function it routed
 /// nowhere - both are "this port will not tell you", and a handler registered on either would be a
 /// handler on a vector nothing raises.
-// USED BY THE ONE PORT THAT ARMS AN INTERRUPT. The slot protocol is config space and every backend
-// polls it; routing a legacy line through an I/O APIC is x86_64's alone, so on the other two this is
-// reached only through a shim that keeps the HAL surface the same shape.
-#[allow(dead_code)]
+// COMPILED WHERE IT IS REACHED FROM, which is the one port that arms an interrupt, and the test
+// build. The slot protocol is config space and every backend polls it; routing a legacy line through
+// an I/O APIC is x86_64's alone, so the other two ports neither call this nor wrap it. Standing on
+// every backend as a shim nothing reached is what made this look portable while it was not.
+#[cfg(any(target_arch = "x86_64", test))]
 pub fn slot_interrupt_line<A: ConfigAccess>(port: &HotPlugPort) -> Option<u8> {
 	let dword = A::read32(port.bus, port.dev, port.func, 0x3c);
 	let line = dword as u8;
@@ -736,7 +737,11 @@ pub fn set_slot_power<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
 }
 
 /// Every hot-plug port this machine has, for a caller that binds their interrupts.
-#[allow(dead_code)]
+///
+/// COMPILED WHERE IT IS REACHED FROM: x86_64's arming pass, and the guest suite on every port - the
+/// suite asserts the scan found the slot the harness attaches, which is true of a machine that only
+/// polls it. The list itself is filled by the scan on all three backends either way.
+#[cfg(any(target_arch = "x86_64", test))]
 pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
 	let ports = PORTS.lock();
 	*out = ports.0;

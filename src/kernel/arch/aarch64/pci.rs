@@ -18,7 +18,7 @@ use crate::arch::common::pci as common;
 // directly in this backend's code. A TEST build names none of it at all: every shim that does is
 // `not(test)`, because what a kernel test drives is a fake config space and not this machine's.
 #[cfg(not(test))]
-pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
+pub use common::{ErrorRecord, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
 static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -150,30 +150,17 @@ pub fn set_slot_power(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_slot_power::<Access>(bus, dev, func, on);
 }
 
-// Every hot-plug port this machine has - see `arch::common::pci::hot_plug_ports`.
-#[cfg(not(test))]
-// THE HAL CONTRACT IS THE SAME SURFACE ON EVERY BACKEND, and this half of it has no caller here:
-// arming a slot's interrupt routes a legacy line through an I/O APIC, which this port does not have.
-// The slot itself is polled on the idle pass like every other one.
-#[allow(dead_code)]
-pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
-	common::hot_plug_ports(out)
-}
-
 // Read every hot-plug slot and answer what changed - see `arch::common::pci::poll_slots`.
+//
+// POLLING IS THE WHOLE OF THIS PORT'S HOT-PLUG CONTRACT, and that is a decision and not a gap.
+// Arming a slot means routing the function's legacy INTx line through an I/O APIC and registering a
+// handler on the vector it lands at. This machine has no I/O APIC, and the two calls that arming
+// needs - the port list to walk and the line each port asserts on - are compiled on x86_64 alone.
+// They stood here as wrappers nothing called, which made the surface look portable and cost a
+// dead-code suppression apiece; the surface says what it does instead.
 #[cfg(not(test))]
 pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) -> usize {
 	common::poll_slots::<Access>(out)
-}
-
-// The legacy interrupt line a hot-plug port asserts on, or `None` where it has none.
-#[cfg(not(test))]
-// THE HAL CONTRACT IS THE SAME SURFACE ON EVERY BACKEND, and this half of it has no caller here:
-// arming a slot's interrupt routes a legacy line through an I/O APIC, which this port does not have.
-// The slot itself is polled on the idle pass like every other one.
-#[allow(dead_code)]
-pub fn slot_interrupt_line(port: &common::HotPlugPort) -> Option<u8> {
-	common::slot_interrupt_line::<Access>(port)
 }
 
 pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
