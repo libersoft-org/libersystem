@@ -18,7 +18,7 @@ use crate::arch::common::pci as common;
 // directly in this backend's code. A TEST build names none of it at all: every shim that does is
 // `not(test)`, because what a kernel test drives is a fake config space and not this machine's.
 #[cfg(not(test))]
-pub use common::{ErrorRecord, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
+pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
 static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -150,17 +150,55 @@ pub fn set_slot_power(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_slot_power::<Access>(bus, dev, func, on);
 }
 
+// Every hot-plug port this machine has - see `arch::common::pci::hot_plug_ports`.
+#[cfg(not(test))]
+pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
+	common::hot_plug_ports(out)
+}
+
 // Read every hot-plug slot and answer what changed - see `arch::common::pci::poll_slots`.
-//
-// POLLING IS THE WHOLE OF THIS PORT'S HOT-PLUG CONTRACT, and that is a decision and not a gap.
-// Arming a slot means routing the function's legacy INTx line through an I/O APIC and registering a
-// handler on the vector it lands at. This machine has no I/O APIC, and the two calls that arming
-// needs - the port list to walk and the line each port asserts on - are compiled on x86_64 alone.
-// They stood here as wrappers nothing called, which made the surface look portable and cost a
-// dead-code suppression apiece; the surface says what it does instead.
 #[cfg(not(test))]
 pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) -> usize {
 	common::poll_slots::<Access>(out)
+}
+
+// Bind this hot-plug port's slot interrupt to `handler`, and answer the INTID it was bound to.
+// `None` for a port this board routes nowhere, whose slot is polled on the idle pass instead.
+//
+// THE BOARD SAYS WHERE THE PIN GOES, BECAUSE NOTHING ELSE CAN. x86 firmware writes the routed line
+// into the function's own config space and that port reads it back; the firmware that boots this
+// one writes nothing there. What it hands over instead is a device tree, and the host bridge's
+// `interrupt-map` is where the board states which pin of which device reaches which GIC input. So
+// the pin comes from config space, the tree turns it into a specifier, and the GIC binding's three
+// cells - `(type, number, flags)` - turn that into an INTID: an SPI is type 0 and starts at 32.
+//
+// AND IT IS CONFIGURED AS A LEVEL SOURCE, which is what an INTx line is. See `gic::enable_spi`: an
+// edge configuration on a shared line loses the second device to assert while the first is being
+// serviced, and a hot-plug line is shared by construction - four root ports swizzle onto four GIC
+// inputs, so any two of them can land on one.
+#[cfg(not(test))]
+pub fn arm_slot_interrupt(port: &common::HotPlugPort, handler: crate::arch::interrupts::HandlerFn) -> Option<u32> {
+	let pin: u8 = common::slot_interrupt_pin::<Access>(port)?;
+	let route = super::device_tree()?.pci_intx_route(port.bus, port.dev, port.func, pin)?;
+	// A CONTROLLER THIS PORT IS NOT DRIVING IS REFUSED RATHER THAN GUESSED AT. Three cells whose
+	// first is zero is the `arm,gic` binding saying "an SPI"; anything else is a board wiring its
+	// PCI legacy lines somewhere this kernel has no code for, and arming INTID `spec[1] + 32` on
+	// that machine would enable an input belonging to something else.
+	if route.cells != 3 || route.spec[0] != 0 {
+		crate::serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed through a controller this kernel does not drive", port.bus, port.dev, port.func);
+		return None;
+	}
+	let intid: u32 = route.spec[1].checked_add(32)?;
+	// REGISTERED BEFORE THE SOURCE IS ENABLED, in that order and for the obvious reason: the line
+	// may be asserted already - a slot that was occupied at reset latches its presence bit - and an
+	// enable that ran first would take an interrupt with no handler behind it.
+	if !crate::arch::interrupts::register(intid, handler) {
+		crate::serial_println!("pci: this kernel answers as many wired lines as it carries rows for; {:02x}:{:02x}.{} is polled only", port.bus, port.dev, port.func);
+		return None;
+	}
+	common::set_intx_disabled::<Access>(port.bus, port.dev, port.func, false);
+	super::gic::enable_spi(intid, super::gic::Trigger::Level);
+	Some(intid)
 }
 
 pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {

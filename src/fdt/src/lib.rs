@@ -2606,6 +2606,365 @@ impl Fdt {
 			}
 		}
 	}
+
+	/// Where one PCI function's INTx pin lands on this machine's interrupt controller.
+	///
+	/// `pin` is the function's PCI Interrupt Pin register: 1..=4 for INTA..INTD, and anything else
+	/// is a function that asserts no legacy line. The answer is the interrupt parent's OWN
+	/// specifier, UNINTERPRETED - three cells of `(type, number, flags)` on a GIC, two of
+	/// `(source, trigger)` on an APLIC, one of `(source)` on a PLIC - because what those cells mean
+	/// is the controller's binding and not this reader's business. The port that owns the controller
+	/// is what turns them into an interrupt number.
+	///
+	/// THIS IS THE ONLY ROUTE A DEVICE-TREE MACHINE HAS. x86 firmware writes the routed line into
+	/// the function's own Interrupt Line register and a kernel reads it back from config space; a
+	/// device tree names no such thing, and this map is where the board says which pin of which
+	/// device reaches which controller input. A tree that carries no map describes a machine with no
+	/// legacy routing to find, which is `None` rather than a failure - its devices raise MSIs.
+	///
+	/// AND THE MASK IS WHY FOUR ROWS CAN DESCRIBE EVERY DEVICE. The standard swizzle repeats every
+	/// four device numbers, so a host bridge masks all but two bits of the device field and lists
+	/// sixteen rows; a function at device 5 matches the row written for device 1, which is the
+	/// routing the board really has and not an approximation of it.
+	///
+	/// WHAT IT ANSWERS FOR IS A FUNCTION ON THE BUS THIS BRIDGE ROOTS, and the limit is worth
+	/// stating because the answer for anything else looks just as plausible. A device BEHIND a
+	/// bridge does not assert its own pin at the host: the bridge swizzles it by the device number
+	/// at each level and asserts the result, so routing one means walking up to the root bus first.
+	/// QEMU's mask keeps no bus bits at all, so passing a secondary-bus address here would match a
+	/// row and return a line that device never raises. Every caller in this tree arms a hot-plug
+	/// PORT, which is a function on the root bus, and that is the shape this was written for.
+	pub fn pci_intx_route(&self, bus: u8, dev: u8, func: u8, pin: u8) -> Option<IntxRoute> {
+		if !(1..=4).contains(&pin) {
+			return None;
+		}
+		let map = self.pci_interrupt_map()?;
+		// The bindings this reader knows how to key a row by. A host bridge that numbered its
+		// children differently would need its rows read differently, and reading them the PCI way
+		// anyway would match the wrong row rather than none.
+		if map.child_address_cells != PCI_ADDRESS_CELLS || map.child_interrupt_cells != 1 {
+			return None;
+		}
+		// The child key, in the binding's own shape: `phys.hi` carries bus, device and function,
+		// and the other two address cells are zero for a configuration-space address.
+		let child: [u32; PCI_CHILD_CELLS] = [((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8), 0, 0, pin as u32];
+		let mut mask = [u32::MAX; PCI_CHILD_CELLS];
+		if map.mask_len != 0 {
+			// A mask that is not exactly the child key's width is a tree this reader cannot align
+			// its rows against, and aligning them anyway would compare the wrong cells.
+			if map.mask_len as usize != PCI_CHILD_CELLS * 4 {
+				return None;
+			}
+			for (index, cell) in mask.iter_mut().enumerate() {
+				// SAFETY: `prop_in` bounded this value inside the structure block, and `mask_len`
+				// is that property's own length.
+				*cell = unsafe { self.be32(map.mask + index as u64 * 4) };
+			}
+		}
+		let mut offset: u32 = 0;
+		let mut rows: usize = 0;
+		// The fixed head of every row: the child key, then the phandle of the controller it goes to.
+		let head: u32 = (PCI_CHILD_CELLS as u32 + 1) * 4;
+		while offset.checked_add(head)? <= map.map_len {
+			rows += 1;
+			if rows > MAX_INTX_ROWS {
+				return None;
+			}
+			let row = map.map.checked_add(offset as u64)?;
+			let mut key = [0u32; PCI_CHILD_CELLS];
+			for (index, cell) in key.iter_mut().enumerate() {
+				// SAFETY: this row's head lies inside the value `prop_in` bounded - the loop
+				// condition checked it before entering.
+				*cell = unsafe { self.be32(row + index as u64 * 4) };
+			}
+			// SAFETY: as above; the phandle is the cell after the child key.
+			let controller = unsafe { self.be32(row + PCI_CHILD_CELLS as u64 * 4) };
+			// HOW LONG THIS ROW IS DEPENDS ON THE CONTROLLER IT NAMES, which is why the phandle is
+			// resolved before the row can be stepped over rather than after a match fails. A row
+			// whose parent the tree does not describe is a tree contradicting itself, and guessing
+			// a width would put the next row's read at an offset nothing wrote.
+			let (parent_address_cells, parent_interrupt_cells) = self.node_cells_by_phandle(controller)?;
+			if parent_interrupt_cells == 0 || parent_interrupt_cells as usize > MAX_INTERRUPT_CELLS || parent_address_cells > MAX_CELLS {
+				return None;
+			}
+			let stride: u32 = head.checked_add((parent_address_cells + parent_interrupt_cells).checked_mul(4)?)?;
+			if offset.checked_add(stride)? > map.map_len {
+				return None;
+			}
+			if key.iter().zip(child.iter()).zip(mask.iter()).all(|((&row_cell, &want), &bits)| row_cell & bits == want & bits) {
+				let mut spec = [0u32; MAX_INTERRUPT_CELLS];
+				let at = row + head as u64 + parent_address_cells as u64 * 4;
+				for (index, cell) in spec.iter_mut().enumerate().take(parent_interrupt_cells as usize) {
+					// SAFETY: the whole row was checked to lie inside the value above.
+					*cell = unsafe { self.be32(at + index as u64 * 4) };
+				}
+				return Some(IntxRoute { controller, cells: parent_interrupt_cells, spec });
+			}
+			offset += stride;
+		}
+		None
+	}
+
+	// The `interrupt-map` of this machine's PCI host bridge, and the two cell counts a row of it is
+	// keyed by. The FIRST such node that carries a map: a tree with two host bridges has two maps,
+	// and this kernel addresses devices without a segment, so it has one bus space to route for.
+	fn pci_interrupt_map(&self) -> Option<IntxMap> {
+		let b = self.bounds()?;
+		unsafe {
+			let mut p = b.struct_start;
+			let mut depth: i32 = -1;
+			let mut inside: i32 = -1;
+			let mut current = IntxMap::empty();
+			loop {
+				let token = self.be32_in(p, b.struct_end)?;
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						let (name, next) = self.node_name_in(p, &b)?;
+						p = next;
+						// The same two spellings the boot parse looks for, and for the same reason:
+						// this node sits at the root on aarch64 virt and under `/soc` on riscv64.
+						if inside < 0 && (self.str_starts(name, "pcie") || self.str_starts(name, "pci@")) {
+							inside = depth;
+							current = IntxMap::empty();
+						}
+					}
+					FDT_END_NODE => {
+						if inside == depth {
+							inside = -1;
+							if current.map_len != 0 {
+								return Some(current);
+							}
+						}
+						depth -= 1;
+						if depth < -1 {
+							return None;
+						}
+					}
+					FDT_PROP => {
+						let (pname, len, val, next) = self.prop_in(p, &b)?;
+						p = next;
+						if inside != depth {
+							continue;
+						}
+						if len == 4 && self.str_eq(pname, "#address-cells") {
+							current.child_address_cells = self.be32(val);
+						} else if len == 4 && self.str_eq(pname, "#interrupt-cells") {
+							current.child_interrupt_cells = self.be32(val);
+						} else if self.str_eq(pname, "interrupt-map") {
+							current.map = val;
+							current.map_len = len;
+						} else if self.str_eq(pname, "interrupt-map-mask") {
+							current.mask = val;
+							current.mask_len = len;
+						}
+					}
+					FDT_NOP => {}
+					FDT_END => return None,
+					_ => return None,
+				}
+			}
+		}
+	}
+
+	/// Where the interrupt controller identified by `phandle` has its registers: `(base, size)`.
+	///
+	/// A ROUTE NAMES ITS CONTROLLER AND THIS IS HOW A PORT FINDS IT. `pci_intx_route` answers with a
+	/// phandle because a machine can have several controllers and the row says which one the line
+	/// reaches; a port that has to PROGRAM that controller needs its address, and looking the node
+	/// up by name would be looking it up by a spelling the board chose.
+	///
+	/// The `reg` is read with the cell counts its PARENT declares, which is where they live - a
+	/// controller under `/soc` is addressed as `/soc` says and not as the root does.
+	pub fn interrupt_controller_reg(&self, phandle: u32) -> Option<(u64, u64)> {
+		let facts = self.node_facts_by_phandle(phandle)?;
+		(facts.reg_size != 0).then_some((facts.reg_base, facts.reg_size))
+	}
+
+	// What a node identified by `phandle` declares, and where it lives.
+	//
+	// KEPT PER DEPTH RATHER THAN PER WALK, because an interrupt controller can have children - a
+	// GICv3 carries its ITS as one - and a single set of variables would have the child's `END_NODE`
+	// answer for the parent, with the parent's own properties already overwritten.
+	//
+	// `#address-cells` DEFAULTS TO ZERO HERE AND NOWHERE ELSE. In an `interrupt-map` row the parent
+	// unit address is as wide as the interrupt parent says, and a controller that declares nothing
+	// is one whose rows carry no address at all - which is what a PLIC's and an APLIC's rows do.
+	// The counts a `reg` is read with are a different question with a different default, and they
+	// come from the ancestors below.
+	fn node_facts_by_phandle(&self, phandle: u32) -> Option<NodeFacts> {
+		if phandle == 0 || phandle == u32::MAX {
+			return None;
+		}
+		let b = self.bounds()?;
+		unsafe {
+			let mut p = b.struct_start;
+			let mut depth: i32 = -1;
+			let mut seen = [0u32; MAX_NODE_DEPTH];
+			let mut address = [0u32; MAX_NODE_DEPTH];
+			let mut interrupt = [0u32; MAX_NODE_DEPTH];
+			// The cell counts each level declares FOR ITS CHILDREN, `UNDECLARED` where it says
+			// nothing - which is not the same as declaring zero, and a `reg` read with zero address
+			// cells is a `reg` read at the wrong offset.
+			let mut child_address = [UNDECLARED; MAX_NODE_DEPTH];
+			let mut child_size = [UNDECLARED; MAX_NODE_DEPTH];
+			let mut reg = [(0u64, 0u32); MAX_NODE_DEPTH];
+			loop {
+				let token = self.be32_in(p, b.struct_end)?;
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						let (_, next) = self.node_name_in(p, &b)?;
+						p = next;
+						let at = usize::try_from(depth).ok()?;
+						if at >= MAX_NODE_DEPTH {
+							return None;
+						}
+						(seen[at], address[at], interrupt[at]) = (0, 0, 0);
+						(child_address[at], child_size[at], reg[at]) = (UNDECLARED, UNDECLARED, (0, 0));
+					}
+					FDT_END_NODE => {
+						let at = usize::try_from(depth).ok()?;
+						if at < MAX_NODE_DEPTH && seen[at] == phandle {
+							// THE ANCESTORS' COUNTS AND NOT THIS NODE'S. A controller declaring
+							// `#address-cells` declares how its OWN children are numbered; its own
+							// address is in whatever its parent numbers children in, and the
+							// nearest ancestor that says so is the one that decides.
+							let inherited = |declared: &[u32; MAX_NODE_DEPTH]| -> u32 { (0..at).rev().map(|level| declared[level]).find(|cells| *cells != UNDECLARED).unwrap_or(DEFAULT_CELLS) };
+							let (address_cells, size_cells) = (inherited(&child_address), inherited(&child_size));
+							let (base, size) = self.reg_of(reg[at], address_cells, size_cells);
+							return Some(NodeFacts { address_cells: address[at], interrupt_cells: interrupt[at], reg_base: base, reg_size: size });
+						}
+						depth -= 1;
+						if depth < -1 {
+							return None;
+						}
+					}
+					FDT_PROP => {
+						let (pname, len, val, next) = self.prop_in(p, &b)?;
+						p = next;
+						let Ok(at) = usize::try_from(depth) else { continue };
+						if at >= MAX_NODE_DEPTH {
+							continue;
+						}
+						if self.str_eq(pname, "reg") {
+							reg[at] = (val, len);
+							continue;
+						}
+						if len != 4 {
+							continue;
+						}
+						// `linux,phandle` is the older spelling of the same property, and a tree
+						// written by an older writer carries only that one.
+						if self.str_eq(pname, "phandle") || self.str_eq(pname, "linux,phandle") {
+							seen[at] = self.be32(val);
+						} else if self.str_eq(pname, "#address-cells") {
+							address[at] = self.be32(val);
+							child_address[at] = self.be32(val);
+						} else if self.str_eq(pname, "#interrupt-cells") {
+							interrupt[at] = self.be32(val);
+						} else if self.str_eq(pname, "#size-cells") {
+							child_size[at] = self.be32(val);
+						}
+					}
+					FDT_NOP => {}
+					FDT_END => return None,
+					_ => return None,
+				}
+			}
+		}
+	}
+
+	// The first `(base, size)` pair of a `reg` property, read with the counts its parent declares.
+	// A pair that does not fit the property, or either count outside what this reader carries, is
+	// no address at all rather than a truncated one.
+	fn reg_of(&self, property: (u64, u32), address_cells: u32, size_cells: u32) -> (u64, u64) {
+		if address_cells == 0 || address_cells > MAX_CELLS || size_cells == 0 || size_cells > MAX_CELLS {
+			return (0, 0);
+		}
+		if property.1 < (address_cells + size_cells) * 4 {
+			return (0, 0);
+		}
+		let mut cursor = property.0;
+		// SAFETY: `prop_in` bounded this value inside the structure block, and the length check
+		// above keeps both reads inside the property.
+		unsafe { (self.read_cells(&mut cursor, address_cells), self.read_cells(&mut cursor, size_cells)) }
+	}
+
+	// What a node identified by `phandle` numbers its children's addresses and interrupts in.
+	fn node_cells_by_phandle(&self, phandle: u32) -> Option<(u32, u32)> {
+		let facts = self.node_facts_by_phandle(phandle)?;
+		Some((facts.address_cells, facts.interrupt_cells))
+	}
+}
+
+// What one node says about itself, for a caller that found it by phandle.
+struct NodeFacts {
+	address_cells: u32,
+	interrupt_cells: u32,
+	reg_base: u64,
+	reg_size: u64,
+}
+
+// A level that declares no cell count at all, which the specification says is to be read as the
+// default rather than as zero.
+const UNDECLARED: u32 = u32::MAX;
+const DEFAULT_CELLS: u32 = 2;
+
+/// Where a PCI function's INTx pin lands, in the interrupt controller's own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntxRoute {
+	/// The phandle of the controller the line reaches, so a port can refuse a row that names a
+	/// controller it is not driving.
+	pub controller: u32,
+	/// How many of `spec` that controller's binding defines.
+	pub cells: u32,
+	/// The controller's interrupt specifier, in tree order. Cells past `cells` are zero.
+	pub spec: [u32; MAX_INTERRUPT_CELLS],
+}
+
+/// The widest interrupt specifier this reader will carry. The GIC binding uses three cells
+/// (type, number, flags), the RISC-V APLIC two (source, trigger) and the PLIC one (source); four is
+/// the margin, and a controller declaring more is one this reader refuses to route through rather
+/// than one it truncates.
+pub const MAX_INTERRUPT_CELLS: usize = 4;
+
+// A PCI host bridge numbers its children with three address cells - `phys.hi`, `phys.mid`,
+// `phys.lo` - which is more than `MAX_CELLS` allows an ordinary `reg`. The bound lives here rather
+// than widening the one every address walk shares, because widening that one would let a memory
+// node claim an address this kernel cannot hold.
+const PCI_ADDRESS_CELLS: u32 = 3;
+
+// One `interrupt-map` row is keyed by the child's address and its one interrupt cell.
+const PCI_CHILD_CELLS: usize = PCI_ADDRESS_CELLS as usize + 1;
+
+// A map longer than this is a tree this reader will not follow. The swizzle repeats every four
+// devices, so sixteen rows describe every pin of every device a mask can tell apart; sixty-four
+// leaves room for a bridge that masks more of the device field and refuses a blob that has gone
+// wrong or is trying to.
+const MAX_INTX_ROWS: usize = 64;
+
+// How deep a tree this reader will follow while it is looking for a node by phandle. QEMU's trees
+// are four deep; sixteen is the same kind of margin as the row bound above.
+const MAX_NODE_DEPTH: usize = 16;
+
+// A host bridge's `interrupt-map` as it lies in the blob, with the two counts its rows are keyed by.
+#[derive(Clone, Copy)]
+struct IntxMap {
+	map: u64,
+	map_len: u32,
+	mask: u64,
+	mask_len: u32,
+	child_address_cells: u32,
+	child_interrupt_cells: u32,
+}
+
+impl IntxMap {
+	fn empty() -> Self {
+		Self { map: 0, map_len: 0, mask: 0, mask_len: 0, child_address_cells: 0, child_interrupt_cells: 0 }
+	}
 }
 
 // A reservation list longer than this is a device tree this reader will not follow. Boards reserve

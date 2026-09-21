@@ -24,6 +24,9 @@
 // backend's cycle clock reports through.
 // `rng`: the SplitMix64 mixer the arch random fallbacks share (no arch guarantees a
 // hardware RNG on the bring-up core).
+// `wired`: the kernel's own handlers for wired interrupt lines, shared by the two backends whose
+// controller hands over an interrupt NUMBER (a GIC INTID, an APLIC-delivered EID) rather than a
+// vector it chose - x86_64 indexes by vector and has its own table.
 
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod bootmem;
@@ -35,3 +38,7 @@ pub mod paging;
 pub mod pci;
 pub mod rng;
 pub mod time;
+// The kernel's own wired-interrupt handlers, on the backends whose controller delivers a NUMBER
+// rather than a vector. x86_64 indexes its handlers by vector in its own table and needs none.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+pub mod wired;

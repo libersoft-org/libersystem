@@ -168,7 +168,38 @@ fn is_msi(vector: u32) -> bool {
 	spi_slot(vector).is_some()
 }
 
-// No legacy-INTx binding on aarch64: every driver that needs an interrupt uses MSI-X.
+// THE KERNEL'S OWN WIRED LINES, WHICH ARE NOT DRIVER BINDINGS.
+//
+// Everything else in this file hands an interrupt to a USERSPACE driver: a slot is reserved for a
+// process, an `Interrupt` object is signalled, and the whole lifecycle is about what happens when
+// that process dies. These are the lines this binary answers itself, and today there is exactly
+// one - a PCI hot-plug port's INTx, which the board's `interrupt-map` routes to an SPI. It has to
+// be answered INSIDE the interrupt, because the line is level-sensitive and the source has to be
+// cleared before the EOI; there is no process to wake and nothing to wait for.
+//
+// EIGHT ROWS, WHICH IS MORE HOT-PLUG PORTS THAN A MACHINE HAS. See `arch::common::wired`, which
+// this shares with riscv64 for the reason both ports needed it at once: neither controller hands
+// over a vector it chose, so neither can index a table by one.
+static WIRED: crate::arch::common::wired::Wired<8> = crate::arch::common::wired::Wired::new();
+
+/// What answers one of this kernel's own wired lines: told the INTID it was raised for, because one
+/// function answers for every port on a shared line.
+pub type HandlerFn = crate::arch::common::wired::Handler;
+
+/// Answer `intid` with `handler` from now on. `false` when this kernel already answers as many
+/// wired lines as it carries rows for, which the caller reports rather than swallows.
+pub fn register(intid: u32, handler: HandlerFn) -> bool {
+	WIRED.register(intid, handler)
+}
+
+/// Run this kernel's own handler for `intid`, and say whether there was one. `false` sends the
+/// interrupt on to the MSI registry, which is where every other one belongs.
+pub fn dispatch_wired(intid: u32) -> bool {
+	WIRED.dispatch(intid)
+}
+
+// No legacy-INTx binding on aarch64 FOR A USERSPACE DRIVER: every driver that needs an interrupt
+// uses MSI-X, and the wired lines above are the kernel's own.
 pub fn is_bindable(_vector: u32) -> bool {
 	false
 }

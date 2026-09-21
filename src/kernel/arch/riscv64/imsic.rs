@@ -365,6 +365,12 @@ pub fn handle_external() {
 		if eid == 0 {
 			break;
 		}
-		super::interrupts::dispatch_msi(eid);
+		// THE KERNEL'S OWN WIRED LINES FIRST. An APLIC in MSI delivery mode writes a wired
+		// source's identity into this same file, so a hot-plug port's INTx and a device's MSI-X
+		// arrive by one path and are told apart only by the identity - see `interrupts::WIRED_EID`,
+		// which is outside the window any device is ever given.
+		if !super::interrupts::dispatch_wired(eid) {
+			super::interrupts::dispatch_msi(eid);
+		}
 	}
 }

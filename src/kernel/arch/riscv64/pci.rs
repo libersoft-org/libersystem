@@ -18,7 +18,7 @@ use crate::arch::common::pci as common;
 // directly in this backend's code. A TEST build names none of it at all: every shim that does is
 // `not(test)`, because what a kernel test drives is a fake config space and not this machine's.
 #[cfg(not(test))]
-pub use common::{ErrorRecord, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
+pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
 static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -148,17 +148,68 @@ pub fn set_slot_power(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_slot_power::<Access>(bus, dev, func, on);
 }
 
+// Every hot-plug port this machine has - see `arch::common::pci::hot_plug_ports`.
+#[cfg(not(test))]
+pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
+	common::hot_plug_ports(out)
+}
+
 // Read every hot-plug slot and answer what changed - see `arch::common::pci::poll_slots`.
-//
-// POLLING IS THE WHOLE OF THIS PORT'S HOT-PLUG CONTRACT, and that is a decision and not a gap.
-// Arming a slot means routing the function's legacy INTx line through an I/O APIC and registering a
-// handler on the vector it lands at. This machine has no I/O APIC, and the two calls that arming
-// needs - the port list to walk and the line each port asserts on - are compiled on x86_64 alone.
-// They stood here as wrappers nothing called, which made the surface look portable and cost a
-// dead-code suppression apiece; the surface says what it does instead.
 #[cfg(not(test))]
 pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) -> usize {
 	common::poll_slots::<Access>(out)
+}
+
+// Bind this hot-plug port's slot interrupt to `handler`, and answer the APLIC source it was bound
+// to. `None` for a port this board routes nowhere, whose slot is polled on the idle pass instead.
+//
+// THE BOARD SAYS WHERE THE PIN GOES, BECAUSE NOTHING ELSE CAN. x86 firmware writes the routed line
+// into the function's own config space and that port reads it back; the firmware that boots this one
+// writes nothing there. What it hands over instead is a device tree, and the host bridge's
+// `interrupt-map` is where the board states which pin of which device reaches which controller
+// input. So the pin comes from config space and the tree turns it into a source and a trigger.
+//
+// AND THE CONTROLLER IS FOUND BY THE PHANDLE THE ROUTE NAMES, rather than by looking for a node
+// with a likely name. This machine has two interrupt controllers that both answer to "interrupt
+// controller" - the APLIC and the IMSIC behind it - and the row says which one the wire reaches.
+#[cfg(not(test))]
+pub fn arm_slot_interrupt(port: &common::HotPlugPort, handler: crate::arch::interrupts::HandlerFn) -> Option<u32> {
+	let pin: u8 = common::slot_interrupt_pin::<Access>(port)?;
+	let tree = super::device_tree()?;
+	let route = tree.pci_intx_route(port.bus, port.dev, port.func, pin)?;
+	// TWO CELLS IS THE APLIC BINDING - `(source, trigger)` - AND ONE IS A PLIC'S. A plain `virt`
+	// machine routes its legacy lines through a PLIC, which this kernel does not drive: every
+	// device interrupt here is an IMSIC message, and the APLIC is reached only because it can turn
+	// a wire into one. Refused in words rather than armed as if the cells meant the same thing.
+	if route.cells != 2 {
+		crate::serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed through a controller this kernel does not drive", port.bus, port.dev, port.func);
+		return None;
+	}
+	let (base, _size) = tree.interrupt_controller_reg(route.controller)?;
+	// A HART WITH NO INTERRUPT FILE IS NOT A TARGET, which is the same check the MSI acquire makes
+	// and for the same reason: the address is `base + hart * stride`, so a hart past the array the
+	// controller declares names something else entirely.
+	let hart: u64 = super::percpu::this_cpu().lapic_id();
+	if !super::imsic::usable() || !super::imsic::has_file(hart) {
+		return None;
+	}
+	let eid: u32 = crate::arch::interrupts::WIRED_EID;
+	// REGISTERED AND ENABLED BEFORE THE SOURCE IS ARMED, in that order: a slot that was occupied at
+	// reset has its presence bit latched already, so the first assertion can arrive the instant the
+	// controller is told to watch the wire.
+	if !crate::arch::interrupts::register(eid, handler) {
+		crate::serial_println!("pci: this kernel answers as many wired lines as it carries rows for; {:02x}:{:02x}.{} is polled only", port.bus, port.dev, port.func);
+		return None;
+	}
+	super::imsic::enable_eid(eid);
+	common::set_intx_disabled::<Access>(port.bus, port.dev, port.func, false);
+	// SAFETY: `base` is where this machine's own device tree places the controller the route names,
+	// and the direct map covers the device window it lies in.
+	if !unsafe { super::aplic::arm_source(base, route.spec[0], route.spec[1], hart, eid) } {
+		crate::serial_println!("pci: the controller did not take source {} for hot-plug port {:02x}:{:02x}.{} - its slot is polled only", route.spec[0], port.bus, port.dev, port.func);
+		return None;
+	}
+	Some(route.spec[0])
 }
 
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10).

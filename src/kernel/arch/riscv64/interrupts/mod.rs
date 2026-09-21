@@ -34,7 +34,42 @@ fn eid_slot(eid: u32) -> Option<usize> {
 	if eid >= EID_BASE && ((eid - EID_BASE) as usize) < MAX_MSI { Some((eid - EID_BASE) as usize) } else { None }
 }
 
-// No legacy-INTx binding on riscv: every driver that needs an interrupt uses MSI-X.
+// THE IDENTITY THIS KERNEL'S OWN WIRED LINES ARRIVE UNDER.
+//
+// The device window above is EIDs 1..=62, which is what `MAX_MSI` says and what `eid_slot` maps.
+// The IMSIC's `EIE0` register holds identities 0..63 on RV64, so 63 is the one identity inside the
+// register this kernel can address and outside everything it hands to a device. A wired line armed
+// on it can never collide with a driver's vector, and the two paths never have to agree about
+// anything beyond that number.
+//
+// ONE IDENTITY FOR EVERY WIRED LINE, WHICH IS WHAT A SHARED LINE ALREADY IS. Four hot-plug ports
+// swizzle onto four APLIC sources and any two can land on one; the handler answers by looking at
+// every slot rather than at the one it hopes asserted, so giving each source its own identity would
+// buy nothing and spend the identities drivers need.
+pub const WIRED_EID: u32 = 63;
+
+// THE KERNEL'S OWN WIRED LINES, WHICH ARE NOT DRIVER BINDINGS. See `arch::common::wired`, and
+// aarch64's copy of this comment: what these answer has no process behind it and must run inside
+// the interrupt.
+static WIRED: crate::arch::common::wired::Wired<8> = crate::arch::common::wired::Wired::new();
+
+/// What answers one of this kernel's own wired lines: told the identity it was raised for.
+pub type HandlerFn = crate::arch::common::wired::Handler;
+
+/// Answer `eid` with `handler` from now on. `false` when this kernel already answers as many wired
+/// lines as it carries rows for, which the caller reports rather than swallows.
+pub fn register(eid: u32, handler: HandlerFn) -> bool {
+	WIRED.register(eid, handler)
+}
+
+/// Run this kernel's own handler for `eid`, and say whether there was one. `false` sends the
+/// identity on to the MSI registry, which is where every device's belongs.
+pub fn dispatch_wired(eid: u32) -> bool {
+	WIRED.dispatch(eid)
+}
+
+// No legacy-INTx binding on riscv FOR A USERSPACE DRIVER: every driver that needs an interrupt uses
+// MSI-X, and the wired lines above are the kernel's own.
 pub fn is_bindable(_vector: u32) -> bool {
 	false
 }

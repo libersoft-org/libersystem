@@ -256,10 +256,27 @@ pub fn poll_slots(out: &mut [common::SlotChange; common::MAX_HOT_PLUG_PORTS]) ->
 	common::poll_slots::<Access>(out)
 }
 
-// The legacy interrupt line a hot-plug port asserts on, or `None` where it has none.
+// Bind this hot-plug port's slot interrupt to `handler`, and answer the interrupt number it was
+// bound to. `None` for a port that raises none, whose slot is polled on the idle pass instead.
+//
+// x86 FIRMWARE ROUTED THE LINE AND WROTE THE NUMBER DOWN, which is the whole of what makes this
+// port's arming different from the two that boot from a device tree. A BIOS or a UEFI picked an I/O
+// APIC input for this function's pin and put it in config space, so there is nothing to resolve:
+// the number is read back, the entry is pointed at the boot core, and the handler is registered on
+// the vector that entry raises.
 #[cfg(not(test))]
-pub fn slot_interrupt_line(port: &common::HotPlugPort) -> Option<u8> {
-	common::slot_interrupt_line::<Access>(port)
+pub fn arm_slot_interrupt(port: &common::HotPlugPort, handler: crate::arch::interrupts::HandlerFn) -> Option<u32> {
+	let line: u8 = common::slot_interrupt_line::<Access>(port)?;
+	common::set_intx_disabled::<Access>(port.bus, port.dev, port.func, false);
+	crate::arch::interrupts::register(crate::arch::interrupts::IRQ_BASE as u32 + line as u32, handler);
+	// LEVEL-TRIGGERED AND ACTIVE-LOW, WHICH IS WHAT AN INTx PIN IS. This routed the ISA defaults,
+	// and the comment on `settle_hot_plug` already named the consequence without connecting it to
+	// the cause: "a level-triggered line one handler already cleared" is a line whose EDGE nobody
+	// saw. Every event this path reports is acknowledged inside the handler - `poll_slots` writes
+	// the slot's sticky bits back before it returns - so the source is clear before the EOI, which
+	// is the condition a level entry needs.
+	crate::arch::ioapic::route(line as u32, crate::arch::interrupts::IRQ_BASE + line, crate::smp::lapic_id(0), crate::arch::ioapic::Kind::LevelLow);
+	Some(line as u32)
 }
 
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10).

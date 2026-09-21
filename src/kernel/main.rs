@@ -458,9 +458,11 @@ fn boot_main() {
 	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
 	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0), arch::ioapic::Kind::IsaEdge);
 	arch::serial::enable_rx_irq();
-	// ONLY THIS PORT ARMS AN INTERRUPT. The slot protocol is config space and every backend polls it
-	// on the idle pass; what is x86_64's alone is routing a legacy line through an I/O APIC.
-	#[cfg(target_arch = "x86_64")]
+	// EVERY PORT ARMS ITS HOT-PLUG SLOTS, and how it does so is the port's business: x86_64 routes
+	// the line firmware wrote into config space through an I/O APIC, and the two device-tree ports
+	// resolve the same function's pin through the host bridge's `interrupt-map` and arm the
+	// controller the tree names. The idle-pass poll stays underneath all three - see
+	// `settle_hot_plug` - because a shared line can be missed on any of them.
 	arm_hot_plug_interrupts();
 	// AND THE SAME IS TRUE OF THE ACPI SCI, for the same reason and one more: a device-tree machine
 	// describes its power button as a node with its own interrupt, which is a different mechanism
@@ -1213,26 +1215,21 @@ fn init_extended_config(bi: &'static BootInfo) {
 	}
 }
 
-#[cfg(all(not(test), target_arch = "x86_64"))]
+// Bind every hot-plug slot's interrupt, on whatever this machine's controller is.
+//
+// THE WALK IS THE SAME ON ALL THREE PORTS AND THE ARMING IS NOT, which is why only the arming is
+// behind the HAL. Each backend's `arm_slot_interrupt` answers the number it bound, or `None` for a
+// port that raises nothing - a function with no interrupt pin, a board whose tree routes it
+// nowhere - and either way the slot is still read on the idle pass, so a machine that arms nothing
+// notices an arrival a pass later rather than not at all.
+#[cfg(not(test))]
 fn arm_hot_plug_interrupts() {
-	{
-		let mut ports: [Option<arch::pci::HotPlugPort>; arch::pci::MAX_HOT_PLUG_PORTS] = [None; arch::pci::MAX_HOT_PLUG_PORTS];
-		let count = arch::pci::hot_plug_ports(&mut ports);
-		for port in ports.iter().take(count).flatten() {
-			let Some(line) = arch::pci::slot_interrupt_line(port) else {
-				serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed to no interrupt - its slot is polled only", port.bus, port.dev, port.func);
-				continue;
-			};
-			arch::pci::set_intx_disabled(port.bus, port.dev, port.func, false);
-			arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + line as u32, hot_plug_interrupt);
-			// LEVEL-TRIGGERED AND ACTIVE-LOW, WHICH IS WHAT AN INTx PIN IS. This routed the ISA
-			// defaults, and the comment on `settle_hot_plug` already named the consequence without
-			// connecting it to the cause: "a level-triggered line one handler already cleared" is a
-			// line whose EDGE nobody saw. Every event this path reports is acknowledged inside the
-			// handler - `poll_slots` writes the slot's sticky bits back before it returns - so the
-			// source is clear before the EOI, which is the condition a level entry needs.
-			arch::ioapic::route(line as u32, arch::interrupts::IRQ_BASE + line, smp::lapic_id(0), arch::ioapic::Kind::LevelLow);
-			serial_println!("pci: hot-plug port {:02x}:{:02x}.{} raises IRQ {line}", port.bus, port.dev, port.func);
+	let mut ports: [Option<arch::pci::HotPlugPort>; arch::pci::MAX_HOT_PLUG_PORTS] = [None; arch::pci::MAX_HOT_PLUG_PORTS];
+	let count = arch::pci::hot_plug_ports(&mut ports);
+	for port in ports.iter().take(count).flatten() {
+		match arch::pci::arm_slot_interrupt(port, hot_plug_interrupt) {
+			Some(number) => serial_println!("pci: hot-plug port {:02x}:{:02x}.{} raises interrupt {number}", port.bus, port.dev, port.func),
+			None => serial_println!("pci: hot-plug port {:02x}:{:02x}.{} is routed to no interrupt - its slot is polled only", port.bus, port.dev, port.func),
 		}
 	}
 }
@@ -1299,8 +1296,7 @@ fn settle_pci_faults() {
 // line are indistinguishable from here, and reading them all is both correct and cheap - there are
 // at most eight, and each is two config reads.
 #[cfg(not(test))]
-#[cfg(target_arch = "x86_64")]
-fn hot_plug_interrupt(_vector: u32) {
+fn hot_plug_interrupt(_number: u32) {
 	settle_hot_plug();
 }
 
@@ -1310,10 +1306,10 @@ fn hot_plug_interrupt(_vector: u32) {
 // a level-triggered line one handler already cleared - and a device nobody noticed is the one failure
 // this whole path exists to prevent. The poll costs two config reads per port per idle pass and
 // reports nothing when nothing changed.
-// AND THE POLL IS WHAT THE OTHER TWO PORTS HAVE. Only the INTERRUPT is x86_64's - it is routed
-// through an I/O APIC, which the other two do not have - and the slot protocol itself is config
-// space and nothing else. So a device plugged into an emulated machine is noticed on the idle pass,
-// which is the same fallback an x86_64 port with no interrupt pin already takes.
+// AND EVERY PORT KEEPS IT, including the two that now arm their own controllers. The slot protocol
+// is config space and nothing else, so the poll is the same work on all three; what differs is only
+// how the line that says "look now" is delivered. A port whose tree routes its pin nowhere, or a
+// function with no interrupt pin at all, is noticed here a pass later rather than not at all.
 #[cfg(not(test))]
 fn settle_hot_plug() {
 	{

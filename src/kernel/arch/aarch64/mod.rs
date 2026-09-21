@@ -51,6 +51,23 @@ pub fn device_tree_boot_info() -> Option<fdt::BootInfo> {
 	unsafe { dtb::parse(hint) }
 }
 
+// The tree itself, for a reader that wants a question answered rather than the bring-up summary.
+//
+// THE SUMMARY IS NOT A SUBSTITUTE, and the hot-plug arming is what showed it. `BootInfo` is a fixed
+// set of fields decided at boot; which controller input a given PCI function's INTx pin reaches is a
+// LOOKUP over a table whose size the board chooses, asked once per port, after the bus scan. Adding
+// it to the summary would mean carrying a board's whole routing table through bring-up on the
+// chance somebody asks - so the pointer is re-read, exactly as the topology reader already does.
+pub fn device_tree() -> Option<fdt::Fdt> {
+	if !DEVICE_TREE_TAKEN.load(core::sync::atomic::Ordering::Acquire) {
+		return None;
+	}
+	let hint = DEVICE_TREE.load(core::sync::atomic::Ordering::Acquire);
+	// SAFETY: as above - the pointer this port's bring-up parsed, and `Fdt`'s own header checks
+	// refuse anything that is not a tree before a token is read.
+	unsafe { dtb::located(hint) }
+}
+
 mod exceptions;
 mod gic;
 // The GICv3 ITS: the MSI controller a GICv3 machine has instead of a v2m frame.

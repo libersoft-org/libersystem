@@ -2400,3 +2400,230 @@ fn the_scan_steps_over_what_is_not_a_tree_and_stops_at_the_first_one() {
 	assert_eq!(unsafe { crate::scan(base, end, 0, identity) }, None, "a zero step is refused, not spun on");
 	drop(memory);
 }
+
+// ---------------------------------------------------------------------------------------------
+// PCI INTx routing: which controller input a function's legacy pin reaches.
+// ---------------------------------------------------------------------------------------------
+//
+// THE ANSWERS BELOW ARE THE TREES', NOT THIS READER'S. Every expected value was taken out of the
+// fixture with an independent decoder before a line of `pci_intx_route` existed, which is the only
+// way a test of a parser is evidence of anything: a value read back by the code under test would
+// pass whatever that code did.
+
+// Big-endian cells, which is how every numeric property in a tree is written.
+fn be_cells(values: &[u32]) -> Vec<u8> {
+	values.iter().flat_map(|value| value.to_be_bytes()).collect()
+}
+
+// The four pins of device 0 on QEMU's aarch64 `virt`: SPIs 3, 4, 5 and 6, level-high, through the
+// GIC. The GIC binding's three cells are `(type, number, flags)` and type 0 is an SPI.
+#[test]
+fn aarch64_pci_intx_routes_each_pin_of_the_root_bus() {
+	let tree = at(AARCH64);
+	for (pin, number) in [(1u8, 3u32), (2, 4), (3, 5), (4, 6)] {
+		let route = tree.pci_intx_route(0, 0, 0, pin).expect("every pin of device 0 is in the map");
+		assert_eq!(route.cells, 3, "the GIC binding names three cells");
+		assert_eq!(route.spec[0], 0, "an SPI, which is type 0");
+		assert_eq!(route.spec[1], number, "pin {pin} is SPI {number}");
+		assert_eq!(route.spec[2], 4, "level-high, which is what a PCI INTx line is");
+		assert_eq!(route.controller, 0x8002, "the tree's GIC");
+	}
+}
+
+// The standard swizzle, which is the whole reason a board lists more than four rows: device 1's
+// INTA is the input device 0's INTB uses, and so on round the four.
+#[test]
+fn pci_intx_swizzles_with_the_device_number() {
+	let tree = at(AARCH64);
+	assert_eq!(tree.pci_intx_route(0, 1, 0, 1).expect("device 1 INTA").spec[1], 4);
+	assert_eq!(tree.pci_intx_route(0, 2, 0, 1).expect("device 2 INTA").spec[1], 5);
+	assert_eq!(tree.pci_intx_route(0, 3, 0, 1).expect("device 3 INTA").spec[1], 6);
+	assert_eq!(tree.pci_intx_route(0, 3, 0, 2).expect("device 3 INTB").spec[1], 3, "the swizzle wraps");
+}
+
+// And why sixteen rows describe a bus of thirty-two devices: the mask keeps two bits of the device
+// field, so device 4 is routed exactly as device 0 is. A reader that compared the field unmasked
+// would find no row and report a device that raises no interrupt.
+#[test]
+fn pci_intx_repeats_every_four_devices_because_that_is_what_the_mask_keeps() {
+	let tree = at(AARCH64);
+	assert_eq!(tree.pci_intx_route(0, 4, 0, 1).expect("device 4"), tree.pci_intx_route(0, 0, 0, 1).expect("device 0"));
+	assert_eq!(tree.pci_intx_route(0, 5, 0, 1).expect("device 5"), tree.pci_intx_route(0, 1, 0, 1).expect("device 1"));
+	assert_eq!(tree.pci_intx_route(0, 31, 0, 4).expect("device 31"), tree.pci_intx_route(0, 3, 0, 4).expect("device 3"));
+}
+
+// A multi-function device asserts one pin per function and the mask keeps no function bits, so the
+// function number changes nothing. Asserted rather than assumed: the field is in the same cell as
+// the device number, and a shift that was one bit out would show up here and nowhere else.
+#[test]
+fn pci_intx_ignores_the_function_number_because_the_mask_does() {
+	let tree = at(AARCH64);
+	let first = tree.pci_intx_route(0, 2, 0, 3).expect("function 0");
+	for func in 1..8u8 {
+		assert_eq!(tree.pci_intx_route(0, 2, func, 3).expect("every function"), first);
+	}
+}
+
+// The plain riscv64 `virt`, whose host bridge routes to a PLIC: one cell, and the source number
+// is the whole of it.
+#[test]
+fn riscv64_pci_intx_routes_to_the_plic_in_one_cell() {
+	let tree = at(RISCV64);
+	for (pin, source) in [(1u8, 0x20u32), (2, 0x21), (3, 0x22), (4, 0x23)] {
+		let route = tree.pci_intx_route(0, 0, 0, pin).expect("every pin is in the map");
+		assert_eq!((route.cells, route.spec[0]), (1, source));
+		assert_eq!(route.spec[1..], [0, 0, 0], "cells past the first are not invented");
+	}
+	assert_eq!(tree.pci_intx_route(0, 1, 0, 4).expect("the swizzle").spec[0], 0x20);
+}
+
+// The machine the harness really runs - `virt,aia=aplic-imsic` - whose host bridge routes to an
+// APLIC: two cells, `(source, trigger)`, and trigger 4 is level-high.
+//
+// THIS IS THE ONE THAT MATTERS FOR THIS PORT. The PLIC tree above is the same board without AIA and
+// is kept because a reader that handled only the two-cell shape would pass on it by accident.
+#[test]
+fn riscv64_aia_pci_intx_routes_to_the_aplic_in_two_cells() {
+	let tree = at(RISCV64_AIA);
+	for (pin, source) in [(1u8, 0x20u32), (2, 0x21), (3, 0x22), (4, 0x23)] {
+		let route = tree.pci_intx_route(0, 0, 0, pin).expect("every pin is in the map");
+		assert_eq!((route.cells, route.spec[0], route.spec[1]), (2, source, 4));
+	}
+	assert_eq!(tree.pci_intx_route(0, 2, 0, 1).expect("the swizzle").spec[0], 0x22);
+}
+
+// The same board with a GICv3 and an ITS. The SPIs are the board's and do not move; the phandle
+// does, which is what a port checks when it refuses to route through a controller it is not driving.
+#[test]
+fn gicv3_its_pci_intx_names_its_own_controller() {
+	let tree = at(AARCH64_GICV3_ITS);
+	let route = tree.pci_intx_route(0, 0, 0, 1).expect("device 0 INTA");
+	assert_eq!((route.cells, route.spec[0], route.spec[1], route.spec[2]), (3, 0, 3, 4));
+	assert_ne!(route.controller, 0x8002, "this machine's controller is not the GICv2 machine's");
+	assert_eq!(route.controller, at(AARCH64_GICV3_ITS).pci_intx_route(0, 1, 0, 1).expect("device 1").controller);
+}
+
+// A pin outside INTA..INTD is a function asserting no legacy line - zero is what config space
+// reports for one - and there is nothing to route. Refused rather than matched against row zero.
+#[test]
+fn pci_intx_refuses_a_pin_that_is_not_inta_to_intd() {
+	let tree = at(AARCH64);
+	for pin in [0u8, 5, 0xff] {
+		assert_eq!(tree.pci_intx_route(0, 0, 0, pin), None, "pin {pin} routes nothing");
+	}
+}
+
+// A machine with no host bridge has no legacy routing, which is an answer and not a failure.
+#[test]
+fn a_machine_with_no_host_bridge_routes_no_legacy_line() {
+	assert_eq!(at(machine(|_| {})).pci_intx_route(0, 0, 0, 1), None);
+}
+
+// A row names its controller by phandle, and the row's WIDTH comes from that controller's own cell
+// counts - so a map naming a node the tree does not contain cannot be stepped over at all. Refused,
+// rather than read on at an offset nothing wrote.
+#[test]
+fn a_map_whose_controller_the_tree_does_not_describe_is_refused() {
+	let tree = machine(|builder| {
+		builder.begin("pcie@10000000");
+		builder.prop_u32("#address-cells", 3).prop_u32("#interrupt-cells", 1);
+		builder.prop("interrupt-map-mask", &be_cells(&[0x1800, 0, 0, 7]));
+		builder.prop("interrupt-map", &be_cells(&[0, 0, 0, 1, 0x99, 0x20]));
+		builder.end();
+	});
+	assert_eq!(at(tree).pci_intx_route(0, 0, 0, 1), None, "no node carries phandle 0x99");
+}
+
+// A host bridge that numbers its children some other way is one whose rows are not keyed the way
+// this reader keys them. Refused: reading them the PCI way anyway would match the wrong row, which
+// is worse than matching none.
+#[test]
+fn a_host_bridge_that_numbers_its_children_differently_is_refused() {
+	for (address_cells, interrupt_cells) in [(2u32, 1u32), (3, 2), (1, 1)] {
+		let tree = machine(|builder| {
+			builder.begin("intc@8000000").prop_u32("phandle", 7).prop_u32("#address-cells", 0).prop_u32("#interrupt-cells", 1).end();
+			builder.begin("pcie@10000000");
+			builder.prop_u32("#address-cells", address_cells).prop_u32("#interrupt-cells", interrupt_cells);
+			builder.prop("interrupt-map-mask", &be_cells(&[0x1800, 0, 0, 7]));
+			builder.prop("interrupt-map", &be_cells(&[0, 0, 0, 1, 7, 0x20]));
+			builder.end();
+		});
+		assert_eq!(at(tree).pci_intx_route(0, 0, 0, 1), None, "#address-cells {address_cells} / #interrupt-cells {interrupt_cells}");
+	}
+}
+
+// An interrupt controller can have children - a GICv3 carries its ITS as one - and the cell counts
+// that size a row are the CONTROLLER's. A reader keeping one set of values for the whole walk would
+// answer with the child's, which is a row width the map does not have.
+#[test]
+fn a_controller_with_a_child_still_answers_with_its_own_cell_counts() {
+	let tree = machine(|builder| {
+		builder.begin("intc@8000000");
+		builder.prop_u32("phandle", 7).prop_u32("#address-cells", 2).prop_u32("#interrupt-cells", 3);
+		builder.begin("its@8080000").prop_u32("phandle", 8).prop_u32("#address-cells", 0).prop_u32("#interrupt-cells", 1).end();
+		builder.end();
+		builder.begin("pcie@10000000");
+		builder.prop_u32("#address-cells", 3).prop_u32("#interrupt-cells", 1);
+		builder.prop("interrupt-map-mask", &be_cells(&[0x1800, 0, 0, 7]));
+		builder.prop("interrupt-map", &be_cells(&[0, 0, 0, 1, 7, 0, 0, 0, 3, 4, 0, 0, 0, 2, 7, 0, 0, 0, 4, 4]));
+		builder.end();
+	});
+	let route = at(tree).pci_intx_route(0, 0, 0, 2).expect("the second row is reachable only at the right stride");
+	assert_eq!((route.cells, route.spec[1]), (3, 4), "the controller's three cells, not its child's one");
+}
+
+// A map longer than this reader follows is a blob that has gone wrong or is trying to, and the
+// bound is on rows SCANNED rather than on rows matched: a lookup that finds nothing must still end.
+#[test]
+fn a_map_longer_than_the_reader_follows_is_refused() {
+	// Sixty-five rows none of which can match the lookup below: every one is written for device 1
+	// pin 2, and the mask keeps both fields. Device numbers counting upwards would have wrapped out
+	// of the five-bit field into the bus field, where the mask drops them - and a row for "device
+	// 32" would then have matched device 0 and ended the scan early.
+	let rows: Vec<u32> = core::iter::repeat([1u32 << 11, 0, 0, 2, 7, 0x20]).take(65).flatten().collect();
+	let tree = machine(|builder| {
+		builder.begin("intc@8000000").prop_u32("phandle", 7).prop_u32("#address-cells", 0).prop_u32("#interrupt-cells", 1).end();
+		builder.begin("pcie@10000000");
+		builder.prop_u32("#address-cells", 3).prop_u32("#interrupt-cells", 1);
+		// A mask keeping the whole device field, so none of the sixty-five rows can match device 0.
+		builder.prop("interrupt-map-mask", &be_cells(&[0xf800, 0, 0, 7]));
+		builder.prop("interrupt-map", &be_cells(&rows));
+		builder.end();
+	});
+	assert_eq!(at(tree).pci_intx_route(0, 0, 0, 1), None);
+}
+
+// A route names its controller by phandle; this is how a port that has to PROGRAM that controller
+// finds it. The addresses below are the fixtures' own, read out with an independent decoder.
+#[test]
+fn an_interrupt_controller_is_found_by_the_phandle_a_route_names() {
+	// The GIC distributor, which is the first `reg` pair of a node that has two.
+	assert_eq!(at(AARCH64).interrupt_controller_reg(0x8002), Some((0x800_0000, 0x1_0000)));
+	assert_eq!(at(AARCH64_GICV3_ITS).interrupt_controller_reg(0x8009), Some((0x800_0000, 0x1_0000)));
+	// AND THESE TWO ARE UNDER `/soc`, whose cell counts are what their `reg` is read with. A reader
+	// taking the ROOT's counts gets the same answer on this board and a different one on a board
+	// whose bus numbers its children differently, which is the bug this asserts against.
+	assert_eq!(at(RISCV64_AIA).interrupt_controller_reg(0x14), Some((0xd00_0000, 0x8000)));
+	assert_eq!(at(RISCV64).interrupt_controller_reg(3), Some((0xc00_0000, 0x60_0000)));
+}
+
+// The controller a route names and the controller found by phandle are the same node, which is the
+// property a port relies on when it refuses to route through something it is not driving.
+#[test]
+fn the_controller_a_pci_route_names_is_one_the_tree_places() {
+	for blob in [AARCH64, AARCH64_GICV3_ITS, RISCV64, RISCV64_AIA] {
+		let tree = at(blob);
+		let route = tree.pci_intx_route(0, 0, 0, 1).expect("every fixture routes INTA");
+		assert!(tree.interrupt_controller_reg(route.controller).is_some(), "the route's controller has an address");
+	}
+}
+
+// A phandle nothing carries, and the two values no node may use, are all "not found" rather than a
+// node found by accident at offset zero.
+#[test]
+fn a_phandle_no_node_carries_places_nothing() {
+	let tree = at(AARCH64);
+	for phandle in [0u32, 0x1234, u32::MAX] {
+		assert_eq!(tree.interrupt_controller_reg(phandle), None, "phandle {phandle:#x}");
+	}
+}

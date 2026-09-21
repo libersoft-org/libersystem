@@ -371,8 +371,15 @@ pub fn handle_irq(from_user: bool) {
 		if super::interrupts::is_device_lpi(intid) && !REPORTED_DEVICE_LPI.swap(true, Ordering::Relaxed) {
 			crate::serial_println!("interrupts: a device raised INTID {intid} - an LPI the ITS translated and delivered");
 		}
-		// A device MSI - a GICv2m SPI or an ITS LPI: wake the bound userspace driver, if any.
-		super::interrupts::dispatch_msi(intid);
+		// THE KERNEL'S OWN WIRED LINES FIRST, AND THEY ARE NOT MSIs. A hot-plug port asserts a
+		// legacy INTx that the board's `interrupt-map` routes to an SPI, and what answers it is a
+		// function in this binary rather than a bound driver - so it is offered here before the MSI
+		// registry, which would find no slot for it and report nothing. The two windows cannot
+		// overlap: an SPI the registry hands out is one this kernel allocated for a device.
+		if !super::interrupts::dispatch_wired(intid) {
+			// A device MSI - a GICv2m SPI or an ITS LPI: wake the bound userspace driver, if any.
+			super::interrupts::dispatch_msi(intid);
+		}
 	}
 	// End of interrupt for any real INTID. 1020..1023 are the special values - spurious, and the
 	// ones a secure view uses - and everything else is an interrupt that was taken and must be
@@ -444,6 +451,34 @@ pub fn send_sgi(cpu: u64, id: u32) {
 // frame and the device's MSI-X table are programmed in arch::interrupts). SPIs are
 // INTID 32.., so the byte-per-INTID target/priority registers are writable for them.
 pub fn enable_msi_spi(spi: u32) {
+	enable_spi(spi, Trigger::Edge);
+}
+
+/// How a source asserts, which is the one thing the two callers of `enable_spi` disagree about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+	/// A GICv2m MSI: the device WRITES, and there is nothing left asserted afterwards.
+	Edge,
+	/// A PCI INTx line: the device holds it asserted until something tells it to stop.
+	Level,
+}
+
+// Configure a shared peripheral interrupt routed to the boot core, and enable it.
+//
+// AND THE TRIGGER IS NOT A DETAIL ON A SHARED LINE. A level source configured as edge is latched
+// once, at the moment it goes high; if it is still asserted when the handler finishes - because a
+// SECOND device on the same line asserted while the first was being serviced - nothing re-latches
+// and that second device waits for ever. Configured as level, the controller re-presents the
+// interrupt for as long as anything holds the line, which is what makes "answer every source that
+// could have raised this" a correct handler rather than a hopeful one.
+pub fn enable_spi(spi: u32, trigger: Trigger) {
+	// SPIs START AT 32. Below that are the per-core SGIs and PPIs, whose byte-per-INTID target and
+	// priority registers are banked per redistributor and read-only here - writing this INTID's
+	// row for one of those would be writing another core's.
+	if !(32..1020).contains(&spi) {
+		crate::serial_println!("gic: INTID {spi} is not a shared peripheral interrupt and was not armed");
+		return;
+	}
 	let spi = spi as usize;
 	unsafe {
 		// Route to the boot core and give it a priority below the CPU-interface mask (PMR 0xf0) so
@@ -461,10 +496,11 @@ pub fn enable_msi_spi(spi: u32) {
 			core::ptr::write_volatile(gicd(GICD_ITARGETSR + spi) as *mut u8, 0x01);
 		}
 		core::ptr::write_volatile(gicd(GICD_IPRIORITYR + spi) as *mut u8, 0xa0);
-		// Edge-triggered: ICFGR holds 2 bits per INTID; the high bit selects edge.
+		// ICFGR holds 2 bits per INTID and the high bit selects edge; level is the zero.
 		let icfgr = gicd(GICD_ICFGR + (spi / 16) * 4);
 		let shift = (spi % 16) * 2;
-		let cfg = (core::ptr::read_volatile(icfgr) & !(0b11 << shift)) | (0b10 << shift);
+		let bits: u32 = if trigger == Trigger::Edge { 0b10 } else { 0b00 };
+		let cfg = (core::ptr::read_volatile(icfgr) & !(0b11 << shift)) | (bits << shift);
 		core::ptr::write_volatile(icfgr, cfg);
 		// Enable the SPI.
 		core::ptr::write_volatile(gicd(GICD_ISENABLER + (spi / 32) * 4), 1 << (spi % 32));

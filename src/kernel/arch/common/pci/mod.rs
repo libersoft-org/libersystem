@@ -701,22 +701,34 @@ pub fn poll_slots<A: ConfigAccess>(out: &mut [SlotChange; MAX_HOT_PLUG_PORTS]) -
 	found
 }
 
+/// The legacy interrupt PIN a hot-plug port asserts on: 1..=4 for INTA..INTD, `None` for a function
+/// that asserts no legacy line at all.
+///
+/// THE HALF EVERY BACKEND NEEDS, and the reason it is its own function. The LINE beside it in the
+/// same register is a number x86 firmware wrote there when it routed the function; a device-tree
+/// machine's firmware writes nothing into it, and those boards put their routing in the host
+/// bridge's `interrupt-map` instead - which the PIN is what indexes. So all three ports read this
+/// one, and only x86_64 goes on to read the line below.
+pub fn slot_interrupt_pin<A: ConfigAccess>(port: &HotPlugPort) -> Option<u8> {
+	let pin = (A::read32(port.bus, port.dev, port.func, 0x3c) >> 8) as u8;
+	(1..=4).contains(&pin).then_some(pin)
+}
+
 /// The legacy interrupt line a hot-plug port asserts on, or `None` where it has none.
 ///
 /// THE LINE AND THE PIN ARE TWO REGISTERS AND BOTH MATTER. A function with no interrupt PIN asserts
 /// nothing whatever its line says, and firmware leaves the line at `0xff` for a function it routed
 /// nowhere - both are "this port will not tell you", and a handler registered on either would be a
 /// handler on a vector nothing raises.
-// COMPILED WHERE IT IS REACHED FROM, which is the one port that arms an interrupt, and the test
-// build. The slot protocol is config space and every backend polls it; routing a legacy line through
-// an I/O APIC is x86_64's alone, so the other two ports neither call this nor wrap it. Standing on
-// every backend as a shim nothing reached is what made this look portable while it was not.
+// COMPILED WHERE IT IS READ FROM, WHICH IS THE PORT WHOSE FIRMWARE WRITES IT. A BIOS or a UEFI puts
+// the routed line in this byte; the two ports that boot from a device tree are handed a byte nobody
+// wrote, and they route through `interrupt-map` and the pin above instead. Standing on all three
+// backends as a wrapper nobody called is what made this surface look portable while one port could
+// use it, and it cost a dead-code suppression on each of the other two.
 #[cfg(any(target_arch = "x86_64", test))]
 pub fn slot_interrupt_line<A: ConfigAccess>(port: &HotPlugPort) -> Option<u8> {
-	let dword = A::read32(port.bus, port.dev, port.func, 0x3c);
-	let line = dword as u8;
-	let pin = (dword >> 8) as u8;
-	(pin != 0 && line != 0xff).then_some(line)
+	let line = A::read32(port.bus, port.dev, port.func, 0x3c) as u8;
+	(slot_interrupt_pin::<A>(port).is_some() && line != 0xff).then_some(line)
 }
 
 /// Power the slot behind one named port off or on, for a caller that has coordinated a removal.
@@ -738,10 +750,9 @@ pub fn set_slot_power<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
 
 /// Every hot-plug port this machine has, for a caller that binds their interrupts.
 ///
-/// COMPILED WHERE IT IS REACHED FROM: x86_64's arming pass, and the guest suite on every port - the
-/// suite asserts the scan found the slot the harness attaches, which is true of a machine that only
-/// polls it. The list itself is filled by the scan on all three backends either way.
-#[cfg(any(target_arch = "x86_64", test))]
+/// Filled by the scan on every backend, and read by every backend's arming pass: x86_64 routes each
+/// port's line through an I/O APIC, and the two device-tree ports resolve the same port's pin
+/// through the host bridge's `interrupt-map` and arm their own controller with it.
 pub fn hot_plug_ports(out: &mut [Option<HotPlugPort>; MAX_HOT_PLUG_PORTS]) -> usize {
 	let ports = PORTS.lock();
 	*out = ports.0;
