@@ -3189,6 +3189,20 @@ pub fn process_create(domain: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_CREATE, domain, 0, 0, 0) as i64 }
 }
 
+/// A handle to THIS process, carrying MANAGE - which is what making a thread of your own needs.
+///
+/// `SYS_THREAD_CREATE` has always taken a caller-chosen entry and stack top, so a second thread was
+/// expressible; what no program could do was NAME ITSELF to that syscall. Every other caller in
+/// this tree is a spawner naming a child.
+///
+/// WHAT IT DOES NOT GET YOU IS CODE. Loading an image or a module into the process this names is
+/// refused - see the kernel's `sys_process_load` - because mapping executable pages into yourself
+/// is the one authority in MANAGE that would mean something new, and it is not the one anybody
+/// asked for.
+pub fn process_self() -> i64 {
+	unsafe { syscall(SYS_PROCESS_SELF, 0, 0, 0, 0) as i64 }
+}
+
 pub fn process_load_main(process: u64, elf: &[u8]) -> i64 {
 	unsafe { syscall(SYS_PROCESS_LOAD, process, elf.as_ptr() as u64, elf.len() as u64, 0) as i64 }
 }

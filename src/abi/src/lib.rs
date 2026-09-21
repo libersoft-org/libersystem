@@ -508,6 +508,30 @@ pub const SYS_DEVICE_EVENTS: u64 = 86;
 // kinds rather than one with a flag, because this system can act on exactly one of them.
 pub const SYS_PLATFORM_EVENTS: u64 = 87;
 
+// A HANDLE TO THE CALLING PROCESS ITSELF, carrying MANAGE.
+//
+// A PROCESS COULD NOT NAME ITSELF, AND THAT WAS THE WHOLE OF WHAT WAS MISSING. `SYS_THREAD_CREATE`
+// takes the entry and the stack top from its caller and validates both, and `SYS_THREAD_START` is a
+// separate gated step beside it - so a program making a thread of its own was already expressible
+// in every respect except one: the syscall wants a `Process` handle carrying MANAGE, and nothing
+// handed a program one for itself. Every caller in this tree was a spawner naming a CHILD.
+//
+// WHY THE AUTHORITY IS BOUNDED WITHOUT WITHHOLDING THE HANDLE. MANAGE on your own process is the
+// authority to create threads in it for ever, and this kernel already bounds that with
+// `PROP_THREAD_LIMIT` - a limit a process cannot raise for itself, because raising it is
+// `SYS_OBJECT_PROPERTY_SET` on a handle the process does not hold. So the bound that matters was
+// already in place and was not the one being enforced by the missing handle.
+//
+// AND MANAGING YOURSELF DOES NOT INCLUDE LOADING CODE INTO YOURSELF. That is the one authority in
+// MANAGE that would have meant something new: `SYS_PROCESS_LOAD` and `SYS_PROCESS_LOAD_MODULE` map
+// executable pages, so a process holding MANAGE over itself could turn any bytes it had into
+// instructions and the W^X the loader enforces would be a formality. Both refuse a handle that
+// names the caller's own process. Nothing in this tree wanted that: every load is a spawner
+// building a child before the child runs.
+//
+// It takes no argument. There is no other process it could name and none it would be allowed to.
+pub const SYS_PROCESS_SELF: u64 = 88;
+
 // What a platform event's one byte says.
 pub const PLATFORM_EVENT_POWER_BUTTON: u8 = 1;
 pub const PLATFORM_EVENT_SLEEP_BUTTON: u8 = 2;

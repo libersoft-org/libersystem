@@ -254,6 +254,22 @@ or preventing further development of `v1`.
 - [x] [P02M0177 - A change is verified in proportion to itself, and integration bugs are catchable without a guest](P02M0177.md)
 - [x] [P02M0179 - A run that ends says so, and a run that stalls says so while it is still stalling](P02M0179.md) - complete 2026-09-13 against the reopened plan: one EXIT dispatcher with registered cleanups in all five entry points, an invocation-owned atomically published terminal file that a nested run can never write, a validated report-only build observer that owns its sleeper and rearms on real step progress, and a registered gate that proves each of those by making real runs fail in a private tree - a subordinate refusal, a compiler dying after setup, a stale image, a sweep that fails after its worktree exists - and that documents the one limit it cannot cross: after a `SIGKILL` a missing record means unknown, never success
 
+**THE NINE DESTINATION SERVICES (2026-09-21).** P02M0099 found thirteen driver items delivering into
+services that existed nowhere - not in another milestone, not in the architecture, not in any phase
+sentence - and put the question to the owner, whose answer was that the drivers are wanted. A driver
+item may not grow its own destination service, because a service invented by the driver that wanted
+it gets the shape that driver needed and no other; so each `yes` is a milestone here.
+
+- [ ] [P02M0180 - A sandboxed Bluetooth service above HCI](P02M0180.md)
+- [ ] [P02M0181 - A platform power-state service](P02M0181.md)
+- [ ] [P02M0182 - A capability-scoped smart-card service](P02M0182.md)
+- [ ] [P02M0183 - A typed modem service](P02M0183.md)
+- [ ] [P02M0184 - A camera vocabulary and service](P02M0184.md)
+- [ ] [P02M0185 - A bounded event and timestamp vocabulary, and the MIDI wire over it](P02M0185.md)
+- [ ] [P02M0186 - A spool and stream service](P02M0186.md)
+- [ ] [P02M0187 - A media import service](P02M0187.md)
+- [ ] [P02M0188 - A trusted administrative path for high-risk operations](P02M0188.md)
+
 ### Definition of done (phase 2)
 
 Done when the capability-scoped appliance provides networking, wall-clock time,

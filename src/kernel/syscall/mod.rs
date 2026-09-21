@@ -43,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CHANNEL_SEND_CAPS_ATTENUATED, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_CLAIM_SNAPSHOT, SYS_DEVICE_COUNT, SYS_DEVICE_EVENTS, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_ENTROPY_ADD, SYS_ENTROPY_HEALTH, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PLATFORM_EVENTS, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LIFECYCLE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SELF, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -520,6 +520,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_QUIESCED => sys_device_quiesced(a0),
 		SYS_DEVICE_EVENTS => sys_device_events(a0, a1),
 		SYS_PLATFORM_EVENTS => sys_platform_events(a0, a1),
+		SYS_PROCESS_SELF => sys_process_self(),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
 		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
@@ -2024,6 +2025,29 @@ fn sys_process_create(domain_handle: u64) -> i64 {
 	install_object(&thread, process, Rights::ALL)
 }
 
+// A handle to the CALLING process, carrying MANAGE.
+//
+// WHAT WAS MISSING WAS A NAME AND NOT A MECHANISM. `SYS_THREAD_CREATE` takes an entry and a stack
+// top from its caller and validates both, and `SYS_THREAD_START` is a separate gated step beside
+// it, so a program making a thread of its own was expressible in every respect except that the
+// syscall wants a `Process` handle carrying MANAGE and nothing handed a program one for itself.
+// Every caller of that syscall in this tree is a spawner naming a CHILD it has just created.
+//
+// MANAGE AND NOT `Rights::ALL`, which is what `process_create` gives a spawner over its child. A
+// spawner needs the whole set because it is building something; a process holding a handle to
+// itself needs exactly the authority that was missing, and the smaller set is the one that can be
+// widened later if something real asks.
+//
+// AND THE AUTHORITY IS ALREADY BOUNDED. MANAGE here is the authority to create threads for ever,
+// which `PROP_THREAD_LIMIT` bounds - and a process cannot raise its own limit, because raising it
+// is `SYS_OBJECT_PROPERTY_SET` on a handle it does not hold. The loading half of MANAGE is refused
+// outright on a self handle: see `sys_process_load`.
+fn sys_process_self() -> i64 {
+	let thread = current_thread!();
+	let process = thread.process().clone();
+	install_object(&thread, process, Rights::MANAGE)
+}
+
 // Load an ELF image into a process created by process_create and return its entry
 // point. The image bytes are read from the caller's address space at [elf_ptr,
 // elf_ptr + elf_len) - a userspace spawner first brings them in via
@@ -2033,10 +2057,21 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 	if elf_len == 0 || elf_len as usize > abi::MAX_ELF_BYTES || !user_buf_ok(elf_ptr, elf_len) {
 		return ERR_INVALID;
 	}
+	let thread = current_thread!();
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
+	// AND NOT INTO YOURSELF, which is the one authority a self handle must not carry.
+	//
+	// `SYS_PROCESS_SELF` hands a process MANAGE over itself so it can make threads. This call maps
+	// EXECUTABLE pages, so the same handle would let any process turn bytes it already had into
+	// instructions, and the W^X the loader enforces would be a formality a program could step
+	// around by loading its own payload. Nothing in this tree wants it either: every load in the
+	// system is a spawner building a child before that child runs.
+	if Arc::ptr_eq(&process, thread.process()) {
+		return ERR_ACCESS_DENIED;
+	}
 	// BUFFERED, and this is the milestone's own defect closed.
 	//
 	// It used to read the image in place: `from_raw_parts(elf_ptr, elf_len)` and the whole loader
@@ -2074,10 +2109,16 @@ fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias
 	if elf_len == 0 || elf_len as usize > abi::MAX_ELF_BYTES || !user_buf_ok(elf_ptr, elf_len) {
 		return ERR_INVALID;
 	}
+	let thread = current_thread!();
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(process) => process,
 		Err(error) => return error,
 	};
+	// AND NOT INTO YOURSELF, for the reason `sys_process_load` states: this maps executable pages,
+	// and a self handle that could map them is a W^X the holder steps around at will.
+	if Arc::ptr_eq(&process, thread.process()) {
+		return ERR_ACCESS_DENIED;
+	}
 	// Buffered for the reason `sys_process_load` is, and it is the same defect: a module image read
 	// in place is read by ordinary loader code that no exception-table entry can rescue.
 	let Some(mut image) = try_zeroed_bytes(elf_len as usize) else {

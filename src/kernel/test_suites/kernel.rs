@@ -2541,3 +2541,73 @@ fn a_typed_receive_keeps_every_capability_a_client_sent() {
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the capability-count thread ran to completion");
 }
+
+// A PROCESS MAY NAME ITSELF, AND NAMING ITSELF DOES NOT GET IT CODE.
+//
+// The authority a self handle carries is the one thing a program making a thread of its own was
+// missing, and it is not the only thing MANAGE grants - so this asserts BOTH halves of the decision
+// in one place: the thread half is admitted and the loading half is refused. One without the other
+// is a test that would pass against a self handle carrying nothing and against one carrying
+// everything.
+tagged_test!(a_process_may_manage_itself_but_not_load_code_into_itself, [Syscall, Process, CapabilityTcb, Kernel], id = "kernel.kernel.a_process_may_manage_itself_but_not_load_code_into_itself", covers = ["kernel"]);
+fn a_process_may_manage_itself_but_not_load_code_into_itself() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	// SPAWNED, because the syscalls below read the CURRENT thread's handle table and its process -
+	// and `sched::spawn` gives the thread a single-thread process of its own, which is exactly the
+	// shape `SYS_PROCESS_SELF` is about.
+	extern "C" fn body(_: u64) {
+		unsafe {
+			let me = arch::syscall::invoke(syscall::SYS_PROCESS_SELF, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(me), "a process can obtain a handle to itself");
+			// TWO CALLS ARE TWO HANDLES TO ONE OBJECT, which is what every other minting syscall
+			// here does; a call that answered with the same number twice would be caching a
+			// capability, and closing one copy would take the other with it.
+			let again = arch::syscall::invoke(syscall::SYS_PROCESS_SELF, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(again));
+			assert_ne!(me, again, "each call installs its own handle");
+
+			// A REAL IMAGE, so the refusal below is the guard and not a parse failure. The loader
+			// never sees these bytes: the handle check and the self check both run before the copy.
+			let bytes = init_package_bytes().expect("init package present");
+			let package = pkg::Package::parse(bytes).expect("init package parses");
+			let elf = package.lookup(b"log_service.lsexe").expect("log_service.lsexe image");
+
+			// THE HALF THAT IS REFUSED. Mapping executable pages into yourself is the authority
+			// that would make W^X a formality, and it is refused on the SELF handle specifically -
+			// not on the syscall, which the child below still uses.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_PROCESS_LOAD, me, elf.as_ptr() as u64, elf.len() as u64, 0) as i64, syscall::ERR_ACCESS_DENIED, "loading an image into yourself is refused");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_PROCESS_LOAD_MODULE, me, elf.as_ptr() as u64, elf.len() as u64, 0) as i64, syscall::ERR_ACCESS_DENIED, "and so is loading a module into yourself");
+
+			// AND THE SAME CALL ON A CHILD STILL WORKS, which is what makes the two assertions above
+			// a statement about the HANDLE rather than about the syscall. A guard that refused every
+			// load would pass the first two and break every spawn in the system.
+			let child = arch::syscall::invoke(syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(child), "process_create");
+			let entry = arch::syscall::invoke(syscall::SYS_PROCESS_LOAD, child, elf.as_ptr() as u64, elf.len() as u64, 0);
+			assert!(!syscall::sys_is_err(entry), "loading the same image into a child is unaffected");
+
+			// THE HALF THAT IS ADMITTED, and it is checked as a RIGHTS question rather than by
+			// starting a thread: what the decision was about is whether the handle carries MANAGE.
+			// A handle that did not would be refused here before the thread was built, and the
+			// entry and stack are the ones the syscall already validates.
+			let thread = arch::syscall::invoke(syscall::SYS_THREAD_CREATE, me, entry, memlayout::USER_STACK_TOP, 0);
+			assert!(!syscall::sys_is_err(thread), "a self handle carries the authority to create a thread");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, thread, 0, 0, 0) as i64, 0, "the thread was never started and its handle is given back");
+
+			// AND A SELF HANDLE ATTENUATED BELOW MANAGE IS NOT ONE, which is what says the check
+			// above is reading the rights rather than the object.
+			let weaker = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, me, object::rights::Rights::WAIT.bits() as u64, 0, 0);
+			assert!(!syscall::sys_is_err(weaker));
+			assert_eq!(arch::syscall::invoke(syscall::SYS_THREAD_CREATE, weaker, entry, memlayout::USER_STACK_TOP, 0) as i64, syscall::ERR_ACCESS_DENIED, "the same object without MANAGE creates nothing");
+
+			for handle in [me, again, weaker, child] {
+				assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
+			}
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the self-handle thread ran to completion");
+}

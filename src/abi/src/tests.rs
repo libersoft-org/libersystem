@@ -168,6 +168,11 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// power and sleep buttons, decoded by the kernel from the ACPI PM1 event block because the line
 	// they arrive on cannot be handed to a driver.
 	(SYS_PLATFORM_EVENTS, 87),
+	// A HANDLE TO YOURSELF, which is the one thing a process could not obtain. It is what a program
+	// making a thread of its own needs and the only thing it was missing; the authority it carries
+	// is bounded by `PROP_THREAD_LIMIT`, which a process cannot raise for itself, and the loading
+	// half of MANAGE is refused on a self handle rather than granted.
+	(SYS_PROCESS_SELF, 88),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
