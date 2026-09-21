@@ -1289,9 +1289,14 @@ pub struct Heartbeat {
 	due: u64,
 	expires: u64,
 	// Expiry is final even while the node's event queue cannot accept its verdict. A late reply
-	// cannot revive this watchdog; the next binding starts its own schedule through `arm`.
+	// cannot revive this watchdog; the next binding starts its own schedule through `arm` - or,
+	// for a supervisor that answers a miss with something other than a teardown, through `resume`.
 	spent: bool,
 	expiry_pending: bool,
+	// How many deadlines this binding has missed, counting the ones its supervisor chose not to
+	// act on. Cumulative for the binding and reset only by `arm`, because that is the record of
+	// what this driver did and not a gauge of what it is doing now.
+	missed: u32,
 }
 
 // What the watchdog wants done this tick.
@@ -1310,9 +1315,38 @@ impl Heartbeat {
 	// number: a driver always gets one whole period to answer inside the deadline it declared.
 	pub fn arm(&mut self, deadline: Option<u32>, now: u64, period: u32) {
 		match deadline {
-			Some(deadline) if deadline != 0 => *self = Heartbeat { deadline, sequence: 0, awaiting: false, due: now.saturating_add(period as u64), expires: 0, spent: false, expiry_pending: false },
+			Some(deadline) if deadline != 0 => *self = Heartbeat { deadline, sequence: 0, awaiting: false, due: now.saturating_add(period as u64), expires: 0, spent: false, expiry_pending: false, missed: 0 },
 			_ => *self = Heartbeat::default(),
 		}
+	}
+
+	/// Put this watchdog back to work after a miss its supervisor chose not to tear the driver down
+	/// for, and answer how many it has now missed.
+	///
+	/// EXPIRY IS FINAL FOR A BINDING, NOT FOR A WATCHDOG, and the difference is the whole of what
+	/// "left running and marked" means. `spent` exists so a late reply cannot revive a verdict that
+	/// has already been acted on - a driver being torn down must not be un-torn-down by an answer
+	/// arriving mid-teardown. A supervisor that did NOT act has no verdict to protect: what it has
+	/// is a driver still online and still worth asking, and leaving the watchdog spent would leave
+	/// it online and never asked again, which is the one outcome nobody chose.
+	///
+	/// THE COUNT IS WHAT MAKES THE MARK MEAN ANYTHING. "It missed once under load" and "it has
+	/// missed four hundred times" are the same state without it, and they are not the same driver.
+	pub fn resume(&mut self, now: u64, period: u32) -> u32 {
+		self.missed = self.missed.saturating_add(1);
+		if !self.supervised() {
+			return self.missed;
+		}
+		self.spent = false;
+		self.awaiting = false;
+		self.expiry_pending = false;
+		self.due = now.saturating_add(period as u64);
+		self.missed
+	}
+
+	/// How many deadlines this binding has missed.
+	pub fn missed(&self) -> u32 {
+		self.missed
 	}
 
 	pub fn supervised(&self) -> bool {

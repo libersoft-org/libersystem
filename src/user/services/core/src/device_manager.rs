@@ -4272,6 +4272,43 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 				// `hung`, NOT `handshake-timeout`. A driver that came up and then went quiet is
 				// a different fact from one that never answered at all, and a reader cannot act
 				// on "it did not answer" without knowing which.
+				//
+				// **EXCEPT THE PROVIDER THE VOLUME ITSELF STANDS ON, WHICH IS MARKED AND LEFT
+				// RUNNING (2026-09-21, the owner's decision).**
+				//
+				// Tearing that one down takes the system volume with it, and the artifact needed
+				// to bring it back is ON the volume that is gone. The init-package fallback in
+				// `start_candidate` closes the second half of that circle - the bytes are found -
+				// but it cannot close the first: between the teardown and the rebind there is a
+				// window with no disk, and every service that tried to start in it failed to.
+				// Measured on all three architectures: one missed heartbeat ended with four
+				// `restarting virtio-blk` and `0 of 0 device(s) online` on a disk the machine had
+				// been reading a second earlier.
+				//
+				// AND THE MISS IS NOT NOTHING, WHICH IS WHY IT IS MARKED RATHER THAN IGNORED. A
+				// deadline of one second is a deadline this machine misses under load on a port
+				// that emulates every instruction; a provider that has missed four hundred is a
+				// provider that is gone, and the two must not read the same. The count is the
+				// difference and it is said out loud - at the first miss and whenever it doubles,
+				// so a driver missing a beat a second reports six times in a minute instead of
+				// sixty, and the first one is never the one that got rate-limited.
+				//
+				// `boot_critical` IS THE MANIFEST'S OWN WORD FOR IT, and nothing new: it already
+				// means "the volume cannot be mounted without this driver", which is exactly the
+				// set whose teardown removes the ground the recovery stands on.
+				if node.entry().is_some_and(|entry| entry.boot_critical) {
+					let missed: u32 = node.beat.resume(clock(), driver_protocol::heartbeat_period(node.beat.deadline()));
+					if missed.is_power_of_two() {
+						let mut count = [0u8; 20];
+						let written = decimal(missed as u64, &mut count);
+						print(b"DeviceManager: ");
+						print_driver_name(driver_name);
+						print(b" is the provider this volume stands on; it is marked suspect and left running, and it is still asked - ");
+						print(&count[..written]);
+						print(b" deadline(s) missed so far\n");
+					}
+					continue;
+				}
 			}
 			// A CLAIM SETTLING WHEN NO TEARDOWN IS OUTSTANDING. The teardown arm above consumes
 			// these; one arriving here belongs to a teardown that has already been resolved -

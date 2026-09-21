@@ -458,12 +458,6 @@ fn boot_main() {
 	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
 	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0), arch::ioapic::Kind::IsaEdge);
 	arch::serial::enable_rx_irq();
-	// EVERY PORT ARMS ITS HOT-PLUG SLOTS, and how it does so is the port's business: x86_64 routes
-	// the line firmware wrote into config space through an I/O APIC, and the two device-tree ports
-	// resolve the same function's pin through the host bridge's `interrupt-map` and arm the
-	// controller the tree names. The idle-pass poll stays underneath all three - see
-	// `settle_hot_plug` - because a shared line can be missed on any of them.
-	arm_hot_plug_interrupts();
 	// AND THE SAME IS TRUE OF THE ACPI SCI, for the same reason and one more: a device-tree machine
 	// describes its power button as a node with its own interrupt, which is a different mechanism
 	// with a different owner. This is the FIXED-HARDWARE path and it exists on x86 alone.
@@ -1446,6 +1440,18 @@ pub(crate) fn boot_userspace(window_ticks: u64) {
 	// BSP would never reach console_shell_loop to poll the UART. The idle hook keeps
 	// serial input live regardless (the keyboard is interrupt-driven and unaffected),
 	// and it is what watches for a resident SystemManager going away later.
+	// EVERY PORT ARMS ITS HOT-PLUG SLOTS, AND THIS IS WHERE, because it is the one place all three
+	// reach: `boot_main` is x86_64's alone and the other two prologues call straight in here. How a
+	// port arms is its own business - x86_64 routes the line firmware wrote into config space
+	// through an I/O APIC, and the two device-tree ports resolve the same function's pin through
+	// the host bridge's `interrupt-map` and arm the controller the tree names.
+	//
+	// AND IT SITS BESIDE THE IDLE HOOK ON PURPOSE. The two are halves of one mechanism: the
+	// interrupt says "look now" and the poll below is what notices an arrival the interrupt missed,
+	// which on a shared line is a case every port has. Arming after the device inventory is built
+	// and before userspace exists means the first slot event a running machine can produce already
+	// has somewhere to go.
+	arm_hot_plug_interrupts();
 	sched::set_idle_hook(serial_console_pump);
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);

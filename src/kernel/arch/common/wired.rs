@@ -97,11 +97,6 @@ impl<const N: usize> Wired<N> {
 		}
 		false
 	}
-
-	/// Whether `number` has a handler, for a caller reporting what it armed.
-	pub fn answers(&self, number: u32) -> bool {
-		number != EMPTY && (0..N).any(|row| self.number[row].load(Ordering::Acquire) == number && self.handler[row].load(Ordering::Acquire) != 0)
-	}
 }
 
 #[cfg(test)]
@@ -137,7 +132,6 @@ mod tests {
 		let wired: Wired<4> = Wired::new();
 		assert!(!wired.register(0, record));
 		assert!(!wired.dispatch(0));
-		assert!(!wired.answers(0));
 	}
 
 	// Four ports on one line is the ordinary case - a shared INTx - and it must not take four rows.
@@ -159,10 +153,14 @@ mod tests {
 	crate::tagged_test!(a_full_table_refuses_instead_of_forgetting, [Kernel, Interrupt], id = "kernel.arch.common.wired.a_full_table_refuses", covers = ["kernel"]);
 	fn a_full_table_refuses_instead_of_forgetting() {
 		let wired: Wired<2> = Wired::new();
+		SEEN.store(0, Ordering::SeqCst);
 		assert!(wired.register(35, record));
 		assert!(wired.register(36, record));
 		assert!(!wired.register(37, record));
-		assert!(!wired.answers(37));
-		assert!(wired.answers(35) && wired.answers(36));
+		assert!(!wired.dispatch(37), "the line that did not fit answers nothing");
+		// AND THE TWO THAT DID FIT ARE UNTOUCHED, which is the half a refusal could still get
+		// wrong: a table that overwrote a row to make space would refuse and lose a line at once.
+		assert!(wired.dispatch(35) && wired.dispatch(36));
+		assert_eq!(SEEN.load(Ordering::SeqCst), (1 << 35) + (1 << 36));
 	}
 }

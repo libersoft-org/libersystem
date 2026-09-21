@@ -1887,3 +1887,91 @@ fn a_device_that_reported_a_fatal_error_is_quarantined_even_when_the_teardown_is
 	assert!(!BindingState::Online.may_move_to(BindingState::Quarantined), "a live driver is stopped first");
 	assert_eq!(StopIntent::DeviceFaulted.name(), b"the device reported a fatal error".as_slice());
 }
+
+// ------------------------------------------- A miss a supervisor chose not to tear the driver down for
+//
+// THE DEFAULT IS A TEARDOWN AND IT STAYS THE DEFAULT. What these cover is the other answer, which
+// one kind of driver needs: the provider the system volume itself stands on. Tearing that one down
+// for a missed beat takes the volume with it, and the bytes needed to bring it back are on the
+// volume that is gone - so the supervisor marks it and leaves it running. `resume` is what makes
+// "left running" mean "still supervised" rather than "never asked again".
+
+// The watchdog after one deadline has passed with a ping outstanding, and the verdict taken.
+fn wedged(now: u64) -> Heartbeat {
+	let mut beat = armed(0);
+	assert_eq!(beat.tick(PERIOD as u64), Beat::Ask(1));
+	beat.asked(PERIOD as u64);
+	assert_eq!(beat.tick(now), Beat::Wedged, "the deadline passed with the ping unanswered");
+	beat.expiry_queued();
+	beat
+}
+
+// THE GUARANTEE THAT MUST NOT WEAKEN, asserted first and on its own. A supervisor that DID act on
+// the verdict must not have it revived by anything - a late reply, another tick, the passage of any
+// amount of time. `resume` is a second entry point and not a change to this one.
+#[test]
+fn an_expiry_nobody_resumed_is_still_final() {
+	let mut beat = wedged(20);
+	for now in [21u64, 30, 100, 10_000] {
+		assert_eq!(beat.tick(now), Beat::Idle, "a spent watchdog asks nothing at {now}");
+	}
+	assert!(!beat.answered(1, 30, PERIOD), "and a late answer does not revive it");
+	assert_eq!(beat.wake_at(), 0, "so it asks the wait for nothing");
+}
+
+// And the other answer: the driver was left running, so it goes on being asked.
+#[test]
+fn a_watchdog_resumed_after_a_miss_asks_again() {
+	let mut beat = wedged(20);
+	assert_eq!(beat.resume(20, PERIOD), 1, "the first miss");
+	assert_eq!(beat.tick(20 + PERIOD as u64 - 1), Beat::Idle, "and nothing is due before the period is up");
+	assert_eq!(beat.tick(20 + PERIOD as u64), Beat::Ask(2), "then the next ping goes out, under the next sequence");
+	beat.asked(20 + PERIOD as u64);
+	// AND THE DRIVER CAN STILL ANSWER, which is the point of leaving it running: a provider that
+	// was merely slow under load is supervised again rather than marked and abandoned.
+	assert!(beat.answered(2, 21 + PERIOD as u64, PERIOD), "the number it was asked with");
+	assert!(!beat.awaiting());
+}
+
+// "It missed once under load" and "it has missed four hundred times" are the same state without a
+// count, and they are not the same driver.
+#[test]
+fn a_resumed_watchdog_counts_every_miss() {
+	let mut beat = armed(0);
+	assert_eq!(beat.missed(), 0, "a fresh binding has missed nothing");
+	let mut now = 0u64;
+	for expected in 1..=4u32 {
+		now += PERIOD as u64;
+		assert_eq!(beat.tick(now), Beat::Ask(expected), "a ping per period");
+		beat.asked(now);
+		now += DEADLINE as u64;
+		assert_eq!(beat.tick(now), Beat::Wedged);
+		beat.expiry_queued();
+		assert_eq!(beat.resume(now, PERIOD), expected, "every miss is counted, not just the first");
+	}
+	assert_eq!(beat.missed(), 4);
+}
+
+// The count belongs to the BINDING. A driver that was restarted and is answering is not carrying
+// the previous process's record, and a supervisor reading one would mark a healthy driver.
+#[test]
+fn arming_a_new_binding_forgets_what_the_previous_one_missed() {
+	let mut beat = wedged(20);
+	assert_eq!(beat.resume(20, PERIOD), 1);
+	beat.arm(Some(DEADLINE), 100, PERIOD);
+	assert_eq!(beat.missed(), 0, "a new binding starts its own record");
+	assert_eq!(beat.tick(100 + PERIOD as u64), Beat::Ask(1), "and its own schedule");
+}
+
+// A driver its entry does not supervise has no deadline to miss, and `resume` must not invent a
+// schedule for it - a ping to a driver that never agreed to answer one is a wedge report waiting
+// to happen.
+#[test]
+fn resuming_an_unsupervised_watchdog_schedules_nothing() {
+	let mut beat = Heartbeat::default();
+	beat.arm(None, 0, PERIOD);
+	assert!(!beat.supervised());
+	assert_eq!(beat.resume(0, PERIOD), 1, "the count is still kept");
+	assert_eq!(beat.tick(1_000), Beat::Idle, "and nothing is ever asked");
+	assert_eq!(beat.wake_at(), 0);
+}
