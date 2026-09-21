@@ -304,13 +304,11 @@ fn offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], k
 // they have to be told apart. The xHCI controller publishes two block providers - a Bulk-Only stick
 // and a UAS target, two devices with two transports - so a harness that asked for "the block one"
 // would be asking a question with two answers.
-#[allow(dead_code)]
 fn nth_offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16, index: usize) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
 	offers.iter().filter(|(k, _, _)| *k == kind).map(|(_, _, object)| object.clone()).nth(index)
 }
 
 // The publisher-local token one kind was offered under, which a `CONNECT` has to name.
-#[allow(dead_code)]
 fn offer_token_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<u16> {
 	offers.iter().find(|(k, _, _)| *k == kind).map(|(_, token, _)| *token)
 }
@@ -318,7 +316,6 @@ fn offer_token_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject
 // Mint one connection to a driver's publication, the way DeviceManager mints one: a `CONNECT`
 // naming the publication's token and carrying the server end of a fresh channel. The driver serves
 // it beside every other consumer, and a provider that speaks first speaks on it.
-#[allow(dead_code)]
 fn send_connect(channel: &object::channel::Channel, generation: u64, token: u16, endpoint: alloc::sync::Arc<dyn object::KernelObject>) -> Result<(), &'static str> {
 	let mut payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
 	driver_protocol::encode_u16(token, &mut payload);
@@ -2657,7 +2654,6 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 // The mirror of `read_from_object`, and it has to be a mirror: a memory object of more than one page
 // is a LIST OF FRAMES that need not be contiguous, so filling one through its first frame writes
 // past that frame into whatever physically follows it.
-#[allow(dead_code)]
 fn write_to_object(object: &object::memory_object::MemoryObject, bytes: &[u8]) {
 	let hhdm = mem::hhdm_offset();
 	let page = mem::frame::PAGE_SIZE as usize;

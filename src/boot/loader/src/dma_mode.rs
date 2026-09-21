@@ -19,7 +19,7 @@
 // ESP file is. A boot-media-controlled value may never present itself as authenticated policy, and
 // two producers agreeing is still two producers.
 
-use bootproto::dma_mode::{Carrier, Handoff, Latch, LatchRefusal, Mode};
+use bootproto::dma_mode::{Carrier, Handoff, Latch, LatchRefusal};
 
 // THE LATCH, recorded by `trust::verify_for` for every manifest it accepts - the same set the
 // release latch is taken over - and resolved once, before the hand-off.
@@ -116,14 +116,12 @@ fn malformed_name(reason: bootproto::dma_mode::Malformed) -> &'static str {
 	}
 }
 
-// The mode a carrier names, for a backend that wants to say it. Unused where the sentence above is
-// enough, kept so the type is spelled once.
-#[allow(dead_code)]
-pub(crate) fn mode_name(mode: Mode) -> &'static str {
-	mode.name()
-}
-
 // The name the refusal above prints for the ports' independent producer, spelled once.
+//
+// THE PORTS' ONLY, AND SAID IN A CFG RATHER THAN SUPPRESSED. x86_64's independent input is a file on
+// the ESP, not a node in a tree, so nothing on that target reaches either of these - which is what
+// the prose under `independent_tree` has always said and what an `allow` was standing in for.
+#[cfg(not(target_arch = "x86_64"))]
 const BOOT_POLICY_NODE: &str = "the device tree's boot-policy node";
 
 // Does the device tree the FIRMWARE PUBLISHED carry the boot-policy node? The two device-tree ports
@@ -148,7 +146,7 @@ const BOOT_POLICY_NODE: &str = "the device tree's boot-policy node";
 // `published` must be 0 or the address the firmware published for a device tree, and
 // `phys_to_virt` must reach it - `Fdt`'s methods dereference what this is handed (FDT-007).
 // Unused on x86_64, whose independent input is a file on the ESP rather than a node in a tree.
-#[allow(dead_code)]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn independent_tree(published: u64, phys_to_virt: fn(u64) -> u64) -> Option<&'static str> {
 	if published == 0 {
 		return None;

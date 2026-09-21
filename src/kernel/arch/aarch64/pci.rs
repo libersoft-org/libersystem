@@ -17,7 +17,7 @@ use crate::arch::common::pci as common;
 // THE PCI SURFACE EVERY BACKEND RE-EXPORTS (the HAL contract), and not every type is named
 // directly in this backend's code. A TEST build names none of it at all: every shim that does is
 // `not(test)`, because what a kernel test drives is a fake config space and not this machine's.
-#[cfg_attr(test, allow(unused_imports))]
+#[cfg(not(test))]
 pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.

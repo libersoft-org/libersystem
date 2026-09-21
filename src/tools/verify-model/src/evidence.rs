@@ -431,14 +431,22 @@ pub fn start_run(root: &Path, repo: &Path) -> Result<Run, String> {
 // THE FROZEN RELEASE SET, as a checked-in TOML list of fully qualified keys.
 #[derive(Debug, Deserialize)]
 struct RequiredFile {
-	#[allow(dead_code)]
 	schema: u32,
 	keys: Vec<String>,
 }
 
+// The only schema this reader understands. `render_required` writes it beside the keys, so the two
+// halves of the same file agree by construction; a file from a LATER writer is the case worth
+// refusing, and the field was parsed and never looked at - which is a version number that costs
+// something to carry and buys nothing.
+const REQUIRED_SCHEMA: u32 = 1;
+
 pub fn load_required(path: &Path) -> Result<BTreeSet<String>, String> {
 	let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
 	let file: RequiredFile = toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+	if file.schema != REQUIRED_SCHEMA {
+		return Err(format!("{}: schema {} - this build reads {REQUIRED_SCHEMA}, so the list would be read under rules it was not written to", path.display(), file.schema));
+	}
 	Ok(file.keys.into_iter().collect())
 }
 

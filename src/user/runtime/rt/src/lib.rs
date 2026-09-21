@@ -30,6 +30,9 @@ pub use abi::*;
 // The global allocator: a lazily-mapped per-process heap that enables `alloc`
 // (Box, Vec, String) for programs that need it. Registers itself as the
 // #[global_allocator]; dormant until the first allocation.
+// THE HEAP IS NOT REGISTERED UNDER THE HOST-TEST SEAM, so nothing in it has a caller there. The
+// module carried the lint switched off for that; the condition itself says it.
+#[cfg(not(feature = "host-tests"))]
 mod heap;
 // The byte-stream contract shared by stdio, pipeline edges and storage adapters.
 pub mod stream;
@@ -195,8 +198,10 @@ pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
 	alloc_failure()
 }
 
-// Reached only through the allocator hooks, which the host-test seam leaves unregistered.
-#[cfg_attr(feature = "host-tests", allow(dead_code))]
+// Reached only through the allocator hooks, and both of them are compiled out under the host-test
+// seam - so this is not reached there either. SAID IN A CFG RATHER THAN SUPPRESSED: the same
+// condition the two hooks above already carry, written once more where the body is.
+#[cfg(not(feature = "host-tests"))]
 fn alloc_failure() -> ! {
 	let pointer = ALLOC_ERROR_MESSAGE.load(Ordering::Relaxed);
 	let length = ALLOC_ERROR_MESSAGE_LEN.load(Ordering::Relaxed);

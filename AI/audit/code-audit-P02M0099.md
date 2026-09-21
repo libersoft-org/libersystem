@@ -2729,3 +2729,80 @@ may tear down the root's provider is a lifecycle question for whoever owns it. T
 cannot be restarted from the volume it provides is not a question: it is a circularity, it is
 reachable from a single missed deadline, and the bytes that would break it are the ones phase one
 already used.
+
+## The circle is cut, and measured (2026-09-21)
+
+`Recovery` keeps the init package now, and `start_candidate` falls back to it when the volume cannot
+answer for a driver's artifact. Two things had to be right and only one of them was obvious: the
+volume is read by the entry's NAME and a package is keyed by its ARTIFACT - phase one uses the
+second - so the first attempt looked the driver up under a key no archive has and fired zero times.
+
+WITH THE KEY CORRECTED, ON riscv64:
+
+    DeviceManager: virtio-blk is not readable on the volume; starting it from the init package this boot came up on   (x4)
+    driver.virtio-blk: online (00:01.0) ... (00:04.0)
+    DeviceManager: bind window virtio_blk = 318 / 270 / 194 tick(s) from BIND to READY
+
+All four block drivers come back. `is named by the registry and not on the volume` fell from ten to
+six, and the six that remain are the drivers the init package does NOT carry - gpu, snd, rng,
+console, xhci, nvme - which is correct: it carries the boot set, and those are not in it.
+
+x86_64's boot tag passes unchanged either side of the change (53 s, 52 s).
+
+WHAT THE BOOT STILL DOES NOT DO, AND IT IS THE NEXT LINK RATHER THAN THIS ONE: the services were
+marked `FAILED to start` while the volume was gone, and nothing starts them again once it is back.
+A service whose start failed because its volume was momentarily unavailable is not the same thing as
+one that failed on its own terms, and ServiceManager does not tell them apart today. That is a
+lifecycle question of the same family as the one above it - and with the circle cut, it is now the
+only thing between these ports and a green boot chain.
+
+## And the last link, with the fact the decision needs (2026-09-21)
+
+The supervisor already has the machinery: `restart_service` rebuilds a service's bootstrap and is
+driven from the supervision loop for a service that came up and then died, under the restart POLICY
+its manifest row declares - `transparent` or `escalate`, with a budget. What it does not cover is a
+service that never came up: a failed START sets `State::Failed` with a `Reason`, and nothing asks
+again.
+
+So the question is not "should there be a retry" - there is one - but whether a start that failed
+belongs under the same policy as a death, and whether it spends the same budget. That is a lifecycle
+rule, it has two defensible answers, and the tree does not state one today. What this session can say
+is the measurement under it: on both ports the services failed to start for ONE reason, the system
+volume was briefly unreadable, the volume came back seconds later, and nothing asked again.
+
+## `no-suppression`: twenty-two down to six, and the six are one question (2026-09-21)
+
+The gate refuses any `allow(dead_code|unused…)` under `src/` and names the three answers it accepts:
+a cfg that says where the code is reached from, a deletion, or the caller that is missing. Sixteen of
+the twenty-two were answered, each verified by building all three architectures AND the test kernel:
+
+  - SIX WERE SIMPLY STALE. `nth_offer_of`, `offer_token_of`, `send_connect`, `write_to_object`,
+    `stream_round` and `stream_drain` all have callers today; the suppressions outlived whatever
+    made them true.
+  - TWO WERE A WRAPPER AND A HELPER WITH NO CALLER AT ALL. `loader::rollback::letter` wraps
+    `Slot::letter` and every "caller" is the method it wraps; `dma_mode::mode_name` the same shape.
+    Deleted, with the imports they were the last users of.
+  - TWO WERE A PORT-ONLY PATH. `independent_tree` and the node name it prints are the DEVICE TREE's
+    independent producer, which x86_64 does not have - its own comment said so in prose and now says
+    it in `#[cfg(not(target_arch = "x86_64"))]`.
+  - THREE WERE A RE-EXPORT A TEST BUILD DOES NOT NAME. The hot-plug half of each backend's PCI
+    surface is read by handlers that are `not(test)`; the re-export carries the same condition now,
+    split from the half every build does name.
+  - TWO WERE THE HOST-TEST SEAM. The allocator hook's body and the whole heap module are not
+    registered there; both carry `#[cfg(not(feature = "host-tests"))]` instead of an allow.
+  - ONE WAS A VERSION NUMBER NOBODY CHECKED. `release-required.toml` carries `schema = 1`, parsed and
+    never read. It is compared against what this build understands now, so a list written by a later
+    writer is refused rather than read under rules it was not written to.
+  - AND ONE WAS A COMMENT THAT WAS WRONG. `sdhci`'s `Dma` kept a `handle` field "because the handle
+    is what holds the region" - but dropping that struct gives nothing back and nothing closes the
+    handle, so the field was documentation pretending to be a mechanism. Removed, with the truth
+    written where the region is created.
+
+THE SIX THAT REMAIN ARE ONE QUESTION AND ARE LEFT DELIBERATELY. `hot_plug_ports` and
+`slot_interrupt_line` exist on all three backends and in the shared PCI module, and only x86_64 has a
+caller: arming a slot's interrupt routes a legacy line through an I/O APIC. Removing the allow makes
+the whole chain dead on both ports - measured, not assumed - so the three answers the gate accepts
+are: cfg the pair to x86_64 (which says the HAL surface is NOT the same shape on the three ports,
+against what its own comment states it is for), give the ports a caller (a feature), or delete the
+shims (the same statement as the first). That is a HAL-contract decision, it is one decision covering
+all six, and it is the only thing between this gate and green.

@@ -95,10 +95,6 @@ impl Bringup {
 // A contiguous DMA region this driver owns.
 #[derive(Clone, Copy)]
 struct Dma {
-	// KEPT AND NOT READ, and that is the point: the handle is what holds the region. Dropping it
-	// would give the frames back while the controller still has their addresses in a descriptor.
-	#[allow(dead_code)]
-	handle: u64,
 	virt: u64,
 	phys: u64,
 }
@@ -119,7 +115,12 @@ fn dma(device: u64, bytes: u64) -> Option<Dma> {
 	if sys_is_err(virt as u64) {
 		return None;
 	}
-	Some(Dma { handle: handle as u64, virt: virt as u64, phys: unsafe { dma_buffer_phys(handle as u64) } })
+	// THE REGION IS HELD BY THE HANDLE NEVER BEING CLOSED, which is the whole mechanism - and the
+	// struct used to carry a copy of it that nothing read, with a comment calling that copy the
+	// thing doing the holding. Dropping this struct gives nothing back; closing the handle would,
+	// and nothing here does, because the controller keeps these addresses in its descriptors for
+	// as long as the driver runs.
+	Some(Dma { virt: virt as u64, phys: unsafe { dma_buffer_phys(handle as u64) } })
 }
 
 struct Controller {

@@ -16,9 +16,14 @@ use crate::sync::SpinLock;
 // The PCI surface every backend re-exports (the HAL contract); not every type is
 // named directly in this backend's code.
 // `SlotChange` and `SlotEvent` are what the boot's hot-plug handler reads, and that handler is
-// `not(test)` - so a test build re-exports two names nothing in it uses.
-#[cfg_attr(test, allow(unused_imports))]
-pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PciDevice, PowerEvent, ResourcedDevice, SlotChange, SlotEvent, VirtioDevice};
+// `not(test)` - so a test build re-exports two names nothing in it uses. SAID IN A CFG RATHER
+// THAN SUPPRESSED: the two names travel with the handler that reads them.
+pub use common::{PciDevice, ResourcedDevice, VirtioDevice};
+// AND THE HOT-PLUG HALF, WHICH A TEST BUILD NAMES NOWHERE: every shim that reads an error
+// record or a slot event is `not(test)`, because what a kernel test drives is a fake config
+// space and not this machine's.
+#[cfg(not(test))]
+pub use common::{ErrorRecord, HotPlugPort, MAX_ERROR_REPORTERS, MAX_HOT_PLUG_PORTS, PowerEvent, SlotChange, SlotEvent};
 
 // The PCI configuration mechanism #1 ports.
 const CONFIG_ADDRESS: u16 = 0xCF8;

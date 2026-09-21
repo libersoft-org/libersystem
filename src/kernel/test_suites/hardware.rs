@@ -405,7 +405,6 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 }
 
 // One request to a `local-stream` provider and its reply, with the scheduler run in between.
-#[allow(dead_code)]
 fn stream_round(channel: &object::channel::Channel, request: alloc::vec::Vec<u8>) -> (u32, u32, alloc::vec::Vec<u8>) {
 	channel.send(object::channel::Message::new(request, alloc::vec::Vec::new())).expect("the stream request should send");
 	sched::run_until_idle();
@@ -415,7 +414,6 @@ fn stream_round(channel: &object::channel::Channel, request: alloc::vec::Vec<u8>
 }
 
 // Read from one stream until it has answered `wanted` bytes or stops answering.
-#[allow(dead_code)]
 fn stream_drain(channel: &object::channel::Channel, wanted: usize) -> alloc::vec::Vec<u8> {
 	let mut got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 	for _ in 0..64 {

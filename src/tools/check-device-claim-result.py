@@ -117,7 +117,7 @@ fn setup(pre:Option<u32>,post:Option<u32>,errno:i64,prior:u32,manual:bool,count:
     node
 }
 fn start(node:&mut Node,standing:bool) {
-    unsafe { if standing {start_candidate(node,1,0,0,0,1,&Catalogue,&mut [0]);}
+    unsafe { if standing {start_candidate(node,1,None,0,0,0,1,&Catalogue,&mut [0]);}
     else {let info=node.info;begin_bind(node,&info,&IMAGE,b"fixture",0,0,0,1);} }
 }
 #[test]

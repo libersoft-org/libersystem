@@ -11,10 +11,6 @@
 //! went without it at first, and a service that allocated and freed a large block
 //! on every request grew by a megabyte each time and never returned any of it.
 
-// UNREGISTERED UNDER THE HOST-TEST SEAM (see the crate features), so nothing here has a caller
-// there and the dead-code lint is answered once, for the module.
-#![cfg_attr(feature = "host-tests", allow(dead_code))]
-
 use crate::{SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, sys_is_err, syscall};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;

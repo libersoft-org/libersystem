@@ -12,7 +12,7 @@
 // profile is signed for the firmware by a signer of its own, which is what makes replacement media
 // unable to offer a current, correctly signed loader that ignores the floor.
 
-use bootproto::rollback::{Fault, Invalid, MarkerRefusal, Outcome, Refusal, Slot, SlotState, WriteFault};
+use bootproto::rollback::{Fault, Invalid, MarkerRefusal, Outcome, Refusal, SlotState, WriteFault};
 
 use crate::trust;
 
@@ -145,10 +145,4 @@ fn write_slot_state(state: SlotState) {
 
 fn write_u64(value: u64) {
 	crate::serial_write_usize(value as usize);
-}
-
-// Spelled once for the sentence above, so a slot's letter is never assembled by hand.
-#[allow(dead_code)]
-const fn letter(slot: Slot) -> &'static str {
-	slot.letter()
 }
