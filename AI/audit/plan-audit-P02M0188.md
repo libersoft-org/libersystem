@@ -64,3 +64,20 @@ Verified all five findings against the current plan, P02M0099's DFU requirement,
 Re-check: the dependency order has no PermissionManager/AdminService bootstrap cycle; approval, consumption and hardware outcome are distinct; target/payload scope cannot change after confirmation; unsupported paths fail without authority; audit retention/failure promises match their implementation plan; and the host/guest oracles exercise the claimed boundaries. The plan is ready for implementation within its stated trusted-path assumptions and fixture-backed generic scope. Real DFU integration remains separately owned and incomplete.
 
 Final consistency refinements within the same response: the plan now makes the initial operator request policy explicit, bounds every local preparation/control/journal exchange to five seconds, and tests silent peers. Grant transfer delegates the exact operation while retaining the live original request context and attribution; it does not imply sender-PID authentication. Journal records are capped at 8192 encoded bytes and segments at 8 MB including framing, below StorageService's current 64 MB writer cap; both count and byte limits apply. These refine accepted findings 2 and 4 without changing their disposition.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0188 (2026-09-21T15:43:17Z):
+
+**Rating: 9/10.**
+
+Read the complete audit history and independently checked the planner's responses against the current plan, P02M0099's ownership, and the actual permission, capability-transfer, process-observation, display/input, storage and verification paths. One part of accepted finding 2 remains incomplete:
+
+1. **Medium - Request-channel lifetime does not enforce the promised cancellation on requester death.**
+
+   The plan requires cancellation on [loss of the requester](/data/yellow/libersystem/docs/todo/P02M0188.md:81) and explicitly includes [requester-death verification](/data/yellow/libersystem/docs/todo/P02M0188.md:178). However, its concrete lifetime mechanism binds authority to the [request connection](/data/yellow/libersystem/docs/todo/P02M0188.md:92) and requires only that this connection [remain live after grant delegation](/data/yellow/libersystem/docs/todo/P02M0188.md:101). It supplies no observation of the original launching task. After confirmation, the requester can transfer both its request endpoint and unused grant to another process and exit; both connections remain live, allowing redemption within the grant deadline despite the promised requester-death cancellation. Removing `DUPLICATE` does not prevent this transfer case.
+
+   This distinction is already explicit in [PermissionManager's task-bound grant path](/data/yellow/libersystem/src/user/services/core/src/permission_manager.rs:543) and [DisplayService's process observation](/data/yellow/libersystem/src/user/services/core/src/display_service.rs:1756): an open channel proves that somebody retains its peer, not that the launching process still exists. The planner's final clarification correctly permits delegation without authenticating the delegate's PID, but does not resolve observation of the original owner's death.
+
+   **Complete the lifetime correction** by binding the private request factory to a `WAIT | TRANSFER` observer of the exact prepared launching task through the existing `grant_for_task` integration. Observe termination independently of endpoint closure and invalidate pending requests and unconsumed grants, including while a journal acknowledgment is pending. This needs no task-management authority and can preserve redemption by a delegate while the original owner remains alive. Extend the guest death case to retain both endpoints in another process, terminate the original owner, and assert zero executor dispatches; retain a successful live-owner delegation case as well.
+
+Validation: plan and source inspection only; no builds or guest execution. The rating concerns implementation-plan readiness. No plan or source code was modified.

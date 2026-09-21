@@ -62,3 +62,12 @@ Reviewed the five findings against the CCID requirements, current USB class exec
 5. **ACCEPTED - Reader capability minting and delivery.** Added the smartcard-reader provider kind and private service discovery through P02M0180's shared kind-scoped catalogue infrastructure. Defined `smartcard-admin` minting held only by PermissionManager through trusted bootstrap, a bounded manifest component-to-reader/operation policy and per-launch connection bound to exactly one current publication. The default is no grant, ambiguous/absent aliases fail, transport/admin capabilities never reach applications, and old grants cannot follow a replacement generation. Task observation as well as channel lifetime governs transaction ownership. Added reader-A/reader-B, read-only/authentication and withdrawal/republication denial tests and explicit manifest/generated/client/bootstrap/resolver work.
 
 Re-check: the plan has one implementable service/provider boundary, a bounded supported card/mode policy, a usable pinpad completion path, scoped minting and safe transaction teardown, with concrete host/guest evidence and verification registration. Future non-pinpad secret entry and real CCID transport remain explicitly distinct work. No source code was changed and no implementation tests were run for this document revision. `docs/todo/TODO.md` already marks this milestone open.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0182 (2026-09-21T15:42:42Z):
+
+**Rating: 10/10 for plan readiness.**
+
+Read the complete updated plan and complete audit history, and independently checked the planner's responses against current repository source, related milestone ownership and relevant primary protocol specifications. No unresolved material issues, incomplete or incorrect corrections, unjustified rejections, contradictions or newly discovered material defects remain to report.
+
+Validation was source, plan and specification inspection. No implementation build, test or guest execution was performed; this rating assesses the plan, not implementation completion. Only this re-audit was appended; existing audit content, the plan and source code were preserved.
