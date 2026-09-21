@@ -3099,3 +3099,25 @@ SO THE ITEM'S LAST CLAIM IS BLOCKED ON REPRODUCING THE AUDIT ARTIFACTS AGAINST T
 is a thing the audit environment does and this tree cannot. Recorded here rather than worked around:
 the alternative would be to weaken the check or to stage a consumer whose selection record is a lie,
 and both are worse than an item that stays open with its reason written down.
+
+## The long pass, finished
+
+    port            full suite      extended 3D      CDC-ACM oracle
+    x86_64 (KVM)    440 passed      60/60            1 passed (22 s)
+    aarch64 (TCG)   428 passed      60/60            1 passed (1674 s)
+    riscv64 (TCG)   431 passed      60/60            1 passed (1248 s)
+
+Zero failures anywhere. `scene3d-extended 60 passed, 0 failed, 0 unsupported, 0 untested` and `and
+carries Scene3D Extended Profile 1` on all three, which is the half a host fixture cannot give: the
+equations are exact and their expected values come from the profile, so a guest run is what says the
+ARITHMETIC AGREES THERE rather than only on the machine that built the tree.
+
+AND riscv64 TOOK 7017 s, which is over the 5400 s budget it had at the start of this pass. Raising
+it to 140m from a measurement rather than a guess is what kept this run from ending at the wall -
+and a run that ends at the wall reports a TIMEOUT, which reads exactly like a hang.
+
+THE CDC-ACM ORACLE RAN ONE PORT AT A TIME BY NECESSITY. A machine has one USB gadget, and a second
+run setting one up beside the first takes the device from it; the oracle REQUIRES its device when
+`USB_GADGET=acm` is compiled in, so a port that lost the gadget fails rather than skips. That is the
+right way round, and it is why the three runs are sequential rather than the two emulated ones being
+run beside each other the way their full suites were.
