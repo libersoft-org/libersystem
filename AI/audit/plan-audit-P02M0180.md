@@ -1,0 +1,47 @@
+AUDITOR'S REVIEW OF PLAN P02M0180 (2026-09-21T14:02:16Z):
+
+**Rating: 3/10.** The requirements establish the intended service boundary, but material dependency, scope, isolation and verification decisions remain unresolved before implementation.
+
+Reviewed [the plan](/data/yellow/libersystem/docs/todo/P02M0180.md), its originating driver requirements, the current IDL and provider catalogue, USB dispatch, service deployment and launch paths, permission model, and host/guest verification infrastructure at commit `467f761df5a27b5409ffa3cd54e942485b4cf078`. The document is a requirements checklist; these findings concern missing implementation decisions and unsupported assumptions, not the expected absence of feature code in an open milestone.
+
+1. **High - The transport dependency is presented as ready, but neither the transport nor its service contract is available.**
+
+   The [footer](/data/yellow/libersystem/docs/todo/P02M0180.md:54) calls the HCI transport "written and waiting for a destination", while the [actual driver item](/data/yellow/libersystem/docs/todo/P02M0099.md:5685) remains unchecked and explicitly defers binding endpoints, carrying packets and recovering stalls/unplug until this milestone. Current [USB class dispatch](/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:1147) has no Bluetooth binding, and the closed [provider-kind vocabulary](/data/yellow/libersystem/src/idl/device.lsidl:151) contains no HCI transport. No corresponding implementation was found in the relevant driver, service or IDL sources.
+
+   The plan therefore leaves the service without a defined controller connection and risks a circular completion dependency: this milestone requires enumeration, scanning and pairing, while the transport waits for this milestone. Merely naming a destination does not define the boundary both implementations must share.
+
+   **Correct the introductory boundary, first interface item and "What it unblocks"** to describe the transport's actual status and stage the work explicitly. Specify ownership of the bounded HCI transport contract, packet directions and limits, controller discovery/connection, and reset/removal behavior. Reuse the catalogue's [provider identities, generations and withdrawals](/data/yellow/libersystem/src/idl/device.lsidl:179) and [connection operation](/data/yellow/libersystem/src/idl/device.lsidl:315). State whether service completion uses a faithful transport fixture or waits for the separately owned USB implementation.
+
+2. **High - The first profile and its real consumer are still unspecified, so the implementation scope is not bounded.**
+
+   The [profile item](/data/yellow/libersystem/docs/todo/P02M0180.md:34) requires a consumer-backed choice but names neither a profile nor a consumer. The [completion condition](/data/yellow/libersystem/docs/todo/P02M0180.md:47) nevertheless depends on opening that profile's channel. The enumeration/scan interface item does not describe the pairing or profile operations needed to get there.
+
+   This choice determines the required link procedures, security mode, protocol layers, channel contract and existing service integration. Leaving it to implementation can produce an arbitrary demonstration with no real consumer, or unnecessary support for protocols the selected use case never needs. The references to RFCOMM and profiles in the introduction do not settle that scope.
+
+   **Correct the interface, pairing, L2CAP and profile items** by selecting the real consumer first and naming the minimum profile and supported controller/link/security features that satisfy it. Describe the client's typed pairing and channel lifecycle, the profile's useful observable result, and explicit unsupported behavior. Clarify who authorizes power changes and pairing interaction while retaining the exclusion of platform radio policy. Only include additional protocol layers when this chosen path requires them; a profile catalogue is unnecessary.
+
+3. **High - Bonding assumes a key-store dependency that has no identified implementation or owner.**
+
+   The [pairing/bonding item](/data/yellow/libersystem/docs/todo/P02M0180.md:28) refers to "the key store" as an available separate capability. Searches of `src` and `docs` found no other key-store definition or owned prerequisite. The existing [security capability vocabulary](/data/yellow/libersystem/src/idl/security.lsidl:12) also supplies no such contract.
+
+   This is a security-sensitive dependency, not a routine storage detail. Without deciding it, an implementer must either invent secret persistence inside the Bluetooth work, grant broader storage authority than intended, or implement transient pairing that does not satisfy bonding. The plan also leaves the meaning of "asked rather than read" unresolved at the operation boundary.
+
+   **Correct the pairing/bonding item** to name an owned prerequisite or include a narrowly scoped bond-store implementation and capability contract. Define which trusted party creates and grants that capability, permitted store/use/retrieve/delete operations, peer/controller identity binding, persistence across restart/reboot, and behavior when storage is unavailable. Require proof that ordinary Bluetooth clients cannot obtain the secret-store authority or bond secrets. This can be a small protected backend; the milestone does not require a general-purpose key-management framework.
+
+4. **High - Ordinary service registration will not enforce the promised independent resource domain.**
+
+   The [isolation item](/data/yellow/libersystem/docs/todo/P02M0180.md:36) correctly requires boot-enforced bounds, but identifies no launch changes or resource policy. Current [ServiceManager startup](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:403) creates a separate domain only for DeviceManager and documents the shared-domain behavior of ordinary services. Volume-loaded services go through [ordinary `process.launch`](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:223), whose [implementation](/data/yellow/libersystem/src/user/services/core/src/process_service.rs:1128) supplies domain `0`. The manifest's [service record](/data/yellow/libersystem/src/tools/system-manifest/src/lib.rs:718) has no budget fields. Existing [bounded launch](/data/yellow/libersystem/src/user/services/core/src/process_service.rs:681) provides a useful starting point, but limits memory while leaving the other domain-create limits unlimited.
+
+   Adding a Bluetooth binary and manifest row through the normal path could therefore deliver a separate process while missing the milestone's central containment guarantee. Per-connection queue limits alone do not establish aggregate service bounds.
+
+   **Correct the isolation item and definition of done** to identify the boot-owned domain/limit mechanism, finite resource and aggregate connection/queue policy, failure when limits cannot be established, and teardown/restart behavior. Include the concrete [deployment/bootstrap manifest](/data/yellow/libersystem/src/user/services/manifest.toml:1), generated IDL/client and permission-grant integration: the service receives HCI and bond-store capabilities; the consumer receives only its Bluetooth endpoint. Choose a narrow extension of existing launch machinery and verify that terminating or exhausting the service leaves unrelated services operational.
+
+5. **Medium - The test requirements do not yet identify a runnable end-to-end proof.**
+
+   The [host/guest test items](/data/yellow/libersystem/docs/todo/P02M0180.md:39) provide no controller/peer fixture or concrete observable assertions. The [current QEMU USB attachment set](/data/yellow/libersystem/src/harness/qemu-run.sh:868) contains no Bluetooth device, and the [gadget helper](/data/yellow/libersystem/src/harness/usb-gadget.sh:73) implements only ACM, HID and UAC2 fixtures. Host testing also needs an explicit code boundary: [service-logic's crate contract](/data/yellow/libersystem/src/user/services/logic/Cargo.toml:8) explains why pure decisions cannot be host-tested when coupled to the freestanding service runtime.
+
+   Without these choices, a service-online marker or an inert returned channel could pass a nominal gate without proving scanning, bonding, useful profile behavior or containment. Registration alone cannot repair that missing oracle.
+
+   **Correct both test items** to put production parser/state-machine logic in a host-testable leaf, select a bounded HCI controller/peer fixture, and define live client assertions for enumeration, scan, pairing/bond reuse and the chosen profile's effect. Include malformed sequences, transport loss, capability denial and actual resource-isolation checks. State the distinction between fixture-based service coverage and later USB transport coverage. Select a guest test or standalone gate and name its verification ownership/coverage and image prerequisites. For a standalone gate, account for [catalogue and guest-evidence registration](/data/yellow/libersystem/src/tools/verify-model/src/catalog.rs:892), agreement with `check.sh`, and the [release-required exact-set checks](/data/yellow/libersystem/src/tools/verify-model/src/main.rs:1591), so relevant service changes actually select the proof.
+
+Validation was source and plan inspection; no build or guest execution was needed for these findings. The plan and source code were not modified.
