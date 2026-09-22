@@ -11,7 +11,10 @@
 extern crate alloc;
 
 pub mod addr_select;
+pub mod aes;
+pub mod att;
 pub mod catalogue_scope;
+pub mod cmac;
 pub mod dhcp;
 pub mod dns;
 pub mod executable;
@@ -20,6 +23,8 @@ pub mod font_record;
 pub mod font_rescan;
 pub mod font_scan;
 pub mod graph_limits;
+pub mod hci;
+pub mod hogp;
 pub mod invalidation;
 pub mod ipv6;
 pub mod ipv6_budget;
@@ -35,6 +40,7 @@ pub mod ipv6_router;
 pub mod ipv6_slaac;
 pub mod ipv6_solicit;
 pub mod ipv6_timers;
+pub mod l2cap;
 pub mod net_profile;
 pub mod open_sequence;
 pub mod selection;
