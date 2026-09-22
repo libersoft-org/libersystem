@@ -3499,3 +3499,14 @@ recorded at 1248 s before this session and passes in **199 s** with the write in
 there all along, stealing the machine between every wake; what changed on riscv64 was only that it
 grew from stealing most of the time to taking all of it. A measurement that improves by a factor of
 six on a one-line change is the shape of a defect that was being paid for quietly everywhere.
+
+**THE SIX RUNS AFTER THE FIX, on both emulated ports, one gadget at a time:** aarch64 125 s, 116 s
+and 275 s; riscv64 195 s, 132 s and 188 s, for the single port, the two-port composite and the
+serial function in the second configuration. Against 1674 s and 1248 s for the single-port oracle
+before it. All six pass, and the x86_64 column was re-checked with the enumeration oracle at 23 s.
+
+AND THE LAST TWO RUNS OF THE SET REFUSED TO START FOR A REASON THAT IS NOT A DEFECT: `commit.sh` ran
+in the tree between them, which rewrites the files it commits and moves their mtimes, so `test.sh`
+read the build as stale and said so. The content was identical; a rebuild and a re-run finished the
+set. Worth recording because the message - "the build does not match the sources" - reads like a
+missed rebuild and was a commit.
