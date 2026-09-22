@@ -18,7 +18,7 @@
 
 use alloc::vec::Vec;
 
-use render_math::{Vec3, powf};
+use render_math::{Mat4, Vec3, camera, powf};
 
 use crate::scene::{Error, Limits};
 
@@ -216,4 +216,128 @@ pub fn cube_face(direction: Vec3) -> Option<CubeFace> {
 		return Some(if direction.y >= 0.0 { CubeFace::PositiveY } else { CubeFace::NegativeY });
 	}
 	Some(if direction.z >= 0.0 { CubeFace::PositiveZ } else { CubeFace::NegativeZ })
+}
+
+/// How far from +Y a direction has to be before +Y stops being a usable up axis.
+///
+/// ONE PART IN A THOUSAND, and it is the profile's number rather than a tolerance chosen here. A
+/// `look_at` whose forward and up are parallel has no basis at all, and the failure is not a wrong
+/// picture but a matrix of NaNs - so the fallback has to trigger BEFORE the cross product gets small
+/// enough to lose its precision, not when it reaches zero.
+const UP_DEGENERATE: f32 = 0.001;
+
+/// The up axis a light's view uses, which is +Y unless the light points along it.
+fn up_for(direction: Vec3) -> Vec3 {
+	if (direction.y.abs() - 1.0).abs() < UP_DEGENERATE { Vec3::new(0.0, 0.0, 1.0) } else { Vec3::new(0.0, 1.0, 0.0) }
+}
+
+/// The view-projection one CASCADE of a directional light is rendered with, fitted to the BOUNDING
+/// SPHERE of its slice of the view frustum.
+///
+/// A SPHERE AND NOT THE SLICE'S BOX, which is the whole reason this is a profile rule rather than an
+/// implementer's choice. A box fitted to the slice changes SIZE as the camera turns - the same
+/// volume seen corner-on is longer than seen face-on - so the map's texel footprint changes every
+/// frame and the shadow edge crawls. A sphere is invariant under rotation, so the only thing left
+/// that moves is the centre.
+///
+/// NEAR IS ZERO AND FAR IS THE DIAMETER because the eye is placed one radius back along the light's
+/// direction: the sphere then sits exactly between the two planes, and a caster outside it is
+/// outside this cascade by definition.
+pub fn directional_projection(direction: Vec3, centre: Vec3, radius: f32) -> Result<Mat4, Error> {
+	if !direction.is_finite() || !centre.is_finite() || !radius.is_finite() || radius <= 0.0 {
+		return Err(Error::Degenerate { reason: "a directional shadow projection needs a finite centre and a positive radius" });
+	}
+	let Ok(forward) = direction.normalise() else {
+		return Err(Error::Degenerate { reason: "a directional light with no direction casts no shadow" });
+	};
+	let eye = centre.sub(forward.scale(radius));
+	let view = camera::look_at_rh(eye, centre, up_for(forward)).map_err(|_| Error::Degenerate { reason: "a directional shadow view whose eye and target do not make a basis" })?;
+	let projection = camera::orthographic_rh_zo(-radius, radius, -radius, radius, 0.0, radius * 2.0).map_err(|_| Error::Degenerate { reason: "a directional shadow volume the projection refuses" })?;
+	Ok(projection.mul(&view))
+}
+
+/// The view-projection a SPOT light's shadow map is rendered with.
+///
+/// TWICE THE OUTER CONE ANGLE, because the cone's half-angle is measured from its axis and a
+/// perspective's field of view is measured across the whole frustum. Halving that once too often is
+/// the defect this is written down to prevent: the map then covers the middle of the cone and
+/// everything outside it is unshadowed, which looks like a shadow that ends in mid-air.
+pub fn spot_projection(position: Vec3, direction: Vec3, outer_cone: f32, near: f32, range: f32) -> Result<Mat4, Error> {
+	if !position.is_finite() || !outer_cone.is_finite() || !near.is_finite() || !range.is_finite() || outer_cone <= 0.0 || near <= 0.0 || range <= near {
+		return Err(Error::Degenerate { reason: "a spot shadow projection needs a positive cone, a positive near and a range beyond it" });
+	}
+	let Ok(forward) = direction.normalise() else {
+		return Err(Error::Degenerate { reason: "a spot light with no direction casts no shadow" });
+	};
+	let view = camera::look_at_rh(position, position.add(forward), up_for(forward)).map_err(|_| Error::Degenerate { reason: "a spot shadow view whose eye and target do not make a basis" })?;
+	let projection = camera::perspective_rh_zo(outer_cone * 2.0, 1.0, near, range).map_err(|_| Error::Degenerate { reason: "a spot shadow frustum the projection refuses" })?;
+	Ok(projection.mul(&view))
+}
+
+/// Which way one cube face looks, and which way is up on it.
+///
+/// THE 3D PROFILE'S TABLE AND NOT A SECOND ONE. The face axis and the sign conventions are already
+/// fixed there so a cube built for any other system loads without a flip; what this does is read
+/// them as a view basis.
+pub fn cube_face_basis(face: CubeFace) -> (Vec3, Vec3) {
+	match face {
+		CubeFace::PositiveX => (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+		CubeFace::NegativeX => (Vec3::new(-1.0, 0.0, 0.0), Vec3::new(0.0, -1.0, 0.0)),
+		CubeFace::PositiveY => (Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)),
+		CubeFace::NegativeY => (Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0)),
+		CubeFace::PositiveZ => (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, -1.0, 0.0)),
+		CubeFace::NegativeZ => (Vec3::new(0.0, 0.0, -1.0), Vec3::new(0.0, -1.0, 0.0)),
+	}
+}
+
+/// The view-projection ONE FACE of a point light's shadow cube is rendered with.
+///
+/// NINETY DEGREES EXACTLY, because six of them have to tile the sphere with no gap and no overlap: a
+/// wider field wastes texels on what the neighbouring face already has, and a narrower one leaves a
+/// band around every edge that no face covers - which reads as a cross-shaped seam of unshadowed
+/// surface radiating from the light.
+pub fn point_face_projection(position: Vec3, face: CubeFace, near: f32, range: f32) -> Result<Mat4, Error> {
+	if !position.is_finite() || !near.is_finite() || !range.is_finite() || near <= 0.0 || range <= near {
+		return Err(Error::Degenerate { reason: "a point shadow face needs a positive near and a range beyond it" });
+	}
+	let (forward, up) = cube_face_basis(face);
+	let view = camera::look_at_rh(position, position.add(forward), up).map_err(|_| Error::Degenerate { reason: "a point shadow face view whose basis the camera refuses" })?;
+	let projection = camera::perspective_rh_zo(core::f32::consts::FRAC_PI_2, 1.0, near, range).map_err(|_| Error::Degenerate { reason: "a point shadow frustum the projection refuses" })?;
+	Ok(projection.mul(&view))
+}
+
+/// The texture a DIRECTIONAL light's cascades are rendered into: one square depth layer per cascade.
+///
+/// AN ARRAY AND NOT `cascades` SEPARATE TEXTURES, because the lighting pass samples ONE of them per
+/// fragment, chosen by that fragment's own view depth - and a sampler that had to pick between
+/// several bound textures would need a branch per fragment over a value the profile already says is
+/// per fragment. One array with an index is the same decision expressed where the hardware can take
+/// it.
+///
+/// NO MIPS. A shadow map is compared and not filtered by magnitude: a mip is an AVERAGE of depths,
+/// and the average of a near depth and a far one is a depth nothing in the scene is at.
+pub fn cascade_map_desc(size: u32, cascades: u32, limits: &Limits) -> Result<render3d::resource::TextureDesc, Error> {
+	if size == 0 {
+		return Err(Error::Degenerate { reason: "a shadow map with no extent" });
+	}
+	if cascades == 0 || cascades > limits.max_shadow_cascades {
+		return Err(Error::LimitExceeded { limit: "max_shadow_cascades", ceiling: limits.max_shadow_cascades, asked: cascades });
+	}
+	Ok(render3d::resource::TextureDesc { dimension: render3d::resource::TextureDimension::D2Array, width: size, height: size, depth: 1, mip_levels: 1, layers: cascades, samples: 1, format: MAP_FORMAT.name(), usage: render3d::resource::TextureUsage { sampled: true, depth_stencil_attachment: true, ..Default::default() } })
+}
+
+/// The texture a POINT light's shadow is rendered into: six square depth faces.
+///
+/// A CUBE AND NOT SIX TEXTURES, for the reason the profile's own rule gives: the face is chosen by
+/// the major axis of the light-to-fragment vector, which is what a cube sampler does from the
+/// direction itself. Six textures would make the lighting pass compute the selection the sampler
+/// already performs, and get the seam rule wrong while doing it.
+pub fn cube_map_desc(size: u32, limits: &Limits) -> Result<render3d::resource::TextureDesc, Error> {
+	if size == 0 {
+		return Err(Error::Degenerate { reason: "a shadow cube with no extent" });
+	}
+	if limits.max_shadow_maps == 0 {
+		return Err(Error::LimitExceeded { limit: "max_shadow_maps", ceiling: 0, asked: 1 });
+	}
+	Ok(render3d::resource::TextureDesc { dimension: render3d::resource::TextureDimension::Cube, width: size, height: size, depth: 1, mip_levels: 1, layers: 6, samples: 1, format: MAP_FORMAT.name(), usage: render3d::resource::TextureUsage { sampled: true, depth_stencil_attachment: true, ..Default::default() } })
 }

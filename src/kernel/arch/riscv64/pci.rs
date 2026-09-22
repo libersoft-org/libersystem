@@ -269,7 +269,7 @@ pub fn function_bar(bus: u8, dev: u8, func: u8, index: usize) -> Option<(u64, u6
 	// Placed here, once: a BAR that already has an address is left exactly where it is, so this is
 	// idempotent and never moves a window somebody is already decoding.
 	if common::bar_address::<Access>(&device, index).is_none_or(|base| base == 0) {
-		common::assign_bars_ecam::<Access>(&device);
+		common::place_bars::<Access>(&device);
 	}
 	let base = common::bar_address::<Access>(&device, index)?;
 	let size = common::bar_size::<Access>(&device, index)?;

@@ -46,11 +46,11 @@ pub use emit::{Geometry, Indices, MeshDraw, PassTargets};
 pub use environment::Irradiance;
 pub use graph::{Pass, PassGraph};
 pub use light::{Light, LightKind};
-pub use material::{Blending, Incident, Material, MaterialKind, Surface, shade};
+pub use material::{Blending, ExtendedMaterial, Incident, Material, MaterialKind, PbrMap, PbrMaps, Shading, Surface, shade};
 pub use pbr::{PbrMaterial, PbrSurface};
 pub use pick::{Hit, Pending, PickRequest, Ray, Readback};
 pub use queue::{Queue, QueueKind, Queued};
-pub use scene::{Camera, Drawable, DrawableId, Error, Instance, Limits, Node, Scene, VisibilityMask};
+pub use scene::{Camera, Drawable, DrawableId, Error, Instance, Limits, MaterialRef, Node, Scene, VisibilityMask};
 pub use shadow::CubeFace;
 
 #[cfg(test)]

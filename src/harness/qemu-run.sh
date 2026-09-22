@@ -2435,6 +2435,33 @@ qemu_run_aarch64() {
 		cp "$aavmf_vars" "$vars"
 		# ESP goes last so system volume enumerates ahead of it.
 		qemu_attach_virtio_blk qemu_args "$ESP" esp "$virtio_opts"
+		# AN EMPTY HOT-PLUG SLOT, ON THIS PORT TOO AND NOT ONLY UNDER `TEST=1`.
+		#
+		# `qemu_attach_suite_devices` returns at its first line unless the run is a TEST run, so a
+		# cold or interactive boot of this target had no hot-plug port at all - which is what the
+		# hot-plug item means when it says the slot path "has only ever had a slot to find on
+		# x86_64's interactive profile". The scenario that plugs a device into a live machine runs
+		# cold on all three targets by design, and on these two it was answering `Bus 'hotplug0'
+		# not found` from the monitor before the guest was ever asked anything.
+		#
+		# NO `acpi-pci-hotplug-with-bridge-support=off` BESIDE IT, and that is not an omission. That
+		# global is q35's: on x86_64 the machine defaults to ACPI-based hot-plug even for PCIe root
+		# ports, so the guest is signalled through a GPE and a kernel reading Slot Status sees
+		# nothing. `virt` has no such default and signals through the port itself, which is what the
+		# PCI Express specification says a root port reports through.
+		#
+		# LAST OF ALL, so QEMU gives it the next free address and renumbers nothing: the driver
+		# oracles print their bus addresses and those are what a renumbering would break.
+		#
+		# AND ONLY WHEN THE SUITE PATH IS NOT ADDING ONE, which is the condition `qemu_attach_suite_devices`
+		# returns on. That function attaches the slot too, for the runs whose tests need the devices
+		# beside it - so adding one here unconditionally gave a TEST run TWO ports with one id and
+		# QEMU refused the whole machine with `Duplicate ID 'hotplug0' for device`. The two additions
+		# are one machine shape expressed in two places, and this is the place that covers the
+		# profiles the other one returns before reaching.
+		if [[ "${TEST:-0}" != "1" || "$reduced" == "1" ]]; then
+			qemu_args+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
+		fi
 		qemu_attach_suite_devices qemu_args "$reduced"
 		local -a independent=()
 		MACHINE_FOR_DUMP="$machine"
@@ -2766,6 +2793,33 @@ qemu_run_riscv64() {
 		bind_tool qemu_bin qemu-system-riscv64
 		# ESP is NVMe so U-Boot's default boot order tries nvme0 first.
 		qemu_args+=(-drive "if=none,id=esp,format=raw,file=$ESP" -device "nvme,serial=libersystem-esp,drive=esp")
+		# AN EMPTY HOT-PLUG SLOT, ON THIS PORT TOO AND NOT ONLY UNDER `TEST=1`.
+		#
+		# `qemu_attach_suite_devices` returns at its first line unless the run is a TEST run, so a
+		# cold or interactive boot of this target had no hot-plug port at all - which is what the
+		# hot-plug item means when it says the slot path "has only ever had a slot to find on
+		# x86_64's interactive profile". The scenario that plugs a device into a live machine runs
+		# cold on all three targets by design, and on these two it was answering `Bus 'hotplug0'
+		# not found` from the monitor before the guest was ever asked anything.
+		#
+		# NO `acpi-pci-hotplug-with-bridge-support=off` BESIDE IT, and that is not an omission. That
+		# global is q35's: on x86_64 the machine defaults to ACPI-based hot-plug even for PCIe root
+		# ports, so the guest is signalled through a GPE and a kernel reading Slot Status sees
+		# nothing. `virt` has no such default and signals through the port itself, which is what the
+		# PCI Express specification says a root port reports through.
+		#
+		# LAST OF ALL, so QEMU gives it the next free address and renumbers nothing: the driver
+		# oracles print their bus addresses and those are what a renumbering would break.
+		#
+		# AND ONLY WHEN THE SUITE PATH IS NOT ADDING ONE, which is the condition `qemu_attach_suite_devices`
+		# returns on. That function attaches the slot too, for the runs whose tests need the devices
+		# beside it - so adding one here unconditionally gave a TEST run TWO ports with one id and
+		# QEMU refused the whole machine with `Duplicate ID 'hotplug0' for device`. The two additions
+		# are one machine shape expressed in two places, and this is the place that covers the
+		# profiles the other one returns before reaching.
+		if [[ "${TEST:-0}" != "1" || "$reduced" == "1" ]]; then
+			qemu_args+=(-device "pcie-root-port,id=hotplug0,chassis=1,slot=1,bus=pcie.0")
+		fi
 		qemu_attach_suite_devices qemu_args "$reduced"
 		local -a independent=()
 		MACHINE_FOR_DUMP="virt,aia=aplic-imsic"

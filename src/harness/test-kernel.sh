@@ -463,10 +463,15 @@ usb_gadget_teardown() {
 	[[ -n "${USB_GADGET:-}" ]] || return 0
 	# THE ECHO FIRST, because it holds the tty the gadget owns: a teardown that removed the gadget
 	# under a process still reading it leaves that process on a device that is gone.
-	if [[ -n "${SERIAL_ECHO_PID:-}" ]]; then
-		kill "$SERIAL_ECHO_PID" 2>/dev/null || true
-		wait "$SERIAL_ECHO_PID" 2>/dev/null || true
-		SERIAL_ECHO_PID=""
+	# EVERY ECHOER, because a composite adapter has one per port. A list rather than a variable, so
+	# the two-port fixture does not leave a process holding a tty after the run.
+	if [[ -n "${SERIAL_ECHO_PIDS:-}" ]]; then
+		local echo_pid
+		for echo_pid in $SERIAL_ECHO_PIDS; do
+			kill "$echo_pid" 2>/dev/null || true
+			wait "$echo_pid" 2>/dev/null || true
+		done
+		SERIAL_ECHO_PIDS=""
 	fi
 	"$ROOT/harness/usb-gadget.sh" teardown || true
 }
@@ -500,10 +505,28 @@ if [[ -n "${USB_GADGET:-}" ]]; then
 		# driver that binds an adapter and reports a state is not a driver that moves bytes, and
 		# this is the process the guest's bytes come back from. The gadget side of a CDC-ACM
 		# device is an ordinary tty on this host.
-		if [[ "$USB_GADGET" == "acm" ]]; then
-			python3 "$ROOT/harness/serial-echo.py" >&2 &
-			SERIAL_ECHO_PID=$!
-		fi
+		# ONE ECHOER PER PORT. A single-function adapter is `/dev/ttyGS0` alone; the two-port
+		# fixture is one device presenting two of them, and an oracle that proved the second port
+		# by reading the first one's echo would prove nothing about the second port at all.
+		case "$USB_GADGET" in
+		acm)
+			python3 "$ROOT/harness/serial-echo.py" --tty /dev/ttyGS0 >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
+		acm-pair)
+			python3 "$ROOT/harness/serial-echo.py" --tty /dev/ttyGS0 >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			python3 "$ROOT/harness/serial-echo.py" --tty /dev/ttyGS1 >&2 &
+			SERIAL_ECHO_PIDS="$SERIAL_ECHO_PIDS $!"
+			;;
+		acm-late)
+			# THE SERIAL FUNCTION IS IN THE SECOND CONFIGURATION, and the gadget side of it is
+			# still one tty - what this fixture is about is the guest finding it, not a second
+			# stream.
+			python3 "$ROOT/harness/serial-echo.py" --tty /dev/ttyGS0 >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
+		esac
 	else
 		# REFUSED RATHER THAN FORCED, and the run goes on without it: the tests that wanted the
 		# gadget report unavailable, which is a state this harness already has, and the ones that

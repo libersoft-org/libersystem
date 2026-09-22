@@ -46,7 +46,7 @@ PRODUCT_ID=0104
 # Every module a gadget of any supported kind needs, in dependency order. `modprobe` pulls what it
 # needs anyway; the list is here because the REMOVAL set is computed against it and a module this
 # script never names is a module it never removes.
-ALL_MODULES=(udc_core libcomposite dummy_hcd u_serial usb_f_acm usb_f_hid usb_f_uac2)
+ALL_MODULES=(udc_core libcomposite dummy_hcd u_serial usb_f_acm usb_f_hid usb_f_uac2 usb_f_printer)
 
 say() {
 	echo "usb-gadget: $*" >&2
@@ -70,14 +70,35 @@ gadget_dir() {
 	echo "$GADGET_ROOT/$(cat "$(state_file name)" 2>/dev/null || true)"
 }
 
-# The function directory and the report descriptor, per kind. A kind this script does not know is a
-# refusal: inventing a descriptor for it would be inventing the device the test is about.
-function_for() {
+# WHAT A KIND IS MADE OF: one line per function, as `<config> <function directory> <shape>`.
+#
+# IT IS A LIST AND NOT A NAME because two of the things the serial item has to be exercised against
+# are not single-function devices. "Several simultaneous adapters" is two serial functions at once,
+# and "the serial function in a later configuration" is a device whose FIRST configuration is
+# something else - and a fixture that can only hold one function in one configuration can express
+# neither. The shape is what the setup configures the function as; the config and the directory are
+# what the teardown undoes, which is why the whole plan is written down before the first mkdir.
+#
+# A kind this script does not know is a refusal: inventing a descriptor for it would be inventing
+# the device the test is about.
+plan_for() {
 	case "$1" in
-	acm) echo "acm.usb0" ;;
-	hid-touch | hid-gamepad) echo "hid.usb0" ;;
-	uac2) echo "uac2.usb0" ;;
-	*) refuse "unknown gadget kind '$1' - known kinds are acm, hid-touch, hid-gamepad, uac2" ;;
+	acm) printf 'c.1 acm.usb0 acm\n' ;;
+	# TWO ADAPTERS ON ONE DEVICE, which is the harder half of "several simultaneous adapters" and
+	# the one a driver gets wrong: each function has its own union descriptor naming its own data
+	# interface, so a driver that takes "the lowest bulk pair in the configuration" binds function
+	# zero's endpoints to function one's control interface and the two streams cross.
+	acm-pair) printf 'c.1 acm.usb0 acm\nc.1 acm.usb1 acm\n' ;;
+	# THE SERIAL FUNCTION IN A LATER CONFIGURATION. The first configuration holds a printer, which
+	# is a class nothing in this tree binds - so what the driver has to do to find the serial port
+	# is read past a configuration it cannot use, which is the whole of what this fixture is for. A
+	# first configuration holding a function some OTHER module here binds would test the dispatch
+	# order instead, which is a different question.
+	acm-late) printf 'c.1 printer.usb0 printer\nc.2 acm.usb0 acm\n' ;;
+	hid-touch) printf 'c.1 hid.usb0 hid-touch\n' ;;
+	hid-gamepad) printf 'c.1 hid.usb0 hid-gamepad\n' ;;
+	uac2) printf 'c.1 uac2.usb0 uac2\n' ;;
+	*) refuse "unknown gadget kind '$1' - known kinds are acm, acm-pair, acm-late, hid-touch, hid-gamepad, uac2" ;;
 	esac
 }
 
@@ -159,8 +180,8 @@ hid_report_length() {
 cmd_setup() {
 	local kind="${1:-}"
 	[[ -n "$kind" ]] || refuse "setup needs a kind"
-	local function_name
-	function_name="$(function_for "$kind")"
+	local plan
+	plan="$(plan_for "$kind")"
 
 	# RULE 4, FIRST: every precondition, checked and named.
 	[[ "$(id -u)" == "0" ]] || refuse "building a gadget needs root, and this is not it"
@@ -205,7 +226,7 @@ cmd_setup() {
 	# Recorded BEFORE the first mkdir, so a setup that dies half way still has a teardown that knows
 	# what to undo. Rule 5 is why the order is this way round.
 	printf '%s\n' "$name" >"$(state_file name)"
-	printf '%s\n' "$function_name" >"$(state_file function)"
+	printf '%s\n' "$plan" >"$(state_file plan)"
 	printf '%s\n' "$udc" >"$(state_file udc)"
 	: >"$(state_file modules)"
 	for module in "${absent[@]}"; do
@@ -219,30 +240,22 @@ cmd_setup() {
 	printf 'LiberSystem harness\n' >"$dir/strings/0x409/manufacturer"
 	printf '%s\n' "$kind" >"$dir/strings/0x409/product"
 	printf '%s\n' "$name" >"$dir/strings/0x409/serialnumber"
-	mkdir "$dir/configs/c.1"
-	mkdir "$dir/configs/c.1/strings/0x409"
-	printf '%s\n' "$kind" >"$dir/configs/c.1/strings/0x409/configuration"
-	mkdir "$dir/functions/$function_name"
-	case "$kind" in
-	# THE CAPTURE RATE, BECAUSE THE DEFAULT IS NOT ONE THIS SYSTEM ADMITS. `usb_f_uac2` comes up
-	# with playback at 48 kHz and CAPTURE AT 64 - and the driver above refuses anything but 48 kHz
-	# stereo 16-bit rather than resampling, for the reason its own item states: a driver that
-	# quietly took 44.1 for 48 plays everything a semitone out with nothing reporting it. A
-	# fixture presenting a rate the driver is right to refuse would be testing the refusal.
-	#
-	# The sample size and the channel mask already match - two bytes and stereo on both
-	# directions - and are left as the module set them.
-	uac2)
-		write_attr "$dir/functions/$function_name/c_srate" 48000
-		;;
-	hid-touch | hid-gamepad)
-		write_attr "$dir/functions/$function_name/protocol" 0
-		write_attr "$dir/functions/$function_name/subclass" 0
-		write_attr "$dir/functions/$function_name/report_length" "$(hid_report_length "$kind")"
-		hid_descriptor "$kind" >"$dir/functions/$function_name/report_desc"
-		;;
-	esac
-	ln -s "$dir/functions/$function_name" "$dir/configs/c.1/$function_name"
+	local config function_name shape
+	local made_configs=" "
+	while read -r config function_name shape; do
+		[[ -n "$config" ]] || continue
+		# EACH CONFIGURATION MADE ONCE, however many functions land in it.
+		if [[ "$made_configs" != *" $config "* ]]; then
+			mkdir "$dir/configs/$config"
+			mkdir "$dir/configs/$config/strings/0x409"
+			printf '%s %s\n' "$kind" "$config" >"$dir/configs/$config/strings/0x409/configuration"
+			made_configs+="$config "
+		fi
+		mkdir "$dir/functions/$function_name"
+		configure_function "$dir" "$function_name" "$shape"
+		ln -s "$dir/functions/$function_name" "$dir/configs/$config/$function_name"
+	done <<<"$plan"
+
 	# THE BIND HAS TWO FAILURES THAT LOOK IDENTICAL FROM HERE, and the wait tells them apart.
 	#
 	# A controller whose PREVIOUS gadget is still unbinding answers EBUSY for a moment, which is a
@@ -259,6 +272,31 @@ cmd_setup() {
 	printf '%s:%s\n' "$VENDOR_ID" "$PRODUCT_ID"
 }
 
+# What one function needs written into it before it is linked into a configuration. A shape with
+# nothing to set is not an omission: `acm` and `printer` are what their modules make them.
+configure_function() {
+	local dir="$1" function_name="$2" shape="$3"
+	case "$shape" in
+	# THE CAPTURE RATE, BECAUSE THE DEFAULT IS NOT ONE THIS SYSTEM ADMITS. `usb_f_uac2` comes up
+	# with playback at 48 kHz and CAPTURE AT 64 - and the driver above refuses anything but 48 kHz
+	# stereo 16-bit rather than resampling, for the reason its own item states: a driver that
+	# quietly took 44.1 for 48 plays everything a semitone out with nothing reporting it. A
+	# fixture presenting a rate the driver is right to refuse would be testing the refusal.
+	#
+	# The sample size and the channel mask already match - two bytes and stereo on both
+	# directions - and are left as the module set them.
+	uac2)
+		write_attr "$dir/functions/$function_name/c_srate" 48000
+		;;
+	hid-touch | hid-gamepad)
+		write_attr "$dir/functions/$function_name/protocol" 0
+		write_attr "$dir/functions/$function_name/subclass" 0
+		write_attr "$dir/functions/$function_name/report_length" "$(hid_report_length "$shape")"
+		hid_descriptor "$shape" >"$dir/functions/$function_name/report_desc"
+		;;
+	esac
+}
+
 # RULE 5: idempotent, and safe against a setup that never finished. Every step is guarded, because
 # teardown running against half a tree is the ordinary case rather than the exceptional one.
 cmd_teardown() {
@@ -269,18 +307,27 @@ cmd_teardown() {
 		return 0
 	fi
 	local dir="$GADGET_ROOT/$name"
-	local function_name
-	function_name="$(cat "$(state_file function)" 2>/dev/null || true)"
+	local plan
+	plan="$(cat "$(state_file plan)" 2>/dev/null || true)"
 
 	if [[ -d "$dir" ]]; then
 		# Unbind first: a gadget still bound to a UDC refuses every rmdir under it.
 		[[ ! -e "$dir/UDC" ]] || printf '\n' >"$dir/UDC" 2>/dev/null || true
-		# The one symlink this script made, inside the directory this script made. Rule 3's whole
-		# extent: `rm` is never called on anything outside `$dir`.
-		[[ -z "$function_name" || ! -L "$dir/configs/c.1/$function_name" ]] || rm "$dir/configs/c.1/$function_name"
-		[[ ! -d "$dir/configs/c.1/strings/0x409" ]] || rmdir "$dir/configs/c.1/strings/0x409"
-		[[ ! -d "$dir/configs/c.1" ]] || rmdir "$dir/configs/c.1"
-		[[ -z "$function_name" || ! -d "$dir/functions/$function_name" ]] || rmdir "$dir/functions/$function_name"
+		# EXACTLY WHAT THE PLAN SAYS WAS MADE, and nothing else. Rule 3's whole extent: `rm` is
+		# never called on anything outside `$dir`, and the paths it is called on are the ones setup
+		# wrote down before it created them.
+		local config function_name shape
+		local configs=""
+		while read -r config function_name shape; do
+			[[ -n "$config" ]] || continue
+			[[ ! -L "$dir/configs/$config/$function_name" ]] || rm "$dir/configs/$config/$function_name"
+			[[ ! -d "$dir/functions/$function_name" ]] || rmdir "$dir/functions/$function_name"
+			[[ "$configs" == *" $config "* ]] || configs+=" $config "
+		done <<<"$plan"
+		for config in $configs; do
+			[[ ! -d "$dir/configs/$config/strings/0x409" ]] || rmdir "$dir/configs/$config/strings/0x409"
+			[[ ! -d "$dir/configs/$config" ]] || rmdir "$dir/configs/$config"
+		done
 		[[ ! -d "$dir/strings/0x409" ]] || rmdir "$dir/strings/0x409"
 		rmdir "$dir"
 	fi
@@ -300,7 +347,7 @@ cmd_teardown() {
 		fi
 	done
 
-	rm -f "$(state_file name)" "$(state_file function)" "$(state_file udc)" "$(state_file modules)"
+	rm -f "$(state_file name)" "$(state_file plan)" "$(state_file function)" "$(state_file udc)" "$(state_file modules)"
 	rmdir "$STATE_DIR" 2>/dev/null || true
 	say "torn down"
 }
@@ -330,7 +377,7 @@ setup)
 teardown) cmd_teardown ;;
 verify) cmd_verify ;;
 *)
-	echo "usage: usb-gadget.sh setup <acm|hid-touch|hid-gamepad|uac2> | teardown | verify" >&2
+	echo "usage: usb-gadget.sh setup <acm|acm-pair|acm-late|hid-touch|hid-gamepad|uac2> | teardown | verify" >&2
 	exit 2
 	;;
 esac

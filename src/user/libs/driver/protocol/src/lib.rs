@@ -415,6 +415,16 @@ pub mod provider {
 	// this system opens for itself; a serial adapter is somebody's hardware, and a consumer that
 	// confused the two would be attaching a diagnostic agent to whatever is plugged into a USB port.
 	pub const USB_SERIAL_NAME: &[u8] = b"org.libersystem.usb.serial";
+
+	// AND THE SECOND PORT'S, because one controller can carry two.
+	//
+	// A COMPOSITE ADAPTER IS ONE DEVICE AND TWO SERIAL PORTS, and both publish `console-stream` at
+	// the same version - so the kind cannot select between them any more than it can between an
+	// adapter and the development channel. This name is the SECOND port the controller bound, which
+	// is an ORDER and not an identity: a machine whose two adapters enumerate the other way round
+	// gets them the other way round. A consumer that needs a particular piece of hardware asks the
+	// USB bus provider what is on which port; this name is how it asks for the second stream.
+	pub const USB_SERIAL_SECOND_NAME: &[u8] = b"org.libersystem.usb.serial.2";
 }
 
 // WHAT A DRIVER CAN HONESTLY KNOW ABOUT ITSELF.

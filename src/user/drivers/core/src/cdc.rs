@@ -403,50 +403,117 @@ pub fn control_lines(dtr: bool, rts: bool) -> u16 {
 	(dtr as u16) | ((rts as u16) << 1)
 }
 
+/// How many ACM functions of one configuration this binder will look at.
+///
+/// A COMPOSITE DEVICE CARRIES SEVERAL, which is what a two-port USB serial adapter is and what the
+/// item this binder belongs to asks to be exercised against. Four is a bound and not a guess: the
+/// walk is over a descriptor a device wrote, so the number of functions it declares is an input.
+pub const MAX_ACM_FUNCTIONS: usize = 4;
+
+/// How many CDC-data interfaces one configuration may declare, as far as this binder looks.
+const MAX_DATA_INTERFACES: usize = 8;
+
+/// One ACM function's control half, collected while the walk runs.
+#[derive(Clone, Copy)]
+struct AcmFunction {
+	control: u8,
+	union_data: Option<u8>,
+	capabilities: u8,
+	notify: Option<(u8, u16)>,
+}
+
+/// Put a finished data-interface candidate away under ITS OWN INTERFACE NUMBER.
+///
+/// PER INTERFACE AND NOT ONE BEST IN THE CONFIGURATION, which is the whole difference a composite
+/// device makes. `keep_lowest` keeps a single lowest-alternate pair for the whole descriptor, which
+/// is right when there is one data interface and wrong the moment there are two: the second
+/// function's union names interface three, and the pair kept was interface one's - so either the
+/// binder refuses a device that is perfectly good, or it hands one function's control interface the
+/// other function's endpoints and the two streams cross with nothing reporting it.
+fn keep_lowest_per_interface(candidate: &mut Candidate, data: &mut [Option<Pair>; MAX_DATA_INTERFACES], count: &mut usize) {
+	let Some((iface, alt, Some((in_addr, in_mps)), Some((out_addr, out_mps)))) = candidate.take() else {
+		return;
+	};
+	let pair: Pair = (iface, alt, in_addr, out_addr, in_mps, out_mps);
+	if let Some(slot) = data.iter_mut().flatten().find(|(have, ..)| *have == iface) {
+		if alt < slot.1 {
+			*slot = pair;
+		}
+		return;
+	}
+	if *count < data.len() {
+		data[*count] = Some(pair);
+		*count += 1;
+	}
+}
+
 /// Read one configuration descriptor and decide what to bind as an ACM adapter.
+///
+/// The FIRST ACM function in the configuration. `bind_acm_nth` is the same walk asking for a later
+/// one, which is what a device carrying several serial ports needs.
+pub fn bind_acm(config: &[u8]) -> Result<AcmBinding, NotBindable> {
+	bind_acm_nth(config, 0)
+}
+
+/// The `nth` ACM function of one configuration, counted in the order the descriptor declares them.
 ///
 /// ONE PASS AND NO ASSUMED ORDER, for the reason `bind` above states: several devices put the union
 /// descriptor after the interface it names.
-pub fn bind_acm(config: &[u8]) -> Result<AcmBinding, NotBindable> {
+///
+/// A CONFIGURATION WITH NO `nth` FUNCTION ANSWERS `NoNetworkInterface`, which is the same answer a
+/// configuration carrying no ACM function at all gives - and is what lets a caller walk `0, 1, 2...`
+/// until it is told there are no more, without a second way of saying the same thing.
+pub fn bind_acm_nth(config: &[u8], nth: usize) -> Result<AcmBinding, NotBindable> {
 	let mut walk = descriptor::Walk::new(config);
 	let mut config_value: Option<u8> = None;
-	let mut control_interface: Option<u8> = None;
-	let mut union_data: Option<u8> = None;
-	let mut capabilities: u8 = 0;
-	let mut notify: Option<(u8, u16)> = None;
+	let mut functions: [Option<AcmFunction>; MAX_ACM_FUNCTIONS] = [None; MAX_ACM_FUNCTIONS];
+	let mut found: usize = 0;
+	// Which function the class descriptors and the interrupt endpoint that follow belong to.
+	let mut current: Option<usize> = None;
+	let mut data: [Option<Pair>; MAX_DATA_INTERFACES] = [None; MAX_DATA_INTERFACES];
+	let mut data_count: usize = 0;
 	let mut candidate: Candidate = None;
-	let mut best: Option<Pair> = None;
-	let mut current_is_control = false;
 
 	for record in walk.by_ref() {
 		match record.kind {
 			descriptor::DT_CONFIG => config_value = record.field(5).ok(),
 			descriptor::DT_INTERFACE => {
-				keep_lowest(&mut candidate, &mut best);
+				keep_lowest_per_interface(&mut candidate, &mut data, &mut data_count);
 				let (Ok(number), Ok(alternate), Ok(class), Ok(subclass), Ok(protocol)) = (record.field(2), record.field(3), record.field(5), record.field(6), record.field(7)) else {
 					return Err(NotBindable::Malformed);
 				};
-				current_is_control = false;
+				current = None;
 				// THE PROTOCOL IS PART OF THE ANSWER - see `PROTOCOL_VENDOR`. Class and subclass
 				// alone accept RNDIS, which is an Ethernet adapter wearing a serial port's
 				// identity.
-				if class == CLASS_COMMUNICATIONS && subclass == SUBCLASS_ACM && protocol != PROTOCOL_VENDOR && control_interface.is_none() {
-					control_interface = Some(number);
-					current_is_control = true;
-				} else if class == CLASS_COMMUNICATIONS && Some(number) == control_interface {
-					current_is_control = true;
+				if class == CLASS_COMMUNICATIONS && subclass == SUBCLASS_ACM && protocol != PROTOCOL_VENDOR {
+					current = match functions.iter().position(|slot| matches!(slot, Some(function) if function.control == number)) {
+						// AN ALTERNATE SETTING OF A CONTROL INTERFACE ALREADY SEEN is the same
+						// function and not a second one.
+						Some(index) => Some(index),
+						None if found < MAX_ACM_FUNCTIONS => {
+							functions[found] = Some(AcmFunction { control: number, union_data: None, capabilities: 0, notify: None });
+							found += 1;
+							Some(found - 1)
+						}
+						None => None,
+					};
+				} else if class == CLASS_COMMUNICATIONS {
+					current = functions.iter().position(|slot| matches!(slot, Some(function) if function.control == number));
 				} else if class == CLASS_CDC_DATA {
 					candidate = Some((number, alternate, None, None));
 				}
 			}
-			DT_CS_INTERFACE if current_is_control => {
+			DT_CS_INTERFACE => {
+				let Some(index) = current else { continue };
 				let Ok(subtype) = record.field(2) else { return Err(NotBindable::Malformed) };
+				let Some(function) = functions[index].as_mut() else { continue };
 				match subtype {
 					// The subordinate interface at offset four is the data interface.
-					FN_UNION => union_data = record.field(4).ok(),
+					FN_UNION => function.union_data = record.field(4).ok(),
 					// The capability bitmap at offset three. A device that published no ACM
 					// descriptor supports none of them, which is what zero already says.
-					FN_ACM => capabilities = record.field(3).unwrap_or(0),
+					FN_ACM => function.capabilities = record.field(3).unwrap_or(0),
 					_ => {}
 				}
 			}
@@ -457,8 +524,12 @@ pub fn bind_acm(config: &[u8]) -> Result<AcmBinding, NotBindable> {
 				// THE NOTIFICATION ENDPOINT BELONGS TO THE COMMUNICATIONS INTERFACE, and taking an
 				// interrupt endpoint from whichever interface carried one would take a HID
 				// function's on a composite adapter.
-				if current_is_control && attributes & 0x03 == 0x03 && address & 0x80 != 0 {
-					notify.get_or_insert((address, packet));
+				if let Some(index) = current
+					&& attributes & 0x03 == 0x03
+					&& address & 0x80 != 0
+					&& let Some(function) = functions[index].as_mut()
+				{
+					function.notify.get_or_insert((address, packet));
 					continue;
 				}
 				if let Some((_, _, ref mut ep_in, ref mut ep_out)) = candidate
@@ -474,21 +545,21 @@ pub fn bind_acm(config: &[u8]) -> Result<AcmBinding, NotBindable> {
 			_ => {}
 		}
 	}
-	keep_lowest(&mut candidate, &mut best);
+	keep_lowest_per_interface(&mut candidate, &mut data, &mut data_count);
 	if walk.fault().is_some() {
 		return Err(NotBindable::Malformed);
 	}
 
-	let control_interface = control_interface.ok_or(NotBindable::NoNetworkInterface)?;
+	let function = functions.get(nth).copied().flatten().ok_or(NotBindable::NoNetworkInterface)?;
 	// THE UNION NAMES THE DATA INTERFACE, and "the next interface" is what binds the wrong function
 	// on a composite device.
-	let union_data = union_data.ok_or(NotBindable::NoUnion)?;
-	let (data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet) = best.ok_or(NotBindable::NoBulkPair)?;
-	if union_data != data_interface {
-		return Err(NotBindable::NoDataInterface);
+	let union_data = function.union_data.ok_or(NotBindable::NoUnion)?;
+	if data_count == 0 {
+		return Err(NotBindable::NoBulkPair);
 	}
-	let (notify_in, notify_packet) = notify.unwrap_or((0, 0));
-	Ok(AcmBinding { config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, notify_in, notify_packet, capabilities })
+	let (data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet) = data.iter().flatten().find(|(iface, ..)| *iface == union_data).copied().ok_or(NotBindable::NoDataInterface)?;
+	let (notify_in, notify_packet) = function.notify.unwrap_or((0, 0));
+	Ok(AcmBinding { config_value: config_value.ok_or(NotBindable::Malformed)?, control_interface: function.control, data_interface, data_alternate, bulk_in, bulk_out, bulk_in_packet, bulk_out_packet, notify_in, notify_packet, capabilities: function.capabilities })
 }
 
 pub fn mac_from_string(bytes: &[u8]) -> Option<[u8; 6]> {

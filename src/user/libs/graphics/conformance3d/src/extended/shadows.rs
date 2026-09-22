@@ -156,3 +156,60 @@ pub fn point_light_cube_shadow() -> Outcome {
 	require!(shadow::cube_face(Vec3::new(0.0, 0.0, 0.0)).is_none(), "a direction that is not one is answered rather than guessed at");
 	Ok(())
 }
+
+pub fn shadow_projection_fit() -> Outcome {
+	// A MAP WITH AN UNSTATED PROJECTION HAS NO ONE RIGHT PIXEL, which is why the fit is a profile
+	// rule and this case exists. Every expectation below is read off the rule rather than off the
+	// matrices.
+
+	// A DIRECTIONAL CASCADE IS FITTED TO ITS SLICE'S BOUNDING SPHERE, near at the eye and far a
+	// diameter away - so the sphere's centre lands exactly half way through the depth range and its
+	// equator exactly on the edges of the map. A fit any wider is texels spent on nothing, and a
+	// box fit would change size as the camera turned.
+	let centre = Vec3::new(0.0, 0.0, 0.0);
+	let directional = shadow::directional_projection(Vec3::new(0.0, -1.0, 0.0), centre, 1.0)?;
+	let middle = directional.transform_point(centre);
+	require!(exact(middle.z, 0.5), "the sphere's centre is half way through the depth range, got {}", middle.z);
+	let far_side = directional.transform_point(Vec3::new(0.0, -1.0, 0.0));
+	require!(exact(far_side.z, 1.0), "and its far side at the far plane, got {}", far_side.z);
+	let equator = directional.transform_point(Vec3::new(1.0, 0.0, 0.0));
+	require!(exact(equator.x.abs(), 1.0), "one radius sideways is at the edge of the map, got {}", equator.x);
+
+	// AND A LIGHT POINTING ALONG THE UP AXIS STILL HAS ONE. A `look_at` whose forward and up are
+	// parallel has no basis, and what comes out is a matrix of NaNs rather than a wrong picture.
+	let along_up = shadow::directional_projection(Vec3::new(0.0, 1.0, 0.0), centre, 1.0)?;
+	require!(along_up.is_finite(), "a light along the up axis falls back to another one");
+
+	// A SPOT'S FRUSTUM IS TWICE ITS OUTER CONE. Halving it once too often covers the middle of the
+	// cone and leaves the rest unshadowed, which reads as a shadow ending in mid-air.
+	let quarter = core::f32::consts::FRAC_PI_4;
+	let spot = shadow::spot_projection(centre, Vec3::new(0.0, 0.0, -1.0), quarter, 1.0, 100.0)?;
+	let on_the_cone = spot.transform_point(Vec3::new(10.0, 0.0, -10.0));
+	require!(on_the_cone.w > 0.0, "the cone's outer ray is in front of the light");
+	require!(exact((on_the_cone.x / on_the_cone.w).abs(), 1.0), "and lands on the edge of the map, got {}", on_the_cone.x / on_the_cone.w);
+
+	// SIX FACES OF NINETY DEGREES TILE THE SPHERE. A direction is sent to its face by the major-axis
+	// rule, and that face's own projection has to cover it - a gap here is a cross-shaped seam of
+	// unshadowed surface radiating from the light.
+	let position = Vec3::new(1.0, 2.0, 3.0);
+	for direction in [
+		Vec3::new(1.0, 0.0, 0.0),
+		Vec3::new(-1.0, 0.0, 0.0),
+		Vec3::new(0.0, 1.0, 0.0),
+		Vec3::new(0.0, -1.0, 0.0),
+		Vec3::new(0.0, 0.0, 1.0),
+		Vec3::new(0.0, 0.0, -1.0),
+		Vec3::new(1.0, 1.0, 0.0),
+		Vec3::new(-0.9, 0.2, 0.89),
+	] {
+		let Some(face) = shadow::cube_face(direction) else {
+			return Err(crate::Trouble::Failed(alloc::format!("every non-zero direction falls on a face, {direction:?} did not")));
+		};
+		let at = shadow::point_face_projection(position, face, 0.1, 50.0)?;
+		let clip = at.transform_point(position.add(direction.scale(10.0)));
+		require!(clip.w > 0.0, "a point on its own face is in front of it, {direction:?}");
+		let (x, y) = (clip.x / clip.w, clip.y / clip.w);
+		require!(x.abs() <= 1.0 + 1e-4 && y.abs() <= 1.0 + 1e-4, "and inside that face's map, {direction:?} landed at ({x}, {y})");
+	}
+	Ok(())
+}

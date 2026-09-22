@@ -158,3 +158,157 @@ pub fn tone_map(colour: Vec3) -> Vec3 {
 pub fn resolve(fogged_scene: Vec3, bloom: Vec3, weight: f32) -> Vec3 {
 	tone_map(combine(fogged_scene, bloom, weight))
 }
+
+// -------------------------------------------------------------------------------------------------
+// The resources the chain runs over, and the passes that run it.
+//
+// THE ARITHMETIC ABOVE IS WHAT EACH PASS COMPUTES; THIS IS WHICH PASSES THERE ARE. A layer that had
+// only the operators would still have to decide how many targets a bloom needs, what each reads and
+// what order they run in - and every layer would decide it differently, which is the same drift the
+// frozen operators exist to prevent.
+// -------------------------------------------------------------------------------------------------
+
+/// The smallest render extent a bloom pyramid fits in.
+///
+/// SIX HALVINGS NEED SIXTY-FOUR TEXELS. The profile fixes the pyramid at six levels, so the
+/// coarsest is a sixty-fourth of each dimension - and below that a level would have no texels at
+/// all. REFUSED RATHER THAN SHORTENED: a pyramid with fewer levels has a different shape at the
+/// same weight, so a small window would bloom differently from a large one rather than not at all.
+pub const BLOOM_MINIMUM_EXTENT: u32 = 1 << BLOOM_LEVELS;
+
+/// The bloom pyramid's targets, FINEST FIRST: `BLOOM_LEVELS` of them, each half the extent of the
+/// one before it and the first half the render's own.
+///
+/// `RGBA16F` LIKE THE TARGET THEY COME FROM, because the pyramid carries linear radiance above one -
+/// that is the whole of what a bloom is - and a normalised format would clip exactly the excess the
+/// threshold selected.
+pub fn bloom_pyramid_desc(width: u32, height: u32) -> Result<alloc::vec::Vec<render3d::resource::TextureDesc>, crate::scene::Error> {
+	if width < BLOOM_MINIMUM_EXTENT || height < BLOOM_MINIMUM_EXTENT {
+		return Err(crate::scene::Error::Degenerate { reason: "a render too small for a six-level bloom pyramid, whose coarsest level would have no texels" });
+	}
+	let mut levels = alloc::vec::Vec::with_capacity(BLOOM_LEVELS as usize);
+	let (mut level_width, mut level_height) = (width, height);
+	for _ in 0..BLOOM_LEVELS {
+		level_width /= 2;
+		level_height /= 2;
+		levels.push(render3d::resource::TextureDesc {
+			dimension: render3d::resource::TextureDimension::D2,
+			width: level_width,
+			height: level_height,
+			depth: 1,
+			// NO MIP CHAIN ON A PYRAMID LEVEL. The pyramid IS the chain, one target per level,
+			// because each level is written by its own pass and a mip of a render target is not.
+			mip_levels: 1,
+			layers: 1,
+			samples: 1,
+			format: crate::environment::HDR_FORMAT,
+			usage: render3d::resource::TextureUsage { sampled: true, colour_attachment: true, ..Default::default() },
+		});
+	}
+	Ok(levels)
+}
+
+/// The targets one frame's chain runs over.
+///
+/// TWO CHAINS AND NOT ONE, which is a resource decision rather than a style: the tent upsample reads
+/// the level below it AND the level it is adding into, and a pass that samples the target it writes
+/// is undefined in the resource model and unorderable in the graph. So the descending pass writes
+/// `pyramid` and the ascending one writes `ascent`, each target written exactly once per frame. The
+/// cost is five more targets at a sixty-fourth to a quarter of the render's area; the alternative is
+/// a copy per level, which is the same memory moved twice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Chain<'a> {
+	/// The HDR target the scene is drawn into, which `environment::hdr_target_desc` describes.
+	pub scene: u32,
+	/// The bloom pyramid the downsamples write, finest first, as `bloom_pyramid_desc` describes it.
+	pub pyramid: &'a [u32],
+	/// What the upsamples write, finest first: one per level EXCEPT the coarsest, which is where the
+	/// ascent starts and so is read out of `pyramid` directly.
+	pub ascent: &'a [u32],
+}
+
+/// Which pass is which, beside the graph that orders them.
+///
+/// THE IDENTIFIERS COME BACK NAMED rather than being left for the caller to count out of the graph:
+/// a caller has to record commands into each of them, and "the fourth pass" is how a bloom comes to
+/// be built in the wrong order by a caller that inserted one.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Passes {
+	pub graph: crate::graph::PassGraph,
+	/// The lighting pass, which writes the HDR target.
+	pub scene: u32,
+	/// One per level, FINEST FIRST. The first reads the scene target and applies the threshold; each
+	/// of the rest reads the level above it.
+	pub downsample: alloc::vec::Vec<u32>,
+	/// One per level except the coarsest, COARSEST FIRST: each reads the level below it and its own
+	/// pyramid level, adds them with the 9-tap tent, and writes the ascent target.
+	pub upsample: alloc::vec::Vec<u32>,
+	/// Fog, the combine and the tone map, drawn to the screen. WRITES NO OFFSCREEN TARGET, which is
+	/// what makes it the pass that ends the frame.
+	pub resolve: u32,
+}
+
+/// Build the frame's pass graph: the lighting pass, the bloom pyramid's two halves, and the resolve.
+///
+/// THE ORDER IS DERIVED FROM WHAT EACH PASS READS and not declared here, which is the pass graph's
+/// own rule - so a layer that inserts a pass of its own between two of these gets an order that
+/// accounts for it rather than one that ignores it.
+pub fn chain(chain: &Chain<'_>, first_pass: u32) -> Result<Passes, crate::scene::Error> {
+	if chain.pyramid.len() != BLOOM_LEVELS as usize {
+		return Err(crate::scene::Error::Degenerate { reason: "a bloom pyramid that is not the profile's six levels, which is a different bloom at the same weight" });
+	}
+	if chain.ascent.len() != BLOOM_LEVELS as usize - 1 {
+		return Err(crate::scene::Error::Degenerate { reason: "an ascending chain that is not one target per upsample, which leaves a level with nowhere to be written" });
+	}
+	// ONE TARGET CANNOT BE TWO OF THEM. Two passes writing one target have no order between them,
+	// and a pass reading the target it writes is undefined in the resource model - so every
+	// identifier in the frame is checked against every other rather than trusted.
+	let mut seen: alloc::vec::Vec<u32> = alloc::vec![chain.scene];
+	for target in chain.pyramid.iter().chain(chain.ascent.iter()) {
+		if seen.contains(target) {
+			return Err(crate::scene::Error::Degenerate { reason: "two passes of one frame writing the same target, which has no order and no answer" });
+		}
+		seen.push(*target);
+	}
+	let mut graph = crate::graph::PassGraph::new();
+	let mut next = first_pass;
+	let mut identify = || {
+		let id = next;
+		next += 1;
+		id
+	};
+
+	let scene = identify();
+	graph.add(crate::graph::Pass { id: scene, writes: alloc::vec![chain.scene], reads: alloc::vec::Vec::new() });
+
+	let mut downsample = alloc::vec::Vec::with_capacity(BLOOM_LEVELS as usize);
+	for (index, target) in chain.pyramid.iter().enumerate() {
+		let id = identify();
+		// THE FIRST READS THE SCENE AND THRESHOLDS IT; the rest read the level above. The threshold
+		// is applied ONCE, at the top, because applying it at every level would subtract the knee
+		// again from a value that has already passed it.
+		let source = if index == 0 { chain.scene } else { chain.pyramid[index - 1] };
+		graph.add(crate::graph::Pass { id, writes: alloc::vec![*target], reads: alloc::vec![source] });
+		downsample.push(id);
+	}
+
+	let mut upsample = alloc::vec::Vec::with_capacity(BLOOM_LEVELS as usize - 1);
+	// COARSEST FIRST, which is the direction a tent upsample runs: each level is widened onto the
+	// one above it and the sum is written to that level's ascent target. The coarsest step reads the
+	// pyramid on both inputs because there is no ascent above it yet.
+	for index in (0..chain.ascent.len()).rev() {
+		let id = identify();
+		let below = if index + 1 == chain.ascent.len() { chain.pyramid[index + 1] } else { chain.ascent[index + 1] };
+		graph.add(crate::graph::Pass { id, writes: alloc::vec![chain.ascent[index]], reads: alloc::vec![below, chain.pyramid[index]] });
+		upsample.push(id);
+	}
+
+	let resolve = identify();
+	graph.add(crate::graph::Pass { id: resolve, writes: alloc::vec::Vec::new(), reads: alloc::vec![chain.scene, chain.ascent[0]] });
+
+	// THE GRAPH IS ORDERED HERE RATHER THAN LEFT FOR THE CALLER TO DISCOVER IS BROKEN. Every refusal
+	// this function can produce is about the frame it was asked for, so it belongs to the call that
+	// asked rather than to the one that runs.
+	graph.order()?;
+	Ok(Passes { graph, scene, downsample, upsample, resolve })
+}

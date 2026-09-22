@@ -42,3 +42,20 @@ timeout = 30
 do = "expect"
 contains = "a device arrived in the slot behind"
 timeout = 60
+
+# AND THE SCENARIO ENDS WHEN THE MACHINE DOES, not when the line it came for appears.
+#
+# The arrival is the front of a sequence: the kernel adds the device, DeviceManager binds a driver
+# to it, the driver reports, and the manager closes the window. A run that stopped at the first of
+# those handed back a guest that was still working, and the driver's report then landed AFTER the
+# teardown had already redrawn the prompt - so the terminal was not at one, and a scenario whose
+# every step had passed failed on being given back. That is a real dirty instance and the check is
+# right; what was wrong was ending the run in the middle of the thing it asked for.
+#
+# `bind window` is the last line of the sequence and it is the manager saying BIND reached READY, so
+# waiting for it is both the settle and the honest end of the arrival. A bind that never completes
+# fails here rather than in someone else's teardown.
+[[step]]
+do = "expect"
+contains = "DeviceManager: bind window virtio_console"
+timeout = 90

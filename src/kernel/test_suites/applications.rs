@@ -2384,5 +2384,121 @@ fn the_3d_demo_renders_a_lit_scene_and_survives_a_resize() {
 	// so this is the whole path and not a flag the demo set itself.
 	assert!(asked_to_leave, "the demo was asked to leave with a key");
 	assert!(process.is_terminated(), "and it left: {output:?}");
+
 	assert!(contains(b"test3d-sw: presented "), "reporting what it had drawn: {output:?}");
+}
+
+tagged_test!(the_3d_demo_draws_the_extended_scene_with_a_cast_shadow, [Display, Process, Service, Image], id = "kernel.applications.the_3d_demo_draws_the_extended_scene_with_a_cast_shadow", covers = ["bin.test3d-sw", "render3d", "soft3d", "render-shader", "render-math", "graphics-app", "surface"]);
+// `Scene3D Extended Profile 1`'s OWN DEMO PHASE, and it is a phase and not an addition: `--extended`
+// draws a physically based sphere with a tangent-space normal map and a cast shadow INSTEAD OF the
+// core scene, so every core check above is about a picture this part cannot change.
+//
+// WHAT IT READS IS THE SHADOW, in two places that fail for different reasons. The demo reports how
+// many of the light's map held a caster, which is zero when the light points away from the scene,
+// when its projection does not contain the object and when the pass never ran - three failures that
+// all produce a picture with no shadow in it. And the GROUND is read out of the frame: it is one
+// flat quad of one material under one directional light, so the only thing that can darken part of
+// it is something standing between it and the light.
+fn the_3d_demo_draws_the_extended_scene_with_a_cast_shadow() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	const WIDTH: u32 = 64;
+	const HEIGHT: u32 = 48;
+	// THE BOTTOM OF THE FRAME IS GROUND AND NOTHING ELSE. The sphere stands above the ground plane
+	// and the camera looks slightly down at it, so the last rows are the ground in front of it -
+	// which is where its shadow falls and where the background cannot reach.
+	const GROUND_ROWS: u32 = 6;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let demo_elf = program_elf(&package, volume, b"test3d-sw").expect("test3d-sw in the package or volume");
+
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let (display, display_client) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	// FIXED, AND A FRAME COUNT. This phase has nothing to animate - the sphere does not spin, because
+	// what it is here to show is a map and a shadow rather than a rotation - so the run ends on a
+	// count rather than on a key, and takes no input service at all.
+	bootstrap.send(Message::new(launch_context(b"--extended --fixed --frames 3 --no-input --width 64 --height 48", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
+	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("the demo's display");
+
+	let mut host = SurfaceHost::new(display, WIDTH, HEIGHT);
+	let mut output: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let mut frame: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..400_000u32 {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		if host.poll() == Some(HostCall::Presented) && frame.is_empty() {
+			frame = read_from_object(&host.image(0), (WIDTH * HEIGHT * 4) as usize);
+		}
+		while let Ok(message) = stdout.recv() {
+			output.extend_from_slice(&message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	while let Ok(message) = stdout.recv() {
+		output.extend_from_slice(&message.bytes);
+	}
+	for line in output.split(|byte| *byte == b'\n') {
+		if !line.is_empty() {
+			crate::serial_println!("  {}", alloc::string::String::from_utf8_lossy(line));
+		}
+	}
+	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
+
+	assert!(contains(b"test3d-sw: open"), "the Extended phase opened its surface: {output:?}");
+	assert!(host.presents >= 1, "and presented: {} present(s), {output:?}", host.presents);
+	assert!(!frame.is_empty(), "a frame was sampled");
+
+	// THE LIGHT SAW THE CASTER. The line carries the count, so this reads the number rather than the
+	// fact that a line was printed: a map of nothing is exactly what a pass pointed the wrong way
+	// writes, and it prints the same line.
+	let marker = b"test3d-sw: shadow map holds ";
+	let at = output.windows(marker.len()).position(|window| window == marker).expect("the shadow map's coverage is reported");
+	let digits: alloc::vec::Vec<u8> = output[at + marker.len()..].iter().copied().take_while(|byte| byte.is_ascii_digit()).collect();
+	let covered: u64 = alloc::string::String::from_utf8_lossy(&digits).parse().unwrap_or(0);
+	assert!(covered > 0, "the light's map holds a caster rather than the far plane everywhere: {output:?}");
+	assert!(covered < 512 * 512, "and not the whole map, which is what a projection inside the object would write");
+
+	// A RENDERED SCENE AND NOT A CLEAR.
+	let mut distinct = alloc::vec::Vec::new();
+	for pixel in frame.chunks_exact(4) {
+		if !distinct.iter().any(|seen| seen == &pixel) {
+			distinct.push(pixel);
+		}
+		if distinct.len() > 8 {
+			break;
+		}
+	}
+	assert!(distinct.len() > 8, "the frame is a rendered scene rather than a cleared surface: {} distinct colour(s)", distinct.len());
+
+	// AND THE SHADOW IS IN THE PICTURE. One flat quad, one material, one directional light: without
+	// something standing in the way every one of these pixels would carry the same light.
+	let mut darkest = (u32::MAX, 0u32);
+	let mut brightest = 0u32;
+	for row in HEIGHT - GROUND_ROWS..HEIGHT {
+		for column in 0..WIDTH {
+			let at = ((row * WIDTH + column) * 4) as usize;
+			let Some(pixel) = frame.get(at..at + 3) else { continue };
+			// A SUM AND NOT A WEIGHTED LUMINANCE, because this surface is grey: the three channels
+			// carry the same light and weighting them would be arithmetic with no question behind it.
+			let light = pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32;
+			if light < darkest.0 {
+				darkest = (light, column);
+			}
+			brightest = brightest.max(light);
+		}
+	}
+	assert!(brightest > 0, "the ground is lit at all: {brightest}");
+	assert!(brightest as f32 > darkest.0 as f32 * 1.4, "part of the ground is in shadow and part is not: brightest {brightest}, darkest {} at column {}", darkest.0, darkest.1);
+	// AND IT IS WHERE THE LIGHT PUTS IT. The light stands to the RIGHT of the scene and in front of
+	// it, so the shadow falls to the left - a shadow on the other side is a sign flip in the
+	// projection, which a test that only checked for darkness would pass.
+	assert!(darkest.1 < WIDTH / 2, "the shadow falls on the side the light's direction puts it: darkest column {}", darkest.1);
+
+	assert!(process.is_terminated(), "the run ended on its frame count: {output:?}");
 }

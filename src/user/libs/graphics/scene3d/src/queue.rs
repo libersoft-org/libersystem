@@ -50,6 +50,14 @@ impl QueueKind {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Queued {
 	pub drawable: u32,
+	/// THE MESH THIS ENTRY DRAWS, which is the drawable's own unless a level-of-detail ladder chose a
+	/// coarser one for THIS VIEW.
+	///
+	/// RESOLVED HERE AND NOT AT THE DRAW. The queue is already the per-view list and the chosen level
+	/// is already a per-view answer, so this is where the two meet; resolving it in the recorder
+	/// would thread a second per-view structure through a function whose whole input is otherwise
+	/// the queue - and two per-view answers is how a view comes to sort one mesh and draw another.
+	pub mesh: u32,
 	/// The distance from the camera position to the bounding sphere's centre, which is what the sort
 	/// is on.
 	pub depth: f32,
@@ -77,6 +85,12 @@ pub struct Queue {
 	pub transparent: Vec<Queued>,
 	/// How many drawables the frustum rejected whole.
 	pub culled: u32,
+	/// How many drawables the level-of-detail ladder dropped as too small to be worth a draw call.
+	///
+	/// ITS OWN TALLY BESIDE `culled`, because the two answer different questions: how much geometry
+	/// the frustum rejected, and how much the ladder did. One number for both would make a scene
+	/// tuning its thresholds unable to see what its thresholds did.
+	pub vanished: u32,
 	/// How many individual instances the frustum rejected inside drawables that survived. CULLING
 	/// THE WHOLE SET BECAUSE ONE BUILDING IS OUTSIDE WOULD DRAW A CITY, so instances are tested one
 	/// at a time and this is how many that removed.
@@ -90,14 +104,27 @@ impl Queue {
 	}
 }
 
-/// Build the queues for a camera's view.
+/// Build the queues for a camera's view, with every drawable at its finest level.
 pub fn build(scene: &mut Scene, camera: &Camera) -> Result<Queue, Error> {
+	build_for(scene, camera, None)
+}
+
+/// Build the queues for a camera's view, at the levels THAT view chose.
+///
+/// THE STATE IS THE VIEW'S AND SO IS THE QUEUE, which is why they are passed together: two cameras
+/// looking at one scene pick different levels for one drawable, and a queue built against the other
+/// view's state would draw the level the other camera wanted.
+pub fn build_detailed(scene: &mut Scene, camera: &Camera, detail: &crate::detail::ViewDetail) -> Result<Queue, Error> {
+	build_for(scene, camera, Some(detail))
+}
+
+fn build_for(scene: &mut Scene, camera: &Camera, detail: Option<&crate::detail::ViewDetail>) -> Result<Queue, Error> {
 	scene.update();
 	let view = scene.view_of(camera)?;
 	let view_projection = camera.projection().mul(&view);
 	let frustum = Frustum::from_view_projection(&view_projection);
 	let eye = scene.transforms()[camera.node as usize].translation();
-	Ok(build_with(scene, eye, &frustum, camera.visibility))
+	Ok(build_with_detail(scene, eye, &frustum, camera.visibility, detail))
 }
 
 /// Build the queues against a frustum the caller already has.
@@ -105,6 +132,12 @@ pub fn build(scene: &mut Scene, camera: &Camera) -> Result<Queue, Error> {
 /// CULLING AND QUEUEING ARE ONE PASS because they read the same things: a world transform, a bound
 /// and a mask. Two passes would transform every bound twice.
 pub fn build_with(scene: &mut Scene, eye: Vec3, frustum: &Frustum, mask: VisibilityMask) -> Queue {
+	build_with_detail(scene, eye, frustum, mask, None)
+}
+
+/// The same, at the levels a view chose. `None` draws every drawable at its finest level, which is
+/// what a scene that does not claim Extended has.
+pub fn build_with_detail(scene: &mut Scene, eye: Vec3, frustum: &Frustum, mask: VisibilityMask, detail: Option<&crate::detail::ViewDetail>) -> Queue {
 	scene.update();
 	let mut queue = Queue::default();
 	for index in 0..scene.drawables().len() {
@@ -118,6 +151,21 @@ pub fn build_with(scene: &mut Scene, eye: Vec3, frustum: &Frustum, mask: Visibil
 		let Some(world) = scene.transforms().get(drawable.node as usize).copied() else { continue };
 		let Ok(material) = scene.material_of(drawable) else { continue };
 		let kind = material.queue();
+		// THE LEVEL THIS VIEW CHOSE, RESOLVED INTO THE ENTRY. A drawable with no ladder draws its own
+		// mesh, and so does one whose view remembered no level for it yet - the first frame of a view
+		// is the finest level, not no mesh at all.
+		let mesh = match (drawable.lod.as_ref(), detail.and_then(|state| state.of(index as u32))) {
+			(Some(ladder), Some(chosen)) => match ladder.mesh_of(chosen) {
+				Some(mesh) => mesh,
+				// VANISHED IS NOT CULLED. The drawable is on screen and the ladder decided it is too
+				// small to be worth a draw call, which is a different answer and its own tally.
+				None => {
+					queue.vanished += 1;
+					continue;
+				}
+			},
+			_ => drawable.mesh,
+		};
 
 		let entry = if drawable.instances.is_empty() {
 			// A drawable with no bounds is NEVER CULLED; its sort key is its node's position, which
@@ -130,7 +178,7 @@ pub fn build_with(scene: &mut Scene, eye: Vec3, frustum: &Frustum, mask: Visibil
 				queue.culled += 1;
 				continue;
 			}
-			Queued { drawable: index as u32, depth: bounds.centre.sub(eye).length(), world, bounds, instances: Vec::new() }
+			Queued { drawable: index as u32, mesh, depth: bounds.centre.sub(eye).length(), world, bounds, instances: Vec::new() }
 		} else {
 			let mut survivors: Vec<u32> = Vec::new();
 			// THE SET'S SPHERE IS OVER EVERY INSTANCE AND NOT OVER THE SURVIVORS, because an
@@ -157,7 +205,7 @@ pub fn build_with(scene: &mut Scene, eye: Vec3, frustum: &Frustum, mask: Visibil
 				continue;
 			}
 			let bounds = whole.unwrap_or(Sphere::new(world.translation(), 0.0));
-			Queued { drawable: index as u32, depth: bounds.centre.sub(eye).length(), world, bounds, instances: survivors }
+			Queued { drawable: index as u32, mesh, depth: bounds.centre.sub(eye).length(), world, bounds, instances: survivors }
 		};
 
 		match kind {

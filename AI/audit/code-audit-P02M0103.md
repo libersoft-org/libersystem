@@ -2757,3 +2757,50 @@ matched on text and landed in the 2D conformance test, which has a character-for
 loop - so I quietly broke a passing test while trying to fix a failing one, and the failing one did
 not move. The second attempt located the 3D occurrence by position after restoring the 2D one, and
 both tests pass together, which is why they were run together rather than one at a time.
+
+## The Extended part's join, its demo phase, and one feature that reached nothing (2026-09-21)
+
+Three pieces of `f-ext` closed together, and the order they closed in is the finding.
+
+**THE PBR MATERIAL'S JOIN WAS A DECISION AND IT IS WRITTEN DOWN BEFORE IT IS BUILT.** A drawable
+names one material in one of two tables, and which table is part of the NAME rather than a flag
+beside an index: `MaterialRef::Core` or `MaterialRef::Extended`. The shape that was rejected is a
+core index with an optional Extended index beside it, whose ambiguous case is a drawable that one
+pass reads as a `BlinnPhong` surface and another as a physically based one. `Drawable::new` keeps its
+signature and means core, so a program implementing only the core profile never spells the enum -
+which is what "the core stays unaware of the part" means in code rather than in a sentence.
+
+**AND THE QUEUE RULE WAS MOVED RATHER THAN COPIED.** `queue`, `writes_depth` and `writes_id` are
+functions of the blending and of nothing else, so they became methods on `Blending` and both material
+families delegate. A second copy on the Extended type is how the two come to disagree about what a
+transparent surface does, and the symptom - a PBR surface hiding what is behind it while a core one
+does not - reads as a defect in the shading.
+
+**THE LEVEL OF DETAIL REACHED NOTHING, AND A FIXTURE WRITTEN FOR A DIFFERENT CLAUSE FOUND IT.**
+`detail::select` chose a level every frame into a `ViewDetail` that nothing read: the recorder drew
+`drawable.mesh`. Twenty-four fixtures and sixty conformance scenes held the DECISION and none of them
+touched the effect. What found it was `a_scene_that_uses_every_extended_feature_emits_only_render3d_commands`,
+whose geometry source makes a mesh identifier its own vertex buffer so the recorded list says WHICH
+level was drawn. The level is resolved into `Queued::mesh` now, where the per-view list already is,
+and a vanished drawable is dropped with its own tally beside `culled`.
+
+**THE DEMO PHASE PUT THE PROFILE'S SHAPE AGAINST A BACKEND FOR THE FIRST TIME**, and the backend
+decided one thing the scene layer had left open: `Render3D Core Profile 1` has no depth-texture
+binding and no comparison sampler, so the shadow pass writes light-space depth into a COLOUR
+attachment and the frame reads it back into a texture between the passes. That is a real constraint
+of the frozen profile rather than a demo shortcut, and it is where a GPU backend would bind the
+attachment directly.
+
+TWO THINGS THE COMPILER COULD NOT CATCH AND THE FIRST RUN WOULD HAVE:
+
+- `BinaryOp::Cross` in the shader IR is THREE-COMPONENT and refuses anything else, which is right -
+  a cross product of four-vectors is not defined. The tangent frame was written over `vec4`s and
+  would have failed at `prepare` with a type mismatch. Caught by reading the interpreter rather than
+  by running it, because the run costs a full image build.
+- The source was edited while a build of it was in flight, which moves the digest and makes the
+  `test.sh` after it refuse. The build was stopped and restarted rather than gambling on which half
+  of the tree it had already read.
+
+WHAT THE MEASUREMENT SAID: the light's map holds 18,512 of 262,144 texels, which is the sphere's
+silhouette at that projection computed independently before the run and matched by it. A number
+predicted and then measured is a different kind of evidence from a number read off a passing test.

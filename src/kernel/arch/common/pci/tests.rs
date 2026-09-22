@@ -8,8 +8,11 @@ use super::{ConfigAccess, PciDevice, SLOT_CAP_HOT_PLUG, SLOT_CAP_POWER_CONTROLLE
 use crate::sync::SpinLock;
 
 const WINDOW_BASE: u64 = 0x1000_0000;
-// Deliberately small - 256 kB - so a window that runs out is one line of setup away.
-const WINDOW_END: u64 = 0x1004_0000;
+// Deliberately small - 4 MB - so a window that runs out is one line of setup away. It is no
+// smaller because a BRIDGE window cannot be: the base and limit registers name whole megabytes, so
+// a platform window under one could never hold a bridge, and the fixture would be unable to
+// express the machine these tests are about.
+const WINDOW_END: u64 = 0x1040_0000;
 
 struct Space {
 	bar: [u32; 6],
@@ -44,9 +47,21 @@ struct Space {
 	// these tests are about is modelled here rather than assumed away.
 	rw1c: u16,
 	next: u64,
+	// A PCI-TO-PCI BRIDGE ON THE SAME FAKE BUS, when a test stands one up.
+	//
+	// A SECOND ADDRESS AND NOT A SECOND FIXTURE, because what these tests are about is one walk
+	// reading BOTH: the kernel is not told where the bridge is, it SCANS for the one that forwards
+	// the bus its device is on. So the fixture has to answer for two addresses and to answer
+	// `absent` - all ones - for every other one, which is the only thing that makes a scan a scan.
+	bridge: Option<[u8; 64]>,
 }
 
-static SPACE: SpinLock<Space> = SpinLock::new(Space { bar: [0; 6], mask: [0; 6], command: 0, cfg: [0; 256], ext: [0; 256], ext_reach: false, ext_rw1c: [0; 4], rw1c: 0, next: WINDOW_BASE });
+// The device every test that needs one bus stands up, the bridge, and the address behind it.
+const DEVICE_AT: (u8, u8, u8) = (0, 0, 0);
+const BRIDGE_AT: (u8, u8, u8) = (0, 2, 0);
+const BEHIND_AT: (u8, u8, u8) = (1, 0, 0);
+
+static SPACE: SpinLock<Space> = SpinLock::new(Space { bar: [0; 6], mask: [0; 6], command: 0, cfg: [0; 256], ext: [0; 256], ext_reach: false, ext_rw1c: [0; 4], rw1c: 0, next: WINDOW_BASE, bridge: None });
 
 // Put a device on the fake bus: `bar` is what the firmware left in each slot, `mask` what each
 // slot answers a probe with.
@@ -61,6 +76,49 @@ fn stand_up(bar: [u32; 6], mask: [u32; 6]) {
 	space.ext_rw1c = [0; 4];
 	space.rw1c = 0;
 	space.next = WINDOW_BASE;
+	space.bridge = None;
+	drop(space);
+	super::forget_apertures();
+}
+
+// Put a bridge on the fake bus, forwarding one bus, with `window` in its memory base/limit dword.
+// `window` is what firmware left there: `BRIDGE_CLOSED` for a bridge nobody opened.
+fn stand_up_bridge(secondary: u8, subordinate: u8, window: u32) {
+	let mut cfg = [0u8; 64];
+	cfg[0x00..0x04].copy_from_slice(&0x000c_1b36u32.to_le_bytes()); // a QEMU PCIe root port
+	cfg[0x0e] = 0x01; // header type 1: a PCI-to-PCI bridge
+	cfg[0x18] = 0; // primary bus
+	cfg[0x19] = secondary;
+	cfg[0x1a] = subordinate;
+	cfg[0x20..0x24].copy_from_slice(&window.to_le_bytes());
+	SPACE.lock().bridge = Some(cfg);
+}
+
+// What a bridge holds out of reset: base 0xfff0_0000 above limit 0x0000_0000, which is a window
+// that forwards nothing. It is also what firmware leaves behind a slot that was empty when it
+// looked, which is the case the hot-plug path runs into.
+const BRIDGE_CLOSED: u32 = 0x0000_FFF0;
+
+// A bridge's window as programmed: `base` and `last` are addresses, and the register keeps the top
+// twelve bits of each.
+const fn bridge_window(base: u64, last: u64) -> u32 {
+	((base >> 16) as u32 & 0xFFF0) | (((last >> 16) as u32 & 0xFFF0) << 16)
+}
+
+// What the bridge's memory window reads back, and its command register.
+fn bridge_cfg(off: usize) -> u32 {
+	let space = SPACE.lock();
+	let cfg = space.bridge.expect("a bridge is standing");
+	u32::from_le_bytes([cfg[off], cfg[off + 1], cfg[off + 2], cfg[off + 3]])
+}
+
+// The slot is emptied and filled again: the same device, arriving with its BARs unprogrammed the
+// way anything plugged into a live machine does. The bridge and its aperture stay, because the
+// machine's topology is what outlives a device.
+fn replug() {
+	let mut space = SPACE.lock();
+	space.bar = [0; 6];
+	space.command = 0;
 }
 
 // One virtio vendor capability, as a device lays it out: id, next pointer, length, type, BAR
@@ -108,8 +166,21 @@ impl ConfigAccess for Fake {
 		SPACE.lock().ext_reach
 	}
 
-	fn read32(_bus: u8, _dev: u8, _func: u8, off: u16) -> u32 {
+	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
 		let space = SPACE.lock();
+		// ONE FUNCTION IS NOT A BUS. Every address other than the two this fixture stands devices
+		// up at answers ALL ONES, which is what an absent function answers and what stops a scan.
+		if (bus, dev, func) == BRIDGE_AT {
+			let at = off as usize;
+			return match space.bridge {
+				Some(cfg) if at + 4 <= cfg.len() => u32::from_le_bytes([cfg[at], cfg[at + 1], cfg[at + 2], cfg[at + 3]]),
+				Some(_) => 0,
+				None => u32::MAX,
+			};
+		}
+		if (bus, dev, func) != DEVICE_AT && (bus, dev, func) != BEHIND_AT {
+			return u32::MAX;
+		}
 		// A MECHANISM THAT CANNOT REACH THIS HALF DOES NOT ANSWER NOTHING - it answers the register
 		// 0x100 bytes BELOW, because the address wraps in eight bits. That is the defect the reach
 		// question exists to prevent, and a fixture that answered zeros here would hide it.
@@ -135,8 +206,20 @@ impl ConfigAccess for Fake {
 		}
 	}
 
-	fn write32(_bus: u8, _dev: u8, _func: u8, off: u16, val: u32) {
+	fn write32(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
 		let mut space = SPACE.lock();
+		if (bus, dev, func) == BRIDGE_AT {
+			let at = off as usize;
+			if let Some(cfg) = space.bridge.as_mut()
+				&& at + 4 <= cfg.len()
+			{
+				cfg[at..at + 4].copy_from_slice(&val.to_le_bytes());
+			}
+			return;
+		}
+		if (bus, dev, func) != DEVICE_AT && (bus, dev, func) != BEHIND_AT {
+			return;
+		}
 		if off >= 0x100 {
 			if !space.ext_reach {
 				return;
@@ -157,7 +240,11 @@ impl ConfigAccess for Fake {
 			return;
 		}
 		match off {
-			0x04 => space.command = val,
+			// THE STATUS HALF IS NOT STORED. Its bits are write-one-to-clear, so a zero written
+			// there changes nothing at all - which is exactly what every writer of this register
+			// puts there. A fixture that stored the write made an ordinary command-register write
+			// look as though it had wiped the device's status, and the capability-list bit with it.
+			0x04 => space.command = (val & 0xFFFF) | (space.command & 0xFFFF_0000),
 			0x10..=0x24 => {
 				let index = ((off - 0x10) / 4) as usize;
 				// A device answers an all-ones write with its size mask and stores anything else.
@@ -196,6 +283,13 @@ impl ConfigAccess for Fake {
 		}
 		space.next = base + size;
 		Some(base)
+	}
+
+	// THE FIXTURE PLACES ITS OWN BARS, as the two ports with no firmware do. It did not, so every
+	// device resolved through it had a BAR reading zero - and a resolver that took zero for an
+	// address was a resolver these tests could never catch out.
+	fn assign_bars(d: &PciDevice) {
+		assign_bars_ecam::<Self>(d);
 	}
 
 	fn reserve_mmio(base: u64, size: u64) {
@@ -281,8 +375,8 @@ fn a_device_whose_bar_will_not_fit_is_left_switched_off() {
 	// The device was told to decode memory and to master the bus with a BAR still reading zero:
 	// responding at address zero, and a bus master with no aperture of its own.
 	//
-	// One BAR larger than the whole 256 kB window.
-	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x8_0000), 0, 0, 0, 0, 0]);
+	// One BAR larger than the whole 4 MB window.
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x80_0000), 0, 0, 0, 0, 0]);
 	assign_bars_ecam::<Fake>(&DEVICE);
 	assert_eq!(bar(0) & 0xFFFF_FFF0, 0, "there was nowhere to put it");
 	assert_eq!(command() & 0x02, 0, "so memory decoding stays off");
@@ -319,6 +413,119 @@ fn a_sixty_four_bit_bar_takes_two_slots_and_both_halves_are_written() {
 	let third = (bar(2) & 0xFFFF_FFF0) as u64;
 	assert!(third >= low + 0x2000, "the next BAR starts past the whole 8 kB aperture, not past its first half: {third:#x}");
 	assert!(command() & 0x02 != 0, "everything was placed");
+}
+
+// The function a bridge forwards to, which is where a hot-plug slot puts what is plugged into it:
+// function zero of device zero on the bridge's secondary bus.
+const BEHIND: PciDevice = PciDevice { bus: 1, dev: 0, func: 0, vendor: 0x1af4, device_id: 0x1000, class: 0x02, subclass: 0x00, prog_if: 0x00, header_type: 0 };
+
+crate::tagged_test!(a_bar_that_could_not_be_placed_is_not_physical_zero, [Kernel, Pci], id = "kernel.arch.common.pci.a_bar_that_could_not_be_placed_is_not_physical_zero", covers = ["kernel"]);
+fn a_bar_that_could_not_be_placed_is_not_physical_zero() {
+	// A BAR nobody placed reads back zero, and zero was read as an address.
+	//
+	// THE FAILURE IS NOT THAT THE DEVICE DOES NOT WORK. The driver is handed a writable window over
+	// the bottom of physical memory, and a virtio handshake performed against RAM reads back every
+	// value it writes: the reset is acknowledged because the zero written is the zero read, and
+	// FEATURES_OK is accepted because the byte is still there. The device reports itself ONLINE
+	// with nothing having answered it - which is how a device plugged into a live machine looked
+	// bound on one port while the same device on another said honestly that it was not responding.
+	//
+	// One BAR larger than the whole window, so it cannot be placed and stays at zero.
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x80_0000), 0, 0, 0, 0, 0]);
+	stand_up_caps(&[
+		Cap { cfg_type: VIRTIO_CAP_COMMON, bar: 0, offset: 0, length: 0x38 },
+		Cap { cfg_type: VIRTIO_CAP_NOTIFY, bar: 0, offset: 0x1000, length: 0x100 },
+		Cap { cfg_type: VIRTIO_CAP_ISR, bar: 0, offset: 0x2000, length: 4 },
+	]);
+	assert!(super::resolve_virtio::<Fake>(&DEVICE).is_none(), "a device whose window could not be placed is left unclaimed");
+	assert_eq!(bar(0) & 0xFFFF_FFF0, 0, "its BAR is still unplaced");
+	assert!(super::bar_address::<Fake>(&DEVICE, 0).is_none(), "and the address of an unplaced BAR is no address, not zero");
+}
+
+crate::tagged_test!(a_device_behind_a_bridge_is_placed_where_the_bridge_forwards, [Kernel, Pci], id = "kernel.arch.common.pci.a_device_behind_a_bridge_is_placed_where_the_bridge_forwards", covers = ["kernel"]);
+fn a_device_behind_a_bridge_is_placed_where_the_bridge_forwards() {
+	// A BRIDGE FORWARDS AN ADDRESS RANGE, AND AN ADDRESS OUTSIDE IT REACHES NOTHING.
+	//
+	// BARs were placed out of the platform window whatever bus the device was on, which is correct
+	// for a root bus and unreachable behind a bridge: the address is perfectly valid, the device
+	// decodes it, and every read of it returns all ones because the bridge in front never forwards
+	// the transaction. What the driver reports is a device that is not responding, which is true
+	// and says nothing about why.
+	//
+	// The bridge starts as one out of reset: a base above its limit, forwarding nothing.
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x1000), 0, 0, 0, 0, 0]);
+	stand_up_bridge(1, 1, BRIDGE_CLOSED);
+	super::place_bars::<Fake>(&BEHIND);
+
+	let window = bridge_cfg(0x20);
+	assert_ne!(window, BRIDGE_CLOSED, "a bridge that forwarded nothing was given a window");
+	let base = ((window & 0xFFF0) as u64) << 16;
+	let last = ((((window >> 16) & 0xFFF0) as u64) << 16) | 0xF_FFFF;
+	assert!(base >= WINDOW_BASE && last < WINDOW_END, "and the window came out of the platform's own addresses: {base:#x}..{last:#x}");
+
+	let placed = (bar(0) & 0xFFFF_FFF0) as u64;
+	assert!(placed >= base && placed <= last, "the BAR is inside the range its bridge forwards: {placed:#x} in {base:#x}..{last:#x}");
+	assert!(bridge_cfg(0x04) & 0x02 != 0, "and the bridge decodes memory, or it forwards nothing whatever its window says");
+	assert!(command() & 0x02 != 0, "the device is switched on");
+}
+
+crate::tagged_test!(a_window_the_firmware_left_open_is_the_window_a_bar_goes_into, [Kernel, Pci], id = "kernel.arch.common.pci.a_window_the_firmware_left_open_is_the_window_a_bar_goes_into", covers = ["kernel"]);
+fn a_window_the_firmware_left_open_is_the_window_a_bar_goes_into() {
+	// FIRMWARE THAT PADS A HOT-PLUG BRIDGE LEAVES THE ROOM FOR A LATER ARRIVAL IN THE WINDOW, and
+	// on a port whose firmware places the BARs this kernel hands out no addresses of its own at
+	// all - so the padded window is the only source of an address a device added to a live machine
+	// can be reached at. Opening a second window over the platform's addresses would be this kernel
+	// telling the bridge to forward a range firmware had not reserved for it.
+	const BASE: u64 = WINDOW_BASE + 0x20_0000;
+	const LAST: u64 = BASE + 0x20_0000 - 1;
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x1000), 0, 0, 0, 0, 0]);
+	stand_up_bridge(1, 1, bridge_window(BASE, LAST));
+	let before = bridge_cfg(0x20);
+	super::place_bars::<Fake>(&BEHIND);
+
+	assert_eq!(bridge_cfg(0x20), before, "the window firmware programmed is the window, unchanged");
+	let placed = (bar(0) & 0xFFFF_FFF0) as u64;
+	assert!(placed >= BASE && placed <= LAST, "and the BAR went into it: {placed:#x}");
+	assert_ne!(placed, WINDOW_BASE, "rather than out of the platform window, where the bump was standing");
+}
+
+crate::tagged_test!(a_bar_inside_a_bridge_window_is_not_handed_out_to_another, [Kernel, Pci], id = "kernel.arch.common.pci.a_bar_inside_a_bridge_window_is_not_handed_out_to_another", covers = ["kernel"]);
+fn a_bar_inside_a_bridge_window_is_not_handed_out_to_another() {
+	// KERN-ARCH-015, one level down. A bridge's window is a second allocator and it inherits the
+	// same rule: what is already placed inside it was never told to it, so a cursor starting at the
+	// base would hand those addresses out again. Two apertures, one span, and nothing either device
+	// can report - whichever decodes first answers, and the other's driver reads someone else's
+	// registers.
+	//
+	// BAR0 sits at the bottom of the bridge's window already; BAR1 is unprogrammed and the same size.
+	const BASE: u64 = WINDOW_BASE + 0x20_0000;
+	const LAST: u64 = BASE + 0x20_0000 - 1;
+	stand_up([BASE as u32, 0, 0, 0, 0, 0], [mask32(0x1000), mask32(0x1000), 0, 0, 0, 0]);
+	stand_up_bridge(1, 1, bridge_window(BASE, LAST));
+	super::place_bars::<Fake>(&BEHIND);
+
+	assert_eq!((bar(0) & 0xFFFF_FFF0) as u64, BASE, "the placed BAR was left where it was");
+	let placed = (bar(1) & 0xFFFF_FFF0) as u64;
+	assert!(placed >= BASE + 0x1000 && placed <= LAST, "and the unprogrammed one did not land on top of it: {placed:#x}");
+}
+
+crate::tagged_test!(a_slot_emptied_and_filled_again_gets_its_addresses_back, [Kernel, Pci], id = "kernel.arch.common.pci.a_slot_emptied_and_filled_again_gets_its_addresses_back", covers = ["kernel"]);
+fn a_slot_emptied_and_filled_again_gets_its_addresses_back() {
+	// A HOT-PLUG SLOT IS THE THING A PERSON USES REPEATEDLY, and the cursor in a bridge's window
+	// only ever moved forward: a device that left took its addresses with it and gave nothing back,
+	// so the same one device in the same one slot would eventually arrive to a window with nothing
+	// left in it and be left disabled. Nothing about the machine would have changed.
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x1000), 0, 0, 0, 0, 0]);
+	stand_up_bridge(1, 1, BRIDGE_CLOSED);
+	super::place_bars::<Fake>(&BEHIND);
+	let first = bar(0) & 0xFFFF_FFF0;
+	let window = bridge_cfg(0x20);
+	assert_ne!(first, 0, "the first arrival was placed");
+
+	replug();
+	super::place_bars::<Fake>(&BEHIND);
+	assert_eq!(bar(0) & 0xFFFF_FFF0, first, "and the second arrival is given the addresses the first one left");
+	assert_eq!(bridge_cfg(0x20), window, "the window itself is the machine's and does not move");
 }
 
 crate::tagged_test!(a_virtio_device_that_spreads_itself_over_bars_is_not_claimed, [Kernel, Pci], id = "kernel.arch.common.pci.a_virtio_device_that_spreads_itself_over_bars_is_not_claimed", covers = ["kernel"]);

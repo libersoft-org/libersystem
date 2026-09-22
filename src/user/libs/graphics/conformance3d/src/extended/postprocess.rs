@@ -110,3 +110,24 @@ pub fn fixed_postprocess_order() -> Outcome {
 	require!(right.x - wrong.x > 0.1, "which is a different picture and not a rounding difference");
 	Ok(())
 }
+
+pub fn hdr_target_format() -> Outcome {
+	// "A LINEAR HDR RENDER TARGET" ADMITS TWO ANSWERS AND THEY ARE NOT EQUIVALENT, which is why the
+	// profile names one. `RGBA32F` doubles the bandwidth of every pass for precision a tone map
+	// spends immediately; a normalised format is not HDR at all, because the bloom threshold sits at
+	// luminance 1.0 and there would be nothing above it to spread.
+	require!(scene3d::environment::HDR_FORMAT == "RGBA16F", "the HDR target is RGBA16F, got {}", scene3d::environment::HDR_FORMAT);
+	let target = scene3d::environment::hdr_target_desc(320, 240)?;
+	require!(target.format == "RGBA16F", "and so is the target this layer describes, got {}", target.format);
+	require!(target.mip_levels == 1, "the target has no mips - the bloom pyramid is its own chain, got {}", target.mip_levels);
+	require!(target.usage.sampled && target.usage.colour_attachment, "it is written by the scene pass and read by the post-process ones");
+
+	// AND THE ENVIRONMENT CUBE IS THE SAME FORMAT, with the prefilter levels as its mips: level i is
+	// the radiance at roughness i/(levels-1), and the chain stops at 8x8 because below that the
+	// filter is wider than the face.
+	let cube = scene3d::environment::cube_desc(256)?;
+	require!(cube.format == "RGBA16F", "the environment cube is RGBA16F, got {}", cube.format);
+	require!(cube.mip_levels == scene3d::environment::prefilter_levels(256), "its mips are the roughness axis, got {}", cube.mip_levels);
+	require!(cube.layers == 6, "six faces, checked rather than assumed, got {}", cube.layers);
+	Ok(())
+}

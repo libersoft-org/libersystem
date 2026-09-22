@@ -278,6 +278,59 @@ pixel, a depth-stencil at five, and the shared image the overlay composites into
 | 640x480 | 9,600 kB | 1,500 kB | 1,200 kB |
 | 800x600 | 15,000 kB | 2,343 kB | 1,875 kB |
 
+## The 3D demo's EXTENDED phase, live, at three sizes (2026-09-22)
+
+`test3d-sw --extended --frames 20 --no-input --report` inside a booted x86_64 guest under QEMU/KVM,
+release - the same program, the same harness and the same three sizes as the core rows above, so the
+two tables can be read line against line. What differs is the scene: `Scene3D Extended Profile 1`'s
+own phase, a physically based sphere with a tangent-space normal map and a cast shadow, in place of
+the core cube, ground and transparent panel. These are `f-ext`'s rows and no core gate reads them.
+
+| surface and scene | frame | rate | shadow pass | lighting pass | fragments |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 320x240 | 489.2 ms | 2.0 fps | 40.1 ms | 375.7 ms | 74,561 |
+| 640x480 | 1512.8 ms | 0.6 fps | 37.9 ms | 1362.4 ms | 242,760 |
+| 800x600 | 2257.1 ms | 0.4 fps | 37.6 ms | 2081.0 ms | 368,889 |
+
+THE SHADOW PASS IS FLAT AT ALL THREE SIZES - 38 to 40 ms whatever the window - and that is what it
+is rather than a surprise: it draws through the LIGHT'S projection into the light's own 512x512 map,
+whose extent is a property of the light and not of the surface. The present is flat for the same
+kind of reason and at almost the same number, 37 to 38 ms, which is the display's pacing.
+
+THE FRAGMENT COUNT INCLUDES BOTH PASSES, and the shadow pass contributes 18,512 of it at every size -
+the sphere's silhouette in the light's map. So the lighting pass covers 56,049, 224,248 and 350,377
+fragments at the three sizes, which is FEWER than the core scene covers at the same extents: a sphere
+over a ground plane occupies less of the frame than a cube, a ground and a panel in front of it.
+
+WHAT THE EXTENDED SHADING COSTS PER FRAGMENT, at 640x480 where the core's per-stage numbers are also
+recorded: 1362.4 ms over 224,248 fragments is **6.08 us a fragment**, against the core scene's
+1074.1 ms of opaque and transparent over 280,592 fragments, which is **3.83 us**. A factor of 1.59,
+and the three things in it are named: GGX with Smith and Schlick in place of Lambert with a
+Blinn-Phong highlight, a normal-map sample with a tangent frame re-orthogonalised per fragment, and a
+shadow-map sample with its projective divide.
+
+THE SHADOW PASS'S OWN FRAGMENTS ARE CHEAP AND ITS FRAME COST IS NOT ALL IN THE PASS. 37.9 ms over
+18,512 fragments is 2.05 us a fragment - a divide and a compose, which is all its fragment stage does
+- and beside it every frame clears 262,144 texels and reads the same number back into a texture. That
+copy is the 25 ms the stages do not account for (489.2 against 465.1 summed, 1512.8 against 1487.5,
+2257.1 against 2230.6): flat with the window, like the pass itself, and the price of a profile with
+no depth-texture binding. A backend that could bind the attachment directly would not pay it.
+
+Memory is the core table's plus the light's map: 512x512 at sixteen bytes a pixel is 4,096 kB for the
+shadow attachment and 4,096 kB for the texture it is read back into, at every window size.
+
+**THE FLOOR IN THIS FILE IS THE CORE DEMO'S AND THESE ROWS ARE NOT MEASURED AGAINST IT.** `f-ext` is
+an optional part whose own completion clause asks for its own rows, and the milestone's frame budget
+is closed by `i` over the core scene - which is why a shadow pass and a postprocess chain were kept
+out of the benchmark scene deliberately. What these numbers are for is the SHAPE: what the Extended
+material costs per fragment, and what a shadow map costs whatever the window.
+
+WHAT IS NOT MEASURED HERE, AND WHY: the postprocess chain. `scene3d::postprocess` carries the
+threshold, both kernels, the fog, the tone map and the pass graph that orders them, and no backend
+runs a full-screen pass over an HDR target yet - so a bloom row would be a measurement of arithmetic
+called in a loop written for the benchmark rather than of a pass the system executes. It is left out
+rather than invented, and the HDR item in `P02M0103` records the same boundary.
+
 **THE 30 FPS FLOOR AT 640x480 IS NOT MET AND THIS IS THE MEASUREMENT THAT SAYS SO.** The frame is
 1185 ms where the floor is 33, which is a factor of thirty-six. The number is not a tuning gap: the
 benchmark above locates the cost in the shader interpreter's value plumbing, and closing a gap of

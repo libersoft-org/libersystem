@@ -295,7 +295,6 @@ pub trait ConfigAccess {
 	// The end of the low 32-bit MMIO window that `assign_bars` reassigns BARs into,
 	// used to decide whether a firmware-placed BAR sits outside the mapped window.
 	// Only consulted by ECAM platforms that override `assign_bars`; 0 otherwise.
-	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	const MMIO_WINDOW_END: u64 = 0;
 
 	// Whether this mechanism can address EXTENDED config space - offsets at or past 0x100.
@@ -373,7 +372,6 @@ pub trait ConfigAccess {
 
 	// Allocate a size-aligned span from the platform's low MMIO window, or None when
 	// exhausted. Provided by ECAM platforms whose `assign_bars` reprograms BARs.
-	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	fn alloc_mmio(_size: u64) -> Option<u64> {
 		None
 	}
@@ -385,7 +383,6 @@ pub trait ConfigAccess {
 	//
 	// Provided by the same ECAM platforms as `alloc_mmio`; a backend that allocates nothing has
 	// nothing to reserve.
-	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	fn reserve_mmio(_base: u64, _size: u64) {}
 }
 
@@ -855,13 +852,31 @@ pub fn bar_address<A: ConfigAccess>(d: &PciDevice, bar_idx: usize) -> Option<u64
 		return None; // an I/O-space BAR, not memory
 	}
 	let base_lo = (bar & 0xFFFF_FFF0) as u64;
-	if (bar >> 1) & 3 == 2 {
+	let base = if (bar >> 1) & 3 == 2 {
 		// 64-bit memory BAR: the high half lives in the next slot.
 		let hi = A::read32(d.bus, d.dev, d.func, 0x10 + (bar_idx as u16 + 1) * 4) as u64;
-		Some(hi << 32 | base_lo)
+		hi << 32 | base_lo
 	} else {
-		Some(base_lo)
+		base_lo
+	};
+	// A BAR NOBODY PLACED READS BACK ZERO, AND ZERO IS NOT AN ADDRESS.
+	//
+	// A function added to a LIVE machine arrives with its BARs unprogrammed - firmware placed the
+	// ones it found when it looked and has not run since - so this read answers zero unless
+	// something in this kernel placed them first. Taken as an address it is physical zero, and the
+	// consequences are not a failure to work: the driver is handed a writable window over the
+	// bottom of memory, and a virtio handshake performed against RAM reads back every value it
+	// writes. The reset is acknowledged because the zero written is the zero read; FEATURES_OK is
+	// accepted because the byte is still there. The device then REPORTS ITSELF ONLINE without
+	// anything having answered it, which is how a hot-plug arrival passed on one port while the
+	// same device on another said honestly that it was not responding.
+	//
+	// The caller's `None` is the honest answer: a function whose register window cannot be located
+	// gets an inventory row with no resources, the same place a family with no resolver lands.
+	if base == 0 {
+		return None;
 	}
+	Some(base)
 }
 
 // Measure a memory BAR's window size with the standard probe: write all-ones to the
@@ -898,7 +913,6 @@ pub fn bar_size<A: ConfigAccess>(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 // Probing means writing all-ones and reading the mask back, so it is only safe while memory
 // decoding is off; both passes below run inside that window and the original value is always
 // restored.
-#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 fn probe_bar<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, u64, u64)>) {
 	let off = 0x10 + (i as u16) * 4;
 	let bar = A::read32(d.bus, d.dev, d.func, off);
@@ -936,13 +950,363 @@ fn probe_bar<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, 
 
 // Whether a BAR the firmware left at `cur` is one this kernel keeps: inside the low window the
 // boot stub maps, and actually programmed.
-#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 fn is_retained<A: ConfigAccess>(cur: u64) -> bool {
 	cur != 0 && cur < A::MMIO_WINDOW_END
 }
 
+// A PCI-TO-PCI BRIDGE FORWARDS AN ADDRESS RANGE AND NOT A DEVICE, and this is the range.
+//
+// The window is one dword: the base in the low half and the limit in the high half, each naming
+// the top twelve bits of an address, so a window covers whole megabytes and a base ABOVE the limit
+// is a window that is CLOSED. Closed is what a bridge holds out of reset and what firmware leaves
+// behind a hot-plug slot that was empty when it looked - which is a bridge that forwards nothing,
+// however correctly the BAR behind it is programmed.
+const BRIDGE_MEMORY_WINDOW: u16 = 0x20;
+const BRIDGE_WINDOW_GRAIN: u64 = 0x10_0000;
+
+// What a bridge whose window is closed is given, when this kernel has addresses to open one from.
+// Two megabytes is what the PCI Hot Plug specification names as a bridge's default memory padding,
+// and it holds a hundred virtio register files.
+const BRIDGE_APERTURE: u64 = 2 * BRIDGE_WINDOW_GRAIN;
+
+// One bridge's window, and where the next BAR placed behind it goes.
+#[derive(Clone, Copy)]
+struct Aperture {
+	// The buses this bridge forwards: how a device finds the window its own address has to be in.
+	bus_lo: u8,
+	bus_hi: u8,
+	base: u64,
+	next: u64,
+	end: u64,
+}
+
+// EIGHT, one per bridge that has anything placed behind it. A row is made the first time a BAR is
+// placed behind a bridge and lives as long as the machine does: the window is programmed once, and
+// what moves afterwards is only the cursor inside it.
+const MAX_BRIDGE_APERTURES: usize = 8;
+static APERTURES: SpinLock<[Option<Aperture>; MAX_BRIDGE_APERTURES]> = SpinLock::new([None; MAX_BRIDGE_APERTURES]);
+
+// Where a device's addresses come from.
+#[derive(Clone, Copy)]
+enum Pool {
+	// The platform's own low MMIO window - a root bus, and the only case there has ever been.
+	Platform,
+	// The window a bridge forwards to the bus this device is on.
+	Aperture(usize),
+	// Behind a bridge this kernel could not give a window to, so there is no address that reaches
+	// this device at all. Named rather than folded into an exhausted pool, because the operator's
+	// two questions - "is the window full" and "is there a window" - have different answers.
+	Unreachable,
+}
+
+impl Pool {
+	fn describe(self) -> &'static str {
+		match self {
+			Pool::Platform => "the MMIO window",
+			Pool::Aperture(_) => "the window its bridge forwards",
+			Pool::Unreachable => "a bridge with no window",
+		}
+	}
+}
+
+// Whether a BAR already at `cur` is one this pool keeps where it is.
+fn pool_retains<A: ConfigAccess>(pool: Pool, cur: u64) -> bool {
+	match pool {
+		Pool::Platform => is_retained::<A>(cur),
+		// INSIDE THE WINDOW ITS BRIDGE FORWARDS, which is a different question from the platform's
+		// and has to be: a BAR firmware placed in the low window is a perfectly good address that
+		// nothing behind this bridge can be reached at.
+		Pool::Aperture(index) => matches!(APERTURES.lock()[index], Some(row) if cur >= row.base && cur < row.end),
+		Pool::Unreachable => false,
+	}
+}
+
+fn pool_reserve<A: ConfigAccess>(pool: Pool, base: u64, size: u64) {
+	match pool {
+		Pool::Platform => A::reserve_mmio(base, size),
+		// A retained BAR inside an aperture was already pushed past when the aperture was made
+		// (`occupied_behind`), which is the only moment every function behind the bridge is read.
+		Pool::Aperture(_) | Pool::Unreachable => {}
+	}
+}
+
+fn pool_alloc<A: ConfigAccess>(pool: Pool, size: u64) -> Option<u64> {
+	match pool {
+		Pool::Platform => A::alloc_mmio(size),
+		Pool::Aperture(index) => {
+			let mut table = APERTURES.lock();
+			let row = table[index].as_mut()?;
+			let size = size.max(0x1000);
+			let base = (row.next + size - 1) & !(size - 1);
+			if base.checked_add(size)? > row.end {
+				return None;
+			}
+			row.next = base + size;
+			Some(base)
+		}
+		Pool::Unreachable => None,
+	}
+}
+
+// The bridge that forwards `target`, or None when `target` is a root bus.
+//
+// THE CLOSEST ONE. A bus behind two bridges is forwarded by both, and the window a BAR has to fit
+// inside is the inner bridge's - so the walk goes down before it answers.
+fn forwarding_bridge<A: ConfigAccess>(target: u8) -> Option<(u8, u8, u8)> {
+	fn walk<A: ConfigAccess>(from: u8, target: u8, depth: u8) -> Option<(u8, u8, u8)> {
+		if from == target || depth > MAX_BRIDGE_DEPTH {
+			return None;
+		}
+		for dev in 0..32u8 {
+			if A::read16(from, dev, 0, 0x00) == 0xFFFF {
+				continue;
+			}
+			let func_count: u8 = if A::read8(from, dev, 0, 0x0e) & 0x80 != 0 { 8 } else { 1 };
+			for func in 0..func_count {
+				if A::read16(from, dev, func, 0x00) == 0xFFFF || A::read8(from, dev, func, 0x0e) & 0x7F != HEADER_TYPE_BRIDGE {
+					continue;
+				}
+				let secondary = A::read8(from, dev, func, BRIDGE_SECONDARY_BUS);
+				let subordinate = A::read8(from, dev, func, BRIDGE_SUBORDINATE_BUS).min(A::MAX_BUS);
+				if secondary <= from || subordinate < secondary || target < secondary || target > subordinate {
+					continue;
+				}
+				return walk::<A>(secondary, target, depth + 1).or(Some((from, dev, func)));
+			}
+		}
+		None
+	}
+	walk::<A>(0, target, 0)
+}
+
+// Probe one function's BAR with its memory decoding off, which is the only state a probe is valid
+// in: probing writes all-ones and reads the size mask back, so a function that is decoding would
+// answer at whatever the all-ones address decodes to for as long as the write stood.
+fn probe_bar_quietly<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, u64, u64)>) {
+	let command = A::read32(d.bus, d.dev, d.func, 0x04) as u16;
+	// THE STATUS HALF IS WRITTEN AS ZERO, both times. Its bits are write-one-to-clear, so putting
+	// back what was read would clear whatever the device had reported between the two writes -
+	// which is the same reason every other writer of this register in this file writes zeros.
+	A::write32(d.bus, d.dev, d.func, 0x04, (command & !CMD_MEMORY_SPACE) as u32);
+	let probed = probe_bar::<A>(d, i);
+	A::write32(d.bus, d.dev, d.func, 0x04, command as u32);
+	probed
+}
+
+// The highest address already spoken for inside a bridge's window, so a cursor starting there
+// cannot hand out what something behind the bridge already decodes.
+//
+// THE SAME RULE AS THE PLATFORM WINDOW'S (KERN-ARCH-015), for the same reason and one level down:
+// firmware placed the BARs of whatever was behind this bridge when it looked, inside the window it
+// gave the bridge, and a bump starting at the base would hand those addresses to the next device
+// to arrive. Two apertures, one span, and nothing either device can report.
+//
+// NOTHING BEHIND THE BRIDGE IS BEING DRIVEN WHILE THIS RUNS, which is what makes probing here
+// safe: a row is made the FIRST time a BAR is placed behind this bridge, so either this is the
+// boot scan - before any driver exists - or the bridge was empty until the function now arriving,
+// which has no driver yet either.
+fn occupied_behind<A: ConfigAccess>(secondary: u8, subordinate: u8, base: u64, end: u64) -> u64 {
+	let mut next = base;
+	for bus in secondary..=subordinate {
+		for dev in 0..32u8 {
+			if A::read16(bus, dev, 0, 0x00) == 0xFFFF {
+				continue;
+			}
+			let func_count: u8 = if A::read8(bus, dev, 0, 0x0e) & 0x80 != 0 { 8 } else { 1 };
+			for func in 0..func_count {
+				if A::read16(bus, dev, func, 0x00) == 0xFFFF {
+					continue;
+				}
+				let header_type = A::read8(bus, dev, func, 0x0e);
+				let function = PciDevice { bus, dev, func, vendor: 0, device_id: 0, class: 0, subclass: 0, prog_if: 0, header_type };
+				// A BRIDGE HAS TWO BAR SLOTS AND NOT SIX: the four dwords a header-type-0 function
+				// keeps its remaining BARs in are where a bridge keeps its bus numbers and its
+				// windows, and probing those would write all-ones over the numbering this walk is
+				// standing on.
+				let slots = if header_type & 0x7F == HEADER_TYPE_BRIDGE { 2 } else { 6 };
+				let mut i = 0usize;
+				while i < slots {
+					let (step, bar) = probe_bar_quietly::<A>(&function, i);
+					if let Some((_, cur, size)) = bar
+						&& cur >= base && cur < end
+					{
+						next = next.max(cur.saturating_add(size).min(end));
+					}
+					i += step;
+				}
+			}
+		}
+	}
+	next
+}
+
+// How many functions are present behind a bridge. Config reads only - nothing is probed and
+// nothing is written - because this is the question that decides whether probing is allowed.
+fn functions_behind<A: ConfigAccess>(secondary: u8, subordinate: u8) -> usize {
+	let mut found = 0usize;
+	for bus in secondary..=subordinate {
+		for dev in 0..32u8 {
+			if A::read16(bus, dev, 0, 0x00) == 0xFFFF {
+				continue;
+			}
+			let func_count: u8 = if A::read8(bus, dev, 0, 0x0e) & 0x80 != 0 { 8 } else { 1 };
+			for func in 0..func_count {
+				if A::read16(bus, dev, func, 0x00) != 0xFFFF {
+					found += 1;
+				}
+			}
+		}
+	}
+	found
+}
+
+// Give a bridge a window and turn its memory decoding on, so the span it now forwards is one that
+// transactions actually reach.
+//
+// THE PREFETCHABLE WINDOW IS LEFT EXACTLY AS FOUND. A bridge decodes by ADDRESS and not by what a
+// device's BAR says about itself, so a prefetchable BAR placed in the ordinary window is forwarded
+// by the ordinary window; and this only runs when the ordinary window was CLOSED, which on a
+// machine whose firmware programmed neither leaves nothing to conflict with. Rewriting it would be
+// this kernel closing a window firmware opened for a device it cannot see.
+fn program_bridge_window<A: ConfigAccess>(bus: u8, dev: u8, func: u8, base: u64, size: u64) {
+	let last = base + size - 1;
+	let window = ((base >> 16) as u32 & 0xFFF0) | (((last >> 16) as u32 & 0xFFF0) << 16);
+	A::write32(bus, dev, func, BRIDGE_MEMORY_WINDOW, window);
+	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE) as u32);
+	crate::serial_println!("pci: {:02x}:{:02x}.{} now forwards {:#x}..{:#x} to the bus behind it", bus, dev, func, base, last + 1);
+}
+
+// The aperture for one bridge, made on first use. `parent` is where its window comes from if it
+// has to be opened, which for a bridge behind another bridge is that one's aperture - so an inner
+// window is inside its outer one by construction rather than by luck.
+fn ensure_aperture<A: ConfigAccess>(bus: u8, dev: u8, func: u8, parent: Pool) -> Option<usize> {
+	let secondary = A::read8(bus, dev, func, BRIDGE_SECONDARY_BUS);
+	let subordinate = A::read8(bus, dev, func, BRIDGE_SUBORDINATE_BUS).min(A::MAX_BUS);
+	if secondary == 0 || subordinate < secondary {
+		return None;
+	}
+	let find = |table: &[Option<Aperture>; MAX_BRIDGE_APERTURES]| table.iter().position(|row| matches!(row, Some(a) if a.bus_lo == secondary && a.bus_hi == subordinate));
+	// BOUND BEFORE THE `if let` AND NOT INSIDE ITS SCRUTINEE. A temporary in an `if let` condition
+	// lives until the end of its body, so the guard this lock returns would still be held while the
+	// body below locks again - which on a spin lock is not a race, it is a stop.
+	let existing = find(&APERTURES.lock());
+	if let Some(index) = existing {
+		// A SLOT EMPTIED AND FILLED AGAIN GETS ITS ADDRESSES BACK.
+		//
+		// The cursor only ever moves forward, and a device that leaves takes its BARs with it and
+		// gives nothing back - so a slot plugged and unplugged enough times would run its bridge's
+		// window out and the arrival after that would be left disabled, on a machine with the same
+		// one device in the same one slot. A hot-plug slot is the thing a person uses REPEATEDLY.
+		//
+		// RE-READING IS SAFE EXACTLY WHEN THERE IS ONE FUNCTION BEHIND THE BRIDGE, and the guard is
+		// that count: the one function is then the one now arriving, which has no driver yet, so
+		// the probe `occupied_behind` does cannot disturb anything. With a second function present
+		// - a multi-function card, a device already bound - the cursor is left where it is and the
+		// window is spent rather than risked.
+		let (base, end) = match APERTURES.lock()[index] {
+			Some(row) => (row.base, row.end),
+			None => return None,
+		};
+		if functions_behind::<A>(secondary, subordinate) == 1 {
+			let next = occupied_behind::<A>(secondary, subordinate, base, end);
+			if let Some(row) = APERTURES.lock()[index].as_mut() {
+				row.next = next;
+			}
+		}
+		return Some(index);
+	}
+	// THE WINDOW FIRMWARE ALREADY FORWARDS, WHERE THERE IS ONE. Firmware that padded a hot-plug
+	// bridge left the room for a device added later HERE, and using it is what makes such a device
+	// reachable on a port where this kernel hands out no addresses of its own at all.
+	let programmed = A::read32(bus, dev, func, BRIDGE_MEMORY_WINDOW);
+	let open_base = ((programmed & 0xFFF0) as u64) << 16;
+	let open_last = (((programmed >> 16) & 0xFFF0) as u64) << 16;
+	// AND A WINDOW AT ADDRESS ZERO IS NOT A WINDOW, the same rule as a BAR's and for the same
+	// reason: a base of zero with a limit of zero is what a register nobody wrote reads back, and
+	// read as a window it says the bridge forwards the first megabyte of physical memory.
+	let (base, end) = if open_last >= open_base && open_base != 0 {
+		(open_base, open_last + BRIDGE_WINDOW_GRAIN)
+	} else {
+		let base = pool_alloc::<A>(parent, BRIDGE_APERTURE)?;
+		program_bridge_window::<A>(bus, dev, func, base, BRIDGE_APERTURE);
+		(base, base + BRIDGE_APERTURE)
+	};
+	let next = occupied_behind::<A>(secondary, subordinate, base, end);
+	let mut table = APERTURES.lock();
+	if let Some(index) = find(&table) {
+		return Some(index);
+	}
+	let index = table.iter().position(|row| row.is_none())?;
+	table[index] = Some(Aperture { bus_lo: secondary, bus_hi: subordinate, base, next, end });
+	Some(index)
+}
+
+// Forget every aperture, so a test that stands up a bridge does not inherit the one before it.
+// The table is a machine's topology, which outlives everything else in a running kernel.
+#[cfg(test)]
+pub fn forget_apertures() {
+	*APERTURES.lock() = [None; MAX_BRIDGE_APERTURES];
+}
+
+// Which pool a device on `bus` is placed out of, opening every window on the way down that is not
+// open yet.
+fn pool_for<A: ConfigAccess>(bus: u8) -> Pool {
+	let Some(bridge) = forwarding_bridge::<A>(bus) else {
+		return Pool::Platform;
+	};
+	// The chain from the device's bridge up to the root, walked OUTWARDS and then used INWARDS: a
+	// bridge's window can only be carved out of its parent's, so the outer one has to exist first.
+	let mut chain = [(0u8, 0u8, 0u8); MAX_BRIDGE_DEPTH as usize + 1];
+	let mut depth = 0usize;
+	let mut at = bridge;
+	while depth < chain.len() {
+		chain[depth] = at;
+		depth += 1;
+		match forwarding_bridge::<A>(at.0) {
+			Some(parent) => at = parent,
+			None => break,
+		}
+	}
+	let mut pool = Pool::Platform;
+	for &(bus, dev, func) in chain[..depth].iter().rev() {
+		pool = match ensure_aperture::<A>(bus, dev, func, pool) {
+			Some(index) => Pool::Aperture(index),
+			None => return Pool::Unreachable,
+		};
+	}
+	pool
+}
+
+// EVERY BAR PLACEMENT GOES THROUGH HERE, and this is the one place that knows a device behind a
+// bridge is not placed the way a device on a root bus is.
+//
+// A root bus keeps exactly the behaviour each port already had - the ports with firmware place
+// nothing, the ports without place out of their own window. What is new is the other case, which
+// used to be the same as the first and is why a device plugged into a live machine did not work on
+// any port: on the ports with no firmware its BAR went into the platform window, which the bridge
+// in front of it does not forward, and the driver found nothing at the address it was given; on
+// the port with firmware the BAR was never placed at all, and the driver was given physical zero.
+pub fn place_bars<A: ConfigAccess>(d: &PciDevice) {
+	match pool_for::<A>(d.bus) {
+		Pool::Platform => A::assign_bars(d),
+		Pool::Unreachable => crate::serial_println!("pci: {:02x}:{:02x}.{} is behind a bridge this kernel has no addresses to open a window for; it is left as it was found", d.bus, d.dev, d.func),
+		pool => place_bars_from::<A>(d, pool),
+	}
+}
+
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
+	place_bars_from::<A>(d, Pool::Platform);
+}
+
+// THE SAME PLACEMENT, OUT OF WHICHEVER POOL THE DEVICE'S ADDRESSES HAVE TO COME FROM.
+//
+// A device on a root bus is placed out of the platform's low MMIO window, which is what this has
+// always done. A device BEHIND A BRIDGE cannot be: a bridge forwards an address RANGE, and an
+// address outside the range it forwards reaches nothing - so its BARs come out of that bridge's
+// own window and nowhere else. The two cases differ only in where an address comes from and which
+// already-placed BARs have to be kept clear of, so they are one function and a pool.
+fn place_bars_from<A: ConfigAccess>(d: &PciDevice, pool: Pool) {
 	// Disable memory-space decoding while the BARs move (the firmware may have enabled it).
 	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) & !CMD_MEMORY_SPACE) as u32);
 
@@ -954,9 +1318,9 @@ pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 	while i < 6 {
 		let (step, bar) = probe_bar::<A>(d, i);
 		if let Some((_, cur, size)) = bar
-			&& is_retained::<A>(cur)
+			&& pool_retains::<A>(pool, cur)
 		{
-			A::reserve_mmio(cur, size);
+			pool_reserve::<A>(pool, cur, size);
 		}
 		i += step;
 	}
@@ -967,9 +1331,9 @@ pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 	while i < 6 {
 		let (step, bar) = probe_bar::<A>(d, i);
 		if let Some((is64, cur, size)) = bar
-			&& !is_retained::<A>(cur)
+			&& !pool_retains::<A>(pool, cur)
 		{
-			match A::alloc_mmio(size) {
+			match pool_alloc::<A>(pool, size) {
 				Some(base) => {
 					let off = 0x10 + (i as u16) * 4;
 					let raw = A::read32(d.bus, d.dev, d.func, off);
@@ -980,7 +1344,7 @@ pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 				}
 				None => {
 					all_placed = false;
-					crate::serial_println!("pci: {:02x}:{:02x}.{} BAR{i} needs {size} bytes and the MMIO window has none left", d.bus, d.dev, d.func);
+					crate::serial_println!("pci: {:02x}:{:02x}.{} BAR{i} needs {size} bytes and {} has none left", d.bus, d.dev, d.func, pool.describe());
 				}
 			}
 		}
@@ -1044,7 +1408,7 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 	if A::read16(d.bus, d.dev, d.func, 0x06) & STATUS_CAP_LIST == 0 {
 		return None;
 	}
-	A::assign_bars(d);
+	place_bars::<A>(d);
 	let (mut common, mut notify, mut isr, mut device) = (None, None, None, None);
 	let mut ptr: u16 = (A::read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
 	// Bound the walk so a malformed (cyclic) list cannot spin forever.
@@ -1165,7 +1529,7 @@ pub fn scan_virtio<A: ConfigAccess>() -> Vec<VirtioDevice> {
 // produce an entry that claims a profile and hands out a window of nothing.
 fn resolve_endpoint<A: ConfigAccess>(d: &PciDevice) -> Option<ResourcedDevice> {
 	let (device_type, bar) = d.resourced_type()?;
-	A::assign_bars(d);
+	place_bars::<A>(d);
 	let bar_phys = bar_address::<A>(d, bar)?;
 	let bar_len = bar_size::<A>(d, bar)?;
 	let (msix_cap, msix_table_phys) = resolve_msix::<A>(d);

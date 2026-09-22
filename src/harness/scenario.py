@@ -573,6 +573,20 @@ def run(document, lab, verbose=False):
 # is asked afterwards what it is actually holding. Returns the list of things that could not be
 # given back, empty when the instance is as the next run needs to find it.
 def teardown(lab, verbose=False, baseline=None, first_run=True, ends=None):
+	# EVERY DEADLINE HERE IS SCALED, BECAUSE A SECOND IS NOT A UNIT OF WORK.
+	#
+	# The step loop above already multiplies each step's own timeout by `TIME_SCALE` - ten on an
+	# emulated target - and this function did not: it waited five fixed seconds for a prompt on a
+	# machine that interprets every instruction. A scenario whose steps all PASSED then failed on
+	# "the terminal is not at a prompt", which reads as a dirty instance rather than as a slow one.
+	# Observed on aarch64 with the PCIe hot-plug scenario, whose guest had done everything asked of
+	# it and said so in its own log.
+	#
+	# AND THEY ARE INTEGERS, WHICH IS NOT COSMETIC. `lab.reset` passes its timeout to a child as
+	# `--timeout str(value)`, so `10 * 1.0` reaches the other side as "10.0" and its parser refuses
+	# it - which turned a passing x86_64 run into "the development state was not dropped" the moment
+	# the multiplication was introduced. The scale is a float and every deadline crossing that seam
+	# has to stop being one.
 	lab_module.timing_event('scenario', 'steps-end')
 	lab_module.timing_event('scenario', 'cleanup-start')
 	notes = []
@@ -583,7 +597,7 @@ def teardown(lab, verbose=False, baseline=None, first_run=True, ends=None):
 	# machine that was supposed to stop did not.
 	if ends == 'powered-off':
 		lab_module.timing_event('scenario', 'cleanup-end')
-		if lab.wait_prompt(2):
+		if lab.wait_prompt(int(2 * TIME_SCALE)):
 			return ['the machine answered a prompt after it was asked to power off']
 		return []
 	# ASSIGNED BEFORE THE `try`, all three. `free` was not, and it is read after the handler below:
@@ -603,8 +617,8 @@ def teardown(lab, verbose=False, baseline=None, first_run=True, ends=None):
 		# Nothing here is sent unless the one before it left no prompt, so a run that ended
 		# tidily pays for one keystroke and one check.
 		for key in ('\x03', '\x1b', 'q'):
-			lab.type_text(key, False, 10)
-			if lab.wait_prompt(5):
+			lab.type_text(key, False, int(10 * TIME_SCALE))
+			if lab.wait_prompt(int(5 * TIME_SCALE)):
 				# AND WHATEVER THE ESCALATION LEFT IN THE LINE EDITOR GOES WITH IT. A prompt is
 				# not an empty line: the `q` that quits a full-screen program lands in the line
 				# buffer when the program is already gone, and stays there - so the NEXT
@@ -615,13 +629,13 @@ def teardown(lab, verbose=False, baseline=None, first_run=True, ends=None):
 				# Ctrl+C at a prompt discards the line and draws a fresh one, so this costs one
 				# keystroke and is a no-op when the ladder stopped at Ctrl+C in the first place.
 				if key != '\x03':
-					lab.type_text('\x03', False, 10)
-					if not lab.wait_prompt(5):
+					lab.type_text('\x03', False, int(10 * TIME_SCALE))
+					if not lab.wait_prompt(int(5 * TIME_SCALE)):
 						left.append('the terminal is not at a prompt')
 				break
 		else:
 			left.append('the terminal is not at a prompt')
-		if not lab.reset(10):
+		if not lab.reset(int(10 * TIME_SCALE)):
 			left.append('the development state was not dropped')
 		# One question of the guest, answered in one exchange: remove the fixtures this run
 		# wrote, say what is still held, and report the memory account. Held is the only account

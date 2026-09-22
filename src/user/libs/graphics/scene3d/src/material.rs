@@ -27,6 +27,7 @@ use render_math::{Vec3, Vec4};
 
 use render3d::blend::{AttachmentBlend, BlendEquation, ColorWriteMask};
 
+use crate::pbr::PbrMaterial;
 use crate::queue::QueueKind;
 use crate::scene::Error;
 
@@ -58,6 +59,55 @@ pub enum Blending {
 		threshold: f32,
 	},
 	Blended,
+}
+
+impl Blending {
+	/// THE QUEUE IS THE MATERIAL'S BLENDING AND NOT A FLAG ON THE NODE, so a node's queue changes
+	/// when its material does and the two can never disagree.
+	///
+	/// ON `Blending` RATHER THAN ON EACH MATERIAL TYPE, because the core four and the Extended
+	/// physically based material answer it identically. A second copy of this rule is how the two
+	/// families come to disagree about what a transparent surface does, and a PBR surface that hid
+	/// what was behind it while a `BlinnPhong` one did not would read as a defect in the shading.
+	pub fn queue(self) -> QueueKind {
+		match self {
+			Self::Opaque => QueueKind::Opaque,
+			Self::AlphaMask { .. } => QueueKind::AlphaMask,
+			Self::Blended => QueueKind::Transparent,
+		}
+	}
+
+	/// Whether a drawable of this blending writes the depth buffer. THE TWO OPAQUE QUEUES DO AND THE
+	/// TRANSPARENT ONE DOES NOT: writing it would make a transparent surface hide the one behind it,
+	/// which is the commonest transparency bug.
+	pub fn writes_depth(self) -> bool {
+		!matches!(self, Self::Blended)
+	}
+
+	/// Whether a drawable of this blending writes the picking attachment. A TRANSPARENT ONE DOES
+	/// NOT, so a pick through glass answers what is behind it.
+	pub fn writes_id(self) -> bool {
+		!matches!(self, Self::Blended)
+	}
+
+	/// The blend state this blending implies, which is the state the material's pipeline must have
+	/// been built with.
+	pub fn blend_state(self) -> AttachmentBlend {
+		match self {
+			Self::Blended => AttachmentBlend { enabled: true, colour: BlendEquation::PREMULTIPLIED_OVER, alpha: BlendEquation::PREMULTIPLIED_OVER, write_mask: ColorWriteMask::ALL },
+			_ => AttachmentBlend { enabled: false, colour: BlendEquation::REPLACE, alpha: BlendEquation::REPLACE, write_mask: ColorWriteMask::ALL },
+		}
+	}
+
+	/// The one thing a blending can be wrong about on its own.
+	pub fn validate(self) -> Result<(), Error> {
+		if let Self::AlphaMask { threshold } = self {
+			if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+				return Err(Error::Degenerate { reason: "an alpha threshold outside zero to one, which discards everything or nothing whatever the surface holds" });
+			}
+		}
+		Ok(())
+	}
 }
 
 /// A surface's appearance.
@@ -95,11 +145,7 @@ impl Material {
 	/// Set the blending, and with it the blend state that blending implies. A caller that wants a
 	/// different equation says so with `with_blend_state` afterwards.
 	pub fn with_blending(self, blending: Blending) -> Self {
-		let blend = match blending {
-			Blending::Blended => AttachmentBlend { enabled: true, colour: BlendEquation::PREMULTIPLIED_OVER, alpha: BlendEquation::PREMULTIPLIED_OVER, write_mask: ColorWriteMask::ALL },
-			_ => AttachmentBlend { enabled: false, colour: BlendEquation::REPLACE, alpha: BlendEquation::REPLACE, write_mask: ColorWriteMask::ALL },
-		};
-		Self { blending, blend, ..self }
+		Self { blending, blend: blending.blend_state(), ..self }
 	}
 
 	pub fn with_blend_state(self, blend: AttachmentBlend) -> Self {
@@ -125,35 +171,27 @@ impl Material {
 	/// THE QUEUE IS THE MATERIAL'S BLENDING AND NOT A FLAG ON THE NODE, so a node's queue changes
 	/// when its material does and the two can never disagree.
 	pub fn queue(&self) -> QueueKind {
-		match self.blending {
-			Blending::Opaque => QueueKind::Opaque,
-			Blending::AlphaMask { .. } => QueueKind::AlphaMask,
-			Blending::Blended => QueueKind::Transparent,
-		}
+		self.blending.queue()
 	}
 
 	/// Whether a drawable of this material writes the depth buffer. THE TWO OPAQUE QUEUES DO AND THE
 	/// TRANSPARENT ONE DOES NOT: writing it would make a transparent surface hide the one behind it,
 	/// which is the commonest transparency bug.
 	pub fn writes_depth(&self) -> bool {
-		!matches!(self.blending, Blending::Blended)
+		self.blending.writes_depth()
 	}
 
 	/// Whether a drawable of this material writes the picking attachment. A TRANSPARENT ONE DOES
 	/// NOT, so a pick through glass answers what is behind it.
 	pub fn writes_id(&self) -> bool {
-		!matches!(self.blending, Blending::Blended)
+		self.blending.writes_id()
 	}
 
 	pub fn validate(&self) -> Result<(), Error> {
 		if !self.base_colour.is_finite() || !self.specular.is_finite() {
 			return Err(Error::Degenerate { reason: "a material with a non-finite colour" });
 		}
-		if let Blending::AlphaMask { threshold } = self.blending {
-			if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-				return Err(Error::Degenerate { reason: "an alpha threshold outside zero to one, which discards everything or nothing whatever the surface holds" });
-			}
-		}
+		self.blending.validate()?;
 		if self.shininess == 0 || self.shininess > MAX_SHININESS {
 			return Err(Error::Degenerate { reason: "a specular exponent of zero or past the profile's ceiling; the exponent is a loop count and an unbounded one is a frame that never ends" });
 		}
@@ -163,6 +201,207 @@ impl Material {
 			return Err(Error::Degenerate { reason: "a material whose blend state disagrees with its blending: a transparent material must blend and an opaque one must not" });
 		}
 		Ok(())
+	}
+}
+
+/// Which of the five maps `PbrMetallicRoughness` names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PbrMap {
+	BaseColour,
+	MetallicRoughness,
+	Normal,
+	Occlusion,
+	Emissive,
+}
+
+impl PbrMap {
+	/// What this map's numbers MEAN, which is what decides whether a transfer function is applied
+	/// to it.
+	///
+	/// A FUNCTION AND NOT A COMMENT, because this is the rule that costs nothing to get wrong and
+	/// changes every pixel: decoding a normal map bends every normal toward the surface and
+	/// decoding a roughness map makes a whole material glossier, and neither reports itself.
+	pub const fn semantics(self) -> graphics_profile::image::Semantics {
+		match self {
+			Self::BaseColour | Self::Emissive => graphics_profile::image::Semantics::Color,
+			Self::MetallicRoughness | Self::Normal | Self::Occlusion => graphics_profile::image::Semantics::Data,
+		}
+	}
+
+	/// The five, in the order the profile's rules name them.
+	pub const ALL: [Self; 5] = [Self::BaseColour, Self::MetallicRoughness, Self::Normal, Self::Occlusion, Self::Emissive];
+}
+
+/// The maps a physically based material samples, by the caller's own identifiers.
+///
+/// `None` IS A MAP THE MATERIAL DOES NOT HAVE, and its absence is the identity - which is what makes
+/// a material with no maps the same path as one with five rather than a second one.
+///
+/// THE IDENTIFIERS ARE HERE AND THE SAMPLED VALUES ARE IN `PbrSurface`, which is the same split the
+/// core material has: a material names a texture, a fragment carries what was read out of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PbrMaps {
+	pub base_colour: Option<u32>,
+	pub metallic_roughness: Option<u32>,
+	pub normal: Option<u32>,
+	pub occlusion: Option<u32>,
+	pub emissive: Option<u32>,
+}
+
+impl PbrMaps {
+	pub const fn of(&self, map: PbrMap) -> Option<u32> {
+		match map {
+			PbrMap::BaseColour => self.base_colour,
+			PbrMap::MetallicRoughness => self.metallic_roughness,
+			PbrMap::Normal => self.normal,
+			PbrMap::Occlusion => self.occlusion,
+			PbrMap::Emissive => self.emissive,
+		}
+	}
+
+	pub fn with(self, map: PbrMap, texture: u32) -> Self {
+		let texture = Some(texture);
+		match map {
+			PbrMap::BaseColour => Self { base_colour: texture, ..self },
+			PbrMap::MetallicRoughness => Self { metallic_roughness: texture, ..self },
+			PbrMap::Normal => Self { normal: texture, ..self },
+			PbrMap::Occlusion => Self { occlusion: texture, ..self },
+			PbrMap::Emissive => Self { emissive: texture, ..self },
+		}
+	}
+
+	/// How many of the five this material samples.
+	pub fn count(&self) -> usize {
+		PbrMap::ALL.iter().filter(|map| self.of(**map).is_some()).count()
+	}
+}
+
+/// A PHYSICALLY BASED MATERIAL AND THE BINDING A BACKEND DRAWS IT WITH, which is what makes it a
+/// scene's material rather than a set of factors.
+///
+/// A SECOND TABLE AND NOT A FIFTH `MaterialKind`. `Scene3D Core Profile 1`'s material list is
+/// exactly four entries; a physically based material held in the core table would either claim one
+/// of those four kinds, which is a lie in the inventory, or add a fifth, which changes what the core
+/// profile means. So the Extended materials live in a table of their own, and only a scene whose
+/// limits claim Extended has one at all.
+///
+/// `PbrMaterial` STAYS THE PURE FACTORS. The equations and every input they take are `pbr`'s, with
+/// fixtures that compute their expected values by hand; this type adds the three things the RECORDER
+/// needs - a pipeline, a uniform block and a blend state - and nothing the arithmetic can see.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ExtendedMaterial {
+	/// The factors `pbr::shade` evaluates.
+	pub shading: PbrMaterial,
+	/// The five maps the glTF data model names, by the caller's own identifiers.
+	pub maps: PbrMaps,
+	/// The pipeline a backend draws this material with.
+	pub pipeline: render3d::GraphicsPipeline,
+	/// The uniform block this material's parameters live in.
+	pub uniforms: u32,
+	/// The PER-DRAW blend state, held against the shading's blending by `validate` for the same
+	/// reason the core material's is: a material that says it is transparent and carries a pipeline
+	/// that does not blend draws opaque, which reads as a missing texture.
+	pub blend: AttachmentBlend,
+}
+
+impl ExtendedMaterial {
+	pub fn new(shading: PbrMaterial, pipeline: render3d::GraphicsPipeline, uniforms: u32) -> Self {
+		Self { shading, maps: PbrMaps::default(), pipeline, uniforms, blend: shading.blending.blend_state() }
+	}
+
+	pub fn with_blend_state(self, blend: AttachmentBlend) -> Self {
+		Self { blend, ..self }
+	}
+
+	/// Name one of the five maps.
+	pub fn with_map(self, map: PbrMap, texture: u32) -> Self {
+		Self { maps: self.maps.with(map, texture), ..self }
+	}
+
+	pub fn queue(&self) -> QueueKind {
+		self.shading.blending.queue()
+	}
+
+	pub fn writes_depth(&self) -> bool {
+		self.shading.blending.writes_depth()
+	}
+
+	pub fn writes_id(&self) -> bool {
+		self.shading.blending.writes_id()
+	}
+
+	pub fn validate(&self) -> Result<(), Error> {
+		if !self.shading.base_colour.is_finite() || !self.shading.emissive.is_finite() {
+			return Err(Error::Degenerate { reason: "a material with a non-finite colour" });
+		}
+		// BOTH FACTORS ARE MIXES, AND A MIX OUTSIDE ZERO TO ONE IS NOT ONE. A metallic above one
+		// drives the diffuse term negative, and a roughness above one takes `a = roughness^2` past
+		// the range every fit in these equations was made over - neither of which the shading
+		// reports, because both produce a colour.
+		if !(0.0..=1.0).contains(&self.shading.metallic) || !(0.0..=1.0).contains(&self.shading.roughness) {
+			return Err(Error::Degenerate { reason: "a metallic or roughness outside zero to one, which is a mix factor that does not mix" });
+		}
+		if !(0.0..=1.0).contains(&self.shading.occlusion_strength) || !self.shading.normal_scale.is_finite() {
+			return Err(Error::Degenerate { reason: "an occlusion strength outside zero to one or a non-finite normal scale" });
+		}
+		self.shading.blending.validate()?;
+		if matches!(self.shading.blending, Blending::Blended) != self.blend.enabled {
+			return Err(Error::Degenerate { reason: "a material whose blend state disagrees with its blending: a transparent material must blend and an opaque one must not" });
+		}
+		Ok(())
+	}
+}
+
+/// A drawable's material, resolved out of whichever table holds it.
+///
+/// THE RECORDER ASKS THIS AND NOT A TABLE. `emit`, `queue` and `pick` each need the same answers
+/// from a material - its pipeline, its uniforms, its queue, whether it writes depth and whether it
+/// writes an identity - and a branch per material family in each of the three is three places a
+/// family added later is forgotten in one of them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Shading<'a> {
+	Core(&'a Material),
+	Extended(&'a ExtendedMaterial),
+}
+
+impl Shading<'_> {
+	pub fn blending(&self) -> Blending {
+		match self {
+			Self::Core(material) => material.blending,
+			Self::Extended(material) => material.shading.blending,
+		}
+	}
+
+	pub fn queue(&self) -> QueueKind {
+		self.blending().queue()
+	}
+
+	pub fn writes_depth(&self) -> bool {
+		self.blending().writes_depth()
+	}
+
+	pub fn writes_id(&self) -> bool {
+		self.blending().writes_id()
+	}
+
+	pub fn pipeline(&self) -> render3d::GraphicsPipeline {
+		match self {
+			Self::Core(material) => material.pipeline,
+			Self::Extended(material) => material.pipeline,
+		}
+	}
+
+	pub fn uniforms(&self) -> u32 {
+		match self {
+			Self::Core(material) => material.uniforms,
+			Self::Extended(material) => material.uniforms,
+		}
+	}
+
+	/// Whether this is a material from the Extended part, for a caller that has to know - the
+	/// backend that picks a shader family, and nothing in this layer.
+	pub fn is_extended(&self) -> bool {
+		matches!(self, Self::Extended(_))
 	}
 }
 

@@ -266,9 +266,21 @@ fn send_resource(channel: &object::channel::Channel, kind: driver_protocol::Reso
 //
 // A frame carrying a generation that is not this binding's is DROPPED. There is one binding per test
 // here, so it can only come from a process that should no longer be speaking.
-fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<alloc::vec::Vec<(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)>> {
+/// One publication a driver offered in its bind handshake.
+///
+/// WHAT A PUBLICATION IS, AND NOT ONLY WHAT IT CARRIES: the kind says which contract it speaks, the
+/// token is the publisher's own name for it - which is what a `CONNECT` has to name - and the NAME
+/// is how two publications of one kind are told apart.
+struct Offer {
+	kind: u16,
+	token: u16,
+	name: alloc::vec::Vec<u8>,
+	object: alloc::sync::Arc<dyn object::KernelObject>,
+}
+
+fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<alloc::vec::Vec<Offer>> {
 	// ALLOC-OK: `#[cfg(test)]`, bounded by `MAX_INITIAL_OFFERS`.
-	let mut offers: alloc::vec::Vec<(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)> = alloc::vec::Vec::new();
+	let mut offers: alloc::vec::Vec<Offer> = alloc::vec::Vec::new();
 	loop {
 		let message = channel.recv().ok()?;
 		let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
@@ -282,8 +294,12 @@ fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<al
 				// reason the manager does: a `CONNECT` names WHICH publication the endpoint it
 				// carries is a connection to, and a provider whose contract begins with the driver
 				// speaking first - a NIC leading with its MAC - is only reachable that way.
-				if let (Ok((kind, token, _name)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
-					offers.push((kind, token, cap.object()));
+				// AND THE NAME BESIDE BOTH, because a kind does not tell two publications of one
+				// kind apart and this machine can carry several: two serial ports on one composite
+				// adapter both publish `console-bytes`, and a harness that dropped the name could
+				// only ever reach the first of them.
+				if let (Ok((kind, token, name)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
+					offers.push(Offer { kind, token, name: name.to_vec(), object: cap.object() });
 				}
 			}
 			driver_protocol::Opcode::Ready => return Some(offers),
@@ -294,8 +310,8 @@ fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<al
 }
 
 // The provider of one kind out of what a handshake offered.
-fn offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
-	offers.iter().find(|(k, _, _)| *k == kind).map(|(_, _, object)| object.clone())
+fn offer_of(offers: &[Offer], kind: u16) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+	offers.iter().find(|offer| offer.kind == kind).map(|offer| offer.object.clone())
 }
 
 // The nth provider of one kind out of what a handshake offered.
@@ -304,13 +320,24 @@ fn offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], k
 // they have to be told apart. The xHCI controller publishes two block providers - a Bulk-Only stick
 // and a UAS target, two devices with two transports - so a harness that asked for "the block one"
 // would be asking a question with two answers.
-fn nth_offer_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16, index: usize) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
-	offers.iter().filter(|(k, _, _)| *k == kind).map(|(_, _, object)| object.clone()).nth(index)
+fn nth_offer_of(offers: &[Offer], kind: u16, index: usize) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+	offers.iter().filter(|offer| offer.kind == kind).map(|offer| offer.object.clone()).nth(index)
 }
 
 // The publisher-local token one kind was offered under, which a `CONNECT` has to name.
-fn offer_token_of(offers: &[(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<u16> {
-	offers.iter().find(|(k, _, _)| *k == kind).map(|(_, token, _)| *token)
+fn offer_token_of(offers: &[Offer], kind: u16) -> Option<u16> {
+	offers.iter().find(|offer| offer.kind == kind).map(|offer| offer.token)
+}
+
+/// The token of the publication with this kind AND this name.
+///
+/// THE NAME IS WHAT SELECTS WHEN THE KIND CANNOT. A driver may publish several providers of one
+/// kind - two serial ports on one composite adapter, the UAS target's block channel beside the
+/// mass-storage one - and every one of them answers the same handshake. Asking by kind alone gets
+/// whichever was published first, which is a question with two right answers.
+#[allow(dead_code, reason = "used by the oracles that drive a composite device, which are compiled only when their gadget is")]
+fn offer_token_named(offers: &[Offer], kind: u16, name: &[u8]) -> Option<u16> {
+	offers.iter().find(|offer| offer.kind == kind && offer.name == name).map(|offer| offer.token)
 }
 
 // Mint one connection to a driver's publication, the way DeviceManager mints one: a `CONNECT`

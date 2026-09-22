@@ -4352,7 +4352,25 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 				// not kill it. What is NOT lost is the observation; what is lost is the automatic
 				// recovery, which on this evidence was recovering drivers that had nothing wrong
 				// with them and killing the boot to do it.
-				{
+				//
+				// **AND IT IS THE HEARTBEAT'S `Wedged` AND NOT EVERY `Wedged` (corrected
+				// 2026-09-21).** This event has TWO injectors and the comment eighty lines above
+				// says so: `expire_heartbeat` raises it for a driver that went quiet, and
+				// `expire_planned_stop` raises it for one that was ASKED to stop and did not
+				// confirm inside its slice. Widening the arm to every driver widened it to both,
+				// so an operator disabling a device stopped forcing the teardown and the device
+				// went on running - which is the opposite of what the operator asked for.
+				//
+				// THE TWO ARE TOLD APART BY THE STATE THEY ARE RAISED IN, which each injector
+				// already requires: `Online` for the watchdog, `Stopping` for the planned stop. So
+				// the mark-and-leave is guarded on `Online` and everything else falls through to
+				// the one teardown route, which is what the arm did before.
+				//
+				// FOUND BY `planned_stop_deadlines`, a fixture that runs at startup in the
+				// DEVELOPMENT build and asserts the node ends `Disabled` with no binding. The
+				// ordinary suites never run it, so 440 tests on three ports had nothing to say
+				// about this: the first thing that did was a cold scenario refusing to boot.
+				if node.record.state == BindingState::Online {
 					let missed: u32 = node.beat.resume(clock(), driver_protocol::heartbeat_period(node.beat.deadline()));
 					if missed.is_power_of_two() {
 						let mut count = [0u8; 20];

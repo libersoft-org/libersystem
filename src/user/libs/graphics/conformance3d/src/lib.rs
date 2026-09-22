@@ -441,6 +441,8 @@ pub const EXTENDED_CASES: &[ExtendedCase] = &[
 	ExtendedCase { feature: ExtendedFeature::UnshadowedBeyondLastCascade, scene: extended::shadows::unshadowed_beyond_last_cascade },
 	ExtendedCase { feature: ExtendedFeature::CascadeCountRefusal, scene: extended::shadows::cascade_count_refusal },
 	ExtendedCase { feature: ExtendedFeature::PointLightCubeShadow, scene: extended::shadows::point_light_cube_shadow },
+	ExtendedCase { feature: ExtendedFeature::ShadowProjectionFit, scene: extended::shadows::shadow_projection_fit },
+	ExtendedCase { feature: ExtendedFeature::HdrTargetFormat, scene: extended::postprocess::hdr_target_format },
 	ExtendedCase { feature: ExtendedFeature::BloomSoftKnee, scene: extended::postprocess::bloom_soft_knee },
 	ExtendedCase { feature: ExtendedFeature::BloomPyramid, scene: extended::postprocess::bloom_pyramid },
 	ExtendedCase { feature: ExtendedFeature::Rec709Luminance, scene: extended::postprocess::rec709_luminance },

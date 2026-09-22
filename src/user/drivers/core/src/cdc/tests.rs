@@ -354,6 +354,92 @@ fn acm_config_protocol(with_acm_descriptor: bool, capabilities: u8, protocol: u8
 	out
 }
 
+// TWO SERIAL FUNCTIONS ON ONE DEVICE, laid out the way a real one is.
+//
+// These bytes are the shape a Linux composite gadget with two `acm` functions actually presents,
+// read off the host with the fixture standing: interfaces 0 and 2 are the control halves, each with
+// a union naming ITS OWN data interface - 1 and 3 - and each data interface carries its own bulk
+// pair. Nothing about it is invented, which matters for a fixture whose whole job is to be the
+// device the binder will meet.
+fn acm_pair_config() -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(&[9, descriptor::DT_CONFIG, 0, 0, 4, 1, 0, 0x80, 50]);
+	// Function zero: control interface 0, data interface 1.
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 1, CLASS_COMMUNICATIONS, SUBCLASS_ACM, 1, 0]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_HEADER, 0x10, 0x01]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_CALL_MANAGEMENT, 0x00, 1]);
+	out.extend_from_slice(&[4, DT_CS_INTERFACE, FN_ACM, 0x02]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_UNION, 0, 1]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x85, 0x03, 0x0A, 0x00, 9]);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, 0, 2, CLASS_CDC_DATA, 0, 0, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x81, 0x02, 0x00, 0x02, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x02, 0x02, 0x00, 0x02, 0]);
+	// Function one: control interface 2, data interface 3.
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 2, 0, 1, CLASS_COMMUNICATIONS, SUBCLASS_ACM, 1, 0]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_HEADER, 0x10, 0x01]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_CALL_MANAGEMENT, 0x00, 3]);
+	out.extend_from_slice(&[4, DT_CS_INTERFACE, FN_ACM, 0x02]);
+	out.extend_from_slice(&[5, DT_CS_INTERFACE, FN_UNION, 2, 3]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x8A, 0x03, 0x0A, 0x00, 9]);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 3, 0, 2, CLASS_CDC_DATA, 0, 0, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x86, 0x02, 0x00, 0x02, 0]);
+	out.extend_from_slice(&[7, descriptor::DT_ENDPOINT, 0x07, 0x02, 0x00, 0x02, 0]);
+	out[2] = out.len() as u8;
+	out[3] = (out.len() >> 8) as u8;
+	out
+}
+
+#[test]
+fn each_serial_function_of_a_composite_device_binds_its_own_endpoints() {
+	// ONE BEST BULK PAIR IN THE CONFIGURATION IS THE DEFECT A SECOND FUNCTION EXPOSES. The binder
+	// kept a single lowest-alternate pair for the whole descriptor, which is right while there is
+	// one data interface and wrong the moment there are two: function one's union names interface
+	// three and the pair kept was interface one's, so the second port would either be refused as
+	// "its union names a data interface that is not in the configuration" or - worse - be handed
+	// the first port's endpoints, and the two byte streams would cross with nothing reporting it.
+	let config = acm_pair_config();
+
+	let first = bind_acm_nth(&config, 0).expect("the first serial function binds");
+	assert_eq!(first.control_interface, 0);
+	assert_eq!(first.data_interface, 1, "the interface ITS union names");
+	assert_eq!((first.bulk_in, first.bulk_out), (0x81, 0x02));
+	assert_eq!(first.notify_in, 0x85, "and its own notification endpoint");
+
+	let second = bind_acm_nth(&config, 1).expect("the second serial function binds");
+	assert_eq!(second.control_interface, 2);
+	assert_eq!(second.data_interface, 3, "the interface ITS union names, not the lowest in the configuration");
+	assert_eq!((second.bulk_in, second.bulk_out), (0x86, 0x07), "its own bulk pair, not the first function's");
+	assert_eq!(second.notify_in, 0x8A, "and its own notification endpoint, not the first function's 0x85");
+
+	assert_eq!(first.config_value, second.config_value, "both are in the same configuration, so both are reached by one SET_CONFIGURATION");
+}
+
+#[test]
+fn a_configuration_runs_out_of_serial_functions_and_says_so_the_one_way() {
+	// A caller walks 0, 1, 2... until it is told there are no more, and "no more" has to be the
+	// same answer as "this configuration carries none at all" - otherwise every caller needs a
+	// second way of asking the same question, and a device with one port would be read as an error
+	// on the second look.
+	assert_eq!(bind_acm_nth(&acm_pair_config(), 2), Err(NotBindable::NoNetworkInterface));
+	assert_eq!(bind_acm_nth(&acm_config(true, 0x02), 1), Err(NotBindable::NoNetworkInterface));
+}
+
+#[test]
+fn an_alternate_setting_of_a_control_interface_is_not_a_second_function() {
+	// A control interface with two alternate settings declares the interface number twice, and a
+	// binder counting DECLARATIONS rather than interfaces would report two serial ports on a device
+	// that has one - the second of them with no union, so it would be refused as malformed.
+	let mut config = acm_config(true, 0x02);
+	// A second alternate setting of interface 0, carrying nothing.
+	let mut extra: Vec<u8> = alloc::vec![9, descriptor::DT_INTERFACE, 0, 1, 0, CLASS_COMMUNICATIONS, SUBCLASS_ACM, 1, 0];
+	config.append(&mut extra);
+	let total = config.len();
+	config[2] = total as u8;
+	config[3] = (total >> 8) as u8;
+	assert!(bind_acm_nth(&config, 0).is_ok(), "the one function still binds");
+	assert_eq!(bind_acm_nth(&config, 1), Err(NotBindable::NoNetworkInterface), "and there is no second one");
+}
+
 #[test]
 fn the_union_names_the_data_interface_and_the_next_one_is_not_it() {
 	// On a composite device the interface after the communications one belongs to something else,

@@ -45,6 +45,13 @@ pub const RX_BYTES: usize = 2048;
 
 /// One bound CDC-ACM adapter: its two bulk pipes and what the device said it can do.
 pub struct Serial {
+	// THE SLOT THIS ADAPTER IS ON, kept HERE rather than taken from a `UsbDevice` beside it.
+	//
+	// A COMPOSITE DEVICE CARRIES SEVERAL ADAPTERS ON ONE SLOT, so "the device this port belongs to"
+	// stopped being a one-to-one pairing the moment a second function was bindable - and every
+	// operation on a bound port needs exactly one thing from the device, which is this number. The
+	// device itself is still held, once, because it owns the pages its control transfers use.
+	slot: u32,
 	dci_in: u32,
 	dci_out: u32,
 	ring_in: Ring,
@@ -82,6 +89,11 @@ impl Serial {
 		self.line_coding
 	}
 
+	/// The slot this port's device is on, which is how a port and its device find each other.
+	pub fn slot(&self) -> u32 {
+		self.slot
+	}
+
 	/// Give this adapter's pages and rings back.
 	pub fn release(&mut self) {
 		self.ring_in.release();
@@ -95,7 +107,19 @@ impl Serial {
 	}
 }
 
-/// Walk this device's configurations, bind it as a CDC-ACM adapter and bring its pipes up.
+/// Walk this device's configurations, bind EVERY CDC-ACM adapter it carries and bring their pipes
+/// up. Answers how many are in `out`.
+///
+/// SEVERAL, BECAUSE ONE DEVICE CAN BE SEVERAL SERIAL PORTS. A two-port USB serial adapter is one
+/// composite device with two ACM functions in one configuration, and a driver that stopped at the
+/// first one left the second port on the bus with nothing driving it - which looks from outside
+/// exactly like a port that does not work.
+///
+/// ONE WALK AND ONE COMMAND, whatever the count. The configuration descriptors are read once, every
+/// function in the chosen configuration is decided from the same bytes before any other control
+/// transfer disturbs them, and all their endpoints go into ONE input context and ONE
+/// `CONFIGURE_ENDPOINT` - which is also the only way to build it, since a device has one slot
+/// context whose Context Entries field has to cover the highest endpoint of all of them.
 ///
 /// QUIET WHEN IT IS NOT AN ACM DEVICE AT ALL, and loud about every other refusal. This is offered
 /// every communications-class device before the network models are, and most of them are adapters:
@@ -106,7 +130,7 @@ impl Serial {
 /// # Safety
 /// `dev` is an addressed device this controller owns, and its input context and data page are this
 /// driver's mappings.
-pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Serial> {
+pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice, limit: usize, out: &mut Vec<Serial>) -> usize {
 	unsafe {
 		let mut hids: Hids = Hids::new();
 		// A DEVICE MAY OFFER SEVERAL CONFIGURATIONS and the host picks one; a composite adapter that
@@ -116,7 +140,12 @@ pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ser
 			Some(received) if received >= 18 => r8(dev.data_virt + 17).max(1),
 			_ => 1,
 		};
-		let mut chosen: Option<cdc::AcmBinding> = None;
+		// EVERY FUNCTION OF THE CHOSEN CONFIGURATION, DECIDED BEFORE ANYTHING ELSE IS ASKED OF THE
+		// DEVICE. `bind_acm_nth` reads the descriptor where the last control transfer left it, and
+		// the next transfer overwrites that page - so the bindings are taken out of it here, while
+		// the bytes are still the ones they were read from.
+		let mut bound: [Option<cdc::AcmBinding>; cdc::MAX_ACM_FUNCTIONS] = [const { None }; cdc::MAX_ACM_FUNCTIONS];
+		let mut count: usize = 0;
 		let mut refusal: Option<cdc::NotBindable> = None;
 		for index in 0..configurations.min(8) {
 			let Some(head) = control_in_req(hc, &mut hids, dev, 0x80, REQ_GET_DESCRIPTOR, DESC_CONFIG << 8 | index as u16, 0, 9) else {
@@ -134,40 +163,72 @@ pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ser
 			};
 			let Ok(total) = descriptor::check_transfer(total, received) else { continue };
 			let config_bytes = core::slice::from_raw_parts(dev.data_virt as *const u8, total as usize);
-			match cdc::bind_acm(config_bytes) {
-				Ok(bound) => {
-					chosen = Some(bound);
-					break;
+			for nth in 0..limit.min(cdc::MAX_ACM_FUNCTIONS) {
+				match cdc::bind_acm_nth(config_bytes, nth) {
+					Ok(one) => {
+						bound[count] = Some(one);
+						count += 1;
+					}
+					// NO `nth` FUNCTION IS THE END OF THIS CONFIGURATION AND NOT A REFUSAL, unless
+					// nothing was found at all - in which case it is the quiet answer below.
+					Err(cdc::NotBindable::NoNetworkInterface) => break,
+					Err(why) => {
+						refusal = Some(why);
+						break;
+					}
 				}
-				Err(why) => refusal = Some(why),
+			}
+			if count > 0 {
+				break;
 			}
 		}
-		let bound = match chosen {
-			Some(bound) => bound,
+		if count == 0 {
 			// THE QUIET REFUSAL, and the only one. Every other device offered here is a
 			// communications-class device that is not a serial port, and the module after this one
 			// says what it is or is not.
-			None if matches!(refusal, Some(cdc::NotBindable::NoNetworkInterface) | None) => return None,
-			None => {
-				print(b"driver.xhci: a CDC-ACM interface is on the bus and could not be bound - ");
-				print(match refusal {
-					Some(cdc::NotBindable::NoUnion) => b"no union functional descriptor".as_slice(),
-					Some(cdc::NotBindable::NoDataInterface) => b"its union names a data interface that is not in the configuration",
-					Some(cdc::NotBindable::NoBulkPair) => b"no alternate setting carries a bulk pair",
-					_ => b"its configuration descriptor is malformed",
-				});
-				print(b"\n");
-				return None;
+			if matches!(refusal, Some(cdc::NotBindable::NoNetworkInterface) | None) {
+				return 0;
 			}
-		};
+			print(b"driver.xhci: a CDC-ACM interface is on the bus and could not be bound - ");
+			print(match refusal {
+				Some(cdc::NotBindable::NoUnion) => b"no union functional descriptor".as_slice(),
+				Some(cdc::NotBindable::NoDataInterface) => b"its union names a data interface that is not in the configuration",
+				Some(cdc::NotBindable::NoBulkPair) => b"no alternate setting carries a bulk pair",
+				_ => b"its configuration descriptor is malformed",
+			});
+			print(b"\n");
+			return 0;
+		}
 
-		let dci_in: u32 = (bound.bulk_in & 0x0f) as u32 * 2 + 1;
-		let dci_out: u32 = (bound.bulk_out & 0x0f) as u32 * 2;
-		let ring_in: Ring = Ring::new()?;
-		let ring_out: Ring = Ring::new()?;
+		// THE RINGS FIRST, because the input context has to carry their addresses and a ring that
+		// could not be allocated is a port that is not brought up rather than one whose endpoint
+		// context points at nothing.
+		let mut rings: [Option<(Ring, Ring)>; cdc::MAX_ACM_FUNCTIONS] = [const { None }; cdc::MAX_ACM_FUNCTIONS];
+		for slot in rings.iter_mut().take(count) {
+			let Some(ring_in) = Ring::new() else { break };
+			let Some(ring_out) = Ring::new() else {
+				let mut ring_in = ring_in;
+				ring_in.release();
+				break;
+			};
+			*slot = Some((ring_in, ring_out));
+		}
+		let ready = rings.iter().take(count).take_while(|slot| slot.is_some()).count();
+		if ready == 0 {
+			return 0;
+		}
+
 		core::ptr::write_bytes(dev.in_virt as *mut u8, 0, 4096);
-		((dev.in_virt + 4) as *mut u32).write_volatile(1 | 1 << dci_in | 1 << dci_out);
-		let entries: u32 = dci_in.max(dci_out);
+		let mut add: u32 = 1;
+		let mut entries: u32 = 0;
+		for index in 0..ready {
+			let one = bound[index].as_ref().expect("a binding that was counted");
+			let dci_in: u32 = (one.bulk_in & 0x0f) as u32 * 2 + 1;
+			let dci_out: u32 = (one.bulk_out & 0x0f) as u32 * 2;
+			add |= 1 << dci_in | 1 << dci_out;
+			entries = entries.max(dci_in).max(dci_out);
+		}
+		((dev.in_virt + 4) as *mut u32).write_volatile(add);
 		let slot_ctx: u64 = dev.in_virt + hc.ctx_size;
 		(slot_ctx as *mut u32).write_volatile(entries << 27 | dev.speed << 20 | dev.route);
 		((slot_ctx + 4) as *mut u32).write_volatile(dev.port << 16);
@@ -176,60 +237,134 @@ pub unsafe fn configure_serial(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Ser
 		// state - carrier, ring, break, framing errors - and there is nothing above this driver that
 		// takes them. An interrupt pipe configured for a consumer that does not exist is bandwidth
 		// the bus reserves for nobody and an endpoint whose transfers have to be reaped anyway.
-		let contexts: [(u32, u32, u32, &Ring); 2] = [(dci_in, bound.bulk_in_packet as u32, 6u32, &ring_in), (dci_out, bound.bulk_out_packet as u32, 2u32, &ring_out)];
-		for &(dci, mps, ep_type, ring) in &contexts {
-			let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
-			((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
-			((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
-			((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
-			((ep_ctx + 16) as *mut u32).write_volatile(mps);
+		for index in 0..ready {
+			let one = bound[index].as_ref().expect("a binding that was counted");
+			let (ring_in, ring_out) = rings[index].as_ref().expect("a ring pair that was made");
+			let dci_in: u32 = (one.bulk_in & 0x0f) as u32 * 2 + 1;
+			let dci_out: u32 = (one.bulk_out & 0x0f) as u32 * 2;
+			let contexts: [(u32, u32, u32, &Ring); 2] = [(dci_in, one.bulk_in_packet as u32, 6u32, ring_in), (dci_out, one.bulk_out_packet as u32, 2u32, ring_out)];
+			for &(dci, mps, ep_type, ring) in &contexts {
+				let ep_ctx: u64 = dev.in_virt + (1 + dci as u64) * hc.ctx_size;
+				((ep_ctx + 4) as *mut u32).write_volatile(mps << 16 | ep_type << 3 | 3 << 1);
+				((ep_ctx + 8) as *mut u32).write_volatile((ring.phys | ring.cycle as u64) as u32);
+				((ep_ctx + 12) as *mut u32).write_volatile((ring.phys >> 32) as u32);
+				((ep_ctx + 16) as *mut u32).write_volatile(mps);
+			}
 		}
 		if command_and_wait(hc, dev.in_phys, 0, TRB_CONFIGURE_ENDPOINT << 10 | dev.slot << 24).is_none() {
 			print(b"driver.xhci: the CDC-ACM adapter's bulk endpoints were refused by the controller\n");
-			return None;
+			return 0;
 		}
-		if control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, bound.config_value as u16, 0).is_none() {
+		// ONE SET_CONFIGURATION FOR THE DEVICE AND NOT ONE PER PORT: the request selects a
+		// configuration, and issuing it again would reset every interface in it - including the one
+		// a port brought up a moment ago.
+		let config_value = bound[0].as_ref().expect("a binding that was counted").config_value;
+		if control_nodata(hc, &mut hids, dev, 0x00, REQ_SET_CONFIGURATION, config_value as u16, 0).is_none() {
 			print(b"driver.xhci: the CDC-ACM adapter refused SET_CONFIGURATION\n");
-			return None;
-		}
-		// THE ALTERNATE SETTING THAT HAS THE ENDPOINTS, which is the request a CDC driver forgets:
-		// setting zero carries none by definition, so everything above is correct and nothing ever
-		// arrives.
-		if control_nodata(hc, &mut hids, dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, bound.data_alternate as u16, bound.data_interface as u16).is_none() {
-			print(b"driver.xhci: the CDC-ACM adapter refused the alternate setting that carries its endpoints\n");
-			return None;
+			return 0;
 		}
 
-		// AND THE LINE, ONLY IF THE DEVICE SAID IT HAS ONE. A stall here is recovered from rather
-		// than fatal for the same reason the capability is read at all: the byte stream is the
-		// product, and a link with no UART behind it is a working one that cannot be configured.
-		if bound.supports_line_coding() {
-			let coding = cdc::LineCoding::default_8n1().encode();
-			core::ptr::copy_nonoverlapping(coding.as_ptr(), dev.data_virt as *mut u8, coding.len());
-			if control_out_req(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_LINE_CODING, 0, bound.control_interface as u16, coding.len() as u16).is_none() {
-				print(b"driver.xhci: the CDC-ACM adapter stalled SET_LINE_CODING although it declared the capability - the byte stream is kept and the line is left as it was\n");
+		let mut brought_up: usize = 0;
+		for index in 0..ready {
+			let one = bound[index].as_ref().expect("a binding that was counted");
+			// THE ALTERNATE SETTING THAT HAS THE ENDPOINTS, which is the request a CDC driver
+			// forgets: setting zero carries none by definition, so everything above is correct and
+			// nothing ever arrives.
+			if control_nodata(hc, &mut hids, dev, RT_INTERFACE_OUT, REQ_SET_INTERFACE, one.data_alternate as u16, one.data_interface as u16).is_none() {
+				print(b"driver.xhci: the CDC-ACM adapter refused the alternate setting that carries its endpoints\n");
+				continue;
 			}
-			// DTR AND RTS ARE A BITMAP IN wValue AND THE REQUEST HAS NO DATA STAGE. Raising both is
-			// what tells the other end somebody is here; a device with no modem lines ignores it.
-			if control_nodata(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_CONTROL_LINE_STATE, cdc::control_lines(true, true), bound.control_interface as u16).is_none() {
-				print(b"driver.xhci: the CDC-ACM adapter stalled SET_CONTROL_LINE_STATE - the byte stream is kept\n");
+			// AND THE LINE, ONLY IF THE DEVICE SAID IT HAS ONE. A stall here is recovered from
+			// rather than fatal for the same reason the capability is read at all: the byte stream
+			// is the product, and a link with no UART behind it is a working one that cannot be
+			// configured.
+			if one.supports_line_coding() {
+				let coding = cdc::LineCoding::default_8n1().encode();
+				core::ptr::copy_nonoverlapping(coding.as_ptr(), dev.data_virt as *mut u8, coding.len());
+				if control_out_req(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_LINE_CODING, 0, one.control_interface as u16, coding.len() as u16).is_none() {
+					print(b"driver.xhci: the CDC-ACM adapter stalled SET_LINE_CODING although it declared the capability - the byte stream is kept and the line is left as it was\n");
+				}
+				// DTR AND RTS ARE A BITMAP IN wValue AND THE REQUEST HAS NO DATA STAGE. Raising both
+				// is what tells the other end somebody is here; a device with no modem lines
+				// ignores it.
+				if control_nodata(hc, &mut hids, dev, RT_CLASS_INTERFACE_OUT, cdc::REQ_SET_CONTROL_LINE_STATE, cdc::control_lines(true, true), one.control_interface as u16).is_none() {
+					print(b"driver.xhci: the CDC-ACM adapter stalled SET_CONTROL_LINE_STATE - the byte stream is kept\n");
+				}
 			}
+			let (Some((rx_handle, rx_virt, rx_phys)), Some((tx_handle, tx_virt, tx_phys))) = (dma_page(), dma_page()) else {
+				break;
+			};
+			let (ring_in, ring_out) = rings[index].take().expect("a ring pair that was made");
+			out.push(Serial { slot: dev.slot, dci_in: (one.bulk_in & 0x0f) as u32 * 2 + 1, dci_out: (one.bulk_out & 0x0f) as u32 * 2, ring_in, ring_out, rx_handle, rx_virt, rx_phys, tx_handle, tx_virt, tx_phys, posted: false, line_coding: one.supports_line_coding() });
+			brought_up += 1;
 		}
+		// A RING PAIR WHOSE PORT DID NOT COME UP IS GIVEN BACK rather than left to the process's
+		// lifetime - the same rule `Serial::release` keeps for the ones that did.
+		for slot in rings.iter_mut() {
+			if let Some((ring_in, ring_out)) = slot.as_mut() {
+				ring_in.release();
+				ring_out.release();
+			}
+			*slot = None;
+		}
+		brought_up
+	}
+}
 
-		let (rx_handle, rx_virt, rx_phys) = dma_page()?;
-		let (tx_handle, tx_virt, tx_phys) = dma_page()?;
-		Some(Serial { dci_in, dci_out, ring_in, ring_out, rx_handle, rx_virt, rx_phys, tx_handle, tx_virt, tx_phys, posted: false, line_coding: bound.supports_line_coding() })
+/// HOW MANY SERIAL PORTS THIS CONTROLLER PUBLISHES.
+///
+/// TWO, AND THE NUMBER IS A PUBLICATION AND NOT A CAPACITY. Each bound port is a `console-bytes`
+/// provider of its own, and the provider list a driver offers is POSITIONAL - a token is a place in
+/// it - so the count has to be fixed when the binding is made rather than when a device arrives.
+/// Two is what the fixture this was proved against carries and what a two-port adapter is; a third
+/// port is one more entry in that list and one more name, decided the day a machine has one.
+pub const MAX_PORTS: usize = 2;
+
+/// The serial adapters this controller has bound, and the devices they are on.
+///
+/// TWO LISTS AND NOT A LIST OF PAIRS, because the relation is not one to one: a composite adapter
+/// is ONE device carrying TWO ports, and pairing each port with a device would either duplicate a
+/// `UsbDevice` - which owns pages, so a copy is a double free waiting to happen - or force the two
+/// ports of one device to be modelled as something other than two ports.
+pub struct Serials {
+	pub devices: Vec<UsbDevice>,
+	pub ports: Vec<Serial>,
+}
+
+impl Serials {
+	pub const fn new() -> Serials {
+		Serials { devices: Vec::new(), ports: Vec::new() }
+	}
+
+	pub fn len(&self) -> usize {
+		self.ports.len()
+	}
+
+	/// The device a port is on, and the port, borrowed together.
+	///
+	/// BY SLOT, because that is what a port knows about its device and what an event carries.
+	pub fn pair(&mut self, index: usize) -> Option<(&mut UsbDevice, &mut Serial)> {
+		let slot = self.ports.get(index)?.slot();
+		let port = self.ports.get_mut(index)?;
+		let device = self.devices.iter_mut().find(|device| device.slot == slot)?;
+		Some((device, port))
+	}
+}
+
+impl Default for Serials {
+	fn default() -> Serials {
+		Serials::new()
 	}
 }
 
 /// Post the standing receive, if one is not already outstanding.
-pub fn post_receive(hc: &Xhci, dev: &UsbDevice, serial: &mut Serial) {
+pub fn post_receive(hc: &Xhci, serial: &mut Serial) {
 	unsafe {
 		if serial.posted {
 			return;
 		}
 		serial.ring_in.push(serial.rx_phys, RX_BYTES as u32, TRB_NORMAL << 10 | TRB_IOC);
-		w32(hc.db + dev.slot as u64 * 4, serial.dci_in);
+		w32(hc.db + serial.slot as u64 * 4, serial.dci_in);
 		serial.posted = true;
 	}
 }
@@ -248,7 +383,7 @@ pub fn handle_serial_event(hc: &mut Xhci, dev: &mut UsbDevice, serial: &mut Seri
 		if control >> 10 & 0x3f != TRB_EV_TRANSFER {
 			return false;
 		}
-		if control >> 24 != dev.slot || (control >> 16 & 0x1f) != serial.dci_in {
+		if control >> 24 != serial.slot || (control >> 16 & 0x1f) != serial.dci_in {
 			return false;
 		}
 		serial.posted = false;
@@ -256,20 +391,20 @@ pub fn handle_serial_event(hc: &mut Xhci, dev: &mut UsbDevice, serial: &mut Seri
 		if code == CC_STALL {
 			let dequeue: u64 = serial.ring_in.phys + serial.ring_in.index * 16 | serial.ring_in.cycle as u64;
 			let mut none: Hids = Hids::new();
-			reset_endpoint(hc, &mut none, dev.slot, serial.dci_in, dequeue);
+			reset_endpoint(hc, &mut none, serial.slot, serial.dci_in, dequeue);
 			let address: u16 = 0x80 | (serial.dci_in >> 1) as u16;
 			let _ = control_nodata(hc, &mut none, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, address);
-			post_receive(hc, dev, serial);
+			post_receive(hc, serial);
 			return false;
 		}
 		if code != CC_SUCCESS && code != CC_SHORT_PACKET {
-			post_receive(hc, dev, serial);
+			post_receive(hc, serial);
 			return false;
 		}
 		// The event's residual is what was NOT transferred, so what arrived is the difference.
 		let moved: usize = RX_BYTES.saturating_sub((status & 0x00ff_ffff) as usize);
 		if moved == 0 {
-			post_receive(hc, dev, serial);
+			post_receive(hc, serial);
 			return false;
 		}
 		out.clear();
@@ -277,7 +412,7 @@ pub fn handle_serial_event(hc: &mut Xhci, dev: &mut UsbDevice, serial: &mut Seri
 		for i in 0..moved {
 			out.push(r8(serial.rx_virt + i as u64));
 		}
-		post_receive(hc, dev, serial);
+		post_receive(hc, serial);
 		true
 	}
 }
@@ -290,12 +425,12 @@ fn transmit(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, serial: &mut Se
 		}
 		core::ptr::copy_nonoverlapping(bytes.as_ptr(), serial.tx_virt as *mut u8, bytes.len());
 		serial.ring_out.push(serial.tx_phys, bytes.len() as u32, TRB_NORMAL << 10 | TRB_IOC);
-		w32(hc.db + dev.slot as u64 * 4, serial.dci_out);
-		match wait_transfer(hc, hids, dev.slot, serial.dci_out) {
+		w32(hc.db + serial.slot as u64 * 4, serial.dci_out);
+		match wait_transfer(hc, hids, serial.slot, serial.dci_out) {
 			Some(CC_SUCCESS) | Some(CC_SHORT_PACKET) => true,
 			Some(CC_STALL) => {
 				let dequeue: u64 = serial.ring_out.phys + serial.ring_out.index * 16 | serial.ring_out.cycle as u64;
-				reset_endpoint(hc, hids, dev.slot, serial.dci_out, dequeue);
+				reset_endpoint(hc, hids, serial.slot, serial.dci_out, dequeue);
 				let address: u16 = (serial.dci_out >> 1) as u16;
 				let _ = control_nodata(hc, hids, dev, RT_ENDPOINT, REQ_CLEAR_FEATURE, FEATURE_ENDPOINT_HALT, address);
 				false
@@ -315,6 +450,10 @@ fn transmit(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, serial: &mut Se
 pub struct Adapter<'a> {
 	pub hc: &'a mut Xhci,
 	pub hids: &'a mut Hids,
+	// THE DEVICE, STILL, ALTHOUGH THE PORT CARRIES ITS OWN SLOT. Clearing a halted endpoint is a
+	// CONTROL transfer, which runs on the device's control ring and through its data page - so a
+	// port that can recover from a stall cannot be addressed by its slot number alone. Everything
+	// else here is the port's.
 	pub dev: &'a mut UsbDevice,
 	pub serial: &'a mut Serial,
 }

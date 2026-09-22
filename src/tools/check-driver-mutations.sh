@@ -313,10 +313,20 @@ mutate "$DRIVERS" src/user/drivers/core/src/hid.rs \
 # CDC-ACM: the union names the data interface. Binding "the interface after the communications one"
 # takes a bulk pair another function is using on a composite device - and neither half refuses.
 mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
-	"	let (notify_in, notify_packet) = notify.unwrap_or((0, 0));" \
-	"	let (notify_in, notify_packet) = notify.unwrap_or((0, 0));
+	"	let (notify_in, notify_packet) = function.notify.unwrap_or((0, 0));" \
+	"	let (notify_in, notify_packet) = function.notify.unwrap_or((0, 0));
 	let data_interface = union_data + 1;" \
 	the_union_names_the_data_interface_and_the_next_one_is_not_it
+
+# CDC-ACM: a data interface's bulk pair is kept UNDER ITS OWN INTERFACE NUMBER, and the union is what
+# selects which one. Keeping one best pair for the whole configuration is right while there is one
+# data interface and wrong the moment a composite device carries two: the second function's union
+# names interface three and the pair kept is interface one's, so either a good device is refused or
+# one function is handed the other's endpoints and the two byte streams cross.
+mutate "$DRIVERS" src/user/drivers/core/src/cdc.rs \
+	"data.iter().flatten().find(|(iface, ..)| *iface == union_data)" \
+	"data.iter().flatten().min_by_key(|(iface, ..)| *iface)" \
+	each_serial_function_of_a_composite_device_binds_its_own_endpoints
 
 # CDC-ACM: ONE stop bit is encoded as ZERO. Writing the number you mean asks for one and a half,
 # which some devices accept and then frame every byte differently.

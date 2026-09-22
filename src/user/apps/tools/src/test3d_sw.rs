@@ -30,7 +30,7 @@ use graphics_core::{AlphaMode, ColorSpace, ImageView, ImageViewMut, OwnedImage, 
 use keys::usage;
 use proto::system::{LaunchContext, input};
 use render_math::camera::Viewport;
-use render_math::{Mat4, Quat, Vec3, Vec4, camera};
+use render_math::{Mat4, Quat, Vec3, Vec4, camera, sqrt};
 use render_shader::builder::Builder;
 use render_shader::ir::{BinaryOp, Binding, Constant, Module, Op, Output, Stage, Transcendental, Type, UnaryOp};
 use render2d::Canvas;
@@ -46,7 +46,7 @@ use soft3d::pass::{Colour, DepthStencil};
 use soft3d::texture::{Filter, Kind, Level, Sampler, Texture, Wrap};
 use soft3d::{Indices, Val};
 
-const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
+const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
 
 // THE SCENE IS RENDERED AT THE SURFACE'S OWN SIZE unless a run says otherwise, because that is what
 // an application does and what makes a measurement at a stated resolution mean anything: a demo that
@@ -103,6 +103,43 @@ const U_LIGHT_DIR: u32 = 2;
 const U_LIGHT_POINT: u32 = 3;
 const U_EYE: u32 = 4;
 const U_AMBIENT: u32 = 5;
+// THE LIGHT'S OWN VIEW-PROJECTION, which the Extended phase needs in BOTH stages: the shadow pass
+// draws through it and the lighting pass looks the fragment up in what it wrote.
+const U_LIGHT_VP: u32 = 6;
+
+// -------------------------------------------------------------------------------------------------
+// `Scene3D Extended Profile 1`'s own phase: a physically based sphere with a normal map, and a cast
+// shadow. SEPARATE FROM THE CORE SCENE AND NOT ADDED TO IT, because the core demo is a core gate:
+// `--extended` selects this scene instead, and nothing the core phase does changes.
+// -------------------------------------------------------------------------------------------------
+
+/// The tangent-space normal map, generated like the checkerboards are.
+const TEX_NORMAL: u32 = 2;
+/// The shadow map: what the light saw, as depth in a colour attachment.
+const TEX_SHADOW: u32 = 3;
+const SAMP_SHADOW: u32 = 2;
+const ID_SPHERE: f32 = 4.0;
+/// The shadow map's extent. SQUARE AND FIXED, because the light's projection is square: a map whose
+/// aspect did not match the projection's would stretch every shadow along one axis.
+const SHADOW_EXTENT: u32 = 512;
+/// The constant depth bias, in light-space depth units.
+///
+/// WITHOUT ONE EVERY LIT SURFACE SHADOWS ITSELF: the depth the map holds for a texel and the depth
+/// the fragment has are the same surface sampled at two different places, and half the comparisons
+/// come out the wrong way. The value is a texel's worth of slope at this extent and this projection.
+const SHADOW_BIAS: f32 = 0.0035;
+/// How far across the scene the light's orthographic box reaches.
+const SHADOW_HALF_EXTENT: f32 = 3.0;
+/// The sphere's own roughness and reflectance, which this scene fixes rather than sampling: the maps
+/// under test here are the NORMAL map and the shadow map, and a metallic-roughness map would put a
+/// third thing in one picture.
+const PBR_ROUGHNESS: f32 = 0.35;
+const PBR_F0: f32 = 0.04;
+/// The Extended light's intensity. THE DIFFUSE TERM CARRIES A `1 / pi`, which is the BRDF's own
+/// normalisation and not a brightness choice - a scene lit by a light of intensity one through a
+/// correctly normalised BRDF is a third as bright as the same scene through an unnormalised one, and
+/// the answer is to state the light's intensity rather than to drop the divisor.
+const PBR_LIGHT: f32 = 3.0;
 
 // One vertex of the scene. Position and normal are in MODEL space; the shader transforms both.
 #[derive(Clone, Copy)]
@@ -124,6 +161,13 @@ struct Vertex {
 	/// "what is under this pixel", and the only answer that survives lighting, texturing and
 	/// transparency is one the rasteriser wrote at the same time as the colour.
 	ident: [f32; 4],
+	/// THE TANGENT, in model space, with the handedness in `w`.
+	///
+	/// A NORMAL MAP IS IN TANGENT SPACE AND NOTHING ELSE KNOWS WHERE THAT IS. The map's three numbers
+	/// are a direction relative to the surface's own texture axes, so a surface that carries a normal
+	/// map has to carry those axes too - the bitangent is the cross product, which is why one vector
+	/// and a sign is enough. Zero for a surface with no map, which the core phase's every vertex is.
+	tangent: [f32; 4],
 }
 
 // The scene's geometry, as one indexed mesh.
@@ -168,7 +212,7 @@ impl Mesh {
 				// THE CORNERS ARE EXACTLY `0` AND `1`, so the clamped sampler's edge behaviour is
 				// the one under test and not an accident of where the texture happened to end.
 				let uv = [(sx + 1.0) * 0.5, (1.0 - sy) * 0.5, 0.0, 0.0];
-				vertices.push(Vertex { position: [position[0] * 0.75, position[1] * 0.75, position[2] * 0.75, 1.0], normal: [n.x, n.y, n.z, 0.0], colour, uv, weights, ident: [ID_CUBE, 0.0, 0.0, 0.0] });
+				vertices.push(Vertex { position: [position[0] * 0.75, position[1] * 0.75, position[2] * 0.75, 1.0], normal: [n.x, n.y, n.z, 0.0], colour, uv, weights, ident: [ID_CUBE, 0.0, 0.0, 0.0], tangent: [0.0; 4] });
 			}
 			indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 		}
@@ -180,7 +224,64 @@ impl Mesh {
 			// COORDINATES WELL OUTSIDE `0..=1`, which is the whole of the repeat test: a ground whose
 			// UVs stayed in range would sample the same texel pattern once and prove nothing.
 			let uv = [(x + 6.0) / 12.0 * GROUND_REPEATS, (z + 6.0) / 12.0 * GROUND_REPEATS, 0.0, 0.0];
-			vertices.push(Vertex { position: [x, -1.4, z, 1.0], normal: [0.0, 1.0, 0.0, 0.0], colour: grey, uv, weights: [0.0, 1.0, 0.0, 0.0], ident: [ID_GROUND, 0.0, 0.0, 0.0] });
+			vertices.push(Vertex { position: [x, -1.4, z, 1.0], normal: [0.0, 1.0, 0.0, 0.0], colour: grey, uv, weights: [0.0, 1.0, 0.0, 0.0], ident: [ID_GROUND, 0.0, 0.0, 0.0], tangent: [1.0, 0.0, 0.0, 1.0] });
+		}
+		indices.extend_from_slice(&[ground, ground + 2, ground + 1, ground, ground + 3, ground + 2]);
+		Mesh { vertices, indices }
+	}
+
+	/// The Extended phase's scene: a sphere on the same ground the core scene uses.
+	///
+	/// A SPHERE AND NOT A CUBE, because what this scene is for is a normal map and a shadow, and both
+	/// are invisible on a flat face: a normal map perturbs a direction, so a surface whose direction
+	/// never changes shows one constant perturbation, and a shadow cast by a box is a box.
+	///
+	/// THE TANGENTS ARE DERIVED FROM THE PARAMETRISATION rather than solved from the triangles. The
+	/// sphere's `u` runs along its longitude, so the tangent IS the derivative of the position with
+	/// respect to that angle - exact, per vertex, and with no averaging over a triangle fan at the
+	/// poles where an averaged tangent is undefined.
+	fn extended() -> Mesh {
+		let mut vertices: Vec<Vertex> = Vec::new();
+		let mut indices: Vec<u32> = Vec::new();
+		const RINGS: u32 = 48;
+		const SEGMENTS: u32 = 96;
+		const RADIUS: f32 = 0.9;
+		// THE UV REPEATS, so the map's own texels are visible as a pattern rather than stretched once
+		// over the whole sphere.
+		const UV_REPEATS: f32 = 4.0;
+		let base_colour = [0.82, 0.78, 0.72, 1.0];
+		for ring in 0..=RINGS {
+			let polar = ring as f32 / RINGS as f32 * core::f32::consts::PI;
+			let (sin_polar, cos_polar) = (sin(polar), cos(polar));
+			for segment in 0..=SEGMENTS {
+				let azimuth = segment as f32 / SEGMENTS as f32 * core::f32::consts::PI * 2.0;
+				let (sin_azimuth, cos_azimuth) = (sin(azimuth), cos(azimuth));
+				let normal = [sin_polar * cos_azimuth, cos_polar, sin_polar * sin_azimuth];
+				let position = [normal[0] * RADIUS, normal[1] * RADIUS, normal[2] * RADIUS, 1.0];
+				// d(position)/d(azimuth), with the `sin_polar` factor divided out so it is a unit
+				// vector at every latitude. AT A POLE that factor is zero and the derivative
+				// vanishes; the expression without it is the limit, which keeps the pole's tangent
+				// in the same family as its neighbours' rather than at an arbitrary angle to them.
+				let tangent = [-sin_azimuth, 0.0, cos_azimuth];
+				let uv = [segment as f32 / SEGMENTS as f32 * UV_REPEATS, ring as f32 / RINGS as f32 * UV_REPEATS, 0.0, 0.0];
+				vertices.push(Vertex { position: [position[0], position[1] + 0.35, position[2], 1.0], normal: [normal[0], normal[1], normal[2], 0.0], colour: base_colour, uv, weights: [0.0; 4], ident: [ID_SPHERE, 0.0, 0.0, 0.0], tangent: [tangent[0], tangent[1], tangent[2], 1.0] });
+			}
+		}
+		let stride = SEGMENTS + 1;
+		for ring in 0..RINGS {
+			for segment in 0..SEGMENTS {
+				let a = ring * stride + segment;
+				let b = a + stride;
+				indices.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+			}
+		}
+		// THE GROUND THE SHADOW FALLS ON. A cast shadow needs something to be cast ONTO, and a scene
+		// whose only surface is the caster shows nothing at all.
+		let ground = vertices.len() as u32;
+		let grey = [0.34, 0.35, 0.38, 1.0];
+		for (x, z) in [(-6.0_f32, -6.0_f32), (6.0, -6.0), (6.0, 6.0), (-6.0, 6.0)] {
+			let uv = [(x + 6.0) / 12.0 * GROUND_REPEATS, (z + 6.0) / 12.0 * GROUND_REPEATS, 0.0, 0.0];
+			vertices.push(Vertex { position: [x, -1.4, z, 1.0], normal: [0.0, 1.0, 0.0, 0.0], colour: grey, uv, weights: [0.0; 4], ident: [ID_GROUND, 0.0, 0.0, 0.0], tangent: [1.0, 0.0, 0.0, 1.0] });
 		}
 		indices.extend_from_slice(&[ground, ground + 2, ground + 1, ground, ground + 3, ground + 2]);
 		Mesh { vertices, indices }
@@ -201,7 +302,7 @@ impl Mesh {
 		let mut vertices: Vec<Vertex> = Vec::new();
 		let colour = [0.35, 0.85, 0.95, 0.45];
 		for (x, y) in [(-0.95_f32, -0.75_f32), (0.95, -0.75), (0.95, 0.75), (-0.95, 0.75)] {
-			vertices.push(Vertex { position: [x, y, 1.45, 1.0], normal: [0.0, 0.0, 1.0, 0.0], colour, uv: [0.0; 4], weights: [0.0; 4], ident: [ID_PANEL, 0.0, 0.0, 0.0] });
+			vertices.push(Vertex { position: [x, y, 1.45, 1.0], normal: [0.0, 0.0, 1.0, 0.0], colour, uv: [0.0; 4], weights: [0.0; 4], ident: [ID_PANEL, 0.0, 0.0, 0.0], tangent: [0.0; 4] });
 		}
 		Mesh { vertices, indices: vec![0, 1, 2, 0, 2, 3] }
 	}
@@ -213,6 +314,10 @@ impl Mesh {
 enum Pass {
 	Scene,
 	Panel,
+	/// The Extended phase's depth pass, drawn from the light.
+	Shadow,
+	/// The Extended phase's lighting pass.
+	Pbr,
 }
 
 /// A checkerboard, generated rather than loaded - which is what keeps this program's grants at two.
@@ -232,17 +337,109 @@ fn checkerboard(id: u32, extent: u32, squares: u32, light: [f32; 4], dark: [f32;
 	Texture { id, kind: Kind::Dim2, levels: vec![level], transfer: graphics_profile::image::Transfer::Linear, semantics: graphics_profile::image::Semantics::Color, premultiplied: false }
 }
 
+/// A tangent-space normal map, generated the way the checkerboards are.
+///
+/// A GRID OF ROUND BUMPS, from the analytic derivative of a height field rather than from a
+/// difference of neighbouring texels: the field is `cos(u) * cos(v)`, so its two slopes are known
+/// exactly and the map has no quantisation of its own to confuse with the sampler's.
+///
+/// ENCODED INTO `0..=1` LIKE EVERY NORMAL MAP THERE IS, and declared `Normal` so the sampler never
+/// transfer-decodes it: these three numbers are a DIRECTION, and decoding one bends every normal
+/// toward the surface - which looks like a lighting bug and is a colour-space one.
+fn normal_map(id: u32, extent: u32, bumps: u32, amplitude: f32) -> Texture {
+	let mut level = Level::new(extent, extent, 1);
+	let turns = bumps as f32 * core::f32::consts::PI * 2.0;
+	for y in 0..extent {
+		for x in 0..extent {
+			let u = x as f32 / extent as f32;
+			let v = y as f32 / extent as f32;
+			// The height field's own slopes: `d/du` and `d/dv` of `amplitude * cos(turns u) cos(turns v)`.
+			let slope_u = -amplitude * turns * sin(turns * u) * cos(turns * v);
+			let slope_v = -amplitude * turns * cos(turns * u) * sin(turns * v);
+			let length = sqrt(slope_u * slope_u + slope_v * slope_v + 1.0);
+			let normal = [-slope_u / length, -slope_v / length, 1.0 / length];
+			level.set(x, y, 0, [normal[0] * 0.5 + 0.5, normal[1] * 0.5 + 0.5, normal[2] * 0.5 + 0.5, 1.0]);
+		}
+	}
+	Texture { id, kind: Kind::Dim2, levels: vec![level], transfer: graphics_profile::image::Transfer::Linear, semantics: graphics_profile::image::Semantics::Normal, premultiplied: false }
+}
+
+/// A shadow map before anything has been rendered into it: FULLY LIT, because a map of a light that
+/// has not drawn yet must not shadow the first frame.
+fn empty_shadow_map(id: u32, extent: u32) -> Texture {
+	let mut level = Level::new(extent, extent, 1);
+	for y in 0..extent {
+		for x in 0..extent {
+			level.set(x, y, 0, [1.0, 1.0, 1.0, 1.0]);
+		}
+	}
+	Texture { id, kind: Kind::Dim2, levels: vec![level], transfer: graphics_profile::image::Transfer::Linear, semantics: graphics_profile::image::Semantics::Depth, premultiplied: false }
+}
+
+/// Read the shadow pass's attachment back into the texture the lighting pass samples.
+///
+/// THE COPY IS THE WHOLE OF WHAT THIS STACK HAS NO COMPARISON SAMPLER FOR. `Render3D Core Profile 1`
+/// carries no depth-texture binding, so the light's depth reaches the lighting pass as ordinary
+/// texels - which is also why the shadow pass writes depth into a COLOUR attachment rather than
+/// relying on the depth buffer it also has.
+fn read_shadow_map(attachment: &Colour, into: &mut Texture) {
+	let Some(level) = into.levels.first_mut() else { return };
+	for y in 0..level.height.min(attachment.height) {
+		for x in 0..level.width.min(attachment.width) {
+			let texel = attachment.at(x, y, 0);
+			level.set(x, y, 0, [texel.x, texel.y, texel.z, texel.w]);
+		}
+	}
+}
+
+/// How many of the shadow map's texels hold a caster rather than the far plane.
+///
+/// WHAT IT PROVES IS THAT THE LIGHT SAW SOMETHING. A map that is entirely far plane is what a light
+/// pointed away from the scene writes, what a projection too small to contain the caster writes, and
+/// what a pass that was never executed leaves behind - and all three of those produce a picture with
+/// no shadow in it, which is also what a correct scene with nothing to cast one looks like.
+fn shadow_coverage(map: &Texture) -> u32 {
+	let Some(level) = map.levels.first() else { return 0 };
+	let mut covered = 0;
+	for y in 0..level.height {
+		for x in 0..level.width {
+			if level.at(x, y, 0)[0] < 1.0 {
+				covered += 1;
+			}
+		}
+	}
+	covered
+}
+
 // What the shaders read: the mesh, and the frame's transforms and lights.
 struct Frame3d {
 	mesh: Mesh,
 	panel: Mesh,
+	/// The Extended phase's geometry: the sphere and its ground.
+	extended: Mesh,
 	pass: Pass,
 	checker: Texture,
 	ground: Texture,
+	/// The tangent-space normal map the sphere carries.
+	normal_map: Texture,
+	/// WHAT THE LIGHT SAW, rebuilt from the shadow pass's attachment each frame.
+	///
+	/// A TEXTURE AND NOT A TARGET, because this stack has no comparison sampler and a backend's
+	/// attachment is not a sampler binding: the shadow pass writes light-space depth into a colour
+	/// attachment, the frame reads it back, and the lighting pass samples it like any other texture.
+	/// On a software renderer the read back costs a copy of one small buffer; on a GPU it is the
+	/// place a real backend would bind the attachment directly.
+	shadow_map: Texture,
 	clamped: Sampler,
 	repeated: Sampler,
+	/// The sampler the shadow map is read through. NEAREST AND CLAMPED: a filtered depth is the
+	/// average of two surfaces and is a depth nothing is at, and a lookup outside the light's box
+	/// must read the far plane rather than wrap round to the other side of the scene.
+	shadowed: Sampler,
 	mvp: Mat4,
 	model: Mat4,
+	/// The light's own view-projection, which both Extended passes need.
+	light_vp: Mat4,
 	light_dir: [f32; 4],
 	light_point: [f32; 4],
 	eye: [f32; 4],
@@ -254,6 +451,10 @@ impl Frame3d {
 		match self.pass {
 			Pass::Scene => &self.mesh,
 			Pass::Panel => &self.panel,
+			// ONE MESH FOR BOTH EXTENDED PASSES, which is what makes the shadow the shape of the
+			// thing casting it: a caster drawn from different geometry than its surface is a shadow
+			// whose silhouette does not match what stands in the light.
+			Pass::Shadow | Pass::Pbr => &self.extended,
 		}
 	}
 }
@@ -268,6 +469,7 @@ impl Source for Frame3d {
 			3 => Some(Val::vector_f32(&vertex.uv)),
 			4 => Some(Val::vector_f32(&vertex.weights)),
 			5 => Some(Val::vector_f32(&vertex.ident)),
+			6 => Some(Val::vector_f32(&vertex.tangent)),
 			_ => None,
 		}
 	}
@@ -283,6 +485,7 @@ impl Source for Frame3d {
 			U_LIGHT_POINT => Some(Val::vector_f32(&self.light_point)),
 			U_EYE => Some(Val::vector_f32(&self.eye)),
 			U_AMBIENT => Some(Val::vector_f32(&self.ambient)),
+			U_LIGHT_VP => Some(Val::matrix(&columns(self.light_vp), 4)),
 			_ => None,
 		}
 	}
@@ -298,6 +501,8 @@ impl Source for Frame3d {
 		let (texture, sampler) = match (texture, sampler) {
 			(TEX_CHECKER, SAMP_CLAMP) => (&self.checker, &self.clamped),
 			(TEX_GROUND, SAMP_REPEAT) => (&self.ground, &self.repeated),
+			(TEX_NORMAL, SAMP_REPEAT) => (&self.normal_map, &self.repeated),
+			(TEX_SHADOW, SAMP_SHADOW) => (&self.shadow_map, &self.shadowed),
 			_ => return None,
 		};
 		// MAGNIFYING, WITH NO MIP CHAIN. These textures are read at close to one texel per pixel and
@@ -478,6 +683,311 @@ fn fragment_stage() -> Module {
 	builder.finish()
 }
 
+// -------------------------------------------------------------------------------------------------
+// The Extended phase's four stages.
+// -------------------------------------------------------------------------------------------------
+
+/// A direction out of a point or a tangent: the same three numbers with `w` at zero.
+///
+/// WITHOUT IT A MODEL MATRIX TRANSLATES A DIRECTION. A tangent stored with `w = 1` multiplied by a
+/// model matrix comes out displaced by the object's position, which is a vector that points at the
+/// origin from wherever the object happens to be - and the error is invisible at the origin, which
+/// is exactly where a demo is first looked at.
+fn direction(builder: &mut Builder, value: render_shader::ir::Value, zero: render_shader::ir::Value) -> render_shader::ir::Value {
+	let x = builder.assign(Type::f32(), Op::Extract(value, 0));
+	let y = builder.assign(Type::f32(), Op::Extract(value, 1));
+	let z = builder.assign(Type::f32(), Op::Extract(value, 2));
+	builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![x, y, z, zero]))
+}
+
+/// One scalar as a vec4, for the component-wise multiplies the IR has no scalar form of.
+fn splat(builder: &mut Builder, scalar: render_shader::ir::Value) -> render_shader::ir::Value {
+	builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![scalar, scalar, scalar, scalar]))
+}
+
+/// A cross product between two directions carried as vec4s.
+///
+/// THE IR'S `Cross` IS THREE-COMPONENT AND REFUSES ANYTHING ELSE, which is right: a cross product of
+/// four-vectors is not defined, and an operation that quietly ignored the fourth component would
+/// make a shader that passes a homogeneous point look like it worked. So the two are narrowed, the
+/// product is taken, and the result comes back as a direction with `w` at zero.
+fn cross(builder: &mut Builder, left: render_shader::ir::Value, right: render_shader::ir::Value, zero: render_shader::ir::Value) -> render_shader::ir::Value {
+	let narrow = |builder: &mut Builder, value: render_shader::ir::Value| {
+		let x = builder.assign(Type::f32(), Op::Extract(value, 0));
+		let y = builder.assign(Type::f32(), Op::Extract(value, 1));
+		let z = builder.assign(Type::f32(), Op::Extract(value, 2));
+		builder.assign(Type::vec(3), Op::Compose(Type::vec(3), vec![x, y, z]))
+	};
+	let left = narrow(builder, left);
+	let right = narrow(builder, right);
+	let product = builder.assign(Type::vec(3), Op::Binary(BinaryOp::Cross, left, right));
+	let x = builder.assign(Type::f32(), Op::Extract(product, 0));
+	let y = builder.assign(Type::f32(), Op::Extract(product, 1));
+	let z = builder.assign(Type::f32(), Op::Extract(product, 2));
+	builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![x, y, z, zero]))
+}
+
+/// The shadow pass's vertex stage: the scene through the LIGHT's view-projection.
+fn shadow_vertex_stage() -> Module {
+	let mut builder = Builder::new(Stage::Vertex, "shadow-vertex");
+	builder.varying(0, Type::vec(4), render_shader::Interpolation::Smooth);
+	let position = builder.load(Type::vec(4), Binding::Attribute { location: 0 });
+	let model = builder.load(Type::Matrix(4), Binding::Uniform { block: 0, member: U_MODEL });
+	let light_vp = builder.load(Type::Matrix(4), Binding::Uniform { block: 0, member: U_LIGHT_VP });
+	let world = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, model, position));
+	let clip = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, light_vp, world));
+	builder.store(Output::Position, clip);
+	// THE CLIP POSITION IS ALSO A VARYING, because what this pass stores is the DEPTH and the
+	// fragment stage has no way to ask the rasteriser for it.
+	builder.store(Output::Varying(0), clip);
+	builder.finish()
+}
+
+/// The shadow pass's fragment stage: light-space depth, written as a colour.
+///
+/// INTO A COLOUR ATTACHMENT AND NOT LEFT IN THE DEPTH BUFFER, because this profile has no
+/// depth-texture binding and no comparison sampler: the lighting pass reads this map as ordinary
+/// texels, so the depth has to BE texels.
+fn shadow_fragment_stage() -> Module {
+	let mut builder = Builder::new(Stage::Fragment, "shadow-fragment");
+	builder.varying(0, Type::vec(4), render_shader::Interpolation::Smooth);
+	let clip = builder.load(Type::vec(4), Binding::Varying { location: 0 });
+	let z = builder.assign(Type::f32(), Op::Extract(clip, 2));
+	let w = builder.assign(Type::f32(), Op::Extract(clip, 3));
+	let depth = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, z, w));
+	let one = builder.constant(Constant::F32(1.0));
+	let out = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![depth, depth, depth, one]));
+	builder.store(Output::Colour(0), out);
+	builder.finish()
+}
+
+/// The Extended lighting pass's vertex stage.
+fn pbr_vertex_stage() -> Module {
+	let mut builder = Builder::new(Stage::Vertex, "pbr-vertex");
+	for location in [0, 1, 2, 3, 4] {
+		builder.varying(location, Type::vec(4), render_shader::Interpolation::Smooth);
+	}
+	builder.varying_at(5, Type::vec(4), render_shader::Interpolation::Flat, render_shader::ir::Sampling::Pixel);
+	builder.varying(6, Type::vec(4), render_shader::Interpolation::Smooth);
+	let position = builder.load(Type::vec(4), Binding::Attribute { location: 0 });
+	let normal = builder.load(Type::vec(4), Binding::Attribute { location: 1 });
+	let colour = builder.load(Type::vec(4), Binding::Attribute { location: 2 });
+	let uv = builder.load(Type::vec(4), Binding::Attribute { location: 3 });
+	let ident = builder.load(Type::vec(4), Binding::Attribute { location: 5 });
+	let tangent = builder.load(Type::vec(4), Binding::Attribute { location: 6 });
+	let mvp = builder.load(Type::Matrix(4), Binding::Uniform { block: 0, member: U_MVP });
+	let model = builder.load(Type::Matrix(4), Binding::Uniform { block: 0, member: U_MODEL });
+	let light_vp = builder.load(Type::Matrix(4), Binding::Uniform { block: 0, member: U_LIGHT_VP });
+	let zero = builder.constant(Constant::F32(0.0));
+	let clip = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, mvp, position));
+	let world = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, model, position));
+	let world_normal = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, model, normal));
+	let tangent_direction = direction(&mut builder, tangent, zero);
+	let world_tangent = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, model, tangent_direction));
+	// THE SAME WORLD POSITION THROUGH THE LIGHT'S MATRIX, which is what makes the lookup agree with
+	// what the shadow pass wrote: both are the light's view-projection times the world position, and
+	// a lookup computed from anything else would be comparing two different points.
+	let light_clip = builder.assign(Type::vec(4), Op::Binary(BinaryOp::MatrixProduct, light_vp, world));
+	builder.store(Output::Position, clip);
+	builder.store(Output::Varying(0), colour);
+	builder.store(Output::Varying(1), world_normal);
+	builder.store(Output::Varying(2), world);
+	builder.store(Output::Varying(3), uv);
+	builder.store(Output::Varying(4), world_tangent);
+	builder.store(Output::Varying(5), ident);
+	builder.store(Output::Varying(6), light_clip);
+	builder.finish()
+}
+
+/// The Extended lighting pass's fragment stage: `PbrMetallicRoughness` over one directional light,
+/// with a tangent-space normal map and a shadow lookup.
+///
+/// THE THREE TERMS ARE THE PROFILE'S, WRITTEN OUT. GGX / Trowbridge-Reitz for the distribution,
+/// Smith height-correlated for the visibility - which CARRIES the `1 / (4 NoL NoV)` denominator, so
+/// the specular is `D * V * F` and not `D * G * F / (4 ...)` - and Schlick for the Fresnel, its
+/// fifth power by multiplication rather than by a transcendental. A demo that wrote a different
+/// Smith term from the one `scene3d` fixtures would look right and prove nothing.
+fn pbr_fragment_stage() -> Module {
+	let mut builder = Builder::new(Stage::Fragment, "pbr-fragment");
+	for location in [0, 1, 2, 3, 4] {
+		builder.varying(location, Type::vec(4), render_shader::Interpolation::Smooth);
+	}
+	builder.varying_at(5, Type::vec(4), render_shader::Interpolation::Flat, render_shader::ir::Sampling::Pixel);
+	builder.varying(6, Type::vec(4), render_shader::Interpolation::Smooth);
+
+	let base = builder.load(Type::vec(4), Binding::Varying { location: 0 });
+	let normal_in = builder.load(Type::vec(4), Binding::Varying { location: 1 });
+	let world = builder.load(Type::vec(4), Binding::Varying { location: 2 });
+	let uv = builder.load(Type::vec(4), Binding::Varying { location: 3 });
+	let tangent_in = builder.load(Type::vec(4), Binding::Varying { location: 4 });
+	let light_clip = builder.load(Type::vec(4), Binding::Varying { location: 6 });
+	let light_dir = builder.load(Type::vec(4), Binding::Uniform { block: 0, member: U_LIGHT_DIR });
+	let eye = builder.load(Type::vec(4), Binding::Uniform { block: 0, member: U_EYE });
+	let ambient = builder.load(Type::vec(4), Binding::Uniform { block: 0, member: U_AMBIENT });
+
+	let zero = builder.constant(Constant::F32(0.0));
+	let one = builder.constant(Constant::F32(1.0));
+	let half = builder.constant(Constant::F32(0.5));
+	let two = builder.constant(Constant::F32(2.0));
+	let minus_one = builder.constant(Constant::F32(-1.0));
+	let pi = builder.constant(Constant::F32(core::f32::consts::PI));
+	let epsilon = builder.constant(Constant::F32(1.0e-4));
+	let roughness = builder.constant(Constant::F32(PBR_ROUGHNESS));
+	let f0 = builder.constant(Constant::F32(PBR_F0));
+	let bias = builder.constant(Constant::F32(SHADOW_BIAS));
+
+	// THE TANGENT FRAME, RE-ORTHOGONALISED HERE. Interpolating two unit vectors across a triangle
+	// gives two that are neither unit nor perpendicular, and a frame that is not orthonormal tilts
+	// every mapped normal by an amount that varies across the surface - which reads as a wobble in
+	// the lighting rather than as a broken frame.
+	let n = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, normal_in));
+	let t_raw = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, tangent_in));
+	let t_dot_n = builder.assign(Type::f32(), Op::Binary(BinaryOp::Dot, t_raw, n));
+	let t_dot_n_v = splat(&mut builder, t_dot_n);
+	let projected = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, n, t_dot_n_v));
+	let t_ortho = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Subtract, t_raw, projected));
+	let t = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, t_ortho));
+	let b = cross(&mut builder, n, t, zero);
+
+	// THE MAP, DECODED FROM `0..=1` BACK TO A DIRECTION.
+	let texel = builder.assign(Type::vec(4), Op::Sample { binding: Binding::Texture { texture: TEX_NORMAL, sampler: SAMP_REPEAT }, coordinate: uv });
+	let two_v = splat(&mut builder, two);
+	let one_v = splat(&mut builder, one);
+	let scaled = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, texel, two_v));
+	let centred = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Subtract, scaled, one_v));
+	let map_x = builder.assign(Type::f32(), Op::Extract(centred, 0));
+	let map_y = builder.assign(Type::f32(), Op::Extract(centred, 1));
+	let map_z = builder.assign(Type::f32(), Op::Extract(centred, 2));
+	let map_x_v = splat(&mut builder, map_x);
+	let map_y_v = splat(&mut builder, map_y);
+	let map_z_v = splat(&mut builder, map_z);
+	let along_t = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, t, map_x_v));
+	let along_b = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, b, map_y_v));
+	let along_n = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, n, map_z_v));
+	let mapped_raw = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, along_t, along_b));
+	let mapped_raw = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, mapped_raw, along_n));
+	let nm = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, mapped_raw));
+
+	// THE THREE DIRECTIONS THE TERMS ARE FUNCTIONS OF.
+	let l = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, light_dir));
+	let to_eye = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Subtract, eye, world));
+	let v = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, to_eye));
+	let h_raw = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, l, v));
+	let h = builder.assign(Type::vec(4), Op::Unary(UnaryOp::Normalize, h_raw));
+	let n_dot_l_raw = builder.assign(Type::f32(), Op::Binary(BinaryOp::Dot, nm, l));
+	let n_dot_l = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, n_dot_l_raw, zero));
+	let n_dot_v_raw = builder.assign(Type::f32(), Op::Binary(BinaryOp::Dot, nm, v));
+	let n_dot_v = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, n_dot_v_raw, epsilon));
+	let n_dot_h_raw = builder.assign(Type::f32(), Op::Binary(BinaryOp::Dot, nm, h));
+	let n_dot_h = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, n_dot_h_raw, zero));
+	let v_dot_h_raw = builder.assign(Type::f32(), Op::Binary(BinaryOp::Dot, v, h));
+	let v_dot_h = builder.assign(Type::f32(), Op::Clamp { value: v_dot_h_raw, low: zero, high: one });
+
+	// `a = roughness^2`, and `a2` with it.
+	let a = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, roughness, roughness));
+	let a2 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, a, a));
+
+	// D: `a2 / (pi * (NoH^2 (a2 - 1) + 1)^2)`.
+	let n_dot_h2 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_h, n_dot_h));
+	let a2_minus_one = builder.assign(Type::f32(), Op::Binary(BinaryOp::Subtract, a2, one));
+	let inner = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_h2, a2_minus_one));
+	let inner = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, inner, one));
+	let inner2 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, inner, inner));
+	let denominator = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, pi, inner2));
+	let denominator = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, denominator, epsilon));
+	let d_term = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, a2, denominator));
+
+	// V: Smith, height-correlated, WITH the `1 / (4 NoL NoV)` denominator folded in.
+	let one_minus_a2 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Subtract, one, a2));
+	let n_dot_v2 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_v, n_dot_v));
+	let from_view_inner = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_v2, one_minus_a2));
+	let from_view_inner = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, from_view_inner, a2));
+	let from_view_root = builder.assign(Type::f32(), Op::Transcendental(Transcendental::Sqrt, from_view_inner, None));
+	let from_view = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_l, from_view_root));
+	let n_dot_l2 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_l, n_dot_l));
+	let from_light_inner = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_l2, one_minus_a2));
+	let from_light_inner = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, from_light_inner, a2));
+	let from_light_root = builder.assign(Type::f32(), Op::Transcendental(Transcendental::Sqrt, from_light_inner, None));
+	let from_light = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, n_dot_v, from_light_root));
+	let total = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, from_view, from_light));
+	let total = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, total, epsilon));
+	let v_term = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, half, total));
+
+	// F: Schlick, the fifth power BY MULTIPLICATION.
+	let one_minus_voh = builder.assign(Type::f32(), Op::Binary(BinaryOp::Subtract, one, v_dot_h));
+	let squared = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, one_minus_voh, one_minus_voh));
+	let fourth = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, squared, squared));
+	let fifth = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, fourth, one_minus_voh));
+	let one_minus_f0 = builder.assign(Type::f32(), Op::Binary(BinaryOp::Subtract, one, f0));
+	let f_rest = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, one_minus_f0, fifth));
+	let f_term = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, f0, f_rest));
+
+	// THE SHADOW LOOKUP. The light-space position divided through by `w`, mapped from `-1..=1` to
+	// the texture's `0..=1`, and compared against what the light wrote there.
+	let light_x = builder.assign(Type::f32(), Op::Extract(light_clip, 0));
+	let light_y = builder.assign(Type::f32(), Op::Extract(light_clip, 1));
+	let light_z = builder.assign(Type::f32(), Op::Extract(light_clip, 2));
+	let light_w = builder.assign(Type::f32(), Op::Extract(light_clip, 3));
+	let light_w = builder.assign(Type::f32(), Op::Binary(BinaryOp::Max, light_w, epsilon));
+	let ndc_x = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, light_x, light_w));
+	let ndc_y = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, light_y, light_w));
+	let ndc_z = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, light_z, light_w));
+	let map_u = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, ndc_x, half));
+	let map_u = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, map_u, half));
+	// THE `v` AXIS IS FLIPPED, because clip space climbs upward and a texture's rows run downward.
+	// A map sampled without the flip shadows the mirror image of the scene, which looks like an
+	// offset rather than like an inversion and is chased in the bias for hours.
+	let map_v = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, ndc_y, minus_one));
+	let map_v = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, map_v, half));
+	let map_v = builder.assign(Type::f32(), Op::Binary(BinaryOp::Add, map_v, half));
+	let lookup = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![map_u, map_v, zero, zero]));
+	let occluder = builder.assign(Type::vec(4), Op::Sample { binding: Binding::Texture { texture: TEX_SHADOW, sampler: SAMP_SHADOW }, coordinate: lookup });
+	let occluder_depth = builder.assign(Type::f32(), Op::Extract(occluder, 0));
+	let biased = builder.assign(Type::f32(), Op::Binary(BinaryOp::Subtract, ndc_z, bias));
+	let occluded = builder.assign(Type::Scalar(render_shader::ir::ScalarType::Bool), Op::Compare(render_shader::ir::CompareKind::Greater, biased, occluder_depth));
+	let visibility = builder.assign(Type::f32(), Op::Select { condition: occluded, on_true: zero, on_false: one });
+
+	// THE SUM. Diffuse is `(1 - F) * base / pi` - the energy the specular lobe did not take - and
+	// the whole direct term is scaled by `NoL` and by the visibility. AMBIENT IS NOT SHADOWED,
+	// because a shadow is the absence of the DIRECT light and a surface in shadow is still lit by
+	// its surroundings; shadowing the ambient term too makes every shadow a hole.
+	let intensity = builder.constant(Constant::F32(PBR_LIGHT));
+	let one_minus_f = builder.assign(Type::f32(), Op::Binary(BinaryOp::Subtract, one, f_term));
+	let diffuse_scale = builder.assign(Type::f32(), Op::Binary(BinaryOp::Divide, one_minus_f, pi));
+	let diffuse_scale = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, diffuse_scale, n_dot_l));
+	let diffuse_scale = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, diffuse_scale, visibility));
+	let diffuse_scale = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, diffuse_scale, intensity));
+	let diffuse_scale_v = splat(&mut builder, diffuse_scale);
+	let diffuse = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, base, diffuse_scale_v));
+	let specular = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, d_term, v_term));
+	let specular = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, specular, f_term));
+	let specular = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, specular, n_dot_l));
+	let specular = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, specular, visibility));
+	let specular = builder.assign(Type::f32(), Op::Binary(BinaryOp::Multiply, specular, intensity));
+	let specular_v = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![specular, specular, specular, zero]));
+	let ambient_term = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Multiply, base, ambient));
+	let lit = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, diffuse, specular_v));
+	let lit = builder.assign(Type::vec(4), Op::Binary(BinaryOp::Add, lit, ambient_term));
+
+	// THE SCENE IS WRITTEN CLAMPED, because this attachment is what a person sees and there is no
+	// tone map between here and the surface. The HDR path's own answer is the `postprocess` chain in
+	// `scene3d`, which is a pass graph rather than a demo.
+	let alpha = builder.assign(Type::f32(), Op::Extract(base, 3));
+	let r = builder.assign(Type::f32(), Op::Extract(lit, 0));
+	let g = builder.assign(Type::f32(), Op::Extract(lit, 1));
+	let bb = builder.assign(Type::f32(), Op::Extract(lit, 2));
+	let r = builder.assign(Type::f32(), Op::Clamp { value: r, low: zero, high: one });
+	let g = builder.assign(Type::f32(), Op::Clamp { value: g, low: zero, high: one });
+	let bb = builder.assign(Type::f32(), Op::Clamp { value: bb, low: zero, high: one });
+	let out = builder.assign(Type::vec(4), Op::Compose(Type::vec(4), vec![r, g, bb, alpha]));
+	builder.store(Output::Colour(ATTACH_COLOUR), out);
+	let ident = builder.load(Type::vec(4), Binding::Varying { location: 5 });
+	let ident_f = builder.assign(Type::f32(), Op::Extract(ident, 0));
+	let ident_u = builder.assign(Type::Scalar(render_shader::ir::ScalarType::U32), Op::Unary(UnaryOp::Convert(render_shader::ir::ScalarType::U32), ident_f));
+	builder.store(Output::Integer(ATTACH_IDENT), ident_u);
+	builder.finish()
+}
+
 // What the run was asked for.
 struct Controls {
 	width: u32,
@@ -495,11 +1005,18 @@ struct Controls {
 	/// position, and "capture at frame N" is not one - a slow machine and a fast one reach different
 	/// rotations in the same wall time.
 	pose: u32,
+	/// Draw `Scene3D Extended Profile 1`'s scene INSTEAD OF the core one: a physically based sphere
+	/// with a normal map, and a cast shadow.
+	///
+	/// INSTEAD OF AND NOT BESIDE, which is what keeps this an optional part. The core demo is a core
+	/// gate and its scene is what that gate asserts about; a phase that added to it would make every
+	/// core check depend on an optional profile being implemented.
+	extended: bool,
 }
 
 impl Controls {
 	fn parse(arguments: &[u8]) -> Controls {
-		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0 };
+		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false };
 		let mut words = arguments.split(|byte| *byte == b' ').filter(|word| !word.is_empty());
 		while let Some(word) = words.next() {
 			match word {
@@ -512,6 +1029,7 @@ impl Controls {
 				b"--height" => controls.height = words.next().and_then(number).unwrap_or(controls.height),
 				b"--frames" => controls.frames = words.next().and_then(number).unwrap_or(0),
 				b"--report" => controls.report = true,
+				b"--extended" => controls.extended = true,
 				b"--scene-width" => controls.scene_width = words.next().and_then(number).unwrap_or(0),
 				b"--scene-height" => controls.scene_height = words.next().and_then(number).unwrap_or(0),
 				b"--pose" => controls.pose = words.next().and_then(number).unwrap_or(u32::MAX),
@@ -609,16 +1127,30 @@ struct Targets {
 	extent: (u32, u32),
 	scene: Prepared,
 	panel: Prepared,
+	/// The Extended phase's lighting plan, prepared beside the core ones. PREPARED WHETHER OR NOT
+	/// THE PHASE RUNS, because what a resize has to rebuild is every plan that depends on the extent
+	/// and a plan built lazily on the first Extended frame would be built at a size that has already
+	/// changed.
+	pbr: Prepared,
+	/// The shadow plan, which is the one thing here that does NOT follow the window: its extent is
+	/// the map's.
+	shadow: Prepared,
 	colour: [Colour; 2],
 	depth: DepthStencil,
+	/// What the light writes: one colour attachment holding light-space depth, and a depth buffer of
+	/// its own so the nearest caster is the one recorded.
+	shadow_colour: [Colour; 1],
+	shadow_depth: DepthStencil,
 	image: OwnedImage,
 }
 
 impl Targets {
-	fn new(extent: (u32, u32), draw: &Draw, panel_draw: &Draw) -> Option<Targets> {
+	fn new(extent: (u32, u32), draw: &Draw, panel_draw: &Draw, extended_draw: &Draw) -> Option<Targets> {
 		let (width, height) = extent;
 		let scene = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![scene_pipeline()], vec![*draw], width, height).ok()?;
 		let panel = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![panel_pipeline()], vec![*panel_draw], width, height).ok()?;
+		let pbr = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pbr_pipeline()], vec![*extended_draw], width, height).ok()?;
+		let shadow = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![shadow_pipeline()], vec![*extended_draw], SHADOW_EXTENT, SHADOW_EXTENT).ok()?;
 		// STRAIGHT ALPHA AND sRGB, which is what the surface this ends up on holds. A scene image in
 		// a different space would be converted twice - once here and once at the composite - and
 		// neither conversion would be wrong on its own.
@@ -635,6 +1167,10 @@ impl Targets {
 			// declared INTEGER, which is what stops it being resolved, filtered or blended.
 			colour: [Colour::new(width, height, 1, false), Colour::new(width, height, 1, true)],
 			depth: DepthStencil::new(width, height, 1, DepthFormat::Depth32F),
+			pbr,
+			shadow,
+			shadow_colour: [Colour::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, false)],
+			shadow_depth: DepthStencil::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, DepthFormat::Depth32F),
 			image: OwnedImage::new(layout).ok()?,
 		})
 	}
@@ -642,6 +1178,11 @@ impl Targets {
 	/// The viewport the whole scene is drawn into.
 	fn viewport(&self) -> Viewport {
 		Viewport { x: 0.0, y: 0.0, width: self.extent.0 as f32, height: self.extent.1 as f32, min_depth: 0.0, max_depth: 1.0 }
+	}
+
+	/// The light's own viewport, which is the map's extent and not the window's.
+	fn shadow_viewport(&self) -> Viewport {
+		Viewport { x: 0.0, y: 0.0, width: SHADOW_EXTENT as f32, height: SHADOW_EXTENT as f32, min_depth: 0.0, max_depth: 1.0 }
 	}
 
 	fn aspect(&self) -> f32 {
@@ -681,6 +1222,35 @@ fn scene_pipeline() -> Pipeline {
 		alpha_to_coverage: false,
 		sample_mask: u32::MAX,
 	}
+}
+
+/// The Extended lighting pass's pipeline: the same attachments as the core scene's, its own stages.
+fn pbr_pipeline() -> Pipeline {
+	Pipeline {
+		state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: CullMode::Back, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false },
+		vertex: pbr_vertex_stage(),
+		fragment: pbr_fragment_stage(),
+		blend: vec![
+			render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL },
+			render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL },
+		],
+		stencil: None,
+		depth_compare: CompareOp::Less,
+		depth_write: true,
+		bias: (0.0, 0.0, 0.0),
+		alpha_to_coverage: false,
+		sample_mask: u32::MAX,
+	}
+}
+
+/// The shadow pass's pipeline.
+///
+/// THE FRONT FACES ARE CULLED AND NOT THE BACK ONES, which is the one state here that differs from
+/// every other pass in this program. A shadow map records where the light STOPS, and recording the
+/// far side of a closed object puts the recorded depth behind the surface that is lit - which moves
+/// the self-shadowing error to the side facing away from the camera, where nobody is looking.
+fn shadow_pipeline() -> Pipeline {
+	Pipeline { state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: CullMode::Front, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: shadow_vertex_stage(), fragment: shadow_fragment_stage(), blend: vec![render3d::AttachmentBlend { enabled: false, colour: render3d::BlendEquation::REPLACE, alpha: render3d::BlendEquation::REPLACE, write_mask: render3d::ColorWriteMask::ALL }], stencil: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
 }
 
 /// THE TRANSPARENT PASS IS A SECOND PLAN OVER THE SAME ATTACHMENTS, and the three differences
@@ -755,7 +1325,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	let mesh = Mesh::scene();
 	let panel = Mesh::panel();
+	let extended = Mesh::extended();
 	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: mesh.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let extended_draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: extended.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 
 	let panel_draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: panel.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 
@@ -765,7 +1337,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The camera, the spin, the pause and the overlay toggle are in `View`, which this does not
 	// touch: that is what "preserves camera and animation state" means.
 	let configuration = frames.surface().configuration();
-	let Some(mut targets) = Targets::new(controls.scene_extent(configuration.physical_extent.width, configuration.physical_extent.height), &draw, &panel_draw) else {
+	let Some(mut targets) = Targets::new(controls.scene_extent(configuration.physical_extent.width, configuration.physical_extent.height), &draw, &panel_draw, &extended_draw) else {
 		print(b"test3d-sw: the pipeline was refused\n");
 		exit();
 	};
@@ -774,7 +1346,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		exit();
 	};
 	let mut view = View::reset();
-	let mut state = Frame3d { mesh, panel, pass: Pass::Scene, checker: checkerboard(TEX_CHECKER, 64, 8, [1.0, 1.0, 1.0, 1.0], [0.16, 0.16, 0.20, 1.0]), ground: checkerboard(TEX_GROUND, 32, 2, [1.28, 1.28, 1.36, 1.0], [0.62, 0.62, 0.70, 1.0]), clamped: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, repeated: Sampler { wrap_u: Wrap::Repeat, wrap_v: Wrap::Repeat, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, mvp: Mat4::IDENTITY, model: Mat4::IDENTITY, light_dir: [0.45, 0.8, 0.35, 0.0], light_point: [0.0, 2.0, 0.0, 1.0], eye: [0.0, 0.0, DISTANCE_START, 1.0], ambient: [0.22, 0.22, 0.26, 0.0] };
+	let mut state = Frame3d { mesh, panel, extended, normal_map: normal_map(TEX_NORMAL, 128, 6, 0.045), shadow_map: empty_shadow_map(TEX_SHADOW, SHADOW_EXTENT), shadowed: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Nearest, minify: Filter::Nearest, ..Sampler::NEAREST }, light_vp: Mat4::IDENTITY, pass: Pass::Scene, checker: checkerboard(TEX_CHECKER, 64, 8, [1.0, 1.0, 1.0, 1.0], [0.16, 0.16, 0.20, 1.0]), ground: checkerboard(TEX_GROUND, 32, 2, [1.28, 1.28, 1.36, 1.0], [0.62, 0.62, 0.70, 1.0]), clamped: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, repeated: Sampler { wrap_u: Wrap::Repeat, wrap_v: Wrap::Repeat, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, mvp: Mat4::IDENTITY, model: Mat4::IDENTITY, light_dir: [0.45, 0.8, 0.35, 0.0], light_point: [0.0, 2.0, 0.0, 1.0], eye: [0.0, 0.0, DISTANCE_START, 1.0], ambient: [0.22, 0.22, 0.26, 0.0] };
+	if controls.extended {
+		// THE EXTENDED PHASE'S OWN LIGHT, and it points the other way across `z` on purpose: the
+		// shadow falls AWAY from the light, so a light behind the object puts its shadow behind it
+		// too - where the object itself hides it. This one stands in front and to the side, which is
+		// where a shadow is a thing a person can see.
+		state.light_dir = [0.55, 0.72, -0.42, 0.0];
+		// AND A LOWER AMBIENT, because ambient is what a shadowed surface is lit by: a scene whose
+		// ambient equals its direct light has shadows nobody can find.
+		state.ambient = [0.10, 0.11, 0.14, 0.0];
+	}
+	// Whether the shadow map's coverage has been reported: once a run, so a run says whether the
+	// light saw anything at all.
+	let mut shadow_reported = false;
 	let mut presented: u32 = 0;
 	let mut rebuilt: u32 = 0;
 	/// How many acquires in a row may answer nothing before the display is taken to have gone.
@@ -832,7 +1417,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						// continue the animation rather than restart it.
 						let wanted = controls.scene_extent(rebuilt_to.extent.width, rebuilt_to.extent.height);
 						if wanted != targets.extent {
-							let Some(rebuilt_targets) = Targets::new(wanted, &draw, &panel_draw) else {
+							let Some(rebuilt_targets) = Targets::new(wanted, &draw, &panel_draw, &extended_draw) else {
 								print(b"test3d-sw: the scene could not be rebuilt at the new size\n");
 								break;
 							};
@@ -868,11 +1453,66 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		targets.colour[ATTACH_COLOUR as usize].fill(Vec4::new(0.05, 0.06, 0.10, 1.0));
 		targets.colour[ATTACH_IDENT as usize].fill(Vec4::new(ID_NONE, 0.0, 0.0, 0.0));
 		targets.depth.clear(1.0, 0);
-		state.pass = Pass::Scene;
+
+		// THE EXTENDED PHASE'S SHADOW PASS, BEFORE ANYTHING IS LIT. It runs first because the
+		// lighting pass SAMPLES what it writes, and a map read in the frame that produced it is the
+		// only order in which a moving light's shadow is where the light is now.
+		if controls.extended {
+			let to_light = Vec3::new(state.light_dir[0], state.light_dir[1], state.light_dir[2]);
+			// AN ORTHOGRAPHIC PROJECTION, because this is a DIRECTIONAL light: its rays are parallel,
+			// and a perspective projection here would converge them on a point the light does not
+			// have. The box is fitted to the scene by hand - this scene is a sphere and a ground
+			// quad, and `scene3d`'s cascade fit is what a scene that does not know its own extent
+			// uses.
+			let Ok(light_projection) = camera::orthographic_rh_zo(-SHADOW_HALF_EXTENT, SHADOW_HALF_EXTENT, -SHADOW_HALF_EXTENT, SHADOW_HALF_EXTENT, 0.1, 16.0) else { break };
+			let Ok(light_view) = camera::look_at_rh(to_light.scale(6.0), Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)) else { break };
+			state.light_vp = light_projection.mul(&light_view);
+			state.pass = Pass::Shadow;
+			state.model = Mat4::IDENTITY;
+			// THE MAP IS CLEARED TO THE FAR PLANE, which is what "nothing occludes this texel"
+			// means: a map cleared to zero would say every texel is occluded at the near plane and
+			// the whole scene would be in shadow.
+			targets.shadow_colour[0].fill(Vec4::new(1.0, 1.0, 1.0, 1.0));
+			targets.shadow_depth.clear(1.0, 0);
+			let shadow_viewport = targets.shadow_viewport();
+			let mut shadow_attachments = Attachments { colour: &mut targets.shadow_colour, depth_stencil: Some(&mut targets.shadow_depth), viewport: shadow_viewport, scissor: None };
+			let stage_began = clock_ns();
+			match soft3d::frame::execute(&mut targets.shadow, &mut shadow_attachments, &state) {
+				Ok(stats) => {
+					counts.primitives += stats.primitives;
+					counts.fragments += stats.fragments;
+					counts.samples_written += stats.samples_written;
+				}
+				Err(_) => {
+					print(b"test3d-sw: the shadow pass was refused\n");
+					break;
+				}
+			}
+			timing.shadow += clock_ns().saturating_sub(stage_began);
+			// AND THE MAP BECOMES A TEXTURE. This profile has no comparison sampler and no depth
+			// binding, so what the light wrote reaches the lighting pass as texels.
+			read_shadow_map(&targets.shadow_colour[0], &mut state.shadow_map);
+			if !shadow_reported {
+				shadow_reported = true;
+				let covered = shadow_coverage(&state.shadow_map);
+				let mut line = common_line::Line::new();
+				line.push(b"test3d-sw: shadow map holds ");
+				line.decimal(covered as u64);
+				line.push(b" of ");
+				line.decimal((SHADOW_EXTENT * SHADOW_EXTENT) as u64);
+				line.push(b" texel(s)\n");
+				print(line.as_bytes());
+			}
+		}
+
+		state.pass = if controls.extended { Pass::Pbr } else { Pass::Scene };
+		state.model = if controls.extended { Mat4::IDENTITY } else { state.model };
+		state.mvp = projection.mul(&look).mul(&state.model);
 		let viewport = targets.viewport();
 		let mut attachments = Attachments { colour: &mut targets.colour, depth_stencil: Some(&mut targets.depth), viewport, scissor: None };
 		let stage_began = clock_ns();
-		match soft3d::frame::execute(&mut targets.scene, &mut attachments, &state) {
+		let plan = if controls.extended { &mut targets.pbr } else { &mut targets.scene };
+		match soft3d::frame::execute(plan, &mut attachments, &state) {
 			Ok(stats) => {
 				counts.primitives += stats.primitives;
 				counts.clipped += stats.clipped;
@@ -892,24 +1532,29 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// model transform would swing edge-on twice a revolution and spend most of the animation
 		// as a one-pixel sliver, which is a transparency test that is invisible for most of its
 		// run. Its transform is therefore the camera's alone.
-		state.pass = Pass::Panel;
-		state.model = Mat4::IDENTITY;
-		state.mvp = projection.mul(&look);
-		let viewport = targets.viewport();
-		let mut attachments = Attachments { colour: &mut targets.colour, depth_stencil: Some(&mut targets.depth), viewport, scissor: None };
-		let stage_began = clock_ns();
-		match soft3d::frame::execute(&mut targets.panel, &mut attachments, &state) {
-			Ok(stats) => {
-				counts.primitives += stats.primitives;
-				counts.fragments += stats.fragments;
-				counts.samples_written += stats.samples_written;
+		// THE TRANSPARENT PANEL IS THE CORE SCENE'S, and the Extended phase does not draw it: what
+		// stands in front of the sphere there is its own shadow, and a translucent quad over it
+		// would hide the one surface this phase exists to show.
+		if !controls.extended {
+			state.pass = Pass::Panel;
+			state.model = Mat4::IDENTITY;
+			state.mvp = projection.mul(&look);
+			let viewport = targets.viewport();
+			let mut attachments = Attachments { colour: &mut targets.colour, depth_stencil: Some(&mut targets.depth), viewport, scissor: None };
+			let stage_began = clock_ns();
+			match soft3d::frame::execute(&mut targets.panel, &mut attachments, &state) {
+				Ok(stats) => {
+					counts.primitives += stats.primitives;
+					counts.fragments += stats.fragments;
+					counts.samples_written += stats.samples_written;
+				}
+				Err(_) => {
+					print(b"test3d-sw: the transparent pass was refused\n");
+					break;
+				}
 			}
-			Err(_) => {
-				print(b"test3d-sw: the transparent pass was refused\n");
-				break;
-			}
+			timing.transparent += clock_ns().saturating_sub(stage_began);
 		}
-		timing.transparent += clock_ns().saturating_sub(stage_began);
 
 		// AND THE FRAME CROSSES INTO THE 2D MODEL HERE. What was a direct write into the mapped
 		// surface is now an image the 2D half composites a HUD over - which is the path an
@@ -1258,6 +1903,10 @@ fn label(origin_x: f32, origin_y: f32, size: f32) -> RecordedGlyphRun {
 #[derive(Default)]
 struct Timing {
 	scene: u64,
+	/// The Extended phase's shadow pass, counted SEPARATELY from the lighting pass it feeds. Folding
+	/// it into `scene` would report one number for two passes that scale with different things: the
+	/// lighting pass with the window, and the shadow pass with the light's own map.
+	shadow: u64,
 	transparent: u64,
 	handover: u64,
 	overlay: u64,
@@ -1293,7 +1942,14 @@ fn report(timing: &Timing, counts: &soft3d::frame::Stats, frames: u32, wall: u64
 	line.decimal((mfps % 1000) / 100);
 	line.push(b" fps\n");
 	print(line.as_bytes());
-	for (name, total) in [(&b"scene"[..], timing.scene), (b"transparent", timing.transparent), (b"handover", timing.handover), (b"overlay", timing.overlay), (b"present", timing.present)] {
+	for (name, total) in [
+		(&b"shadow"[..], timing.shadow),
+		(b"scene", timing.scene),
+		(b"transparent", timing.transparent),
+		(b"handover", timing.handover),
+		(b"overlay", timing.overlay),
+		(b"present", timing.present),
+	] {
 		let mut line = common_line::Line::new();
 		line.push(b"test3d-sw: ");
 		line.push(name);

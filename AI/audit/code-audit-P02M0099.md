@@ -3121,3 +3121,381 @@ run setting one up beside the first takes the device from it; the oracle REQUIRE
 `USB_GADGET=acm` is compiled in, so a port that lost the gadget fails rather than skips. That is the
 right way round, and it is why the three runs are sequential rather than the two emulated ones being
 run beside each other the way their full suites were.
+
+## CORRECTION: the quarantine consumers ARE built by this tree
+
+THE SECTION ABOVE CONCLUDES THAT `abiprobe` AND `vkprobe` "cannot be rebuilt here" AND THAT
+UNBLOCKING IS "the audit environment's to do". BOTH ARE WRONG. `src/tools/foreign-audit-link.py`
+builds them, in this tree, for all three targets; the image build only stages what it finds in
+`.build/foreign/pass2/<arch>/`. `producer = "audit"` names the TOOL, not another machine.
+
+I had read the manifest's "the upstream it links against is audit-only and is not in this tree" as
+"these artifacts come from elsewhere". It says the upstream's SOURCES are not carried here, which is
+a different claim - and one grep for who writes those files would have shown the difference. The
+bisection above was careful and the conclusion on the end of it was not.
+
+RUN HERE IT CONVERGES on all three targets and reports "the recorded pass-2 inventory reproduces",
+so the upstream IS fetched on this machine. After the relink the development build passes -
+`RESULT ok exit=0 seconds=346` - where it had refused three times.
+
+WHAT THE FAILURE MEANT, CORRECTLY: the staged quarantine consumers were STALE with respect to
+`icdprobe`, and nothing in the ordinary build regenerates them because nothing in the ordinary build
+stages them. The identity note records the compiler and the linker, so anything that moves those
+moves `icdprobe`'s identity and leaves the consumers behind until `foreign-audit-link.py` is run.
+
+THE LESSON IS THE ONE THIS SESSION KEEPS RELEARNING. Three times now a written claim about why
+something could not be done turned out to be a claim nobody had checked: the kernel "does not link
+`proto`" (it links `device-proto`, which carries `console-stream`); the `console-stream` client is
+"behind `channel-client-impl`" (only its channel transport is); and now these artifacts "are not
+built by this tree". Each time the check cost minutes and the claim had cost weeks.
+
+## The hot-plug bind failure: two defects, and the port that "passed" had the worse one
+
+THE SCENARIO WAS GREEN ON x86_64 AND RED ON BOTH EMULATED PORTS, and the green one was wrong.
+
+What the emulated ports said was `virtio-console answered its bind with a refusal - the driver says
+the device is not responding`, for a device at `01:00.0` behind the hot-plug root port. What x86_64
+said was `driver.virtio-console: online (01:00.0, one port, tx failed)`. The first is a driver
+reporting honestly; the second is a driver reporting success about a device it had never touched.
+
+### Defect one: a bridge forwards an address range, and nothing programmed it
+
+`assign_bars_ecam` places a BAR out of the platform's low MMIO window whatever bus the device is on.
+That is correct for a root bus and unreachable behind a bridge: a PCI-to-PCI bridge forwards a
+RANGE, named by its memory base/limit dword, and an address outside it reaches nothing. Nothing in
+this kernel ever wrote that dword - `grep` for 0x20 in the three PCI backends found the PCIe root
+status register and nothing else.
+
+MEASURED RATHER THAN ASSUMED. `qemu-system-aarch64 -S` with the same root port, asked `info pci`:
+
+    secondary bus 0.
+    subordinate bus 0.
+    memory range [0xfff00000, 0x000fffff]
+    prefetchable memory range [0xfff00000, 0x000fffff]
+
+Base above limit is a window that is closed, and that is what a bridge holds out of reset. Firmware
+numbered the buses on all three ports - which is why the device was VISIBLE at 01:00.0 - and left
+the window of an EMPTY slot closed, because a slot with nothing in it needs no addresses. So the
+BAR was placed at a perfectly valid address the bridge in front of it never forwarded, every read
+returned all ones, and `negotiate_features` spun its hundred thousand times on a status that would
+never read zero.
+
+### Defect two: a BAR that was never placed reads zero, and zero was taken for an address
+
+On x86_64 `assign_bars` is a no-op, because firmware placed the BARs at boot. A device added to a
+LIVE machine arrives after firmware has run, so its BARs are unprogrammed - confirmed the same way,
+by booting OVMF to its own shell and adding the device over the monitor:
+
+    Bus  1, device   0, function 0:
+        Class 1920: PCI device 1af4:1043
+          BAR1: 32 bit memory (not mapped)
+          BAR4: 64 bit prefetchable memory (not mapped)
+          id "liberhp"
+
+`bar_address` returned `Some(0)` for that, `resolve_virtio` built a device with `bar_phys = 0`, and
+`sys_device_memory_map` mapped it - writable, uncached, from physical zero - with no check anywhere
+that a base of zero is not a base. `function_bar` on all three ports already refuses `base == 0`, so
+the rule existed in this tree; the resolvers did not have it.
+
+THE CONSEQUENCE IS NOT THAT THE DEVICE FAILS TO WORK. The virtio handshake is performed against RAM,
+and RAM reads back what is written to it: the reset is acknowledged because the zero written is the
+zero read, and FEATURES_OK is accepted because the byte is still there. The driver reports ONLINE.
+`resolve_msix` took the same zero, so the MSI-X table this kernel programmed was physical memory
+near address zero as well.
+
+A scenario that asserted the arrival passed on that. It is the failure mode the emulated ports do
+not have, and it is why the port that looked right was the one to fix first.
+
+### What was changed
+
+- `bar_address` refuses a memory BAR reading zero. Every resolver inherits it, so a function whose
+  window cannot be located gets an inventory row with no resources instead of physical zero.
+- A device behind a bridge is placed out of THAT BRIDGE'S window (`place_bars`). The window
+  firmware already forwards is used as it stands - which is what x86 firmware's hot-plug padding is
+  for, and the only source of an address on a port that hands out none of its own. A window that is
+  closed is opened out of the parent pool, 2 MB, and the bridge is told to decode memory.
+- An aperture starts its cursor past everything already placed inside it (`occupied_behind`), which
+  is KERN-ARCH-015 one level down. A bridge behind a bridge carves its window out of its parent's,
+  so an inner window is inside its outer one by construction.
+- A window whose base is zero is read as closed, because a register nobody wrote reads back zero and
+  would otherwise say the bridge forwards the first megabyte of physical memory.
+
+Four kernel tests cover it, and the fixture had to grow a second address to hold them: it answered
+for one function at every bus/device/function, so a scan could not find a bridge because there was
+nothing for a scan to find. It also did not place its own BARs, which is why a resolver that took
+zero for an address had never been caught by it.
+
+### What the scenario was doing wrong
+
+It ended at the arrival line, which is the FRONT of a sequence - kernel adds the device,
+DeviceManager binds, the driver reports, the manager closes the window. Before the fix the whole
+sequence completed in the time RAM takes to answer; after it, the driver's report lands 54 ticks
+later, which is AFTER the teardown has redrawn the prompt. The terminal was then not at a prompt and
+a scenario whose every step passed failed on being given back. The teardown check is right; the
+scenario was handing back a machine that was still working. It now waits for `bind window`, which is
+the manager saying BIND reached READY and the last line of the sequence.
+
+### CORRECTION: the emulated ports' bridge window was OPEN, and the BAR was placed outside it
+
+THE SECTION ABOVE SAYS FIRMWARE "left the window of an EMPTY slot closed" ON THE EMULATED PORTS.
+That is what `qemu-system-aarch64 -S` showed, and `-S` is the machine BEFORE FIRMWARE RUNS - so what
+it measured is QEMU's reset default and not what AAVMF leaves behind. The aarch64 run with the fix
+in prints no `now forwards` line at all, which means `ensure_aperture` found a window already open
+and used it. AAVMF pads a hot-plug bridge the same way OVMF does.
+
+SO THE DEFECT ON THOSE PORTS IS THE OTHER HALF OF THE SAME SENTENCE: the window was there and
+`assign_bars_ecam` placed the BAR in the PLATFORM window instead, at an address the bridge does not
+forward. The fix is what makes the difference either way - a device behind a bridge is placed out of
+THAT BRIDGE'S window - and the closed-window path is still the right thing for a bridge firmware did
+not pad, but it is not the path these three machines take. The claim that it was is corrected here
+rather than left standing because the run happened to pass.
+
+THE MEASUREMENT WAS REAL AND THE INFERENCE FROM IT WAS NOT. `-S` answers "what does this bridge hold
+out of reset", and I read it as "what does this bridge hold when the kernel gets it". One line of
+the guest's own log - the absence of `now forwards` - answers the second question directly.
+
+### Result
+
+    x86_64   pcie hotplug passed in 2.0 s    bind window virtio_console = 54 tick(s)
+    aarch64  pcie hotplug passed in 9.3 s    bind window virtio_console = 731 tick(s)
+
+Both bind the arrival for real: `driver.virtio-console: online (01:00.0, multiport 0/0/0, tx fail)`,
+where the 0/0/0 is the device honestly reporting no ports configured. Before the fix x86_64 said
+`one port` - read out of RAM, because MULTIPORT cannot be negotiated with a device that is not
+there - and the emulated ports said the device was not responding, which it was not.
+
+### AND riscv64 TAKES THE OTHER PATH, which is what makes both halves of the fix load-bearing
+
+The correction above says the closed-window path "is not the path these three machines take". That
+is true of two of them. riscv64's firmware does NOT pad its hot-plug bridge, and the guest says so:
+
+    pci: 00:0e.0 now forwards 0x40200000..0x40400000 to the bus behind it
+    pci: a device arrived in the slot behind 00:0e.0 - device 15
+    driver.virtio-console: online (01:00.0, multiport 0/0/0, tx fail)
+    DeviceManager: bind window virtio_console = 1310 tick(s) from BIND to READY
+
+So the three ports between them exercise both branches: x86_64 and aarch64 use the window their
+firmware already forwards, riscv64 gets one this kernel opens out of the platform's own addresses.
+Neither branch is there for a machine nobody has.
+
+    x86_64   pcie hotplug passed in  2.0 s    bind window virtio_console =   54 tick(s)
+    aarch64  pcie hotplug passed in  9.3 s    bind window virtio_console =  731 tick(s)
+    riscv64  pcie hotplug passed in 14.9 s    bind window virtio_console = 1310 tick(s)
+
+## CDC-ACM: several simultaneous adapters, and a serial function in a later configuration
+
+WHAT WAS LEFT OF THIS ITEM WAS TWO CLAUSES OF ITS OWN TEXT, and both of them were out of reach for
+one reason: the harness could build a gadget with ONE function in ONE configuration. So the first
+thing changed was the fixture, from a name to a PLAN - `<config> <function> <shape>` per line,
+written down before the first `mkdir` so the teardown undoes exactly what the setup made, which is
+the permission this whole path runs under. Two kinds came out of it: `acm-pair` and `acm-late`.
+
+THE DEVICE WAS READ OFF THE HOST BEFORE ANY DRIVER CODE WAS WRITTEN, which is worth stating because
+the alternative was available and would have been wrong. The `acm-pair` gadget presents:
+
+    INTERFACE num=0 class=0x02 sub=0x02 proto=0x01   CS_INTERFACE UNION bytes=0001
+    INTERFACE num=1 class=0x0a                       ENDPOINT 0x81  ENDPOINT 0x02
+    INTERFACE num=2 class=0x02 sub=0x02 proto=0x01   CS_INTERFACE UNION bytes=0203
+    INTERFACE num=3 class=0x0a                       ENDPOINT 0x86  ENDPOINT 0x07
+
+Each function's union names its OWN data interface. `bind_acm` kept ONE best bulk pair for the whole
+configuration - correct while there is one data interface, and wrong the moment there are two: the
+second function's union names interface three and the pair kept was interface one's. The old binder
+did not CROSS them, which is worth being precise about: it took function zero correctly and could
+not see function one at all. A pair per interface plus `bind_acm_nth` is the fix, and three host
+tests hold it - including that an alternate setting of a control interface is not a second function,
+which is how a binder that counted declarations rather than interfaces would report two ports on a
+device with one.
+
+AND A PORT CARRIES ITS OWN SLOT NOW. An adapter was a property of the `UsbDevice` beside it, which
+stops being a one-to-one pairing the moment one device is two ports - so `Serials` is two lists and
+not a list of pairs, because pairing each port with a device would either duplicate a `UsbDevice`,
+which owns pages, or force the two ports of one device to be modelled as something else.
+
+ONE WALK, ONE `CONFIGURE_ENDPOINT`, ONE `SET_CONFIGURATION`. The first because the configuration
+descriptors are bus traffic per device at enumeration and the emulated ports already run their bind
+windows at 97 to 181 ticks against an allowance of 200. The second because a device has one slot
+context whose Context Entries field has to cover the highest endpoint of all its ports. The third
+because `SET_CONFIGURATION` RESETS every interface in the configuration - issuing it per port would
+tear down the port before it.
+
+THE ORACLES SAY WHICH PORT, which is the only way this can be proved. Different bytes to each port,
+each asserted on its OWN stream, with an echo process per tty - so a driver that bound one port
+twice or crossed the two fails rather than passing on a coincidence. Both passed on the FIRST run:
+
+    serial-echo: echoing on /dev/ttyGS0     driver.xhci: serial adapter bound - a byte stream ...
+    serial-echo: echoing on /dev/ttyGS1     driver.xhci: serial adapter bound - a byte stream ...
+    serial-echo: echoed 8 byte(s)           driver.xhci: online (00:05.0, 8 device(s)) ... (serial x2)
+    serial-echo: echoed 18 byte(s)          usb-cdc-acm: two ports on one device, 8 and 18 byte(s)
+
+AND THE HARNESS COULD NOT TELL TWO PUBLICATIONS OF ONE KIND APART. `recv_offers` decoded the offer's
+NAME and threw it away - `_name` - which was harmless while no driver published two providers of one
+kind that a test had to choose between. The moment one does, asking by kind is a question with two
+right answers. The offers are a struct now and `offer_token_named` is how an oracle asks for the
+second port rather than the first.
+
+WHAT IS NOT CLAIMED, AND WHY: two adapters on two SEPARATE devices. The model admits it - the ports
+are a list and each carries its own slot - but this machine has one gadget controller, so a second
+device needs `dummy_hcd num=2` and a second passthrough. What is PROVED is two ports on one device,
+which is what a two-port USB serial adapter is.
+
+### AND THE HOT-PLUG SLOT WAS ADDED TWICE, WHICH ONLY A TEST RUN COULD SHOW
+
+The scenario work earlier in this session appended `pcie-root-port,id=hotplug0` to both emulated
+profiles, because `qemu_attach_suite_devices` returns at its first line unless `TEST=1` and a cold
+or interactive boot of those targets therefore had no slot at all. What that missed is that the
+function does not only attach the suite's DEVICES: past its early return it attaches the SLOT too.
+So a TEST run of either emulated port got two ports with one id, and QEMU refused the whole machine:
+
+    qemu-system-aarch64: -device pcie-root-port,id=hotplug0,...: Duplicate ID 'hotplug0' for device
+    [test-aarch64] FAIL (exit 1, 15s)
+
+EVERY RUN THAT PROVED THE SCENARIO WAS A COLD RUN, which is exactly the profile the addition was for
+and exactly the profile where it is correct. The three scenario passes, on all three ports, could
+not have found this; the first TEST run did, in fifteen seconds.
+
+The addition is now conditional on the same expression the suite path returns on, so the two are one
+machine shape expressed in two places rather than two shapes. `--tags pci` on aarch64 afterwards:
+68 passed in 110 s.
+
+THE LESSON IS ABOUT WHERE A FIX IS VERIFIED AND NOT ABOUT THE FIX. A harness change made for one
+profile was verified on that profile only, and the profile it broke is the one every other test in
+the tree runs under. A scenario and a suite are different machines, and this file has now spent two
+separate findings on that difference.
+
+## The two full suites after the BAR-placement change (2026-09-21)
+
+aarch64: 435 passed, 6074 s. riscv64: 438 passed, 6198 s. Zero failures in either. Both under TCG,
+both started from the same tree, both after the duplicate-slot harness fix above.
+
+THE MEASUREMENT IS THE POINT RATHER THAN THE NUMBERS. `bar_address` refusing zero and `place_bars`
+putting a function behind a bridge inside that bridge's window are changes underneath EVERY device
+this kernel binds, so the scope of the verification is the whole suite and not the PCI tags. A pass
+of `--tags pci` would have said nothing about the storage stack reading a disk through a BAR this
+code placed.
+
+AND ONE NON-FINDING, WRITTEN DOWN BECAUSE IT COST TWENTY MINUTES AND WOULD COST THEM AGAIN. Both
+guest logs stopped growing for half an hour, at the same line of the same test, while both QEMUs sat
+at 125 per cent CPU. That reads exactly like a driver spinning, and the suspicion had a candidate:
+the xHCI driver had just grown a second serial publication and a second port's polling. Three things
+settled it without touching the code. The host was not contended - a hundred cores at a load of four.
+The test that was running could not hang, because its waits are bounded loops over
+`run_until_idle`. And the log is a BUFFERED file: when it moved, it moved by sixty-eight completed
+tests at once, which is a flush and not a recovery. The per-test watchdog reads that same buffered
+file, which is why its window is forty minutes and not the ten the slowest test would suggest.
+
+WHAT WOULD HAVE MADE IT CHEAPER: the test is tagged `Slow`, so the `--tags usb,drivers` run earlier
+in the session never ran it, and the first execution of it after the driver change was inside a
+hundred-minute suite on an emulated port. A tag that excludes a test from every scoped run makes
+that test's first evidence arrive at the worst possible moment.
+
+## A note filed here because the session that found it is this one (2026-09-21)
+
+Not a P02M0099 finding. `scene3d`'s level-of-detail feature chose a level every frame into a
+`ViewDetail` that nothing read: `queue::build` sorted by material and `emit::record` drew
+`drawable.mesh`, so a scene could coarsen for ever and still draw its finest mesh. Everything around
+it was right - the ladder, the thresholds, the hysteresis, the per-view split, twenty-four fixtures
+and sixty conformance scenes - and none of them touched the recorder, because each held the DECISION
+rather than its effect.
+
+WHAT FOUND IT was a fixture written for a different clause: "every Extended feature emits only
+`render3d` commands", with a geometry source whose mesh identifier IS its vertex buffer, so the
+recorded list says which level was drawn. The first run said the fine one.
+
+THE SHAPE TO LOOK FOR ELSEWHERE: a feature whose output is a structure rather than a command, with
+fixtures that read the structure. Those fixtures pass for ever whether or not anything downstream
+consumes it. The cheap test is to assert on the thing the next layer actually reads.
+
+## One architecture, one run: the harness says so and I had to be told (2026-09-22)
+
+Trying to save wall-clock, I queued the graphics tests and the gadget oracles to start together. Two
+`test.sh --arch aarch64` processes refuse each other in one second:
+
+    test.sh: a qemu-system-aarch64 already holds this tree's disk images: 813595 (.../uas-scratch.813595.img)
+
+THE REFUSAL IS THE DESIGN AND NOT A LIMITATION. The scratch images a run attaches are named per tree
+and per run, and the check is about the TREE: two guests writing one tree's disks would produce two
+sets of results neither of which is about a known state. The message even names the pid to kill,
+which is what a run left behind looks like.
+
+WHAT IS ACTUALLY PARALLEL is one run per ARCHITECTURE - aarch64 and riscv64 at the same time, which
+is how both full suites ran earlier - and the gadget oracles are serial beyond that, because the
+machine has one gadget controller whatever the architecture is pointed at it.
+
+AND KILLING A GADGET RUN MID-FLIGHT IS SAFE, which was worth confirming rather than assuming: the
+stopped run's exit trap ran, `usb-gadget.sh` reported `torn down`, `/sys/kernel/config/usb_gadget/`
+came back empty and no echo process was left holding a tty. The teardown is on the trap and not on
+the happy path, which is what makes that true.
+
+## The per-test watchdog and a selection of ONE test (2026-09-22)
+
+`TEST_SELECTION` naming a single test turns the progress watchdog into a wall-clock one. The watchdog
+counts COMPLETED tests and fires when none completes for its window; with one test selected there is
+exactly one completion and it arrives at the end, so the window is measured against the whole test
+rather than against a gap between tests.
+
+The two-port CDC-ACM oracle costs 1203 s on aarch64 and more than the 2400 s window on riscv64, so
+the riscv64 run was stopped by the watchdog with the guest mid-test. The harness's own message names
+the answer - `TEST_STALL=<seconds>` - and that is what the re-run uses.
+
+THIS IS NOT A DEFECT IN THE WATCHDOG. Its window is calibrated for a FULL suite, where a gap between
+completions of forty minutes is a genuine stall. A single-test selection is a different shape of run,
+and the number that suits one does not suit the other. What it means in practice: a scoped run of a
+`Slow` test on an emulated port should carry `TEST_STALL` with it, and this file records it because
+the same trap is waiting for every future single-test run on a slow target.
+
+AND THE THING THAT LOOKED LIKE THE SAME FAULT EARLIER WAS NOT. In the full suites both guests went
+quiet for half an hour inside one test and recovered on their own, because a full run has other tests
+completing around it and the log is buffered. Here nothing completed because nothing else was
+selected. Two different causes, one symptom.
+
+## An xHCI driver that is runnable for ever, found on riscv64 by the CDC-ACM oracles (2026-09-22)
+
+**THE DEFECT.** `take_event` wrote `ERDP` with the Event Handler Busy bit only when it actually
+dequeued an event, because a dequeue moves the pointer anyway. The controller SETS EHB when it
+asserts, and the driver is what clears it - so a wake whose ring turned out to be EMPTY left EHB set.
+A set EHB with an acknowledged line is a wake that arrives again the instant it is acknowledged, and
+the service loop is then runnable for ever.
+
+**WHAT IT COSTS IS NOT A BUSY DRIVER.** The kernel test harness drives the system with
+`sched::run_until_idle`, which returns when the run queue is empty - and with one thread always
+runnable it never returns. So a test that waits for anything at all waits for ever, inside a
+scheduler call, with no output. The guest sits at a hundred per cent of a core and prints nothing.
+
+**HOW IT WAS FOUND, AND THE THREE WRONG ANSWERS ON THE WAY.**
+
+1. `acm-late` on riscv64 was stopped by the per-test watchdog at 2400 s. First reading: the test is
+   legitimately slower there than the window allows. That reading was reasonable - a single-test
+   selection turns the progress watchdog into a wall-clock one - and it was WRONG.
+2. Raising `TEST_STALL` to 5400 s made `acm-pair` pass in 1247 s, which DISPROVED the slowness
+   reading for that oracle, and left `acm-late` failing at 5400 s.
+3. Sampling the host's view of the guest was the measurement that turned it round: QEMU at 110 to 119
+   per cent of a core, steady, with the guest log frozen. A guest waiting for a device is idle; a
+   guest at a full core is executing. That is the difference between slow and wedged, and nothing in
+   the logs says it.
+4. Instrumenting the TEST narrowed it to before the first byte moved. Instrumenting the DRIVER'S
+   service loop - a counter and a print of what `wait_providers_or_answer` returned - named it
+   exactly: `kind=3 token=999`, which is the DEVICE interrupt and not any publication. Ten live
+   endpoints, so the consumer's connection had arrived and was simply never reached, because the
+   poll returns the first ready handle and the interrupt was always it.
+
+**WHY IT APPEARED NOW AND ONLY THERE.** The same binary passes on x86_64 and aarch64, whose interrupt
+delivery did not produce an empty wake in these runs. It is not a riscv64 defect; riscv64 is where
+the timing exposed it. The single-port oracle passed on riscv64 before this session, which is what
+made it look like a regression of this session's publication work - it is not: the defect is older
+than the change that shifted the timing onto it.
+
+**THE FIX IS ONE WRITE.** `ERDP` with EHB is written on every wake of the service loop, beside the
+interrupt acknowledgement, and not only where an event was taken. It is idempotent - `evt_index` is
+the driver's own dequeue pointer, which is what `ERDP` is meant to hold, and EHB is write-one-to-clear.
+
+**THE LESSON THAT GENERALISES.** A wake with nothing to do is not a special case to be skipped; it is
+the case where the acknowledgement matters most, because the handler that does nothing is the one
+that leaves the state that caused the wake. Every ring consumer in this tree deserves the same
+question asked of it: what does it write back when it finds the ring empty?
+
+**AND THE FIX IS NOT ONLY A FIX, IT IS A SPEED-UP OF SIX.** The single-port oracle on riscv64 was
+recorded at 1248 s before this session and passes in **199 s** with the write in place. The spin was
+there all along, stealing the machine between every wake; what changed on riscv64 was only that it
+grew from stealing most of the time to taking all of it. A measurement that improves by a factor of
+six on a one-line change is the shape of a defect that was being paid for quietly everywhere.

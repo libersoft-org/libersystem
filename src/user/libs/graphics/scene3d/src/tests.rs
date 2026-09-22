@@ -1084,8 +1084,121 @@ fn colour_target() -> RenderTargetView {
 	RenderTargetView { texture: 1, view: TextureViewDesc { dimension: TextureDimension::D2, aspect: Aspect::Colour, base_mip: 0, mip_count: 1, base_layer: 0, layer_count: 1 }, format: "RGBA8", samples: 1, width: 800, height: 800, load: LoadOp::Clear, store: StoreOp::Store }
 }
 
+/// A depth-only attachment, which is the whole of what a shadow pass writes into.
+fn shadow_target() -> render3d::resource::DepthStencilView {
+	render3d::resource::DepthStencilView { texture: 2, view: TextureViewDesc { dimension: TextureDimension::D2, aspect: Aspect::Depth, base_mip: 0, mip_count: 1, base_layer: 0, layer_count: 1 }, format: shadow::MAP_FORMAT, samples: 1, width: 64, height: 64, depth_load: LoadOp::Clear, depth_store: StoreOp::Store, stencil_load: LoadOp::Discard, stencil_store: StoreOp::Discard }
+}
+
 fn pass_targets() -> PassTargets {
 	PassTargets { targets: 0, viewport: Rect { x: 0, y: 0, width: 800, height: 800 }, samples: 1, id_set: Some(64) }
+}
+
+#[test]
+fn a_shadow_pass_draws_the_casters_and_not_the_glass() {
+	// A SURFACE THAT LETS LIGHT THROUGH DOES NOT STOP IT. A shadow map holds ONE depth per texel and
+	// has no way to say "some of the light got past", so a transparent caster written into it casts
+	// a SOLID shadow - the opposite of what the surface does. Leaving the transparent queue out is
+	// the profile's shape and not a simplification.
+	let mut scene = Scene::new(Limits::EXTENDED_MINIMUM);
+	let plain = scene.add_material(opaque(1)).unwrap();
+	let masked = scene.add_material(opaque(2).with_blending(Blending::AlphaMask { threshold: 0.5 })).unwrap();
+	let glass = scene.add_material(blended(3)).unwrap();
+	let rig = scene.add_node(at(Vec3::new(0.0, 0.0, 0.0))).unwrap();
+	let camera = Camera::perspective(rig, core::f32::consts::FRAC_PI_2, 1.0, 1.0, 100.0, u32::MAX).unwrap();
+	scene.add_camera(camera).unwrap();
+	let group = scene.add_node(at(Vec3::new(0.0, 0.0, -10.0))).unwrap();
+	scene.add_drawable(Drawable::new(group, 0, plain).with_bounds(cube())).unwrap();
+	scene.add_drawable(Drawable::new(group, 0, masked).with_bounds(cube())).unwrap();
+	scene.add_drawable(Drawable::new(group, 0, glass).with_bounds(cube())).unwrap();
+	let queue = crate::queue::build(&mut scene, &camera).unwrap();
+
+	let map = shadow_target();
+	let depth_only = RenderTargetSet { colour: &[], depth_stencil: Some(map), resolve: &[] };
+	let pass = crate::emit::CasterPass { targets: 7, viewport: Rect { x: 0, y: 0, width: 64, height: 64 }, pipeline: GraphicsPipeline(11), masked_pipeline: Some(GraphicsPipeline(12)), light_set: 5 };
+	let mut list = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+	crate::emit::record_casters(&scene, &queue, &OneMesh { indexed: true }, &mut list, &depth_only, &pass).unwrap();
+	list.finish().unwrap();
+
+	let commands = list.commands();
+	let draws = commands.iter().filter(|command| matches!(command, Command::Draw { .. } | Command::DrawIndexed { .. })).count();
+	assert_eq!(draws, 2, "the opaque caster and the masked one, and not the glass");
+
+	// THE MASKED CASTERS GET THEIR OWN PIPELINE, because an alpha mask decides whether a fragment
+	// EXISTS and a leaf drawn as a solid quad is worse than no leaf shadow at all.
+	let pipelines: Vec<u32> = commands.iter().filter_map(|command| if let Command::BindPipeline(pipeline) = command { Some(pipeline.0) } else { None }).collect();
+	assert_eq!(pipelines, vec![11, 12], "the depth-only pipeline for the opaque queue and the cutout one for the mask queue");
+
+	// AND THE DEPTH WRITE IS FORCED ON. A caster pass that inherited the lighting pass's per-queue
+	// rule would write nothing for the mask queue on a layer that shared one state, and an empty
+	// shadow map reads exactly like a scene with no shadows in it. Read from the decision itself,
+	// because `BindPipeline` carries the pipeline and not the state it was validated against.
+	let arrived = PipelineState { topology: Topology::TriangleList, cull: Cull::Back, depth_test: Some(render3d::depth::CompareOp::LessOrEqual), depth_write: false, samples: 1, per_sample_shading: false };
+	assert!(crate::emit::caster_state(arrived).depth_write, "every caster writes depth, whatever its geometry arrived carrying");
+	assert!(matches!(commands.first(), Some(Command::BeginRenderPass { targets: 7 })));
+	assert!(matches!(commands.last(), Some(Command::EndRenderPass)));
+}
+
+#[test]
+fn a_shadow_pass_with_no_cutout_pipeline_leaves_the_masked_casters_out() {
+	// THE HONEST ANSWER FOR A LAYER THAT HAS NO SUCH PIPELINE. Drawing a masked caster with the
+	// opaque one would put a solid silhouette where the cutout is, so `None` means it is not drawn -
+	// which is a shadow that is missing rather than a shadow that is wrong.
+	let mut scene = Scene::new(Limits::EXTENDED_MINIMUM);
+	let masked = scene.add_material(opaque(2).with_blending(Blending::AlphaMask { threshold: 0.5 })).unwrap();
+	let rig = scene.add_node(at(Vec3::new(0.0, 0.0, 0.0))).unwrap();
+	let camera = Camera::perspective(rig, core::f32::consts::FRAC_PI_2, 1.0, 1.0, 100.0, u32::MAX).unwrap();
+	scene.add_camera(camera).unwrap();
+	let group = scene.add_node(at(Vec3::new(0.0, 0.0, -10.0))).unwrap();
+	scene.add_drawable(Drawable::new(group, 0, masked).with_bounds(cube())).unwrap();
+	let queue = crate::queue::build(&mut scene, &camera).unwrap();
+
+	let map = shadow_target();
+	let depth_only = RenderTargetSet { colour: &[], depth_stencil: Some(map), resolve: &[] };
+	let pass = crate::emit::CasterPass { targets: 7, viewport: Rect { x: 0, y: 0, width: 64, height: 64 }, pipeline: GraphicsPipeline(11), masked_pipeline: None, light_set: 5 };
+	let mut list = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+	crate::emit::record_casters(&scene, &queue, &OneMesh { indexed: true }, &mut list, &depth_only, &pass).unwrap();
+	list.finish().unwrap();
+	let draws = list.commands().iter().filter(|command| matches!(command, Command::Draw { .. } | Command::DrawIndexed { .. })).count();
+	assert_eq!(draws, 0, "no cutout pipeline means no masked caster in the map");
+}
+
+#[test]
+fn the_shadow_and_environment_resources_are_what_the_profile_names() {
+	// A SHADOW MAP IS AN ARRAY WITH NO MIPS, and the no-mips half is the one worth holding: a mip is
+	// an AVERAGE of depths, and the average of a near depth and a far one is a depth nothing in the
+	// scene is at - so a filtered shadow map compares against a surface that does not exist.
+	let limits = Limits::EXTENDED_MINIMUM;
+	let cascades = shadow::cascade_map_desc(1024, 4, &limits).expect("four cascades at the profile's floor");
+	assert_eq!(cascades.dimension, TextureDimension::D2Array);
+	assert_eq!((cascades.width, cascades.height, cascades.layers), (1024, 1024, 4));
+	assert_eq!(cascades.mip_levels, 1, "a shadow map is compared and not filtered by magnitude");
+	assert_eq!(cascades.format, "Depth32F");
+	assert!(cascades.usage.sampled && cascades.usage.depth_stencil_attachment, "it is written by the caster pass and read by the lighting one");
+
+	// AND A COUNT ABOVE THE LIMIT IS REFUSED RATHER THAN SILENTLY GIVEN FEWER, which is the
+	// profile's own rule for cascades.
+	assert!(matches!(shadow::cascade_map_desc(1024, limits.max_shadow_cascades + 1, &limits), Err(Error::LimitExceeded { limit: "max_shadow_cascades", .. })));
+	assert!(matches!(shadow::cascade_map_desc(0, 1, &limits), Err(Error::Degenerate { .. })), "a map with no extent");
+
+	// A POINT LIGHT'S IS A CUBE, because the face is chosen by the major axis of a direction - which
+	// is what a cube sampler does from the direction itself.
+	let cube_map = shadow::cube_map_desc(512, &limits).expect("a point light's shadow cube");
+	assert_eq!(cube_map.dimension, TextureDimension::Cube);
+	assert_eq!(cube_map.layers, 6, "six faces, and the value is checked rather than assumed");
+
+	// THE ENVIRONMENT'S MIPS ARE THE ROUGHNESS AXIS. 256 halves to 8 in six steps, so six levels -
+	// and the chain stops there because below 8x8 the filter is wider than the face.
+	let environment = crate::environment::cube_desc(256).expect("an environment cube");
+	assert_eq!(environment.mip_levels, crate::environment::prefilter_levels(256));
+	assert_eq!(environment.mip_levels, 6, "256, 128, 64, 32, 16, 8");
+	assert_eq!(environment.format, crate::environment::HDR_FORMAT);
+	assert!(matches!(crate::environment::cube_desc(4), Err(Error::Degenerate { .. })), "faces below the smallest prefilter level");
+
+	// AND THE HDR TARGET IS HALF FLOATS, because the bloom threshold sits at luminance 1.0 and a
+	// normalised format has nothing above it to spread.
+	let hdr = crate::environment::hdr_target_desc(320, 240).expect("an HDR target");
+	assert_eq!(hdr.format, "RGBA16F");
+	assert_eq!(hdr.mip_levels, 1, "the bloom pyramid is its own chain of targets");
 }
 
 #[test]
@@ -2262,6 +2375,105 @@ fn the_sample_sequence_is_hammersley_and_stays_inside_the_unit_square() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
+fn a_directional_cascade_is_fitted_to_its_slice_s_bounding_sphere() {
+	// A SPHERE AND NOT THE SLICE'S BOX, which is the profile's rule and the reason the shadow edge
+	// does not crawl when the camera turns: a box fitted to the slice changes SIZE with the view's
+	// orientation and a sphere does not.
+	//
+	// The light points straight down, the sphere is the unit sphere at the origin, so the eye is one
+	// radius up at (0, 1, 0), near is 0 at the eye and far is the diameter. Every expected value
+	// below is worked out from that rather than read back from the matrix.
+	let down = Vec3::new(0.0, -1.0, 0.0);
+	let at = shadow::directional_projection(down, Vec3::new(0.0, 0.0, 0.0), 1.0).expect("a unit sphere under a downward light");
+
+	// The sphere's centre sits at the middle of the depth range: near 0, far 2, so half of it.
+	let centre = at.transform_point(Vec3::new(0.0, 0.0, 0.0));
+	assert!((centre.z - 0.5).abs() < 1e-5, "the centre is half way between the near and far planes, got {}", centre.z);
+	assert!(centre.x.abs() < 1e-5 && centre.y.abs() < 1e-5, "and at the middle of the map");
+
+	// A point one radius BELOW the centre is at the far plane; one radius above is at the near one.
+	let bottom = at.transform_point(Vec3::new(0.0, -1.0, 0.0));
+	let top = at.transform_point(Vec3::new(0.0, 1.0, 0.0));
+	assert!((bottom.z - 1.0).abs() < 1e-5, "the far side of the sphere is at the far plane, got {}", bottom.z);
+	assert!(top.z.abs() < 1e-5, "and the near side at the near plane, got {}", top.z);
+
+	// THE VOLUME IS EXACTLY THE DIAMETER ACROSS, so the sphere's equator lands on the map's edges
+	// rather than inside them - a volume any wider is texels spent on nothing.
+	let east = at.transform_point(Vec3::new(1.0, 0.0, 0.0));
+	assert!((east.x.abs() - 1.0).abs() < 1e-5, "one radius sideways is at the edge of the map, got {}", east.x);
+
+	// AND THE UP AXIS FALLS BACK when the light points ALONG +Y, which is the case a `look_at` has
+	// no basis for at all: the failure there is a matrix of NaNs and not a wrong picture.
+	let straight = shadow::directional_projection(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 0.0), 1.0).expect("a light pointing along the up axis still has a projection");
+	assert!(straight.is_finite(), "the fallback up axis is what keeps it finite");
+}
+
+#[test]
+fn a_directional_cascade_refuses_what_it_cannot_fit() {
+	// NAMED RATHER THAN CLAMPED. A radius of zero is a slice with no volume and a direction of zero
+	// is a light that points nowhere; both are arithmetic that cannot be done, and answering with a
+	// matrix would answer a question nobody asked.
+	let down = Vec3::new(0.0, -1.0, 0.0);
+	assert!(matches!(shadow::directional_projection(down, Vec3::new(0.0, 0.0, 0.0), 0.0), Err(Error::Degenerate { .. })), "a cascade with no radius");
+	assert!(matches!(shadow::directional_projection(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0), 1.0), Err(Error::Degenerate { .. })), "a light with no direction");
+	assert!(matches!(shadow::directional_projection(down, Vec3::new(f32::NAN, 0.0, 0.0), 1.0), Err(Error::Degenerate { .. })), "a centre that is not a point");
+}
+
+#[test]
+fn a_spot_light_s_frustum_is_twice_its_cone_and_not_its_cone() {
+	// HALVING IT ONCE TOO OFTEN is the defect this holds: a cone's half-angle is measured from its
+	// axis and a perspective's field of view across the whole frustum, so a map built with the cone
+	// angle covers the MIDDLE of the cone and everything outside reads as unshadowed - a shadow that
+	// ends in mid-air.
+	//
+	// A 45-degree outer cone means a 90-degree frustum, whose edge ray at 45 degrees from the axis
+	// lands exactly on the edge of the map. Worked out from the angle, not from the matrix.
+	let quarter = core::f32::consts::FRAC_PI_4;
+	let at = shadow::spot_projection(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -1.0), quarter, 1.0, 100.0).expect("a spot light with a 45 degree outer cone");
+	let edge = at.transform_point(Vec3::new(10.0, 0.0, -10.0));
+	assert!(((edge.x / edge.w).abs() - 1.0).abs() < 1e-4, "the ray at the cone's outer angle is at the edge of the map, got {}", edge.x / edge.w);
+	let inside = at.transform_point(Vec3::new(5.0, 0.0, -10.0));
+	assert!((inside.x / inside.w).abs() < 1.0, "and a ray inside the cone is inside the map");
+
+	assert!(matches!(shadow::spot_projection(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -1.0), quarter, 1.0, 1.0), Err(Error::Degenerate { .. })), "a range that does not reach past the near plane");
+	assert!(matches!(shadow::spot_projection(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0), quarter, 1.0, 100.0), Err(Error::Degenerate { .. })), "a spot with no direction");
+}
+
+#[test]
+fn the_six_cube_faces_tile_the_sphere_with_no_gap_and_no_overlap() {
+	// NINETY DEGREES EXACTLY. A wider field spends texels on what the neighbouring face already has;
+	// a narrower one leaves a band around every edge that no face covers, which reads as a
+	// cross-shaped seam of unshadowed surface radiating from the light.
+	//
+	// The test is the tiling itself: a direction is sent to its face by the profile's major-axis
+	// rule, and that face's own projection must put it INSIDE the map. A gap would be a direction
+	// whose own face does not cover it.
+	let position = Vec3::new(1.0, 2.0, 3.0);
+	for direction in [
+		Vec3::new(1.0, 0.0, 0.0),
+		Vec3::new(-1.0, 0.0, 0.0),
+		Vec3::new(0.0, 1.0, 0.0),
+		Vec3::new(0.0, -1.0, 0.0),
+		Vec3::new(0.0, 0.0, 1.0),
+		Vec3::new(0.0, 0.0, -1.0),
+		// And the awkward ones: just inside a face, and along an edge between two.
+		Vec3::new(0.99, 0.98, 0.0),
+		Vec3::new(1.0, 1.0, 0.0),
+		Vec3::new(-0.9, 0.2, 0.89),
+	] {
+		let face = shadow::cube_face(direction).expect("every non-zero direction falls on a face");
+		let at = shadow::point_face_projection(position, face, 0.1, 50.0).expect("a face of a point light's cube");
+		let clip = at.transform_point(position.add(direction.scale(10.0)));
+		assert!(clip.w > 0.0, "a point on the face is in front of it, {direction:?}");
+		let (x, y) = (clip.x / clip.w, clip.y / clip.w);
+		assert!(x.abs() <= 1.0 + 1e-4 && y.abs() <= 1.0 + 1e-4, "and inside the face's own map, {direction:?} landed at ({x}, {y})");
+	}
+
+	assert!(matches!(shadow::point_face_projection(position, shadow::CubeFace::PositiveX, 0.0, 50.0), Err(Error::Degenerate { .. })), "a near plane at zero");
+	assert!(matches!(shadow::point_face_projection(position, shadow::CubeFace::PositiveX, 1.0, 0.5), Err(Error::Degenerate { .. })), "a range inside the near plane");
+}
+
+#[test]
 // THE BIAS IS RELATIVE TO THE DEPTH'S OWN PRECISION, which is what `r = 2^(exponent(z) - 23)` in the
 // 3D profile's equation means. A constant bias in absolute units is far too small near the camera
 // and far too large at the far plane, and a scene tuned at one distance acnes at the other.
@@ -2869,4 +3081,387 @@ fn a_clip_drives_the_nodes_its_skeleton_names_and_touches_nothing_else() {
 	let many: Vec<u32> = (0..129).map(|_| root).collect();
 	assert!(matches!(Skeleton::new(many, &extended()), Err(Error::LimitExceeded { limit: "max_skeleton_joints", ceiling: 128, asked: 129 })));
 	assert!(matches!(Skeleton::new(Vec::new(), &extended()), Err(Error::Degenerate { .. })));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The PBR material's join: a second table, and one drawable naming one material in one of them.
+// ---------------------------------------------------------------------------------------------
+
+/// An Extended material with the plainest factors there are, so a fixture about WHERE it lives is
+/// not also a fixture about what it computes - `pbr`'s own ten hold that.
+fn physical(pipeline: u32) -> ExtendedMaterial {
+	ExtendedMaterial::new(PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5), GraphicsPipeline(pipeline), pipeline)
+}
+
+#[test]
+// A PHYSICALLY BASED MATERIAL LIVES IN ITS OWN TABLE AND THE CORE LIST STAYS FOUR. The core profile
+// enumerates exactly four material kinds; a fifth would change what `Scene3D Core Profile 1` means,
+// and giving a PBR material one of the four would put a lie in the inventory. So it goes somewhere
+// else, and `material_of` is what knows where.
+fn an_extended_material_lives_in_its_own_table_and_the_core_list_stays_four() {
+	let mut scene = Scene::new(extended());
+	let core = scene.add_material(opaque(1)).expect("a core material");
+	let physically = scene.add_extended_material(physical(2)).expect("an Extended material");
+	assert_eq!(core, 0, "the two tables have their own indices, and both start at zero");
+	assert_eq!(physically, 0);
+	assert_eq!(scene.materials().len(), 1, "the core table did not grow");
+	assert_eq!(scene.extended_materials().len(), 1);
+
+	let node = scene.add_node(at(Vec3::new(0.0, 0.0, -10.0))).unwrap();
+	let plain = scene.add_drawable(Drawable::new(node, 0, core).with_bounds(cube())).unwrap();
+	let shiny = scene.add_drawable(Drawable::extended(node, 0, physically).with_bounds(cube())).unwrap();
+	assert_eq!(scene.drawables()[plain as usize].material, MaterialRef::Core(0));
+	assert_eq!(scene.drawables()[shiny as usize].material, MaterialRef::Extended(0));
+
+	// AND THE RESOLUTION IS BY TABLE AND NOT BY INDEX. Both drawables name material ZERO, and the
+	// two zeroes are different materials - which is the whole reason the table is part of the name.
+	let resolved = scene.material_of(&scene.drawables()[plain as usize]).expect("the core material resolves");
+	assert!(matches!(resolved, Shading::Core(_)));
+	assert!(!resolved.is_extended());
+	assert_eq!(resolved.pipeline(), GraphicsPipeline(1));
+	let resolved = scene.material_of(&scene.drawables()[shiny as usize]).expect("the Extended material resolves");
+	assert!(matches!(resolved, Shading::Extended(_)));
+	assert!(resolved.is_extended());
+	assert_eq!(resolved.pipeline(), GraphicsPipeline(2), "and the second table's pipeline is the one recorded");
+}
+
+#[test]
+// A SCENE THAT DOES NOT CLAIM EXTENDED HAS NO SECOND TABLE AT ALL. The six Extended limits are set
+// together or left at zero, and this is the one entry point through which a layer could otherwise
+// acquire a piece of the part - a material it could draw with, under a profile it does not claim.
+fn a_scene_that_does_not_claim_extended_refuses_an_extended_material() {
+	let mut scene = Scene::new(Limits::PROFILE_MINIMUM);
+	assert!(!Limits::PROFILE_MINIMUM.claims_extended());
+	assert!(matches!(scene.add_extended_material(physical(1)), Err(Error::NotExtended { operation: "add_extended_material" })));
+	assert!(scene.extended_materials().is_empty(), "and nothing was added on the way to the refusal");
+
+	// AND THE CORE TABLE IS UNAFFECTED, because refusing the part is not refusing the profile.
+	assert!(scene.add_material(opaque(1)).is_ok());
+}
+
+#[test]
+// BOTH TABLES ARE COUNTED AGAINST ONE CEILING, for the reason `max_transparent_items` was refused: a
+// physically based material IS a material, the core profile already says how many a scene may hold,
+// and a second limit over the second table is two numbers that can disagree.
+fn both_material_tables_are_counted_against_one_ceiling() {
+	let limits = Limits { max_materials: 2, ..extended() };
+	let mut scene = Scene::new(limits);
+	scene.add_material(opaque(1)).expect("the first of two");
+	scene.add_extended_material(physical(2)).expect("the second of two, in the other table");
+	assert_eq!(scene.material_count(), 2);
+	// THE THIRD IS REFUSED WHICHEVER TABLE IT IS FOR, and both refusals name the core limit.
+	assert!(matches!(scene.add_material(opaque(3)), Err(Error::LimitExceeded { limit: "max_materials", ceiling: 2, asked: 3 })));
+	assert!(matches!(scene.add_extended_material(physical(3)), Err(Error::LimitExceeded { limit: "max_materials", ceiling: 2, asked: 3 })));
+}
+
+#[test]
+// A DRAWABLE NAMING A MATERIAL THE TABLE DOES NOT HOLD IS REFUSED, and the refusal says WHICH table,
+// because the two carry their own indices and "no such material" would send a reader to the wrong
+// list.
+fn a_drawable_naming_a_material_no_table_holds_is_refused_by_table() {
+	let mut scene = Scene::new(extended());
+	let node = scene.add_node(at(Vec3::ZERO)).unwrap();
+	scene.add_material(opaque(1)).unwrap();
+	assert!(matches!(scene.add_drawable(Drawable::new(node, 0, 1)), Err(Error::NoSuchMaterial { material: 1 })));
+	// INDEX ZERO EXISTS IN THE CORE TABLE AND NOT IN THE OTHER ONE, which is exactly the confusion
+	// one shared refusal would hide.
+	assert!(matches!(scene.add_drawable(Drawable::extended(node, 0, 0)), Err(Error::NoSuchExtendedMaterial { material: 0 })));
+}
+
+#[test]
+// THE QUEUE RULE IS ONE RULE AND BOTH FAMILIES OBEY IT. `queue`, `writes_depth` and `writes_id` are
+// functions of the blending and of nothing else, so they live on `Blending` and both materials
+// delegate - a second copy is how a PBR surface comes to hide what is behind it while a
+// `BlinnPhong` one does not.
+fn an_extended_material_takes_its_queue_from_the_same_rule_as_a_core_one() {
+	for blending in [Blending::Opaque, Blending::AlphaMask { threshold: 0.5 }, Blending::Blended] {
+		let core = opaque(1).with_blending(blending);
+		let physically = ExtendedMaterial::new(PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 1.0), 0.0, 0.5).with_blending(blending), GraphicsPipeline(2), 2);
+		assert_eq!(core.queue(), physically.queue(), "the same blending is the same queue: {blending:?}");
+		assert_eq!(core.writes_depth(), physically.writes_depth());
+		assert_eq!(core.writes_id(), physically.writes_id());
+		assert_eq!(core.blend, physically.blend, "and the blend state a blending implies is the same state");
+		physically.validate().expect("and each of the three validates");
+	}
+
+	// AND THE SCENE PUTS IT IN THAT QUEUE. A blended Extended material is sorted with the glass and
+	// writes neither depth nor an identity, which is the rule reaching the passes rather than only
+	// the type.
+	let mut scene = Scene::new(extended());
+	let glass = ExtendedMaterial::new(PbrMaterial::new(Vec4::new(1.0, 1.0, 1.0, 0.5), 0.0, 0.5).with_blending(Blending::Blended), GraphicsPipeline(2), 2);
+	let index = scene.add_extended_material(glass).expect("a transparent Extended material");
+	let node = scene.add_node(at(Vec3::new(0.0, 0.0, -10.0))).unwrap();
+	scene.add_drawable(Drawable::extended(node, 0, index).with_bounds(cube())).unwrap();
+	let (_, frustum) = known_frustum();
+	let queue = crate::queue::build_with(&mut scene, Vec3::ZERO, &frustum, u32::MAX);
+	assert_eq!(queue.transparent.len(), 1, "a blended physically based surface is in the transparent queue");
+	assert!(queue.opaque.is_empty());
+
+	// AND A PICK PASSES THROUGH IT, which is `writes_id` reaching the third caller.
+	let ray = crate::pick::Ray { origin: Vec3::ZERO, direction: Vec3::new(0.0, 0.0, -1.0) };
+	assert!(crate::pick::resolve(&scene, &ray, u32::MAX).is_none(), "the glass writes no identity, so the ray answers nothing");
+}
+
+#[test]
+// AN EXTENDED MATERIAL IS REFUSED FOR WHAT IT IS RATHER THAN DRAWN WRONG. Both factors are mixes,
+// and a mix outside zero to one is not one: a metallic above one drives the diffuse term negative
+// and a roughness above one takes `a = roughness^2` past the range the fits were made over. Neither
+// reports itself, because both still produce a colour.
+fn an_extended_material_refuses_factors_that_are_not_mixes() {
+	let mut scene = Scene::new(extended());
+	let mut wrong = physical(1);
+	wrong.shading.metallic = 1.5;
+	assert!(matches!(scene.add_extended_material(wrong), Err(Error::Degenerate { .. })));
+	let mut wrong = physical(1);
+	wrong.shading.roughness = -0.1;
+	assert!(matches!(scene.add_extended_material(wrong), Err(Error::Degenerate { .. })));
+	let mut wrong = physical(1);
+	wrong.shading.occlusion_strength = 2.0;
+	assert!(matches!(scene.add_extended_material(wrong), Err(Error::Degenerate { .. })));
+	// AND THE BLEND STATE MUST AGREE WITH THE BLENDING on the same terms as a core material's: one
+	// that says it is transparent and carries a pipeline that does not blend draws opaque, which
+	// reads as a missing texture.
+	let lying = physical(1).with_blend_state(Blending::Blended.blend_state());
+	assert!(matches!(scene.add_extended_material(lying), Err(Error::Degenerate { .. })));
+	assert!(scene.extended_materials().is_empty(), "no refusal left anything behind");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Every Extended feature, end to end: the sixth clause of the host-test item.
+// ---------------------------------------------------------------------------------------------
+
+/// A geometry source where a mesh identifier IS its vertex buffer, so the recorded list says WHICH
+/// level was drawn rather than only that something was.
+struct MeshPerLevel;
+
+impl Geometry for MeshPerLevel {
+	fn draw_of(&self, mesh: u32) -> Option<MeshDraw> {
+		Some(MeshDraw { topology: Topology::TriangleList, state: PipelineState { topology: Topology::TriangleList, cull: Cull::Back, depth_test: Some(render3d::depth::CompareOp::LessOrEqual), depth_write: true, samples: 1, per_sample_shading: false }, vertex_buffer: Buffer(mesh), instance_buffer: Some(Buffer(3)), vertices: 36, indices: Some(Indices { buffer: Buffer(2), count: 36, wide: false }) })
+	}
+}
+
+#[test]
+// EVERY EXTENDED FEATURE ENDS IN A `render3d` COMMAND AND NOWHERE ELSE, which is the sixth clause of
+// the host-test item and the one the core fixture of this shape does not cover: that one ranges over
+// materials, instancing, culling, lights and a camera, and no Extended feature appears in it at all.
+//
+// THIS SCENE CARRIES ALL OF THEM: a level-of-detail ladder that chooses a coarser mesh, a second
+// ladder that vanishes, a skeleton driven by a clip, a bound recomputed after morphing and skinning,
+// a physically based material out of the second table, all three queues, and a shadow caster pass.
+// The whole of its output is the two recorded lists, and each feature is read back from the commands
+// rather than from the structures that produced them.
+fn a_scene_that_uses_every_extended_feature_emits_only_render3d_commands() {
+	let limits = extended();
+	let mut scene = Scene::new(limits);
+
+	// THE BOUND THE LADDER MEASURES IS THE DEFORMED ONE and not the rest pose's, which is the whole
+	// of why `deformed_bounds` exists: a mesh a clip has moved is measured where it now is.
+	let base = [Vec3::new(-0.5, -0.5, -0.5), Vec3::new(0.5, 0.5, 0.5)];
+	let displacement = [Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, 0.5, 0.0)];
+	let targets = [crate::deform::MorphTarget { displacement: &displacement, weight: 1.0 }];
+	let influences = [Influences::new([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]).expect("one joint at full weight"); 2];
+	let pose = Pose::compose(&[Mat4::IDENTITY], &[Mat4::IDENTITY], &limits).expect("a one-joint pose");
+	let deformed = crate::deform::deformed_bounds(&base, &targets, &influences, &pose, &limits).expect("the deformed bound");
+	assert!(near(deformed.maximum.y, 1.0), "the morph raised the top of the box, got {:?}", deformed.maximum);
+
+	// THE MATERIALS: one out of each table, plus the two the caster pass has rules about.
+	let plain = scene.add_material(opaque(1)).unwrap();
+	let masked = scene.add_material(opaque(2).with_blending(Blending::AlphaMask { threshold: 0.5 })).unwrap();
+	let glass = scene.add_material(blended(3)).unwrap();
+	let physically = scene.add_extended_material(physical(5)).expect("a physically based material");
+
+	let rig = scene.add_node(at(Vec3::ZERO)).unwrap();
+	let camera = Camera::perspective(rig, core::f32::consts::FRAC_PI_2, 1.0, 1.0, 100.0, u32::MAX).unwrap();
+	scene.add_camera(camera).unwrap();
+	scene.add_light(Light { node: rig, kind: LightKind::Directional { direction: Vec3::new(0.0, -1.0, 0.0) }, colour: Vec3::new(1.0, 1.0, 1.0), intensity: 3.0, visibility: u32::MAX }).unwrap();
+
+	// THE HERO: the physically based material, a ladder it stays at the finest level of, and the
+	// deformed bound. Its node is what the clip drives.
+	let joint = scene.add_node(at(Vec3::new(0.0, 0.0, -10.0))).unwrap();
+	let fine = Ladder::new(10, vec![crate::detail::Level { mesh: 11, threshold: 1e-6 }], &limits).expect("a two-level ladder");
+	let hero = scene.add_drawable(Drawable::extended(joint, 10, physically).with_bounds(deformed).with_lod(fine)).unwrap();
+
+	// THE DISTANT ONE: a ladder whose coarse level takes over at any coverage this scene produces.
+	let far = scene.add_node(at(Vec3::new(3.0, 0.0, -10.0))).unwrap();
+	let coarsening = Ladder::new(20, vec![crate::detail::Level { mesh: 21, threshold: 0.9 }], &limits).expect("a coarsening ladder");
+	let distant = scene.add_drawable(Drawable::new(far, 20, plain).with_bounds(cube()).with_lod(coarsening)).unwrap();
+
+	// THE SPECK: a ladder that says this is too small to be worth a draw call at all.
+	let speck_node = scene.add_node(at(Vec3::new(-3.0, 0.0, -10.0))).unwrap();
+	let vanishing = Ladder::new(30, Vec::new(), &limits).expect("a one-level ladder").vanishing_below(0.9).expect("a vanishing coverage");
+	let speck = scene.add_drawable(Drawable::new(speck_node, 30, plain).with_bounds(cube()).with_lod(vanishing)).unwrap();
+
+	// AND THE TWO THE CASTER PASS HAS RULES ABOUT, with no ladder at all - a feature every scene may
+	// leave out has to stay free for the ones that do.
+	scene.add_drawable(Drawable::new(far, 40, masked).with_bounds(cube())).unwrap();
+	scene.add_drawable(Drawable::new(far, 41, glass).with_bounds(cube())).unwrap();
+
+	// THE ANIMATION, APPLIED: a quarter turn about z on the hero's joint.
+	let skeleton = Skeleton::new(vec![joint], &limits).expect("a one-joint skeleton");
+	let clip = Clip::new(vec![Track { target: Target::Joint(0), channel: Channel::Rotation(linear(&[(0.0, turn(0.0)), (1.0, turn(core::f32::consts::FRAC_PI_2))])) }], 1.0, Ending::Clamp, 0, true, &limits).expect("a rotation clip");
+	animate::apply(&mut scene, &skeleton, &clip.sample(1.0)).expect("the pose applies");
+
+	// THE LEVELS, CHOSEN BY THE VIEW, then the queue built at them.
+	let mut state = ViewDetail::new();
+	crate::detail::select(&mut scene, &camera, &mut state).expect("the levels are chosen");
+	assert_eq!(state.of(hero), Some(Detail::Level(0)), "the hero stays at its finest level");
+	assert_eq!(state.of(distant), Some(Detail::Level(1)), "the distant one takes its coarse level");
+	assert_eq!(state.of(speck), Some(Detail::Vanished), "and the speck vanishes");
+
+	let queue = crate::queue::build_detailed(&mut scene, &camera, &state).expect("a queue at the chosen levels");
+	assert_eq!(queue.vanished, 1, "the vanished drawable is counted in its own tally");
+	assert_eq!(queue.culled, 0, "and not as a culled one, which is a different question");
+	assert_eq!(queue.opaque.len(), 2, "the hero and the distant one");
+
+	// THE ANIMATION REACHED THE ENTRY. The queue carries the world transform the recorder draws at,
+	// so a clip that moved a joint moved the thing that is drawn.
+	let entry = queue.opaque.iter().find(|entry| entry.drawable == hero).expect("the hero is queued");
+	assert!(near(entry.world.at(1, 0), 1.0) && near(entry.world.at(0, 0), 0.0), "the hero's world transform carries the quarter turn, got {:?}", entry.world);
+
+	let colour = [colour_target()];
+	let set = RenderTargetSet { colour: &colour, depth_stencil: None, resolve: &[] };
+	let mut list = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+	crate::emit::record(&scene, &queue, &MeshPerLevel, &mut list, &set, &pass_targets()).unwrap();
+	list.finish().unwrap();
+	let commands = list.commands();
+
+	// THE LEVEL REACHED THE DRAW. A mesh identifier is its vertex buffer here, so the coarse level
+	// is a command and the fine one is not - which is the assertion that would have failed for as
+	// long as the recorder drew `drawable.mesh`.
+	let buffers: Vec<u32> = commands.iter().filter_map(|command| if let Command::BindVertexBuffer { slot: 0, buffer, .. } = command { Some(buffer.0) } else { None }).collect();
+	assert!(buffers.contains(&21), "the distant drawable was drawn at its COARSE mesh: {buffers:?}");
+	assert!(!buffers.contains(&20), "and not at its fine one");
+	assert!(buffers.contains(&10), "the hero was drawn at its finest");
+	assert!(!buffers.contains(&30), "and the vanished one was not drawn at all");
+
+	// THE PHYSICALLY BASED MATERIAL REACHED THE DRAW, out of the second table and through the same
+	// recorder: its pipeline is bound and its uniform block with it.
+	let pipelines: Vec<u32> = commands.iter().filter_map(|command| if let Command::BindPipeline(pipeline) = command { Some(pipeline.0) } else { None }).collect();
+	assert!(pipelines.contains(&5), "the Extended material's pipeline is bound: {pipelines:?}");
+	assert!(commands.iter().any(|command| matches!(command, Command::BindResources { set: 5 })), "and its uniform block");
+
+	// AND NOTHING LEFT THE LIST BY ANY OTHER ROUTE. Every command is one of the nine `render3d`
+	// records, which is the claim this fixture is named for.
+	assert!(commands.iter().all(|command| matches!(command, Command::BeginRenderPass { .. } | Command::EndRenderPass | Command::SetViewport(_) | Command::SetScissor(_) | Command::BindPipeline(_) | Command::BindVertexBuffer { .. } | Command::BindIndexBuffer { .. } | Command::BindResources { .. } | Command::Draw { .. } | Command::DrawIndexed { .. })), "the whole of the scene's output is `render3d` commands");
+
+	// AND THE SHADOW HALF, which is the one Extended feature with a pass of its own.
+	let map = shadow_target();
+	let depth_only = RenderTargetSet { colour: &[], depth_stencil: Some(map), resolve: &[] };
+	let caster = crate::emit::CasterPass { targets: 7, viewport: Rect { x: 0, y: 0, width: 64, height: 64 }, pipeline: GraphicsPipeline(11), masked_pipeline: Some(GraphicsPipeline(12)), light_set: 5 };
+	let mut casters = CommandList::new(Render3DLimits::PROFILE_MINIMUM);
+	crate::emit::record_casters(&scene, &queue, &MeshPerLevel, &mut casters, &depth_only, &caster).unwrap();
+	casters.finish().unwrap();
+	let shadow_buffers: Vec<u32> = casters.commands().iter().filter_map(|command| if let Command::BindVertexBuffer { slot: 0, buffer, .. } = command { Some(buffer.0) } else { None }).collect();
+	assert!(shadow_buffers.contains(&21) && !shadow_buffers.contains(&20), "a caster is drawn at the same level its surface is: {shadow_buffers:?}");
+	assert!(!shadow_buffers.contains(&41), "and the glass casts no shadow");
+
+	// THE THREE RESOURCE DESCRIPTIONS ARE DESCRIPTIONS AND NOT COMMANDS, which is what the profile
+	// says they are: a shadow map, an environment cube and an HDR target are things a layer CREATES,
+	// and the passes over them are `render3d` work. Named here so the list above is read as complete
+	// rather than as a list that forgot them.
+	shadow::cascade_map_desc(1024, limits.max_shadow_cascades, &limits).expect("a cascade array");
+	crate::environment::cube_desc(256).expect("an environment cube");
+	crate::environment::hdr_target_desc(320, 240).expect("an HDR target");
+}
+
+#[test]
+// THE FIVE MAPS ARE NAMED BY THE MATERIAL, which is what "the PBR material carries base-colour,
+// metallic-roughness, normal, occlusion and emissive maps" means in code: a material a backend can
+// draw has to say WHICH texture each of the five is, and the sampled values stay in `PbrSurface`
+// where a fragment carries them.
+fn a_physically_based_material_names_its_five_maps_and_their_colour_spaces() {
+	let mut scene = Scene::new(extended());
+	let mut material = physical(1);
+	for (index, map) in PbrMap::ALL.iter().enumerate() {
+		material = material.with_map(*map, 100 + index as u32);
+	}
+	assert_eq!(material.maps.count(), 5, "all five are nameable at once");
+	assert_eq!(material.maps.of(PbrMap::BaseColour), Some(100));
+	assert_eq!(material.maps.of(PbrMap::Emissive), Some(104), "and each names its own texture rather than the last one written");
+	let index = scene.add_extended_material(material).expect("a material with five maps");
+	assert_eq!(scene.extended_materials()[index as usize].maps.of(PbrMap::Normal), Some(102));
+
+	// A MATERIAL WITH NO MAPS IS THE SAME TYPE AND THE SAME PATH, which is what makes the absence of
+	// a map the identity rather than a second material model.
+	assert_eq!(physical(2).maps.count(), 0);
+
+	// AND THE COLOUR SPACE OF EACH IS THE PROFILE'S, AS A FUNCTION. Base colour and emissive are
+	// COLOUR and are transfer-decoded; metallic-roughness, normal and occlusion are DATA and are
+	// never decoded. Reading a roughness map as sRGB makes a whole material glossier and reading a
+	// normal map that way bends every normal toward the surface, and neither reports itself.
+	assert!(PbrMap::BaseColour.semantics().is_colour());
+	assert!(PbrMap::Emissive.semantics().is_colour());
+	for map in [PbrMap::MetallicRoughness, PbrMap::Normal, PbrMap::Occlusion] {
+		assert!(!map.semantics().is_colour(), "{map:?} is data and is never transfer-decoded");
+		assert_eq!(map.semantics(), graphics_profile::image::Semantics::Data);
+	}
+}
+
+#[test]
+// THE HDR FRAME IS A GRAPH OF PASSES AND NOT A LIST OF OPERATORS. A layer that had only the
+// threshold, the two kernels, the fog and the tone map would still have to decide how many targets a
+// bloom needs, what each pass reads and what order they run in - and every layer would decide it
+// differently, which is the drift the frozen operators exist to prevent.
+fn the_hdr_chain_is_a_pass_graph_whose_resolve_is_last() {
+	let pyramid: [u32; 6] = [10, 11, 12, 13, 14, 15];
+	let ascent: [u32; 5] = [20, 21, 22, 23, 24];
+	let chain = crate::postprocess::Chain { scene: 1, pyramid: &pyramid, ascent: &ascent };
+	let passes = crate::postprocess::chain(&chain, 100).expect("a frame's chain");
+	assert_eq!(passes.downsample.len(), 6, "one pass per pyramid level");
+	assert_eq!(passes.upsample.len(), 5, "and one per level except the coarsest");
+
+	// THE ORDER IS DERIVED AND NOT DECLARED, so this reads it back out of the graph rather than out
+	// of the order the passes were added in.
+	let order = passes.graph.order().expect("the graph orders");
+	assert_eq!(order.len(), 13, "the scene, six downsamples, five upsamples and the resolve");
+	assert_eq!(order.first(), Some(&passes.scene), "nothing runs before the pass that fills the HDR target");
+	assert_eq!(order.last(), Some(&passes.resolve), "and TONE MAPPING IS LAST, which is the profile's order");
+	let at = |id: u32| order.iter().position(|pass| *pass == id).expect("every pass is in the order");
+	for (level, pass) in passes.downsample.iter().enumerate() {
+		assert!(at(*pass) > at(passes.scene), "a downsample runs after the scene");
+		if level > 0 {
+			assert!(at(*pass) > at(passes.downsample[level - 1]), "and after the level it reads");
+		}
+	}
+	// THE ASCENT RUNS COARSEST FIRST, each after the level below it has been written.
+	for (step, pass) in passes.upsample.iter().enumerate() {
+		assert!(at(*pass) > at(passes.downsample[passes.downsample.len() - 1]), "every upsample runs after the pyramid is built");
+		if step > 0 {
+			assert!(at(*pass) > at(passes.upsample[step - 1]), "and after the coarser step it reads");
+		}
+	}
+
+	// TWO CHAINS AND NOT ONE, and the graph is why: an upsample that wrote back into the level it
+	// read would make one target carry two writers and a reader of itself, which has no order.
+	assert!(passes.graph.passes().iter().all(|pass| pass.writes.iter().all(|target| !pass.reads.contains(target))), "no pass reads what it writes");
+	let mut written: Vec<u32> = passes.graph.passes().iter().flat_map(|pass| pass.writes.clone()).collect();
+	let before = written.len();
+	written.sort_unstable();
+	written.dedup();
+	assert_eq!(written.len(), before, "every target is written exactly once per frame");
+
+	// AND THE REFUSALS ARE ABOUT THE FRAME THAT WAS ASKED FOR.
+	let short: [u32; 5] = [10, 11, 12, 13, 14];
+	assert!(matches!(crate::postprocess::chain(&crate::postprocess::Chain { scene: 1, pyramid: &short, ascent: &ascent }, 0), Err(Error::Degenerate { .. })), "five levels is a different bloom at the same weight");
+	let collided: [u32; 6] = [1, 11, 12, 13, 14, 15];
+	assert!(matches!(crate::postprocess::chain(&crate::postprocess::Chain { scene: 1, pyramid: &collided, ascent: &ascent }, 0), Err(Error::Degenerate { .. })), "a level sharing the scene target has no order");
+}
+
+#[test]
+// THE PYRAMID'S TARGETS ARE HALF FLOATS AND ITS LEVELS ARE HALVINGS, and a render too small to
+// carry six of them is REFUSED rather than given a shorter pyramid: a bloom built from four levels
+// has a different shape at the same weight, so a small window would bloom differently from a large
+// one rather than not at all.
+fn the_bloom_pyramid_is_six_halvings_of_half_floats() {
+	let levels = crate::postprocess::bloom_pyramid_desc(320, 240).expect("a pyramid for a 320x240 render");
+	assert_eq!(levels.len(), crate::postprocess::BLOOM_LEVELS as usize);
+	assert_eq!((levels[0].width, levels[0].height), (160, 120), "the first level is half the render");
+	assert_eq!((levels[5].width, levels[5].height), (5, 3), "and the sixth is a sixty-fourth of it");
+	assert!(levels.iter().all(|level| level.format == crate::environment::HDR_FORMAT), "the pyramid carries radiance above one, which a normalised format would clip");
+	assert!(levels.iter().all(|level| level.mip_levels == 1), "the pyramid IS the chain; a level is not a mip of another");
+	assert!(levels.iter().all(|level| level.usage.sampled && level.usage.colour_attachment), "each level is written by a pass and read by the next");
+
+	assert_eq!(crate::postprocess::BLOOM_MINIMUM_EXTENT, 64, "six halvings need sixty-four texels");
+	assert!(matches!(crate::postprocess::bloom_pyramid_desc(64, 48), Err(Error::Degenerate { .. })), "a 64x48 render cannot carry the profile's pyramid");
+	assert!(crate::postprocess::bloom_pyramid_desc(64, 64).is_ok(), "and the smallest that can is exactly the minimum");
 }

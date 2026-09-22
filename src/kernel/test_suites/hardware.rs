@@ -288,7 +288,7 @@ fn virtio_scsi_driver_serves_a_write_and_reads_it_back() {
 	// a driver that asks every target from one that stops at the first that answers - both find
 	// everything there is. The third lives behind target 1, so it is reachable only by asking again
 	// after the first target has already filled two of the table's slots.
-	let units: alloc::vec::Vec<alloc::sync::Arc<dyn object::KernelObject>> = offers.iter().filter(|(kind, _, _)| *kind == driver_protocol::provider::BLOCK).map(|(_, _, object)| object.clone()).collect();
+	let units: alloc::vec::Vec<alloc::sync::Arc<dyn object::KernelObject>> = offers.iter().filter(|offer| offer.kind == driver_protocol::provider::BLOCK).map(|offer| offer.object.clone()).collect();
 	assert_eq!(units.len(), 3, "the driver enumerates the units behind every target it walks rather than taking the first that answers or stopping at the first target");
 	let blk = units[0].clone().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
 	let second = units[1].clone().into_any_arc().downcast::<Channel>().expect("the second unit's block channel is a channel");
@@ -1148,7 +1148,7 @@ fn nvme_driver_serves_a_write_and_reads_it_back() {
 /// MSI-X, claiming the device and sending the four-resource `BIND` is sixty lines that say
 /// nothing about what either test is for - and a second copy of them is a second place for the
 /// handshake to drift when a resource is added to it.
-fn bind_xhci_controller() -> (alloc::sync::Arc<object::channel::Channel>, u64, alloc::vec::Vec<(u16, u16, alloc::sync::Arc<dyn object::KernelObject>)>, alloc::sync::Arc<object::process::Process>, abi::ClaimKey) {
+fn bind_xhci_controller() -> (alloc::sync::Arc<object::channel::Channel>, u64, alloc::vec::Vec<crate::tests::Offer>, alloc::sync::Arc<object::process::Process>, abi::ClaimKey) {
 	use object::device_memory::DeviceMemory;
 	use object::rights::Rights;
 
@@ -1408,7 +1408,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// BOTH REQUESTS GO OUT BEFORE EITHER REPLY IS READ. Sending one and waiting for it would pass
 	// against a driver that never had two tags outstanding in its life, which is the claim under
 	// test rather than something to assume.
-	let uas_token = offers.iter().filter(|(k, _, _)| *k == driver_protocol::provider::BLOCK).map(|(_, token, _)| *token).nth(1).expect("the UAS target's block publication has a token of its own");
+	let uas_token = offers.iter().filter(|offer| offer.kind == driver_protocol::provider::BLOCK).map(|offer| offer.token).nth(1).expect("the UAS target's block publication has a token of its own");
 	let (second, second_driver_end) = Channel::create();
 	send_connect(&kernel_ep, generation, uas_token, second_driver_end).expect("a second consumer of the UAS target should connect");
 	sched::run_until_idle();
@@ -2230,39 +2230,23 @@ fn a_platform_event_raised_before_anything_listens_is_held_and_delivered_once() 
 	crate::platform_event::drain_for_test();
 }
 
-tagged_test!(usb_cdc_acm_carries_bytes_to_the_host_and_back, [Drivers, Usb, Slow], id = "kernel.hardware.usb_cdc_acm_carries_bytes_to_the_host_and_back", covers = ["kernel", "drivers", "device-proto"]);
-fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
+/// One `console-stream` publication, driven end to end: attach, open the inbound stream, write, and
+/// read back what the host echoed. Answers what came back.
+///
+/// A HELPER AND NOT A COPY, because there are two oracles now - one adapter and a composite device
+/// carrying two - and the four steps below are the same four for each of them. The thing that must
+/// not be duplicated is the ORDER, which cost three runs out of four to find: see step 2.
+#[cfg(test)]
+fn acm_round_trip(kernel_ep: &alloc::sync::Arc<object::channel::Channel>, generation: u64, token: u16, sent: &[u8]) -> alloc::vec::Vec<u8> {
 	use device_proto::codec as wire;
 	use device_proto::generated::liber::device::v1 as device;
 	use object::channel::{Channel, Message};
 
-	// THE ONE ORACLE IN THIS SUITE WHOSE DEVICE THE HARNESS BUILT. QEMU models fifteen USB devices
-	// and none of them is a CDC-ACM port, which is why this item read for a long time as "a device
-	// model to write". It is not: Linux can BE a USB device, `usb-gadget.sh` builds one out of
-	// `dummy_hcd` and `usb_f_acm`, and `usb-host` hands it to the guest. The gadget side of it is an
-	// ordinary tty on the host, and `serial-echo.py` sits on that tty echoing raw bytes - so what
-	// comes back here has been out through the controller, through the host's USB gadget stack, into
-	// a process that read it, and all the way back.
-	//
-	// GATED AT COMPILE TIME, on the same terms as `TEST_TAGS` and `LIBER_NO_DT_PROFILE`: the gadget
-	// is built only when a run asks for it, because building one modprobes into the developer's own
-	// kernel and that is not something every test run should do. Without it there is no device to
-	// bind and this states so rather than passing quietly - a run that says nothing is how a test
-	// that stopped testing anything goes unnoticed.
-	let asked = option_env!("USB_GADGET").unwrap_or("");
-	if asked != "acm" {
-		crate::serial_println!("usb-cdc-acm: NOT RUN - no CDC-ACM gadget on this run; build one with USB_GADGET=acm");
-		return;
-	}
-
-	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
-
 	// THE PROVIDER IS A `console-stream` FACTORY, so a connection is MINTED the way DeviceManager
 	// mints one rather than the offered endpoint being used directly - the same shape the CDC
 	// Ethernet adapter's link uses beside it.
-	let token = offer_token_of(&offers, driver_protocol::provider::CONSOLE_BYTES).expect("the driver publishes the CDC-ACM adapter's byte stream, because this run attached one");
 	let (host_end, driver_end) = Channel::create();
-	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	send_connect(kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
 	sched::run_until_idle();
 
 	// THE TRANSPORT THE GENERATED CLIENT CALLS OVER.
@@ -2335,7 +2319,6 @@ fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
 
 	// 1. ATTACH, which is where the version is agreed and the bounds come back. Every other
 	//    operation on a connection that has not attached is refused, so this is not a formality.
-	let sent: &[u8] = b"liber-acm";
 	let attachment = client.attach(&1).expect("the adapter answered the attach").expect("the adapter speaks version 1 of console-stream");
 	assert_eq!(attachment.version, 1, "the provider answers with the version asked for and not a negotiation of its own");
 	assert!(attachment.max_frame > 0, "an attachment states the largest frame it takes and delivers, got {}", attachment.max_frame);
@@ -2390,6 +2373,111 @@ fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
 			}
 		}
 	}
+	back
+}
+
+tagged_test!(usb_cdc_acm_carries_two_ports_of_one_device_without_crossing_them, [Drivers, Usb, Slow], id = "kernel.hardware.usb_cdc_acm_carries_two_ports_of_one_device_without_crossing_them", covers = ["kernel", "drivers", "device-proto"]);
+fn usb_cdc_acm_carries_two_ports_of_one_device_without_crossing_them() {
+	// SEVERAL SIMULTANEOUS ADAPTERS, WHICH IS WHAT THIS ITEM ASKS FOR AND WHAT ONE DEVICE CAN BE.
+	//
+	// A two-port USB serial adapter is ONE composite device carrying TWO ACM functions in one
+	// configuration: control interfaces 0 and 2, each with a union naming ITS OWN data interface -
+	// 1 and 3 - and each data interface with its own bulk pair. The harness builds exactly that out
+	// of two `usb_f_acm` functions, and the host sees two ttys with an echo on each.
+	//
+	// WHAT WOULD PASS A WEAKER TEST. A driver that bound the first function and stopped would leave
+	// the second port on the bus with nothing driving it, and a driver that took "the lowest bulk
+	// pair in the configuration" for both would hand function one's control interface function
+	// zero's endpoints. Neither is refused anywhere: the first looks like a device with one port,
+	// and the second looks like two ports that both work until somebody notices they are the same
+	// one. So the two probes are DIFFERENT BYTES and each is asserted on its OWN stream - a crossing
+	// is then a failure and not a coincidence.
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "acm-pair" {
+		crate::serial_println!("usb-cdc-acm: NOT RUN - no two-port CDC-ACM gadget on this run; build one with USB_GADGET=acm-pair");
+		return;
+	}
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+
+	// THE NAME IS WHAT SELECTS, because the kind cannot: both ports publish `console-bytes` at the
+	// same version, which is the whole reason the second publication has a name of its own.
+	let first = offer_token_named(&offers, driver_protocol::provider::CONSOLE_BYTES, driver_protocol::provider::USB_SERIAL_NAME).expect("the driver publishes the first port's byte stream");
+	let second = offer_token_named(&offers, driver_protocol::provider::CONSOLE_BYTES, driver_protocol::provider::USB_SERIAL_SECOND_NAME).expect("and the second port's, because this device carries two");
+	assert_ne!(first, second, "two publications, two tokens - a `CONNECT` names which one it is a connection to");
+
+	let to_first: &[u8] = b"port-one";
+	let to_second: &[u8] = b"PORT-TWO-IS-LONGER";
+	let back_first = acm_round_trip(&kernel_ep, generation, first, to_first);
+	assert_eq!(&back_first[..], to_first, "the first port echoed its own bytes");
+	let back_second = acm_round_trip(&kernel_ep, generation, second, to_second);
+	assert_eq!(&back_second[..], to_second, "and the second port echoed ITS own bytes, which are not the first port's");
+
+	crate::serial_println!("usb-cdc-acm: two ports on one device, {} and {} byte(s) out and the same back on each", to_first.len(), to_second.len());
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_cdc_acm_finds_a_serial_function_in_a_later_configuration, [Drivers, Usb, Slow], id = "kernel.hardware.usb_cdc_acm_finds_a_serial_function_in_a_later_configuration", covers = ["kernel", "drivers", "device-proto"]);
+fn usb_cdc_acm_finds_a_serial_function_in_a_later_configuration() {
+	// A COMPOSITE DEVICE WHOSE SERIAL FUNCTION IS NOT IN THE FIRST CONFIGURATION, which is the
+	// other half of what this item asks to be exercised against.
+	//
+	// The fixture's first configuration carries a PRINTER - a class nothing in this tree binds - and
+	// its second carries the ACM function. A driver that read configuration index zero and decided
+	// would find no serial interface and walk away; what it has to do instead is read past a
+	// configuration it cannot use and then SELECT the one it can, which is a `SET_CONFIGURATION`
+	// with a value that is not one.
+	//
+	// THE CODE FOR THIS EXISTED AND HAD NEVER MET A DEVICE. That is the difference this oracle
+	// makes: the configuration walk was written from the specification, and a walk that picked the
+	// wrong index, or selected configuration 1 while binding the descriptors of configuration 2,
+	// would read exactly as correct until something plugged one in.
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "acm-late" {
+		crate::serial_println!("usb-cdc-acm: NOT RUN - no late-configuration CDC-ACM gadget on this run; build one with USB_GADGET=acm-late");
+		return;
+	}
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+	let token = offer_token_of(&offers, driver_protocol::provider::CONSOLE_BYTES).expect("the driver publishes a byte stream for a device whose serial function is in its second configuration");
+	let sent: &[u8] = b"second-config";
+	let back = acm_round_trip(&kernel_ep, generation, token, sent);
+	assert_eq!(&back[..], sent, "the port in the second configuration carries bytes like any other");
+
+	crate::serial_println!("usb-cdc-acm: {} byte(s) out and back through a serial function in the second configuration", sent.len());
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_cdc_acm_carries_bytes_to_the_host_and_back, [Drivers, Usb, Slow], id = "kernel.hardware.usb_cdc_acm_carries_bytes_to_the_host_and_back", covers = ["kernel", "drivers", "device-proto"]);
+fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
+	// THE ONE ORACLE IN THIS SUITE WHOSE DEVICE THE HARNESS BUILT. QEMU models fifteen USB devices
+	// and none of them is a CDC-ACM port, which is why this item read for a long time as "a device
+	// model to write". It is not: Linux can BE a USB device, `usb-gadget.sh` builds one out of
+	// `dummy_hcd` and `usb_f_acm`, and `usb-host` hands it to the guest. The gadget side of it is an
+	// ordinary tty on the host, and `serial-echo.py` sits on that tty echoing raw bytes - so what
+	// comes back here has been out through the controller, through the host's USB gadget stack, into
+	// a process that read it, and all the way back.
+	//
+	// GATED AT COMPILE TIME, on the same terms as `TEST_TAGS` and `LIBER_NO_DT_PROFILE`: the gadget
+	// is built only when a run asks for it, because building one modprobes into the developer's own
+	// kernel and that is not something every test run should do. Without it there is no device to
+	// bind and this states so rather than passing quietly - a run that says nothing is how a test
+	// that stopped testing anything goes unnoticed.
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "acm" {
+		crate::serial_println!("usb-cdc-acm: NOT RUN - no CDC-ACM gadget on this run; build one with USB_GADGET=acm");
+		return;
+	}
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+
+	let token = offer_token_of(&offers, driver_protocol::provider::CONSOLE_BYTES).expect("the driver publishes the CDC-ACM adapter's byte stream, because this run attached one");
+	let sent: &[u8] = b"liber-acm";
+	let back = acm_round_trip(&kernel_ep, generation, token, sent);
 	assert_eq!(&back[..], sent, "what the host echoed came back byte for byte");
 	crate::serial_println!("usb-cdc-acm: {} byte(s) out and the same {} back", sent.len(), back.len());
 	// AND THE DEVICE IS GIVEN BACK WITH THE TEST, DRIVER FIRST AND CLAIM AFTER.

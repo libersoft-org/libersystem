@@ -266,3 +266,37 @@ fn basis(d: Vec3) -> [f32; 9] {
 		0.546_274 * (d.x * d.x - d.y * d.y),
 	]
 }
+
+/// The format the profile fixes for the HDR target, the environment cube and its prefilter levels.
+///
+/// HALF FLOATS AND NOT SINGLE ONES. `RGBA32F` doubles the bandwidth of every pass for precision a
+/// tone map spends immediately; a normalised format is not HDR at all, because the bloom threshold
+/// sits at luminance 1.0 and there would be nothing above it to spread. And `RGBA16F` is the only
+/// float format the 3D profile's table marks blendable, which a bloom composite requires.
+pub const HDR_FORMAT: &str = "RGBA16F";
+
+/// The cube a radiance environment is stored in, with the prefilter levels as its mips.
+///
+/// THE MIPS ARE THE ROUGHNESS AXIS AND NOT A FILTER PYRAMID, which is why the count comes from
+/// `prefilter_levels` rather than from the size: level `i` holds the GGX-importance-sampled radiance
+/// at `roughness = i / (levels - 1)`, and the chain stops at 8x8 because below that the filter is
+/// wider than the face and every level would be the average of the whole environment.
+pub fn cube_desc(face_size: u32) -> Result<render3d::resource::TextureDesc, crate::scene::Error> {
+	let levels = prefilter_levels(face_size);
+	if levels == 0 {
+		return Err(crate::scene::Error::Degenerate { reason: "an environment cube whose faces are below the smallest prefilter level" });
+	}
+	Ok(render3d::resource::TextureDesc { dimension: render3d::resource::TextureDimension::Cube, width: face_size, height: face_size, depth: 1, mip_levels: levels, layers: 6, samples: 1, format: HDR_FORMAT, usage: render3d::resource::TextureUsage { sampled: true, colour_attachment: true, copy_destination: true, ..Default::default() } })
+}
+
+/// The HDR target a frame is rendered into before bloom, fog and the tone map.
+///
+/// NO MIPS AND NOT A CUBE: this is one image the passes read and write in turn. The bloom pyramid is
+/// its own chain of targets, because a mip chain of the target itself would be written by the
+/// downsample while the composite was reading the level above it.
+pub fn hdr_target_desc(width: u32, height: u32) -> Result<render3d::resource::TextureDesc, crate::scene::Error> {
+	if width == 0 || height == 0 {
+		return Err(crate::scene::Error::Degenerate { reason: "an HDR target with no extent" });
+	}
+	Ok(render3d::resource::TextureDesc { dimension: render3d::resource::TextureDimension::D2, width, height, depth: 1, mip_levels: 1, layers: 1, samples: 1, format: HDR_FORMAT, usage: render3d::resource::TextureUsage { sampled: true, colour_attachment: true, ..Default::default() } })
+}

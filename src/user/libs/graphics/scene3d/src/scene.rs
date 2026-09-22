@@ -30,7 +30,7 @@ use render_math::{Mat4, Quat, Vec3};
 
 use crate::bounds::Aabb;
 use crate::light::Light;
-use crate::material::Material;
+use crate::material::{ExtendedMaterial, Material, Shading};
 
 /// Which layers a camera sees. A bitmask, ANDed with the camera's own and with every ancestor's.
 ///
@@ -49,6 +49,14 @@ pub enum Error {
 	NoSuchNode { node: u32 },
 	/// A material index nothing declared.
 	NoSuchMaterial { material: u32 },
+	/// An Extended material index nothing declared. NAMED SEPARATELY FROM THE CORE ONE, because the
+	/// two tables carry their own indices and a refusal that said only "no such material" would send
+	/// a reader to the wrong list.
+	NoSuchExtendedMaterial { material: u32 },
+	/// An operation from `Scene3D Extended Profile 1` on a scene whose limits do not claim it. THE
+	/// PART IS ENTIRE OR ABSENT, and a scene that had acquired one Extended material would hold half
+	/// of a part the six limits say a layer has whole or not at all.
+	NotExtended { operation: &'static str },
 	/// A drawable index nothing declared.
 	NoSuchDrawable { drawable: u32 },
 	/// A parenting that would make a node its own ancestor. REFUSED AT THE EDGE, so the scene is
@@ -317,15 +325,30 @@ pub struct Instance {
 	pub colour: render_math::Vec4,
 }
 
+/// Which table a drawable's material is in, and where in it.
+///
+/// THE TABLE IS PART OF THE NAME rather than a flag beside an index. A drawable carries exactly one
+/// material and cannot carry one of each: a core index with an optional Extended index beside it
+/// would admit a drawable that one pass reads as a `BlinnPhong` surface and another as a
+/// physically based one, drawn as two different surfaces in a single frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MaterialRef {
+	/// An index into the scene's core materials, which is the only kind a core layer has.
+	Core(u32),
+	/// An index into the scene's Extended materials, which only a scene claiming
+	/// `Scene3D Extended Profile 1` holds at all.
+	Extended(u32),
+}
+
 /// One drawable: a mesh, a material, and where it is.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Drawable {
 	pub node: u32,
 	/// The caller's own identifier for the geometry.
 	pub mesh: u32,
-	/// An index into the scene's materials. THE MATERIAL DECIDES THE QUEUE, so the two can never
-	/// disagree the way a queue flag on a node can.
-	pub material: u32,
+	/// Which material this drawable is drawn with, in whichever table holds it. THE MATERIAL DECIDES
+	/// THE QUEUE, so the two can never disagree the way a queue flag on a node can.
+	pub material: MaterialRef,
 	/// The mesh's bound, in LOCAL space. `None` is NEVER CULLED: an unbounded drawable is one the
 	/// scene cannot reason about, and dropping it would make it disappear for a reason nobody can
 	/// see.
@@ -347,8 +370,16 @@ pub struct Drawable {
 }
 
 impl Drawable {
+	/// A drawable of one of the four CORE materials. The signature is a core index and stays one, so
+	/// a program that implements only `Scene3D Core Profile 1` never names the other table.
 	pub fn new(node: u32, mesh: u32, material: u32) -> Self {
-		Self { node, mesh, material, bounds: None, visibility: u32::MAX, instances: Vec::new(), lod: None, id: 0 }
+		Self { node, mesh, material: MaterialRef::Core(material), bounds: None, visibility: u32::MAX, instances: Vec::new(), lod: None, id: 0 }
+	}
+
+	/// A drawable of an Extended material, which only a scene claiming
+	/// `Scene3D Extended Profile 1` can hold one of.
+	pub fn extended(node: u32, mesh: u32, material: u32) -> Self {
+		Self { node, mesh, material: MaterialRef::Extended(material), bounds: None, visibility: u32::MAX, instances: Vec::new(), lod: None, id: 0 }
 	}
 
 	pub fn with_bounds(self, bounds: Aabb) -> Self {
@@ -396,6 +427,9 @@ pub struct Scene {
 	cameras: Vec<Camera>,
 	lights: Vec<Light>,
 	materials: Vec<Material>,
+	/// `Scene3D Extended Profile 1`'s material table, EMPTY on every scene that does not claim the
+	/// part - and unreachable on one, because the one entry point that fills it refuses first.
+	extended: Vec<ExtendedMaterial>,
 	drawables: Vec<Drawable>,
 	next_id: DrawableId,
 	limits: Limits,
@@ -412,6 +446,7 @@ impl Scene {
 			cameras: Vec::new(),
 			lights: Vec::new(),
 			materials: Vec::new(),
+			extended: Vec::new(),
 			drawables: Vec::new(),
 			// ZERO IS NOTHING, so the first identity the scene hands out is one.
 			next_id: 1,
@@ -439,12 +474,30 @@ impl Scene {
 		&self.materials
 	}
 
+	/// The Extended material table, which is empty unless the scene claims the part.
+	pub fn extended_materials(&self) -> &[ExtendedMaterial] {
+		&self.extended
+	}
+
+	/// How many materials the scene holds across BOTH tables, which is what `max_materials` bounds.
+	///
+	/// ONE CEILING OVER THE TWO, for the reason `max_transparent_items` was refused: a physically
+	/// based material IS a material, the core profile already says how many a scene may hold, and a
+	/// second limit for the second table is two numbers that can disagree.
+	pub fn material_count(&self) -> u32 {
+		(self.materials.len() + self.extended.len()) as u32
+	}
+
 	pub fn drawables(&self) -> &[Drawable] {
 		&self.drawables
 	}
 
-	pub fn material_of(&self, drawable: &Drawable) -> Result<&Material, Error> {
-		self.materials.get(drawable.material as usize).ok_or(Error::NoSuchMaterial { material: drawable.material })
+	/// Resolve a drawable into whichever table holds its material.
+	pub fn material_of(&self, drawable: &Drawable) -> Result<Shading<'_>, Error> {
+		match drawable.material {
+			MaterialRef::Core(index) => self.materials.get(index as usize).map(Shading::Core).ok_or(Error::NoSuchMaterial { material: index }),
+			MaterialRef::Extended(index) => self.extended.get(index as usize).map(Shading::Extended).ok_or(Error::NoSuchExtendedMaterial { material: index }),
+		}
 	}
 
 	// -----------------------------------------------------------------------------------------
@@ -734,12 +787,30 @@ impl Scene {
 	}
 
 	pub fn add_material(&mut self, material: Material) -> Result<u32, Error> {
-		if self.materials.len() as u32 >= self.limits.max_materials {
-			return Err(Error::LimitExceeded { limit: "max_materials", ceiling: self.limits.max_materials, asked: self.materials.len() as u32 + 1 });
+		if self.material_count() >= self.limits.max_materials {
+			return Err(Error::LimitExceeded { limit: "max_materials", ceiling: self.limits.max_materials, asked: self.material_count() + 1 });
 		}
 		material.validate()?;
 		self.materials.push(material);
 		Ok(self.materials.len() as u32 - 1)
+	}
+
+	/// Add a material from `Scene3D Extended Profile 1`'s physically based model.
+	///
+	/// REFUSED OUTRIGHT ON A SCENE THAT DOES NOT CLAIM EXTENDED. The six Extended limits are set
+	/// together or left at zero, and this is the one entry point through which a layer could
+	/// otherwise acquire a piece of the part without them - a material it could then draw with,
+	/// under a profile it does not claim.
+	pub fn add_extended_material(&mut self, material: ExtendedMaterial) -> Result<u32, Error> {
+		if !self.limits.claims_extended() {
+			return Err(Error::NotExtended { operation: "add_extended_material" });
+		}
+		if self.material_count() >= self.limits.max_materials {
+			return Err(Error::LimitExceeded { limit: "max_materials", ceiling: self.limits.max_materials, asked: self.material_count() + 1 });
+		}
+		material.validate()?;
+		self.extended.push(material);
+		Ok(self.extended.len() as u32 - 1)
 	}
 
 	/// Add a drawable, assigning it a picking identity if it does not carry one.
@@ -750,8 +821,17 @@ impl Scene {
 		if drawable.node as usize >= self.nodes.len() {
 			return Err(Error::NoSuchNode { node: drawable.node });
 		}
-		if drawable.material as usize >= self.materials.len() {
-			return Err(Error::NoSuchMaterial { material: drawable.material });
+		match drawable.material {
+			MaterialRef::Core(index) => {
+				if index as usize >= self.materials.len() {
+					return Err(Error::NoSuchMaterial { material: index });
+				}
+			}
+			MaterialRef::Extended(index) => {
+				if index as usize >= self.extended.len() {
+					return Err(Error::NoSuchExtendedMaterial { material: index });
+				}
+			}
 		}
 		if drawable.instances.len() as u32 > self.limits.max_instances_per_drawable {
 			return Err(Error::LimitExceeded { limit: "max_instances_per_drawable", ceiling: self.limits.max_instances_per_drawable, asked: drawable.instances.len() as u32 });

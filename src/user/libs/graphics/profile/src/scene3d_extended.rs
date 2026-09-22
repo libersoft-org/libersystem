@@ -79,6 +79,7 @@ pub const SHADOW_RULES: &[Rule] = &[
 	Rule { question: "the transition between cascades", answer: "a blend over the last 10 per cent of each cascade's range, so the seam is a gradient rather than a line" },
 	Rule { question: "what is outside the last cascade", answer: "UNSHADOWED. Extending the last cascade to infinity makes its texels useless everywhere; saying so lets a scene choose its far distance" },
 	Rule { question: "a point light's shadow", answer: "a cube map with the same bias and filter, its face chosen by the major axis of the light-to-fragment vector as the 3D profile's cube orientation defines" },
+	Rule { question: "the projection fit", answer: "NAMED, because a map with an unstated projection has no one right pixel. A DIRECTIONAL light's cascade is fitted to the BOUNDING SPHERE of its slice of the view frustum - a sphere and not the slice's box, because a box changes size as the camera turns and a sphere does not, so the map does not shimmer on a rotating view - with the light's eye at the sphere's centre less its direction times the radius, the up axis +Y unless the direction is within one part in a thousand of it and +Z then, and an orthographic volume of exactly the sphere's diameter on both axes, near 0 and far twice the radius. A SPOT light is a perspective of twice its outer cone angle, aspect 1, near the light's own and far its range. A POINT light is six perspectives of ninety degrees, aspect 1, one per cube face in the 3D profile's index order and sharing that near and far, each looking along its own face axis with the up vector the 3D profile's cube-face orientation already fixes - which is why this rule does not state six more vectors: two statements of one orientation is one of them being wrong later" },
 ];
 
 /// Post-processing.
@@ -89,6 +90,7 @@ pub const POSTPROCESS_RULES: &[Rule] = &[
 	Rule { question: "tone mapping", answer: "the SAME operator the 2D image-colour profile fixes - extended Reinhard with WHITE = 4.0 - applied in linear space before encoding. Two operators in one system is two systems" },
 	Rule { question: "the fog equation", answer: "exponential-squared: `f = exp(-(density * distance)^2)`, with distance the view-space depth and the result mixing toward the fog colour. Squared rather than linear because it has no visible start plane" },
 	Rule { question: "the order", answer: "tone mapping is LAST, after bloom and fog, because both are defined on linear radiance and a tone-mapped input would compress the highlights they exist to spread" },
+	Rule { question: "the HDR target's format", answer: "`RGBA16F` from the 3D profile's own format table, and the same for the environment cube and its prefilter levels. NAMED because 'a linear HDR render target' admits two answers there and they are not equivalent: `RGBA32F` doubles the bandwidth of every pass for precision a tone map spends immediately, and a normalised format is not HDR at all - the bloom threshold sits at luminance 1.0 and there would be nothing above it to spread. Half floats carry the range the threshold needs and are the only float format that table marks blendable, which a bloom composite requires" },
 ];
 
 /// Animation and skinning.
@@ -215,7 +217,9 @@ pub enum ExtendedFeature {
 	UnshadowedBeyondLastCascade,
 	CascadeCountRefusal,
 	PointLightCubeShadow,
+	ShadowProjectionFit,
 	// Post-processing.
+	HdrTargetFormat,
 	BloomSoftKnee,
 	BloomPyramid,
 	Rec709Luminance,
@@ -284,6 +288,8 @@ profile! {
 	"shadows", Scene3D, UnshadowedBeyondLastCascade;
 	"shadows", Scene3D, CascadeCountRefusal;
 	"shadows", Scene3D, PointLightCubeShadow;
+	"shadows", Scene3D, ShadowProjectionFit;
+	"postprocess", Scene3D, HdrTargetFormat;
 	"postprocess", Scene3D, BloomSoftKnee;
 	"postprocess", Scene3D, BloomPyramid;
 	"postprocess", Scene3D, Rec709Luminance;
