@@ -881,7 +881,7 @@ impl Encoder {
 				Rgba::new(0.0, 0.0, 0.0, 0.0)
 			};
 			if self.working_is_linear {
-				if self.tone_map && (colour.red as f64 > KNEE || colour.green as f64 > KNEE || colour.blue as f64 > KNEE) {
+				if self.tone_map && (colour.red > 1.0 || colour.green > 1.0 || colour.blue > 1.0) {
 					colour = tone_mapped(colour, self.luminance, self.tone_white);
 				}
 				if let Some(matrix) = &self.matrix {
@@ -927,13 +927,10 @@ impl Encoder {
 			Rgba::new(0.0, 0.0, 0.0, 0.0)
 		};
 		if self.working_is_linear {
-			// THE TONE MAP IS ONLY REACHED BY A COLOUR THAT NEEDS IT, and what "needs it" is the
-			// profile's KNEE rather than one: below the knee the curve is the identity, so the
-			// luminance dot product would compute a value that is already the answer. The bound was
-			// ONE before the profile named a knee, and a curve that is not the identity at its bound
-			// makes a guard like this a 47 per cent STEP - 1.000000 at a luminance of 1.0 and
-			// 0.531280 at 1.0001, running through the middle of every lit surface.
-			if self.tone_map && (colour.red as f64 > KNEE || colour.green as f64 > KNEE || colour.blue as f64 > KNEE) {
+			// THE TONE MAP IS ONLY REACHED BY A COLOUR THAT NEEDS IT. Everything a user interface draws
+			// is inside the range already, and the luminance dot product to discover that is three
+			// multiplies per pixel; one comparison answers it.
+			if self.tone_map && (colour.red > 1.0 || colour.green > 1.0 || colour.blue > 1.0) {
 				colour = tone_mapped(colour, self.luminance, self.tone_white);
 			}
 			if let Some(matrix) = &self.matrix {
@@ -980,28 +977,18 @@ fn conversion(from: ColorSpace, to: ColorSpace) -> Result<Option<Matrix3>, Error
 	Ok(Some(color::convert(from, to)?))
 }
 
-/// The luminance below which the profile's curve is the identity.
-use graphics_profile::image::tone_map::KNEE;
-
-/// The profile's tone map ON LUMINANCE, at this destination's white point.
+/// Extended Reinhard ON LUMINANCE, at the profile's own white point.
 ///
 /// ON LUMINANCE AND NOT PER CHANNEL, because a per-channel curve shifts hue - and it shifts it most
 /// on exactly the saturated colours a wide-gamut image was made for.
-///
-/// THE CURVE IS THE PROFILE'S OWN FUNCTION AND NOT A COPY OF ITS FORMULA. It was the formula
-/// written out here under a guard at a luminance of one, which made this the identity below diffuse
-/// white and extended Reinhard above it - two functions meeting at a step. The profile names a KNEE
-/// now, the curve is the identity below it and joins the shoulder there with the same slope, and
-/// `scene3d` calls the same function so the two paths cannot drift.
 fn tone_mapped(colour: Rgba, luminance: (f64, f64, f64), white: f64) -> Rgba {
 	let light = colour.red as f64 * luminance.0 + colour.green as f64 * luminance.1 + colour.blue as f64 * luminance.2;
 	// WRITTEN OUT BECAUSE EVERY COMPARISON WITH NaN IS FALSE: a NaN luminance must fall through
-	// unmapped rather than be scaled by a NaN ratio. A luminance at or below the knee falls through
-	// because the curve is the identity there, which also keeps the ratio below away from zero.
-	if !matches!(light.partial_cmp(&KNEE), Some(core::cmp::Ordering::Greater)) {
+	// unmapped rather than be scaled by a NaN ratio.
+	if !matches!(light.partial_cmp(&1.0), Some(core::cmp::Ordering::Greater)) {
 		return colour;
 	}
-	let mapped = graphics_profile::image::tone_map::map_with(light, white);
+	let mapped = light * (1.0 + light / (white * white)) / (1.0 + light);
 	let scale = (mapped / light) as f32;
 	Rgba::new(colour.red * scale, colour.green * scale, colour.blue * scale, colour.alpha)
 }

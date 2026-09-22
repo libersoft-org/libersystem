@@ -47,7 +47,7 @@ hlg a=0.17883277 b=0.28466892 c=0.55991073 split=0.08333333333333333
 bradford=forward 0.8951,0.2664,-0.1614,-0.7502,1.7135,0.0367,0.0389,-0.0685,1.0296
 bradford=inverse 0.9869929,-0.1470543,0.1599627,0.4323053,0.5183603,0.0492912,-0.0085287,0.0400428,0.9684867
 reference diffuse-white-nits=203 pq-absolute=true
-tone-map=extended Reinhard above a knee, on luminance white=4 knee=0.8
+tone-map=extended Reinhard, on luminance white=4
 gamut-map=hue-preserving desaturation toward equal luminance, by bisection steps=16 tolerance=0.000244140625
 dither=ordered, Bayer 8x8 phase=the target's origin matrix=0,32,8,40,2,34,10,42;48,16,56,24,50,18,58,26;12,44,4,36,14,46,6,38;60,28,52,20,62,30,54,22;3,35,11,43,1,33,9,41;51,19,59,27,49,17,57,25;15,47,7,39,13,45,5,37;63,31,55,23,61,29,53,21
 rounding=float-to-integer rule=clamp, then round half away from zero

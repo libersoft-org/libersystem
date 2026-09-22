@@ -128,20 +128,14 @@ pub fn combine(scene: Vec3, bloom: Vec3, weight: f32) -> Vec3 {
 /// an exposure decision the scene makes by choosing its radiances, not something the curve should
 /// take back by leaving part of its range alone.
 ///
-/// AND THE CURVE IS THE IDENTITY BELOW THE PROFILE'S KNEE, which is what lets ONE operator serve
-/// this path and the 2D one at once.
-///
-/// THE 2D PATH HAD A GUARD AT A LUMINANCE OF ONE AND THIS ONE HAD NONE, and this note used to
-/// record that as a divergence nothing pinned. It was a real defect and it is fixed: extended
-/// Reinhard without a knee is 0.53125 at diffuse white, so a guard that passed everything at or
-/// below one through unchanged produced a 47 per cent STEP - 1.000000 at `L = 1.0` and 0.531280 at
-/// `L = 1.0001`. The guard was reaching for the right thing and the curve under it could not
-/// provide it, because a guard like that belongs with a curve that IS the identity at its knee.
-///
-/// SO THE PROFILE NAMES A KNEE AND BOTH PATHS CALL THE SAME FUNCTION. What a scene gives up is the
-/// compression of its darkest range, which it was never spending - below the knee the curve was
-/// already within a few per cent of the identity. What a compositor gains is that content an author
-/// already put inside the range comes back as itself.
+/// AND THAT IS WHY THERE IS NO `if L > 1` GUARD HERE, although `graphics-core`'s 2D path has one.
+/// The curve is not the identity at 1 - it is 0.53125 there - so a guard that passes values at or
+/// below 1 through unchanged and maps everything above produces a STEP: measured, 1.000000 at
+/// `L = 1.0` and 0.531280 at `L = 1.0001`, a 47 per cent drop across a boundary that runs through
+/// the middle of every lit surface. A guard like that belongs with a curve that IS the identity at
+/// its knee, and this one is not. The divergence is recorded where the finding is rather than
+/// silently copied here; nothing pins the 2D behaviour, and changing it changes every image that
+/// path produces, so it is not this part's to change.
 pub fn tone_map(colour: Vec3) -> Vec3 {
 	let light = luminance(colour);
 	// EVERY COMPARISON WITH NaN IS FALSE, and this is written so a NaN falls through unmapped rather
@@ -151,7 +145,8 @@ pub fn tone_map(colour: Vec3) -> Vec3 {
 	if !matches!(light.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
 		return colour;
 	}
-	let mapped = graphics_profile::image::tone_map::map_with(light as f64, tone_map_white() as f64) as f32;
+	let white = tone_map_white();
+	let mapped = light * (1.0 + light / (white * white)) / (1.0 + light);
 	colour.scale(mapped / light)
 }
 

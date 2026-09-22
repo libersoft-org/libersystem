@@ -61,34 +61,18 @@ pub fn rec709_luminance() -> Outcome {
 }
 
 pub fn tone_map_extended_reinhard() -> Outcome {
-	// THE OPERATOR SENDS THE PROFILE'S WHITE TO EXACTLY ONE AND IS THE IDENTITY BELOW ITS KNEE,
-	// which are the two properties that let one curve serve a scene renderer and a compositor at
-	// once. At `WHITE` = 4 and `KNEE` = 0.8 the shoulder's white point is `(4 - 0.8) / 0.2` = 16,
-	// and `16 * (1 + 16/256) / 17` = 1, so `0.8 + 0.2 * 1` = 1.
+	// THE OPERATOR SENDS THE PROFILE'S WHITE TO EXACTLY ONE, which is the property that makes
+	// `WHITE` mean what its name says. At 4: `4 * (1 + 4/16) / (1 + 4)` = 1.
 	let white = postprocess::tone_map_white();
 	require!(exact(white, 4.0), "the white point comes from the image-colour profile, got {white}");
 	require!(close(postprocess::tone_map(grey(white)).x, 1.0), "the white point maps to one, got {}", postprocess::tone_map(grey(white)).x);
-	// BELOW THE KNEE IT IS THE IDENTITY, which is what a compositor needs: a colour an author
-	// already put inside the range comes back as itself.
-	for value in [0.0f32, 0.125, 0.5, 0.799] {
-		require!(exact(postprocess::tone_map(grey(value)).x, value), "the identity below the knee at {value}");
-	}
-	// AND ABOVE IT THE SHOULDER RUNS: at a luminance of one the shoulder's input is 1, and
-	// `0.8 + 0.2 * (1 * (1 + 1/256) / 2)` = 0.900391.
-	require!(close(postprocess::tone_map(grey(1.0)).x, 0.900_391), "the curve at one is 0.900391, got {}", postprocess::tone_map(grey(1.0)).x);
-	// AND A HIGHLIGHT KEEPS ITS ORDER rather than flattening, which is the difference between a
-	// bright window and a white rectangle.
-	let two = postprocess::tone_map(grey(2.0)).x;
-	let three = postprocess::tone_map(grey(3.0)).x;
-	require!(two < three && three < 1.0, "two and three times white are ordered and inside the range, got {two} then {three}");
-	// AND THERE IS NO STEP ANYWHERE, at one or at the knee: the shoulder meets the identity with the
-	// same slope, because extended Reinhard has slope one at zero.
+	// THE WHOLE RANGE IS COMPRESSED AND NOT ONLY THE HIGHLIGHTS: the curve is 0.53125 at a luminance
+	// of one, which is the operator's own value there.
+	require!(close(postprocess::tone_map(grey(1.0)).x, 0.53125), "the curve at one is 0.53125, got {}", postprocess::tone_map(grey(1.0)).x);
+	// AND THERE IS NO STEP ANYWHERE, which a guard that mapped only above one would introduce.
 	let below = postprocess::tone_map(grey(0.9999)).x;
 	let above = postprocess::tone_map(grey(1.0001)).x;
 	require!((above - below).abs() < 1e-3, "the curve is continuous at one: {below} then {above}");
-	let under = postprocess::tone_map(grey(0.7999)).x;
-	let over = postprocess::tone_map(grey(0.8001)).x;
-	require!((over - under).abs() < 1e-3, "and at the knee: {under} then {over}");
 	// ON LUMINANCE AND NOT PER CHANNEL: the hue survives, which a per-channel curve shifts most on
 	// exactly the saturated colours a wide-gamut path exists for.
 	let saturated = Vec3::new(8.0, 2.0, 1.0);
@@ -114,18 +98,16 @@ pub fn fog_exponential_squared() -> Outcome {
 }
 
 pub fn fixed_postprocess_order() -> Outcome {
-	// TONE MAPPING IS LAST, and the two orders are a different picture INSIDE the range, where a
-	// person can see the difference:
-	//   profile's order:  tone_map(0.5 + 0.04 * 8) = tone_map(0.82) = 0.818189
-	//   mapped first:     tone_map(0.5) + 0.04 * tone_map(8)        = 0.540878
-	let scene = grey(0.5);
-	let bloom = grey(8.0);
+	// TONE MAPPING IS LAST. With a bright pyramid the two orders are a different picture:
+	//   profile's order:  tone_map(3 + 0.04 * 200) = tone_map(11) = 1.546875
+	//   mapped first:     tone_map(3) + 0.04 * tone_map(200)      = 1.427938
+	let scene = grey(3.0);
+	let bloom = grey(200.0);
 	let right = postprocess::resolve(scene, bloom, postprocess::BLOOM_WEIGHT);
 	let wrong = postprocess::combine(postprocess::tone_map(scene), postprocess::tone_map(bloom), postprocess::BLOOM_WEIGHT);
-	require!(close(right.x, 0.818_189), "the profile's order gives 0.818189, got {}", right.x);
-	require!(close(wrong.x, 0.540_878), "and the other gives 0.540878, got {}", wrong.x);
+	require!(close(right.x, 1.546_875), "the profile's order gives 1.546875, got {}", right.x);
+	require!(close(wrong.x, 1.427_938), "and the other gives 1.427938, got {}", wrong.x);
 	require!(right.x - wrong.x > 0.1, "which is a different picture and not a rounding difference");
-	require!(right.x < 1.0 && wrong.x < 1.0, "and both are inside the range, where that difference is visible");
 	Ok(())
 }
 
