@@ -192,3 +192,46 @@ pub fn boot_attempt_budget() {
 	}
 	debug_write(b"DeviceManager: boot attempt budget and one-shot operator retry verified\n");
 }
+
+// THE KIND SUBSET IS ENFORCED BY THE SERVER AND NOT BY THE CALLER'S RESTRAINT.
+//
+// The scope decision itself is held by host tests in `service_logic::catalogue_scope`; what cannot
+// be judged there is whether this program CONSULTS it, and on which of the two operations that
+// reach a provider. A connection minted for one kind must be refused on every other, and the kind
+// it is checked against must be the PUBLICATION'S rather than the one the request names - a caller
+// that could be believed about its own kind could name a different one.
+pub fn catalogue_scope_denial() {
+	let binding = BindingId::new(0, 0, 0, 1);
+	let mut catalogue = Catalogue::new();
+	catalogue.entries.push(Some(Provider { id: ProviderId::new(binding, 0, 1), kind: driver_protocol::provider::BLOCK, token: 1, handle: 0, consumers: 0, name: [0; driver_protocol::MAX_PROVIDER_NAME], name_len: 0 }));
+	catalogue.entries.push(Some(Provider { id: ProviderId::new(binding, 1, 1), kind: driver_protocol::provider::NET, token: 2, handle: 0, consumers: 0, name: [0; driver_protocol::MAX_PROVIDER_NAME], name_len: 0 }));
+	let info = |kind: proto::system::ProviderKind, slot: u32| proto::system::ProviderInfo { kind, bus: 0, dev: 0, func: 0, binding_generation: 1, slot, provider_generation: 1, live: true, name: alloc::string::String::new() };
+	let nodes: [Node; 0] = [];
+	{
+		// Minted for the network and nothing else.
+		let net_only = Scope::of(&[driver_protocol::provider::NET]).expect("one kind is a subset");
+		let mut view = CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: net_only };
+		use proto::system::provider_catalogue::Service;
+		assert_eq!(view.open(info(proto::system::ProviderKind::Block, 0)), Err(proto::system::Error::Denied), "a connection minted for the network may not open a disk");
+		// THE ALLOWED KIND GETS PAST THE SUBSET, and then fails for the reason this fixture has no
+		// node - which is a DIFFERENT refusal, and that is the whole point of asserting it: a scope
+		// check that refused everything would pass a test that only looked for a refusal.
+		assert_eq!(view.open(info(proto::system::ProviderKind::Net, 1)), Err(proto::system::Error::NotFound), "the allowed kind reaches the binding lookup");
+		// A STALE GENERATION IS REFUSED ON AN ALLOWED KIND TOO. The subset says which providers a
+		// consumer may reach; it says nothing about which ones still exist.
+		let mut stale = info(proto::system::ProviderKind::Net, 1);
+		stale.provider_generation = 2;
+		assert_eq!(view.open(stale), Err(proto::system::Error::NotFound), "a consumer holding a stale provider-info names a publication that is gone");
+	}
+	{
+		// The inventory connection - what the catalogue's own root answers CONNECT with - reaches
+		// no provider at all, which is what makes "read the binding snapshot" an authority of its
+		// own rather than the whole vocabulary handed over for want of a smaller word.
+		let mut view = CatalogueView { catalogue: &mut catalogue, nodes: &nodes, scope: Scope::inventory() };
+		use proto::system::provider_catalogue::Service;
+		assert_eq!(view.open(info(proto::system::ProviderKind::Block, 0)), Err(proto::system::Error::Denied));
+		assert_eq!(view.open(info(proto::system::ProviderKind::Net, 1)), Err(proto::system::Error::Denied));
+		assert_eq!(view.bindings().len(), 0, "and the snapshot it exists for is still answered");
+	}
+	debug_write(b"DeviceManager: a catalogue connection is refused every kind it was not minted for\n");
+}

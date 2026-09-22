@@ -558,6 +558,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		#[cfg(feature = "development")]
 		{
 			tests::unopened_provider_withdrawal();
+			tests::catalogue_scope_denial();
 			tests::pending_shutdown_outcomes();
 			tests::boot_attempt_budget();
 		}
@@ -6065,6 +6066,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::ConsoleBytes => driver_protocol::provider::CONSOLE_BYTES,
 		proto::system::ProviderKind::LocalStream => driver_protocol::provider::LOCAL_STREAM,
 		proto::system::ProviderKind::Touch => driver_protocol::provider::TOUCH,
+		proto::system::ProviderKind::BluetoothHci => driver_protocol::provider::BLUETOOTH_HCI,
 	}
 }
 
@@ -6326,7 +6328,10 @@ fn open_subscription(service: u64, scope: Scope, catalogue: &mut Catalogue, node
 		// WITH THE KIND IN IT. A refusal that does not say what was refused is a line somebody has
 		// to reproduce under a debugger to act on, and the number is what names the manifest row
 		// that forgot a kind.
-		let mut line = [0u8; 96];
+		// SIZED FOR THE WHOLE LINE. At 96 this overflowed - the two literals are 113 bytes between
+		// them before a digit is written - and an index past a fixed array panics, which took
+		// DeviceManager down mid-bring-up and read as a boot that stopped for no reason.
+		let mut line = [0u8; 160];
 		let mut n = 0;
 		for byte in b"DeviceManager: a catalogue connection asked to subscribe to provider kind " {
 			line[n] = *byte;
@@ -6336,7 +6341,18 @@ fn open_subscription(service: u64, scope: Scope, catalogue: &mut Catalogue, node
 		let digits = decimal(kind as u64, &mut number);
 		line[n..n + digits].copy_from_slice(&number[..digits]);
 		n += digits;
-		for byte in b", which it was not minted for; refused\n" {
+		for byte in b", which it was not minted for; refused (its subset is " {
+			line[n] = *byte;
+			n += 1;
+		}
+		// AND WHAT IT WAS MINTED FOR, BESIDE IT. Zero is the inventory connection - the one the
+		// catalogue's own root answers CONNECT with - and any other number is a manifest row whose
+		// kind list is missing one. The two are different mistakes in different files, and a
+		// refusal that does not separate them sends the reader to the wrong one.
+		let digits = decimal(scope.bits() as u64, &mut number);
+		line[n..n + digits].copy_from_slice(&number[..digits]);
+		n += digits;
+		for byte in b")\n" {
 			line[n] = *byte;
 			n += 1;
 		}

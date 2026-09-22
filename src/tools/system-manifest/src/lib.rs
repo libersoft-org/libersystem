@@ -181,6 +181,11 @@ pub enum ProviderKindName {
 	/// A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `Pointer` is handed one cursor; a
 	/// surface published as one would be flattened into whichever contact was decoded last.
 	Touch,
+	/// A BLUETOOTH CONTROLLER'S HCI TRANSPORT: a bounded two-way packet pipe to a radio, over which
+	/// a host stack in another process speaks. The pointer a mouse eventually produces is several
+	/// protocol layers above this and is published by nothing - it reaches InputService over a
+	/// typed report channel from a service with no device claim.
+	BluetoothHci,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
@@ -203,6 +208,7 @@ impl ProviderKindName {
 			ProviderKindName::ConsoleBytes => 8,
 			ProviderKindName::LocalStream => 9,
 			ProviderKindName::Touch => 10,
+			ProviderKindName::BluetoothHci => 11,
 		}
 	}
 }

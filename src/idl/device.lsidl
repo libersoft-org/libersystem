@@ -174,6 +174,15 @@ enum provider-kind {
 	/// touches at different places. Published as `pointer`, a digitizer would be flattened into
 	/// whichever contact happened to be decoded last, which is the defect this whole item is about.
 	touch         = 10,
+	/// A BLUETOOTH CONTROLLER'S HCI TRANSPORT, which is not `net` and not `input`.
+	///
+	/// A consumer of `net` gets a link it can route; a consumer of `input` gets decoded events. This
+	/// is neither: it is a bounded two-way packet transport to a radio controller, over which a
+	/// HOST STACK speaks - and the mouse that eventually reaches InputService is several protocol
+	/// layers above it, in a service that holds no device claim at all. Published as `input`, a
+	/// controller would hand its raw HCI stream to whatever consumes pointers; published as `net`,
+	/// it would make an ambient path around the host stack out of a kind every consumer asks for.
+	bluetooth-hci = 11,
 }
 
 /// One published provider, named by the identity DeviceManager assigned it - never by
@@ -356,6 +365,114 @@ interface provider-catalogue-admin {
 	/// refuses every request turns a declaration error into a runtime mystery. A kind repeated is
 	/// the same subset and is accepted; a kind this vocabulary does not have is a refusal.
 	@op(1) open-consumer: func(@bound(16) kinds: list<provider-kind>) -> result<handle<channel>, error>;
+}
+
+/// WHICH OF THE FOUR HCI PACKET TYPES THIS IS. The numbers are this interface's own and not the
+/// transport-layer codes any particular physical transport puts in front of a packet: a USB
+/// controller frames these across four endpoints and a UART one prefixes a byte, and a driver that
+/// passed its own framing up would make the host stack learn one transport's habits.
+enum hci-packet-kind {
+	/// Host to controller. At most one may be outstanding - see `hci-attachment.command-credits`.
+	command = 1,
+	/// Controller to host.
+	event   = 2,
+	/// Data, both directions.
+	acl     = 3,
+	/// RESERVED AND NEGOTIATED, for the isochronous transport that is not this milestone's. It is
+	/// named here so that a provider which carries it can say so and a consumer which does not
+	/// speak it can refuse a packet by kind rather than by guessing at a length - and so the kind
+	/// is not allocated twice when that work arrives.
+	iso     = 4,
+}
+
+/// WHAT THE TRANSPORT WILL CARRY, LEARNED BEFORE A BYTE MOVES.
+///
+/// The ceilings are the specification's own, headers included: 258 bytes for a command, 257 for an
+/// event, 1028 for ACL data and 4100 for ISO. A provider advertises what IT will carry, which may be
+/// smaller - a controller reports its own buffer sizes - and the consumer is bound by the smaller of
+/// the two. A consumer that assumed the specification's ceiling would hand a controller a packet it
+/// answers with a hardware error rather than with data.
+record hci-attachment {
+	/// The version this provider speaks, which is the one the consumer asked for.
+	version:          u32,
+	/// Whether this provider carries `iso` at all. False is the ordinary answer and is not a fault.
+	iso:              bool,
+	max-command:      u32,
+	max-event:        u32,
+	max-acl:          u32,
+	max-iso:          u32,
+	/// How many commands the controller will accept before it answers one. ONE is what nearly every
+	/// controller reports, and a host that sent two would have the second silently dropped.
+	command-credits:  u32,
+	/// How many ACL buffers the controller has, and how deep this provider's own queue is. The two
+	/// are different bounds: the first is the controller's and is refreshed by its completion
+	/// events, the second is the transport's and is refreshed by the wire draining.
+	acl-credits:      u32,
+	acl-queue:        u32,
+	/// THE SESSION THIS ATTACHMENT BELONGS TO. Every packet carries it, and a reset advances it -
+	/// which is what makes a packet from before a reset distinguishable from one after it, rather
+	/// than being delivered into a host stack that has forgotten the link it belongs to.
+	epoch:            u32,
+}
+
+/// One HCI packet as the transport delivered it, with none of the consumer's own framing implied.
+record hci-packet {
+	kind:             hci-packet-kind,
+	/// The session this packet belongs to. A consumer discards one from an epoch it has left.
+	epoch:            u32,
+	@bound(4100) bytes: list<u8>,
+}
+
+/// What happened to the transport itself, as opposed to on it.
+enum hci-control-kind {
+	/// The controller was reset and the session is a new one. Links, scans and profile handles the
+	/// consumer held are gone; the epoch says which session they belonged to.
+	reset   = 1,
+	/// The transport failed and the session is over. A reset may recover it; a removal will not.
+	fault   = 2,
+	/// The device is gone. This publication is over and a replacement arrives as a NEW publication
+	/// through the catalogue, never as this one recovering.
+	removed = 3,
+}
+
+record hci-control-event {
+	kind:  hci-control-kind,
+	/// The session this is about, which for `reset` is the session that ENDED.
+	epoch: u32,
+}
+
+/// THE DEVICE-SIDE CONTRACT A `bluetooth-hci` PROVIDER SERVES.
+///
+/// A BOUNDED PACKET TRANSPORT AND NOTHING ABOVE IT. Everything that makes Bluetooth Bluetooth - the
+/// command state machine, L2CAP, ATT, pairing - lives in a service with no device claim, no MMIO and
+/// no DMA. What is here is the two-way pipe and the numbers that bound it.
+///
+/// `send` IS A REQUEST WITH A REPLY BECAUSE A TRANSPORT SEND IS NOT A COMMAND COMPLETION. A host that
+/// treated the enqueue as the answer would issue its next command against credits the controller
+/// has not returned, and the controller drops it - which from the host looks like a command that was
+/// answered and then forgotten.
+interface hci-transport {
+	/// Ask for a version and learn the bounds that go with it. Refused with `unsupported` when this
+	/// provider does not speak the version asked for; every other operation on a connection that has
+	/// not attached is refused with `invalid`, so an unattached consumer cannot move a packet by
+	/// accident.
+	@op(1) attach:  func(version: u32) -> result<hci-attachment, error>;
+	/// One packet to the controller, and how many bytes it took. A kind this provider does not carry
+	/// is `unsupported`; a kind that travels the other way - an event - is `invalid`, because a host
+	/// sending one is a host that has confused its directions rather than one that is early; a
+	/// length past the advertised ceiling is `invalid`; and `again` says the transport's own queue
+	/// is full, which is different from the controller having no buffers.
+	@op(2) send:    func(kind: hci-packet-kind, @bound(4100) bytes: list<u8>) -> result<u32, error>;
+	/// Packets from the controller, as a live stream. One subscription per connection.
+	@op(3) receive: func() -> stream<hci-packet>;
+	/// What happened to the transport, as a live stream. SEPARATE FROM THE PACKETS, because a
+	/// consumer that has stopped draining packets is exactly the consumer that must still learn the
+	/// device is gone.
+	@op(4) control: func() -> stream<hci-control-event>;
+	/// Reset the controller and answer the new epoch. Everything the consumer held from the previous
+	/// session is invalid when this returns, and the provider says so on `control` as well - a
+	/// consumer that reset the controller itself still learns it the same way one that did not does.
+	@op(5) reset:   func() -> result<u32, error>;
 }
 
 /// THE LARGEST FRAME EITHER DIRECTION OF A CONSOLE BYTE STREAM WILL CARRY, and the version the two

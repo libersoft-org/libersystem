@@ -390,6 +390,10 @@ pub mod provider {
 	// is down. Published as a pointer, a digitizer is flattened into whichever contact was decoded
 	// last - which is the same class of loss `LOCAL_STREAM` exists to avoid against `NET`.
 	pub const TOUCH: u16 = 10;
+	/// A Bluetooth controller's HCI transport - a bounded two-way packet pipe to a radio, over which
+	/// a host stack in another process speaks. Not `net` and not `input`: the pointer a mouse
+	/// eventually produces is several protocol layers above this, in a service with no device claim.
+	pub const BLUETOOTH_HCI: u16 = 11;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

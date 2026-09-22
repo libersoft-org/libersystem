@@ -841,7 +841,7 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 		// that root would reach it on a channel it does not know, and one end cannot be owned twice.
 		let font_root: u64 = kept.end_of(b"font_catalogue", CAP_SERVE);
 		let font_admin_root: u64 = kept.take_end_of(b"font_catalogue", CAP_ADMIN);
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", CAP_SERVE), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, font_root, font_admin_root, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", b"CATADMIN"), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		let report_buf: &mut [u8] = if name == b"storage_service" { &mut system_report } else { buf };
@@ -1163,7 +1163,7 @@ pub(super) fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N]
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root: u64, font_admin_root: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, catalogue_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root: u64, font_admin_root: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, catalogue_admin_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	// A fresh StorageService connection for the manager (independent of the shell's),
 	// duplicable so the manager can grant a narrowed copy to a sandboxed component.
 	let storage: u64 = match service_connect(storage_client) {
@@ -1394,7 +1394,18 @@ fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root:
 	// command (whose manifest grants usb): handed up by DeviceManager in phase 2, held by
 	// the supervisor until here (0 when the driver never came up - the manager simply
 	// cannot grant what it does not hold).
-	let catalogue = service_connect(catalogue_root).unwrap_or(0);
+	// MINTED WITH THE SUBSET THIS SERVICE'S MANIFEST ROW DECLARES, which for PermissionManager is
+	// the USB bus and nothing else: it holds this connection to grant `lsusb` a query channel, and
+	// that is the whole of what it reaches the catalogue for.
+	//
+	// THE ROW IS THE SOURCE OF TRUTH AND THIS BRANCH IS NOT YET READING IT. PermissionManager is one
+	// of the hand-written bootstraps the plan executor is replacing a service at a time, so the kind
+	// is spelled here as well as in the row - and the two were observed disagreeing the moment the
+	// subset became enforceable: the row said `usb-bus`, this branch minted through the catalogue's
+	// own root, and the connection PermissionManager actually held reached nothing at all. The
+	// refusal named the kind and the subset, which is how a line in a boot log found a hand-written
+	// branch that a manifest change could not.
+	let catalogue = mint_scoped_consumer(catalogue_admin_root, &[driver_protocol::provider::USB_BUS]).unwrap_or(0);
 	if !send_blocking(manager_side, b"CATALOGUE", catalogue) {
 		return false;
 	}

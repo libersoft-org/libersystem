@@ -8,7 +8,7 @@ interface device
 method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>
 method device.get op=2 (index:u32:rights=) -> result<device-entry, liber:base@1::error>
 method device.bindings op=3 () -> result<list<binding-record>, liber:base@1::error>
-enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8,local-stream=9,touch=10)
+enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8,local-stream=9,touch=10,bluetooth-hci=11)
 record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32,live:bool,name:string:bound=48)
 enum policy-verb(disable=0,enable=1,select=2,retry=3)
 enum policy-outcome(accepted=0,no-such-device=1,not-a-candidate=2,quarantined=3,busy=4,refused=5,not-stored=6)
@@ -23,6 +23,17 @@ method provider-catalogue.bindings op=2 () -> list<binding-record>
 method provider-catalogue.open op=3 (provider:provider-info:rights=) -> result<handle<channel>, liber:base@1::error>
 interface provider-catalogue-admin
 method provider-catalogue-admin.open-consumer op=1 (kinds:list<provider-kind>:bound=16:rights=) -> result<handle<channel>, liber:base@1::error>
+enum hci-packet-kind(command=1,event=2,acl=3,iso=4)
+record hci-attachment(version:u32,iso:bool,max-command:u32,max-event:u32,max-acl:u32,max-iso:u32,command-credits:u32,acl-credits:u32,acl-queue:u32,epoch:u32)
+record hci-packet(kind:hci-packet-kind,epoch:u32,bytes:list<u8>:bound=4100)
+enum hci-control-kind(reset=1,fault=2,removed=3)
+record hci-control-event(kind:hci-control-kind,epoch:u32)
+interface hci-transport
+method hci-transport.attach op=1 (version:u32:rights=) -> result<hci-attachment, liber:base@1::error>
+method hci-transport.send op=2 (kind:hci-packet-kind:rights=,bytes:list<u8>:bound=4100:rights=) -> result<u32, liber:base@1::error>
+method hci-transport.receive op=3 () -> stream<hci-packet>
+method hci-transport.control op=4 () -> stream<hci-control-event>
+method hci-transport.reset op=5 () -> result<u32, liber:base@1::error>
 record console-attachment(version:u32,max-frame:u32)
 record console-chunk(bytes:list<u8>:bound=4096)
 interface console-stream

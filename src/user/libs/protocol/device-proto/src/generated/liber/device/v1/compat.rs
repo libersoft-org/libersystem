@@ -163,6 +163,46 @@ fn incident_report_wire_is_stable() {
 	assert_eq!(IncidentReport::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn hci_packet_kind_wire_is_stable() {
+	let sample = HciPacketKind::Command;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(HciPacketKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn hci_attachment_wire_is_stable() {
+	let sample = HciAttachment { version: 7, iso: true, max_command: 7, max_event: 7, max_acl: 7, max_iso: 7, command_credits: 7, acl_credits: 7, acl_queue: 7, epoch: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(HciAttachment::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn hci_packet_wire_is_stable() {
+	let sample = HciPacket { kind: HciPacketKind::Command, epoch: 7, bytes: alloc::vec![7] };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 7, 0, 0, 0, 1, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(HciPacket::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn hci_control_kind_wire_is_stable() {
+	let sample = HciControlKind::Reset;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(HciControlKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn hci_control_event_wire_is_stable() {
+	let sample = HciControlEvent { kind: HciControlKind::Reset, epoch: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(HciControlEvent::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn console_attachment_wire_is_stable() {
 	let sample = ConsoleAttachment { version: 7, max_frame: 7 };
 	let bytes = sample.encode_vec().expect("encode");

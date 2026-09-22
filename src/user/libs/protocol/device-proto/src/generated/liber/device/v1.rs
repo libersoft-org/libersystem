@@ -860,6 +860,15 @@ pub enum ProviderKind {
 	/// touches at different places. Published as `pointer`, a digitizer would be flattened into
 	/// whichever contact happened to be decoded last, which is the defect this whole item is about.
 	Touch = 10,
+	/// A BLUETOOTH CONTROLLER'S HCI TRANSPORT, which is not `net` and not `input`.
+	///
+	/// A consumer of `net` gets a link it can route; a consumer of `input` gets decoded events. This
+	/// is neither: it is a bounded two-way packet transport to a radio controller, over which a
+	/// HOST STACK speaks - and the mouse that eventually reaches InputService is several protocol
+	/// layers above it, in a service that holds no device claim at all. Published as `input`, a
+	/// controller would hand its raw HCI stream to whatever consumes pointers; published as `net`,
+	/// it would make an ambient path around the host stack out of a kind every consumer asks for.
+	BluetoothHci = 11,
 }
 
 impl ProviderKind {
@@ -912,6 +921,7 @@ impl ProviderKind {
 			8 => Some(ProviderKind::ConsoleBytes),
 			9 => Some(ProviderKind::LocalStream),
 			10 => Some(ProviderKind::Touch),
+			11 => Some(ProviderKind::BluetoothHci),
 			_ => None,
 		}
 	}
@@ -2266,6 +2276,900 @@ pub mod provider_catalogue_admin {
 	}
 }
 
+/// WHICH OF THE FOUR HCI PACKET TYPES THIS IS. The numbers are this interface's own and not the
+/// transport-layer codes any particular physical transport puts in front of a packet: a USB
+/// controller frames these across four endpoints and a UART one prefixes a byte, and a driver that
+/// passed its own framing up would make the host stack learn one transport's habits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HciPacketKind {
+	/// Host to controller. At most one may be outstanding - see `hci-attachment.command-credits`.
+	Command = 1,
+	/// Controller to host.
+	Event = 2,
+	/// Data, both directions.
+	Acl = 3,
+	/// RESERVED AND NEGOTIATED, for the isochronous transport that is not this milestone's. It is
+	/// named here so that a provider which carries it can say so and a consumer which does not
+	/// speak it can refuse a packet by kind rather than by guessing at a length - and so the kind
+	/// is not allocated twice when that work arrives.
+	Iso = 4,
+}
+
+impl HciPacketKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HciPacketKind> {
+		let mut r = Reader::new(bytes);
+		let value = HciPacketKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HciPacketKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HciPacketKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<HciPacketKind> {
+		match r.u8()? {
+			1 => Some(HciPacketKind::Command),
+			2 => Some(HciPacketKind::Event),
+			3 => Some(HciPacketKind::Acl),
+			4 => Some(HciPacketKind::Iso),
+			_ => None,
+		}
+	}
+}
+
+/// WHAT THE TRANSPORT WILL CARRY, LEARNED BEFORE A BYTE MOVES.
+///
+/// The ceilings are the specification's own, headers included: 258 bytes for a command, 257 for an
+/// event, 1028 for ACL data and 4100 for ISO. A provider advertises what IT will carry, which may be
+/// smaller - a controller reports its own buffer sizes - and the consumer is bound by the smaller of
+/// the two. A consumer that assumed the specification's ceiling would hand a controller a packet it
+/// answers with a hardware error rather than with data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HciAttachment {
+	/// The version this provider speaks, which is the one the consumer asked for.
+	pub version: u32,
+	/// Whether this provider carries `iso` at all. False is the ordinary answer and is not a fault.
+	pub iso: bool,
+	pub max_command: u32,
+	pub max_event: u32,
+	pub max_acl: u32,
+	pub max_iso: u32,
+	/// How many commands the controller will accept before it answers one. ONE is what nearly every
+	/// controller reports, and a host that sent two would have the second silently dropped.
+	pub command_credits: u32,
+	/// How many ACL buffers the controller has, and how deep this provider's own queue is. The two
+	/// are different bounds: the first is the controller's and is refreshed by its completion
+	/// events, the second is the transport's and is refreshed by the wire draining.
+	pub acl_credits: u32,
+	pub acl_queue: u32,
+	/// THE SESSION THIS ATTACHMENT BELONGS TO. Every packet carries it, and a reset advances it -
+	/// which is what makes a packet from before a reset distinguishable from one after it, rather
+	/// than being delivered into a host stack that has forgotten the link it belongs to.
+	pub epoch: u32,
+}
+
+impl HciAttachment {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HciAttachment> {
+		let mut r = Reader::new(bytes);
+		let value = HciAttachment::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HciAttachment> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HciAttachment::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.version)?;
+		w.boolean(self.iso)?;
+		w.u32(self.max_command)?;
+		w.u32(self.max_event)?;
+		w.u32(self.max_acl)?;
+		w.u32(self.max_iso)?;
+		w.u32(self.command_credits)?;
+		w.u32(self.acl_credits)?;
+		w.u32(self.acl_queue)?;
+		w.u32(self.epoch)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<HciAttachment> {
+		let version = r.u32()?;
+		let iso = r.boolean()?;
+		let max_command = r.u32()?;
+		let max_event = r.u32()?;
+		let max_acl = r.u32()?;
+		let max_iso = r.u32()?;
+		let command_credits = r.u32()?;
+		let acl_credits = r.u32()?;
+		let acl_queue = r.u32()?;
+		let epoch = r.u32()?;
+		Some(HciAttachment { version, iso, max_command, max_event, max_acl, max_iso, command_credits, acl_credits, acl_queue, epoch })
+	}
+}
+
+/// One HCI packet as the transport delivered it, with none of the consumer's own framing implied.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HciPacket {
+	pub kind: HciPacketKind,
+	/// The session this packet belongs to. A consumer discards one from an epoch it has left.
+	pub epoch: u32,
+	pub bytes: Vec<u8>,
+}
+
+impl HciPacket {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HciPacket> {
+		let mut r = Reader::new(bytes);
+		let value = HciPacket::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HciPacket> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HciPacket::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.u32(self.epoch)?;
+		if self.bytes.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.bytes.len() as u16)?;
+		for v29 in self.bytes.iter() {
+			w.u8(*v29)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<HciPacket> {
+		let kind = HciPacketKind::read(r)?;
+		let epoch = r.u32()?;
+		let bytes = {
+			let v30 = r.u16()? as usize;
+			let v30 = (v30 <= 4100).then_some(v30)?;
+			let mut v31 = Vec::new();
+			v31.try_reserve_exact(v30).ok()?;
+			for _ in 0..v30 {
+				v31.push(r.u8()?);
+			}
+			v31
+		};
+		Some(HciPacket { kind, epoch, bytes })
+	}
+}
+
+/// What happened to the transport itself, as opposed to on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HciControlKind {
+	/// The controller was reset and the session is a new one. Links, scans and profile handles the
+	/// consumer held are gone; the epoch says which session they belonged to.
+	Reset = 1,
+	/// The transport failed and the session is over. A reset may recover it; a removal will not.
+	Fault = 2,
+	/// The device is gone. This publication is over and a replacement arrives as a NEW publication
+	/// through the catalogue, never as this one recovering.
+	Removed = 3,
+}
+
+impl HciControlKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HciControlKind> {
+		let mut r = Reader::new(bytes);
+		let value = HciControlKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HciControlKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HciControlKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<HciControlKind> {
+		match r.u8()? {
+			1 => Some(HciControlKind::Reset),
+			2 => Some(HciControlKind::Fault),
+			3 => Some(HciControlKind::Removed),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HciControlEvent {
+	pub kind: HciControlKind,
+	/// The session this is about, which for `reset` is the session that ENDED.
+	pub epoch: u32,
+}
+
+impl HciControlEvent {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HciControlEvent> {
+		let mut r = Reader::new(bytes);
+		let value = HciControlEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HciControlEvent> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HciControlEvent::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.u32(self.epoch)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<HciControlEvent> {
+		let kind = HciControlKind::read(r)?;
+		let epoch = r.u32()?;
+		Some(HciControlEvent { kind, epoch })
+	}
+}
+
+/// THE DEVICE-SIDE CONTRACT A `bluetooth-hci` PROVIDER SERVES.
+///
+/// A BOUNDED PACKET TRANSPORT AND NOTHING ABOVE IT. Everything that makes Bluetooth Bluetooth - the
+/// command state machine, L2CAP, ATT, pairing - lives in a service with no device claim, no MMIO and
+/// no DMA. What is here is the two-way pipe and the numbers that bound it.
+///
+/// `send` IS A REQUEST WITH A REPLY BECAUSE A TRANSPORT SEND IS NOT A COMMAND COMPLETION. A host that
+/// treated the enqueue as the answer would issue its next command against credits the controller
+/// has not returned, and the controller drops it - which from the host looks like a command that was
+/// answered and then forgotten.
+// interface `hci-transport` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod hci_transport {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_ATTACH: u16 = 1;
+	pub const OP_SEND: u16 = 2;
+	pub const OP_RECEIVE: u16 = 3;
+	pub const OP_CONTROL: u16 = 4;
+	pub const OP_RESET: u16 = 5;
+
+	pub trait Service {
+		/// Ask for a version and learn the bounds that go with it. Refused with `unsupported` when this
+		/// provider does not speak the version asked for; every other operation on a connection that has
+		/// not attached is refused with `invalid`, so an unattached consumer cannot move a packet by
+		/// accident.
+		fn attach(&mut self, version: u32) -> Result<HciAttachment, Error>;
+		/// One packet to the controller, and how many bytes it took. A kind this provider does not carry
+		/// is `unsupported`; a kind that travels the other way - an event - is `invalid`, because a host
+		/// sending one is a host that has confused its directions rather than one that is early; a
+		/// length past the advertised ceiling is `invalid`; and `again` says the transport's own queue
+		/// is full, which is different from the controller having no buffers.
+		fn send(&mut self, kind: HciPacketKind, bytes: Vec<u8>) -> Result<u32, Error>;
+		/// Packets from the controller, as a live stream. One subscription per connection.
+		fn receive(&mut self) -> Vec<HciPacket>;
+		/// What happened to the transport, as a live stream. SEPARATE FROM THE PACKETS, because a
+		/// consumer that has stopped draining packets is exactly the consumer that must still learn the
+		/// device is gone.
+		fn control(&mut self) -> Vec<HciControlEvent>;
+		/// Reset the controller and answer the new epoch. Everything the consumer held from the previous
+		/// session is invalid when this returns, and the provider says so on `control` as well - a
+		/// consumer that reset the controller itself still learns it the same way one that did not does.
+		fn reset(&mut self) -> Result<u32, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:device")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ATTACH => {
+				let version = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.attach(version);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v32) => {
+							w.u8(1)?;
+							v32.write(w)?;
+						}
+						Err(v33) => {
+							w.u8(0)?;
+							v33.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SEND => {
+				let kind = HciPacketKind::read(r)?;
+				let bytes = {
+					let v34 = r.u16()? as usize;
+					let v34 = (v34 <= 4100).then_some(v34)?;
+					let mut v35 = Vec::new();
+					v35.try_reserve_exact(v34).ok()?;
+					for _ in 0..v34 {
+						v35.push(r.u8()?);
+					}
+					v35
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.send(kind, bytes);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v36) => {
+							w.u8(1)?;
+							w.u32(*v36)?;
+						}
+						Err(v37) => {
+							w.u8(0)?;
+							v37.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RESET => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.reset();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v38) => {
+							w.u8(1)?;
+							w.u32(*v38)?;
+						}
+						Err(v39) => {
+							w.u8(0)?;
+							v39.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	pub fn receive_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<HciPacket>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.receive();
+		Some((corr, items))
+	}
+	pub fn receive_frame(seq: u32, item: &HciPacket, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn receive_read(msg: &[u8], frame_handles: &mut Handles) -> Option<HciPacket> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = HciPacket::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	pub fn control_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<HciControlEvent>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.control();
+		Some((corr, items))
+	}
+	pub fn control_frame(seq: u32, item: &HciControlEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn control_read(msg: &[u8], frame_handles: &mut Handles) -> Option<HciControlEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = HciControlEvent::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn attach(&mut self, version: &u32) -> Option<Result<HciAttachment, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ATTACH)?;
+			w.u32(corr)?;
+			w.u32(*version)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(HciAttachment::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn send(&mut self, kind: &HciPacketKind, bytes: &[u8]) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SEND)?;
+			w.u32(corr)?;
+			kind.write(w)?;
+			if bytes.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(bytes.len() as u16)?;
+			for v40 in bytes.iter() {
+				w.u8(*v40)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn receive(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RECEIVE)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+		pub fn control(&mut self) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CONTROL)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+		pub fn reset(&mut self) -> Option<Result<u32, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RESET)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_hci_transport_attach")]
+	fn channel_invoke_attach(chan: u64, version: &u32) -> Option<Result<HciAttachment, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.attach(version)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_hci_transport_send")]
+	fn channel_invoke_send(chan: u64, kind: &HciPacketKind, bytes: &[u8]) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.send(kind, bytes)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_hci_transport_receive")]
+	fn channel_invoke_receive(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.receive()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_hci_transport_control")]
+	fn channel_invoke_control(chan: u64) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.control()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_hci_transport_reset")]
+	fn channel_invoke_reset(chan: u64) -> Option<Result<u32, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.reset()
+	}
+}
+
 /// THE LARGEST FRAME EITHER DIRECTION OF A CONSOLE BYTE STREAM WILL CARRY, and the version the two
 /// ends agreed on.
 ///
@@ -2381,21 +3285,21 @@ impl ConsoleChunk {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v29 in self.bytes.iter() {
-			w.u8(*v29)?;
+		for v41 in self.bytes.iter() {
+			w.u8(*v41)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ConsoleChunk> {
 		let bytes = {
-			let v30 = r.u16()? as usize;
-			let v30 = (v30 <= 4096).then_some(v30)?;
-			let mut v31 = Vec::new();
-			v31.try_reserve_exact(v30).ok()?;
-			for _ in 0..v30 {
-				v31.push(r.u8()?);
+			let v42 = r.u16()? as usize;
+			let v42 = (v42 <= 4096).then_some(v42)?;
+			let mut v43 = Vec::new();
+			v43.try_reserve_exact(v42).ok()?;
+			for _ in 0..v42 {
+				v43.push(r.u8()?);
 			}
-			v31
+			v43
 		};
 		Some(ConsoleChunk { bytes })
 	}
@@ -2466,13 +3370,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v32) => {
+						Ok(v44) => {
 							w.u8(1)?;
-							v32.write(w)?;
+							v44.write(w)?;
 						}
-						Err(v33) => {
+						Err(v45) => {
 							w.u8(0)?;
-							v33.write(w)?;
+							v45.write(w)?;
 						}
 					}
 					Some(())
@@ -2496,14 +3400,14 @@ pub mod console_stream {
 			}
 			OP_WRITE => {
 				let bytes = {
-					let v34 = r.u16()? as usize;
-					let v34 = (v34 <= 65535).then_some(v34)?;
-					let mut v35 = Vec::new();
-					v35.try_reserve_exact(v34).ok()?;
-					for _ in 0..v34 {
-						v35.push(r.u8()?);
+					let v46 = r.u16()? as usize;
+					let v46 = (v46 <= 65535).then_some(v46)?;
+					let mut v47 = Vec::new();
+					v47.try_reserve_exact(v46).ok()?;
+					for _ in 0..v46 {
+						v47.push(r.u8()?);
 					}
-					v35
+					v47
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2512,13 +3416,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v36) => {
+						Ok(v48) => {
 							w.u8(1)?;
-							w.u32(*v36)?;
+							w.u32(*v48)?;
 						}
-						Err(v37) => {
+						Err(v49) => {
 							w.u8(0)?;
-							v37.write(w)?;
+							v49.write(w)?;
 						}
 					}
 					Some(())
@@ -2720,8 +3624,8 @@ pub mod console_stream {
 				return None;
 			}
 			w.u16(bytes.len() as u16)?;
-			for v38 in bytes.iter() {
-				w.u8(*v38)?;
+			for v50 in bytes.iter() {
+				w.u8(*v50)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -2930,19 +3834,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v39) => {
+						Ok(v51) => {
 							w.u8(1)?;
-							if v39.len() > u16::MAX as usize {
+							if v51.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v39.len() as u16)?;
-							for v41 in v39.iter() {
-								v41.write(w)?;
+							w.u16(v51.len() as u16)?;
+							for v53 in v51.iter() {
+								v53.write(w)?;
 							}
 						}
-						Err(v40) => {
+						Err(v52) => {
 							w.u8(0)?;
-							v40.write(w)?;
+							v52.write(w)?;
 						}
 					}
 					Some(())
@@ -3072,13 +3976,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v42 = r.u16()? as usize;
-						let mut v43 = Vec::new();
-						v43.try_reserve_exact(v42).ok()?;
-						for _ in 0..v42 {
-							v43.push(UsbDevice::read(r)?);
+						let v54 = r.u16()? as usize;
+						let mut v55 = Vec::new();
+						v55.try_reserve_exact(v54).ok()?;
+						for _ in 0..v54 {
+							v55.push(UsbDevice::read(r)?);
 						}
-						v43
+						v55
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3519,6 +4423,7 @@ impl ProviderKind {
 			ProviderKind::ConsoleBytes => out.push_str("\"console-bytes\""),
 			ProviderKind::LocalStream => out.push_str("\"local-stream\""),
 			ProviderKind::Touch => out.push_str("\"touch\""),
+			ProviderKind::BluetoothHci => out.push_str("\"bluetooth-hci\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -3533,6 +4438,7 @@ impl ProviderKind {
 			ProviderKind::ConsoleBytes => out.push_str("console-bytes"),
 			ProviderKind::LocalStream => out.push_str("local-stream"),
 			ProviderKind::Touch => out.push_str("touch"),
+			ProviderKind::BluetoothHci => out.push_str("bluetooth-hci"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -3547,6 +4453,7 @@ impl ProviderKind {
 			ProviderKind::ConsoleBytes => crate::codec::cbor::text(out, "console-bytes"),
 			ProviderKind::LocalStream => crate::codec::cbor::text(out, "local-stream"),
 			ProviderKind::Touch => crate::codec::cbor::text(out, "touch"),
+			ProviderKind::BluetoothHci => crate::codec::cbor::text(out, "bluetooth-hci"),
 		}
 	}
 }
@@ -3922,6 +4829,317 @@ impl IncidentReport {
 	}
 }
 
+impl HciPacketKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			HciPacketKind::Command => out.push_str("\"command\""),
+			HciPacketKind::Event => out.push_str("\"event\""),
+			HciPacketKind::Acl => out.push_str("\"acl\""),
+			HciPacketKind::Iso => out.push_str("\"iso\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			HciPacketKind::Command => out.push_str("command"),
+			HciPacketKind::Event => out.push_str("event"),
+			HciPacketKind::Acl => out.push_str("acl"),
+			HciPacketKind::Iso => out.push_str("iso"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			HciPacketKind::Command => crate::codec::cbor::text(out, "command"),
+			HciPacketKind::Event => crate::codec::cbor::text(out, "event"),
+			HciPacketKind::Acl => crate::codec::cbor::text(out, "acl"),
+			HciPacketKind::Iso => crate::codec::cbor::text(out, "iso"),
+		}
+	}
+}
+
+impl HciAttachment {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"version\":");
+		let _ = write!(out, "{}", self.version);
+		out.push(',');
+		out.push_str("\"iso\":");
+		if self.iso {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"max-command\":");
+		let _ = write!(out, "{}", self.max_command);
+		out.push(',');
+		out.push_str("\"max-event\":");
+		let _ = write!(out, "{}", self.max_event);
+		out.push(',');
+		out.push_str("\"max-acl\":");
+		let _ = write!(out, "{}", self.max_acl);
+		out.push(',');
+		out.push_str("\"max-iso\":");
+		let _ = write!(out, "{}", self.max_iso);
+		out.push(',');
+		out.push_str("\"command-credits\":");
+		let _ = write!(out, "{}", self.command_credits);
+		out.push(',');
+		out.push_str("\"acl-credits\":");
+		let _ = write!(out, "{}", self.acl_credits);
+		out.push(',');
+		out.push_str("\"acl-queue\":");
+		let _ = write!(out, "{}", self.acl_queue);
+		out.push(',');
+		out.push_str("\"epoch\":");
+		let _ = write!(out, "{}", self.epoch);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("version=");
+		let _ = write!(out, "{}", self.version);
+		out.push_str(", ");
+		out.push_str("iso=");
+		if self.iso {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("max-command=");
+		let _ = write!(out, "{}", self.max_command);
+		out.push_str(", ");
+		out.push_str("max-event=");
+		let _ = write!(out, "{}", self.max_event);
+		out.push_str(", ");
+		out.push_str("max-acl=");
+		let _ = write!(out, "{}", self.max_acl);
+		out.push_str(", ");
+		out.push_str("max-iso=");
+		let _ = write!(out, "{}", self.max_iso);
+		out.push_str(", ");
+		out.push_str("command-credits=");
+		let _ = write!(out, "{}", self.command_credits);
+		out.push_str(", ");
+		out.push_str("acl-credits=");
+		let _ = write!(out, "{}", self.acl_credits);
+		out.push_str(", ");
+		out.push_str("acl-queue=");
+		let _ = write!(out, "{}", self.acl_queue);
+		out.push_str(", ");
+		out.push_str("epoch=");
+		let _ = write!(out, "{}", self.epoch);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 10);
+		crate::codec::cbor::text(out, "version");
+		crate::codec::cbor::uint(out, self.version as u64);
+		crate::codec::cbor::text(out, "iso");
+		crate::codec::cbor::boolean(out, self.iso);
+		crate::codec::cbor::text(out, "max-command");
+		crate::codec::cbor::uint(out, self.max_command as u64);
+		crate::codec::cbor::text(out, "max-event");
+		crate::codec::cbor::uint(out, self.max_event as u64);
+		crate::codec::cbor::text(out, "max-acl");
+		crate::codec::cbor::uint(out, self.max_acl as u64);
+		crate::codec::cbor::text(out, "max-iso");
+		crate::codec::cbor::uint(out, self.max_iso as u64);
+		crate::codec::cbor::text(out, "command-credits");
+		crate::codec::cbor::uint(out, self.command_credits as u64);
+		crate::codec::cbor::text(out, "acl-credits");
+		crate::codec::cbor::uint(out, self.acl_credits as u64);
+		crate::codec::cbor::text(out, "acl-queue");
+		crate::codec::cbor::uint(out, self.acl_queue as u64);
+		crate::codec::cbor::text(out, "epoch");
+		crate::codec::cbor::uint(out, self.epoch as u64);
+	}
+}
+
+impl HciPacket {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"epoch\":");
+		let _ = write!(out, "{}", self.epoch);
+		out.push(',');
+		out.push_str("\"bytes\":");
+		out.push('[');
+		let mut v57 = true;
+		for v56 in self.bytes.iter() {
+			if !v57 {
+				out.push(',');
+			}
+			v57 = false;
+			let _ = write!(out, "{}", v56);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("epoch=");
+		let _ = write!(out, "{}", self.epoch);
+		out.push_str(", ");
+		out.push_str("bytes=");
+		out.push('[');
+		let mut v59 = true;
+		for v58 in self.bytes.iter() {
+			if !v59 {
+				out.push_str(", ");
+			}
+			v59 = false;
+			let _ = write!(out, "{}", v58);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "epoch");
+		crate::codec::cbor::uint(out, self.epoch as u64);
+		crate::codec::cbor::text(out, "bytes");
+		crate::codec::cbor::array(out, self.bytes.len());
+		for v60 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v60 as u64);
+		}
+	}
+}
+
+impl HciControlKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			HciControlKind::Reset => out.push_str("\"reset\""),
+			HciControlKind::Fault => out.push_str("\"fault\""),
+			HciControlKind::Removed => out.push_str("\"removed\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			HciControlKind::Reset => out.push_str("reset"),
+			HciControlKind::Fault => out.push_str("fault"),
+			HciControlKind::Removed => out.push_str("removed"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			HciControlKind::Reset => crate::codec::cbor::text(out, "reset"),
+			HciControlKind::Fault => crate::codec::cbor::text(out, "fault"),
+			HciControlKind::Removed => crate::codec::cbor::text(out, "removed"),
+		}
+	}
+}
+
+impl HciControlEvent {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"epoch\":");
+		let _ = write!(out, "{}", self.epoch);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("epoch=");
+		let _ = write!(out, "{}", self.epoch);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "epoch");
+		crate::codec::cbor::uint(out, self.epoch as u64);
+	}
+}
+
 impl ConsoleAttachment {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3985,13 +5203,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v45 = true;
-		for v44 in self.bytes.iter() {
-			if !v45 {
+		let mut v62 = true;
+		for v61 in self.bytes.iter() {
+			if !v62 {
 				out.push(',');
 			}
-			v45 = false;
-			let _ = write!(out, "{}", v44);
+			v62 = false;
+			let _ = write!(out, "{}", v61);
 		}
 		out.push(']');
 		out.push('}');
@@ -4000,13 +5218,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v47 = true;
-		for v46 in self.bytes.iter() {
-			if !v47 {
+		let mut v64 = true;
+		for v63 in self.bytes.iter() {
+			if !v64 {
 				out.push_str(", ");
 			}
-			v47 = false;
-			let _ = write!(out, "{}", v46);
+			v64 = false;
+			let _ = write!(out, "{}", v63);
 		}
 		out.push(']');
 		out.push('}');
@@ -4015,8 +5233,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v48 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v48 as u64);
+		for v65 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v65 as u64);
 		}
 	}
 }

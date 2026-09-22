@@ -1,0 +1,39 @@
+thread 'rustc' panicked at /rustc-dev/01dfd79246f1b2d5f146616deff08223a840a9ae/compiler/rustc_middle/src/dep_graph/graph.rs:750:18:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+   0:     0x7f742b6b8e9b - <std[59c6a60ba8e89306]::backtrace::Backtrace>::create
+   1:     0x7f742b6b8de5 - <std[59c6a60ba8e89306]::backtrace::Backtrace>::force_capture
+   2:     0x7f742a4a74f8 - std[59c6a60ba8e89306]::panicking::update_hook::<alloc[8bd4a5f83aeff985]::boxed::Box<rustc_driver_impl[612172d3fffba438]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7f742b6cca22 - std[59c6a60ba8e89306]::panicking::panic_with_hook
+   4:     0x7f742b6aee44 - std[59c6a60ba8e89306]::panicking::panic_handler::{closure#0}
+   5:     0x7f742b6a3339 - std[59c6a60ba8e89306]::sys::backtrace::__rust_end_short_backtrace::<std[59c6a60ba8e89306]::panicking::panic_handler::{closure#0}, !>
+   6:     0x7f742b6b087d - __rustc[c8f31f49d175aaf6]::rust_begin_unwind
+   7:     0x7f742819777c - core[ed07a1efed088ad0]::panicking::panic_fmt
+   8:     0x7f7428a8f2d2 - core[ed07a1efed088ad0]::panicking::panic
+   9:     0x7f7428330a99 - core[ed07a1efed088ad0]::option::unwrap_failed
+  10:     0x7f742d2c900e - <rustc_query_impl[442a6da4cb289e52]::dep_kind_vtables::non_query::SideEffect::{closure#0} as core[ed07a1efed088ad0]::ops::function::FnOnce<(rustc_middle[67f6af85fdf6e9f0]::ty::context::TyCtxt, rustc_middle[67f6af85fdf6e9f0]::dep_graph::dep_node::DepNode, rustc_middle[67f6af85fdf6e9f0]::dep_graph::serialized::SerializedDepNodeIndex)>>::call_once
+  11:     0x7f742be1d4b7 - <rustc_middle[67f6af85fdf6e9f0]::dep_graph::graph::DepGraphData>::try_mark_previous_green
+  12:     0x7f742c1307a5 - rustc_query_impl[442a6da4cb289e52]::execution::ensure_can_skip_execution::<rustc_data_structures[f9b58af056a886a2]::vec_cache::VecCache<rustc_span[d4fd5768c485f4c5]::def_id::LocalDefId, rustc_middle[67f6af85fdf6e9f0]::query::erase::ErasedData<[u8; 1usize]>, rustc_middle[67f6af85fdf6e9f0]::dep_graph::graph::DepNodeIndex>>
+  13:     0x7f742c12a9d6 - rustc_query_impl[442a6da4cb289e52]::query_impl::typeck_root::execute_query_incr::__rust_end_short_backtrace
+  14:     0x7f742c3d3e97 - <rustc_middle[67f6af85fdf6e9f0]::ty::context::TyCtxt>::par_hir_body_owners::<rustc_hir_analysis[22d29cf3288c9316]::check_crate::{closure#1}>::{closure#0}
+  15:     0x7f742c3d386f - rustc_hir_analysis[22d29cf3288c9316]::check_crate
+  16:     0x7f742c3d5b8c - rustc_interface[679c31579adae330]::passes::analysis
+  17:     0x7f742d086382 - rustc_query_impl[442a6da4cb289e52]::execution::try_execute_query::<rustc_middle[67f6af85fdf6e9f0]::query::caches::SingleCache<rustc_middle[67f6af85fdf6e9f0]::query::erase::ErasedData<[u8; 0usize]>>, true>
+  18:     0x7f742d085cb7 - rustc_query_impl[442a6da4cb289e52]::query_impl::analysis::execute_query_incr::__rust_end_short_backtrace
+  19:     0x7f742d044317 - rustc_interface[679c31579adae330]::interface::run_compiler::<(), rustc_driver_impl[612172d3fffba438]::run_compiler::{closure#0}>::{closure#1}
+  20:     0x7f742d006e3a - std[59c6a60ba8e89306]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[679c31579adae330]::util::run_in_thread_with_globals<rustc_interface[679c31579adae330]::util::run_in_thread_pool_with_globals<rustc_interface[679c31579adae330]::interface::run_compiler<(), rustc_driver_impl[612172d3fffba438]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  21:     0x7f742d006bed - <std[59c6a60ba8e89306]::thread::lifecycle::spawn_unchecked<rustc_interface[679c31579adae330]::util::run_in_thread_with_globals<rustc_interface[679c31579adae330]::util::run_in_thread_pool_with_globals<rustc_interface[679c31579adae330]::interface::run_compiler<(), rustc_driver_impl[612172d3fffba438]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[ed07a1efed088ad0]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  22:     0x7f742cffd090 - <std[59c6a60ba8e89306]::sys::thread::unix::Thread>::new::thread_start
+  23:     0x7f742669eb7b - start_thread
+                               at ./nptl/pthread_create.c:448:8
+  24:     0x7f742671c7f8 - __GI___clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78:0
+  25:                0x0 - <unknown>
+
+
+rustc version: 1.98.0-nightly (01dfd7924 2026-06-15)
+platform: x86_64-unknown-linux-gnu
+
+query stack during panic:
+#0 [analysis] running analysis passes on crate `kernel`
+end of query stack
