@@ -794,9 +794,20 @@ impl OutputLuminance {
 	/// diffuse white, a zero or a non-finite value is a display description that cannot be true, and
 	/// the answer there is the profile's constant rather than a curve computed from nonsense.
 	pub fn tone_map_white(&self) -> f64 {
+		self.headroom().unwrap_or(graphics_profile::image::tone_map::WHITE)
+	}
+
+	/// HOW MUCH BRIGHTER THAN DIFFUSE WHITE THIS DESTINATION SAID IT CAN GO, or `None` when it said
+	/// nothing believable.
+	///
+	/// A SEPARATE QUESTION FROM THE WHITE POINT, and the two were conflated. `tone_map_white` is
+	/// WHAT the curve maps to one and always has an answer, because a curve needs a parameter even
+	/// where the display is silent. This is WHETHER the display said anything, which is what decides
+	/// if the curve runs at all.
+	pub fn headroom(&self) -> Option<f64> {
 		match (self.sdr_white_nits, self.max_nits) {
-			(Some(white), Some(max)) if white > 0.0 && white.is_finite() && max.is_finite() && max >= white => (max as f64) / (white as f64),
-			_ => graphics_profile::image::tone_map::WHITE,
+			(Some(white), Some(max)) if white > 0.0 && white.is_finite() && max.is_finite() && max >= white => Some((max as f64) / (white as f64)),
+			_ => None,
 		}
 	}
 }
@@ -824,7 +835,29 @@ impl Encoder {
 		working.validate()?;
 		let matrix = conversion(working.space(), space)?;
 		let steps = quantisation_steps(storage);
-		Ok(Self { transfer: space.transfer(), matrix, luminance: luminance_coefficients(space)?, alpha, working_is_linear: working.is_linear(), steps, step: steps.map(|steps| 1.0 / steps).unwrap_or(0.0), tone_map: steps.is_some(), tone_white: output.tone_map_white() })
+		// THE TONE MAP IS TURNED ON BY THE DESTINATION'S REPORTED LUMINANCE, which is what the line
+		// above this function already says it is. What the code did instead was turn it on for any
+		// QUANTISED destination, which is nearly all of them, and then compensate PER PIXEL.
+		//
+		// WHY THAT COMPENSATION WAS A DEFECT. The operator maps `[0, white]` onto `[0, 1]`, so
+		// running it puts diffuse white at 0.53 of the output range - right for a display with four
+		// times the headroom, and grey-for-white on one without. The per-pixel guard passed a colour
+		// at or below a luminance of one through unchanged and scaled everything above by the curve,
+		// which is a DISCONTINUITY: 1.000000 at a luminance of 1.0 and 0.531280 at 1.0001, a 47 per
+		// cent drop across a boundary that runs through the middle of every lit surface.
+		//
+		// A DESTINATION THAT REPORTED NOTHING HAS NOWHERE TO MAP A HIGHLIGHT INTO, and the profile
+		// says what happens then: "clamping happens at OUTPUT and nowhere else". So the curve runs
+		// where there is headroom to run into, over the WHOLE range as a global operator must, and
+		// where there is none the values clamp. No step, no second curve, and every pixel an
+		// application already put inside the range comes back as itself.
+		//
+		// AND THIS IS WHAT RECONCILES THIS PATH WITH `scene3d::postprocess`, which applies the same
+		// operator to scene radiance - high dynamic range by construction, and therefore always with
+		// somewhere to be mapped from. One operator; what differs is a property of the destination
+		// rather than a second curve or a guard.
+		let headroom = output.headroom();
+		Ok(Self { transfer: space.transfer(), matrix, luminance: luminance_coefficients(space)?, alpha, working_is_linear: working.is_linear(), steps, step: steps.map(|steps| 1.0 / steps).unwrap_or(0.0), tone_map: steps.is_some() && headroom.is_some(), tone_white: output.tone_map_white() })
 	}
 
 	/// What this encoder maps to one, relative to diffuse white - the destination's own when it
@@ -881,7 +914,7 @@ impl Encoder {
 				Rgba::new(0.0, 0.0, 0.0, 0.0)
 			};
 			if self.working_is_linear {
-				if self.tone_map && (colour.red > 1.0 || colour.green > 1.0 || colour.blue > 1.0) {
+				if self.tone_map {
 					colour = tone_mapped(colour, self.luminance, self.tone_white);
 				}
 				if let Some(matrix) = &self.matrix {
@@ -927,10 +960,12 @@ impl Encoder {
 			Rgba::new(0.0, 0.0, 0.0, 0.0)
 		};
 		if self.working_is_linear {
-			// THE TONE MAP IS ONLY REACHED BY A COLOUR THAT NEEDS IT. Everything a user interface draws
-			// is inside the range already, and the luminance dot product to discover that is three
-			// multiplies per pixel; one comparison answers it.
-			if self.tone_map && (colour.red > 1.0 || colour.green > 1.0 || colour.blue > 1.0) {
+			// EVERY PIXEL OR NONE OF THEM. A global operator that skipped the pixels it happened to
+			// leave near-unchanged would not be global, and the comparison that decided which was
+			// where the step came from. A conversion whose destination reported no headroom does not
+			// reach this at all, so what that comparison saved is saved once, where the encoder is
+			// built.
+			if self.tone_map {
 				colour = tone_mapped(colour, self.luminance, self.tone_white);
 			}
 			if let Some(matrix) = &self.matrix {
@@ -984,8 +1019,13 @@ fn conversion(from: ColorSpace, to: ColorSpace) -> Result<Option<Matrix3>, Error
 fn tone_mapped(colour: Rgba, luminance: (f64, f64, f64), white: f64) -> Rgba {
 	let light = colour.red as f64 * luminance.0 + colour.green as f64 * luminance.1 + colour.blue as f64 * luminance.2;
 	// WRITTEN OUT BECAUSE EVERY COMPARISON WITH NaN IS FALSE: a NaN luminance must fall through
-	// unmapped rather than be scaled by a NaN ratio.
-	if !matches!(light.partial_cmp(&1.0), Some(core::cmp::Ordering::Greater)) {
+	// unmapped rather than be scaled by a NaN ratio. Zero and below fall through too, because the
+	// ratio below divides by it and black is already where the curve would send it.
+	//
+	// AND THE BOUND IS ZERO AND NOT ONE. It was one, which made this the identity below diffuse
+	// white and the curve above - two functions meeting at a 47 per cent step. The curve is applied
+	// over its whole domain now, and WHETHER it is applied is the destination's question.
+	if !matches!(light.partial_cmp(&0.0), Some(core::cmp::Ordering::Greater)) {
 		return colour;
 	}
 	let mapped = light * (1.0 + light / (white * white)) / (1.0 + light);

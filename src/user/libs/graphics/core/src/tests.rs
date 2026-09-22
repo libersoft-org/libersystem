@@ -419,10 +419,32 @@ fn the_pipeline_round_trips_a_pixel_through_every_stage() {
 	assert_eq!(pixel::Working::LinearPremultiplied(ColorSpace::Srgb).validate(), Err(Error::UnknownColorSpace));
 	assert_eq!(pixel::Working::linear(ColorSpace::Rec2020Pq).space(), ColorSpace::Rec2020Linear, "the three Rec. 2020 transfers share one linear space");
 
-	// TONE MAPPING WHERE THE TARGET IS NARROWER, and not clipping: the difference between a bright
-	// window and a white rectangle.
+	// TONE MAPPING WHERE THE DESTINATION SAID IT HAS SOMEWHERE TO MAP INTO, and clamping where it
+	// did not. This encoder was built with `new`, so its destination reported nothing.
+	//
+	// WHAT THIS ASSERTED BEFORE, AND WHY IT WAS THE WRONG QUESTION. It read "four times diffuse
+	// white comes back inside the range" and called that the difference between a bright window and
+	// a white rectangle. The behaviour underneath was not a tone map: a colour at or below a
+	// luminance of one passed through and everything above was scaled by the curve, so the picture
+	// had a 47 per cent STEP at diffuse white. A window drawn across that boundary was not a bright
+	// window - it was two flat regions with a hard edge between them.
+	//
+	// NO CURVE KEEPS ALL THREE of white at white, a highlight with its gradations, and an output
+	// range that ends at one: the first two need room the third does not have. So the destination
+	// decides. One that reported headroom gets the operator over its whole range; one that reported
+	// nothing clamps, which is the profile's own sentence for that case - and every pixel an
+	// application already put inside the range comes back as itself.
 	let bright = encoder.encode(Rgba::new(4.0, 4.0, 4.0, 1.0), 0, 0);
-	assert!(bright.red < 1.0, "a value four times diffuse white must come back inside the target's range: {bright:?}");
+	assert!(bright.red >= 1.0 - 1.0 / 255.0, "a destination that reported nothing clamps rather than pulling the whole colour down: {bright:?}");
+	let white = encoder.encode(Rgba::new(1.0, 1.0, 1.0, 1.0), 0, 0);
+	assert!(white.red >= 1.0 - 1.0 / 255.0, "and diffuse white is still white: {white:?}");
+	// AND WHERE THE DISPLAY SAID WHAT IT CAN SHOW the curve runs over the whole range, with no step
+	// at diffuse white and a highlight that keeps its gradations.
+	let reported = pixel::OutputLuminance { sdr_white_nits: Some(203.0), max_nits: Some(812.0), min_nits: Some(0.1), max_frame_average_nits: Some(400.0) };
+	let hdr = pixel::Encoder::new_for_output(&target_semantics, PixelStorage::Known(PixelFormat::R8G8B8A8Unorm), working, reported).expect("an encoder");
+	let mapped: [f32; 4] = [0.9999, 1.0001, 2.0, 4.0].map(|value| hdr.encode(Rgba::new(value, value, value, 1.0), 0, 0).red);
+	assert!((mapped[1] - mapped[0]).abs() < 4.0 / 255.0, "the curve has no step at diffuse white: {mapped:?}");
+	assert!(mapped[2] < mapped[3] && mapped[3] <= 1.0, "and a highlight keeps its gradations inside the range: {mapped:?}");
 	let float_target = pixel::Encoder::new(&target_semantics, PixelStorage::Known(PixelFormat::R16G16B16A16Float), working).expect("an encoder");
 	let kept = float_target.encode(Rgba::new(4.0, 4.0, 4.0, 1.0), 0, 0);
 	assert!(kept.red > 1.0, "a float target holds what it is given rather than tone-mapping it away: {kept:?}");

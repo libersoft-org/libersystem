@@ -2804,3 +2804,46 @@ TWO THINGS THE COMPILER COULD NOT CATCH AND THE FIRST RUN WOULD HAVE:
 WHAT THE MEASUREMENT SAID: the light's map holds 18,512 of 262,144 texels, which is the sphere's
 silhouette at that projection computed independently before the run and matched by it. A number
 predicted and then measured is a different kind of evidence from a number read off a passing test.
+
+## The 2D and 3D tone maps, reconciled by asking a different question (2026-09-22)
+
+**THE DEFECT.** `graphics-core`'s encoder ran the profile's tone map on any QUANTISED destination and
+then compensated PER PIXEL: a colour at or below a luminance of one passed through unchanged, and
+everything above was scaled by extended Reinhard. The curve is 0.53125 at a luminance of one, so the
+two halves met at a 47 per cent STEP - 1.000000 at `L = 1.0` and 0.531280 at `L = 1.0001` - running
+through the middle of every lit surface. `scene3d` had no such guard, and the milestone recorded the
+divergence as an open question about which curve was right.
+
+**IT WAS NOT A QUESTION ABOUT THE CURVE.** `Image Colour Profile 1` fixes the OPERATOR and says
+nothing about which conversions invoke it; it does say that "clamping happens at OUTPUT and nowhere
+else". The code had decided the policy for itself, per pixel, and the step was that decision.
+
+**THE PROOF THAT IT WAS NOT A PREFERENCE.** Three things are wanted and only two can hold: white
+stays at the top of the range, a highlight above one keeps its gradations, and the output range ends
+at one. The operator maps `[0, white]` onto `[0, 1]`, so keeping a highlight means something below
+one must move. That is arithmetic and not taste, and it is why every attempt to satisfy all three
+produced a discontinuity.
+
+**WHAT WAS BUILT AND BACKED OUT, WITH THE MEASUREMENT KEPT.** A knee at 0.8 was implemented end to
+end - the profile named it, both crates called one shared function, the shoulder met the identity
+with the same slope so there was no kink, and `WHITE` still mapped to exactly one. It works. It
+costs white: 255 becomes 243, and it moved bright colours across three scenes of the 2D conformance
+suite. Buying highlight detail above white, on displays this system does not yet have, by changing
+every picture the 2D path produces today is the wrong trade. Backed out; the numbers are in the
+milestone so a reader who wants it back can see what it costs.
+
+**WHAT SHIPPED.** The curve runs where the destination REPORTED headroom to map into, over its whole
+range, and where none was reported the values clamp at output. `OutputLuminance::headroom` is the
+new question, separate from `tone_map_white`, which always has an answer and was conflating the two.
+No guard, no second curve, no boundary for a step to live on - and every pixel an application
+already put inside the range comes back as itself. The frozen profile is untouched.
+
+**THE SHAPE TO LOOK FOR ELSEWHERE.** A guard added to make a correct operator behave acceptably is
+evidence that the operator is being invoked where it should not be. The guard is the symptom; the
+policy is the defect. This one had a comment explaining why it was there, which is what made it look
+like a decision rather than a workaround.
+
+**AND ONE PROCESS NOTE.** This was surfaced to the owner twice as a choice, and the second framing
+was wrong: "identity below one, continuous above" cannot exist, because a curve that is the identity
+up to one has no range left above it. Catching that needed the arithmetic written out rather than
+described. A recommendation that has not been evaluated numerically is not a recommendation.

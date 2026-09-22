@@ -569,8 +569,21 @@ fn colour_conversion_tone_mapping_and_dithering_reach_the_target() {
 	draw(&canvas.finish().expect("a list"), &mut plain);
 	assert!(converted != pixel(&plain, 1, 1), "the same numbers in two spaces are two colours: {converted:?}");
 
-	// ADDITIVE LIGHT GOES ABOVE ONE and the narrow target TONE MAPS it rather than clipping: the
-	// result is brighter than either input and is not saturated white.
+	// ADDITIVE LIGHT GOES ABOVE ONE and this target has nowhere to put it, so it CLAMPS at output -
+	// which is the image-colour profile's own sentence for a destination that reported nothing about
+	// what it can show.
+	//
+	// THIS FIXTURE USED TO REQUIRE THE OPPOSITE, and the requirement could not be met without a
+	// cost nobody had agreed to. The operator maps `[0, white]` onto `[0, 1]`, so compressing a
+	// highlight into an eight-bit target means diffuse white stops being the top of the range -
+	// white comes back grey. The code had tried to have both with a guard at a luminance of one,
+	// and what that produced was a 47 per cent STEP at exactly diffuse white: 1.000000 at 1.0 and
+	// 0.531280 at 1.0001. A "bright window" across that boundary was two flat regions with a hard
+	// edge between them, which is worse than the white rectangle the fixture was written to avoid.
+	//
+	// SO THE DESTINATION DECIDES. One that reports its luminance gets the curve over its whole
+	// range and keeps its highlights; one that reports nothing clamps, and every pixel already
+	// inside the range is returned untouched. What this reads is the second case.
 	let mut bright = target(4, 4);
 	let mut canvas = Canvas::new();
 	let grey = Paint::Solid(Color::new(0.7, 0.7, 0.7, 1.0, ColorSpace::Srgb));
@@ -581,7 +594,12 @@ fn colour_conversion_tone_mapping_and_dithering_reach_the_target() {
 	draw(&canvas.finish().expect("a list"), &mut bright);
 	let added = pixel(&bright, 1, 1);
 	assert!(added[0] > pixel(&plain, 1, 1)[1], "additive light is brighter: {added:?}");
-	assert!(added[0] < 255, "and a narrow target compresses it rather than clipping it to white: {added:?}");
+	assert_eq!(added[0], 255, "and a destination that reported nothing clamps it at the top of its range: {added:?}");
+	// AND THE PIXEL BELOW THE TOP IS UNTOUCHED, which is the half that matters for a compositor: one
+	// grey and two greys added are two different colours, and neither has been pulled down by a
+	// curve mapping a range this destination does not have.
+	let single = pixel(&plain, 1, 1);
+	assert!(single[0] < added[0], "a colour inside the range is left where the application put it: {single:?} against {added:?}");
 
 	// THE DITHER IS ORDERED AND ITS PHASE IS THE TARGET'S ORIGIN, so a colour that falls between two
 	// levels is a pattern rather than a band - and the pattern repeats every eight pixels.

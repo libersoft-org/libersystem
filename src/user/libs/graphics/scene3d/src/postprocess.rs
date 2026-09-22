@@ -133,9 +133,13 @@ pub fn combine(scene: Vec3, bloom: Vec3, weight: f32) -> Vec3 {
 /// below 1 through unchanged and maps everything above produces a STEP: measured, 1.000000 at
 /// `L = 1.0` and 0.531280 at `L = 1.0001`, a 47 per cent drop across a boundary that runs through
 /// the middle of every lit surface. A guard like that belongs with a curve that IS the identity at
-/// its knee, and this one is not. The divergence is recorded where the finding is rather than
-/// silently copied here; nothing pins the 2D behaviour, and changing it changes every image that
-/// path produces, so it is not this part's to change.
+/// its knee, and this one is not.
+///
+/// SO THE 2D PATH DOES NOT HAVE THAT GUARD ANY MORE. The two paths differ in WHETHER the operator
+/// runs and not in what it is: this one always runs it, because a scene's radiances are high
+/// dynamic range by construction; the 2D encoder runs it when its destination reported headroom to
+/// map into, and clamps at output when it did not, which is what the image-colour profile says
+/// happens in that case. One operator, and the difference is a property of the destination.
 pub fn tone_map(colour: Vec3) -> Vec3 {
 	let light = luminance(colour);
 	// EVERY COMPARISON WITH NaN IS FALSE, and this is written so a NaN falls through unmapped rather
