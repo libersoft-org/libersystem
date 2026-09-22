@@ -183,6 +183,10 @@ pub enum ProviderKindName {
 	Touch,
 }
 
+/// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
+/// `provider-catalogue-admin.open-consumer` written where the manifest can check it.
+pub const MAX_ROLE_KINDS: usize = 16;
+
 impl ProviderKindName {
 	// The wire number `driver_protocol::provider` gives this kind. Written here because this crate
 	// is a build-time tool and does not link the driver protocol; the generated registry carries the
@@ -362,6 +366,9 @@ struct RawRole {
 	exclusive: bool,
 	#[serde(default)]
 	handed_on: bool,
+	/// WHICH PROVIDER KINDS A MINTED CATALOGUE CONNECTION MAY REACH - see `Role::kinds`.
+	#[serde(default)]
+	kinds: Vec<ProviderKindName>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -816,6 +823,17 @@ pub struct Role {
 	/// at the role, so the widening is a decision somebody made about one channel rather than a
 	/// right handed to every client in the system.
 	pub handed_on: bool,
+	/// WHICH PROVIDER KINDS A MINTED CONNECTION MAY REACH, for a factory role that mints one.
+	///
+	/// A catalogue connection used to carry the WHOLE vocabulary because there was no way to mint a
+	/// smaller one: a service needing one kind held the same authority as one driving eight, and an
+	/// inventory reader held it too. The subset belongs in the manifest because the manifest is
+	/// where a service's needs are already declared - and because the supervisor, which is what
+	/// reads this, is the only program that knows them.
+	///
+	/// EMPTY IS A REAL ANSWER AND NOT AN OMISSION for the two consumers that read the binding
+	/// snapshot and open nothing. It mints the inventory connection, which admits no kind at all.
+	pub kinds: Vec<ProviderKindName>,
 }
 
 /// How a role is delivered - which is also what decides whether it can be delivered AGAIN, and
@@ -1320,7 +1338,25 @@ impl Manifest {
 				if raw_role.exclusive && raw_role.kind != RoleKind::Client {
 					push_error(&mut errors, format!("{where_role}.exclusive"), "only a client role is delivered as a duplicate, so only a client role can be handed over instead");
 				}
-				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive, handed_on: raw_role.handed_on });
+				// A SUBSET IS A PROPERTY OF A MINTED CONNECTION, so it can only be said where one is
+				// minted. Every other kind of role either carries no channel or carries one the
+				// supervisor copied from somewhere else, and a subset on either would be a word with
+				// nothing behind it - worse, one a reader would believe.
+				if !raw_role.kinds.is_empty() && raw_role.kind != RoleKind::Factory {
+					push_error(&mut errors, format!("{where_role}.kinds"), "only a factory role mints a connection, so only a factory role can restrict what one reaches");
+				}
+				if raw_role.kinds.len() > MAX_ROLE_KINDS {
+					push_error(&mut errors, format!("{where_role}.kinds"), format!("a minted connection may name at most {MAX_ROLE_KINDS} kinds and this names {}", raw_role.kinds.len()));
+				}
+				// A REPEAT IS THE SAME SUBSET AND IS STILL A MISTAKE HERE. The runtime accepts one
+				// because refusing it would buy nothing; a manifest is written once and read by
+				// people, and a row naming a kind twice is a row somebody edited without reading.
+				for (at, kind) in raw_role.kinds.iter().enumerate() {
+					if raw_role.kinds[..at].contains(kind) {
+						push_error(&mut errors, format!("{where_role}.kinds"), format!("{kind:?} is named twice, which is the same subset written at greater length"));
+					}
+				}
+				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive, handed_on: raw_role.handed_on, kinds: raw_role.kinds.clone() });
 			}
 			// A CLASS AND A PLACE MUST AGREE. Durable means written down, so it has to say where;
 			// anything else means not written down, so a path would be a claim about a file that
@@ -2072,7 +2108,8 @@ pub fn service_manifest_source(manifest: &Manifest) -> String {
 					RoleKind::Payload => "RoleKind::Payload",
 				};
 				let required = role.presence == Presence::Required;
-				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required}, exclusive: {}, handed_on: {} }}", role.tag, role.provider, role.source, role.exclusive, role.handed_on)
+				let kinds = role.kinds.iter().map(|kind| format!("{}u16", kind.wire())).collect::<Vec<_>>().join(", ");
+				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required}, exclusive: {}, handed_on: {}, kinds: &[{kinds}] }}", role.tag, role.provider, role.source, role.exclusive, role.handed_on)
 			})
 			.collect::<Vec<_>>()
 			.join(", ");

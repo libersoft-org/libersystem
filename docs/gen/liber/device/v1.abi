@@ -21,6 +21,8 @@ interface provider-catalogue
 method provider-catalogue.subscribe op=1 (kind:provider-kind:rights=) -> stream<provider-info>
 method provider-catalogue.bindings op=2 () -> list<binding-record>
 method provider-catalogue.open op=3 (provider:provider-info:rights=) -> result<handle<channel>, liber:base@1::error>
+interface provider-catalogue-admin
+method provider-catalogue-admin.open-consumer op=1 (kinds:list<provider-kind>:bound=16:rights=) -> result<handle<channel>, liber:base@1::error>
 record console-attachment(version:u32,max-frame:u32)
 record console-chunk(bytes:list<u8>:bound=4096)
 interface console-stream

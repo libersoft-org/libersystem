@@ -105,6 +105,10 @@ struct Role {
 	// Whether the holder passes this channel on, and therefore whether it may duplicate it. See
 	// `system_manifest::Role::handed_on` for what it is for and what went wrong without it.
 	handed_on: bool,
+	// WHICH PROVIDER KINDS A MINTED CATALOGUE CONNECTION MAY REACH, as the wire numbers the
+	// catalogue itself uses. Empty for every role that mints nothing, and empty ON PURPOSE for the
+	// two that read the binding snapshot and open no provider - see `RoleKind::Factory`'s arm.
+	kinds: &'static [u16],
 }
 
 // How a role is delivered, which is also what decides whether it can be delivered AGAIN.

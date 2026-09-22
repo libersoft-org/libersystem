@@ -2023,6 +2023,249 @@ pub mod provider_catalogue {
 	}
 }
 
+/// THE CATALOGUE'S ADMIN ROOT, WHERE A CONSUMER CONNECTION IS MINTED WITH A KIND SUBSET ON IT.
+///
+/// The catalogue's own root answers the reserved CONNECT opcode with an UNRESTRICTED connection:
+/// whoever holds it can subscribe to every kind this machine publishes and open any provider of
+/// any of them. That was the only shape there was, so every consumer got the whole vocabulary
+/// whether it needed one kind or eight - and an inventory client that only ever wanted to LIST
+/// devices held the same authority as the service that drives them.
+///
+/// A MINTED CLIENT CARRIES ITS SUBSET AND THE SERVER ENFORCES IT, which is the half that makes
+/// this a capability rather than a convention: the check is against the manager's own record of
+/// what it minted, never against a kind the caller names in the request. A caller that could be
+/// believed about its own kind could name another one.
+///
+/// THE ROOT OF THIS INTERFACE GOES TO SERVICEMANAGER AND TO NOBODY ELSE. It is the supervisor that
+/// knows which service was declared to need which kinds - that is what a manifest row is - so it is
+/// the supervisor that mints, and the minting authority never reaches a service. A second holder of
+/// this root would be a second place able to grant the whole vocabulary.
+// interface `provider-catalogue-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod provider_catalogue_admin {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_OPEN_CONSUMER: u16 = 1;
+
+	pub trait Service {
+		/// Mint a `provider-catalogue` connection restricted to `kinds`.
+		///
+		/// AN EMPTY SET IS REFUSED rather than minted as a connection that can do nothing: a consumer
+		/// with no kinds is a manifest row that forgot one, and answering it with a channel that
+		/// refuses every request turns a declaration error into a runtime mystery. A kind repeated is
+		/// the same subset and is accepted; a kind this vocabulary does not have is a refusal.
+		fn open_consumer(&mut self, kinds: Vec<ProviderKind>) -> Result<u64, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:device")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_OPEN_CONSUMER => {
+				let kinds = {
+					let v24 = r.u16()? as usize;
+					let v24 = (v24 <= 16).then_some(v24)?;
+					let mut v25 = Vec::new();
+					v25.try_reserve_exact(v24).ok()?;
+					for _ in 0..v24 {
+						v25.push(ProviderKind::read(r)?);
+					}
+					v25
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_consumer(kinds);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v26) => {
+							w.u8(1)?;
+							w.set_handle(*v26)?;
+							w.u32(0)?;
+						}
+						Err(v27) => {
+							w.u8(0)?;
+							v27.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn open_consumer(&mut self, kinds: &[ProviderKind]) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_CONSUMER)?;
+			w.u32(corr)?;
+			if kinds.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(kinds.len() as u16)?;
+			for v28 in kinds.iter() {
+				v28.write(w)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_provider_catalogue_admin_open_consumer")]
+	fn channel_invoke_open_consumer(chan: u64, kinds: &[ProviderKind]) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_consumer(kinds)
+	}
+}
+
 /// THE LARGEST FRAME EITHER DIRECTION OF A CONSOLE BYTE STREAM WILL CARRY, and the version the two
 /// ends agreed on.
 ///
@@ -2138,21 +2381,21 @@ impl ConsoleChunk {
 			return None;
 		}
 		w.u16(self.bytes.len() as u16)?;
-		for v24 in self.bytes.iter() {
-			w.u8(*v24)?;
+		for v29 in self.bytes.iter() {
+			w.u8(*v29)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ConsoleChunk> {
 		let bytes = {
-			let v25 = r.u16()? as usize;
-			let v25 = (v25 <= 4096).then_some(v25)?;
-			let mut v26 = Vec::new();
-			v26.try_reserve_exact(v25).ok()?;
-			for _ in 0..v25 {
-				v26.push(r.u8()?);
+			let v30 = r.u16()? as usize;
+			let v30 = (v30 <= 4096).then_some(v30)?;
+			let mut v31 = Vec::new();
+			v31.try_reserve_exact(v30).ok()?;
+			for _ in 0..v30 {
+				v31.push(r.u8()?);
 			}
-			v26
+			v31
 		};
 		Some(ConsoleChunk { bytes })
 	}
@@ -2223,13 +2466,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v27) => {
+						Ok(v32) => {
 							w.u8(1)?;
-							v27.write(w)?;
+							v32.write(w)?;
 						}
-						Err(v28) => {
+						Err(v33) => {
 							w.u8(0)?;
-							v28.write(w)?;
+							v33.write(w)?;
 						}
 					}
 					Some(())
@@ -2253,14 +2496,14 @@ pub mod console_stream {
 			}
 			OP_WRITE => {
 				let bytes = {
-					let v29 = r.u16()? as usize;
-					let v29 = (v29 <= 65535).then_some(v29)?;
-					let mut v30 = Vec::new();
-					v30.try_reserve_exact(v29).ok()?;
-					for _ in 0..v29 {
-						v30.push(r.u8()?);
+					let v34 = r.u16()? as usize;
+					let v34 = (v34 <= 65535).then_some(v34)?;
+					let mut v35 = Vec::new();
+					v35.try_reserve_exact(v34).ok()?;
+					for _ in 0..v34 {
+						v35.push(r.u8()?);
 					}
-					v30
+					v35
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2269,13 +2512,13 @@ pub mod console_stream {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v31) => {
+						Ok(v36) => {
 							w.u8(1)?;
-							w.u32(*v31)?;
+							w.u32(*v36)?;
 						}
-						Err(v32) => {
+						Err(v37) => {
 							w.u8(0)?;
-							v32.write(w)?;
+							v37.write(w)?;
 						}
 					}
 					Some(())
@@ -2477,8 +2720,8 @@ pub mod console_stream {
 				return None;
 			}
 			w.u16(bytes.len() as u16)?;
-			for v33 in bytes.iter() {
-				w.u8(*v33)?;
+			for v38 in bytes.iter() {
+				w.u8(*v38)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -2687,19 +2930,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v34) => {
+						Ok(v39) => {
 							w.u8(1)?;
-							if v34.len() > u16::MAX as usize {
+							if v39.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v34.len() as u16)?;
-							for v36 in v34.iter() {
-								v36.write(w)?;
+							w.u16(v39.len() as u16)?;
+							for v41 in v39.iter() {
+								v41.write(w)?;
 							}
 						}
-						Err(v35) => {
+						Err(v40) => {
 							w.u8(0)?;
-							v35.write(w)?;
+							v40.write(w)?;
 						}
 					}
 					Some(())
@@ -2829,13 +3072,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v37 = r.u16()? as usize;
-						let mut v38 = Vec::new();
-						v38.try_reserve_exact(v37).ok()?;
-						for _ in 0..v37 {
-							v38.push(UsbDevice::read(r)?);
+						let v42 = r.u16()? as usize;
+						let mut v43 = Vec::new();
+						v43.try_reserve_exact(v42).ok()?;
+						for _ in 0..v42 {
+							v43.push(UsbDevice::read(r)?);
 						}
-						v38
+						v43
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -3742,13 +3985,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v40 = true;
-		for v39 in self.bytes.iter() {
-			if !v40 {
+		let mut v45 = true;
+		for v44 in self.bytes.iter() {
+			if !v45 {
 				out.push(',');
 			}
-			v40 = false;
-			let _ = write!(out, "{}", v39);
+			v45 = false;
+			let _ = write!(out, "{}", v44);
 		}
 		out.push(']');
 		out.push('}');
@@ -3757,13 +4000,13 @@ impl ConsoleChunk {
 		out.push('{');
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v42 = true;
-		for v41 in self.bytes.iter() {
-			if !v42 {
+		let mut v47 = true;
+		for v46 in self.bytes.iter() {
+			if !v47 {
 				out.push_str(", ");
 			}
-			v42 = false;
-			let _ = write!(out, "{}", v41);
+			v47 = false;
+			let _ = write!(out, "{}", v46);
 		}
 		out.push(']');
 		out.push('}');
@@ -3772,8 +4015,8 @@ impl ConsoleChunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v43 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v43 as u64);
+		for v48 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v48 as u64);
 		}
 	}
 }

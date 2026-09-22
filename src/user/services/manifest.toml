@@ -2473,8 +2473,9 @@ interface = "liber:audio@1/audio"
 tag = "CATALOGUE"
 kind = "factory"
 provider = "device_manager"
-source = "SERVE"
+source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
+kinds = ["audio"]
 presence = "optional"
 
 [[services]]
@@ -2756,6 +2757,22 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:device@1/provider-catalogue"
 
+# AND THE ADMIN ROOT BESIDE IT, where a consumer connection is minted with a KIND SUBSET on it.
+#
+# The root above answers the reserved CONNECT opcode, which takes no arguments - so every connection
+# it mints reaches every kind this machine publishes, and a service needing one held authority over
+# all of them. This root has an operation that takes the subset, and it is handed to ServiceManager
+# alone: the supervisor is the only program that knows which service was declared to need which
+# kinds, so the minting authority never reaches a service.
+#
+# AFTER `SERVE`, because this bootstrap is read positionally and DeviceManager reads it in this
+# order. Anything inserted between them shifts every read after it.
+[[services.roles]]
+tag = "CATADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:device@1/provider-catalogue-admin"
+
 [[services]]
 name = "device_service"
 program = "device_service"
@@ -2841,8 +2858,9 @@ presence = "optional"
 tag = "CATALOGUE"
 kind = "factory"
 provider = "device_manager"
-source = "SERVE"
+source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
+kinds = ["display"]
 presence = "optional"
 
 
@@ -2915,8 +2933,9 @@ interface = "liber:input@1/input-admin"
 tag = "CATALOGUE"
 kind = "factory"
 provider = "device_manager"
-source = "SERVE"
+source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
+kinds = ["input", "pointer", "touch"]
 presence = "optional"
 
 # THE SYSTEM INSTANCE STARTS BEFORE THE THREE VOLUME INSTANCES, AND THE DEPENDENCY IS WHAT SAYS SO
@@ -3054,8 +3073,9 @@ interface = "liber:network@1/network"
 tag = "CATALOGUE"
 kind = "factory"
 provider = "device_manager"
-source = "SERVE"
+source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
+kinds = ["net"]
 presence = "optional"
 
 [[services]]
@@ -3268,8 +3288,9 @@ provider = "service_manager"
 tag = "CATALOGUE"
 kind = "factory"
 provider = "device_manager"
-source = "SERVE"
+source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
+kinds = ["usb-bus"]
 
 [[services.roles]]
 tag = "PROCESS"
@@ -3712,8 +3733,9 @@ dependencies = ["log_service", "storage_service", "device_manager"]
 tag = "CATALOGUE"
 kind = "factory"
 provider = "device_manager"
-source = "SERVE"
+source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
+kinds = ["block", "usb-bus"]
 
 [[services.roles]]
 tag = "SERVE"

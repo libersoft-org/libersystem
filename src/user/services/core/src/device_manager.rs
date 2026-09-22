@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::{OpenOpts, volume};
 use rt::*;
+use service_logic::catalogue_scope::Scope;
 
 include!(concat!(env!("OUT_DIR"), "/program_path.rs"));
 
@@ -417,7 +418,7 @@ impl DevAgent {
 			// itself, so a restart owes it exactly what a first start owes it, and the driver is
 			// told nothing at all: the connection it lost closed with the process that held it, and
 			// the one the replacement opens arrives as an ordinary `CONNECT`.
-			let Some(catalogue) = channel_pair_for_catalogue(clients) else {
+			let Some(catalogue) = channel_pair_for_catalogue(clients, dev_agent_scope()) else {
 				print(b"DeviceManager: no catalogue connection for the replacement development agent; it is not restarted\n");
 				return;
 			};
@@ -538,6 +539,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//      granted none simply has nobody asking, and refusing to start over it would trade a
 		//      missing query interface for a machine with no drivers.
 		let catalogue_service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or(0);
+		// 1b6. and the ADMIN root beside it, where the supervisor mints a consumer connection with a
+		//      kind subset on it. Optional for the same reason the one above is: a boot that grants
+		//      none has services that reach no provider, which is a smaller machine rather than a
+		//      broken one - and refusing to start would trade that for a machine with no drivers.
+		let catalogue_admin: u64 = recv_tagged(bootstrap, &mut buf, b"CATADMIN").unwrap_or(0);
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager
@@ -755,6 +761,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waiting[waiting_count] = catalogue_service;
 				waiting_count += 1;
 			}
+			// THE ADMIN ROOT, IN THE SAME ONE WAIT. It is a root like the one above it - a service
+			// registration rather than a per-client connection - so it is never retired, and it goes
+			// AFTER the catalogue root so `at == 1` still names that one. Every index below is
+			// computed from `waiting_count` rather than written down, which is what makes an
+			// insertion here safe.
+			let catalogue_admin_at: usize = waiting_count;
+			if catalogue_admin != 0 {
+				waiting[waiting_count] = catalogue_admin;
+				waiting_count += 1;
+			}
 			// THE DEVELOPMENT AGENT'S BOOTSTRAP GOES IN THE ONE WAIT, AND THAT IS THE WHOLE FIX
 			// (corrected 2026-09-02).
 			//
@@ -965,9 +981,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 							print(b"DeviceManager: a device-policy client closed its connection; the slot is given back\n");
 							policy_clients.retire(at - policy_clients_at);
 						}
+					} else if catalogue_admin != 0 && at == catalogue_admin_at {
+						if !serve_catalogue_admin_once(waiting[at], &mut catalogue_clients, &mut buf) {
+							machine_log(b"DeviceManager: the catalogue's admin root is closed - no further consumer connection can be minted\n");
+						}
 					} else {
 						let is_root: bool = catalogue_service != 0 && at == 1;
-						if !serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &mut catalogue, &nodes, &mut buf) && !is_root {
+						// WHAT THIS CONNECTION WAS MINTED FOR, read from the slot it lives in. The
+						// root is not a minted connection and reaches no provider: a request that
+						// arrives on it is the supervisor's, and the supervisor asks the ADMIN root
+						// for authority rather than using this one.
+						let scope: Scope = if is_root { Scope::inventory() } else { catalogue_clients.scope_at(at - catalogue_clients_at) };
+						if !serve_catalogue_once(waiting[at], is_root, scope, &mut catalogue_clients, &mut catalogue, &nodes, &mut buf) && !is_root {
 							print(b"DeviceManager: a provider-catalogue client closed its connection; the slot is given back\n");
 							catalogue_clients.retire(at - catalogue_clients_at);
 						}
@@ -1020,7 +1045,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						// unguessable.
 						random_insecure(&mut dev.nonce);
 						dev.console_input = console_input;
-						match channel_pair_for_catalogue(&mut catalogue_clients) {
+						match channel_pair_for_catalogue(&mut catalogue_clients, dev_agent_scope()) {
 							// SAFETY: `start_dev_agent` maps the agent's ELF and reads it as a
 							// slice, which is the one genuinely unsafe thing on this path.
 							Some(connection) => dev.bootstrap = start_dev_agent(dev.storage, connection, console_input, &dev.nonce),
@@ -4611,6 +4636,10 @@ fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> St
 struct CatalogueView<'a> {
 	catalogue: &'a mut Catalogue,
 	nodes: &'a [Node],
+	// WHAT THE CONNECTION THIS REQUEST ARRIVED ON MAY REACH. Not what the request says it wants:
+	// the subset is this program's own record of what it minted, and a caller that could be
+	// believed about its kind could name a different one.
+	scope: Scope,
 }
 
 // The operator's endpoint, served by this program and reached only through the one connection
@@ -5479,6 +5508,15 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 		let Some(slot) = self.catalogue.entries.iter().position(|entry| entry.as_ref().is_some_and(|held| held.kind == wire && held.id.slot as u32 == provider.slot && held.id.generation == provider.provider_generation && held.id.binding.generation == provider.binding_generation)) else {
 			return Err(proto::system::Error::NotFound);
 		};
+		// AND THE KIND CHECKED IS THE PUBLICATION'S, NOT THE ONE THE CALLER NAMED. The lookup above
+		// already requires the two to agree - a `provider-info` whose kind does not match the entry
+		// at that slot and generation finds nothing - so this reads the entry rather than the
+		// request, which is what makes the subset a property of what was minted.
+		let published: u16 = self.catalogue.entries[slot].as_ref().expect("the slot was just found").kind;
+		if !self.scope.admits(published) {
+			print(b"DeviceManager: a catalogue connection asked to open a provider of a kind it was not minted for; refused\n");
+			return Err(proto::system::Error::Denied);
+		}
 		// WHAT ITS DRIVER DECLARED. A kind that admits one consumer is refused here, at the ask,
 		// which is the difference between a consumer that knows and one that waits for ever.
 		let (token, admits) = {
@@ -6058,7 +6096,11 @@ fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients
 			return reply_or_retire(service, b"PONG", 0);
 		}
 		if op == CONNECT_OP && is_root {
-			match channel_pair_for_catalogue(clients) {
+			// INVENTORY, AND NEVER CONSULTED. This table is `CatalogueClients` because it is the
+			// same fixed-slot shape, but the connections it holds serve the OPERATOR endpoint and
+			// no catalogue operation reaches them - so the scope stored beside them is the one that
+			// grants nothing, which is what a field nobody reads should hold.
+			match channel_pair_for_catalogue(clients, Scope::inventory()) {
 				Some(theirs) => {
 					reply_or_retire(service, &[], theirs);
 				}
@@ -6086,7 +6128,14 @@ fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients
 //
 // A BOUND, because a server that mints a channel per request without one is a server a client can
 // exhaust. `lsdev` and the System Graph are two; the rest is headroom.
-const MAX_CATALOGUE_CLIENTS: usize = 8;
+//
+// THIRTY-TWO, AND EIGHT WAS ALREADY THE WHOLE BUDGET (2026-09-22). Nine manifest rows mint a
+// catalogue connection today - audio, display, input, network, PermissionManager, StorageService's
+// USB half, the two inventory readers and the development agent - so a boot that started all of
+// them was at the ceiling with nothing left for a restart, and the log line this refusal prints was
+// observed during bring-up. The services arriving above this one each need theirs, and a bound that
+// a normal boot reaches is a bound that describes the image rather than protecting it.
+const MAX_CATALOGUE_CLIENTS: usize = 32;
 
 /// How long this program may sleep while it holds a channel the kernel pushes platform events to.
 ///
@@ -6096,18 +6145,31 @@ const MAX_CATALOGUE_CLIENTS: usize = 8;
 const PLATFORM_POLL_TICKS: u64 = 100;
 
 // The client connections minted from the catalogue's root, and the root itself at index 0.
+//
+// AND WHAT EACH OF THEM MAY REACH, BESIDE IT. A minted connection carries a kind subset, and the
+// subset is the SERVER'S record of what it minted - stored here, beside the channel it was minted
+// with - rather than anything the caller names in a request. See `service_logic::catalogue_scope`.
 struct CatalogueClients {
 	channels: [u64; MAX_CATALOGUE_CLIENTS],
+	// Indexed exactly like `channels`, and moved with it by `retire`: a scope that stayed behind
+	// when its channel was replaced would be the previous holder's authority handed to the next.
+	scopes: [u32; MAX_CATALOGUE_CLIENTS],
 	count: usize,
 }
 
 impl CatalogueClients {
 	const fn new() -> Self {
-		Self { channels: [0; MAX_CATALOGUE_CLIENTS], count: 0 }
+		Self { channels: [0; MAX_CATALOGUE_CLIENTS], scopes: [0; MAX_CATALOGUE_CLIENTS], count: 0 }
 	}
 
 	fn live(&self) -> &[u64] {
 		&self.channels[..self.count]
+	}
+
+	// What the connection in this slot may reach. A slot past the live count has no scope rather
+	// than a stale one, which is what `inventory` says here.
+	fn scope_at(&self, at: usize) -> Scope {
+		if at >= self.count { Scope::inventory() } else { Scope::from_bits(self.scopes[at]) }
 	}
 
 	// GIVE ONE BACK. The slot is capacity for a LIVE client, not a lifetime allocation.
@@ -6131,6 +6193,11 @@ impl CatalogueClients {
 		self.count -= 1;
 		self.channels[at] = self.channels[self.count];
 		self.channels[self.count] = 0;
+		// THE SCOPE MOVES WITH THE CHANNEL. The last entry fills the gap, and a scope left where it
+		// was would belong to a channel that is no longer there - so the connection that moved into
+		// the slot would be checked against somebody else's subset.
+		self.scopes[at] = self.scopes[self.count];
+		self.scopes[self.count] = 0;
 	}
 }
 
@@ -6152,7 +6219,7 @@ fn reply_or_retire(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	matches!(try_send_outcome(channel, bytes, xfer), SendOutcome::Delivered)
 }
 
-fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut CatalogueClients, catalogue: &mut Catalogue, nodes: &[Node], buf: &mut [u8]) -> bool {
+fn serve_catalogue_once(channel: u64, is_root: bool, scope: Scope, clients: &mut CatalogueClients, catalogue: &mut Catalogue, nodes: &[Node], buf: &mut [u8]) -> bool {
 	// **TAKEN, NOT WAITED FOR - SEE THE NOTE ON `supervise`.** `recv_caps_blocking` parks on ONE
 	// handle with no deadline, which is a second wait in front of the one wait; the loop's own note
 	// forbids that in as many words. `wait_any` says this handle is READY, so the ordinary answer is
@@ -6177,7 +6244,18 @@ fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut CatalogueClie
 			return reply_or_retire(channel, b"PONG", 0);
 		}
 		if op == CONNECT_OP && is_root {
-			match channel_pair_for_catalogue(clients) {
+			// AN INVENTORY CONNECTION, AND THIS IS WHERE THE UNRESTRICTED ONE USED TO COME FROM.
+			//
+			// The reserved CONNECT opcode answered with a connection that could subscribe to every
+			// kind and open any provider of any of them, because there was no way to mint a smaller
+			// one. So a consumer that only ever reads the binding snapshot - `lsdev`'s service and
+			// the System Graph both do - held authority over every device on the machine, and the
+			// only thing standing between that authority and use was the client's own restraint.
+			//
+			// A KIND-SCOPED CONNECTION COMES FROM THE ADMIN ROOT, which the supervisor holds and a
+			// service never does. What is left here is what this path was actually being used for:
+			// the read-only inventory, which opens nothing.
+			match channel_pair_for_catalogue(clients, Scope::inventory()) {
 				Some(theirs) => {
 					if !reply_or_retire(channel, &[], theirs) {
 						close(theirs);
@@ -6198,10 +6276,10 @@ fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut CatalogueClie
 	// called this path, so `subscribe` - the milestone's Goal - could not be reached through the
 	// server at all, and the `None` fell through to a reply that was never sent.
 	if len >= 2 && u16::from_le_bytes([buf[0], buf[1]]) == proto::system::provider_catalogue::OP_SUBSCRIBE {
-		open_subscription(channel, catalogue, nodes, &request, &mut request_handles);
+		open_subscription(channel, scope, catalogue, nodes, &request, &mut request_handles);
 		return true;
 	}
-	let mut view = CatalogueView { catalogue, nodes };
+	let mut view = CatalogueView { catalogue, nodes, scope };
 	let mut reply = [0u8; 4096];
 	let mut reply_handles = wire::Handles::new();
 	if let Some(written) = proto::system::provider_catalogue::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
@@ -6233,16 +6311,47 @@ fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut CatalogueClie
 // keeps. Closing the producer is what tells a consumer the stream has ended - so it is kept for the
 // life of the subscription rather than closed after the snapshot, which is the difference between
 // this and a one-shot `tail`.
-fn open_subscription(service: u64, catalogue: &mut Catalogue, nodes: &[Node], request: &[u8], request_handles: &mut wire::Handles) {
+fn open_subscription(service: u64, scope: Scope, catalogue: &mut Catalogue, nodes: &[Node], request: &[u8], request_handles: &mut wire::Handles) {
+	// THE KIND, READ FROM THE REQUEST, AND CHECKED BEFORE THE SNAPSHOT IS TAKEN. `subscribe_open`
+	// hands back the snapshot rather than the argument, and a live stream has to know which kind it
+	// is watching to know which frames are its own - so the kind is decoded here, from the same
+	// bytes, and a kind this connection was not minted for never reaches the snapshot at all.
+	//
+	// A REFUSAL IS AN ANSWERED CALL WITH NO ENDPOINT IN IT. The reply carries the correlation and
+	// nothing else, which the generated client reads as the `None` its callers already handle -
+	// every one of them writes `unwrap_or(0)` - rather than as a call that was never answered. A
+	// denied consumer that waits forever for a reply is a denial nobody can debug.
+	let Some(kind) = subscribed_kind(request) else { return };
+	if !scope.admits(kind) {
+		// WITH THE KIND IN IT. A refusal that does not say what was refused is a line somebody has
+		// to reproduce under a debugger to act on, and the number is what names the manifest row
+		// that forgot a kind.
+		let mut line = [0u8; 96];
+		let mut n = 0;
+		for byte in b"DeviceManager: a catalogue connection asked to subscribe to provider kind " {
+			line[n] = *byte;
+			n += 1;
+		}
+		let mut number = [0u8; 20];
+		let digits = decimal(kind as u64, &mut number);
+		line[n..n + digits].copy_from_slice(&number[..digits]);
+		n += digits;
+		for byte in b", which it was not minted for; refused\n" {
+			line[n] = *byte;
+			n += 1;
+		}
+		print(&line[..n]);
+		let mut view = CatalogueView { catalogue, nodes, scope };
+		if let Some((corr, _)) = proto::system::provider_catalogue::subscribe_open(&mut view, request, request_handles) {
+			let _ = send_with_room(service, &corr.to_le_bytes(), 0);
+		}
+		return;
+	}
 	let corr: u32 = {
-		let mut view = CatalogueView { catalogue, nodes };
+		let mut view = CatalogueView { catalogue, nodes, scope };
 		let Some((corr, _)) = proto::system::provider_catalogue::subscribe_open(&mut view, request, request_handles) else { return };
 		corr
 	};
-	// THE KIND, READ FROM THE REQUEST. `subscribe_open` hands back the snapshot rather than the
-	// argument, and a live stream has to know which kind it is watching to know which frames are
-	// its own - so the kind is decoded here, from the same bytes.
-	let Some(kind) = subscribed_kind(request) else { return };
 	// The consumer cannot drain until its endpoint is transferred. Size for the complete
 	// snapshot plus a normal queue's worth of live events, rather than the default 64 total.
 	let depth = catalogue.count_of(kind).saturating_add(64) as u64;
@@ -6269,15 +6378,94 @@ fn subscribed_kind(request: &[u8]) -> Option<u16> {
 	Some(provider_kind_wire(proto::system::ProviderKind::decode(&request[2 + 4..])?))
 }
 
-// Mint one client connection, keeping the server end. None once the bound is reached, which the
-// caller answers with a zero handle rather than by growing.
-fn channel_pair_for_catalogue(clients: &mut CatalogueClients) -> Option<u64> {
+// WHAT THE DEVELOPMENT AGENT'S CONNECTION MAY REACH: the console byte streams it attaches to, and
+// nothing else. It is the one consumer this program mints for itself rather than through the
+// supervisor, so its subset is written here for the same reason every other one is written in a
+// manifest row - beside the thing that decides it.
+#[cfg(feature = "development")]
+fn dev_agent_scope() -> Scope {
+	Scope::of(&[provider_kind_wire(proto::system::ProviderKind::ConsoleBytes)]).unwrap_or_else(|_| Scope::inventory())
+}
+
+// Answer one request on the catalogue's ADMIN root: mint a kind-scoped consumer connection.
+//
+// THE SUPERVISOR IS THE ONLY CALLER, because the supervisor is the only program that knows which
+// service was declared to need which kinds - that is what a manifest row is. Nothing here checks
+// WHO is asking, and nothing needs to: the root is a capability, it is delivered to one service by
+// the bootstrap, and a program that does not hold it cannot reach this code at all.
+fn serve_catalogue_admin_once(channel: u64, clients: &mut CatalogueClients, buf: &mut [u8]) -> bool {
+	let (len, handles) = match try_recv_caps(channel, buf) {
+		PolledCaps::Message { len, handles } => (len, handles),
+		PolledCaps::Empty => return true,
+		PolledCaps::Closed => return false,
+	};
+	for &handle in handles.as_slice() {
+		close(handle);
+	}
+	if len >= 2 {
+		let op: u16 = u16::from_le_bytes([buf[0], buf[1]]);
+		if op == HEARTBEAT_OP {
+			return reply_or_retire(channel, b"PONG", 0);
+		}
+	}
+	let request: Vec<u8> = buf[..len].to_vec();
+	let mut request_handles = wire::Handles::new();
+	let mut view = CatalogueAdminView { clients };
+	let mut reply = [0u8; 256];
+	let mut reply_handles = wire::Handles::new();
+	if let Some(written) = proto::system::provider_catalogue_admin::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles)
+		&& send_caps_blocking(channel, &reply[..written], reply_handles.as_slice())
+	{
+		return true;
+	}
+	// An undelivered reply leaves the minted connection live here and unreachable by anybody, so it
+	// is closed and its slot given back rather than held for the life of the boot.
+	for &handle in reply_handles.as_slice() {
+		close(handle);
+		if clients.count > 0 {
+			clients.retire(clients.count - 1);
+		}
+	}
+	true
+}
+
+// The admin root's view: the client table, and nothing else. It holds no catalogue and no nodes
+// because minting is not a question about what is published.
+struct CatalogueAdminView<'a> {
+	clients: &'a mut CatalogueClients,
+}
+
+impl proto::system::provider_catalogue_admin::Service for CatalogueAdminView<'_> {
+	fn open_consumer(&mut self, kinds: Vec<proto::system::ProviderKind>) -> Result<u64, proto::system::Error> {
+		let wire: Vec<u16> = kinds.iter().map(|kind| provider_kind_wire(*kind)).collect();
+		// THE SUBSET IS VALIDATED WHERE IT IS MINTED AND NOT WHERE IT IS USED. An empty set is a
+		// declaration error - see `catalogue_scope::Refusal::EmptySet` - and answering it with a
+		// channel that refuses every request would turn it into a consumer that appears to be up.
+		let scope = match Scope::of(&wire) {
+			Ok(scope) => scope,
+			Err(_) => {
+				print(b"DeviceManager: a catalogue consumer was asked for with a kind set this vocabulary cannot express; refused\n");
+				return Err(proto::system::Error::Invalid);
+			}
+		};
+		match channel_pair_for_catalogue(self.clients, scope) {
+			Some(theirs) => Ok(theirs),
+			None => Err(proto::system::Error::Exhausted),
+		}
+	}
+}
+
+// Mint one client connection with the scope it may reach, keeping the server end. None once the
+// bound is reached, which the caller answers with a zero handle rather than by growing.
+fn channel_pair_for_catalogue(clients: &mut CatalogueClients, scope: Scope) -> Option<u64> {
 	if clients.count >= MAX_CATALOGUE_CLIENTS {
 		print(b"DeviceManager: the provider catalogue has as many clients as it will hold; refusing another\n");
 		return None;
 	}
 	let (mine, theirs) = channel()?;
 	clients.channels[clients.count] = mine;
+	// BEFORE THE COUNT MOVES, so a slot is never live with the previous holder's scope in it.
+	clients.scopes[clients.count] = scope.bits();
 	clients.count += 1;
 	Some(theirs)
 }

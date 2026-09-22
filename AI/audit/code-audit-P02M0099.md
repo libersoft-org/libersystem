@@ -3510,3 +3510,27 @@ in the tree between them, which rewrites the files it commits and moves their mt
 read the build as stale and said so. The content was identical; a rebuild and a re-run finished the
 set. Worth recording because the message - "the build does not match the sources" - reads like a
 missed rebuild and was a commit.
+
+## DRV-016 closed: every decision module now carries a planted defect (2026-09-22)
+
+The gate went from 42 mutations over nine modules to 89 over twenty-four. The thirteen decision
+modules that had fixtures and no mutation - `descriptor`, `usb`, `virtio`, `usb_class`, `snd`,
+`uac`, `keys`, `console`, `gpu`, `net`, `port`, `blk`, `input` - each got one planted defect per
+decision its own comments document, anchored on the line that makes the decision and named for the
+test that must fail.
+
+Every one of the 47 was validated against the real fixture before it was added, on a copy under
+`.build/mutations/drivers`, and one of them did not fail: the console's lock-key test claims in its
+own comment that an autorepeat must not toggle a lock and never sends value 2, so `if value == 1`
+mutated to `if value != 0` passed it. The fixture gained the autorepeat case it always claimed to
+hold; the mutation is caught now.
+
+Two mutations were considered and rejected rather than planted, and the reason is the same in both:
+`if length < 2` in the descriptor walk mutated to `if length < 1` makes a zero-length record advance
+the walk by nothing, so the test HANGS instead of failing - a mutation whose kill is a timeout is
+not a kill this harness can report. `if x >= extent.0` in `visible_rect` mutated to `>` is caught by
+nothing, because the clip that follows answers `None` for a zero width either way; the mutation that
+does catch it is the one on the clip itself, `width.min(extent.0 - x)` losing the origin.
+
+The whole gate runs in 77 seconds, which is what makes it worth running on every driver change
+rather than at the end of a milestone.

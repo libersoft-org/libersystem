@@ -165,7 +165,22 @@ pub(super) fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, ex
 			}
 			RoleKind::Factory => {
 				let root: u64 = kept.end_of(role.provider, role.source);
-				match if root == 0 { None } else { service_connect(root) } {
+				// A KIND-SCOPED CONNECTION IS ASKED FOR BY NAME, and the reserved CONNECT opcode
+				// cannot carry the subset: it takes no arguments, which is why every catalogue
+				// connection used to reach every kind. A role that names kinds is minted through
+				// the provider's ADMIN root instead, which has an operation that takes them.
+				//
+				// THE SUPERVISOR IS WHERE THIS BELONGS because the supervisor is the only program
+				// that knows which service was declared to need which kinds - that is what the
+				// manifest row is - and the minting authority therefore never reaches a service.
+				let minted: Option<u64> = if root == 0 {
+					None
+				} else if role.kinds.is_empty() {
+					service_connect(root)
+				} else {
+					mint_scoped_consumer(root, role.kinds)
+				};
+				match minted {
 					// NARROWED LIKE EVERY OTHER CHANNEL ROLE. A minted connection comes back
 					// carrying every right its pair was made with, because the provider made
 					// the pair - and a receiver checking the ceiling refuses that, correctly.
@@ -194,6 +209,33 @@ pub(super) fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, ex
 		}
 	}
 	true
+}
+
+// Mint one kind-scoped catalogue connection from the ADMIN root, answering the client end.
+//
+// THE WIRE NUMBERS COME FROM THE MANIFEST AND ARE TURNED BACK INTO THE PROTOCOL'S OWN ENUM HERE,
+// rather than being sent as bare integers: the generated encoder is what decides how a kind travels,
+// and a hand-written number on the wire is the second spelling of an encoding that this tree has
+// already been bitten by. A number the enum does not have is dropped from the request rather than
+// sent - the catalogue refuses an empty set at the far end, which is where that refusal belongs.
+fn mint_scoped_consumer(root: u64, kinds: &[u16]) -> Option<u64> {
+	let named: alloc::vec::Vec<proto::system::ProviderKind> = kinds.iter().filter_map(|wire| u8::try_from(*wire).ok()).filter_map(|wire| proto::system::ProviderKind::decode(&[wire])).collect();
+	// ON THE ROOT ITSELF, AND NOT THROUGH `service_connect`. Every other root in this executor is
+	// reached by minting a per-caller connection first, because every other root has many callers.
+	// This one has exactly one for the life of the system - the supervisor, which is what makes the
+	// subset a thing a service cannot choose - so a per-caller connection would be a second channel
+	// to the same single conversation.
+	//
+	// AND THE FIRST ATTEMPT HUNG THE BOOT, which is worth keeping. `service_connect` sends the
+	// reserved CONNECT opcode and waits; the generated dispatcher answers `None` for an opcode its
+	// interface does not have, so DeviceManager read the request, found no operation and sent
+	// nothing at all. The supervisor waited for a reply nobody owed it, and the boot stopped with
+	// six services online and every driver bound and publishing - a stall with no error anywhere,
+	// because nothing had failed.
+	match proto::system::provider_catalogue_admin::Client::new(ChannelTransport { chan: root }).open_consumer(&named) {
+		Some(Ok(connection)) => Some(connection),
+		_ => None,
+	}
 }
 
 // Load a non-pinned service from its manifest-declared system-volume path through ProcessService,

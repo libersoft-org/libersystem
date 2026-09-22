@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod addr_select;
+pub mod catalogue_scope;
 pub mod dhcp;
 pub mod dns;
 pub mod executable;

@@ -74,4 +74,15 @@ fn a_lock_key_toggles_once_per_press() {
 	assert_ne!(mods.caps, before, "the release did not");
 	feed_key(KEY_CAPSLOCK, 1, &mut mods);
 	assert_eq!(mods.caps, before, "and the next press toggled it back");
+	// AND AN AUTOREPEAT IS NOT A SECOND PRESS. A key held down repeats with value 2, and a lock that
+	// toggled on the repeat would flicker at the repeat rate for as long as the key was down - which is
+	// the half of this rule the test above claimed and did not hold.
+	feed_key(KEY_CAPSLOCK, 1, &mut mods);
+	let held = mods.caps;
+	feed_key(KEY_CAPSLOCK, 2, &mut mods);
+	assert_eq!(mods.caps, held, "an autorepeat is not a second press");
+	feed_key(KEY_CAPSLOCK, 2, &mut mods);
+	assert_eq!(mods.caps, held, "and neither is the next one");
+	feed_key(KEY_CAPSLOCK, 0, &mut mods);
+	assert_eq!(mods.caps, held, "the release that ends the repeat is still a release");
 }

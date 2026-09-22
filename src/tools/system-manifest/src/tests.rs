@@ -629,3 +629,66 @@ fn the_font_destination_admits_a_face_and_its_declaration_and_nothing_else() {
 	}
 	fs::remove_dir_all(root).unwrap();
 }
+
+// A catalogue connection used to carry the whole provider vocabulary because there was no way to
+// mint a smaller one. The subset is declared in the row that mints it, and these are the three ways
+// that declaration can be wrong.
+// A provider with a serve root and a consumer that depends on it, because a factory role mints from
+// somebody else's root and the fixture's one service cannot be its own provider.
+fn with_role(stanza: &str) -> String {
+	format!(
+		"{}\n[[services.roles]]\ntag = \"SERVE\"\nkind = \"serve-root\"\nprovider = \"self\"\n\n\
+		 [[services]]\nname = \"zz_consumer\"\nprogram = \"tool\"\nrestart = \"escalate\"\n\
+		 state_class = \"ephemeral\"\nstate_scope = \"service\"\ndependencies = [\"tool_service\"]\n\n{stanza}",
+		valid_fixture()
+	)
+}
+
+#[test]
+// A SUBSET IS A PROPERTY OF A MINTED CONNECTION. Every other role either carries no channel or
+// carries one the supervisor copied from somewhere else, so a subset on one would be a word with
+// nothing behind it - and worse, one a reader would believe.
+fn a_kind_subset_belongs_only_to_a_role_that_mints_a_connection() {
+	let root = fixture_workspace();
+	let client = with_role("[[services.roles]]\ntag = \"CAT\"\nkind = \"client\"\nprovider = \"tool_service\"\nkinds = [\"block\"]\n");
+	let error = Manifest::parse(&client, &root).unwrap_err().to_string();
+	assert!(error.contains("only a factory role mints a connection"), "{error}");
+	// And the same row as a factory is the ordinary case, with the subset kept.
+	let factory = with_role("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [\"block\", \"usb-bus\"]\n");
+	let manifest = Manifest::parse(&factory, &root).unwrap();
+	let role = &manifest.services.values().next_back().expect("the consumer service").roles[0];
+	assert_eq!(role.kinds.len(), 2);
+	assert_eq!(role.kinds[0].wire(), 1, "block is the vocabulary's first kind");
+	assert_eq!(role.kinds[1].wire(), 6);
+	// A factory role that names NO kind is the inventory connection, which is a real answer: two
+	// consumers read the binding snapshot and open no provider at all.
+	let inventory = with_role("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\n");
+	assert!(Manifest::parse(&inventory, &root).unwrap().services.values().next_back().expect("the consumer service").roles[0].kinds.is_empty());
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+// A REPEAT IS THE SAME SUBSET AND IS STILL A MISTAKE HERE. The runtime accepts one because refusing
+// it would buy nothing; a manifest is written once and read by people, and a row naming a kind twice
+// is a row somebody edited without reading.
+fn a_kind_named_twice_is_refused_where_the_row_is_written() {
+	let root = fixture_workspace();
+	let twice = with_role("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [\"input\", \"pointer\", \"input\"]\n");
+	let error = Manifest::parse(&twice, &root).unwrap_err().to_string();
+	assert!(error.contains("is named twice"), "{error}");
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+// THE BOUND IS THE INTERFACE'S OWN, written where the manifest can check it. It is unreachable with
+// ten kinds in the vocabulary and every entry distinct, which is exactly why it is worth having:
+// the row that first exceeds it will be written years after the person who set it has stopped
+// reading this file.
+fn a_minted_connection_names_at_most_the_interfaces_own_bound() {
+	let root = fixture_workspace();
+	let kinds = core::iter::repeat_n("\"block\"", MAX_ROLE_KINDS + 1).collect::<Vec<_>>().join(", ");
+	let over = with_role(&format!("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [{kinds}]\n"));
+	let error = Manifest::parse(&over, &root).unwrap_err().to_string();
+	assert!(error.contains(&format!("may name at most {MAX_ROLE_KINDS} kinds")), "{error}");
+	fs::remove_dir_all(root).unwrap();
+}

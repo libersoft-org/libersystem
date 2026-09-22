@@ -375,7 +375,16 @@ fn probes() -> Vec<(&'static str, DrawList)> {
 	// composite back whether or not a filter runs over it, so subtracting them separates the FILTER
 	// from the LAYER MACHINERY - and the item's reading so far has assumed the blur is the cost
 	// without any row able to say so.
-	for stage in ["effects-base", "effects-image", "effects-layers-plain", "effects-layers-blur", "effects-layers-filtered", "effects-backdrop"] {
+	for stage in [
+		"effects-base",
+		"effects-image",
+		"effects-layers-plain",
+		"effects-layers-blur",
+		"effects-layers-blur-x",
+		"effects-layers-blur-y",
+		"effects-layers-filtered",
+		"effects-backdrop",
+	] {
 		let mut canvas = Canvas::new();
 		if stage != "effects-backdrop" {
 			rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.5, 1.0, ColorSpace::Srgb))).expect("a backdrop");
@@ -383,7 +392,7 @@ fn probes() -> Vec<(&'static str, DrawList)> {
 		if stage == "effects-image" {
 			canvas.draw_image(ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 512.0, 512.0), RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), ImageQuality::Bilinear).expect("an image");
 		}
-		if stage == "effects-layers-plain" || stage == "effects-layers-blur" || stage == "effects-layers-filtered" {
+		if stage.starts_with("effects-layers") {
 			for index in 0..10 {
 				let x = 20.0 + (index % 5) as f32 * 120.0;
 				let y = 40.0 + (index / 5) as f32 * 200.0;
@@ -403,10 +412,21 @@ fn probes() -> Vec<(&'static str, DrawList)> {
 						graph.push(FilterNode::Composite { source, backdrop: shadow, operator: Operator::SrcOver }).expect("a composite");
 						Some(canvas.resources().add_filter(graph).expect("a filter"))
 					}
-					"effects-layers-blur" => {
+					// THE TWO PASSES OF THE SEPARABLE BLUR, ONE AT A TIME. A sigma of zero on an axis
+					// is a one-tap kernel, so that pass still walks its runs and does no arithmetic -
+					// which is what makes the pair subtract to the cost of the OTHER pass. They read
+					// the same pixels with the same kernel and differ only in DIRECTION, so a
+					// difference between them is locality and nothing else: the horizontal pass walks
+					// rows the cache has already fetched, and the vertical one walks columns.
+					"effects-layers-blur" | "effects-layers-blur-x" | "effects-layers-blur-y" => {
+						let (sigma_x, sigma_y) = match stage {
+							"effects-layers-blur-x" => (4.0, 0.0),
+							"effects-layers-blur-y" => (0.0, 4.0),
+							_ => (4.0, 4.0),
+						};
 						let mut graph = FilterGraph::default();
 						let source = graph.push(FilterNode::Source).expect("a source");
-						graph.push(FilterNode::Blur { input: source, x: 4.0, y: 4.0 }).expect("a blur");
+						graph.push(FilterNode::Blur { input: source, x: sigma_x, y: sigma_y }).expect("a blur");
 						Some(canvas.resources().add_filter(graph).expect("a filter"))
 					}
 					_ => None,
