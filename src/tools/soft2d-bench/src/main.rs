@@ -360,6 +360,75 @@ fn probes() -> Vec<(&'static str, DrawList)> {
 		out.push((name, canvas.finish().expect("a list")));
 	}
 
+	// THE EFFECTS SCENE, TAKEN APART, which is the one this item has twice recorded as having NO
+	// DOMINANT TERM - 49 ms of blur and a hundred more spread over forty-five commands with nothing
+	// separating them. These five rows are that separation: each is a piece of `ui_effects` and
+	// nothing else, so a difference between two of them is one term.
+	//
+	//   effects-base            the full-screen fill alone
+	//   effects-image           the fill plus the 512-square image draw
+	//   effects-layers-plain    the fill plus the ten layers WITHOUT their filter graphs
+	//   effects-layers-filtered the same ten layers WITH them - the pair is what a filter costs
+	//   effects-backdrop        the frosted panel alone, which is the one backdrop blur
+	//
+	// THE PAIR THAT MATTERS IS THE THIRD AND FOURTH. A layer is an allocation, two rectangles and a
+	// composite back whether or not a filter runs over it, so subtracting them separates the FILTER
+	// from the LAYER MACHINERY - and the item's reading so far has assumed the blur is the cost
+	// without any row able to say so.
+	for stage in ["effects-base", "effects-image", "effects-layers-plain", "effects-layers-blur", "effects-layers-filtered", "effects-backdrop"] {
+		let mut canvas = Canvas::new();
+		if stage != "effects-backdrop" {
+			rect(&mut canvas, RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), Paint::Solid(Color::new(0.2, 0.3, 0.5, 1.0, ColorSpace::Srgb))).expect("a backdrop");
+		}
+		if stage == "effects-image" {
+			canvas.draw_image(ImageRecord { identity: 1, layout_generation: 1, content_generation: 1 }, RectF::new(0.0, 0.0, 512.0, 512.0), RectF::new(0.0, 0.0, WIDTH as f32, HEIGHT as f32), ImageQuality::Bilinear).expect("an image");
+		}
+		if stage == "effects-layers-plain" || stage == "effects-layers-blur" || stage == "effects-layers-filtered" {
+			for index in 0..10 {
+				let x = 20.0 + (index % 5) as f32 * 120.0;
+				let y = 40.0 + (index / 5) as f32 * 200.0;
+				// THE GRAPH IS THE SAME FIVE NODES, OR ONLY ITS BLUR, OR NOTHING. Three rows rather
+				// than two, because "the filter costs 78 ms" does not say whether that is the
+				// Gaussian - which the profile fixes and which therefore cannot be made cheaper
+				// without changing what this system draws - or the four nodes around it, which it
+				// does not fix and which can.
+				let filter = match stage {
+					"effects-layers-filtered" => {
+						let mut graph = FilterGraph::default();
+						let source = graph.push(FilterNode::Source).expect("a source");
+						let blur = graph.push(FilterNode::Blur { input: source, x: 4.0, y: 4.0 }).expect("a blur");
+						let offset = graph.push(FilterNode::Offset { input: blur, dx: 3.0, dy: 5.0 }).expect("an offset");
+						let flood = graph.push(FilterNode::Flood { color: Color::new(0.0, 0.0, 0.0, 0.6, ColorSpace::Srgb) }).expect("a flood");
+						let shadow = graph.push(FilterNode::In { input: flood, mask: offset }).expect("a mask");
+						graph.push(FilterNode::Composite { source, backdrop: shadow, operator: Operator::SrcOver }).expect("a composite");
+						Some(canvas.resources().add_filter(graph).expect("a filter"))
+					}
+					"effects-layers-blur" => {
+						let mut graph = FilterGraph::default();
+						let source = graph.push(FilterNode::Source).expect("a source");
+						graph.push(FilterNode::Blur { input: source, x: 4.0, y: 4.0 }).expect("a blur");
+						Some(canvas.resources().add_filter(graph).expect("a filter"))
+					}
+					_ => None,
+				};
+				canvas.begin_layer(Some(RectF::new(x - 12.0, y - 12.0, 124.0, 174.0)), 0.95, BlendMode::Normal, filter).expect("a layer");
+				rect(&mut canvas, RectF::new(x, y, 100.0, 150.0), Paint::Solid(Color::new(0.95, 0.95, 0.98, 1.0, ColorSpace::Srgb))).expect("a card");
+				rect(&mut canvas, RectF::new(x + 8.0, y + 8.0, 84.0, 40.0), Paint::Solid(Color::new(0.3, 0.6, 0.9, 1.0, ColorSpace::Srgb))).expect("a header");
+				canvas.end_layer().expect("the layer ends");
+			}
+		}
+		if stage == "effects-backdrop" {
+			let mut graph = FilterGraph::default();
+			let backdrop = graph.push(FilterNode::Backdrop).expect("a backdrop");
+			graph.push(FilterNode::Blur { input: backdrop, x: 6.0, y: 6.0 }).expect("a blur");
+			let handle = canvas.resources().add_filter(graph).expect("a filter");
+			canvas.begin_layer(Some(RectF::new(80.0, 180.0, 480.0, 120.0)), 1.0, BlendMode::Normal, Some(handle)).expect("a layer");
+			rect(&mut canvas, RectF::new(80.0, 180.0, 480.0, 120.0), Paint::Solid(Color::new(1.0, 1.0, 1.0, 0.15, ColorSpace::Srgb))).expect("a panel");
+			canvas.end_layer().expect("the layer ends");
+		}
+		out.push((stage, canvas.finish().expect("a list")));
+	}
+
 	out
 }
 
