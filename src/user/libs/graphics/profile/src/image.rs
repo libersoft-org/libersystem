@@ -362,9 +362,61 @@ pub mod reference {
 /// the colour scaled by `L_out / L`. Luminance uses the DESTINATION space's own coefficients, not
 /// sRGB's, because a Rec. 2020 colour's luminance is not its sRGB luminance.
 pub mod tone_map {
-	pub const NAME: &str = "extended Reinhard, on luminance";
+	pub const NAME: &str = "extended Reinhard above a knee, on luminance";
 	/// The luminance mapped to 1.0, relative to diffuse white.
 	pub const WHITE: f64 = 4.0;
+	/// The luminance below which the curve is the IDENTITY, relative to diffuse white.
+	///
+	/// THE THREE THINGS THAT CANNOT ALL HOLD, and this knee is the only shape that reconciles them.
+	/// A highlight above one must keep its gradations rather than becoming a flat white rectangle;
+	/// a value an author already put inside the range must come back as itself; and the output
+	/// range ends at one. The first two need room the third does not have, so something below one
+	/// has to move - and the knee is the decision about WHERE, taken once, here.
+	///
+	/// WITHOUT IT THE CURVE IS 0.53 AT DIFFUSE WHITE. That is right for a scene whose radiances the
+	/// author chose and wrong for a compositor handed content already in display space, and the code
+	/// compensated with a guard at a luminance of one - which is a 47 per cent STEP, 1.000000 at 1.0
+	/// and 0.531280 at 1.0001, running through the middle of every lit surface.
+	///
+	/// WHAT 0.8 COSTS AND BUYS: everything below 0.8 is returned bit for bit, diffuse white comes
+	/// back at 0.900391 instead of 1.0, and the whole of `[1, 4]` keeps its ordering in the top
+	/// tenth of the range. That white is no longer the top is not a new decision - this system
+	/// already requires a narrow target to COMPRESS additive light rather than clip it, which is
+	/// only possible if white sits below the top. The knee makes that continuous instead of a cliff.
+	/// It is one number and it is meant to be argued with.
+	///
+	/// THE CURVE ABOVE IT IS THE SAME OPERATOR AND NOT A SECOND ONE: extended Reinhard on the
+	/// remaining range, with its own white at `(WHITE - KNEE) / (1 - KNEE)`. `R` has slope one at
+	/// zero, so the shoulder meets the identity with the SAME SLOPE - no kink - and `WHITE` still
+	/// maps to exactly one.
+	pub const KNEE: f64 = 0.8;
+
+	/// `R`'s white point on the range above the knee, which is what makes `WHITE` land on one.
+	pub const fn shoulder_white() -> f64 {
+		(WHITE - KNEE) / (1.0 - KNEE)
+	}
+
+	/// The operator at a stated white point.
+	///
+	/// ONE IMPLEMENTATION AND NOT ONE PER CRATE. `graphics-core` needs it for the 2D encode path and
+	/// `scene3d` for the 3D resolve, and both already depend on this crate - so the curve lives with
+	/// the constants it is made of. Two copies of a curve is how two paths come to disagree about
+	/// what a highlight looks like, which is the defect this knee ends.
+	pub fn map_with(light: f64, white: f64) -> f64 {
+		// AT OR BELOW THE KNEE THE CURVE IS THE IDENTITY, written so a NaN falls through here rather
+		// than into the arithmetic below.
+		if !(light > KNEE) {
+			return light;
+		}
+		let x = (light - KNEE) / (1.0 - KNEE);
+		let shoulder = (white - KNEE) / (1.0 - KNEE);
+		KNEE + (1.0 - KNEE) * (x * (1.0 + x / (shoulder * shoulder)) / (1.0 + x))
+	}
+
+	/// The operator at the profile's own white point.
+	pub fn map(light: f64) -> f64 {
+		map_with(light, WHITE)
+	}
 }
 
 /// THE GAMUT-MAPPING RULE, which is an algorithm and not a preference.

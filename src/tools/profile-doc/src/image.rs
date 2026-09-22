@@ -55,7 +55,7 @@ pub fn canonical() -> String {
 		let _ = writeln!(out, "bradford={which} {}", row.join(","));
 	}
 	let _ = writeln!(out, "reference diffuse-white-nits={} pq-absolute={}", image::reference::DIFFUSE_WHITE_NITS, image::reference::PQ_IS_ABSOLUTE);
-	let _ = writeln!(out, "tone-map={} white={}", image::tone_map::NAME, image::tone_map::WHITE);
+	let _ = writeln!(out, "tone-map={} white={} knee={}", image::tone_map::NAME, image::tone_map::WHITE, image::tone_map::KNEE);
 	let _ = writeln!(out, "gamut-map={} steps={} tolerance={}", image::gamut_map::NAME, image::gamut_map::STEPS, image::gamut_map::TOLERANCE);
 	let rows: Vec<String> = image::dither::MATRIX.iter().map(|row| row.iter().map(|value| value.to_string()).collect::<Vec<String>>().join(",")).collect();
 	let _ = writeln!(out, "dither={} phase={} matrix={}", image::dither::NAME, image::dither::PHASE, rows.join(";"));
@@ -274,14 +274,22 @@ pub fn document(hash: &str) -> String {
 	let _ = writeln!(out, "what makes an SDR image and an HDR image composable at all. Inside the pipeline a linear value may");
 	let _ = writeln!(out, "be negative or above one - a wide-gamut colour in a narrower space is negative, and a highlight is");
 	let _ = writeln!(out, "above one - and clamping happens at OUTPUT and nowhere else.\n");
-	let _ = writeln!(out, "TONE MAPPING is {}, with white at {} times diffuse white:\n", image::tone_map::NAME, image::tone_map::WHITE);
+	let _ = writeln!(out, "TONE MAPPING is {}, with white at {} times diffuse white and a knee at {}:\n", image::tone_map::NAME, image::tone_map::WHITE, image::tone_map::KNEE);
 	let _ = writeln!(out, "```text");
-	let _ = writeln!(out, "L_out = L * (1 + L / white^2) / (1 + L)");
+	let _ = writeln!(out, "L_out = L                                                      for L <= knee");
+	let _ = writeln!(out, "L_out = knee + (1 - knee) * R(x),   x = (L - knee) / (1 - knee)");
+	let _ = writeln!(out, "R(x)  = x * (1 + x / shoulder^2) / (1 + x),   shoulder = (white - knee) / (1 - knee)");
 	let _ = writeln!(out, "```\n");
 	let _ = writeln!(out, "applied to LUMINANCE, with the colour scaled by `L_out / L`, and with luminance taken from the");
-	let _ = writeln!(out, "DESTINATION space's own coefficients: a Rec. 2020 colour's luminance is not its sRGB luminance. One");
-	let _ = writeln!(out, "parameter and exact reproducibility were chosen over a filmic curve, which is prettier and is five");
+	let _ = writeln!(out, "DESTINATION space's own coefficients: a Rec. 2020 colour's luminance is not its sRGB luminance. Two");
+	let _ = writeln!(out, "parameters and exact reproducibility were chosen over a filmic curve, which is prettier and is five");
 	let _ = writeln!(out, "constants two implementations will copy from different sources.\n");
+	let _ = writeln!(out, "THE KNEE IS WHAT LETS ONE OPERATOR SERVE BOTH PATHS. A scene renderer chooses its own radiances and");
+	let _ = writeln!(out, "wants its whole range compressed; a compositor is handed content ALREADY in display space and must");
+	let _ = writeln!(out, "return it unchanged. Without a knee the curve is 0.53 at diffuse white, which is right for the first");
+	let _ = writeln!(out, "and turns white into grey for the second. Below the knee the curve is the identity; at the knee it");
+	let _ = writeln!(out, "meets the shoulder with the SAME SLOPE - `R` has slope one at zero - so there is no kink and no step");
+	let _ = writeln!(out, "anywhere, and `white` still maps to exactly one.\n");
 	let _ = writeln!(out, "GAMUT MAPPING is {}, in {} steps to a tolerance of", image::gamut_map::NAME, image::gamut_map::STEPS);
 	let _ = writeln!(out, "{}. Clipping each channel shifts hue, and it shifts it most on exactly the", image::gamut_map::TOLERANCE);
 	let _ = writeln!(out, "saturated colours a wide-gamut image was made for. A fixed step count is what makes two");

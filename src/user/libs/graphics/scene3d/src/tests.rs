@@ -2651,24 +2651,40 @@ fn the_luminance_is_linear_rec_709_and_white_is_one() {
 // EXTENDED REINHARD MAPS THE PROFILE'S WHITE TO EXACTLY ONE, which is the property that makes
 // `WHITE` mean what its name says: the luminance the operator sends to display white.
 //
-// WORKED BY HAND at `WHITE` = 4: `4 * (1 + 4/16) / (1 + 4)` = `4 * 1.25 / 5` = 1.
+// WORKED BY HAND at `WHITE` = 4 and `KNEE` = 0.8. The shoulder's own white point is
+// `(4 - 0.8) / (1 - 0.8)` = 16, and extended Reinhard sends its white point to one -
+// `16 * (1 + 16/256) / 17` = 1 - so `0.8 + 0.2 * 1` = 1. Below 0.8 there is no arithmetic at all.
 fn the_tone_map_sends_the_profile_s_white_to_one_and_leaves_the_rest_alone() {
 	let white = postprocess::tone_map_white();
 	assert_eq!(white, 4.0, "the white point comes from the image-colour profile");
 	let at_white = postprocess::tone_map(Vec3::new(white, white, white));
 	assert!((at_white.x - 1.0).abs() < 1e-5, "the white point maps to one, got {}", at_white.x);
-	// THE WHOLE RANGE IS COMPRESSED AND NOT ONLY THE HIGHLIGHTS. The curve is 0.53125 at a
-	// luminance of 1, which is the operator's own value there - `1 * (1 + 1/16) / 2` - and applying
-	// it to everything is what a global operator is for.
+	// BELOW THE KNEE IT IS THE IDENTITY, BIT FOR BIT. That is what a compositor needs from it, and
+	// "close enough" is a different claim.
+	for value in [0.0f32, 0.125, 0.5, 0.799] {
+		assert_eq!(postprocess::tone_map(Vec3::new(value, value, value)).x, value, "the identity below the knee at {value}");
+	}
+	// AND ABOVE IT THE SHOULDER RUNS, worked by hand: at a luminance of one the shoulder's input is
+	// `(1 - 0.8) / 0.2` = 1, `1 * (1 + 1/256) / 2` = 0.501953, and `0.8 + 0.2 * 0.501953` = 0.900391.
 	let at_one = postprocess::tone_map(Vec3::new(1.0, 1.0, 1.0));
-	assert!((at_one.x - 0.53125).abs() < 1e-5, "the curve at one is 0.53125, got {}", at_one.x);
+	assert!((at_one.x - 0.900_391).abs() < 1e-5, "the curve at one is 0.900391, got {}", at_one.x);
+	// AND A HIGHLIGHT KEEPS ITS ORDER rather than flattening, which is the difference between a
+	// bright window and a white rectangle: 0.975446 at two times white and 0.991211 at three.
+	let two = postprocess::tone_map(Vec3::new(2.0, 2.0, 2.0)).x;
+	let three = postprocess::tone_map(Vec3::new(3.0, 3.0, 3.0)).x;
+	assert!((two - 0.975_446).abs() < 1e-5, "two times white is 0.975446, got {two}");
+	assert!((three - 0.991_211).abs() < 1e-5, "three times white is 0.991211, got {three}");
+	assert!(two < three && three < 1.0, "and they are ordered and inside the range");
 	assert_eq!(postprocess::tone_map(Vec3::new(0.0, 0.0, 0.0)), Vec3::new(0.0, 0.0, 0.0), "black stays black");
-	// AND THERE IS NO STEP ANYWHERE, which is what a guard that mapped only above 1 would introduce:
-	// `graphics-core`'s 2D path has one, and it reads 1.000000 at a luminance of 1.0 and 0.531280 at
-	// 1.0001 - a 47 per cent drop across a boundary running through the middle of every lit surface.
+	// AND THERE IS NO STEP ANYWHERE, INCLUDING AT THE KNEE, which is the join a knee could have
+	// introduced: the shoulder meets the identity with the SAME SLOPE, because extended Reinhard has
+	// slope one at zero.
 	let below = postprocess::tone_map(Vec3::new(0.9999, 0.9999, 0.9999)).x;
 	let above = postprocess::tone_map(Vec3::new(1.0001, 1.0001, 1.0001)).x;
 	assert!((above - below).abs() < 1e-3, "the curve is continuous at one: {below} then {above}");
+	let under = postprocess::tone_map(Vec3::new(0.7999, 0.7999, 0.7999)).x;
+	let over = postprocess::tone_map(Vec3::new(0.8001, 0.8001, 0.8001)).x;
+	assert!((over - under).abs() < 1e-3 && over > under, "and at the knee: {under} then {over}");
 	// AND IT IS MONOTONIC, so a brighter input is never a darker output.
 	let mut previous = 0.0f32;
 	for step in 0..64u32 {
@@ -2775,21 +2791,28 @@ fn the_chain_tone_maps_after_the_bloom_is_added() {
 	let scene = Vec3::new(3.0, 3.0, 3.0);
 	let bloom = Vec3::new(20.0, 20.0, 20.0);
 	let resolved = postprocess::resolve(scene, bloom, postprocess::BLOOM_WEIGHT);
-	// 3 + 0.04 * 20 = 3.8, and `3.8 * (1 + 3.8/16) / (1 + 3.8)` = 0.9796875.
-	assert!((resolved.x - 0.979_687).abs() < 1e-4, "the sum is tone-mapped, got {}", resolved.x);
+	// 3 + 0.04 * 20 = 3.8. The shoulder's input is `(3.8 - 0.8) / 0.2` = 15, and
+	// `15 * (1 + 15/256) / 16` = 0.992432, so `0.8 + 0.2 * 0.992432` = 0.998486.
+	assert!((resolved.x - 0.998_486).abs() < 1e-4, "the sum is tone-mapped, got {}", resolved.x);
 
-	// THE OTHER ORDER IS A DIFFERENT PICTURE, and by more than rounding. With a bright pyramid:
-	//   profile's order:  tone_map(3 + 0.04 * 200) = tone_map(11) = 11 * 1.6875 / 12   = 1.546875
-	//   mapped first:     tone_map(3) + 0.04 * tone_map(200)
-	//                   = 0.890625 + 0.04 * 13.432836                                  = 1.427938
-	// The second compresses the highlight before spreading it, which is exactly what bloom exists
-	// to do and exactly what the profile's order protects.
-	let bright = Vec3::new(200.0, 200.0, 200.0);
-	let right_way = postprocess::resolve(scene, bright, postprocess::BLOOM_WEIGHT);
-	let wrong_way = postprocess::combine(postprocess::tone_map(scene), postprocess::tone_map(bright), postprocess::BLOOM_WEIGHT);
-	assert!((right_way.x - 1.546_875).abs() < 1e-3, "the profile's order gives 1.546875, got {}", right_way.x);
-	assert!((wrong_way.x - 1.427_938).abs() < 1e-3, "and the other gives 1.427938, got {}", wrong_way.x);
+	// THE OTHER ORDER IS A DIFFERENT PICTURE, and by more than rounding:
+	//   profile's order:  tone_map(0.5 + 0.04 * 8) = tone_map(0.82)  = 0.818189
+	//   mapped first:     tone_map(0.5) + 0.04 * tone_map(8)         = 0.540878
+	// The second compresses the highlight BEFORE spreading it, so what the bloom spreads has already
+	// been flattened - which is what bloom exists to avoid and what the profile's order protects.
+	//
+	// BOTH VALUES ARE INSIDE THE RANGE ON PURPOSE. The pair this used before were 1.546875 and
+	// 1.427938, and both clamp to white on any ordinary target - so the difference the assertion
+	// measured was one nobody could see. A test for "a different picture" has to stay where pictures
+	// are.
+	let bright = Vec3::new(8.0, 8.0, 8.0);
+	let dim = Vec3::new(0.5, 0.5, 0.5);
+	let right_way = postprocess::resolve(dim, bright, postprocess::BLOOM_WEIGHT);
+	let wrong_way = postprocess::combine(postprocess::tone_map(dim), postprocess::tone_map(bright), postprocess::BLOOM_WEIGHT);
+	assert!((right_way.x - 0.818_189).abs() < 1e-4, "the profile's order gives 0.818189, got {}", right_way.x);
+	assert!((wrong_way.x - 0.540_878).abs() < 1e-4, "and the other gives 0.540878, got {}", wrong_way.x);
 	assert!(right_way.x - wrong_way.x > 0.1, "which is a different picture and not a rounding difference");
+	assert!(right_way.x < 1.0 && wrong_way.x < 1.0, "and both are inside the range, where that difference is visible");
 }
 
 // ---------------------------------------------------------------------------------------------

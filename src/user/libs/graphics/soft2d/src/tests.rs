@@ -529,9 +529,22 @@ fn images_are_drawn_at_quality_and_minified_without_aliasing() {
 		assert!(value[0] > 60 && value[0] < 220, "a minified checkerboard is grey and not noise: {value:?}");
 	}
 	// NEAREST IS THE OTHER ANSWER, and it is a real one: pixel art must not be softened.
+	//
+	// THE CLAIM IS THAT A TEXEL SURVIVES, NOT THAT ITS VALUE IS 255. This counted pixels that were
+	// exactly 0 or exactly 255, which stopped being the same question when the image-colour profile
+	// named a KNEE: diffuse white is above it, so white comes back at 243 rather than 255 - and a
+	// count of 0-or-255 then reads a softened image where there is none. What nearest sampling
+	// promises is that an output pixel IS one of the two texels it landed on rather than a blend of
+	// them, so the two surviving values are read off the image and the pixels are counted against
+	// THEM.
 	let nearest = draw_scaled(render2d::paint::ImageQuality::Nearest);
-	let extremes = (0..4).flat_map(|y| (0..4).map(move |x| (x, y))).filter(|(x, y)| pixel(&nearest, *x, *y)[0] == 0 || pixel(&nearest, *x, *y)[0] == 255).count();
-	assert!(extremes > 8, "nearest keeps the texels it lands on: {extremes} of sixteen are black or white");
+	let values: alloc::vec::Vec<u8> = (0..4).flat_map(|y| (0..4).map(move |x| (x, y))).map(|(x, y)| pixel(&nearest, x, y)[0]).collect();
+	let light = *values.iter().max().expect("sixteen pixels");
+	// WITHIN ONE LEVEL OF THE BRIGHTEST, because the mapped white is not a representable 8-bit level
+	// and the ordered dither spreads it over the two either side of it. A blend of the two texels
+	// would land in the middle of the range, nowhere near either end.
+	let extremes = values.iter().filter(|value| **value == 0 || **value + 1 >= light).count();
+	assert!(extremes > 8, "nearest keeps the texels it lands on: {extremes} of sixteen are 0 or about {light}, from {values:?}");
 
 	// A PROJECTIVE TRANSFORM IS IN THE PROFILE, and an image under one is drawn rather than refused:
 	// the near edge is larger than the far one, which is what perspective means.
