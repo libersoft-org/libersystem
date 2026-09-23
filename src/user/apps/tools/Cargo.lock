@@ -117,6 +117,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluetooth-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "bmp"
 version = "0.0.0"
 dependencies = [
@@ -616,6 +625,7 @@ version = "0.0.0"
 dependencies = [
  "audio-proto",
  "base-proto",
+ "bluetooth-proto",
  "config-proto",
  "device-proto",
  "display-device-proto",

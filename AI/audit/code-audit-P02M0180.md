@@ -41,3 +41,35 @@ declaration - so the minting authority never reaches a service.
 **What is not covered.** The in-guest denial test runs in the development configuration, like the
 three tests beside it in that module; the shipping boot image does not run any of them. The
 `development-build` gate compiles that configuration and the scenarios harness replays it.
+
+## The host-testable leaf (2026-09-22)
+
+Six modules, 39 tests. The order they were written in is the order they depend on each other, and
+each was checked against a document before the next was started.
+
+**Where the vectors came from.** FIPS-197 for AES, RFC 4493 for CMAC, Core Appendix D for f4/f5/f6/g2
+and for the Core's own `e` sample. The owner approved fetching the specification for the Appendix D
+sample data; the fetch was a read of a public document and nothing left this machine.
+
+**One vector was written from memory and was wrong.** A second Core `e` sample, typed before the
+document was fetched, failed - while FIPS-197 Appendix B, FIPS-197 C.1, the all-zero known answer
+and the first Core sample all passed, so the cipher was right and the expectation was not. It was
+removed rather than corrected to whatever the code produced. That is the whole argument for the
+rule the test files state: an expected value that cannot be sourced proves only that the
+implementation agrees with whoever typed it.
+
+**What the document gave that memory could not.**
+
+- The f5 salt could be CONFIRMED rather than asserted, because D.3 prints the intermediate `T`.
+  Nothing else in the derivation would have caught a wrong salt - every downstream value would have
+  been wrong together and consistently.
+- Which of the two f5 counters is the MacKey and which is the LTK. The flattened table is ambiguous
+  about which label belongs to which block; D.4 resolves it, because f6's sample is keyed with the
+  number counter zero produces. A guess here is the defect that still completes a pairing.
+- `keyID` is `62746c65`, which is ASCII `btle` - one letter away from what memory offered.
+
+**What is deliberately absent.** No P-256: the controller owns it, and the milestone requires a
+controller that does. No inverse AES: CMAC is forward-only, and code that exists and is never
+exercised is code nothing would notice breaking. No constant-time claim: the S-box is a table, the
+module says so in its own header, and the threat this service faces is a peer on a radio rather
+than a process that can measure a cache.

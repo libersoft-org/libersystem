@@ -1,0 +1,243 @@
+//! LiberSystem Bluetooth - what a client may ask of the host stack, in three separate authorities.
+//!
+//! THREE INTERFACES AND NOT THREE METHODS ON ONE, because the difference between them is who may
+//! hold them rather than what they do. A component that may LIST the radios on a machine must not
+//! be able to power one; a component that may pair must not be able to read a link key; and the
+//! input service, which is the one consumer of what pairing produces, must be able to do neither.
+//!
+//! NOTHING HERE CARRIES A KEY OR A RAW HCI PACKET. The keys live in a backend this service reaches
+//! over a private capability and the packets live under the transport; a client of any interface
+//! below sees typed state and typed outcomes, and a component that could see either could be the
+//! stack itself.
+
+package liber:bluetooth@1;
+
+use liber:base@1.{error};
+
+/// Which kind a peer address is.
+///
+/// THIS SLICE SPEAKS TWO AND REFUSES THE REST. Resolvable private addresses - the ones a device
+/// rotates for privacy - need an identity resolving key and a resolution step that this milestone
+/// excludes by name, and a stack that treated one as a static address would bond to a peer whose
+/// address is different by the time it reconnects.
+enum peer-kind {
+	/// An address from the device's own assigned block.
+	public        = 1,
+	/// A random address the device does not rotate.
+	random-static = 2,
+}
+
+/// A peer's address, most significant byte first - the order the specification's own sample data is
+/// printed in, and the order the key derivations take.
+record peer-address {
+	kind:              peer-kind,
+	@bound(6) bytes:   list<u8>,
+}
+
+/// What a controller is and what it can do.
+record controller-info {
+	/// Its own identity address.
+	address:            peer-address,
+	/// Whether the radio is on.
+	powered:            bool,
+	/// WHETHER IT HAS THE P-256 COMMANDS LE SECURE CONNECTIONS NEEDS. The curve half of pairing is
+	/// the controller's here, so a controller without them cannot pair at all under this service -
+	/// and that is reported as a fact about the machine rather than discovered as a pairing that
+	/// fails halfway.
+	secure-connections: bool,
+	/// The session this controller is in. A reset advances it, and everything a client held from
+	/// the previous one is gone.
+	epoch:              u32,
+}
+
+/// One device a scan found.
+record scan-result {
+	address:           peer-address,
+	/// The name it advertised, empty when it advertised none. A NAME IS NOT AN IDENTITY: it is
+	/// whatever the device chose to broadcast, any device may broadcast any name, and nothing in
+	/// this stack decides anything from it.
+	@bound(48) name:   string,
+	/// The received signal strength, in dBm as the controller reported it.
+	rssi:              i32,
+	/// Whether it advertised the human-interface service. A hint for an operator choosing from a
+	/// list, and not a claim that this stack can drive it.
+	human-interface:   bool,
+}
+
+/// How far a pairing attempt has got.
+enum pairing-state {
+	/// Nothing is in flight.
+	idle       = 1,
+	/// Connecting to the peer.
+	connecting = 2,
+	/// Exchanging keys.
+	pairing    = 3,
+	/// Bonded and durably stored. A pairing is not reported as bonded before the record is
+	/// committed: a bond that exists only in memory is one a reboot silently removes, and a person
+	/// told they had paired would find the device asking again.
+	bonded     = 4,
+	/// It ended without bonding. `outcome` says why.
+	failed     = 5,
+}
+
+/// WHAT THE ENCRYPTION ON A LINK IS WORTH, reported rather than implied.
+///
+/// This slice implements the Just Works association model, which buys encryption against a listener
+/// and NOT authentication against a radio that answered first. A stack that reported one number for
+/// both would be telling an operator that a device is the device they pressed a button on, which
+/// nothing here establishes.
+enum security-level {
+	/// No encryption.
+	none                        = 1,
+	/// Encrypted, and the peer is NOT authenticated. This is what Just Works produces.
+	encrypted-unauthenticated   = 2,
+	/// Encrypted and authenticated. No association model in this slice reaches it, and it is named
+	/// so that a client reads the level rather than assuming the one it was given.
+	encrypted-authenticated     = 3,
+}
+
+/// What a pairing attempt came to.
+record pairing-progress {
+	state:    pairing-state,
+	/// What the link is worth, once there is one.
+	security: security-level,
+	/// The peer this is about.
+	address:  peer-address,
+}
+
+/// One bonded peer, as an operator sees it. NO KEY MATERIAL: a client of the operator interface may
+/// forget a bond and may not read one.
+record bonded-peer {
+	address:           peer-address,
+	@bound(48) name:   string,
+	/// Whether this peer's input is currently an input source.
+	enabled:           bool,
+	security:          security-level,
+}
+
+/// A scan's own identity, so that a cancellation names the scan it cancels rather than whichever one
+/// happens to be running.
+record scan-handle {
+	id: u32,
+}
+
+/// THE READ AUTHORITY: what is here, and nothing that changes it.
+///
+/// A component holding this may enumerate controllers and look for devices. It may not power a
+/// radio, pair, forget a bond or make a peer an input source - those are the operator's, and they
+/// are on a different interface for that reason rather than being checked by a flag.
+interface bluetooth {
+	/// The controllers this machine has.
+	@op(1) controllers: func() -> result<list<controller-info>, error>;
+	/// Start a scan. `deadline-ms` is the caller's own limit and is CAPPED rather than believed: a
+	/// scan is a radio running and a client asking for an hour of it is a client deciding how the
+	/// machine behaves. At most 64 deduplicated results are reported and the scan ends by itself at
+	/// the deadline, whichever comes first.
+	@op(2) scan:        func(controller: u32, deadline-ms: u32) -> result<scan-handle, error>;
+	/// The results so far, and whether the scan has finished. A scan that ended - at its deadline,
+	/// at the result cap, or because it was cancelled - says so here, so a client learns of the end
+	/// rather than waiting for one more result that will never come.
+	@op(3) results:     func(scan: scan-handle) -> result<list<scan-result>, error>;
+	/// Whether that scan is still running.
+	@op(4) scanning:    func(scan: scan-handle) -> result<bool, error>;
+	/// Stop a scan now. EXPLICIT, because a scan that only ever ended at its deadline would keep a
+	/// radio busy for the rest of a caller's ten seconds after it had found what it wanted.
+	@op(5) cancel:      func(scan: scan-handle) -> result<unit, error>;
+}
+
+/// THE OPERATOR AUTHORITY: the verbs that change what the machine is doing.
+///
+/// Granted to one explicitly trusted component through the manifest's own grant path, and to nothing
+/// else. THIS IS AN ADMINISTRATIVE AUTHORIZATION AND NOT A CLAIM ABOUT THE PHYSICAL DEVICE: that a
+/// person is allowed to pair says nothing about whether the radio that answered is the mouse on the
+/// desk, and the security level every answer here carries is what says so.
+interface bluetooth-operator {
+	/// Turn a controller's radio on or off. The platform's own allow or deny setting is enforced
+	/// here and a refusal says so; this service invents no radio policy of its own.
+	@op(1) power:    func(controller: u32, on: bool) -> result<unit, error>;
+	/// Begin pairing with a peer. ONE ATTEMPT PER CONTROLLER IS LIVE, and a second while one is in
+	/// flight is refused rather than queued - a queued pairing is one an operator has stopped
+	/// watching. The attempt is capped at sixty seconds whatever the peer does.
+	@op(2) pair:     func(controller: u32, peer: peer-address) -> result<unit, error>;
+	/// How the live attempt is going.
+	@op(3) progress: func(controller: u32) -> result<pairing-progress, error>;
+	/// Abandon the live attempt.
+	@op(4) cancel:   func(controller: u32) -> result<unit, error>;
+	/// The peers this machine is bonded to.
+	@op(5) bonded:   func(controller: u32) -> result<list<bonded-peer>, error>;
+	/// Delete a bond. DURABLY, AND BEFORE THIS ANSWERS: a forget that reported success and left the
+	/// record on the volume is a device an operator believes is gone and which reconnects after a
+	/// reboot. The live link is terminated with it.
+	@op(6) forget:   func(controller: u32, peer: peer-address) -> result<unit, error>;
+	/// Make a bonded peer an input source, or stop it being one. Disabling closes whatever channel
+	/// the input service holds for it.
+	@op(7) enable:   func(controller: u32, peer: peer-address, on: bool) -> result<unit, error>;
+}
+
+/// One pointer report, as this stack hands it up.
+///
+/// ALREADY DECODED AND NOT A HID REPORT. What crosses this channel is movement and buttons, so the
+/// consumer needs no report parser and no knowledge of boot protocol - which is what keeps the one
+/// consumer of this from having to become a second HID implementation.
+record mouse-report {
+	/// Movement since the last report, signed.
+	dx:      i32,
+	dy:      i32,
+	/// Wheel ticks since the last report, signed.
+	wheel:   i32,
+	/// The three defined buttons, as bits: left, right, middle.
+	buttons: u8,
+}
+
+/// THE PROFILE AUTHORITY: one verb, over peers an operator has already enabled.
+///
+/// Held by the input service and by nothing else. It cannot scan, cannot pair, cannot enumerate
+/// bonds and cannot reach a peer the operator has not enabled - so the component that consumes
+/// pointer input has no authority over the radio that produces it.
+interface bluetooth-profile {
+	/// A bounded stream of reports from one enabled peer. Refused for a peer that is not bonded or
+	/// not enabled. The stream ends when the peer is disabled, when the link is lost, or when the
+	/// controller's session ends - and a consumer learns of all three the same way.
+	@op(1) open-mouse: func(controller: u32, peer: peer-address) -> result<stream<mouse-report>, error>;
+}
+
+/// WHAT A BOND IS, on the private wire between this service and the store that keeps it.
+///
+/// THE KEY IS IN HERE AND THIS RECORD GOES NOWHERE ELSE. No client interface above carries one, and
+/// the capability that reaches this one is granted to the Bluetooth service alone.
+record bond-record {
+	/// Which record format this is. A version this store does not know is unavailable rather than
+	/// read: a record read under the wrong layout is a key applied to the wrong link.
+	version:          u32,
+	/// The controller whose bond this is. A record whose controller is not the one asking is
+	/// refused: one machine's key is not another's, and a store that answered by peer address alone
+	/// would hand a second controller the first one's link.
+	local:            peer-address,
+	peer:             peer-address,
+	/// The long-term key.
+	@bound(16) key:   list<u8>,
+	/// What the link this key came from was worth. Stored rather than recomputed, because the
+	/// association model that produced it is not derivable from the key.
+	security:         security-level,
+	@bound(48) name:  string,
+	/// Whether the operator has made this peer an input source.
+	enabled:          bool,
+}
+
+/// THE BOND STORE'S PRIVATE INTERFACE. One holder, and it is not a client of anything above.
+interface bluetooth-bond-store {
+	/// The record for this controller and peer, key included. ANSWERED ONLY TO THE ONE HOLDER of
+	/// this capability - "asked rather than read" means a typed confined operation and not a claim
+	/// that the key is unnecessary.
+	@op(1) lookup: func(local: peer-address, peer: peer-address) -> result<bond-record, error>;
+	/// Store or replace a record. ATOMIC: a partially written bond is a key that decrypts nothing
+	/// and a peer that cannot be paired again without being forgotten first.
+	@op(2) store:  func(record: bond-record) -> result<unit, error>;
+	/// Delete one. Answers `not-found` for a record that was not there, which is a different answer
+	/// from a delete that failed.
+	@op(3) delete: func(local: peer-address, peer: peer-address) -> result<unit, error>;
+	/// Every record for this controller, WITHOUT KEY MATERIAL - the key field is empty. This is what
+	/// the operator's `bonded` list is built from, and building it from `lookup` would mean reading
+	/// every key to show a list of names.
+	@op(4) list:   func(local: peer-address) -> result<list<bond-record>, error>;
+}

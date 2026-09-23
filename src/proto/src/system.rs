@@ -2,6 +2,10 @@
 
 pub use crate::generated::liber::audio::v1::*;
 pub use crate::generated::liber::base::v1::*;
+// The host stack's CLIENT contracts. The HCI transport a controller publishes is a DEVICE contract
+// and is in `device` with the other driver wires, for the same reason the display's device side is
+// separate from the display's.
+pub use crate::generated::liber::bluetooth::v1::*;
 pub use crate::generated::liber::config::v1::*;
 pub use crate::generated::liber::device::v1::*;
 pub use crate::generated::liber::display::v1::*;

@@ -27,7 +27,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics)
+PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -59,11 +59,17 @@ declare -A EXTERNAL=(
 	# format need no error type, and a shared vocabulary that depended on another package would make
 	# every importer depend on that one too.
 	[graphics]=""
+	# THE HOST STACK'S CLIENT CONTRACTS. It imports the base error and nothing else: the HCI
+	# transport a controller publishes is a DEVICE contract and lives in `device`, for the same
+	# reason the display's device side is separate from the display's - a driver's wire and an
+	# application's wire are two contracts, and one package carrying both would make every client
+	# depend on the device one.
+	[bluetooth]="base"
 )
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(audio base config device display display-device font graphics input log network observability process resources security session storage time)
+AGGREGATE_EXTERNAL=(audio base bluetooth config device display display-device font graphics input log network observability process resources security session storage time)
 
 help() {
 	usage_and_exit <<EOF

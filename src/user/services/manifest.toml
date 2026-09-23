@@ -406,6 +406,10 @@ owner = "inflate"
 path = "user/libs/compression/inflate"
 
 [[sources]]
+owner = "bluetooth-proto"
+path = "user/libs/protocol/bluetooth-proto"
+
+[[sources]]
 owner = "input-proto"
 path = "user/libs/protocol/input-proto"
 

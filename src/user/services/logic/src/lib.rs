@@ -46,6 +46,7 @@ pub mod open_sequence;
 pub mod selection;
 pub mod service_lifecycle;
 pub mod shell_language;
+pub mod smp;
 pub mod sntp;
 pub mod tcp_admission;
 pub mod tcp_bind;

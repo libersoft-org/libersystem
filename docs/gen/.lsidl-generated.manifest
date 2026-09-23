@@ -2,6 +2,8 @@ liber/audio/v1.abi
 liber/audio/v1.md
 liber/base/v1.abi
 liber/base/v1.md
+liber/bluetooth/v1.abi
+liber/bluetooth/v1.md
 liber/config/v1.abi
 liber/config/v1.md
 liber/device/v1.abi

@@ -1,0 +1,33 @@
+package liber:bluetooth@1
+enum peer-kind(public=1,random-static=2)
+record peer-address(kind:peer-kind,bytes:list<u8>:bound=6)
+record controller-info(address:peer-address,powered:bool,secure-connections:bool,epoch:u32)
+record scan-result(address:peer-address,name:string:bound=48,rssi:i32,human-interface:bool)
+enum pairing-state(idle=1,connecting=2,pairing=3,bonded=4,failed=5)
+enum security-level(none=1,encrypted-unauthenticated=2,encrypted-authenticated=3)
+record pairing-progress(state:pairing-state,security:security-level,address:peer-address)
+record bonded-peer(address:peer-address,name:string:bound=48,enabled:bool,security:security-level)
+record scan-handle(id:u32)
+interface bluetooth
+method bluetooth.controllers op=1 () -> result<list<controller-info>, liber:base@1::error>
+method bluetooth.scan op=2 (controller:u32:rights=,deadline-ms:u32:rights=) -> result<scan-handle, liber:base@1::error>
+method bluetooth.results op=3 (scan:scan-handle:rights=) -> result<list<scan-result>, liber:base@1::error>
+method bluetooth.scanning op=4 (scan:scan-handle:rights=) -> result<bool, liber:base@1::error>
+method bluetooth.cancel op=5 (scan:scan-handle:rights=) -> result<unit, liber:base@1::error>
+interface bluetooth-operator
+method bluetooth-operator.power op=1 (controller:u32:rights=,on:bool:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.pair op=2 (controller:u32:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.progress op=3 (controller:u32:rights=) -> result<pairing-progress, liber:base@1::error>
+method bluetooth-operator.cancel op=4 (controller:u32:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.bonded op=5 (controller:u32:rights=) -> result<list<bonded-peer>, liber:base@1::error>
+method bluetooth-operator.forget op=6 (controller:u32:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-operator.enable op=7 (controller:u32:rights=,peer:peer-address:rights=,on:bool:rights=) -> result<unit, liber:base@1::error>
+record mouse-report(dx:i32,dy:i32,wheel:i32,buttons:u8)
+interface bluetooth-profile
+method bluetooth-profile.open-mouse op=1 (controller:u32:rights=,peer:peer-address:rights=) -> result<stream<mouse-report>, liber:base@1::error>
+record bond-record(version:u32,local:peer-address,peer:peer-address,key:list<u8>:bound=16,security:security-level,name:string:bound=48,enabled:bool)
+interface bluetooth-bond-store
+method bluetooth-bond-store.lookup op=1 (local:peer-address:rights=,peer:peer-address:rights=) -> result<bond-record, liber:base@1::error>
+method bluetooth-bond-store.store op=2 (record:bond-record:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-bond-store.delete op=3 (local:peer-address:rights=,peer:peer-address:rights=) -> result<unit, liber:base@1::error>
+method bluetooth-bond-store.list op=4 (local:peer-address:rights=) -> result<list<bond-record>, liber:base@1::error>
