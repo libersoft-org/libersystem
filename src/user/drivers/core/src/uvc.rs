@@ -249,9 +249,13 @@ pub fn normalize(graph: &[u8]) -> Result<Normalized, Refused> {
 				}
 				// It follows the frames it describes; with no format open it describes nothing.
 				let Some((format, _, _)) = open.as_mut() else { return Err(Refused::Structure) };
+				// UVC's OWN CODE POINTS, which are not H.273's: 1 BT.709, 2 FCC, 3 BT.470-2 System B,G, 4 SMPTE
+				// 170M (the default), 5 SMPTE 240M, 6 and above reserved. B,G and 170M share BT.601's
+				// coefficients; FCC's (0.30, 0.11) and 240M's are neither of the two this knows, and a
+				// reserved value is nothing - so each of those is unknown rather than a guess.
 				format.matrix = match descriptor[5] {
 					1 => Matrix::Bt709,
-					4 | 5 | 6 => Matrix::Bt601,
+					3 | 4 => Matrix::Bt601,
 					_ => Matrix::Unknown,
 				};
 				// UVC does not state a range; Motion-JPEG is full range by its own definition.

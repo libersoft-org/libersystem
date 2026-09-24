@@ -676,3 +676,109 @@ That is evidence, not proof, that the failures predate the job: no pre-job build
 stays open on it, because the gate it names has not passed; the owner's options are the three recorded above,
 and a fix to the first-prompt race (the driver waiting for the prompt to settle, or the line discipline taking a
 line typed at once) would belong to the console or the harness, not to these milestones.
+
+---
+
+AUDITOR'S REVIEW ON P02M0183 (2026-09-24T06:58:57Z):
+
+Rating: 8/10
+
+ModemService, the command logic, the uplink selection and NetworkService's raw-IP medium are careful, and they
+match the plan closely. The findings are:
+- one small secret-hygiene gap;
+- the run item's existing-network-check requirement, which is not met - largely for reasons outside this
+  milestone's code;
+- the alias configuration, which is compiled into the service.
+
+## Findings
+
+### 1. A submitted PIN/PUK survives in two buffers (minor defect)
+
+The plan: "clear submitted-secret buffers after bounded handling." ModemService does most of this deliberately:
+- `Secret` zeroes itself with volatile writes on drop;
+- `submit_with` scrubs the `Command` fields and the encoded bytes after sending;
+- `grant_request` scrubs the reply buffer.
+
+Two copies are missed:
+- **The encoder's own buffer.** The generated `modem_device::Client::command` encodes into a `VecWriter` and
+  passes `request` to the transport; the `Capture` copies it, and that copy is scrubbed. The generated
+  `request` vector is then dropped unzeroed at the end of `command`, together with any smaller buffers the
+  writer outgrew while encoding.
+- **The receive buffer.** The client's `enter_pin`/`enter_puk` request - PIN, PUK and new PIN in the clear -
+  sits in the service loop's `buf` (`BUF_BYTES`). `grant_request` notes that "the request buffer carried the
+  secret; it is not read again", but nothing zeroes it. It is overwritten only as far as later messages happen
+  to reach.
+
+Neither copy leaves the process, and nothing logs them. The requirement, however, is about exactly these
+buffers. Scrubbing `buf[..len]` after a manage request, and encoding the secret-bearing command into a buffer the
+service owns and scrubs, would close it.
+
+### 2. The run item's "affected existing network guest checks" are not met (open item, cause largely outside this milestone)
+
+- **What passes:** the `dhcp_lease_renews_at_t1_and_restarts_its_clock` kernel test.
+- **What fails:** `./check.sh --gate ipv6-peer`, as the implementer's records show.
+  - On the development image, the quiet row does not see three router solicitations in its 45 s window.
+  - On the shipping image, nine of ten rows pass in each full run. The tenth row varies, and its two identified
+    causes are in code this job did not change (verified: `git diff 048e0abe HEAD` over `console_service.rs`,
+    `guest-console.py`, `ipv6-peer.py` and `check-ipv6-peer.sh` is empty):
+    - the shell's first typed line arriving split;
+    - the peer's single early IPv4 ping.
+  - NetworkService's DHCP-phase frame handling is unchanged (`do_dhcp` is identical to the pre-job version).
+- **A real contribution from the job, but not from this milestone's code.** ServiceManager's bring-up walks the
+  services in manifest order and waits for each, and the job inserted its services at positions 1-10. Seven of
+  them start ahead of `config_service` and hold NetworkService back by about 2.5 s: power, smartcard, camera,
+  MIDI, spool, import and the bond store. `modem_service` itself depends on `network_service` and does not.
+- **Conclusion:** the requirement is unmet and correctly left open. The fix, or an acceptance, is the owner's.
+
+### 3. The modem alias is compiled in (minor deviation)
+
+`ALIASES` in `modem_service.rs` binds only the fixture's alias, in every build; a shipping image names no
+configured modem. This matches "identity and management are denied by default". It also means a real modem
+cannot be granted without a code change, rather than through configured policy. It is the same observation as for
+P02M0182, and nothing is affected until P02M0099's MBIM provider exists.
+
+## Verified
+
+- **Grants.**
+  - The admin mint resolves an alias to exactly one current publication, or fails. It binds the modem, the SIM
+    generation and, for data, the APN and replace-uplink policy.
+  - Non-data grants refuse a data policy.
+  - The owner task handle is in the wait set, and its termination retires the grant. That ends its context,
+    closes its connection and drops its pending calls, whatever copies of the endpoint exist.
+  - SIM replacement retires the grants bound to the old SIM generation and ends the context. Provider loss ends
+    the context and every grant bound to the modem.
+- **Commands.**
+  - The provider's limits are clamped down.
+  - Commands are correlated by connection generation, transaction and the SIM/context generations.
+  - A reply to nothing outstanding is dropped.
+  - An unknown outcome is never replayed; a read-only query reconciles it.
+  - A PIN attempt is preceded by a fresh counter query and refused against an unknown count unless acknowledged.
+  - A context found up with no owner after reconciliation is taken down.
+- **Context flow.**
+  - Reservation with NetworkService comes before the modem is asked anything; `again` means busy without
+    replace authority.
+  - Activation is followed by installation, and success is reported only on `installed`.
+  - An installation failure makes a bounded deactivation; an uncertain activation abandons, then reconciles.
+  - One context globally, and 32 clients.
+  - Datagrams are admitted only for the active context generation, within the MTU, bounded by
+    `mc::PacketQueue`, and counted when refused.
+- **Uplink selection (`service_logic::uplink`).**
+  - At most 16 NICs; the current usable NIC is kept, otherwise the lowest live publication is chosen.
+  - Reservations are refused as busy without replace authority, and re-checked at install time.
+  - Release restores the replaced NIC if it is still live, otherwise falls back.
+  - Every switch advances the interface generation.
+  - `validate` refuses IPv6 as unsupported, and refuses non-unicast addresses, a gateway off the subnet and an
+    out-of-range MTU.
+- **Raw-IP medium.** `NetworkService::bring_up_raw` builds a raw stack from the attachment alone: no MAC, ARP,
+  DHCP or static fallback.
+- **Registration.** The gate is registered in `check.sh`, the verify-model catalogue (including the guest-booting
+  list) and `release-required.toml`. Its third part runs the provider and client bounds scenario, which the
+  implementer's records show was also demonstrated failing with the bounds mutated.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read: `modem_service.rs` (commands, grants,
+context flow, link calls; about 900 of 1769 lines), `service_logic/src/uplink.rs` (whole), NetworkService's
+`bring_up_raw` and `bring_up_nic`, the generated `modem_device::Client::command`, and PermissionManager's
+`modem_policy`. I compared the pre-job NetworkService start-up (`git show 048e0abe:...network_service.rs`) with
+the current one, and read the implementer's recorded `ipv6-peer` evidence.

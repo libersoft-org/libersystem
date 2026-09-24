@@ -1606,6 +1606,17 @@ const TEXT: [u8; 4] = [0xff, 0xff, 0xff, 0x00];
 
 fn render(screen: &TrustedScreen, lines: &[String]) -> Option<u64> {
 	let (width, height, pitch) = (screen.width as usize, screen.height as usize, screen.pitch as usize);
+	// THE WHOLE PROMPT OR NONE OF IT. A line wider than the screen continues on the next row; doubled cells
+	// where the screen is wide enough and the wrapped prompt still fits, single ones otherwise. A screen too
+	// small for all of it shows nothing, and the request is refused as undrawable - never confirmed from a
+	// digest or a label cut off at the edge with nothing to say so.
+	let (scale, rows) = [2, 1].into_iter().filter(|&scale| scale == 1 || width >= 1024).find_map(|scale: usize| {
+		let (cell_w, cell_h, band) = (8 * scale, 16 * scale, 8 * scale);
+		let left = (4 * cell_w).min(width / 8);
+		let rows = ad::wrap(lines, width.saturating_sub(2 * left) / cell_w)?;
+		let bottom = band + 2 * cell_h + rows.len().saturating_sub(1) * (cell_h + cell_h / 2) + cell_h;
+		(bottom + band <= height).then_some((scale, rows))
+	})?;
 	let length = pitch.checked_mul(height)?;
 	let handle = memory_object_create(length as u64);
 	if handle < 0 {
@@ -1617,7 +1628,6 @@ fn render(screen: &TrustedScreen, lines: &[String]) -> Option<u64> {
 		return None;
 	};
 	let pixels: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, length) };
-	let scale: usize = if width >= 1024 { 2 } else { 1 };
 	let band: usize = 8 * scale;
 	for row in 0..height {
 		let colour = if row < band || row + band >= height { BAND } else { FIELD };
@@ -1629,7 +1639,7 @@ fn render(screen: &TrustedScreen, lines: &[String]) -> Option<u64> {
 	let (cell_w, cell_h) = (8 * scale, 16 * scale);
 	let left = (4 * cell_w).min(width / 8);
 	let mut top = band + 2 * cell_h;
-	for line in lines {
+	for line in &rows {
 		let mut x = left;
 		for character in line.chars() {
 			if x + cell_w > width || top + cell_h > height {

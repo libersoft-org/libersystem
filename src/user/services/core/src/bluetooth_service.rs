@@ -179,6 +179,15 @@ fn local_wire(controller: &Controller) -> PeerAddress {
 	peer_to_wire(&local_address(controller))
 }
 
+// Zero a buffer that held key material, with writes the compiler may not drop as dead because the buffer
+// is about to be freed.
+fn scrub(bytes: &mut [u8]) {
+	for byte in bytes.iter_mut() {
+		// SAFETY: a valid, aligned byte of this slice.
+		unsafe { core::ptr::write_volatile(byte, 0) };
+	}
+}
+
 // ------------------------------------------------------------------ the controller
 
 impl Controller {
@@ -189,8 +198,31 @@ impl Controller {
 			print(b"BluetoothService: the command queue is full; a command is refused\n");
 			return false;
 		}
+		// THE CONTROLLER'S OWN MAXIMUM, checked before the command is queued rather than learnt from a
+		// transport that refuses it later.
+		if service_logic::hci::check_outbound(&self.limits, Kind::Command as u16, (3 + params.len()) as u32).is_err() {
+			print(b"BluetoothService: a command is longer than the controller accepts and is refused\n");
+			return false;
+		}
 		self.pending.push((op, params.to_vec()));
 		true
+	}
+
+	// Queue `LE Enable Encryption` for a link. The parameters carry the LTK, so the copy built here is
+	// zeroed once the queue holds its own - and the queue's is zeroed when it is sent or dropped.
+	fn encrypt(&mut self, handle: u16, ltk: &[u8; 16]) {
+		let mut params = hci_codec::enable_encryption(handle, ltk);
+		self.command(opcode::LE_ENABLE_ENCRYPTION, &params);
+		scrub(&mut params);
+	}
+
+	// Drop every queued command. One of them may be an encryption carrying a key, so each is zeroed
+	// first rather than freed as it is.
+	fn clear_pending(&mut self) {
+		for (_, params) in self.pending.iter_mut() {
+			scrub(params);
+		}
+		self.pending.clear();
 	}
 
 	// Send the next command if the controller will take one. AT MOST ONE IS OUTSTANDING, and the
@@ -203,13 +235,18 @@ impl Controller {
 		if self.credits.take(Kind::Command).is_err() {
 			return;
 		}
-		let (op, params) = self.pending.remove(0);
-		let Some(bytes) = hci_codec::command(op, &params) else {
+		let (op, mut params) = self.pending.remove(0);
+		let Some(mut bytes) = hci_codec::command(op, &params) else {
+			scrub(&mut params);
 			self.credits.commands_completed(1);
 			self.credits.drained();
 			return;
 		};
 		let sent = hci_transport::Client::new(ChannelTransport { chan: self.transport }).send(&HciPacketKind::Command, &bytes);
+		// The command has gone, or failed to; either way neither copy is read again, and an encryption's
+		// carries the LTK.
+		scrub(&mut params);
+		scrub(&mut bytes);
 		self.credits.drained();
 		match sent {
 			Some(Ok(_)) => self.outstanding = Some(op),
@@ -252,7 +289,7 @@ impl Controller {
 		self.init = Init::Reset;
 		self.powered = false;
 		self.public_key = None;
-		self.pending.clear();
+		self.clear_pending();
 		self.outstanding = None;
 		self.credits.reset();
 		self.command(opcode::RESET, &[]);
@@ -304,20 +341,19 @@ impl Controller {
 	}
 
 	// End whatever this controller's session held: links, scans, attempts and report streams. A
-	// reset or a fault does this, and so does powering the radio off.
+	// reset or a fault does this, and so does powering the radio off. THE SESSION'S SCAN GOES WITH IT:
+	// its handle answers `not-found`, and nothing it found can be chosen for a pairing in the next one.
 	fn end_session(&mut self) {
 		if let Some(mut link) = self.link.take() {
 			release_streams(&mut link);
 		}
-		if let Some(scan) = self.scan.as_mut() {
-			scan.running = false;
-		}
+		self.scan = None;
 		if let Some(attempt) = self.attempt.as_mut()
 			&& matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)
 		{
 			attempt.state = PairingState::Failed;
 		}
-		self.pending.clear();
+		self.clear_pending();
 		self.outstanding = None;
 		self.credits.reset();
 	}
@@ -356,13 +392,31 @@ impl Stack {
 		bluetooth_bond_store::Client::new(ChannelTransport { chan: self.bonds })
 	}
 
-	// The stored record for this controller and peer, key included.
+	// The stored record for this controller and peer, KEY INCLUDED - so only the two callers that need the
+	// key ask for it, and each zeroes it once it has.
 	fn bond(&self, at: usize, peer: &[u8; 7]) -> Option<BondRecord> {
 		if self.bonds == 0 {
 			return None;
 		}
 		match self.bonds().lookup(&local_wire(&self.controllers[at]), &peer_to_wire(peer)) {
 			Some(Ok(record)) if record.key.len() == 16 => Some(record),
+			Some(Ok(mut record)) => {
+				scrub(&mut record.key);
+				None
+			}
+			_ => None,
+		}
+	}
+
+	// Whether this peer is bonded on this controller and an operator made it an input source - read from
+	// the store's listing, which carries no key.
+	fn enabled_peer(&self, at: usize, peer: &[u8; 7]) -> Option<bool> {
+		if self.bonds == 0 {
+			return None;
+		}
+		let wire = peer_to_wire(peer);
+		match self.bonds().list(&local_wire(&self.controllers[at])) {
+			Some(Ok(records)) => records.iter().find(|record| record.peer == wire).map(|record| record.enabled),
 			_ => None,
 		}
 	}
@@ -449,8 +503,11 @@ impl Stack {
 		let status = params.first().copied().unwrap_or(0xff);
 		if controller.init != Init::Ready {
 			if status != 0 {
+				// NOT USED, AND NOT STUCK: left as a controller that is ready and off, so an operator's
+				// power-on runs initialisation again from the reset rather than answering for nothing.
 				print(b"BluetoothService: the controller refused an initialisation command; it is not used\n");
 				controller.powered = false;
+				controller.init = Init::Ready;
 				return;
 			}
 			match op {
@@ -573,10 +630,12 @@ impl Stack {
 			// enabled - a link that will not encrypt with the stored key is a peer that is not the one
 			// that bonded, or one that forgot the bond, and either way it is not an input source.
 			match self.bond(at, &peer) {
-				Some(record) => {
+				Some(mut record) => {
 					let mut ltk = [0u8; 16];
 					ltk.copy_from_slice(&record.key);
-					self.controllers[at].command(opcode::LE_ENABLE_ENCRYPTION, &hci_codec::enable_encryption(handle, &ltk));
+					scrub(&mut record.key);
+					self.controllers[at].encrypt(handle, &ltk);
+					scrub(&mut ltk);
 				}
 				None => {
 					let controller = &mut self.controllers[at];
@@ -615,21 +674,23 @@ impl Stack {
 		self.run_smp(at, alloc::vec![first]);
 	}
 
-	fn run_smp(&mut self, at: usize, steps: Vec<Step>) {
-		for step in steps {
+	fn run_smp(&mut self, at: usize, mut steps: Vec<Step>) {
+		for step in steps.iter_mut() {
 			let controller = &mut self.controllers[at];
 			match step {
 				Step::Send(pdu) => {
-					controller.l2cap(SMP_CID, &pdu);
+					controller.l2cap(SMP_CID, pdu);
 				}
 				Step::GenerateDhKey(key) => {
-					controller.command(opcode::LE_GENERATE_DHKEY, &hci_codec::generate_dhkey(&key));
+					controller.command(opcode::LE_GENERATE_DHKEY, &hci_codec::generate_dhkey(key));
 				}
+				// The key rides in the step list, which is freed after this loop: zeroed in place first.
 				Step::Encrypt(ltk) => {
 					if let Some(link) = controller.link.as_ref() {
 						let handle = link.handle;
-						controller.command(opcode::LE_ENABLE_ENCRYPTION, &hci_codec::enable_encryption(handle, &ltk));
+						controller.encrypt(handle, ltk);
 					}
+					scrub(ltk);
 				}
 				Step::Failed(_) => {
 					if let Some(attempt) = controller.attempt.as_mut() {
@@ -655,9 +716,8 @@ impl Stack {
 		}
 		let peer = link.peer;
 		let reconnecting = link.reconnecting;
-		let pairing_key = link.pairing.as_ref().and_then(|pairing| pairing.ltk());
 		if !reconnecting {
-			let Some(mut ltk) = pairing_key else {
+			let Some(mut ltk) = link.pairing.as_ref().and_then(Initiator::ltk) else {
 				self.encryption_failed(at);
 				return;
 			};
@@ -666,12 +726,14 @@ impl Stack {
 			// exists only in memory is one a reboot silently removes. A store that cannot write ENDS
 			// the attempt: there is no transient bond to fall back to.
 			let local = local_wire(&self.controllers[at]);
-			let record = BondRecord { version: service_logic::bond_store::VERSION, local, peer: peer_to_wire(&peer), key: ltk.to_vec(), security: SecurityLevel::EncryptedUnauthenticated, name: alloc::string::String::new(), enabled: false };
+			let mut record = BondRecord { version: service_logic::bond_store::VERSION, local, peer: peer_to_wire(&peer), key: ltk.to_vec(), security: SecurityLevel::EncryptedUnauthenticated, name: alloc::string::String::new(), enabled: false };
 			let stored = self.bonds != 0 && matches!(self.bonds().store(&record), Some(Ok(())));
-			ltk.fill(0);
+			scrub(&mut record.key);
+			scrub(&mut ltk);
 			let controller = &mut self.controllers[at];
 			if let Some(link) = controller.link.as_mut() {
 				// The key has done its work in this process; the store holds the copy that outlives it.
+				// Dropping the initiator zeroes what it held.
 				link.pairing = None;
 			}
 			if !stored {
@@ -692,7 +754,7 @@ impl Stack {
 			link.encrypted = true;
 			link.security = SecurityLevel::EncryptedUnauthenticated;
 		}
-		if self.bond(at, &peer).is_some_and(|record| record.enabled) {
+		if self.enabled_peer(at, &peer) == Some(true) {
 			self.start_discovery(at);
 		}
 	}
@@ -991,17 +1053,19 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 			}
 			return Ok(());
 		}
-		if let Some(link) = controller.link.as_ref() {
-			let handle = link.handle;
-			controller.command(opcode::DISCONNECT, &hci_codec::disconnect(handle, REASON_USER));
-		}
-		if controller.scan.as_ref().is_some_and(|scan| scan.running) {
-			controller.command(opcode::LE_SET_SCAN_ENABLE, &hci_codec::scan_enable(false));
-		}
-		controller.pump();
+		// OFF IS A CONTROLLER RESET, NOT A DISCONNECT AND A SCAN-DISABLE QUEUED BEHIND WHATEVER IS IN FLIGHT.
+		// This host forgets the session at once, so commands still waiting their turn would be dropped with
+		// it and leave the controller connected and scanning against the operator's request. `HCI_Reset`
+		// ends every link and scan in the controller itself; it goes out alone, ahead of anything the
+		// forgotten session was waiting for.
+		// Ready and off, even when this arrives halfway through initialisation: the next power-on starts
+		// it again from the reset.
 		controller.end_session();
 		controller.powered = false;
+		controller.init = Init::Ready;
 		controller.reconnect = None;
+		controller.command(opcode::RESET, &[]);
+		controller.pump();
 		Ok(())
 	}
 
@@ -1018,6 +1082,12 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		// pairing is one an operator has stopped watching.
 		if controller.attempt.as_ref().is_some_and(|attempt| matches!(attempt.state, PairingState::Connecting | PairingState::Pairing)) || controller.link.is_some() {
 			return Err(Error::Again);
+		}
+		// THE OPERATOR SELECTS WHAT THE RADIO REPORTED: an address this controller's current scan did not
+		// find is not a choice made from a scan, whatever the operator typed.
+		let wire = peer_to_wire(&peer);
+		if !controller.scan.as_ref().is_some_and(|scan| scan.results.iter().any(|result| result.address == wire)) {
+			return Err(Error::NotFound);
 		}
 		let mut address = [0u8; 6];
 		address.copy_from_slice(&peer[1..]);
@@ -1094,7 +1164,7 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		let Some(mut record) = self.stack.bond(at as usize, &peer) else { return Err(Error::NotFound) };
 		record.enabled = on;
 		let stored = matches!(self.stack.bonds().store(&record), Some(Ok(())));
-		record.key.fill(0);
+		scrub(&mut record.key);
 		if !stored {
 			return Err(Error::Io);
 		}
@@ -1131,9 +1201,10 @@ impl bluetooth_profile::Service for ProfileView<'_> {
 		}
 		// ONLY OVER A PEER AN OPERATOR ENABLED. The input service cannot reach a peer that is merely
 		// bonded, and a peer an operator has not approved is not an input source whatever it sends.
-		let Some(record) = self.stack.bond(at as usize, &peer_address) else { return Err(Error::NotFound) };
-		if !record.enabled {
-			return Err(Error::Denied);
+		match self.stack.enabled_peer(at as usize, &peer_address) {
+			Some(true) => {}
+			Some(false) => return Err(Error::Denied),
+			None => return Err(Error::NotFound),
 		}
 		let controller = &self.stack.controllers[at as usize];
 		match controller.link.as_ref() {

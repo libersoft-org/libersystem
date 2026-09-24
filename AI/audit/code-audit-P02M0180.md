@@ -786,3 +786,150 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0180 (2026-09-24T06:39:11Z):
+
+Rating: 7/10
+
+The host stack, the bond store, the bounded launch, the catalogue scoping and the gate are real and largely
+correct. Two defects need a code change inside this milestone - key material is not actually cleared, and a
+power-off can leave the radio working - and the operator item is not met in a shipping configuration.
+
+## Findings
+
+### 1. Transient key material is not cleared (defect)
+
+The plan requires: "Clear transient key buffers on completion/failure and exclude key bytes from logs and events."
+The code says it does this in several places but does not:
+
+- `service_logic::smp_pairing::Initiator` "clears" the Diffie-Hellman key by assigning `None` (`fail`, the
+  `PAIRING_FAILED` branch, and the DHKey-check success branch: `self.dhkey = None`). Assigning `None` to an
+  `Option<[u8; 32]>` rewrites the discriminant, not the 32 payload bytes, so the key stays in the struct. The LTK
+  stays in `keys.ltk` by design. `BluetoothService` then drops the initiator with `link.pairing = None`
+  (`on_encryption`, `encryption_failed`, `on_disconnected`, `OperatorView::cancel`), which again rewrites only the
+  discriminant of the `Option<Initiator>` held inside `Link`. The key bytes stay in `controller.link` for the whole
+  life of the connection.
+- `bluetooth_service.rs::Stack::on_encryption` (pairing path): the `BondRecord` built for `store` carries
+  `key: ltk.to_vec()` and is dropped without zeroing. Only the local `ltk` array is filled.
+- `bluetooth_service.rs::Stack::on_connected` (reconnect path): the `ltk` array copied from the looked-up record
+  is never cleared, and neither is `record.key`. The `LE_ENABLE_ENCRYPTION` parameters built by
+  `hci_codec::enable_encryption` sit in `Controller::pending` and are dropped after `pump()` sends them, again
+  unzeroed. The same holds for the command built from `Step::Encrypt` in `run_smp`.
+- `Stack::bond()` calls the store's `lookup`, which returns the key. It is used by `ProfileView::open_mouse` and by
+  `on_encryption` only to read `record.enabled`, so every open and every encryption pulls an LTK into this process
+  and drops it uncleared. The store's `list` already returns the same records without keys.
+
+Why it matters: the milestone's containment argument is that the process parsing a stranger's radio packets
+holds as little key material as possible, for as short a time as possible. As written, several copies of the LTK
+(and the DHKey) persist in that process, including in memory that is freed and reused. `enable()` shows the
+intended pattern (`record.key.fill(0)` after the store). It needs applying, together with an explicit overwrite
+before an `Option` is set to `None`, in the places above.
+
+### 2. Power-off can leave the link and the scan running at the controller (defect)
+
+`OperatorView::power(false)` does the following, in order:
+1. Queues `DISCONNECT` for a live link and `LE_SET_SCAN_ENABLE(false)` for a running scan.
+2. Calls `controller.pump()` once. `pump` sends at most one command, and none while another command is
+   outstanding.
+3. Calls `end_session()`, which clears `pending`, resets `outstanding` and the credits, and takes the link.
+
+The effects:
+- With both a link and a scan, the scan-disable is discarded.
+- With any command in flight (during a pairing's DHKey generation, for example), the `DISCONNECT` is discarded
+  too.
+- The host has already forgotten the link, but the controller keeps the connection and keeps scanning, and the
+  operator is answered `Ok`.
+
+The next power-on sends HCI Reset, which cleans up, but until then the radio stays active against the operator's
+explicit request. Power-off needs to either deliver the commands it queued, or reset the controller, before the
+host forgets the session.
+
+### 3. The operator item is not met in a shipping configuration (open item - confirms the implementer's record)
+
+- **No shipping operator.** No shipping component holds `bluetooth-operator`. The only holder is the
+  development probe `btcheck`. Its PermissionManager row is compiled into the shipping build as well, since
+  these rows are no longer `cfg`-gated (a documented decision), so it is inert there only while nothing named
+  `btcheck` is launchable. A shipping image therefore has no path at all to pair or enable a mouse. That
+  contradicts the plan's "done when the supported mouse path scans, pairs, durably bonds and supplies useful
+  input".
+- **Any address can be paired.** `OperatorView::pair` accepts any address. The plan says "the operator selects a
+  current scan identity", and nothing checks that the address came from a current scan.
+- **The platform allow/deny setting.** It does not exist, and the implementation maps it to DeviceManager's
+  device policy: a disabled controller is absent, so `power` answers `not-found`. That is a reasonable reading,
+  but it is a departure the plan leaves to the owner.
+- **Power-on (minor).** If initialisation stopped because the controller refused an init command
+  (`on_complete` leaves `init` short of `Ready` with `powered = false`), `power(true)` returns `Ok` without doing
+  anything. The request is not refused, and it cannot be retried.
+
+### 4. InputService reaches the profile through the broker, not a bootstrap role (open item - justified departure)
+
+Verified against the code:
+- `system-manifest` requires a role's provider to be a declared dependency ("supplies this role but is not a
+  declared dependency").
+- ServiceManager stops the reverse-dependency closure.
+
+So the bootstrap client the plan names would have made `stop bluetooth_service` stop InputService and the display
+above it, contradicting the plan's own restart/refund proof.
+
+The slot in `input_service.rs` (`Bluetooth`) meets the functional clauses:
+- **Bounded:** one profile connection and one stream.
+- **Recovers:** it re-resolves after a dead profile connection (`retry`, via `client.last_error()`) and reopens
+  after a closed stream.
+- **Same path as other pointers:** it forwards the normalised record through the existing forward path, and not
+  while the protected session holds the keyboard.
+- **No pretend provider:** it publishes no driver provider.
+
+This is not a code defect, but the item is correctly left open for the owner.
+
+### Optional (not required for the milestone)
+
+- `Controller::pump` bounds a command only by `hci_codec::command` (255 parameter bytes). It never checks
+  `limits.ceiling(Kind::Command)`, so a transport advertising a smaller command maximum would refuse the send, and
+  the command would be dropped with a message. The plan asks to "honor smaller advertised/controller limits". The
+  only transport today (the fixture) advertises 258, so nothing is affected yet. `hci::check_outbound` exists and
+  is unused on this path.
+
+## Verified
+
+- **Catalogue scoping:** DeviceManager's `open` finds the provider by kind, slot, publication generation and
+  binding generation, and checks the minted scope against the publication's kind. `subscribe` is refused
+  before the snapshot, and the root's CONNECT answers an inventory-only connection.
+- **Bounded launch:**
+  - `service_manager/bootstrap.rs::service_limits` states exactly the plan's figures for both services.
+  - `launch_limited_from_volume` prepares, releases, and cancels on a failed release, with no fallback.
+  - ProcessService's `limited_domain` rejects zero or unlimited values, creates the Domain and sets the IPC
+    queue, stack and DMA limits before the process can run, and closes the Domain on any failure.
+- **Bond store:**
+  - The file is replaced whole through `open_writer(Replace)` and `writer.commit`, answered only after the
+    commit, and the in-memory table is rolled back on a failed write.
+  - 64 records, 64 kB, unsupported versions and wrong key lengths are all refused.
+  - `list` carries no key, and a record that does not parse is unavailable rather than an empty peer.
+- **Bonded only after the durable commit:** a failed store ends the attempt with a disconnect. `forget` deletes
+  durably before it answers, then disconnects the live link.
+- **Scan:** the deadline is capped at 10 s, with 64 deduplicated results and explicit cancel/complete. Pairing
+  is capped at 60 s, with one live attempt per controller.
+- **Pairing security:** no downgrade (a response without Secure Connections is refused), healthy randomness or
+  no pairing, and the reflected public key is refused.
+- **Controller sessions and bounds:**
+  - Reset advances the session epoch.
+  - Stale-epoch packets are discarded.
+  - Loss releases held buttons before the report streams close.
+  - A withdrawn controller is dropped and its replacement is initialised from scratch.
+  - Scan handles from a previous session answer `not-found`.
+  - Bounds: two controllers, 16 clients, 16 queued commands, four report streams per link, SDU 512 with a
+    1-second assembly deadline.
+- **Fixture:** `drivers::bt_peer` implements AES, CMAC and f4/f5/f6 independently of `service_logic::smp` (the
+  S-box is generated, not copied).
+- **Gate registration:** the gate is registered in `check.sh`, the verify-model catalogue (including the
+  guest-booting list) and `release-required.toml`. The implementer's records show it passing, including the
+  `deny` and stale-handle assertions.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read: `bluetooth_service.rs` (whole),
+`bluetooth_bond_store.rs` (whole), `service_logic::{smp_pairing, hci, l2cap (bounds), bond_store (bounds)}`,
+the Bluetooth parts of `input_service.rs` and `permission_manager.rs`, `service_manager/bootstrap.rs` (limited
+launch), `process_service.rs` (`limited_domain`, prepared launch), `device_manager.rs` (scoped `open`),
+`drivers/core/src/bt_peer.rs` (provenance), and the registration lists.

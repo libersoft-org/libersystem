@@ -61,6 +61,9 @@ const LINK_TICKS: u64 = 1000;
 // newest and never holds more.
 const WATCH_DEPTH: u64 = 2;
 const BUF_BYTES: usize = 8192;
+// One `modem-device.command` frame: its operation and correlation, two secrets of at most eight bytes,
+// an APN of at most 64 and the fixed fields, with room to spare.
+const COMMAND_FRAME: usize = 256;
 
 // ------------------------------------------------------------------ what the service holds
 
@@ -216,12 +219,6 @@ impl Transport for &mut Capture {
 		Err(TransportError::TimedOut)
 	}
 	fn discard_handles(&mut self, _handles: &[u64]) {}
-}
-
-fn captured_device(encode: impl FnOnce(&mut modem_device::Client<&mut Capture>), corr: u32) -> Option<Vec<u8>> {
-	let mut capture = Capture { bytes: Vec::new(), handles: Vec::new() };
-	encode(&mut modem_device::Client::new(&mut capture));
-	stamp(capture.bytes, corr)
 }
 
 fn captured_link(encode: impl FnOnce(&mut network_link_admin::Client<&mut Capture>), corr: u32) -> Option<(Vec<u8>, Vec<u64>)> {
@@ -550,14 +547,18 @@ impl Service {
 			None => (Vec::new(), Vec::new()),
 		};
 		let mut wire = Command { connection_generation: command.connection, transaction: command.transaction, kind: kind_of(kind), sim_generation: command.sim_generation, context_generation: command.context_generation, secret, new_secret, apn: String::from(apn) };
-		let mut bytes = captured_device(|client| drop(client.command(&wire)), corr);
+		// ENCODED INTO A BUFFER THIS SERVICE OWNS AND ZEROES. The generated client encodes into a vector of
+		// its own, growing it as it goes, and frees that vector - and every smaller one it outgrew - with
+		// the PIN still in it.
+		let mut frame = [0u8; COMMAND_FRAME];
+		frame[..2].copy_from_slice(&modem_device::OP_COMMAND.to_le_bytes());
+		frame[2..6].copy_from_slice(&corr.to_le_bytes());
+		let len = wire.encode(&mut frame[6..]).map(|body| 6 + body);
 		scrub(&mut wire.secret);
 		scrub(&mut wire.new_secret);
 		drop(secrets);
-		let sent = bytes.as_ref().is_some_and(|bytes| try_send(modem.chan, bytes, 0));
-		if let Some(bytes) = bytes.as_mut() {
-			scrub(bytes);
-		}
+		let sent = len.is_some_and(|len| try_send(modem.chan, &frame[..len], 0));
+		scrub(&mut frame);
 		// Bounded: a provider that never answers cannot grow this past the commands it could hold.
 		if modem.sent.len() >= 32 {
 			modem.sent.remove(0);

@@ -509,3 +509,79 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0181 (2026-09-24T06:46:31Z):
+
+Rating: 9/10
+
+The service-first stage is complete and correct as far as this review could find. No defect was found that needs a
+code change in what was implemented. The point is withheld because the milestone is not complete: its three
+remaining items depend on P02M0099's real HID Power Device and ACPI producers. The plan makes that explicit, and the
+implementer correctly left those items open rather than redefining completion.
+
+## Findings
+
+No implementation defect.
+
+Open by the plan's own terms, not a code defect of this implementation:
+- P02M0099 owns HID report decoding and the ACPI namespace prerequisites.
+- The final integration item (real HID and ACPI producers through this service with live client assertions) cannot
+  be done until those land.
+
+## Verified
+
+- **Separate authorities.** `liber:power@1` has separate state, control and provider interfaces. In
+  `power_service.rs`, the root a connection is minted from decides its interface. A state connection has no
+  control operation, and an unknown operation closes the connection, so a reader cannot smuggle a control.
+  Bootstrap roles are the `power-source`-scoped catalogue connection and the two roots; there is no system-power
+  client.
+- **Provider protocol (`service_logic::power_registry`).**
+  - A snapshot must end before any change is accepted. Duplicate locals, locals outside 0..16, revision regressions
+    and updates for unregistered or removed locals end the provider.
+  - Every record is checked with `power_model::canon::validate` before the registry sees it, and a non-canonical
+    record ends the provider. The same check applies to reconciliation replies.
+  - Provider loss, withdrawal, protocol error or snapshot timeout (`SNAPSHOT_TICKS`) removes every source it
+    published, with a removal each, and completes an outstanding control as indeterminate.
+  - A replacement publication has another generation and so other source keys.
+- **Bounds.** 128 sources, eight providers and 16 subscribers are enforced. A source beyond the cap is refused,
+  remembered as refused and reported, not admitted by eviction. Enumeration is sorted by key.
+- **Subscriptions.**
+  - `subscribe` builds every snapshot frame and allocates a channel deep enough for them plus `LIVE_DEPTH`
+    before registering the subscriber. Registration happens in the same loop step the snapshot was read in, so
+    nothing falls between the two.
+  - The per-subscriber queue holds 32 records. Ordinary measurements coalesce, and are emitted at most once per
+    100 ms per source.
+  - Additions, removals and alarm transitions are pinned. A removal drops only unread, unpinned measurements of its
+    source.
+  - Overflow, or no drain for five seconds, closes the subscription, and the reader learns that from the channel
+    closing.
+- **Controls.**
+  - A control is checked against a live source key (slot, publication generation, binding generation, local), so
+    forged or stale identities are denied. The advertised operation is checked, outlet in range, delay capped at
+    86400 s.
+  - One control per provider may be outstanding.
+  - The command is sent without blocking. A deadline makes it indeterminate, and it is never retried.
+  - The source is then uncertain until a fresh query (itself on a five-second deadline) answers. A late reply is
+    dropped, not delivered twice.
+  - Continued silence leaves the controls unavailable, while other providers and state clients carry on.
+  - A send that failed is released as `again`, which is correct because nothing could have been delivered.
+- **Normalisation (`power_model`).** Checked in `acpi.rs` and `convert`:
+  - The ACPI unknown sentinel is honoured before arithmetic.
+  - Capacities are scaled by 1000 in the unit's own quantity.
+  - The `_BST` rate is published as power or current according to the power unit, signed by the state bits.
+  - State of charge comes from last-full, never design, capacity.
+  - Absolute thermal readings are `raw * 100 - 273150`, and relative ones keep their reference.
+  - The one derived over-temperature alarm compares against the critical trip on the same reference.
+  - Reported and derived alarms are separate entries.
+- **Fixture confinement.** The fixture control authority is granted only to `powercheck`. A shipping build mints no
+  catalogue connection admitting the fixture kind.
+- **Registration.** The gate is registered in `check.sh`, the verify-model catalogue (including the guest-booting
+  list) and `release-required.toml`.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read: `power_service.rs` (whole),
+`service_logic/src/power_registry.rs` (whole), `libs/power/model/src/acpi.rs` (whole), the relevant parts of
+`convert` and `canon`, the PermissionManager rows, and the registration lists.

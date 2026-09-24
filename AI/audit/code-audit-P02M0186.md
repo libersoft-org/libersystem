@@ -474,3 +474,92 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0186 (2026-09-24T07:14:37Z):
+
+Rating: 10/10
+
+I found no defect that needs a code change within this milestone. Everything the job contract, the evidence
+boundary and the backend contract require is implemented, and in the places the plan names:
+- the job state machine and bounds, in `service_logic::spool_jobs`;
+- device-ID and port evidence, in `service_logic::printer_status`;
+- non-blocking I/O around them, in `spool_service.rs`.
+
+The one fix this milestone needed during the job was the cross-target provider mismatch, fixed with a bounded
+array in `pump` and a providers-list change. It is in place, and it is correct: at most one printer is lost per
+printer per pass.
+
+## Findings
+
+None that require a change.
+
+### Observation (optional, not scored): the published port status is the last one read
+
+`read_port` runs after an attach or a reset (`attached`) and before re-offering a frame after `again` (`tick`).
+Nothing else refreshes it. So between jobs, `printers()` reports the port as it was at attach time.
+
+The observation values are honest about what was read, and the plan does not require a refresh schedule.
+However, an idle printer that ran out of paper still shows `paper-empty: no`. If that matters to the owner, an
+idle status read on a timer, still non-blocking, would fix it; the contract needs no change.
+
+## Verified
+
+- **The state machine.**
+  - Jobs go `writing -> queued -> active -> transferred | failed | cancelled` and never back.
+  - `submit` moves a job only from `writing`, only with exactly the declared length staged, and answers the
+    existing state on a repeat.
+  - `write` refuses a job that is not `writing`. A frame larger than the job's remaining space takes none of it
+    and fails the job with `size-limit`.
+  - Zero-length jobs and jobs over 4 MB are `invalid` before admission. Unsupported languages are refused even
+    earlier.
+  - Admission checks 16 records, 2 per context and 16 MB reserved, and only then reserves fallibly
+    (`try_reserve_exact`).
+  - `end` refunds the reservation once, frees the staging, marks an outstanding write as uncertain unless the job
+    transferred, and retires an unwatched record.
+  - Closing a `writing` job abandons and refunds it. Closing a submitted one detaches it. Closing a terminal one
+    retires it. Cancel ends queued and active jobs, and an active one keeps its acknowledged count and the
+    uncertainty.
+- **Transmission.**
+  - One active job per printer, promoted oldest submission first. A job admitted under another attachment is
+    failed, never sent.
+  - One request is outstanding per printer (`Printer::asked`), and `pump` skips a printer with one outstanding or
+    a retry pending. A late answer to a replaced request carries a stale correlation and is dropped.
+  - An acknowledged count advances the job by exactly that much. A count larger than offered fails the job as
+    uncertain and resets the printer. `again` or zero schedules a port read and a re-offer.
+  - Any other error, or 30 s without an answer, fails the job as uncertain and resets the printer.
+  - The job deadlines are 30 s without progress while active and 10 min from submission.
+  - Withdrawal and connection loss fail every non-terminal job on the printer with `unplugged`. A reset fails them
+    with `reset`, and nothing is replayed.
+  - A failed or unanswered attach or reset leaves the printer unavailable. A new attachment must differ from the
+    previous one.
+- **Evidence.**
+  - The device ID length is big-endian and includes itself; it must equal the received length and be at most
+    4096 bytes before anything is parsed.
+  - Only printable ASCII is accepted, and a duplicate key or disagreeing `CMD`/`COMMAND SET` is ambiguous.
+  - PostScript is an exact, case-insensitive `POSTSCRIPT`, `POSTSCRIPT2` or `POSTSCRIPT3`. Other tokens are kept
+    as bounded metadata (16 x 32).
+  - Port bits: 5 is paper empty, 4 is selected, 3 is NOT error. Cover-open and jam are `unsupported` without the
+    backend's evidence. An unreadable port is `unavailable`.
+- **Identity and admission.**
+  - `create` requires the full `printer-id` (publication, attachment, incarnation) of a `Ready` printer. `stale`,
+    `again` and `io` are distinct.
+  - Grant contexts are capped at 16 and survive their connection while anything is still charged (`prune`).
+  - PermissionManager mints a fresh connection per launch (`Capability::Spool` in the fresh-connection table), and
+    only `spool_probe` is granted it.
+  - The buffers fit both the job write frame and the attach answer frame; a compile-time assertion checks this.
+  - Manifest: `restart = "escalate"`, `ephemeral`, dependencies on LogService, DeviceManager and ProcessService,
+    SERVE, and a `printer`-only CATALOGUE factory.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read:
+- `spool_service.rs` (whole);
+- `service_logic/src/spool_jobs.rs` (whole);
+- `service_logic/src/printer_status.rs` (whole);
+- `spool.lsidl` and `printer-device.lsidl`;
+- PermissionManager's `spool_probe` row and fresh-connection minting;
+- the manifest's service entry.
+
+I checked the port bits against the USB Printer Class 1.1 `GET_PORT_STATUS` layout.

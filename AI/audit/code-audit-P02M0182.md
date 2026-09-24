@@ -520,3 +520,88 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0182 (2026-09-24T06:54:16Z):
+
+Rating: 9/10
+
+The supported slice is implemented completely and correctly. No defect was found in the command policy, the slot and
+transaction state machine, removal and recovery, or the grant model. One deviation from the plan's wording (how
+reader aliases are configured) keeps this from 10.
+
+## Findings
+
+### 1. Reader aliases are compiled into the service, not delivered as bootstrap policy (minor deviation)
+
+The plan says: "Policy selects an explicit configured reader alias ... Bootstrap policy binds approved aliases to
+provider metadata." In `smartcard_service.rs`, the alias table `ALIASES` is a compile-time constant:
+- a development build binds `fixture-a` and `fixture-b` to the fixture's publication names;
+- a shipping build binds none.
+
+The component-to-alias half lives in PermissionManager (`smartcard_policy`), which is the manifest grant path.
+The alias-to-provider-metadata half, however, cannot be configured for a shipping image without a code change,
+so there is no deployment-time path to grant a real reader.
+
+This satisfies "the default is no reader grant" and the fixture-proven slice, but not the plan's "bootstrap
+policy" wording. No real CCID provider exists yet (it is P02M0099's), so nothing is broken today.
+
+## Verified
+
+- **Command allowlist (`service_logic::piv`).**
+  - Only byte-exact canonical SELECT of the full PIV AID and the two canonical GET DATA commands pass.
+  - The short-APDU length grammar is checked first, including the 261-byte cap.
+  - The instruction is judged before the class byte, so VERIFY (including the status-only 4-byte form),
+    CHANGE REFERENCE DATA, RESET RETRY COUNTER, PUT DATA, key generation/import and GENERAL AUTHENTICATE are
+    refused as forbidden behind any class byte. A client's GET RESPONSE is refused.
+- **PIN and authentication.**
+  - The PIN never exists in the service: `verify_template` carries eight 0xFF placeholders for the reader to fill.
+  - The secure-verify request carries block and digit bounds only. A reader whose advertised format cannot fill the
+    template, or which has no pinpad, answers `trusted-input-unavailable`.
+  - `pin_status` maps 63Cx, 6983, 6400 and 6401, and nothing is retried.
+  - `authenticate` requires a verification that succeeded in the same transaction. It builds the P-256
+    GENERAL AUTHENTICATE itself, continues the answer within 64 pieces and 16 kB, and accepts only
+    `7C {82 DER-ECDSA}` with minimal positive integers. The card's 6A8x answers are `unsupported`, and 6982 is
+    `denied`.
+- **Slots and transactions (`service_logic::card_slots`).**
+  - Limits: one operation in flight per slot, eight FIFO waiters with deadlines, a 60 s lease cap, 10 s per APDU and
+    30 s for the pinpad (all bounded by the remaining lease). Queued waiters count against the 32-transaction bound.
+  - Operations are checked against grant, operation mask, card generation, reset epoch, presence and phase before
+    dispatch.
+  - Release, cancel, lease expiry and owner death all end the transaction:
+    - an operation in flight is answered once and aborted;
+    - the slot is not reset until the provider reports the abort complete;
+    - the reset is power off, power on, protocol selection from the ATR (read through the shared
+      `smartcard_model::atr` parser) and SELECT;
+    - only after that can another client acquire the slot;
+    - verification state goes with the transaction.
+  - Abort and reset are capped at five seconds; past that the slot is unavailable and its waiters fail, until the
+    provider reports quiescence.
+  - Removal ends every transaction on the slot. A reinsertion is a new generation, and a draining slot stays draining
+    until its abort completes.
+  - Replies are accepted only for the slot's current request, and the service additionally requires the echoed
+    request, slot and card generation.
+- **Grants.**
+  - The mint resolves an alias to exactly one current publication, refusing absence and ambiguity, and never takes
+    the first reader.
+  - The grant is bound to one reader key and an operation mask, and the public connection has no reader selector.
+  - The grant holds the owner task observer; its termination drops the grant whatever copies of the endpoint
+    exist.
+  - Withdrawal closes every grant to that reader. Only PermissionManager may resolve the minting root: the
+    broker's `cap_grants` lists `CAP_SMARTCARD_ADMIN` for `permission_manager` alone.
+- **Bounds.** Eight readers and four slots are enforced; a larger advertisement is refused, not truncated. There
+  are 32 grants, an ATR of at most 33 bytes and a response of at most 258 bytes.
+- **Events.** Event streams start with an atomic snapshot, charged before admission, and hold at most 16 pending
+  events. Removal and reinsertion are separate events, and an overflowed stream is closed without holding up any
+  transaction.
+- **Provider session.** A provider session is admitted only on the `open_session` answer, the provider's proof it
+  drained a previous session, within 10 s; otherwise the reader is passed over.
+- **Registration.** The gate is registered in `check.sh`, the verify-model catalogue (including the
+  guest-booting list) and `release-required.toml`.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read: `smartcard_service.rs` (whole),
+`service_logic/src/piv.rs` (whole), `service_logic/src/card_slots.rs` (state machine, 255-1044), the broker's
+`cap_grants`/`service_of_cap` in `service_manager.rs`, and PermissionManager's smart-card mint path.

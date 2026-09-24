@@ -55,6 +55,8 @@ enum Pending {
 	Queue,
 	Start { grant: u32, corr: u32, generation: u64 },
 	Stop { generation: u64 },
+	// A stream that never ran, let go: the producer releases its mappings, and nobody waits for the answer.
+	Discard,
 }
 
 // The one stream a camera may carry, and the grant it belongs to.
@@ -91,8 +93,8 @@ struct GrantConn {
 	camera_id: CameraId,
 	events: u64,
 	event_seq: u32,
-	// Completions its stream had no room for, oldest first. At most one per registered buffer: each names a
-	// buffer the camera filled and the client now holds, and the camera fills only buffers that were queued.
+	// Completions its stream had no room for, oldest first. At most one per registered buffer of the running
+	// stream: `completion` lets a newer one for the same buffer, or one from a newer stream, replace it.
 	frames: Vec<CaptureEvent>,
 }
 
@@ -265,11 +267,20 @@ impl Service {
 		}
 	}
 
-	// A COMPLETION IS NEVER DROPPED: it names a buffer the client now holds, and a client that never heard of
-	// it could never give it back - the stream would lose a buffer for good. One that does not fit waits on
+	// A COMPLETION IS NEVER DROPPED WHILE IT NAMES A BUFFER THE CLIENT HOLDS: a client that never heard of it
+	// could never give that buffer back - the stream would lose it for good. One that does not fit waits on
 	// the grant and goes out before anything else does.
+	//
+	// AND AT MOST ONE WAITS PER BUFFER OF THE RUNNING STREAM. A new completion supersedes a waiting one for
+	// the same buffer - the camera refilled it, so the client gave that lease back without reading of it -
+	// and any waiting from an earlier stream, whose leases nothing can return any more. Without that, a
+	// client that returns leases it guessed, or renegotiates, while never reading its events grows this
+	// list for as long as it keeps doing so.
 	fn completion(&mut self, grant: u32, event: CaptureEvent) {
 		let Some(at) = self.grants.iter().position(|held| held.id == grant) else { return };
+		if let CaptureEvent::Frame(frame) = &event {
+			self.grants[at].frames.retain(|waiting| !matches!(waiting, CaptureEvent::Frame(old) if old.buffer == frame.buffer || old.stream_generation != frame.stream_generation));
+		}
 		self.grants[at].frames.push(event);
 		self.flush(grant);
 	}
@@ -345,11 +356,26 @@ impl Service {
 					let _ = client.stop(&generation);
 				});
 			}
-			// Never started, or already over: nothing the producer writes to.
-			cs::Phase::Ready | cs::Phase::Retired => self.cameras[camera].run = None,
+			// Never started: nothing the producer writes to, but it maps what was registered.
+			cs::Phase::Ready => {
+				let generation = run.stream.generation;
+				self.cameras[camera].run = None;
+				self.discard(camera, generation);
+			}
+			// Already over: the stop that ended it released everything.
+			cs::Phase::Retired => self.cameras[camera].run = None,
 			// Still waiting for the producer: the stream stays until it confirms or the camera goes.
 			cs::Phase::Stopping { .. } | cs::Phase::Quarantined => {}
 		}
+	}
+
+	// A STREAM THAT ENDS BEFORE IT STARTED is still one the producer mapped buffers for, and a producer told
+	// nothing keeps them - a dead client's memory among them - until somebody negotiates on this camera
+	// again. `stop` is answered once every mapping is released, and needs no running stream.
+	fn discard(&mut self, camera: usize, generation: u64) {
+		self.send(camera, Pending::Discard, |client| {
+			let _ = client.stop(&generation);
+		});
 	}
 
 	// ------------------------------------------------------------------ providers
@@ -495,14 +521,16 @@ impl Service {
 				}
 				self.answer(grant, corr, result.map(|_| buffer), |buffer, w| w.u8(*buffer));
 			}
-			Pending::Queue => {}
+			Pending::Queue | Pending::Discard => {}
 			Pending::Start { grant, corr, generation } => {
 				if let Err(error) = result {
-					// A START THE PRODUCER REFUSED unwinds: nothing was written, and every buffer comes back.
+					// A START THE PRODUCER REFUSED unwinds: nothing was written, and every buffer comes back -
+					// and the producer lets go of the mappings it was given for them.
 					if let Some(run) = self.cameras[camera].run.as_mut()
 						&& run.stream.generation == generation
 					{
 						run.stream.stopped();
+						self.discard(camera, generation);
 					}
 					self.answer::<()>(grant, corr, Err(error), |_, _| Some(()));
 					return;
@@ -901,8 +929,16 @@ impl Service {
 	fn stop(&mut self, camera: usize, grant: u32, corr: u32) -> Result<(), Error> {
 		let Some(run) = self.cameras[camera].run.as_mut().filter(|run| run.grant == grant) else { return Err(Error::NotFound) };
 		match run.stream.phase() {
-			cs::Phase::Ready | cs::Phase::Retired => {
+			// NEVER STARTED: answered at once, since the producer never wrote to it - and the producer is told
+			// to let go of what it mapped.
+			cs::Phase::Ready => {
+				let generation = run.stream.generation;
 				let _ = run.stream.stop(clock());
+				self.discard(camera, generation);
+				self.answer(grant, corr, Ok(()), |_, _| Some(()));
+				Ok(())
+			}
+			cs::Phase::Retired => {
 				self.answer(grant, corr, Ok(()), |_, _| Some(()));
 				Ok(())
 			}

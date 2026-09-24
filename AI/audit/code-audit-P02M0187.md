@@ -478,3 +478,89 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0187 (2026-09-24T07:18:07Z):
+
+Rating: 10/10
+
+I found no defect that needs a code change within this milestone. The code keeps the split the plan asks for:
+- the protocol is validated once, in `service_logic::ptp`;
+- admission, the budget, identity, snapshots, pages and transfer endings are decided in
+  `service_logic::media_import`;
+- the transport I/O around them is non-blocking, one request per device, in `media_import_service.rs`.
+
+The cross-target fix this milestone needed during the job is correct. In `tick`, the idle transfers' devices are
+collected before the transfers are failed. `Transfer::timed_out` only reads, so both passes select the same
+transfers.
+
+## Findings
+
+None that require a change.
+
+## Verified
+
+- **Containers.**
+  - The header layout is length, type, code and transaction ID. Commands are at most 32 bytes (five parameters)
+    and OpenSession goes out as transaction 0.
+  - `Inbound` parses bulk-IN incrementally across arbitrary splits:
+    - a transaction mismatch, a data container for another operation, a second or unexpected data phase, and any
+      byte after the final response are faults;
+    - a data length of `0xffffffff` is unrepresentable;
+    - a length over the transaction's limit is refused from the header, before any payload is kept;
+    - a response must be 12..32 bytes in whole parameters.
+  - The operation, response and event codes and the ObjectInfo fixed part (52 bytes) match the PTP definitions.
+  - UCS-2 strings require their terminator and no interior NUL. DateTime parsing is fallible.
+  - `format_known` leaves out the reserved image codes 0x3806 and 0x380c.
+- **The device link.**
+  - Every attach or reset must bring a new, non-zero attachment and a fresh session ID, and it advances the
+    content epoch.
+  - A device that lacks any of the eight required operations is listed, but is not usable.
+  - A failed or uncertain command send (`Ask::Command` not `Some(true)`) resets the device instead of resending.
+  - `again` from a pull schedules a retry and is never taken as an ending.
+  - An abandoned transaction is cancelled. A failed cancel, a malformed stream, a lost session or an unanswered
+    request resets the device. Recovery gets two seconds (`RECOVERY_TICKS`) before the device becomes unavailable.
+  - An event overflow and every reported change advance the content epoch. A transfer in progress then ends as
+    stale, and the storages are read again before `storages` answers.
+- **Enumeration and pages.**
+  - A snapshot is one GetObjectHandles transaction with the limit `4 + 4 x 65536`. A longer one is answered
+    `over-limit(count)` and the transaction is cancelled. The count must equal the container's arithmetic before
+    anything is reserved.
+  - Snapshot memory is charged against the 2 MB sub-budget and reserved fallibly, and the transaction ends before
+    the cursor is handed out.
+  - A page makes at most two serialized ObjectInfo reads, each at most 4096 bytes, charged as declared.
+  - A record either fits its 4096-byte budget with both the typed fields and the original dataset, or is named
+    `unrepresentable`. `fits` keeps a page within two records and 8192 bytes including the envelope, and the
+    cursor advances only by the entries sent.
+  - A missing object (`InvalidObjectHandle`) is stale and advances the epoch. Cursors expire after 60 s idle.
+- **Identity and admission.**
+  - `resolve` checks the publication, the client context, the incarnation and the full epoch before anything is
+    sent. A parent must belong to the same device identity.
+  - At most one cursor and one transfer per client and per device, in-flight enumerations and revalidations
+    included. Hard limits answer `exhausted`, and a busy device answers `again`.
+  - Limits: 16 contexts, 8 providers (each charged its buffers at adoption) and the 4 MB budget.
+- **Transfers.**
+  - A read revalidates the object's ObjectInfo revision first, and a changed object is stale.
+  - A size of `0xffffffff` or more than `u32::MAX - 12` is `unsupported`.
+  - The data container must declare exactly the expected length, and bytes past it are corrupt. Bytes are pulled
+    only while a read waits, and at most one chunk is held.
+  - `complete` requires every byte, the framing, and the matching OK response. A zero-byte object also needs the
+    response.
+  - A response that is not OK is `device-error`. Every other ending is `partial` with the delivered count, and the
+    status stays readable until the channel closes.
+  - Cancel, closure and idle timeout (30 s without progress or demand) cancel the transaction and release the
+    chunk. Withdrawal ends transfers as `removed` and closes cursors.
+- **Authority.** PermissionManager mints a fresh connection per launch, and only `import_probe` is granted
+  `media-import`. The service's roles are SERVE and a `ptp-transport`-only CATALOGUE; it has no storage.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read:
+- `media_import_service.rs` (whole);
+- `service_logic/src/ptp.rs` (whole);
+- `service_logic/src/media_import.rs` (whole);
+- `import.lsidl` and `ptp-transport.lsidl`;
+- PermissionManager's `import_probe` row and fresh-connection minting.
+
+I checked the codes and dataset layouts against the PTP (ISO 15740) definitions.

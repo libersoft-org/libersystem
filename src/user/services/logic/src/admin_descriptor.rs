@@ -163,5 +163,34 @@ pub fn idle_prompt() -> Vec<String> {
 	alloc::vec![String::from("ADMINISTRATIVE CONFIRMATION"), String::new(), String::from("No request is waiting."), String::new(), String::from("Escape returns.")]
 }
 
+/// Where the template's values begin: `prompt` names each field in this many columns.
+pub const VALUE_COLUMN: usize = 15;
+
+/// THE PROMPT AS ROWS OF AT MOST `columns` CHARACTERS, WITH NOTHING CUT. A line that does not fit continues
+/// on the next row, indented to where the template's values begin - so a digest or a label is shown whole,
+/// and a continuation cannot pass for a field of its own. `None` when a continuation would have no room: a
+/// screen that narrow cannot show the operation, and showing part of it is what this exists to prevent.
+pub fn wrap(lines: &[String], columns: usize) -> Option<Vec<String>> {
+	if columns <= VALUE_COLUMN {
+		return None;
+	}
+	let mut rows = Vec::new();
+	for line in lines {
+		let mut row = String::new();
+		let mut used = 0;
+		for character in line.chars() {
+			if used == columns {
+				rows.push(core::mem::take(&mut row));
+				row.push_str(&" ".repeat(VALUE_COLUMN));
+				used = VALUE_COLUMN;
+			}
+			row.push(character);
+			used += 1;
+		}
+		rows.push(row);
+	}
+	Some(rows)
+}
+
 #[cfg(test)]
 mod tests;

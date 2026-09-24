@@ -141,9 +141,22 @@ impl Initiator {
 		// THE TRANSIENT KEYS ARE CLEARED ON FAILURE, not only on completion. A failed attempt that
 		// left its Diffie-Hellman key and MacKey in memory would leave key material behind for the
 		// life of this object, which outlives the attempt.
+		self.forget_keys();
+		alloc::vec![Step::Send(alloc::vec![code::PAIRING_FAILED, why]), Step::Failed(why)]
+	}
+
+	// OVERWRITTEN WHERE THEY LIE, THEN LET GO. Setting an `Option` to `None` rewrites its tag and leaves
+	// the key bytes behind it exactly as they were, in memory this object keeps or frees.
+	fn forget_keys(&mut self) {
+		if let Some(dhkey) = self.dhkey.as_mut() {
+			clear(dhkey);
+		}
+		if let Some(keys) = self.keys.as_mut() {
+			clear(&mut keys.mac_key);
+			clear(&mut keys.ltk);
+		}
 		self.dhkey = None;
 		self.keys = None;
-		alloc::vec![Step::Send(alloc::vec![code::PAIRING_FAILED, why]), Step::Failed(why)]
 	}
 
 	/// One PDU from the peer.
@@ -156,8 +169,7 @@ impl Initiator {
 			// THE PEER'S REASON IS REPORTED AND NOT ANSWERED: a failed PDU is not replied to with
 			// another, which would be two sides each telling the other it had failed.
 			self.state = State::Failed;
-			self.dhkey = None;
-			self.keys = None;
+			self.forget_keys();
 			return alloc::vec![Step::Failed(pdu.get(1).copied().unwrap_or(reason::UNSPECIFIED))];
 		}
 		match (self.state, kind) {
@@ -220,18 +232,24 @@ impl Initiator {
 			}
 			(State::AwaitCheck, code::PAIRING_DHKEY_CHECK) => {
 				let Ok(eb) = <[u8; 16]>::try_from(&pdu[1..]) else { return self.fail(reason::INVALID_PARAMETERS) };
-				let (Some(keys), Some(nb)) = (self.keys, self.nb) else { return self.fail(reason::UNSPECIFIED) };
+				let (Some(keys), Some(nb)) = (self.keys.as_ref(), self.nb) else { return self.fail(reason::UNSPECIFIED) };
 				let io_b = [self.response[3], self.response[2], self.response[1]];
 				// THE PEER'S CHECK VALUE IS ITS PROOF THAT IT HOLDS THE SAME DIFFIE-HELLMAN KEY: it
 				// is keyed with the MacKey both sides derived, over the exchange in its own order.
 				if f6(&keys.mac_key, &nb, &self.na, &[0u8; 16], &io_b, &self.peer, &self.local) != reverse16(&eb) {
 					return self.fail(reason::DHKEY_CHECK_FAILED);
 				}
-				self.state = State::Done;
-				// The MacKey has done its work; the LTK is what outlives the exchange.
 				let ltk = keys.ltk;
+				self.state = State::Done;
+				// The Diffie-Hellman key and the MacKey have done their work; the LTK is what outlives the
+				// exchange.
+				if let Some(dhkey) = self.dhkey.as_mut() {
+					clear(dhkey);
+				}
 				self.dhkey = None;
-				self.keys = Some(Keys { mac_key: [0; 16], ltk });
+				if let Some(keys) = self.keys.as_mut() {
+					clear(&mut keys.mac_key);
+				}
 				alloc::vec![Step::Encrypt(ltk)]
 			}
 			// A PDU THAT IS WELL FORMED AND ARRIVES IN THE WRONG STATE is a peer that is not
@@ -262,11 +280,11 @@ impl Initiator {
 	// Stage two, once BOTH the peer's nonce and the Diffie-Hellman key are in hand - they arrive in
 	// either order, because one comes from the peer and the other from the controller.
 	fn check_value(&mut self) -> alloc::vec::Vec<Step> {
-		let (Some(dhkey), Some(nb)) = (self.dhkey, self.nb) else { return alloc::vec::Vec::new() };
+		let (Some(dhkey), Some(nb)) = (self.dhkey.as_ref(), self.nb) else { return alloc::vec::Vec::new() };
 		if self.state != State::AwaitDhKey {
 			return alloc::vec::Vec::new();
 		}
-		let keys = f5(&dhkey, &self.na, &nb, &self.local, &self.peer);
+		let keys = f5(dhkey, &self.na, &nb, &self.local, &self.peer);
 		let io_a = [self.request[3], self.request[2], self.request[1]];
 		let ea = f6(&keys.mac_key, &self.na, &nb, &[0u8; 16], &io_a, &self.local, &self.peer);
 		self.keys = Some(keys);
@@ -275,6 +293,23 @@ impl Initiator {
 		check.extend_from_slice(&reverse16(&ea));
 		alloc::vec![Step::Send(check)]
 	}
+}
+
+// AN ATTEMPT THAT IS DROPPED TAKES ITS KEYS WITH IT, however it ends: the service lets go of an initiator
+// on encryption, on failure, on cancellation and with the link, and none of those may leave the
+// Diffie-Hellman key or the LTK behind in the memory it frees.
+impl Drop for Initiator {
+	fn drop(&mut self) {
+		self.forget_keys();
+	}
+}
+
+// Zero key bytes. `black_box` stands for a reader of what was written, so a store the optimiser could
+// prove dead - the value is about to be discarded, which is exactly when these run - is still made.
+// This crate holds no `unsafe`, so it is this rather than a volatile write.
+fn clear(bytes: &mut [u8]) {
+	bytes.fill(0);
+	core::hint::black_box(bytes);
 }
 
 #[cfg(test)]

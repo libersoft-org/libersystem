@@ -175,3 +175,23 @@ fn selection_is_exactly_what_was_asked_or_nothing() {
 	assert_eq!(select(&normalized, 2, 1, 1_333_332), None, "past the range");
 	assert_eq!(select(&normalized, 2, 1, 333_333).map(|selection| selection.stride), Some(0), "encoded data has no stride");
 }
+
+#[test]
+// THE COLOUR MATRIX IN UVC'S NUMBERING, which is not H.273's: B,G and SMPTE 170M are BT.601 and 1 is BT.709,
+// while FCC, SMPTE 240M, a reserved value and "unspecified" are unknown - H.273's 5 and 6 are BT.601, UVC's
+// are 240M and reserved.
+fn the_colour_matrix_follows_the_uvc_code_points() {
+	for (code, expected) in [
+		(0, Matrix::Unknown),
+		(1, Matrix::Bt709),
+		(2, Matrix::Unknown),
+		(3, Matrix::Bt601),
+		(4, Matrix::Bt601),
+		(5, Matrix::Unknown),
+		(6, Matrix::Unknown),
+		(255, Matrix::Unknown),
+	] {
+		let normalized = normalize(&graph(&[format_mjpeg(1, 1), frame(VS_FRAME_MJPEG, 1, 64, 64, 4096, &[333_333]), color(code)])).unwrap();
+		assert_eq!(normalized.formats[0].matrix, expected, "bMatrixCoefficients {code}");
+	}
+}

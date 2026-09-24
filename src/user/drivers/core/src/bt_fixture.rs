@@ -147,7 +147,15 @@ impl Fixture {
 		let opcode = u16::from_le_bytes([bytes[0], bytes[1]]);
 		let params = &bytes[3..];
 		match opcode {
-			0x0c03 | 0x0c01 | 0x2001 | 0x200b => self.complete(opcode, &[0]),
+			// A RESET ENDS WHAT THE LINK LAYER WAS DOING - the connection and the scan, with no disconnection
+			// event - which is what a host powering the radio off relies on.
+			0x0c03 => {
+				self.scanning = false;
+				self.connected = false;
+				self.encrypted = false;
+				self.complete(opcode, &[0]);
+			}
+			0x0c01 | 0x2001 | 0x200b => self.complete(opcode, &[0]),
 			0x1009 => {
 				let mut out = alloc::vec![0];
 				let mut wire = CONTROLLER_ADDRESS;

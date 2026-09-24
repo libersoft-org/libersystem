@@ -651,3 +651,151 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0188 (2026-09-24T14:04:25Z):
+
+Rating: 8/10
+
+**The authorization path is sound.** I found no way to get an effect without these steps, in this order:
+- a recorded request;
+- a person's fresh Enter on an acknowledged protected session;
+- a recorded approval;
+- a recorded consumption;
+- a final owner and deadline check.
+
+The pure modules carry every decision the plan names, and the service keeps to one outstanding exchange per peer
+with 5 s deadlines. The main concerns are:
+- **What the person sees (defect):** the protected screen silently cuts lines, and at the harness's own
+  resolution that includes the payload digest.
+- **An open item:** the registration item is still unticked. What it lacks is the owner's `./verify.sh` run, not
+  code.
+
+## Findings
+
+### 1. The protected screen silently truncates the canonical operation (defect)
+
+The plan: "The person must invoke the chord and inspect the canonical action/target/payload there". The prompt
+comes from `admin_descriptor::prompt`, and `render` (`admin_service.rs`) draws it one text line per template line.
+`render` never wraps a line. When the next glyph would pass the right edge, the rest of the line is dropped
+without a mark:
+
+    if x + cell_w > width || top + cell_h > height { break; }
+
+The geometry:
+- 8x16 cells, doubled when the width is at least 1024.
+- A left margin of `min(4 cells, width/8)`.
+- So a line holds 76 characters at 1280 px, 60 at 1024 px and 96 at 800 px.
+
+The two lines that matter do not fit:
+- **The payload line.** `Payload:       N bytes, SHA-256 <64 hex digits>` is about 99 characters. It fits only
+  on screens between 824 and 1023 px wide, or 1648 px and wider.
+  - The harness gives the guest QEMU's virtio GPU and overrides no resolution, so the default 1280x800 applies.
+    There, the person sees 41 of the 64 digest digits.
+  - At 1024x768 they see 25.
+  - Nothing on the screen says the rest is missing.
+- **The label line.** `Label:         "<label>" (the requester's words, not verified)` loses its
+  "not verified" marker for any label longer than about 21 characters at 1280 px, and loses part of the label
+  beyond that. The label bound is 128 bytes, and escaping lengthens it further.
+
+Why it matters: the protected screen is the only place the person can check the frozen payload's digest. As
+drawn, the milestone's central evidence (the canonical descriptor) is incomplete on typical screens, with no hint
+that it is.
+
+The authorization itself is unaffected:
+- the confirmed operation is still exactly the frozen one;
+- 41 hex digits is still a strong prefix;
+- the "Label:" prefix still sets the label apart.
+
+The gate's frame check counts colours only (field, band, text, hostile green), so it could not see this. Wrapping
+a line that does not fit onto the next line, or splitting the digest across two lines, would fix it. Choosing
+the cell scale from the longest line would also work.
+
+### 2. The registration item is still open (open item, no code change)
+
+The gate is registered in all three places:
+- `check.sh` (`qemu-admin-path`);
+- `verify-model/src/catalog.rs` (the gate and its prerequisite, and the guest-booting list);
+- `release-required.toml`.
+
+The bypass demonstrations are recorded. What the item still names is the owner's `./verify.sh --plan` and
+`./verify.sh` run. The item is correctly left unticked until that run, and it is not a defect of the code.
+
+## Verified
+
+- **Grants and owners.**
+  - PermissionManager is the only place that mints `admin-request`, only through `grant_for_task` (all four
+    launch paths), and only for a policy row. It passes a `RIGHT_WAIT | RIGHT_TRANSFER` duplicate of the prepared
+    task and the task's koid as the launch correlation.
+  - `for_capability(AdminRequest)` is 0, so there is no unbound fallback.
+  - The factory refuses an owner that has ended or cannot be observed, using a wait with an already-reached
+    deadline.
+  - `check_owners` asks every owner explicitly before anything else that is ready is served, so termination wins
+    over a key, a reply or a redemption that is ready at the same time.
+  - Loss of the connection and death of the owner are independent losses. Either one cancels a pending request
+    and any unconsumed grant, whoever holds the endpoints.
+- **The broker.**
+  - Admission declines, all as `declined` and all recorded:
+    - a requester that is gone;
+    - a request outside its scope or past its bounds;
+    - no path to a person;
+    - an unrecorded outcome;
+    - contention.
+  - The executor's descriptor must match the asked action, parameters and payload length, and name itself as
+    published.
+  - Every journal acknowledgment is correlated by request and event, and a late one changes nothing.
+  - The confirmation deadline is 60 s from the request's commit and the grant deadline is 30 s.
+  - Approval requires the shown session, a live owner, the deadline not passed and no `blocked`. It first
+    revalidates with the executor, and only then records.
+  - Redemption requires `Granted`, a live original connection and owner, and the deadline. It records consumption
+    and rechecks both at the acknowledgment, which is the execution admission boundary. A lost or failed
+    consumption record means no dispatch, with the grant spent.
+  - A lost execution reply is `outcome-unknown` after the executor's own deadline, and is never retried.
+- **Presentation and input** (apart from Finding 1).
+  - DisplayService: while the lock is held, surfaces are created hidden, hidden presents complete as occluded,
+    and the protected pseudo-surface holds no ordinary focus. The prior surface is restored on release. A resize,
+    a replaced backing or a lost scanout ends the session.
+  - InputService:
+    - secure attention is taken from the trusted sink, which only keyboard drivers can feed, before any ordinary
+      delivery;
+    - the chord is swallowed on the ordinary path;
+    - protection revokes focus, discards queued pointer events and tells the console it has lost the keyboard;
+    - arming waits until nothing is held.
+  - `Decision` approves only an Enter down and up after both the arm and the present acknowledged the same epoch.
+    Any other key pressed in between spoils the Enter.
+- **The executor seam.**
+  - Executors come only from `admin-executor` publications. The probe mapping exists only in development builds,
+    and the DFU slot declines until something publishes it.
+  - The fixture copies at most 4096 payload bytes, and never more than the object holds. Its start guard checks
+    the epoch, the target generation, cancellation, whether it has started and the lifetime, and marks it started
+    once.
+- **The journal.**
+  - Segments: at most 1024 records and 8 MB each, at most four, and only complete ones are retired.
+  - Space is reserved per request at preparation, and a segment is pinned while a request in flight has a record
+    in it.
+  - A record is at most 8192 bytes, and one that would be larger carries a bounded refusal instead.
+  - The emergency ring is 256 entries in order, dropping from behind the head and counting what it drops.
+  - An unanswered commit is discarded, never rewritten.
+  - A restart reads the journal back for numbering and investigation only. A torn tail is never appended to. The
+    new epoch is higher than any recorded one.
+- **Records and documentation.**
+  - Records carry the broker epoch, request, launch, trusted requester, action, descriptor digest, event, reason,
+    monotonic time and optional UTC with its provenance, and no payload.
+  - `docs/THREAT_MODEL.md` §2.3 names the trusted drivers, the display, InputService and AdminService.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read:
+- `admin_service.rs` (whole);
+- `service_logic` `admin_broker.rs`, `admin_descriptor.rs`, `admin_journal.rs`, `trusted_keys.rs` and
+  `display_lock.rs` (whole), and the broker's test names;
+- `drivers` `admin_operation.rs` and `admin_fixture.rs` (whole);
+- `admin.lsidl`;
+- DisplayService's lock, present, release and reset paths;
+- InputService's trusted sink, arming and `protect`;
+- PermissionManager's `AdminRequest` minting and `admin_policy`;
+- the gate's frame check;
+- THREAT_MODEL §2.3.
+
+The line-width arithmetic in Finding 1 is taken from `render`'s constants and the template's line formats.

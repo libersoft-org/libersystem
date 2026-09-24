@@ -191,3 +191,20 @@ fn a_failure_from_the_peer_ends_the_attempt_and_nothing_revives_it() {
 	assert!(pairing.on_dhkey(&dhkey_wire()).is_empty());
 	assert_eq!(pairing.ltk(), None);
 }
+
+#[test]
+// THE TRANSIENT KEYS DO NOT OUTLIVE THEIR WORK: once the peer's check value verifies, the Diffie-Hellman
+// key is gone and the MacKey zeroed, and only the LTK is kept - and an attempt that failed keeps neither.
+fn only_the_ltk_outlives_a_completed_exchange_and_nothing_a_failed_one() {
+	let (mut pairing, _) = to_check(false);
+	pairing.on_pdu(&peer_check());
+	assert!(pairing.dhkey.is_none(), "the Diffie-Hellman key is let go");
+	let keys = pairing.keys.expect("the LTK is kept for encryption");
+	assert_eq!(keys.mac_key, [0u8; 16], "the MacKey is zeroed");
+	assert_eq!(pairing.ltk(), Some(keys.ltk));
+	let (mut failed, _) = to_check(false);
+	let mut wrong = peer_check();
+	wrong[5] ^= 0xff;
+	failed.on_pdu(&wrong);
+	assert!(failed.dhkey.is_none() && failed.keys.is_none(), "a failed attempt keeps no key");
+}

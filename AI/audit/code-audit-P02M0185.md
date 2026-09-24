@@ -444,3 +444,103 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0185 (2026-09-24T07:11:56Z):
+
+Rating: 9/10
+
+The following all do what the plan says:
+- the generic queue (`service_logic::bounded_event`);
+- the staged USB-MIDI 1.0 decoder (`drivers::usb_midi`);
+- MidiService's receivers, admission and endings;
+- the grant path.
+
+I checked the decoder code index by code index against the USB MIDI 1.0 table, and found no misclassification.
+One path does not end a receiver when the plan and the code's own comment say it should.
+
+## Findings
+
+### 1. A start the provider refuses leaves the receiver active and silent (minor defect)
+
+`AdminView::mint` sends `midi-device.start(endpoint, generation)` without waiting, registers the receiver as
+`active`, and answers the grant. The provider's reply arrives in `Service::on_reply`, and a refusal is handled
+there as follows:
+
+    // A start the provider refused ends that receiver: it will never deliver.
+    if reader.tag() == Some(false) {
+        print(b"MidiService: a MIDI device refused to start or stop an endpoint\n");
+    }
+
+It only prints. `Provider::sent` keeps bare correlations, so the reply cannot be matched to a receiver, and the
+receiver is never ended. The consequences:
+- The endpoint's one receiver slot stays taken. `mint` refuses a second receiver as busy while one is `active`.
+- The client's reads return empty batches with no `end` until the client stops it or its owner ends.
+
+This goes against "loss/removal cannot be silent" and "reclaiming slots after failed opens". The fixture never
+refuses a `start` for an endpoint it advertises, so the gate cannot show this. A real provider (P02M0099) can
+refuse, for example on a transfer setup failure.
+
+Keeping the receiver generation with the correlation, and ending that receiver (e.g. `removed` or
+`source-discontinuity`) on a refused start, would make the code do what its comment says.
+
+## Verified
+
+- **`bounded_event`.**
+  - The 256-event and 32 kB limits are checked at admission. The caller supplies each event's encoded size.
+  - An overflow terminates the stream: the queue is cleared, and the end is kept outside it and returned only
+    after the events queued before it.
+  - The first end stands.
+  - The sequence is assigned in push order, never sorted, and `u64::MAX` ends the stream with `exhausted` instead
+    of wrapping.
+  - The module knows no MIDI and no `rt`. Its tests run a key-press `generic-event` fixture through it.
+- **Decoder.** Every CIN is checked against the specification's table:
+  - 0/1 are reserved faults.
+  - 2 is F1/F3 plus one data byte, with padding checked. 3 is F2 plus two data bytes.
+  - 4 is a SysEx start or continue. 5 is F7 as an end, or F6.
+  - 6/7 are two- and three-byte ends, including one-fragment F0..F7.
+  - 8..E require the status nibble to equal the CIN, with data bytes and padding checked per length.
+  - F is the single-byte form, with SysEx tracking identical to the packet form, realtime bytes passed as short
+    messages, and any other byte as `raw`.
+  - SysEx is counted, never assembled.
+  - The 64 kB cap includes delimiters and uses checked accumulation.
+  - An abort is raised for restart, interruption by a non-realtime status, a fault on the cable, and two idle
+    seconds (200 ticks).
+  - After an abort, the remainder is discarded until an end or a new start, and a discarded end is never reported
+    as a successful end.
+  - A bad alignment or an out-of-range cable resets every cable and emits a fault with no cable. A fault on a
+    known cable resets only that cable.
+- **Service.**
+  - At most four providers, eight endpoints each, and 1..=16 cables per endpoint. An advertisement outside these
+    is refused whole.
+  - One active receiver per endpoint (a second is `again`), and 32 connections.
+  - Inventory's `open` answers `unsupported` for transmit or UMP, and `denied` for receive.
+  - A batch is accepted only for the active receiver with the same provider, endpoint and generation, and
+    refused if it is from the future.
+  - Every decoder output, including aborts and faults, goes through the same bounded queue with the batch's
+    receipt time. An overflow ends the receiver and stops the provider.
+  - A provider's `lost` ends the receiver with `source-discontinuity`.
+  - Withdrawal or provider loss ends every receiver on it with `removed`, and the connection stays readable.
+  - `revoke` ends with `revoked`. The owner's end retires the receiver: its connection is closed and so is its
+    observer.
+  - Reads pull at most 64 events, one waiting read at a time, and replies are sent without blocking.
+- **Grants.**
+  - PermissionManager passes a `RIGHT_WAIT | RIGHT_TRANSFER` duplicate of the prepared task.
+  - A mint resolves the alias to exactly one publication and the index to one of its endpoints.
+  - The source identity carries the incarnation, the publication and binding generations, the endpoint and the
+    receiver generation.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read:
+- `midi_service.rs` (whole);
+- `service_logic/src/bounded_event.rs` (whole) and its test names;
+- `drivers/core/src/usb_midi.rs` (whole) and its test names;
+- `event.lsidl`, `midi.lsidl` and `midi-device.lsidl`;
+- `midi_fixture.rs`'s `start`, `stop` and `deliver`;
+- PermissionManager's `midi_policy` and `MidiInput` minting.
+
+I also checked where the `development` feature applies. Static services are built by `build.sh` with
+`$(dev_features)`, so the gated `ALIASES` is present in a development image. Dynamic programs are built with
+`shared-image` only, which is why the camera's alias is not gated.

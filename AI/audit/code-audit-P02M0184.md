@@ -482,3 +482,151 @@ The gate was then run on the shipping image, which `./verify.sh` builds for its 
 `hostile-quote`, failed both times with a different symptom each time, while six runs of that row by itself passed
 all eight of its assertions. Details, commands and times are in `code-audit-P02M0183.md`. P02M0183 stays open on
 `ipv6-peer` alone; nothing about this milestone changes.
+
+---
+
+AUDITOR'S REVIEW ON P02M0184 (2026-09-24T07:08:32Z):
+
+Rating: 8/10
+
+The contract, the grant path, the descriptor normalizer, the selection and lease state machine, the stop deadline
+and the timing and loss handling are sound, and they match the plan closely. Three things fall short of
+what the plan asks for:
+- the per-grant completion backlog is not actually bounded;
+- a stream that ends before `start` leaves its buffers mapped in the provider;
+- the normalizer's colour-matrix table uses the wrong code points.
+
+## Findings
+
+### 1. The waiting-completion backlog is not bounded to the four buffers (defect)
+
+The plan: "Bound completion metadata to the four registered buffers". `camera_service.rs` keeps completions that
+did not fit the client's event stream in `GrantConn::frames`. `Service::completion` pushes unconditionally, and
+only a successful send in `flush` removes an entry. The bound depends on a comment's assumption ("at most one per
+registered buffer ... the camera fills only buffers that were queued"): that a client cannot give a buffer back
+before it has heard of its completion.
+
+`Service::release` breaks that assumption. It checks only `Stream::release`, which compares the holder with
+`Holder::Leased(lease)`. It neither consults nor removes the waiting entry. Leases are not secret: `Stream::lease`
+numbers them 1, 2, 3, ... per stream, and the fixture fills slots in registration order. So a client that does
+not read its event stream can do the following:
+- fill it (eight entries);
+- call `release(buffer, lease)` with predicted leases (a wrong guess costs one `stale`);
+- let the provider refill the buffer.
+
+Each round appends another completion for the same buffer, so `frames` grows at the frame rate for as long as
+the client keeps this up. This is service-heap growth caused by one granted client, which the item forbids. A
+service that runs out of memory takes every camera's capture down with it. While the backlog is non-empty,
+`statuses_due` also keeps the loop polling every tick.
+
+A small fix would close it:
+- refuse (`again`) a release of a buffer whose completion is still waiting; or
+- when a buffer is requeued, drop its waiting entry (its lease no longer matches).
+
+Either keeps `frames` at most `MAX_BUFFERS` long.
+
+### 2. A stream that ends before `start` leaves its buffers mapped in the provider (minor defect)
+
+A stream can end while in `Ready`, after buffers were registered, in three ways:
+- the client stops it: `Service::stop` answers at once through `Stream::stop`;
+- its grant retires, through close, owner death or revocation: `Service::end_stream` sets `run = None`;
+- the provider refuses `start`: `provider_answer` / `Pending::Start` calls `Stream::stopped`.
+
+In none of these cases is the provider told anything. `camera_fixture.rs` maps each buffer in `register`, and
+releases the mapping only on `stop`, on the next `negotiate` ("replaces a stream that never started") or on
+departure. So up to four client objects (32 MB) stay mapped and referenced by the provider until another client
+negotiates on that camera. If the client died, they are objects of a dead client.
+
+This goes against "Release service/producer mappings and handles after confirmed stop". The service and the
+contract already have what is needed: `camera-device.stop(stream-generation)` is "answered once every buffer is
+back and every mapping of it released", and the fixture accepts it for a stream that never started.
+
+The gate does not cover this path. `camcheck` checks `stats.mapped == 0` only after a started stream (`capture`,
+`inherit`). No new grant is exposed: the provider writes only a running stream, and the next negotiation
+replaces the slots. So the impact is a bounded retention, not a leak of pixels.
+
+### 3. The UVC colour-matrix code points are mapped wrongly (minor defect)
+
+`uvc::normalize` maps `bMatrixCoefficients` as `1 => Bt709, 4 | 5 | 6 => Bt601`, everything else unknown. In
+the UVC colour-matching descriptor, the code points are:
+- 1: BT.709;
+- 2: FCC;
+- 3: BT.470-2 B,G;
+- 4: SMPTE 170M, i.e. BT.601, the default;
+- 5: SMPTE 240M;
+- 6 and above: reserved.
+
+The Linux UVC driver maps these the same way (FCC, B,G and 170M to 601; 240M to its own encoding). The set used
+here resembles H.273's numbering, where 5 and 6 are both BT.601. Common cameras (4) and the fixture's two formats
+(4, 1) come out right, and 2/3 becoming "unknown" is allowed. However, an SMPTE 240M stream and any reserved value
+are reported as BT.601, which contradicts "color-range/matrix metadata with unknown allowed". The later UVC
+module will reuse this production helper for real cameras. The table should be `1 => Bt709, 2 | 3 | 4 => Bt601,
+_ => Unknown`, and the module test should cover 5.
+
+### Observation (not scored as a defect): the camera alias and the policy rows are compiled in
+
+`ALIASES` (`camera_service.rs`) binds only the fixture's provider name, and PermissionManager's `camera_policy`
+names only the gate's probes. Both are in every build. A shipping image binds no fixture, so nothing can be
+granted there. This matches the default-deny intent, and is the same shape as the modem's (P02M0183). It means a
+real camera cannot be granted without a code change, which is P02M0099's to settle.
+
+## Verified
+
+- **Roles and wiring.**
+  - `camera` is value 16 in `device.lsidl`, `driver_protocol::provider::CAMERA` and both of DeviceManager's
+    conversions.
+  - The service receives a `camera`-only catalogue connection and the SERVE and ADMIN roots, and subscribes to its
+    kind.
+  - Withdrawal (`lose`) retires every grant bound to the camera; a republished camera is a new `CameraId`
+    (slot, generations, incarnation). The gate's `quarantine` scenario proves the latter.
+- **Authority.**
+  - Inventory (`InventoryView`) has only `cameras` and `sizes`; any other request closes the connection.
+  - `mint` resolves an alias to exactly one current publication or fails, and starts nothing.
+  - PermissionManager hands the service a `RIGHT_WAIT | RIGHT_TRANSFER` duplicate of the prepared task, and the
+    service waits on it. Owner termination, closure, invalid requests and `revoke` all go through `retire`, which
+    closes the connection, the owner handle and the event stream, and stops the stream internally. The gate's
+    `inherit` and `camfail` show that a duplicated endpoint and a failed prepared launch both end.
+  - Admission of observers and grants is 32; admins are 4.
+- **Negotiation.**
+  - One stream per camera, for any grant; renegotiation needs a retired stream; a negotiation already in flight
+    answers busy; a quarantined camera answers `io`.
+  - The expected selection is computed before asking (`cs::expect`). The answer is accepted only for the same
+    stream generation and when `cs::verify` matches every field, including stride and plane offset. Otherwise no
+    stream exists.
+- **Buffers.**
+  - `register` checks the real object type, size and koid through `object_info`, the per-buffer, per-stream and
+    global byte bounds (`Stream::register`) and duplicate backings.
+  - Rights are narrowed to map, read, write and transfer (a handle that cannot be narrowed is refused); the IDL's
+    `@rights(map, write)` already required map and write.
+  - Leases move client → producer → leased on the stream's own checks; stale and double returns are refused.
+  - Stop waits for the producer's confirmation. `tick` quarantines after `STOP_TICKS` (200 ticks, 2 s), and the
+    stop answers `timed-out`. A late confirmation or the provider's death releases the quarantine.
+- **Timing and loss.**
+  - The arrival time is the provider's `clock_ns` sample, refused if from the future.
+  - Device time is passed through only when `DeviceClock::valid`. Its reset generation advances on reset, domain
+    change and every gap.
+  - The observation sequence advances for frames, counted drops (no-buffer and device) and gaps. An unexplained
+    jump counts as an unknown discontinuity, never as a number of frames.
+  - The status is a coalesced snapshot outside the completion queue, sent only after the waiting completions, and
+    readable through `status`.
+- **The normalizer (`uvc.rs`).**
+  - Descriptor lengths (27/11 for formats, 26 + 4n or 38 for frames, 6 for colour) are checked against UVC 1.5.
+  - Counts and budgets are enforced: 8 formats, 32 sizes, 32 intervals, and a 64 KB graph.
+  - Other checks: zero or overflowing dimensions, a YUY2 size larger than the declared buffer, zero, duplicate or
+    disordered intervals, and duplicate indices. Other formats are skipped and counted.
+  - `select` returns exactly what was asked for, or nothing.
+
+## Checks performed
+
+Code reading only; nothing was built or run for this review. Files read:
+- `camera_service.rs` (whole);
+- `service_logic/src/camera_streams.rs` (whole);
+- `drivers/core/src/uvc.rs` (whole) and its colour-format test inputs;
+- `camera_fixture.rs` (stream, register, stop and release paths);
+- `camera.lsidl` and `camera-device.lsidl`;
+- PermissionManager's `CameraCapture` minting and `camera_policy`;
+- the kind value in `device.lsidl`, `driver_protocol` and DeviceManager;
+- the gate script and `camcheck.rs`'s `busy`, `inherit`, `quarantine` and `again` scenarios.
+
+The UVC colour-matching code points were checked against the specification's table and the Linux `uvc_driver.c`
+mapping.

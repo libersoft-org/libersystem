@@ -54,7 +54,9 @@ struct Provider {
 	events: u64,
 	// Index, name and cable count of each receive endpoint.
 	endpoints: Vec<(u32, String, u8)>,
-	sent: Vec<u32>,
+	// Calls not yet answered: the correlation, and for a `start` the endpoint and receiver generation it
+	// was for - so a refusal can end the receiver it refused.
+	sent: Vec<(u32, Option<(u32, u64)>)>,
 	next_corr: u32,
 }
 
@@ -229,7 +231,7 @@ impl Service {
 		self.observers.len() + self.receivers.len()
 	}
 
-	fn send(&mut self, provider: u32, encode: impl FnOnce(&mut midi_device::Client<&mut Capture>)) -> bool {
+	fn send(&mut self, provider: u32, start: Option<(u32, u64)>, encode: impl FnOnce(&mut midi_device::Client<&mut Capture>)) -> bool {
 		let Some(at) = self.providers.iter().position(|held| held.key == provider) else { return false };
 		let corr = self.providers[at].next_corr;
 		self.providers[at].next_corr = self.providers[at].next_corr.wrapping_add(1).max(1);
@@ -238,7 +240,7 @@ impl Service {
 			if self.providers[at].sent.len() >= 32 {
 				self.providers[at].sent.remove(0);
 			}
-			self.providers[at].sent.push(corr);
+			self.providers[at].sent.push((corr, start));
 		}
 		sent
 	}
@@ -253,7 +255,7 @@ impl Service {
 		if receiver.active {
 			receiver.active = false;
 			let (provider, endpoint, generation) = (receiver.provider, receiver.endpoint, receiver.generation);
-			self.send(provider, |client| {
+			self.send(provider, None, |client| {
 				let _ = client.stop(&endpoint, &generation);
 			});
 		}
@@ -344,11 +346,20 @@ impl Service {
 			}
 			let mut reader = Reader::new(&buf[..len]);
 			let Some(corr) = reader.u32() else { return Err(b"a reply carried no correlation") };
-			let Some(place) = self.providers[at].sent.iter().position(|sent| *sent == corr) else { continue };
-			self.providers[at].sent.remove(place);
-			// A start the provider refused ends that receiver: it will never deliver.
-			if reader.tag() == Some(false) {
-				print(b"MidiService: a MIDI device refused to start or stop an endpoint\n");
+			let Some(place) = self.providers[at].sent.iter().position(|(sent, _)| *sent == corr) else { continue };
+			let (_, start) = self.providers[at].sent.remove(place);
+			if reader.tag() != Some(false) {
+				continue;
+			}
+			print(b"MidiService: a MIDI device refused to start or stop an endpoint\n");
+			// A START THE PROVIDER REFUSED ENDS THAT RECEIVER: it will never deliver, and left active it would
+			// hold its endpoint's one slot while its reader waited on nothing. Ended as removed - its source
+			// failed - and with no stop sent for a start that never took.
+			if let Some((endpoint, generation)) = start
+				&& let Some(at) = self.receivers.iter().position(|receiver| receiver.active && receiver.provider == key && receiver.endpoint == endpoint && receiver.generation == generation)
+			{
+				self.receivers[at].active = false;
+				self.end(at, be::Reason::Removed);
 			}
 		}
 	}
@@ -460,7 +471,7 @@ impl midi_admin::Service for AdminView<'_> {
 		service.next_generation += 1;
 		let info = &service.providers[at].info;
 		let source = EventSource { incarnation: service.incarnation, slot: info.slot, generation: info.provider_generation, binding_generation: info.binding_generation, endpoint, receiver_generation: generation };
-		if !service.send(key, |client| {
+		if !service.send(key, Some((endpoint, generation)), |client| {
 			let _ = client.start(&endpoint, &generation);
 		}) {
 			close(mine);
