@@ -1,0 +1,17 @@
+package liber:spool@1
+record printer-id(slot:u32,generation:u32,binding-generation:u64,attachment:u64,incarnation:u64)
+enum document-language(postscript=1,pcl=2,pdf=3)
+enum observation(yes=1,no=2,unavailable=3,unsupported=4)
+record port-status(paper-empty:observation,selected:observation,error:observation,cover-open:observation,jam:observation)
+record printer-info(id:printer-id,model:string:bound=64,languages:list<document-language>:bound=3,status:port-status,available:bool,queued:u8,active:bool,max-job-bytes:u32)
+enum job-state(writing=1,queued=2,active=3,transferred=4,failed=5,cancelled=6)
+enum job-cause(size-limit=1,unplugged=2,backend-error=3,stalled=4,lifetime=5,reset=6,abandoned=7,cancelled=8)
+record job-status(state:job-state,printer:printer-id,declared:u32,staged:u32,acknowledged:u32,cause:option<job-cause>,delivery-uncertain:bool)
+interface spool
+method spool.printers op=1 () -> result<list<printer-info>, liber:base@1::error>:bound=8
+method spool.create op=2 (printer:printer-id:rights=,language:document-language:rights=,length:u32:rights=) -> result<handle<channel>, liber:base@1::error>
+interface job
+method job.write op=1 (bytes:list<u8>:bound=4096:rights=) -> result<u32, liber:base@1::error>
+method job.submit op=2 () -> result<job-status, liber:base@1::error>
+method job.status op=3 () -> result<job-status, liber:base@1::error>
+method job.cancel op=4 () -> result<job-status, liber:base@1::error>

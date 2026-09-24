@@ -249,7 +249,10 @@ STEP_FIELDS = {
 	# because restoration is escape sequences and nothing else.
 	'restored': {'required': ('expect',), 'optional': ('timeout',)},
 	# Wait for the guest's terminal output to contain `contains`, or fail on the deadline.
-	'expect': {'required': ('contains',), 'optional': ('timeout',)},
+	# `unordered` looks from where the last step that did something left the log, not from where the
+	# previous `expect` matched: for lines two processes print about one action, whose order in the log is
+	# the order two paths to the console happened to deliver them in.
+	'expect': {'required': ('contains',), 'optional': ('timeout', 'unordered')},
 	# Wait for the shell prompt to come back.
 	'prompt': {'required': (), 'optional': ('timeout',)},
 	# Assert that the guest's terminal output since the previous step does NOT contain
@@ -413,6 +416,8 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} (refused): program {step["program"]!r} is not a plain component name')
 		if 'status' in step and (not isinstance(step['status'], int) or isinstance(step['status'], bool) or not 0 < step['status'] < 256):
 			raise ScenarioError(f'{where} (refused): status must be a protocol status, 1..255')
+	if kind == 'expect' and 'unordered' in step and not isinstance(step['unordered'], bool):
+		raise ScenarioError(f'{where} (expect): unordered must be true or false')
 	if kind == 'absent' and 'until' in step and step['until'] not in ('quiet', 'prompt'):
 		raise ScenarioError(f'{where} (absent): until must be quiet or prompt')
 	if kind == 'restored':
@@ -434,6 +439,9 @@ class Guest:
 	def __init__(self, lab):
 		self.lab = lab
 		self.at = lab.serial_size()
+		# Where the log stood when the last step that is not an `expect` began: what an `unordered`
+		# expectation searches from.
+		self.acted = self.at
 		# What the launched program has printed so far, accumulated across `output` steps so a
 		# later assertion can match something an earlier read already consumed.
 		self.launched = ''
@@ -521,6 +529,8 @@ def run(document, lab, verbose=False):
 			limit = min(step.get('timeout', 30) * TIME_SCALE, remaining)
 			label = f'{index + 1}/{len(document["step"])} {step["do"]}'
 			at = time.monotonic()
+			if step['do'] != 'expect':
+				guest.acted = guest.at
 			try:
 				run_step(step, guest, lab, limit, index)
 			except ScenarioError:
@@ -757,9 +767,15 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'expect':
 		wanted = step['contains'].encode()
 		end = time.monotonic() + limit
+		start = min(guest.acted, guest.at) if step.get('unordered') else guest.at
 		while True:
-			raw = guest.raw_since(guest.at)
+			raw = guest.raw_since(start)
 			found = lab_module.strip_ansi(raw).find(wanted)
+			if found >= 0 and step.get('unordered'):
+				# AN UNORDERED MATCH NEVER MOVES THE CURSOR BACK: the next ordered step still starts after
+				# everything an earlier one consumed.
+				guest.at = max(guest.at, start + raw_span(raw, found + len(wanted)))
+				return
 			if found >= 0:
 				# **THE CURSOR STOPS AT THE END OF THE MATCH, NOT AT THE END OF THE READ.**
 				#

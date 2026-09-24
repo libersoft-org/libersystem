@@ -211,6 +211,54 @@ class AbsentTest(unittest.TestCase):
 		self.assertIn('hello', self.guest.output())
 
 
+class UnorderedExpectTest(unittest.TestCase):
+	def setUp(self):
+		self.directory = tempfile.TemporaryDirectory()
+		self.log = SerialLog(self.directory.name)
+		self.guest = scenario.Guest(FakeLab())
+		self.addCleanup(self.directory.cleanup)
+		self.addCleanup(setattr, lab, 'SERIAL_OVERRIDE', None)
+
+	def expect(self, contains, unordered=False, limit=1):
+		step = {'do': 'expect', 'contains': contains}
+		if unordered:
+			step['unordered'] = True
+		scenario.run_step(step, self.guest, FakeLab(), limit, 0)
+
+	# Two lines about one action, in the order the log happened to get them: an ordered pair fails on the
+	# second, and an unordered one finds both.
+	def test_lines_in_either_order_after_the_action(self):
+		self.guest.acted = self.guest.at
+		self.log.write('service: declined\nprobe: ends\n')
+		self.expect('probe: ends')
+		with self.assertRaises(scenario.ScenarioError):
+			self.expect('service: declined')
+		self.expect('service: declined', unordered=True)
+
+	# It never reaches back past the action it belongs to.
+	def test_nothing_before_the_action_is_found(self):
+		self.log.write('service: declined\n')
+		self.guest.at = lab.serial_size()
+		self.guest.acted = self.guest.at
+		self.log.write('probe: ends\n')
+		with self.assertRaises(scenario.ScenarioError):
+			self.expect('service: declined', unordered=True)
+
+	# And it never moves the cursor back: the next ordered step starts after the furthest match.
+	def test_the_cursor_only_moves_forward(self):
+		self.guest.acted = self.guest.at
+		self.log.write('a\nb\nc\n')
+		self.expect('c')
+		furthest = self.guest.at
+		self.expect('a', unordered=True)
+		self.assertEqual(self.guest.at, furthest, 'an earlier unordered match left the cursor where it was')
+
+	# A scenario can only say true or false.
+	def test_the_option_is_a_boolean(self):
+		with self.assertRaises(scenario.ScenarioError):
+			scenario.validate_step({'do': 'expect', 'contains': 'x', 'unordered': 'yes'}, 0, 'test')
+
+
 # A control socket answering exactly the frames a test wants, so the client half can be exercised
 # without a guest. The broker half is exercised through `serve_request` against a socket pair.
 class FakeBroker:

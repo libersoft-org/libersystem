@@ -5,10 +5,24 @@ pub use crate::generated::liber::base::v1::*;
 // The host stack's CLIENT contracts. The HCI transport a controller publishes is a DEVICE contract
 // and is in `device` with the other driver wires, for the same reason the display's device side is
 // separate from the display's.
+pub use crate::generated::liber::admin::v1::*;
 pub use crate::generated::liber::bluetooth::v1::*;
+pub use crate::generated::liber::camera::v1::*;
+pub use crate::generated::liber::camera_device::v1::*;
 pub use crate::generated::liber::config::v1::*;
 pub use crate::generated::liber::device::v1::*;
 pub use crate::generated::liber::display::v1::*;
+pub use crate::generated::liber::event::v1::*;
+pub use crate::generated::liber::import::v1::*;
+pub use crate::generated::liber::midi::v1::*;
+pub use crate::generated::liber::midi_device::v1::*;
+pub use crate::generated::liber::modem::v1::*;
+pub use crate::generated::liber::modem_device::v1::*;
+pub use crate::generated::liber::power::v1::*;
+pub use crate::generated::liber::printer_device::v1::*;
+pub use crate::generated::liber::ptp_transport::v1::*;
+pub use crate::generated::liber::smartcard::v1::*;
+pub use crate::generated::liber::spool::v1::*;
 // The DEVICE side of the display, which is a different contract from the application side: the
 // service calls it and a driver serves it.
 pub use crate::generated::liber::display_device::v1::*;

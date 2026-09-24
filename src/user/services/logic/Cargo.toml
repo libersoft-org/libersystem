@@ -27,6 +27,16 @@ bootproto = { path = "../../../boot/protocol" }
 # actually told rather than in a private one both hosts would then have to translate.
 wasm = { path = "../../../wasm" }
 
+[dev-dependencies]
+# THE ANSWER-TO-RESET PARSER every reader provider uses. SmartcardService reads a card's ATR with it and hands
+# the decisions what it offers; the suites here do the same. A DEV-DEPENDENCY AND NOT A DEPENDENCY: this crate
+# is also built as the shared `service-util`, and a call into a crate no staged library publishes is an import
+# nothing provides - which the image build refuses.
+smartcard-model = { path = "../../libs/smartcard/model" }
+# THE GENERIC EVENT VOCABULARY, for the non-MIDI fixture that proves `bounded_event` is not MIDI's. It
+# reaches only `wire`, which keeps this crate's contract.
+event-proto = { path = "../../libs/protocol/event-proto" }
+
 # A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
 # call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry

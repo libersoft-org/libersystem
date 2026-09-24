@@ -43,6 +43,36 @@ record start-result {
 	info: process-info,
 }
 
+/// EVERY LIMIT A DOMAIN HAS, ALL OF THEM FINITE.
+///
+/// `launch-bounded` takes one number and leaves the other five at no limit, which is what a tool
+/// launched to do one thing needs: the resource it could exhaust is memory and the rest are bounded
+/// by what a short-lived process can reach. A SERVICE IS NOT THAT SHAPE. It runs for the life of the
+/// boot, it holds channels to other services, and the ways it can grow without bound are handles it
+/// never closes, threads it keeps creating and queued messages nobody drains - none of which a
+/// memory ceiling notices until the machine is already in trouble.
+///
+/// SO EVERY FIELD IS REQUIRED AND NONE OF THEM MAY BE UNLIMITED. A record with a field left at
+/// `u64::MAX` is refused rather than accepted as "no opinion about that one": the whole point of
+/// this record is that a service's footprint is stated, and a field nobody filled in is a limit
+/// nobody decided.
+record resource-limits {
+	/// Bytes of memory the Domain may have mapped.
+	memory:    u64,
+	/// Handles it may hold at once.
+	handles:   u64,
+	/// Threads it may run.
+	threads:   u64,
+	/// Bytes of queued IPC it may have outstanding.
+	ipc-queue: u64,
+	/// Bytes of thread stack.
+	stack:     u64,
+	/// Bytes of DMA-capable memory. ZERO IS A REAL VALUE AND IS THE ORDINARY ONE HERE: a service
+	/// with no device claim has no business addressing a device's memory, and saying so costs
+	/// nothing where the alternative is a number nobody chose.
+	dma:       u64,
+}
+
 /// The Process service contract: the process-loading mechanism. `start` launches an
 /// unattended program (no bootstrap capability), `list` reports the processes started
 /// so far, and `launch` is the full launcher primitive - it loads and starts a program
@@ -128,6 +158,15 @@ interface process {
 	@op(8) release-group: func(@bound(8) koids: list<koid>) -> result<bool, error>;
 	@op(9) cancel: func(koid: koid) -> result<bool, error>;
 	@op(10) launch-prepared-bounded: func(name: string, memory-limit: u64, bootstrap: handle<channel>) -> result<start-result, error>;
+	/// `launch-prepared-bounded` with EVERY limit rather than one, for a program whose footprint is
+	/// stated in full - which is what a long-running service's is.
+	///
+	/// PREPARED AND NOT LIVE, because the limits have to be in place before the program runs and a
+	/// live launch has already started it. Every one of the six is assigned to the Domain before the
+	/// first thread is queued; if the Domain cannot be created or ANY assignment is refused, the
+	/// launch fails and the Domain is torn down. There is no fallback to an unbounded launch: a
+	/// service that came up outside its stated limits is one nothing would notice was outside them.
+	@op(11) launch-prepared-limited: func(name: string, limits: resource-limits, bootstrap: handle<channel>) -> result<start-result, error>;
 }
 
 /// THE NARROW DOOR TO STOPPING THE MACHINE.

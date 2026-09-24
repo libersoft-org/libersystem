@@ -1,0 +1,31 @@
+package liber:modem-device@1
+record device-limits(version:u32,pending:u8,fragments:u16,message-bytes:u32,assembly-bytes:u32,assemblies:u8,mtu:u16)
+record device-open(limits:device-limits,connection-generation:u64)
+enum device-sim(unknown=0,absent=1,locked-pin=2,locked-puk=3,ready=4,blocked=5)
+enum device-registration(unknown=0,not-registered=1,searching=2,home=3,roaming=4,denied=5)
+record device-state(manufacturer:string:bound=32,model:string:bound=32,sim:device-sim,sim-generation:u64,registration:device-registration,operator:option<string>:bound=32,signal-valid:bool,rssi-dbm:i32,quality:u8,pin-attempts:option<u8>,puk-attempts:option<u8>,context-active:bool)
+enum ip-family(ipv4=4,ipv6=6)
+record ip-config(family:ip-family,address:u32,prefix:u8,gateway:option<u32>,dns:list<u32>:bound=2,mtu:u16)
+record device-identity(imsi:option<string>:bound=16,iccid:option<string>:bound=22,msisdn:option<string>:bound=16)
+enum command-kind(query=1,enter-pin=2,enter-puk=3,activate=4,deactivate=5,identity=6)
+record command(connection-generation:u64,transaction:u64,kind:command-kind,sim-generation:u64,context-generation:u64,secret:list<u8>:bound=8,new-secret:list<u8>:bound=8,apn:string:bound=64)
+enum command-status(done=1,rejected=2,failed=3,stale=4)
+record command-reply(connection-generation:u64,transaction:u64,kind:command-kind,status:command-status,sim-generation:u64,context-generation:u64,state:option<device-state>,config:option<ip-config>,identity:option<device-identity>)
+record indication(revision:u64,state:device-state)
+record datagram(context-generation:u64,bytes:list<u8>:bound=4096)
+interface modem-device
+method modem-device.open op=1 (version:u32:rights=) -> result<device-open, liber:base@1::error>
+method modem-device.command op=2 (command:command:rights=) -> result<command-reply, liber:base@1::error>
+method modem-device.indications op=3 () -> stream<indication>
+method modem-device.receive op=4 () -> stream<datagram>
+method modem-device.transmit op=5 () -> result<handle<channel>, liber:base@1::error>
+record fixture-stats(commands:u32,pin-attempts:u32,activations:u32,datagrams-in:u32,datagrams-out:u32,echo-replies:u32,dns-answers:u32,last-secret-bytes:u8)
+interface modem-fixture
+method modem-fixture.set-sim op=1 (present:bool:rights=,locked:bool:rights=) -> result<unit, liber:base@1::error>
+method modem-fixture.delay op=2 (kind:command-kind:rights=,delay-ms:u32:rights=) -> result<unit, liber:base@1::error>
+method modem-fixture.withdraw op=3 () -> result<unit, liber:base@1::error>
+method modem-fixture.republish op=4 () -> result<unit, liber:base@1::error>
+method modem-fixture.stats op=5 () -> result<fixture-stats, liber:base@1::error>
+method modem-fixture.replay op=6 () -> result<unit, liber:base@1::error>
+method modem-fixture.drop-context op=7 () -> result<unit, liber:base@1::error>
+method modem-fixture.ipv6-only op=8 (on:bool:rights=) -> result<unit, liber:base@1::error>

@@ -69,6 +69,16 @@ display-device-proto = { path = "../user/libs/protocol/display-device-proto" }
 # `net-info` is how that harness and the service drift apart - which is exactly what happened when
 # the record grew from four fields to nine.
 network-proto = { path = "../user/libs/protocol/network-proto" }
+# THE PRINTER BACKEND WIRE, for the spool scenario's sink: it plays every printer SpoolService drives and answers
+# through the generated dispatch, so a harness that drifted from the interface fails to compile rather than
+# reporting the service broken. Default features only, like the rest.
+printer-device-proto = { path = "../user/libs/protocol/printer-device-proto" }
+# AND THE PTP TRANSPORT WIRE, for the import scenario's responder, for the same reason.
+ptp-transport-proto = { path = "../user/libs/protocol/ptp-transport-proto" }
+# AND THE MODEM WIRES, for the scenario that plays five modems to ModemService and reads its limits back: the
+# provider wire it answers and the observation wire it reads, both through the generated code.
+modem-device-proto = { path = "../user/libs/protocol/modem-device-proto" }
+modem-proto = { path = "../user/libs/protocol/modem-proto" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
 # can drive tens of millions of operations through - which is what the one unexplained
 # double allocation needed and could never get from a guest boot.

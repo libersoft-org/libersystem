@@ -1,0 +1,6 @@
+package liber:event@1
+record event-source(incarnation:u64,slot:u32,generation:u32,binding-generation:u64,endpoint:u32,receiver-generation:u64)
+record event-header(sequence:u64,received-ns:u64)
+enum event-end-reason(overflow=1,source-discontinuity=2,removed=3,revoked=4,exhausted=5,stopped=6,shutdown=7)
+record event-end(reason:event-end-reason,next-sequence:u64)
+record generic-event(header:event-header,payload:list<u8>:bound=64)

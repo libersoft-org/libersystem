@@ -4022,6 +4022,645 @@ pub mod listener {
 	}
 }
 
+/// The publication a link belongs to, as DeviceManager identified it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkProvider {
+	pub slot: u32,
+	pub generation: u32,
+	pub binding_generation: u64,
+}
+
+impl LinkProvider {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<LinkProvider> {
+		let mut r = Reader::new(bytes);
+		let value = LinkProvider::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<LinkProvider> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = LinkProvider::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.slot)?;
+		w.u32(self.generation)?;
+		w.u64(self.binding_generation)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<LinkProvider> {
+		let slot = r.u32()?;
+		let generation = r.u32()?;
+		let binding_generation = r.u64()?;
+		Some(LinkProvider { slot, generation, binding_generation })
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LinkFamily {
+	Ipv4 = 4,
+	Ipv6 = 6,
+}
+
+impl LinkFamily {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<LinkFamily> {
+		let mut r = Reader::new(bytes);
+		let value = LinkFamily::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<LinkFamily> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = LinkFamily::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<LinkFamily> {
+		match r.u8()? {
+			4 => Some(LinkFamily::Ipv4),
+			6 => Some(LinkFamily::Ipv6),
+			_ => None,
+		}
+	}
+}
+
+/// A RAW-IP LINK, AS ITS ATTACHER DESCRIBES IT: which provider, SIM and context it belongs to, the
+/// channel its packets travel on, and the configuration the network gave it. NetworkService validates
+/// every field and owns what it installs.
+///
+/// THE PACKET CHANNEL CARRIES ONE IP DATAGRAM PER MESSAGE, in both directions, with no framing of its own
+/// and never more than `mtu` bytes. There is no Ethernet header, no ARP and no DHCP on it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkAttachment {
+	pub provider: LinkProvider,
+	pub sim_generation: u64,
+	pub context_generation: u64,
+	pub packets: u64,
+	pub family: LinkFamily,
+	pub address: Ipv4Addr,
+	pub prefix: u8,
+	pub gateway: Option<Ipv4Addr>,
+	pub dns: Vec<Ipv4Addr>,
+	pub mtu: u16,
+}
+
+impl LinkAttachment {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<LinkAttachment> {
+		let mut r = Reader::new(bytes);
+		let value = LinkAttachment::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<LinkAttachment> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = LinkAttachment::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.provider.write(w)?;
+		w.u64(self.sim_generation)?;
+		w.u64(self.context_generation)?;
+		w.set_handle(self.packets)?;
+		w.u32(0)?;
+		self.family.write(w)?;
+		self.address.write(w)?;
+		w.u8(self.prefix)?;
+		match &self.gateway {
+			Some(v67) => {
+				w.u8(1)?;
+				v67.write(w)?;
+			}
+			None => {
+				w.u8(0)?;
+			}
+		}
+		if self.dns.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.dns.len() as u16)?;
+		for v68 in self.dns.iter() {
+			v68.write(w)?;
+		}
+		w.u16(self.mtu)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<LinkAttachment> {
+		let provider = LinkProvider::read(r)?;
+		let sim_generation = r.u64()?;
+		let context_generation = r.u64()?;
+		let packets = {
+			let _ = r.u32()?;
+			r.take_handle()?
+		};
+		let family = LinkFamily::read(r)?;
+		let address = Ipv4Addr::read(r)?;
+		let prefix = r.u8()?;
+		let gateway = if r.tag()? { Some(Ipv4Addr::read(r)?) } else { None };
+		let dns = {
+			let v69 = r.u16()? as usize;
+			let v69 = (v69 <= 2).then_some(v69)?;
+			let mut v70 = Vec::new();
+			v70.try_reserve_exact(v69).ok()?;
+			for _ in 0..v69 {
+				v70.push(Ipv4Addr::read(r)?);
+			}
+			v70
+		};
+		let mtu = r.u16()?;
+		Some(LinkAttachment { provider, sim_generation, context_generation, packets, family, address, prefix, gateway, dns, mtu })
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkInstalled {
+	pub interface: InterfaceId,
+	pub mtu: u16,
+}
+
+impl LinkInstalled {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<LinkInstalled> {
+		let mut r = Reader::new(bytes);
+		let value = LinkInstalled::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<LinkInstalled> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = LinkInstalled::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.interface.write(w)?;
+		w.u16(self.mtu)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<LinkInstalled> {
+		let interface = InterfaceId::read(r)?;
+		let mtu = r.u16()?;
+		Some(LinkInstalled { interface, mtu })
+	}
+}
+
+/// THE PRIVATE LINK ADMINISTRATION, which ServiceManager keeps and ModemService alone is a client of. No
+/// ordinary network client reaches it: the root it is served on is not the one they are minted from.
+///
+/// RESERVE BEFORE ACTIVATING. A reservation says whether a link could be installed at all - `again`
+/// when another uplink is selected and replacing it was not allowed - before the modem is asked to do
+/// anything. Install commits a reserved link atomically, or refuses and leaves the current one intact;
+/// release removes it, or gives an unused reservation back.
+// interface `network-link-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod network_link_admin {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_RESERVE: u16 = 1;
+	pub const OP_INSTALL: u16 = 2;
+	pub const OP_RELEASE: u16 = 3;
+
+	pub trait Service {
+		fn reserve(&mut self, replace_uplink: bool) -> Result<u64, Error>;
+		fn install(&mut self, reservation: u64, attachment: LinkAttachment) -> Result<LinkInstalled, Error>;
+		fn release(&mut self, reservation: u64) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:network")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_RESERVE => {
+				let replace_uplink = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.reserve(replace_uplink);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v71) => {
+							w.u8(1)?;
+							w.u64(*v71)?;
+						}
+						Err(v72) => {
+							w.u8(0)?;
+							v72.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_INSTALL => {
+				let reservation = r.u64()?;
+				let attachment = LinkAttachment::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.install(reservation, attachment);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v73) => {
+							w.u8(1)?;
+							v73.write(w)?;
+						}
+						Err(v74) => {
+							w.u8(0)?;
+							v74.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RELEASE => {
+				let reservation = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.release(reservation);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v75) => {
+							w.u8(1)?;
+						}
+						Err(v76) => {
+							w.u8(0)?;
+							v76.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn reserve(&mut self, replace_uplink: &bool) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RESERVE)?;
+			w.u32(corr)?;
+			w.boolean(*replace_uplink)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.u64()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn install(&mut self, reservation: &u64, attachment: &LinkAttachment) -> Option<Result<LinkInstalled, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_INSTALL)?;
+			w.u32(corr)?;
+			w.u64(*reservation)?;
+			attachment.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(LinkInstalled::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn release(&mut self, reservation: &u64) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RELEASE)?;
+			w.u32(corr)?;
+			w.u64(*reservation)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_link_admin_reserve")]
+	fn channel_invoke_reserve(chan: u64, replace_uplink: &bool) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.reserve(replace_uplink)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_link_admin_install")]
+	fn channel_invoke_install(chan: u64, reservation: &u64, attachment: &LinkAttachment) -> Option<Result<LinkInstalled, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.install(reservation, attachment)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_link_admin_release")]
+	fn channel_invoke_release(chan: u64, reservation: &u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.release(reservation)
+	}
+}
+
 impl Ipv4Addr {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -4329,43 +4968,43 @@ impl IpAddress {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			IpAddress::V4(v67) => {
+			IpAddress::V4(v77) => {
 				out.push_str("{\"v4\":");
-				v67.to_json_into(out);
+				v77.to_json_into(out);
 				out.push('}');
 			}
-			IpAddress::V6(v68) => {
+			IpAddress::V6(v78) => {
 				out.push_str("{\"v6\":");
-				v68.to_json_into(out);
+				v78.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			IpAddress::V4(v69) => {
+			IpAddress::V4(v79) => {
 				out.push_str("v4(");
-				v69.to_text_into(out);
+				v79.to_text_into(out);
 				out.push(')');
 			}
-			IpAddress::V6(v70) => {
+			IpAddress::V6(v80) => {
 				out.push_str("v6(");
-				v70.to_text_into(out);
+				v80.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			IpAddress::V4(v71) => {
+			IpAddress::V4(v81) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "v4");
-				v71.to_cbor_into(out);
+				v81.to_cbor_into(out);
 			}
-			IpAddress::V6(v72) => {
+			IpAddress::V6(v82) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "v6");
-				v72.to_cbor_into(out);
+				v82.to_cbor_into(out);
 			}
 		}
 	}
@@ -4437,8 +5076,8 @@ impl ScopedAddress {
 		out.push(',');
 		out.push_str("\"scope\":");
 		match &self.scope {
-			Some(v73) => {
-				v73.to_json_into(out);
+			Some(v83) => {
+				v83.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -4453,8 +5092,8 @@ impl ScopedAddress {
 		out.push_str(", ");
 		out.push_str("scope=");
 		match &self.scope {
-			Some(v74) => {
-				v74.to_text_into(out);
+			Some(v84) => {
+				v84.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -4468,8 +5107,8 @@ impl ScopedAddress {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "scope");
 		match &self.scope {
-			Some(v75) => {
-				v75.to_cbor_into(out);
+			Some(v85) => {
+				v85.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -4649,9 +5288,9 @@ impl NextHop {
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
 			NextHop::Direct => out.push_str("\"direct\""),
-			NextHop::Via(v76) => {
+			NextHop::Via(v86) => {
 				out.push_str("{\"via\":");
-				v76.to_json_into(out);
+				v86.to_json_into(out);
 				out.push('}');
 			}
 		}
@@ -4659,9 +5298,9 @@ impl NextHop {
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
 			NextHop::Direct => out.push_str("direct"),
-			NextHop::Via(v77) => {
+			NextHop::Via(v87) => {
 				out.push_str("via(");
-				v77.to_text_into(out);
+				v87.to_text_into(out);
 				out.push(')');
 			}
 		}
@@ -4669,10 +5308,10 @@ impl NextHop {
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
 			NextHop::Direct => crate::codec::cbor::text(out, "direct"),
-			NextHop::Via(v78) => {
+			NextHop::Via(v88) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "via");
-				v78.to_cbor_into(out);
+				v88.to_cbor_into(out);
 			}
 		}
 	}
@@ -5033,61 +5672,61 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"addresses\":");
 		out.push('[');
-		let mut v80 = true;
-		for v79 in self.addresses.iter() {
-			if !v80 {
+		let mut v90 = true;
+		for v89 in self.addresses.iter() {
+			if !v90 {
 				out.push(',');
 			}
-			v80 = false;
-			v79.to_json_into(out);
+			v90 = false;
+			v89.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"routes\":");
 		out.push('[');
-		let mut v82 = true;
-		for v81 in self.routes.iter() {
-			if !v82 {
+		let mut v92 = true;
+		for v91 in self.routes.iter() {
+			if !v92 {
 				out.push(',');
 			}
-			v82 = false;
-			v81.to_json_into(out);
+			v92 = false;
+			v91.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"routers\":");
 		out.push('[');
-		let mut v84 = true;
-		for v83 in self.routers.iter() {
-			if !v84 {
+		let mut v94 = true;
+		for v93 in self.routers.iter() {
+			if !v94 {
 				out.push(',');
 			}
-			v84 = false;
-			v83.to_json_into(out);
+			v94 = false;
+			v93.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"dns\":");
 		out.push('[');
-		let mut v86 = true;
-		for v85 in self.dns.iter() {
-			if !v86 {
+		let mut v96 = true;
+		for v95 in self.dns.iter() {
+			if !v96 {
 				out.push(',');
 			}
-			v86 = false;
-			v85.to_json_into(out);
+			v96 = false;
+			v95.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v88 = true;
-		for v87 in self.neighbors.iter() {
-			if !v88 {
+		let mut v98 = true;
+		for v97 in self.neighbors.iter() {
+			if !v98 {
 				out.push(',');
 			}
-			v88 = false;
-			v87.to_json_into(out);
+			v98 = false;
+			v97.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -5108,61 +5747,61 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("addresses=");
 		out.push('[');
-		let mut v90 = true;
-		for v89 in self.addresses.iter() {
-			if !v90 {
+		let mut v100 = true;
+		for v99 in self.addresses.iter() {
+			if !v100 {
 				out.push_str(", ");
 			}
-			v90 = false;
-			v89.to_text_into(out);
+			v100 = false;
+			v99.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("routes=");
 		out.push('[');
-		let mut v92 = true;
-		for v91 in self.routes.iter() {
-			if !v92 {
+		let mut v102 = true;
+		for v101 in self.routes.iter() {
+			if !v102 {
 				out.push_str(", ");
 			}
-			v92 = false;
-			v91.to_text_into(out);
+			v102 = false;
+			v101.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("routers=");
 		out.push('[');
-		let mut v94 = true;
-		for v93 in self.routers.iter() {
-			if !v94 {
+		let mut v104 = true;
+		for v103 in self.routers.iter() {
+			if !v104 {
 				out.push_str(", ");
 			}
-			v94 = false;
-			v93.to_text_into(out);
+			v104 = false;
+			v103.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("dns=");
 		out.push('[');
-		let mut v96 = true;
-		for v95 in self.dns.iter() {
-			if !v96 {
+		let mut v106 = true;
+		for v105 in self.dns.iter() {
+			if !v106 {
 				out.push_str(", ");
 			}
-			v96 = false;
-			v95.to_text_into(out);
+			v106 = false;
+			v105.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v98 = true;
-		for v97 in self.neighbors.iter() {
-			if !v98 {
+		let mut v108 = true;
+		for v107 in self.neighbors.iter() {
+			if !v108 {
 				out.push_str(", ");
 			}
-			v98 = false;
-			v97.to_text_into(out);
+			v108 = false;
+			v107.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -5179,28 +5818,28 @@ impl NetInfo {
 		crate::codec::cbor::uint(out, self.mtu as u64);
 		crate::codec::cbor::text(out, "addresses");
 		crate::codec::cbor::array(out, self.addresses.len());
-		for v99 in self.addresses.iter() {
-			v99.to_cbor_into(out);
+		for v109 in self.addresses.iter() {
+			v109.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "routes");
 		crate::codec::cbor::array(out, self.routes.len());
-		for v100 in self.routes.iter() {
-			v100.to_cbor_into(out);
+		for v110 in self.routes.iter() {
+			v110.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "routers");
 		crate::codec::cbor::array(out, self.routers.len());
-		for v101 in self.routers.iter() {
-			v101.to_cbor_into(out);
+		for v111 in self.routers.iter() {
+			v111.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "dns");
 		crate::codec::cbor::array(out, self.dns.len());
-		for v102 in self.dns.iter() {
-			v102.to_cbor_into(out);
+		for v112 in self.dns.iter() {
+			v112.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "neighbors");
 		crate::codec::cbor::array(out, self.neighbors.len());
-		for v103 in self.neighbors.iter() {
-			v103.to_cbor_into(out);
+		for v113 in self.neighbors.iter() {
+			v113.to_cbor_into(out);
 		}
 	}
 }
@@ -5549,13 +6188,13 @@ impl OpenTarget {
 		out.push('{');
 		out.push_str("\"destinations\":");
 		out.push('[');
-		let mut v105 = true;
-		for v104 in self.destinations.iter() {
-			if !v105 {
+		let mut v115 = true;
+		for v114 in self.destinations.iter() {
+			if !v115 {
 				out.push(',');
 			}
-			v105 = false;
-			v104.to_json_into(out);
+			v115 = false;
+			v114.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
@@ -5564,8 +6203,8 @@ impl OpenTarget {
 		out.push(',');
 		out.push_str("\"source\":");
 		match &self.source {
-			Some(v106) => {
-				v106.to_json_into(out);
+			Some(v116) => {
+				v116.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -5577,13 +6216,13 @@ impl OpenTarget {
 		out.push('{');
 		out.push_str("destinations=");
 		out.push('[');
-		let mut v108 = true;
-		for v107 in self.destinations.iter() {
-			if !v108 {
+		let mut v118 = true;
+		for v117 in self.destinations.iter() {
+			if !v118 {
 				out.push_str(", ");
 			}
-			v108 = false;
-			v107.to_text_into(out);
+			v118 = false;
+			v117.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -5592,8 +6231,8 @@ impl OpenTarget {
 		out.push_str(", ");
 		out.push_str("source=");
 		match &self.source {
-			Some(v109) => {
-				v109.to_text_into(out);
+			Some(v119) => {
+				v119.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -5605,15 +6244,15 @@ impl OpenTarget {
 		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "destinations");
 		crate::codec::cbor::array(out, self.destinations.len());
-		for v110 in self.destinations.iter() {
-			v110.to_cbor_into(out);
+		for v120 in self.destinations.iter() {
+			v120.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "port");
 		crate::codec::cbor::uint(out, self.port as u64);
 		crate::codec::cbor::text(out, "source");
 		match &self.source {
-			Some(v111) => {
-				v111.to_cbor_into(out);
+			Some(v121) => {
+				v121.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -5645,13 +6284,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v113 = true;
-		for v112 in self.request.iter() {
-			if !v113 {
+		let mut v123 = true;
+		for v122 in self.request.iter() {
+			if !v123 {
 				out.push(',');
 			}
-			v113 = false;
-			let _ = write!(out, "{}", v112);
+			v123 = false;
+			let _ = write!(out, "{}", v122);
 		}
 		out.push(']');
 		out.push('}');
@@ -5663,13 +6302,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v115 = true;
-		for v114 in self.request.iter() {
-			if !v115 {
+		let mut v125 = true;
+		for v124 in self.request.iter() {
+			if !v125 {
 				out.push_str(", ");
 			}
-			v115 = false;
-			let _ = write!(out, "{}", v114);
+			v125 = false;
+			let _ = write!(out, "{}", v124);
 		}
 		out.push(']');
 		out.push('}');
@@ -5680,8 +6319,8 @@ impl TcpRequest {
 		self.target.to_cbor_into(out);
 		crate::codec::cbor::text(out, "request");
 		crate::codec::cbor::array(out, self.request.len());
-		for v116 in self.request.iter() {
-			crate::codec::cbor::uint(out, *v116 as u64);
+		for v126 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v126 as u64);
 		}
 	}
 }
@@ -5745,20 +6384,20 @@ impl FetchChunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v118 = true;
-		for v117 in self.data.iter() {
-			if !v118 {
+		let mut v128 = true;
+		for v127 in self.data.iter() {
+			if !v128 {
 				out.push(',');
 			}
-			v118 = false;
-			let _ = write!(out, "{}", v117);
+			v128 = false;
+			let _ = write!(out, "{}", v127);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"outcome\":");
 		match &self.outcome {
-			Some(v119) => {
-				v119.to_json_into(out);
+			Some(v129) => {
+				v129.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -5770,20 +6409,20 @@ impl FetchChunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v121 = true;
-		for v120 in self.data.iter() {
-			if !v121 {
+		let mut v131 = true;
+		for v130 in self.data.iter() {
+			if !v131 {
 				out.push_str(", ");
 			}
-			v121 = false;
-			let _ = write!(out, "{}", v120);
+			v131 = false;
+			let _ = write!(out, "{}", v130);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("outcome=");
 		match &self.outcome {
-			Some(v122) => {
-				v122.to_text_into(out);
+			Some(v132) => {
+				v132.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -5795,13 +6434,13 @@ impl FetchChunk {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v123 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v123 as u64);
+		for v133 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v133 as u64);
 		}
 		crate::codec::cbor::text(out, "outcome");
 		match &self.outcome {
-			Some(v124) => {
-				v124.to_cbor_into(out);
+			Some(v134) => {
+				v134.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -6113,13 +6752,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v126 = true;
-		for v125 in self.data.iter() {
-			if !v126 {
+		let mut v136 = true;
+		for v135 in self.data.iter() {
+			if !v136 {
 				out.push(',');
 			}
-			v126 = false;
-			let _ = write!(out, "{}", v125);
+			v136 = false;
+			let _ = write!(out, "{}", v135);
 		}
 		out.push(']');
 		out.push('}');
@@ -6128,13 +6767,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v128 = true;
-		for v127 in self.data.iter() {
-			if !v128 {
+		let mut v138 = true;
+		for v137 in self.data.iter() {
+			if !v138 {
 				out.push_str(", ");
 			}
-			v128 = false;
-			let _ = write!(out, "{}", v127);
+			v138 = false;
+			let _ = write!(out, "{}", v137);
 		}
 		out.push(']');
 		out.push('}');
@@ -6143,9 +6782,288 @@ impl Chunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v129 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v129 as u64);
+		for v139 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v139 as u64);
 		}
+	}
+}
+
+impl LinkProvider {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"slot\":");
+		let _ = write!(out, "{}", self.slot);
+		out.push(',');
+		out.push_str("\"generation\":");
+		let _ = write!(out, "{}", self.generation);
+		out.push(',');
+		out.push_str("\"binding-generation\":");
+		let _ = write!(out, "{}", self.binding_generation);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("slot=");
+		let _ = write!(out, "{}", self.slot);
+		out.push_str(", ");
+		out.push_str("generation=");
+		let _ = write!(out, "{}", self.generation);
+		out.push_str(", ");
+		out.push_str("binding-generation=");
+		let _ = write!(out, "{}", self.binding_generation);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "slot");
+		crate::codec::cbor::uint(out, self.slot as u64);
+		crate::codec::cbor::text(out, "generation");
+		crate::codec::cbor::uint(out, self.generation as u64);
+		crate::codec::cbor::text(out, "binding-generation");
+		crate::codec::cbor::uint(out, self.binding_generation as u64);
+	}
+}
+
+impl LinkFamily {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			LinkFamily::Ipv4 => out.push_str("\"ipv4\""),
+			LinkFamily::Ipv6 => out.push_str("\"ipv6\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			LinkFamily::Ipv4 => out.push_str("ipv4"),
+			LinkFamily::Ipv6 => out.push_str("ipv6"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			LinkFamily::Ipv4 => crate::codec::cbor::text(out, "ipv4"),
+			LinkFamily::Ipv6 => crate::codec::cbor::text(out, "ipv6"),
+		}
+	}
+}
+
+impl LinkAttachment {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"provider\":");
+		self.provider.to_json_into(out);
+		out.push(',');
+		out.push_str("\"sim-generation\":");
+		let _ = write!(out, "{}", self.sim_generation);
+		out.push(',');
+		out.push_str("\"context-generation\":");
+		let _ = write!(out, "{}", self.context_generation);
+		out.push(',');
+		out.push_str("\"packets\":");
+		let _ = write!(out, "{}", self.packets);
+		out.push(',');
+		out.push_str("\"family\":");
+		self.family.to_json_into(out);
+		out.push(',');
+		out.push_str("\"address\":");
+		self.address.to_json_into(out);
+		out.push(',');
+		out.push_str("\"prefix\":");
+		let _ = write!(out, "{}", self.prefix);
+		out.push(',');
+		out.push_str("\"gateway\":");
+		match &self.gateway {
+			Some(v140) => {
+				v140.to_json_into(out);
+			}
+			None => {
+				out.push_str("null");
+			}
+		}
+		out.push(',');
+		out.push_str("\"dns\":");
+		out.push('[');
+		let mut v142 = true;
+		for v141 in self.dns.iter() {
+			if !v142 {
+				out.push(',');
+			}
+			v142 = false;
+			v141.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"mtu\":");
+		let _ = write!(out, "{}", self.mtu);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("provider=");
+		self.provider.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("sim-generation=");
+		let _ = write!(out, "{}", self.sim_generation);
+		out.push_str(", ");
+		out.push_str("context-generation=");
+		let _ = write!(out, "{}", self.context_generation);
+		out.push_str(", ");
+		out.push_str("packets=");
+		let _ = write!(out, "{}", self.packets);
+		out.push_str(", ");
+		out.push_str("family=");
+		self.family.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("address=");
+		self.address.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("prefix=");
+		let _ = write!(out, "{}", self.prefix);
+		out.push_str(", ");
+		out.push_str("gateway=");
+		match &self.gateway {
+			Some(v143) => {
+				v143.to_text_into(out);
+			}
+			None => {
+				out.push('-');
+			}
+		}
+		out.push_str(", ");
+		out.push_str("dns=");
+		out.push('[');
+		let mut v145 = true;
+		for v144 in self.dns.iter() {
+			if !v145 {
+				out.push_str(", ");
+			}
+			v145 = false;
+			v144.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("mtu=");
+		let _ = write!(out, "{}", self.mtu);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 10);
+		crate::codec::cbor::text(out, "provider");
+		self.provider.to_cbor_into(out);
+		crate::codec::cbor::text(out, "sim-generation");
+		crate::codec::cbor::uint(out, self.sim_generation as u64);
+		crate::codec::cbor::text(out, "context-generation");
+		crate::codec::cbor::uint(out, self.context_generation as u64);
+		crate::codec::cbor::text(out, "packets");
+		crate::codec::cbor::uint(out, self.packets as u64);
+		crate::codec::cbor::text(out, "family");
+		self.family.to_cbor_into(out);
+		crate::codec::cbor::text(out, "address");
+		self.address.to_cbor_into(out);
+		crate::codec::cbor::text(out, "prefix");
+		crate::codec::cbor::uint(out, self.prefix as u64);
+		crate::codec::cbor::text(out, "gateway");
+		match &self.gateway {
+			Some(v146) => {
+				v146.to_cbor_into(out);
+			}
+			None => {
+				crate::codec::cbor::null(out);
+			}
+		}
+		crate::codec::cbor::text(out, "dns");
+		crate::codec::cbor::array(out, self.dns.len());
+		for v147 in self.dns.iter() {
+			v147.to_cbor_into(out);
+		}
+		crate::codec::cbor::text(out, "mtu");
+		crate::codec::cbor::uint(out, self.mtu as u64);
+	}
+}
+
+impl LinkInstalled {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"interface\":");
+		self.interface.to_json_into(out);
+		out.push(',');
+		out.push_str("\"mtu\":");
+		let _ = write!(out, "{}", self.mtu);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("interface=");
+		self.interface.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("mtu=");
+		let _ = write!(out, "{}", self.mtu);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "interface");
+		self.interface.to_cbor_into(out);
+		crate::codec::cbor::text(out, "mtu");
+		crate::codec::cbor::uint(out, self.mtu as u64);
 	}
 }
 

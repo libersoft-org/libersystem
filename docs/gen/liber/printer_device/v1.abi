@@ -1,0 +1,8 @@
+package liber:printer-device@1
+record printer-attach(version:u32,attachment:u64,device-id:list<u8>:bound=4096)
+record port-reading(bits:u8,cover-open:option<bool>,jam:option<bool>)
+interface printer-backend
+method printer-backend.attach op=1 (version:u32:rights=) -> result<printer-attach, liber:base@1::error>
+method printer-backend.port-status op=2 (attachment:u64:rights=) -> result<port-reading, liber:base@1::error>
+method printer-backend.write op=3 (attachment:u64:rights=,bytes:list<u8>:bound=4096:rights=) -> result<u32, liber:base@1::error>
+method printer-backend.reset op=4 (attachment:u64:rights=) -> result<printer-attach, liber:base@1::error>

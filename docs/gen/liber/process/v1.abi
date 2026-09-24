@@ -3,6 +3,7 @@ record process-info(koid:u64,name:string)
 resource task
 resource task-group
 record start-result(task:handle<task>,info:process-info)
+record resource-limits(memory:u64,handles:u64,threads:u64,ipc-queue:u64,stack:u64,dma:u64)
 interface process
 method process.start op=1 (name:string:rights=) -> result<process-info, liber:base@1::error>
 method process.list op=2 () -> result<list<process-info>, liber:base@1::error>
@@ -14,6 +15,7 @@ method process.release op=7 (koid:u64:rights=) -> result<bool, liber:base@1::err
 method process.release-group op=8 (koids:list<u64>:bound=8:rights=) -> result<bool, liber:base@1::error>
 method process.cancel op=9 (koid:u64:rights=) -> result<bool, liber:base@1::error>
 method process.launch-prepared-bounded op=10 (name:string:rights=,memory-limit:u64:rights=,bootstrap:handle<channel>:rights=) -> result<start-result, liber:base@1::error>
+method process.launch-prepared-limited op=11 (name:string:rights=,limits:resource-limits:rights=,bootstrap:handle<channel>:rights=) -> result<start-result, liber:base@1::error>
 interface system-power
 method system-power.reboot op=1 () -> result<unit, liber:base@1::error>
 method system-power.power-off op=2 () -> result<unit, liber:base@1::error>

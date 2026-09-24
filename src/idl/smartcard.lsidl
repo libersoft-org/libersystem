@@ -1,0 +1,326 @@
+//! LiberSystem smart cards - reader presence, exclusive expiring transactions, and a bounded set of
+//! PIV operations over a reader one component was granted.
+//!
+//! THREE PARTIES, THREE INTERFACES. An APPLICATION holds a `smartcard` connection minted for ONE reader
+//! and a set of operations, and nothing on it can name another reader. PERMISSIONMANAGER holds the
+//! private `smartcard-admin` endpoint that mints those connections. A PROVIDER - the USB CCID class
+//! module, or the in-guest fixture - serves `smartcard-reader`, and SmartcardService is its one
+//! consumer.
+//!
+//! NO PIN CROSSES ANY OF THEM. `verify-piv-pin` takes a transaction and a deadline and nothing else;
+//! the service builds the secure-verification template and the reader's own keypad collects the PIN.
+//! A reader without a usable pinpad answers `trusted-input-unavailable`, and there is no operation
+//! through which an application could supply a PIN instead.
+//!
+//! THE EXCHANGE IS AN ALLOWLIST, NOT A TUNNEL. The PIV application's canonical SELECT and GET DATA for
+//! the Discovery Object and the PIV Authentication certificate, and nothing else; authentication is
+//! the typed `authenticate-piv`, whose command the service builds.
+
+package liber:smartcard@1;
+
+use liber:base@1.{error};
+use liber:process@1.{task};
+
+/// How a reader exchanges with a card. This service drives short-APDU exchange only; the others are
+/// named so a reader can say what it is, and a reader that offers only them is unsupported.
+enum exchange-level {
+	character     = 1,
+	tpdu          = 2,
+	short-apdu    = 3,
+	extended-apdu = 4,
+}
+
+enum card-protocol {
+	t0 = 0,
+	t1 = 1,
+}
+
+/// A reader's identity as DeviceManager published it. A republished reader is another reader.
+record reader-id {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+}
+
+record reader-info {
+	id:       reader-id,
+	name:     string,
+	/// The configured alias this connection was granted under.
+	alias:    string,
+	slots:    u8,
+	exchange: exchange-level,
+	/// Whether PIN verification is usable on this reader: a secure-verification pinpad whose
+	/// advertised format fits the PIV template.
+	pinpad:   bool,
+}
+
+enum presence {
+	absent  = 1,
+	present = 2,
+}
+
+record slot-state {
+	slot:            u8,
+	presence:        presence,
+	/// Changes on every insertion. A transaction captures it, and a new card is a new generation even
+	/// when its ATR is the same.
+	card-generation: u64,
+	@bound(33) atr:  list<u8>,
+	/// False while the slot waits for its provider to prove it quiescent after a failed recovery.
+	available:       bool,
+}
+
+enum event-kind {
+	/// The current state of one slot, part of a subscription's atomic snapshot.
+	snapshot     = 1,
+	snapshot-end = 2,
+	inserted     = 3,
+	removed      = 4,
+	unavailable  = 5,
+	available    = 6,
+}
+
+/// One frame of a reader's event stream: a snapshot, then ordered changes. A removal and a
+/// reinsertion are two frames, never one unchanged presence. At most sixteen wait for a client; past
+/// that the stream is CLOSED, and a new subscription takes a new snapshot.
+record card-event {
+	sequence: u64,
+	kind:     event-kind,
+	slot:     option<slot-state>,
+}
+
+/// An acquired transaction: exclusive use of one slot of the granted reader, for one card, until it is
+/// released, cancelled or its lease ends.
+record transaction {
+	id:              u64,
+	slot:            u8,
+	card-generation: u64,
+	lease-ms:        u32,
+}
+
+record apdu-response {
+	@bound(16384) data: list<u8>,
+	sw1:                u8,
+	sw2:                u8,
+}
+
+/// How an operation that reached the card came to an end. `card-removed` is terminal and distinct:
+/// the card that transaction was for is gone.
+enum card-outcome {
+	done          = 1,
+	card-removed  = 2,
+	cancelled     = 3,
+	timed-out     = 4,
+	provider-error = 5,
+}
+
+record exchange-result {
+	outcome:  card-outcome,
+	response: option<apdu-response>,
+}
+
+enum pin-result {
+	verified                  = 1,
+	/// `retries` says how many attempts remain.
+	incorrect                 = 2,
+	blocked                   = 3,
+	cancelled                 = 4,
+	timed-out                 = 5,
+	card-removed              = 6,
+	provider-error            = 7,
+	/// The reader has no pinpad this service can use, and no other way to enter a PIN exists.
+	trusted-input-unavailable = 8,
+}
+
+record pin-outcome {
+	result:  pin-result,
+	retries: option<u8>,
+}
+
+record authenticate-result {
+	outcome:   card-outcome,
+	/// The card's ECDSA signature, DER-encoded, when the outcome is `done`.
+	@bound(80) signature: option<list<u8>>,
+}
+
+/// THE APPLICATION'S CONNECTION, bound to one reader and one set of operations when it was minted.
+interface smartcard {
+	@op(1) reader:          func() -> result<reader-info, error>;
+	@op(2) slots:           func() -> result<list<slot-state>, error>;
+	@op(3) events:          func() -> result<stream<card-event>, error>;
+	/// Wait up to `wait-ms` for the slot, in first-come order behind at most eight others. `lease-ms`
+	/// is capped at sixty seconds and cannot be renewed.
+	@op(4) acquire:         func(slot: u8, wait-ms: u32, lease-ms: u32) -> result<transaction, error>;
+	@op(5) exchange:        func(transaction: u64, @bound(261) apdu: list<u8>) -> result<exchange-result, error>;
+	@op(6) verify-piv-pin:  func(transaction: u64, timeout-ms: u32) -> result<pin-outcome, error>;
+	/// Sign a 32-byte challenge with the PIV Authentication key (P-256), after a successful
+	/// verification in this same transaction.
+	@op(7) authenticate-piv: func(transaction: u64, @bound(32) challenge: list<u8>) -> result<authenticate-result, error>;
+	@op(8) cancel:          func(transaction: u64) -> result<unit, error>;
+	@op(9) release:         func(transaction: u64) -> result<unit, error>;
+}
+
+/// What a minted connection may do. `read` is the reader's metadata, events and public-data exchange;
+/// `transact` is acquiring a slot; `authenticate` is PIN verification and PIV authentication.
+record operations {
+	read:         bool,
+	transact:     bool,
+	authenticate: bool,
+}
+
+record minted {
+	connection: handle<channel>,
+	/// Exactly which publication the alias resolved to, for the permission audit.
+	reader:     reader-id,
+	name:       string,
+}
+
+/// THE MINTING ENDPOINT, PermissionManager's alone. The alias names a reader the service's
+/// configuration binds to provider metadata; it resolves to exactly one current publication or the
+/// mint fails. The connection lives as long as `owner` does, and no longer, however it is copied.
+interface smartcard-admin {
+	@op(1) mint: func(alias: string, operations: operations, owner: handle<task>) -> result<minted, error>;
+}
+
+// ------------------------------------------------------------------ the provider contract
+
+/// A reader's secure PIN-verification support, as advertised. The service asks only for what the PIV
+/// template needs: ASCII digits, an eight-byte block, six to eight digits.
+record pinpad-capabilities {
+	secure-verify: bool,
+	ascii:         bool,
+	max-block:     u8,
+	min-digits:    u8,
+	max-digits:    u8,
+}
+
+record reader-description {
+	name:     string,
+	/// At most four; a reader advertising more is refused rather than truncated.
+	slots:    u8,
+	exchange: exchange-level,
+	/// Bit 0 T=0, bit 1 T=1.
+	protocols: u8,
+	pinpad:   pinpad-capabilities,
+}
+
+record slot-report {
+	slot:            u8,
+	present:         bool,
+	card-generation: u64,
+	@bound(33) atr:  list<u8>,
+	powered:         bool,
+}
+
+/// Every request names the service's request, the slot, and the card generation it was prepared
+/// against; every reply echoes them, and one that does not match what is outstanding is dropped.
+record request-header {
+	request:         u64,
+	slot:            u8,
+	card-generation: u64,
+}
+
+/// The fixed secure-verification request: the template APDU with eight 0xFF placeholder bytes the
+/// reader overwrites with the digits it collects.
+record secure-verify-request {
+	header:          request-header,
+	block:           u8,
+	min-digits:      u8,
+	max-digits:      u8,
+	timeout-seconds: u8,
+	@bound(16) apdu: list<u8>,
+}
+
+enum provider-outcome {
+	done         = 1,
+	card-removed = 2,
+	/// Ended by `abort`.
+	aborted      = 3,
+	/// The pinpad's own entry timeout.
+	timed-out    = 4,
+	/// The user cancelled on the pinpad.
+	cancelled    = 5,
+	fault        = 6,
+}
+
+record provider-reply {
+	header:              request-header,
+	outcome:             provider-outcome,
+	@bound(258) response: list<u8>,
+	@bound(33) atr:      list<u8>,
+}
+
+enum reader-event-kind {
+	presence  = 1,
+	fault     = 2,
+	/// The slot is proven quiescent after a recovery this service could not complete itself.
+	quiescent = 3,
+}
+
+record reader-event {
+	kind:   reader-event-kind,
+	slot:   u8,
+	report: option<slot-report>,
+}
+
+/// THE PROVIDER CONTRACT a `smartcard-reader` publication serves - to SmartcardService alone. The
+/// provider owns the transport: descriptor and slot parsing, ATR, negotiation, sequence numbers,
+/// framing, abort and drain. It makes no decision about who may do what.
+interface smartcard-reader {
+	@op(1)  describe:        func() -> result<reader-description, error>;
+	/// A NEW SERVICE SESSION. Answered only once everything a previous session left outstanding has
+	/// been aborted and drained and every slot is powered off.
+	@op(2)  open-session:    func() -> result<list<slot-report>, error>;
+	@op(3)  events:          func() -> stream<reader-event>;
+	@op(4)  power:           func(header: request-header, on: bool) -> result<provider-reply, error>;
+	@op(5)  select-protocol: func(header: request-header, protocol: card-protocol) -> result<provider-reply, error>;
+	@op(6)  exchange:        func(header: request-header, @bound(261) apdu: list<u8>) -> result<provider-reply, error>;
+	@op(7)  secure-verify:   func(request: secure-verify-request) -> result<provider-reply, error>;
+	/// Abort whatever the slot is doing and answer once it is quiescent.
+	@op(8)  abort:           func(header: request-header) -> result<provider-reply, error>;
+}
+
+// ------------------------------------------------------------------ development only
+
+/// A pinpad outcome the fixture's reader will produce for the next verification. DEVELOPMENT ONLY,
+/// like everything below: the endpoint serving it exists on a development fixture bound to a QEMU test
+/// device, reached through PermissionManager in a development build for a probe whose policy row
+/// grants `fixture-control`. It is not a way to enter a PIN: it decides what the fixture's keypad
+/// "saw", and no PIN exists anywhere.
+enum fixture-pin {
+	verified  = 1,
+	incorrect = 2,
+	blocked   = 3,
+	cancelled = 4,
+	timed-out = 5,
+}
+
+/// One provider operation the fixture received, in order, with the fixture's clock.
+record fixture-operation {
+	at:      u64,
+	reader:  u8,
+	slot:    u8,
+	/// `power-on`, `power-off`, `protocol`, `exchange`, `verify`, `abort`, `session`, `quiescent`.
+	what:    string,
+	/// For an exchange, its first four bytes: class, instruction and parameters.
+	@bound(4) header: list<u8>,
+	/// For a secure verification, whether any byte of the template was other than the placeholders.
+	pin-bytes: bool,
+}
+
+interface smartcard-fixture {
+	@op(1) insert:    func(reader: u8, slot: u8) -> result<unit, error>;
+	@op(2) remove:    func(reader: u8, slot: u8) -> result<unit, error>;
+	@op(3) pin:       func(outcome: fixture-pin, delay-ms: u32) -> result<unit, error>;
+	/// Hold the next exchange's reply for `delay-ms`; zero never answers it.
+	@op(4) delay:     func(reader: u8, delay-ms: u32) -> result<unit, error>;
+	/// Hold the next abort's completion for `delay-ms`; zero never completes it.
+	@op(5) hold-abort: func(reader: u8, delay-ms: u32) -> result<unit, error>;
+	/// Prove a slot quiescent after a recovery the service gave up on.
+	@op(6) recover:   func(reader: u8, slot: u8) -> result<unit, error>;
+	@op(7) withdraw:  func(reader: u8) -> result<unit, error>;
+	@op(8) republish: func(reader: u8) -> result<unit, error>;
+	@op(9) operations: func() -> result<list<fixture-operation>, error>;
+	/// The fixture's clock, for ordering what a probe observed against the operation log.
+	@op(10) now:      func() -> result<u64, error>;
+}

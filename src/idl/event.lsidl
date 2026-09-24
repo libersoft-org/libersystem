@@ -1,0 +1,68 @@
+//! LiberSystem bounded events - a transport-independent vocabulary for ordered, timestamped events from one
+//! source, and for how a stream of them ends.
+//!
+//! WHAT IT IS NOT. Not a broker, not a router and not a sequencer: it names what one bounded queue delivers
+//! to one reader. MIDI is its first user (`liber:midi@1` puts typed chunks beside this header); any other
+//! ordered input with a host receipt time can use the same records and the same bounded queue.
+//!
+//! ORDER IS OBSERVATION ORDER. A source's sequence numbers events in the order the transport produced them,
+//! never sorted by time; equal timestamps keep that order. A sequence never wraps: a source that would run
+//! out ENDS, rather than reuse a number an earlier event had.
+//!
+//! TIME IS HOST RECEIPT. `received-ns` is `clock_ns()` - monotonic nanoseconds since this boot - sampled when
+//! the transport completion carrying the event became available, before anything queued it. It is not the
+//! performance time, not wall-clock time, and not comparable across boots or across two sources' lifetimes.
+//!
+//! LOSS IS NEVER SILENT. A stream that could not keep everything ENDS with a reason, kept apart from the
+//! queue it could not fill, and the next read returns it; nothing after a gap is presented as continuous.
+
+package liber:event@1;
+
+/// Which source an event came from, and WHICH LIFETIME of it: the service incarnation, the publication and
+/// its binding, the endpoint inside it, and the receiver generation. A new receiver on the same endpoint is a
+/// new source, and nothing queued for an old one is ever delivered to it.
+record event-source {
+	incarnation:         u64,
+	slot:                u32,
+	generation:          u32,
+	binding-generation:  u64,
+	endpoint:            u32,
+	receiver-generation: u64,
+}
+
+/// The part of every event that is the same whatever the payload: its place in its source's order, and the
+/// host time it was received.
+record event-header {
+	sequence:    u64,
+	received-ns: u64,
+}
+
+enum event-end-reason {
+	/// The receiver's bounded queue could not take the next event: everything queued was discarded.
+	overflow             = 1,
+	/// The source reported input it could not deliver: what survives is not complete.
+	source-discontinuity = 2,
+	/// The source was withdrawn or its provider failed.
+	removed              = 3,
+	/// The authority to receive was revoked, or its owner ended.
+	revoked              = 4,
+	/// The sequence would have wrapped.
+	exhausted            = 5,
+	/// The reader stopped it.
+	stopped              = 6,
+	/// The service is shutting down.
+	shutdown             = 7,
+}
+
+/// How a stream ended: the reason, and the sequence the next event would have had.
+record event-end {
+	reason:        event-end-reason,
+	next-sequence: u64,
+}
+
+/// A payload-agnostic event: the header and at most 64 bytes. A user with a typed payload - MIDI - carries its
+/// own record beside the header instead, and holds itself to this bound or a smaller one.
+record generic-event {
+	header:            event-header,
+	@bound(64) payload: list<u8>,
+}

@@ -299,6 +299,13 @@ pub enum Error {
 	/// path from either of the other two. A display frame drawn for a backing the driver has since
 	/// given back is the case this was added for.
 	Stale = 14,
+	/// The link this operation was running over was replaced or removed, and everything bound to it -
+	/// the connection, the listener, the addresses it used - ended with it.
+	///
+	/// DISTINCT FROM `closed` AND FROM `address-unavailable`. The peer did not close anything and the
+	/// caller named no source; the machine switched its uplink, and a connection is never carried from
+	/// one link to the next. The caller's answer is to open again, over whatever link is selected now.
+	LinkChanged = 15,
 }
 
 impl Error {
@@ -356,6 +363,7 @@ impl Error {
 			12 => Some(Error::CommitUncertain),
 			13 => Some(Error::AddressUnavailable),
 			14 => Some(Error::Stale),
+			15 => Some(Error::LinkChanged),
 			_ => None,
 		}
 	}
@@ -568,6 +576,7 @@ impl Error {
 			Error::CommitUncertain => out.push_str("\"commit-uncertain\""),
 			Error::AddressUnavailable => out.push_str("\"address-unavailable\""),
 			Error::Stale => out.push_str("\"stale\""),
+			Error::LinkChanged => out.push_str("\"link-changed\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -587,6 +596,7 @@ impl Error {
 			Error::CommitUncertain => out.push_str("commit-uncertain"),
 			Error::AddressUnavailable => out.push_str("address-unavailable"),
 			Error::Stale => out.push_str("stale"),
+			Error::LinkChanged => out.push_str("link-changed"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -606,6 +616,7 @@ impl Error {
 			Error::CommitUncertain => crate::codec::cbor::text(out, "commit-uncertain"),
 			Error::AddressUnavailable => crate::codec::cbor::text(out, "address-unavailable"),
 			Error::Stale => crate::codec::cbor::text(out, "stale"),
+			Error::LinkChanged => crate::codec::cbor::text(out, "link-changed"),
 		}
 	}
 }

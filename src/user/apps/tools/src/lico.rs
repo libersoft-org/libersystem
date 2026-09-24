@@ -1711,6 +1711,8 @@ fn volume_words(error: Error) -> &'static [u8] {
 		// Nor does a volume carry generations, for the same reason and with the same answer: the
 		// words say what happened rather than guessing at what a volume might have meant by it.
 		Error::Stale => b"what it was asked about had already been replaced",
+		// Nor is a volume reached over a link; the words say what the error means all the same.
+		Error::LinkChanged => b"the network link it ran over was replaced",
 	}
 }
 

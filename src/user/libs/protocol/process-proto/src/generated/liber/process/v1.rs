@@ -127,6 +127,92 @@ impl StartResult {
 	}
 }
 
+/// EVERY LIMIT A DOMAIN HAS, ALL OF THEM FINITE.
+///
+/// `launch-bounded` takes one number and leaves the other five at no limit, which is what a tool
+/// launched to do one thing needs: the resource it could exhaust is memory and the rest are bounded
+/// by what a short-lived process can reach. A SERVICE IS NOT THAT SHAPE. It runs for the life of the
+/// boot, it holds channels to other services, and the ways it can grow without bound are handles it
+/// never closes, threads it keeps creating and queued messages nobody drains - none of which a
+/// memory ceiling notices until the machine is already in trouble.
+///
+/// SO EVERY FIELD IS REQUIRED AND NONE OF THEM MAY BE UNLIMITED. A record with a field left at
+/// `u64::MAX` is refused rather than accepted as "no opinion about that one": the whole point of
+/// this record is that a service's footprint is stated, and a field nobody filled in is a limit
+/// nobody decided.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceLimits {
+	/// Bytes of memory the Domain may have mapped.
+	pub memory: u64,
+	/// Handles it may hold at once.
+	pub handles: u64,
+	/// Threads it may run.
+	pub threads: u64,
+	/// Bytes of queued IPC it may have outstanding.
+	pub ipc_queue: u64,
+	/// Bytes of thread stack.
+	pub stack: u64,
+	/// Bytes of DMA-capable memory. ZERO IS A REAL VALUE AND IS THE ORDINARY ONE HERE: a service
+	/// with no device claim has no business addressing a device's memory, and saying so costs
+	/// nothing where the alternative is a number nobody chose.
+	pub dma: u64,
+}
+
+impl ResourceLimits {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ResourceLimits> {
+		let mut r = Reader::new(bytes);
+		let value = ResourceLimits::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ResourceLimits> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ResourceLimits::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u64(self.memory)?;
+		w.u64(self.handles)?;
+		w.u64(self.threads)?;
+		w.u64(self.ipc_queue)?;
+		w.u64(self.stack)?;
+		w.u64(self.dma)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ResourceLimits> {
+		let memory = r.u64()?;
+		let handles = r.u64()?;
+		let threads = r.u64()?;
+		let ipc_queue = r.u64()?;
+		let stack = r.u64()?;
+		let dma = r.u64()?;
+		Some(ResourceLimits { memory, handles, threads, ipc_queue, stack, dma })
+	}
+}
+
 /// The Process service contract: the process-loading mechanism. `start` launches an
 /// unattended program (no bootstrap capability), `list` reports the processes started
 /// so far, and `launch` is the full launcher primitive - it loads and starts a program
@@ -217,6 +303,7 @@ pub mod process {
 	pub const OP_RELEASE_GROUP: u16 = 8;
 	pub const OP_CANCEL: u16 = 9;
 	pub const OP_LAUNCH_PREPARED_BOUNDED: u16 = 10;
+	pub const OP_LAUNCH_PREPARED_LIMITED: u16 = 11;
 
 	pub trait Service {
 		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
@@ -229,6 +316,15 @@ pub mod process {
 		fn release_group(&mut self, koids: Vec<Koid>) -> Result<bool, Error>;
 		fn cancel(&mut self, koid: Koid) -> Result<bool, Error>;
 		fn launch_prepared_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error>;
+		/// `launch-prepared-bounded` with EVERY limit rather than one, for a program whose footprint is
+		/// stated in full - which is what a long-running service's is.
+		///
+		/// PREPARED AND NOT LIVE, because the limits have to be in place before the program runs and a
+		/// live launch has already started it. Every one of the six is assigned to the Domain before the
+		/// first thread is queued; if the Domain cannot be created or ANY assignment is refused, the
+		/// launch fails and the Domain is torn down. There is no fallback to an unbounded launch: a
+		/// service that came up outside its stated limits is one nothing would notice was outside them.
+		fn launch_prepared_limited(&mut self, name: String, limits: ResourceLimits, bootstrap: u64) -> Result<StartResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -658,6 +754,48 @@ pub mod process {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_LAUNCH_PREPARED_LIMITED => {
+				let name = r.string_lp()?;
+				let limits = ResourceLimits::read(r)?;
+				let bootstrap = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.launch_prepared_limited(name, limits, bootstrap);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v24) => {
+							w.u8(1)?;
+							v24.write(w)?;
+						}
+						Err(v25) => {
+							w.u8(0)?;
+							v25.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -799,13 +937,13 @@ pub mod process {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v24 = r.u16()? as usize;
-						let mut v25 = Vec::new();
-						v25.try_reserve_exact(v24).ok()?;
-						for _ in 0..v24 {
-							v25.push(ProcessInfo::read(r)?);
+						let v26 = r.u16()? as usize;
+						let mut v27 = Vec::new();
+						v27.try_reserve_exact(v26).ok()?;
+						for _ in 0..v26 {
+							v27.push(ProcessInfo::read(r)?);
 						}
-						v25
+						v27
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -914,13 +1052,13 @@ pub mod process {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v26 = r.u16()? as usize;
-						let mut v27 = Vec::new();
-						v27.try_reserve_exact(v26).ok()?;
-						for _ in 0..v26 {
-							v27.push(Budget::read(r)?);
+						let v28 = r.u16()? as usize;
+						let mut v29 = Vec::new();
+						v29.try_reserve_exact(v28).ok()?;
+						for _ in 0..v28 {
+							v29.push(Budget::read(r)?);
 						}
-						v27
+						v29
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1012,8 +1150,8 @@ pub mod process {
 				return None;
 			}
 			w.u16(koids.len() as u16)?;
-			for v28 in koids.iter() {
-				w.u64(*v28)?;
+			for v30 in koids.iter() {
+				w.u64(*v30)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -1082,6 +1220,42 @@ pub mod process {
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
 			w.u64(*memory_limit)?;
+			w.set_handle(*bootstrap)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn launch_prepared_limited(&mut self, name: &str, limits: &ResourceLimits, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LAUNCH_PREPARED_LIMITED)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			limits.write(w)?;
 			w.set_handle(*bootstrap)?;
 			w.u32(0)?;
 			// One call for both halves: the bytes cannot be taken without them.
@@ -1191,6 +1365,14 @@ pub mod process {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.launch_prepared_bounded(name, memory_limit, bootstrap)
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_launch_prepared_limited")]
+	fn channel_invoke_launch_prepared_limited(chan: u64, name: &str, limits: &ResourceLimits, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.launch_prepared_limited(name, limits, bootstrap)
+	}
 }
 
 /// THE NARROW DOOR TO STOPPING THE MACHINE.
@@ -1253,12 +1435,12 @@ pub mod system_power {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v29) => {
+						Ok(v31) => {
 							w.u8(1)?;
 						}
-						Err(v30) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v30.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -1288,12 +1470,12 @@ pub mod system_power {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v31) => {
+						Ok(v33) => {
 							w.u8(1)?;
 						}
-						Err(v32) => {
+						Err(v34) => {
 							w.u8(0)?;
-							v32.write(w)?;
+							v34.write(w)?;
 						}
 					}
 					Some(())
@@ -1565,6 +1747,81 @@ impl StartResult {
 		crate::codec::cbor::uint(out, self.task as u64);
 		crate::codec::cbor::text(out, "info");
 		self.info.to_cbor_into(out);
+	}
+}
+
+impl ResourceLimits {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"memory\":");
+		let _ = write!(out, "{}", self.memory);
+		out.push(',');
+		out.push_str("\"handles\":");
+		let _ = write!(out, "{}", self.handles);
+		out.push(',');
+		out.push_str("\"threads\":");
+		let _ = write!(out, "{}", self.threads);
+		out.push(',');
+		out.push_str("\"ipc-queue\":");
+		let _ = write!(out, "{}", self.ipc_queue);
+		out.push(',');
+		out.push_str("\"stack\":");
+		let _ = write!(out, "{}", self.stack);
+		out.push(',');
+		out.push_str("\"dma\":");
+		let _ = write!(out, "{}", self.dma);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("memory=");
+		let _ = write!(out, "{}", self.memory);
+		out.push_str(", ");
+		out.push_str("handles=");
+		let _ = write!(out, "{}", self.handles);
+		out.push_str(", ");
+		out.push_str("threads=");
+		let _ = write!(out, "{}", self.threads);
+		out.push_str(", ");
+		out.push_str("ipc-queue=");
+		let _ = write!(out, "{}", self.ipc_queue);
+		out.push_str(", ");
+		out.push_str("stack=");
+		let _ = write!(out, "{}", self.stack);
+		out.push_str(", ");
+		out.push_str("dma=");
+		let _ = write!(out, "{}", self.dma);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 6);
+		crate::codec::cbor::text(out, "memory");
+		crate::codec::cbor::uint(out, self.memory as u64);
+		crate::codec::cbor::text(out, "handles");
+		crate::codec::cbor::uint(out, self.handles as u64);
+		crate::codec::cbor::text(out, "threads");
+		crate::codec::cbor::uint(out, self.threads as u64);
+		crate::codec::cbor::text(out, "ipc-queue");
+		crate::codec::cbor::uint(out, self.ipc_queue as u64);
+		crate::codec::cbor::text(out, "stack");
+		crate::codec::cbor::uint(out, self.stack as u64);
+		crate::codec::cbor::text(out, "dma");
+		crate::codec::cbor::uint(out, self.dma as u64);
 	}
 }
 

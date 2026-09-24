@@ -32,6 +32,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "camera-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "camera-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "config-proto"
 version = "0.0.0"
 dependencies = [
@@ -72,6 +92,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-proto"
+version = "0.0.0"
+dependencies = [
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "font-proto"
 version = "0.0.0"
 dependencies = [
@@ -84,6 +112,15 @@ dependencies = [
 name = "graphics-proto"
 version = "0.0.0"
 dependencies = [
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "import-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "ipc-client",
  "wire",
 ]
@@ -115,6 +152,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "midi-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "midi-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "event-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "modem-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "modem-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "network-proto"
 version = "0.0.0"
 dependencies = [
@@ -125,6 +201,24 @@ dependencies = [
 
 [[package]]
 name = "observability-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "power-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "printer-device-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
@@ -150,23 +244,45 @@ dependencies = [
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "camera-device-proto",
+ "camera-proto",
  "config-proto",
  "device-proto",
  "display-device-proto",
  "display-proto",
+ "event-proto",
  "font-proto",
  "graphics-proto",
+ "import-proto",
  "input-proto",
  "ipc-client",
  "log-proto",
+ "midi-device-proto",
+ "midi-proto",
+ "modem-device-proto",
+ "modem-proto",
  "network-proto",
  "observability-proto",
+ "power-proto",
+ "printer-device-proto",
  "process-proto",
+ "ptp-transport-proto",
  "resources-proto",
  "security-proto",
  "session-proto",
+ "smartcard-proto",
+ "spool-proto",
  "storage-proto",
  "time-proto",
+ "wire",
+]
+
+[[package]]
+name = "ptp-transport-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 
@@ -204,6 +320,25 @@ dependencies = [
  "base-proto",
  "ipc-client",
  "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "smartcard-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "spool-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 

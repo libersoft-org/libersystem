@@ -1,0 +1,47 @@
+//! LiberSystem PTP transport - the private contract a `ptp-transport` publication serves to MediaImportService.
+//!
+//! BYTES OUT, BYTES IN, AND NOTHING UNDERSTOOD. The USB Still Image class module, and the kernel's responder
+//! fixture before it, sends one command container, returns bulk-IN bytes as they arrive, delivers event
+//! containers, cancels the active transaction and resets the device. It bounds every frame before it copies
+//! it and parses none of them: container lengths, types and codes, transaction IDs, sessions, datasets and the
+//! order of data and responses are validated once, by the service.
+
+package liber:ptp-transport@1;
+
+use liber:base@1.{error};
+
+record ptp-attach {
+	version:    u32,
+	/// A new attachment - after a reset or a recovery - is a new epoch.
+	attachment: u64,
+}
+
+record ptp-event-container {
+	attachment:         u64,
+	/// A container header and its parameters.
+	@bound(32) bytes:   list<u8>,
+}
+
+variant ptp-event {
+	container(ptp-event-container),
+	/// Eight events were already waiting and later ones were dropped: whatever they said is unknown. The
+	/// attachment it happened on.
+	overflow(u64),
+}
+
+/// THE TRANSPORT CONTRACT, served to MediaImportService alone. One transaction at a time.
+interface ptp-transport {
+	@op(1) attach:  func(version: u32) -> result<ptp-attach, error>;
+	/// ONE COMMAND CONTAINER, sent whole or not at all. An error means it may or may not have left: the
+	/// service ends the session rather than send it again.
+	@op(2) command: func(attachment: u64, @bound(32) container: list<u8>) -> result<unit, error>;
+	/// Up to `max` bulk-IN bytes, as they arrived. `again` when none have yet - never an empty success, and
+	/// never a response the device did not send.
+	@op(3) @bound(4096) pull: func(attachment: u64, max: u16) -> result<list<u8>, error>;
+	/// Event containers as the device sends them, eight at most waiting.
+	@op(4) events:  func() -> stream<ptp-event>;
+	/// Cancel the active transaction.
+	@op(5) cancel:  func(attachment: u64) -> result<unit, error>;
+	/// Reset the device. A new attachment on success; the old one is gone either way.
+	@op(6) reset:   func(attachment: u64) -> result<ptp-attach, error>;
+}

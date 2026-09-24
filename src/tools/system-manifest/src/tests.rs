@@ -590,6 +590,9 @@ fn the_production_manifest_classifies_every_staged_driver() {
 			// descriptor table is memory the CONTROLLER reads, which is what `none` said it never
 			// did - and said by ENFORCEMENT, since a claim under that policy mints no DMA buffer.
 			"sdhci" => DmaPolicy::TrustedUntranslated,
+			// THE IN-GUEST FIXTURES MASTER NOTHING: each binds a QEMU test function only to hold a
+			// binding, never maps it, and publishes what it emulates over ordinary channels.
+			"bt_fixture" | "power_fixture" | "smartcard_fixture" | "modem_fixture" | "camera_fixture" | "midi_fixture" | "admin_fixture" => DmaPolicy::None,
 			_ => DmaPolicy::TrustedUntranslated,
 		};
 		assert_eq!(*policy, expected, "{name} carries the policy it declares");
@@ -690,5 +693,47 @@ fn a_minted_connection_names_at_most_the_interfaces_own_bound() {
 	let over = with_role(&format!("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [{kinds}]\n"));
 	let error = Manifest::parse(&over, &root).unwrap_err().to_string();
 	assert!(error.contains(&format!("may name at most {MAX_ROLE_KINDS} kinds")), "{error}");
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+// A FIXTURE'S CONTROL ENDPOINT IS A TEST AUTHORITY, and neither half of the configuration that ships
+// may name it: an entry that is not development-only may not publish it, and no role may be minted a
+// connection that reaches it - PermissionManager opens it for a probe through a scope its own
+// development bootstrap mints.
+fn a_fixtures_control_endpoint_stays_out_of_the_shipping_configuration() {
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let driver = |development: bool| -> String { format!("{}\n[[programs]]\nname = \"a_fixture\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_fixture.lsexe\"\ndevelopment = {development}\n[programs.driver]\nlifecycle = \"controller\"\ndma = \"none\"\nmatch = [{{ transport = \"plain-pci\", pci-class = 0xff, pci-subclass = 0x00, pci-interface = 0x00 }}]\nprovides = [{{ kind = \"fixture-control\", most = 1 }}]\n", valid_fixture()) };
+	assert_eq!(errors(&driver(true)), "", "a development-only fixture may publish its control endpoint");
+	assert!(errors(&driver(false)).contains("only a development-only driver may publish a fixture's control endpoint"), "{}", errors(&driver(false)));
+	let role = with_role("[[services.roles]]\ntag = \"CAT\"\nkind = \"factory\"\nprovider = \"tool_service\"\nkinds = [\"fixture-control\"]\n");
+	assert!(errors(&role).contains("no service is minted a connection that reaches a fixture's control endpoint"), "{}", errors(&role));
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+// THE CATALOGUE'S CLIENTS, ADDED UP ACROSS THE WHOLE MANIFEST. Every role minting a connection from one
+// of DeviceManager's catalogue roots holds a slot - two at worst for a service a restart replaces, since
+// the replacement is minted before the manager has seen the old channel close, and one for a service
+// that is never replaced - and the sum, with what the manager mints for itself, has to fit the one
+// table. The numbers are derived from the bound, so the test says whether the two constants agree
+// rather than what they were when it was written.
+fn the_manifests_catalogue_connections_fit_the_catalogues_client_table() {
+	let root = fixture_workspace();
+	let manifest = |restart: &str, consumers: usize| -> String {
+		let mut text = format!("{}\n[[services]]\nname = \"device_manager\"\nprogram = \"tool\"\nrestart = \"escalate\"\nstate_class = \"ephemeral\"\nstate_scope = \"service\"\ndependencies = []\n\n[[services.roles]]\ntag = \"SERVE\"\nkind = \"serve-root\"\nprovider = \"self\"\ninterface = \"liber:device@1/provider-catalogue\"\n", valid_fixture());
+		for at in 0..consumers {
+			text.push_str(&format!("\n[[services]]\nname = \"consumer_{at:02}\"\nprogram = \"tool\"\nrestart = \"{restart}\"\nstate_class = \"ephemeral\"\nstate_scope = \"service\"\ndependencies = [\"device_manager\"]\n\n[[services.roles]]\ntag = \"CATALOGUE\"\nkind = \"factory\"\nprovider = \"device_manager\"\nsource = \"SERVE\"\ninterface = \"liber:device@1/provider-catalogue\"\nkinds = [\"block\"]\n"));
+		}
+		text
+	};
+	for (restart, slots) in [("transparent", 2), ("escalate", 1)] {
+		let fits = (MAX_CATALOGUE_CLIENTS - CATALOGUE_CLIENTS_UNDECLARED) / slots;
+		let at_the_bound = Manifest::parse(&manifest(restart, fits), &root).err().map(|error| error.to_string()).unwrap_or_default();
+		assert!(!at_the_bound.contains("client slots"), "{fits} minting roles of `{restart}` services fit the table: {at_the_bound}");
+		let over = Manifest::parse(&manifest(restart, fits + 1), &root).err().map(|error| error.to_string()).unwrap_or_default();
+		assert!(over.contains(&format!("the catalogue has {MAX_CATALOGUE_CLIENTS}")), "one `{restart}` role more does not: {over}");
+	}
 	fs::remove_dir_all(root).unwrap();
 }

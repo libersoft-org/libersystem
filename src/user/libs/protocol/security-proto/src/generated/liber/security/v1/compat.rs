@@ -19,9 +19,9 @@ fn manifest_wire_is_stable() {
 }
 #[test]
 fn audit_entry_wire_is_stable() {
-	let sample = AuditEntry { component: String::from("x"), capability: Capability::Log, granted: true, dynamic: true };
+	let sample = AuditEntry { component: String::from("x"), capability: Capability::Log, granted: true, dynamic: true, detail: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[1, 0, 120, 0, 1, 1];
+	let golden: &[u8] = &[1, 0, 120, 0, 1, 1, 1, 0, 120];
 	assert_eq!(bytes, golden);
 	assert_eq!(AuditEntry::decode(&bytes).unwrap(), sample);
 }

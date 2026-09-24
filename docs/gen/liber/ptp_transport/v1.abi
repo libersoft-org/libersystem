@@ -1,0 +1,11 @@
+package liber:ptp-transport@1
+record ptp-attach(version:u32,attachment:u64)
+record ptp-event-container(attachment:u64,bytes:list<u8>:bound=32)
+variant ptp-event(container=0:ptp-event-container,overflow=1:u64)
+interface ptp-transport
+method ptp-transport.attach op=1 (version:u32:rights=) -> result<ptp-attach, liber:base@1::error>
+method ptp-transport.command op=2 (attachment:u64:rights=,container:list<u8>:bound=32:rights=) -> result<unit, liber:base@1::error>
+method ptp-transport.pull op=3 (attachment:u64:rights=,max:u16:rights=) -> result<list<u8>, liber:base@1::error>:bound=4096
+method ptp-transport.events op=4 () -> stream<ptp-event>
+method ptp-transport.cancel op=5 (attachment:u64:rights=) -> result<unit, liber:base@1::error>
+method ptp-transport.reset op=6 (attachment:u64:rights=) -> result<ptp-attach, liber:base@1::error>

@@ -43,6 +43,7 @@ pub struct Resources {
 	pub keys: u64,
 	pub syspower: u64,
 	pub console: u64,
+	pub trusted_keys: u64,
 }
 
 // Read one frame. Answers with the header, the payload length, and every capability it carried.
@@ -136,6 +137,7 @@ pub fn handshake(bootstrap: u64) -> (Bind, Resources) {
 			proto::ResourceKind::Keys => &mut resources.keys,
 			proto::ResourceKind::SysPower => &mut resources.syspower,
 			proto::ResourceKind::Console => &mut resources.console,
+			proto::ResourceKind::TrustedKeys => &mut resources.trusted_keys,
 		};
 		// A SECOND RESOURCE OF ONE KIND IS NOT A SPARE. Overwriting the slot would leak the
 		// first capability silently; this keeps the first and closes the second, which is the
@@ -777,6 +779,18 @@ impl Serving {
 		self.tokens[self.count] = 0;
 		self.new[self.count] = false;
 		token
+	}
+
+	// A PUBLICATION MADE AFTER THE HANDSHAKE - a replacement for one this driver withdrew, under a
+	// fresh token - and the end it kept of the connection it offered with it. False when the set of
+	// publications or of endpoints is full; the caller then closes both ends rather than offering.
+	pub fn publish(&mut self, token: u16, first: u64) -> bool {
+		if self.publication_count >= MAX_PROVIDER_CLIENTS || self.publications[..self.publication_count].contains(&token) || self.count >= MAX_PROVIDER_CLIENTS {
+			return false;
+		}
+		self.publications[self.publication_count] = token;
+		self.publication_count += 1;
+		self.accept(first, token)
 	}
 
 	// One more, from a `CONNECT`, under the token that frame named. False when this driver is already

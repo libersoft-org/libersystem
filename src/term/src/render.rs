@@ -107,6 +107,12 @@ fn glyph_bitmap(cp: u32) -> &'static [u8] {
 	glyph_bitmap(b'?' as u32)
 }
 
+/// One character's 8x16 bitmap from the same font, for a program that draws its own text rather than
+/// running a terminal: sixteen rows, bit 7 the leftmost pixel. A character the font lacks is '?'.
+pub fn glyph(character: char) -> &'static [u8] {
+	glyph_bitmap(character as u32)
+}
+
 // The raw pixel buffer: a mapped linear framebuffer and the layout that describes it. The only
 // place that touches pixels and the framebuffer address. A display backend (the boot framebuffer,
 // the virtio-gpu shared backing) is a `Raster` plus how to make its writes visible; it holds no

@@ -51,8 +51,14 @@ pub const DOMAIN: &[u8] = b"libersystem-boot-manifest-v3\0";
 
 // Bounds, checked BEFORE anything is allocated or indexed. Each is far above any real manifest and
 // far below what would make the arithmetic below interesting.
+//
+// THE ROW BOUND WAS 256, and a real manifest reached it: the development volume carried 291 rows - every
+// library, program and factory file, plus the kernel and the bootstrap list - once the destination services
+// and their protocols arrived (2026-09-23), and the shipping one 256. 512 is again far above both, and the
+// row count is a `u16` on the wire, so nothing about the format moves; 512 rows of the longest paths this
+// tree stages still fit `MAX_MANIFEST_BYTES`.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-pub const MAX_ROWS: usize = 256;
+pub const MAX_ROWS: usize = 512;
 pub const MAX_PATH_BYTES: usize = 255;
 pub const MAX_NAME_BYTES: usize = 64;
 

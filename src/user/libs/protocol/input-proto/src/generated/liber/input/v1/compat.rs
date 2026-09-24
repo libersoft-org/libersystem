@@ -25,3 +25,19 @@ fn contact_event_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(ContactEvent::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn trusted_input_kind_wire_is_stable() {
+	let sample = TrustedInputKind::Attention;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(TrustedInputKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn trusted_input_wire_is_stable() {
+	let sample = TrustedInput { kind: TrustedInputKind::Attention, epoch: 7, usage: 7, down: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(TrustedInput::decode(&bytes).unwrap(), sample);
+}

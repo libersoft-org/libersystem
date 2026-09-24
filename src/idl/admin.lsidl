@@ -1,0 +1,210 @@
+//! LiberSystem administrative authorization - one person's confirmation, on a protected screen, of one bound
+//! high-risk operation, and at most one attempt at it.
+//!
+//! A REQUEST IS NOT AUTHORITY. A component PermissionManager granted `admin-request` holds a request
+//! connection bound to the task it was launched as. It asks for an action on a target; the executor that
+//! owns the target resolves and freezes the exact operation - target instance and generation, parameters,
+//! payload length and digest - and AdminService waits for a person. Nothing a requester sends is identity:
+//! its label is shown as its own words, escaped, beside the canonical operation the service renders itself.
+//!
+//! A PERSON DECIDES, ON A SCREEN NOTHING ELSE CAN DRAW. Ctrl+Alt+F12 on the trusted keyboard always enters an
+//! OS-owned protected screen; the display is locked to it and the trusted keyboard reports to AdminService
+//! alone. Only a fresh Enter after every key was released approves; Escape declines. Refusal, timeout,
+//! contention and an unavailable path are all the same `declined`.
+//!
+//! A GRANT IS ONE ATTEMPT. A granted request answers a channel served by its grant record. `execute` takes
+//! no argument - the operation is the one that was confirmed - and the first call consumes the grant; a
+//! second, an expired one, or one whose launching task has ended reaches no executor. A lost reply is
+//! `outcome-unknown` and is never retried.
+//!
+//! EVERY DECISION IS RECORDED FIRST. Requests and approvals are committed to the service's journal before a
+//! grant exists, consumption before the effect is dispatched, and every decline is recorded.
+
+package liber:admin@1;
+
+use liber:base@1.{error};
+use liber:process@1.{task};
+
+/// Bytes a requester hands over for an operation. The executor copies what it needs when it prepares, so
+/// whatever the requester can still write through its own alias changes nothing that was confirmed.
+@kernel(memory-object)
+resource admin-payload;
+
+enum admin-action {
+	/// Download firmware to a registered DFU target.
+	firmware-download = 1,
+	/// The test executor's bounded write. Development images only.
+	probe-write       = 2,
+}
+
+/// THE OPERATION EXACTLY AS THE EXECUTOR FROZE IT, and all that a confirmation authorizes.
+record admin-descriptor {
+	version:                u32,
+	action:                 admin-action,
+	/// The executor's identity: its publication name.
+	@bound(64) executor:    string,
+	executor-epoch:         u64,
+	/// The live target instance, as the executor names it, and its generation.
+	@bound(64) target:      string,
+	target-generation:      u64,
+	@bound(256) parameters: list<u8>,
+	payload-length:         u32,
+	/// SHA-256 of the payload the executor copied.
+	@bound(32) payload-digest: list<u8>,
+}
+
+/// What a requester asks for.
+record admin-request-args {
+	action:                 admin-action,
+	/// A selector the executor resolves to a live target. Never identity by itself.
+	@bound(64) target:      string,
+	@bound(256) parameters: list<u8>,
+	payload-length:         u32,
+	/// Words for a person, shown as the requester's and escaped. Never identity.
+	@bound(128) label:      string,
+}
+
+record admin-grant {
+	/// The grant: a channel served by its record, carrying no `duplicate`.
+	grant:      handle<channel>,
+	descriptor: admin-descriptor,
+}
+
+variant admin-answer {
+	/// Refused - by the person, by the clock, by contention, or because the path is unavailable. One
+	/// answer for all of them.
+	declined,
+	granted(admin-grant),
+}
+
+enum admin-result {
+	completed       = 1,
+	failed          = 2,
+	/// The operation was dispatched and its end was not observed. It is never retried.
+	outcome-unknown = 3,
+}
+
+/// ONE REQUEST AT A TIME ON A CONNECTION. `request` is answered when it is decided.
+interface admin-request {
+	@op(1) request: func(args: admin-request-args, @rights(map) payload: handle<admin-payload>) -> result<admin-answer, error>;
+	/// Withdraw the request in progress; it is answered `declined`.
+	@op(2) cancel:  func() -> result<unit, error>;
+}
+
+/// A GRANT'S CHANNEL. `execute` is the one attempt at the confirmed operation.
+interface admin-authority {
+	@op(1) execute: func() -> result<admin-result, error>;
+}
+
+/// What a request connection may ask for: these actions, on targets whose selector starts with this.
+record admin-scope {
+	@bound(2) actions:        list<admin-action>,
+	@bound(64) target-prefix: string,
+}
+
+/// PERMISSIONMANAGER'S FACTORY: one request connection per authorized launch, bound to the exact task that
+/// launch prepared, under the component's trusted name and its policy's scope.
+interface admin-factory {
+	@op(1) mint: func(@bound(64) component: string, scope: admin-scope, launch: u64, @rights(wait) owner: handle<task>) -> result<handle<channel>, error>;
+}
+
+record admin-prepared {
+	operation:   u64,
+	descriptor:  admin-descriptor,
+	/// How long the executor may take once started.
+	deadline-ms: u32,
+}
+
+/// THE EXECUTOR CONTRACT, which an `admin-executor` publication serves to AdminService alone. Preparation
+/// freezes the operation; revalidation checks it is still the same live target; execution is at most one
+/// attempt, under the executor's own start guard.
+interface admin-executor {
+	@op(1) prepare:    func(action: admin-action, @bound(64) target: string, @bound(256) parameters: list<u8>, payload-length: u32, @rights(map) payload: handle<admin-payload>) -> result<admin-prepared, error>;
+	@op(2) revalidate: func(operation: u64) -> result<unit, error>;
+	@op(3) execute:    func(operation: u64, epoch: u64) -> result<admin-result, error>;
+	@op(4) cancel:     func(operation: u64) -> result<unit, error>;
+}
+
+enum admin-event {
+	requested       = 1,
+	granted         = 2,
+	declined        = 3,
+	consumed        = 4,
+	completed       = 5,
+	failed          = 6,
+	outcome-unknown = 7,
+}
+
+/// One decision record, as the journal keeps it.
+record admin-record {
+	sequence:                 u64,
+	broker-epoch:             u64,
+	request:                  u64,
+	launch:                   u64,
+	@bound(64) requester:     string,
+	/// Zero for no action.
+	action:                   u8,
+	/// SHA-256 of the canonical descriptor; empty before there is one.
+	@bound(32) digest:        list<u8>,
+	event:                    admin-event,
+	@bound(64) reason:        string,
+	monotonic-ns:             u64,
+	utc-seconds:              option<u64>,
+	@bound(16) utc-provenance: string,
+}
+
+record admin-journal-page {
+	@bound(16) records: list<admin-record>,
+	/// The oldest sequence still retained.
+	oldest:             u64,
+	/// The sequence after the last one returned.
+	next:               u64,
+	/// Records the emergency ring had to drop.
+	evicted:            u64,
+}
+
+/// THE OPERATOR'S READ VIEW of the decision journal. No requester holds it.
+interface admin-journal {
+	@op(1) read: func(from: u64) -> result<admin-journal-page, error>;
+}
+
+/// What the development test executor actually did, for the gate that has to count it.
+record admin-probe-effects {
+	writes:            u32,
+	dispatches:        u32,
+	@bound(32) digest: list<u8>,
+	generation:        u64,
+}
+
+enum admin-probe-fault {
+	none       = 0,
+	/// Perform the effect and do not answer.
+	lose-reply = 1,
+	/// Refuse the next execution.
+	fail       = 2,
+}
+
+/// THE TEST EXECUTOR'S WITNESS AND CONTROLS, on its fixture-control endpoint in development images.
+interface admin-probe-witness {
+	@op(1) effects:        func() -> result<admin-probe-effects, error>;
+	/// A new target generation: every preparation against the old one fails revalidation.
+	@op(2) replace-target: func() -> result<u64, error>;
+	@op(3) inject:         func(fault: admin-probe-fault) -> result<unit, error>;
+}
+
+enum admin-journal-fault {
+	none  = 0,
+	/// Every journal write fails.
+	fail  = 1,
+	/// Journal acknowledgments are held until released.
+	hold  = 2,
+}
+
+/// AdminService's own test controls, in development images only. None of them approves anything.
+interface admin-test {
+	@op(1) journal: func(fault: admin-journal-fault) -> result<unit, error>;
+	/// Take the path to a person away, or give it back, as a lost display or keyboard would.
+	@op(2) path:    func(present: bool) -> result<unit, error>;
+	/// How many journal acknowledgments `hold` is keeping back right now.
+	@op(3) held:    func() -> result<u32, error>;
+}

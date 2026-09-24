@@ -21,7 +21,7 @@ mod text;
 
 pub use ld::{Echo, EchoBuf, LD_HIST_MAX, Ld};
 pub use raw::RawSink;
-pub use render::{CELL_H, CELL_W, Raster, Surface, Term};
+pub use render::{CELL_H, CELL_W, Raster, Surface, Term, glyph};
 pub use screen::{Cell, Color, CursorShape, SCROLLBACK_ROWS, Screen, ScrollOp};
 pub use text::TextSink;
 

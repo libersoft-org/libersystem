@@ -1,6 +1,6 @@
 use super::*;
 use ipc_client::ChannelTransport;
-use proto::system::volume_admin;
+use proto::system::{volume, volume_admin};
 
 // THE PLAN EXECUTOR: hand one service its declared roles, in the declared order.
 //
@@ -20,6 +20,14 @@ use proto::system::volume_admin;
 // The rest - a driver's handle, a privileged capability from the kernel, a message of bytes - come
 // from outside the service graph, and the executor takes them from the caller rather than
 // inventing a way to derive what is not derivable.
+// WHERE THE BOND STORE'S STATE LIVES. Named here rather than in the service because the supervisor
+// is what makes the directory and what scopes the client to it; the service is handed a client it
+// cannot widen and a path inside it.
+pub(super) const BOND_STATE_PARENT: &str = "vol://system/state";
+pub(super) const BOND_STATE_DIRECTORY: &str = "vol://system/state/bluetooth-bonds";
+// ADMINSERVICE'S DECISION JOURNAL, directly under the system volume's root.
+pub(super) const ADMIN_JOURNAL_DIRECTORY: &str = "vol://system/admin-audit";
+
 pub(super) struct Kept {
 	// One kept client end per serve root, indexed the same way `MANIFEST` is, so a lookup is a
 	// walk over one service's roles rather than a map.
@@ -60,6 +68,18 @@ impl Kept {
 			}
 		}
 		0
+	}
+
+	// Close and forget every serve root this service's plan made - its instance has ended and every
+	// one of them died with it. What a relaunch does before re-running the plan, so the executor's new
+	// ends do not overwrite live handles.
+	pub(super) fn release_serve_roots(&mut self, index: usize) {
+		for (slot, role) in ROLES[index].iter().enumerate() {
+			if role.kind == RoleKind::ServeRoot && slot < MAX_ROLES && self.ends[index][slot] != 0 {
+				close(self.ends[index][slot]);
+				self.ends[index][slot] = 0;
+			}
+		}
 	}
 
 	// The same end, GIVEN UP: returned and forgotten, so nothing here holds it any more. What an
@@ -238,6 +258,84 @@ fn mint_scoped_consumer(root: u64, kinds: &[u16]) -> Option<u64> {
 	}
 }
 
+// THE TWO SERVICES WHOSE FOOTPRINT IS STATED IN FULL, and the numbers that state it.
+//
+// Every other service runs in the supervisor's own Domain, which is the shape this system has and
+// not an oversight: a Domain per service is a resource boundary somebody has to size, and sizing one
+// without a measurement produces a number that is either meaningless or a boot that fails under
+// load. These two are sized because the milestone sizes them, and because what they hold makes the
+// boundary worth the cost - one parses a stranger's radio packets and the other holds every link key
+// on the machine.
+//
+// MEASURED OR NOT, THEY ARE FINITE. The values are the milestone's own initial figures; if a boot
+// shows them to be wrong the answer is to measure and change the number, never to widen it to no
+// limit - a service running outside its stated footprint is one nothing would notice was outside it.
+fn service_limits(name: &[u8]) -> Option<proto::system::ResourceLimits> {
+	const MB: u64 = 1024 * 1024;
+	match name {
+		b"bluetooth_service" => Some(proto::system::ResourceLimits { memory: 64 * MB, handles: 256, threads: 4, ipc_queue: 2 * MB, stack: 2 * MB, dma: 0 }),
+		b"bluetooth_bond_store" => Some(proto::system::ResourceLimits { memory: 16 * MB, handles: 64, threads: 2, ipc_queue: 256 * 1024, stack: MB, dma: 0 }),
+		_ => None,
+	}
+}
+
+// Load one service from the volume, under its stated limits when it has them and ordinarily when it
+// does not. The single entry point a relaunch uses, so a restart cannot bring a limited service back
+// without its limits - which is the defect a second launch path would make possible.
+pub(super) fn launch_service_from_volume(process_client: u64, name: &[u8], program: &[u8], bootstrap: u64) -> i64 {
+	match service_limits(name) {
+		Some(limits) => launch_limited_from_volume(process_client, program, bootstrap, limits),
+		None => launch_from_volume(process_client, program, bootstrap),
+	}
+}
+
+// Load a service under a Domain carrying every one of its limits.
+//
+// PREPARED AND THEN RELEASED, because the limits have to be in place before the program runs and a
+// live launch has already started it. A prepared launch that cannot be released is CANCELLED rather
+// than left: an abandoned one is a process that is loaded, stopped and holding its Domain for the
+// rest of the boot, which is the leak `cancel` exists for.
+//
+// THERE IS NO FALLBACK TO AN ORDINARY LAUNCH. A service that came up outside its stated limits is a
+// service whose statement describes nothing, and the failure that says so is worth more than a boot
+// that continues.
+fn launch_limited_from_volume(process_client: u64, name: &[u8], bootstrap: u64, limits: proto::system::ResourceLimits) -> i64 {
+	if process_client == 0 {
+		print(b"ServiceManager: ");
+		print(name);
+		print(b" is launched from the volume under resource limits and ProcessService is not up yet - its manifest row does not declare `process_service` as a dependency\n");
+		return -1;
+	}
+	let Ok(name_str) = core::str::from_utf8(name) else { return -1 };
+	let Some(launcher) = service_connect(process_client) else { return -1 };
+	let mut client = proto::system::process::Client::new(ChannelTransport { chan: launcher });
+	let prepared = client.launch_prepared_limited(name_str, &limits, &bootstrap);
+	let started = match prepared {
+		Some(Ok(result)) => result,
+		_ => {
+			close(launcher);
+			print(b"ServiceManager: ");
+			print(name);
+			print(b" could not be loaded inside its resource limits; it is not started\n");
+			return -1;
+		}
+	};
+	// THE SAME CONNECTION, because a prepared launch is keyed by the channel it was prepared on: a
+	// release on a second connection names a koid that client does not own, which answers exactly as
+	// a koid that does not exist.
+	let released = matches!(client.release(&started.info.koid), Some(Ok(true)));
+	if !released {
+		let _ = client.cancel(&started.info.koid);
+		close(launcher);
+		print(b"ServiceManager: ");
+		print(name);
+		print(b" was loaded inside its limits and could not be started; the prepared launch is cancelled\n");
+		return -1;
+	}
+	close(launcher);
+	started.task as i64
+}
+
 // Load a non-pinned service from its manifest-declared system-volume path through ProcessService,
 // handing the new process `bootstrap` as its bootstrap channel. Mints a dedicated
 // launcher connection to the `process` factory (so the client end kept for the shell
@@ -303,7 +401,7 @@ pub(super) fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_on
 	// Reading by tag makes the eight independent: a message may be added, removed or reordered on
 	// either side without silently misrouting a capability, and one that arrives under a tag this
 	// build does not know is CLOSED rather than assigned to whatever slot came next.
-	for _ in 0..8 {
+	for _ in 0..9 {
 		let Received::Message { len, handle } = recv_blocking(dm_control, buf) else { break };
 		let tag: &[u8] = &buf[..len.min(buf.len())];
 		match tag {
@@ -367,6 +465,8 @@ pub(super) fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_on
 			}
 
 			b"KEYS" => *raw_keys = handle,
+			// THE TRUSTED KEYBOARD'S SINK, held until InputService's protected path is started with it.
+			b"TRUSTEDKEYS" => super::TRUSTED_KEYS.store(handle, core::sync::atomic::Ordering::Relaxed),
 			_ => {
 				// A capability under a tag this build has no slot for is not silently kept: it
 				// would be a channel nobody serves and a handle nobody closes.
@@ -469,6 +569,8 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 				Some(elf) => spawn_in(elf, service_side, *service_domain),
 				None => return (State::Failed, Reason::BootstrapRefused),
 			}
+		} else if let Some(limits) = service_limits(name) {
+			launch_limited_from_volume(*process_client, program, service_side, limits)
 		} else {
 			launch_from_volume(*process_client, program, service_side)
 		};
@@ -629,6 +731,10 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 				if name == b"input_service" && role.tag == b"KEYS" {
 					return Some((role.tag.to_vec(), keys));
 				}
+				// AND THE TRUSTED ONE, handed on exactly once: nothing else in this system receives it.
+				if name == b"input_service" && role.tag == b"TRUSTEDKEYS" {
+					return Some((role.tag.to_vec(), super::TRUSTED_KEYS.swap(0, core::sync::atomic::Ordering::Relaxed)));
+				}
 				// CONFIGSERVICE GETS A CLIENT SCOPED TO ONE DIRECTORY, minted from StorageService's
 				// admin endpoint rather than duplicated from its public root. The plan can say the
 				// role is a factory of that endpoint; the directory is the part it cannot say, and
@@ -639,6 +745,49 @@ pub(super) fn start_service(package: &Package, kept: &mut Kept, name: &[u8], pro
 					}
 					let scoped: u64 = open_storage_directory(storage_adm, "vol://system/libexec/config_service");
 					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
+				}
+				// THE BOND STORE GETS ITS OWN STATE DIRECTORY, and the directory has to be made before
+				// it can be scoped to: a scoped client is a path prefix and nothing more, so it can
+				// create files and subdirectories INSIDE its scope and cannot create the scope
+				// itself. `vol://system/state` is a new place on the volume - nothing else on this
+				// machine keeps service state outside `libexec` - so both levels are made here,
+				// top-down, through the supervisor's full client. `mkdir` on a directory that
+				// already exists is what every boot after the first does, and its refusal is not an
+				// error this cares about.
+				if name == b"bluetooth_bond_store" && role.tag == CAP_STORAGE {
+					if storage_root == 0 {
+						return Some((role.tag.to_vec(), 0));
+					}
+					let mut full = volume::Client::new(ChannelTransport { chan: storage_root });
+					let _ = full.mkdir(BOND_STATE_PARENT);
+					let _ = full.mkdir(BOND_STATE_DIRECTORY);
+					let scoped: u64 = open_storage_directory(storage_adm, BOND_STATE_DIRECTORY);
+					if scoped == 0 {
+						print(b"ServiceManager: the bond directory could not be minted from StorageService's admin root\n");
+						return None;
+					}
+					// NARROWED, as every factory role is: the minted connection carries every right its pair
+					// was made with, and the store's receiver refuses what its role kind does not allow.
+					let narrowed: i64 = duplicate(scoped, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+					close(scoped);
+					return if narrowed > 0 { Some((role.tag.to_vec(), narrowed as u64)) } else { None };
+				}
+				// ADMINSERVICE GETS ITS JOURNAL'S DIRECTORY, made first for the same reason the bond store's is: a
+				// scoped client can create inside its scope and cannot create the scope. WRITABLE, and narrowed like
+				// every factory role - the journal's commits are the only thing it writes.
+				if name == b"admin_service" && role.tag == b"JOURNAL" {
+					if storage_root == 0 {
+						return Some((role.tag.to_vec(), 0));
+					}
+					let _ = volume::Client::new(ChannelTransport { chan: storage_root }).mkdir(ADMIN_JOURNAL_DIRECTORY);
+					let scoped: u64 = open_storage_directory(storage_adm, ADMIN_JOURNAL_DIRECTORY);
+					if scoped == 0 {
+						print(b"ServiceManager: the admin journal directory could not be minted from StorageService's admin root\n");
+						return None;
+					}
+					let narrowed: i64 = duplicate(scoped, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+					close(scoped);
+					return if narrowed > 0 { Some((role.tag.to_vec(), narrowed as u64)) } else { None };
 				}
 				// THE FONT CATALOGUE GETS THE ONE READ-ONLY SCOPED CLIENT IN THIS SUPERVISOR, and it
 				// is the case `Role` cannot express: a role carries a tag, a kind, a provider, a
@@ -1405,7 +1554,16 @@ fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, font_root:
 	// own root, and the connection PermissionManager actually held reached nothing at all. The
 	// refusal named the kind and the subset, which is how a line in a boot log found a hand-written
 	// branch that a manifest change could not.
-	let catalogue = mint_scoped_consumer(catalogue_admin_root, &[driver_protocol::provider::USB_BUS]).unwrap_or(0);
+	//
+	// AND IN A DEVELOPMENT BUILD, A FIXTURE'S CONTROL ENDPOINT, which PermissionManager opens for the
+	// probe a gate drives. Spelled here and not in the row, because the row is the configuration that
+	// ships and the manifest refuses a role naming that kind: the one connection that can reach a
+	// fixture exists only in a build that can carry one.
+	#[cfg(not(feature = "development"))]
+	let kinds: &[u16] = &[driver_protocol::provider::USB_BUS];
+	#[cfg(feature = "development")]
+	let kinds: &[u16] = &[driver_protocol::provider::USB_BUS, driver_protocol::provider::FIXTURE_CONTROL];
+	let catalogue = mint_scoped_consumer(catalogue_admin_root, kinds).unwrap_or(0);
 	if !send_blocking(manager_side, b"CATALOGUE", catalogue) {
 		return false;
 	}

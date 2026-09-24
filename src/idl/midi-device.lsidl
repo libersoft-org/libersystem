@@ -1,0 +1,78 @@
+//! LiberSystem MIDI devices - the provider contract a `midi` publication serves to MidiService.
+//!
+//! A PROVIDER MOVES PACKETS; THE SERVICE DECODES. The USB MIDI class module, and the in-guest fixture before
+//! it, deliver USB-MIDI 1.0 event packets exactly as the transport completed them - at most 64 to a batch,
+//! with the host time the completion became available - and MidiService decodes them with the driver
+//! library's staged decoder. No client ever sees a raw packet.
+
+package liber:midi-device@1;
+
+use liber:base@1.{error};
+
+record midi-bounds {
+	version:     u32,
+	/// Packets in one batch; at most 64.
+	max-packets: u16,
+}
+
+record midi-open {
+	connection-generation: u64,
+	bounds:                midi-bounds,
+}
+
+record midi-device-endpoint {
+	index:           u32,
+	@bound(64) name: string,
+	cables:          u8,
+}
+
+/// One transport completion's packets, four bytes each, in the order they arrived.
+record midi-packet-batch {
+	endpoint:            u32,
+	receiver-generation: u64,
+	received-ns:         u64,
+	@bound(256) packets: list<u8>,
+}
+
+/// Input the provider could not deliver.
+record midi-input-lost {
+	endpoint:            u32,
+	receiver-generation: u64,
+}
+
+variant midi-device-event {
+	batch(midi-packet-batch),
+	lost(midi-input-lost),
+}
+
+/// THE PROVIDER CONTRACT a `midi` publication serves - to MidiService alone.
+interface midi-device {
+	@op(1) open:      func(version: u32) -> result<midi-open, error>;
+	@op(2) @bound(8) endpoints: func() -> result<list<midi-device-endpoint>, error>;
+	@op(3) start:     func(endpoint: u32, receiver-generation: u64) -> result<unit, error>;
+	@op(4) stop:      func(endpoint: u32, receiver-generation: u64) -> result<unit, error>;
+	@op(5) events:    func() -> stream<midi-device-event>;
+}
+
+// ------------------------------------------------------------------ development only
+
+record midi-fixture-stats {
+	batches:  u32,
+	packets:  u32,
+	receiving: u8,
+}
+
+/// The in-guest MIDI fixture's control endpoint. DEVELOPMENT ONLY: it exists on a development fixture bound
+/// to a QEMU test device, reached through PermissionManager in a development build for a probe whose policy
+/// row grants `fixture-control`.
+interface midi-fixture {
+	/// Deliver these packets as one batch on an endpoint that is receiving.
+	@op(1) inject:    func(endpoint: u32, @bound(256) packets: list<u8>) -> result<unit, error>;
+	/// Deliver `batches` batches of 64 note-on packets as fast as the service takes them.
+	@op(2) flood:     func(endpoint: u32, batches: u32) -> result<unit, error>;
+	/// Report input on an endpoint as lost.
+	@op(3) lose:      func(endpoint: u32) -> result<unit, error>;
+	@op(4) withdraw:  func() -> result<unit, error>;
+	@op(5) republish: func() -> result<unit, error>;
+	@op(6) stats:     func() -> result<midi-fixture-stats, error>;
+}

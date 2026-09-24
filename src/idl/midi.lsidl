@@ -1,0 +1,176 @@
+//! LiberSystem MIDI - MIDI 1.0 receive endpoints, as ordered bounded chunks with their host receipt time and
+//! cable, for components PermissionManager granted one endpoint.
+//!
+//! THREE PARTIES. An ordinary client holds `midi`: it lists endpoints and can open nothing - receiving needs a
+//! grant, and output and UMP are not supported at all yet. A client PermissionManager granted `midi-input`
+//! holds a receiver minted through the private `midi-admin` for ONE endpoint of one publication and the life
+//! of one launched component. A PROVIDER - the USB MIDI class module, or the in-guest fixture - serves
+//! `liber:midi-device@1`, and MidiService is its one consumer.
+//!
+//! CHUNKS, NOT MESSAGES. A chunk carries at most three MIDI bytes: a complete short message, a raw byte, or a
+//! FRAGMENT of a System Exclusive message - start, continuation, end, or start and end at once - under a
+//! per-cable message number. A consumer treats a SysEx as incomplete until the fragment that ends it, and
+//! discards it when an abort names it. Nothing assembles a whole SysEx: its cap, 64 kB with its delimiters,
+//! is enforced by counting.
+//!
+//! ORDER AND TIME are `liber:event@1`'s: the endpoint's observation order across all its cables, never sorted,
+//! and host receipt time only - USB MIDI 1.0 carries no device timestamp, and none is invented.
+
+package liber:midi@1;
+
+use liber:base@1.{error};
+use liber:process@1.{task};
+use liber:event@1.{event-source, event-header, event-end};
+
+/// An endpoint as this service knows it: its publication, its index in it, and the service incarnation.
+record midi-endpoint-id {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+	endpoint:           u32,
+	incarnation:        u64,
+}
+
+enum midi-protocol {
+	midi1 = 1,
+	ump   = 2,
+}
+
+enum midi-direction {
+	receive  = 1,
+	transmit = 2,
+}
+
+record midi-endpoint {
+	id:              midi-endpoint-id,
+	@bound(64) name: string,
+	protocol:        midi-protocol,
+	direction:       midi-direction,
+	/// Cables 0..cables-1 are this endpoint's; at most 16.
+	cables:          u8,
+	/// A receiver holds it now.
+	receiving:       bool,
+}
+
+enum midi-chunk-kind {
+	/// A complete message: channel voice, system common, or realtime.
+	short         = 1,
+	sysex-start   = 2,
+	sysex-continue = 3,
+	sysex-end     = 4,
+	/// A byte from the single-byte form that belongs to no message this decoder tracks.
+	raw           = 5,
+}
+
+record midi-chunk {
+	/// 0..15. There is no group: MIDI 1.0 has none, and none is fabricated.
+	cable:              u8,
+	kind:               midi-chunk-kind,
+	@bound(3) bytes:    list<u8>,
+	/// The per-cable SysEx message this fragment belongs to; absent for anything else.
+	sysex-message:      option<u32>,
+	/// This fragment starts, and this one ends, its message - both at once for a one-fragment SysEx.
+	start:              bool,
+	end:                bool,
+}
+
+enum midi-abort-reason {
+	/// The message crossed 64 kB with its delimiters.
+	cap          = 1,
+	/// A continuation or an end that does not fit the message.
+	malformed    = 2,
+	/// A non-realtime status arrived inside it.
+	interrupted  = 3,
+	/// Two seconds passed with nothing more of it.
+	inactivity   = 4,
+	/// A new start arrived before its end.
+	restarted    = 5,
+	/// Its cable, or the whole endpoint, was reset.
+	reset        = 6,
+}
+
+/// A SysEx that will never end: discard what was received of it.
+record midi-abort {
+	cable:   u8,
+	message: u32,
+	reason:  midi-abort-reason,
+}
+
+enum midi-fault-code {
+	/// A packet batch whose length is not a whole number of four-byte packets.
+	alignment = 1,
+	/// A cable outside the endpoint's.
+	cable     = 2,
+	/// A reserved or unsupported code index.
+	reserved  = 3,
+	/// A status that does not match its code index, or a data byte with the top bit set.
+	status    = 4,
+	/// Padding that is not zero.
+	padding   = 5,
+}
+
+/// A packet the decoder refused; `cable` is absent when the refusal could not be attributed to one, in which
+/// case every cable's partial state was reset.
+record midi-fault {
+	cable: option<u8>,
+	code:  midi-fault-code,
+}
+
+variant midi-item {
+	chunk(midi-chunk),
+	aborted(midi-abort),
+	fault(midi-fault),
+}
+
+record midi-event {
+	header: event-header,
+	item:   midi-item,
+}
+
+/// What one read returns: events in order, and - once everything before it has been read - how the stream
+/// ended.
+record midi-batch {
+	source:             event-source,
+	@bound(64) events:  list<midi-event>,
+	end:                option<event-end>,
+}
+
+record midi-receiver-status {
+	source:       event-source,
+	queued:       u16,
+	queued-bytes: u32,
+	end:          option<event-end>,
+}
+
+/// INVENTORY: the endpoints and what they are. `open` exists to say no precisely: receiving needs a grant,
+/// and output and UMP are unsupported.
+interface midi {
+	@op(1) @bound(32) endpoints: func() -> result<list<midi-endpoint>, error>;
+	@op(2) open: func(endpoint: midi-endpoint-id, direction: midi-direction, protocol: midi-protocol) -> result<unit, error>;
+}
+
+/// ONE RECEIVER, on the one endpoint this connection was minted for, for as long as its owner lives. Reads
+/// PULL: nothing is pushed into a client that is not reading.
+interface midi-input {
+	@op(1) endpoint: func() -> result<midi-endpoint, error>;
+	/// At most `max` events, waiting at most `wait-ms` for the first; after the last event of an ended stream,
+	/// the end.
+	@op(2) read:     func(max: u16, wait-ms: u32) -> result<midi-batch, error>;
+	@op(3) status:   func() -> result<midi-receiver-status, error>;
+	/// Stop receiving; the queued events are discarded and the slot freed.
+	@op(4) stop:     func() -> result<unit, error>;
+}
+
+record midi-grant {
+	connection: handle<channel>,
+	source:     event-source,
+}
+
+/// THE MINTING ENDPOINT, PermissionManager's alone. The alias names a MIDI device the service's configuration
+/// binds to provider metadata; it resolves to exactly one current publication, and `endpoint` to one of its
+/// receive endpoints, or the mint fails. Minting starts the receiver; one receiver per endpoint.
+interface midi-admin {
+	@op(1) mint:   func(@bound(32) alias: string, endpoint: u32, owner: handle<task>) -> result<midi-grant, error>;
+	/// End every receiver on one endpoint; answers how many.
+	@op(2) revoke: func(endpoint: midi-endpoint-id) -> result<u32, error>;
+}

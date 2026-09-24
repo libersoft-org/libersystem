@@ -1,0 +1,33 @@
+package liber:import@1
+record import-device-id(slot:u32,generation:u32,binding-generation:u64,attachment:u64,session:u32,content-epoch:u64,incarnation:u64,context:u32)
+record import-storage-id(device:import-device-id,storage:u32)
+record import-object-id(device:import-device-id,handle:u32,revision:u32)
+record import-parent-id(device:import-device-id,handle:u32)
+record import-limits(providers:u8,clients:u8,cursors:u8,transfers:u8,cursors-per-client:u8,transfers-per-client:u8,cursors-per-device:u8,transfers-per-device:u8,data-budget:u32,snapshot-budget:u32,max-handles:u32,page-records:u8,page-bytes:u32,record-bytes:u32,chunk-bytes:u32,cursor-idle-seconds:u32,transfer-idle-seconds:u32)
+record import-device(id:import-device-id,manufacturer:string:bound=64,model:string:bound=64,serial:string:bound=64,usable:bool,busy:bool)
+record import-storage(id:import-storage-id,storage-type:u16,filesystem-type:u16,access:u16,capacity:u64,free:u64,description:string:bound=64,label:string:bound=64)
+record import-time(year:u16,month:u8,day:u8,hour:u8,minute:u8,second:u8,utc-offset-minutes:option<i32>)
+enum import-interpretation(complete=1,partial=2)
+record import-object(id:import-object-id,format:u16,format-known:bool,size:option<u64>,captured:option<import-time>,parent:option<import-parent-id>,filename:string:bound=255,interpretation:import-interpretation,original:list<u8>:bound=4096)
+variant import-entry(object=0:import-object,unrepresentable=1:import-object-id)
+record import-page(entries:list<import-entry>:bound=2,remaining:u32)
+record import-cursor-grant(cursor:handle<channel>,count:u32)
+variant import-enumeration(opened=0:import-cursor-grant,over-limit=1:u32)
+enum import-transfer-state(opening=1,reading=2,complete=3,partial=4)
+enum import-cause(removed=1,timed-out=2,cancelled=3,corrupt=4,stale=5,device-error=6)
+record import-transfer-status(state:import-transfer-state,object:import-object-id,expected:u64,delivered:u64,cause:option<import-cause>)
+record import-chunk(offset:u64,bytes:list<u8>:bound=4096)
+variant import-read(chunk=0:import-chunk,end=1:import-transfer-status)
+interface media-import
+method media-import.limits op=1 () -> result<import-limits, liber:base@1::error>
+method media-import.devices op=2 () -> result<list<import-device>, liber:base@1::error>:bound=8
+method media-import.storages op=3 (device:import-device-id:rights=) -> result<list<import-storage>, liber:base@1::error>:bound=32
+method media-import.open-enumeration op=4 (storage:import-storage-id:rights=,parent:option<import-parent-id>:rights=) -> result<import-enumeration, liber:base@1::error>
+method media-import.open-read op=5 (object:import-object-id:rights=) -> result<handle<channel>, liber:base@1::error>
+interface import-cursor
+method import-cursor.next op=1 () -> result<import-page, liber:base@1::error>
+method import-cursor.close op=2 () -> result<unit, liber:base@1::error>
+interface import-transfer
+method import-transfer.read op=1 () -> result<import-read, liber:base@1::error>
+method import-transfer.status op=2 () -> result<import-transfer-status, liber:base@1::error>
+method import-transfer.cancel op=3 () -> result<import-transfer-status, liber:base@1::error>

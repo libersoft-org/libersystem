@@ -142,5 +142,50 @@ pub fn decodable(current: Mode) -> Result<(), Refusal> {
 pub const NOTIFICATIONS_ON: [u8; 2] = [0x01, 0x00];
 pub const NOTIFICATIONS_OFF: [u8; 2] = [0x00, 0x00];
 
+/// THE RANGE A RELATIVE DEVICE IS GIVEN, since it reports none - the same number the pointer drivers
+/// use, so a Bluetooth mouse and a USB one move the cursor by the same distance for the same motion.
+pub const RELATIVE_RANGE: i32 = 0x7fff;
+
+/// What a normalised coordinate is scaled to - the drivers' own, for the same reason.
+pub const NORMALISED_MAX: u32 = u16::MAX as u32;
+
+/// A relative pointer folded onto the absolute, normalised position a consumer of pointer input
+/// receives.
+///
+/// THE MOUSE REPORTS MOTION AND THE CONSUMER READS A POSITION. Every other pointer on this machine is
+/// folded by its driver before it reaches the input service; a Bluetooth mouse has no driver in that
+/// sense - its reports arrive decoded from another service - so the fold happens where they arrive,
+/// with the drivers' own range and the drivers' own rule: saturating, then clamped, so a device that
+/// reports a very large move reaches the edge rather than wrapping to the other one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pointer {
+	x: i32,
+	y: i32,
+}
+
+impl Default for Pointer {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl Pointer {
+	/// A pointer in the middle of the range, which is where one with no history is.
+	pub const fn new() -> Pointer {
+		Pointer { x: RELATIVE_RANGE / 2, y: RELATIVE_RANGE / 2 }
+	}
+
+	/// Fold one report's motion and answer the normalised position.
+	pub fn fold(&mut self, dx: i32, dy: i32) -> (u16, u16) {
+		self.x = self.x.saturating_add(dx).clamp(0, RELATIVE_RANGE);
+		self.y = self.y.saturating_add(dy).clamp(0, RELATIVE_RANGE);
+		(normalise(self.x), normalise(self.y))
+	}
+}
+
+fn normalise(value: i32) -> u16 {
+	((value.clamp(0, RELATIVE_RANGE) as u64 * NORMALISED_MAX as u64) / RELATIVE_RANGE as u64) as u16
+}
+
 #[cfg(test)]
 mod tests;

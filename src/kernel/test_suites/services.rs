@@ -127,6 +127,9 @@ fn input_service_streams_pointer_events() {
 	// because it has no USB pointing device.
 	let (catalogue_server, catalogue_client) = Channel::create();
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	// NO TRUSTED KEYBOARD AND NO PROTECTED-INPUT HOLDER in this scenario: both tags travel, carrying nothing.
+	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
+	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, raw_consumer).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
@@ -238,6 +241,9 @@ fn a_touch_surface_reports_contacts_and_not_a_cursor() {
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
 	let (catalogue_server, catalogue_client) = Channel::create();
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	// NO TRUSTED KEYBOARD AND NO PROTECTED-INPUT HOLDER in this scenario: both tags travel, carrying nothing.
+	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
+	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("no usb pointer");
@@ -328,6 +334,8 @@ fn input_service_streams_keys_only_with_display_focus() {
 	// THE PROVIDER CATALOGUE, LAST - see the other InputService harness in this file.
 	let (pointer_catalogue_server, pointer_catalogue_client) = Channel::create();
 	send_cap(&boot_kernel, b"CATALOGUE", pointer_catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	boot_kernel.send(Message::new(b"TRUSTEDKEYS".to_vec(), alloc::vec::Vec::new())).expect("trusted keys bootstrap");
+	boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("trusted input bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&pointer_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the catalogue answered the pointer subscription");
 	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
@@ -786,6 +794,8 @@ mod display_harness {
 		// catalogue first would be waiting for a subscribe the service cannot send until this arrives.
 		let (stats_root, stats_service) = Channel::create();
 		send_cap(&boot_kernel, b"STATS", stats_service, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("display stats bootstrap");
+		// And the protected-session root, which only AdminService is ever handed: none here.
+		boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 		sched::run_until_idle();
 		crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
@@ -1782,6 +1792,9 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	// finds - so this harness answers that conversation. See `serve_provider_catalogue`.
 	let (catalogue_server, catalogue_client) = Channel::create();
 	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	// AND THE PRIVATE LINK ADMINISTRATION AFTER IT, carrying nothing: this scenario installs no modem
+	// link, and a tag with no capability is how a boot says it serves no such root.
+	boot_kernel.send(Message::new(b"LINKADMIN".to_vec(), alloc::vec::Vec::new())).expect("link-admin bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Net, frames_user).expect("the catalogue answered the subscription and the connection");
 	// The MAC lead-in and the ARP reply that teaches the service the server's MAC (its own gratuitous
@@ -2905,6 +2918,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	// in order, so a harness that answered the subscription first would wait for one this service
 	// cannot send until it has read everything before it.
 	display_boot_kernel.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("display stats bootstrap");
+	display_boot_kernel.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 	sched::run_until_idle();
 	crate::tests::serve_provider_catalogue(&display_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
@@ -3449,4 +3463,1297 @@ fn the_2d_demo_draws_a_real_scene_with_real_damage() {
 	let held = display_resources(&stats_root, 801);
 	assert_eq!(held.surfaces, 0, "every surface the demo held is reclaimed when its process ends: {held:?}");
 	assert_eq!(held.present_images, 0, "and so is every image of every queue it supplied");
+}
+
+// ---- SPOOLSERVICE AGAINST PRINTERS THIS HARNESS PLAYS ----
+//
+// The production service, a real `spool_probe` for every step, and three printers that exist only here: this
+// harness is the catalogue that publishes, withdraws and replaces them, and each one's typed backend - it
+// decides how every write is answered, records every byte it accepted, and holds the only authority over how it
+// behaves. The probe holds `spool` and nothing else. This is service and protocol coverage with a simulated
+// provider; it says nothing about USB printer transport, which belongs to the USB driver set.
+mod spool_sink {
+	use super::*;
+	use alloc::string::String;
+	use alloc::sync::Arc;
+	use alloc::vec::Vec;
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::process::Process;
+	use object::rights::Rights;
+	use printer_device_proto::generated::liber::printer_device::v1 as printer;
+
+	// Everything any step sends to one printer, with room to spare: a sink that is sent more has been sent
+	// something twice.
+	const SINK_BOUND: usize = 128 * 1024;
+	// Passes of one harness tick each; a step that has not ended by then has hung.
+	const PASSES: usize = 20_000;
+
+	// THE DOCUMENTS `spool_probe` SENDS, by its formula, so every byte a sink holds can be accounted for.
+	pub(super) fn pattern(seed: u8, n: usize) -> u8 {
+		((n as u32).wrapping_mul(7).wrapping_add(u32::from(seed) * 13).wrapping_add(n as u32 >> 8)) as u8
+	}
+
+	pub(super) fn document(seed: u8, length: usize) -> Vec<u8> {
+		(0..length).map(|n| pattern(seed, n)).collect()
+	}
+
+	fn device_id(body: &str) -> Vec<u8> {
+		let mut bytes = ((body.len() + 2) as u16).to_be_bytes().to_vec();
+		bytes.extend_from_slice(body.as_bytes());
+		bytes
+	}
+
+	// ONE PRINTER: its publication, its backend connection once SpoolService has opened it, what it reports,
+	// how it answers, and every byte it accepted.
+	pub(super) struct Sink {
+		pub(super) info: device::ProviderInfo,
+		device_id: Vec<u8>,
+		// Cover-open and jam evidence, which only an identified backend has.
+		details: Option<bool>,
+		server: Option<Arc<Channel>>,
+		attachment: u64,
+		attached: bool,
+		pub(super) received: Vec<u8>,
+		// HOW IT ANSWERS: at most `accept` bytes of each write; `again` for the next `again` writes, or for
+		// every write while `stalled`; the port byte; and one failed write, and failed resets, on demand.
+		pub(super) accept: usize,
+		pub(super) again: usize,
+		pub(super) stalled: bool,
+		pub(super) bits: u8,
+		pub(super) fail_write: bool,
+		pub(super) fail_reset: bool,
+		pub(super) resets: usize,
+	}
+
+	impl Sink {
+		pub(super) fn new(slot: u32, generation: u32, id: &str, details: Option<bool>) -> Sink {
+			let info = device::ProviderInfo { kind: device::ProviderKind::Printer, bus: 0, dev: 9, func: 0, binding_generation: u64::from(generation), slot, provider_generation: generation, name: String::new(), live: true };
+			Sink { info, device_id: device_id(id), details, server: None, attachment: 0, attached: false, received: Vec::new(), accept: 4096, again: 0, stalled: false, bits: 0x18, fail_write: false, fail_reset: false, resets: 0 }
+		}
+
+		fn same(&self, info: &device::ProviderInfo) -> bool {
+			self.info.slot == info.slot && self.info.provider_generation == info.provider_generation && self.info.binding_generation == info.binding_generation
+		}
+
+		// Answer everything SpoolService asked, through the generated dispatch.
+		fn serve(&mut self) {
+			let Some(server) = self.server.clone() else { return };
+			while let Ok(request) = server.recv() {
+				let mut handles = wire::Handles::new();
+				let mut out = alloc::vec![0u8; 8192];
+				let mut reply_handles = wire::Handles::new();
+				let written = printer::printer_backend::dispatch(self, &request.bytes, &mut handles, &mut out, &mut reply_handles).expect("SpoolService sent a backend request the interface does not decode");
+				server.send(Message::new(out[..written].to_vec(), Vec::new())).expect("a backend answer");
+			}
+		}
+	}
+
+	impl printer::printer_backend::Service for Sink {
+		// ONE CONSUMER: a second attach while one holds the printer is refused.
+		fn attach(&mut self, version: u32) -> Result<printer::PrinterAttach, printer::Error> {
+			if version != 1 || self.attached {
+				return Err(printer::Error::Invalid);
+			}
+			self.attached = true;
+			self.attachment += 1;
+			Ok(printer::PrinterAttach { version: 1, attachment: self.attachment, device_id: self.device_id.clone() })
+		}
+		fn port_status(&mut self, attachment: u64) -> Result<printer::PortReading, printer::Error> {
+			assert_eq!(attachment, self.attachment, "a status read named an attachment that is over");
+			Ok(printer::PortReading { bits: self.bits, cover_open: self.details, jam: self.details })
+		}
+		fn write(&mut self, attachment: u64, bytes: Vec<u8>) -> Result<u32, printer::Error> {
+			assert_eq!(attachment, self.attachment, "a write named an attachment that is over");
+			assert!(!bytes.is_empty() && bytes.len() <= 4096, "a frame of {} bytes", bytes.len());
+			if self.fail_write {
+				self.fail_write = false;
+				return Err(printer::Error::Io);
+			}
+			if self.stalled || self.again > 0 {
+				self.again = self.again.saturating_sub(1);
+				return Err(printer::Error::Again);
+			}
+			let take = bytes.len().min(self.accept);
+			assert!(self.received.len() + take <= SINK_BOUND, "a printer was sent more than any step sends");
+			self.received.extend_from_slice(&bytes[..take]);
+			Ok(take as u32)
+		}
+		fn reset(&mut self, attachment: u64) -> Result<printer::PrinterAttach, printer::Error> {
+			assert_eq!(attachment, self.attachment, "a reset named an attachment that is over");
+			self.resets += 1;
+			if self.fail_reset {
+				return Err(printer::Error::Io);
+			}
+			self.attachment += 1;
+			Ok(printer::PrinterAttach { version: 1, attachment: self.attachment, device_id: self.device_id.clone() })
+		}
+	}
+
+	pub(super) struct Rig {
+		boot: Arc<Channel>,
+		root: Arc<Channel>,
+		catalogue: Arc<Channel>,
+		stream: Option<Arc<Channel>>,
+		seq: u32,
+		pub(super) sinks: Vec<Sink>,
+		pub(super) service: Arc<Process>,
+	}
+
+	impl Rig {
+		pub(super) fn start(sinks: Vec<Sink>) -> Rig {
+			let init = init_package_bytes().expect("init package module not found");
+			let volume = volume_package_bytes().expect("volume package module not found");
+			let package = pkg::Package::parse(init).expect("init package parses");
+			let elf = program_elf(&package, volume, b"spool_service").expect("spool_service in the package or volume");
+			let (boot, boot_user) = Channel::create();
+			let (root, root_user) = Channel::create();
+			let (catalogue, catalogue_user) = Channel::create();
+			let service = spawn_dynamic_test_process(sched::root_domain(), elf, boot_user);
+			// THE ROLES IN THE ORDER THE MANIFEST DECLARES THEM: its root, then the catalogue minted for `printer`.
+			// WITH WHAT A SERVE ROOT MAY CARRY AND NO MORE, as ServiceManager hands it: the service refuses a role
+			// carrying more than its kind allows, and says so instead of reporting in.
+			send_cap(&boot, b"SERVE", root_user, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the serve role");
+			send_cap(&boot, b"CATALOGUE", catalogue_user, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue role");
+			let mut rig = Rig { boot, root, catalogue, stream: None, seq: 0, sinks, service };
+			let mut online = false;
+			for _ in 0..PASSES {
+				rig.pump();
+				if let Ok(report) = rig.boot.recv() {
+					assert_eq!(&report.bytes[..], b"SpoolService: online", "the service reported in");
+					online = true;
+				}
+				if online && rig.sinks.iter().all(|sink| sink.attached) {
+					return rig;
+				}
+			}
+			panic!("SpoolService did not come up and attach every published printer");
+		}
+
+		// One pass: the guest runs for a tick, then the catalogue and every printer are answered.
+		pub(super) fn pump(&mut self) {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			while let Ok(request) = self.catalogue.recv() {
+				self.catalogue_request(request);
+			}
+			for sink in self.sinks.iter_mut() {
+				sink.serve();
+			}
+		}
+
+		// THE CATALOGUE: a subscription to `printer` answered with a stream whose first frames are the printers
+		// published now, and an `open` answered with a fresh backend connection to the printer it names.
+		fn catalogue_request(&mut self, request: Message) {
+			let op = u16::from_le_bytes([request.bytes[0], request.bytes[1]]);
+			let corr = &request.bytes[2..6];
+			match op {
+				1 => {
+					assert_eq!(request.bytes[6..], [device::ProviderKind::Printer as u8], "the subscription names `printer` and nothing else");
+					let (stream, stream_client) = Channel::create();
+					self.catalogue.send(Message::new(corr.to_vec(), alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the subscribe answer");
+					self.stream = Some(stream);
+					for at in 0..self.sinks.len() {
+						let info = self.sinks[at].info.clone();
+						self.frame(&info);
+					}
+				}
+				3 => {
+					let mut handles = wire::Handles::new();
+					let mut reader = wire::Reader::with_handles(&request.bytes[6..], &mut handles);
+					let info = device::ProviderInfo::read(&mut reader).expect("an open names a publication");
+					let sink = self.sinks.iter_mut().find(|sink| sink.same(&info) && sink.info.live).expect("an open named a printer that is published");
+					assert!(sink.server.is_none(), "one consumer per printer: it was opened twice");
+					let (server, client) = Channel::create();
+					sink.server = Some(server);
+					let mut answer = corr.to_vec();
+					answer.push(1);
+					answer.extend_from_slice(&0u32.to_le_bytes());
+					self.catalogue.send(Message::new(answer, alloc::vec![Capability::new(client, Rights::ALL)])).expect("the open answer");
+				}
+				_ => panic!("SpoolService asked the catalogue for op {op}"),
+			}
+		}
+
+		fn frame(&mut self, info: &device::ProviderInfo) {
+			let mut frame = [0u8; 128];
+			let mut handles = wire::Handles::new();
+			let len = device::provider_catalogue::subscribe_frame(self.seq, info, &mut frame, &mut handles).expect("a publication frame encodes");
+			self.seq += 1;
+			self.stream.as_ref().expect("the subscription was made").send(Message::new(frame[..len].to_vec(), Vec::new())).expect("a publication frame");
+		}
+
+		// WITHDRAW a printer: its publication goes, and its backend connection with it.
+		pub(super) fn withdraw(&mut self, at: usize) {
+			self.sinks[at].info.live = false;
+			let info = self.sinks[at].info.clone();
+			self.frame(&info);
+			self.sinks[at].server = None;
+		}
+
+		pub(super) fn publish(&mut self, sink: Sink) {
+			let info = sink.info.clone();
+			self.sinks.push(sink);
+			self.frame(&info);
+		}
+
+		// A fresh connection from the service's root: a new grant context.
+		fn connect(&mut self) -> Arc<Channel> {
+			self.root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a connect request");
+			for _ in 0..PASSES {
+				self.pump();
+				if let Ok(answer) = self.root.recv() {
+					let cap = answer.caps.first().expect("SpoolService minted a connection");
+					return cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel");
+				}
+			}
+			panic!("SpoolService did not mint a connection");
+		}
+
+		// THE SUPERVISOR'S HEARTBEAT, answered however the printers are behaving.
+		pub(super) fn heartbeat(&mut self) {
+			self.root.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a heartbeat");
+			for _ in 0..200 {
+				self.pump();
+				if let Ok(answer) = self.root.recv() {
+					assert_eq!(&answer.bytes[..], b"PONG", "the heartbeat was answered");
+					return;
+				}
+			}
+			panic!("SpoolService did not answer its heartbeat");
+		}
+
+		// Let the service run with nothing driving it, as long as a job it should not send would take to arrive.
+		pub(super) fn settle(&mut self) {
+			for _ in 0..300 {
+				self.pump();
+			}
+		}
+	}
+
+	// Run one mode of `spool_probe` to its end on a fresh connection. `during` sees the rig and what the probe
+	// has printed on every pass, and is how a step's choreography is driven.
+	pub(super) fn run_spool_probe(rig: &mut Rig, mode: &str, mut during: impl FnMut(&mut Rig, &str)) -> String {
+		let init = init_package_bytes().expect("init package module not found");
+		let volume = volume_package_bytes().expect("volume package module not found");
+		let package = pkg::Package::parse(init).expect("init package parses");
+		let elf = program_elf(&package, volume, b"spool_probe").expect("spool_probe in the package or volume");
+		let connection = rig.connect();
+		let (bootstrap, child) = Channel::create();
+		let (stdout, child_stdout) = Channel::create();
+		let process = spawn_dynamic_test_process(sched::root_domain(), elf, child);
+		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("spool_probe stdout");
+		bootstrap.send(Message::new(b"READY".to_vec(), Vec::new())).expect("endpoint run terminator");
+		bootstrap.send(Message::new(crate::tests::launch_context(mode.as_bytes(), b"vol://system"), Vec::new())).expect("spool_probe arguments");
+		send_cap(&bootstrap, b"SPOOL", connection, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("spool_probe's grant");
+		let mut printed = String::new();
+		for _ in 0..PASSES {
+			rig.pump();
+			while let Ok(message) = stdout.recv() {
+				printed.push_str(core::str::from_utf8(&message.bytes).unwrap_or("<not utf-8>"));
+			}
+			during(rig, &printed);
+			if process.is_terminated() {
+				break;
+			}
+		}
+		while let Ok(message) = stdout.recv() {
+			printed.push_str(core::str::from_utf8(&message.bytes).unwrap_or("<not utf-8>"));
+		}
+		crate::serial_println!("spool: {}", printed.trim_end());
+		assert!(process.is_terminated(), "spool_probe {mode} ran to its end: {printed}");
+		assert!(!printed.contains("FAIL"), "spool_probe {mode}: {printed}");
+		assert!(printed.contains(&alloc::format!("spool-probe: PASS {mode}")), "spool_probe {mode} passed: {printed}");
+		assert!(!rig.service.is_terminated(), "SpoolService outlived spool_probe {mode}");
+		printed
+	}
+}
+
+// THE SPOOL, END TO END, AGAINST A SINK. Every step is a real `spool_probe` process on a fresh grant context,
+// and every byte a printer accepted is accounted for against the documents the steps sent: two jobs arrive
+// whole, once and in order through prefix acceptance and `again`; nothing that was never submitted - closed,
+// abandoned at exit, or cut off by a crash - arrives at all; a submitted job whose owner exited completes; a
+// stalled printer holds up neither another printer nor the heartbeat and finishes when let go; a withdrawn
+// printer's job ends unplugged with honest evidence and its replacement receives only what is sent to it; a
+// failed write ends in a reset that replays nothing; and a reset that fails leaves the printer unavailable.
+tagged_test!(spool_service_sends_submitted_jobs_exactly_once, [Service, Process], id = "kernel.services.spool_service_sends_submitted_jobs_exactly_once", covers = ["kernel", "services", "bin.spool_service", "bin.spool_probe"]);
+fn spool_service_sends_submitted_jobs_exactly_once() {
+	use spool_sink::{Rig, Sink, document, run_spool_probe};
+
+	// ALPHA and BETA name PostScript, BETA with evidence of cover and jam; GAMMA names only PCL.
+	let mut rig = Rig::start(alloc::vec![
+		Sink::new(1, 1, "MFG:Liber;MDL:Sink Alpha;CMD:POSTSCRIPT,PCL;", None),
+		Sink::new(2, 1, "MFG:Liber;MDL:Sink Beta;COMMAND SET:PostScript3;", Some(false)),
+		Sink::new(3, 1, "MFG:Liber;MDL:Sink Gamma;CMD:PCL;", None)
+	]);
+	let (alpha, beta, gamma) = (0usize, 1usize, 2usize);
+
+	// ADMISSION, QUOTA AND STAGING, and one ten-byte job.
+	run_spool_probe(&mut rig, "inventory", |_, _| {});
+	let mut expected = document(1, 10);
+	assert_eq!(rig.sinks[alpha].received, expected, "alpha received the one submitted job, and nothing of the refused or overrun ones");
+
+	// TWO JOBS THROUGH PREFIXES AND `again`.
+	rig.sinks[alpha].accept = 1000;
+	rig.sinks[alpha].again = 3;
+	run_spool_probe(&mut rig, "two", |_, _| {});
+	expected.extend(document(2, 10_000));
+	expected.extend(document(3, 6_000));
+	assert!(rig.sinks[alpha].received == expected, "two jobs arrived contiguous, exact and in submission order ({} bytes, expected {})", rig.sinks[alpha].received.len(), expected.len());
+	rig.sinks[alpha].accept = 4096;
+
+	// A STALL, AND WHAT GOES ON DURING IT.
+	rig.sinks[alpha].stalled = true;
+	rig.sinks[alpha].bits = 0x38;
+	let mut released = false;
+	run_spool_probe(&mut rig, "stall", |rig, printed| {
+		if !released && printed.contains("spool-probe: stalled") {
+			rig.heartbeat();
+			rig.sinks[alpha].stalled = false;
+			rig.sinks[alpha].bits = 0x18;
+			released = true;
+		}
+	});
+	assert!(released, "the stall was observed before it was let go");
+	expected.extend(document(4, 100));
+	assert!(rig.sinks[alpha].received == expected, "the stalled job finished whole once the printer took bytes again");
+	assert_eq!(rig.sinks[beta].received, document(5, 5_000), "the other printer's job went through during the stall");
+
+	// NOTHING UNSUBMITTED: closed half-written, left whole at exit, and cut off by a crash.
+	run_spool_probe(&mut rig, "abandon", |_, _| {});
+	run_spool_probe(&mut rig, "crash", |_, _| {});
+	rig.settle();
+	assert!(rig.sinks[alpha].received == expected, "nothing that was never submitted reached the printer");
+
+	// A SUBMITTED JOB WHOSE OWNER EXITED.
+	run_spool_probe(&mut rig, "detach", |_, _| {});
+	expected.extend(document(9, 9_000));
+	for _ in 0..2_000 {
+		if rig.sinks[alpha].received.len() >= expected.len() {
+			break;
+		}
+		rig.pump();
+	}
+	rig.settle();
+	assert!(rig.sinks[alpha].received == expected, "the detached job completed, whole and once");
+
+	// WITHDRAWAL MID-JOB, AND A REPLACEMENT THAT RECEIVES ONLY WHAT IS SENT TO IT.
+	rig.sinks[alpha].accept = 500;
+	let before = expected.len();
+	let mut pulled = false;
+	let printed = run_spool_probe(&mut rig, "unplug", |rig, _| {
+		if !pulled && rig.sinks[alpha].received.len() >= before + 10_000 {
+			rig.withdraw(alpha);
+			rig.publish(Sink::new(1, 2, "MFG:Liber;MDL:Sink Alpha;CMD:POSTSCRIPT,PCL;", None));
+			pulled = true;
+		}
+	});
+	assert!(pulled, "the printer was withdrawn mid-job");
+	let replacement = rig.sinks.len() - 1;
+	let delivered = rig.sinks[alpha].received.len() - before;
+	assert!(rig.sinks[alpha].received[before..] == document(10, 40_000)[..delivered], "what the withdrawn printer received is an exact prefix of the job");
+	let line = printed.lines().find(|line| line.starts_with("spool-probe: unplugged")).expect("the probe reported the unplugged job's evidence");
+	let acknowledged: usize = line.split("acknowledged=").nth(1).and_then(|rest| rest.split(' ').next()).and_then(|value| value.parse().ok()).expect("an acknowledged count");
+	let uncertain = line.contains("uncertain=true");
+	assert!(delivered >= acknowledged, "no more was acknowledged than the printer took ({acknowledged} of {delivered})");
+	assert!(delivered == acknowledged || uncertain, "bytes past the acknowledged count are reported as uncertain delivery ({acknowledged} of {delivered})");
+	assert_eq!(rig.sinks[replacement].received, document(11, 2_000), "the replacement received nothing of the withdrawn printer's job");
+
+	// A FAILED WRITE AND A RESET THAT WORKS: the queued job ends with it, and nothing is replayed.
+	rig.sinks[replacement].stalled = true;
+	let mut failed = false;
+	run_spool_probe(&mut rig, "reset", |rig, printed| {
+		if !failed && printed.contains("spool-probe: queued") {
+			rig.sinks[replacement].fail_write = true;
+			rig.sinks[replacement].stalled = false;
+			failed = true;
+		}
+	});
+	assert!(failed, "the write failed with both jobs queued");
+	assert_eq!(rig.sinks[replacement].resets, 1, "the printer was reset once");
+	let mut after = document(11, 2_000);
+	after.extend(document(14, 1_000));
+	assert_eq!(rig.sinks[replacement].received, after, "the reset replayed nothing: only the job sent after it arrived");
+
+	// A FAILED WRITE AND A RESET THAT FAILS: the printer is unavailable, and admits nothing.
+	rig.sinks[replacement].fail_write = true;
+	rig.sinks[replacement].fail_reset = true;
+	run_spool_probe(&mut rig, "recovery", |_, _| {});
+	assert_eq!(rig.sinks[replacement].received, after, "the failed job sent nothing");
+	assert!(rig.sinks[gamma].received.is_empty(), "the printer without PostScript evidence was sent nothing");
+	rig.heartbeat();
+}
+
+// ---- MEDIAIMPORTSERVICE AGAINST A CAMERA THIS HARNESS PLAYS ----
+//
+// The production service, a real `import_probe` for every step, a destination on a real StorageService volume,
+// and a bounded PTP responder that exists only here: it serves the private transport through the generated
+// dispatch, answers the read-only subset with standard containers generated on demand - 40 000 handles, a
+// storage of 65 537, exact metadata, a 12 kB photo - records every operation it was sent, and holds the only
+// authority over when a change is reported and when the camera goes. This is the service boundary with an
+// emulated responder, not USB integration.
+mod import_rig {
+	use super::*;
+	use alloc::string::String;
+	use alloc::sync::Arc;
+	use alloc::vec::Vec;
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::process::Process;
+	use object::rights::Rights;
+	use ptp_transport_proto::generated::liber::ptp_transport::v1 as ptp;
+
+	pub(super) const CARD: u32 = 0x0001_0001;
+	pub(super) const OVERFLOW: u32 = 0x0002_0001;
+	pub(super) const OBJECTS: u32 = 40_000;
+	pub(super) const OVERFLOW_OBJECTS: u32 = 65_537;
+	pub(super) const FOLDER: u32 = 1;
+	pub(super) const PHOTO: u32 = 2;
+	pub(super) const PHOTO_BYTES: u64 = 12_288;
+	pub(super) const EMPTY: u32 = 3;
+	const PASSES: usize = 20_000;
+
+	// The read-only subset, and every operation the responder may be sent.
+	pub(super) const READ_ONLY: [u16; 8] = [0x1001, 0x1002, 0x1003, 0x1004, 0x1005, 0x1007, 0x1008, 0x1009];
+
+	// THE OBJECTS, by `import_probe`'s formulas.
+	pub(super) fn object_byte(handle: u32, n: u64) -> u8 {
+		((n as u32).wrapping_mul(31).wrapping_add(handle.wrapping_mul(7)).wrapping_add((n >> 9) as u32)) as u8
+	}
+
+	pub(super) fn object_size(handle: u32) -> u64 {
+		match handle {
+			FOLDER | EMPTY => 0,
+			PHOTO => PHOTO_BYTES,
+			_ => 64 + u64::from(handle % 32),
+		}
+	}
+
+	fn header(length: usize, kind: u16, code: u16, transaction: u32) -> Vec<u8> {
+		let mut bytes = (length as u32).to_le_bytes().to_vec();
+		bytes.extend_from_slice(&kind.to_le_bytes());
+		bytes.extend_from_slice(&code.to_le_bytes());
+		bytes.extend_from_slice(&transaction.to_le_bytes());
+		bytes
+	}
+
+	fn response(code: u16, transaction: u32) -> Vec<u8> {
+		header(12, 3, code, transaction)
+	}
+
+	fn string(text: &str) -> Vec<u8> {
+		if text.is_empty() {
+			return alloc::vec![0];
+		}
+		let units: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
+		let mut bytes = alloc::vec![units.len() as u8];
+		bytes.extend(units.iter().flat_map(|unit| unit.to_le_bytes()));
+		bytes
+	}
+
+	fn device_info() -> Vec<u8> {
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&100u16.to_le_bytes());
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+		bytes.extend_from_slice(&0u16.to_le_bytes());
+		bytes.extend(string(""));
+		bytes.extend_from_slice(&0u16.to_le_bytes());
+		bytes.extend_from_slice(&(READ_ONLY.len() as u32).to_le_bytes());
+		bytes.extend(READ_ONLY.iter().flat_map(|code| code.to_le_bytes()));
+		for _ in 0..4 {
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+		}
+		for text in ["Liber", "Responder", "1.0", "0001"] {
+			bytes.extend(string(text));
+		}
+		bytes
+	}
+
+	fn storage_info(label: &str) -> Vec<u8> {
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&0x0004u16.to_le_bytes());
+		bytes.extend_from_slice(&0x0002u16.to_le_bytes());
+		bytes.extend_from_slice(&0x0001u16.to_le_bytes());
+		bytes.extend_from_slice(&(64u64 << 20).to_le_bytes());
+		bytes.extend_from_slice(&(32u64 << 20).to_le_bytes());
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+		bytes.extend(string("Responder storage"));
+		bytes.extend(string(label));
+		bytes
+	}
+
+	fn object_info(handle: u32) -> Vec<u8> {
+		let (format, name) = if handle == FOLDER { (0x3001u16, String::from("DCIM")) } else { (0x3801, alloc::format!("IMG_{handle:05}.JPG")) };
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&CARD.to_le_bytes());
+		bytes.extend_from_slice(&format.to_le_bytes());
+		bytes.extend_from_slice(&0u16.to_le_bytes());
+		bytes.extend_from_slice(&(object_size(handle) as u32).to_le_bytes());
+		bytes.extend_from_slice(&0u16.to_le_bytes());
+		for _ in 0..6 {
+			bytes.extend_from_slice(&0u32.to_le_bytes());
+		}
+		bytes.extend_from_slice(&(if handle == FOLDER { 0 } else { FOLDER }).to_le_bytes());
+		bytes.extend_from_slice(&0u16.to_le_bytes());
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+		bytes.extend_from_slice(&0u32.to_le_bytes());
+		bytes.extend(string(&name));
+		bytes.extend(string(&alloc::format!("20260921T1015{:02}Z", handle % 60)));
+		bytes.extend(string(""));
+		bytes.extend(string(""));
+		bytes
+	}
+
+	// WHAT THE RESPONDER IS SENDING for the transaction in progress, generated as it is pulled: a prefix, a
+	// generated middle - handle IDs or object bytes - and the final response.
+	enum Middle {
+		None,
+		Handles { first: u32, count: u32 },
+		Object { handle: u32, length: u64 },
+	}
+
+	struct Outbox {
+		prefix: Vec<u8>,
+		middle: Middle,
+		suffix: Vec<u8>,
+		sent: u64,
+	}
+
+	impl Outbox {
+		fn middle_len(&self) -> u64 {
+			match self.middle {
+				Middle::None => 0,
+				Middle::Handles { count, .. } => u64::from(count) * 4,
+				Middle::Object { length, .. } => length,
+			}
+		}
+
+		fn len(&self) -> u64 {
+			self.prefix.len() as u64 + self.middle_len() + self.suffix.len() as u64
+		}
+
+		fn byte(&self, at: u64) -> u8 {
+			let prefix = self.prefix.len() as u64;
+			if at < prefix {
+				return self.prefix[at as usize];
+			}
+			let inner = at - prefix;
+			if inner < self.middle_len() {
+				return match self.middle {
+					Middle::Handles { first, .. } => (first + (inner / 4) as u32).to_le_bytes()[(inner % 4) as usize],
+					Middle::Object { handle, .. } => object_byte(handle, inner),
+					Middle::None => 0,
+				};
+			}
+			self.suffix[(inner - self.middle_len()) as usize]
+		}
+	}
+
+	// ONE CAMERA: its publication, its transport connection and event stream once opened, its session, what it
+	// is sending, and everything it was asked.
+	pub(super) struct Responder {
+		pub(super) info: device::ProviderInfo,
+		server: Option<Arc<Channel>>,
+		events: Option<Arc<Channel>>,
+		event_seq: u32,
+		attachment: u64,
+		session: Option<u32>,
+		outbox: Option<Outbox>,
+		pub(super) operations: Vec<u16>,
+		pub(super) cancels: usize,
+		pub(super) resets: usize,
+		// Pulls of the photo's bytes answered.
+		pub(super) photo_pulls: usize,
+		pub(super) attached: bool,
+	}
+
+	impl Responder {
+		pub(super) fn new(generation: u32) -> Responder {
+			let info = device::ProviderInfo { kind: device::ProviderKind::PtpTransport, bus: 0, dev: 10, func: 0, binding_generation: u64::from(generation), slot: 5, provider_generation: generation, name: String::new(), live: true };
+			Responder { info, server: None, events: None, event_seq: 0, attachment: 0, session: None, outbox: None, operations: Vec::new(), cancels: 0, resets: 0, photo_pulls: 0, attached: false }
+		}
+
+		fn same(&self, info: &device::ProviderInfo) -> bool {
+			self.info.slot == info.slot && self.info.provider_generation == info.provider_generation && self.info.binding_generation == info.binding_generation
+		}
+
+		// Answer everything MediaImportService asked: the event stream by hand, everything else through the
+		// generated dispatch.
+		fn serve(&mut self) {
+			let Some(server) = self.server.clone() else { return };
+			while let Ok(request) = server.recv() {
+				let mut handles = wire::Handles::new();
+				if request.bytes.len() >= 2 && u16::from_le_bytes([request.bytes[0], request.bytes[1]]) == ptp::ptp_transport::OP_EVENTS {
+					let (corr, _) = ptp::ptp_transport::events_open(self, &request.bytes, &mut handles).expect("the events request decodes");
+					let (stream, stream_client) = Channel::create();
+					server.send(Message::new(corr.to_le_bytes().to_vec(), alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the events answer");
+					self.events = Some(stream);
+					continue;
+				}
+				let mut out = alloc::vec![0u8; 8192];
+				let mut reply_handles = wire::Handles::new();
+				let written = ptp::ptp_transport::dispatch(self, &request.bytes, &mut handles, &mut out, &mut reply_handles).expect("MediaImportService sent a transport request the interface does not decode");
+				server.send(Message::new(out[..written].to_vec(), Vec::new())).expect("a transport answer");
+			}
+		}
+
+		// REPORT A CHANGE, as the camera would.
+		pub(super) fn event(&mut self, code: u16, param: u32) {
+			let mut bytes = header(16, 4, code, 0);
+			bytes.extend_from_slice(&param.to_le_bytes());
+			let event = ptp::PtpEvent::Container(ptp::PtpEventContainer { attachment: self.attachment, bytes });
+			let mut frame = [0u8; 96];
+			let mut handles = wire::Handles::new();
+			let len = ptp::ptp_transport::events_frame(self.event_seq, &event, &mut frame, &mut handles).expect("an event frame encodes");
+			self.event_seq += 1;
+			self.events.as_ref().expect("the service subscribed to events").send(Message::new(frame[..len].to_vec(), Vec::new())).expect("an event");
+		}
+
+		fn transaction(&mut self, code: u16, transaction: u32, params: &[u32]) -> Outbox {
+			let data = |payload: Vec<u8>| Outbox { prefix: [header(12 + payload.len(), 2, code, transaction), payload].concat(), middle: Middle::None, suffix: response(0x2001, transaction), sent: 0 };
+			let refuse = |answer: u16| Outbox { prefix: Vec::new(), middle: Middle::None, suffix: response(answer, transaction), sent: 0 };
+			if code != 0x1001 && code != 0x1002 && self.session.is_none() {
+				return refuse(0x2003);
+			}
+			let param = params.first().copied().unwrap_or(0);
+			let card_object = |handle: u32| (1..=OBJECTS).contains(&handle);
+			match code {
+				0x1002 => {
+					self.session = Some(param);
+					refuse(0x2001)
+				}
+				0x1003 => {
+					self.session = None;
+					refuse(0x2001)
+				}
+				0x1001 => data(device_info()),
+				0x1004 => data([2u32.to_le_bytes(), CARD.to_le_bytes(), OVERFLOW.to_le_bytes()].concat()),
+				0x1005 if param == CARD => data(storage_info("CARD")),
+				0x1005 if param == OVERFLOW => data(storage_info("OVERFLOW")),
+				0x1005 => refuse(0x2008),
+				0x1007 => {
+					let (first, count) = if param == OVERFLOW { (100_001, OVERFLOW_OBJECTS) } else { (1, OBJECTS) };
+					let length = 12 + 4 + 4 * count as usize;
+					Outbox { prefix: [header(length, 2, code, transaction), count.to_le_bytes().to_vec()].concat(), middle: Middle::Handles { first, count }, suffix: response(0x2001, transaction), sent: 0 }
+				}
+				0x1008 if card_object(param) => data(object_info(param)),
+				0x1009 if card_object(param) => {
+					let length = object_size(param);
+					Outbox { prefix: header(12 + length as usize, 2, code, transaction), middle: Middle::Object { handle: param, length }, suffix: response(0x2001, transaction), sent: 0 }
+				}
+				0x1008 | 0x1009 => refuse(0x2009),
+				// NOTHING ELSE IS SERVED, and anything else that arrives is recorded for the test to refuse.
+				_ => refuse(0x2005),
+			}
+		}
+	}
+
+	impl ptp::ptp_transport::Service for Responder {
+		// ONE CONSUMER: a second attach while one holds the camera is refused.
+		fn attach(&mut self, version: u32) -> Result<ptp::PtpAttach, ptp::Error> {
+			if version != 1 || self.attached {
+				return Err(ptp::Error::Invalid);
+			}
+			self.attached = true;
+			self.attachment += 1;
+			Ok(ptp::PtpAttach { version: 1, attachment: self.attachment })
+		}
+		fn command(&mut self, attachment: u64, container: Vec<u8>) -> Result<(), ptp::Error> {
+			assert_eq!(attachment, self.attachment, "a command named an attachment that is over");
+			assert!(container.len() >= 12 && container.len() <= 32 && (container.len() - 12) % 4 == 0, "a command container of {} bytes", container.len());
+			assert_eq!(u32::from_le_bytes([container[0], container[1], container[2], container[3]]) as usize, container.len(), "a command container's length is its own");
+			assert_eq!(u16::from_le_bytes([container[4], container[5]]), 1, "a command container is a command");
+			assert!(self.outbox.is_none(), "a command arrived while a transaction was still being sent");
+			let code = u16::from_le_bytes([container[6], container[7]]);
+			let transaction = u32::from_le_bytes([container[8], container[9], container[10], container[11]]);
+			let params: Vec<u32> = container[12..].chunks_exact(4).map(|param| u32::from_le_bytes([param[0], param[1], param[2], param[3]])).collect();
+			self.operations.push(code);
+			self.outbox = Some(self.transaction(code, transaction, &params));
+			Ok(())
+		}
+		fn pull(&mut self, attachment: u64, max: u16) -> Result<Vec<u8>, ptp::Error> {
+			assert_eq!(attachment, self.attachment, "a pull named an attachment that is over");
+			let Some(outbox) = self.outbox.as_mut() else { return Err(ptp::Error::Again) };
+			let take = (usize::from(max)).min(4096).min((outbox.len() - outbox.sent) as usize);
+			let bytes: Vec<u8> = (0..take as u64).map(|at| outbox.byte(outbox.sent + at)).collect();
+			outbox.sent += take as u64;
+			if matches!(outbox.middle, Middle::Object { handle: PHOTO, .. }) {
+				self.photo_pulls += 1;
+			}
+			if outbox.sent == outbox.len() {
+				self.outbox = None;
+			}
+			Ok(bytes)
+		}
+		fn events(&mut self) -> Vec<ptp::PtpEvent> {
+			Vec::new()
+		}
+		fn cancel(&mut self, attachment: u64) -> Result<(), ptp::Error> {
+			assert_eq!(attachment, self.attachment, "a cancel named an attachment that is over");
+			self.cancels += 1;
+			self.outbox = None;
+			Ok(())
+		}
+		fn reset(&mut self, attachment: u64) -> Result<ptp::PtpAttach, ptp::Error> {
+			assert_eq!(attachment, self.attachment, "a reset named an attachment that is over");
+			self.resets += 1;
+			self.outbox = None;
+			self.session = None;
+			self.attachment += 1;
+			Ok(ptp::PtpAttach { version: 1, attachment: self.attachment })
+		}
+	}
+
+	pub(super) struct Rig {
+		boot: Arc<Channel>,
+		root: Arc<Channel>,
+		catalogue: Arc<Channel>,
+		stream: Option<Arc<Channel>>,
+		seq: u32,
+		pub(super) cameras: Vec<Responder>,
+		pub(super) service: Arc<Process>,
+		pub(super) storage: StorageHarness,
+	}
+
+	impl Rig {
+		pub(super) fn start(storage: StorageHarness, camera: Responder) -> Rig {
+			let init = init_package_bytes().expect("init package module not found");
+			let volume = volume_package_bytes().expect("volume package module not found");
+			let package = pkg::Package::parse(init).expect("init package parses");
+			let elf = program_elf(&package, volume, b"media_import_service").expect("media_import_service in the package or volume");
+			let (boot, boot_user) = Channel::create();
+			let (root, root_user) = Channel::create();
+			let (catalogue, catalogue_user) = Channel::create();
+			let service = spawn_dynamic_test_process(sched::root_domain(), elf, boot_user);
+			// THE ROLES IN THE ORDER THE MANIFEST DECLARES THEM: its root, then the catalogue minted for PTP.
+			// WITH WHAT A SERVE ROOT MAY CARRY AND NO MORE, as ServiceManager hands it: the service refuses a role
+			// carrying more than its kind allows, and says so instead of reporting in.
+			send_cap(&boot, b"SERVE", root_user, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the serve role");
+			send_cap(&boot, b"CATALOGUE", catalogue_user, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue role");
+			let mut rig = Rig { boot, root, catalogue, stream: None, seq: 0, cameras: alloc::vec![camera], service, storage };
+			let mut online = false;
+			for _ in 0..PASSES {
+				rig.pump();
+				if let Ok(report) = rig.boot.recv() {
+					assert_eq!(&report.bytes[..], b"MediaImportService: online", "the service reported in");
+					online = true;
+				}
+				if online && rig.cameras.iter().all(|camera| camera.attached && camera.session.is_some() && camera.outbox.is_none() && camera.operations.len() >= 5) {
+					return rig;
+				}
+			}
+			panic!("MediaImportService did not come up and survey the published camera");
+		}
+
+		// One pass: the guest runs for a tick; the catalogue, every camera and the destination's disk are answered.
+		pub(super) fn pump(&mut self) {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			self.answer();
+		}
+
+		// THE ANSWERING HALF OF A PASS, apart so a step can act on what the guest just printed BEFORE the camera
+		// answers what it was just asked: a camera pulled after the first chunk must not have served the second.
+		fn answer(&mut self) {
+			while let Ok(request) = self.catalogue.recv() {
+				self.catalogue_request(request);
+			}
+			for camera in self.cameras.iter_mut() {
+				camera.serve();
+			}
+			pump_block_stand_in(&self.storage.block, &mut self.storage.disk, self.storage.capacity);
+		}
+
+		fn catalogue_request(&mut self, request: Message) {
+			let op = u16::from_le_bytes([request.bytes[0], request.bytes[1]]);
+			let corr = &request.bytes[2..6];
+			match op {
+				1 => {
+					assert_eq!(request.bytes[6..], [device::ProviderKind::PtpTransport as u8], "the subscription names `ptp-transport` and nothing else");
+					let (stream, stream_client) = Channel::create();
+					self.catalogue.send(Message::new(corr.to_vec(), alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the subscribe answer");
+					self.stream = Some(stream);
+					for at in 0..self.cameras.len() {
+						let info = self.cameras[at].info.clone();
+						self.frame(&info);
+					}
+				}
+				3 => {
+					let mut handles = wire::Handles::new();
+					let mut reader = wire::Reader::with_handles(&request.bytes[6..], &mut handles);
+					let info = device::ProviderInfo::read(&mut reader).expect("an open names a publication");
+					let camera = self.cameras.iter_mut().find(|camera| camera.same(&info) && camera.info.live).expect("an open named a camera that is published");
+					assert!(camera.server.is_none(), "one consumer per camera: it was opened twice");
+					let (server, client) = Channel::create();
+					camera.server = Some(server);
+					let mut answer = corr.to_vec();
+					answer.push(1);
+					answer.extend_from_slice(&0u32.to_le_bytes());
+					self.catalogue.send(Message::new(answer, alloc::vec![Capability::new(client, Rights::ALL)])).expect("the open answer");
+				}
+				_ => panic!("MediaImportService asked the catalogue for op {op}"),
+			}
+		}
+
+		fn frame(&mut self, info: &device::ProviderInfo) {
+			let mut frame = [0u8; 128];
+			let mut handles = wire::Handles::new();
+			let len = device::provider_catalogue::subscribe_frame(self.seq, info, &mut frame, &mut handles).expect("a publication frame encodes");
+			self.seq += 1;
+			self.stream.as_ref().expect("the subscription was made").send(Message::new(frame[..len].to_vec(), Vec::new())).expect("a publication frame");
+		}
+
+		// WITHDRAW the camera: its publication goes, and its connections with it.
+		pub(super) fn withdraw(&mut self, at: usize) {
+			self.cameras[at].info.live = false;
+			let info = self.cameras[at].info.clone();
+			self.frame(&info);
+			self.cameras[at].server = None;
+			self.cameras[at].events = None;
+		}
+
+		fn connect(&mut self) -> Arc<Channel> {
+			self.root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a connect request");
+			for _ in 0..PASSES {
+				self.pump();
+				if let Ok(answer) = self.root.recv() {
+					let cap = answer.caps.first().expect("MediaImportService minted a connection");
+					return cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel");
+				}
+			}
+			panic!("MediaImportService did not mint a connection");
+		}
+
+		pub(super) fn heartbeat(&mut self) {
+			self.root.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a heartbeat");
+			for _ in 0..200 {
+				self.pump();
+				if let Ok(answer) = self.root.recv() {
+					assert_eq!(&answer.bytes[..], b"PONG", "the heartbeat was answered");
+					return;
+				}
+			}
+			panic!("MediaImportService did not answer its heartbeat");
+		}
+	}
+
+	// Run one mode of `import_probe` to its end: a fresh import connection, a second one for the step that checks
+	// another client's identities, and a destination on the harness's volume.
+	pub(super) fn run_import_probe(rig: &mut Rig, mode: &str, mut during: impl FnMut(&mut Rig, &str)) -> String {
+		let init = init_package_bytes().expect("init package module not found");
+		let volume = volume_package_bytes().expect("volume package module not found");
+		let package = pkg::Package::parse(init).expect("init package parses");
+		let elf = program_elf(&package, volume, b"import_probe").expect("import_probe in the package or volume");
+		let destination = rig.storage.connect();
+		let connection = rig.connect();
+		let (bootstrap, child) = Channel::create();
+		let (stdout, child_stdout) = Channel::create();
+		let process = spawn_dynamic_test_process(sched::root_domain(), elf, child);
+		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("import_probe stdout");
+		bootstrap.send(Message::new(b"READY".to_vec(), Vec::new())).expect("endpoint run terminator");
+		bootstrap.send(Message::new(crate::tests::launch_context(mode.as_bytes(), b"vol://system"), Vec::new())).expect("import_probe arguments");
+		let granted = Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER;
+		send_cap(&bootstrap, b"STORAGE", destination, granted).expect("import_probe's destination");
+		send_cap(&bootstrap, b"IMPORT", connection, granted).expect("import_probe's grant");
+		if mode == "browse" {
+			let other = rig.connect();
+			send_cap(&bootstrap, b"IMPORT_OTHER", other, granted).expect("import_probe's second context");
+		}
+		let mut printed = String::new();
+		for _ in 0..PASSES {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			while let Ok(message) = stdout.recv() {
+				printed.push_str(core::str::from_utf8(&message.bytes).unwrap_or("<not utf-8>"));
+			}
+			during(rig, &printed);
+			rig.answer();
+			if process.is_terminated() {
+				break;
+			}
+		}
+		while let Ok(message) = stdout.recv() {
+			printed.push_str(core::str::from_utf8(&message.bytes).unwrap_or("<not utf-8>"));
+		}
+		crate::serial_println!("import: {}", printed.trim_end());
+		assert!(process.is_terminated(), "import_probe {mode} ran to its end: {printed}");
+		assert!(!printed.contains("FAIL"), "import_probe {mode}: {printed}");
+		assert!(printed.contains(&alloc::format!("import-probe: PASS {mode}")), "import_probe {mode} passed: {printed}");
+		assert!(!rig.service.is_terminated(), "MediaImportService outlived import_probe {mode}");
+		printed
+	}
+}
+
+// IMPORT, END TO END, AGAINST A RESPONDER. Every step is a real `import_probe` process; the camera is the
+// harness's; the destination is a real StorageService volume. A client pages exact metadata out of a
+// 40 000-handle snapshot and is refused, explicitly, a storage of 65 537; another client's identities are not
+// its own; a change the camera reports stales the cursor and the objects named under it; a 12 kB photo and a
+// zero-byte object end complete and are committed; a camera pulled after one chunk leaves a partial transfer
+// with its count, and the destination's previous contents untouched; and nothing but the read-only subset ever
+// reached the camera.
+tagged_test!(media_import_service_reads_snapshots_and_whole_objects_and_nothing_else, [Service, Process, Storage], id = "kernel.services.media_import_service_reads_snapshots_and_whole_objects_and_nothing_else", covers = ["kernel", "services", "bin.media_import_service", "bin.import_probe"]);
+fn media_import_service_reads_snapshots_and_whole_objects_and_nothing_else() {
+	use import_rig::{PHOTO, PHOTO_BYTES, READ_ONLY, Responder, Rig, object_byte, run_import_probe};
+
+	let init = init_package_bytes().expect("init package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
+	let mut storage = StorageHarness::start_empty(storage_elf, 4 * 1024 * 1024);
+	// THE DESTINATION THE REMOVAL STEP MUST LEAVE ALONE, with contents of its own.
+	assert!(storage.write(b"vol://system/keep.jpg", b"previous contents", 0x700), "the destination was seeded");
+	let mut rig = Rig::start(storage, Responder::new(1));
+
+	// LIMITS, THE DEVICE, EXACT PAGES, THE OVER-LIMIT STORAGE, ANOTHER CLIENT'S IDENTITY, AN UNKNOWN OPERATION.
+	run_import_probe(&mut rig, "browse", |_, _| {});
+	assert!(rig.cameras[0].cancels >= 1, "the over-limit enumeration's transaction was cancelled rather than drained");
+
+	// A CHANGE THE CAMERA REPORTS, mid-enumeration.
+	let mut reported = false;
+	run_import_probe(&mut rig, "stale", |rig, printed| {
+		if !reported && printed.contains("import-probe: paging") {
+			rig.cameras[0].event(0x4002, 40_001);
+			reported = true;
+		}
+	});
+	assert!(reported, "the change was reported while the probe was paging");
+
+	// A WHOLE PHOTO AND A ZERO-BYTE OBJECT, committed only on complete endings.
+	run_import_probe(&mut rig, "import", |_, _| {});
+
+	// THE CAMERA PULLED AFTER ONE CHUNK.
+	let mut pulled = false;
+	run_import_probe(&mut rig, "removal", |rig, printed| {
+		if !pulled && printed.contains("import-probe: first chunk") {
+			rig.withdraw(0);
+			pulled = true;
+		}
+	});
+	assert!(pulled, "the camera was withdrawn mid-transfer");
+	assert_eq!(rig.cameras[0].resets, 0, "nothing in the scenario needed the camera reset");
+	let operations = rig.cameras[0].operations.clone();
+	assert!(operations.iter().all(|code| READ_ONLY.contains(code)), "only the read-only subset reached the camera: {operations:x?}");
+	rig.heartbeat();
+
+	// WHAT THE DESTINATION HOLDS, read back through the volume: the photo exactly, the empty object empty, and the
+	// file the withdrawn import was writing as it was before.
+	let photo: alloc::vec::Vec<u8> = (0..PHOTO_BYTES).map(|n| object_byte(PHOTO, n)).collect();
+	assert!(rig.storage.open(b"vol://system/photo.jpg", 0x701).is_some_and(|bytes| bytes == photo), "the photo was published whole");
+	assert_eq!(rig.storage.open(b"vol://system/empty.bin", 0x702), Some(alloc::vec::Vec::new()), "the zero-byte object was published empty");
+	assert_eq!(rig.storage.open(b"vol://system/keep.jpg", 0x703).as_deref(), Some(&b"previous contents"[..]), "the withdrawn import published nothing of its prefix");
+}
+
+// THE MODEM SCENARIO'S PROVIDERS: stand-ins for as many modems as a step publishes, each answering the provider
+// wire exactly as far as admission needs - a session at the contract's version, the two streams with the first
+// state on the indication stream, and the transmit channel. What is under test is ModemService's bounds, so
+// nothing here plays a SIM or a context.
+mod modem_rig {
+	use super::*;
+	use alloc::string::String;
+	use alloc::sync::Arc;
+	use alloc::vec::Vec;
+	use device_proto::generated::liber::device::v1 as device;
+	use modem_device_proto::generated::liber::modem_device::v1 as md;
+	use modem_proto::generated::liber::modem::v1 as modem;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::process::Process;
+	use object::rights::Rights;
+
+	// Passes of one harness tick each; a step that has not ended by then has hung.
+	pub(super) const PASSES: usize = 20_000;
+
+	fn role_rights() -> Rights {
+		Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER
+	}
+
+	// ONE MODEM: its publication, the connection ModemService opened to it, and the producer ends of what it gave
+	// the service, kept so the streams stay open.
+	pub(super) struct Modem {
+		pub(super) info: device::ProviderInfo,
+		server: Option<Arc<Channel>>,
+		kept: Vec<Arc<Channel>>,
+	}
+
+	impl Modem {
+		pub(super) fn new(slot: u32) -> Modem {
+			let info = device::ProviderInfo { kind: device::ProviderKind::Modem, bus: 0, dev: 28, func: 0, binding_generation: 1, slot, provider_generation: 1, name: String::from("org.libersystem.modem-rig"), live: true };
+			Modem { info, server: None, kept: Vec::new() }
+		}
+
+		// Whether ModemService opened this publication at all: the provider bound is checked before it does.
+		pub(super) fn opened(&self) -> bool {
+			self.server.is_some()
+		}
+
+		fn same(&self, info: &device::ProviderInfo) -> bool {
+			self.info.slot == info.slot && self.info.provider_generation == info.provider_generation && self.info.binding_generation == info.binding_generation
+		}
+
+		fn state() -> md::DeviceState {
+			md::DeviceState { manufacturer: String::from("LiberSystem"), model: String::from("modem rig"), sim: md::DeviceSim::Absent, sim_generation: 1, registration: md::DeviceRegistration::NotRegistered, operator: None, signal_valid: false, rssi_dbm: 0, quality: 0, pin_attempts: None, puk_attempts: None, context_active: false }
+		}
+
+		// The session: `open` through the generated dispatch; the two streams and the transmit channel by hand,
+		// because each answers with a capability.
+		fn serve(&mut self) {
+			let Some(server) = self.server.clone() else { return };
+			while let Ok(request) = server.recv() {
+				let op = u16::from_le_bytes([request.bytes[0], request.bytes[1]]);
+				let corr = request.bytes[2..6].to_vec();
+				match op {
+					md::modem_device::OP_INDICATIONS | md::modem_device::OP_RECEIVE => {
+						let (producer, consumer) = Channel::create();
+						server.send(Message::new(corr, alloc::vec![Capability::new(consumer, Rights::ALL)])).expect("a stream answer");
+						// THE INDICATION STREAM OPENS WITH THE CURRENT STATE, which is what admission waits for.
+						if op == md::modem_device::OP_INDICATIONS {
+							let mut frame = [0u8; 512];
+							let mut handles = wire::Handles::new();
+							let len = md::modem_device::indications_frame(0, &md::Indication { revision: 1, state: Self::state() }, &mut frame, &mut handles).expect("the first state encodes");
+							producer.send(Message::new(frame[..len].to_vec(), Vec::new())).expect("the first state");
+						}
+						self.kept.push(producer);
+					}
+					md::modem_device::OP_TRANSMIT => {
+						let (mine, theirs) = Channel::create();
+						let mut answer = corr;
+						answer.push(1);
+						answer.extend_from_slice(&0u32.to_le_bytes());
+						server.send(Message::new(answer, alloc::vec![Capability::new(theirs, Rights::ALL)])).expect("the transmit answer");
+						self.kept.push(mine);
+					}
+					_ => {
+						let mut handles = wire::Handles::new();
+						let mut out = alloc::vec![0u8; 1024];
+						let mut reply_handles = wire::Handles::new();
+						let written = md::modem_device::dispatch(self, &request.bytes, &mut handles, &mut out, &mut reply_handles).expect("ModemService sent a provider request the interface does not decode");
+						server.send(Message::new(out[..written].to_vec(), Vec::new())).expect("a provider answer");
+					}
+				}
+			}
+		}
+	}
+
+	impl md::modem_device::Service for Modem {
+		fn open(&mut self, version: u32) -> Result<md::DeviceOpen, md::Error> {
+			if version != 1 {
+				return Err(md::Error::Unsupported);
+			}
+			Ok(md::DeviceOpen { limits: md::DeviceLimits { version: 1, pending: 8, fragments: 16, message_bytes: 16 * 1024, assembly_bytes: 64 * 1024, assemblies: 4, mtu: 1400 }, connection_generation: 1 })
+		}
+		fn command(&mut self, _command: md::Command) -> Result<md::CommandReply, md::Error> {
+			Err(md::Error::Unsupported)
+		}
+		fn indications(&mut self) -> Vec<md::Indication> {
+			Vec::new()
+		}
+		fn receive(&mut self) -> Vec<md::Datagram> {
+			Vec::new()
+		}
+		fn transmit(&mut self) -> Result<u64, md::Error> {
+			Err(md::Error::Unsupported)
+		}
+	}
+
+	pub(super) struct Rig {
+		boot: Arc<Channel>,
+		root: Arc<Channel>,
+		_admin: Arc<Channel>,
+		_link: Arc<Channel>,
+		catalogue: Arc<Channel>,
+		stream: Option<Arc<Channel>>,
+		seq: u32,
+		pub(super) modems: Vec<Modem>,
+		_service: Arc<Process>,
+	}
+
+	impl Rig {
+		pub(super) fn start(modems: Vec<Modem>) -> Rig {
+			let init = init_package_bytes().expect("init package module not found");
+			let volume = volume_package_bytes().expect("volume package module not found");
+			let package = pkg::Package::parse(init).expect("init package parses");
+			let elf = program_elf(&package, volume, b"modem_service").expect("modem_service in the package or volume");
+			let (boot, boot_user) = Channel::create();
+			let (catalogue, catalogue_user) = Channel::create();
+			let (root, root_user) = Channel::create();
+			let (admin, admin_user) = Channel::create();
+			let (link, link_user) = Channel::create();
+			let service = spawn_dynamic_test_process(sched::root_domain(), elf, boot_user);
+			// THE ROLES IN THE ORDER THE MANIFEST DECLARES THEM: the catalogue minted for `modem`, the observation
+			// root, the minting root, and the link-admin connection - which nothing in this scenario reaches.
+			send_cap(&boot, b"CATALOGUE", catalogue_user, role_rights()).expect("the catalogue role");
+			send_cap(&boot, b"SERVE", root_user, role_rights()).expect("the serve role");
+			send_cap(&boot, b"ADMIN", admin_user, role_rights()).expect("the admin role");
+			send_cap(&boot, b"LINK", link_user, role_rights()).expect("the link role");
+			let mut rig = Rig { boot, root, _admin: admin, _link: link, catalogue, stream: None, seq: 0, modems, _service: service };
+			for _ in 0..PASSES {
+				rig.pump();
+				if let Ok(report) = rig.boot.recv() {
+					assert_eq!(&report.bytes[..], b"ModemService: online", "the service reported in");
+					return rig;
+				}
+			}
+			panic!("ModemService did not come up");
+		}
+
+		// One pass: the guest runs for a tick, then the catalogue and every modem are answered.
+		pub(super) fn pump(&mut self) {
+			sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			while let Ok(request) = self.catalogue.recv() {
+				self.catalogue_request(request);
+			}
+			for modem in self.modems.iter_mut() {
+				modem.serve();
+			}
+		}
+
+		// THE CATALOGUE: a subscription to `modem` answered with a stream whose first frames are the modems published
+		// now, and an `open` answered with a fresh provider connection to the modem it names.
+		fn catalogue_request(&mut self, request: Message) {
+			let op = u16::from_le_bytes([request.bytes[0], request.bytes[1]]);
+			let corr = &request.bytes[2..6];
+			match op {
+				1 => {
+					assert_eq!(request.bytes[6..], [device::ProviderKind::Modem as u8], "the subscription names `modem` and nothing else");
+					let (stream, stream_client) = Channel::create();
+					self.catalogue.send(Message::new(corr.to_vec(), alloc::vec![Capability::new(stream_client, Rights::ALL)])).expect("the subscribe answer");
+					self.stream = Some(stream);
+					for at in 0..self.modems.len() {
+						let info = self.modems[at].info.clone();
+						self.frame(&info);
+					}
+				}
+				3 => {
+					let mut handles = wire::Handles::new();
+					let mut reader = wire::Reader::with_handles(&request.bytes[6..], &mut handles);
+					let info = device::ProviderInfo::read(&mut reader).expect("an open names a publication");
+					let modem = self.modems.iter_mut().find(|modem| modem.same(&info) && modem.info.live).expect("an open named a modem that is published");
+					assert!(modem.server.is_none(), "one consumer per modem: it was opened twice");
+					let (server, client) = Channel::create();
+					modem.server = Some(server);
+					let mut answer = corr.to_vec();
+					answer.push(1);
+					answer.extend_from_slice(&0u32.to_le_bytes());
+					self.catalogue.send(Message::new(answer, alloc::vec![Capability::new(client, Rights::ALL)])).expect("the open answer");
+				}
+				_ => panic!("ModemService asked the catalogue for op {op}"),
+			}
+		}
+
+		fn frame(&mut self, info: &device::ProviderInfo) {
+			let mut frame = [0u8; 128];
+			let mut handles = wire::Handles::new();
+			let len = device::provider_catalogue::subscribe_frame(self.seq, info, &mut frame, &mut handles).expect("a publication frame encodes");
+			self.seq += 1;
+			self.stream.as_ref().expect("the subscription was made").send(Message::new(frame[..len].to_vec(), Vec::new())).expect("a publication frame");
+		}
+
+		// WITHDRAW a modem: its publication goes, and its provider connection with it.
+		pub(super) fn withdraw(&mut self, at: usize) {
+			self.modems[at].info.live = false;
+			let info = self.modems[at].info.clone();
+			self.frame(&info);
+			self.modems[at].server = None;
+			self.modems[at].kept.clear();
+		}
+
+		pub(super) fn publish(&mut self, modem: Modem) {
+			let info = modem.info.clone();
+			self.modems.push(modem);
+			self.frame(&info);
+		}
+
+		// A connection minted from the observation root, or none when the service refused one.
+		pub(super) fn connect(&mut self) -> Option<Arc<Channel>> {
+			self.root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), Vec::new())).expect("a connect request");
+			for _ in 0..PASSES {
+				self.pump();
+				if let Ok(answer) = self.root.recv() {
+					return answer.caps.first().map(|cap| cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel"));
+				}
+			}
+			panic!("ModemService did not answer a connect");
+		}
+
+		// THE LIMITS, as a client reads them - through a connection of its own, which counts while it is open.
+		pub(super) fn limits(&mut self) -> modem::ModemLimits {
+			let connection = self.connect().expect("a connection to read the limits through");
+			let mut request = modem::modem::OP_LIMITS.to_le_bytes().to_vec();
+			request.extend_from_slice(&0x6d6fu32.to_le_bytes());
+			connection.send(Message::new(request, Vec::new())).expect("a limits request");
+			for _ in 0..PASSES {
+				self.pump();
+				if let Ok(answer) = connection.recv() {
+					let mut handles = wire::Handles::new();
+					let mut reader = wire::Reader::with_handles(&answer.bytes, &mut handles);
+					assert_eq!(reader.u32(), Some(0x6d6f), "the limits answer is this request's");
+					assert_eq!(reader.tag(), Some(true), "the limits were answered");
+					return modem::ModemLimits::read(&mut reader).expect("the limits decode");
+				}
+			}
+			panic!("ModemService did not answer its limits");
+		}
+	}
+}
+
+// THE MODEM SERVICE'S BOUNDS, REFUSED AT AND GIVEN BACK. Five modems are published and four are admitted - the
+// fifth is never even opened - and a withdrawn one is a slot a new publication takes. Thirty-two observation
+// connections are minted and the next is refused, and one closed is a slot the next takes. The plan's third
+// bound, one context, is the modem gate's (`modemcheck context`), where a real context can be installed.
+tagged_test!(modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back, [Service, Process], id = "kernel.services.modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back", covers = ["kernel", "services", "bin.modem_service"]);
+fn modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back() {
+	use modem_rig::{Modem, PASSES, Rig};
+
+	let mut rig = Rig::start((1..=5).map(Modem::new).collect());
+	let opened = |rig: &Rig| rig.modems.iter().filter(|modem| modem.opened()).count();
+	let mut settled = 0;
+	for _ in 0..PASSES {
+		rig.pump();
+		if opened(&rig) == 4 {
+			settled += 1;
+			if settled > 200 {
+				break;
+			}
+		}
+	}
+	let limits = rig.limits();
+	assert_eq!((limits.providers, limits.providers_max), (4, 4), "four of five published modems were admitted");
+	assert_eq!(opened(&rig), 4, "the fifth publication was refused before it was opened");
+
+	// ONE WITHDRAWN IS A SLOT A NEW PUBLICATION TAKES.
+	let first = rig.modems.iter().position(Modem::opened).expect("an admitted modem");
+	rig.withdraw(first);
+	let mut released = false;
+	for _ in 0..200 {
+		if rig.limits().providers == 3 {
+			released = true;
+			break;
+		}
+	}
+	assert!(released, "a withdrawn modem gave its slot back");
+	rig.publish(Modem::new(6));
+	let mut retaken = false;
+	for _ in 0..200 {
+		if rig.modems.last().is_some_and(Modem::opened) && rig.limits().providers == 4 {
+			retaken = true;
+			break;
+		}
+	}
+	assert!(retaken, "the slot a withdrawn modem gave back was taken by a new publication");
+
+	// THIRTY-TWO CONNECTIONS, THEN A REFUSAL, THEN A SLOT GIVEN BACK.
+	let mut held: alloc::vec::Vec<alloc::sync::Arc<object::channel::Channel>> = alloc::vec::Vec::new();
+	while let Some(connection) = rig.connect() {
+		held.push(connection);
+		assert!(held.len() <= 32, "a thirty-third client connection was admitted");
+	}
+	assert_eq!(held.len(), 32, "thirty-two client connections were admitted and the next refused");
+	held.pop();
+	let mut readmitted = None;
+	for _ in 0..200 {
+		rig.pump();
+		readmitted = rig.connect();
+		if readmitted.is_some() {
+			break;
+		}
+	}
+	assert!(readmitted.is_some(), "a closed client connection gave its slot back");
 }

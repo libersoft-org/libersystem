@@ -1,0 +1,338 @@
+//! LiberSystem power state - what power sources and thermal zones report, normalised, and the few
+//! device controls an operator may use.
+//!
+//! THREE INTERFACES FOR THREE PARTIES. A READER sees normalised state and nothing it could change; an
+//! OPERATOR may switch an advertised output of a device such as a UPS; a PROVIDER - a driver - publishes
+//! what its hardware reports. None of them reaches the others' operations, because what separates them
+//! is who holds them.
+//!
+//! THIS IS NOT MACHINE SHUTDOWN. Rebooting and powering off the host stay with SystemManager's
+//! `system-power`; this service holds no client of it. Turning a UPS's output off turns the UPS's
+//! output off. Suspend, fan curves and power policy are not here at all.
+
+package liber:power@1;
+
+use liber:base@1.{error};
+
+/// What kind of thing a source is.
+enum source-kind {
+	ac           = 1,
+	battery      = 2,
+	ups          = 3,
+	load         = 4,
+	thermal-zone = 5,
+}
+
+/// WHETHER A MEASUREMENT IS A MEASUREMENT. Every value below carries one of these, and none of them is
+/// ever encoded as zero or as the largest integer: an unknown charge is not an empty battery, and an
+/// unsupported rate is not a rate of four billion.
+enum value-state {
+	known       = 1,
+	unknown     = 2,
+	unsupported = 3,
+	/// The source reported something that cannot be a value - a sentinel, an overflow, a contradiction,
+	/// a unit that does not convert. `reason` says which, from a bounded set.
+	invalid     = 4,
+}
+
+/// Why a value is invalid.
+enum invalid-reason {
+	none          = 0,
+	sentinel      = 1,
+	overflow      = 2,
+	contradiction = 3,
+	unit          = 4,
+	range         = 5,
+}
+
+/// A three-state fact: a presence or an online state that may simply not be known.
+enum tristate {
+	unknown = 0,
+	no      = 1,
+	yes     = 2,
+}
+
+record measure-u64 {
+	state:  value-state,
+	value:  u64,
+	reason: invalid-reason,
+}
+
+record measure-i64 {
+	state:  value-state,
+	value:  i64,
+	reason: invalid-reason,
+}
+
+/// Energy and charge are different physical quantities, and a capacity says which it is.
+enum quantity {
+	/// Microwatt-hours.
+	energy = 1,
+	/// Microamp-hours.
+	charge = 2,
+}
+
+record capacity {
+	state:    value-state,
+	quantity: quantity,
+	value:    u64,
+	reason:   invalid-reason,
+}
+
+enum charge-state {
+	unknown     = 0,
+	charging    = 1,
+	discharging = 2,
+	idle        = 3,
+	/// The source said it was charging AND discharging. Not a state: a contradiction, reported as one
+	/// rather than resolved by picking either.
+	invalid     = 4,
+}
+
+/// Whether a temperature is absolute, or an offset from its zone's critical reference.
+enum temperature-reference {
+	absolute = 1,
+	relative = 2,
+}
+
+/// Millidegrees Celsius, absolute or relative - and comparable only with a value on the same reference.
+record temperature {
+	state:     value-state,
+	reference: temperature-reference,
+	value:     i64,
+	reason:    invalid-reason,
+}
+
+enum trip-kind {
+	passive  = 1,
+	active   = 2,
+	hot      = 3,
+	critical = 4,
+}
+
+/// A threshold a thermal zone declares. An observation, not an instruction.
+record trip-point {
+	kind:        trip-kind,
+	index:       u8,
+	temperature: temperature,
+}
+
+enum alarm-kind {
+	on-battery        = 1,
+	low-capacity      = 2,
+	critical-capacity = 3,
+	overload          = 4,
+	replace-battery   = 5,
+	source-fault      = 6,
+	over-temperature  = 7,
+}
+
+/// Whether an alarm was REPORTED by the source or DERIVED here from an explicitly defined comparison.
+enum provenance {
+	reported = 1,
+	derived  = 2,
+}
+
+record alarm {
+	kind:       alarm-kind,
+	state:      tristate,
+	provenance: provenance,
+}
+
+/// What the source's provider will do if asked. Advertised, never assumed.
+record controls {
+	set-output:      bool,
+	schedule-off:    bool,
+	cancel-off:      bool,
+	outlets:         u8,
+}
+
+/// One source, normalised.
+record source-state {
+	kind:           source-kind,
+	present:        tristate,
+	online:         tristate,
+	charge:         charge-state,
+	remaining:      capacity,
+	full:           capacity,
+	design:         capacity,
+	/// Basis points, 0 to 10000.
+	state-of-charge: measure-u64,
+	/// Microvolts.
+	voltage:        measure-u64,
+	/// Microamps: positive into the source's storage, negative delivered out of it.
+	current:        measure-i64,
+	/// Microwatts, signed as `current` is. A source that reports only the watts it delivers publishes
+	/// them here, and no load fraction is invented from them.
+	power:          measure-i64,
+	/// Whole seconds.
+	runtime:        measure-u64,
+	/// Basis points of rated load.
+	load:           measure-u64,
+	temperature:    temperature,
+	@bound(16) trips:  list<trip-point>,
+	@bound(16) alarms: list<alarm>,
+	controls:       controls,
+	/// The source's own time, when it gave one. Never synchronised with anything.
+	source-time:    option<u64>,
+}
+
+/// A source's identity: which publication, which generation of it, which local source. A source from
+/// a replacement publication is a DIFFERENT source, and a stale identity names nothing.
+record source-id {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+	local:              u32,
+}
+
+record source-snapshot {
+	id:       source-id,
+	/// When this service received the state, on its monotonic clock.
+	received: u64,
+	state:    source-state,
+}
+
+enum change-kind {
+	/// The subscription's atomic snapshot: one of these per source, then a `snapshot-end`.
+	snapshot     = 1,
+	snapshot-end = 2,
+	added        = 3,
+	updated      = 4,
+	removed      = 5,
+}
+
+/// One frame of a subscription. REVISIONS MAY SKIP after coalescing; a gap is not a loss. A loss is a
+/// closed subscription, which a client answers by subscribing again for a fresh snapshot.
+record power-change {
+	epoch:    u64,
+	revision: u64,
+	kind:     change-kind,
+	source:   option<source-snapshot>,
+	/// For `removed`, the source that went.
+	gone:     option<source-id>,
+}
+
+/// THE READ AUTHORITY: enumerate, and subscribe. No publication and no control.
+interface power {
+	/// Every live source, sorted. Informational: a subscription is correct without it.
+	@op(1) sources:   func() -> result<list<source-snapshot>, error>;
+	/// One atomic snapshot at (epoch, revision), then live changes after it. REFUSED with `exhausted`
+	/// at the service's subscriber limit, rather than admitted and starved.
+	@op(2) subscribe: func() -> result<stream<power-change>, error>;
+}
+
+/// What an operator's command came to. A control the source does not advertise is not an outcome: it
+/// is `error.unsupported`, answered before anything is sent.
+enum control-outcome {
+	done          = 1,
+	/// The provider may have acted and did not say. NEVER RETRIED: the source's control state is
+	/// uncertain until a fresh state query reconciles it.
+	indeterminate = 2,
+}
+
+/// THE OPERATOR AUTHORITY: device controls a provider advertises, and only those. Granted to one
+/// explicitly authorised administrative component and to nothing by default.
+interface power-control {
+	@op(1) set-output:          func(source: source-id, outlet: u8, on: bool) -> result<control-outcome, error>;
+	@op(2) schedule-output-off: func(source: source-id, delay-seconds: u32) -> result<control-outcome, error>;
+	@op(3) cancel-output-off:   func(source: source-id) -> result<control-outcome, error>;
+}
+
+/// One source as a provider describes it, by ITS local identity.
+record provider-source {
+	local: u32,
+	state: source-state,
+}
+
+enum provider-update-kind {
+	snapshot     = 1,
+	snapshot-end = 2,
+	added        = 3,
+	updated      = 4,
+	removed      = 5,
+}
+
+/// One frame of a provider's stream, carrying the provider's own monotonic revision.
+record provider-update {
+	revision: u64,
+	kind:     provider-update-kind,
+	source:   option<provider-source>,
+	gone:     option<u32>,
+}
+
+enum provider-command-kind {
+	set-output          = 1,
+	schedule-output-off = 2,
+	cancel-output-off   = 3,
+}
+
+record provider-command {
+	kind:          provider-command-kind,
+	local:         u32,
+	outlet:        u8,
+	on:            bool,
+	delay-seconds: u32,
+}
+
+/// THE PROVIDER CONTRACT a `power-source` publication serves - to PowerService alone.
+interface power-provider {
+	@op(1) updates: func() -> stream<provider-update>;
+	@op(2) command: func(command: provider-command) -> result<control-outcome, error>;
+	/// A fresh state of one source, for reconciliation after an indeterminate command.
+	@op(3) query:   func(local: u32) -> result<source-state, error>;
+}
+
+/// A decoded input of the in-guest fixture that a gate's probe may change. DEVELOPMENT ONLY, like
+/// everything below: the endpoint serving it exists on a development fixture bound to a QEMU test
+/// device, and PermissionManager reaches it only in a development build, for a probe whose policy
+/// row grants `fixture-control`. None of it is a claim that QEMU attaches a UPS or evaluates AML.
+enum fixture-field {
+	/// The UPS's RemainingCapacity, milliamp-hours by CapacityMode.
+	ups-remaining       = 1,
+	/// The UPS's Voltage, hundredths of a volt.
+	ups-voltage         = 2,
+	/// The UPS's PresentStatus.ACPresent: 1 on line power, 0 not.
+	ups-ac-present      = 3,
+	/// The UPS's PresentStatus.Overload, 1 or 0.
+	ups-overload        = 4,
+	/// The battery's `_BST` remaining capacity, milliwatt-hours.
+	battery-remaining   = 5,
+	/// The battery's `_BST` state bits.
+	battery-state       = 6,
+	/// The adapter's `_PSR`.
+	ac-online           = 7,
+	/// The zone's `_TMP`, tenths of a kelvin.
+	thermal-temperature = 8,
+}
+
+/// One command a fixture's provider received, as it received it.
+record fixture-command {
+	/// 0 is the HID-shaped UPS provider, 1 the ACPI-shaped one.
+	publication:   u8,
+	local:         u32,
+	kind:          provider-command-kind,
+	outlet:        u8,
+	on:            bool,
+	delay-seconds: u32,
+}
+
+/// THE FIXTURE'S CONTROL ENDPOINT: change or remove what the two fixture providers publish, make one
+/// withhold its replies, and read back every command they were sent and what their outlets are.
+interface power-fixture {
+	@op(1) set:         func(field: fixture-field, value: u32) -> result<unit, error>;
+	/// Remove one source from a publication.
+	@op(2) remove:      func(publication: u8, local: u32) -> result<unit, error>;
+	/// Withdraw a whole publication, as a device going would.
+	@op(3) withdraw:    func(publication: u8) -> result<unit, error>;
+	/// Publish a withdrawn one again: a new publication, so a new generation and new sources.
+	@op(4) republish:   func(publication: u8) -> result<unit, error>;
+	@op(5) commands:    func() -> result<list<fixture-command>, error>;
+	/// Leave the next `commands` control replies and `queries` reconciliation replies unanswered.
+	@op(6) withhold:    func(commands: u32, queries: u32) -> result<unit, error>;
+	/// Offer one more `power-source` publication than this fixture's registry entry declares, which
+	/// DeviceManager must refuse.
+	@op(7) offer-extra: func() -> result<unit, error>;
+	/// The UPS's outlets, on or off, in order.
+	@op(8) outlets:     func() -> result<list<bool>, error>;
+}

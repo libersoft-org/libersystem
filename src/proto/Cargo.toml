@@ -21,6 +21,20 @@ default = []
 channel-client-impl = [
 	"audio-proto/channel-client-impl",
 	"bluetooth-proto/channel-client-impl",
+	"power-proto/channel-client-impl",
+	"smartcard-proto/channel-client-impl",
+	"modem-proto/channel-client-impl",
+	"modem-device-proto/channel-client-impl",
+	"camera-proto/channel-client-impl",
+	"camera-device-proto/channel-client-impl",
+	"event-proto/channel-client-impl",
+	"midi-proto/channel-client-impl",
+	"midi-device-proto/channel-client-impl",
+	"spool-proto/channel-client-impl",
+	"printer-device-proto/channel-client-impl",
+	"import-proto/channel-client-impl",
+	"ptp-transport-proto/channel-client-impl",
+	"admin-proto/channel-client-impl",
 	"config-proto/channel-client-impl",
 	"dep:ipc-client",
 	"device-proto/channel-client-impl",
@@ -42,6 +56,20 @@ channel-client-impl = [
 shared-image = [
 	"audio-proto/shared-image",
 	"bluetooth-proto/shared-image",
+	"power-proto/shared-image",
+	"smartcard-proto/shared-image",
+	"modem-proto/shared-image",
+	"modem-device-proto/shared-image",
+	"camera-proto/shared-image",
+	"camera-device-proto/shared-image",
+	"event-proto/shared-image",
+	"midi-proto/shared-image",
+	"midi-device-proto/shared-image",
+	"spool-proto/shared-image",
+	"printer-device-proto/shared-image",
+	"import-proto/shared-image",
+	"ptp-transport-proto/shared-image",
+	"admin-proto/shared-image",
 	"channel-client-impl",
 	"config-proto/shared-image",
 	"device-proto/shared-image",
@@ -72,6 +100,20 @@ abi = { path = "../abi" }
 audio-proto = { path = "../user/libs/protocol/audio-proto" }
 base-proto = { path = "../user/libs/protocol/base-proto" }
 bluetooth-proto = { path = "../user/libs/protocol/bluetooth-proto" }
+power-proto = { path = "../user/libs/protocol/power-proto" }
+smartcard-proto = { path = "../user/libs/protocol/smartcard-proto" }
+modem-proto = { path = "../user/libs/protocol/modem-proto" }
+modem-device-proto = { path = "../user/libs/protocol/modem-device-proto" }
+camera-proto = { path = "../user/libs/protocol/camera-proto" }
+camera-device-proto = { path = "../user/libs/protocol/camera-device-proto" }
+event-proto = { path = "../user/libs/protocol/event-proto" }
+midi-proto = { path = "../user/libs/protocol/midi-proto" }
+midi-device-proto = { path = "../user/libs/protocol/midi-device-proto" }
+spool-proto = { path = "../user/libs/protocol/spool-proto" }
+printer-device-proto = { path = "../user/libs/protocol/printer-device-proto" }
+import-proto = { path = "../user/libs/protocol/import-proto" }
+ptp-transport-proto = { path = "../user/libs/protocol/ptp-transport-proto" }
+admin-proto = { path = "../user/libs/protocol/admin-proto" }
 config-proto = { path = "../user/libs/protocol/config-proto" }
 device-proto = { path = "../user/libs/protocol/device-proto" }
 display-proto = { path = "../user/libs/protocol/display-proto" }

@@ -9,6 +9,8 @@ extern crate alloc;
 // `./check.sh --gate host-tests` reach them.
 pub use service_logic::{executable, graph_limits, service_lifecycle, shell_language};
 
+pub mod capability_names;
+
 // What a development agent says on the resolution channel when it takes it, and the only
 // thing on that channel that is not a query or an answer to one. It lives here because both
 // ends have to agree on it: the agent sends it so ProcessService knows the channel has someone

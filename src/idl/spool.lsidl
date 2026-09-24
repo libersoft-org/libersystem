@@ -1,0 +1,122 @@
+//! LiberSystem spooling - printers, and print jobs an application stages and explicitly submits, with an
+//! honest account of what the transport took.
+//!
+//! A JOB IS A CAPABILITY, NOT AN ENDPOINT. `create` reserves the declared length and answers a job channel;
+//! the application writes exactly that many bytes, then `submit`s - and only then is anything eligible to
+//! reach the printer. Closing a job that was never submitted aborts it and refunds its reservation; closing
+//! a submitted one only stops watching it. Nothing on either interface reaches a catalogue, a backend, a
+//! reset or a raw endpoint.
+//!
+//! `TRANSFERRED` MEANS THE TRANSPORT ACKNOWLEDGED EVERY BYTE, and nothing more: not a finished page. A job
+//! that ended any other way says why, how many bytes were confirmed, and whether more may have reached the
+//! printer than was confirmed. Nothing is ever replayed - not to the same printer, and not to a replacement.
+
+package liber:spool@1;
+
+use liber:base@1.{error};
+
+/// A printer as this service knows it: DeviceManager's publication identity, the attachment generation a
+/// reset or a reattachment advances, and the service incarnation.
+record printer-id {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+	attachment:         u64,
+	incarnation:        u64,
+}
+
+/// What a document is written in. Only `postscript` is accepted, and only by a printer whose device ID
+/// names it; the others are named so a request for them is refused as `unsupported` rather than invalid.
+enum document-language {
+	postscript = 1,
+	pcl        = 2,
+	pdf        = 3,
+}
+
+/// One observation: seen true, seen false, not available because the port could not be read, or not
+/// something this printer's backend has evidence of at all.
+enum observation {
+	yes         = 1,
+	no          = 2,
+	unavailable = 3,
+	unsupported = 4,
+}
+
+/// The port's three standard bits, decoded, and two details only a backend with evidence of them supplies.
+/// They say what the port reports and no more: a benign reading does not prove a printer ready.
+record port-status {
+	paper-empty: observation,
+	selected:    observation,
+	error:       observation,
+	/// `unsupported` unless the backend reported it.
+	cover-open:  observation,
+	jam:         observation,
+}
+
+record printer-info {
+	id:                        printer-id,
+	@bound(64) model:          string,
+	@bound(3) languages:       list<document-language>,
+	status:                    port-status,
+	/// Jobs may be admitted for it now.
+	available:                 bool,
+	queued:                    u8,
+	active:                    bool,
+	max-job-bytes:             u32,
+}
+
+enum job-state {
+	writing     = 1,
+	queued      = 2,
+	active      = 3,
+	transferred = 4,
+	failed      = 5,
+	cancelled   = 6,
+}
+
+enum job-cause {
+	/// More bytes were written than were declared.
+	size-limit    = 1,
+	/// The printer went away.
+	unplugged     = 2,
+	/// The transport refused or failed a write.
+	backend-error = 3,
+	/// Thirty seconds without an accepted byte.
+	stalled       = 4,
+	/// Ten minutes from submission without finishing.
+	lifetime      = 5,
+	/// A reset or a recovery failed, or invalidated the attachment.
+	reset         = 6,
+	/// The job channel closed before it was submitted.
+	abandoned     = 7,
+	/// The application cancelled it.
+	cancelled     = 8,
+}
+
+record job-status {
+	state:              job-state,
+	printer:            printer-id,
+	declared:           u32,
+	staged:             u32,
+	/// Bytes the transport confirmed it accepted.
+	acknowledged:       u32,
+	cause:              option<job-cause>,
+	/// More may have reached the printer than `acknowledged` says.
+	delivery-uncertain: bool,
+}
+
+/// PRINTERS AND JOB CREATION. At most two live jobs per connection, and a job's whole declared length is
+/// reserved before it is admitted.
+interface spool {
+	@op(1) @bound(8) printers: func() -> result<list<printer-info>, error>;
+	@op(2) create:  func(printer: printer-id, language: document-language, length: u32) -> result<handle<channel>, error>;
+}
+
+/// ONE JOB. `write` accepts a whole frame into the job's reservation or none of it; `submit` makes the
+/// staged bytes eligible for transmission exactly once; `status` stays available after submission.
+interface job {
+	@op(1) write:  func(@bound(4096) bytes: list<u8>) -> result<u32, error>;
+	@op(2) submit: func() -> result<job-status, error>;
+	@op(3) status: func() -> result<job-status, error>;
+	@op(4) cancel: func() -> result<job-status, error>;
+}

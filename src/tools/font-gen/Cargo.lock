@@ -44,8 +44,13 @@ dependencies = [
  "abi",
  "base-proto",
  "bootproto",
+ "smartcard-model",
  "wasm",
 ]
+
+[[package]]
+name = "smartcard-model"
+version = "0.0.0"
 
 [[package]]
 name = "wasm"

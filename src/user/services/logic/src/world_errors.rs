@@ -55,6 +55,9 @@ pub fn is_refusal(error: Error) -> bool {
 		// named was replaced by the host's own state changing, and the guest is told to re-read and
 		// rebuild rather than that it was not allowed.
 		Error::Stale => false,
+		// THE UPLINK WAS SWITCHED UNDER A CONNECTION: the host's networking again, not the guest's
+		// authority.
+		Error::LinkChanged => false,
 	}
 }
 

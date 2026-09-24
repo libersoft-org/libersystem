@@ -30,6 +30,9 @@
 #   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
+#   RUN_DISK=   a system disk that outlives the run: created if absent - from the volume the medium is
+#               paired with, where there is one - and used as it is if present, so two boots can share
+#               one disk for a cold-reboot proof
 #   LIBER_RUN_MODE=test|development|public|gate
 #             THE RUN MODE, and the one carrier of it. It is REQUIRED: the outermost entry point
 #             that knows sets it - `test.sh` says `test`, `run.sh` says `public`, the lab says
@@ -244,6 +247,32 @@ qemu_run_disk() {
 	scratch_sweep "${template%.img}" .img
 	cp --reflink=auto "$template" "$run_disk" || return 1
 	printf '%s\n' "$run_disk"
+}
+
+# THE SYSTEM DISK A RUN ATTACHES, which is the private copy above unless a caller names one that
+# outlives the run.
+#
+# A DISK THAT OUTLIVES ONE RUN is what a cold reboot has to prove anything about: state written in
+# one boot being there in the next. Every run otherwise gets a private copy and loses what the guest
+# wrote, which is right for a test and wrong for that one question. A gate that asks it names a path
+# in its own work directory, so two of ITS boots share one disk and nothing else does. Created the
+# first time; used as it is after that. THE SYSTEM DISK ONLY - the USB medium keeps its private copy,
+# because two disks resolving to one file is a corruption, not a reboot.
+#
+# CREATED FROM THE VOLUME THE MEDIUM IS PAIRED WITH, when the caller names one (`paired`): the loader
+# runs the system from that volume and from no other disk, so a persistent disk carrying anything
+# else is classified and left alone while the system runs from the medium's own image in memory -
+# and a reboot proves nothing about a volume the system never used.
+qemu_run_system_disk() {
+	local template="$1" paired="${2:-}"
+	if [[ -n "${RUN_DISK:-}" ]]; then
+		if [[ ! -f "$RUN_DISK" ]]; then
+			cp --reflink=auto "${paired:-$template}" "$RUN_DISK" || return 1
+		fi
+		printf '%s\n' "$RUN_DISK"
+		return 0
+	fi
+	qemu_run_disk "$template"
 }
 
 # THE FIXTURE MEDIA, AND WHY THEY ARE KEYED RATHER THAN MERELY PRESENT.
@@ -570,6 +599,13 @@ qemu_attach_virtio_net() {
 	local net_id="$2"
 	local hostfwd="${3:-}"
 	local legacy="${4:-}"
+	# NO NIC AT ALL, when a test needs a machine without one. `NET_NONE=1` attaches nothing: a boot with
+	# no network provider, which is a state NetworkService has to stand in - and the one the modem gate
+	# installs its first raw-IP link into, with no Ethernet uplink to replace.
+	if [[ "${NET_NONE:-}" == 1 ]]; then
+		echo "qemu-run: no NIC is attached (NET_NONE=1)" >&2
+		return 0
+	fi
 	local net_user="user,id=$net_id"
 	[[ -n "$hostfwd" ]] && net_user="$net_user,$hostfwd"
 	# A CONTROLLABLE PEER INSTEAD OF SLIRP, when one is asked for.
@@ -1871,8 +1907,9 @@ qemu_run_x86_64() {
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
 	if [[ "$dma_fixture" != "1" ]] && virtio_disk="$(qemu_prepare_system_disk "$volume_image" "$virtio_disk")"; then
-		local run_disk
-		run_disk="$(qemu_run_disk "$virtio_disk")" || {
+		local run_disk paired_volume="$QEMU_BUILD_DIR/system-volume-bootable-x86_64.img"
+		[[ -f "$paired_volume" ]] || paired_volume=""
+		run_disk="$(qemu_run_system_disk "$virtio_disk" "$paired_volume")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
@@ -2285,7 +2322,7 @@ qemu_run_aarch64() {
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
 		local run_disk
-		run_disk="$(qemu_run_disk "$virtio_disk")" || {
+		run_disk="$(qemu_run_system_disk "$virtio_disk")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}
@@ -2638,7 +2675,7 @@ qemu_run_riscv64() {
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
 		local run_disk
-		run_disk="$(qemu_run_disk "$virtio_disk")" || {
+		run_disk="$(qemu_run_system_disk "$virtio_disk")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
 			exit 1
 		}

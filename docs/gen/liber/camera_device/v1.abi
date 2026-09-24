@@ -1,0 +1,27 @@
+package liber:camera-device@1
+record camera-open(connection-generation:u64,name:string:bound=64,generation:u64)
+record camera-frame(stream-generation:u64,sequence:u64,buffer:u8,lease:u64,valid-bytes:u32,arrival-ns:u64,device:option<liber:camera@1::device-time>)
+enum camera-drop-reason(no-buffer=1,device=2)
+record camera-drop(stream-generation:u64,first-sequence:u64,count:u32,reason:camera-drop-reason)
+record camera-gap(stream-generation:u64,next-sequence:u64)
+variant camera-device-event(frame=0:camera-frame,dropped=1:camera-drop,gap=2:camera-gap)
+interface camera-device
+method camera-device.open op=1 (version:u32:rights=) -> result<camera-open, liber:base@1::error>
+method camera-device.formats op=2 () -> result<list<liber:camera@1::format-info>, liber:base@1::error>:bound=8
+method camera-device.sizes op=3 (format:u8:rights=) -> result<list<liber:camera@1::frame-size>, liber:base@1::error>:bound=32
+method camera-device.negotiate op=4 (stream-generation:u64:rights=,request:liber:camera@1::stream-request:rights=) -> result<liber:camera@1::negotiated, liber:base@1::error>
+method camera-device.register op=5 (stream-generation:u64:rights=,buffer:u8:rights=,memory:handle<liber:camera@1::frame-buffer>:rights=map+write) -> result<unit, liber:base@1::error>
+method camera-device.queue op=6 (stream-generation:u64:rights=,buffer:u8:rights=,lease:u64:rights=) -> result<unit, liber:base@1::error>
+method camera-device.start op=7 (stream-generation:u64:rights=) -> result<unit, liber:base@1::error>
+method camera-device.stop op=8 (stream-generation:u64:rights=) -> result<unit, liber:base@1::error>
+method camera-device.events op=9 () -> stream<camera-device-event>
+record camera-fixture-stats(frames-written:u32,dropped-no-buffer:u32,dropped-device:u32,gaps:u32,mapped:u8,stops:u32)
+interface camera-fixture
+method camera-fixture.drop-device op=1 (count:u32:rights=) -> result<unit, liber:base@1::error>
+method camera-fixture.gap op=2 () -> result<unit, liber:base@1::error>
+method camera-fixture.timing op=3 (on:bool:rights=) -> result<unit, liber:base@1::error>
+method camera-fixture.reset-clock op=4 () -> result<unit, liber:base@1::error>
+method camera-fixture.delay-stop op=5 (delay-ms:u32:rights=) -> result<unit, liber:base@1::error>
+method camera-fixture.withdraw op=6 () -> result<unit, liber:base@1::error>
+method camera-fixture.republish op=7 () -> result<unit, liber:base@1::error>
+method camera-fixture.stats op=8 () -> result<camera-fixture-stats, liber:base@1::error>

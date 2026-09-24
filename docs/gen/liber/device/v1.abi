@@ -8,7 +8,7 @@ interface device
 method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>
 method device.get op=2 (index:u32:rights=) -> result<device-entry, liber:base@1::error>
 method device.bindings op=3 () -> result<list<binding-record>, liber:base@1::error>
-enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8,local-stream=9,touch=10,bluetooth-hci=11)
+enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8,local-stream=9,touch=10,bluetooth-hci=11,power-source=12,fixture-control=13,smartcard-reader=14,modem=15,camera=16,midi=17,printer=18,ptp-transport=19,admin-executor=20)
 record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32,live:bool,name:string:bound=48)
 enum policy-verb(disable=0,enable=1,select=2,retry=3)
 enum policy-outcome(accepted=0,no-such-device=1,not-a-candidate=2,quarantined=3,busy=4,refused=5,not-stored=6)

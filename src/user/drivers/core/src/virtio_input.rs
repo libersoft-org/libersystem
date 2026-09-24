@@ -66,6 +66,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    does not hold - which is why a zero here is a state and not a failure.
 		let irq: u64 = resources.irq;
 		let key_sink: u64 = resources.keys;
+		// THE TRUSTED SINK, which only a physical keyboard driver is handed: every transition goes there too,
+		// without waiting, so a protected session hears this keyboard and no other source.
+		TRUSTED_SINK.store(resources.trusted_keys, core::sync::atomic::Ordering::Relaxed);
 		keys::set_power(resources.syspower);
 		keys::set_console_input(resources.console);
 		// route this device's interrupts to MSI-X table entry 0: DeviceManager acquired
@@ -272,6 +275,10 @@ unsafe fn pointer_event(addr: u64, state: &mut input::Pointer, wheel: &mut i32, 
 // Decode the virtio_input_event at `addr` and feed a key event into the shared
 // keyboard logic: modifier tracking, layout, navigation escapes and the console
 // injection all live in `keys::feed_key`.
+
+// The trusted key sink, when this instance is a keyboard handed one.
+static TRUSTED_SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 unsafe fn feed_event(addr: u64, mods: &mut Mods, key_sink: u64) {
 	unsafe {
 		let kind: u16 = (addr as *const u16).read_volatile();
@@ -280,11 +287,17 @@ unsafe fn feed_event(addr: u64, mods: &mut Mods, key_sink: u64) {
 		if kind != EV_KEY {
 			return;
 		}
-		if value <= 1 && key_sink != 0 {
+		if value <= 1 {
 			let usage: u16 = keys::keycode_hid(code);
 			if usage != 0 {
 				let event: [u8; 3] = [usage as u8, (usage >> 8) as u8, (value == 1) as u8];
-				let _ = send_blocking(key_sink, &event, 0);
+				let trusted: u64 = TRUSTED_SINK.load(core::sync::atomic::Ordering::Relaxed);
+				if trusted != 0 {
+					let _ = try_send(trusted, &event, 0);
+				}
+				if key_sink != 0 {
+					let _ = send_blocking(key_sink, &event, 0);
+				}
 			}
 		}
 		keys::feed_key(code, value, mods);

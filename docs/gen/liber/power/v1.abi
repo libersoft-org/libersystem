@@ -1,0 +1,51 @@
+package liber:power@1
+enum source-kind(ac=1,battery=2,ups=3,load=4,thermal-zone=5)
+enum value-state(known=1,unknown=2,unsupported=3,invalid=4)
+enum invalid-reason(none=0,sentinel=1,overflow=2,contradiction=3,unit=4,range=5)
+enum tristate(unknown=0,no=1,yes=2)
+record measure-u64(state:value-state,value:u64,reason:invalid-reason)
+record measure-i64(state:value-state,value:i64,reason:invalid-reason)
+enum quantity(energy=1,charge=2)
+record capacity(state:value-state,quantity:quantity,value:u64,reason:invalid-reason)
+enum charge-state(unknown=0,charging=1,discharging=2,idle=3,invalid=4)
+enum temperature-reference(absolute=1,relative=2)
+record temperature(state:value-state,reference:temperature-reference,value:i64,reason:invalid-reason)
+enum trip-kind(passive=1,active=2,hot=3,critical=4)
+record trip-point(kind:trip-kind,index:u8,temperature:temperature)
+enum alarm-kind(on-battery=1,low-capacity=2,critical-capacity=3,overload=4,replace-battery=5,source-fault=6,over-temperature=7)
+enum provenance(reported=1,derived=2)
+record alarm(kind:alarm-kind,state:tristate,provenance:provenance)
+record controls(set-output:bool,schedule-off:bool,cancel-off:bool,outlets:u8)
+record source-state(kind:source-kind,present:tristate,online:tristate,charge:charge-state,remaining:capacity,full:capacity,design:capacity,state-of-charge:measure-u64,voltage:measure-u64,current:measure-i64,power:measure-i64,runtime:measure-u64,load:measure-u64,temperature:temperature,trips:list<trip-point>:bound=16,alarms:list<alarm>:bound=16,controls:controls,source-time:option<u64>)
+record source-id(slot:u32,generation:u32,binding-generation:u64,local:u32)
+record source-snapshot(id:source-id,received:u64,state:source-state)
+enum change-kind(snapshot=1,snapshot-end=2,added=3,updated=4,removed=5)
+record power-change(epoch:u64,revision:u64,kind:change-kind,source:option<source-snapshot>,gone:option<source-id>)
+interface power
+method power.sources op=1 () -> result<list<source-snapshot>, liber:base@1::error>
+method power.subscribe op=2 () -> result<stream<power-change>, liber:base@1::error>
+enum control-outcome(done=1,indeterminate=2)
+interface power-control
+method power-control.set-output op=1 (source:source-id:rights=,outlet:u8:rights=,on:bool:rights=) -> result<control-outcome, liber:base@1::error>
+method power-control.schedule-output-off op=2 (source:source-id:rights=,delay-seconds:u32:rights=) -> result<control-outcome, liber:base@1::error>
+method power-control.cancel-output-off op=3 (source:source-id:rights=) -> result<control-outcome, liber:base@1::error>
+record provider-source(local:u32,state:source-state)
+enum provider-update-kind(snapshot=1,snapshot-end=2,added=3,updated=4,removed=5)
+record provider-update(revision:u64,kind:provider-update-kind,source:option<provider-source>,gone:option<u32>)
+enum provider-command-kind(set-output=1,schedule-output-off=2,cancel-output-off=3)
+record provider-command(kind:provider-command-kind,local:u32,outlet:u8,on:bool,delay-seconds:u32)
+interface power-provider
+method power-provider.updates op=1 () -> stream<provider-update>
+method power-provider.command op=2 (command:provider-command:rights=) -> result<control-outcome, liber:base@1::error>
+method power-provider.query op=3 (local:u32:rights=) -> result<source-state, liber:base@1::error>
+enum fixture-field(ups-remaining=1,ups-voltage=2,ups-ac-present=3,ups-overload=4,battery-remaining=5,battery-state=6,ac-online=7,thermal-temperature=8)
+record fixture-command(publication:u8,local:u32,kind:provider-command-kind,outlet:u8,on:bool,delay-seconds:u32)
+interface power-fixture
+method power-fixture.set op=1 (field:fixture-field:rights=,value:u32:rights=) -> result<unit, liber:base@1::error>
+method power-fixture.remove op=2 (publication:u8:rights=,local:u32:rights=) -> result<unit, liber:base@1::error>
+method power-fixture.withdraw op=3 (publication:u8:rights=) -> result<unit, liber:base@1::error>
+method power-fixture.republish op=4 (publication:u8:rights=) -> result<unit, liber:base@1::error>
+method power-fixture.commands op=5 () -> result<list<fixture-command>, liber:base@1::error>
+method power-fixture.withhold op=6 (commands:u32:rights=,queries:u32:rights=) -> result<unit, liber:base@1::error>
+method power-fixture.offer-extra op=7 () -> result<unit, liber:base@1::error>
+method power-fixture.outlets op=8 () -> result<list<bool>, liber:base@1::error>

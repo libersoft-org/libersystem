@@ -412,6 +412,12 @@ pub fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 	if value != 1 && value != 2 {
 		return;
 	}
+	// CTRL+ALT+F12 IS SECURE ATTENTION, and it types nothing. InputService acts on it from the trusted
+	// keyboard's own sink; the cooked console must not see it either, or a foreground program would read
+	// the chord that opens the protected screen as `ESC [ 24 ~`.
+	if code == KEY_F12 && mods.ctrl && mods.alt {
+		return;
+	}
 	// Ctrl+Alt+Delete is the reboot chord: a Delete press while both Ctrl and Alt are
 	// held reboots the machine. The keyboard is interrupt-driven, so it fires and
 	// interrupts whatever userspace is doing, even if the shell is wedged.

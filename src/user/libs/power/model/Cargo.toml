@@ -1,0 +1,22 @@
+[package]
+name = "power-model"
+edition = "2024"
+description = "The canonical power-source model: the normalisation every producer calls before it publishes, and the checks PowerService applies to what arrives"
+
+# THE PROTOCOL'S TYPES AND NOTHING THAT REACHES THE RUNTIME. A producer - a HID UPS driver, an ACPI
+# battery driver, the in-guest fixtures - and the service all link this, so the arithmetic that turns
+# a source's units into canonical ones exists once, and a host test can run every line of it: the
+# runtime and `std` both define `panic_impl`, which is why nothing here may reach `rt`.
+[dependencies]
+power-proto = { path = "../../protocol/power-proto" }
+
+# A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
+# a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
+# call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry
+# all three backends declared and none called. None of that was reported, because the reporting had
+# been switched off file by file over years, unevenly, and nobody had decided it.
+#
+# `[lints]` rather than `RUSTFLAGS`: this denies in THIS package only. RUSTFLAGS would deny inside
+# `build-std`'s `core` and `compiler_builtins` too, where a warning is not ours to answer.
+[lints.rust]
+warnings = "deny"

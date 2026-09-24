@@ -67,3 +67,23 @@ fn the_configuration_value_turns_on_notifications_and_not_indications() {
 	assert_eq!(NOTIFICATIONS_ON[0] & 0x02, 0, "indications are not set");
 	assert_eq!(NOTIFICATIONS_OFF, [0x00, 0x00]);
 }
+
+#[test]
+// THE MOUSE REPORTS MOTION AND THE CONSUMER READS A POSITION, and the fold is the drivers' own:
+// saturating then clamped, so a very large move reaches the edge rather than wrapping to the other one.
+fn motion_folds_onto_a_position_that_stops_at_the_edges() {
+	use super::{NORMALISED_MAX, Pointer, RELATIVE_RANGE};
+	let mut pointer = Pointer::new();
+	let (x0, y0) = pointer.fold(0, 0);
+	let (x1, _) = pointer.fold(10, 0);
+	assert!(x1 > x0, "a move to the right moves right");
+	let (x2, _) = pointer.fold(-20, 0);
+	assert!(x2 < x0, "and a move to the left moves left - the sign survives the fold");
+	assert_eq!(pointer.fold(i32::MAX, i32::MAX), (NORMALISED_MAX as u16, NORMALISED_MAX as u16), "the far edge, not a wrap");
+	assert_eq!(pointer.fold(i32::MIN, i32::MIN), (0, 0), "and the near one");
+	// Half the range is half the screen, to within the one unit integer division rounds away: the
+	// range is odd, so its half is not a whole number of steps.
+	let half = pointer.fold(RELATIVE_RANGE / 2, 0).0 as i64;
+	assert!((half - (NORMALISED_MAX / 2) as i64).abs() <= 1, "half the range is half the screen, got {half}");
+	let _ = y0;
+}

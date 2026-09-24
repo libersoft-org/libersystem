@@ -78,6 +78,65 @@ enum capability {
 	/// metadata pass is work an ordinary client must not be able to demand, because authority to
 	/// READ a font must not become authority to make the machine work.
 	font-admin,
+	/// BLUETOOTH, READ: list the controllers and look for devices, and nothing that changes either.
+	///
+	/// Separate from `bluetooth-operator` for the reason `device` is separate from `device-policy`:
+	/// what hardware is present is something a status tool may know, and what a radio does is not
+	/// something a status tool may change.
+	bluetooth,
+	/// BLUETOOTH, OPERATOR: power a controller, pair, forget a bond and make a peer an input source.
+	///
+	/// GRANTED TO NOTHING BY DEFAULT. It is minted for a component whose permission manifest asks for it
+	/// and whose policy row grants it, and no row in this tree grants it to a shipping component - an
+	/// administrative authorization is a decision somebody makes about one component, not a default.
+	bluetooth-operator,
+	/// POWER STATE, READ: enumerate power sources and thermal zones and subscribe to their normalised
+	/// state. It publishes nothing and controls nothing, and no device or provider connection comes
+	/// with it - what a status tool may know about a battery is not a channel to the battery.
+	power-state,
+	/// POWER CONTROL: switch an output a device such as a UPS advertises, schedule its turn-off or
+	/// cancel one. THE UPS'S OUTPUT, NOT THE MACHINE: shutting the host down stays with SystemManager.
+	///
+	/// GRANTED TO NOTHING BY DEFAULT, for the reason `bluetooth-operator` is not: an administrative
+	/// authorization is a decision about one component, and no shipping row makes it.
+	power-control,
+	/// A TEST FIXTURE'S CONTROL ENDPOINT: change or remove what a development fixture publishes and
+	/// read back what it was asked to do. Granted only by development-only policy rows, to the probe a
+	/// gate drives - a shipping configuration has neither the row nor a fixture to reach.
+	fixture-control,
+	/// A SMART-CARD READER, minted for one configured reader and one set of operations - public
+	/// reading, transactions, PIN verification and authentication - for the component being launched,
+	/// and alive only as long as that component is. The default is no reader at all.
+	smartcard,
+	/// MODEMS, OBSERVED: registration, signal, SIM presence and lock state - and no subscriber identifier.
+	modem-state,
+	/// A MODEM'S DATA CONTEXT: activate and deactivate the one context this component's policy allows, on
+	/// the modem and SIM current when the grant was minted, for the life of the component.
+	modem-data,
+	/// A MODEM'S SUBSCRIBER IDENTITY: IMSI, ICCID and number. Denied by default.
+	modem-identity,
+	/// A MODEM'S MANAGEMENT: PIN and PUK entry and the retry counters. Denied by default.
+	modem-manage,
+	/// CAMERAS, LISTED: names and formats, and no way to start anything or reach a frame.
+	camera,
+	/// CAPTURE FROM ONE CAMERA, minted per launch for a configured camera and the life of the component.
+	camera-capture,
+	/// MIDI, LISTED: endpoints and what they are, and nothing that receives.
+	midi,
+	/// RECEIVING FROM ONE MIDI ENDPOINT, minted per launch for a configured device and the life of the component.
+	midi-input,
+	/// PRINTING: list printers and create jobs, each a capability of its own. No backend, no reset, no raw endpoint.
+	spool,
+	/// IMPORTING FROM A CAMERA: list devices and storages, page a snapshot of objects and read one at a time.
+	/// Read-only: no command, no delete, no capture, and nowhere to write.
+	media-import,
+	/// ASKING FOR ONE HIGH-RISK OPERATION: a request connection bound to the launched task and its policy's
+	/// scope. A grant needs a person's confirmation on the protected screen. Granted to nothing by default.
+	admin-request,
+	/// THE OPERATOR'S READ VIEW of the administrative decision journal.
+	admin-audit,
+	/// AdminService's test controls. Development images only.
+	admin-test,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the
@@ -107,6 +166,9 @@ record audit-entry {
 	capability: capability,
 	granted:    bool,
 	dynamic:    bool,
+	/// What a grant that resolves a selection was resolved to - for a smart card, the exact reader
+	/// publication - and empty for every grant that selects nothing.
+	detail:     string,
 }
 
 /// The PermissionManager contract: the policy over the kernel's capability mechanism.

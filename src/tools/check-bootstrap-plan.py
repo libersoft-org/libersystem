@@ -127,6 +127,14 @@ if not relaunch:
 	print("check-bootstrap-plan: cannot find relaunch_service's broker-root table", file=sys.stderr)
 	sys.exit(1)
 can_relaunch = set(re.findall(r'b"(\w+)" => &mut broker\.\w+', relaunch.group(0)))
+# AND THE SERVICES A RELAUNCH RE-RUNS THE PLAN FOR, which need no broker-root arm because the plan is
+# their whole bootstrap. They are named in `plan_relaunchable`, and reading that list too is what keeps
+# this comparison two-sided rather than a list of the hand-written ones only.
+planned = re.search(r"fn plan_relaunchable\(name: &\[u8\]\) -> bool \{(.*?)\n\}", supervisor, re.S)
+if not planned:
+	print("check-bootstrap-plan: cannot find plan_relaunchable", file=sys.stderr)
+	sys.exit(1)
+can_relaunch |= set(re.findall(r'b"(\w+)"', planned.group(1)))
 declared_transparent = {service["name"] for service in tomllib.load(open(manifest_path, "rb"))["services"] if service.get("restart") == "transparent"}
 if can_relaunch != declared_transparent:
 	for name in sorted(declared_transparent - can_relaunch):

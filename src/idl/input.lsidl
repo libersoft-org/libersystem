@@ -65,6 +65,37 @@ interface input {
 	@op(3) subscribe-contacts: func(focus: handle<channel>) -> stream<contact-event>;
 }
 
+enum trusted-input-kind {
+	/// Ctrl+Alt+F12 on the trusted keyboard. Nothing else produces it.
+	attention = 1,
+	/// The session is armed under this epoch: every key was released after it began.
+	armed     = 2,
+	/// A key transition from the trusted keyboard, after arming.
+	key       = 3,
+	/// The trusted keyboard is gone.
+	lost      = 4,
+}
+
+record trusted-input {
+	kind:  trusted-input-kind,
+	epoch: u64,
+	usage: u16,
+	down:  bool,
+}
+
+/// THE PROTECTED INPUT, reachable only on a root the supervisor hands AdminService. Its keys come from the
+/// physical keyboard drivers' own trusted sink - never the merged channel, a catalogue provider, Bluetooth,
+/// console injection or a client stream.
+interface input-trusted {
+	/// Secure attention, the armed epoch, and trusted keys while armed.
+	@op(1) events: func() -> stream<trusted-input>;
+	/// Enter the protected session under `epoch`: ordinary key and contact focus are revoked, the cooked
+	/// console is suppressed and queued keys are discarded; `armed` follows once no key is held.
+	@op(2) arm:    func(epoch: u64) -> result<unit, error>;
+	/// Leave it.
+	@op(3) disarm: func(epoch: u64) -> result<unit, error>;
+}
+
 /// Privileged launcher boundary that mints a factory restricted to raw-key
 /// subscriptions. Connections produced from it cannot call the pointer snapshot op.
 interface input-admin {

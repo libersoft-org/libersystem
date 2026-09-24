@@ -6,5 +6,11 @@ interface input
 method input.subscribe op=1 () -> stream<pointer-event>
 method input.subscribe-keys op=2 (focus:handle<channel>:rights=) -> stream<key-event>
 method input.subscribe-contacts op=3 (focus:handle<channel>:rights=) -> stream<contact-event>
+enum trusted-input-kind(attention=1,armed=2,key=3,lost=4)
+record trusted-input(kind:trusted-input-kind,epoch:u64,usage:u16,down:bool)
+interface input-trusted
+method input-trusted.events op=1 () -> stream<trusted-input>
+method input-trusted.arm op=2 (epoch:u64:rights=) -> result<unit, liber:base@1::error>
+method input-trusted.disarm op=3 (epoch:u64:rights=) -> result<unit, liber:base@1::error>
 interface input-admin
 method input-admin.open-keys op=1 () -> result<handle<channel>, liber:base@1::error>

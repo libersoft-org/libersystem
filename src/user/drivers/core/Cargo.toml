@@ -8,6 +8,76 @@ build = "../../build.rs"
 description = "Userspace virtio drivers (blk, net, console, input)"
 
 [[bin]]
+# THE IN-GUEST BLUETOOTH FIXTURE: an emulated controller and the LE boot mouse on the far side of its
+# radio, published as a `bluetooth-hci` provider. Development-only in the manifest, bound to a QEMU
+# test device at a pinned address - a shipping machine has neither.
+name = "bt_fixture"
+path = "src/bt_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE IN-GUEST POWER FIXTURE: a HID-shaped UPS and ACPI-shaped power sources from decoded data,
+# published as two `power-source` providers, and the control endpoint the power gate's probe drives.
+# Development-only in the manifest, bound to a QEMU test device at a pinned address.
+name = "power_fixture"
+path = "src/power_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE IN-GUEST SMART-CARD FIXTURE: two readers and the PIV cards in them, published as
+# `smartcard-reader` providers, and the control endpoint the smart-card gate's probe drives.
+# Development-only in the manifest, bound to a QEMU test device at a pinned address.
+name = "smartcard_fixture"
+path = "src/smartcard_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE IN-GUEST MODEM FIXTURE: a modem, its SIM and the network behind it, published as a `modem`
+# provider over the staged MBIM validators, and the control endpoint the modem gate's probe drives.
+# Development-only in the manifest, bound to a QEMU test device at a pinned address.
+name = "modem_fixture"
+path = "src/modem_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE IN-GUEST CAMERA FIXTURE: a camera whose synthetic descriptors go through the staged UVC normalizer,
+# writing deterministic frames into the buffers its consumer queued, and the control endpoint the camera
+# gate's probe drives. Development-only in the manifest, bound to a QEMU test device at a pinned address.
+name = "camera_fixture"
+path = "src/camera_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE IN-GUEST MIDI FIXTURE: a MIDI device with two receive endpoints delivering the packet batches the MIDI
+# gate's probe scripts, and the control endpoint it drives. Development-only in the manifest, bound to a QEMU
+# test device at a pinned address.
+name = "midi_fixture"
+path = "src/midi_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
+# THE IN-GUEST ADMINISTRATIVE EXECUTOR: a bounded probe write over two target generations, published as an
+# `admin-executor` provider, and the read-only witness the administrative-path gate counts effects through.
+# Development-only in the manifest, bound to a QEMU test device at a pinned address.
+name = "admin_fixture"
+path = "src/admin_fixture.rs"
+test = false
+bench = false
+required-features = ["development"]
+
+[[bin]]
 # The virtio-scsi driver. The SCSI command set it speaks is `src/scsi.rs`, which it extracted from
 # the USB storage path and which that path now shares.
 name = "virtio_scsi"
@@ -142,6 +212,17 @@ ipc-client = { path = "../../libs/ipc/ipc-client" }
 # application-facing display one: a driver's contract and an application's are two things, and one
 # package carrying both would make every application link the driver's wire.
 display-device-proto = { path = "../../libs/protocol/display-device-proto" }
+
+# THE CANONICAL POWER MODEL. A power producer - the in-guest fixture now, the HID Power Device and
+# ACPI drivers when they land - builds every record it publishes with these adapters, so the unit
+# arithmetic exists once and PowerService only has to check it was used.
+power-model = { path = "../../libs/power/model" }
+# THE ANSWER-TO-RESET PARSER, shared by every reader provider and SmartcardService. The in-guest fixture
+# checks the ATR it plays is one a real parser accepts; the USB CCID class module parses cards with it.
+smartcard-model = { path = "../../libs/smartcard/model" }
+# SHA-256, for the digest an administrative executor takes of the payload it copied at preparation - the
+# digest a person confirms. The same implementation the boot chain verifies images with.
+bootproto = { path = "../../../boot/protocol" }
 
 
 # THE HOST-TEST SEAM. The library's PURE layers - ring validation, block request validation - are

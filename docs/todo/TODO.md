@@ -260,15 +260,15 @@ sentence - and put the question to the owner, whose answer was that the drivers 
 item may not grow its own destination service, because a service invented by the driver that wanted
 it gets the shape that driver needed and no other; so each `yes` is a milestone here.
 
-- [ ] [P02M0180 - A sandboxed Bluetooth service above HCI](P02M0180.md)
-- [ ] [P02M0181 - A platform power-state service](P02M0181.md)
-- [ ] [P02M0182 - A capability-scoped smart-card service](P02M0182.md)
-- [ ] [P02M0183 - A typed modem service](P02M0183.md)
-- [ ] [P02M0184 - A camera vocabulary and service](P02M0184.md)
-- [ ] [P02M0185 - A bounded event and timestamp vocabulary, and the MIDI wire over it](P02M0185.md)
-- [ ] [P02M0186 - A spool and stream service](P02M0186.md)
-- [ ] [P02M0187 - A media import service](P02M0187.md)
-- [ ] [P02M0188 - A trusted administrative path for high-risk operations](P02M0188.md)
+- [ ] [P02M0180 - A sandboxed Bluetooth service above HCI](P02M0180.md) - OPEN (2026-09-24): `bluetooth-service` passes on x86_64; open are the AArch64/RISC-V cross-builds, the in-guest key/store-capability denial and stale-handle assertions, and two stated departures awaiting the owner.
+- [ ] [P02M0181 - A platform power-state service](P02M0181.md) - OPEN (2026-09-24): the service-first `power-service` gate passes on x86_64; open are the cross-builds and the real HID and ACPI producers P02M0099 owns.
+- [ ] [P02M0182 - A capability-scoped smart-card service](P02M0182.md) - OPEN (2026-09-24): `smartcard-service` passes on x86_64; only the cross-builds are open.
+- [ ] [P02M0183 - A typed modem service](P02M0183.md) - OPEN (2026-09-24): `qemu-modem-service` passes on x86_64; open are tests of refusal at the provider, client and context caps, the cross-builds and the existing network guest checks.
+- [ ] [P02M0184 - A camera vocabulary and service](P02M0184.md) - OPEN (2026-09-24): `qemu-camera-service` passes on x86_64; only the cross-builds are open.
+- [ ] [P02M0185 - A bounded event and timestamp vocabulary, and the MIDI wire over it](P02M0185.md) - OPEN (2026-09-24): `qemu-midi-service` passes on x86_64; only the cross-builds are open.
+- [ ] [P02M0186 - A spool and stream service](P02M0186.md) - OPEN (2026-09-24): `spool-service` passes on x86_64; open are the cross-builds and the dynamic graph check that needs them.
+- [ ] [P02M0187 - A media import service](P02M0187.md) - OPEN (2026-09-24): `media-import-service` passes on x86_64; open are the cross-builds and the dynamic graph check that needs them.
+- [ ] [P02M0188 - A trusted administrative path for high-risk operations](P02M0188.md) - OPEN (2026-09-24): `qemu-admin-path` passes on x86_64; open are the cross-builds, `./verify.sh` and the demonstration that a bypassed presentation or executor boundary fails the gate.
 - [ ] [P02M0189 - Where the system's time goes, measured layer by layer](P02M0189.md)
 
 ### Definition of done (phase 2)

@@ -91,6 +91,8 @@ impl Hids {
 // reaped - the service loop or a wait deep inside a disk transfer.
 pub static PTR_SINK: AtomicU64 = AtomicU64::new(0);
 pub static KEY_SINK: AtomicU64 = AtomicU64::new(0);
+/// The trusted key sink, for a keyboard: every transition goes there too, without waiting.
+pub static TRUSTED_KEY_SINK: AtomicU64 = AtomicU64::new(0);
 /// WHERE CONTACTS GO, AND IT IS NOT THE POINTER SINK.
 ///
 /// A consumer of `POINTER` is handed ONE cursor, and a surface published as one would be flattened
@@ -305,9 +307,15 @@ unsafe fn feed_hid_report(h: &mut Hid, report: &[u8]) {
 		let page: u16 = (usage >> 16) as u16;
 		let raw: u16 = usage as u16;
 		let key_sink: u64 = KEY_SINK.load(Ordering::Relaxed);
-		if page == 0x07 && key_sink != 0 {
+		if page == 0x07 {
 			let event: [u8; 3] = [raw as u8, (raw >> 8) as u8, down as u8];
-			let _ = send_blocking(key_sink, &event, 0);
+			let trusted: u64 = TRUSTED_KEY_SINK.load(Ordering::Relaxed);
+			if trusted != 0 {
+				let _ = try_send(trusted, &event, 0);
+			}
+			if key_sink != 0 {
+				let _ = send_blocking(key_sink, &event, 0);
+			}
 		}
 		let code: u16 = usage_keycode(usage);
 		if code != 0 {

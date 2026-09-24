@@ -1,0 +1,218 @@
+//! LiberSystem media import - objects read from a camera's Picture Transfer Protocol storage, for a component
+//! PermissionManager granted `media-import`.
+//!
+//! A CAMERA IS AN OBJECT SOURCE, NOT A VOLUME. A client lists devices and their storages, takes a bounded
+//! snapshot of one storage's object handles and pages through it for typed metadata, and reads one object at a
+//! time in bounded chunks. It cannot send a command, reach a catalogue or a backend, write anywhere, delete or
+//! capture: the service is a source and nothing else, and it holds no storage of its own to write into.
+//!
+//! EVERY IDENTITY IS SCOPED AND EXPIRES. A device, storage or object identity carries the publication, the
+//! attachment epoch, the PTP session, the content epoch and the service incarnation. A change the device
+//! reports, a dropped event, a reset, a lost session or a withdrawal advances one of them, and everything named
+//! under the old one is stale - a numeric object handle alone is never enough to reach an object again.
+//!
+//! COMPLETION IS NEVER INFERRED. A transfer ends `complete` only after every expected byte and the device's
+//! matching successful final response; anything else is `partial`, with the count delivered and the cause. A
+//! short or empty chunk is not an end, and a lost connection without a final status is an unknown outcome.
+//!
+//! WHAT A CONSUMER OWES ITS DESTINATION. Publish a normal, completed destination only after a `complete`
+//! ending. A storage consumer writes through `volume.open-writer`, commits only on `complete`, and aborts on
+//! `partial`, on an error and on a lost connection - within that writer's own size cap. An import larger than
+//! that cap needs a staging consumer specified for it; nothing here promises one.
+
+package liber:import@1;
+
+use liber:base@1.{error};
+
+/// A camera as this service knows it.
+record import-device-id {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+	/// Advanced by every reset and recovery.
+	attachment:         u64,
+	/// The PTP session this service opened on it.
+	session:            u32,
+	/// Advanced by every change the device reports, and by every event this service could not receive.
+	content-epoch:      u64,
+	incarnation:        u64,
+	/// The client context this identity was issued to: another client's identities are not this one's to use.
+	context:            u32,
+}
+
+record import-storage-id {
+	device:  import-device-id,
+	storage: u32,
+}
+
+record import-object-id {
+	device:   import-device-id,
+	handle:   u32,
+	/// The revision of the object's metadata as it was fetched: a read revalidates it, and a change is stale.
+	revision: u32,
+}
+
+/// An association - a folder - named as an enumeration's parent, or as an object's.
+record import-parent-id {
+	device: import-device-id,
+	handle: u32,
+}
+
+/// The service's bounds, as it enforces them.
+record import-limits {
+	providers:            u8,
+	clients:              u8,
+	cursors:              u8,
+	transfers:            u8,
+	cursors-per-client:   u8,
+	transfers-per-client: u8,
+	cursors-per-device:   u8,
+	transfers-per-device: u8,
+	data-budget:          u32,
+	snapshot-budget:      u32,
+	max-handles:          u32,
+	page-records:         u8,
+	page-bytes:           u32,
+	record-bytes:         u32,
+	chunk-bytes:          u32,
+	cursor-idle-seconds:  u32,
+	transfer-idle-seconds: u32,
+}
+
+record import-device {
+	id:                      import-device-id,
+	@bound(64) manufacturer: string,
+	@bound(64) model:        string,
+	@bound(64) serial:       string,
+	/// It offers every operation of the read-only subset this service needs. One that does not is listed,
+	/// and everything else on it is `unsupported`.
+	usable:                  bool,
+	/// Another client's transaction is in progress on it now.
+	busy:                    bool,
+}
+
+record import-storage {
+	id:                     import-storage-id,
+	storage-type:           u16,
+	filesystem-type:        u16,
+	access:                 u16,
+	capacity:               u64,
+	free:                   u64,
+	@bound(64) description: string,
+	@bound(64) label:       string,
+}
+
+/// A calendar time exactly as the device wrote it; the offset is absent when the device named none.
+record import-time {
+	year:               u16,
+	month:              u8,
+	day:                u8,
+	hour:               u8,
+	minute:             u8,
+	second:             u8,
+	utc-offset-minutes: option<i32>,
+}
+
+enum import-interpretation {
+	/// Every typed field was read from the dataset.
+	complete = 1,
+	/// A field could not be interpreted: it is absent from the typed fields, and still in `original`.
+	partial  = 2,
+}
+
+record import-object {
+	id:                   import-object-id,
+	/// The PTP object format code.
+	format:               u16,
+	/// The code is one the standard defines.
+	format-known:         bool,
+	size:                 option<u64>,
+	captured:             option<import-time>,
+	parent:               option<import-parent-id>,
+	@bound(255) filename: string,
+	interpretation:       import-interpretation,
+	/// The ObjectInfo dataset exactly as the device sent it, unparsed and untruncated.
+	@bound(4096) original: list<u8>,
+}
+
+variant import-entry {
+	object(import-object),
+	/// This object's record does not fit the record budget. Nothing of it was truncated to make it fit.
+	unrepresentable(import-object-id),
+}
+
+record import-page {
+	@bound(2) entries: list<import-entry>,
+	/// Handles of the snapshot not yet paged.
+	remaining:         u32,
+}
+
+record import-cursor-grant {
+	cursor: handle<channel>,
+	/// Handles in the snapshot.
+	count:  u32,
+}
+
+variant import-enumeration {
+	opened(import-cursor-grant),
+	/// The storage holds more objects than one enumeration admits: nothing was kept, and nothing truncated.
+	over-limit(u32),
+}
+
+enum import-transfer-state {
+	opening  = 1,
+	reading  = 2,
+	complete = 3,
+	partial  = 4,
+}
+
+enum import-cause {
+	removed      = 1,
+	timed-out    = 2,
+	cancelled    = 3,
+	corrupt      = 4,
+	stale        = 5,
+	device-error = 6,
+}
+
+record import-transfer-status {
+	state:     import-transfer-state,
+	object:    import-object-id,
+	expected:  u64,
+	delivered: u64,
+	cause:     option<import-cause>,
+}
+
+record import-chunk {
+	offset:             u64,
+	@bound(4096) bytes: list<u8>,
+}
+
+variant import-read {
+	chunk(import-chunk),
+	/// The transfer is over, and this is why.
+	end(import-transfer-status),
+}
+
+/// DEVICES, STORAGES, AND THE TWO CAPABILITIES A CLIENT CAN BE GIVEN: a cursor over a snapshot, and one
+/// object's transfer. One of each at a time per client and per device.
+interface media-import {
+	@op(1) limits:             func() -> result<import-limits, error>;
+	@op(2) @bound(8) devices:  func() -> result<list<import-device>, error>;
+	@op(3) @bound(32) storages: func(device: import-device-id) -> result<list<import-storage>, error>;
+	@op(4) open-enumeration:   func(storage: import-storage-id, parent: option<import-parent-id>) -> result<import-enumeration, error>;
+	@op(5) open-read:          func(object: import-object-id) -> result<handle<channel>, error>;
+}
+
+/// A SNAPSHOT OF HANDLES, and metadata fetched for them as they are paged - current when fetched.
+interface import-cursor {
+	@op(1) next:  func() -> result<import-page, error>;
+	@op(2) close: func() -> result<unit, error>;
+}
+
+/// ONE OBJECT, IN ORDER. `read` answers a chunk at its exact offset or the terminal status.
+interface import-transfer {
+	@op(1) read:   func() -> result<import-read, error>;
+	@op(2) status: func() -> result<import-transfer-status, error>;
+	@op(3) cancel: func() -> result<import-transfer-status, error>;
+}

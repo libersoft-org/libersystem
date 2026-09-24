@@ -1,0 +1,38 @@
+package liber:admin@1
+resource admin-payload
+enum admin-action(firmware-download=1,probe-write=2)
+record admin-descriptor(version:u32,action:admin-action,executor:string:bound=64,executor-epoch:u64,target:string:bound=64,target-generation:u64,parameters:list<u8>:bound=256,payload-length:u32,payload-digest:list<u8>:bound=32)
+record admin-request-args(action:admin-action,target:string:bound=64,parameters:list<u8>:bound=256,payload-length:u32,label:string:bound=128)
+record admin-grant(grant:handle<channel>,descriptor:admin-descriptor)
+variant admin-answer(declined=0:unit,granted=1:admin-grant)
+enum admin-result(completed=1,failed=2,outcome-unknown=3)
+interface admin-request
+method admin-request.request op=1 (args:admin-request-args:rights=,payload:handle<admin-payload>:rights=map) -> result<admin-answer, liber:base@1::error>
+method admin-request.cancel op=2 () -> result<unit, liber:base@1::error>
+interface admin-authority
+method admin-authority.execute op=1 () -> result<admin-result, liber:base@1::error>
+record admin-scope(actions:list<admin-action>:bound=2,target-prefix:string:bound=64)
+interface admin-factory
+method admin-factory.mint op=1 (component:string:bound=64:rights=,scope:admin-scope:rights=,launch:u64:rights=,owner:handle<liber:process@1::task>:rights=wait) -> result<handle<channel>, liber:base@1::error>
+record admin-prepared(operation:u64,descriptor:admin-descriptor,deadline-ms:u32)
+interface admin-executor
+method admin-executor.prepare op=1 (action:admin-action:rights=,target:string:bound=64:rights=,parameters:list<u8>:bound=256:rights=,payload-length:u32:rights=,payload:handle<admin-payload>:rights=map) -> result<admin-prepared, liber:base@1::error>
+method admin-executor.revalidate op=2 (operation:u64:rights=) -> result<unit, liber:base@1::error>
+method admin-executor.execute op=3 (operation:u64:rights=,epoch:u64:rights=) -> result<admin-result, liber:base@1::error>
+method admin-executor.cancel op=4 (operation:u64:rights=) -> result<unit, liber:base@1::error>
+enum admin-event(requested=1,granted=2,declined=3,consumed=4,completed=5,failed=6,outcome-unknown=7)
+record admin-record(sequence:u64,broker-epoch:u64,request:u64,launch:u64,requester:string:bound=64,action:u8,digest:list<u8>:bound=32,event:admin-event,reason:string:bound=64,monotonic-ns:u64,utc-seconds:option<u64>,utc-provenance:string:bound=16)
+record admin-journal-page(records:list<admin-record>:bound=16,oldest:u64,next:u64,evicted:u64)
+interface admin-journal
+method admin-journal.read op=1 (from:u64:rights=) -> result<admin-journal-page, liber:base@1::error>
+record admin-probe-effects(writes:u32,dispatches:u32,digest:list<u8>:bound=32,generation:u64)
+enum admin-probe-fault(none=0,lose-reply=1,fail=2)
+interface admin-probe-witness
+method admin-probe-witness.effects op=1 () -> result<admin-probe-effects, liber:base@1::error>
+method admin-probe-witness.replace-target op=2 () -> result<u64, liber:base@1::error>
+method admin-probe-witness.inject op=3 (fault:admin-probe-fault:rights=) -> result<unit, liber:base@1::error>
+enum admin-journal-fault(none=0,fail=1,hold=2)
+interface admin-test
+method admin-test.journal op=1 (fault:admin-journal-fault:rights=) -> result<unit, liber:base@1::error>
+method admin-test.path op=2 (present:bool:rights=) -> result<unit, liber:base@1::error>
+method admin-test.held op=3 () -> result<u32, liber:base@1::error>

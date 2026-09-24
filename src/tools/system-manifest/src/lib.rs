@@ -186,11 +186,39 @@ pub enum ProviderKindName {
 	/// protocol layers above this and is published by nothing - it reaches InputService over a
 	/// typed report channel from a service with no device claim.
 	BluetoothHci,
+	/// A POWER SOURCE OR THERMAL ZONE, published normalised, with PowerService its one consumer.
+	PowerSource,
+	/// A DEVELOPMENT FIXTURE'S CONTROL ENDPOINT, which only a development-only driver may declare.
+	FixtureControl,
+	/// A SMART-CARD READER, with SmartcardService its one consumer.
+	SmartcardReader,
+	/// A MODEM, with ModemService its one consumer.
+	Modem,
+	/// A CAMERA, with CameraService its one consumer.
+	Camera,
+	/// A MIDI DEVICE, with MidiService its one consumer.
+	Midi,
+	/// A PRINTER, with SpoolService its one consumer.
+	Printer,
+	/// A PICTURE TRANSFER PROTOCOL TRANSPORT, with MediaImportService its one consumer.
+	PtpTransport,
+	/// AN ADMINISTRATIVE EXECUTOR, with AdminService its one consumer.
+	AdminExecutor,
 }
 
 /// The most kinds one minted catalogue connection may name, which is the LSIDL bound on
 /// `provider-catalogue-admin.open-consumer` written where the manifest can check it.
 pub const MAX_ROLE_KINDS: usize = 16;
+
+/// DeviceManager's catalogue client table, and its subscription table, which is the same size:
+/// every connection its roots mint - scoped through the admin root or inventory-only through the
+/// catalogue's own - holds one slot until its channel closes. Written here so the manifest's combined
+/// demand can be checked against it before a boot finds the ceiling.
+pub const MAX_CATALOGUE_CLIENTS: usize = 32;
+
+/// What DeviceManager mints for itself, outside every role: the development agent's catalogue
+/// connection. Counted in every configuration, because the shipping one is the smaller.
+pub const CATALOGUE_CLIENTS_UNDECLARED: usize = 1;
 
 impl ProviderKindName {
 	// The wire number `driver_protocol::provider` gives this kind. Written here because this crate
@@ -209,6 +237,15 @@ impl ProviderKindName {
 			ProviderKindName::LocalStream => 9,
 			ProviderKindName::Touch => 10,
 			ProviderKindName::BluetoothHci => 11,
+			ProviderKindName::PowerSource => 12,
+			ProviderKindName::FixtureControl => 13,
+			ProviderKindName::SmartcardReader => 14,
+			ProviderKindName::Modem => 15,
+			ProviderKindName::Camera => 16,
+			ProviderKindName::Midi => 17,
+			ProviderKindName::Printer => 18,
+			ProviderKindName::PtpTransport => 19,
+			ProviderKindName::AdminExecutor => 20,
 		}
 	}
 }
@@ -1362,6 +1399,12 @@ impl Manifest {
 						push_error(&mut errors, format!("{where_role}.kinds"), format!("{kind:?} is named twice, which is the same subset written at greater length"));
 					}
 				}
+				// A FIXTURE'S CONTROL ENDPOINT IS NO SERVICE'S TO REACH. PermissionManager opens it for
+				// a development probe through a scope its own bootstrap mints in a development build;
+				// a role naming it would put a test authority into the configuration that ships.
+				if raw_role.kinds.contains(&ProviderKindName::FixtureControl) {
+					push_error(&mut errors, format!("{where_role}.kinds"), "no service is minted a connection that reaches a fixture's control endpoint");
+				}
 				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive, handed_on: raw_role.handed_on, kinds: raw_role.kinds.clone() });
 			}
 			// A CLASS AND A PLACE MUST AGREE. Durable means written down, so it has to say where;
@@ -1435,6 +1478,27 @@ impl Manifest {
 					push_error(&mut errors, format!("services.{}.roles.{}.provider", service.name, role.tag), format!("{} supplies this role but is not a declared dependency, so nothing orders it first", provider));
 				}
 			}
+		}
+
+		// THE CATALOGUE'S CLIENTS, ADDED UP. Each role that mints a connection from one of
+		// DeviceManager's catalogue roots holds a client slot - and a subscription, if it subscribes -
+		// for as long as its channel is open, and a restart mints the replacement BEFORE the manager
+		// has seen the old channel close. So a role of a service the supervisor restarts needs two
+		// slots at its worst, and the sum of them, with what the manager mints for itself, has to fit
+		// the one table. A manifest that did not would boot, and the last service up would find the
+		// ceiling.
+		//
+		// ONLY A `transparent` SERVICE IS EVER REPLACED. The supervisor relaunches nothing else - not
+		// after a crash, and not on an operator's start, which it refuses for the same services - so an
+		// `escalate` service's role is one channel for the life of the boot and needs one slot.
+		// Counting it twice reported a manifest that fits as one that does not.
+		let catalogue_roots: Vec<&str> = services.values().find(|service| service.name.as_str() == "device_manager").map(|manager| manager.roles.iter().filter(|role| role.kind == RoleKind::ServeRoot && role.interface.starts_with("liber:device@1/provider-catalogue")).map(|role| role.tag.as_str()).collect()).unwrap_or_default();
+		let minting_roles = |service: &&Service| service.roles.iter().filter(|role| role.kind == RoleKind::Factory && role.provider.as_str() == "device_manager" && catalogue_roots.contains(&if role.source.as_str().is_empty() { "SERVE" } else { role.source.as_str() })).count();
+		let minting: usize = services.values().map(|service| minting_roles(&service)).sum();
+		let replaced: usize = services.values().filter(|service| service.restart == Restart::Transparent).map(|service| minting_roles(&service)).sum();
+		let demand = minting + replaced + CATALOGUE_CLIENTS_UNDECLARED;
+		if demand > MAX_CATALOGUE_CLIENTS {
+			push_error(&mut errors, "services", format!("{minting} role(s) mint a catalogue connection, {replaced} of them for a service a restart replaces, which with a replacement each and DeviceManager's own is {demand} client slots, and the catalogue has {MAX_CATALOGUE_CLIENTS}"));
 		}
 
 		// AN EXCLUSIVE CLIENT IS THE ONLY CLIENT. The supervisor has one end of each serve root and
@@ -1863,6 +1927,10 @@ fn validate_references(libraries: &BTreeMap<Name, Library>, programs: &BTreeMap<
 		for provides in &driver.provides {
 			if provides.most == 0 {
 				push_error(errors, format!("programs.{name}.driver.provides"), "`most = 0` declares a publication that may never happen, which is what leaving the row out already says");
+			}
+			// A FIXTURE'S CONTROL ENDPOINT ONLY FROM A FIXTURE: an entry that ships may not declare it.
+			if provides.kind == ProviderKindName::FixtureControl && !program.development {
+				push_error(errors, format!("programs.{name}.driver.provides"), "only a development-only driver may publish a fixture's control endpoint");
 			}
 		}
 		// AND NO ENTRY MAY DECLARE MORE CONNECTIONS THAN A DRIVER CAN SERVE.

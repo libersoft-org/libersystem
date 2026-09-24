@@ -54,6 +54,16 @@ guest_gate_triple() {
 	esac
 }
 
+# The programs a gate needs, BUILT: a dynamic one where the image stages it, a static one - a fixture driver,
+# a scenario probe, a service that links what no staged library publishes - where cargo built it, which is
+# where the volume packager copies it from. The staged image directory holds only the dynamic half.
+guest_gate_require_programs() {
+	local image="$root/../.build/image/$(guest_gate_triple)" built="$root/../.build/cargo/user/$(guest_gate_triple)/debug" name
+	for name in "$@"; do
+		[[ -f "$image/libexec/$name" || -f "$image/bin/$name" || -f "$built/$name" ]] || guest_gate_fail "$name is not built - build the development image:  LIBER_DEVELOPMENT=1 ./build.sh --arch $GUEST_ARCH"
+	done
+}
+
 # A quarantine artifact is absent whenever its upstream is, and that is reported rather than failed.
 guest_gate_require_quarantine() {
 	local name="$1"

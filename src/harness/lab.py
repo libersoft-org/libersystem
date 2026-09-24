@@ -3229,13 +3229,15 @@ def cmd_log(args):
 
 # The monitor sendkey names for the characters the shell needs; letters pass
 # through (uppercase via shift-), so only the specials are listed.
-KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '\n': 'ret'}
+# `&` and `|` because a scenario starts background jobs and pipelines as a person would, by typing them.
+KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '&': 'shift-7', '|': 'shift-backslash', '\n': 'ret'}
 
 # The key names a scenario or a command may name directly, beyond letters and digits. A fixed
 # vocabulary rather than a string handed through to QEMU: this is the one place where what a
 # scenario says becomes what the emulator does, and an open channel there would be a way to
 # run monitor commands from scenario data.
-KEY_NAMES = frozenset(list(KEYMAP.values()) + ['ret', 'esc', 'tab', 'spc', 'backspace', 'delete', 'insert', 'home', 'end', 'pgup', 'pgdn', 'up', 'down', 'left', 'right'] + [f'f{index}' for index in range(1, 13)])
+# `backslash` by itself because `|` is typed as `shift-backslash`, and a chord is checked by its last key.
+KEY_NAMES = frozenset(list(KEYMAP.values()) + ['backslash', 'ret', 'esc', 'tab', 'spc', 'backspace', 'delete', 'insert', 'home', 'end', 'pgup', 'pgdn', 'up', 'down', 'left', 'right'] + [f'f{index}' for index in range(1, 13)])
 MODIFIERS = frozenset(['ctrl', 'alt', 'shift'])
 # The pointer buttons QEMU knows, and the only ones a scenario may name.
 POINTER_BUTTONS = frozenset(['left', 'middle', 'right', 'wheel-up', 'wheel-down'])

@@ -402,6 +402,29 @@ interface display {
 	@op(2) image-limits: func() -> result<image-limits, error>;
 }
 
+/// A protected session's screen: the size of the pixels `present` takes, and a channel whose closing says the
+/// session is over, however it ended - released, a reset display, a lost scanout.
+record trusted-screen {
+	width:   u32,
+	height:  u32,
+	/// Bytes per row of those pixels: four per pixel, in blue, green, red, unused order.
+	pitch:   u32,
+	session: handle<channel>,
+}
+
+/// THE PROTECTED SESSION, reachable only on a root the supervisor hands AdminService. While it is held the
+/// screen is the session's: no ordinary surface, present or focus request can replace or overpaint it, and
+/// the keyboard belongs to nobody on the ordinary path. Hidden surfaces keep what they had.
+interface display-trusted {
+	/// Take the screen under `epoch`. Every ordinary surface is hidden and loses focus at once.
+	@op(1) lock:    func(epoch: u64) -> result<trusted-screen, error>;
+	/// Show these pixels, whole, and answer once the display has taken them: that answer is the fresh
+	/// presentation a decision waits for. A stale epoch shows nothing.
+	@op(2) present: func(epoch: u64, @rights(read, map) pixels: handle<image-object>) -> result<u64, error>;
+	/// Give it back: the surface that was live before is restored, or the console, or nothing.
+	@op(3) release: func(epoch: u64) -> result<unit, error>;
+}
+
 /// Privileged launcher boundary. PermissionManager transfers the Process capability returned by
 /// ProcessService and receives a fresh display connection bound to that exact process. Ordinary
 /// display clients never receive this interface and cannot bind themselves or another task;

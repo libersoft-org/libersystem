@@ -1953,6 +1953,61 @@ impl MouseReport {
 	}
 }
 
+/// A peer this machine's operator has made an input source, as the input service learns of it: the
+/// controller it is bonded on and its address, and nothing else - no key, no name, no security record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnabledPeer {
+	pub controller: u32,
+	pub peer: PeerAddress,
+}
+
+impl EnabledPeer {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<EnabledPeer> {
+		let mut r = Reader::new(bytes);
+		let value = EnabledPeer::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<EnabledPeer> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = EnabledPeer::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.controller)?;
+		self.peer.write(w)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<EnabledPeer> {
+		let controller = r.u32()?;
+		let peer = PeerAddress::read(r)?;
+		Some(EnabledPeer { controller, peer })
+	}
+}
+
 /// THE PROFILE AUTHORITY: one verb, over peers an operator has already enabled.
 ///
 /// Held by the input service and by nothing else. It cannot scan, cannot pair, cannot enumerate
@@ -1965,16 +2020,89 @@ pub mod bluetooth_profile {
 	use alloc::vec::Vec;
 
 	pub const OP_OPEN_MOUSE: u16 = 1;
+	pub const OP_ENABLED: u16 = 2;
 
 	pub trait Service {
 		/// A bounded stream of reports from one enabled peer. Refused for a peer that is not bonded or
 		/// not enabled. The stream ends when the peer is disabled, when the link is lost, or when the
 		/// controller's session ends - and a consumer learns of all three the same way.
 		fn open_mouse(&mut self, controller: u32, peer: PeerAddress) -> Result<Vec<MouseReport>, Error>;
+		/// The peers `open-mouse` would accept right now. WITHOUT IT THE ONE CONSUMER OF THIS INTERFACE
+		/// COULD NOT FIND WHAT IT IS ALLOWED TO OPEN: the operator's bonded list is on another authority,
+		/// and handing the input service that authority to learn a peer address would give it the verbs
+		/// that come with it. This answers with the enabled peers and nothing about the others.
+		fn enabled(&mut self) -> Result<Vec<EnabledPeer>, Error>;
 	}
 
-	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
-		None
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:bluetooth")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ENABLED => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.enabled();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v38) => {
+							w.u8(1)?;
+							if v38.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v38.len() as u16)?;
+							for v40 in v38.iter() {
+								v40.write(w)?;
+							}
+						}
+						Err(v39) => {
+							w.u8(0)?;
+							v39.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
 	}
 
 	pub fn open_mouse_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<MouseReport>, Error>)> {
@@ -2151,6 +2279,50 @@ pub mod bluetooth_profile {
 			}
 			decoded
 		}
+		pub fn enabled(&mut self) -> Option<Result<Vec<EnabledPeer>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENABLED)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v41 = r.u16()? as usize;
+						let mut v42 = Vec::new();
+						v42.try_reserve_exact(v41).ok()?;
+						for _ in 0..v41 {
+							v42.push(EnabledPeer::read(r)?);
+						}
+						v42
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -2159,6 +2331,14 @@ pub mod bluetooth_profile {
 	fn channel_invoke_open_mouse(chan: u64, controller: &u32, peer: &PeerAddress) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.open_mouse(controller, peer)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_bluetooth_bluetooth_profile_enabled")]
+	fn channel_invoke_enabled(chan: u64) -> Option<Result<Vec<EnabledPeer>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.enabled()
 	}
 }
 
@@ -2229,8 +2409,8 @@ impl BondRecord {
 			return None;
 		}
 		w.u16(self.key.len() as u16)?;
-		for v38 in self.key.iter() {
-			w.u8(*v38)?;
+		for v43 in self.key.iter() {
+			w.u8(*v43)?;
 		}
 		self.security.write(w)?;
 		w.bytes_lp(self.name.as_bytes())?;
@@ -2242,19 +2422,19 @@ impl BondRecord {
 		let local = PeerAddress::read(r)?;
 		let peer = PeerAddress::read(r)?;
 		let key = {
-			let v39 = r.u16()? as usize;
-			let v39 = (v39 <= 16).then_some(v39)?;
-			let mut v40 = Vec::new();
-			v40.try_reserve_exact(v39).ok()?;
-			for _ in 0..v39 {
-				v40.push(r.u8()?);
+			let v44 = r.u16()? as usize;
+			let v44 = (v44 <= 16).then_some(v44)?;
+			let mut v45 = Vec::new();
+			v45.try_reserve_exact(v44).ok()?;
+			for _ in 0..v44 {
+				v45.push(r.u8()?);
 			}
-			v40
+			v45
 		};
 		let security = SecurityLevel::read(r)?;
 		let name = {
-			let v41 = r.string_lp()?;
-			(v41.len() <= 48).then_some(v41)?
+			let v46 = r.string_lp()?;
+			(v46.len() <= 48).then_some(v46)?
 		};
 		let enabled = r.boolean()?;
 		Some(BondRecord { version, local, peer, key, security, name, enabled })
@@ -2320,13 +2500,13 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v42) => {
+						Ok(v47) => {
 							w.u8(1)?;
-							v42.write(w)?;
+							v47.write(w)?;
 						}
-						Err(v43) => {
+						Err(v48) => {
 							w.u8(0)?;
-							v43.write(w)?;
+							v48.write(w)?;
 						}
 					}
 					Some(())
@@ -2357,12 +2537,12 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v44) => {
+						Ok(v49) => {
 							w.u8(1)?;
 						}
-						Err(v45) => {
+						Err(v50) => {
 							w.u8(0)?;
-							v45.write(w)?;
+							v50.write(w)?;
 						}
 					}
 					Some(())
@@ -2394,12 +2574,12 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v46) => {
+						Ok(v51) => {
 							w.u8(1)?;
 						}
-						Err(v47) => {
+						Err(v52) => {
 							w.u8(0)?;
-							v47.write(w)?;
+							v52.write(w)?;
 						}
 					}
 					Some(())
@@ -2430,19 +2610,19 @@ pub mod bluetooth_bond_store {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v48) => {
+						Ok(v53) => {
 							w.u8(1)?;
-							if v48.len() > u16::MAX as usize {
+							if v53.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v48.len() as u16)?;
-							for v50 in v48.iter() {
-								v50.write(w)?;
+							w.u16(v53.len() as u16)?;
+							for v55 in v53.iter() {
+								v55.write(w)?;
 							}
 						}
-						Err(v49) => {
+						Err(v54) => {
 							w.u8(0)?;
-							v49.write(w)?;
+							v54.write(w)?;
 						}
 					}
 					Some(())
@@ -2674,13 +2854,13 @@ pub mod bluetooth_bond_store {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v51 = r.u16()? as usize;
-						let mut v52 = Vec::new();
-						v52.try_reserve_exact(v51).ok()?;
-						for _ in 0..v51 {
-							v52.push(BondRecord::read(r)?);
+						let v56 = r.u16()? as usize;
+						let mut v57 = Vec::new();
+						v57.try_reserve_exact(v56).ok()?;
+						for _ in 0..v56 {
+							v57.push(BondRecord::read(r)?);
 						}
-						v52
+						v57
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -2788,13 +2968,13 @@ impl PeerAddress {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v54 = true;
-		for v53 in self.bytes.iter() {
-			if !v54 {
+		let mut v59 = true;
+		for v58 in self.bytes.iter() {
+			if !v59 {
 				out.push(',');
 			}
-			v54 = false;
-			let _ = write!(out, "{}", v53);
+			v59 = false;
+			let _ = write!(out, "{}", v58);
 		}
 		out.push(']');
 		out.push('}');
@@ -2806,13 +2986,13 @@ impl PeerAddress {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v56 = true;
-		for v55 in self.bytes.iter() {
-			if !v56 {
+		let mut v61 = true;
+		for v60 in self.bytes.iter() {
+			if !v61 {
 				out.push_str(", ");
 			}
-			v56 = false;
-			let _ = write!(out, "{}", v55);
+			v61 = false;
+			let _ = write!(out, "{}", v60);
 		}
 		out.push(']');
 		out.push('}');
@@ -2823,8 +3003,8 @@ impl PeerAddress {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v57 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v57 as u64);
+		for v62 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v62 as u64);
 		}
 	}
 }
@@ -3267,6 +3447,49 @@ impl MouseReport {
 	}
 }
 
+impl EnabledPeer {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"controller\":");
+		let _ = write!(out, "{}", self.controller);
+		out.push(',');
+		out.push_str("\"peer\":");
+		self.peer.to_json_into(out);
+		out.push('}');
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("controller=");
+		let _ = write!(out, "{}", self.controller);
+		out.push_str(", ");
+		out.push_str("peer=");
+		self.peer.to_text_into(out);
+		out.push('}');
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "controller");
+		crate::codec::cbor::uint(out, self.controller as u64);
+		crate::codec::cbor::text(out, "peer");
+		self.peer.to_cbor_into(out);
+	}
+}
+
 impl BondRecord {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -3296,13 +3519,13 @@ impl BondRecord {
 		out.push(',');
 		out.push_str("\"key\":");
 		out.push('[');
-		let mut v59 = true;
-		for v58 in self.key.iter() {
-			if !v59 {
+		let mut v64 = true;
+		for v63 in self.key.iter() {
+			if !v64 {
 				out.push(',');
 			}
-			v59 = false;
-			let _ = write!(out, "{}", v58);
+			v64 = false;
+			let _ = write!(out, "{}", v63);
 		}
 		out.push(']');
 		out.push(',');
@@ -3333,13 +3556,13 @@ impl BondRecord {
 		out.push_str(", ");
 		out.push_str("key=");
 		out.push('[');
-		let mut v61 = true;
-		for v60 in self.key.iter() {
-			if !v61 {
+		let mut v66 = true;
+		for v65 in self.key.iter() {
+			if !v66 {
 				out.push_str(", ");
 			}
-			v61 = false;
-			let _ = write!(out, "{}", v60);
+			v66 = false;
+			let _ = write!(out, "{}", v65);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -3367,8 +3590,8 @@ impl BondRecord {
 		self.peer.to_cbor_into(out);
 		crate::codec::cbor::text(out, "key");
 		crate::codec::cbor::array(out, self.key.len());
-		for v62 in self.key.iter() {
-			crate::codec::cbor::uint(out, *v62 as u64);
+		for v67 in self.key.iter() {
+			crate::codec::cbor::uint(out, *v67 as u64);
 		}
 		crate::codec::cbor::text(out, "security");
 		self.security.to_cbor_into(out);

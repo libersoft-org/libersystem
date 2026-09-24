@@ -1087,9 +1087,11 @@ impl IncidentWindow {
 // and in what order, which is what makes "closed exactly once, in this order, and nothing left" a
 // thing a machine checks.
 
-// The most resources one bind hands over: the device MMIO, an MSI vector, a key sink, a power
-// connection and a console feed.
-pub const MAX_BIND_RESOURCES: usize = 5;
+// The most resources one bind hands over: the device MMIO, an MSI vector, a key sink, the trusted key
+// sink, a power connection and a console feed - the six a physical keyboard's driver is given. A ledger
+// that is full refuses the next entry, and DeviceManager does not look: at five, the trusted key sink
+// pushed the console feed out of every keyboard's bind, and nothing a person typed reached the console.
+pub const MAX_BIND_RESOURCES: usize = 6;
 
 // What a rollback does to the world. Separated from the ledger so the ledger can be driven.
 //

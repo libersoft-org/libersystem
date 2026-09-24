@@ -869,6 +869,42 @@ pub enum ProviderKind {
 	/// controller would hand its raw HCI stream to whatever consumes pointers; published as `net`,
 	/// it would make an ambient path around the host stack out of a kind every consumer asks for.
 	BluetoothHci = 11,
+	/// A POWER SOURCE OR THERMAL ZONE: a UPS, a battery, AC, a zone. A driver publishes it with its
+	/// sources already normalised, and PowerService is its one consumer - a driver never receives a
+	/// writable power-service connection, it serves this and the service connects.
+	PowerSource = 12,
+	/// A TEST FIXTURE'S CONTROL ENDPOINT, and nothing a shipping machine has. Published only by a
+	/// development fixture bound to a QEMU test device at a pinned address, and reachable only through
+	/// PermissionManager for a probe whose development-only policy row grants `fixture-control`. It is
+	/// a kind of its own so that no scope minted for real hardware can ever admit it.
+	FixtureControl = 13,
+	/// A SMART-CARD READER: slots, card presence, and a bounded APDU and secure-PIN transport, which
+	/// SmartcardService alone consumes. Not `usb-bus` and not `input`: a reader's PIN pad is a trusted
+	/// input path to the card, and a consumer of either would get a channel to a card nobody granted.
+	SmartcardReader = 14,
+	/// A MODEM: SIM, registration, contexts and the session-tagged datagrams of one, which ModemService
+	/// alone consumes. Not `net`: a modem's packets are raw IP of a context a policy activated, and a
+	/// consumer of `net` would take them as a link nobody authorized.
+	Modem = 15,
+	/// A CAMERA: bounded formats, negotiated streams and frames written into buffers its consumer queued,
+	/// which CameraService alone consumes. Not `display`: capture is not scanout, and a frame path through
+	/// the display would put a camera behind a service that owns the screen.
+	Camera = 16,
+	/// A MIDI DEVICE: receive endpoints delivering USB-MIDI 1.0 packet batches, which MidiService alone
+	/// consumes and decodes. Not `input`: a MIDI stream is ordered timed events with its own bounds, not
+	/// keystrokes, and a consumer of `input` would take it as a keyboard.
+	Midi = 17,
+	/// A PRINTER: a byte transport with a device ID and a port status, which SpoolService alone consumes.
+	/// Applications reach printing through job capabilities and never through this.
+	Printer = 18,
+	/// A PICTURE TRANSFER PROTOCOL TRANSPORT: command containers out, bulk-IN bytes and event containers in,
+	/// cancel and reset - bytes only, validated by MediaImportService, its one consumer. Applications reach a
+	/// camera's objects through read-only import capabilities and never through this.
+	PtpTransport = 19,
+	/// AN ADMINISTRATIVE EXECUTOR: the private `liber:admin@1` executor contract for one registered kind of
+	/// high-risk operation, which AdminService alone consumes. A published executor is how an operation
+	/// becomes possible at all; no client can register one.
+	AdminExecutor = 20,
 }
 
 impl ProviderKind {
@@ -922,6 +958,15 @@ impl ProviderKind {
 			9 => Some(ProviderKind::LocalStream),
 			10 => Some(ProviderKind::Touch),
 			11 => Some(ProviderKind::BluetoothHci),
+			12 => Some(ProviderKind::PowerSource),
+			13 => Some(ProviderKind::FixtureControl),
+			14 => Some(ProviderKind::SmartcardReader),
+			15 => Some(ProviderKind::Modem),
+			16 => Some(ProviderKind::Camera),
+			17 => Some(ProviderKind::Midi),
+			18 => Some(ProviderKind::Printer),
+			19 => Some(ProviderKind::PtpTransport),
+			20 => Some(ProviderKind::AdminExecutor),
 			_ => None,
 		}
 	}
@@ -4424,6 +4469,15 @@ impl ProviderKind {
 			ProviderKind::LocalStream => out.push_str("\"local-stream\""),
 			ProviderKind::Touch => out.push_str("\"touch\""),
 			ProviderKind::BluetoothHci => out.push_str("\"bluetooth-hci\""),
+			ProviderKind::PowerSource => out.push_str("\"power-source\""),
+			ProviderKind::FixtureControl => out.push_str("\"fixture-control\""),
+			ProviderKind::SmartcardReader => out.push_str("\"smartcard-reader\""),
+			ProviderKind::Modem => out.push_str("\"modem\""),
+			ProviderKind::Camera => out.push_str("\"camera\""),
+			ProviderKind::Midi => out.push_str("\"midi\""),
+			ProviderKind::Printer => out.push_str("\"printer\""),
+			ProviderKind::PtpTransport => out.push_str("\"ptp-transport\""),
+			ProviderKind::AdminExecutor => out.push_str("\"admin-executor\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -4439,6 +4493,15 @@ impl ProviderKind {
 			ProviderKind::LocalStream => out.push_str("local-stream"),
 			ProviderKind::Touch => out.push_str("touch"),
 			ProviderKind::BluetoothHci => out.push_str("bluetooth-hci"),
+			ProviderKind::PowerSource => out.push_str("power-source"),
+			ProviderKind::FixtureControl => out.push_str("fixture-control"),
+			ProviderKind::SmartcardReader => out.push_str("smartcard-reader"),
+			ProviderKind::Modem => out.push_str("modem"),
+			ProviderKind::Camera => out.push_str("camera"),
+			ProviderKind::Midi => out.push_str("midi"),
+			ProviderKind::Printer => out.push_str("printer"),
+			ProviderKind::PtpTransport => out.push_str("ptp-transport"),
+			ProviderKind::AdminExecutor => out.push_str("admin-executor"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -4454,6 +4517,15 @@ impl ProviderKind {
 			ProviderKind::LocalStream => crate::codec::cbor::text(out, "local-stream"),
 			ProviderKind::Touch => crate::codec::cbor::text(out, "touch"),
 			ProviderKind::BluetoothHci => crate::codec::cbor::text(out, "bluetooth-hci"),
+			ProviderKind::PowerSource => crate::codec::cbor::text(out, "power-source"),
+			ProviderKind::FixtureControl => crate::codec::cbor::text(out, "fixture-control"),
+			ProviderKind::SmartcardReader => crate::codec::cbor::text(out, "smartcard-reader"),
+			ProviderKind::Modem => crate::codec::cbor::text(out, "modem"),
+			ProviderKind::Camera => crate::codec::cbor::text(out, "camera"),
+			ProviderKind::Midi => crate::codec::cbor::text(out, "midi"),
+			ProviderKind::Printer => crate::codec::cbor::text(out, "printer"),
+			ProviderKind::PtpTransport => crate::codec::cbor::text(out, "ptp-transport"),
+			ProviderKind::AdminExecutor => crate::codec::cbor::text(out, "admin-executor"),
 		}
 	}
 }

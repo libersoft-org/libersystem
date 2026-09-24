@@ -626,6 +626,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		keys::set_power(resources.syspower);
 		keys::set_console_input(resources.console);
 		KEY_SINK.store(key_sink, Ordering::Relaxed);
+		crate::usb_hid::TRUSTED_KEY_SINK.store(resources.trusted_keys, Ordering::Relaxed);
 		// map the controller's register file.
 		let base: u64 = syscall(SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);
 		if sys_is_err(base) {

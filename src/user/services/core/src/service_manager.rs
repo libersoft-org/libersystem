@@ -39,6 +39,7 @@ use proto::system::supervisor;
 use proto::system::system_power;
 use proto::system::{Entry, Error, Field, Severity, SupervisorStat};
 use rt::*;
+use services::capability_names::*;
 
 #[path = "service_manager/bootstrap.rs"]
 mod bootstrap;
@@ -381,6 +382,8 @@ static ROOT_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 static ROOT_UUID_LOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static ROOT_UUID_HIGH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// The trusted keyboard sink DeviceManager handed over, until InputService is started with it.
+pub(crate) static TRUSTED_KEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BOOT_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BOOT_WINDOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -914,7 +917,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     system volume, which stopping DeviceManager makes unavailable. The broker
 	//     stands for the life of the system (the supervise loop serves resolves and
 	//     restarts config on a runtime crash the same way).
-	let mut broker: Broker = Broker { config: config_client, device: device_client, device_manager: kept.end_of(b"device_manager", b"SERVE"), display_stats, graph: graph_client, process: broker_process, storage_admin: broker_storage_admin, lifecycle };
+	let mut broker: Broker = Broker { config: config_client, device: device_client, device_manager: kept.end_of(b"device_manager", b"SERVE"), display_stats, graph: graph_client, process: broker_process, storage_admin: broker_storage_admin, lifecycle, kept };
 	if selftest && canary_ctrl != 0 {
 		if let Some(cfg) = index_of(b"config_service") {
 			if state[cfg] == State::Ready && procs[cfg] != 0 {
@@ -1048,7 +1051,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// routing it here is what makes the namespace DeviceManager's.
 		// TAKEN, not read: it is handed to DeviceManager below, and a handle two places believe
 		// they own is exactly what `take_end_of` exists to prevent.
-		let owner: u64 = kept.take_end_of(b"config_service", b"POLICYOWNER");
+		let owner: u64 = broker.kept.take_end_of(b"config_service", b"POLICYOWNER");
 		let config_for_dm: u64 = if owner != 0 {
 			owner
 		} else if config_client != 0 {
@@ -1068,7 +1071,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// AND THE ONE CONSOLESERVICE HANDS TO EVERY SHELL IT SPAWNS. Read from the plan's own table
 	// rather than threaded out through `start_service`: the end is recorded there when the role
 	// is delivered, and this is the only place that needs it.
-	let admin_server3: u64 = kept.end_of(b"console_service", b"ADMIN");
+	let admin_server3: u64 = broker.kept.end_of(b"console_service", b"ADMIN");
 	supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut device_manager_domain, &mut buf);
 	exit();
 }
@@ -1217,6 +1220,13 @@ struct Broker {
 	// The lifecycle record travels with the broker because the broker is what restarts a service,
 	// and a restart is the transition the record exists for.
 	lifecycle: LifecycleLog,
+	// EVERY SERVE ROOT THE PLAN MADE, moved here when bring-up is over. It is what a restart of a
+	// plan-driven service re-runs the plan against - the providers it is a client of are found here,
+	// and the replacement's new roots are kept here - and it is what the broker mints a resolved
+	// connection from for the names that belong to such a service. One table for both, because a
+	// root the restart replaced and a root the broker still minted from would be two answers to
+	// "which instance is live".
+	kept: Kept,
 }
 
 // The grant set of each resolving component: which capability names its resolves may
@@ -1228,7 +1238,41 @@ struct Broker {
 fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 	match requester {
 		b"watchdog_probe" => &[CAP_CONFIG],
-		b"permission_manager" => &[CAP_CONFIG, CAP_DEVICE],
+		// AND BLUETOOTHSERVICE'S READ AND OPERATOR ROOTS, resolved rather than handed over at bring-up:
+		// a role from a service is a dependency on it, and PermissionManager depending on the Bluetooth
+		// stack would make every tool on the machine wait for a radio. It mints each grant from the
+		// resolved root, which also keeps its grants working across a restart of that service.
+		// POWERSERVICE'S STATE AND CONTROL ROOTS the same way, for the same two reasons.
+		// AND SMARTCARDSERVICE'S MINTING ROOT, from which every smart-card grant is minted per launch.
+		// AND MODEMSERVICE'S OBSERVATION AND MINTING ROOTS.
+		// AND SPOOLSERVICE'S ROOT, from which every `spool` grant is a fresh connection, and MEDIAIMPORTSERVICE'S,
+		// from which every `media-import` grant is.
+		// AND ADMINSERVICE'S REQUEST FACTORY, which mints each `admin-request` connection bound to the task a
+		// launch prepared; its journal view; and its test controls, which only a development image serves.
+		b"permission_manager" => &[
+			CAP_CONFIG,
+			CAP_DEVICE,
+			CAP_BT_READ,
+			CAP_BT_OPERATOR,
+			CAP_INPUT,
+			CAP_POWER_STATE,
+			CAP_POWER_CONTROL,
+			CAP_SMARTCARD_ADMIN,
+			CAP_MODEM_STATE,
+			CAP_MODEM_ADMIN,
+			CAP_CAMERA,
+			CAP_CAMERA_ADMIN,
+			CAP_MIDI,
+			CAP_MIDI_ADMIN,
+			CAP_SPOOL,
+			CAP_MEDIA_IMPORT,
+			CAP_ADMIN_FACTORY,
+			CAP_ADMIN_AUDIT,
+			CAP_ADMIN_TEST,
+		],
+		// THE PROFILE AUTHORITY, re-resolved when the stack has been restarted and the connection handed
+		// over at bring-up went with the instance that ended.
+		b"input_service" => &[CAP_BT_PROFILE],
 		b"console_service" => &[CAP_CONFIG, CAP_DEVICE],
 		b"system_graph_service" => &[CAP_DEVICE],
 		// The shell resolves the system graph rather than holding the connection it was given
@@ -1244,6 +1288,16 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 		CAP_CONFIG => Some(b"config_service"),
 		CAP_DEVICE => Some(b"device_service"),
 		CAP_GRAPH => Some(b"system_graph_service"),
+		CAP_BT_READ | CAP_BT_OPERATOR | CAP_BT_PROFILE => Some(b"bluetooth_service"),
+		CAP_INPUT => Some(b"input_service"),
+		CAP_POWER_STATE | CAP_POWER_CONTROL => Some(b"power_service"),
+		CAP_SMARTCARD_ADMIN => Some(b"smartcard_service"),
+		CAP_MODEM_STATE | CAP_MODEM_ADMIN => Some(b"modem_service"),
+		CAP_CAMERA | CAP_CAMERA_ADMIN => Some(b"camera_service"),
+		CAP_MIDI | CAP_MIDI_ADMIN => Some(b"midi_service"),
+		CAP_SPOOL => Some(b"spool_service"),
+		CAP_MEDIA_IMPORT => Some(b"media_import_service"),
+		CAP_ADMIN_FACTORY | CAP_ADMIN_AUDIT | CAP_ADMIN_TEST => Some(b"admin_service"),
 		_ => None,
 	}
 }
@@ -1261,6 +1315,28 @@ fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Broker, s
 		CAP_CONFIG => broker.config,
 		CAP_DEVICE => broker.device,
 		CAP_GRAPH => broker.graph,
+		CAP_BT_READ => broker.kept.end_of(b"bluetooth_service", b"SERVE"),
+		CAP_BT_OPERATOR => broker.kept.end_of(b"bluetooth_service", b"OPERATOR"),
+		CAP_BT_PROFILE => broker.kept.end_of(b"bluetooth_service", b"PROFILE"),
+		// INPUTSERVICE'S ORDINARY ROOT, for the one grant that could never deliver anything. The
+		// `input` capability has been in the vocabulary with no client behind it - PermissionManager's
+		// table held zero - so a component granted it received nothing and could not subscribe to a
+		// pointer at all. Resolved like the others, it is a real connection.
+		CAP_INPUT => broker.kept.end_of(b"input_service", b"SERVE"),
+		CAP_POWER_STATE => broker.kept.end_of(b"power_service", b"SERVE"),
+		CAP_POWER_CONTROL => broker.kept.end_of(b"power_service", b"CONTROL"),
+		CAP_SMARTCARD_ADMIN => broker.kept.end_of(b"smartcard_service", b"ADMIN"),
+		CAP_MODEM_STATE => broker.kept.end_of(b"modem_service", b"SERVE"),
+		CAP_MODEM_ADMIN => broker.kept.end_of(b"modem_service", b"ADMIN"),
+		CAP_CAMERA => broker.kept.end_of(b"camera_service", b"SERVE"),
+		CAP_CAMERA_ADMIN => broker.kept.end_of(b"camera_service", b"ADMIN"),
+		CAP_MIDI => broker.kept.end_of(b"midi_service", b"SERVE"),
+		CAP_MIDI_ADMIN => broker.kept.end_of(b"midi_service", b"ADMIN"),
+		CAP_SPOOL => broker.kept.end_of(b"spool_service", b"SERVE"),
+		CAP_MEDIA_IMPORT => broker.kept.end_of(b"media_import_service", b"SERVE"),
+		CAP_ADMIN_FACTORY => broker.kept.end_of(b"admin_service", b"FACTORY"),
+		CAP_ADMIN_AUDIT => broker.kept.end_of(b"admin_service", b"AUDIT"),
+		CAP_ADMIN_TEST => broker.kept.end_of(b"admin_service", b"TEST"),
 		_ => 0,
 	};
 	let alive: bool = match service_of_cap(name).and_then(index_of) {
@@ -1401,6 +1477,9 @@ fn restartable(idx: usize) -> bool {
 // up, then adopt it. Shared by the crash restart and the deliberate start above; it assumes
 // the previous instance's endpoints are already released.
 fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
+	if plan_relaunchable(MANIFEST[idx].name) {
+		return relaunch_planned(broker, idx, state, channels, procs, buf);
+	}
 	unsafe {
 		let (process, storage_admin, device): (u64, u64, u64) = (broker.process, broker.storage_admin, broker.device);
 		let root: &mut u64 = match MANIFEST[idx].name {
@@ -1469,6 +1548,69 @@ fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], cha
 		state[idx] = State::Ready;
 		true
 	}
+}
+
+// The services whose bootstrap is the plan and nothing else, so a restart can re-run it as it stands.
+//
+// A SHORT LIST ON PURPOSE. The three older restartable services each have a hand-written bootstrap
+// the ladder re-runs by name; a service whose roles the plan resolves entirely needs no branch, and
+// naming it here is the whole of what makes it restartable. BluetoothService is the first;
+// PowerService, whose state is rebuilt from the catalogue, the second; SmartcardService, whose grants are
+// ephemeral and minted again after a restart, the third. AdminService's authority dies with the instance that
+// held it by design, and its journal is read back by the replacement - which is what makes it restartable.
+fn plan_relaunchable(name: &[u8]) -> bool {
+	name == b"bluetooth_service" || name == b"power_service" || name == b"smartcard_service" || name == b"modem_service" || name == b"camera_service" || name == b"midi_service" || name == b"admin_service"
+}
+
+// Relaunch a plan-driven service: its Domain limits, its roles as the plan declares them, and its
+// online report - the same three things its first start was.
+//
+// THE DEAD INSTANCE'S ROOTS ARE CLOSED FIRST. They died with it, and the executor writes the
+// replacement's new client ends into the same slots - so a slot not emptied first would be a live
+// handle overwritten, and the broker would go on minting from a root nobody serves.
+fn relaunch_planned(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], buf: &mut [u8]) -> bool {
+	broker.kept.release_serve_roots(idx);
+	let Some((manager_side, service_side)) = channel() else { return false };
+	let proc: i64 = bootstrap::launch_service_from_volume(broker.process, MANIFEST[idx].name, MANIFEST[idx].program, service_side);
+	if proc < 0 {
+		close(manager_side);
+		return false;
+	}
+	// ONE ROLE A PLAN CANNOT CARRY: AdminService's journal is its directory, scoped again for the replacement
+	// exactly as it was for the first start - never the admin root the factory arm would otherwise mint from.
+	let storage_admin: u64 = broker.storage_admin;
+	let mut external = |role: &Role| -> Option<(Vec<u8>, u64)> {
+		if MANIFEST[idx].name == b"admin_service" && role.tag == b"JOURNAL" {
+			let scoped: u64 = bootstrap::open_storage_directory(storage_admin, bootstrap::ADMIN_JOURNAL_DIRECTORY);
+			let narrowed: i64 = if scoped != 0 { duplicate(scoped, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER) } else { 0 };
+			if scoped != 0 {
+				close(scoped);
+			}
+			return Some((role.tag.to_vec(), if narrowed > 0 { narrowed as u64 } else { 0 }));
+		}
+		None
+	};
+	let mut follow = |_role: &Role| -> Vec<u64> { Vec::new() };
+	if !bootstrap::deliver_roles(manager_side, idx, &mut broker.kept, &mut external, &mut follow) {
+		close(proc as u64);
+		close(manager_side);
+		return false;
+	}
+	match recv_blocking(manager_side, buf) {
+		Received::Message { .. } => {}
+		Received::Closed => {
+			close(proc as u64);
+			close(manager_side);
+			return false;
+		}
+	}
+	channels[idx] = manager_side;
+	procs[idx] = proc as u64;
+	// SAFETY: `procs[idx]` is the Process handle this function just stored.
+	let epoch: u64 = unsafe { epoch_of(procs[idx]) };
+	broker.lifecycle.record(idx, State::Starting, State::Ready, epoch, Reason::ReportedReady);
+	state[idx] = State::Ready;
+	true
 }
 
 // Drive one canary CHECK to its verdict: send the command, then serve the RESOLVE

@@ -318,7 +318,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    service served on one channel can be restarted, but nobody can reconnect to it.
 	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client, display_stats: display_stats_client };
 	let mut request: [u8; 256] = [0u8; 256];
-	let mut reply: [u8; 4096] = [0u8; 4096];
+	// SIZED FOR THE WHOLE GRAPH, which is one component per supervised service and one per device-table
+	// row, each carrying its dependency names. Four kilobytes held the graph while the service set was
+	// small, and a reply that outgrows the buffer is not truncated but replaced with `again`, so every
+	// `graph` failed once the set grew past it. On the heap, because a stack this size is not given.
+	let mut reply: Vec<u8> = alloc::vec![0u8; 64 * 1024];
 	serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { system_graph::dispatch(&mut graph, req, handle, out, reply_handle) });
 	exit();
 }

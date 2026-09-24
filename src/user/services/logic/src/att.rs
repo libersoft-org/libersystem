@@ -186,6 +186,19 @@ impl<'a> Entries<'a> {
 		Ok(Entries { bytes: rest, entry, at: 0, from, to, last: None, count: 0, fault: None })
 	}
 
+	/// The same walk over a list whose entry length is not its first byte.
+	///
+	/// FIND INFORMATION IS THE ONE RESPONSE SHAPED THIS WAY: its first byte is a FORMAT - one for
+	/// sixteen-bit UUIDs, two for 128-bit ones - and the entry length follows from it. Reading that
+	/// byte as a length would size every entry as one byte, which the ragged check refuses, so the
+	/// caller names the length and every other rule applies unchanged.
+	pub fn with_entry(rest: &'a [u8], entry: usize, from: u16, to: u16) -> Result<Entries<'a>, Refusal> {
+		if entry < 2 || rest.is_empty() || rest.len() % entry != 0 {
+			return Err(Refusal::Ragged { entry, bytes: rest.len() });
+		}
+		Ok(Entries { bytes: rest, entry, at: 0, from, to, last: None, count: 0, fault: None })
+	}
+
 	/// The refusal that ended the walk, when one did.
 	pub const fn fault(&self) -> Option<Refusal> {
 		self.fault

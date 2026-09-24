@@ -7,6 +7,16 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "admin-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "audio-proto"
 version = "0.0.0"
 dependencies = [
@@ -34,6 +44,26 @@ dependencies = [
 [[package]]
 name = "bootproto"
 version = "0.0.0"
+
+[[package]]
+name = "camera-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "camera-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "camera-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
 
 [[package]]
 name = "config-proto"
@@ -90,10 +120,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "drivers"
+version = "0.0.0"
+dependencies = [
+ "bootproto",
+ "display-device-proto",
+ "driver-protocol",
+ "ipc-client",
+ "power-model",
+ "proto",
+ "rt",
+ "smartcard-model",
+ "wire",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "event-proto"
+version = "0.0.0"
+dependencies = [
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "font-proto"
@@ -130,6 +183,15 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "import-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
 
 [[package]]
 name = "indexmap"
@@ -193,6 +255,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "midi-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "midi-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "event-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "modem-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "modem-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "network-proto"
 version = "0.0.0"
 dependencies = [
@@ -222,6 +323,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "power-model"
+version = "0.0.0"
+dependencies = [
+ "power-proto",
+]
+
+[[package]]
+name = "power-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
+name = "printer-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "wire",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -244,26 +370,49 @@ dependencies = [
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "admin-proto",
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "camera-device-proto",
+ "camera-proto",
  "config-proto",
  "device-proto",
  "display-device-proto",
  "display-proto",
+ "event-proto",
  "font-proto",
  "graphics-proto",
+ "import-proto",
  "input-proto",
  "ipc-client",
  "log-proto",
+ "midi-device-proto",
+ "midi-proto",
+ "modem-device-proto",
+ "modem-proto",
  "network-proto",
  "observability-proto",
+ "power-proto",
+ "printer-device-proto",
  "process-proto",
+ "ptp-transport-proto",
  "resources-proto",
  "security-proto",
  "session-proto",
+ "smartcard-proto",
+ "spool-proto",
  "storage-proto",
  "time-proto",
+ "wire",
+]
+
+[[package]]
+name = "ptp-transport-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 
@@ -374,14 +523,17 @@ dependencies = [
  "display-device-proto",
  "driver-binding",
  "driver-protocol",
+ "drivers",
  "graphics-core",
  "ipc-client",
  "keys",
  "pcm",
  "pix",
+ "power-model",
  "proto",
  "rt",
  "service-logic",
+ "smartcard-model",
  "storage-proto",
  "surface",
  "system-manifest",
@@ -397,6 +549,29 @@ dependencies = [
  "base-proto",
  "ipc-client",
  "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "smartcard-model"
+version = "0.0.0"
+
+[[package]]
+name = "smartcard-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "spool-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
  "wire",
 ]
 

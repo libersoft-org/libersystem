@@ -470,3 +470,54 @@ record chunk {
 interface listener {
 	@op(1) accept: func() -> result<accept-result, error>;
 }
+
+// ------------------------------------------------------------------ the private link administration
+
+/// The publication a link belongs to, as DeviceManager identified it.
+record link-provider {
+	slot:               u32,
+	generation:         u32,
+	binding-generation: u64,
+}
+
+enum link-family {
+	ipv4 = 4,
+	ipv6 = 6,
+}
+
+/// A RAW-IP LINK, AS ITS ATTACHER DESCRIBES IT: which provider, SIM and context it belongs to, the
+/// channel its packets travel on, and the configuration the network gave it. NetworkService validates
+/// every field and owns what it installs.
+///
+/// THE PACKET CHANNEL CARRIES ONE IP DATAGRAM PER MESSAGE, in both directions, with no framing of its own
+/// and never more than `mtu` bytes. There is no Ethernet header, no ARP and no DHCP on it.
+record link-attachment {
+	provider:           link-provider,
+	sim-generation:     u64,
+	context-generation: u64,
+	packets:            handle<channel>,
+	family:             link-family,
+	address:            ipv4-addr,
+	prefix:             u8,
+	gateway:            option<ipv4-addr>,
+	@bound(2) dns:      list<ipv4-addr>,
+	mtu:                u16,
+}
+
+record link-installed {
+	interface: interface-id,
+	mtu:       u16,
+}
+
+/// THE PRIVATE LINK ADMINISTRATION, which ServiceManager keeps and ModemService alone is a client of. No
+/// ordinary network client reaches it: the root it is served on is not the one they are minted from.
+///
+/// RESERVE BEFORE ACTIVATING. A reservation says whether a link could be installed at all - `again`
+/// when another uplink is selected and replacing it was not allowed - before the modem is asked to do
+/// anything. Install commits a reserved link atomically, or refuses and leaves the current one intact;
+/// release removes it, or gives an unused reservation back.
+interface network-link-admin {
+	@op(1) reserve: func(replace-uplink: bool) -> result<u64, error>;
+	@op(2) install: func(reservation: u64, attachment: link-attachment) -> result<link-installed, error>;
+	@op(3) release: func(reservation: u64) -> result<unit, error>;
+}

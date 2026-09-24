@@ -559,6 +559,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		{
 			tests::unopened_provider_withdrawal();
 			tests::catalogue_scope_denial();
+			tests::catalogue_cap_refusal();
 			tests::pending_shutdown_outcomes();
 			tests::boot_attempt_budget();
 		}
@@ -1111,6 +1112,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// SUPERVISOR-WAIT-OK: the supervisor drove this handshake and is waiting for exactly these
 					// answers - the peer that could stall this send is the peer that asked for it.
 					send_blocking(bootstrap, b"KEYS", raw_keys);
+					// SUPERVISOR-WAIT-OK: the same handshake. The trusted sink's consumer, once and to the supervisor
+					// alone, which hands it to InputService's protected path.
+					send_blocking(bootstrap, b"TRUSTEDKEYS", TRUSTED_KEY_CONSUMER.swap(0, core::sync::atomic::Ordering::Relaxed));
 				}
 				// The development agent's launcher, delivered once PermissionManager is up.
 				// Forwarded rather than held: this program has no use for it, and the agent
@@ -1363,6 +1367,11 @@ fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
+// THE TRUSTED KEY SINK'S PRODUCER, which only the physical keyboard drivers are handed - see `begin_bind`.
+// Its consumer goes to InputService's protected path alone, under `TRUSTEDKEYS`.
+static TRUSTED_KEY_PRODUCER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TRUSTED_KEY_CONSUMER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
@@ -1370,6 +1379,10 @@ fn launch_volume_drivers(storage: u64, boot_package: Option<&[u8]>, catalogue: &
 			None => return,
 		};
 		*raw_keys = key_consumer;
+		if let Some((trusted_producer, trusted_consumer)) = channel() {
+			TRUSTED_KEY_PRODUCER.store(trusted_producer, core::sync::atomic::Ordering::Relaxed);
+			TRUSTED_KEY_CONSUMER.store(trusted_consumer, core::sync::atomic::Ordering::Relaxed);
+		}
 		let count: u64 = device_count();
 		// per-device state, sized by what the kernel actually discovered - the bus is
 		// the only bound, never an artificial cap that would silently skip devices.
@@ -4148,6 +4161,18 @@ fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8]
 			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 		}
 		txn.holds(driver_protocol::ResourceKind::Keys as u16, sink as u64);
+		// AND THE TRUSTED SINK, to these two alone: the physical keyboard drivers this system binds. A
+		// catalogue provider, the Bluetooth stack, console injection and a client's key stream have no
+		// producer for it, which is what makes a key on it a key a person pressed on this keyboard.
+		let trusted_producer: u64 = TRUSTED_KEY_PRODUCER.load(core::sync::atomic::Ordering::Relaxed);
+		if trusted_producer != 0 {
+			let trusted: i64 = duplicate(trusted_producer, RIGHT_SEND | RIGHT_TRANSFER);
+			if trusted < 0 {
+				refused(b"a trusted key sink - the trusted key channel could not be duplicated");
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
+			}
+			txn.holds(driver_protocol::ResourceKind::TrustedKeys as u16, trusted as u64);
+		}
 		// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed a
 		// duplicate of the root-Domain handle - which can kill every process on the machine -
 		// so that the Power key would work. What they get now can ask for a reboot and
@@ -6050,6 +6075,16 @@ fn provider_kind_from_wire(kind: u16) -> proto::system::ProviderKind {
 		provider::CONSOLE_BYTES => proto::system::ProviderKind::ConsoleBytes,
 		provider::LOCAL_STREAM => proto::system::ProviderKind::LocalStream,
 		provider::TOUCH => proto::system::ProviderKind::Touch,
+		provider::BLUETOOTH_HCI => proto::system::ProviderKind::BluetoothHci,
+		provider::POWER_SOURCE => proto::system::ProviderKind::PowerSource,
+		provider::FIXTURE_CONTROL => proto::system::ProviderKind::FixtureControl,
+		provider::SMARTCARD_READER => proto::system::ProviderKind::SmartcardReader,
+		provider::MODEM => proto::system::ProviderKind::Modem,
+		provider::CAMERA => proto::system::ProviderKind::Camera,
+		provider::MIDI => proto::system::ProviderKind::Midi,
+		provider::PRINTER => proto::system::ProviderKind::Printer,
+		provider::PTP_TRANSPORT => proto::system::ProviderKind::PtpTransport,
+		provider::ADMIN_EXECUTOR => proto::system::ProviderKind::AdminExecutor,
 		_ => proto::system::ProviderKind::Block,
 	}
 }
@@ -6067,6 +6102,15 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 		proto::system::ProviderKind::LocalStream => driver_protocol::provider::LOCAL_STREAM,
 		proto::system::ProviderKind::Touch => driver_protocol::provider::TOUCH,
 		proto::system::ProviderKind::BluetoothHci => driver_protocol::provider::BLUETOOTH_HCI,
+		proto::system::ProviderKind::PowerSource => driver_protocol::provider::POWER_SOURCE,
+		proto::system::ProviderKind::FixtureControl => driver_protocol::provider::FIXTURE_CONTROL,
+		proto::system::ProviderKind::SmartcardReader => driver_protocol::provider::SMARTCARD_READER,
+		proto::system::ProviderKind::Modem => driver_protocol::provider::MODEM,
+		proto::system::ProviderKind::Camera => driver_protocol::provider::CAMERA,
+		proto::system::ProviderKind::Midi => driver_protocol::provider::MIDI,
+		proto::system::ProviderKind::Printer => driver_protocol::provider::PRINTER,
+		proto::system::ProviderKind::PtpTransport => driver_protocol::provider::PTP_TRANSPORT,
+		proto::system::ProviderKind::AdminExecutor => driver_protocol::provider::ADMIN_EXECUTOR,
 	}
 }
 

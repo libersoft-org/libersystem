@@ -259,12 +259,16 @@ dependencies = [
  "graphics-core",
  "graphics-proto",
  "liberfs",
+ "modem-device-proto",
+ "modem-proto",
  "mp3",
  "network-proto",
  "partition",
  "pcm",
  "pix",
  "png",
+ "printer-device-proto",
+ "ptp-transport-proto",
  "smpboot",
  "storage-proto",
  "system-manifest",
@@ -303,6 +307,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
+]
+
+[[package]]
+name = "modem-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "modem-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
 ]
 
 [[package]]
@@ -366,6 +387,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "printer-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -380,6 +409,14 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "resources-proto",
+ "wire",
+]
+
+[[package]]
+name = "ptp-transport-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 

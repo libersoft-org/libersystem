@@ -1,0 +1,723 @@
+# THE TRUSTED ADMINISTRATIVE PATH, END TO END, THROUGH THE EMULATED KEYBOARD.
+#
+# Every decision here is made by a key that goes through QEMU's keyboard device, its driver, the trusted
+# sink DeviceManager handed that driver alone, InputService's protected path and AdminService - never
+# through the console `input` shortcut, which reaches the shell and nothing that could approve anything.
+# The requester, its helper and the hostile client are development probes started from the shell; what
+# they report is checked here line by line, and the gate script checks the captured frames, the executor's
+# counts and the journal recovered across a restart and a reboot.
+#
+# `check-admin-path.sh` runs this with the executor's QEMU test device at its pinned address; run bare, the
+# executor is absent and the first step fails.
+version = 1
+name = "admin path"
+description = "One confirmation, through the emulated keyboard on a protected screen, authorizes one attempt at one bound operation - and nothing else authorizes anything."
+timeout = 1750
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+# THE BASELINE: the executor is registered and nothing has reached it.
+[[step]]
+do = "key"
+text = "admincheck effects"
+
+[[step]]
+do = "expect"
+contains = "admincheck: effects writes 0 dispatches 0"
+
+# WHAT NEEDS NOBODY AT THE KEYBOARD: no path to a person, a forged grant, a target nobody serves, and a
+# journal that will not write. Each is declined, and nothing reaches the executor.
+[[step]]
+do = "key"
+text = "admincheck unavailable"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS unavailable"
+
+[[step]]
+do = "key"
+text = "admincheck forged"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS forged"
+
+[[step]]
+do = "key"
+text = "admincheck wrong-target"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS wrong-target"
+
+[[step]]
+do = "key"
+text = "admincheck storage"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS storage"
+
+# SECURE ATTENTION WITH NOTHING WAITING: the OS-owned screen comes up anyway, and Escape takes it down.
+# A FRESH PROMPT BEFORE EVERY LINE TYPED AFTER THE FIRST. A cold run reads readiness from the end of the serial
+# log, and what the log ends with here is AdminService's own lines or a background job's report, printed after
+# the prompt they followed - so Enter asks the shell for a prompt that is the last thing in the log.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and nothing is waiting"
+
+[[step]]
+do = "monitor"
+command = "screendump ../.build/boot/admin-path-idle.ppm"
+
+# READY, NOT ARMED: the keyboard arms when the chord's keys are up and the screen is presented when the display
+# has flushed it, in either order. The session takes keys only once both have happened, and that is the line
+# every step about to press one waits for.
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["esc"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is closed"
+
+# ONE CONFIRMATION, ONE WRITE - with an ordinary client painting over the whole screen, making surfaces and
+# asking for the keyboard the entire time. The frame is captured while it is trying.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request approve &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (approve)"
+
+[[step]]
+do = "key"
+text = "adminhostile 30 &"
+
+[[step]]
+do = "expect"
+contains = "adminhostile: on screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "monitor"
+command = "screendump ../.build/boot/admin-path-prompt.ppm"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS approve"
+
+[[step]]
+do = "expect"
+contains = "adminhostile: PASS"
+timeout = 60
+
+# A KEY ALREADY DOWN WHEN THE SCREEN APPEARS DECIDES NOTHING. Enter goes down first and the chord after it,
+# all four held together and released together; the session arms only once everything is up, and that
+# release approves nothing. Escape then declines.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request refuse &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (refuse)"
+
+[[step]]
+do = "monitor"
+command = "sendkey ret-ctrl-alt-f12 2500"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["esc"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS refuse"
+
+# CONTENTION: a second request while the first holds the confirmation is declined, not queued.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request refuse &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (refuse)"
+
+[[step]]
+do = "key"
+text = "adminhelper contend"
+
+[[step]]
+do = "expect"
+contains = "adminhelper: PASS contend"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["esc"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS refuse"
+
+# A SUBSTITUTED PAYLOAD: the requester rewrites its own buffer after the executor prepared; what is written
+# is what the person confirmed.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request substitute &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (substitute)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS substitute"
+
+# A REPLACED TARGET: the approval is declined at revalidation.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request replace &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (replace)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS replace"
+
+# EXPIRY: a grant redeemed after its thirty seconds reaches nothing.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request expire &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (expire)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS expire"
+timeout = 60
+
+# THE OWNER ENDS WHILE ITS REQUEST IS ON THE SCREEN: the request is cancelled and the screen closes by itself.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request die &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (die)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+# THE SCREEN CLOSES FIRST: the broker takes a request it declines off the screen before it records the decline.
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is closed"
+timeout = 30
+
+[[step]]
+do = "expect"
+contains = "declined: requester task ended"
+
+# DELEGATION, AND THE OWNER ENDS: a helper holds the request connection and the unused grant, confirms it
+# holds both, waits for the original task to end, and redeems - nothing reaches the executor.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck delegate dead | adminhelper redeem &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (delegate)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "adminhelper: holds the delegated request connection and grant"
+
+[[step]]
+do = "expect"
+contains = "adminhelper: PASS the grant died with its owner"
+
+# DELEGATION WHILE THE OWNER LIVES: exactly one attempt, from the helper, with the requester's attribution.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck delegate live | adminhelper redeem-live &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (delegate)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "adminhelper: PASS redeemed once while the owner lived"
+
+[[step]]
+do = "expect"
+contains = "admincheck: ends after its delegate had the grant"
+unordered = true
+timeout = 40
+
+# THE APPROVAL'S RECORD, HELD ACROSS THE OWNER'S DEATH: released afterwards, it revives no grant.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck hold approval | adminhelper release &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (hold)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: the approval's record is held, and this requester ends"
+
+[[step]]
+do = "expect"
+contains = "adminhelper: released the held acknowledgments after their requester ended"
+
+# UNORDERED: AdminService records the decline the moment the requester ends and writes it straight to the port,
+# while the probes' lines come through the console - so the log has them in either order.
+[[step]]
+do = "expect"
+contains = "declined: requester task ended"
+unordered = true
+
+# THE CONSUMPTION'S RECORD, HELD ACROSS THE OWNER'S DEATH: the grant stays spent and nothing is dispatched.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck hold consumption | adminhelper release &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (hold)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: the consumption's record is held, and this requester ends"
+
+[[step]]
+do = "expect"
+contains = "adminhelper: released the held acknowledgments after their requester ended"
+
+[[step]]
+do = "expect"
+contains = "failed: owner lost or deadline passed before dispatch"
+unordered = true
+
+# AN OUTCOME STORAGE REFUSED: approvals stop until the journal writes it.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request block &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (block)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS block"
+timeout = 60
+
+# THE SERVICE RESTARTS: a grant the ended instance issued reaches nothing, and the new instance starts a
+# fresh epoch from the journal it reads back.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck request orphan &"
+
+[[step]]
+do = "expect"
+contains = "admincheck: waiting for a person (orphan)"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "admincheck: holds a grant; restart AdminService now"
+
+[[step]]
+do = "key"
+text = "stop admin_service"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "start admin_service"
+
+[[step]]
+do = "expect"
+contains = "AdminService: online, epoch"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS orphan"
+unordered = true
+timeout = 60
+
+# THE COUNTS: exactly the writes the confirmed attempts made - approve, substitute, the live delegate and the
+# outcome storage refused - and no dispatch that was not one of them.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "admincheck effects"
+
+[[step]]
+do = "expect"
+contains = "admincheck: effects writes 4 dispatches 4"
+
+[[step]]
+do = "key"
+text = "admincheck journal"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS journal"
+
+# THE RESTARTED INSTANCE DECIDES SOMETHING, so its epoch is on the record. A new instance starts above every epoch
+# the journal carries, and an instance that recorded nothing leaves nothing for the next one to be above.
+[[step]]
+do = "key"
+text = "admincheck unavailable"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS unavailable"
+
+# A REBOOT: the committed decisions come back, and authority does not.
+[[step]]
+do = "monitor"
+command = "system_reset"
+
+[[step]]
+do = "expect"
+contains = "AdminService: online, epoch"
+timeout = 240
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+timeout = 240
+
+[[step]]
+do = "key"
+text = "admincheck journal"
+
+[[step]]
+do = "expect"
+contains = "admincheck: PASS journal"
+
+[[step]]
+do = "key"
+text = "admincheck effects"
+
+[[step]]
+do = "expect"
+contains = "admincheck: effects writes 0 dispatches 0"

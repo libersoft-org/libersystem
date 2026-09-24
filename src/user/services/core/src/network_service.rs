@@ -27,13 +27,14 @@ use rt::*;
 
 use crate::net::{DNS_PORT, Event, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Addr, MacAddr, NEIGH_MAX, NTP_PORT, SockEntry, SockEntryState, Stack};
 use proto::codec::{Buffer, Handles};
-use proto::system::{AcceptResult, AddressState, BindMode, Chunk, DnsServer, Error, FamilyReadiness, FetchChunk, FetchOutcome, HopStatus, InterfaceAddress, InterfaceId, IpAddress, Ipv4Addr as WireIp, Ipv6Addr as WireIpv6, ListenRequest, ListenResult, MacAddr as WireMac, Neighbor, NetCapacity, NetInfo, NextHop, OpenTarget, PingReply, PingStatus, ProviderKind, Reachability, RouteEntry, RoutePreference, RouterEntry, ScopedAddress, ScopedEndpoint, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, provider_catalogue, socket};
+use proto::system::{AcceptResult, AddressState, BindMode, Chunk, DnsServer, Error, FamilyReadiness, FetchChunk, FetchOutcome, HopStatus, InterfaceAddress, InterfaceId, IpAddress, Ipv4Addr as WireIp, Ipv6Addr as WireIpv6, LinkAttachment, LinkInstalled, ListenRequest, ListenResult, MacAddr as WireMac, Neighbor, NetCapacity, NetInfo, NextHop, OpenTarget, PingReply, PingStatus, ProviderInfo, ProviderKind, Reachability, RouteEntry, RoutePreference, RouterEntry, ScopedAddress, ScopedEndpoint, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, network_link_admin, provider_catalogue, socket};
 use service_logic::addr_select;
 use service_logic::dhcp;
 use service_logic::dns;
 use service_logic::net_profile::{Families, Pending, PendingKind, Readiness, readiness};
 use service_logic::sntp;
 use service_logic::tcp_bind::Binding;
+use service_logic::uplink;
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -143,14 +144,33 @@ fn net_policy(config: u64) -> (usize, usize, Option<alloc::string::String>, Fami
 	(neigh, mtu, icmpv6_rate, families)
 }
 
+// What the config tree decided for this boot, read once at start and KEPT: every link this service
+// brings up - the NIC found at boot, a late one, one reopened after a modem, a modem context - is
+// sized and configured by the same policy, and the ConfigService client is closed after the read.
+struct Policy {
+	neigh_cap: usize,
+	mtu_knob: usize,
+	icmpv6_rate: Option<alloc::string::String>,
+	families: Families,
+}
+
+// The interface indices the two media are reported under. One link is selected at a time, so the
+// index says WHICH KIND of link a scope names and the generation says which one.
+const ETHERNET_INDEX: u32 = 0;
+const RAW_INDEX: u32 = 1;
+// How long an opened NIC has to lead with its MAC before it is failed and passed over.
+const GREETING_TICKS: u64 = 200;
+// The buffers a link-admin request and reply are read into. The largest request is `install`, a
+// fixed-shape record with two DNS servers; a kilobyte holds it with room to spare.
+const LINK_ADMIN_BYTES: usize = 1024;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
-	// 1. receive the driver's frame channel (we move frames over it), the
-	//    ConfigService client the supervisor minted for us (handle 0 when no
-	//    config tree serves this boot - a test scenario), and the client channel
-	//    the shell reaches us on (the `ip` / `ping` / `nslookup` control
-	//    protocol).
+	// 1. receive the ConfigService client the supervisor minted for us (handle 0 when no config
+	//    tree serves this boot - a test scenario), the client channel the shell reaches us on (the
+	//    `ip` / `ping` / `nslookup` control protocol), the provider catalogue and the private link
+	//    administration.
 	let config: u64 = match recv_blocking(bootstrap, &mut buf) {
 		Received::Message { len, handle } if len >= 6 && &buf[..6] == b"CONFIG" => handle,
 		_ => fail_bootstrap(bootstrap, b"config", b"config client not delivered"),
@@ -165,14 +185,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// started reaches it, and a machine with two of them has a second entry to offer rather than
 	// a slot that is already full.
 	//
-	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+	// Read POSITIONALLY, like every role: the bootstrap is read in order at every hop.
 	let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
-	// THE SNAPSHOT IS ALREADY IN THE CHANNEL when `subscribe` answers - the catalogue registers a
-	// subscriber and sends it everything published in one step - so this is a poll and never a
-	// block. A machine with no NIC published has none, which is the same state a zero `FRAMES`
-	// handle used to be - and is served without a link below rather than refused.
-	let frames: u64 = take_published_nic(catalogue);
-	if frames == 0 {
+	// THE PRIVATE LINK ADMINISTRATION, LAST, for the same positional reason. ServiceManager keeps this
+	// root and mints ModemService's connection from it; no ordinary client is ever minted here, so
+	// nothing a `network` client holds reaches an installation. Zero where no such root is served - a
+	// test harness - which leaves this service Ethernet-only.
+	let link_root: u64 = recv_tagged(bootstrap, &mut buf, b"LINKADMIN").unwrap_or(0);
+	let (neigh_cap, mtu_knob, icmpv6_rate, families): (usize, usize, Option<alloc::string::String>, Families) = net_policy(config);
+	let mut runtime: Runtime = Runtime::new(bootstrap, client, catalogue, link_root, Policy { neigh_cap, mtu_knob, icmpv6_rate, families });
+	// 2. SUBSCRIBE ONCE, FOR THE LIFE OF THE SERVICE. The snapshot is already in the channel when
+	//    `subscribe` answers, and every NIC in it is taken before anything is chosen - so the lowest
+	//    publication identity is the one brought up, whatever order the catalogue listed them in.
+	//    Bringing it up says we are online at the right moment: after the stack exists and before
+	//    either family has started.
+	runtime.subscribe();
+	runtime.on_publications();
+	if !runtime.announced {
 		// NO NETWORK PROVIDER ON THIS BOOT, AND THE SERVICE COMES UP ANYWAY - WITHOUT A LINK.
 		//
 		// This used to fail the bootstrap, and a failed NetworkService is not "no network": the
@@ -183,163 +212,431 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// translation - is a machine with every OTHER driver and no NIC, and that is a state
 		// this service has to be able to stand in: online, answering every link-bound
 		// operation with a typed refusal, minting a fresh connection for every caller that
-		// asks for one, and holding no stack, no lease and no frame buffers.
+		// asks for one, and holding no stack, no lease and no frame buffers - and STILL
+		// SUBSCRIBED, so a NIC published later, or a modem installed, is taken when it comes.
 		//
 		// Said on the console in the same breath as the DHCP report would have been, so a
 		// reader of the boot log sees WHY there is no address rather than a service that went
 		// quiet.
 		print(b"network: no network provider on this boot - NetworkService is up without a link\n");
 		send_blocking(bootstrap, b"NetworkService: online", 0);
-		serve_unlinked(client);
+		runtime.announced = true;
 	}
-	// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
-	//    the frame channel (it owns the device; we own the protocol), so we can
-	//    build the stack - its neighbor-cache sized by the config tree's
-	//    `net.arp-cache` policy, its MTU the smaller of the link's report and the
-	//    `net.mtu` knob.
-	let (mac, link_mtu): (MacAddr, usize) = match recv_blocking(frames, &mut buf) {
-		Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => {
-			let link: usize = if len >= 11 { u16::from_le_bytes([buf[9], buf[10]]) as usize } else { DEFAULT_MTU };
-			(MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), if link == 0 { DEFAULT_MTU } else { link })
-		}
-		_ => fail_bootstrap(bootstrap, b"driver", b"NIC did not report its MAC"),
-	};
-	let (neigh_cap, mtu_knob, icmpv6_rate, families): (usize, usize, Option<alloc::string::String>, Families) = net_policy(config);
-	let mtu: usize = service_logic::ipv6_packet::effective_link_mtu(mtu_knob as u16, link_mtu as u16) as usize;
-	let frame_max: usize = mtu + 14;
-	let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, neigh_cap, mtu as u16);
-	// THE IPv6 HOST BESIDE IT, on the same link and the same MAC, with its own state and its own
-	// deadline. It shares nothing with the IPv4 stack, so a link with no IPv6 router behaves exactly
-	// as it did before: the host keeps soliciting at a widening interval and costs one packet.
-	// ONLINE BEFORE ANY FAMILY IS READY, AND BEFORE EITHER IS EVEN STARTED. That is the whole of
-	// "start serving immediately": the service used to block on the DHCP transaction before saying
-	// this, so an IPv6-only boot waited for a conversation it would never have and every caller
-	// waited for a lease it might not need. Readiness is a per-family fact a caller reads and acts
-	// on, never a gate on answering at all.
-	//
-	// AND IT IS SAID HERE RATHER THAN AFTER THE FAMILIES ARE STARTED, because the console is slow:
-	// two lines written between queueing the first IPv6 frames and yielding to the driver delayed
-	// them by tens of milliseconds, which the solicitation-schedule gate measures on the wire.
-	print(b"network: families=");
-	print(families.as_text().as_bytes());
-	print(b", online before any family is ready\n");
-	send_blocking(bootstrap, b"NetworkService: online", 0);
-	// THE PROFILE DECIDES WHETHER IPv6 IS BROUGHT UP AT ALL. Under `ipv4` the host is never attached,
-	// so the family is `disabled` rather than configured-and-unused.
-	if families.includes_v6() {
-		let mut host: ipv6_host::Ipv6Host = ipv6_host::Ipv6Host::new(mac.0, 0, 1, mtu as u16, ipv6_entropy, now_ms);
-		host.set_error_rate(icmpv6_rate.as_deref());
-		// A LINK THAT CANNOT CARRY IPv6 LEAVES IT REFUSED, and says so once rather than silently.
-		if !host.bring_up(now_ms()) {
-			print(b"ipv6: refused on this link - its effective MTU is below the 1280 bytes IPv6 requires; IPv4 is unaffected\n");
-		}
-		stack.attach_ipv6(host);
-		// AT ONCE, NOT BEHIND DHCP. The listener report has to precede the detection probe on the
-		// WIRE, and both have to precede anything that uses the address; leaving them in the queue
-		// until the first idle moment of the serve loop put them fifteen seconds late on a link with
-		// no DHCP server, which is the one case where they matter most.
-		drain_ipv6(frames, &mut stack);
+	// 3. serve the link, the clients, the catalogue and the link administration at once.
+	serve(runtime);
+}
+
+// A NIC publication this service has seen, and what it takes to open it again: the fallback after a
+// modem, or after the selected NIC fails, reopens one of these through the catalogue.
+struct Published {
+	identity: uplink::Publication,
+	info: ProviderInfo,
+}
+
+// THE LINK THE SERVICE RUNS ON: the channel its frames - or, on a raw-IP link, its datagrams - travel
+// on, the stack built for it, its DHCP clock and the buffers sized from its MTU. All of it is dropped
+// together when the link ends.
+struct Link {
+	frames: u64,
+	stack: Stack,
+	lease: LeaseClock,
+	rx: Vec<u8>,
+	tx: Vec<u8>,
+}
+
+// Everything the serve loop stands on.
+struct Runtime {
+	bootstrap: u64,
+	// Whether "online" has been said. It is said once, by whichever comes first: the first link, or
+	// the finding that there is none.
+	announced: bool,
+	catalogue: u64,
+	// The persistent network-kind subscription, or 0 when there is none or it closed.
+	providers: u64,
+	published: Vec<Published>,
+	uplinks: uplink::Uplinks,
+	link: Option<Link>,
+	policy: Policy,
+	// The link-admin root ServiceManager keeps, and the connections minted from it.
+	link_root: u64,
+	link_admins: Vec<u64>,
+	// The link-admin connection holding the one reservation, and which reservation it is. Only that
+	// connection may install or release under it.
+	holder: Option<(u64, u64)>,
+	// The client channels we serve the `network` interface on: the shell's (clients[0]) plus any
+	// minted by `network.open` for a spawned net tool. Each set below reuses free slots and grows on
+	// demand - never a fixed cap.
+	clients: Vec<u64>,
+	// The active sockets (chan 0 = empty slot). Each is handed out by `network.connect` (or
+	// `listener.accept`): its channel, the stack connection index it drives, and its received-data
+	// stream producer (0 = none) plus that stream's frame sequence.
+	socks: Vec<SockSlot>,
+	// The active listeners (chan 0 = empty), each from `network.listen`: its channel, the port it
+	// accepts on, and a deferred `accept`.
+	listeners: Vec<Listener>,
+	// The DNS identities in flight across every client this loop serves: one table, because two
+	// clients drawing the same identity would each accept the other's answer.
+	dns_flight: dns::InFlight,
+	// The pending-operation partition, and the counter every diagnostic echo takes its identity from.
+	pending: Pending,
+	echo: service_logic::net_profile::EchoCounter,
+	// ON THE HEAP, LIKE EVERY OTHER BUFFER HERE. The request buffer grew to 8192 bytes with the
+	// open-target it now has to hold, and the user stack is 16 kB with a deep connect handshake
+	// nested on top of this frame - an array that size is half the stack before the first call.
+	req: Vec<u8>,
+	out: Vec<u8>,
+}
+
+fn identity_of(info: &ProviderInfo) -> uplink::Publication {
+	uplink::Publication { slot: info.slot, generation: info.provider_generation, binding_generation: info.binding_generation }
+}
+
+impl Runtime {
+	fn new(bootstrap: u64, client: u64, catalogue: u64, link_root: u64, policy: Policy) -> Runtime {
+		let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
+		clients.push(client);
+		Runtime { bootstrap, announced: false, catalogue, providers: 0, published: Vec::new(), uplinks: uplink::Uplinks::new(), link: None, policy, link_root, link_admins: Vec::new(), holder: None, clients, socks: Vec::with_capacity(MAX_SOCKS), listeners: Vec::with_capacity(MAX_LISTEN), dns_flight: dns::InFlight::new(), pending: Pending::new(), echo: service_logic::net_profile::EchoCounter::new(random_u16()), req: alloc::vec![0u8; REQ_MAX], out: alloc::vec![0u8; REPLY_MAX] }
 	}
-	// 3. learn our address / mask / gateway / DNS from DHCP, falling back to the
-	//    static config above if no server answers. Under `ipv6` neither runs at all.
-	let mut lease: LeaseClock = LeaseClock::none();
-	if families.includes_v4() {
-		let mut drx: Vec<u8> = alloc::vec![0u8; frame_max];
-		let mut dtx: Vec<u8> = alloc::vec![0u8; frame_max];
-		// WHAT IT GOT, NOT ONLY THAT IT GOT SOMETHING. Every other line in the boot report
-		// carries its own fact - the frame count, the core count, the volume name, the release -
-		// and this one said a transaction had completed and left the reader to go and look.
-		if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
-			print(b"network: configured via DHCP - ");
-			print_address(&stack);
-			print(b"\n");
-			lease = LeaseClock::bound(&stack);
+
+	// THE NETWORK-KIND SUBSCRIPTION, TAKEN ONCE AND HELD. It used to be given back after the first NIC
+	// was opened, which left a service that could not see a NIC published after boot, a withdrawal, or
+	// a second NIC to fall back to.
+	fn subscribe(&mut self) {
+		if self.catalogue == 0 {
+			print(b"NetworkService: no provider catalogue - this instance has no way to find a NIC\n");
+			return;
+		}
+		match provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).subscribe(&ProviderKind::Net) {
+			Some(subscription) => self.providers = subscription,
+			None => print(b"NetworkService: the catalogue refused a network subscription\n"),
+		}
+	}
+
+	// Every frame the subscription has queued, decoded. POLLED, NEVER BLOCKED. A closed subscription is
+	// given up: the NICs already known stay known, and no new one will be seen.
+	fn take_publications(&mut self) -> Vec<ProviderInfo> {
+		let mut taken: Vec<ProviderInfo> = Vec::new();
+		if self.providers == 0 {
+			return taken;
+		}
+		let mut buf: [u8; 256] = [0; 256];
+		loop {
+			match try_recv_caps(self.providers, &mut buf) {
+				PolledCaps::Message { len, handles } => {
+					for &handle in handles.as_slice() {
+						close(handle);
+					}
+					let mut frame_handles = wire::Handles::new();
+					match provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) {
+						Some(info) if info.kind == ProviderKind::Net => taken.push(info),
+						Some(_) => {}
+						None => print(b"NetworkService: a provider frame did not decode\n"),
+					}
+				}
+				PolledCaps::Empty => break,
+				PolledCaps::Closed => {
+					print(b"NetworkService: the catalogue closed the network subscription - no further NIC will be seen\n");
+					close(self.providers);
+					self.providers = 0;
+					break;
+				}
+			}
+		}
+		taken
+	}
+
+	// NICs appeared or went. Taken in identity order, so a batch - the boot snapshot above all - selects
+	// its lowest member rather than whichever the catalogue happened to list first.
+	fn on_publications(&mut self) {
+		let mut infos: Vec<ProviderInfo> = self.take_publications();
+		infos.sort_by_key(identity_of);
+		for info in infos {
+			let nic: uplink::Publication = identity_of(&info);
+			let decision: uplink::Decision = if info.live {
+				match self.uplinks.published(nic) {
+					Ok(decision) => {
+						if !self.published.iter().any(|held| held.identity == nic) {
+							self.published.push(Published { identity: nic, info });
+						}
+						decision
+					}
+					Err(_) => {
+						print(b"network: a NIC publication past the sixteen this service tracks is ignored\n");
+						continue;
+					}
+				}
+			} else {
+				self.published.retain(|held| held.identity != nic);
+				self.uplinks.withdrawn(nic)
+			};
+			self.apply(decision);
+		}
+	}
+
+	// ACT ON A DECISION: end the current link and bring up the one selected. A NIC that cannot be
+	// opened, or that does not report itself, is failed and the choice is made again - which ends,
+	// because every failure takes one publication out of selection.
+	fn apply(&mut self, decision: uplink::Decision) {
+		let mut decision: uplink::Decision = decision;
+		loop {
+			let uplink::Decision::Switch { to, generation } = decision else {
+				return;
+			};
+			self.tear_down();
+			match to {
+				uplink::Selected::None => {
+					print(b"network: no usable link - serving without one\n");
+					return;
+				}
+				uplink::Selected::Nic(nic) => {
+					if self.bring_up_nic(nic, generation) {
+						return;
+					}
+					decision = self.uplinks.failed(nic);
+				}
+				// Only an installation selects a modem, and it brings its own link up.
+				uplink::Selected::Modem(_) => return,
+			}
+		}
+	}
+
+	// END THE CURRENT LINK AND EVERYTHING BOUND TO IT. No TCP connection is carried to the next link:
+	// every socket and listener that belonged to this one answers `link-changed` from now on, the
+	// receive streams it fed are ended, and its addresses, routes, resolvers and traffic go with the
+	// stack.
+	fn tear_down(&mut self) {
+		let Some(link) = self.link.take() else {
+			return;
+		};
+		for slot in self.socks.iter_mut().filter(|slot| slot.chan != 0 && !slot.dead) {
+			if slot.stream_prod != 0 {
+				close(slot.stream_prod);
+				slot.stream_prod = 0;
+			}
+			slot.dead = true;
+		}
+		for listener in self.listeners.iter_mut().filter(|listener| listener.chan != 0 && !listener.dead) {
+			if listener.pending {
+				refuse_accept(listener.chan, listener.pending_corr);
+				listener.pending = false;
+			}
+			listener.dead = true;
+		}
+		close(link.frames);
+		print(b"network: link down - what was bound to it ends with link-changed\n");
+	}
+
+	// Open a NIC through the catalogue, read its greeting, and build and configure a stack on it.
+	fn bring_up_nic(&mut self, nic: uplink::Publication, generation: u64) -> bool {
+		let Some(info) = self.published.iter().find(|held| held.identity == nic).map(|held| held.info.clone()) else {
+			return false;
+		};
+		let frames: u64 = match provider_catalogue::Client::new(ChannelTransport { chan: self.catalogue }).open(&info) {
+			Some(Ok(handle)) => handle,
+			Some(Err(_)) => {
+				print(b"NetworkService: the catalogue refused a connection to the network provider it published\n");
+				return false;
+			}
+			None => {
+				print(b"NetworkService: the catalogue did not answer the connection it published\n");
+				return false;
+			}
+		};
+		// The frame-mover driver leads with our NIC's MAC and the link's MTU over the frame channel
+		// (it owns the device; we own the protocol), so we can build the stack - its neighbor-cache
+		// sized by the config tree's `net.arp-cache` policy, its MTU the smaller of the link's report
+		// and the `net.mtu` knob. BOUNDED: a NIC that never says what it is, is not used.
+		let mut buf: [u8; 64] = [0u8; 64];
+		let greeting: Received = if wait(frames, clock() + GREETING_TICKS) == 0 { recv_blocking(frames, &mut buf) } else { Received::Closed };
+		let (mac, link_mtu): (MacAddr, usize) = match greeting {
+			Received::Message { len, .. } if len >= 9 && &buf[..3] == b"MAC" => {
+				let link: usize = if len >= 11 { u16::from_le_bytes([buf[9], buf[10]]) as usize } else { DEFAULT_MTU };
+				(MacAddr([buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]), if link == 0 { DEFAULT_MTU } else { link })
+			}
+			_ => {
+				print(b"network: the NIC did not report its MAC - it is not used\n");
+				close(frames);
+				return false;
+			}
+		};
+		let families: Families = self.policy.families;
+		let mtu: usize = service_logic::ipv6_packet::effective_link_mtu(self.policy.mtu_knob as u16, link_mtu as u16) as usize;
+		let frame_max: usize = mtu + 14;
+		let mut stack: Stack = Stack::new(mac, OUR_IP, OUR_MASK, GATEWAY_IP, DNS_SERVER, self.policy.neigh_cap, mtu as u16);
+		stack.set_interface(ETHERNET_INDEX, generation);
+		// ONLINE BEFORE ANY FAMILY IS READY, AND BEFORE EITHER IS EVEN STARTED. That is the whole of
+		// "start serving immediately": the service used to block on the DHCP transaction before saying
+		// this, so an IPv6-only boot waited for a conversation it would never have and every caller
+		// waited for a lease it might not need. Readiness is a per-family fact a caller reads and acts
+		// on, never a gate on answering at all.
+		//
+		// AND IT IS SAID HERE RATHER THAN AFTER THE FAMILIES ARE STARTED, because the console is slow:
+		// two lines written between queueing the first IPv6 frames and yielding to the driver delayed
+		// them by tens of milliseconds, which the solicitation-schedule gate measures on the wire.
+		if !self.announced {
+			print(b"network: families=");
+			print(families.as_text().as_bytes());
+			print(b", online before any family is ready\n");
+			send_blocking(self.bootstrap, b"NetworkService: online", 0);
+			self.announced = true;
+		}
+		// THE IPv6 HOST BESIDE IT, on the same link and the same MAC, with its own state and its own
+		// deadline, and the same interface generation the link was selected under. THE PROFILE DECIDES
+		// WHETHER IPv6 IS BROUGHT UP AT ALL: under `ipv4` the host is never attached, so the family is
+		// `disabled` rather than configured-and-unused.
+		if families.includes_v6() {
+			let mut host: ipv6_host::Ipv6Host = ipv6_host::Ipv6Host::new(mac.0, ETHERNET_INDEX as u16, u32::try_from(generation).unwrap_or(u32::MAX), mtu as u16, ipv6_entropy, now_ms);
+			host.set_error_rate(self.policy.icmpv6_rate.as_deref());
+			// A LINK THAT CANNOT CARRY IPv6 LEAVES IT REFUSED, and says so once rather than silently.
+			if !host.bring_up(now_ms()) {
+				print(b"ipv6: refused on this link - its effective MTU is below the 1280 bytes IPv6 requires; IPv4 is unaffected\n");
+			}
+			stack.attach_ipv6(host);
+			// AT ONCE, NOT BEHIND DHCP. The listener report has to precede the detection probe on the
+			// WIRE, and both have to precede anything that uses the address.
+			drain_ipv6(frames, &mut stack);
+		}
+		// Learn our address / mask / gateway / DNS from DHCP, falling back to the static config if no
+		// server answers. Under `ipv6` neither runs at all.
+		let mut rx: Vec<u8> = alloc::vec![0u8; frame_max];
+		let mut tx: Vec<u8> = alloc::vec![0u8; frame_max];
+		let mut lease: LeaseClock = LeaseClock::none();
+		if families.includes_v4() {
+			// WHAT IT GOT, NOT ONLY THAT IT GOT SOMETHING.
+			if do_dhcp(frames, &mut stack, &mut rx, &mut tx) {
+				print(b"network: configured via DHCP - ");
+				print_address(&stack);
+				print(b"\n");
+				lease = LeaseClock::bound(&stack);
+			} else {
+				print(b"network: DHCP unanswered, using static config - ");
+				print_address(&stack);
+				print(b"\n");
+			}
 		} else {
-			print(b"network: DHCP unanswered, using static config - ");
-			print_address(&stack);
-			print(b"\n");
+			// UNDER `ipv6` THERE IS NO IPv4 ADDRESS AT ALL, and the static fallback is not applied
+			// either: a family outside the profile is disabled, not quietly configured.
+			stack.clear_ipv4();
+			print(b"network: ipv4 disabled by profile\n");
 		}
-	} else {
-		// UNDER `ipv6` THERE IS NO IPv4 ADDRESS AT ALL, and the static fallback is not applied
-		// either: a family outside the profile is disabled, not quietly configured.
-		stack.clear_ipv4();
-		print(b"network: ipv4 disabled by profile\n");
+		// Announce us on the link.
+		let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
+		send_frame(frames, &tx[..arp]);
+		self.link = Some(Link { frames, stack, lease, rx, tx });
+		true
 	}
-	// 4. serve the network and the client at once (serve announces us on the link with a gratuitous
-	//    ARP first).
-	serve(frames, client, &mut stack, lease, frame_max, families);
+
+	// INSTALL A RAW-IP LINK, whose configuration was validated before anything was torn down. Nothing
+	// here waits: no MAC, no ARP, no DHCP and no static fallback - the address, route and resolvers are
+	// the attachment's, and the MTU is the smaller of its own and the `net.mtu` knob.
+	fn bring_up_raw(&mut self, attachment: &LinkAttachment, generation: u64) -> LinkInstalled {
+		let mtu: u16 = attachment.mtu.min(self.policy.mtu_knob.min(usize::from(u16::MAX)) as u16);
+		let octets = |ip: &WireIp| Ipv4Addr([ip.a, ip.b, ip.c, ip.d]);
+		let mask: u32 = if attachment.prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(attachment.prefix.min(32))) };
+		let gateway: Ipv4Addr = attachment.gateway.as_ref().map(octets).unwrap_or(Ipv4Addr([0; 4]));
+		let dns: [Ipv4Addr; 2] = [attachment.dns.first().map(octets).unwrap_or(Ipv4Addr([0; 4])), attachment.dns.get(1).map(octets).unwrap_or(Ipv4Addr([0; 4]))];
+		let mut stack: Stack = Stack::new_raw(octets(&attachment.address), Ipv4Addr(mask.to_be_bytes()), gateway, dns, mtu);
+		stack.set_interface(RAW_INDEX, generation);
+		print(b"network: modem link installed - ");
+		print_address(&stack);
+		print(b"\n");
+		let frame_max: usize = usize::from(mtu) + 14;
+		self.link = Some(Link { frames: attachment.packets, stack, lease: LeaseClock::none(), rx: alloc::vec![0u8; frame_max], tx: alloc::vec![0u8; frame_max] });
+		LinkInstalled { interface: InterfaceId { index: RAW_INDEX, generation }, mtu }
+	}
+
+	// A LINK WHOSE CHANNEL CLOSED IS OVER. A NIC's is failed and not chosen again until it is published
+	// again; a modem's is released, which brings back what it replaced.
+	fn check_link(&mut self) {
+		if !self.link.as_ref().is_some_and(|link| link.stack.channel_closed()) {
+			return;
+		}
+		let decision: uplink::Decision = match self.uplinks.selected() {
+			uplink::Selected::Nic(nic) => {
+				print(b"network: the NIC's channel closed - its link is torn down\n");
+				self.uplinks.failed(nic)
+			}
+			uplink::Selected::Modem(reservation) => {
+				print(b"network: the modem link's channel closed - the link is removed\n");
+				self.holder = None;
+				self.uplinks.release(reservation)
+			}
+			uplink::Selected::None => uplink::Decision::Keep,
+		};
+		match decision {
+			uplink::Decision::Keep => self.tear_down(),
+			switch => self.apply(switch),
+		}
+	}
+
+	// Frames arrived on the link: run one through the stack, then feed the receive streams and answer
+	// any deferred `accept` the frame may have completed.
+	fn on_frames(&mut self) {
+		let Runtime { link, socks, listeners, .. } = self;
+		let Some(Link { frames, stack, lease, rx, tx }) = link.as_mut() else {
+			return;
+		};
+		let frames: u64 = *frames;
+		if let Event::DhcpReply(reply) = pump(frames, stack, rx, tx) {
+			lease.on_reply(&reply, stack);
+		}
+		// Feed any newly received bytes to each active recv stream, closing the producer (end of
+		// stream) once that connection's peer closes or resets.
+		for slot in socks.iter_mut().filter(|slot| slot.chan != 0 && !slot.dead && slot.stream_prod != 0) {
+			let ci: usize = slot.ci;
+			let prod: u64 = stream_pump(ci, frames, stack, tx, slot.stream_prod, &mut slot.stream_seq);
+			slot.stream_prod = prod;
+			if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
+				close(prod);
+				slot.stream_prod = 0;
+			}
+		}
+		// Answer any deferred `accept`: a frame may have completed an inbound handshake, so a listener
+		// that was waiting for a connection gets one now.
+		for listener in listeners.iter_mut().filter(|listener| listener.chan != 0 && !listener.dead && listener.pending) {
+			if let Some(ci) = stack.take_accepted(listener.binding.port) {
+				if accept_handoff(listener.chan, listener.pending_corr, ci, socks, stack) {
+					listener.pending = false;
+				}
+			}
+		}
+	}
+
+	// The periodic wake: the IPv6 layer's timers and the DHCP lease clock.
+	fn on_timer(&mut self) {
+		let Some(Link { frames, stack, lease, rx, tx }) = self.link.as_mut() else {
+			return;
+		};
+		if let Some(host) = stack.ipv6() {
+			host.on_timer(now_ms());
+		}
+		drain_ipv6(*frames, stack);
+		report_ipv6(stack);
+		lease_due(*frames, stack, lease, rx, tx);
+	}
 }
 
 // Send a built frame to the driver to transmit. A zero-length frame (the stack
 // produced no reply) sends nothing.
-// THE FIRST LIVE NETWORK PROVIDER THE SUBSCRIPTION HAS ALREADY QUEUED, connected to.
-//
-// POLLED, NEVER BLOCKED, and it stops at the first provider it CONNECTS to rather than draining the
-// channel: a frame this function reads and drops is a publication nothing will see again. Zero for a
-// boot that granted no catalogue connection or a machine with no NIC, which the caller serves
-// without a link.
-fn take_published_nic(catalogue: u64) -> u64 {
-	if catalogue == 0 {
-		print(b"NetworkService: no provider catalogue - this instance has no way to find a NIC\n");
-		return 0;
-	}
-	let providers: u64 = match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Net) {
-		Some(subscription) => subscription,
-		None => {
-			print(b"NetworkService: the catalogue refused a network subscription\n");
-			return 0;
-		}
-	};
-	let mut buf: [u8; 256] = [0; 256];
-	let mut opened: u64 = 0;
-	loop {
-		let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
-		for &handle in handles.as_slice() {
-			close(handle);
-		}
-		let mut frame_handles = wire::Handles::new();
-		let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
-			print(b"NetworkService: a provider frame did not decode\n");
-			continue;
-		};
-		if !info.live {
-			continue;
-		}
-		match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
-			Some(Ok(handle)) => {
-				opened = handle;
-				break;
-			}
-			Some(Err(_)) => print(b"NetworkService: the catalogue refused a connection to the network provider it published\n"),
-			None => print(b"NetworkService: the catalogue did not answer the connection it published\n"),
-		}
-	}
-	// THE SUBSCRIPTION IS GIVEN BACK. This service takes one NIC at bootstrap and does not follow
-	// a replacement - its whole stack is built on the link it opened - so holding the stream open
-	// would be a handle nothing reads and a slot the catalogue could not give to a consumer that
-	// does follow one.
-	close(providers);
-	opened
-}
-
 fn send_frame(frames: u64, frame: &[u8]) {
 	if !frame.is_empty() {
 		send_blocking(frames, frame, 0);
 	}
 }
 
-// Receive one frame from the driver, run it through the stack, send any reply frame
-// back to the driver, and return the stack event it produced (an echo / DNS reply
-// an in-flight `ping` / `nslookup` is waiting for, or `None`). The frame channel
-// closing means the driver is gone - there is no network left to serve, and a wait
-// on the closed channel would be forever-ready, so the service exits instead of
-// spinning on it.
+// Receive one frame from the link, run it through the stack, send any reply frame
+// back, and return the stack event it produced (an echo / DNS reply an in-flight
+// `ping` / `nslookup` is waiting for, or `None`). The channel closing means the link
+// is gone: the stack is marked, every wait on it stops at once rather than spinning
+// on a channel that is forever ready, and the serve loop tears the link down and
+// moves on to the next one.
 fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Event {
 	match recv_blocking(frames, rx) {
 		Received::Message { len, .. } => {
 			// AN IPv6 FRAME GOES TO THE IPv6 HOST AND NOWHERE ELSE. The two stacks share the link
-			// and nothing else, so neither can be made to misbehave by the other's traffic.
-			if len > 13 && u16::from_be_bytes([rx[12], rx[13]]) == 0x86dd {
+			// and nothing else, so neither can be made to misbehave by the other's traffic. A raw-IP
+			// link carries no ethertype: bytes 12 and 13 of its datagrams are a source address.
+			if !stack.is_raw() && len > 13 && u16::from_be_bytes([rx[12], rx[13]]) == 0x86dd {
 				if let Some(host) = stack.ipv6() {
 					host.receive(&rx[..len], now_ms());
 				}
@@ -355,7 +652,10 @@ fn pump(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> Event {
 			send_frame(frames, &tx[..outcome.reply_len]);
 			outcome.event
 		}
-		Received::Closed => exit(),
+		Received::Closed => {
+			stack.mark_channel_closed();
+			Event::None
+		}
 	}
 }
 
@@ -525,6 +825,11 @@ fn print_u64(mut value: u64) {
 // still means what it meant.
 fn wait_frames(frames: u64, stack: &mut Stack, deadline: u64) -> i64 {
 	loop {
+		// A LINK WHOSE CHANNEL CLOSED HAS NOTHING TO WAIT FOR, and every caller stops at a non-zero
+		// answer.
+		if stack.channel_closed() {
+			return ERR_PEER_CLOSED;
+		}
 		// EVERY TIMER THE STACK OWNS BOUNDS THIS WAIT. The IPv6 layer's deadlines and TCP's
 		// retransmission, persist and TIME-WAIT deadlines are all reasons to wake, and a wait that
 		// knew about only one of them would leave the others firing whenever unrelated traffic
@@ -642,91 +947,11 @@ fn place_client(clients: &mut Vec<u64>, chan: u64) {
 	clients.push(chan);
 }
 
-// THE SERVICE WITHOUT A LINK. Stand on every client channel and nothing else: there is no frame
-// channel to pump, no socket and no listener can exist, and every operation that would need the
-// NIC answers `Io` - the device this service moves frames through is not there. What does work is
-// exactly what does not need a link: the reserved connect request and `open` mint fresh
-// connections, so PermissionManager can still grant the network capability and a tool launched
-// under it gets a typed refusal rather than a hang; `capacity` counts the clients; `sockets` is
-// empty. The service ends when its last client is gone, which is what `serve_multi` does for every
-// other service whose serve root closes.
-fn serve_unlinked(client: u64) -> ! {
-	// ON THE HEAP, LIKE EVERY OTHER BUFFER HERE. The request buffer grew to 8192 bytes with the
-	// open-target it now has to hold, and the user stack is 16 kB with a deep connect handshake
-	// nested on top of this frame - an array that size is half the stack before the first call.
-	let mut req: Vec<u8> = alloc::vec![0u8; REQ_MAX];
-	let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
-	let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
-	clients.push(client);
-	loop {
-		let mut waits: Vec<u64> = Vec::with_capacity(clients.len());
-		let mut slot_of: Vec<usize> = Vec::with_capacity(clients.len());
-		let mut i: usize = 0;
-		while i < clients.len() {
-			if clients[i] != 0 {
-				waits.push(clients[i]);
-				slot_of.push(i);
-			}
-			i += 1;
-		}
-		if waits.is_empty() {
-			exit();
-		}
-		let ready_raw: i64 = wait_any(&waits, 0);
-		if ready_raw < 0 {
-			continue;
-		}
-		let slot: usize = slot_of[ready_raw as usize];
-		let chan: u64 = clients[slot];
-		match recv_caps_blocking(chan, &mut req) {
-			ReceivedCaps::Message { len, handles: caps } => {
-				// A FRESH CONNECTION PER CALLER, answered by hand for the same reason the
-				// linked loop answers it by hand: this service does not stand on `serve_multi`.
-				if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
-					for &unclaimed in caps.as_slice() {
-						close(unclaimed);
-					}
-					match channel() {
-						Some((mine, theirs)) => {
-							place_client(&mut clients, mine);
-							send_blocking(chan, &[], theirs);
-						}
-						None => {
-							send_blocking(chan, &[], 0);
-						}
-					}
-					continue;
-				}
-				let mut handle = caps;
-				let mut new_client: u64 = 0;
-				let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
-				{
-					let mut svc: Unlinked = Unlinked { new_client: &mut new_client, clients_used };
-					let mut reply_handle = proto::codec::Handles::new();
-					if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
-						if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
-							for &leftover in reply_handle.as_slice() {
-								close(leftover);
-							}
-						}
-					}
-				}
-				for &unclaimed in handle.as_slice() {
-					close(unclaimed);
-				}
-				if new_client != 0 {
-					place_client(&mut clients, new_client);
-				}
-			}
-			ReceivedCaps::Closed => {
-				close(chan);
-				clients[slot] = 0;
-			}
-		}
-	}
-}
-
-// The typed `network` service with no link behind it - see `serve_unlinked`.
+// THE SERVICE WITHOUT A LINK: every operation that would need one answers `Io` - the device this
+// service moves frames through is not there. What does work is exactly what does not need a link: the
+// reserved connect request and `open` mint fresh connections, so PermissionManager can still grant the
+// network capability and a tool launched under it gets a typed refusal rather than a hang; `capacity`
+// counts the clients; `sockets` is empty.
 struct Unlinked<'a> {
 	new_client: &'a mut u64,
 	clients_used: u32,
@@ -794,236 +1019,435 @@ impl network::Service for Unlinked<'_> {
 	}
 }
 
-// Stand on the driver's frame channel, every client's typed request channel, and
-// the active socket's channel at once (wait_any): a frame from the driver is parsed
-// (answering ARP / ICMP, any reply sent back to transmit); a client request is
-// decoded, dispatched to the generated `network` server, and answered; a socket
-// request (send / recv / close) is dispatched to the `socket` server for the one
-// connection `network.connect` opened. `network.open` mints a fresh client channel
-// (one per spawned net tool) added to the client set; a client channel closing
-// drops it from the set, the socket channel closing tears the connection down. The
-// gratuitous ARP that announces us on the link goes out first. While a DHCP lease
-// is held, its clock arms the wait's deadline (a periodic housekeeping wake) and
-// `lease_due` extends the lease when a threshold comes due.
-fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClock, frame_max: usize, families: Families) -> ! {
-	// The frame and reply buffers live on the heap, not in this function's frame:
-	// serve holds all of them for its whole lifetime and the connect handshake
-	// nests a deep call chain on top, which would overflow the 16 kB user stack.
-	let mut rx: Vec<u8> = alloc::vec![0u8; frame_max];
-	let mut tx: Vec<u8> = alloc::vec![0u8; frame_max];
-	// ON THE HEAP, LIKE EVERY OTHER BUFFER HERE. The request buffer grew to 8192 bytes with the
-	// open-target it now has to hold, and the user stack is 16 kB with a deep connect handshake
-	// nested on top of this frame - an array that size is half the stack before the first call.
-	let mut req: Vec<u8> = alloc::vec![0u8; REQ_MAX];
-	let mut out: Vec<u8> = alloc::vec![0u8; REPLY_MAX];
-	let arp: usize = stack.build_arp_request(GATEWAY_IP, &mut tx);
-	send_frame(frames, &tx[..arp]);
-	// The client channels we serve the `network` interface on: the shell's
-	// (clients[0]) plus any minted by `network.open` for a spawned net tool.
-	// Each set below reuses free slots and grows on demand - never a fixed cap.
-	let mut clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
-	clients.push(client);
-	// The active sockets (chan 0 = empty slot). Each is handed out by `network.connect`
-	// (later `listener.accept`): its channel, the stack connection index it drives, and
-	// its received-data stream producer (0 = none) plus that stream's frame sequence.
-	// The serve loop waits on every active socket channel at once.
-	let mut socks: Vec<SockSlot> = Vec::with_capacity(MAX_SOCKS);
-	// The active listeners (chan 0 = empty), each from `network.listen`: its channel,
-	// the port it accepts on, and a deferred `accept` (the correlation id to answer
-	// once an inbound connection completes, if accept was called with none pending).
-	let mut listeners: Vec<Listener> = Vec::with_capacity(MAX_LISTEN);
-	// The DNS identities in flight across every client this loop serves: one table, because two
-	// clients drawing the same identity would each accept the other's answer.
-	let mut dns_flight: dns::InFlight = dns::InFlight::new();
-	// The pending-operation partition, and the counter every diagnostic echo takes its identity from.
-	let mut pending: Pending = Pending::new();
-	let mut echo: service_logic::net_profile::EchoCounter = service_logic::net_profile::EchoCounter::new(random_u16());
+// What a ready handle in the serve loop's wait set is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ready {
+	Frames,
+	Providers,
+	LinkAdmin,
+	Client,
+	Socket,
+	Listener,
+}
+
+// ONE LOOP, LINKED OR NOT. Stand on the link's channel when there is a link, the catalogue
+// subscription, the link administration, every client's typed request channel, and every socket and
+// listener at once (wait_any): a frame from the link is parsed (answering ARP / ICMP, any reply sent
+// back to transmit); a publication may switch the link; a client request is decoded, dispatched to the
+// generated `network` server - or, with no link, to the one that refuses what needs a link - and
+// answered; a socket request (send / recv / close) is dispatched to the `socket` server for its
+// connection. `network.open` mints a fresh client channel (one per spawned net tool) added to the
+// client set; a client channel closing drops it from the set, a socket channel closing tears its
+// connection down. While a DHCP lease is held, its clock arms the wait's deadline (a periodic
+// housekeeping wake) and `lease_due` extends the lease when a threshold comes due.
+fn serve(mut runtime: Runtime) -> ! {
 	loop {
-		// Build the wait set: the driver frame channel always (index 0), every active
-		// client channel, then every active socket channel, then every listener. `kind`
-		// tags each wait index (0 = client, 1 = socket, 2 = listener) and `slot_of` maps
-		// it back to its slot.
-		let capacity: usize = 1 + clients.len() + socks.len() + listeners.len();
+		let capacity: usize = 3 + runtime.link_admins.len() + runtime.clients.len() + runtime.socks.len() + runtime.listeners.len();
 		let mut waits: Vec<u64> = Vec::with_capacity(capacity);
-		let mut kind: Vec<u8> = Vec::with_capacity(capacity);
+		let mut kind: Vec<Ready> = Vec::with_capacity(capacity);
 		let mut slot_of: Vec<usize> = Vec::with_capacity(capacity);
-		waits.push(frames);
-		kind.push(0);
-		slot_of.push(usize::MAX);
-		let mut i: usize = 0;
-		while i < clients.len() {
-			if clients[i] != 0 {
-				waits.push(clients[i]);
-				kind.push(0);
-				slot_of.push(i);
+		let mut stand = |handle: u64, ready: Ready, slot: usize| {
+			if handle != 0 {
+				waits.push(handle);
+				kind.push(ready);
+				slot_of.push(slot);
 			}
-			i += 1;
-		}
-		let mut i: usize = 0;
-		while i < socks.len() {
-			if socks[i].chan != 0 {
-				waits.push(socks[i].chan);
-				kind.push(1);
-				slot_of.push(i);
-			}
-			i += 1;
-		}
-		let mut i: usize = 0;
-		while i < listeners.len() {
-			if listeners[i].chan != 0 {
-				waits.push(listeners[i].chan);
-				kind.push(2);
-				slot_of.push(i);
-			}
-			i += 1;
-		}
-		let n: usize = waits.len();
-		// While a lease clock runs, its next threshold bounds the wait as a periodic
-		// housekeeping wake; without one the wait has no deadline at all.
-		// ONE AGGREGATED DEADLINE. Whatever this loop is blocked on, it must not block past the next
-		// thing that has to happen - and after the lease clock, that is the IPv6 layer's own next
-		// timer: a detection probe, a router solicitation, a neighbour retry or a listener report.
-		// Without this, a blocking client request starves every one of them.
-		let ipv6_due: Option<u64> = stack.ipv6_deadline().map(ticks_from_ms);
-		let next: Option<u64> = match (lease.next_due(), ipv6_due) {
-			(Some(left), Some(right)) => Some(left.min(right)),
-			(left, right) => left.or(right),
 		};
+		if let Some(link) = runtime.link.as_ref() {
+			stand(link.frames, Ready::Frames, 0);
+		}
+		stand(runtime.providers, Ready::Providers, 0);
+		stand(runtime.link_root, Ready::LinkAdmin, 0);
+		for &chan in &runtime.link_admins {
+			stand(chan, Ready::LinkAdmin, 0);
+		}
+		for (slot, &chan) in runtime.clients.iter().enumerate() {
+			stand(chan, Ready::Client, slot);
+		}
+		for (slot, sock) in runtime.socks.iter().enumerate() {
+			stand(sock.chan, Ready::Socket, slot);
+		}
+		for (slot, listener) in runtime.listeners.iter().enumerate() {
+			stand(listener.chan, Ready::Listener, slot);
+		}
+		// Nothing left to serve at all: the service ends, which is what `serve_multi` does for every
+		// other service whose serve root closes.
+		if waits.is_empty() {
+			exit();
+		}
+		// ONE AGGREGATED DEADLINE. Whatever this loop is blocked on, it must not block past the next
+		// thing that has to happen - the lease clock, and after it the IPv6 layer's own next timer: a
+		// detection probe, a router solicitation, a neighbour retry or a listener report. Without
+		// this, a blocking client request starves every one of them. No link, no deadline.
+		let next: Option<u64> = runtime.link.as_ref().and_then(|link| {
+			let ipv6_due: Option<u64> = link.stack.ipv6_deadline().map(ticks_from_ms);
+			match (link.lease.next_due(), ipv6_due) {
+				(Some(left), Some(right)) => Some(left.min(right)),
+				(left, right) => left.or(right),
+			}
+		});
 		let ready_raw: i64 = match next {
-			Some(deadline) => wait_any_periodic(&waits[..n], deadline),
-			None => wait_any(&waits[..n], 0),
+			Some(deadline) => wait_any_periodic(&waits, deadline),
+			None => wait_any(&waits, 0),
 		};
 		if ready_raw == ERR_TIMED_OUT {
-			if let Some(host) = stack.ipv6() {
-				host.on_timer(now_ms());
+			runtime.on_timer();
+		} else if ready_raw >= 0 {
+			let ready: usize = ready_raw as usize;
+			match kind[ready] {
+				Ready::Frames => runtime.on_frames(),
+				Ready::Providers => runtime.on_publications(),
+				Ready::LinkAdmin => runtime.on_link_admin(waits[ready]),
+				Ready::Client => runtime.on_client(slot_of[ready]),
+				Ready::Socket => runtime.on_socket(slot_of[ready]),
+				Ready::Listener => runtime.on_listener(slot_of[ready]),
 			}
-			drain_ipv6(frames, stack);
-			report_ipv6(stack);
-			lease_due(frames, stack, &mut lease, &mut rx, &mut tx);
-			continue;
 		}
-		let ready: usize = ready_raw as usize;
-		if ready == 0 {
-			if let Event::DhcpReply(reply) = pump(frames, stack, &mut rx, &mut tx) {
-				lease.on_reply(&reply, stack);
-			}
-			// Feed any newly received bytes to each active recv stream, closing the
-			// producer (end of stream) once that connection's peer closes or resets.
-			let mut si: usize = 0;
-			while si < socks.len() {
-				if socks[si].chan != 0 && socks[si].stream_prod != 0 {
-					let ci: usize = socks[si].ci;
-					let prod: u64 = stream_pump(ci, frames, stack, &mut tx, socks[si].stream_prod, &mut socks[si].stream_seq);
-					socks[si].stream_prod = prod;
-					if prod != 0 && (stack.tcp_peer_fin(ci) || stack.tcp_aborted(ci)) {
-						close(prod);
-						socks[si].stream_prod = 0;
-					}
-				}
-				si += 1;
-			}
-			// Answer any deferred `accept`: a frame may have completed an inbound
-			// handshake, so a listener that was waiting for a connection gets one now.
-			let mut li: usize = 0;
-			while li < listeners.len() {
-				if listeners[li].chan != 0 && listeners[li].pending {
-					if let Some(ci) = stack.take_accepted(listeners[li].binding.port) {
-						if accept_handoff(listeners[li].chan, listeners[li].pending_corr, ci, &mut socks, stack) {
-							listeners[li].pending = false;
-						}
-					}
-				}
-				li += 1;
-			}
-		} else if kind[ready] == 1 {
-			serve_socket(&mut socks[slot_of[ready]], frames, stack, &mut rx, &mut tx, &mut out, &mut req);
-		} else if kind[ready] == 2 {
-			serve_listener(&mut listeners[slot_of[ready]], &mut socks, stack, &mut req);
-		} else {
-			// A client request on clients[slot_of[ready]]: dispatch the `network`
-			// interface. `open` may mint another client channel, `connect` may open a
-			// socket, `listen` a listener; a closed channel is dropped from the set.
-			let slot: usize = slot_of[ready];
-			let chan: u64 = clients[slot];
-			match recv_caps_blocking(chan, &mut req) {
-				ReceivedCaps::Message { len, handles: caps } => {
-					// A FRESH CONNECTION PER CALLER, answered here because it cannot be
-					// answered generically.
-					//
-					// This service is not built on `serve_multi` - it stands on the driver's
-					// frame channel, every client, every socket and every listener at once -
-					// so the reserved connect request has to be handled by hand, as
-					// InputService, DisplayService and the audio engine already do. Without
-					// it `service_connect` waits forever against this service and no other,
-					// and a `factory` role in the bootstrap plan would mean one thing here
-					// and another everywhere else.
-					if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
-						for &unclaimed in caps.as_slice() {
-							close(unclaimed);
-						}
-						match channel() {
-							Some((mine, theirs)) => {
-								place_client(&mut clients, mine);
-								send_blocking(chan, &[], theirs);
-							}
-							// Refused by replying with no capability: a caller that gets none
-							// knows it has no connection, which is better than a channel
-							// nobody is waiting on.
-							None => {
-								send_blocking(chan, &[], 0);
-							}
-						}
-						continue;
-					}
-					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
-					// over the single-handle receive, which keeps the first and drops the rest - so a
-					// client sending stdin, stdout and stderr had two destroyed before dispatch.
-					let mut handle = caps;
-					let mut new_sock: u64 = 0;
-					let mut new_sock_ci: usize = 0;
-					let mut new_client: u64 = 0;
-					let mut new_listener: u64 = 0;
-					let mut new_listener_id: u32 = 0;
-					let mut new_listener_binding: Binding = Binding { mode: service_logic::tcp_bind::BindMode::Ipv4Only, address: service_logic::tcp_bind::Local::V4([0; 4]), port: 0 };
-					// every set grows on demand, so there is always room.
-					let client_room: bool = true;
-					let sock_room: bool = true;
-					let listener_room: bool = true;
-					// the live pool utilization, for the `capacity` reply (observability).
-					let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
-					let sockets_used: u32 = socks.iter().filter(|s| s.chan != 0).count() as u32;
-					let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
-					{
-						let mut svc: Net = Net { frames, seq: 0, flight: &mut dns_flight, pending: &mut pending, echo: &mut echo, families, client: chan, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_binding: &mut new_listener_binding, new_listener_id: &mut new_listener_id, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
-						let mut reply_handle = proto::codec::Handles::new();
-						if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
-							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
-								}
-							}
-						}
-					}
-					for &unclaimed in handle.as_slice() {
+		// A link whose channel closed during any of the above ends here, before the next wait.
+		runtime.check_link();
+	}
+}
+
+impl Runtime {
+	// A client request on clients[slot]: dispatch the `network` interface. `open` may mint another
+	// client channel, `connect` may open a socket, `listen` a listener; a closed channel is dropped
+	// from the set.
+	fn on_client(&mut self, slot: usize) {
+		let Runtime { link, clients, socks, listeners, dns_flight, pending, echo, req, out, policy, .. } = self;
+		let chan: u64 = clients[slot];
+		match recv_caps_blocking(chan, req) {
+			ReceivedCaps::Message { len, handles: caps } => {
+				// A FRESH CONNECTION PER CALLER, answered here because it cannot be answered
+				// generically.
+				//
+				// This service is not built on `serve_multi` - it stands on the link, every client,
+				// every socket and every listener at once - so the reserved connect request has to be
+				// handled by hand, as InputService, DisplayService and the audio engine already do.
+				// Without it `service_connect` waits forever against this service and no other, and a
+				// `factory` role in the bootstrap plan would mean one thing here and another
+				// everywhere else.
+				if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
+					for &unclaimed in caps.as_slice() {
 						close(unclaimed);
 					}
-					if new_sock != 0 {
-						place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
+					match channel() {
+						Some((mine, theirs)) => {
+							place_client(clients, mine);
+							send_blocking(chan, &[], theirs);
+						}
+						// Refused by replying with no capability: a caller that gets none knows it has
+						// no connection, which is better than a channel nobody is waiting on.
+						None => {
+							send_blocking(chan, &[], 0);
+						}
 					}
-					if new_listener != 0 {
-						place_listener(&mut listeners, Listener { chan: new_listener, id: new_listener_id, binding: new_listener_binding, pending_corr: 0, pending: false });
+					return;
+				}
+				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])` over
+				// the single-handle receive, which keeps the first and drops the rest - so a client
+				// sending stdin, stdout and stderr had two destroyed before dispatch.
+				let mut handle = caps;
+				let mut new_sock: u64 = 0;
+				let mut new_sock_ci: usize = 0;
+				let mut new_client: u64 = 0;
+				let mut new_listener: u64 = 0;
+				let mut new_listener_id: u32 = 0;
+				let mut new_listener_binding: Binding = Binding { mode: service_logic::tcp_bind::BindMode::Ipv4Only, address: service_logic::tcp_bind::Local::V4([0; 4]), port: 0 };
+				// the live pool utilization, for the `capacity` reply (observability).
+				let clients_used: u32 = clients.iter().filter(|&&c| c != 0).count() as u32;
+				let sockets_used: u32 = socks.iter().filter(|s| s.chan != 0).count() as u32;
+				let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
+				let mut reply_handle = proto::codec::Handles::new();
+				let answered: Option<usize> = match link.as_mut() {
+					Some(Link { frames, stack, rx, tx, .. }) => {
+						// every set grows on demand, so there is always room.
+						let mut svc: Net = Net { frames: *frames, seq: 0, flight: dns_flight, pending, echo, families: policy.families, client: chan, stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_binding: &mut new_listener_binding, new_listener_id: &mut new_listener_id, sock_room: true, client_room: true, listener_room: true, clients_used, sockets_used, listeners_used };
+						network::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle)
 					}
-					if new_client != 0 {
-						place_client(&mut clients, new_client);
+					None => {
+						let mut svc: Unlinked = Unlinked { new_client: &mut new_client, clients_used };
+						network::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle)
+					}
+				};
+				if let Some(n2) = answered {
+					if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+						for &leftover in reply_handle.as_slice() {
+							close(leftover);
+						}
 					}
 				}
-				ReceivedCaps::Closed => {
-					close(chan);
-					clients[slot] = 0;
+				for &unclaimed in handle.as_slice() {
+					close(unclaimed);
+				}
+				if new_sock != 0 {
+					place_sock(socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0, dead: false });
+				}
+				if new_listener != 0 {
+					place_listener(listeners, Listener { chan: new_listener, id: new_listener_id, binding: new_listener_binding, pending_corr: 0, pending: false, dead: false });
+				}
+				if new_client != 0 {
+					place_client(clients, new_client);
+				}
+			}
+			ReceivedCaps::Closed => {
+				close(chan);
+				clients[slot] = 0;
+			}
+		}
+	}
+
+	fn on_socket(&mut self, slot: usize) {
+		let Runtime { link, socks, req, out, .. } = self;
+		let sock: &mut SockSlot = &mut socks[slot];
+		match link.as_mut() {
+			Some(Link { frames, stack, rx, tx, .. }) if !sock.dead => serve_socket(sock, *frames, stack, rx, tx, out, req),
+			_ => serve_dead_socket(sock, out, req),
+		}
+	}
+
+	fn on_listener(&mut self, slot: usize) {
+		let Runtime { link, socks, listeners, req, .. } = self;
+		let listener: &mut Listener = &mut listeners[slot];
+		match link.as_mut() {
+			Some(link) if !listener.dead => serve_listener(listener, socks, &mut link.stack, req),
+			_ => serve_dead_listener(listener, req),
+		}
+	}
+
+	// A request on the link-admin root or on a connection minted from it.
+	fn on_link_admin(&mut self, chan: u64) {
+		let mut req: Vec<u8> = alloc::vec![0u8; LINK_ADMIN_BYTES];
+		match recv_caps_blocking(chan, &mut req) {
+			ReceivedCaps::Message { len, handles } => {
+				// A CONNECTION PER CALLER, minted here like every other root of this service mints one.
+				if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
+					for &unclaimed in handles.as_slice() {
+						close(unclaimed);
+					}
+					match channel() {
+						Some((mine, theirs)) => {
+							place_client(&mut self.link_admins, mine);
+							send_blocking(chan, &[], theirs);
+						}
+						None => {
+							send_blocking(chan, &[], 0);
+						}
+					}
+					return;
+				}
+				let mut handles = handles;
+				let mut out: Vec<u8> = alloc::vec![0u8; LINK_ADMIN_BYTES];
+				let mut reply_handles = proto::codec::Handles::new();
+				let mut deferred: uplink::Decision = uplink::Decision::Keep;
+				let answered: Option<usize> = {
+					let mut call: LinkAdmin = LinkAdmin { runtime: self, chan, deferred: &mut deferred };
+					network_link_admin::dispatch(&mut call, &req[..len], &mut handles, &mut out, &mut reply_handles)
+				};
+				if let Some(n) = answered {
+					if !send_caps_blocking(chan, &out[..n], reply_handles.as_slice()) {
+						for &leftover in reply_handles.as_slice() {
+							close(leftover);
+						}
+					}
+				}
+				for &unclaimed in handles.as_slice() {
+					close(unclaimed);
+				}
+				// THE ANSWER FIRST, THE FALLBACK AFTER. A release that brings a NIC back runs DHCP, and
+				// the caller has already been told its link is gone.
+				self.apply(deferred);
+			}
+			ReceivedCaps::Closed => {
+				close(chan);
+				if chan == self.link_root {
+					self.link_root = 0;
+				}
+				for held in self.link_admins.iter_mut().filter(|held| **held == chan) {
+					*held = 0;
+				}
+				// THE HOLDER GONE IS ITS RESERVATION GONE: a modem service that ended cannot keep a link
+				// installed, or a reservation open, on its behalf.
+				if let Some((holder, reservation)) = self.holder
+					&& holder == chan
+				{
+					self.holder = None;
+					let decision: uplink::Decision = self.uplinks.release(reservation);
+					self.apply(decision);
 				}
 			}
 		}
 	}
+}
+
+// THE PRIVATE LINK ADMINISTRATION, for one connection. A reservation belongs to the connection that
+// made it: another connection's install or release names nothing it holds.
+struct LinkAdmin<'a> {
+	runtime: &'a mut Runtime,
+	chan: u64,
+	// A release's fallback, applied after the reply has gone.
+	deferred: &'a mut uplink::Decision,
+}
+
+fn octets_of(ip: &WireIp) -> [u8; 4] {
+	[ip.a, ip.b, ip.c, ip.d]
+}
+
+impl network_link_admin::Service for LinkAdmin<'_> {
+	// ADMISSION, BEFORE THE MODEM IS ASKED TO DO ANYTHING. `again` when another link is selected and
+	// the caller may not replace it, or a modem link already exists; the current link is untouched.
+	fn reserve(&mut self, replace_uplink: bool) -> Result<u64, Error> {
+		match self.runtime.uplinks.reserve(replace_uplink) {
+			Ok(reservation) => {
+				self.runtime.holder = Some((self.chan, reservation));
+				Ok(reservation)
+			}
+			Err(uplink::Refusal::Busy) => Err(Error::Again),
+			Err(_) => Err(Error::Invalid),
+		}
+	}
+
+	// COMMIT ATOMICALLY OR NOT AT ALL. Everything is validated before the current link is touched, and
+	// a refusal leaves it exactly as it was and gives the packet channel back.
+	fn install(&mut self, reservation: u64, attachment: LinkAttachment) -> Result<LinkInstalled, Error> {
+		let refuse = |error: Error| -> Result<LinkInstalled, Error> {
+			if attachment.packets != 0 {
+				close(attachment.packets);
+			}
+			Err(error)
+		};
+		if self.runtime.holder != Some((self.chan, reservation)) {
+			return refuse(Error::NotFound);
+		}
+		let checked: uplink::Attachment = uplink::Attachment { family: attachment.family as u8, address: octets_of(&attachment.address), prefix: attachment.prefix, gateway: attachment.gateway.as_ref().map(octets_of), dns: [attachment.dns.first().map(octets_of), attachment.dns.get(1).map(octets_of)], mtu: attachment.mtu };
+		if let Err(refusal) = uplink::validate(&checked) {
+			return refuse(if refusal == uplink::Refusal::Unsupported { Error::Unsupported } else { Error::Invalid });
+		}
+		// A FAMILY THIS BOOT DOES NOT RUN IS NOT INSTALLED. Under the `ipv6` profile there is no IPv4
+		// at all, on any link.
+		if !self.runtime.policy.families.includes_v4() {
+			return refuse(Error::Unsupported);
+		}
+		if attachment.packets == 0 || attachment.dns.len() > 2 {
+			return refuse(Error::Invalid);
+		}
+		match self.runtime.uplinks.install(reservation) {
+			Ok(uplink::Decision::Switch { to: uplink::Selected::Modem(_), generation }) => {
+				self.runtime.tear_down();
+				Ok(self.runtime.bring_up_raw(&attachment, generation))
+			}
+			// A NIC appeared after the reservation and this caller may not replace it: the reservation
+			// was given back with the refusal.
+			Err(uplink::Refusal::Busy) => {
+				self.runtime.holder = None;
+				refuse(Error::Again)
+			}
+			Ok(_) | Err(_) => refuse(Error::NotFound),
+		}
+	}
+
+	// Remove the link installed under the reservation, or give an unused one back. What it replaced
+	// comes back after the reply.
+	fn release(&mut self, reservation: u64) -> Result<(), Error> {
+		if self.runtime.holder != Some((self.chan, reservation)) {
+			return Err(Error::NotFound);
+		}
+		self.runtime.holder = None;
+		*self.deferred = self.runtime.uplinks.release(reservation);
+		Ok(())
+	}
+}
+
+// A SOCKET FROM A LINK THAT IS GONE. Every operation answers `link-changed` - the connection was not
+// carried to the new link and never will be - and a receive stream opens already ended. Closing it, or
+// dropping it, frees the slot; nothing is sent, because the link it would be sent on is gone.
+fn serve_dead_socket(slot: &mut SockSlot, out: &mut [u8], req: &mut [u8]) {
+	match recv_caps_blocking(slot.chan, req) {
+		ReceivedCaps::Message { len, handles } => {
+			let mut handle = handles;
+			let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+			let mut closing: bool = false;
+			{
+				let mut svc: DeadSock = DeadSock { closing: &mut closing };
+				if op == socket::OP_RECV {
+					if let Some((corr, _)) = socket::recv_open(&mut svc, &req[..len], &mut handle)
+						&& let Some((producer, consumer)) = channel()
+					{
+						send_blocking(slot.chan, &corr.to_le_bytes(), consumer);
+						close(producer);
+					}
+				} else {
+					let mut reply_handle = proto::codec::Handles::new();
+					if let Some(n2) = socket::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle)
+						&& !send_caps_blocking(slot.chan, &out[..n2], reply_handle.as_slice())
+					{
+						for &leftover in reply_handle.as_slice() {
+							close(leftover);
+						}
+					}
+				}
+			}
+			for &unclaimed in handle.as_slice() {
+				close(unclaimed);
+			}
+			if closing {
+				close(slot.chan);
+				*slot = SockSlot { chan: 0, ci: 0, stream_prod: 0, stream_seq: 0, dead: false };
+			}
+		}
+		ReceivedCaps::Closed => {
+			close(slot.chan);
+			*slot = SockSlot { chan: 0, ci: 0, stream_prod: 0, stream_seq: 0, dead: false };
+		}
+	}
+}
+
+struct DeadSock<'a> {
+	closing: &'a mut bool,
+}
+
+impl socket::Service for DeadSock<'_> {
+	fn send(&mut self, data: Buffer) -> Result<u32, Error> {
+		close(data.handle);
+		Err(Error::LinkChanged)
+	}
+
+	fn recv(&mut self) -> Vec<Chunk> {
+		Vec::new()
+	}
+
+	// Closed, and said to have been cut rather than closed in order.
+	fn close(&mut self) -> Result<(), Error> {
+		*self.closing = true;
+		Err(Error::LinkChanged)
+	}
+}
+
+// A listener from a link that is gone: every `accept` answers `link-changed`, and closing it frees
+// the slot. Its port belonged to the old stack and went with it.
+fn serve_dead_listener(listener: &mut Listener, req: &mut [u8]) {
+	match recv_blocking(listener.chan, req) {
+		Received::Message { len, .. } => {
+			if len >= 6 && u16::from_le_bytes([req[0], req[1]]) == listener::OP_ACCEPT {
+				refuse_accept(listener.chan, u32::from_le_bytes([req[2], req[3], req[4], req[5]]));
+			}
+		}
+		Received::Closed => {
+			close(listener.chan);
+			listener.chan = 0;
+			listener.pending = false;
+			listener.dead = false;
+		}
+	}
+}
+
+// Answer an `accept` with `link-changed`: the correlation, the `Err` discriminant and the error, which
+// is the generated encoding of that result.
+fn refuse_accept(chan: u64, corr: u32) {
+	let mut reply: Vec<u8> = Vec::with_capacity(6);
+	reply.extend_from_slice(&corr.to_le_bytes());
+	reply.push(0);
+	reply.extend_from_slice(&Error::LinkChanged.encode_vec().unwrap_or_default());
+	send_blocking(chan, &reply, 0);
 }
 
 // One active socket the serve loop multiplexes: the channel the `socket` interface is
@@ -1035,6 +1459,8 @@ struct SockSlot {
 	ci: usize,
 	stream_prod: u64,
 	stream_seq: u32,
+	// Its link is gone: every operation answers `link-changed` until the client lets it go.
+	dead: bool,
 }
 
 // Place a socket in the set: reuse a free slot (chan 0), or grow the set.
@@ -1145,6 +1571,8 @@ struct Listener {
 	binding: Binding,
 	pending_corr: u32,
 	pending: bool,
+	// Its link is gone - see `SockSlot::dead`.
+	dead: bool,
 }
 
 // Place a listener in the set: reuse a free slot (chan 0), or grow the set.
@@ -1208,7 +1636,7 @@ fn accept_handoff(listener_chan: u64, corr: u32, ci: usize, socks: &mut Vec<Sock
 			reply.extend_from_slice(&corr.to_le_bytes());
 			reply.push(1);
 			reply.extend_from_slice(&body);
-			place_sock(socks, SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0 });
+			place_sock(socks, SockSlot { chan: server, ci, stream_prod: 0, stream_seq: 0, dead: false });
 			send_blocking(listener_chan, &reply, handles.first());
 			// THE SLOT IS RELEASED ONLY NOW. Removing a queue entry before a fallible handoff is not
 			// release: a failed channel allocation above leaves the connection queued and charged,
@@ -1279,13 +1707,11 @@ fn wire_v6(addr: service_logic::ipv6::Address) -> IpAddress {
 	IpAddress::V6(WireIpv6::from_octets(addr.octets()))
 }
 
-// This service's single interface identity: one NIC, and the generation the IPv6 host was brought up
-// with so a scoped value cannot outlive a replacement.
+// This service's interface identity: the one link selected, and the generation it was selected under
+// - the IPv6 host is brought up with the same one - so a scoped value cannot outlive a replacement.
 fn interface_of(stack: &Stack) -> InterfaceId {
-	match stack.ipv6_identity() {
-		Some((index, generation)) => InterfaceId { index, generation },
-		None => InterfaceId { index: 0, generation: 1 },
-	}
+	let (index, generation) = stack.interface();
+	InterfaceId { index, generation }
 }
 
 fn endpoint_v4(ip: Ipv4Addr, port: u16) -> ScopedEndpoint {
@@ -1585,9 +2011,18 @@ fn snapshot(stack: &Stack) -> NetInfo {
 	addresses.push(InterfaceAddress { addr: wire_v4(ip), prefix_len, state: AddressState::Preferred, preferred_seconds: INFINITE_LIFETIME, valid_seconds: INFINITE_LIFETIME });
 	let network: Ipv4Addr = Ipv4Addr([ip.0[0] & stack.mask().0[0], ip.0[1] & stack.mask().0[1], ip.0[2] & stack.mask().0[2], ip.0[3] & stack.mask().0[3]]);
 	routes.push(RouteEntry { destination: wire_v4(network), prefix_len, scope: scope.clone(), preference: RoutePreference::Medium, lifetime_seconds: INFINITE_LIFETIME, hop: NextHop::Direct });
-	routes.push(RouteEntry { destination: wire_v4(Ipv4Addr([0, 0, 0, 0])), prefix_len: 0, scope: scope.clone(), preference: RoutePreference::Medium, lifetime_seconds: INFINITE_LIFETIME, hop: NextHop::Via(wire_v4(stack.gateway())) });
-	routers.push(RouterEntry { addr: wire_v4(stack.gateway()), scope: scope.clone(), preference: RoutePreference::Medium, state: Reachability::Reachable, lifetime_seconds: INFINITE_LIFETIME });
+	// A POINT-TO-POINT LINK MAY HAVE NO GATEWAY AT ALL: its default route is the link itself, and there
+	// is no router to report.
+	if stack.is_raw() && stack.gateway().0 == [0; 4] {
+		routes.push(RouteEntry { destination: wire_v4(Ipv4Addr([0, 0, 0, 0])), prefix_len: 0, scope: scope.clone(), preference: RoutePreference::Medium, lifetime_seconds: INFINITE_LIFETIME, hop: NextHop::Direct });
+	} else {
+		routes.push(RouteEntry { destination: wire_v4(Ipv4Addr([0, 0, 0, 0])), prefix_len: 0, scope: scope.clone(), preference: RoutePreference::Medium, lifetime_seconds: INFINITE_LIFETIME, hop: NextHop::Via(wire_v4(stack.gateway())) });
+		routers.push(RouterEntry { addr: wire_v4(stack.gateway()), scope: scope.clone(), preference: RoutePreference::Medium, state: Reachability::Reachable, lifetime_seconds: INFINITE_LIFETIME });
+	}
 	dns.push(DnsServer { addr: wire_v4(stack.dns()), scope: scope.clone() });
+	if let Some(second) = stack.dns_secondary() {
+		dns.push(DnsServer { addr: wire_v4(second), scope: scope.clone() });
+	}
 	let mut i: usize = 0;
 	while let Some((nip, nmac)) = stack.neigh_at(i) {
 		neighbors.push(Neighbor { addr: wire_v4(nip), mac: WireMac::from_octets(nmac.0), scope: scope.clone() });
@@ -1622,7 +2057,9 @@ fn snapshot(stack: &Stack) -> NetInfo {
 			dns.push(DnsServer { addr: wire_v6(server), scope: scope.clone() });
 		}
 	}
-	NetInfo { scope, name: alloc::string::String::from("net0"), mac: WireMac::from_octets(stack.mac().0), mtu: stack.mtu(), addresses, routes, routers, dns, neighbors }
+	// THE LINK'S OWN NAME: `net0` for the Ethernet NIC, `wwan0` for a modem context, which has no MAC.
+	let name: &str = if stack.is_raw() { "wwan0" } else { "net0" };
+	NetInfo { scope, name: alloc::string::String::from(name), mac: WireMac::from_octets(stack.mac().0), mtu: stack.mtu(), addresses, routes, routers, dns, neighbors }
 }
 
 // A lifetime as the wire carries it: seconds remaining, or infinity.
@@ -2608,6 +3045,9 @@ fn dns_servers(stack: &Stack) -> Vec<Destination> {
 		}
 	}
 	servers.push(Destination::V4(stack.dns()));
+	if let Some(second) = stack.dns_secondary() {
+		servers.push(Destination::V4(second));
+	}
 	servers
 }
 

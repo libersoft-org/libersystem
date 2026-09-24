@@ -1,7 +1,7 @@
 package liber:security@1
-enum capability(log=0,storage=1,network=2,device=3,config=4,time=5,audio=6,input=7,graph=8,resource=9,process=10,permission=11,supervisor=12,volumes=13,services=14,usb=15,display=16,input-keys=17,audio-stream=18,session=19,device-policy=20,app-assets=21,audio-capture=22,font-catalogue=23,font-admin=24)
+enum capability(log=0,storage=1,network=2,device=3,config=4,time=5,audio=6,input=7,graph=8,resource=9,process=10,permission=11,supervisor=12,volumes=13,services=14,usb=15,display=16,input-keys=17,audio-stream=18,session=19,device-policy=20,app-assets=21,audio-capture=22,font-catalogue=23,font-admin=24,bluetooth=25,bluetooth-operator=26,power-state=27,power-control=28,fixture-control=29,smartcard=30,modem-state=31,modem-data=32,modem-identity=33,modem-manage=34,camera=35,camera-capture=36,midi=37,midi-input=38,spool=39,media-import=40,admin-request=41,admin-audit=42,admin-test=43)
 record manifest(component:string,requested:list<capability>,grants:list<capability>)
-record audit-entry(component:string,capability:capability,granted:bool,dynamic:bool)
+record audit-entry(component:string,capability:capability,granted:bool,dynamic:bool,detail:string)
 record pipeline-stage(name:string,args:string,merge-errors:bool)
 record pipeline-result(group:handle<liber:process@1::task-group>,stages:u32)
 interface permission

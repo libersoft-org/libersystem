@@ -2447,6 +2447,158 @@ fn run_permission_fault_scenario_in(domain: &alloc::sync::Arc<object::domain::Do
 	Ok(FaultReport { cases, rights_denials })
 }
 
+// ---- THE RESOLVED GRANTS: PermissionManager's decision, observed from the launched component's side ----
+//
+// The production manager, with this fixture playing ProcessService (the stand-in above), the broker on the
+// manager's bootstrap channel, and the roots of SpoolService and MediaImportService. `spool_probe`'s row grants
+// `spool`, `import_probe`'s grants `media-import` and the system volume, and `date`'s grants neither: what
+// arrives on each prepared launch's bootstrap is the evidence - together with where the manager got it: each
+// root resolved BY NAME, once, and a fresh connection minted from it for EVERY launch, so two launches are two
+// client contexts and never one connection shared.
+
+// One launch, as the component would have received it.
+pub(crate) struct GrantedLaunch {
+	// The manager's answer to `run`.
+	pub(crate) reply: alloc::vec::Vec<u8>,
+	// Every message on the component's bootstrap: its bytes, and whether it carried a capability.
+	pub(crate) messages: alloc::vec::Vec<(alloc::vec::Vec<u8>, bool)>,
+	// Which minted connection each resolved grant reaches: the tag, and its index in `minted`.
+	pub(crate) reaches: alloc::vec::Vec<(alloc::vec::Vec<u8>, Option<usize>)>,
+}
+
+pub(crate) struct ResolvedGrantReport {
+	pub(crate) launches: alloc::vec::Vec<GrantedLaunch>,
+	// The names the manager asked the broker to resolve.
+	pub(crate) resolves: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+	// Every connection the manager minted on a played root, by the root's name.
+	pub(crate) minted: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+}
+
+pub(crate) fn run_permission_resolved_grant_scenario() -> Result<ResolvedGrantReport, &'static str> {
+	let domain = object::domain::Domain::new(PERMISSION_FIXTURE_MEMORY, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	let before = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
+	let outcome = run_permission_resolved_grant_scenario_in(&domain);
+	let reaped = reap_permission_fixture(&domain, before);
+	match (outcome, reaped) {
+		(Err(diagnostic), _) => Err(diagnostic),
+		(Ok(_), Err(diagnostic)) => Err(diagnostic),
+		(Ok(report), Ok(())) => Ok(report),
+	}
+}
+
+fn run_permission_resolved_grant_scenario_in(domain: &alloc::sync::Arc<object::domain::Domain>) -> Result<ResolvedGrantReport, &'static str> {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (volume, package) = scenario_packages()?;
+	let pm_elf = program_elf(&package, volume, b"permission_manager").ok_or("permission_manager missing from the package or volume")?;
+	let (pm_boot_kernel, pm_boot_user) = Channel::create();
+	let (perm_server, perm_client) = Channel::create();
+	let (process_server, process_client) = Channel::create();
+	// `date`'s one grant is a narrowed duplicate of the TIME client, and `import_probe`'s destination one of the
+	// STORAGE client, so their roots need a peer and nothing more.
+	let (time_server, time_client) = Channel::create();
+	let (_storage_server, storage_client) = Channel::create();
+	// THE TWO ROOTS, played here. The manager holds neither at bring-up: the broker hands it each client end when
+	// it asks by name.
+	let roots: [(&[u8], alloc::sync::Arc<Channel>, alloc::sync::Arc<Channel>); 2] = {
+		let (spool_root, spool_client) = Channel::create();
+		let (import_root, import_client) = Channel::create();
+		[(b"SPOOL", spool_root, spool_client), (b"IMPORT", import_root, import_client)]
+	};
+	let mut handed: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+
+	let _permission_manager = spawn_dynamic_test_process(domain.clone(), pm_elf, pm_boot_user);
+	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"TIME", time_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
+	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
+	pm_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not end PermissionManager's bootstrap")?;
+
+	let mut stand_in = ProcessStandIn { root: process_server, time: time_server, connections: alloc::vec::Vec::new(), processes: alloc::vec::Vec::new(), held: alloc::vec::Vec::new(), domain: domain.clone() };
+	// The manager's own start-up launches, refused at the prepare as in the fault scenario.
+	let mut startup = FaultCase::new("startup", alloc::vec::Vec::new(), &[], StandInEnding::Answer);
+	let _online = stand_in.serve(&mut startup, &pm_boot_kernel, false)?;
+	// AND THE REST OF ITS START-UP REPORT, drained: the online line is the first of ten, and the nine behind it
+	// - its probes' reads and their summaries - arrive on the channel this scenario then reads as the broker,
+	// where the first of them was taken for a request that was not a RESOLVE.
+	sched::run_until_idle();
+	while pm_boot_kernel.recv().is_ok() {}
+	stand_in.connections.clear();
+
+	let mut resolves: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+	let mut minted: alloc::vec::Vec<(alloc::vec::Vec<u8>, alloc::sync::Arc<Channel>)> = alloc::vec::Vec::new();
+	let mut launches: alloc::vec::Vec<GrantedLaunch> = alloc::vec::Vec::new();
+	for (corr, name) in [(0x600u32, &b"spool_probe"[..]), (0x601, b"spool_probe"), (0x602, b"import_probe"), (0x603, b"import_probe"), (0x604, b"date")] {
+		stand_in.connections.clear();
+		stand_in.processes.clear();
+		stand_in.held.clear();
+		let (_output, stdout) = Channel::create();
+		send_cap(&perm_client, &permission_run_request(corr, name, b""), stdout, Rights::ALL)?;
+		let mut case = FaultCase::new("resolved grant", alloc::vec::Vec::new(), &[StandInEnding::Answer], StandInEnding::Answer);
+		let reply = loop {
+			match stand_in.serve(&mut case, &perm_client, true) {
+				Ok(reply) => break reply,
+				Err(diagnostic) => {
+					// A PAUSE WITH NOTHING ON THE PROCESS SIDE is the manager waiting on the broker or on a root,
+					// which the stand-in does not serve.
+					let mut answered = false;
+					while let Ok(request) = pm_boot_kernel.recv() {
+						if request.bytes.len() < 2 || le_u16(&request.bytes, 0) != abi::RESOLVE_OP {
+							return Err("the manager sent its broker something other than a RESOLVE");
+						}
+						let name = request.bytes[2..].to_vec();
+						resolves.push(name.clone());
+						match roots.iter().find(|(root, _, _)| *root == name.as_slice() && !handed.contains(root)) {
+							Some((root, _, client)) => {
+								handed.push(root);
+								send_cap(&pm_boot_kernel, b"OK", client.clone(), Rights::ALL)?
+							}
+							None => pm_boot_kernel.send(Message::new(b"DENIED".to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not refuse a RESOLVE")?,
+						}
+						answered = true;
+					}
+					for (root, server, _) in roots.iter() {
+						while let Ok(request) = server.recv() {
+							if request.bytes.len() < 2 || le_u16(&request.bytes, 0) != abi::CONNECT_OP {
+								return Err("the manager asked a played root for something other than a connection");
+							}
+							let (mine, theirs) = Channel::create();
+							minted.push((root.to_vec(), mine));
+							send_cap(server, &[], theirs, Rights::ALL)?;
+							answered = true;
+						}
+					}
+					if !answered {
+						return Err(diagnostic);
+					}
+				}
+			}
+		};
+		// WHAT THE COMPONENT WOULD HAVE READ: the bootstrap end the prepare carried, drained.
+		let mut messages: alloc::vec::Vec<(alloc::vec::Vec<u8>, bool)> = alloc::vec::Vec::new();
+		let mut reaches: alloc::vec::Vec<(alloc::vec::Vec<u8>, Option<usize>)> = alloc::vec::Vec::new();
+		if let Some(child) = stand_in.held.first().and_then(|prepare| prepare.caps.first()).and_then(|cap| cap.object().into_any_arc().downcast::<Channel>().ok()) {
+			while let Ok(message) = child.recv() {
+				if roots.iter().any(|(root, _, _)| *root == message.bytes.as_slice())
+					&& let Some(granted) = message.caps.first().and_then(|cap| cap.object().into_any_arc().downcast::<Channel>().ok())
+				{
+					granted.send(Message::new(b"granted".to_vec(), alloc::vec::Vec::new())).map_err(|_| "a granted connection had no peer")?;
+					let reached = minted.iter().position(|(_, server)| server.recv().is_ok_and(|seen| seen.bytes.as_slice() == b"granted"));
+					reaches.push((message.bytes.clone(), reached));
+				}
+				messages.push((message.bytes.clone(), !message.caps.is_empty()));
+			}
+		}
+		launches.push(GrantedLaunch { reply, messages, reaches });
+	}
+	stand_in.processes.clear();
+	stand_in.connections.clear();
+	stand_in.held.clear();
+	core::mem::drop(perm_client);
+	Ok(ResolvedGrantReport { launches, resolves, minted: minted.into_iter().map(|(root, _)| root).collect() })
+}
+
 // Build the component topology and run it to completion. A StorageService serves
 // the ramdisk volume and a LogService holds the journal; the component_host is given
 // exactly two capabilities - a StorageService client and a LogService client - and
@@ -6553,6 +6705,8 @@ impl ConsoleHarness {
 		// AN OPTIONAL ROLE'S TAG STILL TRAVELS, carrying nothing: the bootstrap is read POSITIONALLY,
 		// so a missing message shifts every read after it.
 		display_boot.send(Message::new(b"STATS".to_vec(), alloc::vec::Vec::new())).expect("display stats bootstrap");
+		// And the protected-session root, which only AdminService is ever handed: none here.
+		display_boot.send(Message::new(b"TRUSTED".to_vec(), alloc::vec::Vec::new())).expect("display trusted bootstrap");
 
 		let width: u32 = (cols * 8) as u32;
 		let height: u32 = (rows * 16) as u32;

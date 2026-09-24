@@ -1,0 +1,36 @@
+package liber:modem@1
+record modem-id(slot:u32,generation:u32,binding-generation:u64,incarnation:u64)
+record context-id(modem:modem-id,sim-generation:u64,context-generation:u64)
+enum sim-state(unknown=0,absent=1,locked-pin=2,locked-puk=3,ready=4,blocked=5)
+enum registration(unknown=0,not-registered=1,searching=2,home=3,roaming=4,denied=5)
+record signal(valid:bool,rssi-dbm:i32,quality:u8)
+record attempt-count(known:bool,remaining:u8,sim-generation:u64,observed-ms:u64)
+record attempts(pin:attempt-count,puk:attempt-count)
+enum context-state(inactive=0,activating=1,active=2,deactivating=3,unknown=4)
+record context-status(id:context-id,state:context-state,address:option<u32>,prefix:u8,mtu:u16,transmit-refused:u64,receive-dropped:u64)
+record modem-status(id:modem-id,manufacturer:string:bound=32,model:string:bound=32,sim:sim-state,sim-generation:u64,registration:registration,operator:option<string>:bound=32,signal:signal,attempts:attempts,context:option<context-status>,revision:u64)
+record modem-limits(providers:u8,providers-max:u8,clients:u8,clients-max:u8,contexts:u8,contexts-max:u8)
+enum watch-kind(snapshot=1,resync=2)
+record modem-watch(kind:watch-kind,modems:list<modem-status>:bound=4)
+interface modem
+method modem.modems op=1 () -> result<list<modem-status>, liber:base@1::error>
+method modem.limits op=2 () -> result<modem-limits, liber:base@1::error>
+method modem.watch op=3 () -> result<stream<modem-watch>, liber:base@1::error>
+interface modem-data
+method modem-data.activate op=1 (modem:modem-id:rights=) -> result<context-status, liber:base@1::error>
+method modem-data.deactivate op=2 (context:context-id:rights=) -> result<unit, liber:base@1::error>
+method modem-data.status op=3 () -> result<modem-status, liber:base@1::error>
+record identity(imsi:option<string>:bound=16,iccid:option<string>:bound=22,msisdn:option<string>:bound=16)
+interface modem-identity
+method modem-identity.identity op=1 (modem:modem-id:rights=) -> result<identity, liber:base@1::error>
+enum sim-pin-result(accepted=1,rejected=2,blocked=3,outcome-unknown=4,unknown-count=5)
+record sim-pin-outcome(result:sim-pin-result,attempts:attempts)
+interface modem-manage
+method modem-manage.attempts op=1 (modem:modem-id:rights=) -> result<attempts, liber:base@1::error>
+method modem-manage.enter-pin op=2 (modem:modem-id:rights=,pin:string:bound=8:rights=,acknowledge-unknown:bool:rights=) -> result<sim-pin-outcome, liber:base@1::error>
+method modem-manage.enter-puk op=3 (modem:modem-id:rights=,puk:string:bound=8:rights=,new-pin:string:bound=8:rights=,acknowledge-unknown:bool:rights=) -> result<sim-pin-outcome, liber:base@1::error>
+enum grant-kind(data=1,identity=2,manage=3)
+record data-policy(apn:string:bound=64,replace-uplink:bool)
+record modem-grant(connection:handle<channel>,modem:modem-id,sim-generation:u64)
+interface modem-admin
+method modem-admin.mint op=1 (kind:grant-kind:rights=,alias:string:bound=32:rights=,policy:data-policy:rights=,owner:handle<liber:process@1::task>:rights=) -> result<modem-grant, liber:base@1::error>

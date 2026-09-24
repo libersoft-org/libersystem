@@ -157,6 +157,67 @@ capability, and a faulted driver's DMA frames are quarantined rather than reused
 immediately. `AI/audit/drivers.md` reports this boundary from the driver side as
 DRV-015 and it is the same boundary.
 
+### 2.3 The trusted administrative path
+
+A high-risk operation - firmware download is the first - needs more than a capability: it needs a person on
+this machine to have seen and confirmed the exact operation. AdminService owns that confirmation. A component
+PermissionManager granted `admin-request` holds a request connection minted for its one launch and bound to
+the exact task that launch prepared; the executor that owns the target freezes the operation (target
+instance and generation, parameters, payload length and SHA-256 over its own copy of the payload); the
+person presses Ctrl+Alt+F12, reads the canonical operation on a protected screen and presses Enter; and the
+grant that answers authorizes one attempt at that frozen operation and nothing else.
+
+**This property rests on a path that is trusted for it, and on nothing else.** Section 1 calls drivers
+untrusted, and they remain so for every other property. For this one - "a person pressed these keys while
+this screen showed this operation" - the following are trusted, and a compromise of any of them can forge
+or hide an approval:
+
+```text
+TRUSTED FOR PHYSICAL APPROVAL (and only for it):
+- the keyboard drivers DeviceManager hands the trusted key sink to: `virtio_input` and the xHCI
+  driver's HID keyboard class. No catalogue provider, no Bluetooth input, no console injection
+  and no client key stream has a producer for that sink;
+- DisplayService and the scanout provider it adopted, which own what is on the screen while a
+  protected session holds it;
+- InputService, which notices secure attention before any ordinary delivery and forwards keys
+  only for the session AdminService armed;
+- AdminService, which owns the decision, the grant and the journal;
+- and the physical keyboard and display themselves.
+```
+
+A boot without that path - no trusted display root, no trusted keyboard stream - declines every request.
+An approval is therefore evidence of a person at this keyboard only as far as this path and these devices are
+what they claim; it is not protection from a compromised keyboard driver or display backend.
+
+```text
+Assumed capable of (an ordinary client, including the requester itself):
+- creating surfaces, presenting over the whole screen and asking for input focus at any time,
+  including while the protected screen is up;
+- writing to its payload through its own mapping after handing it over;
+- transferring its request connection and grant to another process, and then ending;
+- sending arbitrary bytes on every channel it holds, and forging channels of its own.
+
+Must NOT be able to:
+- cover, replace or repaint the protected screen, or take the keyboard while it is up - its
+  surfaces are hidden, its acquires refused and its focus requests denied until the session ends;
+- approve anything: only a fresh physical Enter, after every key was released, on a session both
+  the display and the keyboard acknowledged, approves - never a held key, a repeat, a pointer
+  click, another session's key or a message;
+- change what was confirmed: the executor copied and digested the payload at preparation, and
+  `execute` takes no argument;
+- redeem a grant twice, after its thirty seconds, after its owner's launching task ended - whoever
+  holds the endpoints - or after the service or executor that issued it restarted;
+- learn why it was refused: refusal, timeout, contention and an unavailable path are all `declined`.
+```
+
+**What the journal is and is not.** Every decision is written to `vol://system/admin-audit` through the
+volume's transactional writer before the grant exists and before the effect is dispatched; a write storage
+refused waits in a bounded ring and is written when storage returns, and an outcome that cannot be written
+stops further approvals until it is. It is an investigation record, never authority - no grant is restored
+from it - and it is not a tamper-proof archive against an administrator who already holds unrestricted write
+authority over the system volume. The indistinguishable `declined` is a semantic property, not a claim of
+constant-time answers or of the absence of every availability side channel.
+
 ## 3. Enforced boundaries
 
 The boundaries below are mechanisms in the kernel (TCB) plus one policy layer in
@@ -248,6 +309,12 @@ rights are enforced; duplication  handle_rights_enforced,
 fault isolation and cleanup       fault_isolation_kills_only_process,
                                     driver_crash_is_cleaned_up_and_notified,
                                     driver_survives_crash_and_restart
+one confirmation authorizes one   service-logic `admin_broker`, `admin_journal`,
+  bound attempt, and nothing        `trusted_keys`, `display_lock` and drivers
+  else authorizes anything          `admin_operation` host suites; the
+                                    `qemu-admin-path` guest gate (keys through
+                                    QEMU's emulated keyboard, captured frames,
+                                    executor counts, journal across a reboot)
 ```
 
 The property tests use a fixed-seed PRNG, so a run is deterministic and a failure

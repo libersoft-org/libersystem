@@ -895,6 +895,15 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 	assert_eq!(actual, expected, "the component read the user-picked file through the picker");
 }
 
+// THE CAPABILITIES EVERY PROBE BELOW IS DENIED past the font catalogue's: the service destinations added
+// since, in `VOCABULARY` order. The summaries pin the WHOLE vocabulary - a capability that stops being
+// enumerated stops being denied out loud - so each new one is added here, once, rather than to every string.
+macro_rules! later_denials {
+	() => {
+		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny"
+	};
+}
+
 tagged_test!(permission_manager_enforces_static_and_dynamic_probe_policy, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy", covers = ["bin.permission_manager", "kernel", "services"]);
 fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 	declare_permission_cohort("kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy", PermissionCohort::Base);
@@ -916,9 +925,9 @@ fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 	// both appear in every summary below as `deny` for probes whose manifests ask for neither -
 	// which is exactly what these assertions are for. A capability that stops being enumerated stops
 	// being denied out loud, and the summary is the only place that shows it.
-	assert_eq!(result.probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	assert_eq!(result.probe_summary.as_slice(), concat!("storage=grant log=grant network=deny device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", later_denials!()).as_bytes(), "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	assert_eq!(result.request_read.as_slice(), b"storage denied", "request_probe's undeclared storage request was refused by the headless policy default");
-	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
+	assert_eq!(result.request_summary.as_slice(), concat!("storage=deny log=grant network=deny device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", later_denials!(), " storage=deny(dynamic)").as_bytes(), "request_probe's static grants and dynamic denial were recorded independently");
 }
 
 tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_runs_tools_with_minimal_grants", covers = ["bin.permission_manager", "kernel", "services"]);
@@ -933,7 +942,7 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 	assert_eq!(result.date_read[16], b':', "date separates the minute and second");
 	assert_eq!(result.date_read[19], b'Z', "date reports UTC");
 	assert_eq!(result.date_read[20], b'\n', "date ended its stdout line");
-	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny device-policy=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", "date received only its time grant");
+	assert_eq!(result.date_summary.as_slice(), concat!("storage=deny log=deny network=deny device=deny device-policy=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", later_denials!()).as_bytes(), "date received only its time grant");
 	assert_eq!(result.cat_read, result.expected, "cat printed its file through the storage grant");
 	// THE SHAPE AND THE FACTS, NOT ONE FROZEN LINE. `ip` now renders a section per table - addresses,
 	// routes, routers, resolvers, neighbours - and how many rows each has depends on what the link
@@ -949,7 +958,7 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 	assert!(contains(b"mtu 1500"), "ip rendered the interface MTU");
 	assert!(contains(b"address 10.0.2.15/24 preferred"), "ip rendered the IPv4 address with its prefix and state");
 	assert!(contains(b"route 0.0.0.0/0 via 10.0.2.2"), "ip rendered the default route and the router it goes through");
-	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", "ip received only its network grant");
+	assert_eq!(result.ip_summary.as_slice(), concat!("storage=deny log=deny network=grant device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny font-catalogue=deny font-admin=deny", later_denials!()).as_bytes(), "ip received only its network grant");
 }
 
 tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_mints_scoped_application_grants", covers = ["bin.permission_manager", "kernel", "services"]);
@@ -958,6 +967,39 @@ fn permission_manager_mints_scoped_application_grants() {
 	let result = permission_scenario_result(PermissionCohort::Scoped).expect("the scoped application grant scenario should run");
 	assert_eq!(result.graphics_read.as_slice(), b"graphics grants\n", "the graphics probe received process-bound display, key-only input and playback-only audio grants");
 	assert!(result.graphics_start_ns != 0, "the governed app cold-start path is measured");
+}
+
+// THE SPOOL AND IMPORT AUTHORITIES, GRANTED BY THE PRODUCTION MANAGER AND BY NOTHING ELSE. `spool_probe`'s row
+// grants `spool`, `import_probe`'s `media-import`, and `date`'s neither. The manager resolves each service's root
+// by name the first time it needs it and mints a fresh connection from it for every launch - each launch its own
+// client context, which is what both services charge and scope by - and a component whose row does not name an
+// authority receives nothing under its tag.
+tagged_test!(permission_manager_grants_spool_and_import_to_their_probes_alone, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_grants_spool_and_import_to_their_probes_alone", covers = ["bin.permission_manager", "kernel", "services"]);
+fn permission_manager_grants_spool_and_import_to_their_probes_alone() {
+	let report = crate::tests::run_permission_resolved_grant_scenario().expect("the resolved grant scenario should run");
+	let [spool_first, spool_second, import_first, import_second, date] = &report.launches[..] else { panic!("five launches were driven, {} observed", report.launches.len()) };
+	for (label, launch) in [
+		("the first spool_probe", spool_first),
+		("the second spool_probe", spool_second),
+		("the first import_probe", import_first),
+		("the second import_probe", import_second),
+		("date", date),
+	] {
+		assert!(launch.reply.len() >= 5 && launch.reply[4] == 1, "{label} was launched, got {:?}", launch.reply);
+	}
+	let carried = |launch: &crate::tests::GrantedLaunch, tag: &[u8]| launch.messages.iter().filter(|(bytes, _)| bytes.as_slice() == tag).map(|(_, capability)| *capability).collect::<alloc::vec::Vec<bool>>();
+	let reached = |launch: &crate::tests::GrantedLaunch| launch.reaches.iter().map(|(tag, at)| (tag.clone(), *at)).collect::<alloc::vec::Vec<_>>();
+	assert_eq!(report.resolves, [b"SPOOL".to_vec(), b"IMPORT".to_vec()], "each root was resolved by name, once, and nothing else was asked of the broker");
+	assert_eq!(report.minted, [b"SPOOL".to_vec(), b"SPOOL".to_vec(), b"IMPORT".to_vec(), b"IMPORT".to_vec()], "a connection was minted on the right root for each granted launch");
+	assert_eq!(carried(spool_first, b"SPOOL"), [true], "the first spool_probe received one spool capability");
+	assert_eq!(reached(spool_first), [(b"SPOOL".to_vec(), Some(0))]);
+	assert_eq!(reached(spool_second), [(b"SPOOL".to_vec(), Some(1))], "the second its own, never a copy of the first");
+	assert_eq!(carried(import_first, b"IMPORT"), [true], "the first import_probe received one import capability");
+	assert_eq!(reached(import_first), [(b"IMPORT".to_vec(), Some(2))]);
+	assert_eq!(reached(import_second), [(b"IMPORT".to_vec(), Some(3))], "the second its own");
+	assert!(carried(import_first, b"SPOOL").is_empty() && carried(spool_first, b"IMPORT").is_empty(), "neither probe received the other's authority");
+	assert!(carried(date, b"SPOOL").is_empty() && carried(date, b"IMPORT").is_empty(), "date, whose row names neither, received neither");
+	assert!(date.messages.iter().any(|(bytes, capability)| bytes.as_slice() == b"TIME" && *capability), "and received the grant its row does name");
 }
 
 tagged_test!(component_host_runs_an_sdk_component, [Component, Service, Slow], id = "kernel.applications.component_host_runs_an_sdk_component", covers = ["bin.component_host", "liber_component", "wasm"]);

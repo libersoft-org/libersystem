@@ -62,8 +62,12 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, SelectedFile, StartResult, config, process, volume, volume_admin};
+use proto::system::smartcard_admin;
+use proto::system::{AdminAction, AdminScope, admin_factory};
+use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, Operations, PipelineResult, PipelineStage, SelectedFile, StartResult, config, process, volume, volume_admin};
+use proto::system::{DataPolicy, GrantKind, camera_admin, midi_admin, modem_admin};
 use rt::*;
+use services::capability_names::*;
 use services::executable;
 
 // The governed component the manager launches, and the rights a granted client is
@@ -130,7 +134,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 25] = [
+const VOCABULARY: [Capability; 44] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -176,6 +180,46 @@ const VOCABULARY: [Capability; 25] = [
 	// granted either is granted anything between them, and the two are read by tag.
 	Capability::FontCatalogue,
 	Capability::FontAdmin,
+	// BLUETOOTHSERVICE'S READ AND OPERATOR ROOTS, resolved by name through the broker rather than
+	// handed over at bring-up - see `grant_handle`. Position is free: no granted component reads them
+	// positionally yet, and the operator one is granted to nothing by default.
+	Capability::Bluetooth,
+	Capability::BluetoothOperator,
+	// POWERSERVICE'S STATE AND CONTROL ROOTS, resolved the same way. The control one is granted to
+	// nothing that ships.
+	Capability::PowerState,
+	Capability::PowerControl,
+	// A DEVELOPMENT FIXTURE'S CONTROL ENDPOINT, which only a development build can deliver at all: only its
+	// supervisor mints a catalogue connection admitting the kind.
+	Capability::FixtureControl,
+	// A SMART-CARD READER, minted per launch for one configured reader and one set of operations.
+	Capability::Smartcard,
+	// CAMERAS: inventory resolved by name, and capture minted per launch for one configured camera. Ahead
+	// of the modem authorities, which is what lets the camera gate's failing launch fail on a LATER grant.
+	Capability::Camera,
+	Capability::CameraCapture,
+	// MIDI: inventory resolved by name, and one receiver minted per launch for one configured endpoint. Ahead of
+	// the modem authorities for the same reason as the cameras.
+	Capability::Midi,
+	Capability::MidiInput,
+	// MODEMS: observation resolved by name, and the three authorities over one modem - data, subscriber
+	// identity, management - each minted per launch for one configured modem and the SIM in it.
+	Capability::ModemState,
+	Capability::ModemData,
+	Capability::ModemIdentity,
+	Capability::ModemManage,
+	// PRINTING: a fresh connection to SpoolService per launch, which is the grant context its jobs are
+	// charged to. Resolved by name, so this service never waits for the spooler to start.
+	Capability::Spool,
+	// IMPORTING FROM A CAMERA: a fresh, read-only connection to MediaImportService per launch, resolved the same
+	// way.
+	Capability::MediaImport,
+	// THE TRUSTED ADMINISTRATIVE PATH: a request connection minted per launch and bound to the exact task the
+	// launch prepared, the operator's journal view, and the development image's test controls. Position is free:
+	// every holder reads them by tag.
+	Capability::AdminRequest,
+	Capability::AdminAudit,
+	Capability::AdminTest,
 ];
 
 // THE ASSERTION THE COMMENT ABOVE PROMISES, evaluated by the compiler. Two halves: the array is as
@@ -284,6 +328,87 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// catalogue, draws into memory it allocated itself, and prints its verdict on the console it
 		// was handed - so it needs no volume, no display and no scan authority.
 		b"textconf" => Some(granted("textconf", alloc::vec![Capability::FontCatalogue])),
+		// THE BLUETOOTH GATE'S PROBES, development-only. `btcheck` holds a pointer subscription and both
+		// Bluetooth authorities because the scenario it drives needs all three; it is the one row in
+		// this table granting the operator authority, and it is not a shipping component. It holds the
+		// supervisor's admin channel, as `stop` does, because the refund it proves is read across a stop
+		// it makes itself. `btread` is an ordinary read client and holds the read authority ALONE - its
+		// half of the gate is that a component granted only this can list and scan and has nothing to
+		// pair or forget with.
+		b"btcheck" => Some(granted(
+			"btcheck",
+			alloc::vec![
+				Capability::Device,
+				Capability::DevicePolicy,
+				Capability::Input,
+				Capability::Process,
+				Capability::Supervisor,
+				Capability::Bluetooth,
+				Capability::BluetoothOperator
+			],
+		)),
+		b"btread" => Some(granted("btread", alloc::vec![Capability::Bluetooth])),
+		// THE POWER GATE'S PROBES, and the first of the rows naming a fixture's control endpoint.
+		//
+		// NOT `cfg`-GATED, and neither is any row after it: this program is built once, into the shared
+		// image both configurations stage, and that build has no development feature - so a gated row was
+		// absent from the development image too, and every probe it named was refused at launch. What keeps
+		// these rows inert in the configuration that ships is that none of their programs is staged there,
+		// and that its supervisor mints no catalogue connection admitting a fixture's kind.
+		// `powercheck` drives the scenario and is the one holder of the control authority; `powerread`
+		// is an ordinary read client and holds the read authority ALONE, which is its half of the gate.
+		b"powercheck" => Some(granted("powercheck", alloc::vec![Capability::PowerState, Capability::PowerControl, Capability::FixtureControl])),
+		b"powerread" => Some(granted("powerread", alloc::vec![Capability::PowerState])),
+		// THE SMART-CARD GATE'S PROBES, development-only like the fixture they drive. `cardcheck` holds a
+		// grant on fixture reader A with every operation and the fixture's control endpoint; `cardhold` is
+		// the second client a queue needs; `cardread` holds a read-only grant, which is what its half of the
+		// gate is about. Which reader and which operations each is minted for is `smartcard_policy`'s.
+		// `cardcheck` also holds the supervisor's admin channel, as `stop` does: the restart it proves must
+		// land on an exchange in flight and be watched until the replacement's session is answered, and no
+		// probe needing a reader-A grant can be launched in between.
+		b"cardcheck" => Some(granted("cardcheck", alloc::vec![Capability::Supervisor, Capability::FixtureControl, Capability::Smartcard])),
+		b"cardhold" => Some(granted("cardhold", alloc::vec![Capability::Smartcard])),
+		b"cardread" => Some(granted("cardread", alloc::vec![Capability::Smartcard])),
+		b"cardb" => Some(granted("cardb", alloc::vec![Capability::Smartcard])),
+		// THE MODEM GATE'S PROBES, development-only like the fixture they drive. `modemcheck` drives the
+		// scenario: an ordinary network client for the traffic it proves, the fixture's control endpoint,
+		// observation and all three modem authorities. `modemswap` and `modemhold` are further data clients;
+		// `modemdata` REQUESTS every authority and is granted data and the network alone, which is its half of
+		// the gate; `modemfail` is granted data and an identity grant that cannot be minted, so its prepared
+		// launch fails after the first was.
+		b"modemcheck" => Some(granted("modemcheck", alloc::vec![Capability::Network, Capability::FixtureControl, Capability::ModemState, Capability::ModemData, Capability::ModemIdentity, Capability::ModemManage])),
+		b"modemswap" => Some(granted("modemswap", alloc::vec![Capability::Network, Capability::ModemData])),
+		b"modemhold" => Some(granted("modemhold", alloc::vec![Capability::ModemData])),
+		b"modemdata" => Some(intersected("modemdata", alloc::vec![Capability::Network, Capability::ModemData, Capability::ModemIdentity, Capability::ModemManage], &[Capability::Network, Capability::ModemData])),
+		b"modemfail" => Some(granted("modemfail", alloc::vec![Capability::ModemData, Capability::ModemIdentity])),
+		// THE CAMERA GATE'S PROBES, development-only like the fixture they drive. `camcheck` drives the
+		// scenario with the fixture's control endpoint, inventory and capture;
+		// `camhold` is the second capture client; `camread` holds inventory ALONE, which is its half of the
+		// gate; `camfail`'s launch fails after its capture grant was minted.
+		b"camcheck" => Some(granted("camcheck", alloc::vec![Capability::FixtureControl, Capability::Camera, Capability::CameraCapture])),
+		b"camhold" => Some(granted("camhold", alloc::vec![Capability::CameraCapture])),
+		b"camread" => Some(granted("camread", alloc::vec![Capability::Camera])),
+		b"camfail" => Some(granted("camfail", alloc::vec![Capability::CameraCapture, Capability::ModemIdentity])),
+		// THE MIDI GATE'S PROBES, development-only like the fixture they drive. `midicheck` drives the scenario
+		// with the fixture's control endpoint, inventory and a receiver on endpoint 0; `midihold` is the second receiver, on endpoint 1; `midiread` holds inventory ALONE; `midifail`'s
+		// launch fails after its receiver was minted.
+		b"midicheck" => Some(granted("midicheck", alloc::vec![Capability::FixtureControl, Capability::Midi, Capability::MidiInput])),
+		b"midihold" => Some(granted("midihold", alloc::vec![Capability::MidiInput])),
+		b"midiread" => Some(granted("midiread", alloc::vec![Capability::Midi])),
+		b"midifail" => Some(granted("midifail", alloc::vec![Capability::MidiInput, Capability::ModemIdentity])),
+		// THE ADMINISTRATIVE-PATH GATE'S PROBES, development-only like the executor they drive. `admincheck` is a
+		// requester - the probe write on the probe executor's targets, and no other action - with the
+		// executor's witness, the operator's journal view and AdminService's test controls; `adminhelper` is a
+		// second requester, for contention, with the test controls to release what another held;
+		// `adminhostile` is an ordinary client with a screen and a keyboard and nothing else.
+		b"admincheck" => Some(granted("admincheck", alloc::vec![Capability::FixtureControl, Capability::AdminRequest, Capability::AdminAudit, Capability::AdminTest])),
+		b"adminhelper" => Some(granted("adminhelper", alloc::vec![Capability::AdminRequest, Capability::AdminTest])),
+		b"adminhostile" => Some(granted("adminhostile", alloc::vec![Capability::Display, Capability::InputKeys])),
+		// THE SPOOL PROBE, which holds `spool` and nothing else: jobs on a printer, and no catalogue, backend or
+		// device authority of any kind.
+		b"spool_probe" => Some(granted("spool_probe", alloc::vec![Capability::Spool])),
+		// THE IMPORT PROBE: `media-import`, and a destination on the system volume. No device authority.
+		b"import_probe" => Some(granted("import_probe", alloc::vec![Capability::Storage, Capability::MediaImport])),
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
@@ -434,6 +559,25 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::AppAssets => b"APP_ASSETS",
 		Capability::FontCatalogue => b"FONT",
 		Capability::FontAdmin => b"FONTADMIN",
+		Capability::Bluetooth => CAP_BT_READ,
+		Capability::BluetoothOperator => CAP_BT_OPERATOR,
+		Capability::PowerState => CAP_POWER_STATE,
+		Capability::PowerControl => CAP_POWER_CONTROL,
+		Capability::FixtureControl => b"FIXTURE",
+		Capability::Smartcard => b"SMARTCARD",
+		Capability::ModemState => CAP_MODEM_STATE,
+		Capability::ModemData => b"MODEMDATA",
+		Capability::ModemIdentity => b"MODEMIDENTITY",
+		Capability::ModemManage => b"MODEMMANAGE",
+		Capability::Camera => CAP_CAMERA,
+		Capability::CameraCapture => b"CAMERACAPTURE",
+		Capability::Midi => CAP_MIDI,
+		Capability::MidiInput => b"MIDIINPUT",
+		Capability::Spool => CAP_SPOOL,
+		Capability::MediaImport => CAP_MEDIA_IMPORT,
+		Capability::AdminRequest => b"ADMINREQUEST",
+		Capability::AdminAudit => CAP_ADMIN_AUDIT,
+		Capability::AdminTest => CAP_ADMIN_TEST,
 	}
 }
 
@@ -500,6 +644,37 @@ struct Clients {
 	// holder, `lsfont`, which is what makes sharing this connection's reply queue acceptable here
 	// and not for the capability above.
 	font_admin: u64,
+	// BLUETOOTHSERVICE'S READ AND OPERATOR ROOTS, zero until the first grant resolves them by name.
+	bluetooth: u64,
+	bluetooth_operator: u64,
+	// POWERSERVICE'S STATE AND CONTROL ROOTS, the same way.
+	power_state: u64,
+	power_control: u64,
+	// The fixture control endpoints a development build's catalogue connection admits. A shipping build's
+	// connection was minted for the USB bus alone, so this watch finds nothing there.
+	fixture_providers: ProviderWatch,
+	// SMARTCARDSERVICE'S MINTING ROOT, zero until the first smart-card grant resolves it by name.
+	smartcard_admin: u64,
+	// MODEMSERVICE'S OBSERVATION AND MINTING ROOTS, the same way.
+	modem_state: u64,
+	modem_admin: u64,
+	// CAMERASERVICE'S INVENTORY AND MINTING ROOTS, the same way.
+	camera: u64,
+	camera_admin: u64,
+	// MIDISERVICE'S INVENTORY AND MINTING ROOTS, the same way.
+	midi: u64,
+	midi_admin: u64,
+	// SPOOLSERVICE'S ROOT, the same way, and MEDIAIMPORTSERVICE'S.
+	spool: u64,
+	media_import: u64,
+	// ADMINSERVICE'S REQUEST FACTORY, JOURNAL VIEW AND TEST CONTROLS, the same way. The factory is the one this
+	// manager alone holds: every `admin-request` grant is minted from it for one launch and one task.
+	admin_factory: u64,
+	admin_audit: u64,
+	admin_test: u64,
+	// What the last grant resolved a selection to, for its audit entry: the exact reader a smart-card
+	// grant was minted for. Taken by the audit line that follows the grant, so it never outlives it.
+	grant_detail: String,
 }
 
 impl Clients {
@@ -533,6 +708,27 @@ impl Clients {
 			Capability::AppAssets => 0,
 			Capability::FontCatalogue => self.font,
 			Capability::FontAdmin => self.font_admin,
+			Capability::Bluetooth => self.bluetooth,
+			Capability::BluetoothOperator => self.bluetooth_operator,
+			Capability::PowerState => self.power_state,
+			Capability::PowerControl => self.power_control,
+			// Opened per grant, from the catalogue: see `grant_handle`.
+			Capability::FixtureControl => 0,
+			// Minted per launch, bound to the launched task: see `grant_for_task`.
+			Capability::Smartcard => 0,
+			Capability::ModemState => self.modem_state,
+			Capability::ModemData | Capability::ModemIdentity | Capability::ModemManage => 0,
+			Capability::Camera => self.camera,
+			Capability::CameraCapture => 0,
+			Capability::Midi => self.midi,
+			Capability::MidiInput => 0,
+			Capability::Spool => self.spool,
+			Capability::MediaImport => self.media_import,
+			// MINTED PER LAUNCH AND BOUND TO ITS TASK, and never from here: a path with no task - the dynamic
+			// request - can mint nothing. See `grant_for_task`.
+			Capability::AdminRequest => 0,
+			Capability::AdminAudit => self.admin_audit,
+			Capability::AdminTest => self.admin_test,
 		}
 	}
 }
@@ -593,8 +789,236 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 				_ => 0,
 			}
 		}
+		// A SMART-CARD READER, for this component and this task. The policy names a configured alias and
+		// the operations; the service resolves the alias to exactly one current reader or refuses, and
+		// the connection it mints dies with the task however it is copied - which is why the task goes
+		// with the request, with the right to wait on it and nothing more.
+		Capability::Smartcard => {
+			let Some((alias, operations)) = smartcard_policy(component) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.smartcard_admin, clients.broker, CAP_SMARTCARD_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = smartcard_admin::Client::new(ChannelTransport { chan: admin }).mint(alias, &operations, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(minted)) => {
+					let mut detail = String::from("reader ");
+					detail.push_str(&minted.name);
+					detail.push_str(&alloc::format!(" slot {} generation {} binding {}", minted.reader.slot, minted.reader.generation, minted.reader.binding_generation));
+					clients.grant_detail = detail;
+					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
+					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
+		// A MODEM AUTHORITY, for this component and this task: data, subscriber identity or management,
+		// each a separate grant from a separate policy row. The service resolves the alias to exactly one
+		// current modem and binds the connection to the SIM in it now; the connection dies with the task
+		// however it is copied, and an identity or management grant is minted for nobody by default.
+		Capability::ModemData | Capability::ModemIdentity | Capability::ModemManage => {
+			let kind = match cap {
+				Capability::ModemData => GrantKind::Data,
+				Capability::ModemIdentity => GrantKind::Identity,
+				_ => GrantKind::Manage,
+			};
+			let Some((alias, policy)) = modem_policy(component, kind) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.modem_admin, clients.broker, CAP_MODEM_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = modem_admin::Client::new(ChannelTransport { chan: admin }).mint(&kind, alias, &policy, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(minted)) => {
+					clients.grant_detail = alloc::format!("modem slot {} generation {} binding {} sim {}", minted.modem.slot, minted.modem.generation, minted.modem.binding_generation, minted.sim_generation);
+					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
+					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
+		// CAPTURE FROM ONE CAMERA, for this component and this task. Minting starts nothing: the client
+		// negotiates, registers its own buffers and starts explicitly, and the connection dies with the task
+		// however it is copied.
+		Capability::CameraCapture => {
+			let Some(alias) = camera_policy(component) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.camera_admin, clients.broker, CAP_CAMERA_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = camera_admin::Client::new(ChannelTransport { chan: admin }).mint(alias, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(minted)) => {
+					clients.grant_detail = alloc::format!("camera slot {} generation {} binding {}", minted.camera.slot, minted.camera.generation, minted.camera.binding_generation);
+					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
+					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
+		// ONE MIDI RECEIVER, for this component and this task, on the endpoint its policy names. Minting starts it,
+		// and it ends with the task however its endpoint is copied.
+		Capability::MidiInput => {
+			let Some((alias, endpoint)) = midi_policy(component) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.midi_admin, clients.broker, CAP_MIDI_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = midi_admin::Client::new(ChannelTransport { chan: admin }).mint(alias, &endpoint, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(minted)) => {
+					clients.grant_detail = alloc::format!("midi slot {} generation {} binding {} endpoint {} receiver {}", minted.source.slot, minted.source.generation, minted.source.binding_generation, minted.source.endpoint, minted.source.receiver_generation);
+					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
+					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
+		// AN ADMINISTRATIVE REQUEST CONNECTION, for this component and this task. The policy names the actions
+		// and the target prefix it may ask about; AdminService records them with the connection, and binds it to
+		// the task with an observer that may WAIT and nothing more - no `manage`, no `duplicate`, no process
+		// lookup - so the connection is the launched task's however its endpoint is copied. A mint that fails
+		// grants nothing, and the launch fails the way every failed grant makes it fail.
+		Capability::AdminRequest => {
+			let Some(scope) = admin_policy(component) else { return 0 };
+			let Some(factory) = connect_or_resolve(&mut clients.admin_factory, clients.broker, CAP_ADMIN_FACTORY) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(factory);
+				return 0;
+			}
+			// THE LAUNCH'S CORRELATION IS THE TASK'S OWN OBJECT IDENTITY, read from the handle this manager holds:
+			// a number for the journal to join records by, never an authentication of anything.
+			let launch: u64 = object_info(task).map_or(0, |info| info.koid);
+			let minted = admin_factory::Client::new(ChannelTransport { chan: factory }).mint(component, &scope, &launch, &(owner as u64));
+			close(factory);
+			match minted {
+				Some(Ok(connection)) => {
+					clients.grant_detail = alloc::format!("launch {launch} bound to its task");
+					let narrowed = duplicate(connection, GRANT_RIGHTS);
+					close(connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
 		_ => grant_handle(clients, cap, component),
 	}
+}
+
+// WHAT A COMPONENT MAY ASK THE TRUSTED ADMINISTRATIVE PATH ABOUT: the actions, and the prefix of the target
+// selectors it may name. Every request still waits for a person on the protected screen; this decides only
+// which requests may be put to one.
+//
+// THE INITIAL OPERATOR POLICY is firmware download on registered DFU targets, for the DFU tool the USB
+// driver set installs - whose manifest row lands with it - and nothing else: an ordinary tool has no row here
+// and no request grant. The probe action reaches an executor in a development image alone.
+fn admin_policy(component: &str) -> Option<AdminScope> {
+	{
+		// THE ADMINISTRATIVE PATH GATE'S REQUESTERS: the probe write on the probe executor's targets, and nothing
+		// else - not firmware download, whatever their manifest asked for.
+		if matches!(component, "admincheck" | "adminhelper") {
+			return Some(AdminScope { actions: alloc::vec![AdminAction::ProbeWrite], target_prefix: String::from("probe-") });
+		}
+	}
+	match component {
+		"dfu" => Some(AdminScope { actions: alloc::vec![AdminAction::FirmwareDownload], target_prefix: String::from("dfu:") }),
+		_ => None,
+	}
+}
+
+// WHICH MIDI DEVICE AND ENDPOINT A COMPONENT'S RECEIVER IS FOR: an alias MidiService's configuration binds to
+// provider metadata, and an endpoint index in it. The default is none.
+fn midi_policy(component: &str) -> Option<(&'static str, u32)> {
+	{
+		// THE MIDI GATE'S RECEIVERS: endpoint 0 of the fixture for the driver and its failing launch, endpoint 1
+		// for the second client.
+		match component {
+			"midicheck" | "midifail" => return Some(("fixture", 0)),
+			"midihold" => return Some(("fixture", 1)),
+			_ => {}
+		}
+	}
+	let _ = component;
+	None
+}
+
+// WHICH CAMERA A COMPONENT'S CAPTURE GRANT IS FOR: an alias CameraService's configuration binds to provider
+// metadata, never a camera identity and never "the first one present". The default is no camera at all.
+fn camera_policy(component: &str) -> Option<&'static str> {
+	{
+		// THE CAMERA GATE'S CAPTURE PROBES, all on the fixture camera.
+		if matches!(component, "camcheck" | "camhold" | "camfail") {
+			return Some("fixture");
+		}
+	}
+	let _ = component;
+	None
+}
+
+// WHICH MODEM, AND WHAT A DATA GRANT MAY DO WITH IT, for a component's grant of one modem authority. An
+// alias ModemService's configuration binds to provider metadata - never a modem identity, never "the
+// first one present" - and, for data, the access point and whether the context may replace an uplink
+// already selected. The default is no modem at all: identity and management are denied unless a row
+// here names them, and so is data.
+fn modem_policy(component: &str, kind: GrantKind) -> Option<(&'static str, DataPolicy)> {
+	{
+		let data = |replace_uplink: bool| DataPolicy { apn: String::from("internet.fixture"), replace_uplink };
+		let none = DataPolicy { apn: String::new(), replace_uplink: false };
+		// THE MODEM GATE'S PROBES. `modemcheck` drives the scenario and holds all three authorities, with
+		// a data grant that may NOT replace an uplink; `modemswap` holds data that may; `modemhold` is
+		// the second data client an inherited endpoint needs; `modemdata` requested all three and is
+		// given data alone. `modemfail`'s identity grant names a modem nobody configured, so its launch
+		// fails after its data grant was minted - which is what the gate's cleanup proof needs.
+		match (component, kind) {
+			("modemcheck", GrantKind::Data) | ("modemhold", GrantKind::Data) | ("modemdata", GrantKind::Data) | ("modemfail", GrantKind::Data) => return Some(("fixture", data(false))),
+			("modemswap", GrantKind::Data) => return Some(("fixture", data(true))),
+			("modemcheck", GrantKind::Identity) | ("modemcheck", GrantKind::Manage) => return Some(("fixture", none)),
+			("modemfail", GrantKind::Identity) => return Some(("absent", none)),
+			// The camera gate's failing launch: its capture grant is minted first, then this one fails.
+			("camfail", GrantKind::Identity) => return Some(("absent", none)),
+			("midifail", GrantKind::Identity) => return Some(("absent", none)),
+			_ => {}
+		}
+	}
+	let _ = (component, kind);
+	None
+}
+
+// WHICH READER, AND WHICH OPERATIONS, A COMPONENT'S SMART-CARD GRANT IS FOR. An alias the service's
+// configuration binds to provider metadata - never a reader identity, never "the first one present" -
+// and the operation set. The default is no reader: a component with no row here gets no connection even
+// if its manifest grants the capability.
+fn smartcard_policy(component: &str) -> Option<(&'static str, Operations)> {
+	{
+		let all = Operations { read: true, transact: true, authenticate: true };
+		// THE SMART-CARD GATE'S PROBES: the scenario driver and its background holder may do
+		// everything on fixture reader A; the read client may read it and nothing else.
+		match component {
+			"cardcheck" | "cardhold" => return Some(("fixture-a", all)),
+			"cardread" => return Some(("fixture-a", Operations { read: true, transact: false, authenticate: false })),
+			"cardb" => return Some(("fixture-b", all)),
+			_ => {}
+		}
+	}
+	let _ = component;
+	None
 }
 
 // Which asset directory under `bin/` a component reads its own data from.
@@ -671,6 +1095,26 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		}
 		return 0;
 	}
+	// A FIXTURE'S CONTROL ENDPOINT, opened through the same catalogue connection as the USB bus - which a
+	// development build mints admitting this kind too, and a shipping build does not. The endpoint admits
+	// one consumer, so a second probe holding it at once is refused by DeviceManager rather than handed
+	// a shared connection.
+	if cap == Capability::FixtureControl {
+		clients.fixture_providers.poll();
+		if clients.fixture_providers.channel == 0 {
+			clients.fixture_providers = ProviderWatch::subscribe(clients.usb_catalogue, ProviderKind::FixtureControl);
+		}
+		for info in &clients.fixture_providers.entries {
+			let minted = open_provider(clients.usb_catalogue, info);
+			if minted == 0 {
+				continue;
+			}
+			let narrowed = duplicate(minted, GRANT_RIGHTS);
+			close(minted);
+			return if narrowed > 0 { narrowed as u64 } else { 0 };
+		}
+		return 0;
+	}
 	if cap == Capability::Network {
 		let mut client = network::Client::new(ChannelTransport { chan: clients.network });
 		let minted = match client.open() {
@@ -691,6 +1135,33 @@ fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 
 		// that discriminates it is two applications holding it at once, each issuing a list and a
 		// resolve.
 		Capability::FontCatalogue => (&mut clients.font, CAP_FONT),
+		// BLUETOOTH IS NEVER HELD FROM BRING-UP: both roots are resolved by name the first time a grant
+		// needs one, which is what keeps this service from depending on the radio stack to start, and
+		// what keeps a grant working after that stack has been restarted.
+		// AND `input`, WHICH HAD NO CLIENT BEHIND IT AT ALL: the table held zero, so a component granted
+		// it received nothing and could not subscribe to a pointer. Resolved by name through the broker
+		// like the two above.
+		Capability::Input => (&mut clients.input, CAP_INPUT),
+		Capability::Bluetooth => (&mut clients.bluetooth, CAP_BT_READ),
+		Capability::BluetoothOperator => (&mut clients.bluetooth_operator, CAP_BT_OPERATOR),
+		Capability::PowerState => (&mut clients.power_state, CAP_POWER_STATE),
+		Capability::PowerControl => (&mut clients.power_control, CAP_POWER_CONTROL),
+		// OBSERVATION ONLY: this connection names no subscriber and changes nothing, and nothing minted
+		// from it reaches data, identity or management.
+		Capability::ModemState => (&mut clients.modem_state, CAP_MODEM_STATE),
+		// INVENTORY ONLY: names and formats, and nothing on it starts a camera or reaches a frame.
+		Capability::Camera => (&mut clients.camera, CAP_CAMERA),
+		// INVENTORY ONLY: endpoints, and an `open` that answers no.
+		Capability::Midi => (&mut clients.midi, CAP_MIDI),
+		// A FRESH CONNECTION PER LAUNCH, because SpoolService charges jobs to the connection that created them:
+		// a duplicate shared by two launches would be one quota for both, and one reply queue.
+		Capability::Spool => (&mut clients.spool, CAP_SPOOL),
+		// THE SAME FOR IMPORT: each launch its own client context, which is what the service scopes identities,
+		// cursors and transfers to.
+		Capability::MediaImport => (&mut clients.media_import, CAP_MEDIA_IMPORT),
+		// THE OPERATOR'S JOURNAL VIEW, a fresh connection per launch; and the development image's test controls.
+		Capability::AdminAudit => (&mut clients.admin_audit, CAP_ADMIN_AUDIT),
+		Capability::AdminTest => (&mut clients.admin_test, CAP_ADMIN_TEST),
 		_ => {
 			let dup: i64 = duplicate(clients.for_capability(cap), GRANT_RIGHTS);
 			return if dup >= 0 { dup as u64 } else { 0 };
@@ -821,12 +1292,25 @@ impl Service for Manager {
 				}
 			}
 		}
+		// THE TERMINAL THE LAST STAGE WRITES TO, without the right to copy it. The caller hands this broker
+		// a duplicable endpoint so that every stage below can be given a diagnostics endpoint of its own;
+		// a stage receives only what a stage needs, and the duplicable one is closed once they exist.
+		let terminal: i64 = duplicate(stdout, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+		if terminal <= 0 {
+			for (read, write) in edges {
+				close(read);
+				close(write);
+			}
+			close(stdout);
+			return Err(Error::Invalid);
+		}
+		let terminal: u64 = terminal as u64;
 		// Stage i writes to edge i (or the terminal, if it is last) and reads from
 		// edge i-1 (or nothing, if it is first). `channel()` returns (a, b) as a connected
 		// pair; a stage writes into one end and its consumer reads the other.
 		let mut requests: Vec<StageRequest> = Vec::new();
 		for (index, stage) in stages.iter().enumerate() {
-			let out: u64 = if index + 1 == stages.len() { stdout } else { edges[index].1 };
+			let out: u64 = if index + 1 == stages.len() { terminal } else { edges[index].1 };
 			let input: u64 = if index == 0 { 0 } else { edges[index - 1].0 };
 			// A stage's diagnostics belong on the TERMINAL, not in the pipe.
 			//
@@ -845,12 +1329,14 @@ impl Service for Manager {
 			// the last, and the caller's terminal for that one. The shell cannot name it and
 			// deliberately cannot: the record's own comment says a caller names no stdio at all.
 			let error: u64 = {
-				let source: u64 = if stage.merge_errors { out } else { stdout };
+				// The last stage's output IS the terminal, and the duplicable copy of it is `stdout`.
+				let source: u64 = if stage.merge_errors && index + 1 != stages.len() { out } else { stdout };
 				let dup: i64 = duplicate(source, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
 				if dup > 0 { dup as u64 } else { 0 }
 			};
 			requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input, stderr: error });
 		}
+		close(stdout);
 		// EVERY ENDPOINT IS THE TRANSACTION'S FROM HERE. Each edge end, the terminal and the error
 		// duplicates are handed to the stage that owns them as it is installed, and the ones a
 		// failed transaction never installed are closed by the transaction itself - it is the only
@@ -1141,7 +1627,7 @@ fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, 
 				return None;
 			}
 		}
-		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false, detail: core::mem::take(&mut clients.grant_detail) });
 	}
 	// Every static grant is installed, so the graph this component can see is complete:
 	// release it. This MUST happen before the receive loop below - the manager waits on
@@ -1174,7 +1660,7 @@ fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Clients, 
 			Received::Message { len, .. } => {
 				if let Some(cap) = parse_request(&buf[..len]) {
 					let granted: bool = grant_dynamic(policy_name.as_bytes(), cap, clients, manager_side);
-					audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: true });
+					audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: true, detail: String::new() });
 					continue;
 				}
 				break Some(buf[..len].to_vec());
@@ -1327,7 +1813,7 @@ fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], e
 				return Err(Error::NotFound);
 			}
 		}
-		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false, detail: core::mem::take(&mut clients.grant_detail) });
 	}
 	// Commit: the tool's stdout, arguments, grants and cwd are all queued, so what it will
 	// observe is complete. Anything that failed above returned without releasing, which
@@ -1475,7 +1961,7 @@ fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8]
 					return Err(Error::NotFound);
 				}
 			}
-			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false, detail: core::mem::take(&mut clients.grant_detail) });
 		}
 	}
 	// SEAL, over the prepared members. Each task carries MANAGE - it is the same handle the
@@ -1693,7 +2179,7 @@ fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: 
 	// file replaced. The audit records the substitution rather than hiding it.
 	for &cap in VOCABULARY.iter() {
 		if cap == Capability::Volumes {
-			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: false, dynamic: true });
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: false, dynamic: true, detail: String::new() });
 			continue;
 		}
 		let want: bool = manifest.grants.contains(&cap);
@@ -1704,7 +2190,7 @@ fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: 
 				return Err(Error::NotFound);
 			}
 		}
-		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: want, dynamic: false });
+		audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: want, dynamic: false, detail: core::mem::take(&mut clients.grant_detail) });
 	}
 	match transaction.release(stage) {
 		Release::Started => {}
@@ -1950,7 +2436,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = channel().unwrap_or_else(|| fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection"));
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, font, font_admin, storage_admin, broker: bootstrap, bluetooth: 0, bluetooth_operator: 0, power_state: 0, power_control: 0, fixture_providers: ProviderWatch { channel: 0, entries: Vec::new() }, smartcard_admin: 0, modem_state: 0, modem_admin: 0, camera: 0, camera_admin: 0, midi: 0, midi_admin: 0, spool: 0, media_import: 0, admin_factory: 0, admin_audit: 0, admin_test: 0, grant_detail: String::new() };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => fail_bootstrap(bootstrap, b"process", b"process client not delivered"),
 		handle => handle,

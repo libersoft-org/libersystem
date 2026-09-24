@@ -24,15 +24,21 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use pix::{Image, Rect, Target};
 use proto::codec::Handles;
+use proto::system::TrustedScreen;
 use proto::system::display::{self, Service};
 use proto::system::display_admin::{self, Service as AdminService};
 use proto::system::display_device::{self};
 use proto::system::display_stats::{self, Service as StatsService};
+use proto::system::display_trusted::{self, Service as TrustedService};
 use proto::system::surface::{self, Service as SurfaceService};
 use proto::system::{AcquiredImage, ColorSpace, DamageRegion, DeviceEvent, DisplayResources, Error, Extent2d, FrameTiming, ImageLimits, Offset2d, OutputColour, OutputTransform, PixelFormat, PresentComplete, PresentOutcome, PresentQueue, PresentationStats, ProviderInfo, ProviderKind, Rect as WireRect, ScaleRatio, Scanout as DeviceScanout, SubpixelLayout, SurfaceConfiguration, SurfaceEvent, SurfaceRequest, TimestampEvidence, provider_catalogue};
 use rt::*;
+use service_logic::display_lock::Lock;
 
 const MAX_DIM: u32 = 8192;
+// THE PROTECTED SESSION'S PLACE IN `active`: never a channel number, so nothing an ordinary client holds can
+// name it, ask for its focus or present into it.
+const PROTECTED: u64 = u64::MAX;
 /// THE LARGEST EITHER HALF OF THE OUTPUT SCALE MAY BE.
 ///
 /// A scale is a ratio and it decides an ALLOCATION: every surface's physical extent is its logical
@@ -285,6 +291,12 @@ struct DisplayState {
 	// provider this service adopts, written to the debug port so it reaches the serial log whatever
 	// owns the console.
 	report_present: bool,
+	/// THE PROTECTED SESSION, held through the root only AdminService is handed. While it is held no ordinary
+	/// surface may become visible.
+	lock: Lock,
+	/// This end of the session's channel, whose closing tells the holder the session is over; and, waited on,
+	/// what tells this service the holder has gone.
+	trusted_session: u64,
 	/// A surface that asked to be closed, torn down AFTER its answer has gone out.
 	///
 	/// `close` ANSWERS `result<unit, error>`, AND THE ANSWER TRAVELS ON THE CHANNEL THE TEARDOWN
@@ -311,7 +323,7 @@ fn physical_extent(logical: u32, scale: &ScaleRatio) -> Option<u32> {
 
 impl DisplayState {
 	fn new(scanout: Scanout, focus_control: u64, kill_control: u64) -> DisplayState {
-		DisplayState { scanout, surfaces: Vec::new(), scale: ScaleRatio { numerator: 1, denominator: 1 }, focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true, closing: None, resets: 0 }
+		DisplayState { scanout, surfaces: Vec::new(), scale: ScaleRatio { numerator: 1, denominator: 1 }, focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true, lock: Lock::new(), trusted_session: 0, closing: None, resets: 0 }
 	}
 
 	fn surface_index(&self, chan: u64) -> Option<usize> {
@@ -403,7 +415,9 @@ impl DisplayState {
 		self.surfaces.push(surface);
 		// THE NEWEST SURFACE BECOMES THE VISIBLE ONE unless it is the console arriving first, which
 		// is what makes an application that starts take the screen and a console that starts not.
-		if self.active == 0 || !self.surfaces.last().is_some_and(|surface| surface.console) {
+		// AND NEVER WHILE THE PROTECTED SESSION IS HELD: the new surface is created hidden, and keeps
+		// what it has, until the session ends.
+		if self.lock.admits(service_end) && (self.active == 0 || !self.surfaces.last().is_some_and(|surface| surface.console)) {
 			self.set_active(service_end);
 		}
 		Ok(client_end)
@@ -896,6 +910,13 @@ impl DisplayState {
 			self.focus_command(b"CONSOLE", 0);
 			return;
 		}
+		// THE PROTECTED SURFACE HOLDS NO ORDINARY FOCUS. Nobody on the ordinary path gets the keyboard -
+		// application streams close and the cooked console is suppressed - and its own keys come through
+		// the trusted input path instead.
+		if self.lock.held().is_some_and(|held| held.surface == chan) {
+			self.focus_command(b"CLEAR", 0);
+			return;
+		}
 		let Some(index) = self.surface_index(chan) else { return };
 		let (proof, registered): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -910,6 +931,11 @@ impl DisplayState {
 	}
 
 	fn remove_surface(&mut self, chan: u64, restore: bool) {
+		// THE PROTECTED SURFACE GOING IS THE SESSION ENDING, however it went; the surface that was live
+		// before it comes back. Another surface going is one that can no longer be restored.
+		let locked: bool = self.lock.held().is_some_and(|held| held.surface == chan);
+		let restore_to: u64 = if locked { self.lock.end(self.console) } else { 0 };
+		self.lock.forget(chan);
 		if let Some(index) = self.surface_index(chan) {
 			let mut surface: Surface = self.surfaces.swap_remove(index);
 			// EVERY FRAME STILL IN FLIGHT SETTLES BEFORE THE SURFACE GOES. A present that never
@@ -923,6 +949,14 @@ impl DisplayState {
 			if surface.chan != 0 {
 				close(surface.chan);
 			}
+		}
+		if locked {
+			let next: u64 = if self.surface_index(restore_to).is_some() { restore_to } else { 0 };
+			self.set_active(next);
+			if self.active != 0 {
+				self.present_active_full();
+			}
+			return;
 		}
 		if !restore {
 			return;
@@ -1189,6 +1223,9 @@ impl DisplayState {
 	// what it did before this path existed, and `adopt_scanout` is what releases it - when there is
 	// something to replace it with.
 	fn release_scanout(&mut self) {
+		// A LOST SCANOUT ENDS THE PROTECTED SESSION: nothing is showing it any more, so nothing a person
+		// sees can be what they approve.
+		self.end_trusted();
 		if self.scanout.gpu != 0 {
 			close(self.scanout.gpu);
 			self.scanout.gpu = 0;
@@ -1232,6 +1269,8 @@ impl DisplayState {
 			}
 			let old_events: u64 = self.scanout.events;
 			let old: u64 = self.scanout.handle;
+			// AND SO DOES A RESET DISPLAY: what was presented before is not what is showing now.
+			self.end_trusted();
 			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height, generation: described.generation, events: open_device_events(gpu), lost: false };
 			if old_events != 0 {
 				close(old_events);
@@ -1249,6 +1288,94 @@ impl DisplayState {
 			}
 			true
 		}
+	}
+
+	/// End the protected session, whatever its epoch: its channel closes - which is how its holder learns - and
+	/// the surface that was live before comes back, or the console, or nothing.
+	fn end_trusted(&mut self) {
+		if self.lock.held().is_none() {
+			return;
+		}
+		let restore: u64 = self.lock.end(self.console);
+		if self.trusted_session != 0 {
+			close(self.trusted_session);
+			self.trusted_session = 0;
+		}
+		let next: u64 = if self.surface_index(restore).is_some() { restore } else { 0 };
+		self.set_active(next);
+		if self.active != 0 {
+			self.present_active_full();
+		}
+	}
+
+	/// Take the screen for the protected session. It has no ordinary surface - nothing a client holds names
+	/// it - so every surface is hidden at once, focus goes to nobody, and a surface created meanwhile stays
+	/// hidden until the session ends.
+	fn lock_screen(&mut self, epoch: u64) -> Result<TrustedScreen, Error> {
+		if self.lock.held().is_some() {
+			return Err(Error::Again);
+		}
+		// A SCREEN NOBODY CAN SEE IS NO PLACE TO ASK A PERSON ANYTHING.
+		if self.scanout.addr == 0 || self.scanout.width == 0 || self.scanout.height == 0 || self.scanout.lost {
+			return Err(Error::Unsupported);
+		}
+		let pitch: u32 = self.scanout.width.checked_mul(4).ok_or(Error::Invalid)?;
+		let (mine, theirs): (u64, u64) = channel().ok_or(Error::Exhausted)?;
+		if self.lock.take(epoch, PROTECTED, self.active).is_err() {
+			close(mine);
+			close(theirs);
+			return Err(Error::Again);
+		}
+		self.trusted_session = mine;
+		self.set_active(PROTECTED);
+		Ok(TrustedScreen { width: self.scanout.width, height: self.scanout.height, pitch, session: theirs })
+	}
+
+	/// Show the holder's pixels, whole, on the scanout: answered once the device has taken them, which is the
+	/// fresh presentation the holder waits for before any key can decide anything.
+	fn present_screen(&mut self, epoch: u64, pixels: u64) -> Result<u64, Error> {
+		let shown = self.show_screen(epoch, pixels);
+		close(pixels);
+		shown
+	}
+
+	fn show_screen(&mut self, epoch: u64, pixels: u64) -> Result<u64, Error> {
+		let held = self.lock.held().ok_or(Error::Invalid)?;
+		if held.epoch != epoch {
+			return Err(Error::Stale);
+		}
+		let (width, height): (u32, u32) = (self.scanout.width, self.scanout.height);
+		let pitch: u32 = width.checked_mul(4).ok_or(Error::Invalid)?;
+		let needed: u64 = pitch as u64 * height as u64;
+		// THE OBJECT'S OWN SIZE, as for every image this service reads.
+		if object_info(pixels).is_none_or(|info| info.size < needed) {
+			return Err(Error::Invalid);
+		}
+		let addr: u64 = unsafe { map_object(pixels) }.ok_or(Error::Exhausted)?;
+		let blit = {
+			let source: &[u8] = unsafe { core::slice::from_raw_parts(addr as *const u8, needed as usize) };
+			let target_len: usize = self.scanout.fb.pitch as usize * height as usize;
+			let target: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(self.scanout.addr as *mut u8, target_len) };
+			let fb = &self.scanout.fb;
+			match (Image::rgba(source, width, height, pitch), Target::packed(target, width, height, fb.pitch, fb.bytes_per_pixel, (fb.red_shift, fb.red_size), (fb.green_shift, fb.green_size), (fb.blue_shift, fb.blue_size))) {
+				(Some(source), Some(target)) => pix::blit(source, target, Rect { x: 0, y: 0, width, height }, true),
+				_ => None,
+			}
+		};
+		unmap_object(pixels);
+		let blit = blit.ok_or(Error::Invalid)?;
+		self.flush_damage(&[blit.rect])?;
+		self.stats.presents = self.stats.presents.saturating_add(1);
+		Ok(epoch)
+	}
+
+	fn release_screen(&mut self, epoch: u64) -> Result<(), Error> {
+		let held = self.lock.held().ok_or(Error::Invalid)?;
+		if held.epoch != epoch {
+			return Err(Error::Stale);
+		}
+		self.end_trusted();
+		Ok(())
 	}
 
 	// WHAT THE DEVICE REPORTED, ACTED ON.
@@ -1269,10 +1396,15 @@ impl DisplayState {
 				for surface in &mut self.surfaces {
 					surface.initialized = false;
 				}
+				// THE PROTECTED SCREEN WAS DRAWN FOR THE OLD GEOMETRY, so a person no longer sees all of it: the
+				// session ends, and its request with it.
+				self.end_trusted();
 				return true;
 			}
 			DeviceEvent::Replaced(scanout) => scanout,
 		};
+		// A REPLACED BACKING IS A RESET DISPLAY, and ends the protected session with it.
+		self.end_trusted();
 		let handle: u64 = replaced.backing.handle;
 		let Some((fb, width, height)) = describe_framebuffer(&replaced) else {
 			close(handle);
@@ -1454,6 +1586,23 @@ impl StatsService for StatsCall<'_> {
 	}
 }
 
+// THE PROTECTED SESSION'S ROOT, which only AdminService holds.
+struct TrustedCall<'a> {
+	state: &'a mut DisplayState,
+}
+
+impl TrustedService for TrustedCall<'_> {
+	fn lock(&mut self, epoch: u64) -> Result<TrustedScreen, Error> {
+		self.state.lock_screen(epoch)
+	}
+	fn present(&mut self, epoch: u64, pixels: u64) -> Result<u64, Error> {
+		self.state.present_screen(epoch, pixels)
+	}
+	fn release(&mut self, epoch: u64) -> Result<(), Error> {
+		self.state.release_screen(epoch)
+	}
+}
+
 struct AdminCall<'a> {
 	clients: &'a mut Vec<Client>,
 	/// THE WHOLE STATE, because one of these operations CHANGES it. `stats` and `bind` only read or
@@ -1542,6 +1691,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// Graph reports no display resources, which is a smaller answer and not a broken display.
 		// LAST, like every addition to a positional bootstrap.
 		let stats_root: u64 = recv_tagged(bootstrap, &mut buf, b"STATS").unwrap_or(0);
+		// THE PROTECTED SESSION'S ROOT, handed to AdminService alone. Optional: a boot without it has no
+		// protected screen, and AdminService declines every request. LAST, like every addition.
+		let trusted_root: u64 = recv_tagged(bootstrap, &mut buf, b"TRUSTED").unwrap_or(0);
 		let providers: u64 = subscribe_to_displays(catalogue);
 		// THE SNAPSHOT IS ALREADY IN THE CHANNEL, which is what makes a subscription usable at
 		// bootstrap rather than only afterwards: the catalogue registers a subscriber and sends it
@@ -1554,7 +1706,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		serve_display(service, admin, stats_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control));
+		serve_display(service, admin, stats_root, trusted_root, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control));
 	}
 }
 
@@ -1706,7 +1858,7 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, _buf: &mut [u8]) -> Scanout {
 	}
 }
 
-fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
+fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
 	// THE OBSERVATION ROOT IS A FACTORY LIKE EVERY OTHER ROOT IN THIS SYSTEM, and it was not: it
 	// answered `resources()` and NOTHING else, so a supervisor minting an independent connection
@@ -1741,6 +1893,11 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut pro
 			waits.push(state.kill_control);
 		}
 		waits.push(admin);
+		// THE PROTECTED SESSION'S ROOT, right after the admin root.
+		let trusted_present: bool = trusted_root != 0;
+		if trusted_present {
+			waits.push(trusted_root);
+		}
 		// THE OBSERVATION ROOT, WHICH IS WAITED ON LIKE ANY OTHER and answers like no other: nothing
 		// reachable from it changes a thing.
 		// EVERY OBSERVATION CHANNEL IS WAITED ON: the root, and each connection minted from it.
@@ -1771,8 +1928,24 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut pro
 				}
 			}
 		}
+		// AND THE PROTECTED SESSION'S CHANNEL, LAST: its holder going away ends the session.
+		if state.trusted_session != 0 {
+			waits.push(state.trusted_session);
+		}
 		let ready: i64 = wait_any(&waits, 0);
 		if ready < 0 {
+			continue;
+		}
+		if state.trusted_session != 0 && waits[ready as usize] == state.trusted_session {
+			match try_recv_caps(state.trusted_session, &mut request) {
+				PolledCaps::Closed => state.end_trusted(),
+				PolledCaps::Message { handles, .. } => {
+					for &stray in handles.as_slice() {
+						close(stray);
+					}
+				}
+				PolledCaps::Empty => {}
+			}
 			continue;
 		}
 		let events_first: bool = state.scanout.events != 0;
@@ -1949,8 +2122,43 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut pro
 			}
 			continue;
 		}
-		if stats_count > 0 && ready as usize > admin_index && ready as usize <= admin_index + stats_count {
-			let which: usize = ready as usize - admin_index - 1;
+		if trusted_present && ready as usize == admin_index + 1 {
+			match recv_caps_blocking(trusted_root, &mut request) {
+				ReceivedCaps::Message { len, handles: caps } => {
+					let mut handle = caps;
+					let mut reply_handle = proto::codec::Handles::new();
+					let written = display_trusted::dispatch(&mut TrustedCall { state: &mut state }, &request[..len], &mut handle, &mut reply, &mut reply_handle);
+					match written {
+						// THE SESSION'S CHANNEL is the holder's to wait on and nothing more.
+						Some(n) => {
+							if !send_reply(trusted_root, &reply[..n], reply_handle.as_slice(), &[RIGHT_RECEIVE | RIGHT_WAIT][..reply_handle.len().min(1)]) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
+							}
+						}
+						None => {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
+						}
+					}
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
+					}
+				}
+				// ITS HOLDER WENT AWAY, and with it any session it held.
+				ReceivedCaps::Closed => {
+					state.end_trusted();
+					close(trusted_root);
+					trusted_root = 0;
+				}
+			}
+			continue;
+		}
+		let stats_base: usize = admin_index + trusted_present as usize;
+		if stats_count > 0 && ready as usize > stats_base && ready as usize <= stats_base + stats_count {
+			let which: usize = ready as usize - stats_base - 1;
 			let observation: u64 = stats[which];
 			match recv_blocking(observation, &mut request) {
 				Received::Message { len, handle } => {
@@ -1994,9 +2202,10 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, catalogue: u64, mut pro
 			}
 			continue;
 		}
-		// PAST THE ADMIN ROOT AND PAST EVERY OBSERVATION CHANNEL: the admin root is one slot and the
-		// observation channels are `stats_count` of them, so a client's own index starts after both.
-		let client_index: usize = ready as usize - admin_index - 1 - stats_count;
+		// PAST THE ADMIN ROOT, THE PROTECTED ROOT AND EVERY OBSERVATION CHANNEL: the admin root is one slot,
+		// the protected root one more when there is one, and the observation channels are `stats_count` of
+		// them, so a client's own index starts after all of them.
+		let client_index: usize = ready as usize - stats_base - 1 - stats_count;
 		// PAST THE CONNECTIONS IS A SURFACE, and a surface channel is dispatched to the surface
 		// interface rather than to the connection's. Past the surfaces is a WATCHED CLIENT PROCESS.
 		if client_index >= connections + surfaces_watched {

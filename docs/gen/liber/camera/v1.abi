@@ -1,0 +1,37 @@
+package liber:camera@1
+resource frame-buffer
+record camera-id(slot:u32,generation:u32,binding-generation:u64,incarnation:u64)
+enum frame-type(yuy2=1,mjpeg=2)
+enum color-range(unknown=0,limited=1,full=2)
+enum color-matrix(unknown=0,bt601=1,bt709=2)
+record interval(numerator:u32,denominator:u32)
+record discrete-intervals(values:list<interval>:bound=32)
+record interval-range(minimum:interval,maximum:interval,step:interval)
+variant intervals(discrete=0:discrete-intervals,stepwise=1:interval-range)
+record frame-size(index:u8,width:u16,height:u16,max-bytes:u32,intervals:intervals)
+record format-info(index:u8,frame-type:frame-type,compressed:bool,sizes:u8,range:color-range,matrix:color-matrix)
+record camera-info(id:camera-id,name:string:bound=64,formats:list<format-info>:bound=8,generation:u64,streaming:bool,available:bool)
+record format-page(generation:u64,format:format-info,offset:u8,sizes:list<frame-size>:bound=8,total:u8)
+record stream-request(format:u8,size:u8,interval:interval)
+record negotiated(stream-generation:u64,format:u8,frame-type:frame-type,width:u16,height:u16,interval:interval,max-bytes:u32,stride:u32,plane-offset:u32,range:color-range,matrix:color-matrix)
+record device-time(ticks:u64,width-bits:u8,frequency-hz:option<u64>,clock-domain:u32,reset-generation:u32)
+record frame(stream-generation:u64,sequence:u64,buffer:u8,lease:u64,valid-bytes:u32,arrival-ns:u64,device:option<device-time>)
+record capture-status(stream-generation:u64,streaming:bool,next-sequence:u64,dropped-no-buffer:u64,dropped-device:u64,unknown-discontinuities:u64,ended:option<liber:base@1::error>)
+variant capture-event(frame=0:frame,status=1:capture-status)
+interface camera
+method camera.cameras op=1 () -> result<list<camera-info>, liber:base@1::error>:bound=4
+method camera.sizes op=2 (camera:camera-id:rights=,generation:u64:rights=,format:u8:rights=,offset:u8:rights=) -> result<format-page, liber:base@1::error>
+interface camera-capture
+method camera-capture.camera op=1 () -> result<camera-info, liber:base@1::error>
+method camera-capture.sizes op=2 (generation:u64:rights=,format:u8:rights=,offset:u8:rights=) -> result<format-page, liber:base@1::error>
+method camera-capture.negotiate op=3 (request:stream-request:rights=) -> result<negotiated, liber:base@1::error>
+method camera-capture.register op=4 (buffer:handle<frame-buffer>:rights=map+write) -> result<u8, liber:base@1::error>
+method camera-capture.start op=5 () -> result<unit, liber:base@1::error>
+method camera-capture.events op=6 () -> stream<capture-event>
+method camera-capture.release op=7 (buffer:u8:rights=,lease:u64:rights=) -> result<unit, liber:base@1::error>
+method camera-capture.stop op=8 () -> result<unit, liber:base@1::error>
+method camera-capture.status op=9 () -> result<capture-status, liber:base@1::error>
+record capture-grant(connection:handle<channel>,camera:camera-id)
+interface camera-admin
+method camera-admin.mint op=1 (alias:string:bound=32:rights=,owner:handle<liber:process@1::task>:rights=) -> result<capture-grant, liber:base@1::error>
+method camera-admin.revoke op=2 (camera:camera-id:rights=) -> result<u32, liber:base@1::error>

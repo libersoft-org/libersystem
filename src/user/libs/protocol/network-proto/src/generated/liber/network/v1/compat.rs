@@ -393,3 +393,27 @@ fn chunk_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(Chunk::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn link_provider_wire_is_stable() {
+	let sample = LinkProvider { slot: 7, generation: 7, binding_generation: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(LinkProvider::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn link_family_wire_is_stable() {
+	let sample = LinkFamily::Ipv4;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[4];
+	assert_eq!(bytes, golden);
+	assert_eq!(LinkFamily::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn link_installed_wire_is_stable() {
+	let sample = LinkInstalled { interface: InterfaceId { index: 7, generation: 7 }, mtu: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(LinkInstalled::decode(&bytes).unwrap(), sample);
+}

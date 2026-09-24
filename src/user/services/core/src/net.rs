@@ -560,11 +560,25 @@ pub struct Stack {
 	// service stands it up, because forming a link-local address needs a secret and a digest this
 	// module does not own.
 	ipv6: Option<Ipv6Host>,
+	// THE MEDIUM. False is Ethernet: frames carry a 14-byte header, neighbours are resolved with ARP and
+	// DHCP runs. True is a RAW-IP link - a modem context - where every message IS an IPv4 datagram:
+	// there is no link-layer header to write or strip, no neighbour to resolve and no DHCP, and the
+	// address, route and DNS arrive with the link. ICMP, UDP, TCP and DNS are the same code on both.
+	raw: bool,
+	// WHICH LINK THIS STACK IS, as the public contract names it: the interface index and the generation
+	// NetworkService was on when it built this stack. A new link is a new stack and a new generation, so
+	// nothing scoped to this one can be mistaken for the next.
+	interface: (u32, u64),
+	// THE CHANNEL UNDER THIS STACK CLOSED. Every wait in the service stops at once rather than spinning on
+	// a channel that is forever ready, and the serve loop tears the link down when it next looks.
+	channel_closed: bool,
 	mac: MacAddr,
 	ip: Ipv4Addr,
 	mask: Ipv4Addr,
 	gateway: Ipv4Addr,
 	dns: Ipv4Addr,
+	// A second resolver, when the link supplied one (a raw-IP attachment may carry two). Zero is none.
+	dns_secondary: Ipv4Addr,
 	// The interface MTU the frame buffers were sized by (the smaller of the link's
 	// report and the `net.mtu` knob) - rendered by `ip`, bounds a TCP segment.
 	mtu: u16,
@@ -590,7 +604,57 @@ impl Stack {
 		for _ in 0..TCP_CONN_MAX {
 			conns.push(TcpConn::closed());
 		}
-		Stack { ipv6: None, clock_ms: 0, pending_lease: DhcpLease::empty(), dhcp_xid: 0, mac, ip, mask, gateway, dns, mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listeners: BindTable::new(), probe_quotes: Vec::new(), admission: Admission::new(), next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+		Stack { ipv6: None, raw: false, interface: (0, 1), channel_closed: false, clock_ms: 0, pending_lease: DhcpLease::empty(), dhcp_xid: 0, mac, ip, mask, gateway, dns, dns_secondary: Ipv4Addr([0; 4]), mtu, neigh: alloc::vec![Neigh { ip: Ipv4Addr([0; 4]), mac: MacAddr::ZERO, valid: false }; neigh_cap.max(1)], conns, listeners: BindTable::new(), probe_quotes: Vec::new(), admission: Admission::new(), next_iss: 0x1000_0000, dhcp: DhcpLease::empty() }
+	}
+
+	// A stack on a RAW-IP link: the address, prefix, gateway, DNS server and MTU its attachment carried,
+	// and no MAC at all. There is nothing to resolve on a point-to-point link, so the neighbour table is
+	// a single unused row.
+	pub fn new_raw(ip: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr, dns: [Ipv4Addr; 2], mtu: u16) -> Stack {
+		let mut stack = Stack::new(MacAddr::ZERO, ip, mask, gateway, dns[0], 1, mtu);
+		stack.dns_secondary = dns[1];
+		stack.raw = true;
+		stack
+	}
+
+	pub fn is_raw(&self) -> bool {
+		self.raw
+	}
+
+	pub fn set_interface(&mut self, index: u32, generation: u64) {
+		self.interface = (index, generation);
+	}
+
+	pub fn interface(&self) -> (u32, u64) {
+		self.interface
+	}
+
+	pub fn mark_channel_closed(&mut self) {
+		self.channel_closed = true;
+	}
+
+	pub fn channel_closed(&self) -> bool {
+		self.channel_closed
+	}
+
+	// The second resolver, when there is one.
+	pub fn dns_secondary(&self) -> Option<Ipv4Addr> {
+		(self.dns_secondary.0 != [0; 4]).then_some(self.dns_secondary)
+	}
+
+	// How many bytes of link-layer header lead a frame on this medium.
+	fn l2(&self) -> usize {
+		if self.raw { 0 } else { ETH_HDR }
+	}
+
+	// The Ethernet header, on the one medium that has one.
+	fn write_l2(&self, out: &mut [u8], destination: &[u8], ethertype: u16) {
+		if self.raw {
+			return;
+		}
+		out[0..6].copy_from_slice(&destination[..6]);
+		out[6..12].copy_from_slice(&self.mac.0);
+		put16(out, 12, ethertype);
 	}
 
 	// Stand the IPv6 host up on this link.
@@ -621,6 +685,7 @@ impl Stack {
 		self.mask = Ipv4Addr([0; 4]);
 		self.gateway = Ipv4Addr([0; 4]);
 		self.dns = Ipv4Addr([0; 4]);
+		self.dns_secondary = Ipv4Addr([0; 4]);
 	}
 
 	// What each family has, for the readiness report.
@@ -648,15 +713,6 @@ impl Stack {
 
 	pub fn ipv6_ref(&self) -> Option<&Ipv6Host> {
 		self.ipv6.as_ref()
-	}
-
-	// This interface's identity, as the public contract carries it. Absent only on a boot with no
-	// IPv6 host at all, which is a link that refused the family.
-	pub fn ipv6_identity(&self) -> Option<(u32, u64)> {
-		self.ipv6.as_ref().map(|host| {
-			let interface = host.interface();
-			(u32::from(interface.index), u64::from(interface.generation))
-		})
 	}
 
 	// The IPv6 layer's next deadline, in milliseconds, or None when it has nothing pending.
@@ -731,6 +787,11 @@ impl Stack {
 
 	// The cached MAC for `ip`, if known.
 	pub fn lookup(&self, ip: Ipv4Addr) -> Option<MacAddr> {
+		// A POINT-TO-POINT LINK HAS NO NEIGHBOURS TO RESOLVE: every datagram goes to the one peer, and
+		// nothing waits for a MAC that does not exist.
+		if self.raw {
+			return Some(MacAddr::ZERO);
+		}
 		for n in self.neigh.iter() {
 			if n.valid && n.ip == ip {
 				return Some(n.mac);
@@ -795,6 +856,13 @@ impl Stack {
 	// Parse one received Ethernet frame, update the neighbor cache, and write an
 	// optional reply frame to `out`. Any malformed or unhandled frame yields no reply.
 	pub fn on_frame(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
+		// A RAW-IP MESSAGE IS THE DATAGRAM: checked for what its own header says, and nothing else.
+		if self.raw {
+			return match service_logic::raw_ip::datagram(frame, self.mtu) {
+				Ok(datagram) => self.on_ipv4(datagram, out),
+				Err(_) => Outcome { reply_len: 0, event: Event::None },
+			};
+		}
 		if frame.len() < ETH_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
@@ -808,7 +876,7 @@ impl Stack {
 	// Handle an ARP packet: learn the sender, reply to a request for our address, and
 	// report a reply as a learned neighbor.
 	fn on_arp(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
-		let a: &[u8] = &frame[ETH_HDR..];
+		let a: &[u8] = &frame[self.l2()..];
 		if a.len() < ARP_LEN || be16(a, 0) != ARP_HTYPE_ETHERNET || be16(a, 2) != ARP_PTYPE_IPV4 {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
@@ -830,10 +898,8 @@ impl Stack {
 	// Build an Ethernet + ARP frame (request or reply) into `out`, returning its length.
 	fn build_arp(&self, op: u16, target_mac: MacAddr, target_ip: Ipv4Addr, out: &mut [u8]) -> usize {
 		let dst: MacAddr = if op == ARP_OP_REQUEST { MacAddr::BROADCAST } else { target_mac };
-		out[0..6].copy_from_slice(&dst.0);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_ARP);
-		let a: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + ARP_LEN];
+		self.write_l2(out, &dst.0, ETHERTYPE_ARP);
+		let a: &mut [u8] = &mut out[self.l2()..self.l2() + ARP_LEN];
 		put16(a, 0, ARP_HTYPE_ETHERNET);
 		put16(a, 2, ARP_PTYPE_IPV4);
 		a[4] = 6;
@@ -843,11 +909,15 @@ impl Stack {
 		a[14..18].copy_from_slice(&self.ip.0);
 		a[18..24].copy_from_slice(&target_mac.0);
 		a[24..28].copy_from_slice(&target_ip.0);
-		ETH_HDR + ARP_LEN
+		self.l2() + ARP_LEN
 	}
 
 	// Build a broadcast ARP request asking who has `target`, into `out`.
 	pub fn build_arp_request(&self, target: Ipv4Addr, out: &mut [u8]) -> usize {
+		// Nothing is ever asked on a raw-IP link.
+		if self.raw {
+			return 0;
+		}
 		self.build_arp(ARP_OP_REQUEST, MacAddr::ZERO, target, out)
 	}
 
@@ -856,7 +926,7 @@ impl Stack {
 	// rides a minimum-size (60-byte) Ethernet frame whose padding would otherwise
 	// read as protocol payload - a bare ACK's padding once advanced a TCP window.
 	fn on_ipv4(&mut self, frame: &[u8], out: &mut [u8]) -> Outcome {
-		let ip: &[u8] = &frame[ETH_HDR..];
+		let ip: &[u8] = &frame[self.l2()..];
 		if ip.len() < IPV4_HDR || ip[0] >> 4 != 4 {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
@@ -868,8 +938,8 @@ impl Stack {
 		if total < ihl || ip.len() < total {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
-		let frame: &[u8] = &frame[..ETH_HDR + total];
-		let ip: &[u8] = &frame[ETH_HDR..];
+		let frame: &[u8] = &frame[..self.l2() + total];
+		let ip: &[u8] = &frame[self.l2()..];
 		let dst_ip: Ipv4Addr = Ipv4Addr([ip[16], ip[17], ip[18], ip[19]]);
 		let proto: u8 = ip[9];
 		// Accept packets addressed to us, plus limited-broadcast UDP - so the DHCP
@@ -890,7 +960,7 @@ impl Stack {
 	// Handle an inbound UDP datagram: a DNS response (source port 53) is parsed into
 	// the resolved address, a DHCP reply (source port 67) into the learned lease.
 	fn on_udp(&mut self, frame: &[u8], ihl: usize, destination_is_broadcast: bool, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Outcome {
-		let udp: &[u8] = &frame[ETH_HDR + ihl..];
+		let udp: &[u8] = &frame[self.l2() + ihl..];
 		if udp.len() < UDP_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
@@ -1003,8 +1073,8 @@ impl Stack {
 	// acknowledge it, note a peer FIN, and abort on RST. Segments for no live
 	// connection are ignored.
 	fn on_tcp(&mut self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> Outcome {
-		let tcp: &[u8] = &frame[ETH_HDR + ihl..];
-		let remote_mac: MacAddr = MacAddr([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]);
+		let tcp: &[u8] = &frame[self.l2() + ihl..];
+		let remote_mac: MacAddr = if self.raw { MacAddr::ZERO } else { MacAddr([frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]]) };
 		let local: Local = Local::V4(self.ip.0);
 		self.on_tcp_segment(Local::V4(src_ip.0), local, tcp, Some(remote_mac), out)
 	}
@@ -1556,16 +1626,14 @@ impl Stack {
 	fn build_tcp_opts(&self, ci: usize, flags: u8, seq: u32, ack: u32, opts: &[u8], payload: &[u8], out: &mut [u8]) -> usize {
 		let hdr: usize = TCP_HDR + opts.len();
 		let total: usize = IPV4_HDR + hdr + payload.len();
-		if ETH_HDR + total > out.len() {
+		if self.l2() + total > out.len() {
 			return 0;
 		}
 		let c: &TcpConn = &self.conns[ci];
 		let window: usize = if flags & TCP_SYN != 0 { c.rx.len() } else { (c.rx.len() - c.rx_len) >> c.rcv_wscale };
-		out[0..6].copy_from_slice(&c.remote_mac.0);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_IPV4);
+		self.write_l2(out, &c.remote_mac.0, ETHERTYPE_IPV4);
 		// TCP header + options + payload.
-		let t: usize = ETH_HDR + IPV4_HDR;
+		let t: usize = self.l2() + IPV4_HDR;
 		put16(out, t, c.local_port);
 		put16(out, t + 2, c.remote_port);
 		put32(out, t + 4, seq);
@@ -1584,7 +1652,7 @@ impl Stack {
 		let tcp_csum: u16 = tcp_checksum(self.ip, peer, &out[t..t + hdr + payload.len()]);
 		put16(out, t + 16, tcp_csum);
 		// IPv4 header.
-		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		let ip: &mut [u8] = &mut out[self.l2()..self.l2() + IPV4_HDR];
 		ip[0] = 0x45;
 		ip[1] = 0;
 		put16(ip, 2, total as u16);
@@ -1597,7 +1665,7 @@ impl Stack {
 		ip[16..20].copy_from_slice(&self.remote_v4(ci).0);
 		let csum: u16 = checksum(&ip[..IPV4_HDR]);
 		put16(ip, 10, csum);
-		ETH_HDR + total
+		self.l2() + total
 	}
 
 	// Allocate a free connection slot for a new open (outbound or accepted), marking it
@@ -2116,7 +2184,7 @@ impl Stack {
 
 	// Handle an ICMP message: reply to an echo request, report an echo reply.
 	fn on_icmp(&mut self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> Outcome {
-		let icmp: &[u8] = &frame[ETH_HDR + ihl..];
+		let icmp: &[u8] = &frame[self.l2() + ihl..];
 		if icmp.len() < ICMP_HDR {
 			return Outcome { reply_len: 0, event: Event::None };
 		}
@@ -2125,7 +2193,7 @@ impl Stack {
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		if icmp[0] == ICMP_ECHO_REPLY {
-			let ttl: u8 = frame[ETH_HDR + 8];
+			let ttl: u8 = frame[self.l2() + 8];
 			let seq: u16 = be16(icmp, 6);
 			return Outcome { reply_len: 0, event: Event::EchoReply(src_ip, ttl, seq) };
 		}
@@ -2161,17 +2229,15 @@ impl Stack {
 	// Turn a received ICMP echo request into its echo reply in `out`: swap the L2/L3
 	// addresses, flip the ICMP type, and recompute both checksums.
 	fn build_echo_reply(&self, frame: &[u8], ihl: usize, src_ip: Ipv4Addr, out: &mut [u8]) -> usize {
-		let ip_total: usize = be16(&frame[ETH_HDR..], 2) as usize;
-		let frame_len: usize = ETH_HDR + ip_total;
+		let ip_total: usize = be16(&frame[self.l2()..], 2) as usize;
+		let frame_len: usize = self.l2() + ip_total;
 		if ip_total < ihl + ICMP_HDR || frame_len > frame.len() || frame_len > out.len() {
 			return 0;
 		}
 		// Ethernet: destination = the requester, source = us.
-		out[0..6].copy_from_slice(&frame[6..12]);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_IPV4);
-		out[ETH_HDR..frame_len].copy_from_slice(&frame[ETH_HDR..frame_len]);
-		let ip: &mut [u8] = &mut out[ETH_HDR..frame_len];
+		self.write_l2(out, &frame[6..12], ETHERTYPE_IPV4);
+		out[self.l2()..frame_len].copy_from_slice(&frame[self.l2()..frame_len]);
+		let ip: &mut [u8] = &mut out[self.l2()..frame_len];
 		// Swap source/destination IP, then recompute the header checksum.
 		ip[12..16].copy_from_slice(&self.ip.0);
 		ip[16..20].copy_from_slice(&src_ip.0);
@@ -2202,10 +2268,8 @@ impl Stack {
 	// that differ in one byte are two things that can drift.
 	pub fn build_icmp_echo_ttl(&self, dst_mac: MacAddr, dst_ip: Ipv4Addr, ident: u16, seq: u16, ttl: u8, out: &mut [u8]) -> usize {
 		let total: usize = IPV4_HDR + ICMP_HDR + ICMP_PAYLOAD;
-		out[0..6].copy_from_slice(&dst_mac.0);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_IPV4);
-		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + total];
+		self.write_l2(out, &dst_mac.0, ETHERTYPE_IPV4);
+		let ip: &mut [u8] = &mut out[self.l2()..self.l2() + total];
 		ip[0] = 0x45;
 		ip[1] = 0;
 		put16(ip, 2, total as u16);
@@ -2230,7 +2294,7 @@ impl Stack {
 		}
 		let csum2: u16 = checksum(icmp);
 		put16(icmp, 2, csum2);
-		ETH_HDR + total
+		self.l2() + total
 	}
 
 	// Build an Ethernet + IPv4 + UDP + DNS A-record query for `name` (sent to the DNS
@@ -2242,14 +2306,14 @@ impl Stack {
 		// THE MESSAGE IS BUILT WHERE THE RULES ARE. This wraps it in UDP and IPv4 and nothing else:
 		// the header, the question encoding and the identity are `service-logic`'s, where a host test
 		// can drive them.
-		let dns_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
+		let dns_off: usize = self.l2() + IPV4_HDR + UDP_HDR;
 		if dns_off + message.len() > out.len() {
 			return 0;
 		}
 		out[dns_off..dns_off + message.len()].copy_from_slice(message);
 		let dns_len: usize = message.len();
 		// UDP header.
-		let udp_off: usize = ETH_HDR + IPV4_HDR;
+		let udp_off: usize = self.l2() + IPV4_HDR;
 		put16(out, udp_off, src_port);
 		put16(out, udp_off + 2, DNS_PORT);
 		put16(out, udp_off + 4, (UDP_HDR + dns_len) as u16);
@@ -2258,7 +2322,7 @@ impl Stack {
 		put16(out, udp_off + 6, udp_csum);
 		// IPv4 header.
 		let total: usize = IPV4_HDR + UDP_HDR + dns_len;
-		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		let ip: &mut [u8] = &mut out[self.l2()..self.l2() + IPV4_HDR];
 		ip[0] = 0x45;
 		ip[1] = 0;
 		put16(ip, 2, total as u16);
@@ -2272,10 +2336,8 @@ impl Stack {
 		let csum: u16 = checksum(&ip[..IPV4_HDR]);
 		put16(ip, 10, csum);
 		// Ethernet header.
-		out[0..6].copy_from_slice(&server_mac.0);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_IPV4);
-		ETH_HDR + total
+		self.write_l2(out, &server_mac.0, ETHERTYPE_IPV4);
+		self.l2() + total
 	}
 
 	// Build an SNTP (NTP) client request to `server_ip` from `src_port` into `out`,
@@ -2284,14 +2346,14 @@ impl Stack {
 	pub fn build_sntp_request(&self, server_mac: MacAddr, server_ip: Ipv4Addr, src_port: u16, message: &[u8], out: &mut [u8]) -> usize {
 		// THE MESSAGE IS BUILT WHERE THE RULES ARE, as the DNS query is: this wraps it in UDP and IPv4
 		// and nothing else.
-		let ntp_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
+		let ntp_off: usize = self.l2() + IPV4_HDR + UDP_HDR;
 		let ntp_len: usize = message.len();
 		if ntp_off + ntp_len > out.len() {
 			return 0;
 		}
 		out[ntp_off..ntp_off + ntp_len].copy_from_slice(message);
 		// UDP header.
-		let udp_off: usize = ETH_HDR + IPV4_HDR;
+		let udp_off: usize = self.l2() + IPV4_HDR;
 		put16(out, udp_off, src_port);
 		put16(out, udp_off + 2, NTP_PORT);
 		put16(out, udp_off + 4, (UDP_HDR + ntp_len) as u16);
@@ -2300,7 +2362,7 @@ impl Stack {
 		put16(out, udp_off + 6, udp_csum);
 		// IPv4 header.
 		let total: usize = IPV4_HDR + UDP_HDR + ntp_len;
-		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		let ip: &mut [u8] = &mut out[self.l2()..self.l2() + IPV4_HDR];
 		ip[0] = 0x45;
 		ip[1] = 0;
 		put16(ip, 2, total as u16);
@@ -2314,10 +2376,8 @@ impl Stack {
 		let csum: u16 = checksum(&ip[..IPV4_HDR]);
 		put16(ip, 10, csum);
 		// Ethernet header.
-		out[0..6].copy_from_slice(&server_mac.0);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_IPV4);
-		ETH_HDR + total
+		self.write_l2(out, &server_mac.0, ETHERTYPE_IPV4);
+		self.l2() + total
 	}
 
 	// Build a DHCP DISCOVER (broadcast, no address yet) into `out`, returning its
@@ -2348,7 +2408,7 @@ impl Stack {
 	// form instead fills ciaddr with the bound address and sends from it - unicast
 	// to the server when its MAC is known, else broadcast.
 	fn build_dhcp(&self, msg_type: u8, renew: bool, unicast: Option<MacAddr>, out: &mut [u8]) -> usize {
-		let boot_off: usize = ETH_HDR + IPV4_HDR + UDP_HDR;
+		let boot_off: usize = self.l2() + IPV4_HDR + UDP_HDR;
 		if boot_off + BOOTP_HDR + 32 > out.len() {
 			return 0;
 		}
@@ -2402,7 +2462,7 @@ impl Stack {
 		// bound address to the server (or broadcast when rebinding) for a renewal.
 		let src: Ipv4Addr = if renew { self.ip } else { Ipv4Addr([0; 4]) };
 		let dst: Ipv4Addr = if renew && unicast.is_some() { self.dhcp.server } else { Ipv4Addr([255; 4]) };
-		let udp_off: usize = ETH_HDR + IPV4_HDR;
+		let udp_off: usize = self.l2() + IPV4_HDR;
 		put16(out, udp_off, DHCP_CLIENT_PORT);
 		put16(out, udp_off + 2, DHCP_SERVER_PORT);
 		put16(out, udp_off + 4, (UDP_HDR + dhcp_len) as u16);
@@ -2411,7 +2471,7 @@ impl Stack {
 		put16(out, udp_off + 6, udp_csum);
 		// IPv4 header.
 		let total: usize = IPV4_HDR + UDP_HDR + dhcp_len;
-		let ip: &mut [u8] = &mut out[ETH_HDR..ETH_HDR + IPV4_HDR];
+		let ip: &mut [u8] = &mut out[self.l2()..self.l2() + IPV4_HDR];
 		ip[0] = 0x45;
 		ip[1] = 0;
 		put16(ip, 2, total as u16);
@@ -2426,10 +2486,8 @@ impl Stack {
 		put16(ip, 10, csum);
 		// Ethernet header: broadcast, or straight to the server for a unicast renewal.
 		let dst_mac: MacAddr = unicast.unwrap_or(MacAddr::BROADCAST);
-		out[0..6].copy_from_slice(&dst_mac.0);
-		out[6..12].copy_from_slice(&self.mac.0);
-		put16(out, 12, ETHERTYPE_IPV4);
-		ETH_HDR + total
+		self.write_l2(out, &dst_mac.0, ETHERTYPE_IPV4);
+		self.l2() + total
 	}
 
 	// Parse a DHCP reply (a BOOTP reply with the magic cookie): record the offered

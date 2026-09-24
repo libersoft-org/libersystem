@@ -759,6 +759,33 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"lifecheck", Shape::Rest),
 	(b"vkprobe", Shape::Bare),
 	(b"abiprobe", Shape::Bare),
+	// THE DESTINATION SERVICES' GATE PROBES, development-only like the fixtures they drive: each is launched by
+	// name under its own manifest row and prints its verdicts to the terminal it was started from. A shipping
+	// image stages none of them, and there the launch is refused like any other unknown program.
+	(b"btcheck", Shape::Rest),
+	(b"btread", Shape::Rest),
+	(b"powercheck", Shape::Rest),
+	(b"powerread", Shape::Rest),
+	(b"cardcheck", Shape::Rest),
+	(b"cardhold", Shape::Rest),
+	(b"cardread", Shape::Rest),
+	(b"cardb", Shape::Rest),
+	(b"modemcheck", Shape::Rest),
+	(b"modemhold", Shape::Rest),
+	(b"modemswap", Shape::Rest),
+	(b"modemdata", Shape::Rest),
+	(b"modemfail", Shape::Rest),
+	(b"camcheck", Shape::Rest),
+	(b"camhold", Shape::Rest),
+	(b"camread", Shape::Rest),
+	(b"camfail", Shape::Rest),
+	(b"midicheck", Shape::Rest),
+	(b"midihold", Shape::Rest),
+	(b"midiread", Shape::Rest),
+	(b"midifail", Shape::Rest),
+	(b"admincheck", Shape::Rest),
+	(b"adminhelper", Shape::Rest),
+	(b"adminhostile", Shape::Rest),
 	(b"uname", Shape::Bare),
 	(b"uptime", Shape::Bare),
 	(b"dmesg", Shape::Bare),
@@ -906,6 +933,12 @@ fn print_help(cmd: Option<&[u8]>) {
 	}
 }
 
+// Whether a line's command word is a governed tool from `TOOLS`.
+fn is_tool(line: &[u8]) -> bool {
+	let word: &[u8] = line.split(|&byte| byte == b' ').next().unwrap_or(&[]);
+	TOOLS.iter().any(|&(name, _)| name == word)
+}
+
 fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8], vars: &[(String, String)]) -> bool {
 	for &(name, shape) in TOOLS {
 		match shape {
@@ -1046,6 +1079,16 @@ fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64,
 		None => (line, false),
 	};
 	if line.is_empty() {
+		return false;
+	}
+	// A GOVERNED TOOL WITH A TRAILING `&` RUNS IN THE BACKGROUND THROUGH THE BROKER - the path a pipeline
+	// takes, as a single stage: its output on this terminal, its process group a job this shell tracks.
+	// `run_tool` waits for the tool it starts, so the `&` used to be read and then ignored.
+	if bg && is_tool(line) {
+		let words: Vec<Vec<u8>> = line.split(|&byte| byte == b' ').filter(|word| !word.is_empty()).map(|word| word.to_vec()).collect();
+		if !run_pipeline_line(jobs, permsvc, &[ExpandedStage { words, merge_errors: false }], true, cwd.as_bytes(), vars, session) {
+			print(b"shell: the background job could not be started\n");
+		}
 		return false;
 	}
 	// `time <command>` dispatches the command and prints its wall time from the
@@ -1586,7 +1629,10 @@ fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStage], bac
 	if console == 0 {
 		return false;
 	}
-	let out_write: i64 = duplicate(console, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+	// AND DUPLICATE, which the broker needs to give every stage its own diagnostics endpoint on this
+	// terminal. Without it every one of those copies failed to exist, and a stage's `eprint` went down
+	// the pipe as data - the broker narrows what each stage actually receives.
+	let out_write: i64 = duplicate(console, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE);
 	if out_write < 0 {
 		return false;
 	}

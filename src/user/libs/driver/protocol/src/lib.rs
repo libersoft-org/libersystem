@@ -333,6 +333,9 @@ pub enum ResourceKind {
 	SysPower = 4,
 	// The capability that lets keystrokes reach the console.
 	Console = 5,
+	// THE TRUSTED KEY SINK: a second raw-key channel, to InputService's protected path alone, handed only to
+	// the physical keyboard drivers. Nothing else holds a producer for it.
+	TrustedKeys = 6,
 }
 
 impl ResourceKind {
@@ -343,6 +346,7 @@ impl ResourceKind {
 			3 => Some(ResourceKind::Keys),
 			4 => Some(ResourceKind::SysPower),
 			5 => Some(ResourceKind::Console),
+			6 => Some(ResourceKind::TrustedKeys),
 			_ => None,
 		}
 	}
@@ -394,6 +398,32 @@ pub mod provider {
 	/// a host stack in another process speaks. Not `net` and not `input`: the pointer a mouse
 	/// eventually produces is several protocol layers above this, in a service with no device claim.
 	pub const BLUETOOTH_HCI: u16 = 11;
+	/// A power source or thermal zone, published with its sources already normalised. PowerService
+	/// is its one consumer, and a driver never holds a writable power-service connection.
+	pub const POWER_SOURCE: u16 = 12;
+	/// A development fixture's control endpoint. No shipping driver publishes it, and no scope minted
+	/// for real hardware admits it: PermissionManager reaches it for a gate's probe, in a development
+	/// build, and nothing else does.
+	pub const FIXTURE_CONTROL: u16 = 13;
+	/// A smart-card reader: slots, card presence, and a bounded APDU and secure-PIN transport, which
+	/// SmartcardService alone consumes.
+	pub const SMARTCARD_READER: u16 = 14;
+	/// A modem: SIM, registration, contexts and the session-tagged datagrams of one, which ModemService
+	/// alone consumes.
+	pub const MODEM: u16 = 15;
+	/// A camera: formats, negotiated streams and frames written into queued buffers, which CameraService
+	/// alone consumes.
+	pub const CAMERA: u16 = 16;
+	/// A MIDI device: receive endpoints delivering USB-MIDI 1.0 packet batches, which MidiService alone
+	/// consumes and decodes.
+	pub const MIDI: u16 = 17;
+	/// A printer: a byte transport with a device ID and a port status, which SpoolService alone consumes.
+	pub const PRINTER: u16 = 18;
+	/// A Picture Transfer Protocol transport: command containers out, bulk-IN bytes and events in, which
+	/// MediaImportService alone consumes and validates.
+	pub const PTP_TRANSPORT: u16 = 19;
+	/// An administrative executor: the private executor contract AdminService alone consumes.
+	pub const ADMIN_EXECUTOR: u16 = 20;
 
 	// THE NAME THE DEVELOPMENT CHANNEL PUBLISHES ITS PORT UNDER, and the reason a publication carries
 	// a name at all.

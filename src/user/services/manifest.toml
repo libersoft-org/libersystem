@@ -410,6 +410,75 @@ owner = "bluetooth-proto"
 path = "user/libs/protocol/bluetooth-proto"
 
 [[sources]]
+owner = "power-proto"
+path = "user/libs/protocol/power-proto"
+
+[[sources]]
+owner = "smartcard-proto"
+path = "user/libs/protocol/smartcard-proto"
+
+[[sources]]
+owner = "modem-proto"
+path = "user/libs/protocol/modem-proto"
+
+[[sources]]
+owner = "modem-device-proto"
+path = "user/libs/protocol/modem-device-proto"
+
+[[sources]]
+owner = "camera-proto"
+path = "user/libs/protocol/camera-proto"
+
+[[sources]]
+owner = "camera-device-proto"
+path = "user/libs/protocol/camera-device-proto"
+
+[[sources]]
+owner = "event-proto"
+path = "user/libs/protocol/event-proto"
+
+[[sources]]
+owner = "midi-proto"
+path = "user/libs/protocol/midi-proto"
+
+[[sources]]
+owner = "midi-device-proto"
+path = "user/libs/protocol/midi-device-proto"
+
+[[sources]]
+owner = "spool-proto"
+path = "user/libs/protocol/spool-proto"
+
+[[sources]]
+owner = "printer-device-proto"
+path = "user/libs/protocol/printer-device-proto"
+
+[[sources]]
+owner = "import-proto"
+path = "user/libs/protocol/import-proto"
+
+[[sources]]
+owner = "ptp-transport-proto"
+path = "user/libs/protocol/ptp-transport-proto"
+
+[[sources]]
+owner = "admin-proto"
+path = "user/libs/protocol/admin-proto"
+
+# THE ANSWER-TO-RESET, parsed once for every reader provider and for SmartcardService. A SOURCE ROW AND
+# NO LIBRARY ROW, like `power-model`: linked statically by its users, imported by nothing at run time.
+[[sources]]
+owner = "smartcard-model"
+path = "user/libs/smartcard/model"
+
+# THE CANONICAL POWER MODEL: the normalisation every power producer calls before it publishes and the
+# checks PowerService applies to what arrives. A SOURCE ROW AND NO LIBRARY ROW - the service and the
+# drivers link it statically, as they do `service-logic`, and nothing imports it at run time.
+[[sources]]
+owner = "power-model"
+path = "user/libs/power/model"
+
+[[sources]]
 owner = "input-proto"
 path = "user/libs/protocol/input-proto"
 
@@ -736,6 +805,8 @@ stage = "volume"
 destination = "bin/less.lsexe"
 providers = ["base-proto", "lico", "volume-client", "storage-proto", "lsrt"]
 
+# `modem-device-proto` BECAUSE THE LINKER FOUND `Vec<u32>`'S GROWTH ROUTINE THERE: rustc shares one instance of a
+# generic among every upstream crate that exports it and takes the lowest crate id, and that is this one.
 [[programs]]
 name = "traceroute"
 owner = "tools"
@@ -743,7 +814,15 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/traceroute.lsexe"
-providers = ["base-proto", "cli", "network-client", "network-proto", "wire", "lsrt"]
+providers = [
+	"base-proto",
+	"cli",
+	"network-client",
+	"network-proto",
+	"wire",
+	"modem-device-proto",
+	"lsrt",
+]
 
 [[programs]]
 name = "component_host"
@@ -840,6 +919,7 @@ providers = [
 	"base-proto",
 	"ipc-client",
 	"wire",
+	"service-util",
 	"lsrt",
 ]
 
@@ -1083,7 +1163,17 @@ stage = "volume"
 destination = "libexec/input_service.lsexe"
 # `device-proto`, `base-proto` and `ipc-client` because this service DISCOVERS its pointing devices:
 # it holds a provider-catalogue connection and asks for the input and pointer kinds.
-providers = ["keys", "input-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+providers = [
+	"keys",
+	"input-proto",
+	"bluetooth-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"lsrt",
+]
 
 [[programs]]
 name = "ip"
@@ -1151,6 +1241,294 @@ providers = ["base-proto", "config-client", "device-client", "device-proto", "wi
 # THE FONT OPERATOR COMMAND. It holds the READ every text client holds, and the RESCAN nothing else
 # in the system holds - the same separation `lsdev` has between rendering a device list and changing
 # a binding.
+# THE BLUETOOTH GATE'S TWO PROBES, development-only. `btcheck` drives the scenario with a pointer
+# subscription and both Bluetooth authorities; `btread` is an ordinary read client and holds nothing
+# else, which is what its half of the gate is about.
+[[programs]]
+name = "btcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/btcheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "btread"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/btread.lsexe"
+providers = []
+development = true
+
+# THE POWER GATE'S TWO PROBES, development-only. `powercheck` drives the scenario with PowerService's
+# state and control authorities and the power fixture's control endpoint; `powerread` is an ordinary
+# read client and holds nothing else, which is what its half of the gate is about.
+[[programs]]
+name = "powercheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/powercheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "powerread"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/powerread.lsexe"
+providers = []
+development = true
+
+# THE SMART-CARD GATE'S FOUR PROBES, development-only. `cardcheck` drives the scenario with a grant on
+# fixture reader A, the fixture's control endpoint and the supervisor's admin channel its restart phase
+# stops and starts the service through; `cardhold` is the second client a queue, an inherited endpoint and
+# a mid-exchange restart need; `cardread` holds a read-only grant; `cardb` holds a grant on the reader
+# with no pinpad.
+[[programs]]
+name = "cardcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/cardcheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "cardhold"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/cardhold.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "cardread"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/cardread.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "cardb"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/cardb.lsexe"
+providers = []
+development = true
+
+# THE MODEM GATE'S FIVE PROBES, development-only. `modemcheck` drives the scenario with every modem
+# authority, the fixture's control endpoint and an ordinary network client; `modemhold` is the second
+# data client an inherited endpoint needs; `modemswap` holds a data grant that may replace an uplink;
+# `modemdata` requested every authority and was granted data alone; `modemfail`'s launch fails after its
+# first grant was minted, and it never runs.
+[[programs]]
+name = "modemcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/modemcheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "modemhold"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/modemhold.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "modemswap"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/modemswap.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "modemdata"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/modemdata.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "modemfail"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/modemfail.lsexe"
+providers = []
+development = true
+
+# THE CAMERA GATE'S FOUR PROBES, development-only. `camcheck` drives the scenario with inventory, capture and
+# the fixture's control endpoint; `camhold` is the second capture client busy refusal, an inherited endpoint
+# and a kept buffer need; `camread` holds inventory alone; `camfail`'s launch fails after its capture grant
+# was minted, and it never runs.
+[[programs]]
+name = "camcheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/camcheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "camhold"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/camhold.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "camread"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/camread.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "camfail"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/camfail.lsexe"
+providers = []
+development = true
+
+# THE MIDI GATE'S FOUR PROBES, development-only. `midicheck` drives the scenario with a receiver on endpoint 0,
+# inventory and the fixture's control endpoint; `midihold` is the second receiver, on endpoint 1; `midiread`
+# holds inventory alone; `midifail`'s launch fails after its receiver was minted, and it never runs.
+# THE ADMINISTRATIVE-PATH GATE'S PROBES: the requester and scenario driver, the process another launch's
+# endpoints are handed to, and an ordinary client that keeps trying to cover the protected screen.
+[[programs]]
+name = "admincheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/admincheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "adminhelper"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/adminhelper.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "adminhostile"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/adminhostile.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "midicheck"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/midicheck.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "midihold"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/midihold.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "midiread"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/midiread.lsexe"
+providers = []
+development = true
+
+[[programs]]
+name = "midifail"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "volume"
+destination = "libexec/midifail.lsexe"
+providers = []
+development = true
+
+# THE SPOOL PROBE: a real client of SpoolService holding `spool` and nothing else. The kernel's sink scenario
+# runs it against the production service and a harness-served printer, which is why it ships in the test
+# image rather than behind the development feature.
+[[programs]]
+name = "spool_probe"
+owner = "services"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/spool_probe.lsexe"
+providers = ["spool-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+
+# THE IMPORT PROBE: a real client of MediaImportService holding `media-import` and, for its destination, one
+# volume connection. The kernel's responder scenario runs it, which is why it ships in the test image.
+[[programs]]
+name = "import_probe"
+owner = "services"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/import_probe.lsexe"
+providers = ["import-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+
 [[programs]]
 name = "lsfont"
 owner = "tools"
@@ -1338,6 +1716,10 @@ providers = [
 	"device-proto",
 	"process-proto",
 	"security-proto",
+	"smartcard-proto",
+	"modem-proto",
+	"camera-proto",
+	"midi-proto",
 	"ipc-client",
 	"wire",
 	"lsrt",
@@ -1661,6 +2043,8 @@ stage = "volume"
 destination = "bin/cut.lsexe"
 providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
 
+# `modem-device-proto` BECAUSE THE LINKER FOUND `Vec<u32>`'S GROWTH ROUTINE THERE: rustc shares one instance of a
+# generic among every upstream crate that exports it and takes the lowest crate id, and that is this one.
 [[programs]]
 name = "kill"
 owner = "tools"
@@ -1668,7 +2052,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/kill.lsexe"
-providers = ["base-proto", "cli", "session-client", "lsrt"]
+providers = ["base-proto", "cli", "session-client", "modem-device-proto", "lsrt"]
 
 [[programs]]
 name = "pwd"
@@ -1981,6 +2365,163 @@ destination = "libexec/font_catalogue.lsexe"
 providers = []
 
 [[programs]]
+name = "bluetooth_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/bluetooth_service.lsexe"
+providers = [
+	"bluetooth-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"lsrt",
+]
+
+[[programs]]
+name = "bluetooth_bond_store"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/bluetooth_bond_store.lsexe"
+providers = [
+	"bluetooth-proto",
+	"storage-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"lsrt",
+]
+
+# STATIC, FOR THE REASON `font_catalogue` IS: the canonical power checks are `power-model`'s, which no staged library publishes, and a dynamic
+# program imports every function it calls from one.
+[[programs]]
+name = "power_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/power_service.lsexe"
+providers = []
+
+# STATIC, FOR THE REASON `font_catalogue` IS: the answer-to-reset parser is `smartcard-model`'s, which no staged library publishes, and a dynamic
+# program imports every function it calls from one.
+[[programs]]
+name = "smartcard_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/smartcard_service.lsexe"
+providers = []
+
+[[programs]]
+name = "modem_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/modem_service.lsexe"
+providers = [
+	"modem-proto",
+	"modem-device-proto",
+	"network-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"lsrt",
+]
+
+[[programs]]
+name = "camera_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/camera_service.lsexe"
+providers = [
+	"camera-proto",
+	"camera-device-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"lsrt",
+]
+
+# STATIC, FOR THE REASON `font_catalogue` IS: the USB-MIDI decoder is the drivers library's, which no staged library publishes, and a dynamic
+# program imports every function it calls from one.
+[[programs]]
+name = "midi_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/midi_service.lsexe"
+providers = []
+
+# `modem-device-proto` BECAUSE THE LINKER FOUND `Vec<u32>`'S GROWTH ROUTINE THERE: rustc shares one instance of a
+# generic among every upstream crate that exports it and takes the lowest crate id, and that is this one.
+[[programs]]
+name = "spool_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/spool_service.lsexe"
+providers = [
+	"spool-proto",
+	"printer-device-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"modem-device-proto",
+	"lsrt",
+]
+
+# `modem-device-proto` BECAUSE THE LINKER FOUND `Vec<u32>`'S GROWTH ROUTINE THERE: rustc shares one instance of a
+# generic among every upstream crate that exports it and takes the lowest crate id, and that is this one.
+[[programs]]
+name = "media_import_service"
+owner = "services"
+role = "service"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/media_import_service.lsexe"
+providers = [
+	"import-proto",
+	"ptp-transport-proto",
+	"device-proto",
+	"base-proto",
+	"ipc-client",
+	"wire",
+	"service-util",
+	"modem-device-proto",
+	"lsrt",
+]
+
+# STATIC, FOR THE REASON `font_catalogue` IS: the journal records a SHA-256 of every canonical descriptor,
+# SHA-256 is `bootproto`'s, and no staged library publishes it.
+[[programs]]
+name = "admin_service"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/admin_service.lsexe"
+providers = []
+
+[[programs]]
 name = "time_service"
 owner = "services"
 role = "service"
@@ -2093,6 +2634,214 @@ match = [
 ]
 priority = "quirk"
 provides = [{ kind = "console-bytes", most = 1 }]
+heartbeat-deadline = 100
+
+# THE IN-GUEST BLUETOOTH FIXTURE, and the reason the Bluetooth host stack can be proved at all: an
+# emulated controller and the LE boot mouse on the far side of its radio, published as a
+# `bluetooth-hci` provider over the production transport wire. There is no radio in an emulator.
+#
+# DEVELOPMENT-ONLY, AND BOUND BY ADDRESS. The device it binds is QEMU's `edu` test function, which a
+# gate adds at this exact address and which no shipping machine has - so the fixture cannot be
+# enabled by a client, and a development image without that device simply never binds it. `quirk`
+# because an address rule is the most specific one there is, and `none` because it performs no DMA:
+# it never maps the device, it only needs a node to hold a binding on.
+[[programs]]
+name = "bt_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/bt_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 29, func = 0 } },
+]
+priority = "quirk"
+provides = [{ kind = "bluetooth-hci", most = 1, consumers = 1 }]
+heartbeat-deadline = 100
+
+# THE IN-GUEST POWER FIXTURE: a HID-shaped UPS and ACPI-shaped battery, adapter and thermal zone, from
+# decoded data written out in the program, published as two `power-source` providers over the
+# production provider wire - and the control endpoint the power gate's probe drives. It proves the
+# service and the normalisation, and it is not a claim that QEMU attaches a UPS or evaluates AML.
+#
+# DEVELOPMENT-ONLY AND BOUND BY ADDRESS, like the Bluetooth fixture: QEMU's `edu` test function at a
+# pinned address only the power gate adds. TWO POWER SOURCES AND NO THIRD, because the gate's
+# unauthorized-publisher check is this fixture offering a third and DeviceManager refusing it.
+[[programs]]
+name = "power_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/power_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 30, func = 0 } },
+]
+priority = "quirk"
+provides = [
+	{ kind = "power-source", most = 2, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# THE IN-GUEST SMART-CARD FIXTURE: two readers - A with two slots and a secure-verification pinpad, B
+# with one slot and none - and the PIV cards in them, published as `smartcard-reader` providers over the
+# production wire, and the control endpoint the smart-card gate's probe drives. It proves the service and
+# its pinpad policy, and it is not a claim about USB CCID transport or character/TPDU readers.
+#
+# DEVELOPMENT-ONLY AND BOUND BY ADDRESS, like the other fixtures: QEMU's `edu` test function at a pinned
+# address only the smart-card gate adds.
+[[programs]]
+name = "smartcard_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/smartcard_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 27, func = 0 } },
+]
+priority = "quirk"
+provides = [
+	{ kind = "smartcard-reader", most = 2, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# THE IN-GUEST MODEM FIXTURE: a modem with a SIM, one data context and the network behind it - a gateway
+# that answers echo and a resolver that answers one name - published as a `modem` provider over the
+# production wire, every command, reply and datagram carried through the staged MBIM validators, and
+# the control endpoint the modem gate's probe drives. It proves the service, its grants and
+# NetworkService's raw-IP link, and it is not a claim about USB CDC-MBIM transport.
+#
+# DEVELOPMENT-ONLY AND BOUND BY ADDRESS, like the other fixtures: QEMU's `edu` test function at a pinned
+# address only the modem gate adds.
+[[programs]]
+name = "modem_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/modem_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 28, func = 0 } },
+]
+priority = "quirk"
+provides = [
+	{ kind = "modem", most = 2, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# THE IN-GUEST CAMERA FIXTURE: a camera whose synthetic UVC descriptors go through the staged normalizer -
+# a YUY2 format with two sizes and a Motion-JPEG format with a continuous interval range - writing
+# deterministic frames into the buffers its consumer queued, with host arrival times and a wrapping device
+# clock, and the control endpoint the camera gate's probe drives. It proves the service, its grants, its
+# buffer leases and its timing, and it is not a claim about USB Video transport.
+#
+# DEVELOPMENT-ONLY AND BOUND BY ADDRESS, like the other fixtures: QEMU's `edu` test function at a pinned
+# address only the camera gate adds.
+[[programs]]
+name = "camera_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/camera_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 26, func = 0 } },
+]
+priority = "quirk"
+provides = [
+	{ kind = "camera", most = 2, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# THE IN-GUEST MIDI FIXTURE: a MIDI device with two receive endpoints - two cables and one - delivering the raw
+# USB-MIDI 1.0 packet batches the MIDI gate's probe scripts, and the control endpoint it drives. It decodes
+# nothing; MidiService does, with the driver library's decoder. It proves the service, its receivers and its
+# bounds, and it is not a claim about USB MIDI transport.
+#
+# DEVELOPMENT-ONLY AND BOUND BY ADDRESS, like the other fixtures: QEMU's `edu` test function at a pinned
+# address only the MIDI gate adds.
+[[programs]]
+name = "midi_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/midi_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 25, func = 0 } },
+]
+priority = "quirk"
+provides = [
+	{ kind = "midi", most = 2, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
+heartbeat-deadline = 100
+
+# THE IN-GUEST ADMINISTRATIVE EXECUTOR, for the administrative-path gate alone: a bounded probe write over two
+# target generations behind an `admin-executor` publication only AdminService's catalogue connection admits,
+# and a read-only witness behind `fixture-control`. A shipping image has neither the program nor the device.
+[[programs]]
+name = "admin_fixture"
+owner = "drivers"
+role = "driver"
+linkage = "static"
+stage = "volume"
+destination = "drivers/admin_fixture.lsexe"
+providers = []
+development = true
+
+[programs.driver]
+lifecycle = "controller"
+dma = "none"
+match = [
+	{ transport = "plain-pci", pci-class = 0x00, pci-subclass = 0xff, pci-interface = 0x00, pci-address = { bus = 0, dev = 24, func = 0 } },
+]
+priority = "quirk"
+provides = [
+	{ kind = "admin-executor", most = 1, consumers = 1 },
+	{ kind = "fixture-control", most = 1, consumers = 1 },
+]
 heartbeat-deadline = 100
 
 [[programs]]
@@ -2481,6 +3230,442 @@ source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
 kinds = ["audio"]
 presence = "optional"
+
+# THE HOST STACK ABOVE HCI, and the one program on this machine that parses a stranger's radio
+# packets - which is why it holds so little. No device claim, no DMA and no link key at rest: the
+# controller comes from the catalogue, the keys from the bond store over a private capability, and
+# the pointer it produces leaves over a typed channel to InputService. Its Domain is sized by the
+# supervisor from the figures the milestone states.
+#
+# THREE ROOTS FOR THREE AUTHORITIES. What a connection may do is decided by the root it was minted
+# from, so the read root, the operator root and the profile root are the whole of the access
+# argument - a component holding one reaches nothing the others carry.
+[[services]]
+name = "bluetooth_service"
+program = "bluetooth_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager", "bluetooth_bond_store"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["bluetooth-hci"]
+presence = "optional"
+
+# THE BOND STORE'S ONE CAPABILITY, and this service is its only holder.
+[[services.roles]]
+tag = "BONDS"
+kind = "client"
+provider = "bluetooth_bond_store"
+source = "SERVE"
+interface = "liber:bluetooth@1/bluetooth-bond-store"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth"
+
+[[services.roles]]
+tag = "OPERATOR"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-operator"
+
+[[services.roles]]
+tag = "PROFILE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-profile"
+
+# POWER STATE, NORMALISED, AND THE FEW DEVICE CONTROLS AN OPERATOR MAY USE. It consumes every
+# `power-source` publication through a catalogue connection minted for that kind alone, and serves two
+# roots: STATE, which enumerates and subscribes and can change nothing, and CONTROL, which switches an
+# output a device advertises. It holds no system-power client: shutting the machine down is
+# SystemManager's, and nothing here can ask for it.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. Everything it knows, it re-reads from the catalogue: a restarted
+# instance takes a fresh snapshot from every provider and starts a new epoch, and its subscribers,
+# whose streams closed with the old instance, subscribe again.
+[[services]]
+name = "power_service"
+program = "power_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["power-source"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:power@1/power"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:power@1/power-control"
+
+# SMART-CARD READERS, EXCLUSIVE EXPIRING TRANSACTIONS AND A BOUNDED SET OF PIV OPERATIONS. It consumes
+# every `smartcard-reader` publication through a catalogue connection minted for that kind alone, and
+# serves ONE root: ADMIN, the minting endpoint PermissionManager resolves through the broker. There is no
+# public root - every application connection is minted there, for one configured reader, one set of
+# operations and the life of one launched component. No device claim, no input capability, no storage:
+# a PIN never reaches this service, because the reader's own keypad collects it.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance opens a new session with every provider - which
+# the provider answers only once it has drained what the old one left - and every grant, having died
+# with the old instance, is minted again at the next launch.
+[[services]]
+name = "smartcard_service"
+program = "smartcard_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["smartcard-reader"]
+presence = "optional"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:smartcard@1/smartcard-admin"
+
+# MODEMS: SIM, registration and the one data context this system supports. It consumes every `modem`
+# publication through a catalogue connection minted for that kind alone, and serves two roots: SERVE,
+# observation that names no subscriber and changes nothing, and ADMIN, the minting endpoint
+# PermissionManager alone resolves through the broker - data, identity and management are each minted
+# there, per launch, for one modem and one SIM. LINK is its connection to NetworkService's private link
+# administration, minted from the root ServiceManager keeps: the only way a context becomes an uplink.
+#
+# AFTER NETWORKSERVICE, because a context is installed there: activation reserves NetworkService's
+# admission before the modem is asked to do anything.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every modem handle and every
+# grant of the old one names nothing, every context it held ended with it - NetworkService saw its packet
+# channel close - and a reconnect needs a fresh grant and a fresh activation.
+[[services]]
+name = "modem_service"
+program = "modem_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "device_manager", "network_service"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["modem"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:modem@1/modem"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:modem@1/modem-admin"
+
+[[services.roles]]
+tag = "LINK"
+kind = "factory"
+provider = "network_service"
+source = "LINKADMIN"
+interface = "liber:network@1/network-link-admin"
+presence = "optional"
+
+# CAMERAS: formats, and capture into buffers the client owns. It consumes every `camera` publication through a
+# catalogue connection minted for that kind alone, and serves two roots: SERVE, inventory that lists and
+# describes and can start nothing, and ADMIN, the minting endpoint PermissionManager alone resolves through
+# the broker - every capture connection is minted there, for one camera and the life of one component.
+# It holds no display client: capture never passes through the screen's service.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every camera handle and grant
+# of the old one names nothing, every stream it ran stopped when its provider saw the old session close,
+# and a client is granted again and registers its buffers again.
+[[services]]
+name = "camera_service"
+program = "camera_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["camera"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:camera@1/camera"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:camera@1/camera-admin"
+
+# MIDI 1.0 RECEIVE: one bounded queue per endpoint, for one reader. It consumes every `midi` publication
+# through a catalogue connection minted for that kind alone, decodes their packet batches with the driver
+# library's staged decoder, and serves two roots: SERVE, inventory that lists endpoints and opens nothing,
+# and ADMIN, the minting endpoint PermissionManager alone resolves through the broker. No broker, no router,
+# no output.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every source identity of the old
+# one names nothing, every receiver ended with it, and a client is granted again.
+[[services]]
+name = "midi_service"
+program = "midi_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["midi"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:midi@1/midi"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:midi@1/midi-admin"
+
+# PRINT JOBS: an application stages an already-rendered document into a reservation and explicitly submits
+# it, and the service sends it to a `printer` publication by acknowledged prefixes. It consumes that kind
+# through a catalogue connection minted for it alone, and serves one root, SERVE, from which PermissionManager
+# mints a fresh connection per `spool` grant - the context that grant's jobs are charged to. No application
+# reaches a catalogue, a backend, a reset or a raw endpoint.
+#
+# ESCALATE AND EPHEMERAL. Jobs live in RAM: a restarted spooler has lost its queue and closed every job
+# capability of the old one, and a missing final status is an unknown outcome, never a reason to replay.
+[[services]]
+name = "spool_service"
+program = "spool_service"
+restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
+dependencies = ["log_service", "device_manager", "process_service"]
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:spool@1/spool"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["printer"]
+presence = "optional"
+
+# IMPORT FROM A CAMERA, READ-ONLY: devices, storages, a bounded handle snapshot paged for metadata, and one
+# object at a time in bounded chunks, validated at this one boundary. It consumes every `ptp-transport`
+# publication through a catalogue connection minted for that kind alone and serves one root, SERVE, from
+# which PermissionManager mints a fresh connection per `media-import` grant. It holds no storage: a client
+# writes imported bytes wherever it may, and publishes them only after a complete ending.
+#
+# ESCALATE AND EPHEMERAL. A restarted instance holds no session, snapshot or transfer of the old one, and every
+# identity the old one issued is stale.
+[[services]]
+name = "media_import_service"
+program = "media_import_service"
+restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
+dependencies = ["log_service", "device_manager", "process_service"]
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:import@1/media-import"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["ptp-transport"]
+presence = "optional"
+
+# THE TRUSTED ADMINISTRATIVE PATH: one person's confirmation, on a protected screen, of one bound high-risk
+# operation, and at most one attempt at it. PermissionManager mints a request connection per authorized
+# launch from FACTORY, bound to the task that launch prepared; the executors are `admin-executor`
+# publications - drivers DeviceManager bound - reached through a catalogue connection minted for that kind
+# alone; the protected display and keyboard are roots their services hand this service and nothing else.
+#
+# ITS DECISIONS ARE DURABLE AND ITS AUTHORITY IS NOT. The journal in `vol://system/admin-audit` survives a
+# restart and a reboot; a grant never does - a restarted instance starts a fresh epoch with fresh wiring, and
+# nothing it reads back is authority. TRANSPARENT, because that is exactly what a restart gives: the requests
+# and grants of the instance that ended die with its channels, and the next one is a clean start.
+[[services]]
+name = "admin_service"
+program = "admin_service"
+restart = "transparent"
+state_class = "durable"
+state_scope = "service"
+state_storage = "vol://system/admin-audit"
+dependencies = [
+	"log_service",
+	"process_service",
+	"storage_service",
+	"time_service",
+	"display_service",
+	"input_service",
+	"device_manager",
+]
+
+# THE JOURNAL'S DIRECTORY, minted from the admin root and scoped to `vol://system/admin-audit` in the
+# bootstrap, beside the other scoped mints: a role cannot carry the path.
+[[services.roles]]
+tag = "JOURNAL"
+kind = "factory"
+provider = "storage_service"
+source = "ADMIN"
+interface = "liber:storage@1/volume"
+
+# A fresh connection, for the wall-clock reading a record may carry. Never an expiry: deadlines are
+# monotonic.
+[[services.roles]]
+tag = "TIME"
+kind = "factory"
+provider = "time_service"
+interface = "liber:time@1/time"
+presence = "optional"
+
+[[services.roles]]
+tag = "DISPLAY"
+kind = "client"
+provider = "display_service"
+source = "TRUSTED"
+interface = "liber:display@1/display-trusted"
+presence = "optional"
+
+[[services.roles]]
+tag = "INPUT"
+kind = "client"
+provider = "input_service"
+source = "TRUSTED"
+interface = "liber:input@1/input-trusted"
+presence = "optional"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["admin-executor"]
+presence = "optional"
+
+# PERMISSIONMANAGER'S FACTORY, resolved by name through the broker: PermissionManager holds no role of this
+# service, so neither waits for the other to start.
+[[services.roles]]
+tag = "FACTORY"
+kind = "serve-root"
+provider = "self"
+interface = "liber:admin@1/admin-factory"
+
+# THE OPERATOR'S READ VIEW of the journal. No requester holds it.
+[[services.roles]]
+tag = "AUDIT"
+kind = "serve-root"
+provider = "self"
+interface = "liber:admin@1/admin-journal"
+
+# THE TEST CONTROLS, served in a development image alone; a shipping build closes this root on arrival.
+[[services.roles]]
+tag = "TEST"
+kind = "serve-root"
+provider = "self"
+interface = "liber:admin@1/admin-test"
+
+# THE CONFINED KEEPER OF LINK KEYS. It runs in a Domain of its own with one capability in and one
+# out: a volume client scoped to its own state directory, and the private endpoint BluetoothService
+# reaches it on. The key could have lived inside BluetoothService, and then the process that parses a
+# stranger's radio packets would be the process holding every link key on the machine.
+# ESCALATE AND NOT TRANSPARENT, because nothing could use a replacement: BluetoothService holds the
+# one connection to this store, handed over at bring-up, and a restarted store would be serving a
+# root nobody holds. A crash is therefore a failure, and BluetoothService's answer to a store that
+# does not answer is the one the milestone asks for - the bonding attempt ends and no transient bond
+# is kept in its place.
+[[services]]
+name = "bluetooth_bond_store"
+program = "bluetooth_bond_store"
+restart = "escalate"
+state_class = "durable"
+state_scope = "service"
+state_storage = "vol://system/state/bluetooth-bonds"
+dependencies = ["log_service", "process_service", "storage_service"]
+
+# MINTED FROM THE ADMIN ROOT AND SCOPED TO ONE DIRECTORY, the same shape ConfigService's persistence
+# client has. The plan can say the role is a factory of that endpoint; the directory is the part a
+# role cannot carry, and it is named beside the other scoped mints in the bootstrap.
+[[services.roles]]
+tag = "STORAGE"
+kind = "factory"
+provider = "storage_service"
+source = "ADMIN"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-bond-store"
 
 [[services]]
 name = "config_service"
@@ -2882,6 +4067,18 @@ provider = "self"
 interface = "liber:display@1/display-stats"
 presence = "optional"
 
+# THE PROTECTED SESSION'S ROOT, handed to AdminService and to nothing else: while a session holds it no
+# ordinary surface, present or focus request can replace or overpaint what it shows. Optional: a boot with
+# no AdminService simply has no protected path.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY.
+[[services.roles]]
+tag = "TRUSTED"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display-trusted"
+presence = "optional"
+
 [[services]]
 name = "input_service"
 program = "input_service"
@@ -2942,6 +4139,26 @@ interface = "liber:device@1/provider-catalogue"
 kinds = ["input", "pointer", "touch"]
 presence = "optional"
 
+# THE TRUSTED KEYBOARD'S OWN SINK, apart from the merged `KEYS`: DeviceManager hands its producer to the
+# physical keyboard drivers it binds and to nothing else - no catalogue provider, no Bluetooth input, no
+# console injection and no client key stream can put a key in it. And the protected-input root only
+# AdminService is handed. Both optional: a boot without them has no protected path, and AdminService
+# declines every request.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY.
+[[services.roles]]
+tag = "TRUSTEDKEYS"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "TRUSTED"
+kind = "serve-root"
+provider = "self"
+interface = "liber:input@1/input-trusted"
+presence = "optional"
+
 # THE SYSTEM INSTANCE STARTS BEFORE THE THREE VOLUME INSTANCES, AND THE DEPENDENCY IS WHAT SAYS SO
 # (2026-09-04).
 #
@@ -2959,6 +4176,7 @@ presence = "optional"
 # `storage_service` however this file is arranged - moving the block changed nothing and the measured
 # failure was identical. The three volume instances therefore DECLARE the dependency, which is true
 # of them anyway: each needs an answer only the system instance can produce.
+
 [[services]]
 name = "storage_service"
 program = "storage_service"
@@ -3081,6 +4299,16 @@ source = "CATADMIN"
 interface = "liber:device@1/provider-catalogue"
 kinds = ["net"]
 presence = "optional"
+
+# THE PRIVATE LINK ADMINISTRATION, which ServiceManager keeps. ModemService's attachment endpoint is
+# minted from it - a connection whose reservation only that connection can install or release - and no
+# ordinary network client is minted here: they come from SERVE, which has no such operation. Appended
+# LAST, for the positional reason above.
+[[services.roles]]
+tag = "LINKADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:network@1/network-link-admin"
 
 [[services]]
 name = "permission_manager"
@@ -3978,6 +5206,113 @@ providers = ["font-proto"]
 name = "font-proto"
 owner = "font-proto"
 destination = "lib/protocol/font-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "bluetooth-proto"
+owner = "bluetooth-proto"
+destination = "lib/protocol/bluetooth-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "power-proto"
+owner = "power-proto"
+destination = "lib/protocol/power-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "smartcard-proto"
+owner = "smartcard-proto"
+destination = "lib/protocol/smartcard-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "modem-proto"
+owner = "modem-proto"
+destination = "lib/protocol/modem-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "modem-device-proto"
+owner = "modem-device-proto"
+destination = "lib/protocol/modem-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "camera-proto"
+owner = "camera-proto"
+destination = "lib/protocol/camera-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "camera-device-proto"
+owner = "camera-device-proto"
+destination = "lib/protocol/camera-device-proto.lslib"
+features = ["shared-image"]
+providers = ["camera-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "event-proto"
+owner = "event-proto"
+destination = "lib/protocol/event-proto.lslib"
+features = ["shared-image"]
+# NO `ipc-client`, for the reason `graphics-proto` has none: this package declares no interface, so nothing in
+# it calls a transport, and the image build refuses a provider that satisfies no import.
+providers = ["wire", "lsrt"]
+
+[[libraries]]
+name = "midi-proto"
+owner = "midi-proto"
+destination = "lib/protocol/midi-proto.lslib"
+features = ["shared-image"]
+providers = ["event-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "midi-device-proto"
+owner = "midi-device-proto"
+destination = "lib/protocol/midi-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "spool-proto"
+owner = "spool-proto"
+destination = "lib/protocol/spool-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "printer-device-proto"
+owner = "printer-device-proto"
+destination = "lib/protocol/printer-device-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "import-proto"
+owner = "import-proto"
+destination = "lib/protocol/import-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "ptp-transport-proto"
+owner = "ptp-transport-proto"
+destination = "lib/protocol/ptp-transport-proto.lslib"
+features = ["shared-image"]
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[libraries]]
+name = "admin-proto"
+owner = "admin-proto"
+destination = "lib/protocol/admin-proto.lslib"
 features = ["shared-image"]
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 

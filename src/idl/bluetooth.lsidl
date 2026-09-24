@@ -189,6 +189,13 @@ record mouse-report {
 	buttons: u8,
 }
 
+/// A peer this machine's operator has made an input source, as the input service learns of it: the
+/// controller it is bonded on and its address, and nothing else - no key, no name, no security record.
+record enabled-peer {
+	controller: u32,
+	peer:       peer-address,
+}
+
 /// THE PROFILE AUTHORITY: one verb, over peers an operator has already enabled.
 ///
 /// Held by the input service and by nothing else. It cannot scan, cannot pair, cannot enumerate
@@ -199,6 +206,11 @@ interface bluetooth-profile {
 	/// not enabled. The stream ends when the peer is disabled, when the link is lost, or when the
 	/// controller's session ends - and a consumer learns of all three the same way.
 	@op(1) open-mouse: func(controller: u32, peer: peer-address) -> result<stream<mouse-report>, error>;
+	/// The peers `open-mouse` would accept right now. WITHOUT IT THE ONE CONSUMER OF THIS INTERFACE
+	/// COULD NOT FIND WHAT IT IS ALLOWED TO OPEN: the operator's bonded list is on another authority,
+	/// and handing the input service that authority to learn a peer address would give it the verbs
+	/// that come with it. This answers with the enabled peers and nothing about the others.
+	@op(2) enabled: func() -> result<list<enabled-peer>, error>;
 }
 
 /// WHAT A BOND IS, on the private wire between this service and the store that keeps it.

@@ -59,7 +59,7 @@ fn the_message_encoder_takes_both_halves() {
 #[test]
 fn a_value_carrying_no_capability_still_encodes_both_ways() {
 	use crate::generated::liber::security::v1::{AuditEntry, Capability};
-	let entry = AuditEntry { component: alloc::string::String::from("shell"), capability: Capability::Storage, granted: true, dynamic: false };
+	let entry = AuditEntry { component: alloc::string::String::from("shell"), capability: Capability::Storage, granted: true, dynamic: false, detail: alloc::string::String::new() };
 	let mut out = [0u8; 64];
 	let n = entry.encode(&mut out).expect("nothing was recorded, so there is nothing to lose");
 	assert!(n > 0);

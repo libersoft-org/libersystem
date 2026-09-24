@@ -1,0 +1,184 @@
+//! LiberSystem modem devices - the provider contract a modem publication serves to ModemService.
+//!
+//! A PROVIDER TRANSLATES FRAMING; THE SERVICE DECIDES. The USB CDC-MBIM class module, and the in-guest
+//! fixture before it, turn these commands into MBIM control messages and these datagrams into NTB
+//! sessions. Whether a command is allowed, which context may be activated and who asked is ModemService's.
+
+package liber:modem-device@1;
+
+use liber:base@1.{error};
+
+/// The limits a provider negotiates DOWN from the contract's maxima: eight pending commands, 256
+/// fragments and 64 kB per message, 256 kB of assemblies, four assemblies, an MTU of 4096.
+record device-limits {
+	version:        u32,
+	pending:        u8,
+	fragments:      u16,
+	message-bytes:  u32,
+	assembly-bytes: u32,
+	assemblies:     u8,
+	mtu:            u16,
+}
+
+record device-open {
+	limits:                device-limits,
+	/// A new connection is a new generation: transaction numbers start again only with it.
+	connection-generation: u64,
+}
+
+enum device-sim {
+	unknown    = 0,
+	absent     = 1,
+	locked-pin = 2,
+	locked-puk = 3,
+	ready      = 4,
+	blocked    = 5,
+}
+
+enum device-registration {
+	unknown        = 0,
+	not-registered = 1,
+	searching      = 2,
+	home           = 3,
+	roaming        = 4,
+	denied         = 5,
+}
+
+record device-state {
+	@bound(32) manufacturer: string,
+	@bound(32) model:        string,
+	sim:            device-sim,
+	sim-generation: u64,
+	registration:   device-registration,
+	@bound(32) operator: option<string>,
+	signal-valid:   bool,
+	rssi-dbm:       i32,
+	quality:        u8,
+	/// Remaining attempts, when the SIM reports them.
+	pin-attempts:   option<u8>,
+	puk-attempts:   option<u8>,
+	/// Whether the context is up, from the modem's own report.
+	context-active: bool,
+}
+
+enum ip-family {
+	ipv4 = 4,
+	ipv6 = 6,
+}
+
+/// What the network gave the context. An IPv6-only context says so in `family`, and its IPv4 fields
+/// are then meaningless: this system installs IPv4 contexts only, and says `unsupported` to the rest.
+record ip-config {
+	family:           ip-family,
+	address:          u32,
+	prefix:           u8,
+	gateway:          option<u32>,
+	@bound(2) dns:    list<u32>,
+	mtu:              u16,
+}
+
+record device-identity {
+	@bound(16) imsi:   option<string>,
+	@bound(22) iccid:  option<string>,
+	@bound(16) msisdn: option<string>,
+}
+
+enum command-kind {
+	query      = 1,
+	enter-pin  = 2,
+	enter-puk  = 3,
+	activate   = 4,
+	deactivate = 5,
+	identity   = 6,
+}
+
+/// One command, named by the connection generation and a transaction number that connection never
+/// reuses, and by the SIM and context generations it was prepared against.
+record command {
+	connection-generation: u64,
+	transaction:           u64,
+	kind:                  command-kind,
+	sim-generation:        u64,
+	context-generation:    u64,
+	@bound(8) secret:      list<u8>,
+	@bound(8) new-secret:  list<u8>,
+	@bound(64) apn:        string,
+}
+
+enum command-status {
+	done     = 1,
+	rejected = 2,
+	failed   = 3,
+	/// The SIM or context generation the command named is no longer the device's.
+	stale    = 4,
+}
+
+record command-reply {
+	connection-generation: u64,
+	transaction:           u64,
+	kind:                  command-kind,
+	status:                command-status,
+	sim-generation:        u64,
+	context-generation:    u64,
+	state:                 option<device-state>,
+	config:                option<ip-config>,
+	identity:              option<device-identity>,
+}
+
+/// An unsolicited change, carrying the device's whole state at a revision.
+record indication {
+	revision: u64,
+	state:    device-state,
+}
+
+/// One IP datagram of the active context, tagged with the context it belongs to.
+record datagram {
+	context-generation: u64,
+	@bound(4096) bytes: list<u8>,
+}
+
+/// THE PROVIDER CONTRACT a `modem` publication serves - to ModemService alone.
+interface modem-device {
+	@op(1) open:        func(version: u32) -> result<device-open, error>;
+	@op(2) command:     func(command: command) -> result<command-reply, error>;
+	@op(3) indications: func() -> stream<indication>;
+	/// Datagrams from the network, provider to service.
+	@op(4) receive:     func() -> stream<datagram>;
+	/// The channel datagrams to the network go on, service to provider: one `datagram` frame per
+	/// message, never more waiting than the provider's queue holds.
+	@op(5) transmit:    func() -> result<handle<channel>, error>;
+}
+
+// ------------------------------------------------------------------ development only
+
+/// What the in-guest modem fixture's control endpoint can do to it. DEVELOPMENT ONLY: the endpoint exists
+/// on a development fixture bound to a QEMU test device, reached through PermissionManager in a
+/// development build for a probe whose policy row grants `fixture-control`.
+record fixture-stats {
+	commands:       u32,
+	pin-attempts:   u32,
+	activations:    u32,
+	datagrams-in:   u32,
+	datagrams-out:  u32,
+	echo-replies:   u32,
+	dns-answers:    u32,
+	/// The last PIN the fixture's SIM was given, as a count of bytes only: whether one arrived, never
+	/// what it was.
+	last-secret-bytes: u8,
+}
+
+interface modem-fixture {
+	/// Replace the SIM: `present` or not, and a new SIM generation either way.
+	@op(1) set-sim:     func(present: bool, locked: bool) -> result<unit, error>;
+	/// Hold the next reply to a command of this kind for `delay-ms`; zero never answers it.
+	@op(2) delay:       func(kind: command-kind, delay-ms: u32) -> result<unit, error>;
+	@op(3) withdraw:    func() -> result<unit, error>;
+	@op(4) republish:   func() -> result<unit, error>;
+	@op(5) stats:       func() -> result<fixture-stats, error>;
+	/// Send the last activation's reply again, stale: a duplicate the service must not act on.
+	@op(6) replay:      func() -> result<unit, error>;
+	/// The network ends the context on its own.
+	@op(7) drop-context: func() -> result<unit, error>;
+	/// Answer the next activations with an IPv6-only configuration, or stop doing so.
+	@op(8) ipv6-only:    func(on: bool) -> result<unit, error>;
+}

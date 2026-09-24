@@ -235,3 +235,28 @@ pub fn catalogue_scope_denial() {
 	}
 	debug_write(b"DeviceManager: a catalogue connection is refused every kind it was not minted for\n");
 }
+
+// THE TABLE THE WHOLE MANIFEST SHARES, AT ITS BOUND. `system-manifest` checks that every row minting
+// from the catalogue's roots, with a replacement each across a restart, fits these slots; this is the
+// table itself, with real channels, refusing the connection past the last and taking one again once a
+// slot is given back. A refusal is a refusal, not a connection with nothing on the other end.
+pub fn catalogue_cap_refusal() {
+	let mut clients = CatalogueClients::new();
+	let power = Scope::of(&[driver_protocol::provider::POWER_SOURCE]).expect("one kind is a subset");
+	let mut held: Vec<u64> = Vec::new();
+	for _ in 0..MAX_CATALOGUE_CLIENTS {
+		held.push(channel_pair_for_catalogue(&mut clients, power).expect("the table admits a client up to its bound"));
+	}
+	assert!(channel_pair_for_catalogue(&mut clients, power).is_none(), "the client past the bound is refused");
+	assert_eq!(clients.live().len(), MAX_CATALOGUE_CLIENTS, "and refusing it took no slot");
+	clients.retire(0);
+	held.push(channel_pair_for_catalogue(&mut clients, power).expect("a slot given back is a slot again"));
+	assert_eq!(clients.scope_at(MAX_CATALOGUE_CLIENTS - 1).bits(), power.bits(), "and the new client carries its own scope");
+	while !clients.live().is_empty() {
+		clients.retire(0);
+	}
+	for handle in held {
+		close(handle);
+	}
+	debug_write(b"DeviceManager: the catalogue refuses the client past its bound and admits one once a slot is given back\n");
+}

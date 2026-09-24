@@ -82,6 +82,14 @@ fn mouse_report_wire_is_stable() {
 	assert_eq!(MouseReport::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn enabled_peer_wire_is_stable() {
+	let sample = EnabledPeer { controller: 7, peer: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] } };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 1, 0, 7];
+	assert_eq!(bytes, golden);
+	assert_eq!(EnabledPeer::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn bond_record_wire_is_stable() {
 	let sample = BondRecord { version: 7, local: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, peer: PeerAddress { kind: PeerKind::Public, bytes: alloc::vec![7] }, key: alloc::vec![7], security: SecurityLevel::None, name: String::from("x"), enabled: true };
 	let bytes = sample.encode_vec().expect("encode");

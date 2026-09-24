@@ -72,6 +72,40 @@ declare -A GATES=(
 	# before the first thread runs - none of which is observable from outside a launch, so this boots
 	# a guest and reads what the bound provider actually agreed to.
 	["icd-selection"]="tools/check-icd-selection.sh"
+	["bluetooth-service"]="tools/check-bluetooth-service.sh"
+	# POWERSERVICE AGAINST THE IN-GUEST POWER FIXTURE: exact canonical units, read denial, one-outlet
+	# control, coherent bounded subscriptions, a withheld reply and a restart. Service and
+	# normalisation coverage - the fixture's data is decoded HID and ACPI written out, not a device.
+	["power-service"]="tools/check-power-service.sh"
+	# SMARTCARDSERVICE AGAINST THE IN-GUEST SMART-CARD FIXTURE: reader-scoped grants, the PIV allowlist,
+	# the pinpad with no PIN anywhere, an authentication signature verified by OpenSSL on the host,
+	# queues, removal, recovery, events and a restart. The service and its pinpad policy - not USB CCID.
+	["smartcard-service"]="tools/check-smartcard-service.sh"
+	# MODEMSERVICE AND NETWORKSERVICE'S RAW-IP LINK AGAINST THE IN-GUEST MODEM FIXTURE: four separate
+	# authorities, PIN handling without replay, traffic through ordinary network calls, context loss,
+	# rollback, uplink replacement and fallback, and reclamation - on a machine with no NIC and one
+	# with. The service and the link - not USB MBIM transport.
+	["qemu-modem-service"]="tools/check-modem-service.sh"
+	# CAMERASERVICE AGAINST THE IN-GUEST CAMERA FIXTURE: capture grants, exact negotiation, client-owned
+	# leased buffers with known bytes, honest timing and loss, busy refusal, owner death, a failed launch,
+	# quarantine and replacement. The service - not USB Video transport.
+	["qemu-camera-service"]="tools/check-camera-service.sh"
+	# MIDISERVICE AGAINST THE IN-GUEST MIDI FIXTURE: the bounded event vocabulary and queue, the decoder over
+	# scripted packets, SysEx bounds, typed faults, saturation, loss, unplug, grants and reclamation. The
+	# service - not USB MIDI transport, UMP or output.
+	["qemu-midi-service"]="tools/check-midi-service.sh"
+	# SPOOLSERVICE AGAINST PRINTERS THE KERNEL HARNESS PLAYS: admission and bounded staging, exact transmission by
+	# acknowledged prefix, stalls, every ending, withdrawal, reset and failed recovery, and PermissionManager's
+	# grant of `spool`. The service - not USB printer transport.
+	["spool-service"]="tools/check-spool-service.sh"
+	# MEDIAIMPORTSERVICE AGAINST A CAMERA THE KERNEL HARNESS PLAYS: exact pages out of a 40 000-handle snapshot,
+	# the over-limit storage refused explicitly, scoped and stale identities, validated completion into a
+	# transactional destination, removal as an explicit partial ending, and the grant. Not USB Still Image.
+	["media-import-service"]="tools/check-media-import-service.sh"
+	# THE TRUSTED ADMINISTRATIVE PATH, cold, in a development image: one confirmation through the emulated
+	# keyboard on a protected screen nothing else can cover, one attempt at the confirmed operation, none for
+	# anything else, and the decision journal read back after a reboot. The generic seam - not USB DFU.
+	["qemu-admin-path"]="tools/check-admin-path.sh"
 	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
 	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
 	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three

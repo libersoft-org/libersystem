@@ -7,6 +7,15 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "admin-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "audio-proto"
 version = "0.0.0"
 dependencies = [
@@ -26,6 +35,28 @@ name = "bluetooth-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "bootproto"
+version = "0.0.0"
+
+[[package]]
+name = "camera-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "camera-proto",
+ "wire",
+]
+
+[[package]]
+name = "camera-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
  "wire",
 ]
 
@@ -76,11 +107,21 @@ dependencies = [
 name = "drivers"
 version = "0.0.0"
 dependencies = [
+ "bootproto",
  "display-device-proto",
  "driver-protocol",
  "ipc-client",
+ "power-model",
  "proto",
  "rt",
+ "smartcard-model",
+ "wire",
+]
+
+[[package]]
+name = "event-proto"
+version = "0.0.0"
+dependencies = [
  "wire",
 ]
 
@@ -96,6 +137,14 @@ dependencies = [
 name = "graphics-proto"
 version = "0.0.0"
 dependencies = [
+ "wire",
+]
+
+[[package]]
+name = "import-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 
@@ -124,6 +173,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "midi-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "midi-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "event-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "modem-device-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "modem-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "network-proto"
 version = "0.0.0"
 dependencies = [
@@ -133,6 +217,29 @@ dependencies = [
 
 [[package]]
 name = "observability-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "power-model"
+version = "0.0.0"
+dependencies = [
+ "power-proto",
+]
+
+[[package]]
+name = "power-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "printer-device-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
@@ -152,25 +259,47 @@ dependencies = [
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "admin-proto",
  "audio-proto",
  "base-proto",
  "bluetooth-proto",
+ "camera-device-proto",
+ "camera-proto",
  "config-proto",
  "device-proto",
  "display-device-proto",
  "display-proto",
+ "event-proto",
  "font-proto",
  "graphics-proto",
+ "import-proto",
  "input-proto",
  "log-proto",
+ "midi-device-proto",
+ "midi-proto",
+ "modem-device-proto",
+ "modem-proto",
  "network-proto",
  "observability-proto",
+ "power-proto",
+ "printer-device-proto",
  "process-proto",
+ "ptp-transport-proto",
  "resources-proto",
  "security-proto",
  "session-proto",
+ "smartcard-proto",
+ "spool-proto",
  "storage-proto",
  "time-proto",
+ "wire",
+]
+
+[[package]]
+name = "ptp-transport-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 
@@ -205,6 +334,27 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "smartcard-model"
+version = "0.0.0"
+
+[[package]]
+name = "smartcard-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
+name = "spool-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 

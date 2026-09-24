@@ -16,7 +16,16 @@ extern crate alloc;
 // THE AHCI DECISIONS, with no controller behind them: the port bitmap, the port state rules, the
 // scatter-gather arithmetic and the capacity parse, which is where an AHCI driver is actually wrong.
 pub mod ahci;
+// AN ADMINISTRATIVE EXECUTOR'S PREPARED OPERATIONS: the payload copied and digested at preparation, the live
+// target generation frozen with it, and the start guard that admits at most one attempt. The probe fixture
+// uses it now and the DFU class module will.
+pub mod admin_operation;
 pub mod blk;
+// THE EMULATED BLUETOOTH PEER the in-guest fixture plays: an LE boot mouse's responder side of
+// pairing, its GATT table and its scripted reports. DEVELOPMENT-ONLY in what uses it - only the
+// fixture driver links it - and its cryptography is a separate implementation from the host stack's,
+// held to the same published vectors, so the two agreeing in the guest means something.
+pub mod bt_peer;
 // THE COMMUNICATIONS-CLASS DECISIONS, shared by the two network models that are the same descriptors
 // and different framing: where the interfaces and the bulk pair are, and - for NCM - what a transfer
 // block's datagram table may say before it is believed, which is where such a driver reads past a
@@ -40,11 +49,13 @@ pub mod hda;
 pub mod hid;
 pub mod input;
 pub mod keys;
+pub mod mbim;
 pub mod net;
 // THE NVM EXPRESS DECISIONS, with no controller behind them: the register layouts, the completion
 // rules and the PRP arithmetic, which is where an NVMe driver is actually wrong and all of which a
 // host test can watch failing.
 pub mod nvme;
+pub mod piv_card;
 pub mod port;
 // THE SD PROTOCOL DECISIONS, kept independent of how the controller is attached exactly as the item
 // that owns them asks: no PCI, no ACPI, no device tree, so board glue stays outside the driver.
@@ -64,6 +75,8 @@ pub mod usb;
 // The in-controller class-module execution model: what a USB class driver IS in this system, and the
 // per-class budget that stops two of them inside one Domain from starving each other.
 pub mod usb_class;
+pub mod usb_midi;
+pub mod uvc;
 pub mod virtio;
 // THE VIRTIO-VSOCK DECISIONS: the packet header, the credit window and the connection state
 // machine. Credit is the part a vsock driver gets wrong, in both directions and silently, and it is

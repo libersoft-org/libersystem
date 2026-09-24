@@ -51,3 +51,11 @@ method socket.close op=3 () -> result<unit, liber:base@1::error>
 record chunk(data:list<u8>:bound=4096)
 interface listener
 method listener.accept op=1 () -> result<accept-result, liber:base@1::error>
+record link-provider(slot:u32,generation:u32,binding-generation:u64)
+enum link-family(ipv4=4,ipv6=6)
+record link-attachment(provider:link-provider,sim-generation:u64,context-generation:u64,packets:handle<channel>,family:link-family,address:ipv4-addr,prefix:u8,gateway:option<ipv4-addr>,dns:list<ipv4-addr>:bound=2,mtu:u16)
+record link-installed(interface:interface-id,mtu:u16)
+interface network-link-admin
+method network-link-admin.reserve op=1 (replace-uplink:bool:rights=) -> result<u64, liber:base@1::error>
+method network-link-admin.install op=2 (reservation:u64:rights=,attachment:link-attachment:rights=) -> result<link-installed, liber:base@1::error>
+method network-link-admin.release op=3 (reservation:u64:rights=) -> result<unit, liber:base@1::error>

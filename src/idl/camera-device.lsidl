@@ -1,0 +1,108 @@
+//! LiberSystem camera devices - the provider contract a `camera` publication serves to CameraService.
+//!
+//! A PROVIDER NORMALIZES AND WRITES; THE SERVICE DECIDES. The USB Video class module, and the in-guest
+//! fixture before it, turn their descriptors into these bounded formats with the staged normalizer, select
+//! what they are asked for, and write assembled frames into the buffers they were given. Which camera a
+//! client may use, whether what the provider selected is what was asked, and which buffer belongs to whom
+//! are CameraService's.
+//!
+//! A BUFFER IS WRITTEN ONLY WHILE QUEUED. `queue` hands one buffer's write permission to the provider under
+//! a lease; a completion hands it back under the same lease; `stop` is answered only when every buffer the
+//! provider held has been given back and every mapping of it released.
+
+package liber:camera-device@1;
+
+use liber:base@1.{error};
+use liber:camera@1.{frame-buffer, format-info, frame-size, stream-request, negotiated, device-time};
+
+record camera-open {
+	/// A new connection is a new generation; nothing of an earlier one carries over.
+	connection-generation: u64,
+	@bound(64) name:       string,
+	/// The descriptor snapshot the formats belong to.
+	generation:            u64,
+}
+
+record camera-frame {
+	stream-generation: u64,
+	sequence:          u64,
+	buffer:            u8,
+	lease:             u64,
+	valid-bytes:       u32,
+	arrival-ns:        u64,
+	device:            option<device-time>,
+}
+
+enum camera-drop-reason {
+	/// No buffer was queued when the frame was ready.
+	no-buffer = 1,
+	/// The device or its transport lost it.
+	device    = 2,
+}
+
+/// Frames the provider definitely observed and did not deliver, by sequence.
+record camera-drop {
+	stream-generation: u64,
+	first-sequence:    u64,
+	count:             u32,
+	reason:            camera-drop-reason,
+}
+
+/// A loss whose frame count the provider cannot establish.
+record camera-gap {
+	stream-generation: u64,
+	next-sequence:     u64,
+}
+
+variant camera-device-event {
+	frame(camera-frame),
+	dropped(camera-drop),
+	gap(camera-gap),
+}
+
+/// THE PROVIDER CONTRACT a `camera` publication serves - to CameraService alone.
+interface camera-device {
+	@op(1) open:      func(version: u32) -> result<camera-open, error>;
+	@op(2) @bound(8) formats: func() -> result<list<format-info>, error>;
+	@op(3) @bound(32) sizes: func(format: u8) -> result<list<frame-size>, error>;
+	/// Select for a new stream the service has already numbered; a stream that never started is replaced.
+	@op(4) negotiate: func(stream-generation: u64, request: stream-request) -> result<negotiated, error>;
+	@op(5) register:  func(stream-generation: u64, buffer: u8, @rights(map, write) memory: handle<frame-buffer>) -> result<unit, error>;
+	@op(6) queue:     func(stream-generation: u64, buffer: u8, lease: u64) -> result<unit, error>;
+	@op(7) start:     func(stream-generation: u64) -> result<unit, error>;
+	/// Answered once every buffer is back and every mapping of it released.
+	@op(8) stop:      func(stream-generation: u64) -> result<unit, error>;
+	@op(9) events:    func() -> stream<camera-device-event>;
+}
+
+// ------------------------------------------------------------------ development only
+
+/// What the in-guest camera fixture counted. DEVELOPMENT ONLY.
+record camera-fixture-stats {
+	frames-written: u32,
+	dropped-no-buffer: u32,
+	dropped-device:    u32,
+	gaps:              u32,
+	/// Buffers the fixture holds a mapping of right now.
+	mapped:            u8,
+	stops:             u32,
+}
+
+/// The in-guest camera fixture's control endpoint. DEVELOPMENT ONLY: it exists on a development fixture
+/// bound to a QEMU test device, reached through PermissionManager in a development build for a probe
+/// whose policy row grants `fixture-control`.
+interface camera-fixture {
+	/// Lose the next `count` frames in the device, definitely observed.
+	@op(1) drop-device: func(count: u32) -> result<unit, error>;
+	/// Lose frames the device cannot count.
+	@op(2) gap:         func() -> result<unit, error>;
+	/// Deliver device timing with frames, or none at all.
+	@op(3) timing:      func(on: bool) -> result<unit, error>;
+	/// Reset the device clock: a new reset generation.
+	@op(4) reset-clock: func() -> result<unit, error>;
+	/// Hold the next stop's answer for `delay-ms`; zero never answers it.
+	@op(5) delay-stop:  func(delay-ms: u32) -> result<unit, error>;
+	@op(6) withdraw:    func() -> result<unit, error>;
+	@op(7) republish:   func() -> result<unit, error>;
+	@op(8) stats:       func() -> result<camera-fixture-stats, error>;
+}

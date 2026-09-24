@@ -29,7 +29,7 @@ fn verify_artifacts() {
 			(_, "pinned") if row.crate_dir != "-" => user_elf_path(&manifest, &row.crate_path, &row.name),
 			("library", "volume") => user_shared_path(&manifest, row.destination.as_deref().expect("library destination")),
 			("dynamic" | "dynamic-service", "volume") => user_dynamic_path(&manifest, row.destination.as_deref().expect("program destination")),
-			("driver" | "service", "volume") => user_elf_path(&manifest, &row.crate_path, &row.name),
+			("driver" | "service" | "probe", "volume") => user_elf_path(&manifest, &row.crate_path, &row.name),
 			_ => continue,
 		};
 		// A QUARANTINE ARTIFACT IS ABSENT WHEN ITS UPSTREAM IS. Its link comes from the audit
@@ -1222,7 +1222,9 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 			// driver is, so it must not be linked dynamically (that path needs ProcessService)
 			// and must not be pinned (it is development-only and has no business in the
 			// boot-critical bundle).
-			"driver" | "service" if row.stage == "volume" => row.destination.clone().expect("program destination"),
+			// AND A STATIC PROBE, for the same reason: a gate's scenario driver that must link what no staged
+			// library publishes, started from the volume in a development image and absent from every other.
+			"driver" | "service" | "probe" if row.stage == "volume" => row.destination.clone().expect("program destination"),
 			"library" if row.stage == "volume" => row.destination.clone().expect("library destination"),
 			"dynamic" | "dynamic-service" if row.stage == "volume" => row.destination.clone().expect("program destination"),
 			_ => continue,

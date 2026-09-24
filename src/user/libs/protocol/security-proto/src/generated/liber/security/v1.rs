@@ -87,6 +87,65 @@ pub enum Capability {
 	/// metadata pass is work an ordinary client must not be able to demand, because authority to
 	/// READ a font must not become authority to make the machine work.
 	FontAdmin = 24,
+	/// BLUETOOTH, READ: list the controllers and look for devices, and nothing that changes either.
+	///
+	/// Separate from `bluetooth-operator` for the reason `device` is separate from `device-policy`:
+	/// what hardware is present is something a status tool may know, and what a radio does is not
+	/// something a status tool may change.
+	Bluetooth = 25,
+	/// BLUETOOTH, OPERATOR: power a controller, pair, forget a bond and make a peer an input source.
+	///
+	/// GRANTED TO NOTHING BY DEFAULT. It is minted for a component whose permission manifest asks for it
+	/// and whose policy row grants it, and no row in this tree grants it to a shipping component - an
+	/// administrative authorization is a decision somebody makes about one component, not a default.
+	BluetoothOperator = 26,
+	/// POWER STATE, READ: enumerate power sources and thermal zones and subscribe to their normalised
+	/// state. It publishes nothing and controls nothing, and no device or provider connection comes
+	/// with it - what a status tool may know about a battery is not a channel to the battery.
+	PowerState = 27,
+	/// POWER CONTROL: switch an output a device such as a UPS advertises, schedule its turn-off or
+	/// cancel one. THE UPS'S OUTPUT, NOT THE MACHINE: shutting the host down stays with SystemManager.
+	///
+	/// GRANTED TO NOTHING BY DEFAULT, for the reason `bluetooth-operator` is not: an administrative
+	/// authorization is a decision about one component, and no shipping row makes it.
+	PowerControl = 28,
+	/// A TEST FIXTURE'S CONTROL ENDPOINT: change or remove what a development fixture publishes and
+	/// read back what it was asked to do. Granted only by development-only policy rows, to the probe a
+	/// gate drives - a shipping configuration has neither the row nor a fixture to reach.
+	FixtureControl = 29,
+	/// A SMART-CARD READER, minted for one configured reader and one set of operations - public
+	/// reading, transactions, PIN verification and authentication - for the component being launched,
+	/// and alive only as long as that component is. The default is no reader at all.
+	Smartcard = 30,
+	/// MODEMS, OBSERVED: registration, signal, SIM presence and lock state - and no subscriber identifier.
+	ModemState = 31,
+	/// A MODEM'S DATA CONTEXT: activate and deactivate the one context this component's policy allows, on
+	/// the modem and SIM current when the grant was minted, for the life of the component.
+	ModemData = 32,
+	/// A MODEM'S SUBSCRIBER IDENTITY: IMSI, ICCID and number. Denied by default.
+	ModemIdentity = 33,
+	/// A MODEM'S MANAGEMENT: PIN and PUK entry and the retry counters. Denied by default.
+	ModemManage = 34,
+	/// CAMERAS, LISTED: names and formats, and no way to start anything or reach a frame.
+	Camera = 35,
+	/// CAPTURE FROM ONE CAMERA, minted per launch for a configured camera and the life of the component.
+	CameraCapture = 36,
+	/// MIDI, LISTED: endpoints and what they are, and nothing that receives.
+	Midi = 37,
+	/// RECEIVING FROM ONE MIDI ENDPOINT, minted per launch for a configured device and the life of the component.
+	MidiInput = 38,
+	/// PRINTING: list printers and create jobs, each a capability of its own. No backend, no reset, no raw endpoint.
+	Spool = 39,
+	/// IMPORTING FROM A CAMERA: list devices and storages, page a snapshot of objects and read one at a time.
+	/// Read-only: no command, no delete, no capture, and nowhere to write.
+	MediaImport = 40,
+	/// ASKING FOR ONE HIGH-RISK OPERATION: a request connection bound to the launched task and its policy's
+	/// scope. A grant needs a person's confirmation on the protected screen. Granted to nothing by default.
+	AdminRequest = 41,
+	/// THE OPERATOR'S READ VIEW of the administrative decision journal.
+	AdminAudit = 42,
+	/// AdminService's test controls. Development images only.
+	AdminTest = 43,
 }
 
 impl Capability {
@@ -154,6 +213,25 @@ impl Capability {
 			22 => Some(Capability::AudioCapture),
 			23 => Some(Capability::FontCatalogue),
 			24 => Some(Capability::FontAdmin),
+			25 => Some(Capability::Bluetooth),
+			26 => Some(Capability::BluetoothOperator),
+			27 => Some(Capability::PowerState),
+			28 => Some(Capability::PowerControl),
+			29 => Some(Capability::FixtureControl),
+			30 => Some(Capability::Smartcard),
+			31 => Some(Capability::ModemState),
+			32 => Some(Capability::ModemData),
+			33 => Some(Capability::ModemIdentity),
+			34 => Some(Capability::ModemManage),
+			35 => Some(Capability::Camera),
+			36 => Some(Capability::CameraCapture),
+			37 => Some(Capability::Midi),
+			38 => Some(Capability::MidiInput),
+			39 => Some(Capability::Spool),
+			40 => Some(Capability::MediaImport),
+			41 => Some(Capability::AdminRequest),
+			42 => Some(Capability::AdminAudit),
+			43 => Some(Capability::AdminTest),
 			_ => None,
 		}
 	}
@@ -265,6 +343,9 @@ pub struct AuditEntry {
 	pub capability: Capability,
 	pub granted: bool,
 	pub dynamic: bool,
+	/// What a grant that resolves a selection was resolved to - for a smart card, the exact reader
+	/// publication - and empty for every grant that selects nothing.
+	pub detail: String,
 }
 
 impl AuditEntry {
@@ -307,6 +388,7 @@ impl AuditEntry {
 		self.capability.write(w)?;
 		w.boolean(self.granted)?;
 		w.boolean(self.dynamic)?;
+		w.bytes_lp(self.detail.as_bytes())?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<AuditEntry> {
@@ -314,7 +396,8 @@ impl AuditEntry {
 		let capability = Capability::read(r)?;
 		let granted = r.boolean()?;
 		let dynamic = r.boolean()?;
-		Some(AuditEntry { component, capability, granted, dynamic })
+		let detail = r.string_lp()?;
+		Some(AuditEntry { component, capability, granted, dynamic, detail })
 	}
 }
 
@@ -1291,6 +1374,25 @@ impl Capability {
 			Capability::AudioCapture => out.push_str("\"audio-capture\""),
 			Capability::FontCatalogue => out.push_str("\"font-catalogue\""),
 			Capability::FontAdmin => out.push_str("\"font-admin\""),
+			Capability::Bluetooth => out.push_str("\"bluetooth\""),
+			Capability::BluetoothOperator => out.push_str("\"bluetooth-operator\""),
+			Capability::PowerState => out.push_str("\"power-state\""),
+			Capability::PowerControl => out.push_str("\"power-control\""),
+			Capability::FixtureControl => out.push_str("\"fixture-control\""),
+			Capability::Smartcard => out.push_str("\"smartcard\""),
+			Capability::ModemState => out.push_str("\"modem-state\""),
+			Capability::ModemData => out.push_str("\"modem-data\""),
+			Capability::ModemIdentity => out.push_str("\"modem-identity\""),
+			Capability::ModemManage => out.push_str("\"modem-manage\""),
+			Capability::Camera => out.push_str("\"camera\""),
+			Capability::CameraCapture => out.push_str("\"camera-capture\""),
+			Capability::Midi => out.push_str("\"midi\""),
+			Capability::MidiInput => out.push_str("\"midi-input\""),
+			Capability::Spool => out.push_str("\"spool\""),
+			Capability::MediaImport => out.push_str("\"media-import\""),
+			Capability::AdminRequest => out.push_str("\"admin-request\""),
+			Capability::AdminAudit => out.push_str("\"admin-audit\""),
+			Capability::AdminTest => out.push_str("\"admin-test\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1320,6 +1422,25 @@ impl Capability {
 			Capability::AudioCapture => out.push_str("audio-capture"),
 			Capability::FontCatalogue => out.push_str("font-catalogue"),
 			Capability::FontAdmin => out.push_str("font-admin"),
+			Capability::Bluetooth => out.push_str("bluetooth"),
+			Capability::BluetoothOperator => out.push_str("bluetooth-operator"),
+			Capability::PowerState => out.push_str("power-state"),
+			Capability::PowerControl => out.push_str("power-control"),
+			Capability::FixtureControl => out.push_str("fixture-control"),
+			Capability::Smartcard => out.push_str("smartcard"),
+			Capability::ModemState => out.push_str("modem-state"),
+			Capability::ModemData => out.push_str("modem-data"),
+			Capability::ModemIdentity => out.push_str("modem-identity"),
+			Capability::ModemManage => out.push_str("modem-manage"),
+			Capability::Camera => out.push_str("camera"),
+			Capability::CameraCapture => out.push_str("camera-capture"),
+			Capability::Midi => out.push_str("midi"),
+			Capability::MidiInput => out.push_str("midi-input"),
+			Capability::Spool => out.push_str("spool"),
+			Capability::MediaImport => out.push_str("media-import"),
+			Capability::AdminRequest => out.push_str("admin-request"),
+			Capability::AdminAudit => out.push_str("admin-audit"),
+			Capability::AdminTest => out.push_str("admin-test"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1349,6 +1470,25 @@ impl Capability {
 			Capability::AudioCapture => crate::codec::cbor::text(out, "audio-capture"),
 			Capability::FontCatalogue => crate::codec::cbor::text(out, "font-catalogue"),
 			Capability::FontAdmin => crate::codec::cbor::text(out, "font-admin"),
+			Capability::Bluetooth => crate::codec::cbor::text(out, "bluetooth"),
+			Capability::BluetoothOperator => crate::codec::cbor::text(out, "bluetooth-operator"),
+			Capability::PowerState => crate::codec::cbor::text(out, "power-state"),
+			Capability::PowerControl => crate::codec::cbor::text(out, "power-control"),
+			Capability::FixtureControl => crate::codec::cbor::text(out, "fixture-control"),
+			Capability::Smartcard => crate::codec::cbor::text(out, "smartcard"),
+			Capability::ModemState => crate::codec::cbor::text(out, "modem-state"),
+			Capability::ModemData => crate::codec::cbor::text(out, "modem-data"),
+			Capability::ModemIdentity => crate::codec::cbor::text(out, "modem-identity"),
+			Capability::ModemManage => crate::codec::cbor::text(out, "modem-manage"),
+			Capability::Camera => crate::codec::cbor::text(out, "camera"),
+			Capability::CameraCapture => crate::codec::cbor::text(out, "camera-capture"),
+			Capability::Midi => crate::codec::cbor::text(out, "midi"),
+			Capability::MidiInput => crate::codec::cbor::text(out, "midi-input"),
+			Capability::Spool => crate::codec::cbor::text(out, "spool"),
+			Capability::MediaImport => crate::codec::cbor::text(out, "media-import"),
+			Capability::AdminRequest => crate::codec::cbor::text(out, "admin-request"),
+			Capability::AdminAudit => crate::codec::cbor::text(out, "admin-audit"),
+			Capability::AdminTest => crate::codec::cbor::text(out, "admin-test"),
 		}
 	}
 }
@@ -1483,6 +1623,9 @@ impl AuditEntry {
 		} else {
 			out.push_str("false");
 		}
+		out.push(',');
+		out.push_str("\"detail\":");
+		crate::codec::json_escape(&self.detail, out);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1506,10 +1649,13 @@ impl AuditEntry {
 		} else {
 			out.push_str("false");
 		}
+		out.push_str(", ");
+		out.push_str("detail=");
+		out.push_str(&self.detail);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 4);
+		crate::codec::cbor::map(out, 5);
 		crate::codec::cbor::text(out, "component");
 		crate::codec::cbor::text(out, &self.component);
 		crate::codec::cbor::text(out, "capability");
@@ -1518,6 +1664,8 @@ impl AuditEntry {
 		crate::codec::cbor::boolean(out, self.granted);
 		crate::codec::cbor::text(out, "dynamic");
 		crate::codec::cbor::boolean(out, self.dynamic);
+		crate::codec::cbor::text(out, "detail");
+		crate::codec::cbor::text(out, &self.detail);
 	}
 }
 

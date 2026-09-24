@@ -757,7 +757,15 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	// system copies it into memory because the medium it booted from cannot be written. The tag
 	// says which of the two arrived, so the storage service knows whether to unpack an archive or
 	// mount a volume.
-	let (volume, tag): (&[u8], &[u8]) = match module_bytes(crate::product::SYSTEM_VOLUME) {
+	//
+	// AND ONLY WHEN THE LOADER DID NOT CHOOSE A DISK. A medium that carries an image can be booted
+	// beside the disk it is paired with, and then the loader's choice is that disk - the verified
+	// paired block volume wins when it is used, and `adopt_root_selection` has already said so on
+	// the console. Handing the image over anyway made the running system a copy in memory on a boot
+	// whose loader had chosen the disk: `ROOTSEL` named the disk, the storage service was given the
+	// image first, and nothing written survived a reboot.
+	let block_root = ROOT_SELECTION.lock().is_some_and(|root| root.kind == bootproto::ROOT_BLOCK);
+	let (volume, tag): (&[u8], &[u8]) = match module_bytes(crate::product::SYSTEM_VOLUME).filter(|_| !block_root) {
 		Some(image) => (image, b"LIVEVOL"),
 		// An INSTALLED system has neither: its volume is a partition the storage service mounts
 		// off the disk, so there is no archive to seed from and no image to copy. The message is

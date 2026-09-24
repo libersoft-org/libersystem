@@ -1,0 +1,61 @@
+package liber:smartcard@1
+enum exchange-level(character=1,tpdu=2,short-apdu=3,extended-apdu=4)
+enum card-protocol(t0=0,t1=1)
+record reader-id(slot:u32,generation:u32,binding-generation:u64)
+record reader-info(id:reader-id,name:string,alias:string,slots:u8,exchange:exchange-level,pinpad:bool)
+enum presence(absent=1,present=2)
+record slot-state(slot:u8,presence:presence,card-generation:u64,atr:list<u8>:bound=33,available:bool)
+enum event-kind(snapshot=1,snapshot-end=2,inserted=3,removed=4,unavailable=5,available=6)
+record card-event(sequence:u64,kind:event-kind,slot:option<slot-state>)
+record transaction(id:u64,slot:u8,card-generation:u64,lease-ms:u32)
+record apdu-response(data:list<u8>:bound=16384,sw1:u8,sw2:u8)
+enum card-outcome(done=1,card-removed=2,cancelled=3,timed-out=4,provider-error=5)
+record exchange-result(outcome:card-outcome,response:option<apdu-response>)
+enum pin-result(verified=1,incorrect=2,blocked=3,cancelled=4,timed-out=5,card-removed=6,provider-error=7,trusted-input-unavailable=8)
+record pin-outcome(result:pin-result,retries:option<u8>)
+record authenticate-result(outcome:card-outcome,signature:option<list<u8>>:bound=80)
+interface smartcard
+method smartcard.reader op=1 () -> result<reader-info, liber:base@1::error>
+method smartcard.slots op=2 () -> result<list<slot-state>, liber:base@1::error>
+method smartcard.events op=3 () -> result<stream<card-event>, liber:base@1::error>
+method smartcard.acquire op=4 (slot:u8:rights=,wait-ms:u32:rights=,lease-ms:u32:rights=) -> result<transaction, liber:base@1::error>
+method smartcard.exchange op=5 (transaction:u64:rights=,apdu:list<u8>:bound=261:rights=) -> result<exchange-result, liber:base@1::error>
+method smartcard.verify-piv-pin op=6 (transaction:u64:rights=,timeout-ms:u32:rights=) -> result<pin-outcome, liber:base@1::error>
+method smartcard.authenticate-piv op=7 (transaction:u64:rights=,challenge:list<u8>:bound=32:rights=) -> result<authenticate-result, liber:base@1::error>
+method smartcard.cancel op=8 (transaction:u64:rights=) -> result<unit, liber:base@1::error>
+method smartcard.release op=9 (transaction:u64:rights=) -> result<unit, liber:base@1::error>
+record operations(read:bool,transact:bool,authenticate:bool)
+record minted(connection:handle<channel>,reader:reader-id,name:string)
+interface smartcard-admin
+method smartcard-admin.mint op=1 (alias:string:rights=,operations:operations:rights=,owner:handle<liber:process@1::task>:rights=) -> result<minted, liber:base@1::error>
+record pinpad-capabilities(secure-verify:bool,ascii:bool,max-block:u8,min-digits:u8,max-digits:u8)
+record reader-description(name:string,slots:u8,exchange:exchange-level,protocols:u8,pinpad:pinpad-capabilities)
+record slot-report(slot:u8,present:bool,card-generation:u64,atr:list<u8>:bound=33,powered:bool)
+record request-header(request:u64,slot:u8,card-generation:u64)
+record secure-verify-request(header:request-header,block:u8,min-digits:u8,max-digits:u8,timeout-seconds:u8,apdu:list<u8>:bound=16)
+enum provider-outcome(done=1,card-removed=2,aborted=3,timed-out=4,cancelled=5,fault=6)
+record provider-reply(header:request-header,outcome:provider-outcome,response:list<u8>:bound=258,atr:list<u8>:bound=33)
+enum reader-event-kind(presence=1,fault=2,quiescent=3)
+record reader-event(kind:reader-event-kind,slot:u8,report:option<slot-report>)
+interface smartcard-reader
+method smartcard-reader.describe op=1 () -> result<reader-description, liber:base@1::error>
+method smartcard-reader.open-session op=2 () -> result<list<slot-report>, liber:base@1::error>
+method smartcard-reader.events op=3 () -> stream<reader-event>
+method smartcard-reader.power op=4 (header:request-header:rights=,on:bool:rights=) -> result<provider-reply, liber:base@1::error>
+method smartcard-reader.select-protocol op=5 (header:request-header:rights=,protocol:card-protocol:rights=) -> result<provider-reply, liber:base@1::error>
+method smartcard-reader.exchange op=6 (header:request-header:rights=,apdu:list<u8>:bound=261:rights=) -> result<provider-reply, liber:base@1::error>
+method smartcard-reader.secure-verify op=7 (request:secure-verify-request:rights=) -> result<provider-reply, liber:base@1::error>
+method smartcard-reader.abort op=8 (header:request-header:rights=) -> result<provider-reply, liber:base@1::error>
+enum fixture-pin(verified=1,incorrect=2,blocked=3,cancelled=4,timed-out=5)
+record fixture-operation(at:u64,reader:u8,slot:u8,what:string,header:list<u8>:bound=4,pin-bytes:bool)
+interface smartcard-fixture
+method smartcard-fixture.insert op=1 (reader:u8:rights=,slot:u8:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.remove op=2 (reader:u8:rights=,slot:u8:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.pin op=3 (outcome:fixture-pin:rights=,delay-ms:u32:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.delay op=4 (reader:u8:rights=,delay-ms:u32:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.hold-abort op=5 (reader:u8:rights=,delay-ms:u32:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.recover op=6 (reader:u8:rights=,slot:u8:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.withdraw op=7 (reader:u8:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.republish op=8 (reader:u8:rights=) -> result<unit, liber:base@1::error>
+method smartcard-fixture.operations op=9 () -> result<list<fixture-operation>, liber:base@1::error>
+method smartcard-fixture.now op=10 () -> result<u64, liber:base@1::error>

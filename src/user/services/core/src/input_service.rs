@@ -28,8 +28,11 @@ use keys::KeyState;
 use proto::codec::Handles;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
-use proto::system::{ContactEvent, Error, KeyEvent, PointerEvent, ProviderKind, provider_catalogue};
+use proto::system::input_trusted;
+use proto::system::{ContactEvent, Error, KeyEvent, PointerEvent, ProviderKind, TrustedInput, TrustedInputKind, provider_catalogue};
 use rt::*;
+use service_logic::trusted_keys::{Arming, Seen, Watch};
+use services::capability_names::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
 // framebuffer (1280x800) with 16x16 cells. A resize-aware grid (consulting
@@ -69,6 +72,104 @@ struct Input {
 	contact_stream: Option<ContactStream>,
 	contacts_down: Vec<u8>,
 	proof_nonce: u64,
+	/// The secure-attention chord is down on the ordinary path: its keys go nowhere there.
+	chord_held: bool,
+	/// A PROTECTED SESSION IS UP: nothing on the ordinary path is delivered anywhere - no key, no contact, no
+	/// pointer event - and the cooked console is suppressed, until AdminService ends it.
+	protected: bool,
+}
+
+// THE PROTECTED INPUT PATH: the trusted keyboard's own sink, what it is holding, the session AdminService
+// armed, and the one stream AdminService reads.
+struct Trusted {
+	watch: Watch,
+	arming: Arming,
+	producer: u64,
+	seq: u32,
+	/// Secure attention was noticed and AdminService has not ended the session it opened.
+	protected: bool,
+}
+
+impl Trusted {
+	fn emit(&mut self, kind: TrustedInputKind, epoch: u64, usage: u16, down: bool) {
+		if self.producer == 0 {
+			return;
+		}
+		let event = TrustedInput { kind, epoch, usage, down };
+		let mut frame: [u8; 48] = [0; 48];
+		let mut handles = Handles::new();
+		let sent = match input_trusted::events_frame(self.seq, &event, &mut frame, &mut handles) {
+			Some(len) => try_send(self.producer, &frame[..len], 0),
+			None => false,
+		};
+		if sent {
+			self.seq = self.seq.wrapping_add(1);
+		} else {
+			// A READER THAT STOPPED READING has lost the path; the next `events` opens a fresh one.
+			self.reader_lost();
+		}
+	}
+
+	// AdminService's stream is gone: whatever session it held ends here, and the ordinary path comes back.
+	fn reader_lost(&mut self) {
+		if self.producer != 0 {
+			close(self.producer);
+			self.producer = 0;
+		}
+		self.arming = Arming::Off;
+		self.protected = false;
+	}
+
+	// One transition from the trusted keyboard: secure attention, a key for an armed session, and the arming
+	// that follows the last key's release.
+	fn record(&mut self, raw: &[u8]) {
+		if raw.len() != 3 || raw[2] > 1 {
+			return;
+		}
+		let usage = u16::from_le_bytes([raw[0], raw[1]]);
+		let down = raw[2] != 0;
+		match self.watch.record(usage, down) {
+			// ONLY WITH A READER, and only once per session: the chord again while one is up changes nothing.
+			Seen::Attention => {
+				if self.producer != 0 && !self.protected {
+					self.protected = true;
+					self.emit(TrustedInputKind::Attention, 0, usage, true);
+				}
+			}
+			Seen::Key { usage, down } => {
+				if let Some(epoch) = self.arming.armed() {
+					self.emit(TrustedInputKind::Key, epoch, usage, down);
+				}
+			}
+			Seen::Nothing => {}
+		}
+		if let Some(epoch) = self.arming.settle(&self.watch) {
+			self.emit(TrustedInputKind::Armed, epoch, 0, false);
+		}
+	}
+}
+
+impl input_trusted::Service for Trusted {
+	fn events(&mut self) -> Vec<TrustedInput> {
+		Vec::new()
+	}
+	// ARMED ONLY ONCE NOTHING IS HELD: the chord that opened the session is still down now.
+	fn arm(&mut self, epoch: u64) -> Result<(), Error> {
+		self.arming = Arming::arm(epoch, &self.watch);
+		if let Some(epoch) = self.arming.armed() {
+			self.emit(TrustedInputKind::Armed, epoch, 0, false);
+		}
+		Ok(())
+	}
+	// THE SESSION ENDS: the ordinary path comes back. A disarm naming another session's epoch ends nothing.
+	fn disarm(&mut self, epoch: u64) -> Result<(), Error> {
+		if matches!(self.arming, Arming::Waiting(held) | Arming::Armed(held) if held != epoch) {
+			return Err(Error::Stale);
+		}
+		self.arming = Arming::Off;
+		self.protected = false;
+		Ok(())
+	}
 }
 
 struct KeyStream {
@@ -108,11 +209,28 @@ impl AdminService for AdminCall<'_> {
 
 impl Input {
 	fn new(kill_control: u64) -> Input {
-		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, contact_stream: None, contacts_down: Vec::new(), proof_nonce: 0 }
+		Input { recent: Vec::new(), keys: KeyState::new(), focus_peer: 0, kill_control, key_stream: None, contact_stream: None, contacts_down: Vec::new(), proof_nonce: 0, chord_held: false, protected: false }
+	}
+
+	// SECURE ATTENTION WAS NOTICED: application key and contact focus is revoked - held keys and contacts
+	// released to their owners first - queued pointer events are discarded, and the cooked console is told
+	// it does not hold the keyboard. From here nothing on the ordinary path is delivered until the session
+	// AdminService opened ends.
+	fn protect(&mut self, forward: u64) {
+		if self.protected {
+			return;
+		}
+		self.protected = true;
+		self.set_focus(0);
+		self.recent.clear();
+		self.notify_console(false, forward);
 	}
 
 	// Record one mapped event, dropping the oldest once the ring is full.
 	fn record(&mut self, event: PointerEvent) {
+		if self.protected {
+			return;
+		}
 		self.recent.push(event);
 		if self.recent.len() > RING_CAP {
 			self.recent.remove(0);
@@ -121,6 +239,22 @@ impl Input {
 
 	fn record_key(&mut self, raw: &[u8]) {
 		let Some(event) = self.keys.record_raw(raw) else { return };
+		// HELD STATE IS STILL TRACKED, so nothing is stuck when the session ends; nothing is delivered.
+		if self.protected {
+			return;
+		}
+		// SECURE ATTENTION IS RESERVED BEFORE ORDINARY DELIVERY: F12 pressed under Ctrl and Alt, and its
+		// release, reach no application. The chord itself is acted on only from the trusted keyboard.
+		const F12: u16 = service_logic::trusted_keys::F12;
+		if event.code == F12 {
+			if event.pressed && self.keys.is_held(keys::usage::LEFT_CTRL) | self.keys.is_held(keys::usage::RIGHT_CTRL) && self.keys.is_held(keys::usage::LEFT_ALT) | self.keys.is_held(keys::usage::RIGHT_ALT) {
+				self.chord_held = true;
+				return;
+			}
+			if !event.pressed && core::mem::take(&mut self.chord_held) {
+				return;
+			}
+		}
 		let emergency = self.keys.emergency_chord(&event);
 		self.send_key(event);
 		if emergency {
@@ -197,6 +331,9 @@ impl Input {
 	// release below exists for: a finger is held state exactly as a key is, and a foreground
 	// application that inherits one is a program that starts with a touch it never saw begin.
 	fn record_contact(&mut self, event: ContactEvent) {
+		if self.protected {
+			return;
+		}
 		if event.tip {
 			if !self.contacts_down.contains(&event.id) {
 				self.contacts_down.push(event.id);
@@ -378,6 +515,144 @@ fn map_event(raw: &[u8]) -> Option<PointerEvent> {
 	Some(PointerEvent { col, row, buttons })
 }
 
+// THE BLUETOOTH MOUSE, AS ONE MORE POINTER SOURCE.
+//
+// Every other pointer reaches this service already folded by its driver into an absolute, normalised
+// position. A Bluetooth mouse has no driver in that sense - its reports arrive decoded from
+// BluetoothService over the profile channel - so the fold happens here, with the drivers' own range,
+// and what comes out is the same five-byte record every other pointer produces. From there it takes
+// the SAME path: the cell mapping, the ring, and the forward to ConsoleService. There is no second
+// pointer path for it to diverge from.
+//
+// REACHED BY NAME THROUGH THE BROKER, NOT HANDED OVER AT BRING-UP - and that is not a preference. A
+// role from a service is a dependency on it in this manifest, with no optional form, and a dependency
+// is two things this slot must not be: a Bluetooth stack that never starts would be an input service
+// that never starts, and stopping the Bluetooth stack would stop this service and everything above it,
+// because a stop takes the whole reverse-dependency closure. The broker hands out a connection to
+// whatever instance is live, which is also exactly what reconnecting after a restart needs.
+//
+// AND THE RESOLVE IS ASYNCHRONOUS. The broker is the supervisor, which is busy during bring-up and
+// answers a resolve only once it supervises; a blocking resolve here would park the pointer path until
+// then, or for ever on a harness with no broker at all. So the request is sent, the bootstrap channel
+// joins the wait, and the answer is taken when it comes. Until then - and on a machine whose broker
+// never answers - this slot is simply empty, and every other pointer works as it always did.
+struct Bluetooth {
+	// The bootstrap channel, which is also the broker channel a resolve travels on.
+	broker: u64,
+	profile: u64,
+	stream: u64,
+	pointer: service_logic::hogp::Pointer,
+	retry_at: u64,
+	// A resolve has been sent and not answered.
+	resolving: bool,
+	// The broker refused the name: this service is not granted it, and asking again would be asking
+	// the same question for the same answer.
+	refused: bool,
+}
+
+// How long to wait before trying again: two seconds. Long enough that a peer or a stack that is not
+// there costs almost nothing, short enough that a person switching a mouse on does not wonder whether
+// it worked.
+const BLUETOOTH_RETRY_TICKS: u64 = 200;
+
+impl Bluetooth {
+	fn wanted(&self) -> bool {
+		!self.refused
+	}
+
+	// The retry: ask the broker for the profile authority if there is none, or open a stream from the
+	// first enabled peer if there is.
+	fn retry(&mut self) {
+		self.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
+		if self.profile == 0 {
+			if !self.resolving {
+				let mut request = Vec::with_capacity(2 + CAP_BT_PROFILE.len());
+				request.extend_from_slice(&RESOLVE_OP.to_le_bytes());
+				request.extend_from_slice(CAP_BT_PROFILE);
+				self.resolving = send_blocking(self.broker, &request, 0);
+			}
+			return;
+		}
+		let mut client = proto::system::bluetooth_profile::Client::new(ChannelTransport { chan: self.profile });
+		let peers = match client.enabled() {
+			Some(Ok(peers)) => peers,
+			// THE CONNECTION ITSELF IS DEAD: BluetoothService was restarted and this channel was to the
+			// instance that ended. The next retry asks the broker for one to the live instance. A failed
+			// transport answers as an error VALUE like any refusal, so it is told apart by the client's
+			// own record of what the transport did, not by the shape of the answer.
+			_ if client.last_error().is_some() => {
+				close(self.profile);
+				self.profile = 0;
+				return;
+			}
+			_ => return,
+		};
+		let Some(first) = peers.first() else { return };
+		if let Some(Ok(stream)) = client.open_mouse(&first.controller, &first.peer) {
+			self.stream = stream;
+		}
+	}
+
+	// The broker's answer to a resolve. Anything else on this channel is not this slot's and is left
+	// as it came, capability closed.
+	fn answered(&mut self) {
+		let mut reply = [0u8; 16];
+		match try_recv(self.broker, &mut reply) {
+			Polled::Message { len, handle } => {
+				if len >= 2 && &reply[..2] == b"OK" && handle != 0 {
+					self.profile = handle;
+					self.resolving = false;
+					// Open straight away rather than a retry period later.
+					self.retry_at = clock();
+				} else {
+					if handle != 0 {
+						close(handle);
+					}
+					if len >= 6 && &reply[..6] == b"DENIED" {
+						self.refused = true;
+					}
+					self.resolving = false;
+				}
+			}
+			Polled::Empty => {}
+			Polled::Closed => {
+				self.resolving = false;
+				self.refused = true;
+			}
+		}
+	}
+
+	// Drain the stream into the one pointer path, as the same five-byte record a driver sends.
+	fn drain(&mut self, state: &mut Input, forward: u64, buf: &mut [u8]) {
+		loop {
+			match try_recv_caps(self.stream, buf) {
+				PolledCaps::Message { len, handles } => {
+					for &handle in handles.as_slice() {
+						close(handle);
+					}
+					let mut frame = Handles::new();
+					let Some(report) = proto::system::bluetooth_profile::open_mouse_read(&buf[..len], &mut frame) else { continue };
+					let (x, y) = self.pointer.fold(report.dx, report.dy);
+					let raw: [u8; RAW_LEN] = [x.to_le_bytes()[0], x.to_le_bytes()[1], y.to_le_bytes()[0], y.to_le_bytes()[1], report.buttons & 0x07];
+					if let Some(event) = map_event(&raw) {
+						state.record(event);
+					}
+					if forward != 0 && !state.protected {
+						send_blocking(forward, &raw, 0);
+					}
+				}
+				PolledCaps::Empty => return,
+				PolledCaps::Closed => {
+					close(self.stream);
+					self.stream = 0;
+					self.retry_at = clock().saturating_add(BLUETOOTH_RETRY_TICKS);
+					return;
+				}
+			}
+		}
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 64] = [0u8; 64];
@@ -418,11 +693,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//
 	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
 	let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
+	// THE TRUSTED KEYBOARD'S OWN SINK, apart from the merged one: DeviceManager hands it to the physical
+	// keyboard drivers alone, so nothing else can put a key in it. And the protected-input root, which only
+	// AdminService is handed. Both optional; a boot without them has no protected path. LAST, like every
+	// addition to a positional bootstrap.
+	let trusted_keys: u64 = match recv_blocking(bootstrap, &mut buf) {
+		Received::Message { len, handle } if len >= 11 && &buf[..11] == b"TRUSTEDKEYS" => handle,
+		_ => 0,
+	};
+	let trusted_root: u64 = recv_tagged(bootstrap, &mut buf, b"TRUSTED").unwrap_or(0);
 	let raw: u64 = take_published_pointer(catalogue, &ProviderKind::Input);
 	let raw2: u64 = take_published_pointer(catalogue, &ProviderKind::Pointer);
 	// A TOUCH SURFACE IS ITS OWN KIND, discovered the same way. A machine with none has none, which
 	// is what a zero handle already says.
 	let touch: u64 = take_published_pointer(catalogue, &ProviderKind::Touch);
+	// The Bluetooth slot starts empty and asks the broker once this service is online - see `Bluetooth`.
+	let mut bluetooth = Bluetooth { broker: bootstrap, profile: 0, stream: 0, pointer: service_logic::hogp::Pointer::new(), retry_at: clock(), resolving: false, refused: false };
 
 	// 2. report in to the supervisor that started us.
 	{
@@ -431,7 +717,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 3. serve until the client side closes.
 	let mut state: Input = Input::new(kill);
-	serve(service, admin, [raw, raw2], touch, forward, keys, focus, &mut state);
+	let mut trusted = Trusted { watch: Watch::new(), arming: Arming::Off, producer: 0, seq: 0, protected: false };
+	serve(service, admin, [raw, raw2], touch, forward, keys, focus, [trusted_keys, trusted_root], &mut trusted, &mut bluetooth, &mut state);
 	exit();
 }
 
@@ -441,13 +728,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // a raw channel closes (its pointer driver retired), it is dropped from the wait
 // set so a peer-closed channel cannot spin the loop.
 #[allow(clippy::too_many_arguments)]
-fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, keys: u64, focus: u64, state: &mut Input) {
+fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, keys: u64, focus: u64, [trusted_keys, trusted_root]: [u64; 2], trusted: &mut Trusted, bluetooth: &mut Bluetooth, state: &mut Input) {
 	let mut req: [u8; 64] = [0u8; 64];
 	let mut open: [bool; 2] = [raws[0] != 0, raws[1] != 0];
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: service, scope: Scope::Full }];
 	let mut keys_open: bool = keys != 0;
 	let mut touch_open: bool = touch != 0;
 	let mut focus_open: bool = focus != 0;
+	let mut trusted_keys_open: bool = trusted_keys != 0;
+	let mut trusted_open: bool = trusted_root != 0;
 	loop {
 		let mut waitset: Vec<u64> = Vec::with_capacity(clients.len() + 5);
 		if focus_open {
@@ -467,12 +756,125 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 		if admin != 0 {
 			waitset.push(admin);
 		}
+		if bluetooth.stream != 0 {
+			waitset.push(bluetooth.stream);
+		}
+		if bluetooth.resolving {
+			waitset.push(bluetooth.broker);
+		}
+		if trusted_keys_open {
+			waitset.push(trusted_keys);
+		}
+		if trusted_open {
+			waitset.push(trusted_root);
+		}
+		// AND ADMINSERVICE'S STREAM, whose reader going away ends any session it held.
+		if trusted.producer != 0 {
+			waitset.push(trusted.producer);
+		}
 		waitset.extend(clients.iter().map(|client| client.chan));
-		let ready: i64 = wait_any(&waitset, 0);
+		// A BLUETOOTH SLOT WITH NOTHING OPEN WAKES THIS LOOP ON ITS RETRY DEADLINE - unless a resolve is
+		// already in flight, whose answer wakes it instead, or the broker has refused the name.
+		let pending_retry: bool = bluetooth.stream == 0 && !bluetooth.resolving && bluetooth.wanted();
+		let ready: i64 = wait_any(&waitset, if pending_retry { bluetooth.retry_at } else { 0 });
+		if pending_retry && clock() >= bluetooth.retry_at {
+			bluetooth.retry();
+		}
 		if ready < 0 {
 			continue;
 		}
 		let ready_handle: u64 = waitset[ready as usize];
+		// THE TRUSTED KEYBOARD, noticed before anything else is delivered: secure attention, and the keys of
+		// an armed session, go to AdminService's stream and nowhere else.
+		if trusted_keys_open && ready_handle == trusted_keys {
+			loop {
+				match try_recv(trusted_keys, &mut req) {
+					Polled::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						trusted.record(&req[..len]);
+						// SECURE ATTENTION TAKES THE ORDINARY PATH AWAY BEFORE ANYTHING ELSE IS DELIVERED.
+						if trusted.protected {
+							state.protect(forward);
+						}
+					}
+					Polled::Empty => break,
+					Polled::Closed => {
+						trusted_keys_open = false;
+						trusted.watch.clear();
+						trusted.emit(TrustedInputKind::Lost, 0, 0, false);
+						break;
+					}
+				}
+			}
+			continue;
+		}
+		if trusted_open && ready_handle == trusted_root {
+			match recv_caps_blocking(trusted_root, &mut req) {
+				ReceivedCaps::Message { len, handles } => {
+					let mut handles = handles;
+					let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+					if op == input_trusted::OP_EVENTS {
+						// ONE STREAM: a new one replaces the old, whose reader is gone or starting over.
+						if let Some((corr, _)) = input_trusted::events_open(trusted, &req[..len], &mut handles)
+							&& let Some((producer, consumer)) = channel()
+						{
+							if trusted.producer != 0 {
+								close(trusted.producer);
+							}
+							trusted.producer = producer;
+							trusted.seq = 0;
+							if !send_blocking(trusted_root, &corr.to_le_bytes(), consumer) {
+								close(consumer);
+							}
+							if !trusted_keys_open {
+								trusted.emit(TrustedInputKind::Lost, 0, 0, false);
+							}
+						}
+					} else {
+						let mut reply: [u8; 64] = [0; 64];
+						let mut reply_handles = Handles::new();
+						if let Some(n) = input_trusted::dispatch(trusted, &req[..len], &mut handles, &mut reply, &mut reply_handles) {
+							send_blocking(trusted_root, &reply[..n], 0);
+						}
+						// A DISARM gives the ordinary path back.
+						if !trusted.protected {
+							state.protected = false;
+						}
+					}
+					for &leftover in handles.as_slice() {
+						close(leftover);
+					}
+				}
+				ReceivedCaps::Closed => {
+					trusted_open = false;
+					trusted.reader_lost();
+					state.protected = false;
+				}
+			}
+			continue;
+		}
+		if trusted.producer != 0 && ready_handle == trusted.producer {
+			match try_recv(trusted.producer, &mut req) {
+				Polled::Closed => {
+					trusted.reader_lost();
+					state.protected = false;
+				}
+				Polled::Message { handle, .. } if handle != 0 => close(handle),
+				_ => {}
+			}
+			continue;
+		}
+		if bluetooth.resolving && ready_handle == bluetooth.broker {
+			bluetooth.answered();
+			continue;
+		}
+		if bluetooth.stream != 0 && ready_handle == bluetooth.stream {
+			let mut frame_buf: [u8; 64] = [0u8; 64];
+			bluetooth.drain(state, forward, &mut frame_buf);
+			continue;
+		}
 		if focus_open && ready_handle == focus {
 			let acknowledged: bool = match recv_blocking(focus, &mut req) {
 				Received::Message { len, handle } if len >= 3 && &req[..3] == b"SET" && handle != 0 => {
@@ -555,7 +957,7 @@ fn serve(service: u64, admin: u64, raws: [u64; 2], touch: u64, forward: u64, key
 						if let Some(event) = map_event(&req[..len]) {
 							state.record(event);
 						}
-						if forward != 0 {
+						if forward != 0 && !state.protected {
 							send_blocking(forward, &req[..len], 0);
 						}
 					}

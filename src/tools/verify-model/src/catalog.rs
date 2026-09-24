@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 128] = [
+const GATES: [(&str, &str); 137] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -325,6 +325,64 @@ const GATES: [(&str, &str); 128] = [
 	// record that carries the candidates and the foreign artifact that fills the slot - a userspace
 	// change selects it, and it boots a guest because a bound slot is only visible from inside one.
 	("icd-selection", "userspace.build"),
+	// THE BLUETOOTH HOST STACK, end to end, against the in-guest fixture: pairing, a durable bond, a
+	// moving cursor, a restart and a cold reboot of the same disk. Its subject is the stack, the bond
+	// store, the supervisor's restart ladder and the input service's slot - a userspace change selects
+	// it - and it boots a development image twice because the fixture is development-only and a cold
+	// reboot is two boots.
+	("bluetooth-service", "userspace.build"),
+	// POWERSERVICE, against the in-guest power fixture's HID-shaped and ACPI-shaped providers: canonical
+	// units, the read, control and publication boundaries, subscriptions that coalesce and close as
+	// stated, a withheld control reply, and a restart. Its subject is the service, the conversion leaf,
+	// the protocol and the provider and grant plumbing - a userspace change selects it - and it boots
+	// a development image because the fixture is development-only.
+	("power-service", "userspace.build"),
+	// SMARTCARDSERVICE, against the in-guest smart-card fixture: reader-scoped grants, the PIV allowlist, the
+	// pinpad policy, transactions, removal and recovery, events and a restart, with the authentication
+	// signature verified by OpenSSL on the host. Its subject is the service, its pure leaves, the protocol,
+	// the manifest and the grant and bootstrap plumbing - a userspace change selects it - and it boots a
+	// development image because the fixture is development-only.
+	("smartcard-service", "userspace.build"),
+	// MODEMSERVICE AND NETWORKSERVICE'S RAW-IP LINK, against the in-guest modem fixture: four separate
+	// authorities, PIN handling without replay, traffic through ordinary network calls, context loss,
+	// rollback, uplink replacement and fallback and reclamation, on a machine with no NIC and one with.
+	// Its subject is the service, NetworkService's lifecycle and raw-IP medium, the MBIM validators the
+	// fixture carries every record through, the pure leaves, the protocols and the grant and bootstrap
+	// plumbing - a userspace change selects it - and it boots a development image twice because the
+	// fixture is development-only and a NIC cannot be unplugged.
+	("qemu-modem-service", "userspace.build"),
+	// CAMERASERVICE, against the in-guest camera fixture: capture grants, exact negotiation, buffers the
+	// client owns and leases, honest timing and loss, busy refusal, owner death, a failed launch, quarantine
+	// and replacement. Its subject is the service, the UVC normalizer the fixture's descriptors go through,
+	// the pure leaves, the protocols and the grant and bootstrap plumbing - a userspace change selects it -
+	// and it boots a development image because the fixture is development-only.
+	("qemu-camera-service", "userspace.build"),
+	// MIDISERVICE, against the in-guest MIDI fixture: the bounded event vocabulary and queue, the USB-MIDI 1.0
+	// decoder over scripted packets, SysEx bounds, typed faults, saturation, loss, unplug, grants and
+	// reclamation. Its subject is the service, the generic queue, the decoder, the protocols and the grant and
+	// bootstrap plumbing - a userspace change selects it - and it boots a development image because the
+	// fixture is development-only.
+	("qemu-midi-service", "userspace.build"),
+	// SPOOLSERVICE, against printers the kernel harness plays: admission, bounded staging, exact transmission by
+	// acknowledged prefix, stalls, endings, withdrawal, reset and failed recovery, and the production grant of
+	// `spool`. Its subject is the service, its pure leaves, the protocols and the grant plumbing - a userspace
+	// change selects it - and it boots the test kernel, because the sink is a kernel harness.
+	("spool-service", "userspace.build"),
+	// MEDIAIMPORTSERVICE, against a PTP responder the kernel harness plays: exact pages, the over-limit storage,
+	// scoped and stale identities, validated completion into a transactional destination, removal as a partial
+	// ending, and the production grant. Its subject is the service, the PTP parser and the decisions leaf, the
+	// protocols and the grant plumbing - a userspace change selects it - and it boots the test kernel.
+	("media-import-service", "userspace.build"),
+	// THE TRUSTED ADMINISTRATIVE PATH, cold, in a development image: one person's confirmation through the
+	// emulated keyboard on a protected screen a hostile client keeps trying to cover, at most one attempt at
+	// the confirmed operation against the in-guest executor, and none for refusal, contention, an unavailable
+	// path, expiry, replay, a forged grant, a wrong or replaced target, a substituted payload, an owner's
+	// death however its endpoints were delegated, held acknowledgments, a failed journal or a restarted
+	// service - with the journal read back after a reboot. Its subject is AdminService and its pure leaves,
+	// PermissionManager's task-bound grant, the bootstrap wiring, DisplayService's protected session,
+	// InputService's trusted keyboard and the two keyboard drivers - a userspace change selects it - and it
+	// boots a development image with the executor's QEMU test device and a persistent system volume.
+	("qemu-admin-path", "userspace.build"),
 	// The lifecycle contract, end to end. Its subject is the runtime's init/fini runner, the kernel's
 	// per-image lifecycle table and the two fixtures that exercise them - a userspace or kernel
 	// change selects it, and it boots a guest because a constructor is only observable from inside
@@ -760,8 +818,21 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 34] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 43] = [
 	"dma-mode-x86_64",
+	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
+	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
+	"bluetooth-service",
+	"power-service",
+	"smartcard-service",
+	"qemu-modem-service",
+	"qemu-camera-service",
+	"qemu-midi-service",
+	// And the spool gate, which boots the test kernel with its sink scenario rather than a development image.
+	"spool-service",
+	"media-import-service",
+	// And the administrative path, which runs its cold development scenario through the emulated keyboard.
+	"qemu-admin-path",
 	"virtio-multiport",
 	"qemu-2d-demo",
 	"qemu-3d-demo",

@@ -73,6 +73,199 @@ name = "font_catalogue"
 path = "src/font_catalogue.rs"
 
 [[bin]]
+name = "bluetooth_bond_store"
+path = "src/bluetooth_bond_store.rs"
+
+[[bin]]
+name = "bluetooth_service"
+path = "src/bluetooth_service.rs"
+
+[[bin]]
+name = "power_service"
+path = "src/power_service.rs"
+
+[[bin]]
+name = "smartcard_service"
+path = "src/smartcard_service.rs"
+
+[[bin]]
+name = "modem_service"
+path = "src/modem_service.rs"
+
+[[bin]]
+name = "camera_service"
+path = "src/camera_service.rs"
+
+[[bin]]
+name = "midi_service"
+path = "src/midi_service.rs"
+
+[[bin]]
+name = "spool_service"
+path = "src/spool_service.rs"
+
+[[bin]]
+name = "media_import_service"
+path = "src/media_import_service.rs"
+
+[[bin]]
+# THE TRUSTED ADMINISTRATIVE PATH: one person's confirmation, on a protected screen, of one bound
+# high-risk operation, and at most one attempt at it.
+name = "admin_service"
+path = "src/admin_service.rs"
+
+[[bin]]
+# THE ADMINISTRATIVE-PATH GATE'S PROBES, absent from a shipped image: the requester and scenario driver, the
+# second process that is handed another launch's endpoints, and an ordinary client that keeps trying to
+# cover the protected screen.
+name = "admincheck"
+path = "src/admincheck.rs"
+required-features = ["development"]
+
+[[bin]]
+name = "adminhelper"
+path = "src/adminhelper.rs"
+required-features = ["development"]
+
+[[bin]]
+name = "adminhostile"
+path = "src/adminhostile.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE BLUETOOTH GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the operator authority
+# and talks to a fixture only a development image has.
+name = "btcheck"
+path = "src/btcheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# An ordinary Bluetooth read client, for the gate's denial check. Absent from a shipped image with the
+# scenario driver.
+name = "btread"
+path = "src/btread.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE POWER GATE'S SCENARIO DRIVER, absent from a shipped image: it holds PowerService's control
+# authority and the power fixture's control endpoint, which only a development image has.
+name = "powercheck"
+path = "src/powercheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# The power gate's ordinary read client, which holds the read authority and nothing else.
+name = "powerread"
+path = "src/powerread.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE SMART-CARD GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the smart-card
+# fixture's control endpoint, which only a development image has.
+name = "cardcheck"
+path = "src/cardcheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# The smart-card gate's second client: a queue, an inherited endpoint, a service killed mid-exchange.
+name = "cardhold"
+path = "src/cardhold.rs"
+required-features = ["development"]
+
+[[bin]]
+# The smart-card gate's read-only client.
+name = "cardread"
+path = "src/cardread.rs"
+required-features = ["development"]
+
+[[bin]]
+# The smart-card gate's client of the reader with no pinpad.
+name = "cardb"
+path = "src/cardb.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE MODEM GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the modem fixture's control
+# endpoint, which only a development image has.
+name = "modemcheck"
+path = "src/modemcheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# The modem gate's second data client: an inherited endpoint.
+name = "modemhold"
+path = "src/modemhold.rs"
+required-features = ["development"]
+
+[[bin]]
+# The modem gate's data client that may replace an uplink.
+name = "modemswap"
+path = "src/modemswap.rs"
+required-features = ["development"]
+
+[[bin]]
+# The modem gate's data-only client.
+name = "modemdata"
+path = "src/modemdata.rs"
+required-features = ["development"]
+
+[[bin]]
+# The modem gate's launch that must fail after a grant was minted for it.
+name = "modemfail"
+path = "src/modemfail.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE CAMERA GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the camera fixture's control
+# endpoint, which only a development image has.
+name = "camcheck"
+path = "src/camcheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# The camera gate's second capture client.
+name = "camhold"
+path = "src/camhold.rs"
+required-features = ["development"]
+
+[[bin]]
+# The camera gate's inventory-only client.
+name = "camread"
+path = "src/camread.rs"
+required-features = ["development"]
+
+[[bin]]
+# The camera gate's launch that must fail after its capture grant was minted.
+name = "camfail"
+path = "src/camfail.rs"
+required-features = ["development"]
+
+[[bin]]
+# THE MIDI GATE'S SCENARIO DRIVER, absent from a shipped image: it holds the MIDI fixture's control endpoint,
+# which only a development image has.
+name = "midicheck"
+path = "src/midicheck.rs"
+required-features = ["development"]
+
+[[bin]]
+# The MIDI gate's second receiver.
+name = "midihold"
+path = "src/midihold.rs"
+required-features = ["development"]
+
+[[bin]]
+# The MIDI gate's inventory-only client.
+name = "midiread"
+path = "src/midiread.rs"
+required-features = ["development"]
+
+[[bin]]
+# The MIDI gate's launch that must fail after its receiver was minted.
+name = "midifail"
+path = "src/midifail.rs"
+required-features = ["development"]
+
+[[bin]]
 name = "time_service"
 path = "src/time_service.rs"
 
@@ -113,6 +306,16 @@ name = "role_probe"
 path = "src/role_probe.rs"
 
 [[bin]]
+# SpoolService's real client, for the kernel's sink scenario: it holds `spool` and nothing else.
+name = "spool_probe"
+path = "src/spool_probe.rs"
+
+[[bin]]
+# MediaImportService's real client, for the kernel's responder scenario: `media-import` and a destination.
+name = "import_probe"
+path = "src/import_probe.rs"
+
+[[bin]]
 name = "request_probe"
 path = "src/request_probe.rs"
 
@@ -150,6 +353,10 @@ rt = { path = "../../runtime/rt" }
 # build and run their suites on the host. The split is a testing one: everything in this crate links
 # `rt`, whose `panic_impl` collides with the `std` the test harness needs. See services/logic.
 service-logic = { path = "../logic" }
+# THE DRIVER LIBRARY'S STAGED DECODERS, for the one service that decodes what its providers deliver:
+# MidiService turns USB-MIDI 1.0 packets into chunks with `drivers::usb_midi`, the same code the USB MIDI
+# class module will hand its transfers to, so there is one decoder and not a second one here.
+drivers = { path = "../../drivers/core" }
 
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
@@ -164,6 +371,9 @@ driver-binding = { path = "../../libs/driver/binding" }
 wire = { path = "../../../wire" }
 storage-proto = { path = "../../libs/protocol/storage-proto" }
 bootproto = { path = "../../../boot/protocol" }
+# THE ANSWER-TO-RESET PARSER, which SmartcardService reads every card's ATR with before its decisions see what
+# it offers. Linked statically, as `service-logic` is.
+smartcard-model = { path = "../../libs/smartcard/model" }
 abi = { path = "../../../abi" }
 
 # The graphics-free terminal model (L2): the cell grid, escape parser, and text
@@ -187,6 +397,9 @@ display-device-proto = { path = "../../libs/protocol/display-device-proto" }
 # graphical applications and DisplayService use exactly the same geometry semantics.
 pix = { path = "../../libs/image/pix" }
 keys = { path = "../../libs/input/keys" }
+# THE CANONICAL POWER MODEL, which PowerService checks every published record against and never
+# converts with: the producers call its adapters, this service only asks whether they did.
+power-model = { path = "../../libs/power/model" }
 pcm = { path = "../../libs/audio/pcm" }
 surface = { path = "../../libs/display/surface" }
 

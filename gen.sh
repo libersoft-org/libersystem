@@ -27,7 +27,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 arm_run_verdict
 
 # The packages, in dependency order: a package may only name one already generated above it.
-PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth)
+PACKAGES=(base audio device log network observability resources time config process display display-device security session input storage font graphics bluetooth power smartcard modem modem-device camera camera-device event midi midi-device spool printer-device import ptp-transport admin)
 
 # What each package reaches by NAME instead of regenerating. Derived from the schema's own imports;
 # written here because the generator is told, not asked.
@@ -65,11 +65,31 @@ declare -A EXTERNAL=(
 	# application's wire are two contracts, and one package carrying both would make every client
 	# depend on the device one.
 	[bluetooth]="base"
+	# NORMALISED POWER STATE, and the provider contract drivers serve for it. Base only.
+	[power]="base"
+	[smartcard]="base process"
+	[modem]="base process"
+	[modem - device]="base"
+	# CAMERAS: the application's contract, and the provider contract that imports its format records.
+	[camera]="base process"
+	[camera - device]="base camera"
+	# BOUNDED EVENTS, which import nothing, and MIDI over them.
+	[event]=""
+	[midi]="base process event"
+	[midi - device]="base"
+	# PRINTING: the application's job contract and the private backend, both base only.
+	[spool]="base"
+	[printer - device]="base"
+	# MEDIA IMPORT: the application's read-only contract and the private PTP transport, both base only.
+	[import]="base"
+	[ptp - transport]="base"
+	# ADMINISTRATIVE AUTHORIZATION: requests, grants, the private factory and executor, the journal view.
+	[admin]="base process"
 )
 
 # The aggregate crate: no `--rust-package` of its own, every other package external, and the ONE
 # invocation that writes docs/gen - the ABI manifests and the reference pages.
-AGGREGATE_EXTERNAL=(audio base bluetooth config device display display-device font graphics input log network observability process resources security session storage time)
+AGGREGATE_EXTERNAL=(admin audio base bluetooth camera camera-device config device display display-device event font graphics import input log midi midi-device network observability modem modem-device power printer-device process ptp-transport resources security session smartcard spool storage time)
 
 help() {
 	usage_and_exit <<EOF

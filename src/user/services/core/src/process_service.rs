@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::process::{self, Service};
 use proto::system::volume;
-use proto::system::{Budget, Error, OpenOpts, ProcessInfo, ResourceType, ResourceUsage, StartResult};
+use proto::system::{Budget, Error, OpenOpts, ProcessInfo, ResourceLimits, ResourceType, ResourceUsage, StartResult};
 use rt::*;
 use services::REGISTRY_ANNOUNCEMENT;
 use services::executable;
@@ -686,6 +686,43 @@ impl<'a> Processes<'a> {
 		Ok(domain as u64)
 	}
 
+	// The same, with all six limits in place before the caller ever sees the Domain.
+	//
+	// THE RECORD IS VALIDATED BEFORE A DOMAIN EXISTS. A field left at `u64::MAX` is not "no opinion
+	// about that one" - it is a limit nobody decided, and the whole point of this record is that a
+	// service's footprint is stated. A zero is refused for the five that must admit something: a
+	// Domain that may hold no handles cannot open the bootstrap channel it was handed, so the launch
+	// would fail later and somewhere else. DMA IS THE EXCEPTION AND ZERO IS ITS ORDINARY VALUE: a
+	// service with no device claim has no business addressing a device's memory.
+	//
+	// THREE LIMITS ARE THE DOMAIN'S BIRTH AND THREE ARE PROPERTIES OF IT, which is the kernel's
+	// division and not one this chose. Every property assignment is checked, and a refusal tears the
+	// Domain down rather than leaving a half-limited one behind - the caller is answered with a
+	// failure, which is the one answer that cannot be mistaken for a service running inside limits
+	// it is not inside.
+	fn limited_domain(&mut self, limits: &ResourceLimits) -> Result<u64, Error> {
+		for finite in [limits.memory, limits.handles, limits.threads, limits.ipc_queue, limits.stack] {
+			if finite == 0 || finite == u64::MAX {
+				return Err(Error::Invalid);
+			}
+		}
+		if limits.dma == u64::MAX {
+			return Err(Error::Invalid);
+		}
+		let domain = domain_create(limits.memory, limits.handles, limits.threads);
+		if domain < 0 {
+			return Err(Error::Again);
+		}
+		let domain = domain as u64;
+		for (prop, limit) in [(PROP_IPC_QUEUE_LIMIT, limits.ipc_queue), (PROP_STACK_LIMIT, limits.stack), (PROP_DMA_LIMIT, limits.dma)] {
+			if domain_set_limit(domain, prop, limit) < 0 {
+				close(domain);
+				return Err(Error::Invalid);
+			}
+		}
+		Ok(domain)
+	}
+
 	// Load program `name` and create a process from it, handing the child `bootstrap` as
 	// its bootstrap capability. With a storage client wired, the binary is read from the
 	// system volume's manifest-declared path; with none, it comes from the built-in package. Returns the
@@ -1154,6 +1191,28 @@ impl<'a> Service for Processes<'a> {
 	// not be rolled back to "it never ran".
 	fn launch_prepared_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
 		let domain = self.bounded_domain(memory_limit)?;
+		let Some((spawned, artifact)) = self.spawn_program(&name, bootstrap, domain) else {
+			close(domain);
+			return Err(Error::NotFound);
+		};
+		self.hold_prepared(spawned, artifact, domain)
+	}
+
+	// The same gate with EVERY limit rather than one, for a program whose footprint is stated in
+	// full - which is what a long-running service's is.
+	//
+	// ONE NUMBER IS WHAT A TOOL NEEDS AND NOT WHAT A SERVICE NEEDS. A tool runs briefly and the
+	// resource it could exhaust is memory; the rest are bounded by how little a short life can
+	// reach. A service runs for the boot, holds channels to other services, and grows without bound
+	// through handles it never closes, threads it keeps creating and queued messages nobody drains -
+	// none of which a memory ceiling notices until the machine is already in trouble.
+	//
+	// EVERY ASSIGNMENT IS CHECKED AND A REFUSED ONE FAILS THE LAUNCH. A Domain created with three of
+	// six limits in place is a Domain whose other three are unlimited, and a service running inside
+	// one is a service whose stated footprint describes nothing. There is no fallback to an
+	// unbounded launch for the same reason: the fallback would be the case nobody notices.
+	fn launch_prepared_limited(&mut self, name: String, limits: ResourceLimits, bootstrap: u64) -> Result<StartResult, Error> {
+		let domain = self.limited_domain(&limits)?;
 		let Some((spawned, artifact)) = self.spawn_program(&name, bootstrap, domain) else {
 			close(domain);
 			return Err(Error::NotFound);
