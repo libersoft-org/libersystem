@@ -4730,14 +4730,17 @@ fn modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back()
 	}
 	assert!(released, "a withdrawn modem gave its slot back");
 	rig.publish(Modem::new(6));
+	// PUMPED UNTIL THE NEW PUBLICATION IS OPENED: nothing else here lets the service run.
 	let mut retaken = false;
-	for _ in 0..200 {
-		if rig.modems.last().is_some_and(Modem::opened) && rig.limits().providers == 4 {
+	for _ in 0..PASSES {
+		rig.pump();
+		if rig.modems.last().is_some_and(Modem::opened) {
 			retaken = true;
 			break;
 		}
 	}
 	assert!(retaken, "the slot a withdrawn modem gave back was taken by a new publication");
+	assert_eq!(rig.limits().providers, 4, "and the service holds four again");
 
 	// THIRTY-TWO CONNECTIONS, THEN A REFUSAL, THEN A SLOT GIVEN BACK.
 	let mut held: alloc::vec::Vec<alloc::sync::Arc<object::channel::Channel>> = alloc::vec::Vec::new();

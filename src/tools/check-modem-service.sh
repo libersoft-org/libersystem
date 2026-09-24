@@ -141,7 +141,9 @@ expect "$linked" "modemswap: PASS" "a grant that may replace the NIC must, and t
 # bounds, through the same provider and observation wires.
 source "$root/tools/result-logs.sh"
 bounds="kernel.services.modem_service_refuses_at_its_provider_and_client_bounds_and_gives_them_back"
-TEST_SELECTION="$bounds" ./test.sh --arch x86_64 >"$guest_gate_work/bounds.log" 2>&1 || {
+# WITHOUT THE FIXTURE'S DEVICE: `QEMU_EXTRA` reaches test mode too, and the test machine's PCI bridge sits at the
+# slot the fixture's `edu` pins, so QEMU refused to start at all.
+env -u QEMU_EXTRA TEST_SELECTION="$bounds" ./test.sh --arch x86_64 >"$guest_gate_work/bounds.log" 2>&1 || {
 	tail -30 "$guest_gate_work/bounds.log" >&2
 	fail "the bounds scenario failed"
 }
