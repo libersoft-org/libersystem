@@ -139,8 +139,13 @@ fn a_payload_of_the_wrong_shape_is_refused_for_every_opcode_that_has_one() {
 
 #[test]
 fn a_field_outside_its_closed_set_is_refused_and_the_number_is_reported() {
-	for raw in [0u16, 6, 0xffff] {
+	// EACH SET IS PROBED ONE PAST ITS OWN END, the number its next member would take: the resource kinds end at
+	// the trusted key sink, the failure codes at five.
+	assert_eq!(decode_resource(&6u16.to_le_bytes()), Ok(ResourceKind::TrustedKeys), "the trusted key sink is a member");
+	for raw in [0u16, 7, 0xffff] {
 		assert_eq!(decode_resource(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "resource kind {raw}");
+	}
+	for raw in [0u16, 6, 0xffff] {
 		assert_eq!(decode_failed(&raw.to_le_bytes()), Err(FrameError::UnknownValue(raw)), "failure code {raw}");
 	}
 }

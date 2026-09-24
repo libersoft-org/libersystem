@@ -392,7 +392,11 @@ impl Service {
 	// Offer every ready, idle printer its next frame.
 	fn pump(&mut self) {
 		let now = clock();
-		let mut gone = Vec::new();
+		// THE PRINTERS LOST IN THIS PASS, at most one per printer and so at most `MAX_PRINTERS`: a fixed array and
+		// not a `Vec<u32>`, whose growth routine this program would import from whichever loaded crate exports one -
+		// and which crate that is differs between targets.
+		let mut gone = [0u32; jobs::MAX_PRINTERS];
+		let mut lost = 0;
 		for at in 0..self.printers.len() {
 			let printer = &self.printers[at];
 			if printer.phase != Phase::Ready || printer.asked.is_some() || printer.retry_at.is_some() || !self.spool.pending(printer.key) {
@@ -415,10 +419,11 @@ impl Service {
 				// THE FRAME NEVER LEFT, so nothing of it is uncertain: it is taken back, and a backend that
 				// cannot take one request is gone.
 				let _ = self.spool.written(job, 0, now);
-				gone.push(key);
+				gone[lost] = key;
+				lost += 1;
 			}
 		}
-		for key in gone {
+		for &key in &gone[..lost] {
 			self.lose(key, b"a write could not be sent to it");
 		}
 	}

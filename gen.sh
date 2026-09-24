@@ -69,20 +69,20 @@ declare -A EXTERNAL=(
 	[power]="base"
 	[smartcard]="base process"
 	[modem]="base process"
-	[modem - device]="base"
+	["modem-device"]="base"
 	# CAMERAS: the application's contract, and the provider contract that imports its format records.
 	[camera]="base process"
-	[camera - device]="base camera"
+	["camera-device"]="base camera"
 	# BOUNDED EVENTS, which import nothing, and MIDI over them.
 	[event]=""
 	[midi]="base process event"
-	[midi - device]="base"
+	["midi-device"]="base"
 	# PRINTING: the application's job contract and the private backend, both base only.
 	[spool]="base"
-	[printer - device]="base"
+	["printer-device"]="base"
 	# MEDIA IMPORT: the application's read-only contract and the private PTP transport, both base only.
 	[import]="base"
-	[ptp - transport]="base"
+	["ptp-transport"]="base"
 	# ADMINISTRATIVE AUTHORIZATION: requests, grants, the private factory and executor, the journal view.
 	[admin]="base process"
 )

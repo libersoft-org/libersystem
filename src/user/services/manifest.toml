@@ -2468,8 +2468,6 @@ stage = "volume"
 destination = "libexec/midi_service.lsexe"
 providers = []
 
-# `modem-device-proto` BECAUSE THE LINKER FOUND `Vec<u32>`'S GROWTH ROUTINE THERE: rustc shares one instance of a
-# generic among every upstream crate that exports it and takes the lowest crate id, and that is this one.
 [[programs]]
 name = "spool_service"
 owner = "services"
@@ -2485,12 +2483,9 @@ providers = [
 	"ipc-client",
 	"wire",
 	"service-util",
-	"modem-device-proto",
 	"lsrt",
 ]
 
-# `modem-device-proto` BECAUSE THE LINKER FOUND `Vec<u32>`'S GROWTH ROUTINE THERE: rustc shares one instance of a
-# generic among every upstream crate that exports it and takes the lowest crate id, and that is this one.
 [[programs]]
 name = "media_import_service"
 owner = "services"
@@ -2506,7 +2501,6 @@ providers = [
 	"ipc-client",
 	"wire",
 	"service-util",
-	"modem-device-proto",
 	"lsrt",
 ]
 

@@ -7,6 +7,16 @@ name = "abi"
 version = "0.0.0"
 
 [[package]]
+name = "admin-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "ipc-client",
+ "process-proto",
+ "wire",
+]
+
+[[package]]
 name = "audio-proto"
 version = "0.0.0"
 dependencies = [
@@ -241,6 +251,7 @@ name = "proto"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "admin-proto",
  "audio-proto",
  "base-proto",
  "bluetooth-proto",

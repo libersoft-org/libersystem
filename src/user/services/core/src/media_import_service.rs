@@ -1070,13 +1070,12 @@ impl Service {
 				self.pull(at);
 			}
 		}
-		// THIRTY SECONDS without device progress or client demand ends a transfer, and its transaction.
-		let mut idle: Vec<u32> = Vec::new();
-		for entry in self.transfers.iter_mut() {
-			if entry.transfer.timed_out(now) {
-				entry.transfer.fail(mi::Cause::TimedOut);
-				idle.push(entry.transfer.holder.device);
-			}
+		// THIRTY SECONDS without device progress or client demand ends a transfer, and its transaction. The devices
+		// are collected before the transfers fail rather than pushed one by one: a `Vec<u32>` grown by `push` imports
+		// its growth routine from whichever loaded crate exports one, and which crate that is differs between targets.
+		let idle: Vec<u32> = self.transfers.iter().filter(|entry| entry.transfer.timed_out(now)).map(|entry| entry.transfer.holder.device).collect();
+		for entry in self.transfers.iter_mut().filter(|entry| entry.transfer.timed_out(now)) {
+			entry.transfer.fail(mi::Cause::TimedOut);
 		}
 		self.settle_transfers();
 		for device in idle {
