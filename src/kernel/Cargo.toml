@@ -31,6 +31,10 @@ entropy = { path = "../user/libs/entropy" }
 # in this tree where a fixture cannot be planted. The parsing is host-tested over tables no firmware
 # would write; the kernel takes the answers.
 acpi = { path = "../acpi" }
+# THE TPM 2.0 TRANSPORTS AND OPERATIONS, for the in-guest fixture test only: the one oracle that drives the
+# library's FIFO and CRB state machines over QEMU's real front-ends, with swtpm behind them. The shipping kernel
+# calls none of it - no binding exists for a TPM until the firmware-node identity does.
+tpm = { path = "../tpm" }
 # THE BINDING MATCHER, so the kernel validates a claim's registry entry against the concrete device
 # with the SAME host-tested predicate DeviceManager selects with. A second copy of the rule here is
 # a second thing to keep in step, and the one that is not tested is the one that drifts.
@@ -75,6 +79,17 @@ network-proto = { path = "../user/libs/protocol/network-proto" }
 printer-device-proto = { path = "../user/libs/protocol/printer-device-proto" }
 # AND THE PTP TRANSPORT WIRE, for the import scenario's responder, for the same reason.
 ptp-transport-proto = { path = "../user/libs/protocol/ptp-transport-proto" }
+# The USB MIDI class oracle drives the `midi` provider the way MidiService does.
+midi-device-proto = { path = "../user/libs/protocol/midi-device-proto" }
+# And the HID power device oracle drives the `power-source` provider the way PowerService does.
+power-proto = { path = "../user/libs/protocol/power-proto" }
+# And the CCID oracle drives the `smartcard-reader` provider the way SmartcardService does.
+smartcard-proto = { path = "../user/libs/protocol/smartcard-proto" }
+# And the DFU oracle drives the `admin-executor` provider the way AdminService does.
+admin-proto = { path = "../user/libs/protocol/admin-proto" }
+# And the UVC oracle drives the `camera` provider the way CameraService does.
+camera-device-proto = { path = "../user/libs/protocol/camera-device-proto" }
+camera-proto = { path = "../user/libs/protocol/camera-proto" }
 # AND THE MODEM WIRES, for the scenario that plays five modems to ModemService and reads its limits back: the
 # provider wire it answers and the observation wire it reads, both through the generated code.
 modem-device-proto = { path = "../user/libs/protocol/modem-device-proto" }

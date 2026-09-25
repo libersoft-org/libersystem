@@ -107,3 +107,62 @@ fn a_period_is_several_isochronous_packets_and_the_last_one_is_short() {
 	// is must not divide by it.
 	assert_eq!(packets_for(PERIOD, 0), 0);
 }
+
+// A WHOLE AUDIO CONFIGURATION: an audio-control interface, then one streaming interface per endpoint given -
+// alternate 0 with nothing on it and alternate 1 carrying the endpoint, PCM, in `format`.
+fn audio_config(endpoints: &[(u8, u8)], format: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut body: alloc::vec::Vec<u8> = alloc::vec![9, 4, 0, 0, 0, CLASS_AUDIO, SUBCLASS_AUDIOCONTROL, 0, 0];
+	body.extend_from_slice(&[9, DT_CS_INTERFACE, 0x01, 0x00, 0x01, 9, 0, 1, 1]);
+	for (at, &(address, attributes)) in endpoints.iter().enumerate() {
+		let number = at as u8 + 1;
+		body.extend_from_slice(&[9, 4, number, 0, 0, CLASS_AUDIO, SUBCLASS_AUDIOSTREAMING, 0, 0]);
+		body.extend_from_slice(&[9, 4, number, 1, 1, CLASS_AUDIO, SUBCLASS_AUDIOSTREAMING, 0, 0]);
+		body.extend_from_slice(&[7, DT_CS_INTERFACE, AS_GENERAL, 2, 1, 0x01, 0x00]);
+		body.extend_from_slice(format);
+		body.extend_from_slice(&[9, 5, address, attributes, 192, 0, 1, 0, 0]);
+	}
+	let total = (9 + body.len()) as u16;
+	let mut config = alloc::vec![9, 2, total as u8, (total >> 8) as u8, 1 + endpoints.len() as u8, 1, 0, 0x80, 50];
+	config.extend_from_slice(&body);
+	config
+}
+
+#[test]
+fn a_microphone_binds_as_a_source_and_not_as_a_sink() {
+	// THE HARNESS'S MICROPHONE: isochronous IN, asynchronous, data.
+	let microphone = audio_config(&[(0x81, 0x05)], &format_bytes(2, 2, 16, &[48_000]));
+	let source = bind_for(&microphone, Direction::Source).expect("a microphone is a source");
+	assert_eq!((source.streaming_interface, source.alternate, source.endpoint, source.max_packet, source.config_value), (1, 1, 0x81, 192, 1));
+	assert_eq!(bind(&microphone), Err(NotBindable::NoUsableFormat), "and nothing in it plays");
+}
+
+#[test]
+fn a_speaker_binds_as_a_sink_and_its_feedback_endpoint_is_not_a_microphone() {
+	let speaker = audio_config(&[(0x01, 0x09)], &format_bytes(2, 2, 16, &[48_000]));
+	assert_eq!(bind(&speaker).map(|sink| sink.endpoint), Ok(0x01));
+	assert_eq!(bind_for(&speaker, Direction::Source), Err(NotBindable::NoUsableFormat));
+	// AN ASYNCHRONOUS SINK'S FEEDBACK ENDPOINT is isochronous IN with usage type feedback: the rate the sink
+	// wants, not samples.
+	assert!(!isochronous_in(0x82, 0x11), "feedback usage");
+	assert!(isochronous_in(0x81, 0x05) && isochronous_in(0x81, 0x0D), "asynchronous or synchronous data");
+	assert!(!isochronous_in(0x01, 0x05), "an OUT endpoint records nothing");
+	let fed_back = audio_config(&[(0x82, 0x11)], &format_bytes(2, 2, 16, &[48_000]));
+	assert_eq!(bind_for(&fed_back, Direction::Source), Err(NotBindable::NoUsableFormat));
+}
+
+#[test]
+fn a_headset_is_a_sink_and_a_source_on_its_own_interfaces() {
+	let headset = audio_config(&[(0x01, 0x09), (0x82, 0x05)], &format_bytes(2, 2, 16, &[48_000]));
+	let sink = bind(&headset).expect("its speaker");
+	let source = bind_for(&headset, Direction::Source).expect("its microphone");
+	assert_eq!((sink.streaming_interface, sink.endpoint), (1, 0x01));
+	assert_eq!((source.streaming_interface, source.endpoint), (2, 0x82));
+}
+
+#[test]
+fn a_source_at_a_rate_the_wire_is_not_is_refused_as_a_sink_is() {
+	let slow = audio_config(&[(0x81, 0x05)], &format_bytes(2, 2, 16, &[44_100]));
+	assert_eq!(bind_for(&slow, Direction::Source), Err(NotBindable::NoUsableFormat));
+	let mono = audio_config(&[(0x81, 0x05)], &format_bytes(1, 2, 16, &[48_000]));
+	assert_eq!(bind_for(&mono, Direction::Source), Err(NotBindable::NoUsableFormat));
+}

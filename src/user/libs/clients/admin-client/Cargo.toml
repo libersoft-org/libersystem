@@ -1,0 +1,20 @@
+[package]
+# The product version lives only in /product.conf; Cargo's optional package version is unused here and
+# omitted.
+name = "admin-client"
+edition = "2024"
+description = "Dynamic channel-client boundary for the LiberSystem administrative-request LSIDL domain"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = []
+
+[dependencies]
+base-proto = { path = "../../protocol/base-proto" }
+admin-proto = { path = "../../protocol/admin-proto" }
+
+[lints.rust]
+warnings = "deny"

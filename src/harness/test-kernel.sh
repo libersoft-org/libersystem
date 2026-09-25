@@ -358,7 +358,7 @@ STAGED_TEST_KERNEL="$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.elf"
 	# THE BUILT BINARY'S PATH, ASKED FOR RATHER THAN GUESSED. `--message-format=json` names the
 	# executable cargo produced; the last `compiler-artifact` line carrying one for the `kernel`
 	# target is this selection's test binary.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" USB_GADGET="${USB_GADGET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
 	built="$(
 		python3 - "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" <<'PYEOF'
 import json, sys
@@ -460,7 +460,32 @@ publish_suite_evidence() {
 # something. Named first in the handler so a failure anywhere later cannot leave a gadget bound - the
 # permission that allows this at all is conditional on the host being left as it was found.
 usb_gadget_teardown() {
-	[[ -n "${USB_GADGET:-}" ]] || return 0
+	# THE MTP ROOT IS THIS RUN'S OWN DIRECTORY, made by `mktemp` below, and nothing else is removed.
+	if [[ -n "${USB_MTP_ROOT:-}" && "$USB_MTP_ROOT" == */liber-mtp.* && -d "$USB_MTP_ROOT" ]]; then
+		rm -rf -- "$USB_MTP_ROOT"
+		USB_MTP_ROOT=""
+	fi
+	# AND THE REDIRECTED DEVICE: its process, then the directory its socket is in - this run's, by its name.
+	if [[ -n "${USB_REDIR_PID:-}" ]]; then
+		kill "$USB_REDIR_PID" 2>/dev/null || true
+		wait "$USB_REDIR_PID" 2>/dev/null || true
+		USB_REDIR_PID=""
+	fi
+	if [[ -n "${USB_REDIR_DIR:-}" && "$USB_REDIR_DIR" == */liber-usbredir.* && -d "$USB_REDIR_DIR" ]]; then
+		rm -rf -- "$USB_REDIR_DIR"
+		USB_REDIR_DIR=""
+	fi
+	# AND THE SOFTWARE TPM: its process, then its state directory - this run's, by its name.
+	if [[ -n "${TPM_PID:-}" ]]; then
+		kill "$TPM_PID" 2>/dev/null || true
+		wait "$TPM_PID" 2>/dev/null || true
+		TPM_PID=""
+	fi
+	if [[ -n "${TPM_DIR:-}" && "$TPM_DIR" == */liber-swtpm.* && -d "$TPM_DIR" ]]; then
+		rm -rf -- "$TPM_DIR"
+		TPM_DIR=""
+	fi
+	[[ -n "${USB_GADGET:-}" && "${USB_GADGET:-}" != "mtp" && -z "${USB_REDIR_SOCKET:-}" ]] || return 0
 	# THE ECHO FIRST, because it holds the tty the gadget owns: a teardown that removed the gadget
 	# under a process still reading it leaves that process on a device that is gone.
 	# EVERY ECHOER, because a composite adapter has one per port. A list rather than a variable, so
@@ -497,7 +522,41 @@ fi
 #
 # SET UP BEFORE THE GUEST AND TORN DOWN BY THE EXIT TRAP ABOVE, so every way out of this script -
 # the verdict, a signal, a timeout, `set -e` - gives the host back what it started with.
-if [[ -n "${USB_GADGET:-}" ]]; then
+# `mtp` IS NOT A GADGET: it is QEMU's own `usb-mtp`, which is a PTP responder with the MTP operations beside
+# it - so the still image class needs no device built in the host at all, only a directory of objects for the
+# model to present. The directory is this run's, made here and removed by the exit trap.
+if [[ "${USB_GADGET:-}" == "mtp" ]]; then
+	USB_MTP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/liber-mtp.XXXXXX")"
+	if python3 "$ROOT/harness/mtp-root.py" "$USB_MTP_ROOT"; then
+		export USB_MTP_ROOT
+		echo "[test-$ARCH] QEMU's usb-mtp presents $USB_MTP_ROOT on root port 3"
+	else
+		echo "[test-$ARCH] the MTP objects could not be written; the tests that need them are unavailable" >&2
+		unset USB_GADGET
+	fi
+# `mic` AND THE TWO `dfu-*` ARE NOT GADGETS EITHER: each is a device `usbredir_device.py` plays over QEMU's
+# `usb-redir` - a microphone because an isochronous endpoint is the one thing `dummy_hcd` cannot carry, and a DFU
+# target because it changes what it is at a bus reset without leaving the bus, which no gadget can. The process listens on a socket in this run's
+# own directory, QEMU's chardev connects to it, and the exit trap stops the process and removes the directory.
+# Nothing in the host's kernel is touched, so the gadget rules are not engaged at all.
+elif [[ "${USB_GADGET:-}" == "mic" || "${USB_GADGET:-}" == "dfu-reset" || "${USB_GADGET:-}" == "dfu-detach" ]]; then
+	USB_REDIR_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liber-usbredir.XXXXXX")"
+	USB_REDIR_SOCKET="$USB_REDIR_DIR/device.sock"
+	python3 "$ROOT/harness/usbredir_device.py" --emulate "$USB_GADGET" --socket "$USB_REDIR_SOCKET" --ready "$USB_REDIR_DIR/ready" >&2 &
+	USB_REDIR_PID="$!"
+	for _ in $(seq 1 100); do
+		[[ -e "$USB_REDIR_DIR/ready" ]] && break
+		sleep 0.05
+	done
+	if [[ -e "$USB_REDIR_DIR/ready" ]]; then
+		export USB_REDIR_SOCKET
+		echo "[test-$ARCH] usbredir device $USB_GADGET listens for QEMU on root port 3"
+	else
+		echo "[test-$ARCH] the usbredir device did not start; the tests that need it are unavailable" >&2
+		USB_REDIR_SOCKET=""
+		unset USB_GADGET
+	fi
+elif [[ -n "${USB_GADGET:-}" ]]; then
 	if USB_GADGET_ID="$("$ROOT/harness/usb-gadget.sh" setup "$USB_GADGET")"; then
 		export USB_GADGET_ID
 		echo "[test-$ARCH] USB gadget $USB_GADGET presents $USB_GADGET_ID"
@@ -526,6 +585,38 @@ if [[ -n "${USB_GADGET:-}" ]]; then
 			python3 "$ROOT/harness/serial-echo.py" --tty /dev/ttyGS0 >&2 &
 			SERIAL_ECHO_PIDS="$!"
 			;;
+		printer)
+			# THE PAPER, WHICH IS A PROCESS HERE. It reads what the guest prints, pausing once so the
+			# guest's writes have to wait on it, checks every byte against the document the oracle
+			# sends, answers through the printer's port status, and then pulls the device out from
+			# under the second document - so the guest's unplug path is exercised by a device that
+			# really left. Its process joins the echoers', which the teardown already stops.
+			python3 "$ROOT/harness/printer-sink.py" --device /dev/g_printer0 >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
+		midi)
+			# THE INSTRUMENT: it waits for the guest to configure the device and then plays one phrase on
+			# each of the two cables, which the gadget holds until the guest's transport reads it.
+			python3 "$ROOT/harness/midi-source.py" >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
+		midi-echo)
+			# THE SAME CARD, PLAYING BACK: whatever the guest sends on a cable comes back on that cable.
+			python3 "$ROOT/harness/midi-source.py" --echo >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
+		ups)
+			# THE UPS'S FIRMWARE: it answers GET_REPORT from its reports, takes SET_REPORT, and changes what
+			# its input report says when the guest schedules or cancels a turn-off - the oracle's evidence
+			# that the command reached the device.
+			python3 "$ROOT/harness/ups-sim.py" >&2 &
+			SERIAL_ECHO_PIDS="$!"
+			;;
+		esac
+		# THE SERVICE-BACKED CLASSES GO ON A ROOT PORT, because their oracles unplug the device and a
+		# device behind the hub leaves without the driver hearing it. See `qemu_attach_xhci`.
+		case "$USB_GADGET" in
+		printer | midi | midi-echo | ups | ccid | dfu | bt | mbim | uvc) export USB_GADGET_PORT=3 ;;
 		esac
 	else
 		# REFUSED RATHER THAN FORCED, and the run goes on without it: the tests that wanted the
@@ -533,6 +624,31 @@ if [[ -n "${USB_GADGET:-}" ]]; then
 		# did not are unaffected. A setup that could not complete is never a reason to escalate.
 		echo "[test-$ARCH] the USB gadget could not be built; the tests that need it are unavailable" >&2
 		unset USB_GADGET
+	fi
+fi
+
+# A SOFTWARE TPM BEHIND QEMU'S OWN FRONT-END, when a run asks for one: `TPM_FRONTEND=crb` or `tis` names which of
+# QEMU's two TPM devices the guest sees, and `swtpm` - which `setup.sh` installs for exactly this - is the TPM
+# behind it, its state in this run's own directory. QEMU's `emulator` backend drives it over the control socket.
+if [[ -n "${TPM_FRONTEND:-}" ]]; then
+	if [[ "$TPM_FRONTEND" != "crb" && "$TPM_FRONTEND" != "tis" ]]; then
+		echo "[test-$ARCH] TPM_FRONTEND is crb or tis, not '$TPM_FRONTEND'" >&2
+		exit 2
+	fi
+	TPM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liber-swtpm.XXXXXX")"
+	TPM_SOCKET="$TPM_DIR/swtpm.sock"
+	swtpm socket --tpm2 --tpmstate "dir=$TPM_DIR" --ctrl "type=unixio,path=$TPM_SOCKET" --log "file=$TPM_DIR/swtpm.log" >&2 &
+	TPM_PID="$!"
+	for _ in $(seq 1 100); do
+		[[ -S "$TPM_SOCKET" ]] && break
+		sleep 0.05
+	done
+	if [[ -S "$TPM_SOCKET" ]]; then
+		export TPM_SOCKET TPM_FRONTEND
+		echo "[test-$ARCH] swtpm behind QEMU's tpm-$TPM_FRONTEND"
+	else
+		echo "[test-$ARCH] swtpm did not start; the TPM test is unavailable" >&2
+		TPM_SOCKET=""
 	fi
 fi
 
@@ -574,7 +690,7 @@ set +e
 	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
 	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
 	# until the harness timed it out, because nothing had told the guest how to power off.
-	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
+	TEST=1 TEST_TAGS="$TAGS" USB_GADGET_ID="${USB_GADGET_ID:-}" USB_GADGET_PORT="${USB_GADGET_PORT:-}" USB_MTP_ROOT="${USB_MTP_ROOT:-}" USB_REDIR_SOCKET="${USB_REDIR_SOCKET:-}" TPM_SOCKET="${TPM_SOCKET:-}" TPM_FRONTEND="${TPM_FRONTEND:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

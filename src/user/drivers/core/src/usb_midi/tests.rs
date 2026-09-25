@@ -140,3 +140,180 @@ fn what_cannot_be_attributed_resets_every_cable() {
 	assert_eq!(out[1], Output::Fault { cable: Some(1), code: FaultCode::Reserved });
 	assert_eq!(chunk(&out[2]).kind, Kind::SysexEnd, "cable 0's message was untouched and ends");
 }
+
+// A MIDI Streaming configuration the way usb_f_midi builds one: an audio control interface, then a MIDI
+// Streaming interface whose header says 1.0, a bulk OUT with one embedded jack and a bulk IN with two.
+fn streaming(revision: u16, in_cables: u8) -> Vec<u8> {
+	use crate::descriptor;
+	use crate::usb_function::{DT_CS_ENDPOINT, DT_CS_INTERFACE};
+	let mut out: Vec<u8> = alloc::vec![9, descriptor::DT_CONFIG, 0, 0, 2, 1, 0, 0x80, 50];
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 0, 0, 0, CLASS_AUDIO, 0x01, 0, 0]);
+	out.extend_from_slice(&[9, DT_CS_INTERFACE, 0x01, 0x00, 0x01, 9, 0, 1, 1]);
+	out.extend_from_slice(&[9, descriptor::DT_INTERFACE, 1, 0, 2, CLASS_AUDIO, SUBCLASS_MIDI_STREAMING, 0, 0]);
+	let revision = revision.to_le_bytes();
+	out.extend_from_slice(&[7, DT_CS_INTERFACE, MS_HEADER, revision[0], revision[1], 0, 0]);
+	out.extend_from_slice(&[9, descriptor::DT_ENDPOINT, 0x01, 0x02, 0x40, 0x00, 0, 0, 0]);
+	out.extend_from_slice(&[5, DT_CS_ENDPOINT, MS_GENERAL, 1, 1]);
+	out.extend_from_slice(&[9, descriptor::DT_ENDPOINT, 0x82, 0x02, 0x40, 0x00, 0, 0, 0]);
+	let mut general: Vec<u8> = alloc::vec![4 + in_cables, DT_CS_ENDPOINT, MS_GENERAL, in_cables];
+	general.extend((0..in_cables).map(|jack| 3 + jack));
+	out.extend_from_slice(&general);
+	let total = out.len() as u16;
+	out[2..4].copy_from_slice(&total.to_le_bytes());
+	out
+}
+
+#[test]
+fn the_midi_1_0_receive_endpoint_binds_with_its_cable_count() {
+	let bound = bind(&streaming(MS_REVISION_1_0, 2)).expect("a MIDI 1.0 device binds");
+	assert_eq!((bound.interface, bound.alternate, bound.input.address, bound.cables), (1, 0, 0x82, 2));
+	// AND THE SAME SETTING'S OUT ENDPOINT, with the one cable ITS record declares - not the receive side's two.
+	assert_eq!(bound.output.map(|(endpoint, cables)| (endpoint.address, cables)), Some((0x01, 1)));
+}
+
+#[test]
+fn a_midi_2_0_setting_is_not_read_as_event_packets() {
+	assert_eq!(bind(&streaming(0x0200, 2)), Err(NotBindable::NoMidiInterface));
+}
+
+#[test]
+fn a_cable_count_a_packet_cannot_name_is_refused() {
+	assert_eq!(bind(&streaming(MS_REVISION_1_0, 0)), Err(NotBindable::BadCableCount));
+	assert_eq!(bind(&streaming(MS_REVISION_1_0, 17)), Err(NotBindable::BadCableCount));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The way out.
+// ---------------------------------------------------------------------------------------------
+
+fn short(cable: u8, bytes: &[u8]) -> Chunk {
+	let mut chunk = Chunk { cable, kind: Kind::Short, bytes: [0; 3], len: bytes.len() as u8, message: None, start: false, end: false };
+	chunk.bytes[..bytes.len()].copy_from_slice(bytes);
+	chunk
+}
+
+fn fragment(cable: u8, message: u32, bytes: &[u8], start: bool, end: bool) -> Chunk {
+	let kind = if end {
+		Kind::SysexEnd
+	} else if start {
+		Kind::SysexStart
+	} else {
+		Kind::SysexContinue
+	};
+	let mut chunk = Chunk { cable, kind, bytes: [0; 3], len: bytes.len() as u8, message: Some(message), start, end };
+	chunk.bytes[..bytes.len()].copy_from_slice(bytes);
+	chunk
+}
+
+#[test]
+fn every_short_message_gets_the_code_index_its_status_demands() {
+	let mut encoder = Encoder::new(2);
+	let cases: [(&[u8], [u8; 4]); 12] = [
+		(&[0x80, 0x3c, 0x00], [0x08, 0x80, 0x3c, 0x00]),
+		(&[0x90, 0x3c, 0x64], [0x09, 0x90, 0x3c, 0x64]),
+		(&[0xa0, 0x3c, 0x10], [0x0a, 0xa0, 0x3c, 0x10]),
+		(&[0xb1, 0x07, 0x64], [0x0b, 0xb1, 0x07, 0x64]),
+		(&[0xc0, 0x05], [0x0c, 0xc0, 0x05, 0x00]),
+		(&[0xd0, 0x40], [0x0d, 0xd0, 0x40, 0x00]),
+		(&[0xe0, 0x00, 0x40], [0x0e, 0xe0, 0x00, 0x40]),
+		(&[0xf1, 0x12], [0x02, 0xf1, 0x12, 0x00]),
+		(&[0xf2, 0x01, 0x02], [0x03, 0xf2, 0x01, 0x02]),
+		(&[0xf3, 0x04], [0x02, 0xf3, 0x04, 0x00]),
+		(&[0xf6], [0x05, 0xf6, 0x00, 0x00]),
+		(&[0xf8], [0x0f, 0xf8, 0x00, 0x00]),
+	];
+	for (bytes, packet) in cases {
+		assert_eq!(encoder.encode(&short(0, bytes)), Ok(packet), "{bytes:02x?}");
+	}
+	assert_eq!(encoder.encode(&short(1, &[0x91, 0x40, 0x7f])), Ok([0x19, 0x91, 0x40, 0x7f]), "the cable is the header's high nibble");
+}
+
+#[test]
+fn a_chunk_that_is_not_a_message_has_no_packet() {
+	let mut encoder = Encoder::new(2);
+	for bytes in [&[0x90, 0x3c][..], &[0xc0, 0x05, 0x01][..], &[0x90, 0xbc, 0x64][..], &[0x3c, 0x64][..], &[0xf4][..], &[0xf5][..], &[0xf0, 0x7e, 0x7f][..], &[0xf7][..], &[][..]] {
+		assert_eq!(encoder.encode(&short(0, bytes)), Err(Refusal::Status), "{bytes:02x?}");
+	}
+	assert_eq!(encoder.encode(&short(2, &[0x90, 0x3c, 0x64])), Err(Refusal::Cable), "a cable past the endpoint's two");
+	let raw = Chunk { kind: Kind::Raw, ..short(0, &[0x42]) };
+	assert_eq!(encoder.encode(&raw), Err(Refusal::Status), "a raw byte has no packet on the way out");
+}
+
+#[test]
+fn a_sysex_goes_out_as_the_sender_cut_it_and_nothing_else() {
+	let mut encoder = Encoder::new(1);
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0xf0, 0x7e, 0x7f], true, false)), Ok([0x04, 0xf0, 0x7e, 0x7f]));
+	assert!(encoder.open(), "the message is open until its end");
+	assert_eq!(encoder.encode(&short(0, &[0xf8])), Ok([0x0f, 0xf8, 0x00, 0x00]), "a realtime byte may stand inside it");
+	assert_eq!(encoder.encode(&short(0, &[0x90, 0x3c, 0x64])), Err(Refusal::Sequence), "anything else would end it on the device");
+	assert_eq!(encoder.encode(&fragment(0, 6, &[0x01, 0x02, 0x03], false, false)), Err(Refusal::Sequence), "another message's number");
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0x01, 0x02], false, false)), Err(Refusal::Sequence), "a fragment short of three that does not end it");
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0x01, 0x82, 0x03], false, false)), Err(Refusal::Sequence), "a status byte inside");
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0xf0, 0x02, 0x03], true, false)), Err(Refusal::Sequence), "a start while one is open");
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0x01, 0x02, 0x03], false, false)), Ok([0x04, 0x01, 0x02, 0x03]));
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0x06, 0xf7], false, true)), Ok([0x06, 0x06, 0xf7, 0x00]));
+	assert!(!encoder.open());
+	assert_eq!(encoder.encode(&fragment(0, 5, &[0xf7], false, true)), Err(Refusal::Sequence), "an end with nothing open");
+	// ONE FRAGMENT, BOTH ENDS, and the three end sizes.
+	assert_eq!(encoder.encode(&fragment(0, 7, &[0xf0, 0xf7], true, true)), Ok([0x06, 0xf0, 0xf7, 0x00]));
+	assert_eq!(encoder.encode(&fragment(0, 8, &[0xf0, 0x01, 0xf7], true, true)), Ok([0x07, 0xf0, 0x01, 0xf7]));
+	assert_eq!(encoder.encode(&fragment(0, 9, &[0xf0, 0x01, 0x02], true, false)), Ok([0x04, 0xf0, 0x01, 0x02]));
+	assert_eq!(encoder.encode(&fragment(0, 9, &[0xf7], false, true)), Ok([0x05, 0xf7, 0x00, 0x00]));
+	// A KIND THAT DISAGREES WITH ITS FLAGS is refused rather than believed either way.
+	let lying = Chunk { kind: Kind::SysexContinue, ..fragment(0, 10, &[0xf0, 0x01, 0x02], true, false) };
+	assert_eq!(encoder.encode(&lying), Err(Refusal::Sequence));
+}
+
+#[test]
+fn the_cap_counts_what_went_out_with_its_delimiters() {
+	let mut encoder = Encoder::new(1);
+	assert!(encoder.encode(&fragment(0, 1, &[0xf0, 0x00, 0x00], true, false)).is_ok());
+	// 3 bytes are out; 21844 more fragments of three reach 65535, one short of the cap.
+	for _ in 0..21_844 {
+		assert!(encoder.encode(&fragment(0, 1, &[0x00, 0x00, 0x00], false, false)).is_ok());
+	}
+	assert_eq!(encoder.encode(&fragment(0, 1, &[0x00, 0x00, 0x00], false, false)), Err(Refusal::Cap), "three more would cross 64 kB");
+	assert_eq!(encoder.encode(&fragment(0, 1, &[0xf7], false, true)), Ok([0x05, 0xf7, 0x00, 0x00]), "and the end that makes it exactly 64 kB is not");
+}
+
+#[test]
+fn a_batch_is_refused_whole_and_the_state_does_not_move() {
+	let mut encoder = Encoder::new(2);
+	let mut out = Vec::new();
+	let batch = [short(0, &[0x90, 0x3c, 0x64]), fragment(1, 3, &[0xf0, 0x01, 0x02], true, false), short(0, &[0x80, 0x3c, 0x00]), short(1, &[0xc0, 0x05])];
+	assert_eq!(encoder.encode_all(&batch, &mut out), Err((3, Refusal::Sequence)), "the fourth chunk would interrupt cable 1's message");
+	assert!(out.is_empty() && !encoder.open(), "nothing of the batch went out, and cable 1 has no message open");
+	assert_eq!(encoder.encode_all(&batch[..3], &mut out), Ok(()));
+	assert_eq!(out, [[0x09, 0x90, 0x3c, 0x64], [0x14, 0xf0, 0x01, 0x02], [0x08, 0x80, 0x3c, 0x00]].concat());
+	assert!(encoder.open());
+}
+
+#[test]
+fn what_goes_out_decodes_back_to_what_was_sent() {
+	// A PHRASE OVER TWO CABLES with every kind the encoder takes, through the encoder and then the decoder the
+	// receiving side runs: the same chunks come back, message numbers apart - those are each side's own.
+	let sent = [
+		short(0, &[0x90, 0x3c, 0x64]),
+		fragment(0, 40, &[0xf0, 0x7e, 0x7f], true, false),
+		short(0, &[0xf8]),
+		fragment(0, 40, &[0x06, 0x01, 0x02], false, false),
+		short(1, &[0xb1, 0x07, 0x64]),
+		fragment(0, 40, &[0x03, 0xf7], false, true),
+		short(1, &[0xf2, 0x10, 0x20]),
+		fragment(1, 2, &[0xf0, 0x55, 0xf7], true, true),
+		short(0, &[0xc0, 0x05]),
+		short(1, &[0xf6]),
+	];
+	let mut encoder = Encoder::new(2);
+	let mut packets = Vec::new();
+	encoder.encode_all(&sent, &mut packets).expect("every chunk is a message");
+	let mut decoder = Decoder::new(2);
+	let mut out = Vec::new();
+	decoder.decode(&packets, 0, &mut out);
+	let back: Vec<Chunk> = out.iter().map(chunk).collect();
+	assert_eq!(back.len(), sent.len());
+	for (got, want) in back.iter().zip(sent.iter()) {
+		assert_eq!((got.cable, got.kind, got.bytes(), got.start, got.end), (want.cable, want.kind, want.bytes(), want.start, want.end));
+		assert_eq!(got.message.is_some(), want.message.is_some());
+	}
+}

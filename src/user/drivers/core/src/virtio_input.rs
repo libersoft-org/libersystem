@@ -170,6 +170,10 @@ fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue,
 				common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
 				exit();
 			}
+			// Clear the pending flag BEFORE the drain, so a press that lands while the ring is being
+			// read wakes the next wait rather than being cleared with this one (edge-triggered: no
+			// source to unmask).
+			interrupt_ack(irq);
 			// drain the buffers the device filled, re-posting each as we go.
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
@@ -178,9 +182,6 @@ fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue,
 				}
 			}
 			eventq.notify();
-			// clear the pending flag so the next press wakes us (edge-triggered: no source
-			// to unmask).
-			interrupt_ack(irq);
 		}
 	}
 }
@@ -224,6 +225,8 @@ fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queu
 			let connected = matches!(ready, common::ProviderReady::Connected(_));
 			let mut synced: bool = connected;
 			let mut wheel: i32 = 0;
+			// Acknowledged before the drain, for the reason the keyboard loop gives.
+			interrupt_ack(irq);
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
 					if pointer_event(pool_virt + id as u64 * EVENT_SIZE, &mut state, &mut wheel, bound_x, bound_y) {
@@ -233,7 +236,6 @@ fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queu
 				}
 			}
 			eventq.notify();
-			interrupt_ack(irq);
 			// Send when a frame completed and either the position/buttons changed or the
 			// wheel ticked (the wheel is a momentary delta, not part of the held state).
 			if synced && (connected || state != sent || wheel != 0) {

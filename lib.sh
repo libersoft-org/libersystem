@@ -397,7 +397,7 @@ ensure() {
 declare -A TOOL_WAVES=()
 for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln script; do TOOL_WAVES[$tool]=1; done
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do TOOL_WAVES[$tool]=2; done
-for tool in date log config set lsdev lsfont btctl lsusb lssvc usage ps run perm start stop beep; do TOOL_WAVES[$tool]=3; done
+for tool in date log config set lsdev lsfont btctl dfu lsusb lssvc usage ps run perm start stop beep; do TOOL_WAVES[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss traceroute; do TOOL_WAVES[$tool]=4; done
 for tool in imgview imgconv audioconv audiorec play frame_probe graphics_probe lico licoedit licoview textconf test2d-conformance-sw test2d-sw test3d-conformance-sw test3d-sw; do TOOL_WAVES[$tool]=5; done
 # Wave 6: the text-processing command family. They are their own wave because they share a shape - the

@@ -793,6 +793,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"free", Shape::Bare),
 	(b"lsdev", Shape::Json),
 	(b"btctl", Shape::Rest),
+	(b"dfu", Shape::Rest),
 	(b"perm", Shape::Json),
 	(b"usage", Shape::Json),
 	(b"lscpu", Shape::Json),

@@ -208,7 +208,7 @@ Builds the system. With no arguments: every part, for x86_64.
   --dma-mode MODE
                 enforcing-required | no-iommu | harness: which DMA mode the volume's signed
                 manifest declares. A shipping medium is assembled around a volume signed for the
-                same value as the medium, which is why ./image.sh passes it here; $(harness) signs
+                same value as the medium, which is why ./image.sh passes it here; harness signs
                 a manifest that declares none, for the test and development media whose boots
                 take the mode from the harness carrier. Default: harness.
   --rebuild     ignore every build cache and produce each artifact again. The caches are keyed on

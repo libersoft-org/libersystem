@@ -320,5 +320,221 @@ impl Decoder {
 	}
 }
 
+// THE WAY OUT: chunks back into USB-MIDI 1.0 event packets, the decoder's mirror.
+//
+// WHAT A SENDER HANDS OVER IS WHAT A RECEIVER IS HANDED: a complete short message, or a SysEx fragment under a
+// per-cable message number the SENDER chose. Nothing is assembled and nothing is split - a fragment that is not
+// the end of its message is exactly the three bytes one packet carries, and the end is one to three - so what
+// goes on the wire is what the sender cut, and a message the sender did not finish is not finished here either.
+//
+// REFUSED BEFORE ANYTHING MOVES. `encode_all` checks a whole batch against a copy of the per-cable state and
+// commits only if every chunk is a packet; a refusal names the first chunk that is not, and leaves the state as
+// it was - so a sender that sent half of a bad batch is not a thing that can happen.
+
+/// Why a chunk has no packet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refusal {
+	/// A cable past the endpoint's.
+	Cable,
+	/// A short message that is not one: a status this wire has no packet for, a data byte with its top bit set,
+	/// the wrong number of bytes - or a raw byte, which has no packet on the way out.
+	Status,
+	/// A SysEx fragment that does not fit what is open on its cable: a continuation or an end with nothing open,
+	/// a start while a message is open, another message's number, a delimiter out of place, a fragment short of
+	/// three bytes that does not end its message - or a non-realtime message sent into an open SysEx, which
+	/// would end it on the device without its end.
+	Sequence,
+	/// The message would cross 64 kB with its delimiters.
+	Cap,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Encoder {
+	cables: u8,
+	// Per cable, the SysEx the sender has open: its number and its bytes so far, delimiters included.
+	open: [Option<(u32, u32)>; MAX_CABLES as usize],
+}
+
+impl Encoder {
+	/// An encoder for an endpoint with `cables` cables (1..=16).
+	pub fn new(cables: u8) -> Self {
+		Self { cables: cables.clamp(1, MAX_CABLES), open: [None; MAX_CABLES as usize] }
+	}
+
+	/// Whether any cable has a SysEx the sender started and has not ended.
+	pub fn open(&self) -> bool {
+		self.open.iter().any(Option::is_some)
+	}
+
+	/// The one packet for one chunk, moving the per-cable state only when the chunk is accepted.
+	pub fn encode(&mut self, chunk: &Chunk) -> Result<[u8; PACKET], Refusal> {
+		if chunk.cable >= self.cables {
+			return Err(Refusal::Cable);
+		}
+		let bytes = chunk.bytes.get(..usize::from(chunk.len)).ok_or(Refusal::Status)?;
+		let header = |cin: u8| chunk.cable << 4 | cin;
+		let packet = |cin: u8| {
+			let mut out = [header(cin), 0, 0, 0];
+			out[1..1 + bytes.len()].copy_from_slice(bytes);
+			out
+		};
+		match chunk.kind {
+			Kind::Raw => Err(Refusal::Status),
+			Kind::Short => {
+				let (&status, rest) = bytes.split_first().ok_or(Refusal::Status)?;
+				if !rest.iter().all(|byte| data(*byte)) {
+					return Err(Refusal::Status);
+				}
+				let cin = match (status, bytes.len()) {
+					(0x80..=0xbf | 0xe0..=0xef, 3) => status >> 4,
+					(0xc0..=0xdf, 2) => status >> 4,
+					(0xf1 | 0xf3, 2) => 0x2,
+					(0xf2, 3) => 0x3,
+					(0xf6, 1) => 0x5,
+					(0xf8..=0xff, 1) => 0xf,
+					_ => return Err(Refusal::Status),
+				};
+				// A REALTIME BYTE MAY STAND INSIDE A SYSEX, and on the wire nothing else may: a device ends an open
+				// message at the first other status it meets, without the end the sender still owes.
+				if !realtime(status) && self.open[usize::from(chunk.cable)].is_some() {
+					return Err(Refusal::Sequence);
+				}
+				Ok(packet(cin))
+			}
+			Kind::SysexStart | Kind::SysexContinue | Kind::SysexEnd => {
+				let message = chunk.message.ok_or(Refusal::Sequence)?;
+				let slot = &mut self.open[usize::from(chunk.cable)];
+				let count = match (*slot, chunk.start) {
+					(None, true) => 0,
+					(Some((open, count)), false) if open == message => count,
+					_ => return Err(Refusal::Sequence),
+				};
+				// THE KIND AGREES WITH THE FLAGS, which the decoder derives the same way.
+				let kind = if chunk.end {
+					Kind::SysexEnd
+				} else if chunk.start {
+					Kind::SysexStart
+				} else {
+					Kind::SysexContinue
+				};
+				if kind != chunk.kind || bytes.is_empty() || (!chunk.end && bytes.len() != 3) {
+					return Err(Refusal::Sequence);
+				}
+				// Every byte is data but a leading start and a trailing end.
+				let first = usize::from(chunk.start);
+				let last = bytes.len() - usize::from(chunk.end);
+				if (chunk.start && bytes[0] != 0xf0) || (chunk.end && bytes[bytes.len() - 1] != 0xf7) || first > last || !bytes[first..last].iter().all(|byte| data(*byte)) {
+					return Err(Refusal::Sequence);
+				}
+				let total = count.checked_add(bytes.len() as u32).filter(|total| *total <= SYSEX_CAP).ok_or(Refusal::Cap)?;
+				*slot = if chunk.end { None } else { Some((message, total)) };
+				let cin = match (chunk.end, bytes.len()) {
+					(false, _) => 0x4,
+					(true, 1) => 0x5,
+					(true, 2) => 0x6,
+					_ => 0x7,
+				};
+				Ok(packet(cin))
+			}
+		}
+	}
+
+	/// Every chunk's packet, or the first refusal with its index - and then nothing moved.
+	pub fn encode_all(&mut self, chunks: &[Chunk], out: &mut Vec<u8>) -> Result<(), (usize, Refusal)> {
+		let mut trial = *self;
+		let before = out.len();
+		for (index, chunk) in chunks.iter().enumerate() {
+			match trial.encode(chunk) {
+				Ok(packet) => out.extend_from_slice(&packet),
+				Err(refusal) => {
+					out.truncate(before);
+					return Err((index, refusal));
+				}
+			}
+		}
+		*self = trial;
+		Ok(())
+	}
+}
+
+// THE TRANSPORT'S HALF: which interface setting a USB MIDI 1.0 device's packets arrive on, how many cables its
+// receive endpoint carries - and the endpoint of the same setting packets are SENT on, with its own count.
+//
+// MIDI 1.0 AND NOTHING ELSE. A MIDI Streaming interface's class header names its revision, and a device that
+// speaks USB MIDI 2.0 puts that on an alternate setting whose packets are Universal MIDI Packets - which the
+// provider contract does not carry. So the setting bound is the one whose header says 1.0, and a 2.0 setting
+// beside it is left alone rather than read as event packets.
+
+use crate::usb_function::{Configuration, DT_CS_ENDPOINT, DT_CS_INTERFACE, Endpoint, Refused};
+
+pub const CLASS_AUDIO: u8 = 0x01;
+pub const SUBCLASS_MIDI_STREAMING: u8 = 0x03;
+/// The class header's subtype, and the revision a MIDI 1.0 setting declares.
+pub const MS_HEADER: u8 = 0x01;
+pub const MS_REVISION_1_0: u16 = 0x0100;
+/// The class-specific endpoint descriptor that says how many embedded jacks - cables - an endpoint carries.
+pub const MS_GENERAL: u8 = 0x01;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotBindable {
+	/// No MIDI Streaming setting that declares revision 1.0.
+	NoMidiInterface,
+	/// A MIDI 1.0 setting with no IN endpoint that says how many cables it carries.
+	NoReceiveEndpoint,
+	/// A cable count of zero, or past the sixteen a packet can name.
+	BadCableCount,
+	Malformed(Refused),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Binding {
+	pub config_value: u8,
+	pub interface: u8,
+	pub alternate: u8,
+	pub input: Endpoint,
+	pub cables: u8,
+	/// The OUT endpoint of the same setting and the cables IT carries, which need not be the receive side's:
+	/// a device with two inputs and one output is ordinary. `None` for a device that only sends.
+	pub output: Option<(Endpoint, u8)>,
+}
+
+/// How many cables an endpoint's class-specific record says it carries, if it has one.
+fn cables_of(parsed: &Configuration<'_>, endpoint: &Endpoint) -> Option<Result<u8, NotBindable>> {
+	let general = parsed.endpoint_extra(endpoint).find(|record| record.kind == DT_CS_ENDPOINT && record.field(2) == Ok(MS_GENERAL))?;
+	Some(match general.field(3) {
+		Ok(cables) if (1..=MAX_CABLES).contains(&cables) => Ok(cables),
+		Ok(_) => Err(NotBindable::BadCableCount),
+		Err(_) => Err(NotBindable::Malformed(Refused::Malformed)),
+	})
+}
+
+/// The MIDI 1.0 receive endpoint of one configuration, and its transmit endpoint if it has one.
+pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
+	let parsed = Configuration::parse(config).map_err(NotBindable::Malformed)?;
+	let midi_1_0 = |setting: &&crate::usb_function::Setting| setting.is(CLASS_AUDIO, SUBCLASS_MIDI_STREAMING) && parsed.functional(setting).any(|record| record.kind == DT_CS_INTERFACE && record.field(2) == Ok(MS_HEADER) && record.field16(3) == Ok(MS_REVISION_1_0));
+	let mut settings = parsed.settings.iter().filter(midi_1_0).peekable();
+	if settings.peek().is_none() {
+		return Err(NotBindable::NoMidiInterface);
+	}
+	let carries = |endpoint: &&Endpoint| endpoint.transfer() == crate::usb_function::TRANSFER_BULK || endpoint.transfer() == crate::usb_function::TRANSFER_INTERRUPT;
+	for setting in settings {
+		for endpoint in setting.endpoints.iter().filter(carries).filter(|endpoint| endpoint.is_in()) {
+			let Some(cables) = cables_of(&parsed, endpoint) else { continue };
+			let cables = cables?;
+			// THE SAME SETTING'S OUT ENDPOINT, or none: a setting is selected whole, so an output on another one
+			// is an output this binding cannot reach without giving up its input.
+			let mut output = None;
+			for out in setting.endpoints.iter().filter(carries).filter(|endpoint| !endpoint.is_in()) {
+				if let Some(out_cables) = cables_of(&parsed, out) {
+					output = Some((*out, out_cables?));
+					break;
+				}
+			}
+			return Ok(Binding { config_value: parsed.value, interface: setting.interface, alternate: setting.alternate, input: *endpoint, cables, output });
+		}
+	}
+	Err(NotBindable::NoReceiveEndpoint)
+}
+
 #[cfg(test)]
 mod tests;

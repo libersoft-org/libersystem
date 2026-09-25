@@ -200,6 +200,10 @@ pub unsafe fn configure_hid(hc: &mut Xhci, dev: &mut UsbDevice) -> Option<Hid> {
 			control_nodata(hc, &mut pending, dev, 0x21, HID_REQ_SET_PROTOCOL, 0, iface)?;
 			hid::boot_keyboard()
 		} else {
+			// NOT AN INPUT DEVICE, and the ring goes back: a HID power device takes this path every time it is
+			// plugged in, and the page used to stay pinned for the life of the driver.
+			let mut ring = ring;
+			ring.release();
 			return None;
 		};
 		Some(Hid { dci, ring, layout, posted: false, prevs: Vec::new(), mods: Mods::default(), x: 0, y: 0, buttons: 0 })

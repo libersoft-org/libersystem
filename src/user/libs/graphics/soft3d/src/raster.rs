@@ -306,8 +306,19 @@ impl Bins {
 
 	/// The pixel rectangle a tile covers, clamped to the target.
 	pub fn tile_box(&self, x: u32, y: u32, width: u32, height: u32) -> PixelBox {
-		PixelBox { x0: (x * TILE) as i64, y0: (y * TILE) as i64, x1: ((x + 1) * TILE) as i64, y1: ((y + 1) * TILE) as i64 }.clamped(width, height)
+		tile_area(x, y, width, height)
 	}
+
+	/// Every tile's bin, and every tile's depth bound to narrow - apart, because a frame shading its
+	/// tiles at once reads the first while each tile writes its own slot of the second.
+	pub(crate) fn parts(&mut self) -> (&[Vec<u32>], &mut [f32]) {
+		(&self.tiles, &mut self.far)
+	}
+}
+
+/// The pixel rectangle a tile covers, clamped to the target.
+pub fn tile_area(x: u32, y: u32, width: u32, height: u32) -> PixelBox {
+	PixelBox { x0: (x * TILE) as i64, y0: (y * TILE) as i64, x1: ((x + 1) * TILE) as i64, y1: ((y + 1) * TILE) as i64 }.clamped(width, height)
 }
 
 /// The window-space position and `1/w` of a clip-space vertex.

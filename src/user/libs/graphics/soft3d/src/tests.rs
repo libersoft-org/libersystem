@@ -2578,3 +2578,353 @@ fn hostile_shader_modules_are_refused_before_a_frame_runs() {
 	assert!(refused >= 150, "only {refused} modules were refused");
 	assert!(accepted >= 20, "and {accepted} accepted, so the fixture is not refusing everything");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Tiles shaded by a pool.
+// ---------------------------------------------------------------------------------------------
+
+use crate::frame::{Lane, Tile, Workers};
+
+/// Real threads, one per lane, each taking the next tile from a shared queue - so which thread
+/// shades which tile, and in what order, is whatever the host's scheduler makes it.
+struct Threads(usize);
+
+impl Workers for Threads {
+	fn lanes(&self) -> usize {
+		self.0
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		let queue = std::sync::Mutex::new(tiles.iter_mut());
+		std::thread::scope(|scope| {
+			for lane in lanes.iter_mut() {
+				let queue = &queue;
+				// A SMALL STACK, on purpose: a tile's shading is what a guest worker runs on the
+				// stack it is given, and a frame that needed more than this would find out there.
+				std::thread::Builder::new()
+					.stack_size(64 * 1024)
+					.spawn_scoped(scope, move || {
+						loop {
+							let Some(tile) = queue.lock().unwrap().next() else { break };
+							work(lane, tile);
+						}
+					})
+					.unwrap();
+			}
+		});
+	}
+}
+
+/// One thread, every tile, last to first: the order furthest from the serial one.
+struct Backwards;
+
+impl Workers for Backwards {
+	fn lanes(&self) -> usize {
+		1
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		for tile in tiles.iter_mut().rev() {
+			work(&mut lanes[0], tile);
+		}
+	}
+}
+
+/// One thread handing tile `n` to lane `n % lanes`: several lanes and no thread, which is what lets
+/// the counting allocator - a THREAD-LOCAL counter - measure a frame that went through a pool.
+struct Rotating(usize);
+
+impl Workers for Rotating {
+	fn lanes(&self) -> usize {
+		self.0
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		let count = lanes.len();
+		for (index, tile) in tiles.iter_mut().enumerate() {
+			work(&mut lanes[index % count], tile);
+		}
+	}
+}
+
+/// A pool that returns one tile short.
+struct Short;
+
+impl Workers for Short {
+	fn lanes(&self) -> usize {
+		1
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		let keep = tiles.len().saturating_sub(1);
+		for tile in tiles.iter_mut().take(keep) {
+			work(&mut lanes[0], tile);
+		}
+	}
+}
+
+/// A pool that hands every tile out twice.
+struct Twice;
+
+impl Workers for Twice {
+	fn lanes(&self) -> usize {
+		2
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		for tile in tiles.iter_mut() {
+			work(&mut lanes[0], tile);
+			work(&mut lanes[1], tile);
+		}
+	}
+}
+
+/// What a frame left behind, bit for bit: every sample of every colour attachment, then every depth
+/// and stencil value. BITS AND NOT VALUES, so a NaN compares and a negative zero does not pass for a
+/// positive one.
+fn contents(colour: &[Colour], depth: Option<&DepthStencil>) -> Vec<u32> {
+	let mut out = Vec::new();
+	for attachment in colour {
+		for y in 0..attachment.height {
+			for x in 0..attachment.width {
+				for sample in 0..attachment.samples {
+					let value = attachment.at(x, y, sample);
+					out.extend([value.x.to_bits(), value.y.to_bits(), value.z.to_bits(), value.w.to_bits()]);
+				}
+			}
+		}
+	}
+	if let Some(buffer) = depth {
+		for y in 0..buffer.height {
+			for x in 0..buffer.width {
+				for sample in 0..buffer.samples {
+					out.push(match buffer.depth_at(x, y, sample) {
+						render3d::depth::Stored::Normalised(value) => value,
+						render3d::depth::Stored::Float(value) => value.to_bits(),
+					});
+					out.push(buffer.stencil_at(x, y, sample) as u32);
+				}
+			}
+		}
+	}
+	out
+}
+
+/// A crowded scene: overlapping triangles at every depth, translucent and blended, into a
+/// multisampled colour attachment, an identity attachment and a stencilled depth buffer, with a
+/// scissor that cuts across tiles.
+struct Crowd {
+	width: u32,
+	height: u32,
+	pipeline: Pipeline,
+	draws: Vec<Draw>,
+	mesh: Mesh,
+	scissor: Option<frame::Scissor>,
+}
+
+fn crowd(seed: u64, width: u32, height: u32, triangles: usize) -> Crowd {
+	let mut noise = Noise(seed);
+	let mut unit = |low: f32, high: f32| low + (noise.next() % 10_000) as f32 / 10_000.0 * (high - low);
+	let mut positions = Vec::new();
+	let mut colours = Vec::new();
+	for _ in 0..triangles {
+		let (x, y, z) = (unit(-1.1, 1.1), unit(-1.1, 1.1), unit(0.05, 0.95));
+		let size = unit(0.05, 0.9);
+		for _ in 0..3 {
+			positions.push([x + unit(-size, size), y + unit(-size, size), z + unit(-0.04, 0.04), 1.0]);
+		}
+		let colour = [unit(0.0, 1.0), unit(0.0, 1.0), unit(0.0, 1.0), unit(0.3, 1.0)];
+		colours.extend([colour; 3]);
+	}
+	let mut vertex = Builder::new(Stage::Vertex, "crowd");
+	vertex.varying(0, Type::vec(4), render_shader::Interpolation::Smooth);
+	let position = vertex.load(Type::vec(4), Binding::Attribute { location: 0 });
+	let colour = vertex.load(Type::vec(4), Binding::Attribute { location: 1 });
+	vertex.store(Output::Position, position);
+	vertex.store(Output::Varying(0), colour);
+	let mut fragment = Builder::new(Stage::Fragment, "crowd");
+	fragment.varying(0, Type::vec(4), render_shader::Interpolation::Smooth);
+	let value = fragment.load(Type::vec(4), Binding::Varying { location: 0 });
+	let identity = fragment.constant(Constant::U32(42));
+	fragment.store(Output::Colour(0), value);
+	fragment.store(Output::Integer(1), identity);
+	let mut state = pipeline(Topology::TriangleList);
+	state.vertex = vertex.finish();
+	state.fragment = fragment.finish();
+	state.state.samples = 4;
+	state.state.cull = CullMode::None;
+	state.blend[0] = AttachmentBlend { enabled: true, colour: BlendEquation { source: render3d::BlendFactor::SrcAlpha, destination: render3d::BlendFactor::OneMinusSrcAlpha, operation: render3d::BlendOp::Add }, alpha: BlendEquation { source: render3d::BlendFactor::One, destination: render3d::BlendFactor::OneMinusSrcAlpha, operation: render3d::BlendOp::Add }, write_mask: ColorWriteMask::ALL };
+	state.stencil = Some(StencilFace { compare: CompareOp::Always, read_mask: 0xFF, write_mask: 0xFF, reference: 3, on_fail: StencilOp::Keep, on_depth_fail: StencilOp::IncrementClamp, on_pass: StencilOp::IncrementWrap });
+	let count = (triangles * 3) as u32;
+	// TWO DRAWS, so the second is binned against the hierarchical depth the first left behind.
+	let half = count / 6 * 3;
+	let draws = vec![
+		Draw { pipeline: 0, topology: Topology::TriangleList, count: half, instances: 1, first_instance: 0, base_vertex: 0, restart: false },
+		Draw { pipeline: 0, topology: Topology::TriangleList, count: count - half, instances: 1, first_instance: 0, base_vertex: half as i32, restart: false },
+	];
+	Crowd { width, height, pipeline: state, draws, mesh: Mesh { positions, colours, instance_offset: [0.0; 4] }, scissor: Some(frame::Scissor { x: 7, y: 5, width: width - 19, height: height - 13 }) }
+}
+
+/// One frame of a crowd through `workers`, twice over the same plan - the second is the warmed
+/// frame - answering what each frame returned and what the attachments held after the second.
+fn crowd_through(scene: &Crowd, workers: &dyn Workers) -> (Result<frame::Stats, render3d::Error>, Result<frame::Stats, render3d::Error>, Vec<u32>) {
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![scene.pipeline.clone()], scene.draws.clone(), scene.width, scene.height).unwrap();
+	let mut targets = vec![Colour::new(scene.width, scene.height, 4, false), Colour::new(scene.width, scene.height, 4, true)];
+	let mut depth = DepthStencil::new(scene.width, scene.height, 4, DepthFormat::Depth24Stencil8);
+	let mut once = |targets: &mut Vec<Colour>, depth: &mut DepthStencil| {
+		targets[0].fill(Vec4::new(0.1, 0.2, 0.3, 1.0));
+		targets[1].fill(Vec4::new(9.0, 0.0, 0.0, 1.0));
+		depth.clear(1.0, 0);
+		let mut attachments = Attachments { colour: targets, depth_stencil: Some(depth), viewport: viewport(scene.width as f32, scene.height as f32), scissor: scene.scissor };
+		frame::execute_with(&mut prepared, &mut attachments, &scene.mesh, workers)
+	};
+	let first = once(&mut targets, &mut depth);
+	let second = once(&mut targets, &mut depth);
+	let left = contents(&targets, Some(&depth));
+	(first, second, left)
+}
+
+#[test]
+// THE POOL CHANGES WHO SHADES A TILE AND NOTHING A TILE WRITES. A crowded scene - overlapping,
+// blended, multisampled, stencilled, two attachments, a scissor across tiles, two draws against one
+// hierarchical-depth state - through the serial reference, through real threads, through one thread
+// running the tiles backwards, through lanes handed out in rotation and through a pool that hands
+// every tile out twice: every one leaves the attachments bit-identical and counts the same work.
+fn a_pool_shades_the_same_frame_bit_for_bit_as_the_serial_walk() {
+	for (seed, width, height, triangles) in [(0x5EED_0001, 192, 128, 240), (0x5EED_0002, 97, 61, 150), (0x5EED_0003, 33, 33, 60)] {
+		let scene = crowd(seed, width, height, triangles);
+		let (first, second, reference) = crowd_through(&scene, &frame::Serial);
+		let stats = first.unwrap();
+		assert_eq!(second, Ok(stats), "the serial reference repeats itself");
+		assert!(stats.fragments > width * height / 4, "the crowd reached the fragment stage: {stats:?}");
+		let pools: [(&str, &dyn Workers); 6] = [
+			("threads(8)", &Threads(8)),
+			("threads(3)", &Threads(3)),
+			("threads(64)", &Threads(64)),
+			("backwards", &Backwards),
+			("rotating(5)", &Rotating(5)),
+			("twice", &Twice),
+		];
+		for (name, pool) in pools {
+			let (first, second, left) = crowd_through(&scene, pool);
+			assert_eq!(first, Ok(stats), "{name} on {width}x{height}: the first frame's work");
+			assert_eq!(second, Ok(stats), "{name} on {width}x{height}: the warmed frame's work");
+			assert!(left == reference, "{name} on {width}x{height}: the attachments differ from the serial walk's");
+		}
+	}
+}
+
+#[test]
+// A POOL THAT RETURNS BEFORE EVERY TILE IS SHADED IS REFUSED, not trusted: a frame with a hole where
+// a tile should be looks like a rendering defect in the scene, and the pool is the thing to blame.
+fn a_pool_that_stops_short_is_refused() {
+	let scene = crowd(0x5EED_0004, 96, 64, 80);
+	let (first, second, _) = crowd_through(&scene, &Short);
+	assert!(matches!(first, Err(render3d::Error::InvalidRenderState { .. })), "{first:?}");
+	assert!(matches!(second, Err(render3d::Error::InvalidRenderState { .. })), "{second:?}");
+}
+
+#[test]
+// A FAILING DRAW REPORTS THE FAILURE THE SERIAL WALK MEETS FIRST, however its tiles were scheduled:
+// the lowest tile that failed. The fragment stage here reads a texture the frame does not supply in
+// the tiles right of the middle, and whichever tile a pool reaches first, the answer is the same.
+fn a_failing_draw_answers_the_same_failure_through_any_pool() {
+	let mut fragment = Builder::new(Stage::Fragment, "fails-right");
+	fragment.varying(0, Type::vec(4), render_shader::Interpolation::Smooth);
+	let value = fragment.load(Type::vec(4), Binding::Varying { location: 0 });
+	let coordinate = fragment.load(Type::vec(4), Binding::BuiltIn(BuiltIn::FragmentCoordinate));
+	let x = fragment.assign(Type::f32(), Op::Extract(coordinate, 0));
+	let middle = fragment.constant(Constant::F32(48.0));
+	let right = fragment.assign(Type::Scalar(ScalarType::Bool), Op::Compare(CompareKind::Greater, x, middle));
+	let branch = fragment.if_then(right);
+	let _ = fragment.assign(Type::vec(4), Op::Sample { binding: Binding::Texture { texture: 0, sampler: 0 }, coordinate });
+	fragment.end_if(branch);
+	fragment.store(Output::Colour(0), value);
+	let mut state = pipeline(Topology::TriangleList);
+	state.fragment = fragment.finish();
+	let mesh = Mesh { positions: vec![[-1.0, -1.0, 0.5, 1.0], [3.0, -1.0, 0.5, 1.0], [-1.0, 3.0, 0.5, 1.0]], colours: vec![white(); 3], instance_offset: [0.0; 4] };
+	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: 3, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
+	let run = |workers: &dyn Workers| {
+		let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![state.clone()], vec![draw], 96, 96).unwrap();
+		let mut colour = Colour::new(96, 96, 1, false);
+		let mut attachments = Attachments { colour: core::slice::from_mut(&mut colour), depth_stencil: None, viewport: viewport(96.0, 96.0), scissor: None };
+		frame::execute_with(&mut prepared, &mut attachments, &mesh, workers)
+	};
+	let reference = run(&frame::Serial);
+	assert!(reference.is_err(), "the right half samples a texture nobody supplies: {reference:?}");
+	for (name, pool) in [("threads(6)", &Threads(6) as &dyn Workers), ("backwards", &Backwards), ("rotating(4)", &Rotating(4))] {
+		assert_eq!(run(pool), reference, "{name}");
+	}
+}
+
+#[test]
+// A FRAME THROUGH A POOL ALLOCATES NOTHING ONCE WARMED, like the serial one: the lanes, the tiles
+// and the views they carry keep their storage from one frame to the next. Measured through the
+// rotating pool, which uses several lanes on this thread - the counter is thread-local, and a pool
+// that spawned threads would be counting its own allocations, not the frame's.
+fn a_warmed_frame_through_a_pool_asks_the_allocator_for_nothing() {
+	let scene = crowd(0x5EED_0005, 128, 96, 120);
+	let pool = Rotating(4);
+	let mut prepared = frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![scene.pipeline.clone()], scene.draws.clone(), scene.width, scene.height).unwrap();
+	let mut targets = vec![Colour::new(scene.width, scene.height, 4, false), Colour::new(scene.width, scene.height, 4, true)];
+	let mut depth = DepthStencil::new(scene.width, scene.height, 4, DepthFormat::Depth24Stencil8);
+	let mut once = |targets: &mut Vec<Colour>, depth: &mut DepthStencil| {
+		depth.clear(1.0, 0);
+		let mut attachments = Attachments { colour: targets, depth_stencil: Some(depth), viewport: viewport(scene.width as f32, scene.height as f32), scissor: scene.scissor };
+		frame::execute_with(&mut prepared, &mut attachments, &scene.mesh, &pool).unwrap()
+	};
+	let first = once(&mut targets, &mut depth);
+	once(&mut targets, &mut depth);
+	let before = crate::counted::count();
+	let third = once(&mut targets, &mut depth);
+	let after = crate::counted::count();
+	assert_eq!(after - before, 0, "a warmed frame through a pool allocated {} times", after - before);
+	assert_eq!(third, first, "and did exactly the same work");
+}
+
+#[test]
+// TILE-MAJOR STORAGE IS INVISIBLE: every pixel address reads back what was written to it, on
+// extents that are and are not multiples of a tile, and an address outside the target reads as
+// outside rather than as a neighbour.
+fn attachment_storage_answers_every_address_and_nothing_outside() {
+	for (width, height, samples) in [(1, 1, 1), (31, 33, 1), (64, 32, 4), (70, 45, 2)] {
+		let mut colour = Colour::new(width, height, samples, false);
+		let mut depth = DepthStencil::new(width, height, samples, DepthFormat::Depth32F);
+		for y in 0..height {
+			for x in 0..width {
+				for sample in 0..samples {
+					colour.set(x, y, sample, Vec4::new(x as f32, y as f32, sample as f32, 1.0));
+				}
+			}
+		}
+		for y in 0..height {
+			for x in 0..width {
+				for sample in 0..samples {
+					assert_eq!(colour.at(x, y, sample), Vec4::new(x as f32, y as f32, sample as f32, 1.0), "({x}, {y}, {sample}) on {width}x{height}x{samples}");
+				}
+			}
+		}
+		assert_eq!(colour.at(width, 0, 0), Vec4::ZERO, "one past the right edge is outside, not the next row");
+		assert_eq!(colour.at(0, height, 0), Vec4::ZERO, "one past the bottom is outside");
+		assert_eq!(colour.at(0, 0, samples), Vec4::ZERO, "one sample past the count is outside");
+		colour.set(width, 0, 0, Vec4::new(-1.0, -1.0, -1.0, -1.0));
+		assert_eq!(colour.at(0, 1.min(height - 1), 0).x, 0.0, "and a write past the right edge lands nowhere");
+		// EVERY TILE'S VIEW REACHES ITS OWN PIXELS: the views together cover every sample once.
+		let mut seen = 0;
+		for view in colour.tiles() {
+			let mut own = 0;
+			for y in 0..height {
+				for x in 0..width {
+					for sample in 0..samples {
+						if view.at(x, y, sample) == Vec4::new(x as f32, y as f32, sample as f32, 1.0) {
+							own += 1;
+						}
+					}
+				}
+			}
+			seen += own;
+		}
+		assert_eq!(seen, (width * height * samples) as usize, "the tiles partition the attachment");
+		assert_eq!(depth.tiles().count() as u32, width.div_ceil(raster::TILE) * height.div_ceil(raster::TILE));
+	}
+}

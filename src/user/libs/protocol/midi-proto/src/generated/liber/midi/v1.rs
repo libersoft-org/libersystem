@@ -3,11 +3,16 @@
 //! LiberSystem MIDI - MIDI 1.0 receive endpoints, as ordered bounded chunks with their host receipt time and
 //! cable, for components PermissionManager granted one endpoint.
 //!
-//! THREE PARTIES. An ordinary client holds `midi`: it lists endpoints and can open nothing - receiving needs a
-//! grant, and output and UMP are not supported at all yet. A client PermissionManager granted `midi-input`
-//! holds a receiver minted through the private `midi-admin` for ONE endpoint of one publication and the life
-//! of one launched component. A PROVIDER - the USB MIDI class module, or the in-guest fixture - serves
-//! `liber:midi-device@1`, and MidiService is its one consumer.
+//! THREE PARTIES. An ordinary client holds `midi`: it lists endpoints and can open nothing - receiving and
+//! sending each need a grant, and UMP is not supported at all yet. A client PermissionManager granted
+//! `midi-input` holds a receiver, and one granted `midi-output` a sender, minted through the private
+//! `midi-admin` for ONE endpoint of one publication and the life of one launched component. A PROVIDER - the
+//! USB MIDI class module, or the in-guest fixture - serves `liber:midi-device@1`, and MidiService is its one
+//! consumer.
+//!
+//! SENDING IS THE SAME CHUNKS THE OTHER WAY. A sender hands over complete short messages and SysEx fragments
+//! under message numbers of its own choosing; MidiService checks and encodes them and answers once the device
+//! has taken them. There is no time to send AT - USB-MIDI 1.0 carries none - and no output scheduler.
 //!
 //! CHUNKS, NOT MESSAGES. A chunk carries at most three MIDI bytes: a complete short message, a raw byte, or a
 //! FRAGMENT of a System Exclusive message - start, continuation, end, or start and end at once - under a
@@ -208,7 +213,7 @@ pub struct MidiEndpoint {
 	pub direction: MidiDirection,
 	/// Cables 0..cables-1 are this endpoint's; at most 16.
 	pub cables: u8,
-	/// A receiver holds it now.
+	/// A receiver holds it now - or, on a transmit endpoint, a sender.
 	pub receiving: bool,
 }
 
@@ -946,8 +951,8 @@ impl MidiReceiverStatus {
 	}
 }
 
-/// INVENTORY: the endpoints and what they are. `open` exists to say no precisely: receiving needs a grant,
-/// and output and UMP are unsupported.
+/// INVENTORY: the endpoints and what they are. `open` exists to say no precisely: receiving and sending each
+/// need a grant, a direction the endpoint does not have is invalid, and UMP is unsupported.
 // interface `midi` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod midi {
 	use super::*;
@@ -1682,6 +1687,377 @@ pub mod midi_input {
 	}
 }
 
+/// ONE SENDER, on the one transmit endpoint this connection was minted for, for as long as its owner lives.
+// interface `midi-output` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod midi_output {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_ENDPOINT: u16 = 1;
+	pub const OP_SEND: u16 = 2;
+	pub const OP_STOP: u16 = 3;
+
+	pub trait Service {
+		fn endpoint(&mut self) -> Result<MidiEndpoint, Error>;
+		/// Send these chunks, in order, as one batch: complete short messages, and SysEx fragments - three bytes
+		/// each but the one that ends its message. CHECKED WHOLE BEFORE ANY OF IT IS SENT, and answered once the
+		/// device has taken all of it; a refused batch sends nothing and leaves every open message as it was.
+		fn send(&mut self, chunks: Vec<MidiChunk>) -> Result<(), Error>;
+		/// Stop sending; a message the sender left open stays unfinished, and the slot is freed.
+		fn stop(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:midi")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_ENDPOINT => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.endpoint();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v29) => {
+							w.u8(1)?;
+							v29.write(w)?;
+						}
+						Err(v30) => {
+							w.u8(0)?;
+							v30.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SEND => {
+				let chunks = {
+					let v31 = r.u16()? as usize;
+					let v31 = (v31 <= 64).then_some(v31)?;
+					let mut v32 = Vec::new();
+					v32.try_reserve_exact(v31).ok()?;
+					for _ in 0..v31 {
+						v32.push(MidiChunk::read(r)?);
+					}
+					v32
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.send(chunks);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v33) => {
+							w.u8(1)?;
+						}
+						Err(v34) => {
+							w.u8(0)?;
+							v34.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_STOP => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.stop();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v35) => {
+							w.u8(1)?;
+						}
+						Err(v36) => {
+							w.u8(0)?;
+							v36.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn endpoint(&mut self) -> Option<Result<MidiEndpoint, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ENDPOINT)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(MidiEndpoint::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn send(&mut self, chunks: &[MidiChunk]) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SEND)?;
+			w.u32(corr)?;
+			if chunks.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(chunks.len() as u16)?;
+			for v37 in chunks.iter() {
+				v37.write(w)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn stop(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STOP)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_midi_midi_output_endpoint")]
+	fn channel_invoke_endpoint(chan: u64) -> Option<Result<MidiEndpoint, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.endpoint()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_midi_midi_output_send")]
+	fn channel_invoke_send(chan: u64, chunks: &[MidiChunk]) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.send(chunks)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_midi_midi_output_stop")]
+	fn channel_invoke_stop(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.stop()
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MidiGrant {
 	pub connection: u64,
@@ -1750,11 +2126,15 @@ pub mod midi_admin {
 
 	pub const OP_MINT: u16 = 1;
 	pub const OP_REVOKE: u16 = 2;
+	pub const OP_MINT_OUTPUT: u16 = 3;
 
 	pub trait Service {
 		fn mint(&mut self, alias: String, endpoint: u32, owner: u64) -> Result<MidiGrant, Error>;
 		/// End every receiver on one endpoint; answers how many.
 		fn revoke(&mut self, endpoint: MidiEndpointId) -> Result<u32, Error>;
+		/// The same for a SENDER on one transmit endpoint: one per endpoint, ended by close, revocation, owner death
+		/// or device replacement.
+		fn mint_output(&mut self, alias: String, endpoint: u32, owner: u64) -> Result<MidiGrant, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1779,8 +2159,8 @@ pub mod midi_admin {
 		match op {
 			OP_MINT => {
 				let alias = {
-					let v29 = r.string_lp()?;
-					(v29.len() <= 32).then_some(v29)?
+					let v38 = r.string_lp()?;
+					(v38.len() <= 32).then_some(v38)?
 				};
 				let endpoint = r.u32()?;
 				let owner = {
@@ -1794,13 +2174,13 @@ pub mod midi_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v30) => {
+						Ok(v39) => {
 							w.u8(1)?;
-							v30.write(w)?;
+							v39.write(w)?;
 						}
-						Err(v31) => {
+						Err(v40) => {
 							w.u8(0)?;
-							v31.write(w)?;
+							v40.write(w)?;
 						}
 					}
 					Some(())
@@ -1831,13 +2211,58 @@ pub mod midi_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v32) => {
+						Ok(v41) => {
 							w.u8(1)?;
-							w.u32(*v32)?;
+							w.u32(*v41)?;
 						}
-						Err(v33) => {
+						Err(v42) => {
 							w.u8(0)?;
-							v33.write(w)?;
+							v42.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_MINT_OUTPUT => {
+				let alias = {
+					let v43 = r.string_lp()?;
+					(v43.len() <= 32).then_some(v43)?
+				};
+				let endpoint = r.u32()?;
+				let owner = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.mint_output(alias, endpoint, owner);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v44) => {
+							w.u8(1)?;
+							v44.write(w)?;
+						}
+						Err(v45) => {
+							w.u8(0)?;
+							v45.write(w)?;
 						}
 					}
 					Some(())
@@ -2012,6 +2437,42 @@ pub mod midi_admin {
 			}
 			decoded
 		}
+		pub fn mint_output(&mut self, alias: &str, endpoint: &u32, owner: &u64) -> Option<Result<MidiGrant, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_MINT_OUTPUT)?;
+			w.u32(corr)?;
+			w.bytes_lp(alias.as_bytes())?;
+			w.u32(*endpoint)?;
+			w.set_handle(*owner)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(MidiGrant::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -2028,6 +2489,14 @@ pub mod midi_admin {
 	fn channel_invoke_revoke(chan: u64, endpoint: &MidiEndpointId) -> Option<Result<u32, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.revoke(endpoint)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_midi_midi_admin_mint_output")]
+	fn channel_invoke_mint_output(chan: u64, alias: &str, endpoint: &u32, owner: &u64) -> Option<Result<MidiGrant, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.mint_output(alias, endpoint, owner)
 	}
 }
 
@@ -2324,20 +2793,20 @@ impl MidiChunk {
 		out.push(',');
 		out.push_str("\"bytes\":");
 		out.push('[');
-		let mut v35 = true;
-		for v34 in self.bytes.iter() {
-			if !v35 {
+		let mut v47 = true;
+		for v46 in self.bytes.iter() {
+			if !v47 {
 				out.push(',');
 			}
-			v35 = false;
-			let _ = write!(out, "{}", v34);
+			v47 = false;
+			let _ = write!(out, "{}", v46);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"sysex-message\":");
 		match &self.sysex_message {
-			Some(v36) => {
-				let _ = write!(out, "{}", v36);
+			Some(v48) => {
+				let _ = write!(out, "{}", v48);
 			}
 			None => {
 				out.push_str("null");
@@ -2369,20 +2838,20 @@ impl MidiChunk {
 		out.push_str(", ");
 		out.push_str("bytes=");
 		out.push('[');
-		let mut v38 = true;
-		for v37 in self.bytes.iter() {
-			if !v38 {
+		let mut v50 = true;
+		for v49 in self.bytes.iter() {
+			if !v50 {
 				out.push_str(", ");
 			}
-			v38 = false;
-			let _ = write!(out, "{}", v37);
+			v50 = false;
+			let _ = write!(out, "{}", v49);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("sysex-message=");
 		match &self.sysex_message {
-			Some(v39) => {
-				let _ = write!(out, "{}", v39);
+			Some(v51) => {
+				let _ = write!(out, "{}", v51);
 			}
 			None => {
 				out.push('-');
@@ -2412,13 +2881,13 @@ impl MidiChunk {
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bytes");
 		crate::codec::cbor::array(out, self.bytes.len());
-		for v40 in self.bytes.iter() {
-			crate::codec::cbor::uint(out, *v40 as u64);
+		for v52 in self.bytes.iter() {
+			crate::codec::cbor::uint(out, *v52 as u64);
 		}
 		crate::codec::cbor::text(out, "sysex-message");
 		match &self.sysex_message {
-			Some(v41) => {
-				crate::codec::cbor::uint(out, *v41 as u64);
+			Some(v53) => {
+				crate::codec::cbor::uint(out, *v53 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -2595,8 +3064,8 @@ impl MidiFault {
 		out.push('{');
 		out.push_str("\"cable\":");
 		match &self.cable {
-			Some(v42) => {
-				let _ = write!(out, "{}", v42);
+			Some(v54) => {
+				let _ = write!(out, "{}", v54);
 			}
 			None => {
 				out.push_str("null");
@@ -2611,8 +3080,8 @@ impl MidiFault {
 		out.push('{');
 		out.push_str("cable=");
 		match &self.cable {
-			Some(v43) => {
-				let _ = write!(out, "{}", v43);
+			Some(v55) => {
+				let _ = write!(out, "{}", v55);
 			}
 			None => {
 				out.push('-');
@@ -2627,8 +3096,8 @@ impl MidiFault {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "cable");
 		match &self.cable {
-			Some(v44) => {
-				crate::codec::cbor::uint(out, *v44 as u64);
+			Some(v56) => {
+				crate::codec::cbor::uint(out, *v56 as u64);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -2657,58 +3126,58 @@ impl MidiItem {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			MidiItem::Chunk(v45) => {
+			MidiItem::Chunk(v57) => {
 				out.push_str("{\"chunk\":");
-				v45.to_json_into(out);
+				v57.to_json_into(out);
 				out.push('}');
 			}
-			MidiItem::Aborted(v46) => {
+			MidiItem::Aborted(v58) => {
 				out.push_str("{\"aborted\":");
-				v46.to_json_into(out);
+				v58.to_json_into(out);
 				out.push('}');
 			}
-			MidiItem::Fault(v47) => {
+			MidiItem::Fault(v59) => {
 				out.push_str("{\"fault\":");
-				v47.to_json_into(out);
+				v59.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			MidiItem::Chunk(v48) => {
+			MidiItem::Chunk(v60) => {
 				out.push_str("chunk(");
-				v48.to_text_into(out);
+				v60.to_text_into(out);
 				out.push(')');
 			}
-			MidiItem::Aborted(v49) => {
+			MidiItem::Aborted(v61) => {
 				out.push_str("aborted(");
-				v49.to_text_into(out);
+				v61.to_text_into(out);
 				out.push(')');
 			}
-			MidiItem::Fault(v50) => {
+			MidiItem::Fault(v62) => {
 				out.push_str("fault(");
-				v50.to_text_into(out);
+				v62.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			MidiItem::Chunk(v51) => {
+			MidiItem::Chunk(v63) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "chunk");
-				v51.to_cbor_into(out);
+				v63.to_cbor_into(out);
 			}
-			MidiItem::Aborted(v52) => {
+			MidiItem::Aborted(v64) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "aborted");
-				v52.to_cbor_into(out);
+				v64.to_cbor_into(out);
 			}
-			MidiItem::Fault(v53) => {
+			MidiItem::Fault(v65) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "fault");
-				v53.to_cbor_into(out);
+				v65.to_cbor_into(out);
 			}
 		}
 	}
@@ -2780,20 +3249,20 @@ impl MidiBatch {
 		out.push(',');
 		out.push_str("\"events\":");
 		out.push('[');
-		let mut v55 = true;
-		for v54 in self.events.iter() {
-			if !v55 {
+		let mut v67 = true;
+		for v66 in self.events.iter() {
+			if !v67 {
 				out.push(',');
 			}
-			v55 = false;
-			v54.to_json_into(out);
+			v67 = false;
+			v66.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"end\":");
 		match &self.end {
-			Some(v56) => {
-				v56.to_json_into(out);
+			Some(v68) => {
+				v68.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -2808,20 +3277,20 @@ impl MidiBatch {
 		out.push_str(", ");
 		out.push_str("events=");
 		out.push('[');
-		let mut v58 = true;
-		for v57 in self.events.iter() {
-			if !v58 {
+		let mut v70 = true;
+		for v69 in self.events.iter() {
+			if !v70 {
 				out.push_str(", ");
 			}
-			v58 = false;
-			v57.to_text_into(out);
+			v70 = false;
+			v69.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("end=");
 		match &self.end {
-			Some(v59) => {
-				v59.to_text_into(out);
+			Some(v71) => {
+				v71.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -2835,13 +3304,13 @@ impl MidiBatch {
 		self.source.to_cbor_into(out);
 		crate::codec::cbor::text(out, "events");
 		crate::codec::cbor::array(out, self.events.len());
-		for v60 in self.events.iter() {
-			v60.to_cbor_into(out);
+		for v72 in self.events.iter() {
+			v72.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "end");
 		match &self.end {
-			Some(v61) => {
-				v61.to_cbor_into(out);
+			Some(v73) => {
+				v73.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);
@@ -2879,8 +3348,8 @@ impl MidiReceiverStatus {
 		out.push(',');
 		out.push_str("\"end\":");
 		match &self.end {
-			Some(v62) => {
-				v62.to_json_into(out);
+			Some(v74) => {
+				v74.to_json_into(out);
 			}
 			None => {
 				out.push_str("null");
@@ -2901,8 +3370,8 @@ impl MidiReceiverStatus {
 		out.push_str(", ");
 		out.push_str("end=");
 		match &self.end {
-			Some(v63) => {
-				v63.to_text_into(out);
+			Some(v75) => {
+				v75.to_text_into(out);
 			}
 			None => {
 				out.push('-');
@@ -2920,8 +3389,8 @@ impl MidiReceiverStatus {
 		crate::codec::cbor::uint(out, self.queued_bytes as u64);
 		crate::codec::cbor::text(out, "end");
 		match &self.end {
-			Some(v64) => {
-				v64.to_cbor_into(out);
+			Some(v76) => {
+				v76.to_cbor_into(out);
 			}
 			None => {
 				crate::codec::cbor::null(out);

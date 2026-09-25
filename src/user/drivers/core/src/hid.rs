@@ -545,6 +545,273 @@ pub fn parse(desc: &[u8]) -> Layout {
 	Layout { segs, uses_ids, max_bytes }
 }
 
+// ------------------------------------------------------------------ every field, of every report kind
+//
+// THE SAME DESCRIPTOR, READ FOR WHAT A DEVICE THAT IS NOT AN INPUT DEVICE SAYS. `parse` keeps the input fields
+// of the pages the input path decodes, and drops the rest after counting their bits - which is right for a
+// keyboard and leaves nothing for a UPS, whose values are on the Power Device and Battery System pages and
+// half of them in FEATURE reports a host reads with GET_REPORT. `fields` is the generic table: every variable
+// field of every Input, Output and Feature item, with its report, its bits, its logical range and null state,
+// its unit, and the collections it sits in - so a class that maps usages to meaning maps them over this, and
+// the parsing is not written a second time.
+//
+// BOUNDED LIKE `parse`: the collection depth and the push stack by the same limits, a report body by the same
+// sixty-four bytes, and the table by `MAX_FIELDS`. Array fields and constant padding advance their cursor and
+// are not entered: nothing that reads this table reads an array, and a vendor usage is kept exactly as a
+// usage with no meaning attached.
+
+/// Which report a field is in: each kind has its own layout under the same report ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportKind {
+	Input,
+	Output,
+	Feature,
+}
+
+impl ReportKind {
+	/// The report type GET_REPORT and SET_REPORT name in their `wValue`'s high byte.
+	pub fn request_type(self) -> u16 {
+		match self {
+			ReportKind::Input => 1,
+			ReportKind::Output => 2,
+			ReportKind::Feature => 3,
+		}
+	}
+}
+
+/// The most fields `fields` records.
+pub const MAX_FIELDS: usize = 256;
+
+/// One variable field of one report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldInfo {
+	pub kind: ReportKind,
+	pub report_id: u8,
+	/// Where the field starts in the report BODY - after the report ID byte, when the device uses them.
+	pub bit_offset: u32,
+	pub size: u32,
+	/// Page-extended: the usage page in the high half.
+	pub usage: u32,
+	pub logical_min: i32,
+	pub logical_max: i32,
+	pub null_state: bool,
+	pub unit: u32,
+	pub unit_exponent: i8,
+	/// The usage of the application collection the field is in, and of the innermost collection around it.
+	pub application: u32,
+	pub collection: u32,
+	/// Which occurrence of that innermost collection's usage this is: the second Outlet is 1.
+	pub occurrence: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldTable {
+	pub fields: Vec<FieldInfo>,
+	pub uses_ids: bool,
+	// The body length of each (kind, report id), in bits.
+	lengths: Vec<(ReportKind, u8, u32)>,
+}
+
+impl FieldTable {
+	/// How many bytes the body of this report is - the ID byte not counted.
+	pub fn body_bytes(&self, kind: ReportKind, report_id: u8) -> u32 {
+		self.lengths.iter().find(|&&(k, id, _)| k == kind && id == report_id).map_or(0, |&(_, _, bits)| bits.div_ceil(8))
+	}
+
+	/// The report IDs that have a report of this kind.
+	pub fn reports(&self, kind: ReportKind) -> impl Iterator<Item = u8> + '_ {
+		self.lengths.iter().filter(move |&&(k, _, bits)| k == kind && bits > 0).map(|&(_, id, _)| id)
+	}
+}
+
+/// Why a descriptor's field table was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldsRefused {
+	/// An item runs past the descriptor.
+	Truncated,
+	/// Collections nested past `MAX_COLLECTION_DEPTH`.
+	TooDeep,
+	/// A report past sixty-four bytes, or more fields than `MAX_FIELDS`.
+	TooLarge,
+}
+
+/// Every variable field of every report the descriptor declares.
+pub fn fields(desc: &[u8]) -> Result<FieldTable, FieldsRefused> {
+	let mut out: Vec<FieldInfo> = Vec::new();
+	let mut g: Globals = Globals::default();
+	let mut stack: Vec<Globals> = Vec::new();
+	let mut usages: Vec<u32> = Vec::new();
+	let mut usage_min: u32 = 0;
+	let mut usage_max: u32 = 0;
+	let mut lengths: Vec<(ReportKind, u8, u32)> = Vec::new();
+	let mut uses_ids = false;
+	// The open collections: their kind (0 physical, 1 application, 2 logical...), usage and occurrence.
+	let mut collections: Vec<(u32, u32, u16)> = Vec::new();
+	let mut seen: Vec<(u32, u16)> = Vec::new();
+	let mut i: usize = 0;
+	while i < desc.len() {
+		let prefix: u8 = desc[i];
+		if prefix == 0xfe {
+			let dlen: usize = *desc.get(i + 1).ok_or(FieldsRefused::Truncated)? as usize;
+			i = i.checked_add(3 + dlen).ok_or(FieldsRefused::Truncated)?;
+			continue;
+		}
+		let dlen: usize = match prefix & 3 {
+			3 => 4,
+			n => n as usize,
+		};
+		if i + 1 + dlen > desc.len() {
+			return Err(FieldsRefused::Truncated);
+		}
+		let mut data: u32 = 0;
+		for (n, &b) in desc[i + 1..i + 1 + dlen].iter().enumerate() {
+			data |= (b as u32) << (n * 8);
+		}
+		let sdata: i32 = match dlen {
+			1 => data as u8 as i8 as i32,
+			2 => data as u16 as i16 as i32,
+			_ => data as i32,
+		};
+		let tag: u8 = prefix >> 4;
+		match prefix >> 2 & 3 {
+			0 => {
+				match tag {
+					10 => {
+						if collections.len() >= MAX_COLLECTION_DEPTH as usize {
+							return Err(FieldsRefused::TooDeep);
+						}
+						let usage = usages.first().copied().unwrap_or(0);
+						let occurrence = match seen.iter_mut().find(|(seen_usage, _)| *seen_usage == usage) {
+							Some((_, count)) => {
+								*count = count.saturating_add(1);
+								*count
+							}
+							None => {
+								seen.push((usage, 0));
+								0
+							}
+						};
+						collections.push((data, usage, occurrence));
+					}
+					12 => {
+						collections.pop();
+					}
+					8 | 9 | 11 => {
+						let kind = match tag {
+							8 => ReportKind::Input,
+							9 => ReportKind::Output,
+							_ => ReportKind::Feature,
+						};
+						let at = match lengths.iter().position(|&(k, id, _)| k == kind && id == g.id) {
+							Some(at) => at,
+							None => {
+								lengths.push((kind, g.id, 0));
+								lengths.len() - 1
+							}
+						};
+						let cursor = lengths[at].2;
+						let bits = g.size.saturating_mul(g.count);
+						let end = cursor.saturating_add(bits);
+						if end > MAX_REPORT_BYTES * 8 {
+							return Err(FieldsRefused::TooLarge);
+						}
+						// Constant items are padding, and array items are not entered - see above.
+						if data & INPUT_CONSTANT == 0 && data & INPUT_VARIABLE != 0 && (1..=32).contains(&g.size) {
+							let application = collections.iter().find(|&&(kind, _, _)| kind == 1).map_or(0, |&(_, usage, _)| usage);
+							let (collection, occurrence) = collections.last().map_or((0, 0), |&(_, usage, occurrence)| (usage, occurrence));
+							let logical_max: i32 = if g.logical_min >= 0 && g.logical_max < g.logical_min { g.logical_max_raw as i32 } else { g.logical_max };
+							for n in 0..g.count {
+								if out.len() >= MAX_FIELDS {
+									return Err(FieldsRefused::TooLarge);
+								}
+								let usage = if (n as usize) < usages.len() {
+									usages[n as usize]
+								} else if let Some(&last) = usages.last() {
+									last
+								} else if usage_min != 0 || usage_max != 0 {
+									usage_min.saturating_add(n).min(usage_max)
+								} else {
+									0
+								};
+								out.push(FieldInfo { kind, report_id: g.id, bit_offset: cursor + n * g.size, size: g.size, usage, logical_min: g.logical_min, logical_max, null_state: data & (1 << 6) != 0, unit: g.unit, unit_exponent: g.unit_exponent, application, collection, occurrence });
+							}
+						}
+						lengths[at].2 = end;
+					}
+					_ => {}
+				}
+				usages.clear();
+				usage_min = 0;
+				usage_max = 0;
+			}
+			1 => match tag {
+				0 => g.page = data as u16,
+				1 => g.logical_min = sdata,
+				2 => {
+					g.logical_max = sdata;
+					g.logical_max_raw = data;
+				}
+				5 => g.unit_exponent = nibble_exponent(data),
+				6 => g.unit = data,
+				7 => g.size = data,
+				8 => {
+					g.id = data as u8;
+					uses_ids = true;
+				}
+				9 => g.count = data,
+				10 => {
+					if stack.len() < MAX_PUSH_DEPTH {
+						stack.push(g);
+					}
+				}
+				11 => {
+					if let Some(saved) = stack.pop() {
+						g = saved;
+					}
+				}
+				_ => {}
+			},
+			2 => match tag {
+				0 => {
+					if usages.len() < MAX_FIELDS {
+						usages.push(extended(g.page, data, dlen));
+					}
+				}
+				1 => usage_min = extended(g.page, data, dlen),
+				2 => usage_max = extended(g.page, data, dlen),
+				_ => {}
+			},
+			_ => {}
+		}
+		i += 1 + dlen;
+	}
+	Ok(FieldTable { fields: out, uses_ids, lengths })
+}
+
+/// The raw bits of one field of a report body.
+pub fn read_field(body: &[u8], info: &FieldInfo) -> u32 {
+	field(body, info.bit_offset, info.size)
+}
+
+/// Write `raw` into one field of a report body, leaving every other bit as it was. False when the field
+/// does not fit the body.
+pub fn write_field(body: &mut [u8], info: &FieldInfo, raw: u32) -> bool {
+	if info.size == 0 || info.size > 32 || (info.bit_offset + info.size).div_ceil(8) as usize > body.len() {
+		return false;
+	}
+	for n in 0..info.size {
+		let bit = info.bit_offset + n;
+		let byte = (bit / 8) as usize;
+		let mask = 1u8 << (bit % 8);
+		if raw >> n & 1 != 0 {
+			body[byte] |= mask;
+		} else {
+			body[byte] &= !mask;
+		}
+	}
+	true
+}
+
 // The layout of the fixed HID boot-keyboard report (modifier bitmap, one pad
 // byte, six-key array), built through the parser itself - the fallback for a
 // boot-subclass keyboard whose report descriptor cannot be read.

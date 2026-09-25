@@ -924,8 +924,23 @@ qemu_attach_xhci() {
 	# assigns addresses in argument order, so a device inserted among the others renumbers the bus
 	# the driver oracles print; appended last, it changes nothing for a run that did not ask for it -
 	# and no gate sets `USB_GADGET`, so today that is every run.
+	#
+	# OR ON ROOT PORT 3, WHEN THE RUN SAYS SO (`USB_GADGET_PORT`). The hub above is a full-speed hub and this
+	# driver does not read a hub's own port changes, so a device behind it that leaves is a device the guest
+	# never sees leave - and the service-backed classes' oracles unplug theirs mid-job on purpose. Port 3 is
+	# the root port nothing else here takes: the hub is on 1, the stick is given 2 and the UAS device 4.
 	if [[ -n "${USB_GADGET_ID:-}" ]]; then
-		arr+=(-device "usb-host,bus=usb.0,port=1.6,vendorid=0x${USB_GADGET_ID%%:*},productid=0x${USB_GADGET_ID##*:}")
+		arr+=(-device "usb-host,bus=usb.0,port=${USB_GADGET_PORT:-1.6},vendorid=0x${USB_GADGET_ID%%:*},productid=0x${USB_GADGET_ID##*:}")
+	fi
+	# QEMU'S OWN STILL IMAGE DEVICE, when a run asks for the PTP oracle: `usb-mtp` over a directory the run made,
+	# read-only, on the same root port - see `test-kernel.sh`.
+	if [[ -n "${USB_MTP_ROOT:-}" ]]; then
+		arr+=(-device "usb-mtp,bus=usb.0,port=3,rootdir=$USB_MTP_ROOT,readonly=on,desc=LiberSystem harness camera")
+	fi
+	# A DEVICE PLAYED BY A PROCESS OVER `usb-redir`, when a run asks for one: the chardev connects to the socket
+	# `test-kernel.sh` made the process listen on, and the device goes on the same root port.
+	if [[ -n "${USB_REDIR_SOCKET:-}" ]]; then
+		arr+=(-chardev "socket,id=usbredir0,path=$USB_REDIR_SOCKET" -device "usb-redir,chardev=usbredir0,bus=usb.0,port=3")
 	fi
 	# A CDC ETHERNET ADAPTER ON THE SAME HUB, for the suite only.
 	#
@@ -2052,9 +2067,25 @@ qemu_run_x86_64() {
 				echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
 				exit 1
 			}
+			# FILES A GATE PUTS ON THIS RUN'S STICK - its copy only, so the shared fixture never holds them.
+			if [[ -n "${USB_STICK_EXTRA:-}" ]]; then
+				local extra
+				for extra in $USB_STICK_EXTRA; do
+					[[ -f "$extra" ]] && mcopy -o -i "$usb_run_disk" "$extra" "::${extra##*/}" || {
+						echo "qemu-run: $extra could not be put on this run's USB stick" >&2
+						exit 1
+					}
+				done
+			fi
 			qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
 		fi
 		qemu_attach_xhci qemu_args "$usb_storage_id" "${TEST:-0}"
+		# A TPM, WHEN A RUN ASKS FOR ONE: QEMU's CRB or FIFO front-end at the platform's fixed address, described in
+		# the ACPI `TPM2` table QEMU builds, with the `swtpm` `test-kernel.sh` started behind it. Not a PCI device,
+		# so it renumbers nothing.
+		if [[ -n "${TPM_SOCKET:-}" && ("${TPM_FRONTEND:-}" == "crb" || "${TPM_FRONTEND:-}" == "tis") ]]; then
+			qemu_args+=(-chardev "socket,id=chrtpm,path=$TPM_SOCKET" -tpmdev "emulator,id=tpm0,chardev=chrtpm" -device "tpm-$TPM_FRONTEND,tpmdev=tpm0")
+		fi
 
 		# Keep media disks after USB in PCI discovery order, matching the historical
 		# runner and the volume/device inventory expected by the boot chain.

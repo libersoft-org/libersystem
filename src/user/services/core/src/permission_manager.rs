@@ -134,7 +134,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // There is no second classification: every capability the schema declares is walked, because the
 // manager is the one owner of every grant, and a capability it has no client for is a typed failed
 // grant at launch rather than a quiet omission from this list.
-const VOCABULARY: [Capability; 44] = [
+const VOCABULARY: [Capability; 45] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -198,10 +198,11 @@ const VOCABULARY: [Capability; 44] = [
 	// of the modem authorities, which is what lets the camera gate's failing launch fail on a LATER grant.
 	Capability::Camera,
 	Capability::CameraCapture,
-	// MIDI: inventory resolved by name, and one receiver minted per launch for one configured endpoint. Ahead of
-	// the modem authorities for the same reason as the cameras.
+	// MIDI: inventory resolved by name, and one receiver - or one sender - minted per launch for one configured
+	// endpoint. Ahead of the modem authorities for the same reason as the cameras.
 	Capability::Midi,
 	Capability::MidiInput,
+	Capability::MidiOutput,
 	// MODEMS: observation resolved by name, and the three authorities over one modem - data, subscriber
 	// identity, management - each minted per launch for one configured modem and the SIM in it.
 	Capability::ModemState,
@@ -328,6 +329,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// no component receives by default. The READ comes with it for the reason `lsdev` holds both: listing
 		// and scanning are how an operator finds what to pair.
 		b"btctl" => Some(granted("btctl", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator])),
+		// THE FIRMWARE-DOWNLOAD REQUESTER: the files it reads its image from, and ONE administrative request
+		// connection whose scope `admin_policy` fixes - firmware download, on `dfu:` targets, nothing else. Neither
+		// writes anything: a person on the protected screen does, or nothing does.
+		b"dfu" => Some(granted("dfu", alloc::vec![Capability::Volumes, Capability::AdminRequest])),
 		// THE CONFORMANCE RUN HOLDS THE READ AND NOTHING ELSE. It reaches its face through the
 		// catalogue, draws into memory it allocated itself, and prints its verdict on the console it
 		// was handed - so it needs no volume, no display and no scan authority.
@@ -396,7 +401,7 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// THE MIDI GATE'S PROBES, development-only like the fixture they drive. `midicheck` drives the scenario
 		// with the fixture's control endpoint, inventory and a receiver on endpoint 0; `midihold` is the second receiver, on endpoint 1; `midiread` holds inventory ALONE; `midifail`'s
 		// launch fails after its receiver was minted.
-		b"midicheck" => Some(granted("midicheck", alloc::vec![Capability::FixtureControl, Capability::Midi, Capability::MidiInput])),
+		b"midicheck" => Some(granted("midicheck", alloc::vec![Capability::FixtureControl, Capability::Midi, Capability::MidiInput, Capability::MidiOutput])),
 		b"midihold" => Some(granted("midihold", alloc::vec![Capability::MidiInput])),
 		b"midiread" => Some(granted("midiread", alloc::vec![Capability::Midi])),
 		b"midifail" => Some(granted("midifail", alloc::vec![Capability::MidiInput, Capability::ModemIdentity])),
@@ -577,6 +582,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::CameraCapture => b"CAMERACAPTURE",
 		Capability::Midi => CAP_MIDI,
 		Capability::MidiInput => b"MIDIINPUT",
+		Capability::MidiOutput => b"MIDIOUTPUT",
 		Capability::Spool => CAP_SPOOL,
 		Capability::MediaImport => CAP_MEDIA_IMPORT,
 		Capability::AdminRequest => b"ADMINREQUEST",
@@ -725,7 +731,7 @@ impl Clients {
 			Capability::Camera => self.camera,
 			Capability::CameraCapture => 0,
 			Capability::Midi => self.midi,
-			Capability::MidiInput => 0,
+			Capability::MidiInput | Capability::MidiOutput => 0,
 			Capability::Spool => self.spool,
 			Capability::MediaImport => self.media_import,
 			// MINTED PER LAUNCH AND BOUND TO ITS TASK, and never from here: a path with no task - the dynamic
@@ -894,6 +900,28 @@ fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: 
 				_ => 0,
 			}
 		}
+		// ONE MIDI SENDER, the same way: for this component and this task, on the transmit endpoint its policy
+		// names, ending with the task however its endpoint is copied.
+		Capability::MidiOutput => {
+			let Some((alias, endpoint)) = midi_output_policy(component) else { return 0 };
+			let Some(admin) = connect_or_resolve(&mut clients.midi_admin, clients.broker, CAP_MIDI_ADMIN) else { return 0 };
+			let owner: i64 = duplicate(task, RIGHT_WAIT | RIGHT_TRANSFER);
+			if owner < 0 {
+				close(admin);
+				return 0;
+			}
+			let minted = midi_admin::Client::new(ChannelTransport { chan: admin }).mint_output(alias, &endpoint, &(owner as u64));
+			close(admin);
+			match minted {
+				Some(Ok(minted)) => {
+					clients.grant_detail = alloc::format!("midi slot {} generation {} binding {} endpoint {} sender {}", minted.source.slot, minted.source.generation, minted.source.binding_generation, minted.source.endpoint, minted.source.receiver_generation);
+					let narrowed = duplicate(minted.connection, GRANT_RIGHTS);
+					close(minted.connection);
+					if narrowed > 0 { narrowed as u64 } else { 0 }
+				}
+				_ => 0,
+			}
+		}
 		// AN ADMINISTRATIVE REQUEST CONNECTION, for this component and this task. The policy names the actions
 		// and the target prefix it may ask about; AdminService records them with the connection, and binds it to
 		// the task with an observer that may WAIT and nothing more - no `manage`, no `duplicate`, no process
@@ -957,6 +985,19 @@ fn midi_policy(component: &str) -> Option<(&'static str, u32)> {
 			"midicheck" | "midifail" => return Some(("fixture", 0)),
 			"midihold" => return Some(("fixture", 1)),
 			_ => {}
+		}
+	}
+	let _ = component;
+	None
+}
+
+// WHICH MIDI DEVICE AND TRANSMIT ENDPOINT A COMPONENT'S SENDER IS FOR. The default is none.
+fn midi_output_policy(component: &str) -> Option<(&'static str, u32)> {
+	{
+		// THE MIDI GATE'S SENDER: the fixture's transmit endpoint, which plays back on the endpoint its receiver
+		// reads.
+		if component == "midicheck" {
+			return Some(("fixture", 2));
 		}
 	}
 	let _ = component;

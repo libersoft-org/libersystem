@@ -1,9 +1,10 @@
 //! LiberSystem MIDI devices - the provider contract a `midi` publication serves to MidiService.
 //!
-//! A PROVIDER MOVES PACKETS; THE SERVICE DECODES. The USB MIDI class module, and the in-guest fixture before
-//! it, deliver USB-MIDI 1.0 event packets exactly as the transport completed them - at most 64 to a batch,
-//! with the host time the completion became available - and MidiService decodes them with the driver
-//! library's staged decoder. No client ever sees a raw packet.
+//! A PROVIDER MOVES PACKETS; THE SERVICE DECODES AND ENCODES. The USB MIDI class module, and the in-guest
+//! fixture before it, deliver USB-MIDI 1.0 event packets exactly as the transport completed them - at most 64
+//! to a batch, with the host time the completion became available - and MidiService decodes them with the
+//! driver library's staged decoder. The other way, MidiService encodes with the same library and a provider
+//! puts the packets on the wire as they are. No client ever sees or writes a raw packet.
 
 package liber:midi-device@1;
 
@@ -20,10 +21,17 @@ record midi-open {
 	bounds:                midi-bounds,
 }
 
+/// Which way an endpoint's packets go: from the device, or to it.
+enum midi-device-direction {
+	receive  = 1,
+	transmit = 2,
+}
+
 record midi-device-endpoint {
 	index:           u32,
 	@bound(64) name: string,
 	cables:          u8,
+	direction:       midi-device-direction,
 }
 
 /// One transport completion's packets, four bytes each, in the order they arrived.
@@ -52,6 +60,11 @@ interface midi-device {
 	@op(3) start:     func(endpoint: u32, receiver-generation: u64) -> result<unit, error>;
 	@op(4) stop:      func(endpoint: u32, receiver-generation: u64) -> result<unit, error>;
 	@op(5) events:    func() -> stream<midi-device-event>;
+	/// Put at most 64 USB-MIDI 1.0 event packets on a TRANSMIT endpoint, in order. ANSWERED WHEN THE TRANSPORT
+	/// HAS TAKEN ALL OF THEM, so a caller that waits for the answer is paced by the device and nothing queues
+	/// behind it; refused on a receive endpoint, for a cable the endpoint does not carry, and for a batch that
+	/// is not a whole number of packets.
+	@op(6) send:      func(endpoint: u32, @bound(256) packets: list<u8>) -> result<unit, error>;
 }
 
 // ------------------------------------------------------------------ development only
@@ -60,6 +73,8 @@ record midi-fixture-stats {
 	batches:  u32,
 	packets:  u32,
 	receiving: u8,
+	/// Packets taken on the transmit endpoint - each of them played back on receive endpoint 0.
+	sent:     u32,
 }
 
 /// The in-guest MIDI fixture's control endpoint. DEVELOPMENT ONLY: it exists on a development fixture bound

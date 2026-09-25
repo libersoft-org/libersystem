@@ -13,6 +13,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "admin-client"
+version = "0.0.0"
+dependencies = [
+ "admin-proto",
+ "base-proto",
+]
+
+[[package]]
+name = "admin-client-provider"
+version = "0.0.0"
+dependencies = [
+ "admin-proto",
+]
+
+[[package]]
 name = "admin-proto"
 version = "0.0.0"
 dependencies = [
@@ -1101,6 +1116,8 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "tools"
 version = "0.0.0"
 dependencies = [
+ "admin-client",
+ "admin-client-provider",
  "aiff",
  "audio-client",
  "audio-client-provider",

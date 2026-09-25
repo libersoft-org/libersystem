@@ -22,6 +22,17 @@
 
 extern crate alloc;
 
+// THE SERVICE-BACKED CLASS MODULES and what they share - see `classes` for the hold that publishes them.
+mod class_bt;
+mod class_ccid;
+mod class_dfu;
+mod class_mbim;
+mod class_midi;
+mod class_power;
+mod class_printer;
+mod class_ptp;
+mod class_uvc;
+mod classes;
 mod usb_audio;
 mod usb_hid;
 mod usb_net;
@@ -39,7 +50,7 @@ use proto::system::usb;
 use proto::system::{Error as UsbError, UsbDevice as UsbEntry};
 use rt::*;
 
-use crate::usb_audio::{Audio, configure_audio};
+use crate::usb_audio::configure_audio;
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, TOUCH_SINK, configure_hid, handle_hid_event, post_reports};
 use crate::usb_net::{NOTIFY_WINDOW, Net, configure_network, handle_net_event, handle_notification, post_notification, post_receive, transmit};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
@@ -124,6 +135,10 @@ const TRB_EV_PORT_STATUS: u32 = 34;
 // TRB control-word bits.
 const TRB_CYCLE: u32 = 1 << 0;
 const TRB_TOGGLE_CYCLE: u32 = 1 << 1;
+// INTERRUPT ON SHORT PACKET: a short data stage reports itself, with its own residual. Without it the only
+// event a control read produces is the status stage's, whose length is its own zero - which is how every
+// control read here answered "all of it" whatever the device sent.
+const TRB_ISP: u32 = 1 << 2;
 const TRB_IOC: u32 = 1 << 5;
 const TRB_IDT: u32 = 1 << 6;
 const TRB_DIR_IN: u32 = 1 << 16;
@@ -471,6 +486,18 @@ struct Xhci {
 	// the one for whichever port's receive endpoint it belongs to.
 	serial_rx: [Option<(u32, u32)>; usb_serial::MAX_PORTS],
 	serial_pending: [Option<(u32, u32)>; usb_serial::MAX_PORTS],
+	// AND THE CLASS MODULES', FOR EVERY PIPE THEY LEAVE A TRANSFER OUTSTANDING ON - a printer's write as much as
+	// a MIDI device's standing receive. The endpoints are registered when a pipe first posts and dropped when
+	// it is released; see `classes::keep`.
+	class_rx: Vec<(u32, u32)>,
+	class_pending: Vec<(u64, u32, u32)>,
+	// THE AUDIO SOURCE'S ENDPOINT, whose standing capture transfers complete during every synchronous wait,
+	// and the completions those waits kept for the loop.
+	audio_rx: Option<(u32, u32)>,
+	audio_pending: Vec<(u32, u32)>,
+	// A ROOT PORT WHOSE DEVICES ARE TO BE TAKEN DOWN AND ENUMERATED AGAIN although nothing was unplugged: a DFU
+	// target that waits for the host's reset after a detach, which that enumeration's port reset is.
+	redo_port: Option<u32>,
 }
 
 // One addressed USB device: its slot, root-hub port, route string (the hub-port
@@ -556,6 +583,16 @@ const KIND_UAS: u8 = 6;
 const KIND_AUDIO: u8 = 7;
 const KIND_SERIAL: u8 = 8;
 const KIND_TOUCH: u8 = 9;
+// The service-backed classes, in `classes`.
+const KIND_PRINTER: u8 = 10;
+const KIND_STILL_IMAGE: u8 = 11;
+const KIND_SMARTCARD: u8 = 12;
+const KIND_MIDI: u8 = 13;
+const KIND_POWER: u8 = 14;
+const KIND_BLUETOOTH: u8 = 15;
+const KIND_MODEM: u8 = 16;
+const KIND_CAMERA: u8 = 17;
+const KIND_DFU: u8 = 18;
 
 // The addressed devices, by root port - the state hot-plug works against and the
 // inventory `usb.list` serves. An attach enumerates a root port only when no slot
@@ -652,17 +689,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// controller carrying both publishes two.
 		let mut uas: Option<(UsbDevice, Uas)> = None;
 		// AND ONE AUDIO SINK, which is the only isochronous thing this controller drives.
-		let mut audio: Option<(UsbDevice, usb_audio::Audio)> = None;
+		let mut audio: usb_audio::Devices = usb_audio::Devices::new();
 		// AND THE SERIAL ADAPTERS. A SEPARATE hold from the network adapter although both are
 		// communications class: what comes out of them is a byte stream and a frame transport, and
 		// a controller may carry one of each. Several ports, because one composite device is
 		// several of them - see `usb_serial::MAX_PORTS` for why the count is a publication.
 		let mut serials: usb_serial::Serials = usb_serial::Serials::new();
+		// AND THE SERVICE-BACKED CLASSES, one device each, published after the handshake - see `classes`.
+		let mut classes: classes::Classes = classes::Classes::new();
 		let mut slots: Slots = Slots::new();
 		let mut port: u32 = 1;
 		while port <= hc.ports {
 			if let Some(dev) = attach_port(&mut hc, port) {
-				register_device(&mut hc, dev, &mut slots, &mut devices, &mut hids, &mut storage, &mut network, &mut uas, &mut audio, &mut serials);
+				register_device(&mut hc, dev, &mut slots, &mut devices, &mut hids, &mut storage, &mut network, &mut uas, &mut audio, &mut serials, &mut classes);
 			}
 			port += 1;
 		}
@@ -710,7 +749,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// adapter and a touch surface on the bus the line ended mid-word at `(audio`, which is the
 		// truncation this bound promises rather than a crash - and it still cost a reader the two
 		// facts the run existed to establish.
-		let mut report: common::Bounded<160> = common::Bounded::new();
+		let mut report: common::Bounded<256> = common::Bounded::new();
 		// ADDRESSED, like every other driver's report. Two controllers produced two identical online
 		// lines, and xHCI is an ordinary registry driver - a machine may have more than one.
 		report.push(b"driver.xhci: online (");
@@ -737,7 +776,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if uas.is_some() {
 			report.push(b" (uas)");
 		}
-		if audio.is_some() {
+		if !audio.is_empty() {
 			report.push(b" (audio)");
 		}
 		// THE COUNT AND NOT THE FACT, because a composite adapter is two ports and a report that
@@ -751,6 +790,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		if touching(&hids) {
 			report.push(b" (touch)");
+		}
+		// EACH SERVICE-BACKED CLASS BY ITS ROLE, which is the inventory's word for it.
+		for role in classes.roles() {
+			report.push(b" (");
+			report.push(kind_name(role).as_bytes());
+			report.push(b")");
 		}
 		// THREE PROVIDERS, ONE HANDSHAKE. They used to be three messages the manager told apart by
 		// their text - a report, then the literal `USBBUS`, then `POINTER` - which meant the
@@ -793,7 +838,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// a controller with no audio device is a provider AudioService opens and then
 				// cannot drive - and this wire's refusal is an empty reply, not a status, so there
 				// is no way for the service to tell "no device" from "the device said no".
-				(driver_protocol::provider::AUDIO, if audio.is_some() { audio_client } else { 0 }, &[]),
+				(driver_protocol::provider::AUDIO, if audio.is_empty() { 0 } else { audio_client }, &[]),
 				// THE BYTE STREAM, and it is LAST because a token is a POSITION in this list: an
 				// entry inserted among the others renames a publication the manager already holds.
 				(driver_protocol::provider::CONSOLE_BYTES, if !serials.ports.is_empty() { serial_client } else { 0 }, driver_protocol::provider::USB_SERIAL_NAME),
@@ -817,7 +862,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			],
 		);
 		let pending = Unpublished { net: if network.is_some() { 0 } else { net_client }, uas: if uas.is_some() { 0 } else { uas_client }, touch: if touching(&hids) { 0 } else { touch_client } };
-		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, network, uas, audio, serials, blk_server, usbq_server, ptr_server, net_server, uas_server, audio_server, serial_server, serial2_server, touch_server, pending, irq);
+		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, network, uas, audio, serials, classes, blk_server, usbq_server, ptr_server, net_server, uas_server, audio_server, serial_server, serial2_server, touch_server, pending, irq);
 	}
 }
 
@@ -892,7 +937,7 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_RUN | CMD_INTE);
 		wait_clear(op + OP_USBSTS, STS_HCHALTED)?;
 
-		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS] })
+		Some(Xhci { op, ir0, db, ctx_size: if csz { 64 } else { 32 }, ports, cmd, evt_virt, evt_phys, evt_index: 0, evt_cycle: 1, ports_changed: drivers::port::PortSignal::new(), dcbaa_virt, budget: drivers::usb_class::Budget::new(), net_rx: None, net_pending: None, serial_rx: [None; usb_serial::MAX_PORTS], serial_pending: [None; usb_serial::MAX_PORTS], class_rx: Vec::new(), class_pending: Vec::new(), audio_rx: None, audio_pending: Vec::new(), redo_port: None })
 	}
 }
 
@@ -1019,6 +1064,11 @@ fn wait_event(hc: &mut Xhci, wanted: u32) -> Option<(u64, u32, u32)> {
 				let kind: u32 = control >> 10 & 0x3f;
 				if kind == wanted {
 					return Some((param, status, control));
+				}
+				// A STANDING TRANSFER COMPLETING DURING A COMMAND IS NOT THE COMMAND FAILING: it is kept for the
+				// loop, which is what a class device plugged in beside a busy one needs.
+				if keep_stray(hc, param, status, control) {
+					continue;
 				}
 				if kind != TRB_EV_PORT_STATUS {
 					return None;
@@ -1169,14 +1219,15 @@ fn initial_packet_size(speed: u32) -> u32 {
 // expanded (its ports enumerated, each downstream device landing back here
 // recursively), every HID device and the first mass-storage device are
 // configured and kept for the service loop, anything else is left addressed.
-fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut Option<(UsbDevice, Audio)>, serials: &mut usb_serial::Serials) {
+#[allow(clippy::too_many_arguments)]
+fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut usb_audio::Devices, serials: &mut usb_serial::Serials, classes: &mut classes::Classes) {
 	unsafe {
 		report_device(&dev);
 		slots.record(SlotRec { port: dev.port, slot: dev.slot, speed: dev.speed, vendor: dev.vendor, product: dev.product, class: dev.class, kind: KIND_DEVICE, device: None });
 		*devices += 1;
 		if dev.class == CLASS_HUB {
 			slots.set_kind(dev.slot, KIND_HUB);
-			expand_hub(hc, &mut dev, slots, devices, hids, storage, network, uas, audio, serials);
+			expand_hub(hc, &mut dev, slots, devices, hids, storage, network, uas, audio, serials, classes);
 			// A HUB STAYS ADDRESSED because its downstream devices reach the bus through it, so the
 			// inventory holds it until the port it is on goes away.
 			let slot = dev.slot;
@@ -1251,26 +1302,48 @@ fn register_device(hc: &mut Xhci, mut dev: UsbDevice, slots: &mut Slots, devices
 			let _ = hc.budget.admit(ClassKind::Uas);
 			slots.set_kind(dev.slot, KIND_UAS);
 			*uas = Some((dev, target));
-		} else if audio.is_none()
+		} else if (!audio.has_sink() || !audio.has_source())
 			&& admits(hc, ClassKind::Audio, dev.class)
-			&& let Some(sink) = configure_audio(hc, &mut dev)
+			&& let Some(streams) = configure_audio(hc, &mut dev, !audio.has_sink(), !audio.has_source())
 		{
 			let _ = hc.budget.admit(ClassKind::Audio);
 			slots.set_kind(dev.slot, KIND_AUDIO);
-			// WHAT IT IS, SAID ONCE. A sink this driver bound at a format it refuses to convert is
+			// WHAT IT IS, SAID ONCE. A stream this driver bound at a format it refuses to convert is
 			// worth naming: the next machine's device may offer a different one and be refused.
-			let (channels, bits, packet) = sink.describes();
-			let mut line: common::Bounded<96> = common::Bounded::new();
-			line.push(b"driver.xhci: audio sink bound - ");
-			line.decimal(channels as u64);
-			line.push(b" channel(s), ");
-			line.decimal(bits as u64);
-			line.push(b"-bit, ");
-			line.decimal(packet as u64);
-			line.push(b" byte packets\n");
-			print(line.as_bytes());
-			*audio = Some((dev, sink));
+			let described = [
+				(b"driver.xhci: audio sink bound - ".as_slice(), streams.sink.as_ref().map(|sink| sink.describes())),
+				(b"driver.xhci: audio source bound - ".as_slice(), streams.source.as_ref().map(|source| source.describes())),
+			];
+			for (what, stream) in described {
+				let Some((channels, bits, packet)) = stream else { continue };
+				let mut line: common::Bounded<96> = common::Bounded::new();
+				line.push(what);
+				line.decimal(channels as u64);
+				line.push(b" channel(s), ");
+				line.decimal(bits as u64);
+				line.push(b"-bit, ");
+				line.decimal(packet as u64);
+				line.push(b" byte packets\n");
+				print(line.as_bytes());
+			}
+			// A SOURCE'S COMPLETIONS ARE KEPT FOR THE LOOP when a synchronous wait takes them off the ring, as a
+			// class pipe's are: its transfers stand, so their events arrive during every other wait.
+			if let Some(source) = streams.source.as_ref() {
+				hc.audio_rx = Some((dev.slot, source.dci));
+				hc.audio_pending.clear();
+			}
+			audio.list.push((dev, streams));
 		} else {
+			// THE SERVICE-BACKED CLASSES LAST, because each of them reads every configuration the device has
+			// before it knows - which is bus traffic every device the modules above bound would have paid.
+			let mut dev = match classes::probe(hc, dev) {
+				Ok(module) => {
+					slots.set_kind(module.device().slot, module.inventory());
+					classes.add(module);
+					return;
+				}
+				Err(dev) => dev,
+			};
 			// A DEVICE THIS CONTROLLER DOES NOT BIND IS STILL WORTH READING, and for UAS that
 			// reading is what the item asked for before anybody wrote its transport: whether the
 			// device demands bulk STREAMS. The probe binds nothing, it stays in the tree after the
@@ -1307,6 +1380,15 @@ fn admits(hc: &Xhci, kind: ClassKind, class: u8) -> bool {
 					ClassKind::Uas => b"UAS".as_slice(),
 					ClassKind::Serial => b"serial".as_slice(),
 					ClassKind::Audio => b"audio".as_slice(),
+					ClassKind::Printer => b"printer".as_slice(),
+					ClassKind::StillImage => b"still-image".as_slice(),
+					ClassKind::SmartCard => b"smart-card".as_slice(),
+					ClassKind::Midi => b"MIDI".as_slice(),
+					ClassKind::PowerDevice => b"power-device".as_slice(),
+					ClassKind::Bluetooth => b"Bluetooth".as_slice(),
+					ClassKind::Mbim => b"MBIM".as_slice(),
+					ClassKind::Video => b"video".as_slice(),
+					ClassKind::Dfu => b"DFU".as_slice(),
 				});
 				print(b" module is full (");
 				print(refusal.describe());
@@ -1334,6 +1416,18 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 		// An audio device declares its class PER INTERFACE and leaves zero at the device level, like
 		// HID and mass storage - the audio-control and audio-streaming interfaces are what carry it.
 		ClassKind::Audio => class == 0 || class == drivers::uac::CLASS_AUDIO,
+		// THE SERVICE-BACKED CLASSES name themselves per interface, all but two: a Bluetooth controller
+		// declares its class at the device level, and a composite device of any of them declares zero or the
+		// association class (0xef).
+		ClassKind::Printer => class == 0 || class == 0xef || class == drivers::printer::CLASS_PRINTER,
+		ClassKind::StillImage => class == 0 || class == 0xef || class == 0x06,
+		ClassKind::SmartCard => class == 0 || class == 0xef || class == 0x0b,
+		ClassKind::Midi => class == 0 || class == 0xef || class == 0x01,
+		ClassKind::PowerDevice => class == 0 || class == 0xef || class == 0x03,
+		ClassKind::Bluetooth => class == 0 || class == 0xef || class == 0xe0,
+		ClassKind::Mbim => class == 0 || class == 0xef || class == drivers::cdc::CLASS_COMMUNICATIONS,
+		ClassKind::Video => class == 0 || class == 0xef || class == 0x0e,
+		ClassKind::Dfu => class == 0 || class == 0xef || class == 0xfe,
 	}
 }
 
@@ -1342,7 +1436,8 @@ fn class_is_plausible(kind: ClassKind, class: u8) -> bool {
 // up, and bring up whatever is connected. Each addressed downstream device runs
 // through `register_device`, so a hub found downstream expands recursively and a
 // keyboard or disk behind any tier of hubs is configured like a root one.
-fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut Option<(UsbDevice, usb_audio::Audio)>, serials: &mut usb_serial::Serials) {
+#[allow(clippy::too_many_arguments)]
+fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &mut u32, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut usb_audio::Devices, serials: &mut usb_serial::Serials, classes: &mut classes::Classes) {
 	unsafe {
 		// no HID device is serving yet, so the control waits see no HID events.
 		let mut pending: Hids = Hids::new();
@@ -1369,7 +1464,7 @@ fn expand_hub(hc: &mut Xhci, hub: &mut UsbDevice, slots: &mut Slots, devices: &m
 		let mut port: u32 = 1;
 		while port <= ports.min(15) {
 			if let Some(dev) = attach_hub_port(hc, hub, port, shift) {
-				register_device(hc, dev, slots, devices, hids, storage, network, uas, audio, serials);
+				register_device(hc, dev, slots, devices, hids, storage, network, uas, audio, serials, classes);
 			}
 			port += 1;
 		}
@@ -1482,15 +1577,24 @@ fn control_in(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, desc: u16, le
 // THE ANSWER IS HOW MANY BYTES ARRIVED, not merely that the transfer did not fail. The data page is
 // reused between transfers, so a caller that cannot tell a short answer from a complete one reads the
 // PREVIOUS transfer's bytes past the end of this one.
+//
+// MEASURED, AND IT WAS NOT (found 2026-09-25 by the PTP oracle). The data stage carried no ISP, so a short
+// answer raised no event of its own and the one event the read waited for was the status stage's - whose
+// residual is always zero. Every read here therefore answered `len`, and a caller that asked for a page got
+// back the whole page with the last transfer's bytes behind the answer: the still image device status came
+// back as the six bytes of the cancel request written into the same page a moment before. The data stage now
+// reports a short packet, and the status stage's own completion is taken after it, so the next transfer on
+// this endpoint does not read it as its own.
 fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_type: u8, request: u8, value: u16, index: u16, len: u16) -> Option<u32> {
 	unsafe {
 		let setup: u64 = request_type as u64 | (request as u64) << 8 | (value as u64) << 16 | (index as u64) << 32 | (len as u64) << 48;
 		dev.ep0.push(setup, 8, TRB_SETUP << 10 | TRB_IDT | TRB_TRT_IN);
-		dev.ep0.push(dev.data_phys, len as u32, TRB_DATA << 10 | TRB_DIR_IN);
+		let data_trb: u64 = dev.ep0.phys + dev.ep0.index * 16;
+		dev.ep0.push(dev.data_phys, len as u32, TRB_DATA << 10 | TRB_DIR_IN | TRB_ISP);
 		dev.ep0.push(0, 0, TRB_STATUS << 10 | TRB_IOC);
 		// ring the device slot's doorbell for the default control endpoint (DCI 1).
 		w32(hc.db + dev.slot as u64 * 4, 1);
-		let (code, residual) = wait_transfer_len(hc, hids, dev.slot, 1)?;
+		let (pointer, code, residual) = wait_transfer_at(hc, hids, dev.slot, 1)?;
 		if code == CC_STALL {
 			recover_ep0(hc, hids, dev);
 			return None;
@@ -1500,7 +1604,18 @@ fn control_in_req(hc: &mut Xhci, hids: &mut Hids, dev: &mut UsbDevice, request_t
 		}
 		// The transfer event's length field is what was NOT transferred, so what arrived is the
 		// difference - and a residual larger than the request is a device inventing one.
-		Some(len as u32 - residual.min(len as u32))
+		if pointer == data_trb {
+			let arrived = len as u32 - residual.min(len as u32);
+			// A SHORT DATA STAGE: the status stage still runs, and its completion is this transfer's too.
+			let (_, status_code, _) = wait_transfer_at(hc, hids, dev.slot, 1)?;
+			if status_code == CC_STALL {
+				recover_ep0(hc, hids, dev);
+				return None;
+			}
+			return (status_code == CC_SUCCESS || status_code == CC_SHORT_PACKET).then_some(arrived);
+		}
+		// The status stage's event, with no short packet before it: the whole data stage arrived.
+		Some(len as u32)
 	}
 }
 
@@ -1578,9 +1693,12 @@ fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
-			if let Some((_p, status, control)) = take_event(hc) {
+			if let Some((pointer, status, control)) = take_event(hc) {
 				if control >> 10 & 0x3f == TRB_EV_CMD_COMPLETE {
 					return Some(status >> 24);
+				}
+				if keep_stray(hc, pointer, status, control) {
+					continue;
 				}
 				handle_hid_event(hc, hids, status, control);
 				continue;
@@ -1625,7 +1743,7 @@ fn touching(hids: &Hids) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, mut network: Option<(UsbDevice, Net)>, mut uas: Option<(UsbDevice, Uas)>, mut audio: Option<(UsbDevice, Audio)>, mut serials: usb_serial::Serials, blk_server: u64, usbq: u64, pointer: u64, net_server: u64, uas_server: u64, audio_server: u64, serial_server: u64, serial2_server: u64, touch_server: u64, mut pending: Unpublished, irq: u64) -> ! {
+fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, mut network: Option<(UsbDevice, Net)>, mut uas: Option<(UsbDevice, Uas)>, mut audio: usb_audio::Devices, mut serials: usb_serial::Serials, mut classes: classes::Classes, blk_server: u64, usbq: u64, pointer: u64, net_server: u64, uas_server: u64, audio_server: u64, serial_server: u64, serial2_server: u64, touch_server: u64, mut pending: Unpublished, irq: u64) -> ! {
 	unsafe {
 		post_reports(hc, &mut hids);
 		if let Some((dev, net)) = network.as_mut() {
@@ -1651,8 +1769,61 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 		let mut sessions: [drivers::serial_port::Session; usb_serial::MAX_PORTS] = core::array::from_fn(|_| drivers::serial_port::Session::new());
 		let mut buffers: [drivers::serial_port::Buffers; usb_serial::MAX_PORTS] = core::array::from_fn(|_| drivers::serial_port::Buffers::default());
 		let mut serving = common::Serving::from_offers(&[(0, blk_server), (1, usbq), (2, pointer), (3, net_server), (4, uas_server), (5, audio_server), (6, serial_server), (7, touch_server), (8, serial2_server)]);
+		// THE CLASS DEVICES FOUND AT BOOT ARE PUBLISHED NOW, after the handshake: their tokens are fresh ones and
+		// not positions in the list above, so they are live offers like a device plugged in later.
+		classes.settle(hc, &mut hids, bootstrap, bind, &mut serving);
 		loop {
-			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
+			// THE COMPLETIONS A SYNCHRONOUS WAIT KEPT ARE TAKEN BEFORE THIS LOOP SLEEPS, and not after it wakes.
+			//
+			// Their interrupt was consumed by the wait that kept them, so nothing is left to wake the loop for them:
+			// taken after the wake, a standing receive whose completion landed during a command stayed un-reposted
+			// until something unrelated happened - found by the Bluetooth oracle, whose seventy-byte event arrived
+			// as one packet during the command that asked for it and the other four never did.
+			// THE STASHED SERIAL COMPLETION FIRST, on the same terms as the network one below and
+			// for the same reason: it is older than anything still on the ring.
+			for index in 0..usb_serial::MAX_PORTS {
+				let Some((status, control)) = hc.serial_pending[index].take() else { continue };
+				let Some((dev, port)) = serials.pair(index) else { continue };
+				if usb_serial::handle_serial_event(hc, dev, port, status, control, &mut frame) {
+					sessions[index].deliver(bind, bootstrap, &frame, &mut buffers[index]);
+				}
+			}
+			// AND THE CLASS MODULES' KEPT COMPLETIONS, on the same terms.
+			classes.absorb_kept(hc, &mut hids);
+			// THE AUDIO SOURCE'S KEPT COMPLETIONS, oldest first, for the same reason.
+			while !hc.audio_pending.is_empty() {
+				let (status, control) = hc.audio_pending.remove(0);
+				let _ = usb_audio::absorb(hc, &mut audio, status, control);
+			}
+			// A PORT A MODULE ASKED TO HAVE ENUMERATED AGAIN - a DFU target waiting for the reset its detach needs -
+			// is done before the loop sleeps, because nothing else will wake it: the device is waiting too.
+			if hc.redo_port.is_some() {
+				reconcile_ports(hc, slots, &mut hids, &mut storage, &mut network, &mut uas, &mut audio, &mut serials, &mut classes);
+				classes.settle(hc, &mut hids, bootstrap, bind, &mut serving);
+			}
+			// AND A HANDOFF WHOSE DEVICE DID NOT COME BACK is answered and withdrawn once its deadline passes.
+			if classes.waiting() {
+				classes.expire(bootstrap, bind, &mut serving);
+			}
+			// THE STASHED COMPLETION FIRST, because it is older than anything still on the ring.
+			if let Some((status, control)) = hc.net_pending.take()
+				&& let Some((dev, net)) = network.as_mut()
+				&& handle_net_event(hc, dev, net, status, control, &mut frame)
+			{
+				for at in (0..serving.as_slice().len()).rev() {
+					if serving.token_at(at) != 3 {
+						continue;
+					}
+					if !send_blocking(serving.at(at), &frame, 0) {
+						let token = serving.close_at(at);
+						common::disconnected(bootstrap, bind, token);
+					}
+				}
+			}
+			// THE CONTROLLER'S INTERRUPT FIRST, then the channels class modules wait on - a modem's transmit channel.
+			let mut waiting: Vec<u64> = alloc::vec![irq];
+			waiting.extend(classes.waits());
+			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &waiting) else {
 				common::finish_stop(bootstrap, bind, device(), hc.halt());
 				exit();
 			};
@@ -1672,6 +1843,22 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				}
 				continue;
 			}
+			// THE WAKE IS ACKNOWLEDGED BEFORE THE RING IS READ, AND NEVER AFTER IT (corrected 2026-09-25).
+			//
+			// Acknowledging clears the interrupt object's signal. Done after the drain, as it was, it cleared
+			// the signal of an interrupt that arrived WHILE the ring was being read - and that interrupt was
+			// the only notice of an event the drain had already passed: the controller raises nothing more
+			// while Event Handler Busy is set, and it raises again for events left on the ring only when
+			// the ERDP write below clears EHB - which is exactly the interrupt the late acknowledgment then
+			// threw away. The event sat on the ring and the loop slept on it. It surfaced as a Bluetooth
+			// command whose completion "never arrived" in about half of the runs, whichever reply happened
+			// to land in that window: a transfer finished, its event written, and nobody woke to read it.
+			//
+			// In this order every interrupt after this point either finds its event in the drain below or
+			// leaves the object signalled for the next wait - so nothing is lost, and at worst one wake finds
+			// an empty ring. IP is cleared first, for a controller on a level-triggered line.
+			w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
+			interrupt_ack(irq);
 			// Drain hardware events whenever this loop wakes. Synchronous block operations still
 			// service HID events inline; consumer closure does not stop the controller.
 			let mut rescan: bool = false;
@@ -1680,30 +1867,6 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			// for ever, which is worse than an error: a caller can retry an error.
 			if let Some((_, target)) = uas.as_mut() {
 				usb_uas::expire(target);
-			}
-			// THE STASHED SERIAL COMPLETION FIRST, on the same terms as the network one below and
-			// for the same reason: it is older than anything still on the ring.
-			for index in 0..usb_serial::MAX_PORTS {
-				let Some((status, control)) = hc.serial_pending[index].take() else { continue };
-				let Some((dev, port)) = serials.pair(index) else { continue };
-				if usb_serial::handle_serial_event(hc, dev, port, status, control, &mut frame) {
-					sessions[index].deliver(bind, bootstrap, &frame, &mut buffers[index]);
-				}
-			}
-			// THE STASHED COMPLETION FIRST, because it is older than anything still on the ring.
-			if let Some((status, control)) = hc.net_pending.take()
-				&& let Some((dev, net)) = network.as_mut()
-				&& handle_net_event(hc, dev, net, status, control, &mut frame)
-			{
-				for at in (0..serving.as_slice().len()).rev() {
-					if serving.token_at(at) != 3 {
-						continue;
-					}
-					if !send_blocking(serving.at(at), &frame, 0) {
-						let token = serving.close_at(at);
-						common::disconnected(bootstrap, bind, token);
-					}
-				}
 			}
 			while let Some((pointer, status, control)) = take_event(hc) {
 				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
@@ -1787,6 +1950,14 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				if taken {
 					continue;
 				}
+				// THE AUDIO SOURCE'S STANDING CAPTURE.
+				if control >> 10 & 0x3f == TRB_EV_TRANSFER && usb_audio::absorb(hc, &mut audio, status, control) {
+					continue;
+				}
+				// AND THE CLASS MODULES', each answering only for its own pipes.
+				if classes.absorb(hc, &mut hids, pointer, status, control) {
+					continue;
+				}
 				handle_hid_event(hc, &mut hids, status, control);
 			}
 			// EVENT HANDLER BUSY IS CLEARED ON EVERY WAKE AND NOT ONLY WHEN AN EVENT WAS TAKEN.
@@ -1806,15 +1977,17 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 			// not to produce an empty wake.
 			//
 			// The write is idempotent: `evt_index` is the driver's own dequeue pointer, which is
-			// what ERDP is meant to hold, and EHB is write-one-to-clear.
+			// what ERDP is meant to hold, and EHB is write-one-to-clear. A controller that finds events
+			// past that pointer when EHB clears interrupts again, and that interrupt reaches a wait that
+			// was acknowledged above - see the top of this pass.
 			w64(hc.ir0 + IR_ERDP, hc.evt_phys + hc.evt_index * 16 | ERDP_EHB);
-			interrupt_ack(irq);
-			w32(hc.ir0 + IR_IMAN, IMAN_IE | IMAN_IP);
 			// THE FLAG AND THE DRAIN ARE THE SAME QUESTION, and the flag is the half that survives a
 			// synchronous wait - a block transfer that ran while a device was plugged in took the
 			// event off the ring, and without this the loop never learned of it.
 			if rescan || hc.ports_changed.take() {
-				reconcile_ports(hc, slots, &mut hids, &mut storage, &mut network, &mut uas, &mut audio, &mut serials);
+				reconcile_ports(hc, slots, &mut hids, &mut storage, &mut network, &mut uas, &mut audio, &mut serials, &mut classes);
+				// A CLASS DEVICE THAT LEFT IS WITHDRAWN AND ONE THAT ARRIVED IS PUBLISHED, each under a fresh token.
+				classes.settle(hc, &mut hids, bootstrap, bind, &mut serving);
 				// AND A DEVICE THAT ARRIVED NOW GETS ITS PUBLICATION, under the token this driver's
 				// offer list reserved for it. `offer` is the post-READY half of the same handshake:
 				// the manager holds it live rather than waiting for a terminal frame.
@@ -1833,6 +2006,11 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 				if pending.touch != 0 && touching(&hids) && common::offer(bootstrap, bind, driver_protocol::provider::TOUCH, 7, pending.touch) {
 					pending.touch = 0;
 				}
+			}
+			if let common::ProviderReady::Device(index) = ready
+				&& index > 0
+			{
+				classes.ready(hc, &mut hids, waiting[index]);
 			}
 			let common::ProviderReady::Consumer(at) = ready else { continue };
 			let server = serving.at(at);
@@ -1953,11 +2131,18 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 							}
 							match audio::message(&period[..len]) {
 								audio::Message::Play => {
-									let played = match audio.as_mut() {
+									let played = match audio.sink() {
 										Some((dev, sink)) => usb_audio::play(hc, &mut hids, dev, sink, &period[..len]),
 										None => false,
 									};
 									send_blocking(server, if played { audio::OK } else { audio::REFUSED }, 0);
+								}
+								// A CAPTURE IS ANSWERED FROM THE SOURCE'S STANDING CAPTURE - now, or when a
+								// period is there - and its end stops the stream.
+								audio::Message::Capture => usb_audio::capture(hc, &mut hids, &mut audio, server),
+								audio::Message::EndCapture => {
+									usb_audio::end_capture(hc, &mut hids, &mut audio);
+									send_blocking(server, audio::OK, 0);
 								}
 								// AN ISOCHRONOUS SINK HAS NOTHING TO STOP. There is no stream to
 								// release: the endpoint is scheduled when a transfer is posted and
@@ -1966,17 +2151,18 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 								audio::Message::EndPlayback => {
 									send_blocking(server, audio::OK, 0);
 								}
-								// CAPTURE IS REFUSED AND THE REFUSAL IS THE WIRE'S OWN: an empty
-								// reply, which cannot be mistaken for samples because a period is
-								// never empty. This device model has no input.
-								_ => {
+								// A SHAPE THIS WIRE DOES NOT HAVE is refused, with the wire's own refusal.
+								audio::Message::Unknown => {
 									send_blocking(server, audio::REFUSED, 0);
 								}
 							}
 							false
 						}
 						Polled::Empty => false,
-						Polled::Closed => true,
+						Polled::Closed => {
+							audio.consumer_closed(server);
+							true
+						}
 					}
 				}
 				// THE BYTE STREAM, SERVED BY THE CONTRACT'S OWN LOOP. Nothing about `console-stream`
@@ -2014,6 +2200,8 @@ fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut 
 						PolledCaps::Closed => true,
 					},
 				},
+				// A SERVICE-BACKED CLASS PUBLICATION, served by the module that owns its token.
+				token if classes.owns(token) => classes.serve(hc, &mut hids, token, server, bootstrap, bind),
 				// Pointer consumers receive events and send no requests. Drain unexpected input
 				// with its capabilities, and return the allowance when the peer closes.
 				_ => match try_recv_caps(server, &mut req) {
@@ -2075,7 +2263,117 @@ fn kind_name(kind: u8) -> &'static str {
 		KIND_AUDIO => "audio",
 		KIND_SERIAL => "serial",
 		KIND_TOUCH => "touch",
+		KIND_PRINTER => "printer",
+		KIND_STILL_IMAGE => "still-image",
+		KIND_SMARTCARD => "smartcard",
+		KIND_MIDI => "midi",
+		KIND_POWER => "power",
+		KIND_BLUETOOTH => "bluetooth",
+		KIND_MODEM => "modem",
+		KIND_CAMERA => "camera",
+		KIND_DFU => "dfu",
 		_ => "device",
+	}
+}
+
+// Everything a root port owned, given back: the disconnect acknowledged and each device released by whoever holds
+// it. For a device that was unplugged, and for one the controller takes down to enumerate again.
+#[allow(clippy::too_many_arguments)]
+unsafe fn detach_port_devices(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut usb_audio::Devices, serials: &mut usb_serial::Serials, classes: &mut classes::Classes, port: u32) {
+	unsafe {
+		// acknowledge the disconnect and tear the port's devices down.
+		portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
+		// EVERYTHING THIS PORT OWNED IS GIVEN BACK, and each device is released by whoever
+		// holds it: the ones bound to a role live in their own structures, and the rest live
+		// in the inventory. Disabling the slot without closing the pages - which is what this
+		// did - leaks three pages per attach on a port somebody plugs and unplugs.
+		for (dev, hid) in hids.entries.iter_mut().filter(|(dev, _)| dev.port == port) {
+			hid.release();
+			dev.release(hc);
+			// AND THE CHARGE GOES BACK WITH THE PAGES. A release that gave the memory back and
+			// kept the budget would turn a port somebody plugs and unplugs into a controller
+			// that stops accepting keyboards.
+			hc.budget.release(ClassKind::Hid);
+		}
+		hids.entries.retain(|(dev, _)| dev.port != port);
+		if let Some((dev, st)) = storage.as_mut()
+			&& dev.port == port
+		{
+			st.release();
+			dev.release(hc);
+			hc.budget.release(ClassKind::Storage);
+			*storage = None;
+		}
+		if let Some((dev, target)) = uas.as_mut()
+			&& dev.port == port
+		{
+			target.release();
+			dev.release(hc);
+			hc.budget.release(ClassKind::Uas);
+			*uas = None;
+		}
+		if let Some((dev, net)) = network.as_mut()
+			&& dev.port == port
+		{
+			net.release();
+			dev.release(hc);
+			hc.budget.release(ClassKind::Network);
+			hc.net_rx = None;
+			hc.net_pending = None;
+			*network = None;
+		}
+		// AND THE SERIAL ADAPTER, on the same terms. Its two pages are the reason this is
+		// not optional: a driver that let an unplugged adapter's DMA pages go with the
+		// structure rather than giving them back leaks a page a plug and an unplug, and the
+		// budget would refuse the next adapter for a place nothing holds.
+		// A DEVICE THAT LEAVES TAKES EVERY PORT THAT WAS ON IT, which is one for an
+		// ordinary adapter and two for a composite one.
+		if let Some(at) = serials.devices.iter().position(|device| device.port == port) {
+			let slot = serials.devices[at].slot;
+			for index in (0..serials.ports.len()).rev() {
+				if serials.ports[index].slot() != slot {
+					continue;
+				}
+				serials.ports[index].release();
+				serials.ports.remove(index);
+				// AND THE ENDPOINT THIS CONTROLLER KEEPS COMPLETIONS FOR, with anything
+				// already kept. A stashed completion for an adapter that has gone names a
+				// slot the next device will be given, and draining it then would deliver
+				// one adapter's bytes on another's stream.
+				hc.serial_rx[index] = None;
+				hc.serial_pending[index] = None;
+			}
+			let mut gone = serials.devices.remove(at);
+			gone.release(hc);
+			hc.budget.release(ClassKind::Serial);
+		}
+		// AND THE AUDIO SINK, on the same terms: its ring and its slot go back, and the
+		// class budget with them, or a device unplugged and plugged in again is refused by
+		// a budget still holding the first one's place.
+		for mut dev in audio.take_port(port) {
+			if hc.audio_rx.is_some_and(|(slot, _)| slot == dev.slot) {
+				hc.audio_rx = None;
+				hc.audio_pending.clear();
+			}
+			dev.release(hc);
+			hc.budget.release(ClassKind::Audio);
+		}
+		// AND EVERY CLASS MODULE ON THIS PORT: its pipes, its device and its budget line now, and its
+		// publication by the loop that holds the manager's channel.
+		classes.detach_port(hc, port);
+		while let Some(mut rec) = slots.take_port(port) {
+			match rec.device.take() {
+				Some(mut dev) => dev.release(hc),
+				None => {
+					// A record whose device another structure held: its pages went with it,
+					// and the slot is disabled here.
+					command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | rec.slot << 24);
+					let mut none: Hids = Hids::new();
+					let _ = wait_command(hc, &mut none);
+					((hc.dcbaa_virt + rec.slot as u64 * 8) as *mut u64).write_volatile(0);
+				}
+			}
+		}
 	}
 }
 
@@ -2086,20 +2384,28 @@ fn kind_name(kind: u8) -> &'static str {
 // detach - every slot on that port is disabled (a hub takes its downstream devices
 // along) and the HID / storage state dropped, so vol://usb unmounts and a
 // replug enumerates cleanly.
-unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut Option<(UsbDevice, Audio)>, serials: &mut usb_serial::Serials) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, storage: &mut Option<(UsbDevice, Storage)>, network: &mut Option<(UsbDevice, Net)>, uas: &mut Option<(UsbDevice, Uas)>, audio: &mut usb_audio::Devices, serials: &mut usb_serial::Serials, classes: &mut classes::Classes) {
 	unsafe {
+		// A PORT TO ENUMERATE AGAIN is detached as if unplugged and then attached in the same pass - and the attach
+		// resets the port, which is what the device on it was waiting for.
+		let redo = hc.redo_port.take();
 		let mut port: u32 = 1;
 		while port <= hc.ports {
 			let addr: u64 = hc.op + OP_PORTSC_BASE + (port - 1) as u64 * 0x10;
 			let connected: bool = r32(addr) & PORTSC_CCS != 0;
-			let known: bool = slots.has_port(port);
+			let mut known: bool = slots.has_port(port);
+			if redo == Some(port) && known {
+				detach_port_devices(hc, slots, hids, storage, network, uas, audio, serials, classes, port);
+				known = false;
+			}
 			// THE ACTION IS DECIDED FROM THE PORT'S OWN REGISTER and not from a list of events, so a
 			// connect and a disconnect in one window are one attach and one detach rather than two
 			// replays of whichever arrived twice.
 			if drivers::port::port_action(connected, known) == drivers::port::PortAction::Attach {
 				let mut devices: u32 = 0;
 				if let Some(dev) = attach_port(hc, port) {
-					register_device(hc, dev, slots, &mut devices, hids, storage, network, uas, audio, serials);
+					register_device(hc, dev, slots, &mut devices, hids, storage, network, uas, audio, serials, classes);
 				}
 				// a HID device configured by this attach starts serving: post its first
 				// report TRB (the boot-time ones are posted before the service loop).
@@ -2111,101 +2417,50 @@ unsafe fn reconcile_ports(hc: &mut Xhci, slots: &mut Slots, hids: &mut Hids, sto
 					post_notification(hc, dev, net);
 				}
 			} else if drivers::port::port_action(connected, known) == drivers::port::PortAction::Detach {
-				// acknowledge the disconnect and tear the port's devices down.
-				portsc_write(hc, port, PORTSC_CSC | PORTSC_PEC | PORTSC_PRC | PORTSC_WRC | PORTSC_PLC | PORTSC_CEC);
-				// EVERYTHING THIS PORT OWNED IS GIVEN BACK, and each device is released by whoever
-				// holds it: the ones bound to a role live in their own structures, and the rest live
-				// in the inventory. Disabling the slot without closing the pages - which is what this
-				// did - leaks three pages per attach on a port somebody plugs and unplugs.
-				for (dev, hid) in hids.entries.iter_mut().filter(|(dev, _)| dev.port == port) {
-					hid.release();
-					dev.release(hc);
-					// AND THE CHARGE GOES BACK WITH THE PAGES. A release that gave the memory back and
-					// kept the budget would turn a port somebody plugs and unplugs into a controller
-					// that stops accepting keyboards.
-					hc.budget.release(ClassKind::Hid);
-				}
-				hids.entries.retain(|(dev, _)| dev.port != port);
-				if let Some((dev, st)) = storage.as_mut()
-					&& dev.port == port
-				{
-					st.release();
-					dev.release(hc);
-					hc.budget.release(ClassKind::Storage);
-					*storage = None;
-				}
-				if let Some((dev, target)) = uas.as_mut()
-					&& dev.port == port
-				{
-					target.release();
-					dev.release(hc);
-					hc.budget.release(ClassKind::Uas);
-					*uas = None;
-				}
-				if let Some((dev, net)) = network.as_mut()
-					&& dev.port == port
-				{
-					net.release();
-					dev.release(hc);
-					hc.budget.release(ClassKind::Network);
-					hc.net_rx = None;
-					hc.net_pending = None;
-					*network = None;
-				}
-				// AND THE SERIAL ADAPTER, on the same terms. Its two pages are the reason this is
-				// not optional: a driver that let an unplugged adapter's DMA pages go with the
-				// structure rather than giving them back leaks a page a plug and an unplug, and the
-				// budget would refuse the next adapter for a place nothing holds.
-				// A DEVICE THAT LEAVES TAKES EVERY PORT THAT WAS ON IT, which is one for an
-				// ordinary adapter and two for a composite one.
-				if let Some(at) = serials.devices.iter().position(|device| device.port == port) {
-					let slot = serials.devices[at].slot;
-					for index in (0..serials.ports.len()).rev() {
-						if serials.ports[index].slot() != slot {
-							continue;
-						}
-						serials.ports[index].release();
-						serials.ports.remove(index);
-						// AND THE ENDPOINT THIS CONTROLLER KEEPS COMPLETIONS FOR, with anything
-						// already kept. A stashed completion for an adapter that has gone names a
-						// slot the next device will be given, and draining it then would deliver
-						// one adapter's bytes on another's stream.
-						hc.serial_rx[index] = None;
-						hc.serial_pending[index] = None;
-					}
-					let mut gone = serials.devices.remove(at);
-					gone.release(hc);
-					hc.budget.release(ClassKind::Serial);
-				}
-				// AND THE AUDIO SINK, on the same terms: its ring and its slot go back, and the
-				// class budget with them, or a device unplugged and plugged in again is refused by
-				// a budget still holding the first one's place.
-				if let Some((dev, sink)) = audio.as_mut()
-					&& dev.port == port
-				{
-					sink.release();
-					dev.release(hc);
-					hc.budget.release(ClassKind::Audio);
-					*audio = None;
-				}
-				while let Some(mut rec) = slots.take_port(port) {
-					match rec.device.take() {
-						Some(mut dev) => dev.release(hc),
-						None => {
-							// A record whose device another structure held: its pages went with it,
-							// and the slot is disabled here.
-							command(hc, 0, 0, TRB_DISABLE_SLOT << 10 | rec.slot << 24);
-							let mut none: Hids = Hids::new();
-							let _ = wait_command(hc, &mut none);
-							((hc.dcbaa_virt + rec.slot as u64 * 8) as *mut u64).write_volatile(0);
-						}
-					}
-				}
+				detach_port_devices(hc, slots, hids, storage, network, uas, audio, serials, classes, port);
 				print(b"driver.xhci: port detached\n");
 			}
 			port += 1;
 		}
 	}
+}
+
+// KEEP A COMPLETION A SYNCHRONOUS WAIT TOOK OFF THE RING THAT BELONGS TO A STANDING TRANSFER: the network
+// adapter's receive, a serial port's, or any class module's pipe. Answers whether it was kept; what is not
+// kept is the HID path's to answer.
+//
+// ONE PLACE FOR ALL THREE WAITS. The transfer wait kept the network's and the serial ports' and the command
+// wait kept nothing - it offered everything to the HID path, which does not answer for either - so a
+// completion that landed during a Reset Endpoint was lost, and so was the standing transfer it ended.
+fn keep_stray(hc: &mut Xhci, pointer: u64, status: u32, control: u32) -> bool {
+	if control >> 10 & 0x3f != TRB_EV_TRANSFER {
+		return false;
+	}
+	let owner = (control >> 24, control >> 16 & 0x1f);
+	// A COMPLETION FOR THE ADAPTER'S RECEIVE ENDPOINT IS KEPT AND NOT OFFERED TO THE HID PATH, which does not
+	// answer for it. See `Xhci::net_pending`.
+	if hc.net_rx == Some(owner) && hc.net_pending.is_none() {
+		hc.net_pending = Some((status, control));
+		return true;
+	}
+	// AND THE SERIAL ADAPTER'S RECEIVE, FOR THE SAME REASON AND WITH SHARPER TIMING. A write's echo comes back
+	// WHILE a wait for that write's own completion is running, so this is not a rare interleaving - it is the
+	// ordinary one.
+	if let Some(port) = hc.serial_rx.iter().position(|rx| *rx == Some(owner))
+		&& hc.serial_pending[port].is_none()
+	{
+		hc.serial_pending[port] = Some((status, control));
+		return true;
+	}
+	// AND THE AUDIO SOURCE'S, which stand for as long as a capture runs. Bounded by the transfers that can
+	// stand: a completion past that is not one of them.
+	if hc.audio_rx == Some(owner) {
+		if hc.audio_pending.len() < drivers::usb_class::CAPTURE_POSTED as usize + 2 {
+			hc.audio_pending.push((status, control));
+		}
+		return true;
+	}
+	classes::keep(hc, pointer, status, control)
 }
 
 // Wait for a transfer event on the given slot/endpoint, servicing HID events
@@ -2217,28 +2472,21 @@ fn wait_transfer(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<
 
 // The same wait, answering the completion code AND the transfer event's residual length.
 fn wait_transfer_len(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<(u32, u32)> {
+	wait_transfer_at(hc, hids, slot, dci).map(|(_, code, residual)| (code, residual))
+}
+
+// And the TRB the event names, for a transfer of several TRBs that can report from more than one of them.
+fn wait_transfer_at(hc: &mut Xhci, hids: &mut Hids, slot: u32, dci: u32) -> Option<(u64, u32, u32)> {
 	unsafe {
 		let mut spins: u32 = 0;
 		loop {
-			if let Some((_p, status, control)) = take_event(hc) {
+			if let Some((pointer, status, control)) = take_event(hc) {
 				let kind: u32 = control >> 10 & 0x3f;
 				if kind == TRB_EV_TRANSFER && control >> 24 == slot && (control >> 16 & 0x1f) == dci {
-					return Some((status >> 24, status & 0x00ff_ffff));
+					return Some((pointer, status >> 24, status & 0x00ff_ffff));
 				}
-				// A COMPLETION FOR THE ADAPTER'S RECEIVE ENDPOINT IS KEPT AND NOT OFFERED TO THE HID
-				// PATH, which does not answer for it. See `Xhci::net_pending`.
-				if kind == TRB_EV_TRANSFER && hc.net_rx == Some((control >> 24, control >> 16 & 0x1f)) && hc.net_pending.is_none() {
-					hc.net_pending = Some((status, control));
-					continue;
-				}
-				// AND THE SERIAL ADAPTER'S RECEIVE, FOR THE SAME REASON AND WITH SHARPER TIMING. A
-				// write's echo comes back WHILE this function is waiting for that write's own
-				// completion, so this is not a rare interleaving - it is the ordinary one.
-				if kind == TRB_EV_TRANSFER
-					&& let Some(port) = hc.serial_rx.iter().position(|rx| *rx == Some((control >> 24, control >> 16 & 0x1f)))
-					&& hc.serial_pending[port].is_none()
-				{
-					hc.serial_pending[port] = Some((status, control));
+				// A standing transfer's completion is kept for the loop - see `keep_stray`.
+				if keep_stray(hc, pointer, status, control) {
 					continue;
 				}
 				handle_hid_event(hc, hids, status, control);

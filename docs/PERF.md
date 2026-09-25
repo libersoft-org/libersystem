@@ -229,7 +229,8 @@ pass:
   independent by construction. THIS IS THE ONLY ONE WITH THE FLOOR'S FACTOR IN IT: the gap is
   twenty-nine times and the other two below are worth a fraction each. The parallelism has to come
   from outside a `no_std` library that has no threads in it, which makes this an interface question
-  before it is an optimisation.
+  before it is an optimisation. AND IT IS IN (2026-09-25): the interface is `soft3d::frame::Workers`,
+  the threads are `rt::pool`'s, and the measurement is under "More than one thread, measured" below.
 - **Fewer instructions rather than faster ones.** Nothing in this stack folds constants, removes a
   dead assignment or fuses a multiply and an add in the IR before it runs. NOT WORTH ANYTHING ON THIS
   SCENE, and the reason is worth writing down: the benchmark's lit stage has no dead assignment and no
@@ -248,6 +249,53 @@ pure-plumbing compose row moved, 41.7 to 37.7, and the frame does not run that m
 So the route would have bought a type-inference pass and a refusal the shader model does not have, for
 zero on the thing being optimised. It is off the list, and what that leaves is the one route with the
 factor in it.
+
+### More than one thread, measured (2026-09-25)
+
+`soft3d-bench --scaling` runs the whole frame - every stage, the last variant above - with the tiles
+shaded by N host threads through `soft3d::frame::execute_with`, the caller being one of the N. The
+threads are made once and parked between frames, so a frame's time is the renderer's and not the
+cost of making threads, which is also how the guest's `rt::pool` works. Same host, same build, same
+frozen scene; eight samples after two warmup frames at every count.
+
+| workers | frame | against one | of linear |
+| ---: | ---: | ---: | ---: |
+| 1 | 934.3 ms | 1.00x | 100.0 % |
+| 2 | 492.9 ms | 1.90x | 94.8 % |
+| 4 | 277.9 ms | 3.36x | 84.1 % |
+| 8 | 125.6 ms | 7.44x | 93.0 % |
+| 12 | 83.4 ms | 11.21x | 93.4 % |
+| 16 | 68.0 ms | 13.73x | 85.8 % |
+| 24 | 48.5 ms | 19.28x | 80.3 % |
+| 32 | 40.9 ms | 22.82x | 71.3 % |
+| 48 | 37.6 ms | 24.84x | 51.7 % |
+| 64 | 35.5 ms | 26.30x | 41.1 % |
+
+**THE PICTURE IS THE SAME AT EVERY COUNT, AND THE BENCHMARK CHECKS IT RATHER THAN THIS FILE CLAIMING
+IT:** every count must leave the one-worker colour attachment to the bit and count the same work, or
+the run stops. The host suite holds the same property over scenes built to break it - blended,
+multisampled, stencilled, two attachments, a scissor across tiles - through real threads, a pool that
+runs the tiles backwards and one that hands every tile out twice.
+
+THE ONE-WORKER ROW IS THE SERIAL FRAME, AND IT DID NOT MOVE: 934.3 ms against 933.9 before the
+attachments became tile-major. The storage order changed so that each tile's pixels are one slice a
+worker can own; the serial walk pays nothing for it.
+
+WHERE THE LINE BENDS, AND WHY. Up to twelve workers the frame divides almost exactly; past about
+twenty-four it stops. The unit of work is a 32x32 tile - three hundred of them at 640x480 - and the
+scene's cost is not spread evenly over them: the cubes cover the middle of the frame and the corners
+are background. At sixty-four workers each has four or five tiles, and the frame is as long as the
+worker that drew the busiest ones. Smaller tiles would move the bend, and they would also change the
+hierarchical-depth granularity that the fragment count depends on; that is a measurement for later.
+
+Per stage at 32 workers, by difference as above: geometry 1.4 ms (the serial part, unchanged),
+rasterisation, depth and write 10.4, the lit stage 20.3, the two texture samples 6.8, and the blend
+inside the run-to-run spread. The same 442,474 fragments.
+
+**NOT THE FLOOR.** Sixty-four workers bring this frame within a few percent of 33 ms on this host,
+and that is a statement about a hundred-core host and a benchmark scene rather than about the live
+demo in a guest, which is what the floor is measured on. The project owner left the floor open for a
+separate investigation (2026-09-25), and it stays open.
 
 ## The 3D demo, live, at three sizes (2026-09-18)
 

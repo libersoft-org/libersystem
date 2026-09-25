@@ -1,7 +1,8 @@
 // midicheck - the in-guest scenario driver for the MIDI gate. DEVELOPMENT-ONLY.
 //
-// It holds the MIDI fixture's control endpoint, MIDI inventory and a receiver on endpoint 0 of the fixture
-// device, and prints one verdict line per phase for the gate to read. The packets it scripts are raw
+// It holds the MIDI fixture's control endpoint, MIDI inventory, a receiver on endpoint 0 of the fixture device
+// and a sender on its transmit endpoint 2 - which the fixture plays back on endpoint 0 - and prints one
+// verdict line per phase for the gate to read. The packets it scripts are raw
 // USB-MIDI 1.0 packets; what it checks is what MidiService's decoder made of them. The service's handle
 // baseline is the gate's to read, from the system graph, which holds the service's process.
 //
@@ -9,7 +10,9 @@
 //                          time, after a delayed read
 //   midicheck malformed    misalignment, a reserved code, a cable the endpoint lacks: typed faults
 //   midicheck cap          a SysEx over 64 kB in many small fragments is aborted by number; a new one recovers
-//   midicheck unsupported  output and UMP are unsupported; receiving through inventory is denied
+//   midicheck unsupported  UMP is unsupported; a direction an endpoint lacks is invalid; inventory opens nothing
+//   midicheck send         a phrase through the sender comes back through the receiver, chunk for chunk; a bad
+//                          batch sends nothing; a stopped sender is closed
 //   midicheck overflow     a flood past the queue ends the receiver with a readable overflow
 //   midicheck lost         input the device lost ends the receiver with a source discontinuity
 //   midicheck unplug       withdrawal during a SysEx ends the receiver as removed; the device comes back
@@ -23,7 +26,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{Error, EventEndReason, LaunchContext, MidiAbortReason, MidiBatch, MidiChunkKind, MidiDirection, MidiEndpointId, MidiFaultCode, MidiItem, MidiProtocol, midi, midi_fixture, midi_input};
+use proto::system::{Error, EventEndReason, LaunchContext, MidiAbortReason, MidiBatch, MidiChunk, MidiChunkKind, MidiDirection, MidiEndpointId, MidiFaultCode, MidiItem, MidiProtocol, midi, midi_fixture, midi_input, midi_output};
 use rt::*;
 use services::capability_names::*;
 
@@ -46,6 +49,7 @@ struct Probe {
 	fixture: u64,
 	inventory: u64,
 	input: u64,
+	output: u64,
 }
 
 impl Probe {
@@ -83,6 +87,12 @@ impl Probe {
 		match midi_input::Client::with_deadline(ChannelTransport { chan: self.input }, clock() + 5 * TICKS).endpoint() {
 			Some(Ok(endpoint)) => endpoint.id,
 			_ => fail(b"the receiver could not describe its endpoint"),
+		}
+	}
+	fn transmit(&self) -> proto::system::MidiEndpoint {
+		match midi_output::Client::with_deadline(ChannelTransport { chan: self.output }, clock() + 5 * TICKS).endpoint() {
+			Some(Ok(endpoint)) => endpoint,
+			_ => fail(b"the sender could not describe its endpoint"),
 		}
 	}
 }
@@ -172,15 +182,84 @@ fn cap(probe: &Probe) {
 }
 
 fn unsupported(probe: &Probe) {
-	let endpoint = probe.endpoint();
-	let open = |direction: MidiDirection, protocol: MidiProtocol| midi::Client::with_deadline(ChannelTransport { chan: probe.inventory }, clock() + 5 * TICKS).open(&endpoint, &direction, &protocol);
-	if !matches!(open(MidiDirection::Transmit, MidiProtocol::Midi1), Some(Err(Error::Unsupported))) || !matches!(open(MidiDirection::Receive, MidiProtocol::Ump), Some(Err(Error::Unsupported))) {
-		fail(b"unsupported: output or UMP was not refused as unsupported");
+	let receive = probe.endpoint();
+	let transmit = probe.transmit().id;
+	let open = |endpoint: &MidiEndpointId, direction: MidiDirection, protocol: MidiProtocol| midi::Client::with_deadline(ChannelTransport { chan: probe.inventory }, clock() + 5 * TICKS).open(endpoint, &direction, &protocol);
+	if !matches!(open(&receive, MidiDirection::Receive, MidiProtocol::Ump), Some(Err(Error::Unsupported))) || !matches!(open(&transmit, MidiDirection::Transmit, MidiProtocol::Ump), Some(Err(Error::Unsupported))) {
+		fail(b"unsupported: UMP was not refused as unsupported");
 	}
-	if !matches!(open(MidiDirection::Receive, MidiProtocol::Midi1), Some(Err(Error::Denied))) {
-		fail(b"unsupported: inventory opened a receiver");
+	if !matches!(open(&receive, MidiDirection::Transmit, MidiProtocol::Midi1), Some(Err(Error::Invalid))) || !matches!(open(&transmit, MidiDirection::Receive, MidiProtocol::Midi1), Some(Err(Error::Invalid))) {
+		fail(b"unsupported: a direction the endpoint does not have was not refused as invalid");
 	}
-	say(b"PASS unsupported: output and UMP are unsupported, and inventory cannot open a receiver");
+	if !matches!(open(&receive, MidiDirection::Receive, MidiProtocol::Midi1), Some(Err(Error::Denied))) || !matches!(open(&transmit, MidiDirection::Transmit, MidiProtocol::Midi1), Some(Err(Error::Denied))) {
+		fail(b"unsupported: inventory opened a receiver or a sender");
+	}
+	say(b"PASS unsupported: UMP is unsupported, a direction the endpoint lacks is invalid, and inventory opens neither way");
+}
+
+fn chunk(cable: u8, kind: MidiChunkKind, bytes: &[u8], message: Option<u32>) -> MidiChunk {
+	let (start, end) = (kind == MidiChunkKind::SysexStart || (message.is_some() && bytes.first() == Some(&0xf0)), kind == MidiChunkKind::SysexEnd);
+	MidiChunk { cable, kind, bytes: bytes.to_vec(), sysex_message: message, start, end }
+}
+
+fn send(probe: &Probe) {
+	let output = || midi_output::Client::with_deadline(ChannelTransport { chan: probe.output }, clock() + 5 * TICKS);
+	let described = probe.transmit();
+	if described.direction != MidiDirection::Transmit || described.cables != 2 || !described.receiving {
+		fail(b"send: the sender's endpoint is not the fixture's transmit endpoint, held");
+	}
+	let before = match probe.fixture().stats() {
+		Some(Ok(stats)) => stats.sent,
+		_ => fail(b"send: the fixture's counts could not be read"),
+	};
+	// TWO CABLES, INTERLEAVED: a note on and off on cable 0, and on cable 1 a SysEx in three fragments with a
+	// realtime byte inside it, then a program change once it has ended.
+	let phrase = alloc::vec![
+		chunk(0, MidiChunkKind::Short, &[0x90, 0x3c, 0x64], None),
+		chunk(1, MidiChunkKind::SysexStart, &[0xf0, 0x7e, 0x7f], Some(9)),
+		chunk(1, MidiChunkKind::Short, &[0xf8], None),
+		chunk(1, MidiChunkKind::SysexContinue, &[0x06, 0x01, 0x02], Some(9)),
+		chunk(0, MidiChunkKind::Short, &[0x80, 0x3c, 0x00], None),
+		chunk(1, MidiChunkKind::SysexEnd, &[0x03, 0xf7], Some(9)),
+		chunk(1, MidiChunkKind::Short, &[0xc1, 0x05], None),
+	];
+	if !matches!(output().send(&phrase), Some(Ok(()))) {
+		fail(b"send: the phrase was not taken");
+	}
+	// AND IT COMES BACK, through the receiver, chunk for chunk - the message number is the receiver's own.
+	let back = probe.drain();
+	if back.len() != phrase.len() {
+		fail(b"send: the phrase did not come back whole");
+	}
+	for (item, sent) in back.iter().zip(phrase.iter()) {
+		let MidiItem::Chunk(got) = item else { fail(b"send: something other than a chunk came back") };
+		if got.cable != sent.cable || got.kind != sent.kind || got.bytes != sent.bytes || got.start != sent.start || got.end != sent.end || got.sysex_message.is_some() != sent.sysex_message.is_some() {
+			fail(b"send: a chunk came back as something other than what was sent");
+		}
+	}
+	// REFUSED WHOLE: a good note on and a note on missing a byte send nothing - not even the good one; so do a
+	// continuation with no message open and a cable the endpoint does not carry.
+	for bad in [
+		alloc::vec![chunk(0, MidiChunkKind::Short, &[0x90, 0x3c, 0x64], None), chunk(0, MidiChunkKind::Short, &[0x90, 0x3c], None)],
+		alloc::vec![chunk(0, MidiChunkKind::SysexContinue, &[0x01, 0x02, 0x03], Some(4))],
+		alloc::vec![chunk(2, MidiChunkKind::Short, &[0x90, 0x3c, 0x64], None)],
+	] {
+		if !matches!(output().send(&bad), Some(Err(Error::Invalid))) {
+			fail(b"send: a batch that is not all messages was not refused");
+		}
+	}
+	if !probe.drain().is_empty() {
+		fail(b"send: a refused batch reached the device");
+	}
+	match probe.fixture().stats() {
+		Some(Ok(stats)) if stats.sent == before + phrase.len() as u32 => {}
+		_ => fail(b"send: the device did not take exactly the phrase's packets"),
+	}
+	// A STOPPED SENDER IS CLOSED, and its endpoint free.
+	if !matches!(output().stop(), Some(Ok(()))) || !matches!(output().send(&alloc::vec![chunk(0, MidiChunkKind::Short, &[0xf8], None)]), Some(Err(Error::Closed))) {
+		fail(b"send: a stopped sender kept sending");
+	}
+	say(b"PASS send: a phrase over two cables came back chunk for chunk, a SysEx with a realtime byte inside it included; a bad batch sent nothing; a stopped sender is closed");
 }
 
 fn overflow(probe: &Probe) {
@@ -282,21 +361,23 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let fixture = recv_tagged(bootstrap, &mut buf, b"FIXTURE").unwrap_or(0);
 	let inventory = recv_tagged(bootstrap, &mut buf, CAP_MIDI).unwrap_or(0);
 	let input = recv_tagged(bootstrap, &mut buf, b"MIDIINPUT").unwrap_or(0);
-	if fixture == 0 || inventory == 0 || input == 0 {
+	let output = recv_tagged(bootstrap, &mut buf, b"MIDIOUTPUT").unwrap_or(0);
+	if fixture == 0 || inventory == 0 || input == 0 || output == 0 {
 		fail(b"a grant this probe needs was not delivered");
 	}
-	let probe = Probe { fixture, inventory, input };
+	let probe = Probe { fixture, inventory, input, output };
 	match args.split(|&b| b == b' ').next().unwrap_or(&[]) {
 		b"receive" => receive(&probe),
 		b"malformed" => malformed(&probe),
 		b"cap" => cap(&probe),
 		b"unsupported" => unsupported(&probe),
+		b"send" => send(&probe),
 		b"overflow" => overflow(&probe),
 		b"lost" => lost(&probe),
 		b"unplug" => unplug(&probe),
 		b"fresh" => fresh(&probe),
 		b"inherit" => inherit(&probe),
-		_ => fail(b"usage: midicheck receive | malformed | cap | unsupported | overflow | lost | unplug | fresh | inherit"),
+		_ => fail(b"usage: midicheck receive | malformed | cap | unsupported | send | overflow | lost | unplug | fresh | inherit"),
 	}
 	exit();
 }

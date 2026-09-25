@@ -1,0 +1,19 @@
+[package]
+# The product version lives only in /product.conf; Cargo's optional package version is unused here and
+# omitted.
+name = "admin-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem administrative-request channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["admin-proto/shared-image"]
+
+[dependencies]
+admin-proto = { path = "../../protocol/admin-proto" }
+
+[lints.rust]
+warnings = "deny"

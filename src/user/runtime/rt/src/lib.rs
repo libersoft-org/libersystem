@@ -36,6 +36,10 @@ pub use abi::*;
 mod heap;
 // The byte-stream contract shared by stdio, pipeline edges and storage adapters.
 pub mod stream;
+// Worker threads: a bounded pool that lives as long as the process. NOT UNDER THE HOST-TEST SEAM,
+// where there is no kernel to make a thread and no entry stub to start one at.
+#[cfg(not(feature = "host-tests"))]
+pub mod pool;
 
 // ELF entry: the kernel drops us into ring 3 / EL0 here with the bootstrap channel
 // handle in the first argument register. Align the stack to the ABI boundary, then
@@ -149,8 +153,9 @@ fn run_initialisers() {
 static mut FINALISED: bool = false;
 
 fn run_finalisers() {
-	// SAFETY: this process creates no threads - the whole substrate is pinned without thread
-	// creation - so there is no second reader of this flag to race with.
+	// SAFETY: only one thread ever gets here. A process's only other threads are `pool`'s workers,
+	// and a worker that calls `exit` kills the process in `pool::leaving` before reaching this - so
+	// there is no second reader of this flag to race with.
 	unsafe {
 		if FINALISED {
 			return;
@@ -182,6 +187,9 @@ pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
 #[cfg(not(feature = "host-tests"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+	// WITH WORKERS IN THE PROCESS A PANIC KILLS IT, whichever thread panicked: see `pool`. Without
+	// them this is what it always was.
+	pool::crashed();
 	unsafe {
 		syscall(SYS_USER_EXIT, 0, 0, 0, 0);
 	}
@@ -405,6 +413,11 @@ pub fn exit_with(status: u64) -> ! {
 	// contract says. Everything that reaches here asked to end; a process that faults or is killed
 	// never returns to this code, so the difference between the two paths is observable rather than
 	// documented.
+	//
+	// EVERY WORKER ENDS WITH THIS STATUS FIRST, or its thread would keep the process alive after this
+	// one ended - see `pool`.
+	#[cfg(not(feature = "host-tests"))]
+	pool::leaving(status);
 	run_finalisers();
 	unsafe {
 		syscall(SYS_USER_EXIT, status, 0, 0, 0);

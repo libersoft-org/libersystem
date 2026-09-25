@@ -390,6 +390,14 @@ owner = "bluetooth-client-provider"
 path = "user/libs/clients/bluetooth-client-provider"
 
 [[sources]]
+owner = "admin-client"
+path = "user/libs/clients/admin-client"
+
+[[sources]]
+owner = "admin-client-provider"
+path = "user/libs/clients/admin-client-provider"
+
+[[sources]]
 owner = "font-client"
 path = "user/libs/clients/font-client"
 
@@ -1556,6 +1564,18 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/btctl.lsexe"
 providers = ["base-proto", "bluetooth-client", "lsrt"]
+
+# THE FIRMWARE-DOWNLOAD REQUESTER, the one shipping holder of an administrative request connection: PermissionManager
+# scopes it to firmware download on `dfu:` targets, and every request it makes waits for a person on the protected
+# screen.
+[[programs]]
+name = "dfu"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/dfu.lsexe"
+providers = ["base-proto", "admin-client", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "lsirq"
@@ -5233,6 +5253,13 @@ owner = "bluetooth-client-provider"
 destination = "lib/clients/bluetooth-client.lslib"
 features = ["shared-image"]
 providers = ["bluetooth-proto"]
+
+[[libraries]]
+name = "admin-client"
+owner = "admin-client-provider"
+destination = "lib/clients/admin-client.lslib"
+features = ["shared-image"]
+providers = ["admin-proto"]
 
 [[libraries]]
 name = "font-client"

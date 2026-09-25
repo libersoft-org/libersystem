@@ -153,6 +153,22 @@ pub fn isochronous_out(address: u8, attributes: u8) -> bool {
 	attributes & 0x03 == 0x01 && address & 0x80 == 0
 }
 
+/// Whether an endpoint descriptor is an isochronous DATA endpoint coming IN from the device.
+///
+/// DATA, BECAUSE AN ASYNCHRONOUS SINK HAS AN ISOCHRONOUS IN ENDPOINT TOO: its feedback endpoint, which
+/// carries the rate the sink wants rather than samples, and says so in the usage type (bits 5:4, `01`).
+/// A driver that took every isochronous IN endpoint for a microphone would record a speaker's clock.
+pub fn isochronous_in(address: u8, attributes: u8) -> bool {
+	attributes & 0x03 == 0x01 && attributes & 0x30 == 0 && address & 0x80 != 0
+}
+
+/// Which way PCM crosses an isochronous endpoint: to a device that plays it, or from one that records.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Direction {
+	Sink,
+	Source,
+}
+
 /// What a bound audio device is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Binding {
@@ -173,6 +189,12 @@ pub struct Binding {
 
 /// Walk one configuration for an audio sink this system's wire can drive.
 pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
+	bind_for(config, Direction::Sink)
+}
+
+/// Walk one configuration for a streaming setting that carries this system's wire in `direction`: a sink's
+/// isochronous OUT, or a source's isochronous IN data endpoint.
+pub fn bind_for(config: &[u8], direction: Direction) -> Result<Binding, NotBindable> {
 	let mut config_value: Option<u8> = None;
 	let mut have_control = false;
 	// The interface and alternate currently being described, and what has been read about it.
@@ -230,7 +252,11 @@ pub fn bind(config: &[u8]) -> Result<Binding, NotBindable> {
 				let attributes = record.field(3).map_err(|_| NotBindable::Malformed)?;
 				let packet = record.field16(4).map_err(|_| NotBindable::Malformed)?;
 				let interval = record.field(6).unwrap_or(1);
-				if !isochronous_out(address, attributes) || !found.suits(WANTED_RATE_HZ, WANTED_CHANNELS, WANTED_BITS) {
+				let carries = match direction {
+					Direction::Sink => isochronous_out(address, attributes),
+					Direction::Source => isochronous_in(address, attributes),
+				};
+				if !carries || !found.suits(WANTED_RATE_HZ, WANTED_CHANNELS, WANTED_BITS) {
 					continue;
 				}
 				// THE FIRST ONE THAT SUITS, which is the bounded deterministic choice this tree

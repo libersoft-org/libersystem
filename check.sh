@@ -106,6 +106,9 @@ declare -A GATES=(
 	# keyboard on a protected screen nothing else can cover, one attempt at the confirmed operation, none for
 	# anything else, and the decision journal read back after a reboot. The generic seam - not USB DFU.
 	["qemu-admin-path"]="tools/check-admin-path.sh"
+	# THE SHIPPING FIRMWARE REQUESTER against a runtime DFU target played over `usb-redir`: `dfu` asks, a person
+	# confirms on the protected screen, the executor follows the target into DFU mode and writes the image once.
+	["qemu-dfu-tool"]="tools/check-dfu-tool.sh"
 	# THE GRAPHICS PROFILES, WHICH ARE CODE. Two closed enumerations - `Render2D Core Profile 1` and
 	# `Render3D Core Profile 1` - from which every table, checklist, conformance matrix and capability
 	# report is generated, hashed so a change to a profile is a line in a diff. It also runs the three

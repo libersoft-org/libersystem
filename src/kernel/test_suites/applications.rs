@@ -900,7 +900,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 // enumerated stops being denied out loud - so each new one is added here, once, rather than to every string.
 macro_rules! later_denials {
 	() => {
-		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny"
+		" bluetooth=deny bluetooth-operator=deny power-state=deny power-control=deny fixture-control=deny smartcard=deny camera=deny camera-capture=deny midi=deny midi-input=deny midi-output=deny modem-state=deny modem-data=deny modem-identity=deny modem-manage=deny spool=deny media-import=deny admin-request=deny admin-audit=deny admin-test=deny"
 	};
 }
 
@@ -2543,4 +2543,69 @@ fn the_3d_demo_draws_the_extended_scene_with_a_cast_shadow() {
 	assert!(darkest.1 < WIDTH / 2, "the shadow falls on the side the light's direction puts it: darkest column {}", darkest.1);
 
 	assert!(process.is_terminated(), "the run ended on its frame count: {output:?}");
+}
+
+tagged_test!(the_3d_demo_renders_the_same_frames_through_its_workers, [Display, Process, Service, Image], id = "kernel.applications.the_3d_demo_renders_the_same_frames_through_its_workers", covers = ["bin.test3d-sw", "soft3d", "rt", "kernel"]);
+// THE WORKER POOL, WHERE IT RUNS. `--workers 4 --compare` shades every pass on four threads - the
+// demo's own and three `rt::pool` workers - and renders it again on the demo's thread alone into
+// attachments of its own, and the two must hold the same bits. The host suite holds the parallel
+// path to the scalar reference on the machine that built the image; this holds it there on the
+// target, with the target's threads, stacks, channels and scheduler.
+//
+// AND THE PROCESS ENDS, WITH ITS OWN STATUS. A pool's workers never end on their own, so a demo whose
+// workers were not told would stay alive with nothing left running, and a worker that ended first
+// with a status of its own would overwrite the demo's. So the run has to FINISH - not be killed -
+// and report zero.
+fn the_3d_demo_renders_the_same_frames_through_its_workers() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	const WIDTH: u32 = 64;
+	const HEIGHT: u32 = 48;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let demo_elf = program_elf(&package, volume, b"test3d-sw").expect("test3d-sw in the package or volume");
+
+	let (bootstrap, child) = Channel::create();
+	let (stdout, child_stdout) = Channel::create();
+	let (display, display_client) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), demo_elf, child);
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the demo's console");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	bootstrap.send(Message::new(launch_context(b"--fixed --frames 3 --no-input --width 64 --height 48 --workers 4 --compare", b"vol://system"), alloc::vec::Vec::new())).expect("the demo's launch context");
+	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("the demo's display");
+
+	let mut host = SurfaceHost::new(display, WIDTH, HEIGHT);
+	let mut output: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..400_000u32 {
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		host.poll();
+		while let Ok(message) = stdout.recv() {
+			output.extend_from_slice(&message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	while let Ok(message) = stdout.recv() {
+		output.extend_from_slice(&message.bytes);
+	}
+	for line in output.split(|byte| *byte == b'\n') {
+		if !line.is_empty() {
+			crate::serial_println!("  {}", alloc::string::String::from_utf8_lossy(line));
+		}
+	}
+	let contains = |needle: &[u8]| output.windows(needle.len()).any(|window| window == needle);
+
+	assert!(contains(b"test3d-sw: shading on 4 worker(s)"), "the demo got the three workers it asked for besides itself: {output:?}");
+	assert!(host.presents >= 1, "and presented: {} present(s), {output:?}", host.presents);
+	assert!(!contains(b"DIFFERED"), "no pass through the workers differs from the serial walk: {output:?}");
+	// THE COUNT, READ AND NOT ONLY FOUND: a run that compared nothing prints the same line with a zero.
+	let marker = b"test3d-sw: ";
+	let passes: u64 = output.split(|byte| *byte == b'\n').find(|line| line.ends_with(b"worker(s) matched the serial walk")).and_then(|line| line.strip_prefix(&marker[..])).map(|rest| rest.iter().copied().take_while(u8::is_ascii_digit).collect::<alloc::vec::Vec<u8>>()).and_then(|digits| alloc::string::String::from_utf8_lossy(&digits).parse().ok()).unwrap_or(0);
+	assert!(passes >= 2, "every pass of at least one frame was compared - the scene and the panel: {passes}, {output:?}");
+
+	assert!(process.is_terminated(), "the run ended on its frame count with its workers alive, and the process still finished: {output:?}");
+	assert!(!process.is_killed(), "it finished rather than being killed: {output:?}");
+	assert_eq!(process.exit_status(), Some(0), "and reported the demo's own status, not a worker's: {output:?}");
 }

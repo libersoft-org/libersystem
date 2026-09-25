@@ -1,0 +1,86 @@
+# THE SHIPPING FIRMWARE REQUESTER, END TO END, THROUGH THE EMULATED KEYBOARD.
+#
+# `dfu` is the one shipping holder of an administrative request connection, scoped to firmware download on DFU
+# targets. It asks; AdminService shows the frozen operation on the protected screen; a key through QEMU's
+# keyboard decides. The target is `usbredir_device.py`'s runtime DFU device, which the USB DFU executor follows
+# into DFU mode at the reset it waits for, and the image is on this run's USB stick.
+#
+# `check-dfu-tool.sh` runs this with the target, the stick and the images in place; run bare, there is no target.
+version = 1
+name = "dfu tool"
+description = "The shipping dfu command asks for a firmware download, a person confirms it on the protected screen, the executor follows a runtime target into DFU mode and the image is written once; a decline writes nothing."
+timeout = 900
+
+[[step]]
+do = "prompt"
+timeout = 180
+
+# CONFIRMED: the image goes, once.
+[[step]]
+do = "key"
+text = "dfu dfu:1d6b:0104 vol://usb/fw.dfu &"
+
+[[step]]
+do = "expect"
+contains = "dfu: vol://usb/fw.dfu (3016 bytes) for dfu:1d6b:0104 - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "expect"
+contains = "dfu: confirmed - writing it"
+
+[[step]]
+do = "expect"
+contains = "dfu: completed - the device took the image and manifested it"
+timeout = 120
+
+# DECLINED: the same image for the device it has become, and nothing is written.
+[[step]]
+do = "key"
+keys = ["ret"]
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "key"
+text = "dfu dfu:1d6b:0105 vol://usb/fw2.dfu &"
+
+[[step]]
+do = "expect"
+contains = "dfu: vol://usb/fw2.dfu (3016 bytes) for dfu:1d6b:0105 - confirm it on the protected screen"
+
+[[step]]
+do = "key"
+keys = ["ctrl-alt-f12"]
+
+[[step]]
+do = "expect"
+contains = "AdminService: the protected screen is presented, and a request is waiting"
+
+[[step]]
+do = "expect"
+contains = "AdminService: the session is ready for a decision"
+
+[[step]]
+do = "key"
+keys = ["esc"]
+
+[[step]]
+do = "expect"
+contains = "dfu: declined - nothing was written"

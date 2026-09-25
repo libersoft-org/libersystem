@@ -2,10 +2,11 @@
 // Do not edit by hand; regenerate with `./gen.sh`.
 //! LiberSystem MIDI devices - the provider contract a `midi` publication serves to MidiService.
 //!
-//! A PROVIDER MOVES PACKETS; THE SERVICE DECODES. The USB MIDI class module, and the in-guest fixture before
-//! it, deliver USB-MIDI 1.0 event packets exactly as the transport completed them - at most 64 to a batch,
-//! with the host time the completion became available - and MidiService decodes them with the driver
-//! library's staged decoder. No client ever sees a raw packet.
+//! A PROVIDER MOVES PACKETS; THE SERVICE DECODES AND ENCODES. The USB MIDI class module, and the in-guest
+//! fixture before it, deliver USB-MIDI 1.0 event packets exactly as the transport completed them - at most 64
+//! to a batch, with the host time the completion became available - and MidiService decodes them with the
+//! driver library's staged decoder. The other way, MidiService encodes with the same library and a provider
+//! puts the packets on the wire as they are. No client ever sees or writes a raw packet.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
 use crate::codec::{Handles, PROTOCOL_INFO_OP, Reader, Sink, SliceWriter, VecWriter};
@@ -122,11 +123,67 @@ impl MidiOpen {
 	}
 }
 
+/// Which way an endpoint's packets go: from the device, or to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MidiDeviceDirection {
+	Receive = 1,
+	Transmit = 2,
+}
+
+impl MidiDeviceDirection {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<MidiDeviceDirection> {
+		let mut r = Reader::new(bytes);
+		let value = MidiDeviceDirection::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<MidiDeviceDirection> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = MidiDeviceDirection::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<MidiDeviceDirection> {
+		match r.u8()? {
+			1 => Some(MidiDeviceDirection::Receive),
+			2 => Some(MidiDeviceDirection::Transmit),
+			_ => None,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MidiDeviceEndpoint {
 	pub index: u32,
 	pub name: String,
 	pub cables: u8,
+	pub direction: MidiDeviceDirection,
 }
 
 impl MidiDeviceEndpoint {
@@ -168,6 +225,7 @@ impl MidiDeviceEndpoint {
 		w.u32(self.index)?;
 		w.bytes_lp(self.name.as_bytes())?;
 		w.u8(self.cables)?;
+		self.direction.write(w)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<MidiDeviceEndpoint> {
@@ -177,7 +235,8 @@ impl MidiDeviceEndpoint {
 			(v0.len() <= 64).then_some(v0)?
 		};
 		let cables = r.u8()?;
-		Some(MidiDeviceEndpoint { index, name, cables })
+		let direction = MidiDeviceDirection::read(r)?;
+		Some(MidiDeviceEndpoint { index, name, cables, direction })
 	}
 }
 
@@ -385,6 +444,7 @@ pub mod midi_device {
 	pub const OP_START: u16 = 3;
 	pub const OP_STOP: u16 = 4;
 	pub const OP_EVENTS: u16 = 5;
+	pub const OP_SEND: u16 = 6;
 
 	pub trait Service {
 		fn open(&mut self, version: u32) -> Result<MidiOpen, Error>;
@@ -392,6 +452,11 @@ pub mod midi_device {
 		fn start(&mut self, endpoint: u32, receiver_generation: u64) -> Result<(), Error>;
 		fn stop(&mut self, endpoint: u32, receiver_generation: u64) -> Result<(), Error>;
 		fn events(&mut self) -> Vec<MidiDeviceEvent>;
+		/// Put at most 64 USB-MIDI 1.0 event packets on a TRANSMIT endpoint, in order. ANSWERED WHEN THE TRANSPORT
+		/// HAS TAKEN ALL OF THEM, so a caller that waits for the answer is paced by the device and nothing queues
+		/// behind it; refused on a receive endpoint, for a cable the endpoint does not carry, and for a batch that
+		/// is not a whole number of packets.
+		fn send(&mut self, endpoint: u32, packets: Vec<u8>) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -546,6 +611,52 @@ pub mod midi_device {
 						Err(v14) => {
 							w.u8(0)?;
 							v14.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_SEND => {
+				let endpoint = r.u32()?;
+				let packets = {
+					let v15 = r.u16()? as usize;
+					let v15 = (v15 <= 256).then_some(v15)?;
+					let mut v16 = Vec::new();
+					v16.try_reserve_exact(v15).ok()?;
+					for _ in 0..v15 {
+						v16.push(r.u8()?);
+					}
+					v16
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.send(endpoint, packets);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v17) => {
+							w.u8(1)?;
+						}
+						Err(v18) => {
+							w.u8(0)?;
+							v18.write(w)?;
 						}
 					}
 					Some(())
@@ -745,14 +856,14 @@ pub mod midi_device {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v15 = r.u16()? as usize;
-						let v15 = (v15 <= 8).then_some(v15)?;
-						let mut v16 = Vec::new();
-						v16.try_reserve_exact(v15).ok()?;
-						for _ in 0..v15 {
-							v16.push(MidiDeviceEndpoint::read(r)?);
+						let v19 = r.u16()? as usize;
+						let v19 = (v19 <= 8).then_some(v19)?;
+						let mut v20 = Vec::new();
+						v20.try_reserve_exact(v19).ok()?;
+						for _ in 0..v19 {
+							v20.push(MidiDeviceEndpoint::read(r)?);
 						}
-						v16
+						v20
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -859,6 +970,46 @@ pub mod midi_device {
 			}
 			Some(reply_handles.first())
 		}
+		pub fn send(&mut self, endpoint: &u32, packets: &[u8]) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SEND)?;
+			w.u32(corr)?;
+			w.u32(*endpoint)?;
+			if packets.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(packets.len() as u16)?;
+			for v21 in packets.iter() {
+				w.u8(*v21)?;
+			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -900,6 +1051,14 @@ pub mod midi_device {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.events()
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_midi_device_midi_device_send")]
+	fn channel_invoke_send(chan: u64, endpoint: &u32, packets: &[u8]) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.send(endpoint, packets)
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -907,6 +1066,8 @@ pub struct MidiFixtureStats {
 	pub batches: u32,
 	pub packets: u32,
 	pub receiving: u8,
+	/// Packets taken on the transmit endpoint - each of them played back on receive endpoint 0.
+	pub sent: u32,
 }
 
 impl MidiFixtureStats {
@@ -948,13 +1109,15 @@ impl MidiFixtureStats {
 		w.u32(self.batches)?;
 		w.u32(self.packets)?;
 		w.u8(self.receiving)?;
+		w.u32(self.sent)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<MidiFixtureStats> {
 		let batches = r.u32()?;
 		let packets = r.u32()?;
 		let receiving = r.u8()?;
-		Some(MidiFixtureStats { batches, packets, receiving })
+		let sent = r.u32()?;
+		Some(MidiFixtureStats { batches, packets, receiving, sent })
 	}
 }
 
@@ -1009,14 +1172,14 @@ pub mod midi_fixture {
 			OP_INJECT => {
 				let endpoint = r.u32()?;
 				let packets = {
-					let v17 = r.u16()? as usize;
-					let v17 = (v17 <= 256).then_some(v17)?;
-					let mut v18 = Vec::new();
-					v18.try_reserve_exact(v17).ok()?;
-					for _ in 0..v17 {
-						v18.push(r.u8()?);
+					let v22 = r.u16()? as usize;
+					let v22 = (v22 <= 256).then_some(v22)?;
+					let mut v23 = Vec::new();
+					v23.try_reserve_exact(v22).ok()?;
+					for _ in 0..v22 {
+						v23.push(r.u8()?);
 					}
-					v18
+					v23
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -1025,12 +1188,12 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v19) => {
+						Ok(v24) => {
 							w.u8(1)?;
 						}
-						Err(v20) => {
+						Err(v25) => {
 							w.u8(0)?;
-							v20.write(w)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -1062,12 +1225,12 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v21) => {
+						Ok(v26) => {
 							w.u8(1)?;
 						}
-						Err(v22) => {
+						Err(v27) => {
 							w.u8(0)?;
-							v22.write(w)?;
+							v27.write(w)?;
 						}
 					}
 					Some(())
@@ -1098,12 +1261,12 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v23) => {
+						Ok(v28) => {
 							w.u8(1)?;
 						}
-						Err(v24) => {
+						Err(v29) => {
 							w.u8(0)?;
-							v24.write(w)?;
+							v29.write(w)?;
 						}
 					}
 					Some(())
@@ -1133,12 +1296,12 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v25) => {
+						Ok(v30) => {
 							w.u8(1)?;
 						}
-						Err(v26) => {
+						Err(v31) => {
 							w.u8(0)?;
-							v26.write(w)?;
+							v31.write(w)?;
 						}
 					}
 					Some(())
@@ -1168,12 +1331,12 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v27) => {
+						Ok(v32) => {
 							w.u8(1)?;
 						}
-						Err(v28) => {
+						Err(v33) => {
 							w.u8(0)?;
-							v28.write(w)?;
+							v33.write(w)?;
 						}
 					}
 					Some(())
@@ -1203,13 +1366,13 @@ pub mod midi_fixture {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v29) => {
+						Ok(v34) => {
 							w.u8(1)?;
-							v29.write(w)?;
+							v34.write(w)?;
 						}
-						Err(v30) => {
+						Err(v35) => {
 							w.u8(0)?;
-							v30.write(w)?;
+							v35.write(w)?;
 						}
 					}
 					Some(())
@@ -1326,8 +1489,8 @@ pub mod midi_fixture {
 				return None;
 			}
 			w.u16(packets.len() as u16)?;
-			for v31 in packets.iter() {
-				w.u8(*v31)?;
+			for v36 in packets.iter() {
+				w.u8(*v36)?;
 			}
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
@@ -1655,6 +1818,42 @@ impl MidiOpen {
 	}
 }
 
+impl MidiDeviceDirection {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub fn to_json_into(&self, out: &mut String) {
+		match self {
+			MidiDeviceDirection::Receive => out.push_str("\"receive\""),
+			MidiDeviceDirection::Transmit => out.push_str("\"transmit\""),
+		}
+	}
+	pub fn to_text_into(&self, out: &mut String) {
+		match self {
+			MidiDeviceDirection::Receive => out.push_str("receive"),
+			MidiDeviceDirection::Transmit => out.push_str("transmit"),
+		}
+	}
+	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			MidiDeviceDirection::Receive => crate::codec::cbor::text(out, "receive"),
+			MidiDeviceDirection::Transmit => crate::codec::cbor::text(out, "transmit"),
+		}
+	}
+}
+
 impl MidiDeviceEndpoint {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1681,6 +1880,9 @@ impl MidiDeviceEndpoint {
 		out.push(',');
 		out.push_str("\"cables\":");
 		let _ = write!(out, "{}", self.cables);
+		out.push(',');
+		out.push_str("\"direction\":");
+		self.direction.to_json_into(out);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1693,16 +1895,21 @@ impl MidiDeviceEndpoint {
 		out.push_str(", ");
 		out.push_str("cables=");
 		let _ = write!(out, "{}", self.cables);
+		out.push_str(", ");
+		out.push_str("direction=");
+		self.direction.to_text_into(out);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "cables");
 		crate::codec::cbor::uint(out, self.cables as u64);
+		crate::codec::cbor::text(out, "direction");
+		self.direction.to_cbor_into(out);
 	}
 }
 
@@ -1735,13 +1942,13 @@ impl MidiPacketBatch {
 		out.push(',');
 		out.push_str("\"packets\":");
 		out.push('[');
-		let mut v33 = true;
-		for v32 in self.packets.iter() {
-			if !v33 {
+		let mut v38 = true;
+		for v37 in self.packets.iter() {
+			if !v38 {
 				out.push(',');
 			}
-			v33 = false;
-			let _ = write!(out, "{}", v32);
+			v38 = false;
+			let _ = write!(out, "{}", v37);
 		}
 		out.push(']');
 		out.push('}');
@@ -1759,13 +1966,13 @@ impl MidiPacketBatch {
 		out.push_str(", ");
 		out.push_str("packets=");
 		out.push('[');
-		let mut v35 = true;
-		for v34 in self.packets.iter() {
-			if !v35 {
+		let mut v40 = true;
+		for v39 in self.packets.iter() {
+			if !v40 {
 				out.push_str(", ");
 			}
-			v35 = false;
-			let _ = write!(out, "{}", v34);
+			v40 = false;
+			let _ = write!(out, "{}", v39);
 		}
 		out.push(']');
 		out.push('}');
@@ -1780,8 +1987,8 @@ impl MidiPacketBatch {
 		crate::codec::cbor::uint(out, self.received_ns as u64);
 		crate::codec::cbor::text(out, "packets");
 		crate::codec::cbor::array(out, self.packets.len());
-		for v36 in self.packets.iter() {
-			crate::codec::cbor::uint(out, *v36 as u64);
+		for v41 in self.packets.iter() {
+			crate::codec::cbor::uint(out, *v41 as u64);
 		}
 	}
 }
@@ -1847,43 +2054,43 @@ impl MidiDeviceEvent {
 	}
 	pub fn to_json_into(&self, out: &mut String) {
 		match self {
-			MidiDeviceEvent::Batch(v37) => {
+			MidiDeviceEvent::Batch(v42) => {
 				out.push_str("{\"batch\":");
-				v37.to_json_into(out);
+				v42.to_json_into(out);
 				out.push('}');
 			}
-			MidiDeviceEvent::Lost(v38) => {
+			MidiDeviceEvent::Lost(v43) => {
 				out.push_str("{\"lost\":");
-				v38.to_json_into(out);
+				v43.to_json_into(out);
 				out.push('}');
 			}
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
 		match self {
-			MidiDeviceEvent::Batch(v39) => {
+			MidiDeviceEvent::Batch(v44) => {
 				out.push_str("batch(");
-				v39.to_text_into(out);
+				v44.to_text_into(out);
 				out.push(')');
 			}
-			MidiDeviceEvent::Lost(v40) => {
+			MidiDeviceEvent::Lost(v45) => {
 				out.push_str("lost(");
-				v40.to_text_into(out);
+				v45.to_text_into(out);
 				out.push(')');
 			}
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		match self {
-			MidiDeviceEvent::Batch(v41) => {
+			MidiDeviceEvent::Batch(v46) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "batch");
-				v41.to_cbor_into(out);
+				v46.to_cbor_into(out);
 			}
-			MidiDeviceEvent::Lost(v42) => {
+			MidiDeviceEvent::Lost(v47) => {
 				crate::codec::cbor::map(out, 1);
 				crate::codec::cbor::text(out, "lost");
-				v42.to_cbor_into(out);
+				v47.to_cbor_into(out);
 			}
 		}
 	}
@@ -1915,6 +2122,9 @@ impl MidiFixtureStats {
 		out.push(',');
 		out.push_str("\"receiving\":");
 		let _ = write!(out, "{}", self.receiving);
+		out.push(',');
+		out.push_str("\"sent\":");
+		let _ = write!(out, "{}", self.sent);
 		out.push('}');
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1927,16 +2137,21 @@ impl MidiFixtureStats {
 		out.push_str(", ");
 		out.push_str("receiving=");
 		let _ = write!(out, "{}", self.receiving);
+		out.push_str(", ");
+		out.push_str("sent=");
+		let _ = write!(out, "{}", self.sent);
 		out.push('}');
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "batches");
 		crate::codec::cbor::uint(out, self.batches as u64);
 		crate::codec::cbor::text(out, "packets");
 		crate::codec::cbor::uint(out, self.packets as u64);
 		crate::codec::cbor::text(out, "receiving");
 		crate::codec::cbor::uint(out, self.receiving as u64);
+		crate::codec::cbor::text(out, "sent");
+		crate::codec::cbor::uint(out, self.sent as u64);
 	}
 }
 

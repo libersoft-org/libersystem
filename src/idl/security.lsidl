@@ -137,6 +137,10 @@ enum capability {
 	admin-audit,
 	/// AdminService's test controls. Development images only.
 	admin-test,
+	/// SENDING TO ONE MIDI ENDPOINT, minted per launch for a configured device and the life of the component.
+	/// LAST AND NOT BESIDE `midi-input`, because a capability's number is its position and every one after it
+	/// would move.
+	midi-output,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

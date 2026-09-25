@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::{Error, LaunchContext, MidiDirection, MidiProtocol, midi};
 use rt::*;
@@ -36,15 +37,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(Ok(endpoints)) => endpoints,
 		_ => fail(b"the endpoints could not be listed"),
 	};
-	if endpoints.len() != 2 || endpoints.iter().any(|endpoint| endpoint.protocol != MidiProtocol::Midi1 || endpoint.direction != MidiDirection::Receive) || endpoints[0].cables != 2 || endpoints[1].cables != 1 {
-		fail(b"the fixture's two receive endpoints were not listed as they are");
+	let directions: Vec<(MidiDirection, u8)> = endpoints.iter().map(|endpoint| (endpoint.direction, endpoint.cables)).collect();
+	if endpoints.iter().any(|endpoint| endpoint.protocol != MidiProtocol::Midi1) || directions != [(MidiDirection::Receive, 2), (MidiDirection::Receive, 1), (MidiDirection::Transmit, 2)] {
+		fail(b"the fixture's two receive endpoints and its transmit one were not listed as they are");
 	}
-	if !matches!(client().open(&endpoints[0].id, &MidiDirection::Receive, &MidiProtocol::Midi1), Some(Err(Error::Denied))) {
-		fail(b"inventory opened a receiver");
+	if !matches!(client().open(&endpoints[0].id, &MidiDirection::Receive, &MidiProtocol::Midi1), Some(Err(Error::Denied))) || !matches!(client().open(&endpoints[2].id, &MidiDirection::Transmit, &MidiProtocol::Midi1), Some(Err(Error::Denied))) {
+		fail(b"inventory opened a receiver or a sender");
 	}
-	if !matches!(client().open(&endpoints[0].id, &MidiDirection::Transmit, &MidiProtocol::Midi1), Some(Err(Error::Unsupported))) {
-		fail(b"output was not refused as unsupported");
+	if !matches!(client().open(&endpoints[0].id, &MidiDirection::Transmit, &MidiProtocol::Midi1), Some(Err(Error::Invalid))) {
+		fail(b"a receive endpoint was opened to send");
 	}
-	print(b"midiread: PASS endpoints listed with protocol, direction and cables; inventory cannot receive; output is unsupported\n");
+	print(b"midiread: PASS endpoints listed with protocol, direction and cables; inventory can neither receive nor send\n");
 	exit();
 }

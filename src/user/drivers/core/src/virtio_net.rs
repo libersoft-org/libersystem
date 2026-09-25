@@ -124,12 +124,15 @@ unsafe fn transmit_frame(tx: &Queue, tx_virt: u64, tx_phys: u64, slot: u64, fram
 }
 
 // Move frames between the device and NetworkService, standing on the device IRQ and
-// the service's frame channel at once (wait_any). On an interrupt: drain the receive
-// ring (forwarding each frame to the service), then re-post the buffers, re-arm, read
-// the ISR-status register to deassert the device's (level-triggered INTx) line, and ack
-// (reading the ISR is a harmless zero read on MSI-X, edge-triggered). On a channel
-// message: transmit the frame the service handed back. The channel closing
-// (NetworkService gone) leaves us draining the device alone.
+// the service's frame channel at once (wait_any). On an interrupt: read the ISR-status
+// register to deassert the device's (level-triggered INTx) line and ack (reading the ISR is a
+// harmless zero read on MSI-X, edge-triggered) - FIRST, because acknowledging clears the
+// interrupt object, and an acknowledgment after the drain would clear the interrupt of a
+// frame that arrived while the ring was being read, leaving that frame unread until some
+// later frame happened to interrupt again - then drain the receive ring (forwarding each
+// frame to the service), re-post the buffers and re-arm. On a channel message: transmit the
+// frame the service handed back. The channel closing (NetworkService gone) leaves us
+// draining the device alone.
 #[allow(clippy::too_many_arguments)]
 unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64, macmsg: &[u8]) -> ! {
 	unsafe {
@@ -150,6 +153,8 @@ unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq:
 					}
 				}
 				common::ProviderReady::Device(0) => {
+					let _ = device.read_isr();
+					interrupt_ack(irq);
 					while let Some((id, len)) = rx.take_used() {
 						// WHERE THE FRAME IS AND HOW LONG IT IS, from the index and length the device
 						// published - including the case the ring check cannot answer, a length past
@@ -166,8 +171,6 @@ unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq:
 						rx.post_recv(id, rx_phys[id as usize], slot as u32);
 					}
 					rx.notify();
-					let _ = device.read_isr();
-					interrupt_ack(irq);
 				}
 				common::ProviderReady::Consumer(at) => match recv_blocking(serving.at(at), &mut frame) {
 					Received::Message { len, handle } => {

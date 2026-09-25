@@ -193,6 +193,12 @@ name = "btctl"
 path = "src/btctl.rs"
 
 [[bin]]
+# THE FIRMWARE-DOWNLOAD REQUESTER: the one shipping holder of an administrative request connection, scoped to
+# firmware download on DFU targets. It asks; a person on the protected screen decides.
+name = "dfu"
+path = "src/dfu.rs"
+
+[[bin]]
 name = "config"
 path = "src/config.rs"
 
@@ -391,6 +397,8 @@ shared-image = [
 	"audio-client-provider/shared-image",
 	"bluetooth-client/shared-image",
 	"bluetooth-client-provider/shared-image",
+	"admin-client/shared-image",
+	"admin-client-provider/shared-image",
 	"config-client/shared-image",
 	"config-client-provider/shared-image",
 	"device-client/shared-image",
@@ -445,6 +453,8 @@ audio-client = { path = "../../libs/clients/audio-client", optional = true }
 audio-client-provider = { path = "../../libs/clients/audio-client-provider", optional = true }
 bluetooth-client = { path = "../../libs/clients/bluetooth-client", optional = true }
 bluetooth-client-provider = { path = "../../libs/clients/bluetooth-client-provider", optional = true }
+admin-client = { path = "../../libs/clients/admin-client", optional = true }
+admin-client-provider = { path = "../../libs/clients/admin-client-provider", optional = true }
 network-client = { path = "../../libs/clients/network-client", optional = true }
 network-client-provider = { path = "../../libs/clients/network-client-provider", optional = true }
 config-client = { path = "../../libs/clients/config-client", optional = true }

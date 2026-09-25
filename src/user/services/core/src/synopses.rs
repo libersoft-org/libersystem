@@ -65,6 +65,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("lsblk", "lsblk [json] - list the block devices and their volumes"),
 	("lsdev", "lsdev [json] - list the device nodes"),
 	("btctl", "btctl [-c N] [list|scan|pair|enable|disable|forget|power] ... - Bluetooth controllers, pairing and bonds"),
+	("dfu", "dfu TARGET IMAGE - ask for a firmware image to be written to a USB DFU target; a person confirms it on the protected screen"),
 	("lscpu", "lscpu [json] - print the CPU inventory"),
 	("lsmem", "lsmem [json] - print the boot memory map"),
 	("lsirq", "lsirq [json] - print the device-interrupt vectors"),

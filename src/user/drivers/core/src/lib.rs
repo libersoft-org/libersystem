@@ -26,17 +26,25 @@ pub mod blk;
 // fixture driver links it - and its cryptography is a separate implementation from the host stack's,
 // held to the same published vectors, so the two agreeing in the guest means something.
 pub mod bt_peer;
+// THE USB BLUETOOTH HCI TRANSPORT'S DECISIONS: the controller's pipes, and where one HCI packet ends in transfers
+// that do not say.
+pub mod bt_usb;
 // THE COMMUNICATIONS-CLASS DECISIONS, shared by the two network models that are the same descriptors
 // and different framing: where the interfaces and the bulk pair are, and - for NCM - what a transfer
 // block's datagram table may say before it is believed, which is where such a driver reads past a
 // buffer.
 pub mod cdc;
+// THE USB CCID CLASS'S DECISIONS: a reader's class descriptor, its messages, and its slot-change notifications.
+pub mod ccid;
 pub mod common;
 // VIRTIO-SERIAL MULTIPORT AS PURE DECISIONS: which queues a port owns, what a control message means,
 // and what this driver refuses. Every input here is bytes the DEVICE chose, which is why it is a
 // module with fixtures rather than a branch inside a binary nobody can run on the host.
 pub mod console;
 pub mod descriptor;
+// THE USB DFU CLASS'S DECISIONS: which interface is a target and in which mode, what a status says, and what an
+// image's DFU suffix claims.
+pub mod dfu;
 pub mod gpu;
 // THE HIGH DEFINITION AUDIO DECISIONS: the verb packing, the two rings, the widget graph walk and
 // the format word. Most of an HDA driver is not register access, and this is the part that is not.
@@ -47,9 +55,15 @@ pub mod hda;
 // both survived. Nothing about it is transport-specific: a USB HID device, an I2C one and a
 // Bluetooth one all speak the same descriptors.
 pub mod hid;
+// THE HID POWER DEVICE CLASS OVER THE COMMON HID FIELD TABLE: which fields carry a UPS's values, what the latest
+// reports say, and how a control is written back.
+pub mod hid_power;
 pub mod input;
 pub mod keys;
 pub mod mbim;
+// MBIM ABOVE THE FRAMING: the function's interfaces, its control messages and the BASIC_CONNECT information
+// buffers a modem provider reads and writes.
+pub mod mbim_cid;
 pub mod net;
 // THE NVM EXPRESS DECISIONS, with no controller behind them: the register layouts, the completion
 // rules and the PRP arithmetic, which is where an NVMe driver is actually wrong and all of which a
@@ -57,6 +71,11 @@ pub mod net;
 pub mod nvme;
 pub mod piv_card;
 pub mod port;
+// THE USB PRINTER CLASS'S DECISIONS: which interface setting to drive, the class requests, and what a port
+// status byte and a device ID may say.
+pub mod printer;
+// THE USB STILL IMAGE CLASS AS A TRANSPORT: its setting, its class requests and the device status a cancel reads.
+pub mod ptp;
 // THE SD PROTOCOL DECISIONS, kept independent of how the controller is attached exactly as the item
 // that owns them asks: no PCI, no ACPI, no device tree, so board glue stays outside the driver.
 // THE SCSI COMMAND AND SENSE CORE, owned by the first of its three consumers to be written and
@@ -75,6 +94,9 @@ pub mod usb;
 // The in-controller class-module execution model: what a USB class driver IS in this system, and the
 // per-class budget that stops two of them inside one Domain from starving each other.
 pub mod usb_class;
+// ONE CONFIGURATION DESCRIPTOR READ ONCE INTO ITS INTERFACE SETTINGS, which every service-backed class binder
+// reads instead of walking the records itself.
+pub mod usb_function;
 pub mod usb_midi;
 pub mod uvc;
 pub mod virtio;

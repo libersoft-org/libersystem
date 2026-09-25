@@ -41,12 +41,12 @@ use render2d::path::{FillRule, PathBuilder};
 use render3d::{CompareOp, Cull as CullMode, DepthFormat, Render3DLimits, Topology};
 use rt::*;
 use soft2d::Soft2d;
-use soft3d::frame::{Attachments, Draw, Pipeline, Prepared, Source};
+use soft3d::frame::{Attachments, Draw, Lane, Pipeline, Prepared, Source, Tile, Workers};
 use soft3d::pass::{Colour, DepthStencil};
 use soft3d::texture::{Filter, Kind, Level, Sampler, Texture, Wrap};
 use soft3d::{Indices, Val};
 
-const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
+const USAGE: &[u8] = b"Usage: test3d-sw [--width N] [--height N] [--scene-width N] [--scene-height N] [--frames N] [--no-input] [--fixed] [--pose N] [--report] [--extended] [--workers N] [--compare]\nA rotating lit cube over a textured ground, with a transparent panel and a 2D overlay.\n--extended draws the Scene3D Extended scene instead: a physically based sphere with a normal map and a cast shadow.\n--workers N shades the scene on N threads (1 is this thread alone; the default is one per core, up to 32); --compare renders every pass again on this thread and checks the two agree.\nEsc or q exits, Space pauses, R resets, P shows the picking buffer, arrows orbit, +/- changes distance.\nThe scene renders at the window's own size; --scene-width/--scene-height fix it, which a slow machine wants.\n";
 
 // THE SCENE IS RENDERED AT THE SURFACE'S OWN SIZE unless a run says otherwise, because that is what
 // an application does and what makes a measurement at a stated resolution mean anything: a demo that
@@ -1012,11 +1012,18 @@ struct Controls {
 	/// gate and its scene is what that gate asserts about; a phase that added to it would make every
 	/// core check depend on an optional profile being implemented.
 	extended: bool,
+	/// How many threads shade the scene, this one included. ZERO IS "ONE PER CORE", up to
+	/// `AUTO_WORKERS`; one is this thread alone, which is the serial walk.
+	workers: u32,
+	/// Render every pass a second time on this thread alone, into attachments of its own, and hold
+	/// the two to the same bits - the parallel path checked against the scalar reference in the
+	/// place it actually runs.
+	compare: bool,
 }
 
 impl Controls {
 	fn parse(arguments: &[u8]) -> Controls {
-		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false };
+		let mut controls = Controls { width: 800, height: 600, frames: 0, input: true, fixed: false, report: false, pose: u32::MAX, scene_width: 0, scene_height: 0, extended: false, workers: 0, compare: false };
 		let mut words = arguments.split(|byte| *byte == b' ').filter(|word| !word.is_empty());
 		while let Some(word) = words.next() {
 			match word {
@@ -1033,6 +1040,8 @@ impl Controls {
 				b"--scene-width" => controls.scene_width = words.next().and_then(number).unwrap_or(0),
 				b"--scene-height" => controls.scene_height = words.next().and_then(number).unwrap_or(0),
 				b"--pose" => controls.pose = words.next().and_then(number).unwrap_or(u32::MAX),
+				b"--workers" => controls.workers = words.next().and_then(number).unwrap_or(0),
+				b"--compare" => controls.compare = true,
 				_ => {}
 			}
 		}
@@ -1114,6 +1123,89 @@ fn wrap(x: f32) -> f32 {
 		value += two_pi;
 	}
 	value
+}
+
+/// How many threads shade the scene when nobody said: one per core, and no more than this. Past it
+/// a frame this size stops getting faster - the host benchmark measured 32 workers at 23 times one
+/// and 64 at 26 - and every worker holds a stack.
+const AUTO_WORKERS: usize = 32;
+
+/// Who shades the scene's tiles: this thread, and the workers `rt::pool` lent it.
+///
+/// ONE LANE PER PARTICIPANT, this thread's included. With no workers the pool's caller takes every
+/// tile in order, which is the serial walk and `soft3d`'s scalar reference.
+struct Shading {
+	pool: rt::pool::Pool,
+}
+
+impl Workers for Shading {
+	fn lanes(&self) -> usize {
+		self.pool.threads() + 1
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		self.pool.for_each(lanes, tiles, work);
+	}
+}
+
+/// `--compare`'s own attachments, the same extents as the scene's, which every pass is rendered
+/// into a second time on this thread alone.
+struct Spare {
+	colour: [Colour; 2],
+	depth: DepthStencil,
+	shadow_colour: [Colour; 1],
+	shadow_depth: DepthStencil,
+}
+
+impl Spare {
+	fn new(extent: (u32, u32)) -> Spare {
+		let (width, height) = extent;
+		Spare { colour: [Colour::new(width, height, 1, false), Colour::new(width, height, 1, true)], depth: DepthStencil::new(width, height, 1, DepthFormat::Depth32F), shadow_colour: [Colour::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, false)], shadow_depth: DepthStencil::new(SHADOW_EXTENT, SHADOW_EXTENT, 1, DepthFormat::Depth32F) }
+	}
+}
+
+/// How `--compare` went: passes checked, and how many of them did not agree.
+#[derive(Default)]
+struct Verdict {
+	passes: u32,
+	differed: u32,
+}
+
+/// Whether two sets of attachments hold the same bits, every sample of every one.
+fn same(left: &[Colour], right: &[Colour], left_depth: &DepthStencil, right_depth: &DepthStencil) -> bool {
+	let colour = left.len() == right.len()
+		&& left.iter().zip(right).all(|(a, b)| {
+			a.width == b.width
+				&& a.height == b.height
+				&& (0..a.height).all(|y| {
+					(0..a.width).all(|x| {
+						let (p, q) = (a.at(x, y, 0), b.at(x, y, 0));
+						[p.x, p.y, p.z, p.w].map(f32::to_bits) == [q.x, q.y, q.z, q.w].map(f32::to_bits)
+					})
+				})
+		});
+	colour && left_depth.width == right_depth.width && (0..left_depth.height).all(|y| (0..left_depth.width).all(|x| left_depth.depth_at(x, y, 0) == right_depth.depth_at(x, y, 0)))
+}
+
+/// One pass through the workers - and, under `--compare`, the same pass again on this thread alone
+/// into the spare attachments, which must then hold the same bits and count the same work.
+#[allow(clippy::too_many_arguments)]
+fn render(plan: &mut Prepared, colour: &mut [Colour], depth: &mut DepthStencil, spare: Option<(&mut [Colour], &mut DepthStencil)>, viewport: Viewport, state: &Frame3d, shading: &Shading, verdict: &mut Verdict) -> Result<soft3d::frame::Stats, render3d::Error> {
+	let stats = {
+		let mut attachments = Attachments { colour: &mut *colour, depth_stencil: Some(&mut *depth), viewport, scissor: None };
+		soft3d::frame::execute_with(plan, &mut attachments, state, shading)?
+	};
+	if let Some((spare_colour, spare_depth)) = spare {
+		let serial = {
+			let mut attachments = Attachments { colour: &mut *spare_colour, depth_stencil: Some(&mut *spare_depth), viewport, scissor: None };
+			soft3d::frame::execute(plan, &mut attachments, state)
+		};
+		verdict.passes += 1;
+		if serial != Ok(stats) || !same(colour, spare_colour, depth, spare_depth) {
+			verdict.differed += 1;
+		}
+	}
+	Ok(stats)
 }
 
 /// EVERYTHING THAT DEPENDS ON THE SCENE'S EXTENT, in one value that is built in one place and
@@ -1345,6 +1437,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		print(b"test3d-sw: no overlay\n");
 		exit();
 	};
+	// THE WORKERS, ONCE, FOR THE WHOLE RUN. A pool gives its threads back when it is dropped and a
+	// thread in this system does not end before its process, so a resize keeps them: what it
+	// rebuilds is the scene's size, and the tiles are cut from that at every frame.
+	let participants = if controls.workers == 0 { (cpu_info(&mut [0u64; 1]).max(1) as usize).min(AUTO_WORKERS) } else { controls.workers as usize };
+	let shading = Shading { pool: rt::pool::Pool::new(participants.saturating_sub(1)) };
+	let mut line = common_line::Line::new();
+	line.push(b"test3d-sw: shading on ");
+	line.decimal(shading.lanes() as u64);
+	line.push(b" worker(s)\n");
+	print(line.as_bytes());
+	let mut spare = controls.compare.then(|| Spare::new(targets.extent));
+	let mut verdict = Verdict::default();
 	let mut view = View::reset();
 	let mut state = Frame3d { mesh, panel, extended, normal_map: normal_map(TEX_NORMAL, 128, 6, 0.045), shadow_map: empty_shadow_map(TEX_SHADOW, SHADOW_EXTENT), shadowed: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Nearest, minify: Filter::Nearest, ..Sampler::NEAREST }, light_vp: Mat4::IDENTITY, pass: Pass::Scene, checker: checkerboard(TEX_CHECKER, 64, 8, [1.0, 1.0, 1.0, 1.0], [0.16, 0.16, 0.20, 1.0]), ground: checkerboard(TEX_GROUND, 32, 2, [1.28, 1.28, 1.36, 1.0], [0.62, 0.62, 0.70, 1.0]), clamped: Sampler { wrap_u: Wrap::ClampToEdge, wrap_v: Wrap::ClampToEdge, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, repeated: Sampler { wrap_u: Wrap::Repeat, wrap_v: Wrap::Repeat, magnify: Filter::Linear, minify: Filter::Linear, ..Sampler::NEAREST }, mvp: Mat4::IDENTITY, model: Mat4::IDENTITY, light_dir: [0.45, 0.8, 0.35, 0.0], light_point: [0.0, 2.0, 0.0, 1.0], eye: [0.0, 0.0, DISTANCE_START, 1.0], ambient: [0.22, 0.22, 0.26, 0.0] };
 	if controls.extended {
@@ -1422,6 +1526,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 								break;
 							};
 							targets = rebuilt_targets;
+							if let Some(spare) = spare.as_mut() {
+								*spare = Spare::new(targets.extent);
+							}
 						}
 					}
 					_ => {
@@ -1453,6 +1560,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		targets.colour[ATTACH_COLOUR as usize].fill(Vec4::new(0.05, 0.06, 0.10, 1.0));
 		targets.colour[ATTACH_IDENT as usize].fill(Vec4::new(ID_NONE, 0.0, 0.0, 0.0));
 		targets.depth.clear(1.0, 0);
+		if let Some(spare) = spare.as_mut() {
+			spare.colour[ATTACH_COLOUR as usize].fill(Vec4::new(0.05, 0.06, 0.10, 1.0));
+			spare.colour[ATTACH_IDENT as usize].fill(Vec4::new(ID_NONE, 0.0, 0.0, 0.0));
+			spare.depth.clear(1.0, 0);
+		}
 
 		// THE EXTENDED PHASE'S SHADOW PASS, BEFORE ANYTHING IS LIT. It runs first because the
 		// lighting pass SAMPLES what it writes, and a map read in the frame that produced it is the
@@ -1474,10 +1586,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// the whole scene would be in shadow.
 			targets.shadow_colour[0].fill(Vec4::new(1.0, 1.0, 1.0, 1.0));
 			targets.shadow_depth.clear(1.0, 0);
+			if let Some(spare) = spare.as_mut() {
+				spare.shadow_colour[0].fill(Vec4::new(1.0, 1.0, 1.0, 1.0));
+				spare.shadow_depth.clear(1.0, 0);
+			}
 			let shadow_viewport = targets.shadow_viewport();
-			let mut shadow_attachments = Attachments { colour: &mut targets.shadow_colour, depth_stencil: Some(&mut targets.shadow_depth), viewport: shadow_viewport, scissor: None };
 			let stage_began = clock_ns();
-			match soft3d::frame::execute(&mut targets.shadow, &mut shadow_attachments, &state) {
+			let twin = spare.as_mut().map(|spare| (&mut spare.shadow_colour[..], &mut spare.shadow_depth));
+			match render(&mut targets.shadow, &mut targets.shadow_colour, &mut targets.shadow_depth, twin, shadow_viewport, &state, &shading, &mut verdict) {
 				Ok(stats) => {
 					counts.primitives += stats.primitives;
 					counts.fragments += stats.fragments;
@@ -1509,10 +1625,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		state.model = if controls.extended { Mat4::IDENTITY } else { state.model };
 		state.mvp = projection.mul(&look).mul(&state.model);
 		let viewport = targets.viewport();
-		let mut attachments = Attachments { colour: &mut targets.colour, depth_stencil: Some(&mut targets.depth), viewport, scissor: None };
 		let stage_began = clock_ns();
 		let plan = if controls.extended { &mut targets.pbr } else { &mut targets.scene };
-		match soft3d::frame::execute(plan, &mut attachments, &state) {
+		let twin = spare.as_mut().map(|spare| (&mut spare.colour[..], &mut spare.depth));
+		match render(plan, &mut targets.colour, &mut targets.depth, twin, viewport, &state, &shading, &mut verdict) {
 			Ok(stats) => {
 				counts.primitives += stats.primitives;
 				counts.clipped += stats.clipped;
@@ -1540,9 +1656,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			state.model = Mat4::IDENTITY;
 			state.mvp = projection.mul(&look);
 			let viewport = targets.viewport();
-			let mut attachments = Attachments { colour: &mut targets.colour, depth_stencil: Some(&mut targets.depth), viewport, scissor: None };
 			let stage_began = clock_ns();
-			match soft3d::frame::execute(&mut targets.panel, &mut attachments, &state) {
+			let twin = spare.as_mut().map(|spare| (&mut spare.colour[..], &mut spare.depth));
+			match render(&mut targets.panel, &mut targets.colour, &mut targets.depth, twin, viewport, &state, &shading, &mut verdict) {
 				Ok(stats) => {
 					counts.primitives += stats.primitives;
 					counts.fragments += stats.fragments;
@@ -1611,6 +1727,28 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	print(line.as_bytes());
 	if controls.report {
 		report(&timing, &counts, presented, clock_ns().saturating_sub(run_began), controls.width, controls.height, targets.extent, targets.bytes());
+	}
+	if controls.compare {
+		let mut line = common_line::Line::new();
+		line.push(b"test3d-sw: ");
+		if verdict.differed == 0 {
+			line.decimal(verdict.passes as u64);
+			line.push(b" pass(es) through ");
+			line.decimal(shading.lanes() as u64);
+			line.push(b" worker(s) matched the serial walk\n");
+		} else {
+			line.decimal(verdict.differed as u64);
+			line.push(b" of ");
+			line.decimal(verdict.passes as u64);
+			line.push(b" pass(es) through ");
+			line.decimal(shading.lanes() as u64);
+			line.push(b" worker(s) DIFFERED from the serial walk\n");
+		}
+		print(line.as_bytes());
+		// A DIFFERENCE IS A FAILED RUN, and says so where a launcher can read it.
+		if verdict.differed != 0 {
+			exit_with(1);
+		}
 	}
 	exit();
 }

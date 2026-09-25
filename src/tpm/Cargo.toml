@@ -1,0 +1,22 @@
+[package]
+name = "tpm"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "TPM 2.0 below the binding: discovery from the TPM2 table, the FIFO and CRB transports, bounded commands and the typed operations"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+acpi = { path = "../acpi" }
+
+# THE SAME SHA-256 THE LOADER MEASURES WITH, for the one test that holds this crate against a real TPM: what a
+# PCR becomes after an extend is computed here and compared with what the TPM says it became.
+[dev-dependencies]
+bootproto = { path = "../boot/protocol" }
+
+# A WARNING IS AN ERROR HERE, for the reason `acpi` gives: `[lints]` denies in this package only, and
+# not inside `build-std`'s `core`, where a warning is not ours to answer.
+[lints.rust]
+warnings = "deny"

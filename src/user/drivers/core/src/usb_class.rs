@@ -126,15 +126,21 @@ pub const UAS_COST: Cost = Cost { endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 
 /// outstanding under one tag, and a second device would need a second of everything.
 pub const UAS_LIMITS: Limits = Limits { devices: 1, endpoints: 4, dma_bytes: 4 * RING_BYTES + 5 * 4096, in_flight: 1 };
 
-/// What one audio sink costs: ONE isochronous endpoint with its ring, and the period buffer it
-/// streams from. Two periods in flight, because a sink with one is a sink that goes silent between
-/// the transfer completing and the next one being posted - which is the click this buffer exists to
-/// avoid and the reason the count is not one.
-pub const AUDIO_COST: Cost = Cost { endpoints: 1, dma_bytes: RING_BYTES + 4096, in_flight: 2 };
+/// The isochronous IN transfers a capture keeps posted: sixteen milliseconds of a full-speed source, which
+/// is the lead the loop has before a packet the device sent finds no transfer to land in.
+pub const CAPTURE_POSTED: u32 = 16;
 
-/// ONE AUDIO SINK, for the reason the network module admits one adapter: AudioService drives one
-/// device, and a second would publish a provider nobody opens.
-pub const AUDIO_LIMITS: Limits = Limits { devices: 1, endpoints: 1, dma_bytes: RING_BYTES + 4096, in_flight: 2 };
+/// What one audio device costs: an isochronous endpoint EACH WAY with its ring and page - a device may
+/// be a sink, a source or both - and what each keeps in flight. Two periods for the sink, because a sink
+/// with one is a sink that goes silent between the transfer completing and the next one being posted -
+/// which is the click this buffer exists to avoid and the reason the count is not one; and the capture's
+/// standing transfers for the source.
+pub const AUDIO_COST: Cost = Cost { endpoints: 2, dma_bytes: 2 * (RING_BYTES + 4096), in_flight: 2 + CAPTURE_POSTED };
+
+/// TWO AUDIO DEVICES, because the one provider AudioService opens carries playback AND capture, and the
+/// two are often two devices - QEMU's speaker and a microphone - while a headset is one. A third would
+/// duplicate a direction nothing routes to, and is refused.
+pub const AUDIO_LIMITS: Limits = Limits { devices: 2, endpoints: 4, dma_bytes: 4 * (RING_BYTES + 4096), in_flight: 2 * (2 + CAPTURE_POSTED) };
 
 /// A PRINTER: the bulk pair with its rings and the page a write is staged in, one transfer in flight.
 pub const PRINTER_COST: Cost = Cost { endpoints: 2, dma_bytes: 2 * RING_BYTES + 4096, in_flight: 1 };

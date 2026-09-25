@@ -2,19 +2,23 @@
 # MidiService, end to end, against the in-guest MIDI fixture - THE SERVICE, ITS RECEIVERS AND ITS BOUNDS. The
 # fixture delivers raw USB-MIDI 1.0 packet batches the probes script, and MidiService decodes them with the
 # driver library's decoder; success here establishes the bounded event vocabulary, the decoder over real
-# packets, the receiver's queue and lifetime and the grants, and says nothing about USB MIDI transport, UMP or
-# output, none of which exists yet.
+# packets, the receiver's queue and lifetime, the sender's round trip through the fixture's loopback and the
+# grants, and says nothing about USB MIDI transport or UMP - the first is the hardware suite's, the second does
+# not exist yet.
 #
 #   handles return to baseline  MidiService's handles, read from the system graph, are the same after the
 #                                 first probes and after the scenario
-#   inventory                   `midiread`: endpoints with protocol, direction and cables; no receiving; no
-#                                 output
+#   inventory                   `midiread`: endpoints with protocol, direction and cables; neither receiving
+#                                 nor sending through it
 #   exact order and time        `midicheck receive`: bytes, cables, kinds and SysEx fragments in packet order
 #                                 at the batch's one receipt time, after a delayed read
 #   typed faults                `midicheck malformed`
 #   the SysEx cap               `midicheck cap`: 64 kB crossed in small fragments, aborted once by number,
 #                                 never ended; recovery at a new message
 #   unsupported and denied      `midicheck unsupported`
+#   sending                     `midicheck send`: a phrase out through the sender and back through the
+#                                 receiver, chunk for chunk; a bad batch sends nothing; a stopped sender is
+#                                 closed
 #   saturation                  `midicheck overflow`: a readable terminal overflow, nothing continuous
 #   lost input                  `midicheck lost`: a readable source discontinuity
 #   unplug and reattachment     `midicheck unplug`, then `midicheck fresh` on the replacement
@@ -62,7 +66,7 @@ expect() {
 # `fg` BEFORE THE LAST `graph`: the background holder, `midihold hold 2 &`, can still hold what it was granted when
 # the last probe returns, and a count read then is the holder's and not a leak. `fg` waits for it, and says
 # there is no such job when it has already gone.
-guest_gate_run $'midiread\nmidicheck receive\ngraph\nmidicheck malformed\nmidicheck cap\nmidicheck unsupported\nmidihold dup | midicheck inherit\nmidihold hold 2 &\nmidihold hold 1\nmidicheck overflow\nmidicheck lost\nmidifail\nmidicheck unplug\nmidicheck fresh\nfg\ngraph' ""
+guest_gate_run $'midiread\nmidicheck receive\ngraph\nmidicheck malformed\nmidicheck cap\nmidicheck unsupported\nmidicheck send\nmidihold dup | midicheck inherit\nmidihold hold 2 &\nmidihold hold 1\nmidicheck overflow\nmidicheck lost\nmidifail\nmidicheck unplug\nmidicheck fresh\nfg\ngraph' ""
 lines="$GUEST_LINES"
 
 if grep -aq 'midicheck: FAIL\|midiread: FAIL\|midifail: FAIL' "$lines"; then
@@ -75,7 +79,8 @@ expect "$lines" "midiread: PASS" "inventory must list and refuse"
 expect "$lines" "midicheck: PASS receive" "bytes, cables, fragments, order and receipt time must hold"
 expect "$lines" "midicheck: PASS malformed" "malformed packets must be typed faults"
 expect "$lines" "midicheck: PASS cap" "the SysEx cap must hold across fragments, and recovery follow"
-expect "$lines" "midicheck: PASS unsupported" "output and UMP must be unsupported, inventory must not receive"
+expect "$lines" "midicheck: PASS unsupported" "UMP must be unsupported, a missing direction invalid, and inventory must open nothing"
+expect "$lines" "midicheck: PASS send" "a sent phrase must come back through the loopback, and a bad batch send nothing"
 expect "$lines" "midihold: held endpoint 1 and stopped" "a receiver on the second endpoint must work beside the first"
 expect "$lines" "MidiService: a second receiver on an endpoint was refused as busy - there is no fan-out" "a second receiver on one endpoint must be refused"
 expect "$lines" "midicheck: PASS overflow" "saturation must end the receiver readably"
@@ -93,4 +98,4 @@ counts="$(grep -aoE '\{name=midi_service, type=service, [^{]*counters=\{messages
 [[ "$(sed -n 1p <<<"$counts")" == "$(sed -n 2p <<<"$counts")" ]] || fail "MidiService's handles did not return to their baseline ($(tr '\n' ' ' <<<"$counts"))"
 echo "midi-service: the service's handles returned to their baseline ($(sed -n 1p <<<"$counts"))"
 
-echo "midi-service: PASS - the bounded event vocabulary and queue, the decoder over real packets, SysEx bounds, typed faults, saturation, loss, unplug, grants and reclamation (the service; not USB MIDI transport, UMP or output)"
+echo "midi-service: PASS - the bounded event vocabulary and queue, the decoder over real packets, SysEx bounds, typed faults, saturation, loss, unplug, sending through the loopback, grants and reclamation (the service; not USB MIDI transport or UMP)"

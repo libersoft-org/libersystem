@@ -216,10 +216,11 @@ fn wait_for_completion(queue: &mut Queue, irq: u64, status_virt: u64, decide: im
 	let mut last = Err(PeriodFault::NoCompletion);
 	for _ in 0..COMPLETION_WAITS {
 		wait(irq, 0);
-		let completion = queue.take_used();
 		// The pending flag is cleared whether or not the completion was ours, so the next period's
-		// interrupt still wakes us (edge-triggered MSI-X).
+		// interrupt still wakes us (edge-triggered MSI-X) - and cleared BEFORE the ring is read, so a
+		// completion landing between the read and the acknowledgment is not cleared unseen.
 		interrupt_ack(irq);
+		let completion = queue.take_used();
 		let status = unsafe { rd32(status_virt) };
 		last = decide(completion, status);
 		if !matches!(last, Err(PeriodFault::NoCompletion)) {

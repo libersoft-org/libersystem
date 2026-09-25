@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 137] = [
+const GATES: [(&str, &str); 138] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -383,6 +383,10 @@ const GATES: [(&str, &str); 137] = [
 	// InputService's trusted keyboard and the two keyboard drivers - a userspace change selects it - and it
 	// boots a development image with the executor's QEMU test device and a persistent system volume.
 	("qemu-admin-path", "userspace.build"),
+	// THE SHIPPING FIRMWARE REQUESTER, end to end: the `dfu` tool, AdminService's protected screen and the USB DFU
+	// executor against a runtime target the harness plays over `usb-redir`. Its subject is userspace - the tool, the
+	// service and the driver - and it boots a development image through the emulated keyboard.
+	("qemu-dfu-tool", "userspace.build"),
 	// The lifecycle contract, end to end. Its subject is the runtime's init/fini runner, the kernel's
 	// per-image lifecycle table and the two fixtures that exercise them - a userspace or kernel
 	// change selects it, and it boots a guest because a constructor is only observable from inside
@@ -818,7 +822,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 43] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 44] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -833,6 +837,8 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 43] = [
 	"media-import-service",
 	// And the administrative path, which runs its cold development scenario through the emulated keyboard.
 	"qemu-admin-path",
+	// And the firmware requester's, which runs its own against the runtime DFU target.
+	"qemu-dfu-tool",
 	"virtio-multiport",
 	"qemu-2d-demo",
 	"qemu-3d-demo",

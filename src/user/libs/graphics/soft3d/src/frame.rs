@@ -19,20 +19,21 @@
 //! shading, and helper lanes are what it would be approximating.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use render_math::{Vec4, Viewport};
 use render_shader::ir::{Interpolation, Sampling};
 use render_shader::{Module, Stage};
 use render3d::blend::AttachmentBlend;
 use render3d::command::{Command, PipelineState, Topology};
-use render3d::depth::StencilFace;
+use render3d::depth::{DepthFormat, StencilFace};
 use render3d::{CompareOp, Error, Render3DLimits};
 
 use crate::clip::{self, Clipped, Varyings};
 use crate::geometry::{self, Indices, Primitive};
 use crate::interp;
 use crate::interpreter::{self, Resources};
-use crate::pass::{Colour, DepthStencil, Fragment};
+use crate::pass::{Colour, ColourView, DepthStencil, DepthView, Fragment};
 use crate::raster::{self, Bins, Facing, Setup};
 use crate::value::Val;
 
@@ -58,7 +59,12 @@ pub struct Pipeline {
 }
 
 /// What a draw reads its vertices from, and what its shaders read their resources from.
-pub trait Source {
+///
+/// `Sync`, BECAUSE THE TILES OF A DRAW MAY BE SHADED AT ONCE and every one of them reads the same
+/// uniforms and textures. A source is the frame's inputs, which nothing writes while the frame runs;
+/// one that mutated itself on a read - a texel cache behind a `Cell` - would be a race on the first
+/// frame shaded by more than one worker, and the compiler refuses it here instead.
+pub trait Source: Sync {
 	fn attribute(&self, location: u32, vertex: u32, instance: u32) -> Option<Val>;
 	fn uniform(&self, block: u32, member: u32) -> Option<Val>;
 	fn sample(&self, texture: u32, sampler: u32, coordinate: &Val) -> Option<Val>;
@@ -145,6 +151,12 @@ struct Scratch {
 	// frame builds it; nothing after that does.
 	clip_work: Option<alloc::boxed::Box<clip::Workspace>>,
 	clipped: Clipped,
+	/// One per worker, sized to the pool on the first frame that uses it.
+	lanes: Vec<Lane>,
+	/// A draw's tiles and the views of its attachments they carry. EMPTY BETWEEN DRAWS: what they
+	/// held borrowed the caller's attachments, and only their capacity survives - see `recycle`.
+	tiles: Vec<Tile<'static, 'static>>,
+	views: Vec<Option<ColourView<'static>>>,
 }
 
 /// One vertex after the vertex stage. `Copy`, because a per-vertex `Vec` is a per-primitive
@@ -185,6 +197,82 @@ struct Dot {
 	depth: f32,
 	values: Varyings,
 	flat: Varyings,
+}
+
+/// Who shades a draw's tiles, and how many at once.
+///
+/// THE PARALLELISM COMES FROM OUTSIDE THIS CRATE, which has no threads and no clock and runs in
+/// processes that may have neither: a pool is the caller's, and this is the whole of what the crate
+/// asks of one. `soft3d` cuts a draw into tiles - disjoint pixels in every attachment, a depth bound
+/// of their own, a bin that nothing writes any more - and a LANE per worker holds the only mutable
+/// scratch shading needs. So a pool shares nothing mutable, and its scheduling cannot change a
+/// pixel: inside a tile the order is the serial one, and tiles do not meet.
+///
+/// A POOL MUST call `work` once for every tile, with each lane used by one worker at a time, and
+/// return only when every call has returned. `lanes()` is how many lanes the frame gives it, at
+/// least one. A pool that returns early is refused by the frame rather than trusted, and a tile
+/// handed out twice is shaded once.
+pub trait Workers {
+	fn lanes(&self) -> usize;
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync));
+}
+
+/// The caller's own thread, one tile after another in row-major order: the SCALAR REFERENCE every
+/// other pool is differential-tested against, and what `execute` uses.
+pub struct Serial;
+
+impl Workers for Serial {
+	fn lanes(&self) -> usize {
+		1
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		let Some(lane) = lanes.first_mut() else { return };
+		for tile in tiles {
+			work(lane, tile);
+		}
+	}
+}
+
+/// One worker's scratch: the fragment interpreter, what it counted, and the first tile it failed in.
+#[derive(Default)]
+pub struct Lane {
+	machine: interpreter::Machine,
+	stats: Stats,
+	failure: Option<(usize, Error)>,
+}
+
+/// One tile of one draw: its pixels in every colour attachment and the depth one, and its bound.
+pub struct Tile<'t, 'a> {
+	/// Its place in row-major order, which is the order the serial walk meets it in.
+	index: usize,
+	x: u32,
+	y: u32,
+	colour: &'t mut [Option<ColourView<'a>>],
+	depth: Option<DepthView<'a>>,
+	far: &'t mut f32,
+	ran: bool,
+}
+
+impl Tile<'_, '_> {
+	/// Its place in row-major order, for a pool that wants to schedule by position.
+	pub fn index(&self) -> usize {
+		self.index
+	}
+}
+
+/// A vector's storage, kept from one frame to the next while nothing it held is.
+///
+/// THE TILES AND VIEWS BORROW THE CALLER'S ATTACHMENTS, so they cannot outlive a frame - but their
+/// capacity can, and that is the difference between a parallel frame that allocates nothing and one
+/// that allocates per draw. Emptied and collected again, a vector keeps its allocation: `Vec`'s
+/// in-place collection reuses it when the element layout is unchanged, and a change of lifetime
+/// cannot change a layout. That is an optimisation of the standard library and not a promise, so
+/// the counting allocator's warmed-frame test is what holds it - a toolchain that stopped doing it
+/// fails there, and nothing here becomes unsound either way.
+fn recycle<T, U>(mut vector: Vec<T>) -> Vec<U> {
+	vector.clear();
+	vector.into_iter().map(|_| unreachable!("an emptied vector yields nothing")).collect()
 }
 
 /// A validated plan. NOTHING HERE CAN FAIL AT SUBMISSION.
@@ -309,9 +397,20 @@ impl Prepared {
 	}
 }
 
-/// Run a prepared plan. ALLOCATES NOTHING IN STEADY STATE: every buffer it uses is cleared rather
-/// than freed, and the first frame is what sizes them.
+/// Run a prepared plan on the caller's thread. ALLOCATES NOTHING IN STEADY STATE: every buffer it
+/// uses is cleared rather than freed, and the first frame is what sizes them.
 pub fn execute(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source) -> Result<Stats, Error> {
+	execute_with(prepared, attachments, source, &Serial)
+}
+
+/// Run a prepared plan with its triangles' tiles shaded by `workers`.
+///
+/// THE SAME FRAME AS `execute`, BIT FOR BIT, with the same statistics: what a pool changes is which
+/// thread shades a tile and when, and nothing a tile writes depends on either. A draw that fails
+/// reports the failure of the LOWEST tile that failed, which is the one `execute` meets first.
+/// Everything before the tile loop - assembly, the vertex stage, clipping, setup and binning - and
+/// every line and point stays on the caller's thread.
+pub fn execute_with(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers) -> Result<Stats, Error> {
 	let mut stats = Stats::default();
 	let (width, height) = match attachments.colour.first() {
 		Some(first) => (first.width, first.height),
@@ -342,7 +441,7 @@ pub fn execute(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 	for draw in &draws {
 		let pipeline = &pipelines[draw.pipeline as usize];
 		let map = &maps[draw.pipeline as usize];
-		outcome = draw_one(prepared, attachments, source, draw, pipeline, map, width, height, samples, &mut stats);
+		outcome = draw_one(prepared, attachments, source, workers, draw, pipeline, map, width, height, samples, &mut stats);
 		if outcome.is_err() {
 			break;
 		}
@@ -354,7 +453,7 @@ pub fn execute(prepared: &mut Prepared, attachments: &mut Attachments<'_>, sourc
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, draw: &Draw, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, draw: &Draw, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
 	if pipeline.state.samples != samples {
 		return Err(Error::IncompatiblePipeline { reason: "the pipeline's sample count disagrees with the pass's attachments" });
 	}
@@ -389,7 +488,7 @@ fn draw_one(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: 
 			}
 		}
 		prepared.scratch.primitives = primitives;
-		shade_bins(prepared, attachments, source, pipeline, map, width, height, samples, stats)?;
+		shade_bins(prepared, attachments, source, workers, pipeline, map, width, height, samples, stats)?;
 		shade_lines(prepared, attachments, source, pipeline, map, width, height, samples, stats)?;
 		shade_points(prepared, attachments, source, pipeline, map, width, height, samples, stats)?;
 	}
@@ -612,69 +711,161 @@ fn stage_triangle(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Sou
 	Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
-	let setups = core::mem::take(&mut prepared.scratch.setups);
-	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
-	let keep = writable(attachments.scissor, width, height);
-	let mut outcome = Ok(());
-	'outer: for tile_y in 0..prepared.bins.down() {
-		for tile_x in 0..prepared.bins.across() {
-			let area = prepared.bins.tile_box(tile_x, tile_y, width, height);
-			let mut drew_anything = false;
-			// HIERARCHICAL DEPTH: the nearest depth anything in this tile can have, kept per tile and
-			// compared against the triangle's own NEAREST vertex. A triangle entirely behind what the
-			// tile already holds cannot produce a surviving fragment under a `Less` or `LessOrEqual`
-			// test, so it is rejected before a single sample is tested. THE TEST IS CONSERVATIVE: it
-			// rejects only what the per-sample test would reject anyway, so turning it off changes
-			// the frame's speed and not its picture.
-			let tile_far = prepared.bins.tile_far(tile_x, tile_y);
-			for triangle in prepared.bins.tile(tile_x, tile_y) {
-				let binned = &setups[*triangle as usize];
-				if matches!(pipeline.depth_compare, CompareOp::Less | CompareOp::LessOrEqual) {
-					let nearest = binned.setup.depth.iter().fold(f32::INFINITY, |held: f32, depth| held.min(*depth));
-					if nearest > tile_far {
-						continue;
-					}
-				}
-				let bounds = binned.setup.bounds;
-				let x0 = bounds.x0.max(area.x0).max(keep.0);
-				let x1 = bounds.x1.min(area.x1).min(keep.2);
-				let y0 = bounds.y0.max(area.y0).max(keep.1);
-				let y1 = bounds.y1.min(area.y1).min(keep.3);
-				for y in y0..y1 {
-					for x in x0..x1 {
-						let coverage = raster::coverage(&binned.setup, x, y, samples)?;
-						if coverage == 0 {
-							continue;
-						}
-						drew_anything = true;
-						outcome = shade_pixel(attachments, source, pipeline, map, binned, x, y, coverage, samples, stats, &mut machine);
-						if outcome.is_err() {
-							break 'outer;
-						}
-					}
-				}
-			}
-			// THE BOUND IS READ BACK FROM THE DEPTH BUFFER, once per tile, after the tile is drawn.
-			// A bound inferred from the triangles that covered it would only be valid when one of
-			// them covered the WHOLE tile, which after clipping almost never happens: a clipped
-			// polygon is fan-triangulated and each piece covers part of it.
-			if pipeline.depth_write && drew_anything {
-				if let Some(buffer) = attachments.depth_stencil.as_deref() {
-					let furthest = buffer.furthest_in(area.x0.max(0) as u32, area.y0.max(0) as u32, area.x1.max(0) as u32, area.y1.max(0) as u32);
-					prepared.bins.narrow_tile_far(tile_x, tile_y, furthest);
-				}
-			}
-		}
-	}
-	prepared.scratch.setups = setups;
-	prepared.scratch.fragment_machine = machine;
-	outcome
+/// What every tile of one draw reads and none of them writes.
+struct Shared<'s> {
+	setups: &'s [Binned],
+	bins: &'s [Vec<u32>],
+	pipeline: &'s Pipeline,
+	map: &'s [(u32, Interpolation, usize, usize)],
+	source: &'s dyn Source,
+	keep: (i64, i64, i64, i64),
+	width: u32,
+	height: u32,
+	samples: u32,
+	/// The lowest tile that has failed so far. A tile past it is not shaded: the draw has already
+	/// failed, and its answer is that tile's failure or a lower one.
+	failed: AtomicUsize,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn shade_pixel(attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], binned: &Binned, x: i64, y: i64, coverage: u32, samples: u32, stats: &mut Stats, machine: &mut interpreter::Machine) -> Result<(), Error> {
+fn shade_bins(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, workers: &dyn Workers, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+	if prepared.scratch.setups.is_empty() {
+		return Ok(());
+	}
+	let setups = core::mem::take(&mut prepared.scratch.setups);
+	let mut lanes = core::mem::take(&mut prepared.scratch.lanes);
+	// A NEW WORKER COUNT IS THE ONLY THING THAT ALLOCATES HERE, and only on the frame it changes.
+	lanes.resize_with(workers.lanes().max(1), Lane::default);
+	for lane in &mut lanes {
+		lane.stats = Stats::default();
+		lane.failure = None;
+	}
+	let mut views: Vec<Option<ColourView<'_>>> = recycle(core::mem::take(&mut prepared.scratch.views));
+	let mut tiles: Vec<Tile<'_, '_>> = recycle(core::mem::take(&mut prepared.scratch.tiles));
+	let across = prepared.bins.across();
+	let count = (across * prepared.bins.down()) as usize;
+	let per_tile = attachments.colour.len();
+	// EVERY ATTACHMENT'S TILES, GROUPED BY TILE, so each tile's views are one slice it can own.
+	views.resize_with(count * per_tile, || None);
+	for (attachment, colour) in attachments.colour.iter_mut().enumerate() {
+		for (tile, view) in colour.tiles().enumerate() {
+			if let Some(slot) = views.get_mut(tile * per_tile + attachment) {
+				*slot = Some(view);
+			}
+		}
+	}
+	let mut depth_tiles = attachments.depth_stencil.as_deref_mut().map(|buffer| buffer.tiles());
+	let (bins, far) = prepared.bins.parts();
+	for ((index, colour), far) in views.chunks_mut(per_tile).enumerate().zip(far.iter_mut()) {
+		let depth = depth_tiles.as_mut().and_then(Iterator::next);
+		tiles.push(Tile { index, x: index as u32 % across, y: index as u32 / across, colour, depth, far, ran: false });
+	}
+	let shared = Shared { setups: &setups, bins, pipeline, map, source, keep: writable(attachments.scissor, width, height), width, height, samples, failed: AtomicUsize::new(usize::MAX) };
+	// A TILE WHOSE VIEWS ARE MISSING IS A TILE THIS DRAW CANNOT SHADE - storage shorter than the
+	// extent it claims - and it is refused rather than shaded into nothing.
+	let whole = tiles.len() == count && tiles.iter().all(|tile| tile.colour.iter().all(Option::is_some)) && (depth_tiles.is_none() || tiles.iter().all(|tile| tile.depth.is_some()));
+	let outcome = if !whole {
+		Err(Error::InvalidRenderState { reason: "an attachment whose storage is shorter than the extent it claims" })
+	} else {
+		let work = |lane: &mut Lane, tile: &mut Tile<'_, '_>| {
+			if tile.ran {
+				return;
+			}
+			tile.ran = true;
+			if tile.index > shared.failed.load(Ordering::Relaxed) {
+				return;
+			}
+			if let Err(error) = shade_tile(&shared, lane, tile) {
+				shared.failed.fetch_min(tile.index, Ordering::Relaxed);
+				if lane.failure.is_none_or(|(at, _)| tile.index < at) {
+					lane.failure = Some((tile.index, error));
+				}
+			}
+		};
+		workers.run(&mut lanes, &mut tiles, &work);
+		let failure = lanes.iter().filter_map(|lane| lane.failure).min_by_key(|(at, _)| *at);
+		if tiles.iter().any(|tile| !tile.ran) {
+			Err(Error::InvalidRenderState { reason: "a worker pool that returned before it had shaded every tile" })
+		} else if let Some((_, error)) = failure {
+			Err(error)
+		} else {
+			for lane in &lanes {
+				stats.fragments += lane.stats.fragments;
+				stats.samples_written += lane.stats.samples_written;
+				stats.discarded += lane.stats.discarded;
+			}
+			Ok(())
+		}
+	};
+	drop(shared);
+	prepared.scratch.tiles = recycle(tiles);
+	prepared.scratch.views = recycle(views);
+	prepared.scratch.lanes = lanes;
+	prepared.scratch.setups = setups;
+	outcome
+}
+
+/// Shade one tile: every triangle binned into it, in bin order, over the pixels it covers here.
+fn shade_tile(shared: &Shared<'_>, lane: &mut Lane, tile: &mut Tile<'_, '_>) -> Result<(), Error> {
+	let area = raster::tile_area(tile.x, tile.y, shared.width, shared.height);
+	let keep = shared.keep;
+	let pipeline = shared.pipeline;
+	// HIERARCHICAL DEPTH: the nearest depth anything in this tile can have, kept per tile and
+	// compared against the triangle's own NEAREST vertex. A triangle entirely behind what the tile
+	// already holds cannot produce a surviving fragment under a `Less` or `LessOrEqual` test, so it
+	// is rejected before a single sample is tested. THE TEST IS CONSERVATIVE: it rejects only what
+	// the per-sample test would reject anyway, so turning it off changes the frame's speed and not
+	// its picture.
+	let tile_far = *tile.far;
+	let mut drew_anything = false;
+	let mut targets = Targets { colour: &mut *tile.colour, depth: tile.depth.as_mut() };
+	for triangle in shared.bins.get(tile.index).map_or(&[][..], Vec::as_slice) {
+		let binned = &shared.setups[*triangle as usize];
+		if matches!(pipeline.depth_compare, CompareOp::Less | CompareOp::LessOrEqual) {
+			let nearest = binned.setup.depth.iter().fold(f32::INFINITY, |held: f32, depth| held.min(*depth));
+			if nearest > tile_far {
+				continue;
+			}
+		}
+		let bounds = binned.setup.bounds;
+		let x0 = bounds.x0.max(area.x0).max(keep.0);
+		let x1 = bounds.x1.min(area.x1).min(keep.2);
+		let y0 = bounds.y0.max(area.y0).max(keep.1);
+		let y1 = bounds.y1.min(area.y1).min(keep.3);
+		for y in y0..y1 {
+			for x in x0..x1 {
+				let coverage = raster::coverage(&binned.setup, x, y, shared.samples)?;
+				if coverage == 0 {
+					continue;
+				}
+				drew_anything = true;
+				shade_pixel(&mut targets, shared.source, pipeline, shared.map, binned, x, y, coverage, shared.samples, &mut lane.stats, &mut lane.machine)?;
+			}
+		}
+	}
+	// THE BOUND IS READ BACK FROM THE DEPTH BUFFER, once per tile, after the tile is drawn. A bound
+	// inferred from the triangles that covered it would only be valid when one of them covered the
+	// WHOLE tile, which after clipping almost never happens: a clipped polygon is fan-triangulated
+	// and each piece covers part of it.
+	if pipeline.depth_write && drew_anything {
+		if let Some(buffer) = targets.depth.as_deref() {
+			let furthest = buffer.furthest_in(area.x0.max(0) as u32, area.y0.max(0) as u32, area.x1.max(0) as u32, area.y1.max(0) as u32);
+			if furthest < *tile.far {
+				*tile.far = furthest;
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Where a fragment's writes land: the whole of each attachment, or one tile of each.
+struct Targets<'t, 'a> {
+	colour: &'t mut [Option<ColourView<'a>>],
+	depth: Option<&'t mut DepthView<'a>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shade_pixel(targets: &mut Targets<'_, '_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], binned: &Binned, x: i64, y: i64, coverage: u32, samples: u32, stats: &mut Stats, machine: &mut interpreter::Machine) -> Result<(), Error> {
 	let centre = |dx: i64, dy: i64| (crate::Subpixel((x + dx) * crate::fixed::SUBPIXEL_ONE + crate::fixed::SUBPIXEL_HALF), crate::Subpixel((y + dy) * crate::fixed::SUBPIXEL_ONE + crate::fixed::SUBPIXEL_HALF));
 	let weights = raster::barycentric(&binned.setup, centre(0, 0));
 	// INTERPOLATED INTO FIXED ARRAYS, not into vectors: a `Vec` per fragment is an allocation per
@@ -702,7 +893,7 @@ fn shade_pixel(attachments: &mut Attachments<'_>, source: &dyn Source, pipeline:
 	let depth = if pipeline.bias.0 != 0.0 || pipeline.bias.1 != 0.0 {
 		let (dx_weights, dy_weights) = (raster::barycentric(&binned.setup, centre(1, 0)), raster::barycentric(&binned.setup, centre(0, 1)));
 		let slope = (interp::depth(dx_weights, binned.setup.depth) - depth).abs().max((interp::depth(dy_weights, binned.setup.depth) - depth).abs());
-		let format = attachments.depth_stencil.as_deref().map(|buffer| buffer.format).unwrap_or(render3d::depth::DepthFormat::Depth32F);
+		let format = targets.depth.as_deref().map(DepthView::format).unwrap_or(DepthFormat::Depth32F);
 		render3d::depth::bias(format, depth, slope, pipeline.bias.0, pipeline.bias.1, pipeline.bias.2)
 	} else {
 		depth
@@ -716,13 +907,13 @@ fn shade_pixel(attachments: &mut Attachments<'_>, source: &dyn Source, pipeline:
 		return Ok(());
 	}
 	let depth = machine.outputs().depth.unwrap_or(depth);
-	let written = write_outputs(attachments, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, binned.setup.facing, samples)?;
+	let written = write_outputs(targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, binned.setup.facing, samples)?;
 	stats.samples_written += written;
 	Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_outputs(attachments: &mut Attachments<'_>, pipeline: &Pipeline, outputs: &interpreter::Outputs, x: u32, y: u32, coverage: u32, depth: f32, facing: Facing, _samples: u32) -> Result<u32, Error> {
+fn write_outputs(targets: &mut Targets<'_, '_>, pipeline: &Pipeline, outputs: &interpreter::Outputs, x: u32, y: u32, coverage: u32, depth: f32, facing: Facing, _samples: u32) -> Result<u32, Error> {
 	// A SHADER-WRITTEN DEPTH REPLACED THE INTERPOLATED ONE AT THE CALLER, which is what a
 	// depth-writing shader is for; the bias was applied to the interpolated value and is not
 	// reapplied.
@@ -734,9 +925,9 @@ fn write_outputs(attachments: &mut Attachments<'_>, pipeline: &Pipeline, outputs
 	// THE DEPTH AND STENCIL TEST RUNS ONCE, against the first attachment, and the rest follow its
 	// answer. Running it per attachment would test the same fragment several times and write the
 	// depth buffer more than once for one fragment.
-	let mut depth_stencil = attachments.depth_stencil.take();
-	for (index, colour) in attachments.colour.iter_mut().enumerate() {
-		let value = if colour.integer {
+	for (index, colour) in targets.colour.iter_mut().enumerate() {
+		let Some(colour) = colour.as_mut() else { continue };
+		let value = if colour.integer() {
 			let identity = outputs.integer.iter().find(|(slot, _)| *slot as usize == index).map(|(_, value)| *value).unwrap_or(0);
 			Vec4::new(identity as f32, 0.0, 0.0, 1.0)
 		} else {
@@ -761,11 +952,10 @@ fn write_outputs(attachments: &mut Attachments<'_>, pipeline: &Pipeline, outputs
 			// THE SHADER'S MASK AND THE PIPELINE'S ARE BOTH APPLIED, and neither replaces the
 			// other: the pipeline's is the pass's decision and the shader's is the fragment's.
 			sample_mask: outputs.sample_mask.unwrap_or(u32::MAX) & pipeline.sample_mask,
-			alpha_to_coverage: pipeline.alpha_to_coverage && !colour.integer,
+			alpha_to_coverage: pipeline.alpha_to_coverage && !colour.integer(),
 		};
-		written += crate::pass::write_fragment(colour, if index == 0 { depth_stencil.as_deref_mut() } else { None }, &fragment)?;
+		written += crate::pass::write_fragment_into(colour, if index == 0 { targets.depth.as_deref_mut() } else { None }, &fragment)?;
 	}
-	attachments.depth_stencil = depth_stencil;
 	Ok(written)
 }
 
@@ -841,100 +1031,134 @@ fn stage_point(prepared: &mut Prepared, pipeline: &Pipeline, source: &dyn Source
 	Ok(())
 }
 
+/// Every colour attachment and the depth one, whole, for the primitives that are not tiled.
+fn whole<'t, 'a>(attachments: &'t mut Attachments<'a>, views: &mut Vec<Option<ColourView<'t>>>) -> Option<DepthView<'t>> {
+	for colour in attachments.colour.iter_mut() {
+		views.push(Some(colour.view()));
+	}
+	attachments.depth_stencil.as_deref_mut().map(DepthStencil::view)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn shade_lines(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
+	if prepared.scratch.segments.is_empty() {
+		return Ok(());
+	}
+	let keep = writable(attachments.scissor, width, height);
 	let segments = core::mem::take(&mut prepared.scratch.segments);
 	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
-	let keep = writable(attachments.scissor, width, height);
-	for segment in &segments {
-		let x0 = (segment.from.0.pixel().min(segment.to.0.pixel()) - 1).max(keep.0);
-		let x1 = (segment.from.0.pixel().max(segment.to.0.pixel()) + 2).min(keep.2);
-		let y0 = (segment.from.1.pixel().min(segment.to.1.pixel()) - 1).max(keep.1);
-		let y1 = (segment.from.1.pixel().max(segment.to.1.pixel()) + 2).min(keep.3);
-		for y in y0..y1 {
-			for x in x0..x1 {
-				if !geometry::line_covers_pixel(segment.from, segment.to, x, y) {
-					continue;
+	let mut views: Vec<Option<ColourView<'_>>> = recycle(core::mem::take(&mut prepared.scratch.views));
+	let mut depth = whole(attachments, &mut views);
+	let mut targets = Targets { colour: &mut views, depth: depth.as_mut() };
+	// THE SCRATCH GOES BACK WHATEVER HAPPENS: a failed draw that dropped it would make the next frame
+	// allocate it again, which is a steady-state allocation reached through an error.
+	let outcome = (|| -> Result<(), Error> {
+		for segment in &segments {
+			let x0 = (segment.from.0.pixel().min(segment.to.0.pixel()) - 1).max(keep.0);
+			let x1 = (segment.from.0.pixel().max(segment.to.0.pixel()) + 2).min(keep.2);
+			let y0 = (segment.from.1.pixel().min(segment.to.1.pixel()) - 1).max(keep.1);
+			let y1 = (segment.from.1.pixel().max(segment.to.1.pixel()) + 2).min(keep.3);
+			for y in y0..y1 {
+				for x in x0..x1 {
+					if !geometry::line_covers_pixel(segment.from, segment.to, x, y) {
+						continue;
+					}
+					let at = geometry::line_parameter(segment.from, segment.to, x, y);
+					let weights = [1.0 - at, at, 0.0];
+					let mut smooth = Varyings::EMPTY;
+					for index in 0..segment.smooth[0].len() {
+						smooth.push(interp::smooth(weights, [segment.inverse_w[0], segment.inverse_w[1], 1.0], [segment.smooth[0].as_slice()[index], segment.smooth[1].as_slice()[index], 0.0]));
+					}
+					let mut noperspective = Varyings::EMPTY;
+					for index in 0..segment.noperspective[0].len() {
+						noperspective.push(interp::noperspective(weights, [segment.noperspective[0].as_slice()[index], segment.noperspective[1].as_slice()[index], 0.0]));
+					}
+					let depth = interp::depth(weights, [segment.depth[0], segment.depth[1], 0.0]);
+					let bindings = FragmentBindings {
+						source,
+						smooth: smooth.as_slice(),
+						noperspective: noperspective.as_slice(),
+						flat: segment.flat.as_slice(),
+						locations: map,
+						// A LINE HAS NO WINDING, so it is always reported front-facing rather than
+						// being given a side a cull mode could remove it by.
+						front_facing: true,
+						coordinate: [x as f32 + 0.5, y as f32 + 0.5, depth, 1.0],
+						sample_index: 0,
+						sample_mask: u32::MAX,
+					};
+					interpreter::execute_into(&pipeline.fragment, &bindings, &mut machine).map_err(fault)?;
+					stats.fragments += 1;
+					if machine.outputs().discarded {
+						stats.discarded += 1;
+						continue;
+					}
+					let coverage = (1_u32 << samples) - 1;
+					stats.samples_written += write_outputs(&mut targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, Facing::Front, samples)?;
 				}
-				let at = geometry::line_parameter(segment.from, segment.to, x, y);
-				let weights = [1.0 - at, at, 0.0];
-				let mut smooth = Varyings::EMPTY;
-				for index in 0..segment.smooth[0].len() {
-					smooth.push(interp::smooth(weights, [segment.inverse_w[0], segment.inverse_w[1], 1.0], [segment.smooth[0].as_slice()[index], segment.smooth[1].as_slice()[index], 0.0]));
-				}
-				let mut noperspective = Varyings::EMPTY;
-				for index in 0..segment.noperspective[0].len() {
-					noperspective.push(interp::noperspective(weights, [segment.noperspective[0].as_slice()[index], segment.noperspective[1].as_slice()[index], 0.0]));
-				}
-				let depth = interp::depth(weights, [segment.depth[0], segment.depth[1], 0.0]);
-				let bindings = FragmentBindings {
-					source,
-					smooth: smooth.as_slice(),
-					noperspective: noperspective.as_slice(),
-					flat: segment.flat.as_slice(),
-					locations: map,
-					// A LINE HAS NO WINDING, so it is always reported front-facing rather than being
-					// given a side a cull mode could remove it by.
-					front_facing: true,
-					coordinate: [x as f32 + 0.5, y as f32 + 0.5, depth, 1.0],
-					sample_index: 0,
-					sample_mask: u32::MAX,
-				};
-				interpreter::execute_into(&pipeline.fragment, &bindings, &mut machine).map_err(fault)?;
-				stats.fragments += 1;
-				if machine.outputs().discarded {
-					stats.discarded += 1;
-					continue;
-				}
-				let coverage = (1_u32 << samples) - 1;
-				stats.samples_written += write_outputs(attachments, pipeline, machine.outputs(), x as u32, y as u32, coverage, depth, Facing::Front, samples)?;
 			}
 		}
-	}
+		Ok(())
+	})();
+	drop(targets);
+	drop(depth);
+	prepared.scratch.views = recycle(views);
 	prepared.scratch.segments = segments;
 	prepared.scratch.fragment_machine = machine;
-	Ok(())
+	outcome
 }
 
 #[allow(clippy::too_many_arguments)]
 fn shade_points(prepared: &mut Prepared, attachments: &mut Attachments<'_>, source: &dyn Source, pipeline: &Pipeline, map: &[(u32, Interpolation, usize, usize)], width: u32, height: u32, samples: u32, stats: &mut Stats) -> Result<(), Error> {
-	let points = core::mem::take(&mut prepared.scratch.points);
-	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
+	if prepared.scratch.points.is_empty() {
+		return Ok(());
+	}
 	let positions = render3d::msaa::sample_positions(samples)?;
 	let keep = writable(attachments.scissor, width, height);
-	for dot in &points {
-		if dot.size == 0 {
-			continue;
-		}
-		let half = dot.size as i64;
-		let centre_x = dot.centre.0.pixel();
-		let centre_y = dot.centre.1.pixel();
-		for y in (centre_y - half).max(keep.1)..(centre_y + half + 1).min(keep.3) {
-			for x in (centre_x - half).max(keep.0)..(centre_x + half + 1).min(keep.2) {
-				let mut coverage = 0;
-				for position in positions {
-					let sample = (crate::Subpixel(x * crate::fixed::SUBPIXEL_ONE + (position.x as f64 * crate::fixed::SUBPIXEL_ONE as f64) as i64), crate::Subpixel(y * crate::fixed::SUBPIXEL_ONE + (position.y as f64 * crate::fixed::SUBPIXEL_ONE as f64) as i64));
-					if geometry::point_covers(dot.centre, dot.size, sample) {
-						coverage |= 1 << position.index;
+	let points = core::mem::take(&mut prepared.scratch.points);
+	let mut machine = core::mem::take(&mut prepared.scratch.fragment_machine);
+	let mut views: Vec<Option<ColourView<'_>>> = recycle(core::mem::take(&mut prepared.scratch.views));
+	let mut depth = whole(attachments, &mut views);
+	let mut targets = Targets { colour: &mut views, depth: depth.as_mut() };
+	let outcome = (|| -> Result<(), Error> {
+		for dot in &points {
+			if dot.size == 0 {
+				continue;
+			}
+			let half = dot.size as i64;
+			let centre_x = dot.centre.0.pixel();
+			let centre_y = dot.centre.1.pixel();
+			for y in (centre_y - half).max(keep.1)..(centre_y + half + 1).min(keep.3) {
+				for x in (centre_x - half).max(keep.0)..(centre_x + half + 1).min(keep.2) {
+					let mut coverage = 0;
+					for position in positions {
+						let sample = (crate::Subpixel(x * crate::fixed::SUBPIXEL_ONE + (position.x as f64 * crate::fixed::SUBPIXEL_ONE as f64) as i64), crate::Subpixel(y * crate::fixed::SUBPIXEL_ONE + (position.y as f64 * crate::fixed::SUBPIXEL_ONE as f64) as i64));
+						if geometry::point_covers(dot.centre, dot.size, sample) {
+							coverage |= 1 << position.index;
+						}
 					}
+					if coverage == 0 {
+						continue;
+					}
+					let bindings = FragmentBindings { source, smooth: dot.values.as_slice(), noperspective: dot.values.as_slice(), flat: dot.flat.as_slice(), locations: map, front_facing: true, coordinate: [x as f32 + 0.5, y as f32 + 0.5, dot.depth, 1.0], sample_index: 0, sample_mask: coverage };
+					interpreter::execute_into(&pipeline.fragment, &bindings, &mut machine).map_err(fault)?;
+					stats.fragments += 1;
+					if machine.outputs().discarded {
+						stats.discarded += 1;
+						continue;
+					}
+					stats.samples_written += write_outputs(&mut targets, pipeline, machine.outputs(), x as u32, y as u32, coverage, dot.depth, Facing::Front, samples)?;
 				}
-				if coverage == 0 {
-					continue;
-				}
-				let bindings = FragmentBindings { source, smooth: dot.values.as_slice(), noperspective: dot.values.as_slice(), flat: dot.flat.as_slice(), locations: map, front_facing: true, coordinate: [x as f32 + 0.5, y as f32 + 0.5, dot.depth, 1.0], sample_index: 0, sample_mask: coverage };
-				interpreter::execute_into(&pipeline.fragment, &bindings, &mut machine).map_err(fault)?;
-				stats.fragments += 1;
-				if machine.outputs().discarded {
-					stats.discarded += 1;
-					continue;
-				}
-				stats.samples_written += write_outputs(attachments, pipeline, machine.outputs(), x as u32, y as u32, coverage, dot.depth, Facing::Front, samples)?;
 			}
 		}
-	}
+		Ok(())
+	})();
+	drop(targets);
+	drop(depth);
+	prepared.scratch.views = recycle(views);
 	prepared.scratch.points = points;
 	prepared.scratch.fragment_machine = machine;
-	Ok(())
+	outcome
 }
 
 /// The commands a caller recorded, turned into the plan's draws.

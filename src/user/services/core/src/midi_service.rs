@@ -1,12 +1,17 @@
-// MidiService - MIDI 1.0 receive endpoints, as ordered bounded chunks with host receipt time and cable, for
-// components PermissionManager granted one endpoint.
+// MidiService - MIDI 1.0 endpoints: received as ordered bounded chunks with host receipt time and cable, and
+// sent as the same chunks the other way, for components PermissionManager granted one endpoint.
 //
 // WHAT IT HOLDS AND WHAT IT DOES NOT. It consumes every `midi` publication through a catalogue connection
 // minted for that kind alone; a provider - the USB MIDI class module, the in-guest fixture - delivers raw
 // USB-MIDI 1.0 packet batches, and this service decodes them with the driver library's staged decoder and
 // queues the result for exactly one reader per endpoint. It serves inventory on SERVE, which lists endpoints
 // and opens nothing, and on ADMIN the minting endpoint PermissionManager alone reaches. It is not a broker, a
-// router or a sequencer: there is no fan-out, no output and no scheduling.
+// router or a sequencer: there is no fan-out and no scheduling.
+//
+// SENDING IS CHECKED WHOLE AND PACED BY THE DEVICE. A sender's batch is encoded with the driver library's
+// encoder - every chunk a packet, or nothing sent at all - and handed to the provider as one batch, and the
+// sender's answer waits for the provider's, which waits for the device to take the packets. So one batch is in
+// flight per sender, and a slow device slows its sender and nothing else.
 //
 // BOUNDED EVERYWHERE, AND LOSS IS NEVER SILENT. Each receiver has one `service_logic::bounded_event` queue:
 // 256 events and 32 kB, integrity records included. A batch that does not fit ENDS the receiver with
@@ -24,7 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use drivers::usb_midi;
 use ipc_client::ChannelTransport;
-use proto::system::{Error, EventEnd, EventEndReason, EventHeader, EventSource, MidiAbort, MidiAbortReason, MidiBatch, MidiChunk, MidiChunkKind, MidiDeviceEvent, MidiDirection, MidiEndpoint, MidiEndpointId, MidiEvent, MidiFault, MidiFaultCode, MidiGrant, MidiItem, MidiProtocol, MidiReceiverStatus, ProviderInfo, ProviderKind, midi, midi_admin, midi_device, midi_input, provider_catalogue};
+use proto::system::{Error, EventEnd, EventEndReason, EventHeader, EventSource, MidiAbort, MidiAbortReason, MidiBatch, MidiChunk, MidiChunkKind, MidiDeviceDirection, MidiDeviceEvent, MidiDirection, MidiEndpoint, MidiEndpointId, MidiEvent, MidiFault, MidiFaultCode, MidiGrant, MidiItem, MidiProtocol, MidiReceiverStatus, ProviderInfo, ProviderKind, midi, midi_admin, midi_device, midi_input, midi_output, provider_catalogue};
 use rt::*;
 use service_logic::bounded_event as be;
 use wire::{Handles, Reader, Sink, Transport, TransportError};
@@ -52,12 +57,33 @@ struct Provider {
 	info: ProviderInfo,
 	chan: u64,
 	events: u64,
-	// Index, name and cable count of each receive endpoint.
-	endpoints: Vec<(u32, String, u8)>,
-	// Calls not yet answered: the correlation, and for a `start` the endpoint and receiver generation it
-	// was for - so a refusal can end the receiver it refused.
-	sent: Vec<(u32, Option<(u32, u64)>)>,
+	// Index, name, cable count and direction of each endpoint.
+	endpoints: Vec<(u32, String, u8, MidiDeviceDirection)>,
+	// Calls not yet answered, by correlation.
+	sent: Vec<(u32, Pending)>,
 	next_corr: u32,
+}
+
+// What a provider call was for, so its answer reaches the right place.
+#[derive(Clone, Copy)]
+enum Pending {
+	// A `start` - its endpoint and receiver generation, so a refusal can end the receiver it refused - or a `stop`.
+	Control(Option<(u32, u64)>),
+	// A `send`, for the sender of this generation, whose own answer waits for it.
+	Send(u64),
+}
+
+// One sender: the grant's connection, the owner it lives as long as, and the messages it has open.
+struct Sender {
+	chan: u64,
+	owner: u64,
+	provider: u32,
+	endpoint: u32,
+	generation: u64,
+	active: bool,
+	encoder: usb_midi::Encoder,
+	// The sender's `send` waiting for the provider: its correlation.
+	waiting: Option<u32>,
 }
 
 // One receiver: the grant's connection, the owner it lives as long as, and its bounded stream.
@@ -82,6 +108,7 @@ struct Service {
 	catalogue: u64,
 	providers: Vec<Provider>,
 	receivers: Vec<Receiver>,
+	senders: Vec<Sender>,
 	observers: Vec<u64>,
 	admins: Vec<u64>,
 	next_key: u32,
@@ -222,16 +249,22 @@ impl Service {
 		MidiEndpointId { slot: provider.info.slot, generation: provider.info.provider_generation, binding_generation: provider.info.binding_generation, endpoint, incarnation: self.incarnation }
 	}
 
-	fn endpoint_info(&self, provider: &Provider, endpoint: &(u32, String, u8)) -> MidiEndpoint {
-		let receiving = self.receivers.iter().any(|receiver| receiver.active && receiver.provider == provider.key && receiver.endpoint == endpoint.0);
-		MidiEndpoint { id: self.endpoint_id(provider, endpoint.0), name: endpoint.1.clone(), protocol: MidiProtocol::Midi1, direction: MidiDirection::Receive, cables: endpoint.2, receiving }
+	fn endpoint_info(&self, provider: &Provider, endpoint: &(u32, String, u8, MidiDeviceDirection)) -> MidiEndpoint {
+		let held = |held_provider: u32, held_endpoint: u32| held_provider == provider.key && held_endpoint == endpoint.0;
+		let receiving = self.receivers.iter().any(|receiver| receiver.active && held(receiver.provider, receiver.endpoint)) || self.senders.iter().any(|sender| sender.active && held(sender.provider, sender.endpoint));
+		let direction = if endpoint.3 == MidiDeviceDirection::Transmit { MidiDirection::Transmit } else { MidiDirection::Receive };
+		MidiEndpoint { id: self.endpoint_id(provider, endpoint.0), name: endpoint.1.clone(), protocol: MidiProtocol::Midi1, direction, cables: endpoint.2, receiving }
 	}
 
 	fn clients(&self) -> usize {
-		self.observers.len() + self.receivers.len()
+		self.observers.len() + self.receivers.len() + self.senders.len()
 	}
 
 	fn send(&mut self, provider: u32, start: Option<(u32, u64)>, encode: impl FnOnce(&mut midi_device::Client<&mut Capture>)) -> bool {
+		self.call(provider, Pending::Control(start), encode)
+	}
+
+	fn call(&mut self, provider: u32, pending: Pending, encode: impl FnOnce(&mut midi_device::Client<&mut Capture>)) -> bool {
 		let Some(at) = self.providers.iter().position(|held| held.key == provider) else { return false };
 		let corr = self.providers[at].next_corr;
 		self.providers[at].next_corr = self.providers[at].next_corr.wrapping_add(1).max(1);
@@ -240,7 +273,7 @@ impl Service {
 			if self.providers[at].sent.len() >= 32 {
 				self.providers[at].sent.remove(0);
 			}
-			self.providers[at].sent.push((corr, start));
+			self.providers[at].sent.push((corr, pending));
 		}
 		sent
 	}
@@ -260,6 +293,23 @@ impl Service {
 			});
 		}
 		self.answer_read(at);
+	}
+
+	// END A SENDER: its endpoint's slot freed, and a send it is waiting on answered - a batch the provider takes
+	// after this is the provider's to finish, and nobody waits for it.
+	fn end_sender(&mut self, at: usize, result: Result<(), Error>) {
+		let sender = &mut self.senders[at];
+		sender.active = false;
+		if let Some(corr) = sender.waiting.take() {
+			reply(sender.chan, corr, result, |_, _| Some(()));
+		}
+	}
+
+	fn retire_sender(&mut self, at: usize) {
+		self.end_sender(at, Err(Error::Closed));
+		let sender = self.senders.remove(at);
+		close(sender.chan);
+		close(sender.owner);
 	}
 
 	// A waiting read is answered once there is something to answer with.
@@ -311,7 +361,7 @@ impl Service {
 		}
 		let key = self.next_key;
 		self.next_key = self.next_key.wrapping_add(1).max(1);
-		self.providers.push(Provider { key, info, chan, events, endpoints: endpoints.into_iter().map(|endpoint| (endpoint.index, endpoint.name, endpoint.cables)).collect(), sent: Vec::new(), next_corr: 1 });
+		self.providers.push(Provider { key, info, chan, events, endpoints: endpoints.into_iter().map(|endpoint| (endpoint.index, endpoint.name, endpoint.cables, endpoint.direction)).collect(), sent: Vec::new(), next_corr: 1 });
 		print(b"MidiService: a MIDI device was admitted\n");
 	}
 
@@ -326,6 +376,12 @@ impl Service {
 			if self.receivers[at].provider == key {
 				self.receivers[at].active = false;
 				self.end(at, be::Reason::Removed);
+			}
+		}
+		// A SENDER ON IT ENDS TOO: what it waits on will never be taken, and a replacement needs a fresh grant.
+		for at in 0..self.senders.len() {
+			if self.senders[at].provider == key && self.senders[at].active {
+				self.end_sender(at, Err(Error::Io));
 			}
 		}
 		print(b"MidiService: a MIDI device is gone: ");
@@ -347,8 +403,26 @@ impl Service {
 			let mut reader = Reader::new(&buf[..len]);
 			let Some(corr) = reader.u32() else { return Err(b"a reply carried no correlation") };
 			let Some(place) = self.providers[at].sent.iter().position(|(sent, _)| *sent == corr) else { continue };
-			let (_, start) = self.providers[at].sent.remove(place);
-			if reader.tag() != Some(false) {
+			let (_, pending) = self.providers[at].sent.remove(place);
+			let tag = reader.tag();
+			let start = match pending {
+				Pending::Control(start) => start,
+				// A SEND'S ANSWER IS ITS SENDER'S: the provider's error as it gave it, or `io` if it gave none.
+				Pending::Send(generation) => {
+					let result = match tag {
+						Some(true) => Ok(()),
+						Some(false) => Err(Error::read(&mut reader).unwrap_or(Error::Io)),
+						None => Err(Error::Io),
+					};
+					if let Some(at) = self.senders.iter().position(|sender| sender.active && sender.generation == generation)
+						&& let Some(corr) = self.senders[at].waiting.take()
+					{
+						reply(self.senders[at].chan, corr, result, |_, _| Some(()));
+					}
+					continue;
+				}
+			};
+			if tag != Some(false) {
 				continue;
 			}
 			print(b"MidiService: a MIDI device refused to start or stop an endpoint\n");
@@ -457,7 +531,11 @@ impl midi_admin::Service for AdminView<'_> {
 			[] => return refuse(Error::NotFound),
 			_ => return refuse(Error::Invalid),
 		};
-		let Some(&(_, _, cables)) = service.providers[at].endpoints.iter().find(|(index, _, _)| *index == endpoint) else { return refuse(Error::NotFound) };
+		let Some(&(_, _, cables, direction)) = service.providers[at].endpoints.iter().find(|(index, _, _, _)| *index == endpoint) else { return refuse(Error::NotFound) };
+		// A RECEIVER ON A TRANSMIT ENDPOINT would wait for ever on a device that sends nothing there.
+		if direction != MidiDeviceDirection::Receive {
+			return refuse(Error::Invalid);
+		}
 		let key = service.providers[at].key;
 		if service.receivers.iter().any(|receiver| receiver.active && receiver.provider == key && receiver.endpoint == endpoint) {
 			print(b"MidiService: a second receiver on an endpoint was refused as busy - there is no fan-out\n");
@@ -482,6 +560,42 @@ impl midi_admin::Service for AdminView<'_> {
 		Ok(MidiGrant { connection: theirs, source })
 	}
 
+	// THE SAME RESOLUTION FOR A SENDER, onto a TRANSMIT endpoint: one per endpoint, and nothing is sent until the
+	// sender sends - there is nothing to start.
+	fn mint_output(&mut self, alias: String, endpoint: u32, owner: u64) -> Result<MidiGrant, Error> {
+		let refuse = |error: Error| {
+			close(owner);
+			Err(error)
+		};
+		let Some(&(_, bound)) = ALIASES.iter().find(|(name, _)| *name == alias) else { return refuse(Error::NotFound) };
+		let service = &mut *self.service;
+		let matching: Vec<usize> = service.providers.iter().enumerate().filter(|(_, provider)| provider.info.name.as_bytes() == bound).map(|(at, _)| at).collect();
+		let at = match matching.as_slice() {
+			[at] => *at,
+			[] => return refuse(Error::NotFound),
+			_ => return refuse(Error::Invalid),
+		};
+		let Some(&(_, _, cables, direction)) = service.providers[at].endpoints.iter().find(|(index, _, _, _)| *index == endpoint) else { return refuse(Error::NotFound) };
+		if direction != MidiDeviceDirection::Transmit {
+			return refuse(Error::Invalid);
+		}
+		let key = service.providers[at].key;
+		if service.senders.iter().any(|sender| sender.active && sender.provider == key && sender.endpoint == endpoint) {
+			print(b"MidiService: a second sender on an endpoint was refused as busy\n");
+			return refuse(Error::Again);
+		}
+		if service.clients() >= MAX_CLIENTS {
+			return refuse(Error::Exhausted);
+		}
+		let Some((mine, theirs)) = channel() else { return refuse(Error::Exhausted) };
+		let generation = service.next_generation;
+		service.next_generation += 1;
+		let info = &service.providers[at].info;
+		let source = EventSource { incarnation: service.incarnation, slot: info.slot, generation: info.provider_generation, binding_generation: info.binding_generation, endpoint, receiver_generation: generation };
+		service.senders.push(Sender { chan: mine, owner, provider: key, endpoint, generation, active: true, encoder: usb_midi::Encoder::new(cables), waiting: None });
+		Ok(MidiGrant { connection: theirs, source })
+	}
+
 	fn revoke(&mut self, endpoint: MidiEndpointId) -> Result<u32, Error> {
 		let service = &mut *self.service;
 		let Some(key) = service.providers.iter().find(|provider| service.endpoint_id(provider, endpoint.endpoint) == endpoint).map(|provider| provider.key) else { return Ok(0) };
@@ -489,6 +603,12 @@ impl midi_admin::Service for AdminView<'_> {
 		for at in 0..service.receivers.len() {
 			if service.receivers[at].active && service.receivers[at].provider == key && service.receivers[at].endpoint == endpoint.endpoint {
 				service.end(at, be::Reason::Revoked);
+				revoked += 1;
+			}
+		}
+		for at in 0..service.senders.len() {
+			if service.senders[at].active && service.senders[at].provider == key && service.senders[at].endpoint == endpoint.endpoint {
+				service.end_sender(at, Err(Error::Closed));
 				revoked += 1;
 			}
 		}
@@ -507,15 +627,20 @@ impl midi::Service for InventoryView<'_> {
 		Ok(service.providers.iter().flat_map(|provider| provider.endpoints.iter().map(move |endpoint| service.endpoint_info(provider, endpoint))).collect())
 	}
 	fn open(&mut self, endpoint: MidiEndpointId, direction: MidiDirection, protocol: MidiProtocol) -> Result<(), Error> {
-		// OUTPUT AND UMP DO NOT EXIST HERE YET, and saying so is the answer - nothing is silently accepted.
-		if direction == MidiDirection::Transmit || protocol == MidiProtocol::Ump {
+		// UMP DOES NOT EXIST HERE YET, and saying so is the answer - nothing is silently accepted.
+		if protocol == MidiProtocol::Ump {
 			return Err(Error::Unsupported);
 		}
-		let known = self.service.providers.iter().any(|provider| provider.endpoints.iter().any(|held| self.service.endpoint_id(provider, held.0) == endpoint));
-		if !known {
+		let service = self.service;
+		let Some(held) = service.providers.iter().find_map(|provider| provider.endpoints.iter().find(|held| service.endpoint_id(provider, held.0) == endpoint)) else {
 			return Err(Error::NotFound);
+		};
+		// A DIRECTION THE ENDPOINT DOES NOT HAVE is not a question of permission.
+		let transmit = held.3 == MidiDeviceDirection::Transmit;
+		if transmit != (direction == MidiDirection::Transmit) {
+			return Err(Error::Invalid);
 		}
-		// RECEIVING NEEDS A GRANT: inventory can name an endpoint and never open one.
+		// RECEIVING AND SENDING EACH NEED A GRANT: inventory can name an endpoint and never open one.
 		Err(Error::Denied)
 	}
 }
@@ -553,7 +678,108 @@ impl midi_input::Service for InputView<'_> {
 	}
 }
 
+// A sender's connection. `send` waits on the provider, so it is answered by hand.
+enum Told {
+	Send(Vec<MidiChunk>),
+	Stop,
+}
+
+struct OutputView<'a> {
+	service: &'a Service,
+	sender: usize,
+	told: Option<Told>,
+}
+
+impl midi_output::Service for OutputView<'_> {
+	fn endpoint(&mut self) -> Result<MidiEndpoint, Error> {
+		let sender = &self.service.senders[self.sender];
+		let provider = self.service.providers.iter().find(|provider| provider.key == sender.provider).ok_or(Error::Closed)?;
+		let endpoint = provider.endpoints.iter().find(|endpoint| endpoint.0 == sender.endpoint).ok_or(Error::Closed)?;
+		Ok(self.service.endpoint_info(provider, endpoint))
+	}
+	fn send(&mut self, chunks: Vec<MidiChunk>) -> Result<(), Error> {
+		self.told = Some(Told::Send(chunks));
+		Err(Error::Again)
+	}
+	fn stop(&mut self) -> Result<(), Error> {
+		self.told = Some(Told::Stop);
+		Err(Error::Again)
+	}
+}
+
+// A chunk on the wire's vocabulary, as the encoder takes it; `None` for one that cannot even be read as one.
+fn outgoing(chunk: &MidiChunk) -> Option<usb_midi::Chunk> {
+	if chunk.bytes.len() > 3 {
+		return None;
+	}
+	let kind = match chunk.kind {
+		MidiChunkKind::Short => usb_midi::Kind::Short,
+		MidiChunkKind::SysexStart => usb_midi::Kind::SysexStart,
+		MidiChunkKind::SysexContinue => usb_midi::Kind::SysexContinue,
+		MidiChunkKind::SysexEnd => usb_midi::Kind::SysexEnd,
+		MidiChunkKind::Raw => usb_midi::Kind::Raw,
+	};
+	let mut out = usb_midi::Chunk { cable: chunk.cable, kind, bytes: [0; 3], len: chunk.bytes.len() as u8, message: chunk.sysex_message, start: chunk.start, end: chunk.end };
+	out.bytes[..chunk.bytes.len()].copy_from_slice(&chunk.bytes);
+	Some(out)
+}
+
 impl Service {
+	fn output(&mut self, at: usize, request: &[u8], handles: &mut Handles, reply_buf: &mut [u8]) -> bool {
+		let chan = self.senders[at].chan;
+		let mut view = OutputView { service: self, sender: at, told: None };
+		let mut reply_handles = Handles::new();
+		let written = midi_output::dispatch(&mut view, request, handles, reply_buf, &mut reply_handles);
+		let told = view.told.take();
+		let Some(written) = written else { return false };
+		let Some(told) = told else {
+			if !send_caps_blocking(chan, &reply_buf[..written], reply_handles.as_slice()) {
+				for &leftover in reply_handles.as_slice() {
+					close(leftover);
+				}
+			}
+			return true;
+		};
+		let corr = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+		match told {
+			Told::Send(chunks) => {
+				let sender = &mut self.senders[at];
+				if !sender.active {
+					reply::<()>(chan, corr, Err(Error::Closed), |_, _| Some(()));
+					return true;
+				}
+				if sender.waiting.is_some() {
+					reply::<()>(chan, corr, Err(Error::Again), |_, _| Some(()));
+					return true;
+				}
+				// CHECKED WHOLE, AND ENCODED ONLY IF EVERY CHUNK IS A PACKET: a refusal sends nothing and moves no
+				// open message.
+				let Some(outgoing) = chunks.iter().map(outgoing).collect::<Option<Vec<_>>>() else {
+					reply::<()>(chan, corr, Err(Error::Invalid), |_, _| Some(()));
+					return true;
+				};
+				let mut packets = Vec::new();
+				if outgoing.is_empty() || sender.encoder.encode_all(&outgoing, &mut packets).is_err() {
+					reply::<()>(chan, corr, Err(Error::Invalid), |_, _| Some(()));
+					return true;
+				}
+				let (provider, endpoint, generation) = (sender.provider, sender.endpoint, sender.generation);
+				if self.call(provider, Pending::Send(generation), |client| {
+					let _ = client.send(&endpoint, &packets);
+				}) {
+					self.senders[at].waiting = Some(corr);
+				} else {
+					reply::<()>(chan, corr, Err(Error::Io), |_, _| Some(()));
+				}
+			}
+			Told::Stop => {
+				self.end_sender(at, Err(Error::Closed));
+				reply(chan, corr, Ok(()), |_, _| Some(()));
+			}
+		}
+		true
+	}
+
 	fn input(&mut self, at: usize, request: &[u8], handles: &mut Handles, reply_buf: &mut [u8]) -> bool {
 		let chan = self.receivers[at].chan;
 		let mut view = InputView { service: self, receiver: at, asked: None };
@@ -600,7 +826,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let subscription: u64 = if catalogue != 0 { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Midi).unwrap_or(0) } else { 0 };
 	let mut drawn = [0u8; 8];
 	random_get(&mut drawn);
-	let mut service = Service { incarnation: u64::from_le_bytes(drawn) | 1, catalogue, providers: Vec::new(), receivers: Vec::new(), observers: Vec::new(), admins: Vec::new(), next_key: 1, next_generation: 1 };
+	let mut service = Service { incarnation: u64::from_le_bytes(drawn) | 1, catalogue, providers: Vec::new(), receivers: Vec::new(), senders: Vec::new(), observers: Vec::new(), admins: Vec::new(), next_key: 1, next_generation: 1 };
 	send_blocking(bootstrap, b"MidiService: online", 0);
 
 	let mut buf = alloc::vec![0u8; BUF_BYTES];
@@ -623,6 +849,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		for receiver in &service.receivers {
 			waitset.extend([receiver.chan, receiver.owner]);
+		}
+		for sender in &service.senders {
+			waitset.extend([sender.chan, sender.owner]);
 		}
 		let now = clock();
 		let deadline = service.next_deadline().map_or(0, |deadline| deadline.max(now + 1));
@@ -669,6 +898,30 @@ fn serve(service: &mut Service, handle: u64, serve_root: u64, admin_root: u64, s
 		}
 		if !understood && let Some(at) = service.receivers.iter().position(|receiver| receiver.chan == handle) {
 			service.retire(at, be::Reason::Stopped);
+		}
+		return;
+	}
+	// A SENDER'S OWNER ENDED, or its connection spoke: the same two cases as a receiver's.
+	if let Some(at) = service.senders.iter().position(|sender| sender.owner == handle) {
+		print(b"MidiService: a sender's owner ended - its sender is retired\n");
+		service.retire_sender(at);
+		return;
+	}
+	if let Some(at) = service.senders.iter().position(|sender| sender.chan == handle) {
+		let (len, mut handles) = match try_recv_caps(handle, buf) {
+			PolledCaps::Message { len, handles } => (len, handles),
+			PolledCaps::Empty => return,
+			PolledCaps::Closed => {
+				service.retire_sender(at);
+				return;
+			}
+		};
+		let understood = len >= 6 && service.output(at, &buf[..len], &mut handles, reply_buf);
+		for &leftover in handles.as_slice() {
+			close(leftover);
+		}
+		if !understood && let Some(at) = service.senders.iter().position(|sender| sender.chan == handle) {
+			service.retire_sender(at);
 		}
 		return;
 	}

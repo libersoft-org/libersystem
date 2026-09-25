@@ -146,6 +146,10 @@ pub enum Capability {
 	AdminAudit = 42,
 	/// AdminService's test controls. Development images only.
 	AdminTest = 43,
+	/// SENDING TO ONE MIDI ENDPOINT, minted per launch for a configured device and the life of the component.
+	/// LAST AND NOT BESIDE `midi-input`, because a capability's number is its position and every one after it
+	/// would move.
+	MidiOutput = 44,
 }
 
 impl Capability {
@@ -232,6 +236,7 @@ impl Capability {
 			41 => Some(Capability::AdminRequest),
 			42 => Some(Capability::AdminAudit),
 			43 => Some(Capability::AdminTest),
+			44 => Some(Capability::MidiOutput),
 			_ => None,
 		}
 	}
@@ -1393,6 +1398,7 @@ impl Capability {
 			Capability::AdminRequest => out.push_str("\"admin-request\""),
 			Capability::AdminAudit => out.push_str("\"admin-audit\""),
 			Capability::AdminTest => out.push_str("\"admin-test\""),
+			Capability::MidiOutput => out.push_str("\"midi-output\""),
 		}
 	}
 	pub fn to_text_into(&self, out: &mut String) {
@@ -1441,6 +1447,7 @@ impl Capability {
 			Capability::AdminRequest => out.push_str("admin-request"),
 			Capability::AdminAudit => out.push_str("admin-audit"),
 			Capability::AdminTest => out.push_str("admin-test"),
+			Capability::MidiOutput => out.push_str("midi-output"),
 		}
 	}
 	pub fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1489,6 +1496,7 @@ impl Capability {
 			Capability::AdminRequest => crate::codec::cbor::text(out, "admin-request"),
 			Capability::AdminAudit => crate::codec::cbor::text(out, "admin-audit"),
 			Capability::AdminTest => crate::codec::cbor::text(out, "admin-test"),
+			Capability::MidiOutput => crate::codec::cbor::text(out, "midi-output"),
 		}
 	}
 }

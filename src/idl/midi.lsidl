@@ -1,11 +1,16 @@
 //! LiberSystem MIDI - MIDI 1.0 receive endpoints, as ordered bounded chunks with their host receipt time and
 //! cable, for components PermissionManager granted one endpoint.
 //!
-//! THREE PARTIES. An ordinary client holds `midi`: it lists endpoints and can open nothing - receiving needs a
-//! grant, and output and UMP are not supported at all yet. A client PermissionManager granted `midi-input`
-//! holds a receiver minted through the private `midi-admin` for ONE endpoint of one publication and the life
-//! of one launched component. A PROVIDER - the USB MIDI class module, or the in-guest fixture - serves
-//! `liber:midi-device@1`, and MidiService is its one consumer.
+//! THREE PARTIES. An ordinary client holds `midi`: it lists endpoints and can open nothing - receiving and
+//! sending each need a grant, and UMP is not supported at all yet. A client PermissionManager granted
+//! `midi-input` holds a receiver, and one granted `midi-output` a sender, minted through the private
+//! `midi-admin` for ONE endpoint of one publication and the life of one launched component. A PROVIDER - the
+//! USB MIDI class module, or the in-guest fixture - serves `liber:midi-device@1`, and MidiService is its one
+//! consumer.
+//!
+//! SENDING IS THE SAME CHUNKS THE OTHER WAY. A sender hands over complete short messages and SysEx fragments
+//! under message numbers of its own choosing; MidiService checks and encodes them and answers once the device
+//! has taken them. There is no time to send AT - USB-MIDI 1.0 carries none - and no output scheduler.
 //!
 //! CHUNKS, NOT MESSAGES. A chunk carries at most three MIDI bytes: a complete short message, a raw byte, or a
 //! FRAGMENT of a System Exclusive message - start, continuation, end, or start and end at once - under a
@@ -48,7 +53,7 @@ record midi-endpoint {
 	direction:       midi-direction,
 	/// Cables 0..cables-1 are this endpoint's; at most 16.
 	cables:          u8,
-	/// A receiver holds it now.
+	/// A receiver holds it now - or, on a transmit endpoint, a sender.
 	receiving:       bool,
 }
 
@@ -142,8 +147,8 @@ record midi-receiver-status {
 	end:          option<event-end>,
 }
 
-/// INVENTORY: the endpoints and what they are. `open` exists to say no precisely: receiving needs a grant,
-/// and output and UMP are unsupported.
+/// INVENTORY: the endpoints and what they are. `open` exists to say no precisely: receiving and sending each
+/// need a grant, a direction the endpoint does not have is invalid, and UMP is unsupported.
 interface midi {
 	@op(1) @bound(32) endpoints: func() -> result<list<midi-endpoint>, error>;
 	@op(2) open: func(endpoint: midi-endpoint-id, direction: midi-direction, protocol: midi-protocol) -> result<unit, error>;
@@ -161,6 +166,17 @@ interface midi-input {
 	@op(4) stop:     func() -> result<unit, error>;
 }
 
+/// ONE SENDER, on the one transmit endpoint this connection was minted for, for as long as its owner lives.
+interface midi-output {
+	@op(1) endpoint: func() -> result<midi-endpoint, error>;
+	/// Send these chunks, in order, as one batch: complete short messages, and SysEx fragments - three bytes
+	/// each but the one that ends its message. CHECKED WHOLE BEFORE ANY OF IT IS SENT, and answered once the
+	/// device has taken all of it; a refused batch sends nothing and leaves every open message as it was.
+	@op(2) send:     func(@bound(64) chunks: list<midi-chunk>) -> result<unit, error>;
+	/// Stop sending; a message the sender left open stays unfinished, and the slot is freed.
+	@op(3) stop:     func() -> result<unit, error>;
+}
+
 record midi-grant {
 	connection: handle<channel>,
 	source:     event-source,
@@ -173,4 +189,7 @@ interface midi-admin {
 	@op(1) mint:   func(@bound(32) alias: string, endpoint: u32, owner: handle<task>) -> result<midi-grant, error>;
 	/// End every receiver on one endpoint; answers how many.
 	@op(2) revoke: func(endpoint: midi-endpoint-id) -> result<u32, error>;
+	/// The same for a SENDER on one transmit endpoint: one per endpoint, ended by close, revocation, owner death
+	/// or device replacement.
+	@op(3) mint-output: func(@bound(32) alias: string, endpoint: u32, owner: handle<task>) -> result<midi-grant, error>;
 }

@@ -19,18 +19,26 @@
 //! Each difference is one stage's cost, and each figure says which two runs it came from. A reader
 //! who doubts a number can run the two variants and subtract them by hand.
 //!
+//! `--workers N` SHADES THE TILES ON N HOST THREADS through `soft3d::frame::execute_with`, and
+//! `--scaling` measures the whole frame at every worker count up to what the host has. The threads
+//! are made ONCE and parked between frames, so a frame's time is the renderer's and not the cost of
+//! creating threads - which is also how the guest's pool works. And the benchmark checks what it
+//! parallelised: every worker count must leave the same colour attachment, to the bit, or it stops.
+//!
 //! THE WORKLOAD IS FROZEN AND THIS PROGRAM CHECKS THAT IT IS. The triangle count, the vertex count
 //! and the extent are asserted against the numbers recorded here, so a later simplification cannot
 //! quietly lower the workload and report the same milliseconds against an easier scene. A benchmark
 //! whose workload can drift measures the workload and not the renderer.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use render_math::{Mat4, Quat, Vec3, Vec4, camera};
 use render_shader::builder::Builder;
 use render_shader::ir::{BinaryOp, Binding, Constant, Interpolation, Module, Op, Output, Sampling, Stage, Transcendental, Type, UnaryOp};
 use render3d::{CompareOp, Cull, DepthFormat, Render3DLimits, Topology};
-use soft3d::frame::{Attachments, Draw, Pipeline, Prepared, Source, Stats};
+use soft3d::frame::{Attachments, Draw, Lane, Pipeline, Prepared, Source, Stats, Tile, Workers};
 use soft3d::pass::{Colour, DepthStencil};
 use soft3d::texture::{Filter, Kind, Level, Sampler, Texture, Wrap};
 use soft3d::{Indices, Val};
@@ -353,14 +361,172 @@ fn pipeline_for(variant: Variant) -> Pipeline {
 	Pipeline { state: render3d::command::PipelineState { topology: Topology::TriangleList, cull: Cull::Back, depth_test: Some(CompareOp::Less), depth_write: true, samples: 1, per_sample_shading: false }, vertex: vertex_stage(), fragment: fragment_stage(variant), blend: vec![blend], stencil: None, depth_compare: CompareOp::Less, depth_write: true, bias: (0.0, 0.0, 0.0), alpha_to_coverage: false, sample_mask: u32::MAX }
 }
 
+/// Host threads made once and parked between frames: `soft3d`'s `Workers` for this benchmark.
+///
+/// THE CALLER IS A WORKER TOO. It takes lane zero and shades tiles beside the parked threads, which
+/// is the shape of the guest's pool and means `--workers 1` is the caller alone.
+struct HostPool {
+	shared: Arc<PoolShared>,
+	threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct PoolShared {
+	state: Mutex<PoolState>,
+	start: Condvar,
+	finished: Condvar,
+}
+
+struct PoolState {
+	generation: u64,
+	job: Option<Job>,
+	/// Workers that have taken this generation's job and not yet finished it.
+	running: usize,
+	panicked: bool,
+	stop: bool,
+}
+
+/// One dispatch with its lifetimes erased: a function that knows the dispatch's real type, and the
+/// dispatch.
+#[derive(Clone, Copy)]
+struct Job {
+	entry: unsafe fn(*const (), usize),
+	data: *const (),
+}
+
+// SAFETY: `data` points at a `Dispatch` on the stack of the thread inside `HostPool::run`, which
+// does not return until every worker has reported this job finished - so the pointer is valid for
+// as long as any worker holds it, and a `Dispatch` is only ever read through shared references and
+// its atomic counter.
+unsafe impl Send for Job {}
+
+/// What every participant in one `run` reads: the lanes, the tiles, and which tile is next.
+struct Dispatch<'w, 't, 'a> {
+	lanes: *mut Lane,
+	tiles: *mut Tile<'t, 'a>,
+	count: usize,
+	next: AtomicUsize,
+	work: &'w (dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync),
+}
+
+/// One participant's share of a dispatch: tiles claimed one at a time until none are left.
+///
+/// # Safety
+/// `data` must point at a live `Dispatch` whose `lanes` has more than `lane` entries, and no other
+/// participant may be using lane `lane`. Each tile index is claimed by exactly one `fetch_add`, so
+/// each `&mut Tile` made here is the only one.
+unsafe fn participate(data: *const (), lane: usize) {
+	let dispatch = unsafe { &*(data as *const Dispatch<'_, '_, '_>) };
+	let lane = unsafe { &mut *dispatch.lanes.add(lane) };
+	loop {
+		let index = dispatch.next.fetch_add(1, Ordering::Relaxed);
+		if index >= dispatch.count {
+			break;
+		}
+		(dispatch.work)(lane, unsafe { &mut *dispatch.tiles.add(index) });
+	}
+}
+
+impl HostPool {
+	/// `workers` participants: the caller and `workers - 1` threads.
+	fn new(workers: usize) -> HostPool {
+		let shared = Arc::new(PoolShared { state: Mutex::new(PoolState { generation: 0, job: None, running: 0, panicked: false, stop: false }), start: Condvar::new(), finished: Condvar::new() });
+		let threads = (1..workers.max(1))
+			.map(|lane| {
+				let shared = shared.clone();
+				std::thread::spawn(move || {
+					let mut seen = 0;
+					loop {
+						let job = {
+							let mut state = shared.state.lock().unwrap();
+							while state.generation == seen && !state.stop {
+								state = shared.start.wait(state).unwrap();
+							}
+							if state.stop {
+								return;
+							}
+							seen = state.generation;
+							state.job
+						};
+						// A PANIC IS REPORTED, NOT SWALLOWED: the caller is waiting for this worker,
+						// and one that died without saying so would leave it waiting for ever.
+						let outcome = std::panic::catch_unwind(|| {
+							if let Some(job) = job {
+								unsafe { (job.entry)(job.data, lane) };
+							}
+						});
+						let mut state = shared.state.lock().unwrap();
+						state.panicked |= outcome.is_err();
+						state.running -= 1;
+						if state.running == 0 {
+							shared.finished.notify_all();
+						}
+					}
+				})
+			})
+			.collect();
+		HostPool { shared, threads }
+	}
+}
+
+impl Workers for HostPool {
+	fn lanes(&self) -> usize {
+		self.threads.len() + 1
+	}
+
+	fn run<'t, 'a>(&self, lanes: &mut [Lane], tiles: &mut [Tile<'t, 'a>], work: &(dyn Fn(&mut Lane, &mut Tile<'t, 'a>) + Sync)) {
+		assert!(lanes.len() > self.threads.len(), "soft3d gives the pool one lane per participant");
+		let dispatch = Dispatch { lanes: lanes.as_mut_ptr(), tiles: tiles.as_mut_ptr(), count: tiles.len(), next: AtomicUsize::new(0), work };
+		{
+			let mut state = self.shared.state.lock().unwrap();
+			state.generation += 1;
+			state.job = Some(Job { entry: participate, data: &dispatch as *const Dispatch<'_, 't, 'a> as *const () });
+			state.running = self.threads.len();
+			self.shared.start.notify_all();
+		}
+		unsafe { participate(&dispatch as *const Dispatch<'_, 't, 'a> as *const (), 0) };
+		let mut state = self.shared.state.lock().unwrap();
+		while state.running > 0 {
+			state = self.shared.finished.wait(state).unwrap();
+		}
+		state.job = None;
+		assert!(!state.panicked, "a worker panicked while shading a tile");
+	}
+}
+
+impl Drop for HostPool {
+	fn drop(&mut self) {
+		self.shared.state.lock().unwrap().stop = true;
+		self.shared.start.notify_all();
+		for thread in self.threads.drain(..) {
+			let _ = thread.join();
+		}
+	}
+}
+
 /// One variant's measurement.
 struct Measured {
 	variant: Variant,
 	nanoseconds: f64,
 	stats: Stats,
+	/// FNV-1a over every colour value the last frame left, so two worker counts can be held to the
+	/// same picture without keeping either.
+	picture: u64,
 }
 
-fn measure(variant: Variant, frame: &mut Frame, requested_width: u32, requested_height: u32) -> Measured {
+fn fingerprint(colour: &Colour) -> u64 {
+	let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+	for y in 0..colour.height {
+		for x in 0..colour.width {
+			let value = colour.at(x, y, 0);
+			for word in [value.x.to_bits(), value.y.to_bits(), value.z.to_bits(), value.w.to_bits()] {
+				hash = (hash ^ word as u64).wrapping_mul(0x0100_0000_01b3);
+			}
+		}
+	}
+	hash
+}
+
+fn measure(variant: Variant, frame: &mut Frame, requested_width: u32, requested_height: u32, workers: &dyn Workers) -> Measured {
 	let (width, height) = variant.extent(requested_width, requested_height);
 	let draw = Draw { pipeline: 0, topology: Topology::TriangleList, count: frame.scene.indices.len() as u32, instances: 1, first_instance: 0, base_vertex: 0, restart: false };
 	let mut prepared: Prepared = soft3d::frame::prepare(Render3DLimits::PROFILE_MINIMUM, vec![pipeline_for(variant)], vec![draw], width, height).expect("the benchmark pipeline is one the profile admits");
@@ -372,7 +538,7 @@ fn measure(variant: Variant, frame: &mut Frame, requested_width: u32, requested_
 		colour.fill(Vec4::new(0.05, 0.06, 0.10, 1.0));
 		depth.clear(1.0, 0);
 		let mut attachments = Attachments { colour: std::slice::from_mut(colour), depth_stencil: Some(depth), viewport, scissor: None };
-		soft3d::frame::execute(&mut prepared, &mut attachments, frame).expect("the benchmark frame is one the backend accepts")
+		soft3d::frame::execute_with(&mut prepared, &mut attachments, frame, workers).expect("the benchmark frame is one the backend accepts")
 	};
 
 	for _ in 0..WARMUP {
@@ -384,7 +550,7 @@ fn measure(variant: Variant, frame: &mut Frame, requested_width: u32, requested_
 		stats = run(frame, &mut colour, &mut depth);
 	}
 	let elapsed = began.elapsed();
-	Measured { variant, nanoseconds: elapsed.as_nanos() as f64 / SAMPLES as f64, stats }
+	Measured { variant, nanoseconds: elapsed.as_nanos() as f64 / SAMPLES as f64, stats, picture: fingerprint(&colour) }
 }
 
 /// A stub the interpreter can be driven against with no rasteriser in front of it.
@@ -476,17 +642,22 @@ fn main() {
 	let mut arguments = std::env::args().skip(1);
 	let mut width = WIDTH;
 	let mut height = HEIGHT;
+	let mut workers = 1;
+	let mut scaling = false;
 	while let Some(argument) = arguments.next() {
 		match argument.as_str() {
 			"--width" => width = arguments.next().and_then(|value| value.parse().ok()).unwrap_or(WIDTH),
 			"--height" => height = arguments.next().and_then(|value| value.parse().ok()).unwrap_or(HEIGHT),
+			"--workers" => workers = arguments.next().and_then(|value| value.parse().ok()).filter(|count| *count > 0).unwrap_or(1),
+			"--scaling" => scaling = true,
 			"--interpreter" => {
 				interpreter_only(200_000);
 				return;
 			}
 			"--help" | "-h" => {
-				println!("usage: soft3d-bench [--width N] [--height N]");
+				println!("usage: soft3d-bench [--width N] [--height N] [--workers N] [--scaling]");
 				println!("One frozen scene through five pipelines that differ by one stage each.");
+				println!("--workers N shades the tiles on N host threads; --scaling measures the whole frame at 1 to 64 workers.");
 				return;
 			}
 			other => {
@@ -520,10 +691,16 @@ fn main() {
 		ambient: [0.22, 0.22, 0.26, 0.0],
 	};
 
-	println!("soft3d-bench: {width}x{height}, {EXPECTED_TRIANGLES} triangles, {EXPECTED_VERTICES} vertices, {SAMPLES} samples after {WARMUP} warmup frames");
+	if scaling {
+		scale(&mut frame, width, height);
+		return;
+	}
+
+	let pool = HostPool::new(workers);
+	println!("soft3d-bench: {width}x{height}, {EXPECTED_TRIANGLES} triangles, {EXPECTED_VERTICES} vertices, {SAMPLES} samples after {WARMUP} warmup frames, {workers} worker(s)");
 	let mut measurements: Vec<Measured> = Vec::new();
 	for variant in Variant::ALL {
-		measurements.push(measure(variant, &mut frame, width, height));
+		measurements.push(measure(variant, &mut frame, width, height, &pool));
 	}
 
 	let mut previous = 0.0_f64;
@@ -549,4 +726,25 @@ fn main() {
 	// would then be a different workload's.
 	assert!(full.stats.clipped > 0, "the benchmark scene crosses the near plane and must clip");
 	assert!(full.stats.fragments > 0, "the benchmark scene must cover fragments");
+}
+
+/// The whole frame - the last variant, every stage - at each worker count the host can run, against
+/// the frame on the caller alone.
+///
+/// THE PICTURE IS CHECKED AT EVERY COUNT. A parallel frame that is faster and different is a defect
+/// with a good number beside it, so every count must leave the one-worker picture to the bit.
+fn scale(frame: &mut Frame, width: u32, height: u32) {
+	let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+	let counts: Vec<usize> = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64].into_iter().filter(|count| *count <= cores).collect();
+	println!("soft3d-bench: {width}x{height}, the whole frame at 1 to {} worker(s) on a host with {cores} core(s), {SAMPLES} samples after {WARMUP} warmup frames", counts.last().unwrap_or(&1));
+	let mut single: Option<Measured> = None;
+	for count in counts {
+		let pool = HostPool::new(count);
+		let measured = measure(Variant::Blending, frame, width, height, &pool);
+		let reference = single.get_or_insert_with(|| Measured { variant: measured.variant, nanoseconds: measured.nanoseconds, stats: measured.stats, picture: measured.picture });
+		assert_eq!(measured.picture, reference.picture, "{count} worker(s) left a different picture from one");
+		assert_eq!(measured.stats, reference.stats, "{count} worker(s) counted different work from one");
+		let speedup = reference.nanoseconds / measured.nanoseconds;
+		println!("soft3d-bench: workers {count:>3} {:>9.3} ms/frame   {speedup:>5.2}x   {:>5.1}% of linear", measured.nanoseconds / 1_000_000.0, speedup / count as f64 * 100.0);
+	}
 }

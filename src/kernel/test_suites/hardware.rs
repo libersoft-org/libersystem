@@ -2495,3 +2495,1604 @@ fn usb_cdc_acm_carries_bytes_to_the_host_and_back() {
 	sched::run_until_idle();
 	let _ = crate::device::release_claim(claim);
 }
+
+// THE SERVICE-BACKED USB CLASSES, each proved against a device the harness built.
+//
+// THESE PUBLICATIONS ARE LIVE ONES. A class device is published after the handshake, under a fresh token,
+// when the controller binds it - and withdrawn when it leaves - so the oracles below read the driver's
+// channel past its `READY` for the offer, and later for the withdrawal.
+
+/// The token of a publication offered AFTER the handshake, with this kind and this name.
+#[cfg(test)]
+fn recv_live_offer(channel: &object::channel::Channel, generation: u64, kind: u16, name: &[u8], patience: u64) -> Option<u16> {
+	let give_up = arch::apic::ticks() + patience;
+	while arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		while let Ok(message) = channel.recv() {
+			let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
+			if header.generation != generation || header.opcode != driver_protocol::Opcode::Offer {
+				continue;
+			}
+			if let Ok((offered, token, offered_name)) = driver_protocol::decode_offer(header.payload(&message.bytes))
+				&& offered == kind
+				&& offered_name == name
+			{
+				return Some(token);
+			}
+		}
+	}
+	None
+}
+
+/// Whether the driver withdrew the publication under `token` within `patience` ticks.
+#[cfg(test)]
+fn recv_withdrawal(channel: &object::channel::Channel, generation: u64, token: u16, patience: u64) -> bool {
+	let give_up = arch::apic::ticks() + patience;
+	while arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		while let Ok(message) = channel.recv() {
+			let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
+			if header.generation == generation && header.opcode == driver_protocol::Opcode::Withdraw && driver_protocol::decode_withdraw(header.payload(&message.bytes)) == Ok(token) {
+				return true;
+			}
+		}
+	}
+	false
+}
+
+/// THE TRANSPORT THE GENERATED CLIENTS CALL OVER, from a kernel test: a kernel channel, a wait counted in
+/// TICKS - a class device's answer can take as long as the device does, which is not a number of passes -
+/// and a table for the capabilities a reply hands over.
+#[cfg(test)]
+struct KernelTransport<'a> {
+	channel: &'a object::channel::Channel,
+	patience: u64,
+	received: alloc::vec::Vec<(u64, alloc::sync::Arc<dyn object::KernelObject>)>,
+	// What a request may hand over, by the number the test gave it - the other half of the table above.
+	offered: alloc::vec::Vec<(u64, alloc::sync::Arc<dyn object::KernelObject>, object::rights::Rights)>,
+}
+
+#[cfg(test)]
+impl<'a> KernelTransport<'a> {
+	fn new(channel: &'a object::channel::Channel, patience: u64) -> KernelTransport<'a> {
+		KernelTransport { channel, patience, received: alloc::vec::Vec::new(), offered: alloc::vec::Vec::new() }
+	}
+
+	/// A capability a later request hands over, under the number to pass the client for it.
+	#[allow(dead_code, reason = "used by the oracles whose requests carry a capability, compiled only when their gadget is")]
+	fn offer(&mut self, object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> u64 {
+		let number = 0x1000 + self.offered.len() as u64;
+		self.offered.push((number, object, rights));
+		number
+	}
+
+	#[allow(dead_code, reason = "used by the oracles whose contracts hand streams over, compiled only when their gadget is")]
+	fn take(&mut self, handle: u64) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+		let at = self.received.iter().position(|(number, _)| *number == handle)?;
+		Some(self.received.remove(at).1)
+	}
+}
+
+#[cfg(test)]
+impl printer_device_proto::codec::Transport for KernelTransport<'_> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut printer_device_proto::codec::Handles, _deadline: u64) -> Result<alloc::vec::Vec<u8>, printer_device_proto::codec::TransportError> {
+		use printer_device_proto::codec::TransportError;
+		// EVERY HANDLE A REQUEST NAMES IS ONE THE TEST OFFERED, and it goes with the request exactly once.
+		let mut caps = alloc::vec::Vec::new();
+		for &number in request_handles {
+			let at = self.offered.iter().position(|(offered, _, _)| *offered == number).ok_or(TransportError::Malformed)?;
+			let (_, object, rights) = self.offered.remove(at);
+			caps.push(object::handle::Capability::new(object, rights));
+		}
+		self.channel.send(object::channel::Message::new(request.to_vec(), caps)).map_err(|_| TransportError::PeerClosed)?;
+		let give_up = arch::apic::ticks() + self.patience;
+		while arch::apic::ticks() < give_up {
+			sched::run_until_idle();
+			match self.channel.recv() {
+				Ok(message) => {
+					for capability in message.caps {
+						let number = self.received.len() as u64 + 1;
+						if reply_handles.push(number).is_none() {
+							return Err(TransportError::Malformed);
+						}
+						self.received.push((number, capability.object()));
+					}
+					return Ok(message.bytes);
+				}
+				Err(object::channel::ChannelError::PeerClosed) => return Err(TransportError::PeerClosed),
+				Err(_) => {}
+			}
+		}
+		Err(TransportError::TimedOut)
+	}
+
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for handle in handles {
+			let _ = self.take(*handle);
+		}
+	}
+}
+
+// The documents the printer oracle sends, by the formula `printer-sink.py` checks them against.
+#[cfg(test)]
+fn printed(seed: u8, length: usize) -> alloc::vec::Vec<u8> {
+	(0..length).map(|n| ((n as u32).wrapping_mul(7).wrapping_add(u32::from(seed) * 13).wrapping_add(n as u32 >> 8)) as u8).collect()
+}
+
+tagged_test!(usb_printer_prints_a_document_waits_on_a_slow_printer_and_survives_its_unplug, [Drivers, Usb, Slow], id = "kernel.hardware.usb_printer_prints_a_document_waits_on_a_slow_printer_and_survives_its_unplug", covers = ["kernel", "drivers", "printer-device-proto"]);
+fn usb_printer_prints_a_document_waits_on_a_slow_printer_and_survives_its_unplug() {
+	// THE PRINTER IS A GADGET IN THE HOST, and its paper is `printer-sink.py`: it reads what arrives, pauses
+	// once so this side's writes have to wait on it, checks every byte against the document below, answers
+	// through the port status byte, and pulls the device out in the middle of the second document. So each
+	// assertion here is about what a device DID - the bytes it took, the status it raised, the moment it left
+	// - and none of them is about what the driver said it did.
+	use object::channel::Channel;
+	use printer_device_proto::generated::liber::printer_device::v1 as printer;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "printer" {
+		crate::serial_println!("usb-printer: NOT RUN - no printer gadget on this run; build one with USB_GADGET=printer");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::PRINTER, driver_protocol::provider::USB_PRINTER_NAME, patience).expect("the controller publishes the printer it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = printer::printer_backend::Client::new(KernelTransport::new(&host_end, patience));
+
+	// 1. THE ATTACH, AND THE DEVICE ID EXACTLY AS THE PRINTER GAVE IT.
+	let attached = client.attach(&1).expect("the printer answered the attach").expect("the printer attached");
+	assert_eq!(attached.version, 1);
+	let id = &attached.device_id;
+	assert!(id.len() >= 2, "a device ID carries its two length bytes");
+	let declared = u16::from_be_bytes([id[0], id[1]]) as usize;
+	assert!(declared <= id.len(), "the ID handed on is no shorter than the length it declares ({declared} of {})", id.len());
+	let text = core::str::from_utf8(&id[2..]).unwrap_or("");
+	assert!(text.contains("MDL:LiberSystem harness printer"), "the ID is the one the harness gave the printer, got {text:?}");
+	assert_eq!(client.attach(&1), Some(Err(printer::Error::Invalid)), "a second attach while one holds the printer is refused");
+	let attachment = attached.attachment;
+
+	// 2. AN IDLE PRINTER'S PORT: selected, no error, paper in.
+	let idle = client.port_status(&attachment).expect("the port answered").expect("the port was read");
+	assert_eq!(idle.bits & 0x38, 0x18, "an idle printer reads selected and not in error, with paper, got {:#04x}", idle.bits);
+	assert_eq!((idle.cover_open, idle.jam), (None, None), "the class has no cover or jam bit, so there is no evidence of either");
+
+	// 3. THE DOCUMENT, WITH THE HOST PAUSING PART WAY. A write is answered when the printer took it, so the
+	//    pause shows up here as a write that took as long as the host did - not as a failure, and not as a
+	//    write answered before the bytes went anywhere.
+	let document = printed(1, 49152);
+	let mut sent: usize = 0;
+	let mut longest: u64 = 0;
+	let mut waits: usize = 0;
+	while sent < document.len() {
+		let end = (sent + 4096).min(document.len());
+		let asked_at = arch::apic::ticks();
+		match client.write(&attachment, &document[sent..end].to_vec()) {
+			Some(Ok(accepted)) => {
+				assert!(accepted > 0 && accepted as usize <= end - sent, "a write answers the prefix it took, got {accepted} of {}", end - sent);
+				sent += accepted as usize;
+			}
+			Some(Err(printer::Error::Again)) => {
+				waits += 1;
+				assert!(waits < 1000, "the printer never took the rest of the document");
+				sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			}
+			other => panic!("a write of the first document failed: {other:?}"),
+		}
+		longest = longest.max(arch::apic::ticks().saturating_sub(asked_at));
+	}
+	assert!(longest >= 50, "a host that stopped reading for two seconds made a write wait on it, got {longest} ticks at most");
+
+	// 4. THE PAPER'S VERDICT, read the way a spooler reads it: the port status byte.
+	let give_up = arch::apic::ticks() + patience;
+	let verdict = loop {
+		let port = client.port_status(&attachment).expect("the port answered").expect("the port was read");
+		if port.bits & 0x20 != 0 || arch::apic::ticks() >= give_up {
+			break port.bits;
+		}
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(5));
+	};
+	assert!(verdict & 0x20 != 0, "the host said it had the whole document (paper empty), got {verdict:#04x}");
+	assert!(verdict & 0x08 != 0, "and that every byte of it was the document's (no error), got {verdict:#04x}");
+
+	// 5. A RESET IS A NEW ATTACHMENT, and the old one is over.
+	let reset = client.reset(&attachment).expect("the printer answered the reset").expect("the port was reset");
+	assert_ne!(reset.attachment, attachment, "a reset is a new attachment generation");
+	assert_eq!(client.port_status(&attachment), Some(Err(printer::Error::Stale)), "the attachment before the reset is over");
+	let attachment = reset.attachment;
+
+	// 6. THE CABLE, PULLED MID-JOB. The host takes eight kilobytes of the second document and unbinds the
+	//    printer; a write in flight then ends, and the publication is withdrawn.
+	let second = printed(2, 65536);
+	let mut sent: usize = 0;
+	let give_up = arch::apic::ticks() + patience * 3;
+	let ended = loop {
+		if sent >= second.len() || arch::apic::ticks() >= give_up {
+			break None;
+		}
+		let end = (sent + 4096).min(second.len());
+		match client.write(&attachment, &second[sent..end].to_vec()) {
+			Some(Ok(accepted)) => sent += accepted as usize,
+			Some(Err(printer::Error::Again)) => {
+				sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			}
+			other => break Some(other),
+		}
+	};
+	assert!(ended.is_some(), "a printer that left mid-job ends the job - {sent} bytes went and nothing failed");
+	assert!(sent >= 8192, "the host took eight kilobytes before it left, and the writes that carried them were answered - {sent} were");
+	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 2), "the controller withdrew the printer's publication when the printer left");
+
+	crate::serial_println!("usb-printer: {} bytes printed and verified by the printer (the longest write waited {} ticks), reset, then unplugged {} bytes into the next job ({:?})", document.len(), longest, sent, ended);
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+/// One PTP transaction over the transport, the way MediaImportService drives one: the command container, then
+/// bulk-IN bytes pulled until a response container has arrived. Answers the data phase's payload (empty when
+/// there was none) and the response code.
+#[cfg(test)]
+fn ptp_transaction(client: &mut ptp_transport_proto::generated::liber::ptp_transport::v1::ptp_transport::Client<KernelTransport<'_>>, attachment: u64, code: u16, transaction: u32, params: &[u32], patience: u64) -> (alloc::vec::Vec<u8>, u16) {
+	use ptp_transport_proto::generated::liber::ptp_transport::v1 as ptp;
+	let mut container: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	container.extend_from_slice(&(12 + 4 * params.len() as u32).to_le_bytes());
+	container.extend_from_slice(&1u16.to_le_bytes());
+	container.extend_from_slice(&code.to_le_bytes());
+	container.extend_from_slice(&transaction.to_le_bytes());
+	for param in params {
+		container.extend_from_slice(&param.to_le_bytes());
+	}
+	assert_eq!(client.command(&attachment, &container), Some(Ok(())), "the command container {code:#06x} went whole");
+	let mut stream: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	let give_up = arch::apic::ticks() + patience;
+	loop {
+		// Every whole container at the head of what arrived.
+		while stream.len() >= 12 {
+			let length = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]) as usize;
+			let kind = u16::from_le_bytes([stream[4], stream[5]]);
+			assert!(length >= 12, "a container of {length} bytes");
+			if stream.len() < length {
+				break;
+			}
+			let body: alloc::vec::Vec<u8> = stream.drain(..length).collect();
+			assert_eq!(u32::from_le_bytes([body[8], body[9], body[10], body[11]]), transaction, "every container of a transaction names it");
+			match kind {
+				2 => data.extend_from_slice(&body[12..]),
+				3 => return (data, u16::from_le_bytes([body[6], body[7]])),
+				other => panic!("a container of type {other} in a transaction"),
+			}
+		}
+		assert!(arch::apic::ticks() < give_up, "transaction {code:#06x} did not finish: {} bytes of data, {} waiting", data.len(), stream.len());
+		match client.pull(&attachment, &4096) {
+			Some(Ok(bytes)) => {
+				assert!(!bytes.is_empty(), "a pull never succeeds empty");
+				stream.extend_from_slice(&bytes);
+			}
+			Some(Err(ptp::Error::Again)) => {
+				sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			}
+			other => panic!("a pull failed: {other:?}"),
+		}
+	}
+}
+
+// The objects `mtp-root.py` writes, by the same formula as the printer's documents.
+#[cfg(test)]
+fn ptp_filename(info: &[u8]) -> alloc::string::String {
+	// The ObjectInfo dataset's filename is a PTP string at offset 52: a count of UTF-16 units with its
+	// terminator, then the units.
+	let Some(&units) = info.get(52) else { return alloc::string::String::new() };
+	let chars: alloc::vec::Vec<u16> = (0..units.saturating_sub(1) as usize).filter_map(|at| Some(u16::from_le_bytes([*info.get(53 + at * 2)?, *info.get(54 + at * 2)?]))).collect();
+	alloc::string::String::from_utf16_lossy(&chars)
+}
+
+tagged_test!(usb_ptp_reads_objects_cancels_a_transfer_and_resets_the_camera, [Drivers, Usb, Slow], id = "kernel.hardware.usb_ptp_reads_objects_cancels_a_transfer_and_resets_the_camera", covers = ["kernel", "drivers", "ptp-transport-proto"]);
+fn usb_ptp_reads_objects_cancels_a_transfer_and_resets_the_camera() {
+	// THE CAMERA IS QEMU'S OWN `usb-mtp` over a directory `mtp-root.py` filled, and this side plays
+	// MediaImportService: it speaks PTP over the still image class module's transport and checks what comes
+	// back against the files - so a byte lost between the device and the transport, a zero-length packet read
+	// as the end of the world, or a cancel that leaves the pipes wedged is a failure here and not a quiet one.
+	use object::channel::Channel;
+	use ptp_transport_proto::generated::liber::ptp_transport::v1 as ptp;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "mtp" {
+		crate::serial_println!("usb-ptp: NOT RUN - no still image device on this run; attach QEMU's with USB_GADGET=mtp");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::PTP_TRANSPORT, driver_protocol::provider::USB_STILL_IMAGE_NAME, patience).expect("the controller publishes the camera it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = ptp::ptp_transport::Client::new(KernelTransport::new(&host_end, patience));
+
+	let attached = client.attach(&1).expect("the camera answered the attach").expect("the camera attached");
+	let attachment = attached.attachment;
+	assert_eq!(client.pull(&attachment, &4096), Some(Err(ptp::Error::Again)), "with nothing sent, a pull is `again` and never an empty success");
+	assert!(client.events().is_some_and(|stream| stream != 0), "the event stream opens");
+
+	// A SESSION, AND WHAT THE DEVICE SAYS IT IS.
+	let (_, opened) = ptp_transaction(&mut client, attachment, 0x1002, 1, &[1], patience);
+	assert_eq!(opened, 0x2001, "OpenSession is answered OK");
+	let (info, answered) = ptp_transaction(&mut client, attachment, 0x1001, 2, &[], patience);
+	assert_eq!(answered, 0x2001, "GetDeviceInfo is answered OK");
+	assert!(info.len() >= 8 && u16::from_le_bytes([info[0], info[1]]) == 100, "the DeviceInfo dataset carries PTP 1.00 as its standard version");
+	let (storages, answered) = ptp_transaction(&mut client, attachment, 0x1004, 3, &[], patience);
+	assert_eq!(answered, 0x2001);
+	assert!(storages.len() >= 8 && u32::from_le_bytes([storages[0], storages[1], storages[2], storages[3]]) >= 1, "at least one storage");
+
+	// EVERY OBJECT, BY NAME, AND THE BYTES OF TWO OF THEM.
+	let (handles, answered) = ptp_transaction(&mut client, attachment, 0x1007, 4, &[0xffff_ffff, 0, 0xffff_ffff], patience);
+	assert_eq!(answered, 0x2001);
+	let count = u32::from_le_bytes([handles[0], handles[1], handles[2], handles[3]]) as usize;
+	let mut transaction: u32 = 5;
+	let mut found: alloc::vec::Vec<(alloc::string::String, u32)> = alloc::vec::Vec::new();
+	for at in 0..count {
+		let handle = u32::from_le_bytes([handles[4 + at * 4], handles[5 + at * 4], handles[6 + at * 4], handles[7 + at * 4]]);
+		let (object, answered) = ptp_transaction(&mut client, attachment, 0x1008, transaction, &[handle], patience);
+		transaction += 1;
+		assert_eq!(answered, 0x2001);
+		found.push((ptp_filename(&object), handle));
+	}
+	let handle_of = |name: &str| found.iter().find(|(named, _)| named == name).map(|(_, handle)| *handle).unwrap_or_else(|| panic!("{name} is among the objects, which were {:?}", found.iter().map(|(n, _)| n).collect::<alloc::vec::Vec<_>>()));
+	for (name, seed, length) in [("photo-a.bin", 3u8, 150001usize), ("exact.bin", 4, 8180)] {
+		let (bytes, answered) = ptp_transaction(&mut client, attachment, 0x1009, transaction, &[handle_of(name)], patience * 3);
+		transaction += 1;
+		assert_eq!(answered, 0x2001, "GetObject of {name} is answered OK");
+		assert_eq!(bytes.len(), length, "{name} arrived at its own length");
+		assert!(bytes == printed(seed, length), "and every byte of {name} is the file's");
+	}
+
+	// A CANCEL IN THE MIDDLE OF A TRANSFER, and a camera that answers the next transaction afterwards.
+	let mut container: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	container.extend_from_slice(&16u32.to_le_bytes());
+	container.extend_from_slice(&1u16.to_le_bytes());
+	container.extend_from_slice(&0x1009u16.to_le_bytes());
+	container.extend_from_slice(&transaction.to_le_bytes());
+	container.extend_from_slice(&handle_of("photo-a.bin").to_le_bytes());
+	transaction += 1;
+	assert_eq!(client.command(&attachment, &container), Some(Ok(())));
+	let mut pulled: usize = 0;
+	let give_up = arch::apic::ticks() + patience;
+	while pulled < 8192 && arch::apic::ticks() < give_up {
+		match client.pull(&attachment, &4096) {
+			Some(Ok(bytes)) => pulled += bytes.len(),
+			Some(Err(ptp::Error::Again)) => {
+				sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+			}
+			other => panic!("a pull before the cancel failed: {other:?}"),
+		}
+	}
+	assert!(pulled >= 8192, "part of the object arrived before the cancel");
+	assert_eq!(client.cancel(&attachment), Some(Ok(())), "the cancel was sent and the device came back to idle");
+	let (_, answered) = ptp_transaction(&mut client, attachment, 0x1004, transaction, &[], patience);
+	transaction += 1;
+	assert_eq!(answered, 0x2001, "the transaction after a cancel is answered, with nothing of the cancelled one in the way");
+
+	// A RESET IS A NEW ATTACHMENT, and the old one is over.
+	let reset = client.reset(&attachment);
+	crate::serial_println!("usb-ptp: the reset answered {reset:?}");
+	let reset = reset.expect("the camera answered the reset").expect("the camera was reset");
+	assert_ne!(reset.attachment, attachment);
+	assert_eq!(client.pull(&attachment, &4096), Some(Err(ptp::Error::Stale)), "the attachment before the reset is over");
+	let (_, opened) = ptp_transaction(&mut client, reset.attachment, 0x1002, transaction, &[1], patience);
+	assert!(opened == 0x2001 || opened == 0x201e, "a session opens again after the reset (or is still open), got {opened:#06x}");
+
+	crate::serial_println!("usb-ptp: {} objects listed, two read back byte for byte, a transfer cancelled after {} bytes, and the camera reset", count, pulled);
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_midi_delivers_each_cables_bytes_on_that_cable_in_order, [Drivers, Usb, Slow], id = "kernel.hardware.usb_midi_delivers_each_cables_bytes_on_that_cable_in_order", covers = ["kernel", "drivers", "midi-device-proto"]);
+fn usb_midi_delivers_each_cables_bytes_on_that_cable_in_order() {
+	// THE INSTRUMENT IS A GADGET IN THE HOST: `midi-source.py` plays a phrase on each of two raw MIDI ports and
+	// the kernel's MIDI function turns each into USB-MIDI event packets on the cable of the same number. This
+	// side plays MidiService: it opens the provider, starts the endpoint under a receiver generation and reads
+	// batches off the stream - and the packets, decoded back into bytes cable by cable, must be the phrases.
+	use midi_device_proto::generated::liber::midi_device::v1 as midi;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "midi" {
+		crate::serial_println!("usb-midi: NOT RUN - no MIDI gadget on this run; build one with USB_GADGET=midi");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+	// What `midi-source.py` plays, per cable.
+	let phrases: [&[u8]; 2] = [&[0x90, 0x3c, 0x64, 0x80, 0x3c, 0x00, 0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7, 0xc0, 0x05], &[0x91, 0x40, 0x7f, 0xf8, 0xb1, 0x07, 0x64]];
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::MIDI, driver_protocol::provider::USB_MIDI_NAME, patience).expect("the controller publishes the MIDI device it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = midi::midi_device::Client::new(KernelTransport::new(&host_end, patience));
+
+	let opened = client.open(&1).expect("the device answered the open").expect("the device opened");
+	assert_eq!(opened.bounds.max_packets, 64, "a batch is at most sixty-four packets");
+	let endpoints = client.endpoints().expect("the device answered").expect("the endpoints were listed");
+	assert_eq!(endpoints.len(), 2, "one receive endpoint and one transmit endpoint");
+	assert_eq!((endpoints[0].index, endpoints[0].cables, endpoints[0].direction), (0, 2, midi::MidiDeviceDirection::Receive), "carrying the two cables the device declares");
+	let stream = client.events().expect("the device answered the stream request");
+	assert_eq!(client.start(&7, &0x51), Some(Err(midi::Error::NotFound)), "an endpoint the device does not have is refused");
+	assert_eq!(client.start(&0, &0x51), Some(Ok(())), "the endpoint starts under the receiver generation");
+	let mut transport = client.into_transport();
+	let stream = transport.take(stream).expect("the stream was handed over").into_any_arc().downcast::<Channel>().expect("the stream is a channel");
+
+	// Every batch, decoded back into bytes on its own cable: the code index says how many of a packet's three
+	// bytes are the message's.
+	let mut heard: [alloc::vec::Vec<u8>; 2] = [alloc::vec::Vec::new(), alloc::vec::Vec::new()];
+	let mut batches: usize = 0;
+	let give_up = arch::apic::ticks() + patience;
+	while (heard[0].len() < phrases[0].len() || heard[1].len() < phrases[1].len()) && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		let Ok(frame) = stream.recv() else { continue };
+		let mut handles = midi_device_proto::codec::Handles::new();
+		match midi::midi_device::events_read(&frame.bytes, &mut handles).expect("a stream frame decodes") {
+			midi::MidiDeviceEvent::Batch(batch) => {
+				assert_eq!((batch.endpoint, batch.receiver_generation), (0, 0x51), "a batch names the endpoint and the generation it was started under");
+				assert!(batch.packets.len() % 4 == 0 && batch.packets.len() <= 256, "a batch of {} bytes", batch.packets.len());
+				assert!(batch.received_ns > 0, "a batch carries the host time it arrived");
+				batches += 1;
+				for packet in batch.packets.chunks_exact(4) {
+					let cable = usize::from(packet[0] >> 4);
+					let length = match packet[0] & 0x0f {
+						0x5 | 0xf => 1,
+						0x2 | 0x6 | 0xc | 0xd => 2,
+						0x0 | 0x1 => 0,
+						_ => 3,
+					};
+					assert!(cable < 2, "a packet on cable {cable}, which the endpoint does not carry");
+					heard[cable].extend_from_slice(&packet[1..1 + length]);
+				}
+			}
+			midi::MidiDeviceEvent::Lost(lost) => panic!("input was lost on a stream with room: {lost:?}"),
+		}
+	}
+	assert_eq!(&heard[0][..], phrases[0], "cable zero carried its phrase, byte for byte and in order");
+	assert_eq!(&heard[1][..], phrases[1], "and cable one its own, which is not cable zero's");
+	assert_eq!(client_stop(&host_end, patience), Some(Ok(())), "and the endpoint stops");
+
+	crate::serial_println!("usb-midi: {} and {} byte(s) heard on two cables in {} batch(es)", heard[0].len(), heard[1].len(), batches);
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_midi_transmits_on_each_cable_and_hears_it_come_back, [Drivers, Usb, Slow], id = "kernel.hardware.usb_midi_transmits_on_each_cable_and_hears_it_come_back", covers = ["kernel", "drivers", "midi-device-proto"]);
+fn usb_midi_transmits_on_each_cable_and_hears_it_come_back() {
+	// THE FAR END ECHOES: `midi-source.py --echo` plays back on each of the gadget card's raw MIDI ports whatever
+	// arrives on it, so what the driver SENDS on cable 0 and cable 1 must come back on the same cables, byte for
+	// byte and in order. This side plays MidiService: it opens the provider, starts the receive endpoint and puts
+	// USB-MIDI 1.0 event packets on the transmit endpoint - and each send is answered only once the device has
+	// taken the packets.
+	use midi_device_proto::generated::liber::midi_device::v1 as midi;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "midi-echo" {
+		crate::serial_println!("usb-midi-out: NOT RUN - no echoing MIDI gadget on this run; build one with USB_GADGET=midi-echo");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+	// WHAT GOES OUT, per cable, as packets and as the bytes the far end sees: on cable 0 a note on and off, a
+	// SysEx in two packets and a program change; on cable 1 a note on another channel, a timing clock and a
+	// control change.
+	let packets: [[u8; 4]; 8] = [
+		[0x09, 0x90, 0x3c, 0x64],
+		[0x08, 0x80, 0x3c, 0x00],
+		[0x04, 0xf0, 0x7e, 0x7f],
+		[0x07, 0x06, 0x01, 0xf7],
+		[0x0c, 0xc0, 0x05, 0x00],
+		[0x19, 0x91, 0x40, 0x7f],
+		[0x1f, 0xf8, 0x00, 0x00],
+		[0x1b, 0xb1, 0x07, 0x64],
+	];
+	let phrases: [&[u8]; 2] = [&[0x90, 0x3c, 0x64, 0x80, 0x3c, 0x00, 0xf0, 0x7e, 0x7f, 0x06, 0x01, 0xf7, 0xc0, 0x05], &[0x91, 0x40, 0x7f, 0xf8, 0xb1, 0x07, 0x64]];
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::MIDI, driver_protocol::provider::USB_MIDI_NAME, patience).expect("the controller publishes the MIDI device it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = midi::midi_device::Client::new(KernelTransport::new(&host_end, patience));
+	client.open(&1).expect("the device answered the open").expect("the device opened");
+	let endpoints = client.endpoints().expect("the device answered").expect("the endpoints were listed");
+	let out = endpoints.iter().find(|endpoint| endpoint.direction == midi::MidiDeviceDirection::Transmit).expect("the device's OUT endpoint is listed as a transmit endpoint");
+	assert_eq!((out.index, out.cables), (1, 2), "endpoint 1, with the two cables its own record declares");
+	assert_eq!(client.send(&0, &packets[0].to_vec()), Some(Err(midi::Error::Invalid)), "the receive endpoint is not one packets go out on");
+	assert_eq!(client.send(&7, &packets[0].to_vec()), Some(Err(midi::Error::NotFound)), "an endpoint the device does not have is refused");
+	assert_eq!(client.send(&1, &[0x09, 0x90, 0x3c]), Some(Err(midi::Error::Invalid)), "a batch that is not whole packets is refused");
+	assert_eq!(client.send(&1, &[0x29, 0x90, 0x3c, 0x64]), Some(Err(midi::Error::Invalid)), "a cable the endpoint does not carry is refused");
+	let stream = client.events().expect("the device answered the stream request");
+	assert_eq!(client.start(&0, &0x52), Some(Ok(())), "the receive endpoint starts");
+	// THE SEND IS ANSWERED WHEN THE DEVICE HAS TAKEN IT, not when it was asked.
+	assert_eq!(client.send(&1, &packets.concat()), Some(Ok(())), "the device took all eight packets");
+	let mut transport = client.into_transport();
+	let stream = transport.take(stream).expect("the stream was handed over").into_any_arc().downcast::<Channel>().expect("the stream is a channel");
+
+	let mut heard: [alloc::vec::Vec<u8>; 2] = [alloc::vec::Vec::new(), alloc::vec::Vec::new()];
+	let give_up = arch::apic::ticks() + patience;
+	while (heard[0].len() < phrases[0].len() || heard[1].len() < phrases[1].len()) && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		let Ok(frame) = stream.recv() else { continue };
+		let mut handles = midi_device_proto::codec::Handles::new();
+		match midi::midi_device::events_read(&frame.bytes, &mut handles).expect("a stream frame decodes") {
+			midi::MidiDeviceEvent::Batch(batch) => {
+				for packet in batch.packets.chunks_exact(4) {
+					let cable = usize::from(packet[0] >> 4);
+					let length = match packet[0] & 0x0f {
+						0x5 | 0xf => 1,
+						0x2 | 0x6 | 0xc | 0xd => 2,
+						0x0 | 0x1 => 0,
+						_ => 3,
+					};
+					assert!(cable < 2, "a packet on cable {cable}, which the endpoint does not carry");
+					heard[cable].extend_from_slice(&packet[1..1 + length]);
+				}
+			}
+			midi::MidiDeviceEvent::Lost(lost) => panic!("input was lost on a stream with room: {lost:?}"),
+		}
+	}
+	assert_eq!(&heard[0][..], phrases[0], "what went out on cable zero came back on it, byte for byte and in order");
+	assert_eq!(&heard[1][..], phrases[1], "and cable one's on cable one");
+	// A SECOND SEND ON THE SAME CONNECTION, a whole batch of sixty-four: the pipe was free again.
+	let full: alloc::vec::Vec<u8> = (0..64u8).flat_map(|note| [0x09, 0x90, note, 0x40]).collect();
+	let mut again = midi::midi_device::Client::new(KernelTransport::new(&host_end, patience));
+	assert_eq!(again.send(&1, &full), Some(Ok(())), "a full batch of sixty-four packets went out");
+	crate::serial_println!("usb-midi-out: {} and {} byte(s) sent and heard back on two cables, then a batch of 64", heard[0].len(), heard[1].len());
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+// A stop, on a fresh client over the same connection - the first one gave its transport up for the stream.
+#[cfg(test)]
+fn client_stop(channel: &object::channel::Channel, patience: u64) -> Option<Result<(), midi_device_proto::generated::liber::midi_device::v1::Error>> {
+	midi_device_proto::generated::liber::midi_device::v1::midi_device::Client::new(KernelTransport::new(channel, patience)).stop(&0, &0x51)
+}
+
+tagged_test!(usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises, [Drivers, Usb, Slow], id = "kernel.hardware.usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises", covers = ["kernel", "drivers", "power-proto"]);
+fn usb_hid_power_device_reports_its_ups_and_takes_the_turn_off_it_advertises() {
+	// THE UPS IS A GADGET IN THE HOST: the kernel's HID function with a Power Device report descriptor, and
+	// `ups-sim.py` as its firmware. This side plays PowerService: it subscribes to the provider's updates, reads
+	// the snapshot the driver built from GET_REPORT, schedules a turn-off - which the firmware answers by going
+	// onto battery in its next input report - and cancels it again. Every state asserted below is one the DEVICE
+	// reported; the one control it does not advertise is refused without reaching it.
+	use object::channel::Channel;
+	use power_proto::generated::liber::power::v1 as power;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "ups" {
+		crate::serial_println!("usb-power: NOT RUN - no UPS gadget on this run; build one with USB_GADGET=ups");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::POWER_SOURCE, driver_protocol::provider::USB_POWER_NAME, patience).expect("the controller publishes the UPS it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = power::power_provider::Client::new(KernelTransport::new(&host_end, patience));
+	let stream = client.updates().expect("the provider answered the subscription");
+	let mut transport = client.into_transport();
+	let stream = transport.take(stream).expect("the stream was handed over").into_any_arc().downcast::<Channel>().expect("the stream is a channel");
+	let mut client = power::power_provider::Client::new(transport);
+
+	// The next frame the stream carries, within the patience.
+	let next = |stream: &Channel| -> power::ProviderUpdate {
+		let give_up = arch::apic::ticks() + patience;
+		while arch::apic::ticks() < give_up {
+			sched::run_until_idle();
+			if let Ok(frame) = stream.recv() {
+				let mut handles = power_proto::codec::Handles::new();
+				return power::power_provider::updates_read(&frame.bytes, &mut handles).expect("an update frame decodes");
+			}
+		}
+		panic!("the provider's stream carried nothing within the patience");
+	};
+
+	// 1. THE SNAPSHOT: one source, as GET_REPORT found it.
+	let snapshot = next(&stream);
+	assert_eq!(snapshot.kind, power::ProviderUpdateKind::Snapshot);
+	let source = snapshot.source.expect("a snapshot carries its source");
+	assert_eq!(source.local, 0);
+	let state = source.state;
+	assert_eq!((state.kind, state.present, state.online, state.charge), (power::SourceKind::Ups, power::Tristate::Yes, power::Tristate::Yes, power::ChargeState::Charging), "on mains and charging, as the firmware reports");
+	assert_eq!((state.state_of_charge.state, state.state_of_charge.value), (power::ValueState::Known, 8000), "80 %, in basis points");
+	assert_eq!((state.runtime.state, state.runtime.value), (power::ValueState::Known, 3600));
+	assert_eq!((state.voltage.state, state.voltage.value), (power::ValueState::Known, 13_800_000), "13.80 V from the feature report, in microvolts");
+	assert_eq!((state.controls.schedule_off, state.controls.cancel_off, state.controls.set_output), (true, true, false), "the controls the descriptor has, and only those");
+	assert_eq!(next(&stream).kind, power::ProviderUpdateKind::SnapshotEnd);
+
+	// 2. A CONTROL IT DOES NOT HAVE is refused before anything is sent.
+	let switch = power::ProviderCommand { kind: power::ProviderCommandKind::SetOutput, local: 0, outlet: 0, on: false, delay_seconds: 0 };
+	assert_eq!(client.command(&switch), Some(Err(power::Error::Unsupported)));
+
+	// 3. A TURN-OFF, SCHEDULED. The firmware answers by going onto battery, and the next update says so.
+	let schedule = power::ProviderCommand { kind: power::ProviderCommandKind::ScheduleOutputOff, local: 0, outlet: 0, on: false, delay_seconds: 60 };
+	assert_eq!(client.command(&schedule), Some(Ok(power::ControlOutcome::Done)), "the device acknowledged the scheduled turn-off");
+	let on_battery = next(&stream);
+	assert_eq!(on_battery.kind, power::ProviderUpdateKind::Updated);
+	let state = on_battery.source.expect("an update carries its source").state;
+	assert_eq!((state.online, state.charge), (power::Tristate::No, power::ChargeState::Discharging), "mains gone and discharging - the firmware received the command");
+	assert!(state.alarms.iter().any(|alarm| alarm.kind == power::AlarmKind::OnBattery && alarm.state == power::Tristate::Yes), "and the on-battery alarm is reported");
+
+	// 4. AND CANCELLED: back on mains.
+	let cancel = power::ProviderCommand { kind: power::ProviderCommandKind::CancelOutputOff, local: 0, outlet: 0, on: false, delay_seconds: 0 };
+	assert_eq!(client.command(&cancel), Some(Ok(power::ControlOutcome::Done)));
+	let back = next(&stream).source.expect("an update carries its source").state;
+	assert_eq!((back.online, back.charge), (power::Tristate::Yes, power::ChargeState::Charging), "back on mains after the cancel");
+
+	// 5. A FRESH QUERY reads the device again and agrees.
+	let queried = client.query(&0).expect("the provider answered the query").expect("the source was read");
+	assert_eq!((queried.online, queried.state_of_charge.value), (power::Tristate::Yes, 7900));
+	assert_eq!(client.query(&1), Some(Err(power::Error::NotFound)), "a source the provider does not have");
+
+	crate::serial_println!("usb-power: a UPS reported, went onto battery when a turn-off was scheduled and back when it was cancelled");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_ccid_reader_powers_a_card_exchanges_apdus_and_reports_it_leaving, [Drivers, Usb, Slow], id = "kernel.hardware.usb_ccid_reader_powers_a_card_exchanges_apdus_and_reports_it_leaving", covers = ["kernel", "drivers", "smartcard-proto"]);
+fn usb_ccid_reader_powers_a_card_exchanges_apdus_and_reports_it_leaving() {
+	// THE READER IS A FUNCTIONFS EMULATOR IN THE HOST (`usb_ffs.py`'s CCID reader, a PIV card in its one slot),
+	// and this side plays SmartcardService: it opens a session, powers the card and checks its ATR, selects the
+	// PIV application and reads its CHUID - bytes only the card has - and, when it powers the card off, the reader
+	// pulls it out and puts it back, which the transport must report as a card that LEFT and a NEW card. A request
+	// prepared against the card that left is `card-removed`, answered without a word to the reader.
+	use object::channel::Channel;
+	use smartcard_proto::generated::liber::smartcard::v1 as card;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "ccid" {
+		crate::serial_println!("usb-ccid: NOT RUN - no CCID reader on this run; build one with USB_GADGET=ccid");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+	let atr: alloc::vec::Vec<u8> = {
+		let mut body = alloc::vec![0x3b, 0x88, 0x80, 0x01];
+		body.extend_from_slice(b"LIBERPIV");
+		let tck = body[1..].iter().fold(0u8, |sum, byte| sum ^ byte);
+		body.push(tck);
+		body
+	};
+	let chuid: alloc::vec::Vec<u8> = [0x53, 0x19, 0x30, 0x17].into_iter().chain(0x10..0x27).collect();
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::SMARTCARD_READER, driver_protocol::provider::USB_CCID_NAME, patience).expect("the controller publishes the reader it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = card::smartcard_reader::Client::new(KernelTransport::new(&host_end, patience));
+
+	let described = client.describe().expect("the reader answered").expect("the reader described itself");
+	assert_eq!((described.slots, described.exchange, described.protocols), (1, card::ExchangeLevel::ShortApdu, 0b11));
+	assert!(!described.pinpad.secure_verify, "no keypad is driven, so none is advertised");
+	let stream = client.events().expect("the reader answered the stream request");
+	let mut transport = client.into_transport();
+	let stream = transport.take(stream).expect("the stream was handed over").into_any_arc().downcast::<Channel>().expect("the stream is a channel");
+	let mut client = card::smartcard_reader::Client::new(transport);
+
+	let session = client.open_session().expect("the reader answered").expect("a session opened");
+	assert_eq!(session.len(), 1);
+	assert!(session[0].present && !session[0].powered, "the card is in, and the session left it off");
+	let first = session[0].card_generation;
+	let header = |request: u64, generation: u64| card::RequestHeader { request, slot: 0, card_generation: generation };
+
+	let powered = client.power(&header(1, first), &true).expect("answered").expect("the power request was served");
+	assert_eq!(powered.outcome, card::ProviderOutcome::Done);
+	assert_eq!(powered.atr, atr, "the ATR is the card's, byte for byte");
+	assert_eq!(powered.header.request, 1, "a reply echoes its request");
+	let protocol = client.select_protocol(&header(2, first), &card::CardProtocol::T1).expect("answered").expect("served");
+	assert_eq!(protocol.outcome, card::ProviderOutcome::Done);
+
+	let select = client.exchange(&header(3, first), &[0x00, 0xa4, 0x04, 0x00, 0x05, 0xa0, 0x00, 0x00, 0x03, 0x08].to_vec()).expect("answered").expect("served");
+	assert_eq!(select.outcome, card::ProviderOutcome::Done);
+	assert_eq!(&select.response[select.response.len() - 2..], &[0x90, 0x00], "the PIV application is selected");
+	let get = client.exchange(&header(4, first), &[0x00, 0xcb, 0x3f, 0xff, 0x05, 0x5c, 0x03, 0x5f, 0xc1, 0x02].to_vec()).expect("answered").expect("served");
+	assert_eq!(get.outcome, card::ProviderOutcome::Done);
+	assert_eq!(&get.response[..get.response.len() - 2], &chuid[..], "the CHUID is the card's, byte for byte");
+	assert_eq!(&get.response[get.response.len() - 2..], &[0x90, 0x00]);
+
+	let stale = client.exchange(&header(5, first + 1), &[0x00, 0xa4, 0x04, 0x00, 0x00].to_vec()).expect("answered").expect("served");
+	assert_eq!(stale.outcome, card::ProviderOutcome::CardRemoved, "a request prepared against another card is card-removed");
+	let verify = card::SecureVerifyRequest { header: header(6, first), block: 8, min_digits: 6, max_digits: 8, timeout_seconds: 10, apdu: [0x00, 0x20, 0x00, 0x80, 0x08].into_iter().chain([0xff; 8]).collect() };
+	assert_eq!(client.secure_verify(&verify).expect("answered").expect("served").outcome, card::ProviderOutcome::Fault, "secure verification is not advertised, so it is a fault");
+	assert_eq!(client.abort(&header(7, first)).expect("answered").expect("served").outcome, card::ProviderOutcome::Done, "the abort sequence completes");
+
+	// THE CARD LEAVES AND A NEW ONE ARRIVES: the reader pulls it after this power-off.
+	let off = client.power(&header(8, first), &false).expect("answered").expect("served");
+	assert_eq!(off.outcome, card::ProviderOutcome::Done);
+	let mut left = false;
+	let mut arrived: Option<u64> = None;
+	let give_up = arch::apic::ticks() + patience;
+	while arrived.is_none() && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		let Ok(frame) = stream.recv() else { continue };
+		let mut handles = smartcard_proto::codec::Handles::new();
+		let event = card::smartcard_reader::events_read(&frame.bytes, &mut handles).expect("a reader event decodes");
+		assert_eq!((event.kind, event.slot), (card::ReaderEventKind::Presence, 0));
+		let report = event.report.expect("a presence event carries the slot's report");
+		if !report.present {
+			left = true;
+		} else if left {
+			arrived = Some(report.card_generation);
+		}
+	}
+	assert!(left, "the card leaving was reported");
+	let second = arrived.expect("and a card arriving after it");
+	assert_ne!(second, first, "the card that arrived is a new generation");
+	let gone = client.power(&header(9, first), &true).expect("answered").expect("served");
+	assert_eq!(gone.outcome, card::ProviderOutcome::CardRemoved, "the card that left is gone, whatever came back");
+	let again = client.power(&header(10, second), &true).expect("answered").expect("served");
+	assert_eq!((again.outcome, again.atr.clone()), (card::ProviderOutcome::Done, atr), "and the new one powers up");
+
+	crate::serial_println!("usb-ccid: ATR, SELECT and the CHUID read from the card; it left (generation {first}) and a new one arrived (generation {second})");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_dfu_downloads_only_the_confirmed_image_once, [Drivers, Usb, Slow], id = "kernel.hardware.usb_dfu_downloads_only_the_confirmed_image_once", covers = ["kernel", "drivers", "admin-proto"]);
+fn usb_dfu_downloads_only_the_confirmed_image_once() {
+	// THE TARGET IS A FUNCTIONFS EMULATOR IN THE HOST: a DFU 1.1 device in DFU mode that keeps what it is given and,
+	// at manifestation, compares it with the oracle's image - errVERIFY for anything else. This side plays
+	// AdminService: it prepares a download (the executor copies the image and names the live target and its
+	// generation), revalidates it and executes it once. A completed download is therefore one whose every byte
+	// reached the device; a corrupted image is refused BY THE DEVICE; a second start, a cancelled operation, a
+	// target the executor does not have and an image whose DFU suffix names another device are refused here.
+	use admin_proto::generated::liber::admin::v1 as admin;
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "dfu" {
+		crate::serial_println!("usb-dfu: NOT RUN - no DFU target on this run; build one with USB_GADGET=dfu");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+	// A payload in a memory object, as a requester hands one over.
+	let object_of = |bytes: &[u8]| -> alloc::sync::Arc<dyn object::KernelObject> {
+		let memory = object::memory_object::MemoryObject::create(bytes.len()).expect("a payload object");
+		copy_into_object(&memory, bytes);
+		memory
+	};
+	let suffixed = |image: &[u8], vendor: u16, product: u16| -> alloc::vec::Vec<u8> {
+		let mut out = image.to_vec();
+		out.extend_from_slice(&[0xff, 0xff]);
+		out.extend_from_slice(&product.to_le_bytes());
+		out.extend_from_slice(&vendor.to_le_bytes());
+		out.extend_from_slice(&[0x00, 0x01]);
+		out.extend_from_slice(b"UFD");
+		out.push(16);
+		let mut crc: u32 = 0xffff_ffff;
+		for &byte in &out {
+			crc ^= byte as u32;
+			for _ in 0..8 {
+				crc = if crc & 1 != 0 { crc >> 1 ^ 0xedb8_8320 } else { crc >> 1 };
+			}
+		}
+		out.extend_from_slice(&crc.to_le_bytes());
+		out
+	};
+	let image = printed(5, 3000);
+	let payload = suffixed(&image, 0x1d6b, 0x0104);
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::ADMIN_EXECUTOR, driver_protocol::provider::USB_DFU_NAME, patience).expect("the controller publishes the DFU target it bound, under AdminService's name for it");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	// A PREPARATION HANDS A CAPABILITY OVER, so its transport is given the payload object first.
+	fn prepare<'a>(client: admin::admin_executor::Client<KernelTransport<'a>>, action: admin::AdminAction, target: &str, payload: alloc::sync::Arc<dyn object::KernelObject>, length: usize) -> (admin::admin_executor::Client<KernelTransport<'a>>, Result<admin::AdminPrepared, admin::Error>) {
+		let mut transport = client.into_transport();
+		let handle = transport.offer(payload, Rights::READ | Rights::MAP);
+		let mut client = admin::admin_executor::Client::new(transport);
+		let answer = client.prepare(&action, &alloc::string::String::from(target), &alloc::vec::Vec::new(), &(length as u32), &handle).expect("the executor answered the preparation");
+		(client, answer)
+	}
+	let client = admin::admin_executor::Client::new(KernelTransport::new(&host_end, patience * 3));
+	let (client, unsupported) = prepare(client, admin::AdminAction::ProbeWrite, "dfu:1d6b:0104", object_of(&payload), payload.len());
+	let (client, unknown) = prepare(client, admin::AdminAction::FirmwareDownload, "dfu:1d6b:9999", object_of(&payload), payload.len());
+	let other = suffixed(&image, 0x1d6b, 0x0105);
+	let (client, foreign) = prepare(client, admin::AdminAction::FirmwareDownload, "dfu:1d6b:0104", object_of(&other), other.len());
+	let (client, prepared) = prepare(client, admin::AdminAction::FirmwareDownload, "dfu:1d6b:0104", object_of(&payload), payload.len());
+	let mut corrupted = image.clone();
+	corrupted[1234] ^= 0x40;
+	let corrupted = suffixed(&corrupted, 0x1d6b, 0x0104);
+	let (client, bad) = prepare(client, admin::AdminAction::FirmwareDownload, "dfu:1d6b:0104", object_of(&corrupted), corrupted.len());
+	let (mut client, cancelled) = prepare(client, admin::AdminAction::FirmwareDownload, "dfu:1d6b:0104", object_of(&payload), payload.len());
+
+	// REFUSED BEFORE ANYTHING IS FROZEN: another action, a target it does not have, a suffix naming another device.
+	assert_eq!(unsupported.err(), Some(admin::Error::Unsupported));
+	assert_eq!(unknown.err(), Some(admin::Error::NotFound));
+	assert_eq!(foreign.err(), Some(admin::Error::Invalid), "an image whose suffix names another product is not this target's");
+
+	// THE CONFIRMED OPERATION: frozen, named by the live binding and its generation, digested over the copy.
+	let prepared = prepared.expect("the download was prepared");
+	let descriptor = &prepared.descriptor;
+	assert!(descriptor.target.starts_with("dfu:port") && descriptor.target.ends_with("/1d6b:0104"), "the target is the live binding, got {:?}", descriptor.target);
+	assert_eq!(descriptor.executor, "org.libersystem.admin-dfu");
+	assert_eq!(descriptor.payload_length as usize, payload.len());
+	assert_eq!(descriptor.payload_digest, bootproto::sha256::digest(&payload).to_vec(), "the digest is of exactly the bytes handed over");
+	assert_eq!(client.revalidate(&prepared.operation), Some(Ok(())));
+	let epoch = descriptor.executor_epoch;
+	assert_eq!(client.execute(&prepared.operation, &(epoch + 1)), Some(Err(admin::Error::Stale)), "another executor epoch starts nothing");
+	assert_eq!(client.execute(&prepared.operation, &epoch), Some(Ok(admin::AdminResult::Completed)), "the device manifested the image - every byte of it arrived");
+	assert_eq!(client.execute(&prepared.operation, &epoch), Some(Err(admin::Error::Denied)), "one attempt, and it was made");
+
+	// A CORRUPTED IMAGE - its own suffix intact - is refused by the DEVICE, at manifestation.
+	let bad = bad.expect("a well-formed image is prepared");
+	assert_eq!(client.execute(&bad.operation, &epoch), Some(Ok(admin::AdminResult::Failed)), "the device found it was not the image it verifies");
+
+	// A CANCELLED OPERATION starts nothing.
+	let cancelled = cancelled.expect("prepared");
+	assert_eq!(client.cancel(&cancelled.operation), Some(Ok(())));
+	assert_eq!(client.execute(&cancelled.operation, &epoch), Some(Err(admin::Error::Denied)));
+
+	crate::serial_println!("usb-dfu: the confirmed image was downloaded and manifested once, a corrupted one failed at the device, and nothing else started");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_bluetooth_carries_commands_events_and_acl_and_resets_into_a_new_epoch, [Drivers, Usb, Slow], id = "kernel.hardware.usb_bluetooth_carries_commands_events_and_acl_and_resets_into_a_new_epoch", covers = ["kernel", "drivers", "device-proto"]);
+fn usb_bluetooth_carries_commands_events_and_acl_and_resets_into_a_new_epoch() {
+	// THE CONTROLLER IS A FUNCTIONFS EMULATOR IN THE HOST (`usb_ffs.py`'s Bluetooth transport): commands on the
+	// control pipe, events on the interrupt pipe, ACL data looped back on the bulk pair. This side plays
+	// BluetoothService at the transport level: every event checked is one the emulator composed for the command
+	// sent - a 70-byte completion that spans five interrupt packets among them - and every ACL packet checked came
+	// back through the device, one of them ending exactly on a bulk packet boundary with nothing after it to say so,
+	// and one of them through a bulk pipe the device had halted.
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::Channel;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "bt" {
+		crate::serial_println!("usb-bluetooth: NOT RUN - no Bluetooth controller on this run; build one with USB_GADGET=bt");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::BLUETOOTH_HCI, driver_protocol::provider::USB_BLUETOOTH_NAME, patience).expect("the controller publishes the Bluetooth controller it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = device::hci_transport::Client::new(KernelTransport::new(&host_end, patience));
+	let attached = client.attach(&1).expect("answered").expect("attached");
+	assert!(!attached.iso && attached.max_command == 258 && attached.max_acl >= 516, "the ceilings are advertised, and ISO is not carried: {attached:?}");
+	let epoch = attached.epoch;
+	let packets = client.receive().expect("the receive stream opened");
+	let control = client.control().expect("the control stream opened");
+	let mut transport = client.into_transport();
+	let packets = transport.take(packets).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let control = transport.take(control).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let mut client = device::hci_transport::Client::new(transport);
+
+	// The next packet on the stream.
+	let next = |stream: &Channel| -> device::HciPacket {
+		let give_up = arch::apic::ticks() + patience;
+		while arch::apic::ticks() < give_up {
+			sched::run_until_idle();
+			if let Ok(frame) = stream.recv() {
+				let mut handles = device_proto::codec::Handles::new();
+				return device::hci_transport::receive_read(&frame.bytes, &mut handles).expect("a packet frame decodes");
+			}
+		}
+		panic!("nothing arrived on the packet stream");
+	};
+
+	// COMMANDS AND THE EVENTS THEY ANSWER.
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x03, 0x0c, 0x00].to_vec()), Some(Ok(3)));
+	let reset = next(&packets);
+	assert_eq!((reset.kind, reset.epoch, reset.bytes.as_slice()), (device::HciPacketKind::Event, epoch, &[0x0e, 4, 1, 0x03, 0x0c, 0x00][..]), "Command Complete for the reset");
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x09, 0x10, 0x00].to_vec()), Some(Ok(3)));
+	let address = next(&packets);
+	assert_eq!(&address.bytes[6..], &[0x02, 0x00, 0x00, 0xee, 0xff, 0xc0], "the controller's own address, from its Command Complete");
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x02, 0x10, 0x00].to_vec()), Some(Ok(3)));
+	let commands = next(&packets);
+	assert_eq!(commands.bytes.len(), 70, "a completion five interrupt packets long arrives as ONE event");
+	assert!(commands.bytes[6..].iter().copied().eq(0..64u8), "and whole");
+
+	// ACL, THROUGH THE DEVICE AND BACK.
+	for length in [300u16, 508] {
+		let mut packet: alloc::vec::Vec<u8> = alloc::vec![0x40, 0x20];
+		packet.extend_from_slice(&length.to_le_bytes());
+		packet.extend((0..length).map(|n| (n as u8) ^ 0x5a));
+		assert_eq!(client.send(&device::HciPacketKind::Acl, &packet), Some(Ok(packet.len() as u32)), "the controller took the {length}-byte packet");
+		// The echo and the Number Of Completed Packets event, in whichever order the pipes deliver them.
+		let (mut echoed, mut completed) = (false, false);
+		while !(echoed && completed) {
+			let arrived = next(&packets);
+			match arrived.kind {
+				device::HciPacketKind::Acl => {
+					assert_eq!(arrived.bytes, packet, "the {length}-byte packet came back as it went, however the bulk transfers cut it");
+					echoed = true;
+				}
+				device::HciPacketKind::Event => {
+					assert_eq!(arrived.bytes, [0x13, 5, 1, 0x40, 0x00, 1, 0], "one packet completed on handle 0x040");
+					completed = true;
+				}
+				other => panic!("a {other:?} packet"),
+			}
+		}
+	}
+
+	// A STALL EACH WAY, AND THE PIPES BACK AFTER IT. A packet on handle 0x0ee makes the controller halt its bulk IN
+	// before looping the packet back, and its bulk OUT after: the packet must still arrive, the next send meets the
+	// halted OUT pipe and is refused as an I/O error with the pipe recovered, and the one after it goes through.
+	let acl = |handle: u16, length: u16| -> alloc::vec::Vec<u8> {
+		let mut packet = alloc::vec::Vec::from(handle.to_le_bytes());
+		packet.extend_from_slice(&length.to_le_bytes());
+		packet.extend((0..length).map(|n| (n as u8) ^ 0xa5));
+		packet
+	};
+	let looped = |packet: &[u8]| {
+		let handle = [packet[0], packet[1] & 0x0f];
+		let (mut echoed, mut completed) = (false, false);
+		while !(echoed && completed) {
+			let arrived = next(&packets);
+			match arrived.kind {
+				device::HciPacketKind::Acl => {
+					assert_eq!(arrived.bytes, packet, "the packet came back as it went");
+					echoed = true;
+				}
+				device::HciPacketKind::Event => {
+					assert_eq!(arrived.bytes, [0x13, 5, 1, handle[0], handle[1], 1, 0], "its completion, on its own handle");
+					completed = true;
+				}
+				other => panic!("a {other:?} packet"),
+			}
+		}
+	};
+	let probe = acl(0x0ee, 100);
+	assert_eq!(client.send(&device::HciPacketKind::Acl, &probe), Some(Ok(probe.len() as u32)));
+	looped(&probe);
+	let after_stall = acl(0x040, 32);
+	assert_eq!(client.send(&device::HciPacketKind::Acl, &after_stall), Some(Err(device::Error::Io)), "the halted OUT pipe refuses the send, as an I/O error");
+	assert_eq!(client.send(&device::HciPacketKind::Acl, &after_stall), Some(Ok(after_stall.len() as u32)), "and the next send goes through the pipe that was recovered");
+	looped(&after_stall);
+
+	// WHAT A TRANSPORT REFUSES, and says so by kind.
+	assert_eq!(client.send(&device::HciPacketKind::Event, &[0x0e, 0].to_vec()), Some(Err(device::Error::Invalid)), "a host sending an event has confused its directions");
+	assert_eq!(client.send(&device::HciPacketKind::Iso, &[0, 0, 0, 0].to_vec()), Some(Err(device::Error::Unsupported)));
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x03, 0x0c, 0x05].to_vec()), Some(Err(device::Error::Invalid)), "a command whose length is not its own");
+
+	// A RESET IS A NEW SESSION: announced on the control stream, and every packet after it carries the new epoch.
+	let renewed = client.reset().expect("answered").expect("the controller was reset");
+	assert_ne!(renewed, epoch);
+	let give_up = arch::apic::ticks() + patience;
+	let announced = loop {
+		sched::run_until_idle();
+		if let Ok(frame) = control.recv() {
+			let mut handles = device_proto::codec::Handles::new();
+			break device::hci_transport::control_read(&frame.bytes, &mut handles).expect("a control frame decodes");
+		}
+		assert!(arch::apic::ticks() < give_up, "the reset was not announced");
+	};
+	assert_eq!((announced.kind, announced.epoch), (device::HciControlKind::Reset, epoch), "the session that ENDED is the one named");
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x09, 0x10, 0x00].to_vec()), Some(Ok(3)));
+	let after = next(&packets);
+	assert_eq!((after.epoch, after.bytes[3..5].to_vec()), (renewed, alloc::vec![0x09, 0x10]), "the next event is the new session's - the reset's own completion was not delivered into it");
+
+	// AND AN UNPLUG. A vendor command makes the controller leave the bus - its emulator exits, and a FunctionFS
+	// gadget whose function closed is unbound - and the transport says so on the control stream, under the session
+	// that was running, before the controller withdraws the publication.
+	assert_eq!(client.send(&device::HciPacketKind::Command, &[0x99, 0xfc, 0x00].to_vec()), Some(Ok(3)), "the controller took the command that unplugs it");
+	let give_up = arch::apic::ticks() + patience * 2;
+	let removed = loop {
+		sched::run_until_idle();
+		if let Ok(frame) = control.recv() {
+			let mut handles = device_proto::codec::Handles::new();
+			break device::hci_transport::control_read(&frame.bytes, &mut handles).expect("a control frame decodes");
+		}
+		assert!(arch::apic::ticks() < give_up, "the controller leaving was not announced");
+	};
+	assert_eq!((removed.kind, removed.epoch), (device::HciControlKind::Removed, renewed), "the controller's removal, named against the session it ended");
+	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 2), "the controller withdrew the Bluetooth publication when the controller left");
+
+	crate::serial_println!("usb-bluetooth: three commands answered, four ACL packets looped back through the device, a stall recovered each way, a reset into epoch {renewed}, and the controller's unplug announced and withdrawn");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_mbim_modem_unlocks_its_sim_activates_a_context_and_carries_datagrams, [Drivers, Usb, Slow], id = "kernel.hardware.usb_mbim_modem_unlocks_its_sim_activates_a_context_and_carries_datagrams", covers = ["kernel", "drivers", "modem-device-proto"]);
+fn usb_mbim_modem_unlocks_its_sim_activates_a_context_and_carries_datagrams() {
+	// THE MODEM IS A GADGETFS EMULATOR IN THE HOST (`usb_gadgetfs.py`'s MBIM modem): a SIM locked by PIN 1234, a
+	// home network, and a gateway behind the context that answers ICMP echo. This side plays ModemService over the
+	// class module: every state asserted came back from the modem's own BASIC_CONNECT answers, the PIN it refused
+	// cost a try the modem counted, and the echo reply was built by the far end from the request this side sent -
+	// through an NCM transfer block each way.
+	use modem_device_proto::generated::liber::modem_device::v1 as modem;
+	use object::channel::{Channel, Message};
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "mbim" {
+		crate::serial_println!("usb-mbim: NOT RUN - no MBIM modem on this run; build one with USB_GADGET=mbim");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1500;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1500 * 13;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::MODEM, driver_protocol::provider::USB_MBIM_NAME, patience).expect("the controller publishes the modem it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = modem::modem_device::Client::new(KernelTransport::new(&host_end, patience));
+
+	let opened = client.open(&1).expect("the modem answered the open").expect("the modem opened");
+	let connection = opened.connection_generation;
+	let indications = client.indications().expect("the indication stream opened");
+	let receive = client.receive().expect("the receive stream opened");
+	let transmit = client.transmit().expect("answered").expect("a transmit channel");
+	let mut transport = client.into_transport();
+	let indications = transport.take(indications).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let receive = transport.take(receive).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let transmit = transport.take(transmit).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let mut client = modem::modem_device::Client::new(transport);
+	let command = |kind: modem::CommandKind, transaction: u64, sim: u64, context: u64, secret: &[u8], apn: &str| modem::Command { connection_generation: connection, transaction, kind, sim_generation: sim, context_generation: context, secret: secret.to_vec(), new_secret: alloc::vec::Vec::new(), apn: alloc::string::String::from(apn) };
+
+	// A COMMAND PREPARED AGAINST NO SIM is stale, and says which SIM there is.
+	let learned = client.command(&command(modem::CommandKind::Query, 1, 0, 0, &[], "")).expect("answered").expect("served");
+	assert_eq!(learned.status, modem::CommandStatus::Stale);
+	let sim = learned.sim_generation;
+	let state = learned.state.expect("a reply carries the state");
+	assert_eq!((state.sim, state.pin_attempts), (modem::DeviceSim::LockedPin, Some(3)), "the SIM waits for its PIN, three tries left");
+	assert_eq!(state.model, "", "the emulator publishes no product string, and none is invented");
+
+	// A WRONG PIN costs a try, counted by the modem; the right one unlocks it.
+	let wrong = client.command(&command(modem::CommandKind::EnterPin, 2, sim, 0, b"0000", "")).expect("answered").expect("served");
+	assert_eq!(wrong.status, modem::CommandStatus::Rejected);
+	assert_eq!(wrong.state.expect("state").pin_attempts, Some(2));
+	let right = client.command(&command(modem::CommandKind::EnterPin, 3, sim, 0, b"1234", "")).expect("answered").expect("served");
+	assert_eq!(right.status, modem::CommandStatus::Done);
+	let state = right.state.expect("state");
+	assert_eq!((state.sim, state.registration, state.operator.as_deref()), (modem::DeviceSim::Ready, modem::DeviceRegistration::Home, Some("LiberNet")), "registered at home once the SIM is ready");
+	assert!(state.signal_valid && state.rssi_dbm == -73, "the modem's RSSI code 20, in dBm");
+	assert_eq!(right.sim_generation, sim, "unlocking the SIM is not a new SIM");
+	let give_up = arch::apic::ticks() + patience;
+	let indicated = loop {
+		sched::run_until_idle();
+		if let Ok(frame) = indications.recv() {
+			let mut handles = modem_device_proto::codec::Handles::new();
+			break modem::modem_device::indications_read(&frame.bytes, &mut handles).expect("an indication decodes");
+		}
+		assert!(arch::apic::ticks() < give_up, "the modem's indication of the unlocked SIM was not published");
+	};
+	assert_eq!(indicated.state.sim, modem::DeviceSim::Ready);
+
+	let identity = client.command(&command(modem::CommandKind::Identity, 4, sim, 0, &[], "")).expect("answered").expect("served").identity.expect("an identity");
+	assert_eq!((identity.imsi.as_deref(), identity.iccid.as_deref(), identity.msisdn.as_deref()), (Some("001010000000001"), Some("8900100000000000001"), Some("+15550100")));
+
+	// THE CONTEXT, and what the network gave it.
+	let activated = client.command(&command(modem::CommandKind::Activate, 5, sim, 7, &[], "internet")).expect("answered").expect("served");
+	assert_eq!(activated.status, modem::CommandStatus::Done);
+	let config = activated.config.expect("an activation carries its configuration");
+	assert_eq!((config.family, config.address, config.prefix, config.gateway, config.mtu), (modem::IpFamily::Ipv4, u32::from_be_bytes([10, 64, 0, 2]), 30, Some(u32::from_be_bytes([10, 64, 0, 1])), 1400));
+	assert!(activated.state.expect("state").context_active);
+
+	// AN ECHO REQUEST TO THE GATEWAY, and its reply - built by the far end, through a transfer block each way.
+	fn sum(bytes: &[u8]) -> u16 {
+		let mut total: u32 = bytes.chunks(2).map(|pair| u32::from(pair[0]) << 8 | u32::from(*pair.get(1).unwrap_or(&0))).sum();
+		while total >> 16 != 0 {
+			total = (total & 0xffff) + (total >> 16);
+		}
+		!(total as u16)
+	}
+	let payload: alloc::vec::Vec<u8> = (0..56u8).collect();
+	let mut icmp: alloc::vec::Vec<u8> = alloc::vec![8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01];
+	icmp.extend_from_slice(&payload);
+	let checksum = sum(&icmp);
+	icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+	let mut ip: alloc::vec::Vec<u8> = alloc::vec![0x45, 0, 0, 0, 0, 1, 0, 0, 64, 1, 0, 0, 10, 64, 0, 2, 10, 64, 0, 1];
+	let total = (20 + icmp.len()) as u16;
+	ip[2..4].copy_from_slice(&total.to_be_bytes());
+	let checksum = sum(&ip);
+	ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+	ip.extend_from_slice(&icmp);
+	let datagram = modem::Datagram { context_generation: 7, bytes: ip };
+	transmit.send(Message::new(datagram.encode_vec().expect("a datagram encodes"), alloc::vec::Vec::new())).expect("the datagram was queued");
+	let give_up = arch::apic::ticks() + patience;
+	let reply = loop {
+		sched::run_until_idle();
+		if let Ok(frame) = receive.recv() {
+			let mut handles = modem_device_proto::codec::Handles::new();
+			break modem::modem_device::receive_read(&frame.bytes, &mut handles).expect("a datagram frame decodes");
+		}
+		assert!(arch::apic::ticks() < give_up, "no echo reply came back from the gateway");
+	};
+	assert_eq!(reply.context_generation, 7, "the reply belongs to the active context");
+	assert_eq!((&reply.bytes[12..16], &reply.bytes[16..20]), (&[10, 64, 0, 1][..], &[10, 64, 0, 2][..]), "from the gateway, to this side");
+	assert_eq!(reply.bytes[20], 0, "an echo reply");
+	assert_eq!(&reply.bytes[24..28], &[0x12, 0x34, 0x00, 0x01], "for this request's identifier and sequence");
+	assert_eq!(&reply.bytes[28..], &payload[..], "carrying its payload back");
+
+	// A CONTEXT DEACTIVATED is gone; a stale one is refused.
+	assert_eq!(client.command(&command(modem::CommandKind::Deactivate, 6, sim, 8, &[], "")).expect("answered").expect("served").status, modem::CommandStatus::Stale, "a context this side never activated");
+	let deactivated = client.command(&command(modem::CommandKind::Deactivate, 7, sim, 7, &[], "")).expect("answered").expect("served");
+	assert_eq!(deactivated.status, modem::CommandStatus::Done);
+	assert!(!deactivated.state.expect("state").context_active);
+
+	crate::serial_println!("usb-mbim: the SIM unlocked on its second PIN, a context came up at 10.64.0.2/30, and the gateway answered an echo through the modem");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_video_negotiates_a_stream_and_writes_frames_into_queued_buffers, [Drivers, Usb, Slow], id = "kernel.hardware.usb_video_negotiates_a_stream_and_writes_frames_into_queued_buffers", covers = ["kernel", "drivers", "camera-device-proto"]);
+fn usb_video_negotiates_a_stream_and_writes_frames_into_queued_buffers() {
+	// THE CAMERA IS A GADGETFS EMULATOR IN THE HOST (`usb_gadgetfs.py`'s UVC 1.1 camera, 64x48 YUY2 over bulk).
+	// This side plays CameraService: it reads the formats the normalizer made of the device's descriptors,
+	// negotiates a stream through the device's own probe and commit, registers two buffers and queues them, and
+	// reads what arrives in them - each frame's number in its first eight bytes and the oracle's pattern after
+	// it, assembled from two payloads. Frame 3 carries the device's error bit, and must come back as a drop.
+	use camera_device_proto::generated::liber::camera_device::v1 as camera;
+	use camera_proto::generated::liber::camera::v1 as shared;
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "uvc" {
+		crate::serial_println!("usb-video: NOT RUN - no video camera on this run; build one with USB_GADGET=uvc");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1500;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1500 * 13;
+	const FRAME: usize = 64 * 48 * 2;
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::CAMERA, driver_protocol::provider::USB_VIDEO_NAME, patience).expect("the controller publishes the camera it bound, by name, after its handshake");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let mut client = camera::camera_device::Client::new(KernelTransport::new(&host_end, patience));
+
+	client.open(&1).expect("the camera answered").expect("the camera opened");
+	let formats = client.formats().expect("answered").expect("formats listed");
+	assert_eq!(formats.len(), 1);
+	assert_eq!((formats[0].index, formats[0].frame_type), (1, shared::FrameType::Yuy2));
+	let sizes = client.sizes(&1).expect("answered").expect("sizes listed");
+	assert_eq!((sizes[0].width, sizes[0].height, sizes[0].max_bytes), (64, 48, FRAME as u32));
+	let events = client.events().expect("the event stream opened");
+	let request = shared::StreamRequest { format: 1, size: 1, interval: shared::Interval { numerator: 333_333, denominator: 10_000_000 } };
+	let negotiated = client.negotiate(&1, &request).expect("answered").expect("the stream was negotiated with the device");
+	assert_eq!((negotiated.width, negotiated.height, negotiated.stride), (64, 48, 128));
+
+	// TWO BUFFERS, registered with write permission and queued under leases.
+	let buffers: [alloc::sync::Arc<object::memory_object::MemoryObject>; 2] = core::array::from_fn(|_| object::memory_object::MemoryObject::create(FRAME).expect("a frame buffer"));
+	let mut transport = client.into_transport();
+	let events = transport.take(events).expect("handed over").into_any_arc().downcast::<Channel>().expect("a channel");
+	let handles: [u64; 2] = core::array::from_fn(|at| transport.offer(buffers[at].clone(), Rights::READ | Rights::WRITE | Rights::MAP));
+	let mut client = camera::camera_device::Client::new(transport);
+	for (at, handle) in handles.iter().enumerate() {
+		assert_eq!(client.register(&1, &(at as u8), handle), Some(Ok(())), "buffer {at} registered");
+	}
+	let mut lease: u64 = 100;
+	for at in 0..2u8 {
+		assert_eq!(client.queue(&1, &at, &lease), Some(Ok(())));
+		lease += 1;
+	}
+	assert_eq!(client.start(&1), Some(Ok(())));
+
+	// FRAMES, EACH CHECKED BYTE FOR BYTE AND QUEUED AGAIN, until the bad one was dropped and four good ones seen.
+	let mut good: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let mut dropped_by_device = 0;
+	let give_up = arch::apic::ticks() + patience * 2;
+	while (good.len() < 4 || dropped_by_device == 0) && arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		let Ok(frame) = events.recv() else { continue };
+		let mut frame_handles = camera_device_proto::codec::Handles::new();
+		match camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("an event decodes") {
+			camera::CameraDeviceEvent::Frame(done) => {
+				assert_eq!(done.stream_generation, 1);
+				assert_eq!(done.valid_bytes as usize, FRAME, "a whole YUY2 frame");
+				let bytes = read_from_object(&buffers[done.buffer as usize], FRAME);
+				let number = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+				assert!(number != 3, "frame 3 carried the device's error bit and was delivered anyway");
+				assert!(bytes[8..].iter().enumerate().all(|(at, &byte)| byte == (((at + 8) as u64 * 7 + number * 13) % 251) as u8), "frame {number} arrived as the device sent it, across both of its payloads");
+				good.push(number);
+				assert_eq!(client.queue(&1, &done.buffer, &lease), Some(Ok(())), "and its buffer is queued again");
+				lease += 1;
+			}
+			camera::CameraDeviceEvent::Dropped(drop) => {
+				if drop.reason == camera::CameraDropReason::Device {
+					dropped_by_device += 1;
+				}
+			}
+			camera::CameraDeviceEvent::Gap(_) => {}
+		}
+	}
+	assert!(good.len() >= 4, "four whole frames arrived, got {good:?}");
+	assert!(dropped_by_device >= 1, "the frame the device marked bad was dropped with the device as the reason");
+	assert!(good.windows(2).all(|pair| pair[0] < pair[1]), "in the order the device sent them: {good:?}");
+	assert_eq!(client.stop(&1), Some(Ok(())), "the stream stops, every buffer back");
+	assert_eq!(client.queue(&1, &0, &lease), Some(Err(camera::Error::Stale)), "and a stopped stream takes no buffer");
+
+	// AND AN UNPLUG IN THE MIDDLE OF A STREAM. A second stream, on the same buffers registered again: the camera
+	// sends its first frame and leaves the bus. That frame arrives, and then the provider's side ends - the event
+	// stream closes and the publication is withdrawn.
+	let negotiated = client.negotiate(&2, &request).expect("answered").expect("a second stream negotiated");
+	assert_eq!(negotiated.stream_generation, 2);
+	let mut transport = client.into_transport();
+	let handles: [u64; 2] = core::array::from_fn(|at| transport.offer(buffers[at].clone(), Rights::READ | Rights::WRITE | Rights::MAP));
+	let mut client = camera::camera_device::Client::new(transport);
+	for (at, handle) in handles.iter().enumerate() {
+		assert_eq!(client.register(&2, &(at as u8), handle), Some(Ok(())), "buffer {at} registered for the second stream");
+		assert_eq!(client.queue(&2, &(at as u8), &lease), Some(Ok(())));
+		lease += 1;
+	}
+	assert_eq!(client.start(&2), Some(Ok(())));
+	let mut second: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	let give_up = arch::apic::ticks() + patience * 2;
+	let closed = loop {
+		assert!(arch::apic::ticks() < give_up, "the camera leaving did not end the event stream; frames of the second stream: {second:?}");
+		sched::run_until_idle();
+		match events.recv() {
+			Ok(frame) => {
+				let mut frame_handles = camera_device_proto::codec::Handles::new();
+				if let camera::CameraDeviceEvent::Frame(done) = camera::camera_device::events_read(&frame.bytes, &mut frame_handles).expect("an event decodes") {
+					assert_eq!((done.stream_generation, done.valid_bytes as usize), (2, FRAME), "a whole frame of the second stream");
+					let bytes = read_from_object(&buffers[done.buffer as usize], FRAME);
+					second.push(u64::from_le_bytes(bytes[..8].try_into().unwrap()));
+				}
+			}
+			Err(object::channel::ChannelError::PeerClosed) => break true,
+			Err(_) => {}
+		}
+	};
+	assert!(closed && second == [0], "the second stream's first frame arrived before the camera left, and nothing after: {second:?}");
+	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 2), "the controller withdrew the camera's publication when the camera left");
+
+	crate::serial_println!("usb-video: frames {good:?} arrived whole and in order, frame 3 was dropped as the device's, the stream stopped, and a camera unplugged mid-stream closed its events and was withdrawn");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+tagged_test!(usb_audio_capture_delivers_the_microphones_frames_in_order, [Drivers, Usb, Slow], id = "kernel.hardware.usb_audio_capture_delivers_the_microphones_frames_in_order", covers = ["kernel", "drivers"]);
+fn usb_audio_capture_delivers_the_microphones_frames_in_order() {
+	// THE MICROPHONE IS A PROCESS IN THE HOST, played over QEMU's `usb-redir` by `usbredir_device.py`: a UAC1
+	// source whose samples are a counter - left the frame's number, right its complement - so every captured byte
+	// says where in the stream it came from. This side plays AudioService on the PCM wire the controller offers:
+	// it asks for periods and checks that each is whole, consecutive and continues the one before; it plays a
+	// period in between, which must still reach QEMU's speaker through the same provider; it stops asking long
+	// enough to overrun the driver's FIFO, which must END the capture with the wire's refusal; and a stop and a
+	// new capture must start again.
+	use object::channel::{Channel, Message};
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "mic" {
+		crate::serial_println!("usb-audio-capture: NOT RUN - no microphone on this run; play one with USB_GADGET=mic");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+	const PERIOD: usize = driver_protocol::audio::PERIOD_BYTES as usize;
+
+	let (kernel_ep, generation, offers, driver, claim) = bind_xhci_controller();
+	let audio_token = offer_token_of(&offers, driver_protocol::provider::AUDIO).expect("a controller with an audio device on it publishes its PCM provider");
+	let (pcm, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, audio_token, driver_end).expect("the audio CONNECT should send");
+	sched::run_until_idle();
+	let ask = |bytes: alloc::vec::Vec<u8>| -> alloc::vec::Vec<u8> {
+		pcm.send(Message::new(bytes, alloc::vec::Vec::new())).expect("the request should send");
+		let give_up = arch::apic::ticks() + patience;
+		loop {
+			sched::run_until_idle();
+			if let Ok(reply) = pcm.recv() {
+				return reply.bytes;
+			}
+			assert!(arch::apic::ticks() < give_up, "the provider did not answer within the patience");
+		}
+	};
+	// EVERY PERIOD WHOLE, EVERY FRAME ITS OWN COMPLEMENT ON THE RIGHT, AND EACH FRAME THE ONE AFTER THE LAST.
+	let mut expected: Option<u16> = None;
+	let check = |expected: &mut Option<u16>, period: &[u8], what: &str| {
+		assert_eq!(period.len(), PERIOD, "{what}: a captured period is exactly one period");
+		for (at, frame) in period.chunks_exact(4).enumerate() {
+			let left = u16::from_le_bytes([frame[0], frame[1]]);
+			let right = u16::from_le_bytes([frame[2], frame[3]]);
+			assert_eq!(right, left ^ 0xffff, "{what}: frame {at} is the microphone's own, right the complement of left");
+			if let Some(next) = *expected {
+				assert_eq!(left, next, "{what}: frame {at} continues the stream, nothing lost and nothing repeated");
+			}
+			*expected = Some(left.wrapping_add(1));
+		}
+	};
+
+	// THE FIRST PERIOD, once the microphone is on the bus - until then the provider has no source and refuses.
+	let give_up = arch::apic::ticks() + patience * 2;
+	let first = loop {
+		let reply = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+		if !reply.is_empty() {
+			break reply;
+		}
+		assert!(arch::apic::ticks() < give_up, "the controller never captured from the microphone");
+		sched::run_until_idle_until(arch::apic::ticks().saturating_add(20));
+	};
+	check(&mut expected, &first, "the first period");
+	for n in 0..6 {
+		let period = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+		check(&mut expected, &period, if n == 0 { "the second period" } else { "a later period" });
+	}
+	// ONE PROVIDER, BOTH DIRECTIONS: a period played now goes to QEMU's speaker, and the capture's transfers that
+	// complete while it plays are kept and not lost.
+	let silence = alloc::vec![0u8; PERIOD];
+	assert_eq!(ask(silence), driver_protocol::audio::OK, "the speaker took a period through the provider that is capturing");
+	let after = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+	check(&mut expected, &after, "the period after the playback");
+
+	// AN OVERRUN ENDS THE CAPTURE. Nobody asks for long enough to fill the driver's eight periods, and the next
+	// request is refused - and stays refused until the capture is stopped.
+	// A DRAIN RETURNS AS SOON AS NOTHING IS RUNNABLE, so the pause is the clock's and not one call's.
+	let until = arch::apic::ticks().saturating_add(60);
+	while arch::apic::ticks() < until {
+		sched::run_until_idle_until(until);
+	}
+	assert!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]).is_empty(), "a capture that overran is ended, and says so with the wire's refusal");
+	assert!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]).is_empty(), "and stays ended until it is stopped");
+	assert_eq!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP]), driver_protocol::audio::OK, "the stop is acknowledged");
+
+	// A NEW CAPTURE STARTS AGAIN, from wherever the microphone's counter is now.
+	expected = None;
+	let fresh = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+	check(&mut expected, &fresh, "the first period of a new capture");
+	let next = ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE]);
+	check(&mut expected, &next, "the second period of a new capture");
+	assert_eq!(ask(alloc::vec![driver_protocol::audio::CMD_CAPTURE_STOP]), driver_protocol::audio::OK);
+
+	crate::serial_println!("usb-audio-capture: eight periods of the microphone's frames arrived whole and in order around a period played, an overrun ended the capture with the refusal, and a new capture started");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
+
+// THE TPM'S REGISTERS, in a test-only kernel window over the region the `TPM2` table names. Volatile, as the
+// registers are the TPM's and not memory; the clock is the kernel's tick, ten milliseconds apiece.
+#[cfg(all(test, target_arch = "x86_64"))]
+struct TpmWindow {
+	base: u64,
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+impl tpm::Registers for TpmWindow {
+	fn read8(&mut self, offset: usize) -> u8 {
+		// SAFETY: `offset` is inside the five pages mapped at `base` for this test, which are the TPM's registers.
+		unsafe { core::ptr::read_volatile((self.base + offset as u64) as *const u8) }
+	}
+
+	fn write8(&mut self, offset: usize, value: u8) {
+		// SAFETY: as `read8`.
+		unsafe { core::ptr::write_volatile((self.base + offset as u64) as *mut u8, value) }
+	}
+
+	fn read32(&mut self, offset: usize) -> u32 {
+		// SAFETY: as `read8`; every 32-bit register is at a multiple of four.
+		unsafe { core::ptr::read_volatile((self.base + offset as u64) as *const u32) }
+	}
+
+	fn write32(&mut self, offset: usize, value: u32) {
+		// SAFETY: as `read32`.
+		unsafe { core::ptr::write_volatile((self.base + offset as u64) as *mut u32, value) }
+	}
+
+	fn now_ms(&mut self) -> u64 {
+		arch::apic::ticks() * 10
+	}
+
+	fn pause(&mut self) {
+		for _ in 0..1000 {
+			core::hint::spin_loop();
+		}
+	}
+}
+
+tagged_test!(tpm_transport_carries_typed_commands_to_a_tpm, [Drivers, Slow], id = "kernel.hardware.tpm_transport_carries_typed_commands_to_a_tpm", covers = ["kernel", "tpm"]);
+fn tpm_transport_carries_typed_commands_to_a_tpm() {
+	// THE TPM IS swtpm IN THE HOST, behind QEMU's `tpm-crb` or `tpm-tis` front-end as `TPM_FRONTEND` says. No driver
+	// binds it - a TPM is ACPI-described MMIO, and a firmware-node identity to claim it by does not exist yet - so
+	// this test is the library's oracle and not a driver's: it finds the TPM the way a binding would, from the
+	// `TPM2` table, maps its registers in a test-only window, and drives the transport the table named and the typed
+	// operations over it. Every value checked is the TPM's: the PCR chain is computed here and compared with what
+	// the TPM says, the sealed secret comes back only while the PCR holds, and the quote carries this nonce.
+	let asked = option_env!("TPM_FRONTEND").unwrap_or("");
+	if asked != "crb" && asked != "tis" {
+		crate::serial_println!("tpm: NOT RUN - no TPM on this run; put one in front of swtpm with TPM_FRONTEND=crb or TPM_FRONTEND=tis");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	{
+		use tpm::ops::Tpm;
+		const WINDOW: u64 = 0xffff_f500_0000_0000;
+
+		let table = crate::smp::acpi_table(crate::boot_info().rsdp, b"TPM2").expect("the firmware describes the TPM in a TPM2 table");
+		let interface = tpm::table::discover(table).expect("a TPM2 table naming an interface this library drives");
+		let base = match interface {
+			tpm::table::Interface::Fifo { base } => {
+				assert_eq!(asked, "tis", "the table names the FIFO interface, and the run asked for {asked}");
+				base
+			}
+			tpm::table::Interface::Crb { base } => {
+				assert_eq!(asked, "crb", "the table names a CRB, and the run asked for {asked}");
+				base
+			}
+		};
+		for page in 0..(tpm::table::REGION_LEN as u64 / 4096) {
+			arch::paging::map_page(WINDOW + page * 4096, base + page * 4096, arch::paging::WRITABLE | arch::paging::NO_CACHE | arch::paging::NO_EXECUTE);
+		}
+		let window = TpmWindow { base: WINDOW };
+
+		fn exercise<T: tpm::command::Transport>(tpm: &mut Tpm<T>) -> (usize, [u8; 32]) {
+			tpm.startup().expect("Startup(CLEAR), or a TPM the firmware already started");
+			let first = tpm.random(32).expect("random bytes");
+			let second = tpm.random(32).expect("more random bytes");
+			assert_ne!(first, second, "two draws are not the same bytes");
+			let before = tpm.pcr_read(16).expect("PCR 16");
+			let measurement = bootproto::sha256::digest(b"liber in-guest measurement");
+			tpm.pcr_extend(16, &measurement).expect("PCR 16 extended through the register interface");
+			let after = tpm.pcr_read(16).expect("PCR 16 again");
+			let mut chain = alloc::vec::Vec::from(before);
+			chain.extend_from_slice(&measurement);
+			assert_eq!(after, bootproto::sha256::digest(&chain), "the TPM's PCR is the hash chain computed here");
+			let sealed = tpm.seal(b"sealed in the guest", 16).expect("sealed");
+			assert_eq!(tpm.unseal(&sealed).as_deref(), Ok(&b"sealed in the guest"[..]), "opened while PCR 16 holds");
+			tpm.pcr_extend(16, &bootproto::sha256::digest(b"and then something else")).expect("PCR 16 moved");
+			assert_eq!(tpm.unseal(&sealed), Err(tpm::Error::PolicyRefused), "and refused once it moved");
+			let now = tpm.pcr_read(16).expect("PCR 16 now");
+			let nonce = tpm.random(16).expect("a nonce");
+			let quote = tpm.quote(&nonce, 16).expect("a quote");
+			assert_eq!(quote.pcr_digest, bootproto::sha256::digest(&now).to_vec(), "the quote carries this PCR's digest, over this nonce");
+			(quote.attest.len(), now)
+		}
+
+		let (attested, _) = match interface {
+			tpm::table::Interface::Crb { base } => {
+				let transport = tpm::crb::Crb::new(window, base, tpm::table::REGION_LEN).expect("the registers say CRB");
+				exercise(&mut Tpm::new(transport))
+			}
+			tpm::table::Interface::Fifo { .. } => {
+				let transport = tpm::fifo::Fifo::new(window).expect("the registers say FIFO");
+				exercise(&mut Tpm::new(transport))
+			}
+		};
+		crate::serial_println!("tpm: the {asked} interface carried random, a PCR extend, a seal refused after the PCR moved and a {attested}-byte quote to swtpm");
+	}
+}
+
+tagged_test!(usb_dfu_follows_a_runtime_target_into_dfu_mode_and_survives_it_leaving, [Drivers, Usb, Slow], id = "kernel.hardware.usb_dfu_follows_a_runtime_target_into_dfu_mode_and_survives_it_leaving", covers = ["kernel", "drivers", "admin-proto"]);
+fn usb_dfu_follows_a_runtime_target_into_dfu_mode_and_survives_it_leaving() {
+	// THE TARGET IS A PROCESS IN THE HOST (`usbredir_device.py`'s DFU target, over QEMU's `usb-redir`) that starts in
+	// RUNTIME mode: after DFU_DETACH it comes back in DFU mode as another product with the same serial number - at the
+	// host's bus reset with `USB_GADGET=dfu-reset`, or by leaving the bus by itself with `dfu-detach`. This side plays
+	// AdminService: a download prepared against the RUNTIME device is executed once, and its one answer is the DFU-mode
+	// device's manifestation - the executor followed its device through a re-enumeration and nothing else did: another
+	// operation prepared against the runtime device is stale after it. Then a download the device walks away from in
+	// the middle is an outcome nobody observed, and the device's publication goes with it.
+	use admin_proto::generated::liber::admin::v1 as admin;
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let asked = option_env!("USB_GADGET").unwrap_or("");
+	if asked != "dfu-reset" && asked != "dfu-detach" {
+		crate::serial_println!("usb-dfu-runtime: NOT RUN - no runtime DFU target on this run; play one with USB_GADGET=dfu-reset or dfu-detach");
+		return;
+	}
+	#[cfg(target_arch = "x86_64")]
+	let patience: u64 = 1000;
+	#[cfg(not(target_arch = "x86_64"))]
+	let patience: u64 = 1000 * 13;
+	let object_of = |bytes: &[u8]| -> alloc::sync::Arc<dyn object::KernelObject> {
+		let memory = object::memory_object::MemoryObject::create(bytes.len()).expect("a payload object");
+		copy_into_object(&memory, bytes);
+		memory
+	};
+	// A DFU 1.1 suffix naming the product, and its CRC.
+	let suffixed = |image: &[u8], product: u16| -> alloc::vec::Vec<u8> {
+		let mut out = image.to_vec();
+		out.extend_from_slice(&[0xff, 0xff]);
+		out.extend_from_slice(&product.to_le_bytes());
+		out.extend_from_slice(&0x1d6bu16.to_le_bytes());
+		out.extend_from_slice(&[0x00, 0x01]);
+		out.extend_from_slice(b"UFD");
+		out.push(16);
+		let mut crc: u32 = 0xffff_ffff;
+		for &byte in &out {
+			crc ^= byte as u32;
+			for _ in 0..8 {
+				crc = if crc & 1 != 0 { crc >> 1 ^ 0xedb8_8320 } else { crc >> 1 };
+			}
+		}
+		out.extend_from_slice(&crc.to_le_bytes());
+		out
+	};
+	fn prepare<'a>(client: admin::admin_executor::Client<KernelTransport<'a>>, target: &str, payload: alloc::sync::Arc<dyn object::KernelObject>, length: usize) -> (admin::admin_executor::Client<KernelTransport<'a>>, Result<admin::AdminPrepared, admin::Error>) {
+		let mut transport = client.into_transport();
+		let handle = transport.offer(payload, Rights::READ | Rights::MAP);
+		let mut client = admin::admin_executor::Client::new(transport);
+		let answer = client.prepare(&admin::AdminAction::FirmwareDownload, &alloc::string::String::from(target), &alloc::vec::Vec::new(), &(length as u32), &handle).expect("the executor answered the preparation");
+		(client, answer)
+	}
+
+	let (kernel_ep, generation, _offers, driver, claim) = bind_xhci_controller();
+	let token = recv_live_offer(&kernel_ep, generation, driver_protocol::provider::ADMIN_EXECUTOR, driver_protocol::provider::USB_DFU_NAME, patience).expect("the controller publishes the runtime DFU target it bound");
+	let (host_end, driver_end) = Channel::create();
+	send_connect(&kernel_ep, generation, token, driver_end).expect("the CONNECT should send");
+	sched::run_until_idle();
+	let client = admin::admin_executor::Client::new(KernelTransport::new(&host_end, patience * 3));
+
+	// PREPARED AGAINST THE RUNTIME DEVICE, which names itself by its runtime product.
+	let payload = suffixed(&printed(5, 3000), 0x0104);
+	let (client, prepared) = prepare(client, "dfu:1d6b:0104", object_of(&payload), payload.len());
+	let (mut client, sibling) = prepare(client, "dfu:1d6b:0104", object_of(&payload), payload.len());
+	let prepared = prepared.expect("a runtime target takes a preparation for the mode it detaches into");
+	let sibling = sibling.expect("and a second one");
+	assert!(prepared.descriptor.target.ends_with("/1d6b:0104"), "the target is the runtime device's live binding, got {:?}", prepared.descriptor.target);
+	assert_eq!(client.revalidate(&prepared.operation), Some(Ok(())));
+	let epoch = prepared.descriptor.executor_epoch;
+
+	// ONE EXECUTION, ONE ANSWER, AND IT IS THE DFU-MODE DEVICE'S: detached, followed, downloaded, manifested.
+	assert_eq!(client.execute(&prepared.operation, &epoch), Some(Ok(admin::AdminResult::Completed)), "the device the detach turned the target into manifested the confirmed image");
+	assert_eq!(client.execute(&prepared.operation, &epoch), Some(Err(admin::Error::Denied)), "one attempt, and it was made");
+	assert_eq!(client.execute(&sibling.operation, &epoch), Some(Err(admin::Error::Stale)), "what else was prepared against the runtime device died with it");
+
+	// AND IN DFU MODE A DOWNLOAD THE DEVICE WALKS AWAY FROM: it leaves the bus after the first block, so the end is not
+	// observed - never retried, never called a failure the device reported - and its publication is withdrawn.
+	let mut leaving = alloc::vec::Vec::from(&b"UNPLUG"[..]);
+	leaving.extend_from_slice(&printed(9, 2000));
+	let leaving = suffixed(&leaving, 0x0105);
+	let (mut client, walked) = prepare(client, "dfu:1d6b:0105", object_of(&leaving), leaving.len());
+	let walked = walked.expect("the DFU-mode device takes a preparation under its own product");
+	assert!(walked.descriptor.target.ends_with("/1d6b:0105"), "the DFU-mode device's own binding, got {:?}", walked.descriptor.target);
+	assert_eq!(client.execute(&walked.operation, &walked.descriptor.executor_epoch), Some(Ok(admin::AdminResult::OutcomeUnknown)), "a device that left in the middle leaves an outcome nobody observed");
+	assert!(recv_withdrawal(&kernel_ep, generation, token, patience * 3), "and the target's publication is withdrawn when it has gone");
+
+	crate::serial_println!("usb-dfu-runtime: {asked} - the runtime target was followed into DFU mode and manifested the confirmed image once, a sibling preparation was stale, and a download the device walked away from was an unknown outcome");
+	driver.terminate();
+	sched::run_until_idle();
+	let _ = crate::device::release_claim(claim);
+}
