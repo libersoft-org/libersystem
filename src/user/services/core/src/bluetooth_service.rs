@@ -22,13 +22,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{BondRecord, BondedPeer, ControllerInfo, EnabledPeer, Error, HciAttachment, HciControlKind, HciPacketKind, MouseReport, PairingProgress, PairingState, PeerAddress, PeerKind, ProviderInfo, ProviderKind, ScanHandle, ScanResult, SecurityLevel, bluetooth, bluetooth_bond_store, bluetooth_operator, bluetooth_profile, hci_transport, provider_catalogue};
+use proto::system::{BondRecord, BondedPeer, ControllerInfo, EnabledPeer, Error, HciAttachment, HciControlKind, HciPacket, HciPacketKind, MouseReport, PairingProgress, PairingState, PeerAddress, PeerKind, ProviderInfo, ProviderKind, ScanHandle, ScanResult, SecurityLevel, bluetooth, bluetooth_bond_store, bluetooth_operator, bluetooth_profile, hci_transport, provider_catalogue};
 use rt::*;
 use service_logic::gatt_mouse::{Discovery, Next};
 use service_logic::hci::{Credits, Kind, Limits, Session};
 use service_logic::hci_codec::{self, Event, opcode};
 use service_logic::l2cap::{Fed, Reassembly};
 use service_logic::smp_pairing::{Initiator, Step};
+use wire::Transport;
 
 include!(concat!(env!("OUT_DIR"), "/roles_bluetooth_service.rs"));
 
@@ -57,6 +58,14 @@ const SMP_CID: u16 = 0x0006;
 // Why a link is disconnected: remote user terminated, and authentication failure.
 const REASON_USER: u8 = 0x13;
 const REASON_AUTHENTICATION: u8 = 0x05;
+// One `hci-transport.send` frame: its operation, correlation, kind and length ahead of a command of at most
+// 258 bytes.
+const COMMAND_FRAME: usize = 272;
+// One bond-store request. A record is well inside it, and the store reads a request into this much itself.
+const BOND_FRAME: usize = 1024;
+// The correlation the requests encoded here carry. Each is answered before the next goes out, so one number
+// is enough; the reply is still checked against it.
+const CORR: u32 = 1;
 
 // --------------------------------------------------------------------------------- the state
 
@@ -188,6 +197,48 @@ fn scrub(bytes: &mut [u8]) {
 	}
 }
 
+// A request encoded here, sent and answered over one channel. The reply comes back in a vector this service
+// owns, for the caller to zero once it has read it; no key rides in a capability, so any that arrive are closed.
+fn exchange(chan: u64, request: &[u8]) -> Option<Vec<u8>> {
+	let mut handles = wire::Handles::new();
+	let reply = ChannelTransport { chan }.call(request, &[], &mut handles, 0).ok();
+	for &handle in handles.as_slice() {
+		close(handle);
+	}
+	reply
+}
+
+// A `result` reply to one of those requests: `None` for one that is not an answer to it, `Some(Err)` for a
+// refusal, and otherwise what `read` takes from after the tag.
+fn answered<T>(reply: &[u8], read: impl FnOnce(&mut wire::Reader) -> Option<T>) -> Option<Result<T, Error>> {
+	let mut reader = wire::Reader::new(reply);
+	if reader.u32()? != CORR {
+		return None;
+	}
+	let value = if reader.tag()? { Ok(read(&mut reader)?) } else { Err(Error::read(&mut reader)?) };
+	reader.finish()?;
+	Some(value)
+}
+
+// `hci-transport.send` of one command, FROM A FRAME THIS SERVICE OWNS AND ZEROES. An encryption's parameters
+// carry the LTK, and the generated client would copy the command into a vector of its own and free that - and
+// every smaller one it outgrew - with the key still in it. The reply carries a count and nothing secret.
+fn send_command(chan: u64, command: &[u8]) -> bool {
+	let mut frame = [0u8; COMMAND_FRAME];
+	let len = (|| {
+		let length = u16::try_from(command.len()).ok()?;
+		frame[..2].copy_from_slice(&hci_transport::OP_SEND.to_le_bytes());
+		frame[2..6].copy_from_slice(&CORR.to_le_bytes());
+		let at = 6 + HciPacketKind::Command.encode(&mut frame[6..])?;
+		frame.get_mut(at..at + 2)?.copy_from_slice(&length.to_le_bytes());
+		frame.get_mut(at + 2..at + 2 + command.len())?.copy_from_slice(command);
+		Some(at + 2 + command.len())
+	})();
+	let reply = len.and_then(|len| exchange(chan, &frame[..len]));
+	scrub(&mut frame);
+	reply.and_then(|reply| answered(&reply, |reader| reader.u32())).is_some_and(|result| result.is_ok())
+}
+
 // ------------------------------------------------------------------ the controller
 
 impl Controller {
@@ -242,15 +293,15 @@ impl Controller {
 			self.credits.drained();
 			return;
 		};
-		let sent = hci_transport::Client::new(ChannelTransport { chan: self.transport }).send(&HciPacketKind::Command, &bytes);
+		let sent = send_command(self.transport, &bytes);
 		// The command has gone, or failed to; either way neither copy is read again, and an encryption's
 		// carries the LTK.
 		scrub(&mut params);
 		scrub(&mut bytes);
 		self.credits.drained();
 		match sent {
-			Some(Ok(_)) => self.outstanding = Some(op),
-			_ => {
+			true => self.outstanding = Some(op),
+			false => {
 				// A SEND THE TRANSPORT REFUSED IS NOT OUTSTANDING, and the credit it took is given
 				// back: the controller never saw it and will never answer it.
 				self.credits.commands_completed(1);
@@ -393,12 +444,22 @@ impl Stack {
 	}
 
 	// The stored record for this controller and peer, KEY INCLUDED - so only the two callers that need the
-	// key ask for it, and each zeroes it once it has.
+	// key ask for it, and each zeroes it once it has. THE REPLY CARRYING IT is read from a vector this service
+	// owns and zeroed once read; the generated client would free its own with the key in it. The request names
+	// two addresses and nothing secret.
 	fn bond(&self, at: usize, peer: &[u8; 7]) -> Option<BondRecord> {
 		if self.bonds == 0 {
 			return None;
 		}
-		match self.bonds().lookup(&local_wire(&self.controllers[at]), &peer_to_wire(peer)) {
+		let mut request = [0u8; 64];
+		request[..2].copy_from_slice(&bluetooth_bond_store::OP_LOOKUP.to_le_bytes());
+		request[2..6].copy_from_slice(&CORR.to_le_bytes());
+		let local = local_wire(&self.controllers[at]).encode(&mut request[6..])?;
+		let peer = peer_to_wire(peer).encode(&mut request[6 + local..])?;
+		let mut reply = exchange(self.bonds, &request[..6 + local + peer])?;
+		let answer = answered(&reply, BondRecord::read);
+		scrub(&mut reply);
+		match answer {
 			Some(Ok(record)) if record.key.len() == 16 => Some(record),
 			Some(Ok(mut record)) => {
 				scrub(&mut record.key);
@@ -406,6 +467,22 @@ impl Stack {
 			}
 			_ => None,
 		}
+	}
+
+	// Store or replace a record, answered only after the store's durable commit. THE REQUEST CARRIES THE KEY,
+	// so it is encoded into a buffer this service owns and zeroed after the send, not into the generated
+	// client's own vector.
+	fn store_bond(&self, record: &BondRecord) -> bool {
+		if self.bonds == 0 {
+			return false;
+		}
+		let mut request = [0u8; BOND_FRAME];
+		request[..2].copy_from_slice(&bluetooth_bond_store::OP_STORE.to_le_bytes());
+		request[2..6].copy_from_slice(&CORR.to_le_bytes());
+		let len = record.encode(&mut request[6..]).map(|body| 6 + body);
+		let reply = len.and_then(|len| exchange(self.bonds, &request[..len]));
+		scrub(&mut request);
+		reply.and_then(|reply| answered(&reply, |_| Some(()))).is_some_and(|result| result.is_ok())
 	}
 
 	// Whether this peer is bonded on this controller and an operator made it an input source - read from
@@ -473,7 +550,9 @@ impl Stack {
 					if status == 0 && key.len() == 32 {
 						let mut wire = [0u8; 32];
 						wire.copy_from_slice(key);
-						pairing.on_dhkey(&wire)
+						let steps = pairing.on_dhkey(&wire);
+						scrub(&mut wire);
+						steps
 					} else {
 						pairing.on_dhkey_failed()
 					}
@@ -727,7 +806,7 @@ impl Stack {
 			// the attempt: there is no transient bond to fall back to.
 			let local = local_wire(&self.controllers[at]);
 			let mut record = BondRecord { version: service_logic::bond_store::VERSION, local, peer: peer_to_wire(&peer), key: ltk.to_vec(), security: SecurityLevel::EncryptedUnauthenticated, name: alloc::string::String::new(), enabled: false };
-			let stored = self.bonds != 0 && matches!(self.bonds().store(&record), Some(Ok(())));
+			let stored = self.store_bond(&record);
 			scrub(&mut record.key);
 			scrub(&mut ltk);
 			let controller = &mut self.controllers[at];
@@ -1163,7 +1242,7 @@ impl bluetooth_operator::Service for OperatorView<'_> {
 		}
 		let Some(mut record) = self.stack.bond(at as usize, &peer) else { return Err(Error::NotFound) };
 		record.enabled = on;
-		let stored = matches!(self.stack.bonds().store(&record), Some(Ok(())));
+		let stored = self.stack.store_bond(&record);
 		scrub(&mut record.key);
 		if !stored {
 			return Err(Error::Io);
@@ -1291,25 +1370,37 @@ impl Stack {
 				close(handle);
 			}
 			let mut frame_handles = wire::Handles::new();
-			let Some(packet) = hci_transport::receive_read(&buf[..len], &mut frame_handles) else { continue };
-			if !self.controllers[at].session.admits(packet.epoch) {
+			let Some(mut packet) = hci_transport::receive_read(&buf[..len], &mut frame_handles) else {
+				scrub(&mut buf[..len]);
 				continue;
-			}
-			let kind = match packet.kind {
-				HciPacketKind::Event => Kind::Event,
-				HciPacketKind::Acl => Kind::Acl,
-				_ => continue,
 			};
-			if service_logic::hci::check_inbound(&self.controllers[at].limits, kind as u16, packet.bytes.len() as u32).is_err() {
-				continue;
-			}
-			match kind {
-				Kind::Event => self.on_event(at, &packet.bytes),
-				Kind::Acl => self.on_acl(at, &packet.bytes),
-				_ => {}
-			}
-			self.controllers[at].pump();
+			self.on_packet(at, &packet);
+			// A PACKET CAN CARRY KEY MATERIAL - the Diffie-Hellman key arrives in an event - so both copies of
+			// it are zeroed once it has been handled, however that went: the decoded bytes are freed next, and
+			// `buf` is reused for every message after this one.
+			scrub(&mut packet.bytes);
+			scrub(&mut buf[..len]);
 		}
+	}
+
+	fn on_packet(&mut self, at: usize, packet: &HciPacket) {
+		if !self.controllers[at].session.admits(packet.epoch) {
+			return;
+		}
+		let kind = match packet.kind {
+			HciPacketKind::Event => Kind::Event,
+			HciPacketKind::Acl => Kind::Acl,
+			_ => return,
+		};
+		if service_logic::hci::check_inbound(&self.controllers[at].limits, kind as u16, packet.bytes.len() as u32).is_err() {
+			return;
+		}
+		match kind {
+			Kind::Event => self.on_event(at, &packet.bytes),
+			Kind::Acl => self.on_acl(at, &packet.bytes),
+			_ => {}
+		}
+		self.controllers[at].pump();
 	}
 
 	// What happened to one controller's transport.
