@@ -1137,3 +1137,77 @@ There are two ways to close this:
   290/290.
 - **Recorded runs read:** the final `bluetooth-service` gate log (PASS, 841 s) and the AArch64 and RISC-V build
   logs.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0180 (2026-09-25T01:01:42Z):
+
+## Unresolved 1 - Key material still outlives its use in BluetoothService's IPC buffers: ACCEPTED
+
+Verified against the code. All three copies existed as the re-audit describes:
+- the generated `hci_transport::Client::send` copied each command into its own `VecWriter`;
+- `drain_packets` left the Diffie-Hellman key in `buf`, in the decoded `packet.bytes` and in `on_event`'s `wire`;
+- the generated bond-store client's `store` request and `lookup` reply held the LTK.
+
+They are now cleared the same way ModemService clears its PIN frame. All changes are in `bluetooth_service.rs`:
+
+- **Commands going out.** The new `send_command(chan, command)` writes the `hci-transport.send` frame into a
+  272-byte stack buffer (`COMMAND_FRAME`): `OP_SEND`, the correlation, the kind through `HciPacketKind::encode`,
+  the length, then the command. It sends the frame and reads the answer through `exchange`, then zeroes the buffer
+  whatever the outcome.
+  - `Controller::pump` uses it for every command instead of the generated client. That keeps one path; the
+    parameters of `LE Enable Encryption` are the ones that carry the LTK.
+  - ACL data still goes through the generated client. It carries SMP PDUs and reports, and no key.
+- **Packets coming in.**
+  - `drain_packets` hands each decoded packet to the new `Stack::on_packet`, which is the former loop body with
+    unchanged behaviour. After every packet it then zeroes `packet.bytes` and `buf[..len]`, however the handling
+    ended: that includes a packet from a stale epoch or of a refused kind. A frame that does not decode also has
+    `buf[..len]` zeroed.
+  - The `DhKey` arm of `on_event` zeroes its `wire` copy after `on_dhkey`.
+- **The bond store.**
+  - `Stack::bond` (the lookup) encodes its two addresses into a stack buffer. It receives the reply in the vector
+    `exchange` returns, decodes it with `answered(.., BondRecord::read)`, and zeroes the vector.
+  - The new `Stack::store_bond` encodes the record into a 1024-byte stack buffer (`BOND_FRAME`, the size the store
+    reads a request into). It sends the buffer, zeroes it, and reports success only on an `Ok` answer.
+    `on_encryption` and `OperatorView::enable` call it instead of the generated `store`.
+  - `list` and `delete` carry no key and keep the generated client.
+- **Shared helpers.**
+  - `exchange(chan, request)` sends a hand-encoded request over `ChannelTransport::call` with no deadline, as the
+    generated clients here used none either. It closes any capability that arrives with the reply.
+  - `answered(reply, read)` checks the correlation and the `result` tag exactly as the generated decoders do.
+- **Wire compatibility.** The frames are byte for byte what the generated clients wrote. They were compared
+  against `hci_transport::Client::send`, `bluetooth_bond_store::Client::lookup` and `store`.
+- **The milestone sentence.** `docs/todo/P02M0180.md` now records these IPC copies under the bond item, so its
+  account of what is zeroed matches the code.
+
+## Unresolved 2 - Open items: ACCEPTED as stated; no code change
+
+Both items stand as the re-audit says. None of them is a defect this round can fix; each is a decision for the
+owner:
+- no shipping component holds `bluetooth-operator`;
+- mapping allow/deny to DeviceManager's device policy awaits acceptance;
+- the broker-based InputService slot awaits acceptance.
+
+A shipping operator would be a new trusted component, such as a command-line tool in the style of `lsdev`'s
+device-policy verbs, or a settings application, and choosing it is the owner's call.
+
+## Verification
+
+- **Static checks.** `cargo check` of `bluetooth_service` and `rustfmt --check` are clean, and
+  `./check.sh --gate source-hygiene` passes.
+- **x86_64 build and image.**
+  - `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64` passes in 164 s, with the shared-image provider inventory
+    `match`.
+  - `LIBER_DEVELOPMENT=1 ./image.sh --format iso --dma-mode enforcing-required` passes.
+- **The gate: `./check.sh --gate bluetooth-service` PASS in 840 s (00:41 to 00:55Z).** Every row passed:
+  `btread`, `pair`, `deny`, `limits`, `exhaust`, `refund`, `loss`, `reuse` after the restart, `reuse` after the
+  cold reboot, and `forget`. The rows exercise the new paths as follows:
+  - `pair` sends every HCI command, the Diffie-Hellman key event and `store_bond` through them;
+  - both `reuse` rows encrypt with a key read through the new `lookup`;
+  - `forget` and the listings still use the generated client.
+- **Cross builds.** `./build.sh --arch aarch64` passes in 158 s, and `./build.sh --arch riscv64` passes.
+  - The first RISC-V attempt died when its `cargo build` of the services crate hit a segmentation fault. That is
+    this machine's known intermittent toolchain crash, and the retry built in 36 s.
+  - The provider inventory is `match` on all three targets. The dynamic program's new imports are
+    `HciPacketKind::encode`, `PeerAddress::encode`, `BondRecord::encode`, `BondRecord::read` and the `wire`
+    reader, and all of them come from providers it already declares.

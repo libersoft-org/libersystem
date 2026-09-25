@@ -889,3 +889,32 @@ This is unchanged: `ipv6-peer` still does not pass. The decision is still the ow
 so the new services start after `config_service` and `network_service`, or accept the result.
 
 The delay does not come from ModemService's own code. That is why it costs only the one point.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0183 (2026-09-25T01:01:42Z):
+
+## Unresolved - The run item (Finding 2) is still open: ACCEPTED as stated; no code change
+
+The statement is accurate, and nothing in this milestone's code can close the item:
+
+- **On the shipping image, the failures are not in this job's code.** `./verify.sh` builds its gates on the
+  shipping image, and there the quiet row passes. The rows that failed were `hostile-quote` and `budgets`, and
+  they had two causes:
+  - a console line typed split after its first character;
+  - the peer's single early IPv4 ping.
+
+  Both lie in ConsoleService's line discipline, `guest-console.py` and the gate itself, which are unchanged since
+  before this job.
+- **The job's one contribution does not come from ModemService.** On the development image, NetworkService starts
+  about 2.5 s later. That delay comes from seven services of P02M0180 to P02M0187 placed ahead of
+  `config_service`. ModemService starts after `network_service`.
+- **Moving those services would not close the item.**
+  - It would change the boot order of seven services outside this milestone.
+  - By the measurement recorded in the milestone, it would put the development image's third solicitation at
+    the very end of the capture rather than safely inside it.
+  - It would not touch the two causes above.
+
+The item therefore needs the owner's decision, as the milestone records: reorder the services, give the quiet row
+more room, or accept the gate's state. The milestone stays open on this item alone. No code of this milestone
+changed in this round.

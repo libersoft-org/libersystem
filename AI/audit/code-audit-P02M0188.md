@@ -913,3 +913,16 @@ The fix for Finding 1 is correct:
 
 The registration item is still open. It waits for the owner's `./verify.sh --plan` and `./verify.sh` run. No code
 change is needed.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0188 (2026-09-25T01:01:42Z):
+
+## Unresolved - The registration item is still open: ACCEPTED as stated; no code change
+
+The gate is registered in all three places. The item waits only for the owner's `./verify.sh --plan` and
+`./verify.sh` run, and that run is the owner's to start. Once it passes, the item can be ticked and the milestone
+closed.
+
+No code of this milestone changed in this round, so the `qemu-admin-path` pass recorded for the previous round
+still describes the current code.
