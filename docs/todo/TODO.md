@@ -271,6 +271,15 @@ it gets the shape that driver needed and no other; so each `yes` is a milestone 
 - [ ] [P02M0188 - A trusted administrative path for high-risk operations](P02M0188.md) - OPEN (2026-09-24): `qemu-admin-path` passes on x86_64 and fails with either the protected presentation or the executor boundary bypassed, and the cross-builds pass; open is `./verify.sh`, which `--plan` answers with FULL verification - the owner's run, scheduled after P02M0099 and P02M0103.
 - [ ] [P02M0189 - Where the system's time goes, measured layer by layer](P02M0189.md)
 
+**THE OWNER'S FOUR (2026-09-25).** Answering the decision list P02M0099 and P02M0103 ended on, the owner
+asked for four milestones of their own - each a thing a person or a third-party developer can use, not a
+driver growing its own destination.
+
+- [ ] [P02M0190 - TPM 2.0 for applications: a provider, a typed API and a demonstration tool](P02M0190.md) - the library under the binding is done in P02M0099; this adds the driver process, `liber:tpm@1` with split grants, and the `tpm` tool with a `swtpm`-backed gate. Requires the first step of the firmware-node device identity, which is put to the owner separately.
+- [ ] [P02M0191 - Port I/O as a capability: a range-scoped authority for userspace drivers](P02M0191.md) - a `PortRange` object enforced by the TSS I/O bitmap, handed over by DeviceManager with the claim, and the early console's handoff; the 16550 driver in P02M0099 consumes it.
+- [ ] [P02M0192 - Gamepads: an input vocabulary, the USB mapping and a gamepad test tool](P02M0192.md) - the gamepad record and stream in `liber:input@1`, the HID mapping P02M0099 held back for want of it, and the text tool `gamepad` showing which button is pressed on which of two gamepads.
+- [ ] [P02M0193 - soft2d on several cores: parallel tile rendering over the system's worker pool](P02M0193.md) - the 2D half of what P02M0103 built for 3D: per-lane scratch within the ceiling, glyphs rasterised at prepare, the unit of work chosen by measurement, and the scalar reference holding every parallel frame.
+
 ### Definition of done (phase 2)
 
 Done when the capability-scoped appliance provides networking, wall-clock time,
