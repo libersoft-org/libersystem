@@ -1538,6 +1538,17 @@ stage = "volume"
 destination = "bin/lsfont.lsexe"
 providers = ["base-proto", "font-client", "lsrt"]
 
+# THE BLUETOOTH OPERATOR COMMAND, the one shipping holder of the operator authority: without it a machine can
+# list its radios and never pair anything.
+[[programs]]
+name = "btctl"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/btctl.lsexe"
+providers = ["bluetooth-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+
 [[programs]]
 name = "lsirq"
 owner = "tools"
@@ -3225,442 +3236,6 @@ interface = "liber:device@1/provider-catalogue"
 kinds = ["audio"]
 presence = "optional"
 
-# THE HOST STACK ABOVE HCI, and the one program on this machine that parses a stranger's radio
-# packets - which is why it holds so little. No device claim, no DMA and no link key at rest: the
-# controller comes from the catalogue, the keys from the bond store over a private capability, and
-# the pointer it produces leaves over a typed channel to InputService. Its Domain is sized by the
-# supervisor from the figures the milestone states.
-#
-# THREE ROOTS FOR THREE AUTHORITIES. What a connection may do is decided by the root it was minted
-# from, so the read root, the operator root and the profile root are the whole of the access
-# argument - a component holding one reaches nothing the others carry.
-[[services]]
-name = "bluetooth_service"
-program = "bluetooth_service"
-restart = "transparent"
-state_class = "reconstructible"
-state_scope = "service"
-dependencies = ["log_service", "process_service", "device_manager", "bluetooth_bond_store"]
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["bluetooth-hci"]
-presence = "optional"
-
-# THE BOND STORE'S ONE CAPABILITY, and this service is its only holder.
-[[services.roles]]
-tag = "BONDS"
-kind = "client"
-provider = "bluetooth_bond_store"
-source = "SERVE"
-interface = "liber:bluetooth@1/bluetooth-bond-store"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:bluetooth@1/bluetooth"
-
-[[services.roles]]
-tag = "OPERATOR"
-kind = "serve-root"
-provider = "self"
-interface = "liber:bluetooth@1/bluetooth-operator"
-
-[[services.roles]]
-tag = "PROFILE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:bluetooth@1/bluetooth-profile"
-
-# POWER STATE, NORMALISED, AND THE FEW DEVICE CONTROLS AN OPERATOR MAY USE. It consumes every
-# `power-source` publication through a catalogue connection minted for that kind alone, and serves two
-# roots: STATE, which enumerates and subscribes and can change nothing, and CONTROL, which switches an
-# output a device advertises. It holds no system-power client: shutting the machine down is
-# SystemManager's, and nothing here can ask for it.
-#
-# TRANSPARENT AND RECONSTRUCTIBLE. Everything it knows, it re-reads from the catalogue: a restarted
-# instance takes a fresh snapshot from every provider and starts a new epoch, and its subscribers,
-# whose streams closed with the old instance, subscribe again.
-[[services]]
-name = "power_service"
-program = "power_service"
-restart = "transparent"
-state_class = "reconstructible"
-state_scope = "service"
-dependencies = ["log_service", "process_service", "device_manager"]
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["power-source"]
-presence = "optional"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:power@1/power"
-
-[[services.roles]]
-tag = "CONTROL"
-kind = "serve-root"
-provider = "self"
-interface = "liber:power@1/power-control"
-
-# SMART-CARD READERS, EXCLUSIVE EXPIRING TRANSACTIONS AND A BOUNDED SET OF PIV OPERATIONS. It consumes
-# every `smartcard-reader` publication through a catalogue connection minted for that kind alone, and
-# serves ONE root: ADMIN, the minting endpoint PermissionManager resolves through the broker. There is no
-# public root - every application connection is minted there, for one configured reader, one set of
-# operations and the life of one launched component. No device claim, no input capability, no storage:
-# a PIN never reaches this service, because the reader's own keypad collects it.
-#
-# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance opens a new session with every provider - which
-# the provider answers only once it has drained what the old one left - and every grant, having died
-# with the old instance, is minted again at the next launch.
-[[services]]
-name = "smartcard_service"
-program = "smartcard_service"
-restart = "transparent"
-state_class = "reconstructible"
-state_scope = "service"
-dependencies = ["log_service", "process_service", "device_manager"]
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["smartcard-reader"]
-presence = "optional"
-
-[[services.roles]]
-tag = "ADMIN"
-kind = "serve-root"
-provider = "self"
-interface = "liber:smartcard@1/smartcard-admin"
-
-# MODEMS: SIM, registration and the one data context this system supports. It consumes every `modem`
-# publication through a catalogue connection minted for that kind alone, and serves two roots: SERVE,
-# observation that names no subscriber and changes nothing, and ADMIN, the minting endpoint
-# PermissionManager alone resolves through the broker - data, identity and management are each minted
-# there, per launch, for one modem and one SIM. LINK is its connection to NetworkService's private link
-# administration, minted from the root ServiceManager keeps: the only way a context becomes an uplink.
-#
-# AFTER NETWORKSERVICE, because a context is installed there: activation reserves NetworkService's
-# admission before the modem is asked to do anything.
-#
-# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every modem handle and every
-# grant of the old one names nothing, every context it held ended with it - NetworkService saw its packet
-# channel close - and a reconnect needs a fresh grant and a fresh activation.
-[[services]]
-name = "modem_service"
-program = "modem_service"
-restart = "transparent"
-state_class = "reconstructible"
-state_scope = "service"
-dependencies = ["log_service", "device_manager", "network_service"]
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["modem"]
-presence = "optional"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:modem@1/modem"
-
-[[services.roles]]
-tag = "ADMIN"
-kind = "serve-root"
-provider = "self"
-interface = "liber:modem@1/modem-admin"
-
-[[services.roles]]
-tag = "LINK"
-kind = "factory"
-provider = "network_service"
-source = "LINKADMIN"
-interface = "liber:network@1/network-link-admin"
-presence = "optional"
-
-# CAMERAS: formats, and capture into buffers the client owns. It consumes every `camera` publication through a
-# catalogue connection minted for that kind alone, and serves two roots: SERVE, inventory that lists and
-# describes and can start nothing, and ADMIN, the minting endpoint PermissionManager alone resolves through
-# the broker - every capture connection is minted there, for one camera and the life of one component.
-# It holds no display client: capture never passes through the screen's service.
-#
-# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every camera handle and grant
-# of the old one names nothing, every stream it ran stopped when its provider saw the old session close,
-# and a client is granted again and registers its buffers again.
-[[services]]
-name = "camera_service"
-program = "camera_service"
-restart = "transparent"
-state_class = "reconstructible"
-state_scope = "service"
-dependencies = ["log_service", "process_service", "device_manager"]
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["camera"]
-presence = "optional"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:camera@1/camera"
-
-[[services.roles]]
-tag = "ADMIN"
-kind = "serve-root"
-provider = "self"
-interface = "liber:camera@1/camera-admin"
-
-# MIDI 1.0 RECEIVE: one bounded queue per endpoint, for one reader. It consumes every `midi` publication
-# through a catalogue connection minted for that kind alone, decodes their packet batches with the driver
-# library's staged decoder, and serves two roots: SERVE, inventory that lists endpoints and opens nothing,
-# and ADMIN, the minting endpoint PermissionManager alone resolves through the broker. No broker, no router,
-# no output.
-#
-# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every source identity of the old
-# one names nothing, every receiver ended with it, and a client is granted again.
-[[services]]
-name = "midi_service"
-program = "midi_service"
-restart = "transparent"
-state_class = "reconstructible"
-state_scope = "service"
-dependencies = ["log_service", "process_service", "device_manager"]
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["midi"]
-presence = "optional"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:midi@1/midi"
-
-[[services.roles]]
-tag = "ADMIN"
-kind = "serve-root"
-provider = "self"
-interface = "liber:midi@1/midi-admin"
-
-# PRINT JOBS: an application stages an already-rendered document into a reservation and explicitly submits
-# it, and the service sends it to a `printer` publication by acknowledged prefixes. It consumes that kind
-# through a catalogue connection minted for it alone, and serves one root, SERVE, from which PermissionManager
-# mints a fresh connection per `spool` grant - the context that grant's jobs are charged to. No application
-# reaches a catalogue, a backend, a reset or a raw endpoint.
-#
-# ESCALATE AND EPHEMERAL. Jobs live in RAM: a restarted spooler has lost its queue and closed every job
-# capability of the old one, and a missing final status is an unknown outcome, never a reason to replay.
-[[services]]
-name = "spool_service"
-program = "spool_service"
-restart = "escalate"
-state_class = "ephemeral"
-state_scope = "service"
-dependencies = ["log_service", "device_manager", "process_service"]
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:spool@1/spool"
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["printer"]
-presence = "optional"
-
-# IMPORT FROM A CAMERA, READ-ONLY: devices, storages, a bounded handle snapshot paged for metadata, and one
-# object at a time in bounded chunks, validated at this one boundary. It consumes every `ptp-transport`
-# publication through a catalogue connection minted for that kind alone and serves one root, SERVE, from
-# which PermissionManager mints a fresh connection per `media-import` grant. It holds no storage: a client
-# writes imported bytes wherever it may, and publishes them only after a complete ending.
-#
-# ESCALATE AND EPHEMERAL. A restarted instance holds no session, snapshot or transfer of the old one, and every
-# identity the old one issued is stale.
-[[services]]
-name = "media_import_service"
-program = "media_import_service"
-restart = "escalate"
-state_class = "ephemeral"
-state_scope = "service"
-dependencies = ["log_service", "device_manager", "process_service"]
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:import@1/media-import"
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["ptp-transport"]
-presence = "optional"
-
-# THE TRUSTED ADMINISTRATIVE PATH: one person's confirmation, on a protected screen, of one bound high-risk
-# operation, and at most one attempt at it. PermissionManager mints a request connection per authorized
-# launch from FACTORY, bound to the task that launch prepared; the executors are `admin-executor`
-# publications - drivers DeviceManager bound - reached through a catalogue connection minted for that kind
-# alone; the protected display and keyboard are roots their services hand this service and nothing else.
-#
-# ITS DECISIONS ARE DURABLE AND ITS AUTHORITY IS NOT. The journal in `vol://system/admin-audit` survives a
-# restart and a reboot; a grant never does - a restarted instance starts a fresh epoch with fresh wiring, and
-# nothing it reads back is authority. TRANSPARENT, because that is exactly what a restart gives: the requests
-# and grants of the instance that ended die with its channels, and the next one is a clean start.
-[[services]]
-name = "admin_service"
-program = "admin_service"
-restart = "transparent"
-state_class = "durable"
-state_scope = "service"
-state_storage = "vol://system/admin-audit"
-dependencies = [
-	"log_service",
-	"process_service",
-	"storage_service",
-	"time_service",
-	"display_service",
-	"input_service",
-	"device_manager",
-]
-
-# THE JOURNAL'S DIRECTORY, minted from the admin root and scoped to `vol://system/admin-audit` in the
-# bootstrap, beside the other scoped mints: a role cannot carry the path.
-[[services.roles]]
-tag = "JOURNAL"
-kind = "factory"
-provider = "storage_service"
-source = "ADMIN"
-interface = "liber:storage@1/volume"
-
-# A fresh connection, for the wall-clock reading a record may carry. Never an expiry: deadlines are
-# monotonic.
-[[services.roles]]
-tag = "TIME"
-kind = "factory"
-provider = "time_service"
-interface = "liber:time@1/time"
-presence = "optional"
-
-[[services.roles]]
-tag = "DISPLAY"
-kind = "client"
-provider = "display_service"
-source = "TRUSTED"
-interface = "liber:display@1/display-trusted"
-presence = "optional"
-
-[[services.roles]]
-tag = "INPUT"
-kind = "client"
-provider = "input_service"
-source = "TRUSTED"
-interface = "liber:input@1/input-trusted"
-presence = "optional"
-
-[[services.roles]]
-tag = "CATALOGUE"
-kind = "factory"
-provider = "device_manager"
-source = "CATADMIN"
-interface = "liber:device@1/provider-catalogue"
-kinds = ["admin-executor"]
-presence = "optional"
-
-# PERMISSIONMANAGER'S FACTORY, resolved by name through the broker: PermissionManager holds no role of this
-# service, so neither waits for the other to start.
-[[services.roles]]
-tag = "FACTORY"
-kind = "serve-root"
-provider = "self"
-interface = "liber:admin@1/admin-factory"
-
-# THE OPERATOR'S READ VIEW of the journal. No requester holds it.
-[[services.roles]]
-tag = "AUDIT"
-kind = "serve-root"
-provider = "self"
-interface = "liber:admin@1/admin-journal"
-
-# THE TEST CONTROLS, served in a development image alone; a shipping build closes this root on arrival.
-[[services.roles]]
-tag = "TEST"
-kind = "serve-root"
-provider = "self"
-interface = "liber:admin@1/admin-test"
-
-# THE CONFINED KEEPER OF LINK KEYS. It runs in a Domain of its own with one capability in and one
-# out: a volume client scoped to its own state directory, and the private endpoint BluetoothService
-# reaches it on. The key could have lived inside BluetoothService, and then the process that parses a
-# stranger's radio packets would be the process holding every link key on the machine.
-# ESCALATE AND NOT TRANSPARENT, because nothing could use a replacement: BluetoothService holds the
-# one connection to this store, handed over at bring-up, and a restarted store would be serving a
-# root nobody holds. A crash is therefore a failure, and BluetoothService's answer to a store that
-# does not answer is the one the milestone asks for - the bonding attempt ends and no transient bond
-# is kept in its place.
-[[services]]
-name = "bluetooth_bond_store"
-program = "bluetooth_bond_store"
-restart = "escalate"
-state_class = "durable"
-state_scope = "service"
-state_storage = "vol://system/state/bluetooth-bonds"
-dependencies = ["log_service", "process_service", "storage_service"]
-
-# MINTED FROM THE ADMIN ROOT AND SCOPED TO ONE DIRECTORY, the same shape ConfigService's persistence
-# client has. The plan can say the role is a factory of that endpoint; the directory is the part a
-# role cannot carry, and it is named beside the other scoped mints in the bootstrap.
-[[services.roles]]
-tag = "STORAGE"
-kind = "factory"
-provider = "storage_service"
-source = "ADMIN"
-interface = "liber:storage@1/volume"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:bluetooth@1/bluetooth-bond-store"
-
 [[services]]
 name = "config_service"
 program = "config_service"
@@ -4968,6 +4543,448 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:storage@1/volume"
+
+# THE DEVICE-CLASS SERVICES - Bluetooth and its bond store, power, smart cards, the modem, the camera, MIDI,
+# printing, media import and administrative confirmation - AFTER EVERY SERVICE THE SYSTEM HAD BEFORE THEM.
+# Bring-up walks this list in order and starts each service whose dependencies are up, one at a time, so a
+# service placed ahead of the network is one the network waits for. Placed at the front, these held
+# NetworkService back by about two and a half seconds, and none of them needs to start before it.
+
+# THE HOST STACK ABOVE HCI, and the one program on this machine that parses a stranger's radio
+# packets - which is why it holds so little. No device claim, no DMA and no link key at rest: the
+# controller comes from the catalogue, the keys from the bond store over a private capability, and
+# the pointer it produces leaves over a typed channel to InputService. Its Domain is sized by the
+# supervisor from the figures the milestone states.
+#
+# THREE ROOTS FOR THREE AUTHORITIES. What a connection may do is decided by the root it was minted
+# from, so the read root, the operator root and the profile root are the whole of the access
+# argument - a component holding one reaches nothing the others carry.
+[[services]]
+name = "bluetooth_service"
+program = "bluetooth_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager", "bluetooth_bond_store"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["bluetooth-hci"]
+presence = "optional"
+
+# THE BOND STORE'S ONE CAPABILITY, and this service is its only holder.
+[[services.roles]]
+tag = "BONDS"
+kind = "client"
+provider = "bluetooth_bond_store"
+source = "SERVE"
+interface = "liber:bluetooth@1/bluetooth-bond-store"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth"
+
+[[services.roles]]
+tag = "OPERATOR"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-operator"
+
+[[services.roles]]
+tag = "PROFILE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-profile"
+
+# POWER STATE, NORMALISED, AND THE FEW DEVICE CONTROLS AN OPERATOR MAY USE. It consumes every
+# `power-source` publication through a catalogue connection minted for that kind alone, and serves two
+# roots: STATE, which enumerates and subscribes and can change nothing, and CONTROL, which switches an
+# output a device advertises. It holds no system-power client: shutting the machine down is
+# SystemManager's, and nothing here can ask for it.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. Everything it knows, it re-reads from the catalogue: a restarted
+# instance takes a fresh snapshot from every provider and starts a new epoch, and its subscribers,
+# whose streams closed with the old instance, subscribe again.
+[[services]]
+name = "power_service"
+program = "power_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["power-source"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:power@1/power"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+interface = "liber:power@1/power-control"
+
+# SMART-CARD READERS, EXCLUSIVE EXPIRING TRANSACTIONS AND A BOUNDED SET OF PIV OPERATIONS. It consumes
+# every `smartcard-reader` publication through a catalogue connection minted for that kind alone, and
+# serves ONE root: ADMIN, the minting endpoint PermissionManager resolves through the broker. There is no
+# public root - every application connection is minted there, for one configured reader, one set of
+# operations and the life of one launched component. No device claim, no input capability, no storage:
+# a PIN never reaches this service, because the reader's own keypad collects it.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance opens a new session with every provider - which
+# the provider answers only once it has drained what the old one left - and every grant, having died
+# with the old instance, is minted again at the next launch.
+[[services]]
+name = "smartcard_service"
+program = "smartcard_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["smartcard-reader"]
+presence = "optional"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:smartcard@1/smartcard-admin"
+
+# MODEMS: SIM, registration and the one data context this system supports. It consumes every `modem`
+# publication through a catalogue connection minted for that kind alone, and serves two roots: SERVE,
+# observation that names no subscriber and changes nothing, and ADMIN, the minting endpoint
+# PermissionManager alone resolves through the broker - data, identity and management are each minted
+# there, per launch, for one modem and one SIM. LINK is its connection to NetworkService's private link
+# administration, minted from the root ServiceManager keeps: the only way a context becomes an uplink.
+#
+# AFTER NETWORKSERVICE, because a context is installed there: activation reserves NetworkService's
+# admission before the modem is asked to do anything.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every modem handle and every
+# grant of the old one names nothing, every context it held ended with it - NetworkService saw its packet
+# channel close - and a reconnect needs a fresh grant and a fresh activation.
+[[services]]
+name = "modem_service"
+program = "modem_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "device_manager", "network_service"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["modem"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:modem@1/modem"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:modem@1/modem-admin"
+
+[[services.roles]]
+tag = "LINK"
+kind = "factory"
+provider = "network_service"
+source = "LINKADMIN"
+interface = "liber:network@1/network-link-admin"
+presence = "optional"
+
+# CAMERAS: formats, and capture into buffers the client owns. It consumes every `camera` publication through a
+# catalogue connection minted for that kind alone, and serves two roots: SERVE, inventory that lists and
+# describes and can start nothing, and ADMIN, the minting endpoint PermissionManager alone resolves through
+# the broker - every capture connection is minted there, for one camera and the life of one component.
+# It holds no display client: capture never passes through the screen's service.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every camera handle and grant
+# of the old one names nothing, every stream it ran stopped when its provider saw the old session close,
+# and a client is granted again and registers its buffers again.
+[[services]]
+name = "camera_service"
+program = "camera_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["camera"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:camera@1/camera"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:camera@1/camera-admin"
+
+# MIDI 1.0 RECEIVE: one bounded queue per endpoint, for one reader. It consumes every `midi` publication
+# through a catalogue connection minted for that kind alone, decodes their packet batches with the driver
+# library's staged decoder, and serves two roots: SERVE, inventory that lists endpoints and opens nothing,
+# and ADMIN, the minting endpoint PermissionManager alone resolves through the broker. No broker, no router,
+# no output.
+#
+# TRANSPARENT AND RECONSTRUCTIBLE. A restarted instance is a new incarnation: every source identity of the old
+# one names nothing, every receiver ended with it, and a client is granted again.
+[[services]]
+name = "midi_service"
+program = "midi_service"
+restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
+dependencies = ["log_service", "process_service", "device_manager"]
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["midi"]
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:midi@1/midi"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:midi@1/midi-admin"
+
+# PRINT JOBS: an application stages an already-rendered document into a reservation and explicitly submits
+# it, and the service sends it to a `printer` publication by acknowledged prefixes. It consumes that kind
+# through a catalogue connection minted for it alone, and serves one root, SERVE, from which PermissionManager
+# mints a fresh connection per `spool` grant - the context that grant's jobs are charged to. No application
+# reaches a catalogue, a backend, a reset or a raw endpoint.
+#
+# ESCALATE AND EPHEMERAL. Jobs live in RAM: a restarted spooler has lost its queue and closed every job
+# capability of the old one, and a missing final status is an unknown outcome, never a reason to replay.
+[[services]]
+name = "spool_service"
+program = "spool_service"
+restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
+dependencies = ["log_service", "device_manager", "process_service"]
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:spool@1/spool"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["printer"]
+presence = "optional"
+
+# IMPORT FROM A CAMERA, READ-ONLY: devices, storages, a bounded handle snapshot paged for metadata, and one
+# object at a time in bounded chunks, validated at this one boundary. It consumes every `ptp-transport`
+# publication through a catalogue connection minted for that kind alone and serves one root, SERVE, from
+# which PermissionManager mints a fresh connection per `media-import` grant. It holds no storage: a client
+# writes imported bytes wherever it may, and publishes them only after a complete ending.
+#
+# ESCALATE AND EPHEMERAL. A restarted instance holds no session, snapshot or transfer of the old one, and every
+# identity the old one issued is stale.
+[[services]]
+name = "media_import_service"
+program = "media_import_service"
+restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
+dependencies = ["log_service", "device_manager", "process_service"]
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:import@1/media-import"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["ptp-transport"]
+presence = "optional"
+
+# THE TRUSTED ADMINISTRATIVE PATH: one person's confirmation, on a protected screen, of one bound high-risk
+# operation, and at most one attempt at it. PermissionManager mints a request connection per authorized
+# launch from FACTORY, bound to the task that launch prepared; the executors are `admin-executor`
+# publications - drivers DeviceManager bound - reached through a catalogue connection minted for that kind
+# alone; the protected display and keyboard are roots their services hand this service and nothing else.
+#
+# ITS DECISIONS ARE DURABLE AND ITS AUTHORITY IS NOT. The journal in `vol://system/admin-audit` survives a
+# restart and a reboot; a grant never does - a restarted instance starts a fresh epoch with fresh wiring, and
+# nothing it reads back is authority. TRANSPARENT, because that is exactly what a restart gives: the requests
+# and grants of the instance that ended die with its channels, and the next one is a clean start.
+[[services]]
+name = "admin_service"
+program = "admin_service"
+restart = "transparent"
+state_class = "durable"
+state_scope = "service"
+state_storage = "vol://system/admin-audit"
+dependencies = [
+	"log_service",
+	"process_service",
+	"storage_service",
+	"time_service",
+	"display_service",
+	"input_service",
+	"device_manager",
+]
+
+# THE JOURNAL'S DIRECTORY, minted from the admin root and scoped to `vol://system/admin-audit` in the
+# bootstrap, beside the other scoped mints: a role cannot carry the path.
+[[services.roles]]
+tag = "JOURNAL"
+kind = "factory"
+provider = "storage_service"
+source = "ADMIN"
+interface = "liber:storage@1/volume"
+
+# A fresh connection, for the wall-clock reading a record may carry. Never an expiry: deadlines are
+# monotonic.
+[[services.roles]]
+tag = "TIME"
+kind = "factory"
+provider = "time_service"
+interface = "liber:time@1/time"
+presence = "optional"
+
+[[services.roles]]
+tag = "DISPLAY"
+kind = "client"
+provider = "display_service"
+source = "TRUSTED"
+interface = "liber:display@1/display-trusted"
+presence = "optional"
+
+[[services.roles]]
+tag = "INPUT"
+kind = "client"
+provider = "input_service"
+source = "TRUSTED"
+interface = "liber:input@1/input-trusted"
+presence = "optional"
+
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "CATADMIN"
+interface = "liber:device@1/provider-catalogue"
+kinds = ["admin-executor"]
+presence = "optional"
+
+# PERMISSIONMANAGER'S FACTORY, resolved by name through the broker: PermissionManager holds no role of this
+# service, so neither waits for the other to start.
+[[services.roles]]
+tag = "FACTORY"
+kind = "serve-root"
+provider = "self"
+interface = "liber:admin@1/admin-factory"
+
+# THE OPERATOR'S READ VIEW of the journal. No requester holds it.
+[[services.roles]]
+tag = "AUDIT"
+kind = "serve-root"
+provider = "self"
+interface = "liber:admin@1/admin-journal"
+
+# THE TEST CONTROLS, served in a development image alone; a shipping build closes this root on arrival.
+[[services.roles]]
+tag = "TEST"
+kind = "serve-root"
+provider = "self"
+interface = "liber:admin@1/admin-test"
+
+# THE CONFINED KEEPER OF LINK KEYS. It runs in a Domain of its own with one capability in and one
+# out: a volume client scoped to its own state directory, and the private endpoint BluetoothService
+# reaches it on. The key could have lived inside BluetoothService, and then the process that parses a
+# stranger's radio packets would be the process holding every link key on the machine.
+# ESCALATE AND NOT TRANSPARENT, because nothing could use a replacement: BluetoothService holds the
+# one connection to this store, handed over at bring-up, and a restarted store would be serving a
+# root nobody holds. A crash is therefore a failure, and BluetoothService's answer to a store that
+# does not answer is the one the milestone asks for - the bonding attempt ends and no transient bond
+# is kept in its place.
+[[services]]
+name = "bluetooth_bond_store"
+program = "bluetooth_bond_store"
+restart = "escalate"
+state_class = "durable"
+state_scope = "service"
+state_storage = "vol://system/state/bluetooth-bonds"
+dependencies = ["log_service", "process_service", "storage_service"]
+
+# MINTED FROM THE ADMIN ROOT AND SCOPED TO ONE DIRECTORY, the same shape ConfigService's persistence
+# client has. The plan can say the role is a factory of that endpoint; the directory is the part a
+# role cannot carry, and it is named beside the other scoped mints in the bootstrap.
+[[services.roles]]
+tag = "STORAGE"
+kind = "factory"
+provider = "storage_service"
+source = "ADMIN"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:bluetooth@1/bluetooth-bond-store"
 
 [[libraries]]
 name = "adpcm"

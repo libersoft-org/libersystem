@@ -64,6 +64,7 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("lsvol", "lsvol [json] - list the volumes with size / used / free"),
 	("lsblk", "lsblk [json] - list the block devices and their volumes"),
 	("lsdev", "lsdev [json] - list the device nodes"),
+	("btctl", "btctl [-c N] [list|scan|pair|enable|disable|forget|power] ... - Bluetooth controllers, pairing and bonds"),
 	("lscpu", "lscpu [json] - print the CPU inventory"),
 	("lsmem", "lsmem [json] - print the boot memory map"),
 	("lsirq", "lsirq [json] - print the device-interrupt vectors"),

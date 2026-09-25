@@ -188,6 +188,11 @@ name = "lsfont"
 path = "src/lsfont.rs"
 
 [[bin]]
+# THE BLUETOOTH OPERATOR COMMAND: the one shipping holder of the operator authority.
+name = "btctl"
+path = "src/btctl.rs"
+
+[[bin]]
 name = "config"
 path = "src/config.rs"
 

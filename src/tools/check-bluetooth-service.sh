@@ -26,6 +26,10 @@
 #                                 the fingerprint of the key the host presented, and it is the
 #                                 fingerprint the first boot's pairing produced; and no pairing happened
 #   a forget is final           after `btcheck forget` the bond is gone and the cursor does not move
+#   the shipping operator       then `btctl` - the one component a shipping image grants the operator
+#     pairs from a scan           authority - scans, pairs the mouse again from what the scan reported,
+#                                 makes it an input source and lists it; the fixture reports that one
+#                                 pairing, and none before the forget
 #   the Domains are finite      both services run under Domains whose six limits are the stated
 #     and refunded                figures, read from ProcessService's accounting; a stopped service's
 #                                 Domain is gone, and the restarted one has the same limits again
@@ -57,7 +61,7 @@ guest_gate_arch "$@"
 
 fail() { guest_gate_fail "$@"; }
 
-guest_gate_require_programs bt_fixture btcheck btread bluetooth_service bluetooth_bond_store
+guest_gate_require_programs bt_fixture btcheck btread btctl bluetooth_service bluetooth_bond_store
 
 # THE FIXTURE'S DEVICE, at the address its registry entry pins. A machine without it never binds the
 # fixture, which is what keeps it out of every image this gate did not build.
@@ -77,7 +81,7 @@ expect() {
 	grep -qF "$line" "$lines" || {
 		echo "bluetooth-service: expected \"$line\" - $why" >&2
 		echo "--- guest log ---" >&2
-		grep -aE 'btcheck|btread|bt-fixture|BluetoothService|BluetoothBondStore' "$lines" >&2 || cat "$lines" >&2
+		grep -aE 'btcheck|btread|btctl|bt-fixture|BluetoothService|BluetoothBondStore' "$lines" >&2 || cat "$lines" >&2
 		exit 1
 	}
 	echo "bluetooth-service: $line"
@@ -137,18 +141,32 @@ reuses="$(grep -acF 'btcheck: PASS reuse' "$first" || true)"
 pairings="$(grep -acE 'bt-fixture: paired;' "$first" || true)"
 [[ "$pairings" == 1 ]] || fail "the first boot paired $pairings times; the restart must reuse the bond rather than pair again"
 
-# ---- boot two: the same disk, a cold reboot, reuse, then forget.
-guest_gate_run $'btcheck reuse\nbtcheck forget' ""
+# ---- boot two: the same disk, a cold reboot, reuse, then forget - and then the shipping operator command
+# pairing the mouse again from a scan.
+guest_gate_run $'btcheck reuse\nbtcheck forget\nbtctl scan 3\nbtctl pair c0:ff:ee:00:00:01\nbtctl enable c0:ff:ee:00:00:01\nbtctl' ""
 second="$guest_gate_work/second"
 cp "$GUEST_LINES" "$second"
-if grep -aqE 'bt-fixture: paired;' "$second"; then
-	fail "the second boot paired again; a cold reboot must reuse the stored bond"
+# Up to the forget, and after it: `btctl` pairs again on purpose, once the bond is gone.
+before_forget="$guest_gate_work/second-before-forget"
+sed '/btcheck: PASS forget/q' "$second" >"$before_forget"
+if grep -aqE 'bt-fixture: paired;' "$before_forget"; then
+	fail "the second boot paired again before the forget; a cold reboot must reuse the stored bond"
 fi
-presented="$(grep -m 1 -aoE 'bt-fixture: encryption with a key this boot never paired, key [0-9a-f]{8}' "$second" | awk '{print $NF}')"
+presented="$(grep -m 1 -aoE 'bt-fixture: encryption with a key this boot never paired, key [0-9a-f]{8}' "$before_forget" | awk '{print $NF}')"
 [[ -n "$presented" ]] || fail "the stack never encrypted on the second boot"
 [[ "$presented" == "$paired" ]] || fail "after the cold reboot the stack presented key $presented, and the pairing produced $paired"
 echo "bluetooth-service: after the cold reboot the stack presented the key the first boot's pairing produced ($presented)"
 expect "$second" "btcheck: PASS reuse" "after the cold reboot the bond must be reused and the cursor must move"
 expect "$second" "btcheck: PASS forget" "a forgotten bond must be gone and the mouse must no longer move the cursor"
 
-echo "bluetooth-service: PASS - read denial, pairing, cursor, restart reuse, cold-reboot reuse and forget"
+# ---- the shipping operator: `btctl` scans, pairs from the scan, enables and lists.
+grep -aqE 'c0:ff:ee:00:00:01 random +-?[0-9]+ dBm' "$second" || fail "btctl scan did not report the fixture mouse"
+echo "bluetooth-service: btctl scan reported the fixture mouse"
+expect "$second" "bonded: encrypted, not authenticated" "btctl pair must reach a bond from the scan, and say what Just Works does not prove"
+expect "$second" "c0:ff:ee:00:00:01 random is an input source" "btctl enable must make the bonded mouse an input source"
+grep -aqE 'bonded c0:ff:ee:00:00:01 random ".*" - input enabled' "$second" || fail "btctl must list the new bond as an enabled input source"
+echo "bluetooth-service: btctl lists the new bond as an enabled input source"
+repaired="$(sed -n '/btcheck: PASS forget/,$p' "$second" | grep -acE 'bt-fixture: paired;' || true)"
+[[ "$repaired" == 1 ]] || fail "the fixture reported $repaired pairings after the forget; btctl's one is expected"
+
+echo "bluetooth-service: PASS - read denial, pairing, cursor, restart reuse, cold-reboot reuse, forget, and the shipping operator command pairing again"

@@ -324,6 +324,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// and metadata pass is not. A build without this row is a build in which the catalogue's
 		// recovery scan cannot be issued at all.
 		b"lsfont" => Some(granted("lsfont", alloc::vec![Capability::FontCatalogue, Capability::FontAdmin])),
+		// THE BLUETOOTH OPERATOR COMMAND, and the one shipping row that grants the operator authority - which
+		// no component receives by default. The READ comes with it for the reason `lsdev` holds both: listing
+		// and scanning are how an operator finds what to pair.
+		b"btctl" => Some(granted("btctl", alloc::vec![Capability::Bluetooth, Capability::BluetoothOperator])),
 		// THE CONFORMANCE RUN HOLDS THE READ AND NOTHING ELSE. It reaches its face through the
 		// catalogue, draws into memory it allocated itself, and prints its verdict on the console it
 		// was handed - so it needs no volume, no display and no scan authority.
