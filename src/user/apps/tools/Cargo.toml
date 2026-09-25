@@ -389,6 +389,8 @@ shared-image = [
 	"ipc-client/shared-image",
 	"audio-client/shared-image",
 	"audio-client-provider/shared-image",
+	"bluetooth-client/shared-image",
+	"bluetooth-client-provider/shared-image",
 	"config-client/shared-image",
 	"config-client-provider/shared-image",
 	"device-client/shared-image",
@@ -441,6 +443,8 @@ proto = { path = "../../../proto" }
 storage-proto = { path = "../../libs/protocol/storage-proto", features = ["channel-client-impl"] }
 audio-client = { path = "../../libs/clients/audio-client", optional = true }
 audio-client-provider = { path = "../../libs/clients/audio-client-provider", optional = true }
+bluetooth-client = { path = "../../libs/clients/bluetooth-client", optional = true }
+bluetooth-client-provider = { path = "../../libs/clients/bluetooth-client-provider", optional = true }
 network-client = { path = "../../libs/clients/network-client", optional = true }
 network-client-provider = { path = "../../libs/clients/network-client-provider", optional = true }
 config-client = { path = "../../libs/clients/config-client", optional = true }

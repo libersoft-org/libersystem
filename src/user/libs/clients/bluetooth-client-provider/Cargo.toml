@@ -1,0 +1,19 @@
+[package]
+# The product version lives only in /product.conf; Cargo's optional package version is unused here and
+# omitted.
+name = "bluetooth-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem Bluetooth channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["bluetooth-proto/shared-image"]
+
+[dependencies]
+bluetooth-proto = { path = "../../protocol/bluetooth-proto" }
+
+[lints.rust]
+warnings = "deny"

@@ -127,6 +127,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bluetooth-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "bluetooth-proto",
+]
+
+[[package]]
+name = "bluetooth-client-provider"
+version = "0.0.0"
+dependencies = [
+ "bluetooth-proto",
+]
+
+[[package]]
 name = "bluetooth-proto"
 version = "0.0.0"
 dependencies = [
@@ -1091,6 +1106,8 @@ dependencies = [
  "audio-client-provider",
  "audioconv",
  "audiorec",
+ "bluetooth-client",
+ "bluetooth-client-provider",
  "bmp",
  "cli",
  "config-client",

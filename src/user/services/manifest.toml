@@ -382,6 +382,14 @@ owner = "graphics-proto"
 path = "user/libs/protocol/graphics-proto"
 
 [[sources]]
+owner = "bluetooth-client"
+path = "user/libs/clients/bluetooth-client"
+
+[[sources]]
+owner = "bluetooth-client-provider"
+path = "user/libs/clients/bluetooth-client-provider"
+
+[[sources]]
 owner = "font-client"
 path = "user/libs/clients/font-client"
 
@@ -1547,7 +1555,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/btctl.lsexe"
-providers = ["bluetooth-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+providers = ["base-proto", "bluetooth-client", "lsrt"]
 
 [[programs]]
 name = "lsirq"
@@ -4547,8 +4555,9 @@ interface = "liber:storage@1/volume"
 # THE DEVICE-CLASS SERVICES - Bluetooth and its bond store, power, smart cards, the modem, the camera, MIDI,
 # printing, media import and administrative confirmation - AFTER EVERY SERVICE THE SYSTEM HAD BEFORE THEM.
 # Bring-up walks this list in order and starts each service whose dependencies are up, one at a time, so a
-# service placed ahead of the network is one the network waits for. Placed at the front, these held
-# NetworkService back by about two and a half seconds, and none of them needs to start before it.
+# service placed ahead of the network is one the network waits for - and none of these needs to start before
+# it. Measured when they were moved here: the network came up about three tenths of a second sooner, inside
+# the spread of one run, so their old place was not what delays it.
 
 # THE HOST STACK ABOVE HCI, and the one program on this machine that parses a stranger's radio
 # packets - which is why it holds so little. No device claim, no DMA and no link key at rest: the
@@ -5205,6 +5214,13 @@ owner = "inflate"
 destination = "lib/compression/inflate.lslib"
 features = []
 providers = ["lsrt"]
+
+[[libraries]]
+name = "bluetooth-client"
+owner = "bluetooth-client-provider"
+destination = "lib/clients/bluetooth-client.lslib"
+features = ["shared-image"]
+providers = ["bluetooth-proto"]
 
 [[libraries]]
 name = "font-client"

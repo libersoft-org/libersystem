@@ -18,8 +18,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use ipc_client::ChannelTransport;
-use proto::system::{Error, LaunchContext, PairingState, PeerAddress, PeerKind, SecurityLevel, bluetooth, bluetooth_operator};
+use bluetooth_client::{BluetoothClient, BluetoothOperatorClient};
+use proto::system::{Error, LaunchContext, PairingState, PeerAddress, PeerKind, SecurityLevel};
 use rt::*;
 use tools::{parse_u64, split_args};
 
@@ -142,7 +142,7 @@ fn report<T>(what: &str, outcome: Option<Result<T, Error>>) {
 
 // Every controller, and on each the peers bonded to it.
 fn list(read: u64, operator: u64) {
-	let controllers = match bluetooth::Client::new(ChannelTransport { chan: read }).controllers() {
+	let controllers = match BluetoothClient::new(read).controllers() {
 		Some(Ok(controllers)) => controllers,
 		other => return report("listing the controllers", other),
 	};
@@ -150,12 +150,12 @@ fn list(read: u64, operator: u64) {
 		print(b"no Bluetooth controller\n");
 		return;
 	}
-	let mut client = bluetooth_operator::Client::new(ChannelTransport { chan: operator });
+	let mut client = BluetoothOperatorClient::new(operator);
 	for (at, controller) in controllers.iter().enumerate() {
 		let state = if controller.powered { "on" } else { "off" };
 		let pairing = if controller.secure_connections { "" } else { ", cannot pair (no LE Secure Connections)" };
 		print(format!("controller {at}: {} - {state}{pairing}\n", address(&controller.address)).as_bytes());
-		match client.bonded(&(at as u32)) {
+		match client.bonded(at as u32) {
 			Some(Ok(peers)) if peers.is_empty() => print(b"  nothing bonded\n"),
 			Some(Ok(peers)) => {
 				for peer in &peers {
@@ -170,8 +170,8 @@ fn list(read: u64, operator: u64) {
 
 fn scan(read: u64, controller: u32, seconds: u64) {
 	let seconds = seconds.clamp(1, MAX_SCAN_SECONDS);
-	let mut client = bluetooth::Client::new(ChannelTransport { chan: read });
-	let handle = match client.scan(&controller, &((seconds * 1000) as u32)) {
+	let mut client = BluetoothClient::new(read);
+	let handle = match client.scan(controller, (seconds * 1000) as u32) {
 		Some(Ok(handle)) => handle,
 		other => return report("the scan", other),
 	};
@@ -193,11 +193,11 @@ fn scan(read: u64, controller: u32, seconds: u64) {
 }
 
 fn pair(operator: u64, controller: u32, bytes: [u8; 6], kinds: &[PeerKind]) {
-	let mut client = bluetooth_operator::Client::new(ChannelTransport { chan: operator });
+	let mut client = BluetoothOperatorClient::new(operator);
 	let mut chosen = None;
 	for &kind in kinds {
 		let peer = PeerAddress { kind, bytes: bytes.to_vec() };
-		match client.pair(&controller, &peer) {
+		match client.pair(controller, &peer) {
 			Some(Ok(())) => {
 				chosen = Some(peer);
 				break;
@@ -213,7 +213,7 @@ fn pair(operator: u64, controller: u32, bytes: [u8; 6], kinds: &[PeerKind]) {
 	print(format!("pairing with {}...\n", address(&peer)).as_bytes());
 	let deadline = clock() + PAIR_SECONDS * TICKS;
 	loop {
-		match client.progress(&controller) {
+		match client.progress(controller) {
 			Some(Ok(progress)) if progress.state == PairingState::Bonded => {
 				print(format!("bonded: {}\n", security(progress.security)).as_bytes());
 				print(format!("to use it as a pointer: btctl enable {}\n", hex(&peer.bytes)).as_bytes());
@@ -235,9 +235,9 @@ fn pair(operator: u64, controller: u32, bytes: [u8; 6], kinds: &[PeerKind]) {
 }
 
 // The bonded peer with this address, in the kind it was bonded under.
-fn bonded(client: &mut bluetooth_operator::Client<ChannelTransport>, controller: u32, text: &[u8]) -> Option<PeerAddress> {
+fn bonded(client: &mut BluetoothOperatorClient, controller: u32, text: &[u8]) -> Option<PeerAddress> {
 	let Some(bytes) = parse_address(text) else { usage() };
-	match client.bonded(&controller) {
+	match client.bonded(controller) {
 		Some(Ok(peers)) => match peers.into_iter().find(|peer| peer.address.bytes == bytes) {
 			Some(peer) => Some(peer.address),
 			None => {
@@ -253,9 +253,9 @@ fn bonded(client: &mut bluetooth_operator::Client<ChannelTransport>, controller:
 }
 
 fn enable(operator: u64, controller: u32, text: &[u8], on: bool) {
-	let mut client = bluetooth_operator::Client::new(ChannelTransport { chan: operator });
+	let mut client = BluetoothOperatorClient::new(operator);
 	let Some(peer) = bonded(&mut client, controller, text) else { return };
-	match client.enable(&controller, &peer, &on) {
+	match client.enable(controller, &peer, on) {
 		Some(Ok(())) if on => print(format!("{} is an input source\n", address(&peer)).as_bytes()),
 		Some(Ok(())) => print(format!("{} is no longer an input source\n", address(&peer)).as_bytes()),
 		other => report(if on { "enabling it" } else { "disabling it" }, other),
@@ -264,16 +264,16 @@ fn enable(operator: u64, controller: u32, text: &[u8], on: bool) {
 
 // DURABLE BEFORE IT ANSWERS: the service deletes the bond from the volume first, then drops the link.
 fn forget(operator: u64, controller: u32, text: &[u8]) {
-	let mut client = bluetooth_operator::Client::new(ChannelTransport { chan: operator });
+	let mut client = BluetoothOperatorClient::new(operator);
 	let Some(peer) = bonded(&mut client, controller, text) else { return };
-	match client.forget(&controller, &peer) {
+	match client.forget(controller, &peer) {
 		Some(Ok(())) => print(format!("{} is forgotten\n", address(&peer)).as_bytes()),
 		other => report("forgetting it", other),
 	}
 }
 
 fn power(operator: u64, controller: u32, on: bool) {
-	match bluetooth_operator::Client::new(ChannelTransport { chan: operator }).power(&controller, &on) {
+	match BluetoothOperatorClient::new(operator).power(controller, on) {
 		Some(Ok(())) if on => print(format!("controller {controller}: on - it initialises, and `btctl list` shows when it is ready\n").as_bytes()),
 		Some(Ok(())) => print(format!("controller {controller}: off\n").as_bytes()),
 		other => report("the power request", other),
