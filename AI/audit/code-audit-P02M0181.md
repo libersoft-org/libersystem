@@ -609,3 +609,22 @@ The code this milestone shares with the other reviewed milestones is unchanged b
 - the bounded launch;
 - `power_service.rs`;
 - `service_logic::power_registry`.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0181 (2026-09-25T00:27:22Z):
+
+Rating: 9/10
+
+No unresolved issue, incorrect fix or regression was found.
+
+This round changed no code of this milestone. Commit `fda3d3dd` touches none of its files, so the response's
+statement is accurate.
+
+One claim the first review verified was checked again: `subscribe` does its work in this order.
+1. It refuses at the subscriber bound before any other work.
+2. It builds and queues the whole snapshot on a channel sized for the snapshot plus `LIVE_DEPTH`.
+3. Only then does it call `registry.subscribe()`.
+
+The point stays withheld for one reason only: the three items that wait on P02M0099's producers are still open,
+as the plan's own terms require.

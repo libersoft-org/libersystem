@@ -1065,3 +1065,75 @@ the reset item, the bond item and the open operator item. The operator item stay
   - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
 - **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
 
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0180 (2026-09-25T00:27:22Z):
+
+Rating: 8/10
+
+The fixes for Finding 2, for Finding 3's pairing and power-on points, and for the optional point are correct as
+they now stand in the code. The key copies Finding 1 named are cleared. Two things are still unresolved:
+- Finding 1 is only partly resolved, and the milestone text claims more than the code does.
+- The two open items are unchanged.
+
+## Unresolved
+
+### 1. Key material still outlives its use in BluetoothService's IPC buffers (Finding 1, partly resolved)
+
+The plan says: "Clear transient key buffers on completion/failure". Three transient copies of key material remain
+in this process, and each is freed or reused without being zeroed:
+
+- **The encryption command on its way out.**
+  - `Controller::pump` zeroes its own two copies, `params` and `bytes`.
+  - It first hands `bytes` to the generated `hci_transport::Client::send`. That function copies the whole
+    command, LTK included, byte by byte into a growing `VecWriter`, and drops the request unzeroed. See
+    `device-proto` `v1.rs`, `hci_transport::Client::send`.
+  - This happens on every pairing and every reconnect.
+  - `docs/todo/P02M0180.md` (the bond item) says BluetoothService zeroes "every copy of the `LE Enable
+    Encryption` parameters, queued, sent or dropped". That is not accurate.
+- **The Diffie-Hellman key on its way in.** The LE DHKey-complete event passes through three buffers, and none
+  of them is zeroed:
+  - `drain_packets` receives it into the loop's shared `buf`, which keeps the bytes until a longer message
+    overwrites them;
+  - `hci_transport::receive_read` decodes it into `packet.bytes`, a heap `Vec` that is freed at the end of the
+    iteration;
+  - `on_event` copies it into a stack `wire` array.
+
+  The initiator's own copy is now cleared. The key Finding 1 was about still outlives the attempt in these
+  buffers.
+- **The bond-store exchanges.** The `store` request and the `lookup` reply carry the LTK through the generated
+  client's buffers. The response says so and does not claim these copies are cleared.
+
+These are the same kind of copy that P02M0183's Finding 1 required ModemService to clear, and ModemService now
+does: its PIN frame is encoded into a buffer it owns and zeroes, and its request buffer is zeroed after handling.
+
+There are two ways to close this:
+- **Clear these copies too.** That takes three changes:
+  - send a key-bearing HCI command from a buffer the service owns, through `ChannelTransport::call`, and zero
+    it afterwards;
+  - zero `buf[..len]` and `packet.bytes` once an event has been handled;
+  - encode and decode the two bond-store exchanges in buffers the service owns, and zero them.
+- **Have the owner accept IPC frames as outside the requirement.** The acceptance must apply to both services
+  alike, and the milestone sentence must be corrected.
+
+### 2. Open items (unchanged, the owner's decisions)
+
+- **The operator item.** No shipping component holds `bluetooth-operator`. Mapping the allow/deny setting to
+  DeviceManager's device policy still awaits acceptance.
+- **The InputService item.** The broker-based source slot still awaits acceptance as a departure from the plan's
+  bootstrap client.
+
+## Checks performed
+
+- **Code read** in the committed tree (`fda3d3dd`), with no source change:
+  - `smp_pairing.rs`;
+  - the key paths in `bluetooth_service.rs`, and its `power`, `pair`, `end_session`, `on_complete`, `pump` and
+    `drain_packets`;
+  - the generated `hci_transport::Client::send` and `receive_read`;
+  - `bluetooth_bond_store.rs::list`;
+  - `bt_fixture.rs`.
+- **Host suites re-run:** `service-logic` 672/672, including the new key-clearing test, and the `drivers` library
+  290/290.
+- **Recorded runs read:** the final `bluetooth-service` gate log (PASS, 841 s) and the AArch64 and RISC-V build
+  logs.

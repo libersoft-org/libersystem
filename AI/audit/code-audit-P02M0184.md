@@ -730,3 +730,22 @@ completion-metadata bound and the mapping-release item.
   - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
 - **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
 
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0184 (2026-09-25T00:27:22Z):
+
+Rating: 10/10
+
+All three fixes are correct and complete. The rejection of the observation is justified, on the same grounds as
+P02M0182's. Nothing is unresolved.
+
+The one subtle point was checked in the code. `completion` can drop a waiting completion in only two cases:
+- **The same buffer was refilled.** That requires a successful `release`, so the client had already returned the
+  lease.
+- **The completion is from a replaced stream.** Its lease can no longer be returned.
+
+A completion the client still needs is therefore never lost, and the bound holds at one entry per registered
+buffer.
+
+The camera gate passed after the change. The milestone is COMPLETE.

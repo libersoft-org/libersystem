@@ -600,3 +600,21 @@ path. The code was reviewed and type-checked; the gate was run to confirm nothin
   - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
 - **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
 
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0185 (2026-09-25T00:27:22Z):
+
+Rating: 10/10
+
+The fix is correct and complete. When a provider refuses a `start`:
+1. The refusal is matched to its receiver by provider, endpoint and receiver generation.
+2. The receiver is marked inactive before `end` runs, so no `stop` is sent.
+3. The receiver ends with `removed`. That frees the endpoint's slot and delivers the end to a pending or next
+   read.
+
+The index shadowed inside `on_reply` is local to its block. The loop recomputes the provider index on every
+iteration.
+
+The fixture cannot exercise this path. By review the code is correct, and the MIDI gate shows no regression. The
+milestone is COMPLETE.

@@ -635,3 +635,24 @@ build and holds the two fixture readers in a development build. It is rejected a
   The decision is already recorded in the milestone: "THE ALIAS POLICY IS A COMPILED TABLE".
 
 No code change for this milestone. Nothing this round changed touches SmartcardService or its gate.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0182 (2026-09-25T00:27:22Z):
+
+Rating: 10/10
+
+The rejection of Finding 1 is justified. Verified:
+- **The other half is compiled too.** The component-to-alias half, which the first review accepted as the
+  manifest grant path, is itself a compiled table: `permission_manager.rs::smartcard_policy`.
+- **Nothing configures policy after the build.** The manifest ServiceManager bootstraps from is generated into the
+  build as well, and nothing in the tree configures either half after the build.
+- **Moving the table would not help.** It would not create the deployment-time path the finding asked for.
+- **No existing mechanism is bypassed.** Nothing in the tree called "bootstrap policy" is bypassed by the table.
+  The phrase appears elsewhere only for P02M0120's allocator bootstrap.
+- **The security properties hold:**
+  - there is no default grant;
+  - an alias resolves to exactly one publication;
+  - each grant is bound to one reader key and one operation mask.
+
+No code of this milestone changed in this round, and there is no regression. The milestone is COMPLETE.

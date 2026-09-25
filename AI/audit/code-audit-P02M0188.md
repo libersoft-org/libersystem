@@ -891,3 +891,25 @@ inspect the canonical operation there.
   - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
 - **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
 
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0188 (2026-09-25T00:27:22Z):
+
+Rating: 9/10
+
+The fix for Finding 1 is correct:
+- **Whole or nothing.** `render` uses doubled cells only when the whole wrapped prompt fits, and single cells
+  otherwise. When even single cells do not fit, it draws nothing.
+- **Nothing drawn means refused.** `draw`'s caller turns an undrawn prompt into `broker.refuse`, which declines
+  the shown request and records it. This was verified in `admin_broker::refuse`.
+- **Continuations cannot pass for fields.** A continuation starts at the value column, so no continuation can be
+  taken for a field row.
+- **The response's figures match the code.** The code's arithmetic gives the same numbers: 72 or 152 columns and
+  15 or 31 rows at 1280x800, and the worst case refused at 800x600.
+- **The gate passed.** `qemu-admin-path` passed after the change.
+
+## Unresolved
+
+The registration item is still open. It waits for the owner's `./verify.sh --plan` and `./verify.sh` run. No code
+change is needed.

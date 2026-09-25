@@ -863,3 +863,29 @@ secret buffers to be cleared.
   - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
 - **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
 
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0183 (2026-09-25T00:27:22Z):
+
+Rating: 9/10
+
+The accepted half of Finding 1 is fixed correctly, and the other decisions on this milestone are justified.
+
+- **The fix is correct.**
+  - `submit_with` writes the frame into a 256-byte stack buffer (`COMMAND_FRAME`).
+  - The header matches the generated client's: `OP_COMMAND`, then the correlation, both little-endian.
+  - The buffer is zeroed after the send, whether or not the send succeeded.
+  - The `modemcheck pin` row passed on it.
+- **The rejected half of Finding 1 (the receive buffer) is correctly rejected.** The service loop has zeroed
+  `buf[..len]` after every grant request since the implementation commit.
+- **The rejection of Finding 3 stands**, on the same grounds as P02M0182's.
+
+## Unresolved
+
+### The run item (Finding 2) is still open
+
+This is unchanged: `ipv6-peer` still does not pass. The decision is still the owner's: either reorder the manifest
+so the new services start after `config_service` and `network_service`, or accept the result.
+
+The delay does not come from ModemService's own code. That is why it costs only the one point.
