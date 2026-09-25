@@ -933,3 +933,135 @@ Code reading only; nothing was built or run for this review. Files read: `blueto
 the Bluetooth parts of `input_service.rs` and `permission_manager.rs`, `service_manager/bootstrap.rs` (limited
 launch), `process_service.rs` (`limited_domain`, prepared launch), `device_manager.rs` (scoped `open`),
 `drivers/core/src/bt_peer.rs` (provenance), and the registration lists.
+
+---
+
+IMPLEMENTER'S RESPONSE ON P02M0180 (2026-09-24T19:39:29Z):
+
+Each finding was checked against the code before anything was changed. Findings 1 and 2, the pairing and power-on
+parts of Finding 3, and the optional point were confirmed and fixed. The rest of Finding 3 and Finding 4 describe
+the two open items correctly, and they need no code change. Both items stay open for the owner.
+
+## Finding 1 - Transient key material is not cleared: ACCEPTED
+
+Confirmed. Setting an `Option<[u8; N]>` to `None` rewrites only the tag, so the DHKey and the LTK stayed in the
+`Initiator` inside `controller.link`. Several other copies were also dropped without being zeroed. Changes:
+
+- **`service_logic::smp_pairing` (the initiator):**
+  - The new private `Initiator::forget_keys` overwrites the DHKey, the MacKey and the LTK where they are stored,
+    and only then sets the two `Option`s to `None`. `fail` and the peer's `PAIRING_FAILED` branch now call it.
+  - The success branch overwrites the DHKey and the MacKey in place and keeps only the LTK.
+  - A new `impl Drop for Initiator` calls `forget_keys`. Every `link.pairing = None` and every dropped link
+    therefore clears what the initiator held: `on_encryption`, `encryption_failed`, `on_disconnected`,
+    `OperatorView::cancel`, `end_session` and `withdraw`.
+  - The DHKey-check branch and `check_value` now borrow the keys (`as_ref`) instead of copying them into locals.
+  - The overwrite is `fill(0)` followed by `core::hint::black_box`, which keeps the stores from being removed as
+    dead. A volatile write needs `unsafe`, and this crate holds no `unsafe`.
+  - New host test: `only_the_ltk_outlives_a_completed_exchange_and_nothing_a_failed_one`. After completion the
+    DHKey is gone, the MacKey is zero and the LTK is kept. After a failed check, neither key is kept.
+- **`bluetooth_service.rs`:**
+  - A new `scrub` does volatile zeroing, the same helper ModemService uses. It now clears:
+    - `Stack::on_encryption`: the `BondRecord` built for `store` (its `key`) and the local LTK, after the store
+      answers. The LTK is taken with `and_then(Initiator::ltk)`, without the extra `Option` copy there was.
+    - `Stack::on_connected` (reconnect path): the looked-up `record.key` and the local `ltk`, once the
+      encryption command is queued.
+    - The new `Controller::encrypt`: it builds the `LE Enable Encryption` parameters, queues them and clears the
+      local array. The reconnect path and `run_smp` now both use it.
+    - `Controller::pump`: the dequeued parameters and the encoded packet, after the send or after a length
+      refusal.
+    - The new `Controller::clear_pending`: every queued command, before `start_init` and `end_session` drop the
+      queue. A queued encryption carries the LTK.
+    - `run_smp`: the LTK inside `Step::Encrypt`. The loop now iterates the step list mutably, because that heap
+      list is freed right after the loop.
+    - `Stack::bond()`: a record it refuses for its key length.
+    - `OperatorView::enable`: the record's key, which was cleared with `fill(0)` before and now goes through
+      `scrub`.
+  - **LTK lookups:** the new `Stack::enabled_peer` reads `enabled` from the store's keyless `list`.
+    `ProfileView::open_mouse` and the end of `on_encryption` use it. Only two callers of `lookup` remain, and
+    both need the key: the reconnect path and `enable`, which has to write the whole record back.
+- **Not changed:** the IPC frames that carry the key between BluetoothService and the bond store in
+  `store`/`lookup`. The plan prescribes that exchange, and the generated client and `ChannelTransport` own its
+  request and reply buffers. Clearing them would mean writing the bond-store exchange by hand. The finding does
+  not name them, and this response does not claim them.
+
+## Finding 2 - Power-off can leave the link and the scan running: ACCEPTED
+
+Confirmed. `pump()` sends at most one command, and `end_session()` then discarded whatever was still queued.
+Changes:
+
+- `OperatorView::power(false)` now works in this order:
+  1. It ends the host session.
+  2. It queues `HCI_Reset` as the only command and pumps it. `end_session` has already cleared the outstanding
+     slot and the credits.
+- HCI Reset ends every connection and the scan inside the controller itself, so no queued disconnect or
+  scan-disable can be lost. The disconnect/scan-disable queueing was removed.
+- Power-off also leaves the controller ready and off (`init = Init::Ready`, `powered = false`). The next
+  `power(true)` then runs initialisation again from the reset, even when the power-off arrived during
+  initialisation. Without that, `init` would have stayed at a middle step and power-on would have done nothing.
+- `drivers/core/src/bt_fixture.rs` changes, because the fix needs it: the fixture's `HCI_Reset` now drops its
+  connection and scan, as a real LE link layer does. Before, it only completed the command, so a power cycle
+  against the fixture could not have reconnected. The gate's boots are unaffected: the fixture already dropped
+  its link when the service's connection closed.
+
+## Finding 3 - The operator item is not met in a shipping configuration
+
+- **No shipping operator: ACCEPTED as a description of the open item; no code change.** Correct. The only holder
+  of `bluetooth-operator` is the development probe. A shipping operator would be a new trusted component, such as
+  a settings UI, and this milestone cannot invent it. The PermissionManager grant path is ready for it. The item
+  stays open for the owner.
+- **Any address can be paired: ACCEPTED.**
+  - `OperatorView::pair` now answers `not-found` for an address that is not among the controller's current scan
+    results.
+  - To make "current" mean this session, `Controller::end_session` now drops the scan (`self.scan = None`)
+    instead of only stopping it. After a reset, a fault or a power-off, the old scan handle answers `not-found`,
+    and nothing it found can be paired.
+  - This also makes the plan's "a reset ... invalidates ... scans" true for a reset. Before, only a withdrawal
+    removed the scan.
+  - `btcheck pair` pairs the address its scan returned, and `btcheck loss` already expected the old scan to be
+    refused, so the gate's path is unchanged.
+- **The platform allow/deny setting: ACCEPTED as stated; no code change.** Mapping it to DeviceManager's
+  persistent device policy is the recorded departure. Accepting it is the owner's decision.
+- **Power-on after a refused initialisation: ACCEPTED.** In `Stack::on_complete`, a refused init command now
+  leaves the controller ready and off (`init = Init::Ready`, `powered = false`) instead of stuck at the middle
+  step. `power(true)` then restarts initialisation from the reset instead of answering `Ok` for nothing.
+
+## Finding 4 - InputService reaches the profile through the broker: ACCEPTED as stated; no code change
+
+This agrees with the implementer's recorded reason: a role is a dependency, and a stop takes its reverse closure.
+The item stays open for the owner to accept the departure.
+
+## Optional - `Controller::pump` ignores the advertised command maximum: ACCEPTED
+
+`Controller::command` now calls `hci::check_outbound` with the controller's `Limits` before a command is queued.
+A command longer than the advertised maximum is refused with a message, and its caller sees the same `false` it
+already handles for a full queue. This matches the plan's "validate ... declared length before enqueueing".
+
+## Milestone document
+
+`docs/todo/P02M0180.md` records each change in one clause, at the item it belongs to: the packet-ceiling item,
+the reset item, the bond item and the open operator item. The operator item stays unticked.
+
+## Verification
+
+- **Specific to this milestone:**
+  - `smp_pairing`: 9/9, including the new key-clearing test.
+  - `bluetooth-service`: every probe row passed - `btread`, `pair`, `deny`, `limits`, `exhaust`, `refund`, `loss`, `reuse` after the restart and after the cold reboot, and `forget`. That covers the scan-bound `pair`, encryption with the cleared LTK and parameters, reconnect encryption from the bond store, and `enabled` read from the listing.
+  - Power-off is not in the gate. It was checked by reading the code, and the fixture now models the reset it relies on.
+- **Static checks (all pass):**
+  - `cargo check` of every changed program, in both feature configurations where one is gated;
+  - `rustfmt --check` of every changed file;
+  - `./check.sh --gate source-hygiene`: clean.
+- **Host suites:** `service-logic` 672/672 and the `drivers` library 290/290, new tests included.
+- **Builds (all pass):**
+  - `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`: 348 s, provider inventory `match`.
+  - `./build.sh --arch aarch64`: 342 s.
+  - `./build.sh --arch riscv64`: 337 s.
+  - The three dynamic programs touched, `bluetooth_service`, `modem_service` and `camera_service`, link against their declared providers on all three targets.
+- **Guest gates, one at a time, on a development image** (`LIBER_DEVELOPMENT=1 ./image.sh --format iso`):
+  - `bluetooth-service`: PASS, 841 s.
+  - `qemu-modem-service`: PASS, 839 s.
+  - `qemu-camera-service`: PASS, 400 s.
+  - `qemu-midi-service`: PASS, 400 s. These four ran 18:57-19:39Z.
+  - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
+- **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
+

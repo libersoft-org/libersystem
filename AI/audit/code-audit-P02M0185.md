@@ -544,3 +544,59 @@ Code reading only; nothing was built or run for this review. Files read:
 I also checked where the `development` feature applies. Static services are built by `build.sh` with
 `$(dev_features)`, so the gated `ALIASES` is present in a development image. Dynamic programs are built with
 `shared-image` only, which is why the camera's alias is not gated.
+
+---
+
+IMPLEMENTER'S RESPONSE ON P02M0185 (2026-09-24T19:39:29Z):
+
+## Finding 1 - A start the provider refuses leaves the receiver active and silent: ACCEPTED
+
+Confirmed. `Provider::sent` kept bare correlations, so `on_reply` could not tell which receiver a refusal belonged
+to. It printed the refusal, and the receiver kept its endpoint's only slot while its reader waited for nothing.
+Changes in `midi_service.rs`:
+- **The correlation carries the receiver.** `Provider::sent` is now `Vec<(u32, Option<(u32, u64)>)>`: the
+  correlation, plus, for a `start`, the endpoint and receiver generation it was for. `Service::send` takes that
+  second value. `AdminView::mint` passes `Some((endpoint, generation))`, and `Service::end`'s `stop` passes
+  `None`. The 32-entry bound on `sent` is unchanged.
+- **A refused start ends its receiver.** `Service::on_reply`, for a refused `start`, finds the active receiver
+  with that provider, endpoint and generation, marks it inactive and ends it through `Service::end` with
+  `removed`. That means:
+  - the queue terminates, so a pending or next read receives the end;
+  - partial SysEx is discarded;
+  - the endpoint's slot is free again, because `mint` checks only active receivers.
+- **No stop is sent** for a start that never took, because the receiver is marked inactive before `end` runs.
+- **Why `removed`:** `event.lsidl` defines it as "the source was withdrawn or its provider failed", which is what
+  a refused start is. `source-discontinuity` claims input was lost from a stream that was running.
+- A refused `stop` is still only printed: its receiver has already ended.
+
+The code now does what its comment said: "A start the provider refused ends that receiver: it will never
+deliver". The fixture never refuses a start for an endpoint it advertises, so the gate still cannot trigger this
+path. The code was reviewed and type-checked; the gate was run to confirm nothing it covers moved.
+
+## Milestone document
+
+`docs/todo/P02M0185.md` records the change at the item on terminal outcomes and freed slots.
+
+## Verification
+
+- **Specific to this milestone:**
+  - `qemu-midi-service` passed every row: `receive`, `malformed`, `cap`, `unsupported`, `overflow`, `lost`, `inherit`, `unplug` and `fresh`.
+  - The refused-start path itself is not reachable with the fixture, as stated above.
+- **Static checks (all pass):**
+  - `cargo check` of every changed program, in both feature configurations where one is gated;
+  - `rustfmt --check` of every changed file;
+  - `./check.sh --gate source-hygiene`: clean.
+- **Host suites:** `service-logic` 672/672 and the `drivers` library 290/290, new tests included.
+- **Builds (all pass):**
+  - `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`: 348 s, provider inventory `match`.
+  - `./build.sh --arch aarch64`: 342 s.
+  - `./build.sh --arch riscv64`: 337 s.
+  - The three dynamic programs touched, `bluetooth_service`, `modem_service` and `camera_service`, link against their declared providers on all three targets.
+- **Guest gates, one at a time, on a development image** (`LIBER_DEVELOPMENT=1 ./image.sh --format iso`):
+  - `bluetooth-service`: PASS, 841 s.
+  - `qemu-modem-service`: PASS, 839 s.
+  - `qemu-camera-service`: PASS, 400 s.
+  - `qemu-midi-service`: PASS, 400 s. These four ran 18:57-19:39Z.
+  - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
+- **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
+

@@ -630,3 +630,103 @@ Code reading only; nothing was built or run for this review. Files read:
 
 The UVC colour-matching code points were checked against the specification's table and the Linux `uvc_driver.c`
 mapping.
+
+---
+
+IMPLEMENTER'S RESPONSE ON P02M0184 (2026-09-24T19:39:29Z):
+
+All three findings were confirmed against the code and fixed. The observation is not taken up as a change.
+
+## Finding 1 - The waiting-completion backlog is not bounded to the four buffers: ACCEPTED
+
+Confirmed as described. There is also a second route the review does not name, which a release-only fix would
+have missed:
+- A client that never reads its events can stop, renegotiate, register and start again.
+- Each new stream then adds up to four more waiting completions, and the entries of the retired stream are
+  never removed.
+
+The fix follows the review's second option and extends it to cover that route. `Service::completion`
+(`camera_service.rs`) now removes, before it pushes a new frame completion, any waiting frame completion that:
+- names the same buffer: the camera refilled it, so that lease was already returned; or
+- belongs to another stream generation: a retired stream, whose leases nothing can return any more.
+
+The effect:
+- Every entry left names a buffer the client holds in the running stream, so `frames` holds at most one entry per
+  registered buffer (`MAX_BUFFERS`).
+- The promise that matters is kept: a completion the client still needs, in order to give its buffer back, is
+  never dropped.
+- `statuses_due` still polls every tick while a completion waits, as before; the list it retries is now bounded.
+
+The comments on `completion` and on the `frames` field now state this rule, instead of the assumption the review
+refuted.
+
+## Finding 2 - A stream that ends before `start` leaves its buffers mapped in the provider: ACCEPTED
+
+Confirmed on all three paths. Changes in `camera_service.rs`:
+- New `Pending::Discard` and `Service::discard(camera, generation)`. `discard` sends
+  `camera-device.stop(generation)` without waiting, and the answer is ignored like `Pending::Queue`'s.
+- `Service::stop`, `Ready` phase: the stream is retired and answered at once, as before (the producer never
+  wrote to it), and the producer is now told to release its mappings. The `Retired` phase is only answered.
+- `Service::end_stream`, `Ready` phase (grant closed, owner dead or revoked): `discard`, then the run is dropped.
+  `Retired` is unchanged, because the stop that retired it already released everything.
+- `provider_answer`, refused `Pending::Start`: after `stream.stopped()`, `discard` for that generation.
+
+The fixture already accepted `stop` for a stream that never started: `release_all`, `mapped = 0`. None of the
+gate's scenarios ends a stream in `Ready` between `delay_stop` and the stop it is meant for, so the quarantine
+scenario is unaffected.
+
+## Finding 3 - The UVC colour-matrix code points are mapped wrongly: ACCEPTED, with one deviation
+
+Confirmed: the table used H.273's numbering, where 5 and 6 mean BT.601. In UVC's colour matching descriptor they
+are SMPTE 240M and reserved. `drivers/core/src/uvc.rs` now maps:
+- `1 => Bt709`;
+- `3 | 4 => Bt601`;
+- anything else => `Unknown`.
+
+A comment in the code gives UVC's own table.
+
+**The deviation: FCC (2) stays unknown instead of becoming BT.601.** FCC's luma coefficients (Kr 0.30, Kb 0.11)
+are not BT.601's (0.299, 0.114), while BT.470-2 B,G's are. Linux substitutes 601 for FCC because a renderer needs
+some matrix; this is metadata, and the plan allows "unknown". The fixture's two formats (4 and 1) come out as
+before.
+
+New module test: `the_colour_matrix_follows_the_uvc_code_points`, covering codes 0 to 6 and 255.
+
+## Observation - The camera alias and the policy rows are compiled in: REJECTED as a change
+
+This has the same basis as P02M0182, Finding 1:
+- the component-to-alias half in PermissionManager (`camera_policy`) is compiled too, and the image is the unit
+  of configuration;
+- a real camera is granted by a policy row and its alias entry in one change;
+- the default-deny and exact-resolution properties hold;
+- the real UVC provider is P02M0099's.
+
+## Milestone document
+
+`docs/todo/P02M0184.md` records each fix in one clause, at its item: the frame-type metadata item, the
+completion-metadata bound and the mapping-release item.
+
+## Verification
+
+- **Specific to this milestone:**
+  - `uvc`: 9/9, including the new colour-matrix test.
+  - `qemu-camera-service` passed every row: `capture`, `mjpeg`, `timing`, `busy`, `inherit`, `retain`, `again` and `quarantine`.
+  - The mapped-count assertions and the quarantine's held stop are unaffected by the new discard.
+- **Static checks (all pass):**
+  - `cargo check` of every changed program, in both feature configurations where one is gated;
+  - `rustfmt --check` of every changed file;
+  - `./check.sh --gate source-hygiene`: clean.
+- **Host suites:** `service-logic` 672/672 and the `drivers` library 290/290, new tests included.
+- **Builds (all pass):**
+  - `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`: 348 s, provider inventory `match`.
+  - `./build.sh --arch aarch64`: 342 s.
+  - `./build.sh --arch riscv64`: 337 s.
+  - The three dynamic programs touched, `bluetooth_service`, `modem_service` and `camera_service`, link against their declared providers on all three targets.
+- **Guest gates, one at a time, on a development image** (`LIBER_DEVELOPMENT=1 ./image.sh --format iso`):
+  - `bluetooth-service`: PASS, 841 s.
+  - `qemu-modem-service`: PASS, 839 s.
+  - `qemu-camera-service`: PASS, 400 s.
+  - `qemu-midi-service`: PASS, 400 s. These four ran 18:57-19:39Z.
+  - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
+- **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
+

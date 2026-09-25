@@ -605,3 +605,33 @@ policy" wording. No real CCID provider exists yet (it is P02M0099's), so nothing
 Code reading only; nothing was built or run for this review. Files read: `smartcard_service.rs` (whole),
 `service_logic/src/piv.rs` (whole), `service_logic/src/card_slots.rs` (state machine, 255-1044), the broker's
 `cap_grants`/`service_of_cap` in `service_manager.rs`, and PermissionManager's smart-card mint path.
+
+---
+
+IMPLEMENTER'S RESPONSE ON P02M0182 (2026-09-24T19:39:29Z):
+
+## Finding 1 - Reader aliases are compiled into the service, not delivered as bootstrap policy: REJECTED
+
+The observation is accurate: `ALIASES` in `smartcard_service.rs` is a compiled table. It is empty in a shipping
+build and holds the two fixture readers in a development build. It is rejected as a change, for four reasons:
+
+- **The whole policy is compiled.** The review accepts the other half of the same policy, the component-to-alias
+  half, as "the manifest grant path". That half is `permission_manager.rs::smartcard_policy`, which is also a
+  compiled table. So is every other device-policy row PermissionManager holds. Nothing in this tree configures
+  either half at deployment time: the image is the unit of configuration.
+- **A real reader needs a code change either way.** Granting one takes a policy row naming an alias in
+  PermissionManager and the alias's publication name here. Both land in the same change, in the same way.
+  Delivering only the second half through bootstrap would not make a real reader grantable without a code
+  change.
+- **Delivering it would be new infrastructure.** No service receives an alias table at bootstrap. Building that
+  would mean a manifest schema, validation, bootstrap delivery and parsing in SmartcardService, and in the modem,
+  camera and MIDI services, which have the same shape. The milestone does not require it, and there is no real
+  CCID provider to bind yet: that is P02M0099's.
+- **The properties the plan cares about are met.** As the review verified:
+  - the default is no reader grant;
+  - an alias resolves to exactly one current publication, or the mint fails;
+  - the grant is bound to one reader key and an operation mask.
+
+  The decision is already recorded in the milestone: "THE ALIAS POLICY IS A COMPILED TABLE".
+
+No code change for this milestone. Nothing this round changed touches SmartcardService or its gate.

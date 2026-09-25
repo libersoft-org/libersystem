@@ -799,3 +799,95 @@ Code reading only; nothing was built or run for this review. Files read:
 - THREAT_MODEL §2.3.
 
 The line-width arithmetic in Finding 1 is taken from `render`'s constants and the template's line formats.
+
+---
+
+IMPLEMENTER'S RESPONSE ON P02M0188 (2026-09-24T19:39:29Z):
+
+## Finding 1 - The protected screen silently truncates the canonical operation: ACCEPTED
+
+Confirmed. `render` stopped drawing a line at the right edge without any mark. The finding's arithmetic holds.
+
+The same cut also hit a line the finding does not name: `Parameters:`. It shows up to 32 bytes as 64 hex digits
+plus `...`, about 92 characters, so it was cut as well. The fix makes the screen show the whole operation, or
+nothing:
+
+- **A pure wrap step.** The new `service_logic::admin_descriptor::wrap(lines, columns)` and `VALUE_COLUMN` (15,
+  where the template's values begin):
+  - A line wider than `columns` continues on the next row, indented to the value column. A digest or a label is
+    shown whole, and a continuation cannot pass for a field of its own.
+  - Nothing is cut or reordered. Only the indent is added.
+  - It returns `None` when a continuation would have no room at all.
+- **`render` picks a cell size at which the whole prompt fits.** In `admin_service.rs`, `render` tries the
+  doubled cells first, only on a screen at least 1024 px wide, and uses them only if the wrapped prompt fits
+  vertically. Otherwise it uses single cells. The margins are now equal on both sides; before, glyphs ran to the
+  right edge.
+- **If even single cells do not fit, nothing is drawn.** `render` returns `None`, and `draw`'s existing path
+  refuses the request with "the protected screen could not be drawn". Refusing is safer than approving an
+  operation from part of its description.
+
+What this means at the resolutions the finding names:
+
+| Screen | Doubled cells | Single cells |
+|---|---|---|
+| 1280x800 (the harness's default) | 72 columns, 15 rows | 152 columns, 31 rows |
+| 1024x768 | 56 columns, 14 rows | 120 columns, 30 rows |
+| 800x600 | not used | 92 columns, 23 rows |
+
+- At 1280x800 the 99-character payload line takes two rows in doubled cells.
+- With every field at its bound and a label of ordinary characters, the prompt takes 12, 12 and 16 single-cell
+  rows at the three sizes, so it fits at all of them. "Every field at its bound" means:
+  - 64-character executor and target names;
+  - the largest epoch and generation values;
+  - 32 parameter bytes shown.
+- The worst case is a 128-byte label made entirely of control characters, which escapes to 768 characters. With
+  every other field also at its bound, it needs:
+  - 16 rows at 1280x800, which fits;
+  - 18 rows at 1024x768, which fits;
+  - 24 rows at 800x600, where only 23 fit. There the request is refused as undrawable instead of being shown in
+    part. The requester's own label can make only the requester's own request undrawable.
+
+New host test: `a_line_too_long_for_the_screen_continues_on_the_next_row_and_loses_nothing`. It covers 56 to
+156 columns and checks:
+- every row fits;
+- the text without spaces is unchanged, and the digest is whole;
+- continuations are indented;
+- a width at the indent is refused;
+- lines that fit are left alone.
+
+The gate's frame check counts colours (field, band, text, hostile green). Wrapping changes none of them, and the
+field stays well above half the frame.
+
+## Finding 2 - The registration item is still open: ACCEPTED as stated; no code change
+
+The gate is registered in all three places, and the item waits only for the owner's `./verify.sh --plan` and
+`./verify.sh` run. That is the owner's to start, so the item stays unticked.
+
+## Milestone document
+
+`docs/todo/P02M0188.md` records the change at the secure-attention item, the one that requires the person to
+inspect the canonical operation there.
+
+## Verification
+
+- **Specific to this milestone:**
+  - `admin_descriptor`: 4/4, including the new wrap test.
+  - `qemu-admin-path` passed with the wrapped prompt: the frame check found the field, band and text, and no hostile green.
+- **Static checks (all pass):**
+  - `cargo check` of every changed program, in both feature configurations where one is gated;
+  - `rustfmt --check` of every changed file;
+  - `./check.sh --gate source-hygiene`: clean.
+- **Host suites:** `service-logic` 672/672 and the `drivers` library 290/290, new tests included.
+- **Builds (all pass):**
+  - `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`: 348 s, provider inventory `match`.
+  - `./build.sh --arch aarch64`: 342 s.
+  - `./build.sh --arch riscv64`: 337 s.
+  - The three dynamic programs touched, `bluetooth_service`, `modem_service` and `camera_service`, link against their declared providers on all three targets.
+- **Guest gates, one at a time, on a development image** (`LIBER_DEVELOPMENT=1 ./image.sh --format iso`):
+  - `bluetooth-service`: PASS, 841 s.
+  - `qemu-modem-service`: PASS, 839 s.
+  - `qemu-camera-service`: PASS, 400 s.
+  - `qemu-midi-service`: PASS, 400 s. These four ran 18:57-19:39Z.
+  - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
+- **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
+

@@ -782,3 +782,84 @@ context flow, link calls; about 900 of 1769 lines), `service_logic/src/uplink.rs
 `bring_up_raw` and `bring_up_nic`, the generated `modem_device::Client::command`, and PermissionManager's
 `modem_policy`. I compared the pre-job NetworkService start-up (`git show 048e0abe:...network_service.rs`) with
 the current one, and read the implementer's recorded `ipv6-peer` evidence.
+
+---
+
+IMPLEMENTER'S RESPONSE ON P02M0183 (2026-09-24T19:39:29Z):
+
+## Finding 1 - A submitted PIN/PUK survives in two buffers: PARTLY ACCEPTED
+
+The finding names two buffers.
+
+**The encoder's buffer: ACCEPTED.** Confirmed: `captured_device` drove the generated
+`modem_device::Client::command`. That client encodes into its own `VecWriter` and drops the vector unzeroed,
+together with any smaller buffer it outgrew while encoding. Changes in `Service::submit_with`:
+- The frame is now written into a fixed 256-byte buffer the service owns (new constant `COMMAND_FRAME`). It holds
+  the `OP_COMMAND` operation, the correlation and `Command::encode` of the command.
+- The frame is sent with `try_send` as before, and the whole buffer is then zeroed with `scrub`, whether or not
+  the send succeeded.
+- The command's own `secret` and `new_secret` are still scrubbed, and the `Secret`s still zero themselves on
+  drop.
+- The bytes on the wire are the same as the generated client wrote: a little-endian `u16` operation, a `u32`
+  correlation, then the command.
+- `captured_device`, whose only caller this was, is removed. `Capture` and `stamp` remain for the link-admin
+  calls, which carry no secret.
+- The bound: two secrets of at most 8 bytes, which is the IDL's `@bound(8)`, an APN of at most 64 bytes and the
+  fixed fields come to about 130 bytes. A frame that did not fit would not be sent, and would be answered as a
+  failure through the existing not-sent path.
+
+**The receive buffer: REJECTED - already done.** The service loop zeroes the request buffer right after
+`grant_request` returns: `scrub(&mut buf[..len])` in `__user_main`, under "THE REQUEST MAY HAVE CARRIED A PIN: the
+buffer it arrived in is zeroed before anything else uses it". That line was in the implementation commit, before
+this review. The note in `grant_request` that the review quotes means the buffer is not read again inside that
+function. The reply buffer is scrubbed inside `grant_request` as well.
+
+## Finding 2 - The run item's "affected existing network guest checks" are not met: ACCEPTED as stated; no code change
+
+Agreed on every point:
+- `do_dhcp` is unchanged.
+- The two identified `hostile-quote` causes lie in code this job did not change.
+- The job's services ahead of `config_service` add about 2.5 s to NetworkService's start.
+
+Changing the manifest order was refused by the permission classifier in the earlier session and was left to the
+owner. Whether to reorder the manifest or accept the gate's state is still the owner's decision, so the item stays
+open.
+
+## Finding 3 - The modem alias is compiled in: REJECTED
+
+This has the same basis as the smart-card finding (P02M0182, Finding 1):
+- PermissionManager's `modem_policy` is compiled too, and so is every device-policy row. The image is the unit of
+  configuration.
+- Granting a real modem takes a policy row and its alias entry in the same change, whichever way this table was
+  delivered.
+- The default-deny and exact-resolution properties hold.
+- No MBIM provider exists yet: that is P02M0099's.
+
+Building bootstrap delivery of alias tables would be new infrastructure the milestone does not require.
+
+## Milestone document
+
+`docs/todo/P02M0183.md` records the encoder change at the attempt-counter item, the one that asks for the
+secret buffers to be cleared.
+
+## Verification
+
+- **Specific to this milestone:** `qemu-modem-service` passed every row, including `modemcheck: PASS pin`, which sends the PIN command through the new hand-encoded frame, and `sim`, `uncertain` and `limits`.
+- **Static checks (all pass):**
+  - `cargo check` of every changed program, in both feature configurations where one is gated;
+  - `rustfmt --check` of every changed file;
+  - `./check.sh --gate source-hygiene`: clean.
+- **Host suites:** `service-logic` 672/672 and the `drivers` library 290/290, new tests included.
+- **Builds (all pass):**
+  - `LIBER_DEVELOPMENT=1 ./build.sh --arch x86_64`: 348 s, provider inventory `match`.
+  - `./build.sh --arch aarch64`: 342 s.
+  - `./build.sh --arch riscv64`: 337 s.
+  - The three dynamic programs touched, `bluetooth_service`, `modem_service` and `camera_service`, link against their declared providers on all three targets.
+- **Guest gates, one at a time, on a development image** (`LIBER_DEVELOPMENT=1 ./image.sh --format iso`):
+  - `bluetooth-service`: PASS, 841 s.
+  - `qemu-modem-service`: PASS, 839 s.
+  - `qemu-camera-service`: PASS, 400 s.
+  - `qemu-midi-service`: PASS, 400 s. These four ran 18:57-19:39Z.
+  - `qemu-admin-path`: PASS, 465 s, 18:37-18:45Z.
+- **Two earlier attempts at the four service gates tested nothing.** Their images lacked the development probes (`no artifact at vol://system/libexec/btcheck.lsexe`): first `./image.sh` had not been rerun after the build, then it rebuilt a shipping volume because it ran without `LIBER_DEVELOPMENT`. The gates were repeated as above.
+
