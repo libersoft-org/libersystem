@@ -3092,6 +3092,18 @@ provides = [
 	# AND A TOUCH SURFACE, WHICH IS NOT A POINTER. A consumer of `pointer` is handed one cursor, and
 	# a surface published as one would be flattened into whichever contact was decoded last.
 	{ kind = "touch", most = 1 },
+	# THE NINE SERVICE-BACKED CLASSES, one device each and one consumer each - the service that drives it.
+	# Published when the device binds and withdrawn when it leaves, under the names the services' policies
+	# bind (`driver_protocol::provider::USB_*_NAME`).
+	{ kind = "printer", most = 1, consumers = 1 },
+	{ kind = "ptp-transport", most = 1, consumers = 1 },
+	{ kind = "smartcard-reader", most = 1, consumers = 1 },
+	{ kind = "midi", most = 1, consumers = 1 },
+	{ kind = "power-source", most = 1, consumers = 1 },
+	{ kind = "bluetooth-hci", most = 1, consumers = 1 },
+	{ kind = "modem", most = 1, consumers = 1 },
+	{ kind = "camera", most = 1, consumers = 1 },
+	{ kind = "admin-executor", most = 1, consumers = 1 },
 ]
 heartbeat-deadline = 100
 

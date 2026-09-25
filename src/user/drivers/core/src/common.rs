@@ -706,7 +706,12 @@ fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving,
 // entry, so the whole change is about a hundred bytes in each driver that serves consumers. What it
 // does NOT change is the shape - the set is still fixed, and a `CONNECT` past it is still refused by
 // closing the endpoint rather than queued.
-pub const MAX_PROVIDER_CLIENTS: usize = 16;
+//
+// THIRTY-TWO (2026-09-25), AND THE CONSUMER IS THE USB CONTROLLER AGAIN. Each class module it carries is a
+// publication, and the nine service-backed classes - a printer, a camera, a reader, a modem and the rest - came
+// to eighteen publications and more endpoints than sixteen. `system-manifest` holds the same number, because an
+// entry may not declare more connections than a driver can serve.
+pub const MAX_PROVIDER_CLIENTS: usize = 32;
 
 pub struct Serving {
 	ends: [u64; MAX_PROVIDER_CLIENTS],
@@ -791,6 +796,30 @@ impl Serving {
 		self.publications[self.publication_count] = token;
 		self.publication_count += 1;
 		self.accept(first, token)
+	}
+
+	// A PUBLICATION THIS DRIVER WITHDREW, taken out of the set with every connection to it closed: its device
+	// left. The token is not reused - a replacement is published under a fresh one, as `withdraw` requires -
+	// and taking it out is what lets a device that is plugged in again and again be published each time,
+	// where a set that only ever grew would refuse the replacement once it was full. Answers how many
+	// connections were closed.
+	pub fn retire(&mut self, token: u16) -> usize {
+		let mut closed = 0;
+		let mut index = 0;
+		while index < self.count {
+			if self.tokens[index] == token {
+				self.close_at(index);
+				closed += 1;
+			} else {
+				index += 1;
+			}
+		}
+		if let Some(at) = self.publications[..self.publication_count].iter().position(|&held| held == token) {
+			self.publication_count -= 1;
+			self.publications[at] = self.publications[self.publication_count];
+			self.publications[self.publication_count] = 0;
+		}
+		closed
 	}
 
 	// One more, from a `CONNECT`, under the token that frame named. False when this driver is already

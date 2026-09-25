@@ -142,3 +142,31 @@ fn every_dimension_refuses_on_its_own_terms() {
 		}
 	}
 }
+
+#[test]
+// EACH SERVICE-BACKED CLASS ADMITS ONE DEVICE AND REFUSES THE SECOND BY COUNT, and one being full refuses
+// nothing of another's - the same independence the HID and storage budgets have.
+fn every_service_backed_class_takes_one_device_and_refuses_the_second() {
+	let kinds = [
+		ClassKind::Printer,
+		ClassKind::StillImage,
+		ClassKind::SmartCard,
+		ClassKind::Midi,
+		ClassKind::PowerDevice,
+		ClassKind::Bluetooth,
+		ClassKind::Mbim,
+		ClassKind::Video,
+		ClassKind::Dfu,
+	];
+	let mut budget = Budget::new();
+	for kind in kinds {
+		assert_eq!(budget.admit(kind), Ok(()), "{kind:?} takes its first device");
+		assert_eq!(budget.admit(kind), Err(Refusal::Devices), "{kind:?} refuses a second by count");
+		assert_eq!(budget.usage(kind).devices, 1);
+	}
+	for kind in kinds {
+		budget.release(kind);
+		assert_eq!(budget.usage(kind), Usage::default(), "{kind:?} gives everything back");
+	}
+	assert_eq!(budget.admit(ClassKind::Hid), Ok(()), "and none of them touched another class's budget");
+}

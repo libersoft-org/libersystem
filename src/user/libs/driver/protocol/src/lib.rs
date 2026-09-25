@@ -459,6 +459,22 @@ pub mod provider {
 	// gets them the other way round. A consumer that needs a particular piece of hardware asks the
 	// USB bus provider what is on which port; this name is how it asks for the second stream.
 	pub const USB_SERIAL_SECOND_NAME: &[u8] = b"org.libersystem.usb.serial.2";
+
+	// THE NAMES THE USB CONTROLLER PUBLISHES ITS SERVICE-BACKED CLASSES UNDER. Each destination service binds
+	// what it may drive by publication name - an alias in its policy names one of these - so a USB reader and
+	// the in-guest fixture reader are two names and never one, and a consumer granted the fixture is not
+	// handed whatever real device happens to be plugged in.
+	pub const USB_PRINTER_NAME: &[u8] = b"org.libersystem.usb.printer";
+	pub const USB_STILL_IMAGE_NAME: &[u8] = b"org.libersystem.usb.still-image";
+	pub const USB_CCID_NAME: &[u8] = b"org.libersystem.usb.ccid";
+	pub const USB_MIDI_NAME: &[u8] = b"org.libersystem.usb.midi";
+	pub const USB_POWER_NAME: &[u8] = b"org.libersystem.usb.power";
+	pub const USB_BLUETOOTH_NAME: &[u8] = b"org.libersystem.usb.bluetooth";
+	pub const USB_MBIM_NAME: &[u8] = b"org.libersystem.usb.mbim";
+	pub const USB_VIDEO_NAME: &[u8] = b"org.libersystem.usb.video";
+	// THE DFU SLOT ADMINSERVICE ROUTES `firmware-download` TO, and the name is ITS: the administrative path
+	// reserves it, and a DFU function is the executor that fills it.
+	pub const USB_DFU_NAME: &[u8] = b"org.libersystem.admin-dfu";
 }
 
 // WHAT A DRIVER CAN HONESTLY KNOW ABOUT ITSELF.

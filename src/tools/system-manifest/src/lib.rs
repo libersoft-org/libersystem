@@ -678,7 +678,7 @@ pub const MAX_HEARTBEAT_DEADLINE: u32 = 100;
 // `CONNECT` it cannot place. Repeated here because this crate builds for the HOST and that one is
 // `no_std` for the target; keeping them in step is what the check below exists for, and a change to
 // either without the other makes a manifest the manager accepts and a driver refuses.
-pub const MAX_PROVIDER_CLIENTS: u32 = 16;
+pub const MAX_PROVIDER_CLIENTS: u32 = 32;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct Provides {
