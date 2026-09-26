@@ -236,3 +236,111 @@ Verified every finding against the tree and the related plans. `input_service.rs
 8. **ACCEPTED - Codec oracles and the licence basis.** Part i's codec-oracle item names the sources and terms: the A2DP and HFP specifications' SBC/mSBC definitions differentially against AOSP's SBC, LC3's specification differentially against liblc3, both Apache-2.0 and host-only, the SIG's member-only material only if the owner obtains it; CVSD is the controller's and needs none. The owner question is recorded for when part e starts and covers SBC and mSBC with LC3, because the licence clause cited covers every compliant portion of an unqualified product, not LC3 alone.
 
 Re-check of the whole plan: every part names its consumer contract, its authority, its bounds and its oracle; the delivery rule, the pairing rule and the ORDER line agree with the parts after the renumbering; every mechanism it relies on exists (the broker's grant table, PermissionManager's alias-bound grants, the NIC greeting wire, the shell's redirection, `hci-attachment`'s ISO fields) or is an item here; the owner's decisions and dates are intact, the plan references no audit, and the versions stay 1. The plan is complete, correct, feasible and internally consistent, and ready for its parts' own plans. Only `docs/todo/P02M0194.md` and this append were changed; no source was modified, nothing was built or run.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0194 (2026-09-26T04:01:12Z):
+
+**Rating: 6/10.** The delivery, audio, oracle and transport corrections hold, but four problems remain: a Bluetooth keyboard never reaches the text console, OBEX receiving cannot be accepted where the plan says it is, the media keys have no destination, and the pairing rules do not map onto BR/EDR.
+
+I read the whole history: the original review of the plan at `07371c44`, the planner's response, the plan at `07371c44` and at HEAD, and commit `0dd5da07`'s changes to P02M0099. Those changes give ISO to P02M0194h and the service half of SCO to P02M0194f, and they agree with this plan.
+
+I checked the plan against the tree:
+- the Bluetooth IDL, and the HCI contract in `device.lsidl` (the 4100-byte wire bound, `iso` and `max-iso`);
+- the broker's `cap_grants` and `service_of_cap`, and PermissionManager's `btctl` row and alias-bound mints;
+- InputService's Bluetooth slot and key path, AudioService's engine and `audio.lsidl`;
+- NetworkService's NIC greeting and `uplink.rs`, and the bond store's record format;
+- `btctl`, the shell's launch shapes and redirection, `usbredir_device.py` and `usb_ffs.py`.
+
+I also checked the plan against its neighbours: P02M0099, P02M0180, P02M0188, P02M0192 and P02M0199. I read Bumble and RootCanal at their current heads:
+- Bumble has no BNEP, OBEX, HSP or Telephone Bearer client.
+- RootCanal has Secure Simple Pairing, eSCO with host SCO data, CIS and BIG broadcast. It has no LE BIG Create Sync, and the plan's stated fallback to the in-guest fixture already covers that.
+
+These corrections hold: the four broker contracts, the AudioService device model, the service-originated prompt, the independent oracle, the SCO and ISO ownership, the SDP and GATT servers, the GATT grant on the camera route, the stated bounds and the codec oracles. Four places do not hold, below.
+
+1. **High - A bonded Bluetooth keyboard can type only into a graphical application that holds display focus. The text console, the shell, every console tool and `btctl` itself never receive its keys.**
+
+   **What the plan routes.** Part c sends a Bluetooth keyboard's keys ["into the ordinary key stream"](/data/yellow/libersystem/docs/todo/P02M0194.md:157), and the plan names no other key path. That stream is InputService's `subscribe-keys`, ["granted only to the display owner"](/data/yellow/libersystem/src/idl/input.lsidl:52).
+
+   **Why the console never sees it.**
+   - The console does not read that stream. ConsoleService takes its keystrokes from [the kernel's console input](/data/yellow/libersystem/src/user/services/core/src/console_service.rs:9), on [a channel the kernel feeds](/data/yellow/libersystem/src/user/services/core/src/console_service.rs:612).
+   - Bytes enter that input only through `console_feed`, which requires [a ConsoleInputSource capability](/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:3052). DeviceManager holds that capability ["only to delegate to the same two keyboard drivers"](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:449).
+   - The console half of a keyboard lives in those drivers. [`drivers::keys`](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:1) applies the layout and the escapes. It also [suppresses Ctrl+Alt+F12](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:415), handles [the Ctrl+Alt+Delete reboot chord](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:421) and handles [the Power key](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:436). A USB keyboard [feeds both paths](/data/yellow/libersystem/src/user/drivers/core/src/usb_hid.rs:310).
+   - InputService receives [no console capability at bootstrap](/data/yellow/libersystem/src/user/services/core/src/input_service.rs:663). BluetoothService's [manifest roles](/data/yellow/libersystem/src/user/services/manifest.toml:4604) carry none either.
+
+   **Why it matters.** The plan's own premise needs this path. It rejects P02M0188's screen partly because ["a machine whose only keyboard is Bluetooth could never pair one"](/data/yellow/libersystem/docs/todo/P02M0194.md:102). It also says a bonded keyboard ["reconnects with nobody present"](/data/yellow/libersystem/docs/todo/P02M0194.md:106). On such a machine, that keyboard could not type a shell command or answer a `btctl` prompt. A gate that checks only `subscribe-keys` would pass all the same.
+
+   The original finding 1 did not ask for this path ([its input bullet](/data/yellow/libersystem/AI/audit/plan-audit-P02M0194.md:45)), and the correction did not add it. It is newly found.
+
+   **Correct part c's InputService item.** State how a bonded Bluetooth keyboard types into the text console:
+   - which component feeds its keys to the kernel console input, and under which delegated ConsoleInputSource;
+   - that the keys pass through the shared `drivers::keys` cooking;
+   - whether its Ctrl+Alt+Delete and Power key act. Each needs a SystemPower connection. Record the decision in `docs/THREAT_MODEL.md`.
+
+   Add to part c's gate: the independent keyboard peer types a command into the shell.
+
+2. **High - OBEX receiving cannot be accepted on `btctl`'s terminal, and the prompt watchers cannot read an answer from the shape `btctl` launches with today.**
+
+   **What the plan says.** The watchers are "a running `btctl pair` or `btctl pairable`" ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:98)). They are answered "with yes or no, a passkey or a PIN" ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:95)). An OBEX push waits on `btctl receive <peer> > file`, and the offer is ["shown on `btctl`'s terminal and accepted there"](/data/yellow/libersystem/docs/todo/P02M0194.md:246).
+
+   **The watchers.**
+   - The shell launches `btctl` with [the `Rest` shape](/data/yellow/libersystem/src/user/services/core/src/shell.rs:795), which goes through [`run_tool`](/data/yellow/libersystem/src/user/services/core/src/shell.rs:963).
+   - `run_tool` [hands the tool only the write end of a relay channel](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1513). The shell only reads the other end, so the tool has no keyboard.
+   - Only tools with the interactive shape get the terminal, through [`run_tool_interactive`](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1799). The plan does not move `btctl` to it.
+
+   **Receiving.**
+   - A redirection is a pipeline. [`cmd > b` becomes `cmd | redirect_out b`](/data/yellow/libersystem/src/user/services/core/src/shell.rs:272).
+   - Every pipeline stage gets a send-only terminal, because ["a stage that could take from that queue would eat the next line the user typed"](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1628).
+   - The broker gives the first stage [no stdin](/data/yellow/libersystem/src/user/services/core/src/permission_manager.rs:1359). It gives every stage a diagnostics endpoint that is ["Send-only deliberately"](/data/yellow/libersystem/src/user/services/core/src/permission_manager.rs:1368).
+   - So `btctl receive <peer> > file` can print the offer but can never read an answer, whatever shape `btctl` has. The item cannot close as written.
+
+   **How it continues finding 6.** The planner declined the auditor's receive directory ([response](/data/yellow/libersystem/AI/audit/plan-audit-P02M0194.md:232)), saying the shell's redirection gives the same property "with an existing mechanism". That holds for sending with `< file`. It does not hold for receiving.
+
+   **Correct part a's pairing item and part g's OBEX item.**
+   - State that `btctl` takes the interactive launch shape, so `pair` and `pairable` can read answers.
+   - Make the receive invocation its own consent. For example, `btctl receive <peer> <max-bytes> > file` accepts the first object that peer pushes within the deadline and the stated size. It prints the escaped name, size and type on the terminal's diagnostics endpoint and asks nothing.
+   - If the plan keeps an interactive accept, it must give receiving a destination other than a shell redirection.
+
+3. **Medium - Consumer-control keys have no vocabulary, no stream and no consumer, and the ORDER line cites a vocabulary no plan defines. They cover a keyboard's media keys, a headset's AVRCP buttons and LE Audio's media-control commands.**
+
+   **Where the plan sends them.**
+   - `open-input` carries ["consumer-control keys"](/data/yellow/libersystem/docs/todo/P02M0194.md:149).
+   - A headset's AVRCP play, pause, next and previous are ["delivered as the same consumer-control keys"](/data/yellow/libersystem/docs/todo/P02M0194.md:154). The earbuds' Media Control commands [arrive the same way](/data/yellow/libersystem/docs/todo/P02M0194.md:275).
+   - The InputService item routes [pointers, keys and gamepads](/data/yellow/libersystem/docs/todo/P02M0194.md:157) and gives consumer-control keys no destination.
+   - The ORDER line says they ["use the vocabulary P02M0099's HID expansion plans for them"](/data/yellow/libersystem/docs/todo/P02M0194.md:164). That item names consumer controls only in [its opening sentence](/data/yellow/libersystem/docs/todo/P02M0099.md:4764). Neither [what it owns](/data/yellow/libersystem/docs/todo/P02M0099.md:4793) nor [the vocabulary it added](/data/yellow/libersystem/docs/todo/P02M0099.md:4855) has a consumer-control record.
+
+   **What the tree and P02M0199 do.**
+   - [`key-event` is keyboard-page only](/data/yellow/libersystem/src/idl/input.lsidl:17).
+   - A keyboard's media keys are dropped, ["reserved until a media session exists"](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:176).
+   - The one plan that routes consumer-page usages, P02M0199c, rules that ["a consumer-page usage never enters `key-event`"](/data/yellow/libersystem/docs/todo/P02M0199.md:191). Its `system-keys` stream [carries only brightness](/data/yellow/libersystem/docs/todo/P02M0199.md:193).
+
+   **Why it matters.** The planner answered original finding 2's question - who receives the headset's play and pause - with ["where a keyboard's media keys go"](/data/yellow/libersystem/AI/audit/plan-audit-P02M0194.md:224). They go nowhere. Three implementers would build three different things:
+   - one adds media usages to `key-event`, against P02M0199c;
+   - one adds a new stream with no consumer;
+   - one drops them, and a headset's play button does nothing.
+
+   **Correct part c and its ORDER line.** Do one of the following:
+   - Define the record and the stream consumer-control keys travel on, who may subscribe and under what focus rule. Carry them in P02M0199c's consumer-page frame and keep them out of `key-event`.
+   - Or state that they are recognised and dropped until a media session exists, as a keyboard's are, and remove the claims that headset and earbud buttons act.
+
+   Either way, stop citing a P02M0099 vocabulary that is not planned.
+
+4. **Medium - The "one rule for both radios" is written in LE's terms and does not map onto BR/EDR in three places.**
+
+   **IO capability.**
+   - The host declares [KeyboardDisplay while a watcher is attached](/data/yellow/libersystem/docs/todo/P02M0194.md:98). The BR/EDR IO capability reply takes only DisplayOnly, DisplayYesNo, KeyboardOnly and NoInputNoOutput ([Core 5.4, Vol 4 Part E, 7.1.29](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-063323a1-51b0-a373-8e29-84f9d0e0263e)).
+   - GAP maps a keyboard with a numeric display to DisplayYesNo, and with that capability the host shows passkeys and never types one ([Core 5.4, Vol 3 Part C, 5.2.2.5 and 5.2.2.6](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host/generic-access-profile.html#UUID-d3c98a61-d1f0-6c8a-c88f-760073e0b784)). Linux sends DisplayYesNo in its place, "as it is not supported by BT spec" ([hci_event.c](https://github.com/torvalds/linux/blob/master/net/bluetooth/hci_event.c)).
+   - So ["Passkey Entry in either direction"](/data/yellow/libersystem/docs/todo/P02M0194.md:93) holds on LE only. An implementer who picks KeyboardOnly instead changes the model phones and keyboards get.
+
+   **Key strength.**
+   - BR/EDR Secure Simple Pairing yields P-192 or P-256 keys ([Core 5.4, Vol 4 Part E, 7.7.24](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-ef6b7301-ab4b-cce6-1fa4-c053c3cd1585)).
+   - The plan knows only Secure Connections and legacy PIN. It refuses only ["a peer bonded with Secure Connections that later offers only legacy"](/data/yellow/libersystem/docs/todo/P02M0194.md:112).
+   - A P-192 bond has no stated level. A P-256 bond re-paired at P-192 is not covered by "never downgraded".
+
+   **Trust enforcement.** Inbound trust is ["refused at L2CAP"](/data/yellow/libersystem/docs/todo/P02M0194.md:127). HFP, HSP and OPP over RFCOMM share RFCOMM's one PSM, 0x0003 ([Assigned Numbers](https://www.bluetooth.com/specifications/assigned-numbers/)). A per-profile refusal therefore has to happen per RFCOMM server channel.
+
+   **Correct part a's pairing and inbound-policy items.**
+   - State DisplayYesNo as the watcher-attached BR/EDR capability.
+   - Give P-192 Secure Simple Pairing a level of its own, and make "never downgraded" cover a P-256 bond offered P-192.
+   - Enforce inbound trust per PSM, and per RFCOMM server channel for the RFCOMM profiles.
+
+Validation: this was a read-only inspection. I read the plan at HEAD and at `07371c44`, the audit file, commit `0dd5da07`'s diff of P02M0099, the neighbouring plans and the source tree. For reference I read, in the scratchpad, shallow clones of Bumble and RootCanal, the Core 5.4 HCI, GAP and USB transport pages, Linux's `hci_event.c` and liblc3's conformance notes. No plan, source or audit file was modified, and nothing was built, tested or booted.

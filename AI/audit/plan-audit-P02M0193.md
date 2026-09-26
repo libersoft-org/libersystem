@@ -79,3 +79,103 @@ Every finding was checked against the tree: `soft2d`'s `backend.rs` (the tile lo
 Re-check of the whole plan: every item states its design decision. The lane inventory, the no-allocation item, the glyph item and the `Sync` item fit together: lanes read only the prepared list, the shader and transfer tables and a `Sync` image source, and write only their own reserved scratch and their own unit of the target. The oracles (bit-identical differential, zero-allocation counts, whole-or-untouched cancellation, `--compare` in the guest) can be met with the design as written. The unit-of-work item now names the same three options as the introduction. Owner decisions and EXCLUDES are unchanged, and no version changes. No source, test or script was modified, and nothing was built or run.
 
 Final consistency check (2026-09-26T02:56:37Z): the demo-rows item said the pooled row runs "on the guest's two vCPUs". Guest gates pin `--smp 2`, the harness otherwise defaults to the host's core count, and P02M0189's account gate pins four, so the item now requires each re-measured row to name its worker count AND the guest's vCPU count. No other change; no source was modified.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0193 (2026-09-26T04:01:12Z):
+
+**Rating: 8/10.** The four corrections hold and the design can be built, but the lane budget leaves open a choice that can break the plan's own bit-identity rule, and the guest comparison can be built in a way that cannot fail.
+
+I read the complete history: the original review of `07371c44`, the planner's response, and its final consistency check. I checked the current plan and the planner's diff (`07371c44..0dd5da07`) against the tree:
+
+- `soft2d`: the tile loop, `replay`, `draw_glyphs`, the prepare budget with its optional copies, and its clip, layer, raster, glyph, target, filter, paint and tile modules;
+- `render2d`, the `graphics-core` sampler and pyramid, and `soft3d::frame` with its counting-allocator tests;
+- `rt::pool` and the heap lock;
+- `test2d-sw`, `test3d-sw`, both demo guest tests, `soft2d-bench` and `soft3d-bench`;
+- the profile, `docs/PERF.md` and the harness scripts;
+- P02M0189 and P02M0103.
+
+All four corrections hold:
+
+- Bit-identity replaces the tolerance everywhere.
+- The per-unit allocation inventory and the `Sync` bounds match the code. I checked every `ImageSource` and `Cancellation` implementor.
+- The glyph miss rule is sound. Declining lane-scratch glyph edges is justified, because fills already build their edges at prepare.
+- Both plans now say the same about `--workers=1` and the pooled row.
+
+Bit-identity is achievable feature by feature:
+
+- No tile reads another tile's output. A backdrop filter reads the tile's own surface.
+- Layers and masks are cleared when they are taken.
+- The dither phase is the target position.
+- The stale tile that a skipped decode leaves is overwritten exactly.
+
+The one exception is finding 1.
+
+1. **Medium - The lane-count rule does not say whether extra lanes may take the room of the optional decoded image copies. At the ceiling, that choice decides whether the picture stays bit-identical across worker counts.**
+
+   This is a new finding. It bears on the bit-identity rule that original finding 1 introduced.
+
+   The plan prices lanes only: the frame ["computes what one lane costs and runs with as many as fit, down to one"](/data/yellow/libersystem/docs/todo/P02M0193.md:55). It also requires the target [bit-identical at every worker count](/data/yellow/libersystem/docs/todo/P02M0193.md:85), and the bench picture [bit-identical to one worker's at every count](/data/yellow/libersystem/docs/todo/P02M0193.md:95).
+
+   The same ceiling already has a second claimant. Prepare builds an optional level-zero copy for every image drawn [`Bilinear` or `Bicubic`](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:628). It charges one set of scratch in [`fixed`](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:688) and [gives copies back until the total fits](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:693). Its stated reason is that [dropping one "costs time and nothing else"](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:691), and the shader comment says sampling the copy is ["the same picture"](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/paint.rs:414).
+
+   That is not true to the bit:
+
+   - The copy is stored as [`R16G16B16A16Float`](/data/yellow/libersystem/src/user/libs/graphics/core/src/sample.rs:420), and a shader samples it [whenever it exists](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/paint.rs:422).
+   - The direct path [decodes each tap](/data/yellow/libersystem/src/user/libs/graphics/core/src/sample.rs:185) through a table of [`f32`](/data/yellow/libersystem/src/user/libs/graphics/core/src/pixel.rs:538).
+   - So the two paths compute different values, and keeping or giving back a copy can change output pixels.
+
+   With N lanes, the lane part of `fixed` grows N-fold, and the plan allows two readings:
+
+   - Fit lanes first and give copies back to make room. The set of copies, and so the picture, then depends on the worker count.
+   - Settle the copies for one lane and fit lanes into what remains. The picture then does not depend on the worker count.
+
+   One frozen scene sits on this boundary. UI-effects:
+
+   - draws its 512x512 photo `Bilinear` across the frame ([`main.rs:536`](/data/yellow/libersystem/src/tools/soft2d-bench/src/main.rs:536));
+   - opens eleven filtered layers, with blurs up to sigma 6 ([`main.rs:550`](/data/yellow/libersystem/src/tools/soft2d-bench/src/main.rs:550), [`main.rs:558`](/data/yellow/libersystem/src/tools/soft2d-bench/src/main.rs:558)).
+
+   By the code's own arithmetic:
+
+   - A blur reaches [3 sigma](/data/yellow/libersystem/src/user/libs/graphics/render2d/src/filter.rs:111), which gives an expansion of 18 and a [scratch extent](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:671) of 100.
+   - The pool holds [19 surfaces](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:676) at [16 bytes a pixel](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/target.rs:253), about 3.1 MB a lane.
+   - The photo's copy is 512x512 at 8 bytes, 2 MiB.
+   - Against the [64 MiB ceiling](/data/yellow/libersystem/docs/graphics/RENDER2D_PROFILE_1.md:256), twenty lanes fit beside the copy, and a twenty-first fits only if the copy is given back.
+
+   The plan's own [`--scaling` run to sixty-four workers](/data/yellow/libersystem/docs/todo/P02M0193.md:94) crosses that boundary.
+
+   The rule also has no place for a cost that exists only when more than one lane runs. The [tile-major intermediate](/data/yellow/libersystem/docs/todo/P02M0193.md:76) that the unit-of-work item may choose is a whole-frame buffer, not per-lane scratch. If it is not charged, the reported scratch understates the ceiling. If it is charged to the one-lane frame, a frame that fits today can be refused, which contradicts ["exactly as today"](/data/yellow/libersystem/docs/todo/P02M0193.md:56).
+
+   **Correct the lane item.** State four things:
+
+   - The optional copies are settled exactly as today, against one lane's scratch.
+   - Lanes beyond the first are fitted only into what is left, so a lane never displaces a copy.
+   - Any cost that exists only with more than one lane (the intermediate, if chosen) is charged together with those lanes. A frame whose second lane does not fit runs on one lane without that cost.
+   - A host case draws an image whose copy fits beside one lane but not beside the pool's lanes, and its target is bit-identical at every worker count.
+
+2. **Medium - The guest `--compare` test sets no floor on how many units a frame has. At the extent of the test it is told to copy, a soft2d frame is one unit, so the comparison cannot fail.**
+
+   This is a new finding.
+
+   The plan asks for a guest test that runs the demo with several workers ["the way `test3d-sw --workers 4 --compare` is run"](/data/yellow/libersystem/docs/todo/P02M0193.md:100), and for a demo that ["prints how many lanes it used"](/data/yellow/libersystem/docs/todo/P02M0193.md:98).
+
+   How the 3D precedent works:
+
+   - It runs at [64x48](/data/yellow/libersystem/src/kernel/test_suites/applications.rs:2575).
+   - It asserts only ["shading on 4 worker(s)"](/data/yellow/libersystem/src/kernel/test_suites/applications.rs:2600), which the demo derives from [the pool's threads plus one](/data/yellow/libersystem/src/user/apps/tools/src/test3d_sw.rs:1143) and not from the work shared.
+   - It works because soft3d's tile is [32 pixels](/data/yellow/libersystem/src/user/libs/graphics/soft3d/src/raster.rs:32), so 64x48 is four tiles, one per lane.
+
+   Copied to 2D, it tests nothing:
+
+   - soft2d's tile is [64 pixels](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/lib.rs:54) and the tiling [rounds up](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/tile.rs:36), so 64x48 is one tile and one band.
+   - `rt::pool::for_each` wakes at most [`items - 1` helpers](/data/yellow/libersystem/src/user/runtime/rt/src/pool.rs:302). A one-unit frame therefore runs entirely on the demo's thread, and the "pooled" pass is the serial walk compared with itself.
+   - A lane count that reports how many lanes the frame ran with would still say four.
+
+   Even the 2D harness's [192x128 scanout](/data/yellow/libersystem/src/kernel/test_suites/services.rs:3176) gives only two 64-row bands, fewer than four workers, if the measurement chooses bands. The host suite's ["crowded one"](/data/yellow/libersystem/docs/todo/P02M0193.md:83) states no extent either, and "backwards" and "handing units out twice" mean nothing on a one-unit frame.
+
+   **Correct the `test2d-sw` and differential items.** State three things:
+
+   - The guest test's surface is cut into at least as many units as the workers it asks for, whichever unit the measurement chooses. Four 64-row bands need 256 rows.
+   - The demo prints the frame's unit count beside its lane count, and the test asserts both.
+   - The host suite's crowded scene has the same floor.
+
+Validation: I did a read-only inspection of the plan and its history in git (`07371c44`, `0dd5da07`), the audit file, P02M0189, P02M0103 and the source files cited above. The lane arithmetic uses only the code's own constants and the bench's frozen scene. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
