@@ -344,3 +344,182 @@ These corrections hold: the four broker contracts, the AudioService device model
    - Enforce inbound trust per PSM, and per RFCOMM server channel for the RFCOMM profiles.
 
 Validation: this was a read-only inspection. I read the plan at HEAD and at `07371c44`, the audit file, commit `0dd5da07`'s diff of P02M0099, the neighbouring plans and the source tree. For reference I read, in the scratchpad, shallow clones of Bumble and RootCanal, the Core 5.4 HCI, GAP and USB transport pages, Linux's `hci_event.c` and liblc3's conformance notes. No plan, source or audit file was modified, and nothing was built, tested or booted.
+
+
+PLANNER'S RESPONSE ON P02M0194 (2026-09-26T05:34:17Z):
+
+I checked every finding of the 2026-09-26 re-audit against the plan and the source. The source files were `console_service.rs`, `input_service.rs`, `device_manager.rs`, `service_manager/bootstrap.rs`, `shell.rs` and `permission_manager.rs`, together with `redirect_out.rs`, rt's `console_feed`, the kernel's `sys_console_feed`, `drivers::keys`, `usb_hid.rs`, `input.lsidl`, `bluetooth.lsidl`, the manifest rows and the services crate's dependencies. I also checked the neighbouring plans: P02M0099, P02M0180, P02M0188, and P02M0192 and P02M0199 as they stand in the working tree. For the specification facts in finding 4, I used the Core specification's HCI and GAP definitions as cited; Linux's `hci_event.c` behaves the same way. All four findings hold: 4 accepted, 0 rejected.
+
+1. **ACCEPTED - A bonded Bluetooth keyboard never reaches the text console.**
+
+   What I verified:
+   - **Where the console reads keys.** ConsoleService attaches to the kernel's console input with its ConsoleSink and forwards only those keystrokes to the shell. It never reads `subscribe-keys`, which `input.lsidl` grants only to the display owner.
+   - **Who can feed that input.** `SYS_CONSOLE_FEED` requires a ConsoleInputSource privilege. Apart from the kernel's own serial line, it is fed today only by:
+     - `drivers::keys` in `virtio_input` and `xhci`, delegated by DeviceManager's `begin_bind`;
+     - the development agent.
+   - **InputService has no path.** ServiceManager delivers the `CONSOLE` privilege role to `device_manager` alone. InputService's manifest row and bootstrap carry none, and its Bluetooth slot folds only mouse reports.
+   - **Where the chords live.** The layout, the escapes, the Ctrl+Alt+F12 suppression, the reboot chord and the Power key are all in `drivers::keys`. The last two act only through a SystemPower connection (`set_power`) and do nothing without one.
+   - **The cooking cannot be linked as it is.** The services crate does not depend on the drivers crate, so the cooking has to move to a shared library.
+   - **The gate step is feasible.** `lab.py key` already types into the shell through an emulated keyboard.
+
+   Plan changes:
+   - **Part c, new item "THE TEXT CONSOLE".** It says:
+     - The ordinary key stream does not reach the console, and why.
+     - InputService feeds the console input for every Bluetooth keyboard. It does so under a ConsoleInputSource that ServiceManager delegates to it through a privilege role on its manifest row, as it delegates DeviceManager's. The role is optional and comes last in the bootstrap.
+     - The keys go through the drivers' own cooking: `drivers::keys` and the USB keyboard's usage-to-keycode table, moved into a library that the drivers and InputService both link rather than copied. Each peer has its own modifier and lock state.
+     - The console's focus rule applies unchanged, and InputService feeds nothing during a protected session.
+     - Ctrl+Alt+Delete and the Power key do not act from a Bluetooth keyboard. InputService holds no SystemPower connection and is given none; the item states the reason.
+     - THE GATE: the oracle's keyboard peer types a command at the shell prompt and the gate reads its output. The peer's Ctrl+Alt+Delete and Power key leave the machine running.
+   - **Part a, pairing item.** A bonded Bluetooth keyboard now types into the console (part c), so a machine whose only keyboard is Bluetooth pairs the next one from it.
+   - **Part i, `docs/THREAT_MODEL.md` item.** It now records two things:
+     - a keyboard trusted for input types at the console through InputService, so the radio stack joins what console input rests on;
+     - that keyboard's Ctrl+Alt+Delete and Power key act on nothing.
+
+2. **ACCEPTED - OBEX receiving cannot be accepted on `btctl`'s terminal, and the prompt watchers cannot read an answer.**
+
+   What I verified:
+   - **`btctl`'s launch shape.** `btctl` is `Shape::Rest`, so it goes through `run_tool`, which hands the tool only the write end of a relay channel. Only the `InteractiveArgs` shape (`play`, `less`, `audiorec`) passes the terminal with receive rights and the tty control.
+   - **A redirection is a pipeline.** `cmd > b` becomes `cmd | redirect_out b`. The shell gives the last stage a send-only terminal. The broker gives the first stage no stdin and every stage a send-only diagnostics duplicate. So `btctl receive ... > file` can print but never read, whatever its shape.
+   - **Grants inside a pipeline.** Pipeline stages still receive their manifest grants, so `btctl` keeps both Bluetooth authorities as a stage.
+   - **What the redirection publishes.** `redirect_out` publishes when the stream ends normally, and a clean exit with a failure status still counts.
+
+   Plan changes:
+   - **Part a, pairing item.** `btctl` takes the shell's interactive launch shape (the one `play` and `less` have), so `pair` and `pairable` read their answers on their own terminal.
+   - **Part g, OBEX item.** Receiving is consented by the invocation itself:
+     - `btctl receive <peer> <max-bytes> > file` takes the first object that bonded peer pushes while it waits: at most 180 seconds, or until interrupted.
+     - It prints the escaped name, the size and the type on its diagnostics endpoint, asks nothing, and writes the object's bytes to its output.
+     - It refuses a push from any other peer, a push when no receiver is waiting, and an object that declares more than `<max-bytes>`. An object that passes the bound while arriving is aborted.
+     - An object that does not arrive whole is reported with the bytes received, and `btctl` exits with a failure status. The redirection keeps its own rule and publishes what reached it, so the report is what says the file is short.
+     - The peer's name for the object is never a path.
+   - **Part a, SDP item.** The OPP server record is held only while a `btctl receive` waits.
+   - **Part a, inbound-policy item.** BR/EDR is connectable while a `btctl receive` waits. OPP has no standing trust: an inbound OPP connection is admitted only from the peer that a waiting `btctl receive` names, and only for as long as it waits. OPP is removed from the trust list.
+   - **Part i, `btctl` item.** `btctl` is launched with the interactive shape, and `receive <peer> <max-bytes>` is consented by its own invocation.
+
+3. **ACCEPTED - Consumer-control keys have no vocabulary, stream or consumer, and the ORDER line cites a vocabulary no plan defines.**
+
+   What I verified:
+   - **`key-event` is keyboard-page only.**
+   - **USB media keys are dropped today.** `usb_hid.rs` maps consumer-page usages through `consumer_keycode`, and `drivers::keys` reserves the media keys "until a media session exists".
+   - **P02M0099 defines no consumer-control record.** Its HID expansion item names consumer controls only in its opening sentence. Its parser and vocabulary halves added pages, collection depth, units and contacts.
+   - **P02M0199c stays compatible.** It keeps consumer-page usages out of `key-event`, and its `system-keys` stream carries brightness only.
+
+   I applied the settled decision: these keys are recognised and dropped until a media session exists. The Media Control Service waits for that session too. AVRCP controller verbs toward a phone and absolute volume stay.
+
+   Plan changes:
+   - **Part c, `open-input` item.** Key transitions carry their usage page. Consumer-page keys (media, volume and launcher keys) never enter `key-event` and are treated as a USB keyboard's are: today recognised and dropped, and the media keys until a media session exists, which this milestone does not build.
+   - **Part c, classic HID item.** The sentence that delivered a headset's AVRCP buttons as media keys is removed.
+   - **Part c, ORDER line.** The citation of a P02M0099 consumer-control vocabulary is removed.
+   - **Part e, AVRCP item.** The controller verbs toward a phone (`btctl media`) and absolute volume in both directions stay. As target, a headset's play, pause, next and previous are recognised and dropped: answered NOT IMPLEMENTED and never acknowledged as done, and the target's record claims no player category.
+   - **Part h, unicast item.**
+     - The call relay reaches the earbuds through the Generic Telephone Bearer Service (TMAP's Call Gateway). "Telephony Bearer" is corrected to that name.
+     - The Media Control Service waits for a media session, and TMAP's Unicast Media Sender waits with it.
+   - **Part b, GATT server item.** It now lists the Generic Telephone Bearer Service that part h relies on.
+   - **EXCLUDES.** It names the media session: until one exists, media keys and a headset's AVRCP buttons are recognised and dropped, and no Media Control Service is served.
+
+4. **ACCEPTED - The "one rule for both radios" does not map onto BR/EDR.**
+
+   What I verified:
+   - **IO capability.** The BR/EDR IO Capability Request Reply takes only DisplayOnly, DisplayYesNo, KeyboardOnly and NoInputNoOutput. With DisplayYesNo against a KeyboardOnly peer, this host displays the passkey and never enters one; Linux substitutes DisplayYesNo for KeyboardDisplay on BR/EDR.
+   - **Key strength.** The Link Key Notification key types separate P-192 from P-256 keys, authenticated and not. Cross-transport key derivation needs a Secure Connections key.
+   - **IDL levels.** `bluetooth.lsidl`'s `security-level` has only none, encrypted-unauthenticated and encrypted-authenticated.
+   - **Shared PSM.** HFP, HSP and OPP over RFCOMM share RFCOMM's one PSM.
+
+   Plan changes:
+   - **Part a, pairing item.** While a watcher is attached, this host declares KeyboardDisplay on LE and DisplayYesNo on BR/EDR. So on BR/EDR it shows the passkey a keyboard types and never types one itself; Passkey Entry in both directions is LE's. The model list no longer says "in either direction".
+   - **Part a, Secure Simple Pairing item.**
+     - It uses P-256 (Secure Connections) where both sides support it, and P-192 where the peer has nothing newer.
+     - A key for the other radio is derived only from a Secure Connections key, at its source's level.
+     - THE LEVELS are one rule for both radios and are reported with every link and bond (`security-level` grows additively). They are compared on two axes:
+       - key agreement: P-256 above P-192 above legacy on BR/EDR, and LE Secure Connections above LE legacy;
+       - authentication: Numeric Comparison or Passkey Entry above Just Works.
+     - NEVER DOWNGRADED: a bonded peer that pairs again lower on either axis is refused and keeps its bond, and the operator forgets it to pair it anew. Examples: a P-256 bond offered P-192, a Secure Connections bond offered legacy, an authenticated bond offered Just Works.
+   - **Part a, inbound-policy item.** Trust is enforced where the profile is first named:
+     - At L2CAP, by PSM: HID control and interrupt, AVDTP and AVCTP, BNEP, and OBEX's own PSM.
+     - On RFCOMM, by server channel for HFP, HSP and OPP. The RFCOMM session is admitted when the peer may open any channel this system serves, and each channel is refused unless the peer is admitted for that channel's profile.
+     - SDP answers any connected peer.
+   - **Part b, GATT server item.** The Generic Telephone Bearer Service answers only a peer trusted for voice, so trust per profile holds on LE as well.
+
+Re-check of the whole plan: I re-read the whole plan after the edits.
+- **Internal consistency.**
+  - The header's `bluetooth-profile` row is still accurate: consumer-page reports travel on `open-input` and are dropped in InputService.
+  - The trust list, `btctl trust`, the SDP server, the inbound policy and part g now agree on OPP.
+  - Part b's LE legacy line agrees with the new levels rule, and part b's GATT server lists the service part h's call relay uses.
+  - Part d's call relay, part e's AVRCP and part h's media-control text agree with EXCLUDES.
+  - Part c's ORDER line now names only P02M0192's vocabulary.
+  - The bounds, the ORDER lines and the owner questions are untouched.
+- **The neighbouring plans.**
+  - P02M0192: the working-tree gamepad set (InputService's id at arrival, `departed`) matches part c.
+  - P02M0199c: its consumer-page rule is kept (nothing enters `key-event`).
+  - P02M0188: Bluetooth keys still never reach the trusted sink, and the console feed stops during a protected session, as P02M0188 requires of cooked console input.
+  - P02M0180: `btctl` and `enable` are carried forward.
+  - P02M0099: the SCO and ISO hand-offs are unchanged.
+- **Found and fixed during the re-check.** The first wording of the console item omitted the kernel's own serial line as a console-input source.
+- **Rules.** The plan is ASCII only, has no em dash, cites no audit and no coordination number, keeps every version at 1, and keeps the Status line and the owner's decisions (the complete service, voice, underrun policy (a)).
+
+The plan is complete, correct, feasible, internally consistent and ready for implementation.
+
+Only `docs/todo/P02M0194.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0194 (2026-09-26T15:50:59Z):
+
+**Rating: 9/10.** The plan text now corrects all four findings of the last re-audit, and the tree has the mechanisms those corrections rely on, as the planner describes. One small inconsistency is left: part a's storage bound is sized for one controller, but the table allows two.
+
+I read the whole history, the planner's diff of the plan against HEAD, and its response. I checked the new text against the tree:
+- the console input path: `sys_console_feed` and the ConsoleInputSource privilege, ConsoleService's focus rule, ServiceManager's CONSOLE privilege role and its optional manifest shape, InputService's positional bootstrap, its `protected` flag and its focus notice, and `drivers::keys` with `usb_hid`'s usage table;
+- the shell's launch shapes and redirection expansion, PermissionManager's pipeline stage wiring, the manifest grants a stage receives, and `redirect_out`'s publish rule;
+- `bluetooth.lsidl`'s `security-level` and operator interface, `audio.lsidl`'s `audio-admin`, and the broker's `cap_grants`;
+- how the existing Bluetooth gate drives `btctl`.
+
+I also checked the text against P02M0099, P02M0180, P02M0188, P02M0192 and P02M0199 as they stand in the working tree.
+
+These corrections hold:
+- **Previous finding 1 (text console).** [The console item](/data/yellow/libersystem/docs/todo/P02M0194.md:182) names the feeder, the delegated privilege, the shared cooking, the focus and protected-session rules, the inert chords and a gate that types at the shell. The tree already supports each point:
+  - ConsoleService drops unfocused non-serial input itself ([console_service.rs](/data/yellow/libersystem/src/user/services/core/src/console_service.rs:938)).
+  - InputService already tracks the protected session ([input_service.rs](/data/yellow/libersystem/src/user/services/core/src/input_service.rs:77)) and tells the console about focus ([input_service.rs](/data/yellow/libersystem/src/user/services/core/src/input_service.rs:392)).
+  - The CONSOLE privilege is an optional manifest role ([manifest.toml](/data/yellow/libersystem/src/user/services/manifest.toml:3531)). ServiceManager duplicates it today for DeviceManager alone ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:867)).
+  - Without a SystemPower connection the reboot chord and the Power key are inert ([keys.rs](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:128)).
+- **Previous finding 2 (OBEX receiving and the watchers).** `btctl` now takes the interactive shape ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:96)), and the invocation itself is the consent to receive ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:284)). The tree behaves as the item states:
+  - a pipeline stage is launched by name whatever its shape ([shell.rs](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1577));
+  - the stage keeps its manifest grants ([permission_manager.rs](/data/yellow/libersystem/src/user/services/core/src/permission_manager.rs:1975));
+  - `redirect_out` still publishes when the stream closes cleanly after a failure exit ([redirect_out.rs](/data/yellow/libersystem/src/user/apps/tools/src/redirect_out.rs:17)).
+- **Previous finding 3 (consumer-control keys).** The plan now drops these keys after recognising them ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:171)). The claims that headset and earbud buttons act are withdrawn ([AVRCP](/data/yellow/libersystem/docs/todo/P02M0194.md:252), [Media Control](/data/yellow/libersystem/docs/todo/P02M0194.md:320)), and the P02M0099 citation is gone. This agrees with P02M0199c ([P02M0199.md](/data/yellow/libersystem/docs/todo/P02M0199.md:205)).
+- **Previous finding 4 (BR/EDR mapping).** The plan now has:
+  - DisplayYesNo as the BR/EDR IO capability ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:101));
+  - security levels on two axes, with P-192 given its own level ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:119));
+  - trust enforced per PSM, and per RFCOMM server channel for the RFCOMM profiles ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:140)).
+
+**One claim in the response is wrong, but the plan does not depend on it.** The response says that "the services crate does not depend on the drivers crate, so the cooking has to move to a shared library". The evidence says otherwise:
+- the services crate does depend on the drivers crate ([Cargo.toml](/data/yellow/libersystem/src/user/services/core/Cargo.toml:359));
+- `drivers::keys` is public ([lib.rs](/data/yellow/libersystem/src/user/drivers/core/src/lib.rs:62));
+- MidiService already uses a module of that crate ([midi_service.rs](/data/yellow/libersystem/src/user/services/core/src/midi_service.rs:30)).
+
+So the move that the console item orders is a design choice, not a necessity. The plan can be built either way, so this is not raised as a finding.
+
+1. **Low - Part a's storage bound covers one controller's worst cases, but the table allows two controllers and they share the aggregate.**
+
+   - The links row allows ["two controllers, as before; at most 8 ACL links per controller"](/data/yellow/libersystem/docs/todo/P02M0194.md:69).
+   - The storage row sets ["1 MB aggregate packet storage, against worst cases of 8 x 16 x 1691 ..., 8 x 2 x 8 x 1691 ... and 8 x 32 x 1028"](/data/yellow/libersystem/docs/todo/P02M0194.md:81). Every product counts eight links, and the sum is 696 kB.
+   - P02M0180 sets the aggregate across the service's tables, which cover both controllers ([P02M0180.md](/data/yellow/libersystem/docs/todo/P02M0180.md:268)). The service drives both controllers in one process ([bluetooth_service.rs](/data/yellow/libersystem/src/user/services/core/src/bluetooth_service.rs:39)).
+   - At sixteen links the same worst cases are 433 + 433 + 526 kB, about 1.39 MB. That is above the 1 MB the row says covers them.
+   - The Domain row is unaffected: 64 MB is well above either figure.
+
+   This is a new finding; the previous re-audit accepted the bounds. It matters because the item states its bounds before any code and sizes the aggregate "against worst cases" ([plan](/data/yellow/libersystem/docs/todo/P02M0194.md:66)).
+
+   **Correct part a's storage row.** Do one of the following:
+   - State the worst cases for both controllers and size the aggregate above them, at about 1.4 MB.
+   - Or state that the two controllers share the 1 MB, and that load beyond it is refused explicitly, as P02M0180's tables refuse overload ([P02M0180.md](/data/yellow/libersystem/docs/todo/P02M0180.md:272)).
+
+Validation: this was a read-only inspection. I read the plan in the working tree and at HEAD, and the whole audit file with the planner's uncommitted response. I also read the neighbouring plans in the working tree and the source files named above. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0194 (2026-09-26T17:12:45Z):
+
+Verified read-only: P02M0180's bounds item ("two controllers, one link each ... 256 kB aggregate packet storage", one aggregate over both), the Bluetooth service driving both controllers in one process, and the arithmetic: 16 x 16 x 1691 = 432,896, 16 x 2 x 8 x 1691 = 432,896 and 16 x 32 x 1028 = 526,336 bytes, together 1,392,128. Summary: one finding, accepted.
+
+1. **ACCEPTED - part a's storage bound covered one controller's worst cases while two share the aggregate.** Of the two corrections offered I took the first, sizing the aggregate above both controllers' worst cases: the row's own premise is that the aggregate is sized "against worst cases", and refusing load that the per-link bounds already admit would make those bounds unreachable together; the 64 MB Domain has room. Plan change, the storage row: "1.5 MB aggregate packet storage, SHARED BY BOTH CONTROLLERS as P02M0180's aggregate is, against the worst cases of their 16 links together - 16 x 16 x 1691 = 433 kB of reassembly, 16 x 2 x 8 x 1691 = 433 kB of ERTM windows and 16 x 32 x 1028 = 526 kB of queued ACL, about 1.39 MB". The Domain row is unchanged and still true.
+
+ALSO CORRECTED, though not raised as a finding: my last response said the services crate does not depend on the drivers crate. That was wrong - it does, and MidiService uses `drivers::usb_midi`. The console item had built on it ("moved into a library ... rather than copied"). It now says InputService links `drivers::keys` as it is, and that only the USB keyboard's usage-to-keycode table moves - it lives in the xHCI binary's `usb_hid` module (`crate::usb_hid`, not a module of the library), so it moves into the drivers library beside `keys`. Nothing is copied either way.
+
+Re-check of the whole plan: the bounds table is consistent with the links row (two controllers, eight links each) and with P02M0180; every other part is unchanged. The file is ASCII, cites no audit and keeps its `Status:` line.
+
+Edited `docs/todo/P02M0194.md` only; no source was changed, and nothing was built or booted.

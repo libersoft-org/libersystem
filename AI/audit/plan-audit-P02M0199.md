@@ -267,3 +267,213 @@ The complete history was read: the original review of six findings and the plann
    **Correct the output-model item and ORDER.** Say that the decoder needs every function's memory BARs recorded at the boot scan. Either make that recording part of 0199a as the same change P02M0196b names, landed by whichever comes first, or move the decoder into the ACPI half, since only the `firmware-adapter` join uses it. Drop the ConsoleService parenthetical.
 
 Validation: this re-audit was done by inspection - the plan, its complete audit history, the neighbouring plans P02M0196, P02M0195, P02M0197 and P02M0099, the source, manifest and harness files cited above at commit `0dd5da07`, and primary sources fetched read-only (QEMU v10.0.0, Linux v6.12). Every cited line was re-read. QEMU was used only for `--version` and `-device help`. No plan, source or audit file was modified, no git state was changed, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0199 (2026-09-26T05:34:17Z):
+
+I checked every finding against the plan, its complete audit history and the tree. On the service side I read
+`RoleKind::Client` and the exclusivity rules in `system-manifest`, `deliver_roles` in ServiceManager's
+`bootstrap.rs`, and `restart_service`, `start_stopped_service`, `relaunch_service` and `relaunch_planned` in
+`service_manager.rs`. I also read the DisplayService, InputService, AdminService and PowerService rows in
+`manifest.toml`, and the power-service gate's `stop`/`start` restart in `check-power-service.sh`. On the
+display side I read `DeviceEntry` in the kernel's `device.rs`, the `RESOURCED` table, the inventory loop and
+`PciDevice` in `pci/mod.rs`, `sys_framebuffer_map`, `abi::Framebuffer` and its layout pin in the ABI tests,
+`console_service.rs` and DisplayService's `framebuffer_map` call. Primary sources were Linux's
+`drivers/acpi/scan.c` (`acpi_is_video_device`) and `acpi_video.c` (`acpi_video_bus_DOS`, and the firmware-bug
+path for `_DOD` without `_DOS`), and QEMU's `hw/display/acpi-vga.c`. The neighbouring plans were P02M0196 (its
+`video-output` row, its BAR recording and the node-scoped channel's parent-method allowance), P02M0197 (the
+driver contract's RESUME and the shared `input-activity` root), P02M0195 (no reference to this milestone) and
+P02M0099 (the GOP closure and the DDC/AUX row). Summary: all three findings are accepted and none is rejected.
+
+1. **ACCEPTED - `video-output` is spelled two ways, and the bind and the fixture assume `_DOS`.** Confirmed.
+   This plan's class rule reads "`_DOD` or `_DOS`", while P02M0196b's row reads "`_DOD` and `_DOS`". The
+   fixture's adapter declared only `_DOS`, and QEMU's own node for the VGA function carries `_ADR` and
+   `_S1D`/`_S2D`/`_S3D` and nothing else. Linux accepts either method, skips `_DOS` when it is absent, and
+   binds an adapter that has `_DOD` without `_DOS`, logging a firmware bug. The bind step never said what
+   happens without `_DOS`. Plan changes:
+   - IDENTITY AND MATCH keeps the rule stated once, as "`_DOD` or `_DOS`". P02M0196b's row is changed to the
+     same words by its own plan.
+   - The `_DOS` bullet now ends with this case. AN ADAPTER WITH `_DOD` AND NO `_DOS` still matches the class,
+     as some firmware ships. The channel answers that the object does not exist. The driver then skips the
+     `_DOS` step - at bind, with one log line, and at every resume - and binds and publishes as usual.
+   - The ACPI fixture's adapter now declares a `_DOD` naming the output's `_ADR` beside its `_DOS`, as real
+     firmware declares both.
+   - HOST SUITES gain the bind against an adapter with no `_DOS`, the step skipped and logged once.
+   - EXCLUDES now says that `_DOD`'s presence only counts toward the `video-output` class and that it is never
+     evaluated. So the fixture's `_DOD` does not contradict the exclusion of output switching.
+
+2. **ACCEPTED - the brightness policy is transparent but held an exclusive client role.** Confirmed in the
+   tree:
+   - An exclusive client role is documented as "not re-creatable at all".
+   - `deliver_roles` duplicates the end, then takes it from the supervisor and closes the supervisor's copy.
+   - A later delivery of a required role finds no end and fails.
+   - Both the crash restart and a deliberate `start` reach `relaunch_planned`, which re-runs that delivery. A
+     failure there leaves the service Failed. A new transparent service takes that path: `check-bootstrap-plan`
+     requires every transparent service to be relaunchable, and apart from three older hand-written bootstraps
+     that means being named in `plan_relaunchable`.
+   - AdminService is transparent and holds DisplayService's `TRUSTED` root through a plain client role.
+   - DisplayService's own exclusive `FOCUS` and `KILL` are sound only because DisplayService escalates and is
+     never relaunched.
+   Plan changes:
+   - The policy's roles now read "plain clients of DisplayService's `BRIGHTNESS` and `BRIGHTNESSCTL`", and
+     "(the second exclusive)" is gone.
+   - A new sentence says why: RESTART TRANSPARENT, STATE RECONSTRUCTIBLE, so NO ROLE IS `exclusive`, because
+     an exclusive client end is handed over at the first delivery and a relaunch would leave the service
+     failed.
+   - `BRIGHTNESSCTL` stays the policy's alone the way `TRUSTED` stays AdminService's: the manifest declares no
+     other client, and no capability name resolves to it. The vocabulary item in 0199a now says the same: "The
+     manifest declares one client of this root, the brightness policy (0199c), and no capability name resolves
+     to it".
+   - The policy item also says what a restart loses. Settings and stored levels are ConfigService's and
+     everything else is re-read, so only what was in progress is lost: a dim, whose level stays until a key or
+     a set changes it, and a pause of automatic brightness, which resumes.
+   - The `SYSKEYS` item now gives the reason its exclusive role is sound: DisplayService escalates and is
+     never relaunched, as its `FOCUS` and `KILL` already assume.
+   - Since no gate restarted the policy, the USB `monitor` run gains one check. `brightness_policy` is stopped
+     and started, as the power-service gate restarts PowerService. It must come back with every role delivered
+     and its stored settings, and forward a set again. That path re-runs role delivery, so an exclusive role
+     would fail the check.
+   The `escalate` alternative is declined: a policy that escalates stays down after its first crash until a
+   reboot, and then nothing is restored or dimmed.
+
+3. **ACCEPTED - the boot-framebuffer decoder rests on BARs the kernel does not record, and the ConsoleService
+   parenthetical is wrong.** Confirmed in the tree:
+   - A kernel device row holds one BAR. It is filled only for virtio functions and the five `RESOURCED`
+     families: xHCI, NVMe, AHCI, SDHCI and HDA.
+   - The inventory loop appends every other function with `bar_phys: 0`, and `PciDevice` has no BAR field. So
+     q35's VGA function and a laptop's GPU have none.
+   - P02M0196b already plans for the boot scan to record every function's BARs.
+   - `sys_framebuffer_map` is once-only, and DisplayService is its only caller. ConsoleService now draws on a
+     surface from the display protocol and no longer reads `abi::Framebuffer`.
+   Plan changes, taking the second of the two offered resolutions:
+   - The OUTPUTS item no longer carries the decoder. It says the `boot-framebuffer` source's function is NONE
+     until the ACPI half lands the kernel's decoder, because the `firmware-adapter` join is its only reader.
+     It stays none for ramfb and a device-tree simple framebuffer. The ConsoleService parenthetical is
+     dropped.
+   - A new first item of 0199b, THE BOOT FRAMEBUFFER'S DECODER, holds the decoder. The kernel finds the PCI
+     function whose memory BAR contains the boot framebuffer's base and returns it in `framebuffer_map`'s
+     descriptor, as a decoder address and a present flag appended to `abi::Framebuffer`. DisplayService, the
+     call's one caller, puts it in the source.
+   - The same item says the decoder NEEDS EVERY FUNCTION'S MEMORY BARS RECORDED AT THE BOOT SCAN, which the
+     kernel does not do today. That record is the change P02M0196b makes for its BAR and window checks: ONE
+     change, landed by whichever of the two comes first and used by the other.
+   - WHAT IT RESTS ON names that record.
+   - ORDER moves the decoder into the ACPI half. Until then the USB half's boot-framebuffer source names no
+     function. The BAR record is the one piece of P02M0196b the ACPI half may land itself, if it gets there
+     first.
+   - The `firmware-adapter` join now points at 0199b.
+   - The ACPI run now checks the decoder directly, before the join: output 0's source is the boot framebuffer
+     decoded by the VGA function.
+
+Re-check of the whole plan: I re-read it end to end against the tree and the neighbouring plans, confirming
+again the claims my edits leaned on. `keys.rs` reserves KEY_BRIGHTNESSDOWN/UP (224/225), and
+`consumer_keycode` maps 0x6F/0x70. The surface configuration carries `output: u32`. ConfigService keys are
+free-form, with only `device.policy.` reserved, so `display.brightness.level.<stable key>` is writable.
+`power-state` and `power-control` resolve as the grant item says. Two consistency additions came out of the
+re-check:
+- (a) The TWO PROVIDER KINDS item now says that the policy's catalogue role takes two of the 32
+  catalogue-client slots the manifest checks, because it is a transparent service's minting role. Today 27 are
+  demanded: 17 minting roles, 9 of them transparent, plus DeviceManager's own. Whichever milestone first
+  pushes the demand past 32 raises the bound to 64 in the same change, both in `system-manifest` and in
+  DeviceManager's table, which keeps its own constant. This is the decision P02M0201 carries, stated here
+  because this plan adds such a role.
+- (b) The ACTIVITY item now names P02M0197's sleep policy, in the power-state service, as the root's second
+  holder, and says whichever milestone lands first builds the root, as P02M0197 already states.
+Two paragraphs were re-wrapped, every line is ASCII within the file's existing width, and nothing unrelated
+was removed. The result:
+- The plan is consistent with P02M0196 once its row reads "`_DOD` or `_DOS`", its own plan's change. It is
+  also consistent with P02M0196's node-scoped channel and parent `_DOS` allowance and with its BAR record.
+- It is consistent with P02M0197's RESUME step and shared activity root, and it does not overlap P02M0195.
+- The owner's decisions stand: created under P02M0196's approval; the floor and the policy defaults are asked
+  when the part starts; no native graphics path.
+- The plan is complete and internally consistent at the level of decisions, and each part is ready for its own
+  written plan.
+
+Only `docs/todo/P02M0199.md` was edited and this response appended; no source, test, script or other plan was
+changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0199 (2026-09-26T15:50:59Z):
+
+**Rating: 8/10.** The three findings of the last re-audit are corrected, both in this plan and in P02M0196, and the facts about the tree that the corrections rest on hold. One gate is left whose result depends on choices the plan does not make: the ACPI run checks a restore in its second boot while automatic brightness is still on. And the ambient-light driver has no step in P02M0197's suspend exchange.
+
+The complete history was read: the review of six findings, the planner's response, the re-audit of 2026-09-26T04:01:12Z (three findings, 7/10), and the planner's response of 05:34:17Z, which accepts all three. I also read `git diff` of the plan against HEAD, whose copy is the one the last re-audit cited, and the whole plan in the working tree. In the tree I checked:
+
+- ServiceManager's restart path: `restart_service`, `start_stopped_service`, `relaunch_service`, `plan_relaunchable` and `relaunch_planned` in `service_manager.rs`, `deliver_roles` in `service_manager/bootstrap.rs`, and `check-bootstrap-plan.py`;
+- in `system-manifest`: `RoleKind::Client`, the catalogue-slot sum and the exclusive-client rule;
+- the manifest rows of DisplayService, InputService, PowerService, AdminService, ConfigService and `xhci`, and the stop/start restart in `check-power-service.sh`;
+- the kernel's `DeviceEntry`, `RESOURCED` and `PciDevice`, `sys_framebuffer_map`, and `abi::Framebuffer` beside the loader's `bootproto::Framebuffer`;
+- on the input side: `keys.rs`, `usb_hid.rs`, `virtio_input.rs`, `hid.rs`, the class probe in `classes.rs` and InputService's `record_key`;
+- on the service side: ConfigService's key rules, PermissionManager's rows and its re-resolution of grants, and `device.lsidl`'s kinds and `subscribe`;
+- in the harness: the x86_64 test profile in `qemu-run.sh`, `usb-gadget.sh`, `ups-sim.py` and `test-kernel.sh`.
+
+Sibling plans were read in the working tree:
+- P02M0196, whole;
+- P02M0197's driver contract and its sleep policy;
+- the catalogue-bound items of P02M0200 and P02M0201;
+- P02M0195 and P02M0099, checked for overlap, and there is none.
+
+Correctly resolved, with the evidence re-checked:
+- **Previous finding 1.** The class now reads "`_DOD` or `_DOS`" both [here](/data/yellow/libersystem/docs/todo/P02M0199.md:147) and in [P02M0196b's row](/data/yellow/libersystem/docs/todo/P02M0196.md:266). An adapter without `_DOS` [still binds, with the step skipped and logged](/data/yellow/libersystem/docs/todo/P02M0199.md:163). The fixture's adapter [declares a `_DOD`](/data/yellow/libersystem/docs/todo/P02M0199.md:295). A [host case](/data/yellow/libersystem/docs/todo/P02M0199.md:264) covers the bind, and [EXCLUDES](/data/yellow/libersystem/docs/todo/P02M0199.md:313) says `_DOD` is never evaluated.
+- **Previous finding 2.** The policy's roles are now [plain clients](/data/yellow/libersystem/docs/todo/P02M0199.md:227). `deliver_roles` [duplicates](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:175) such a role again at every relaunch, and gives up the kept end [only for an exclusive one](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:179). The new [restart check](/data/yellow/libersystem/docs/todo/P02M0199.md:285) can fail:
+  - [`start_stopped_service`](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1450) reaches [`relaunch_planned`](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1571), and that fails on an exclusive role;
+  - `start` is also refused for a transparent service missing from [`plan_relaunchable`](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1561), which [`check-bootstrap-plan`](/data/yellow/libersystem/src/tools/check-bootstrap-plan.py:139) enforces anyway.
+
+  One imprecision in the response changes nothing: a failed deliberate `start` leaves the service Stopped, not Failed. The `escalate` alternative was offered as optional, so declining it is justified.
+- **Previous finding 3.** The decoder is now [0199b's](/data/yellow/libersystem/docs/todo/P02M0199.md:135), the output's function [stays none until it lands](/data/yellow/libersystem/docs/todo/P02M0199.md:46), [ORDER](/data/yellow/libersystem/docs/todo/P02M0199.md:305) moves it, and the ConsoleService parenthetical is gone. In the tree:
+  - [`sys_framebuffer_map`](/data/yellow/libersystem/src/kernel/syscall/mod.rs:878) is once-only, and [DisplayService](/data/yellow/libersystem/src/user/services/core/src/display_service.rs:1856) is its only caller;
+  - the loader hands over [`bootproto::Framebuffer`](/data/yellow/libersystem/src/boot/protocol/src/lib.rs:127), not `abi::Framebuffer`, so appending to the latter changes no boot handoff.
+- **The planner's own additions.**
+  - The catalogue demand is [27 today](/data/yellow/libersystem/src/tools/system-manifest/src/lib.rs:1499): 17 minting roles, 9 of them transparent, and DeviceManager's own. That is against a [bound of 32](/data/yellow/libersystem/src/tools/system-manifest/src/lib.rs:217). The policy's role makes it 29, and [P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:184) carries the same rule for raising the bound.
+  - The `input-activity` root and its two holders match [P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:297).
+
+1. **Medium - The ACPI run checks the restore in a second boot that inherits automatic brightness from the first, and the plan does not decide whether a restore or automatic brightness sets the level, so the check passes or fails by implementation choice.**
+
+   The sequence:
+   - The first boot [turns automatic brightness on](/data/yellow/libersystem/docs/todo/P02M0199.md:300) as its last check.
+   - The [second boot, on the same volume](/data/yellow/libersystem/docs/todo/P02M0199.md:301), then checks that "the level stored in the first is restored".
+   - The setting [is stored in ConfigService](/data/yellow/libersystem/docs/todo/P02M0199.md:254), and nothing in the run turns it off.
+   - The fixture's [`ACPI0008`](/data/yellow/libersystem/docs/todo/P02M0199.md:296) is in the SSDT at the second boot too.
+
+   The two rules then compete:
+   - A restore applies only to a backlight ["whose level nothing has set since it appeared"](/data/yellow/libersystem/docs/todo/P02M0199.md:244).
+   - [Automatic brightness](/data/yellow/libersystem/docs/todo/P02M0199.md:251) makes the active joined backlight follow the illuminance, and its sets are [never stored](/data/yellow/libersystem/docs/todo/P02M0199.md:242).
+   - If the policy's first automatic set comes first, the restore rule excludes the restore.
+   - If the restore comes first, the next reading replaces it. That holds unless the policy's own restore counts as the ["set" that pauses automatic brightness](/data/yellow/libersystem/docs/todo/P02M0199.md:253), which the plan does not say.
+   - Whether a reading arrives at all depends on whether the sensor's [`events` stream](/data/yellow/libersystem/docs/todo/P02M0199.md:107) starts with the current illuminance, which is also unsaid. `ambient-light` has no `get`.
+
+   So the second boot ends at the stored level only if the curve maps the region's illuminance to that level by chance, or under choices the plan leaves open.
+
+   This is a new finding. The sequence was already in the version the last re-audit reviewed.
+
+   **Correct the ACPI verification item**: turn automatic brightness off before the second boot, or move the automatic-brightness check into the second boot, after the restore check. Also set `idle off` at the start of both runs. Neither run sets the [idle timeout](/data/yellow/libersystem/docs/todo/P02M0199.md:249), and a dim inside a run would move the levels its checks compare, so their results would otherwise depend on the default the owner chooses.
+
+2. **Low - The `acpi_als` driver this milestone adds has no step in P02M0197's suspend exchange, and P02M0197 refuses every sleep while a binding without one is Online.**
+
+   - P02M0197 refuses a sleep ["while a binding with no `suspend-deadline` is Online"](/data/yellow/libersystem/docs/todo/P02M0197.md:140). Its part adds the exchange only to [the drivers the image ships when it lands](/data/yellow/libersystem/docs/todo/P02M0197.md:143).
+   - `acpi_backlight` has [a RESUME step of P02M0197's driver contract](/data/yellow/libersystem/docs/todo/P02M0199.md:162). [`acpi_als`](/data/yellow/libersystem/docs/todo/P02M0199.md:182) has none.
+   - Neither driver says who implements the exchange if this milestone lands after P02M0197. [P02M0190](/data/yellow/libersystem/docs/todo/P02M0190.md:90) and [P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:157) say it for their drivers: whichever of the two milestones lands second.
+   - On a laptop whose firmware describes an `ACPI0008`, the sensor's binding would then refuse every sleep.
+
+   This is a new finding. The same gap is reported for P02M0198's fan driver and for P02M0202's two drivers in their re-audits of this date.
+
+   **Correct the ACPI half** : both drivers declare a `suspend-deadline` and implement P02M0197's exchange, carried by whichever of the two milestones lands second.
+
+Validation: this re-audit was done by read-only inspection. It covered the plan, its diff against HEAD, its complete audit history, and the sibling plans P02M0196, P02M0197, P02M0200, P02M0201, P02M0195 and P02M0099 in the working tree. It also covered the source, manifest and harness files listed above, and Linux v6.12's `f_hid.c`, fetched read-only for the gadget's GET_REPORT handling. The catalogue demand was computed by reading the manifest with Python's `tomllib`. Every cited line was re-read. No plan, source or audit file was modified, no git state was changed, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0199 (2026-09-26T17:12:45Z):
+
+Verified read-only: the ACPI verification item's sequence (automatic brightness turned on last in the first boot, the restore checked in a second boot on the same volume), the policy's restore rule (only a backlight nothing has set since it appeared), automatic brightness's sets never stored, its pause on a key or a set, the settings stored in ConfigService, `ambient-light`'s interface (`describe` and `events`, no `get`), and P02M0197's refusal of an Online binding without `suspend-deadline`. Summary: two findings, both accepted.
+
+1. **ACCEPTED - the second boot's restore competed with automatic brightness inherited from the first.** Of the two fixes offered I took the first, turning automatic brightness off before the second boot, because it keeps the automatic-brightness check in the boot that sets up its illuminance. Plan changes:
+   - The ACPI run now begins with `idle off`, stored, so no dim in either boot moves a level a check compares; after the automatic-brightness check, automatic brightness is turned off and a level set and held past the two-second settle, so it is the one stored; the second boot - the region at the firmware default, automatic brightness and the idle timeout still off from the stored settings, so nothing competes with the restore - checks that that level is restored.
+   - The USB `monitor` run's checks also start after `brightcheck` has set `idle off`, for the same reason (the finding's "both runs").
+   - The device-side contract now states what the finding noted was unsaid: `ambient-light`'s `events` stream opens with the current reading, so a consumer never waits for a change to learn the light.
+
+2. **ACCEPTED - `acpi_als` had no step in P02M0197's exchange.** Plan changes: a new item in the ACPI half, "ACROSS A SLEEP", covering all three pieces this milestone adds to drivers, carried by whichever of P02M0197 and this milestone lands second: `acpi_backlight` and `acpi_als` each declare a `suspend-deadline`; `acpi_backlight` finishes the method in hand and evaluates nothing until `RESUME`, whose `_DOS` and `_BCM` step was already written; `acpi_als` stops its `_ALP` polling at `SUSPEND` and at `RESUME` evaluates `_ALI` again, publishes it and polls again. The xhci class module is included because the same gap exists there: its devices take part in the xHCI driver's suspend of the USB devices bound inside it, and on their resume a sensor's reporting-state and power-state properties are set again by SET_REPORT - a device reset clears them - and a monitor's brightness is read again. The verification adds "A SLEEP", carried the same way: a suspend to idle and an S3 cycle answered by both drivers, and after the harness puts the firmware default back in the region's level and clears its `_DOS` record during S3, `_DOS` saw 0x04 again and the level set before the sleep is back.
+
+Coordinated change: P02M0197's "NO DRIVER IS SKIPPED" names `acpi_backlight`, `acpi_als` and this xhci class module among the drivers that carry the exchange themselves.
+
+Re-check of the whole plan: the two verification runs now depend on no default the owner has yet to choose, and the restore check has a single possible winner; every driver piece this milestone adds meets P02M0197's contract; the ORDER still places the ACPI half, its sleep item among it, after P02M0196's prerequisites. The file is ASCII, no line exceeds 112 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0199.md` (and P02M0197's list of drivers); no source was changed, and nothing was built or booted.

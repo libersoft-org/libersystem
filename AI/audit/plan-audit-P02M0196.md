@@ -259,3 +259,177 @@ The complete history was read: the original review's eleven findings and the pla
    **Correct step 3:** state that its sleep item lands with P02M0197a/b, the registration call introduced by whichever lands first, and name the contract the service serves ServiceManager, through a manifest client role, for `_PTS`, `_SST`, `_WAK` and the wake methods.
 
 Validation: plan, audit, source and harness inspection; `git show 07371c44:docs/todo/P02M0196.md` and `git diff 07371c44 0dd5da07`; read-only QEMU 10.0.11 property queries that start no machine (`-device help` on the three binaries, `-device ICH9-LPC,help`, `-machine q35,help`); primary sources fetched read-only (QEMU v10.0.0, Linux, coreboot). No plan, source or audit file was modified, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0196 (2026-09-26T05:34:17Z):
+
+Every finding of the re-audit was checked against the plan, the consumer plans as they stand (P02M0190, P02M0191, P02M0195, P02M0197 to P02M0202, and P02M0099's identity, UART and ACPI class items), the tree and the primary sources. From the tree: `object/device_memory.rs` (a `DeviceMemory` is always mapped uncached); the loader's `region_kind` in `src/boot/uefi/src/memory.rs`, which folds EfiMemoryMappedIO into `MEM_RESERVED`; `kernel/device.rs` (`attach_events`, the device-event channel DeviceManager listens on); `smp/mod.rs` (the first-match table lookup); and ServiceManager's `bootstrap.rs` and `lifecycle.rs` (each service's report channel is kept as its control channel, which carries `STOP` and LogService's `FLUSH`). From the primary sources: QEMU v10.0.0's `hw/core/sysbus-fdt.c`, `hw/display/acpi-vga.c`, `hw/smbios/smbios_type_38.c`, `hw/acpi/ipmi.c`, the IPMI interface models and `hw/i386/acpi-build.c`; Linux's `drivers/acpi/scan.c`, `drivers/pnp/system.c`, `drivers/usb/typec/ucsi/ucsi_acpi.c`, `drivers/gpio/gpiolib-acpi-core.c` and the `gpio-virtio.yaml` binding; coreboot's ICH9 `lpc.asl`; and a ThinkPad X1 Carbon 6 UCSI DSDT excerpt. All eight findings are valid, and the plan now also carries the two cross-plan decisions that land in it. Summary: 8 accepted, 0 rejected.
+
+1. **ACCEPTED - The policy took the UCSI mailbox away from the node's own AML.** The plan refused the service "a claimed device's ranges", and the carve-out removed the fixture's `_CRS` range "from what the service maps". P02M0202b calls `_DSM` function 1 after every write of CONTROL and MESSAGE_OUT and function 2 to read VERSION and to poll CCI through the reset, and the firmware refreshes CCI and MESSAGE_IN in the node's own code before its `Notify`; its fixture's `_DSM` and notification path copy between the mailbox and staging areas. Real firmware has the same shape. In the X1 Carbon 6 DSDT, `\_SB.UBTC` (`_CID` `PNP0CA0`) returns a `Memory32Fixed` at `UBCB` from `_CRS` and, in the same node, declares `OperationRegion (USBC, SystemMemory, UBCB, 0x38)`. Its `_DSM` functions 1 and 2 (`ECWR`, `ECRD`) and its `NTFY` method (`ECRD` just before `Notify(0x80)`) access that region. Linux maps the same range `MEMREMAP_WB` for the driver. So both hold the range after the claim, and the policy refused one of them. Two gaps also showed. First, the plan named no memory type, while `DeviceMemory` is always uncached. Second, the loader folds firmware MMIO into "reserved", so the kernel cannot yet tell firmware-reserved RAM from MMIO. Plan changes:
+   - THE POLICY's SystemMemory bullet now has TWO ADMISSIONS. The first: a region that a claimed namespace device's OWN node declares, inside that device's own `_CRS` memory range, stays mappable while the device is claimed, because the driver and the node's `_DSM` and pre-`Notify` code share that memory. A region any other node declares over a claimed range stays refused, and a claim is refused, and reported, while another node's region maps any part of its ranges, so the rule holds whichever comes first. The second admission is the existing firmware-held PCI rule.
+   - The same bullet adds ONE MEMORY TYPE PER RANGE for the service's mappings and a claim's alike: write-back for ACPI NVS, ACPI-reclaimable and firmware-reserved memory, uncached for MMIO. The loader then keeps MMIO as a boot-memory-map kind of its own, appended.
+   - The `_CRS`-derived check reads "not over RAM - ACPI NVS and firmware-reserved memory excepted, since firmware places mailboxes there".
+   - The carve-out's `_CRS` range is admitted for the claim and stays reachable by that device's own node.
+   - THE REGION gains a LAYOUT rule: the companion's region covers the harness's own pages only, and each owner's device declares its own region over its `_CRS` range.
+   - The x86_64 verification claims the fixture device with a `_CRS` range in the ivshmem BAR. Its own method reads and writes that range while the claim holds it, and another node's region over it is refused.
+   - The host suites test both admissions and the claim refused under another node's region.
+
+2. **ACCEPTED - P02M0198's fixture registers were refused by every rule.** P02M0198's install check refuses a register "inside a claim" and otherwise defers to this plan's memory-class policy, and its fixture puts the `_PCT` and `_CPC` registers on a page of their own in the ivshmem BAR. That BAR's function becomes FIRMWARE-HELD ("a claim held by the service"), the policy refuses any BAR, and the carve-out admitted only a `_CRS` range, so nothing admitted a register the kernel installs. Plan changes:
+   - The FIXTURE CARVE-OUT (development build only) now admits two things inside the firmware-held `ivshmem-plain` (1af4:1110) BAR. The first is the `_CRS` range. The second is the SystemMemory registers of a processor table P02M0198's install check names, admitted for the kernel's install. The service's firmware-held claim does not count, for them, as a claim, and they are carved out of what the service maps: no region of the service's covers them while the table stands. "Every shipping build refuses both."
+   - THE REGION's layout gives processor registers a page no region covers.
+
+3. **ACCEPTED - `video-output` must be "`_DOD` or `_DOS`".** QEMU v10.0.0's `acpi-vga.c` gives the VGA node `_S1D`, `_S2D` and `_S3D` and nothing else. P02M0199's fixture adds only an adapter `_DOS`, P02M0199 defines the class with "or", and Linux's `acpi_is_video_device` tests `_DOD || _DOS`. Plan change: the class row in THE COMPANION JOIN reads "a child of a companion that has `_DOD` or `_DOS`, itself having `_BCL` and `_BCM`".
+
+4. **ACCEPTED - The tree TPM row was not one page, and child nodes were not delivered.** `add_tpm_tis_fdt_node` sets `reg` to 0x5000 and emits no interrupt, and P02M0190's resource rule is one 4 KiB locality-0 page with no interrupt. P02M0202c reads the `usb-c-connector` child, and a sink without it negotiates nothing. Plan changes:
+   - THE DEVICE TREE: a row carries its translated `reg` whole, except a `tcg,tpm-tis-mmio` node's. That row is ONE MMIO range, the 4 KiB locality-0 page at its translated `reg` base, with no interrupt, exactly as the `TPM2` row is. The bounded property block includes the node's CHILD NODES and their properties.
+   - The aarch64 and riscv64 verification publishes the TPM node "as its locality-0 page".
+   - The host suites check the TPM node cut to its page and child nodes in the property block.
+
+5. **ACCEPTED - `GeneralPurposeIo` and `GpioIo` must be input-only.** P02M0195's line contract is input-only, its scope is one line with its trigger, and it excludes GPIO output. Linux's `acpi_gpio_adr_space_handler` shows that a field write drives the pin. It also shows that a field read may use a line that `_AEI` already holds. Because P02M0195's controller grants each line to one connection, the plan must say how such a read is served. Plan changes:
+   - THE INTERPRETER serves `GeneralPurposeIo` FOR INPUT READS ONLY through a line-scoped connection, and a write is refused by name and reported. A read of a line the service already holds for `_AEI` is served on that connection. `GenericSerialBus` goes through an address-scoped connection, and a protocol the controller does not declare is refused.
+   - CONNECTIONS takes a `GpioIo` only as an input line and refuses one restricted to output by name.
+   - EXCLUDES gains GPIO output lines (a `GeneralPurposeIo` write, an output `GpioIo`) "until a board or a consumer needs one".
+   - The emitter's list names `GpioIo` and a field's `Connection`, the hostile-AML suite includes a `GeneralPurposeIo` write, and the x86_64 verification reads such a field and refuses a write to it.
+
+6. **ACCEPTED - SMBIOS type 38 cannot be merged by range.** `smbios_type_38.c` ORs 1 into an I/O base (QEMU's KCS at 0xCA2 appears as 0xCA3), shifts an SSIF address left by one, and records a register spacing but no length. QEMU's `IPI0001` nodes carry `_CRS` (an I/O range, or an `I2cSerialBusV2` whose source is the parent) and `_IFT`. The PCI forms emit no record. A base-and-containment merge therefore never matches SSIF and needs an invented length for KCS and BT. Plan changes:
+   - IDENTITY FORMS: an SMBIOS IPMI record is no row's identity. `smbios:38#n` is a match id the agreeing `IPI0001` row gains.
+   - The merge rule's examples no longer name SMBIOS.
+   - THE STATIC SOURCES: SMBIOS type 38 creates NO ROW. When step 2 publishes an `IPI0001` row, the agreeing record is attached as that row's match id. Agreement means the record's interface type equals the node's `_IFT`, and its address equals the node's. For KCS and BT, the record's decoded base (its low bit marks I/O space, and the modifier byte gives address bit 0) must equal the base of the node's `_CRS` range. For SSIF, the base shifted right by one (the seven-bit address) must equal the `I2cSerialBusV2` address. A record that no node takes, or that disagrees, is reported and changes nothing, and the node is used either way.
+   - NAMESPACE DEVICES reports an `IPI0001` node with its `_IFT` for that check.
+   - WHAT STEP 1 UNBLOCKS is restated, and the host suites test the attach rule.
+
+7. **ACCEPTED - "Join the kernel's reserved list" was undefined and harmful.** P02M0191's reserved set is refused at every mint and refuses additions that overlap it. Coreboot's ICH9 `LDRC` (`PNP0C02`) reserves the whole PM block (0x80 bytes), port 0x80, 0xB2 and the GPIO base, so under that reading the TCO sub-range, a WDAT's ports and AML regions would be refused. q35's only such node is the `PNP0C01` over ECAM. Linux's `drivers/pnp/system.c` requests these ranges and clears `IORESOURCE_BUSY` "after PCI claim BARs, but before PCI assign resources". Plan changes:
+   - The row states gain RESERVATION.
+   - NAMESPACE DEVICES: `PNP0C01` and `PNP0C02` are RESERVATIONS - rows listed by `lsdev`, never claimable, never merged, and reported before the other devices of each walk. A reservation keeps every new row published after it (and BAR placement, where the kernel places BARs) out of its ranges. It leaves alone the rows published before it and the descriptions merged into them. It never enters P02M0191's reserved set, and a mint inside it (the TCO sub-range, a WDAT port range, an AML region) stays governed by the reserved set, claims and the service policy.
+   - The merge rule and the `_CRS`-derived check defer to that reservation rule, the new calls report a reservation, and the host suites test the rule.
+
+8. **ACCEPTED - Step 3 and P02M0197a/b had no order and no interface.** The plan relied on "P02M0197b's registration call" and "steps of P02M0197a's transaction", while P02M0197b needs step 3 and the node channel refuses `_PTS` and `_WAK`. ServiceManager does hold a control channel per service (its report channel, which carries `STOP` and `FLUSH`). Plan changes:
+   - The step 3 sleep item LANDS TOGETHER WITH P02M0197a AND P02M0197b. The registration call is introduced by P02M0197b and admitted by the `FirmwareInterpreter` privilege.
+   - The steps around the entry travel on the control channel ServiceManager holds for the service, the one its sleep notice travels on (declared in its manifest row). They form a `platform-sleep` interface in `liber:process@1` beside `system-sleep`. `prepare(state, wake nodes)` evaluates `_PRW` (turning on its power resources) and `_DSW` or `_PSW`, sets the wake GPEs, then runs `_PTS` and `_SST`. `wake(state)` runs `_WAK` and `_SST`, then disarms what `prepare` armed.
+   - The node-scoped channel still refuses `_PTS` and `_WAK`.
+   - The host suites test `prepare` and `wake` in order, and the closing list notes the joint landing under P02M0197.
+
+Coordinated changes: two decisions made for other plans' findings land in this plan.
+- The `_AEI` re-grant. WHERE AML RUNS now says DeviceManager reaches the service through a manifest client role, for node channels and to hand over connections. A dead instance's connections close and are granted again to the new instance. Each instance reports "namespace loaded" through the kernel, which passes the report to DeviceManager on its device-event channel after every row the walk published, naming the instance. GPIO-SIGNALLED EVENTS has DeviceManager mint the `_AEI` lines AGAIN for each new instance on that report, as well as after the controller rebinds, and grants the lines and addresses the service's own `GeneralPurposeIo` and `GenericSerialBus` fields name the same way. THE NEW CALLS report those lists with the controller's companion or row, and the namespace loaded. Because these grants are built here on P02M0195a's scoped `CONNECT`, the x86_64 verification now joins the virtio-i2c companion, reads a `GeneralPurposeIo` field, reads and writes a `GenericSerialBus` field at the bus fixture's 0x50, and delivers the `_AEI` line again after the service is killed and restarted.
+- The tree GPIO interrupt. THE DEVICE TREE says an interrupt specifier (`interrupts-extended`, or `interrupts` with `interrupt-parent`) is a WIRED line where its parent is the kernel's interrupt controller. It is a LINE CONNECTION where the parent node is both `gpio-controller` and `interrupt-controller` (the virtio-gpio function's `virtio,device29` node, whose binding sets `#interrupt-cells` to 2): the line is the first cell and the trigger the second, it is made by the companion join, and it is never a wired interrupt. An interrupt whose parent is neither is listed as unresolved, and a `reg` below an I2C controller's node is a bus address, not MMIO. CONNECTIONS replaces "a tree's GPIO phandle" with those words. The aarch64 and riscv64 verification extends the tree with the virtio-gpio function's node and a fixture-only node whose `interrupts-extended` names it: the node binds through a line connection and receives a raised line. The tree host suite covers it too.
+
+Re-check of the whole plan: the plan was re-read end to end against the consumer plans, as their planners have revised them today, and the code above. Four inconsistencies were found and fixed.
+- WHAT DEPENDS ON IT put the lid and buttons among P02M0181's producers, although the closing section gives them to P02M0197.
+- The method-only definition ("a node below a companion ... names no registers of it", with a claim "carrying only the channel") also covered QEMU's ISA `IPI0001` KCS and BT nodes. Those sit below the LPC function's companion and have port resources. The join now says that such a node is a platform device with its own `_CRS` resources, and is method-only only when those name no memory, port or wired line (the video output, HID over I2C, SSIF). Its claim then carries the channel and its connections.
+- The x86_64 "every device accounted for" list gains "refused" for descriptions the checks refuse.
+- The `_CRS`-derived check now says a description merged into an earlier row adds no resource and is not refused by it. Otherwise the `PNP0501` node over COM1, whose ports P02M0191 keeps in the reserved set while the kernel drives them, would have been refused instead of merged.
+The order still holds: P02M0191's object comes before step 1's port half, P02M0195's bus half before the fixture, and step 2 and the join before P02M0195's HID half. Step 3's sleep item now lands with P02M0197a/b, which follow P02M0198a. Every consumer's expectation matches the text:
+- P02M0190: the TPM page on both paths.
+- P02M0195: the `_AEI`, `GeneralPurposeIo` and `GenericSerialBus` grants, and input-only lines.
+- P02M0197: `platform-sleep` and the wake GPE interface.
+- P02M0198: the carve-out and the processor contract.
+- P02M0199: `_DOD` or `_DOS`, and the parent `_DOS`.
+- P02M0200: WDAT rows untouched by reservations, and the TCO mint.
+- P02M0201: the attach rule.
+- P02M0202: the own-node admission and the connector child.
+The owner's approval stands. The deferred questions (installing `acpica-tools`, and the laptop for the embedded controller) are still asked when their part starts. The status line and the closing list are kept, the text is ASCII with every line at most 112 columns (the widest original lines), and nothing points at an audit or a coordination number.
+
+Only `docs/todo/P02M0196.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0196 (2026-09-26T15:50:59Z):
+
+**Rating: 8/10.** The last round's eight corrections hold, and the consumer plans now rely on what this plan provides. Three things are left: where the ACPI service starts and how it restarts, one kernel-held device the SystemIO policy leaves reachable, and reservations that the resource checks refuse.
+
+The complete history was read: the original review's eleven findings and the planner's response, the previous re-audit's eight findings (6/10), and the planner's latest response. That response accepted all eight and added two coordinated changes, the `_AEI` re-grant and the device-tree GPIO interrupt. The plan's latest changes were read with `git diff -- docs/todo/P02M0196.md`. Every consumer was read from the working tree for what it takes from this plan:
+- P02M0099: the `kernel:com1` row.
+- P02M0190: the TPM page on both paths.
+- P02M0191: the reserved set, the mint sources and reservations.
+- P02M0195: the line contract and the service's grants.
+- P02M0197: `platform-sleep`, the joint landing and the registration call.
+- P02M0198: the carve-out and the install check.
+- P02M0199: `video-output` and the parent `_DOS`.
+- P02M0200: the WDAT rows and the TCO sub-range.
+- P02M0201: the type-38 attach.
+- P02M0202: the shared mailbox and the connector child.
+- `TODO.md`.
+
+The planner's claims about the tree were checked in the code: `region_kind` in `src/boot/uefi/src/memory.rs`, `DeviceMemory`, the device-event channel in `src/kernel/device.rs`, and ServiceManager's control channel in `bootstrap.rs` and `lifecycle.rs`. For the new "namespace loaded" and client-role text, these were read too: the service manifest, the role rules in `system-manifest`, DeviceManager's bind phases and ServiceManager's restart ladder. Primary sources: QEMU v10.0.0's `hw/i386/acpi-build.c` and `hw/isa/lpc_ich9.c`, and coreboot's ICH9 `lpc.asl`.
+
+These corrections hold and are not repeated:
+- finding 1: the own-node admission, and one memory type per range;
+- finding 2: the carve-out's processor registers, which now match P02M0198;
+- finding 3: `_DOD` or `_DOS`;
+- finding 4: the tree TPM cut to its page, and child nodes in the property block;
+- finding 5: input-only GPIO, served on P02M0195's level-read scope;
+- finding 6: the type-38 attach, which matches P02M0201;
+- finding 8: the joint landing with P02M0197a/b, and `platform-sleep`, which match P02M0197.
+
+The two coordinated changes match P02M0195 and P02M0202. Finding 7's correction matches P02M0191 and P02M0200 but leaves the gap in finding 3 below.
+
+1. **Medium - The plan does not say where the ACPI service starts, and three things this round ties to that start need positions this tree cannot give together: DeviceManager's manifest client role, the first bind round's wait and the restart the x86_64 gate performs.**
+
+   The plan says four things:
+   - DeviceManager ["reaches it through a manifest client role"](/data/yellow/libersystem/docs/todo/P02M0196.md:152);
+   - a crashed service ["is restarted with a fresh namespace"](/data/yellow/libersystem/docs/todo/P02M0196.md:153);
+   - ["DeviceManager's first bind round waits, bounded, for that report"](/data/yellow/libersystem/docs/todo/P02M0196.md:159);
+   - the gate [kills and restarts the service](/data/yellow/libersystem/docs/todo/P02M0196.md:400).
+
+   No position in this tree satisfies all of them:
+   - A role's provider must be a declared dependency, or `system-manifest` refuses the manifest ([the rule](/data/yellow/libersystem/src/tools/system-manifest/src/lib.rs:1478)). DeviceManager is [pinned](/data/yellow/libersystem/src/user/services/manifest.toml:903), its only dependency is [`log_service`](/data/yellow/libersystem/src/user/services/manifest.toml:3517), and StorageService [depends on DeviceManager](/data/yellow/libersystem/src/user/services/manifest.toml:3796). So the role makes the ACPI service start before DeviceManager, before any volume is mounted. The service must therefore be pinned.
+   - A pinned service cannot be restarted today. The ladder ["relaunches from the volume"](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1376), both relaunch paths launch from it ([ordinary](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1500), [plan-driven](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1574)), and no pinned service in the manifest is `transparent`. The plan adds no relaunch from the init package, so the gate's restart case has no mechanism to use.
+   - The ladder can restart a volume-staged service, but that service cannot be DeviceManager's dependency. It is loaded from the volume, and StorageService mounts the volume only after DeviceManager's phase one. That also breaks the wait. DeviceManager's first bind round is phase one, which binds only the boot-critical drivers staged in `init.pkg` to mount the volume ([phase one](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:1198), [everything else waits for a volume](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:7014)). A volume-staged service cannot report before that round ends, so the wait would run to its bound on every ACPI boot.
+
+   This is a new finding. The client role and the restart case were added in this round; the first-round wait was already in the plan.
+
+   **Correct the WHERE AML RUNS item:** state the service's stage, and make the role, the wait and the restart follow from it. There are two consistent choices:
+   - The service is volume-staged and restarted by the existing ladder. The wait comes before DeviceManager's phase two. DeviceManager gets the service's endpoint without a manifest role of its own on it, for example from ServiceManager, which already hands it StorageService with the [`DRIVERS` message](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:371).
+   - The service is pinned and starts ahead of DeviceManager. The relaunch from the init package that its restart needs is then added as an item.
+
+2. **Medium - The SystemIO policy refuses only P02M0191's reserved set and live claims. So the ports of the ISA DMA controller are minted to the ACPI service whenever AML declares a region over them, although this plan withholds that controller from every claim because nothing translates its DMA.**
+
+   - The kernel-held set includes ["the ISA DMA controller (a bus master nothing translates)"](/data/yellow/libersystem/docs/todo/P02M0196.md:60).
+   - SystemIO regions are ["refused over P02M0191's reserved set ... and inside a live claim's range"](/data/yellow/libersystem/docs/todo/P02M0196.md:178). A kernel-held row is neither. P02M0191 mints the service's regions ["with the same reserved-set and exclusivity checks"](/data/yellow/libersystem/docs/todo/P02M0191.md:77) and nothing more.
+   - P02M0191's fixed set lists what the kernel drives: the PIC, the PIT, 0x61 and the CMOS pair ([fixed set](/data/yellow/libersystem/docs/todo/P02M0191.md:88)). The DMA controller's channel registers at 0x00-0x1F and 0xC0-0xDF are not in it. P02M0191 reserves all of fw_cfg ["because its DMA address registers would let a holder make the device write any physical memory"](/data/yellow/libersystem/docs/todo/P02M0191.md:91). That is the reason this plan gives for holding the DMA controller. P02M0191 also assumes that kernel-held rows ["record the reserved ports they describe"](/data/yellow/libersystem/docs/todo/P02M0191.md:109), and this row does not.
+   - q35 has the controllers: `ich9_lpc_realize` calls `i8257_dma_init` (https://github.com/qemu/qemu/blob/v10.0.0/hw/isa/lpc_ich9.c). A transfer needs a device on a DMA channel: QEMU's floppy controller when one is attached, or a Super I/O floppy or ECP port on a board. Where such a device exists, programming the controller writes into the first 16 MiB of physical memory, with no IOMMU in the path. The service can name any base and length for SystemIO, so AML or a defect in the service reaches kernel memory that way. Original finding 3 asked the policy to exclude exactly that. The plan's own premise is that a defect ["must cost a restart rather than the machine"](/data/yellow/libersystem/docs/todo/P02M0196.md:150).
+
+   This is a new finding: a contradiction inside the plan's trust boundary, and with P02M0191's assumption.
+
+   **Correct the SYSTEM I/O bullet:** also refuse regions over the DMA controller's channel and control registers, 0x00-0x1F and 0xC0-0xDF. The page registers at 0x81-0x8F cannot start a transfer and can stay mintable. That keeps firmware's POST-code regions at 0x80 working where they are wider than one byte.
+
+   P02M0191's reserved-set item has to say the same thing, because the ACPI service's `PortRange` goes through its mint checks. P02M0191's re-audit of this date reports the gap from that side, with the same ranges.
+
+3. **Low - The `_CRS`-derived checks refuse the reservations that the last correction introduced. Both reservations that correction was written for cover kernel-held MMIO or reserved ports, and the checks exempt only a merged description.**
+
+   - The checks refuse MMIO over ["kernel-held ranges"](/data/yellow/libersystem/docs/todo/P02M0196.md:188) and ports ["in the reserved set"](/data/yellow/libersystem/docs/todo/P02M0196.md:189). The only exemption is ["A description merged into an earlier row"](/data/yellow/libersystem/docs/todo/P02M0196.md:191). A reservation is ["never merged"](/data/yellow/libersystem/docs/todo/P02M0196.md:244), and it is reported ["with its `_CRS` resources"](/data/yellow/libersystem/docs/todo/P02M0196.md:207) like a device.
+   - q35's only reservation is `\_SB.DRAC` (`PNP0C01`). Its `_CRS` is the MCFG window (`build_q35_dram_controller`, https://github.com/qemu/qemu/blob/v10.0.0/hw/i386/acpi-build.c), the ECAM that this plan lists as [kernel-held MMIO](/data/yellow/libersystem/docs/todo/P02M0196.md:164).
+   - coreboot's ICH9 `LDRC`, the example the correction answered, lists 0x61, 0xB2 (SWSMI) and the whole PM block (https://github.com/coreboot/coreboot/blob/main/src/southbridge/intel/i82801ix/acpi/lpc.asl). 0x61 is in P02M0191's [fixed set](/data/yellow/libersystem/docs/todo/P02M0191.md:88). The SMI command port, PM1, the PM timer and GPE0 are in its [FADT-derived part](/data/yellow/libersystem/docs/todo/P02M0191.md:93).
+   - As written, both reservations are refused and reported instead of recorded, so the [reservation rule](/data/yellow/libersystem/docs/todo/P02M0196.md:245) never applies on either machine. On q35 the gate's ["reservation"](/data/yellow/libersystem/docs/todo/P02M0196.md:396) category stays empty, and the gate still passes.
+
+   This is an incomplete correction of the previous re-audit's finding 7.
+
+   **Correct the `_CRS`-derived bullet:** a reservation mints nothing, so these checks do not refuse it, just as they do not refuse a merged description. Its overlaps with rows follow the reservation rule.
+
+Validation: read-only inspection of the audit history, the plan and its working-tree diff (`git diff`), the sibling plans and `TODO.md` in the working tree, and the source files named above (`grep`, `sed`). Primary sources were fetched read-only: QEMU v10.0.0's `hw/i386/acpi-build.c`, `hw/isa/lpc_ich9.c` and `hw/i386/pc.c`, and coreboot's ICH9 `lpc.asl`. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0196 (2026-09-26T17:12:45Z):
+
+Verified read-only:
+- `system-manifest`: every role whose provider is a service must name that service as a declared dependency, or the manifest is refused;
+- the manifest, parsed: DeviceManager is `pinned`, `escalate`, depending on LogService alone; StorageService (pinned) depends on DeviceManager; every pinned service is `escalate`, and the `transparent` ones are all volume-staged;
+- ServiceManager: `restart_service` relaunches through `launch_from_volume` and `relaunch_planned` through `launch_service_from_volume`, and nothing relaunches from the init package; the bring-up loop sends `DRIVERS` the moment `storage_service` is Ready and then blocks in `drive_runtime_drivers` on phase two's tagged answers, before `process_service` - which depends on `storage_service` - is started; the development agent's launcher reaches DeviceManager late, as `DEVPERM` on its control channel, and ConfigService's restart has a step of its own in the ladder;
+- DeviceManager: phase one binds only boot-critical drivers staged in `init.pkg`, and everything else waits for a volume;
+- QEMU v10.0.0's `build_q35_dram_controller` (`DRAC`, `PNP0C01`, the MCFG window) and ACPICA's protected-port table.
+Summary: three findings, all accepted; the first with a correction to the placement its first option proposed.
+
+1. **ACCEPTED - the plan did not say where the ACPI service starts, and no position satisfied the role, the wait and the restart together.** Every fact holds. One more fact decides between the two options: the auditor's first option puts the wait "before DeviceManager's phase two", but phase two also runs before a volume-staged service can exist - ServiceManager sends `DRIVERS` as soon as StorageService is ready and waits on phase two's answers before ProcessService starts - so that wait would still run to its bound on every ACPI boot. THE CHOICE: the service is VOLUME-STAGED AND `transparent`, and NO BIND ROUND WAITS. The pinned alternative would need a relaunch path from the init package for this one service, and it would still walk the namespace before any GPIO or I2C controller is bound, so the connections its fields name would be missing during that walk either way; the volume-staged form costs a late companion join, which the restart path already makes every driver handle. Plan changes, in "WHERE AML RUNS", a new paragraph "ITS STAGE, AND WHAT FOLLOWS FROM IT":
+   - the service is launched through ProcessService once that is up (dependencies LogService and ProcessService) and restarted by ServiceManager's existing ladder, which relaunches from the volume and from nothing else;
+   - DeviceManager holds NO MANIFEST ROLE on it; ServiceManager hands DeviceManager a client of each instance on its control channel as it comes up, a restarted one included - the late hand-off the development agent's launcher already takes, and a ladder step for this one service as ConfigService has one;
+   - NO BIND ROUND WAITS FOR THE NAMESPACE: its platform devices are bound as their rows arrive, as a hot-plugged function is; a companion joined after its function's driver bound is attached then, and that driver asks for the node channel as it does after a restart; a node-channel request that reaches DeviceManager before an instance's report is answered at the report. The old sentence about the first bind round's bounded wait is gone;
+   - EXCLUDES gains a system volume on a device the firmware describes only in AML, since the service starts from that volume.
+   The restart case in the x86_64 gate now has its mechanism (the existing ladder), and P02M0195's "again for each new ACPI-service instance on its namespace-loaded report" and P02M0197's "SERVICEMANAGER RESTARTS NOTHING WHILE THE DRIVERS ARE SUSPENDED, because every launch reads the volume" both hold for this service unchanged.
+
+2. **ACCEPTED - the SystemIO policy left the ISA DMA controller's registers mintable.** Plan change, the SYSTEM I/O bullet: regions are refused over P02M0191's reserved set, whose fixed part now holds the DMA controllers' channel and control registers, `0x00..0x1F` and `0xC0..0xDF`, so no region reaches the kernel-held controller and starts a transfer nothing translates; the page registers from `0x81` and a POST-code region at `0x80` stay mintable. The host suite's policy checks add a SystemIO region over a DMA channel register refused and one over `0x80..0x8F` minted.
+
+3. **ACCEPTED - the `_CRS`-derived checks refused the reservations the last correction introduced.** `DRAC`'s `_CRS` is the ECAM, and coreboot's `LDRC` lists `0x61`, the SMI command port and the PM block, so both would have been refused and reported and the reservation rule would never have applied. Plan changes: the `_CRS`-derived bullet now says A RESERVATION MINTS NOTHING, so these checks do not refuse one, as they do not refuse a merged description; its overlaps with rows follow the reservation rule, and a reservation over kernel-held MMIO or reserved ports - `DRAC` over the MCFG window, an ICH9 board's `LDRC` over `0x61`, the SMI command port and the PM block - is recorded as one. The host suites add a reservation over kernel-held MMIO and reserved ports recorded rather than refused, and the x86_64 gate's enumeration names q35's `DRAC` among the reservations, so the gate's reservation category can no longer stay empty and pass.
+
+Coordinated changes: P02M0191's reserved set holds the same DMA ranges (its response of this date).
+
+Re-check of the whole plan: the service's stage now fixes how it is started, restarted and reached, and nothing in the plan waits for it; step 1's static rows (TPM2, WDAT, SPCR, the kernel-held set, `kernel:com1`) never needed the service and are unaffected. The SystemIO, SystemMemory, `_CRS` and reservation rules agree with P02M0191a and with each other. Every consumer plan read in this round still gets what it takes from this plan. The file is ASCII, cites no audit and keeps its `Status:` line.
+
+Edited `docs/todo/P02M0196.md` (and P02M0191 for the shared ranges); no source was changed, and nothing was built or booted.

@@ -227,3 +227,275 @@ The complete history was read: the original review's five findings and the plann
    **Correct the serial-receive item.** State that on riscv64 identity 63 is answered by one handler that services every kernel wired source on each delivery - the UART's receive FIFO and every hot-plug slot - or name the identity the UART gets instead.
 
 Validation: inspection only. The plan, the full audit history and the neighbouring plans were read, and the tree was checked with read-only grep, sed and git. QEMU 10.0 and coreboot sources were fetched read-only, and QEMU was queried only with `--version` and `-cpu help`. No plan, source or audit file was modified, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0198 (2026-09-26T05:34:17Z):
+
+I checked every finding against the tree and against the plans as they stand in the working tree. On the kernel side that meant `sched/mod.rs` (`check_deadlines`, `run_until_idle_bounded`, `run_until_idle_until`, the `drain_deadline` switch, `on_timer_preempt`'s early return, `thread_start`, `enqueue`) and `sched/tests.rs`. It also meant `main.rs` (`serial_console_pump`, `console_shell_loop`, `drive_slice`, `supervise`, `boot_userspace`, the COM1 IRQ 4 arming), the recovery-ladder tests in `test_suites/boot.rs`, and `report_timer` in the aarch64 and riscv64 prologues. I also read each port's `poweroff`, the x86 tick clock and timer ISR, `WIRED_EID` in `arch/riscv64/interrupts/mod.rs`, `arch/common/wired.rs`, `arm_slot_interrupt` in `arch/riscv64/pci.rs`, and the clock readers the audit names: the SCI storm window, `platform_event`'s unread check and the IOMMU command wait. On the harness side I read `qemu_select_cpu` in `qemu-run.sh`. I fetched these sources read-only: QEMU 10.0's `target/i386/cpu.c`, `host-cpu.c`, `kvm/kvm.c` and `target/arm/tcg/psci.c`, and coreboot's AMD `cpu_power_state.c` at the cited commit. I read what this machine's KVM offers from `/proc/cpuinfo` and from a read-only `KVM_GET_SUPPORTED_CPUID` and `KVM_CHECK_EXTENSION` query on `/dev/kvm`, which creates no VM. The neighbouring plans read were P02M0196, P02M0197, P02M0191, P02M0200, P02M0181, P02M0099, P02M0201 and P02M0202. Two coordinated decisions fall in this plan and both are applied with their substance: the development-build fixture exception for processor registers in the firmware-held ivshmem BAR, and the clock held from the sleep entry to the rebase. Summary: all seven findings are accepted, and none is rejected. Finding 6 is accepted with a corrected fix, because the proposed `-cpu host,+invtsc` cannot work on this machine.
+
+1. **ACCEPTED - the forced power-off deadline is checked only where the BSP's run queue empties.** Verified:
+   - `check_deadlines` has one caller, `run_until_idle_bounded`, which reaches it only after the drain loop finds the BSP's queue empty.
+   - `on_timer_preempt` returns before it reschedules when the queue is empty, so a lone thread spinning on the BSP never gives the bootstrap context the core back.
+   - Threads settle on the BSP. `thread_start` and `enqueue` place a thread on the current core, the BSP enqueues every timed-out waiter, and there is no balancer.
+
+   As written, the load that heated the zone, or a hung service, could postpone the forced power-off indefinitely.
+
+   Plan changes:
+   - Part d's bound bullet now says the kernel CHECKS THE DEADLINE IN THE TIMER INTERRUPT ITSELF: on the periodic tick every busy core keeps, and on the idle BSP's one-shot, which includes the deadline. It is not checked on the deadline path, which the BSP reaches only when its run queue empties. Once the deadline has passed, that interrupt powers the machine off through the kernel's terminal power-off path, which waits for no thread or process (P02M0191's terminal-path rule).
+   - Part a's busy-core item lists "part d's forced power-off check" among the duties the periodic tick keeps.
+   - Part e's first item adds a kernel test in which the deadline passes while the BSP runs a thread that never blocks and has nothing queued behind it. A test hook records the power-off instead of performing it.
+
+2. **ACCEPTED - the fixture's registers lie in the firmware-held ivshmem BAR, which both policies refuse.** Verified in P02M0196b as it stands:
+   - the SystemMemory policy refuses any BAR and a claimed device's ranges;
+   - "firmware-held" means "a claim held by the service";
+   - the fixture carve-out covers only a `_CRS` range of a platform device;
+   - processor objects are not published as devices.
+
+   This plan's install check refused any register "inside a claim", so the fixture's registers had no rule that admitted them. I applied the coordinated decision.
+
+   Plan changes:
+   - The install-check item now names ONE FIXTURE EXCEPTION, which is P02M0196b's fixture carve-out and is compiled into the development build only. A processor-table SystemMemory register inside the BAR of the firmware-held `ivshmem-plain` function (1af4:1110) is admitted for the kernel's install and carved out of what the ACPI service maps. For that register, the service's firmware-held claim does not count as a claim.
+   - The same item says every shipping build refuses such a register, as it refuses any other BAR.
+   - Part e's fixture item says the register page is admitted by that exception.
+   - The host suites check that the register is admitted only where the exception is compiled in.
+
+3. **ACCEPTED - the install check refuses a register the kernel already holds for processor power.** Verified:
+   - Tables are per core.
+   - A restarted ProcessorPowerService installs its tables again.
+   - `Notify` 0x81 triggers a re-evaluation.
+
+   In each of these flows the table met its own registers in the reserved set or in the kernel-held memory, and was refused whole. Real firmware does share registers across cores. coreboot's AMD generator, fetched at the cited commit, computes one C-state I/O base and writes the same `_CST` package into every logical core.
+
+   Plan changes:
+   - The install-check item now ADMITS AGAIN a register the kernel already holds for processor power, both for another core's table and for a table that replaces one.
+   - Such a register is COUNTED PER TABLE. It joins the reserved set, or the kernel-held memory, with the first table that names it, and leaves only when the last such table is uninstalled.
+   - AN INSTALL FOR A CORE REPLACES THAT CORE'S TABLE IN ONE STEP. The new table's registers are checked and taken before the old table's are counted down. Installing the same table again therefore changes nothing, and a refused table leaves the old one standing.
+   - In the same sentence, the SystemIO check now says "a live grant" instead of "a claim". That is P02M0191's own term, and it also covers a region the ACPI service holds.
+   - Part e's fixture now has every core's `_LPI` naming one entry register, and every table installed again when ProcessorPowerService restarts, with none refused.
+   - The host suites add the ordinary cases: one register in every core's table, a table replaced by itself and by another, and a shared register counted out only with the last table naming it.
+
+   Cross-plan note: P02M0191's run-time item agrees with this if a register is installed once and then counted per table. Read per table, its sentence "the install is REFUSED if any of its ports is already reserved" would need an exception for a register the kernel already holds for the same use.
+
+4. **ACCEPTED - BSP halts with a bound of their own lose the tick that ends them today.** Verified:
+   - The drain's wait sleeps until the earlier of the nearest progress deadline and `outer`, and relies on the periodic tick to re-check.
+   - `a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer` pins a three-tick window against a sleeper 500 ticks away.
+   - `drive_slice` halts inside its slice, and the supervisor halts between readiness checks.
+   - Every recovery-ladder attempt runs `drive_slice` before its crash check, with no deadline of its own armed. A one-shot programmed from the global deadline alone would hang those tests.
+
+   While re-checking I found two more halts of the same kind: the timer check in the aarch64 and riscv64 prologues, and the kernel tests that loop on `idle_halt`.
+
+   Plan changes:
+   - Part a's deadline-expiry bullet now says EVERY HALT THE BSP MAKES programs its one-shot for the earlier of ITS OWN BOUND and the global earliest deadline, with the same caps as before.
+   - The bullet names each halt with its bound:
+     - the drain's wait: its caller's window;
+     - the console loop's settled halt: none of its own;
+     - `drive_slice`'s settled halt: the end of its slice;
+     - the supervisor's wait between readiness checks: one slice at most, and never past its window;
+     - every other halt, including the prologues' timer check and each kernel test's wait: the bound it loops on, or one tick where it loops by count.
+   - The bullet names P02M0197b's suspend-to-idle wait as the one exception: it programs the sleep's timed wake alone and checks no deadline.
+   - Part e adds a test that every BSP halt ends at its own bound when nothing is armed or only a far deadline is. That covers the bounded drain's window, which the suite already pins, and the recovery ladder's tests.
+
+5. **ACCEPTED - a clock reading between suspend and rebase can latch the atomic maximum.** Verified:
+   - The read path is the counter less the offset, under one atomic maximum, and nothing defined what a reading returns before the rebase.
+   - P02M0197b handles interrupts outside the wake set during suspend to idle, and on S3 it restores the IOMMU before the rebase.
+   - The kernel reads the clock in `check_deadlines`, in the idle wait, in the SCI storm check and in `platform_event`'s unread check.
+
+   I applied the coordinated decision.
+
+   Plan changes:
+   - The sleep-offset item adds a SUSPENDED STATE. From the counter reading the sleep entry takes at suspend until the rebase, every reading of the tick counter and of `SYS_CLOCK_MONO_NS` answers the monotonic value at suspend. That holds on every core and in every interrupt handled meanwhile.
+   - The rebase sets the offset and the atomic maximum from that value together, and leaves the suspended state.
+   - Part e's host suite adds two checks: readings inside the state answer the suspend value, and no reading after the rebase is below it.
+   - A held clock would also hold a forced power-off deadline, so part d's bound bullet now refuses the kernel's sleep entry (P02M0197b) while such a deadline is armed. P02M0197b already unwinds the transaction when the entry does not happen, so it needs no change to accept this.
+
+   One side effect for P02M0197b's attention, with no change here: a rate window the kernel measures on the clock, such as the SCI's storm window, does not advance while the clock is held. Undecoded SCIs across a long suspend to idle therefore count as one window.
+
+6. **ACCEPTED - the x86 guest the gates boot hides the invariant TSC and always offers TSC-deadline.** Verified against QEMU 10.0:
+   - `host` is a subclass of `max`, and `migratable` defaults to true.
+   - invtsc is in `unmigratable_flags` unless tsc-khz is set explicitly, so `-cpu host` leaves it out, and TCG never offers it (`TCG_APM_FEATURES` is 0).
+   - TSC-deadline is added whenever the local APIC is in the kernel and KVM has `KVM_CAP_TSC_DEADLINE_TIMER`.
+
+   The proposed `-cpu host,+invtsc` cannot work on this machine, because the machine is itself a KVM guest:
+   - its CPU is a Xeon 8272CL with the `hypervisor` flag, no `nonstop_tsc` and no `monitor`;
+   - `KVM_GET_SUPPORTED_CPUID` reports 0x80000007 EDX = 0 (no invariant TSC) and no MWAIT;
+   - `KVM_CAP_TSC_DEADLINE_TIMER` = 1;
+   - `KVM_CAP_X86_DISABLE_EXITS` = 0xe, so MWAIT exits cannot be disabled.
+
+   QEMU would therefore drop the requested flag.
+
+   Plan changes:
+   - Part e's PSCI/SBI item now also covers the x86 CPU model. Each property is checked on the gate's host before its case is written, and the fixture gate boots with `-cpu host,+invtsc`.
+   - Where the host's KVM cannot give the invariant TSC, the x86 fixture shows every `_LPI` state deeper than C1 left unentered, with the reason on the log.
+   - In that case the governor's choices, with and without a `LatencyRequest`, are proven on aarch64 and riscv64 from the harness's `idle-states`, where their suspend calls run. QEMU's own PSCI answers any CPU_SUSPEND parameter without affinity bits with a WFI. OpenSBI's default suspends are checked first, as the item already said.
+   - MWAIT is handled as before, and the item records that this machine offers neither the invariant TSC nor MWAIT today.
+   - The fixture item's governor check now runs "on a guest that has the invariant TSC".
+   - Part e's first item adds a second run of part a's x86 kernel tests under `-cpu host,-tsc-deadline`, so that the LAPIC one-shot fallback runs too.
+
+7. **ACCEPTED - on riscv64 the kernel's wired identity has one handler, and a second registration replaces it.** Verified:
+   - Every riscv64 kernel wired line arrives under `WIRED_EID`, which is 63: the one identity inside `EIE0` past the device window 1..=62.
+   - `arm_slot_interrupt` registers the hot-plug handler on that identity.
+   - `Wired::register` replaces the handler when the same number is registered again.
+
+   Plan changes:
+   - Part a's serial-receive bullet now says that this path delivers every wired line the riscv64 kernel answers under one identity, and that a second registration replaces the handler.
+   - The UART and the hot-plug slots are therefore answered by ONE KERNEL HANDLER. On each delivery it drains the UART's receive FIFO and reads every armed slot, in whichever order the two are armed.
+   - The same rule applies wherever the UART's line and a slot's share a number.
+   - Once a userspace driver takes the port, the shared handler leaves the UART alone.
+   - Part e runs the typed-bytes case and the hot-plug-arrival case in the same riscv64 boot.
+
+Re-check of the whole plan: I read the plan end to end after the edits.
+- Every duty of today's tick now has a replacement and a test, including one the audit did not name. The aarch64 and riscv64 prologues prove the timer fires by counting ticks, fatally on aarch64 when none arrive, and that count would prove nothing once ticks are computed from the counter. Part a now has that check count the timer interrupts themselves.
+- Every BSP halt is named with its bound.
+- The forced power-off is enforced wherever a timer interrupt arrives, and no sleep can hold it.
+- The install check admits real firmware's shared and re-installed registers, and names its single development-build exception.
+- The x86 verification says what this machine can and cannot give.
+
+The plan is consistent with its neighbours:
+- P02M0196: the fixture carve-out that the coordinated decision extends, the processor `_OSC` forms, and step 3's processor contract.
+- P02M0197: part a lands before P02M0197b; the per-core resume path; suspend to idle through tickless idle with the timed wake alone; the held clock on both sides; the critical-battery path through `power-off-within` and `system-shutdown`; and a refused entry unwinding the transaction.
+- P02M0191: the run-time reserved set, read as one install per register, and the terminal-path rule.
+- P02M0200: the notice step inside the one `!poweroff` sequence, never past an armed forced deadline.
+- P02M0181 and P02M0099: PowerService's state is unchanged, and the zone driver carries the cooling half and the `_CRT` fallback.
+
+Two cross-plan notes for the coordinator:
+- P02M0191's sentence refusing an install whose ports are already reserved should admit a register the kernel already holds for the same use, if it is read per table.
+- P02M0202's timing budget expects the kernel's deadline resolution to become finer once P02M0198a lands. Ticks stay the unit, so the resolution stays one tick (10 ms).
+
+The owner questions stay asked when each part starts: the profile defaults per power source, the default fan curve, and the ten-second bound. Status stays OPEN, and no part starts without its own written plan.
+
+Only `docs/todo/P02M0198.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0198 (2026-09-26T15:50:59Z):
+
+**Rating: 8/10.** All seven findings of the last re-audit are corrected, and every claim the planner makes about the tree holds. One duty of today's tick still has no replacement: ending a halt whose wake came just before it. Separately, part e places two of its proofs in the test kernel, where the paths they prove are not compiled, and the fan driver has no step in P02M0197's suspend exchange.
+
+What was read and checked:
+
+- The complete history: the original review, both planner responses and the last re-audit's seven findings.
+- The planner's changes, as `git diff` against the plan the last re-audit saw, and then the whole plan.
+- The claims, against the tree:
+  - the scheduler's drain, idle loop and timer preemption;
+  - the TLB shootdown and each port's wake-IPI handler;
+  - each port's `idle_halt`, and the BSP's halts in `main.rs`;
+  - the prologue timer checks on aarch64 and riscv64;
+  - riscv64's wired identity and slot arming;
+  - the SCI storm window and the IOMMU command wait;
+  - the spin lock, the ABI clock constants and the harness's CPU selection;
+  - the kernel tests that place work on other cores.
+- The sibling plans, read from the working tree:
+  - P02M0196: the fixture carve-out, the processor handshake and contract, and the fixture region;
+  - P02M0191: the reserved set and the terminal path;
+  - P02M0197: the sleep entry, the held clock, suspend to idle and the critical battery;
+  - P02M0200's shutdown notice, and P02M0201, P02M0202, P02M0189 and P02M0099.
+- QEMU 10.0's `target/arm/tcg/psci.c` and `translate-a64.c`, fetched read-only, and this host's `/proc/cpuinfo` flags, `qemu-system-x86_64 --version` and `-cpu help`.
+
+These corrections now hold:
+
+1. The forced power-off is checked in the timer interrupt: on every busy core's tick and on the idle BSP's one-shot. The busy-BSP test is in part e. While a forced power-off is armed, the kernel's sleep entry is refused, which P02M0197b's "returns an error and the transaction unwinds" already covers.
+2. The fixture's development-only exception now matches P02M0196b's carve-out.
+3. A register is admitted again and counted per table, and an install replaces a core's table in one step. P02M0191's run-time rule now says the same.
+4. Every BSP halt is named with its own bound. `a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer`, `drive_slice` and the recovery-ladder callers are as the planner says.
+5. The suspended state matches P02M0197b's "held from the entry to the rebase".
+6. The x86 CPU model item uses a corrected fix, because this host's KVM cannot give the invariant TSC: its CPU is a KVM guest without `nonstop_tsc` or `monitor`. The governor's choices fall back to aarch64 and riscv64. On aarch64, QEMU's PSCI turns CPU_SUSPEND into a WFI. The `-tsc-deadline` run is added.
+7. One kernel handler answers riscv64's shared wired identity. The design holds; its proof is finding 2 below.
+
+The new timer-proof item is right: both prologues count ticks, aarch64 fatally, and a computed tick would satisfy that count with no interrupt at all. The planner's two cross-plan notes are already reflected in P02M0191 and P02M0202. The SCI storm window under a held clock is P02M0197b's to weigh. The count resets on every decoded SCI, so a held clock only lengthens a run of undecodable ones.
+
+1. **Medium - Tickless idle removes the tick as the backstop for a wake that lands between a halt's last check and the halt, and the plan names no replacement. The BSP's halts are entered unmasked, aarch64's `idle_halt` takes a pending interrupt before its `wfi`, and a one-shot that fires in that gap is itself lost.**
+
+   What the plan does and does not say:
+   - Its replacements for the tick are three:
+     - the one-shot each BSP halt programs ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:49));
+     - a wake IPI for a deadline armed on another core ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:60));
+     - a wake IPI for work enqueued from another core, "the tick is no longer the backstop" ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:63)).
+   - The console loop's settled halt has no bound of its own ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:53)). A routed slot interrupt and the SCI "end its halt at once" ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:77)).
+   - Nothing requires a halt to check what it waits for with interrupts masked.
+
+   The tree names this race, and names the tick as its backstop:
+   - `cpu_idle_loop` masks, re-checks and then halts, because "Without the mask the IPI could run its handler between the check and the wait, and the wait would then sleep until the next tick despite the queued work" ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:1251)).
+   - `idle_halt` keeps an interrupt pending only when it is entered masked. On x86 that is `sti; hlt` ([x86_64/mod.rs](/data/yellow/libersystem/src/kernel/arch/x86_64/mod.rs:125)). On riscv64 it is a `wfi` under a cleared SIE, which "closes the lost-wakeup race" ([riscv64/mod.rs](/data/yellow/libersystem/src/kernel/arch/riscv64/mod.rs:115)).
+
+   The BSP's halts are entered unmasked:
+   - Interrupts are enabled from boot ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:210)). Every run-queue check runs under a lock guard that restores them when it drops ([sync.rs](/data/yellow/libersystem/src/kernel/sync.rs:41)).
+   - So a handler can run between the check and the halt, and the drain intends that. The 100 Hz timer "wakes us within one tick to re-check the run queue" ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:1186)), so "the ISR that enqueues the woken thread can run between checks" ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:1189)).
+   - The drain's wait runs the idle hook ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:1208)) and `check_deadlines` ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:1210)) just before its halt ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:1211)). Both make threads runnable on the BSP ([check_deadlines](/data/yellow/libersystem/src/kernel/sched/mod.rs:993), [enqueue](/data/yellow/libersystem/src/kernel/sched/mod.rs:1044)).
+   - The console loop halts after `drain_tx` and the IOMMU drain with no re-check ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:615), [main.rs](/data/yellow/libersystem/src/kernel/main.rs:620)). COM1's handler feeds the shell from inside the interrupt ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:1373)).
+
+   On aarch64 even a masked check does not help:
+   - `idle_halt` is `msr daifclr, #2` and then `wfi` ([aarch64/mod.rs](/data/yellow/libersystem/src/kernel/arch/aarch64/mod.rs:131)). The riscv64 comment describes that order as consuming the interrupt first and then sleeping ([riscv64/mod.rs](/data/yellow/libersystem/src/kernel/arch/riscv64/mod.rs:117)).
+   - QEMU 10.0 ends the translation block after DAIFClr "to re-evaluate pending IRQs" (`trans_MSR_i_DAIFCLEAR` in [translate-a64.c](https://github.com/qemu/qemu/blob/v10.0.0/target/arm/tcg/translate-a64.c)), so the interrupt is taken before the `wfi`.
+   - So `cpu_idle_loop`'s check loses its wake on aarch64. So does the wake IPI the plan sends the BSP for an earlier deadline, including the forced power-off's.
+
+   What this costs:
+   - Today every such loss costs one tick at most.
+   - Under the plan it costs until the halt's one-shot: the end of a slice, the housekeeping bound, or nothing at all on a settled console loop.
+   - The one-shot is itself one of these interrupts. If it expires between being programmed and an unmasked halt, the handler takes it first, and the halt then waits past its own bound for whatever interrupt comes next. So no halt's bound in part a holds as written.
+   - P02M0197b parks every core in suspend to idle through this idle ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:206)).
+
+   The kernel suite also relies on this backstop, and part e requires the whole suite green ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:257)):
+   - The claim race queues its racers on cores 1 and 2 through `start_thread_on` ([claim/tests.rs](/data/yellow/libersystem/src/kernel/object/claim/tests.rs:824)), which sends no wake ([sched/mod.rs](/data/yellow/libersystem/src/kernel/sched/mod.rs:531)).
+   - The remote-spawn test's control suppresses the wake on purpose ([sched/tests.rs](/data/yellow/libersystem/src/kernel/sched/tests.rs:209)) and spins until the thread runs ([sched/tests.rs](/data/yellow/libersystem/src/kernel/sched/tests.rs:211)).
+
+   This is a new finding. The planner's re-check says "Every duty of today's tick now has a replacement and a test" ([response](/data/yellow/libersystem/AI/audit/plan-audit-P02M0198.md:347)).
+
+   **Correct part a's duty list** by adding the wake that lands before a halt:
+   - Every halt, on every core, masks interrupts before its last check and before it programs its one-shot. The last check covers its run queue and any work its idle hook has yet to deliver.
+   - It then waits in the form that wakes on an interrupt pending under the mask:
+     - on x86, `sti; hlt` entered masked;
+     - on riscv64, the masked `wfi` it has today;
+     - on aarch64, `wfi` executed masked and the unmask after it, which reverses today's `idle_halt`.
+   - Say that `start_thread_on` gains the wake, and that the remote-spawn control changes.
+   - Add one kernel test: a test hook makes a thread runnable on the BSP between a halt's last check and the halt, and the thread runs within a tick.
+
+2. **Low - Part e lists as "kernel tests" the cases that prove interrupt-driven serial receive and riscv64's shared wired identity, but those paths exist only in the production kernel. The proof for the last re-audit's finding 7 therefore cannot be written where it is placed.**
+
+   - Part e's "Kernel tests for each replaced duty" ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:246)) include two cases:
+     - bytes typed at an idle guest reaching the shell on all three ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:252));
+     - a hot-plug arrival "in the same boot as the typed bytes on riscv64, where the two share one identity" ([plan](/data/yellow/libersystem/docs/todo/P02M0198.md:253)).
+   - None of these paths is compiled into the test kernel. Each is `cfg(not(test))`:
+     - the boot tail ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:1442));
+     - the shell loop ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:532)) and the idle hook ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:487));
+     - COM1's receive handler ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:1371)) and its enable ([serial.rs](/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:74));
+     - hot-plug settling ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:1315));
+     - riscv64's `WIRED_EID` ([interrupts/mod.rs](/data/yellow/libersystem/src/kernel/arch/riscv64/interrupts/mod.rs:51)) and its slot arming ([pci.rs](/data/yellow/libersystem/src/kernel/arch/riscv64/pci.rs:185)).
+   - In the test kernel the UART and the slots never share an identity. A kernel test would fall back to what the existing console tests do, calling `console_input::feed_serial` directly ([kernel.rs](/data/yellow/libersystem/src/kernel/test_suites/kernel.rs:2657)). That proves nothing about a receive interrupt, and nothing about the riscv64 identity.
+   - This is an incomplete correction of the last re-audit's finding 7 (its proof).
+
+   **Correct part e's first item**: move the typed-bytes and hot-plug-arrival cases out of the kernel tests and into gate cases on the development image, with the riscv64 pair in one boot.
+
+3. **Low - The `PNP0C0B` fan driver this milestone adds has no step in P02M0197's suspend exchange, and P02M0197 refuses every sleep while a binding without one is Online.**
+
+   - P02M0197 refuses a sleep ["while a binding with no `suspend-deadline` is Online"](/data/yellow/libersystem/docs/todo/P02M0197.md:140). Its part adds the exchange only to [the drivers the image ships when it lands](/data/yellow/libersystem/docs/todo/P02M0197.md:143).
+   - This plan adds [a `PNP0C0B` fan driver](/data/yellow/libersystem/docs/todo/P02M0198.md:155), which [evaluates `_FSL` and `_FST` over its node-scoped channel](/data/yellow/libersystem/docs/todo/P02M0198.md:161), and names no suspend step for it.
+   - Only part a is ordered against P02M0197 ([ORDER](/data/yellow/libersystem/docs/todo/P02M0198.md:40)). Nothing orders the fan driver.
+   - The plans written beside this one carry the exchange for their own drivers, "by whichever of P02M0197 and this milestone lands second": [P02M0190](/data/yellow/libersystem/docs/todo/P02M0190.md:90) and [P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:157).
+   - If the fan driver lands after P02M0197, a machine whose firmware describes a fan cannot sleep, and the refusal names the fan driver.
+
+   This is a new finding. The same gap is reported for P02M0199's `acpi_als` and for P02M0202's two drivers in their re-audits of this date.
+
+   **Correct the fan item** : the fan driver declares a `suspend-deadline` and implements P02M0197's exchange, carried by whichever of the two milestones lands second.
+
+Validation: this was read-only inspection of the plan, the full audit history, the sibling plans in the working tree, the kernel and harness sources, and QEMU 10.0 sources fetched read-only. QEMU was queried only with `--version` and `-cpu help`, and the host's CPU flags were read from `/proc/cpuinfo`. No plan, source or audit file was modified. Nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0198 (2026-09-26T17:12:45Z):
+
+Verified read-only:
+- `cpu_idle_loop` masks, re-checks and halts, with the comment naming the race; the bounded drain in `run_until_idle_until` runs `service_pending`, the idle hook, `drain_tx` and `check_deadlines` and then halts unmasked, its comment counting on the 100 Hz timer to re-check the run queue; interrupts are enabled from boot and every lock guard restores them on drop;
+- `idle_halt`: `sti; hlt` on x86; `csrci; wfi; csrsi` on riscv64, whose comment explains why the masked form closes the race; `msr daifclr, #2; wfi` on aarch64, which takes a pending interrupt before the `wfi`;
+- `start_thread_on` enqueues on a named core with no wake, the claim race queues its racers through it, and the remote-spawn test's control spawns unwoken and spins until the thread runs;
+- the paths behind part e's typed-bytes and hot-plug cases - `boot_userspace`, `console_shell_loop`, `serial_console_pump`, `serial_rx_interrupt`, `enable_rx_irq`, `settle_hot_plug`, riscv64's `WIRED_EID` and `arm_slot_interrupt` - are all `cfg(not(test))`, and the existing console tests call `console_input::feed_serial` directly;
+- P02M0197's driver contract and its refusal of an Online binding without `suspend-deadline`.
+Summary: three findings, all accepted.
+
+1. **ACCEPTED - tickless idle removed the tick as the backstop for a wake that lands just before a halt.** The analysis holds on all three ports, including the aarch64 detail that even `cpu_idle_loop`'s masked check loses its wake there. Plan changes, part a's duty list gains "THE WAKE THAT LANDS JUST BEFORE A HALT": EVERY HALT, ON EVERY CORE, masks interrupts before its last check and before it programs its one-shot, the last check covering its run queue and whatever its idle hook has yet to deliver, and then waits in the form that wakes on an interrupt pending under the mask - `sti; hlt` entered masked on x86, the masked `wfi` riscv64 has today, and on aarch64 `wfi` executed masked with the unmask after it, reversing today's `idle_halt`. The BSP's halts (the drain's deadline wait, the console loop's settled halt, `drive_slice`'s and the boot supervisor's) move to that form. The work-enqueue duty now says `start_thread_on` gains the wake IPI. The remote-spawn control changes: it waits a bounded number of ticks, finds the unwoken thread not run, then sends the wake and finds it run. Part e adds the kernel test: a test hook makes a thread runnable on the BSP between a halt's last check and the halt, and the thread runs within a tick, on all three.
+
+2. **ACCEPTED - two of part e's "kernel tests" prove paths the test kernel does not compile.** Plan changes: the typed-bytes and hot-plug cases leave part e's kernel-test list, and a new gate on the development image, `tickless-idle`, takes them with the reason written in: bytes typed through `lab` at an idle guest reach the shell within a tick of their arrival on all three; a hot-plug arrival - a QMP `device_add` into an empty hot-plug port the gate's machine carries - is seen on the idle machine on all three; on riscv64 both in the same boot, typed bytes first, since there the UART and the slots share one identity. It is registered in `check.sh`'s gate table and the verification model with its guest slot. The transmit-burst case stays a kernel test: the transmit ring and its drain are compiled into both builds.
+
+3. **ACCEPTED - the fan driver had no step in P02M0197's exchange.** Plan changes: a new item, "THE FAN DRIVER ACROSS A SLEEP": it implements the exchange and declares its `suspend-deadline`, carried by whichever of P02M0197 and this milestone lands second; its `SUSPEND` finishes the evaluation in hand and takes no command until `RESUME`; its `RESUME` evaluates `_FST` again, re-applies the level last commanded (`_FSL`, or the device power state), because firmware may reset a fan across a sleep, and reports the level it found. Part e adds "THE FAN ACROSS A SLEEP", carried the same way: a suspend to idle and an S3 cycle each answered by the driver, and after the harness clears the fan's level in the region during S3, the commanded level back in the region after the resume.
+
+Coordinated change: P02M0197's "NO DRIVER IS SKIPPED" now names this plan's fan driver among the drivers that carry the exchange themselves.
+
+Re-check of the whole plan: every duty of today's tick now has a replacement that holds without it, the lost-wake race included, and each has a proof placed where its path is compiled - kernel tests for the scheduler, clock, deadline and transmit paths, the gate for receive, the shell loop and hot-plug. The forced power-off, the suspended state and the one-shot rules are unchanged and still agree with P02M0197b; the fan driver now meets P02M0197's contract. The file is ASCII, no line exceeds 114 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0198.md` (and P02M0197's list of drivers); no source was changed, and nothing was built or booted.

@@ -180,3 +180,202 @@ The complete history was read: the original review and the planner's response. T
    **Correct the timing budget item.** State the granule as the 10 ms tick with no finer deadline planned. Drop the 1 ms granule from the host suite, or name the plan that would make it real.
 
 Validation: plan, source and specification inspection only. The plan and its audit history were read in full. The tree was read and searched: IDL, manifest, services, logic crates, kernel and ABI, and harness. The manifest's catalogue demand was computed with a read-only script (27 of 32 slots today). Primary sources were fetched read-only into the scratchpad. QEMU was queried only with `-device help`. No plan, source or audit file was modified, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0202 (2026-09-26T05:34:17Z):
+
+Every finding of the re-audit was checked against the plan, the tree and primary sources. In the tree: PowerService's registry (`MAX_LOCAL_SOURCES` = 16; a local id of 16 or more refused with `Refusal::Local`; a local id published again after its removal refused as a duplicate; either refusal ends the provider), and PowerService's canonical check, which ends a provider on a record that is not canonical. PermissionManager's rows: `btctl` is the one shipping row with an operator authority, and `powercheck` is the one holder of `power-control`. DeviceManager: three automatic attempts with 100 ms and 200 ms backoffs, a two-second `READY` deadline, and an offer made after `READY` published at once. The ABI's deadline unit, the tick (`TICKS_PER_SECOND` = 100). The plans checked were P02M0196, P02M0195, P02M0181, P02M0180, P02M0198 and P02M0099. The primary sources were the Lenovo X1C6 UCSI SSDT, Intel's BIOS UCSI white paper, the TCPCI R2.0 v1.3 and Type-C R2.0 specifications, and Linux's `ucsi_acpi.c`, `ucsi.c`, `tcpm.c`, `tcpci.c`, `pd.h` and the `usb-connector` binding. The Linux commits read were bf4f9ae1cb08, eb4573cf2fd8, cdc3d2abf438, 1f9f9d168ce6, fa48d7e81624, 326e1c208f3f, 976e7e9bdc77 and de52aca4d9d5. The cross-plan decisions on the shared mailbox and on the operator grant were applied as agreed. All eight findings are accepted and none is rejected.
+
+1. **ACCEPTED - The mailbox is shared with the node's own AML, which P02M0196b as written refuses.** P02M0196b, as written, refuses a SystemMemory region over "a claimed device's ranges". Its fixture carve-out takes the harness mailbox "out of what the service maps". Its `_CRS` check admits MMIO "not over RAM" and says nothing about firmware-reserved memory. The Lenovo SSDT declares `OperationRegion (USBC, SystemMemory, UBCB, 0x38)` over the base its `_CRS` method patches in. `ECWR` (function 1) reads CONTROL and MESSAGE_OUT from that region, `ECRD` (function 2) writes MESSAGE_IN and CCI into it, and `NTFY` runs `ECRD` before `Notify (\_SB.UBTC, 0x80)`. Intel's white paper (sections 2.2.3 to 2.2.5) defines the same "shared mailbox in main memory" as a SystemMemory region that its `_DSM` and SCI handler copy through. Linux maps the range write-back ("The UCSI mailbox is always in main memory", cdc3d2abf438). An earlier uncached mapping by Linux had failed against the write-back mapping ACPI had already made of the same region (1f9f9d168ce6), which is the evidence for one memory type. Under KVM, the driver's reads of an ivshmem `memory-backend-file` BAR never leave the guest, so "a read not preceded by function 2" cannot be observed.
+   Checking when that AML refreshes the mailbox refined the plan's earlier rule, "function 2 before every read of CCI and MESSAGE_IN". Firmware refreshes CCI and MESSAGE_IN itself before its `Notify`, as `NTFY` does, and a second copy after a notification breaks real firmware:
+   - **fa48d7e81624 (Intel):** Linux removed function 2 from its reads - "ACPI _DSM methods are needed only for UCSI write operations and for reading CCI during RESET_PPM operation" - and `GET_CONNECTOR_STATUS` became "at least 6 seconds faster" on Arrowlake-S.
+   - **326e1c208f3f (ASUS Zenbook UM325):** a function 2 after a notification "retrieves a garbage value", because "the ACPI interrupt handler destroys the CCI in ERAM after copying to system memory".
+   - **976e7e9bdc77:** forcing the copy "on some ACPI implementations ... actually breaks in various interesting ways"; "The only reason to force a sync from the embedded controller is to poll CCI while notifications are disabled".
+
+   Current `ucsi_acpi.c` calls function 2 only in `read_version` and `poll_cci`.
+   Plan changes:
+   - The ORDER paragraph now names P02M0196b's admission of a mailbox that the claimed node's own AML shares.
+   - THE TRANSPORT now says the mailbox IS SHARED. The claim maps it for the driver. The node's own AML reads and writes the same range through a SystemMemory region the node declares, inside `_DSM` and before its `Notify`. Both mappings use ONE memory type: write-back for firmware-reserved or ACPI NVS memory, uncached for MMIO.
+   - THE TRANSPORT also states the two admissions P02M0196b carries. First, a namespace device's `_CRS` range over firmware-reserved or ACPI NVS memory is admitted; usable RAM stays refused. Second, a SystemMemory region that the claimed node itself declares inside its own `_CRS` range stays mappable while the device is claimed; a region any other node declares over a claimed range stays refused. In the fixture, the harness-played range inside the firmware-held ivshmem BAR is admitted for the claim and stays reachable by the node's own AML.
+   - THE TRANSPORT's `_DSM` rule is refined on the evidence above. FUNCTION 1 follows every write of CONTROL and MESSAGE_OUT. FUNCTION 2 is used ONLY where no notification has refreshed the mailbox: to read VERSION at bind, and to poll CCI while notifications are off (the `PPM_RESET` completion). It is NEVER used after a notification, because the firmware refreshes CCI and MESSAGE_IN before its `Notify` and a function 2 after a notification breaks real firmware.
+   - In the UCSI gate, the device declares its own SystemMemory region over the mailbox. The staging areas and the function-2 log lie outside the mailbox range, in the region the ivshmem function's companion declares, so no other node's region covers the claimed range.
+   - The fixture behaves as that firmware does. Its notification path (`_AEI`) copies the inbound staging area into CCI and MESSAGE_IN before `Notify(0x80)`, and its `_DSM` logs each function-2 evaluation in the region, where the harness reads it.
+   - The stale-data check became an assertion on its effect, on the path where function 2 is required. The harness PPM completes `PPM_RESET` only in the inbound staging area while its notifications are off, so a driver that polls without function 2 never sees the reset complete and never publishes.
+   - A fourth, SPOILING PPM profile spoils its inbound staging area once it has notified, as the Zenbook's firmware does, so a function 2 after a notification is also caught by its effect. An attach and a detach are served on it as on the other profiles.
+   - The command log no longer checks "a read not preceded by function 2", which cannot be observed. It keeps "a write not followed by function 1", because the PPM never sees such a command. It adds "a function 2 evaluated after a notification and before the next command", which the fixture's log makes observable.
+
+2. **ACCEPTED - Shipping firmware names `PNP0CA0` by `_CID`.** The Lenovo SSDT (lines 38-39) and Intel's white paper (section 2.2.3, "its own unique ID") both give `_HID` `USBC000` with `_CID` `PNP0CA0`. Linux's `ucsi_acpi_match` is an ACPI id table, which matches `_HID` and `_CID` alike. P02M0196a keeps separate `hid` and `cid` predicates. P02M0195b gives its touchpad a vendor `_HID` with `_CID` `PNP0C50`, so that the `_CID` match is what its gate proves.
+   Plan changes:
+   - The `ucsi-acpi` bullet of THE PROCESSES now binds the device whose `_HID` OR `_CID` is `PNP0CA0`, with one match row using `hid` and one using `cid`, and says why.
+   - The UCSI gate's SSDT device has `_HID` `USBC000` and `_CID` `PNP0CA0`, so the `_CID` match is what is proved.
+   - The ORDER paragraph names P02M0196a's `cid` match.
+
+3. **ACCEPTED - A Hard Reset is not a detach.** Type-C R2.0 section 4.5.2.2.5.2 limits the VBUS exit from Attached.SNK to a port "not in the process of a USB PD PR_Swap or a USB PD Hard Reset or a USB PD FR_Swap". The CC-based exit excludes only the two swaps, so CC open still detaches during a Hard Reset. TCPCI section 4.4.18.2 says a source "shall always discharge to vSafe0V upon a disconnect, Hard Reset, or Power Role Swap". Linux's `tcpm.c` does four things here:
+   - it holds automatic discharge off in `SNK_HARD_RESET_SINK_OFF` ("Do not discharge/disconnect during hard reset");
+   - it ignores VBUS off in `SNK_HARD_RESET_WAIT_VBUS`;
+   - it detaches only after `PD_T_SRC_RECOVER_MAX + PD_T_SRC_TURN_ON` without VBUS;
+   - it keeps the hard-reset count through the cycle.
+
+   Plan changes:
+   - THE TYPE-C SINK STATE MACHINE now detaches on CC open for tPDDebounce, and on VBUS removal only outside a Hard Reset.
+   - From a Hard Reset, sent or received, the port controller's automatic discharge on disconnect is held off. VBUS is expected to fall within tSafe0V (some sources keep it up) and to return within tSrcRecover and tSrcTurnOn at their maximums. The engine detaches only if VBUS does not return, and the partner stays attached in `typec` throughout. The hard-reset count survives the reset and is cleared only by a contract made or a detach.
+   - The TCPCI gate gains two cases. In the first, the partner takes VBUS to vSafe0V and back during a Hard Reset: there is no detach, the count is kept and the contract is made anew. In the second, VBUS stays off: the connector detaches once tSrcRecover and tSrcTurnOn have passed.
+   - The host suite gains both cases.
+
+4. **ACCEPTED - Invariants 1 and 6 now say what binds them.** The `usb-connector` binding defines `sink-pdos` as sink PDOs of any type; its own example contains `PDO_VAR(5000, 12000, 2000)`. Linux's `tcpm_pd_select_pdo` requests a source PDO only when it lies inside one sink PDO's range, and `tcpm_pd_build_request` limits the current by that sink PDO. TCPCI section 4.4.18.3 makes the alarms level-triggered, re-asserted while the condition lasts, and switchable off with `DisableVoltageAlarms`. The TCPCI example in section 4.4.5.4.2 gives a contract's tolerance (21.5 V for a 20 V contract).
+   Plan changes:
+   - Invariant 1: a request's voltage lies inside ONE described sink PDO, meaning it equals a Fixed PDO's voltage or lies within a Variable or Battery PDO's range. Its operating and maximum currents are at or below both the offer's maximum and that PDO's current; for a Battery PDO, the limit is its power divided by the voltage. The invariant gives an example: a board describing Fixed 5 V and 15 V never requests 9 V or 12 V.
+   - The PROPOSED SELECTION RULE is restated on the same basis.
+   - Invariant 6 now places the alarms at each stage:
+     - from attach: vSafe5V's range;
+     - from Accept to PS_RDY: a span covering the old and the new contract's ranges, narrowed to the new contract's at PS_RDY;
+     - after a bind that finds VBUS present: from vSafe5V's lower bound to the upper bound of the highest described sink voltage, until the first PS_RDY;
+     - from a Hard Reset until VBUS is back at vSafe5V: off, while the sink path is off.
+   - The TCPCI gate's first case now offers 5, 9, 12, 15 and 20 V and PPS to a board that describes Fixed 5 V and 15 V, with less current at 15 V than the charger offers. The contract is made at 15 V at the sink PDO's current, and 9 V, 12 V, 20 V and PPS are never requested.
+   - The TCPCI gate gains a 5 V to 15 V transition that stays inside the envelope (no alarm) and one that overshoots it. The rebind case now says that no alarm fires.
+   - The host suite names the sink-PDO cases and the envelope cases.
+
+5. **ACCEPTED - Ten-second PPM bounds, and a slow first reset that does not hold the bind.** Linux commit bf4f9ae1cb08 ("the initial PPM reset may take up to ~8000-10000ms on some Lenovo laptops") raised `UCSI_TIMEOUT_MS` to 10000. Commit eb4573cf2fd8 applied the same bound to command completion, because `SET_NOTIFICATION_ENABLE` and `GET_CAPABILITY` "can exceed 5 seconds". DeviceManager allows three automatic attempts with 100 ms and 200 ms backoffs. The check also found a second problem that the longer bound would create. DeviceManager waits two seconds for a driver's `READY` (`READY_DEADLINE_TICKS`, scaled on the emulated ports), so a ten-second reset before `READY` would be torn down as a hang. An offer made after `READY` is published at once.
+   Plan changes:
+   - RECOVERY now makes every bound ten seconds and says why. A command or acknowledgement not completed within ten seconds is a silent PPM, and a reset's completion is polled for ten seconds.
+   - RECOVERY also has the driver report ready once the mailbox is mapped and VERSION checked. It runs the first reset and the first reads after that, and offers its two providers when every connector has been read.
+   - The operator deadline in `liber:typec@1` is now fifteen seconds: the ten-second command bound plus the five seconds Linux waits for the connector change that reports a swap. With the old five seconds, a slow but working PPM would always be answered `indeterminate`.
+   - The UCSI gate gains a SLOW PPM profile, whose first reset and the two commands after it each take more than five seconds and less than ten. Its case checks that the PPM is served after one reset, that the binding is ready within DeviceManager's deadline, and that the connectors are published once the slow start is over.
+
+6. **ACCEPTED - Who holds the operator grant.** PermissionManager's table calls `btctl` "the one shipping row that grants the operator authority" and `powercheck` "the one holder of the control authority". P02M0181 mints control "for an explicitly authorized administrative component". "Administrative session" appears nowhere else in the plans or the code. Applied as the cross-plan decision settles it.
+   Plan changes:
+   - The `typec` tool item says the shipping tool holds the read grant only.
+   - The operator grant goes to no shipping program. It goes to `typeccheck`, the development probe that drives the gate's requests, as `powercheck` holds `power-control`.
+   - Whether the shipping tool also receives it, with the four requests, as `btctl` holds Bluetooth's, is asked of the owner when the part starts.
+   - "Administrative session" is gone.
+   - In the UCSI gate, `typeccheck` requests the data-role swap, the power-role swap and the DisplayPort entry.
+
+7. **ACCEPTED - The local ids and the 48 V bound would each end the provider.** `power_registry.rs` takes 16 as the range of local ids and refuses a local id of 16 or more with `Refusal::Local`, which ends the provider. Linux numbers UCSI connectors from 1 (`connector[i].num = i + 1`). `power_service.rs` ends a provider whose record fails `canon::validate`. The TCPCI example puts a 20 V contract's VBUS at up to 21.5 V, so a 48 V Extended Power Range contract reads up to 50.9 V. The registry also refuses, as a duplicate, a local id published again after its removal. That is a second way a design that adds and removes a source on attach and detach would end the provider.
+   Plan changes:
+   - The providers bullet now makes a source's local id its connector's number less one. Connectors 1 to 16 are ids 0 to 15, and a PPM with more than 16 connectors is served for the first 16.
+   - The same bullet says a connector's source lives as long as the binding: an attach or a detach changes `present` and never removes the source.
+   - The POWER item now refuses a KNOWN voltage above 60 V, well clear of a 48 V contract's 50.9 V plus measurement error.
+   - The `usbc` adapter publishes a reading past that bound as invalid (range), never as known, so a wild reading never becomes a refused record. Host tests: 50.9 V on a 48 V contract is accepted, and a reading past 60 V is invalid from the adapter and refused when a record claims it known.
+   - The host suite names the connector-to-local-id mapping and the 60 V bound.
+
+8. **ACCEPTED - No finer deadline granule is planned.** The ABI states that every deadline is an absolute value on the tick counter, with `TICKS_PER_SECOND` = 100. P02M0198a says "TICKS STAY THE ABI UNIT".
+   Plan changes:
+   - THE TIMING BUDGET now arms a timer for ceil(minimum / 10 ms) + 1 ticks. It says the 10 ms tick is the kernel's deadline resolution and that no planned milestone makes it finer.
+   - SenderResponseTimer's firing at 30 to 40 ms stays the one listed exception, now as a permanent fact.
+   - The host suite tests every timer's minimum at the 10 ms tick. The 1 ms granule is dropped.
+
+Re-check of the whole plan: the plan was read top to bottom against the tree and the neighbouring plans. The ORDER paragraph matches what each part needs, with P02M0196a's `cid` match and P02M0196b's shared-mailbox admission added. Every publication is made by a driver holding a claim, using local ids PowerService accepts and sources it never removes. The only wire changes are two appended enum values and the new `liber:typec@1`. The operator deadline covers the transport's own bounds, and the transport's memory rules match what P02M0196b admits. The sink engine's invariants, state machine and alarms agree with each other: a Hard Reset turns off the sink path and the alarms together, and the widened envelope after a bind is what lets the 15 V rebind case pass. Every gate case maps to an item, and the one grant holder is named. The re-check found one further error. THE COMMAND DISCIPLINE said every connector change is acknowledged before the next command. Read literally, that sends a connector-change acknowledgement on its own, ahead of the `GET_CONNECTOR_STATUS` that reads the change. It now acknowledges a connector change in the same `ACK_CC_CI` as that command's completion, never alone, because some PPMs refuse a lone one (Linux commit de52aca4d9d5). Three owner questions stay as asked when the part starts: the UCSI configuration defaults, the TCPCI selection rule, and now whether the shipping `typec` tool receives the operator grant. The plan remains consistent with P02M0196 (whose side of the shared mailbox is that plan's own edit), with P02M0195 (the child binding, `vhost-i2c-gpio.py` and its IOTLB) and with P02M0181 (the provider bounds and the rule that a control is never retried).
+
+Only `docs/todo/P02M0202.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0202 (2026-09-26T15:50:59Z):
+
+**Rating: 7/10.** All eight findings of the last re-audit are corrected, and the claims the planner made about the tree, Linux and shipping firmware hold. Four new gaps remain. The two drivers have no step in P02M0197's suspend exchange. The TCPCI gate cannot pass on the emulated ports against a partner that keeps the specification's timers. An absent `usb-c` source would carry a measurement that PowerService refuses. And one UCSI gate check needs a fixture device that no plan adds.
+
+The complete history was read: the original review, both planner's responses and the last re-audit. The planner's latest round was read as `git diff` of the plan against commit eca3cbe7, with the whole plan as it stands in the working tree. Its claims were checked in the tree:
+- PowerService's registry, its canonical check and `canon::validate`;
+- DeviceManager's ready deadline, backoffs, machine scale and late-offer rule;
+- PermissionManager's `btctl` and `powercheck` rows;
+- `liber:power@1`, `provider-kind`, and the loader's UEFI memory-type mapping.
+
+The sibling plans were read as they stand in the working tree: P02M0196 (a's `cid` predicate, b's admissions, carve-out and memory type, d's fixture), P02M0195, P02M0197, P02M0190, P02M0201 and P02M0099.
+
+Primary sources were fetched read-only: Linux's current `ucsi_acpi.c` and `ucsi.c`, and commits fa48d7e81624, 326e1c208f3f, 976e7e9bdc77 and de52aca4d9d5. The UCSI SSDTs of seven shipping machines were also read: Lenovo X1C6, Dell XPS 15 9570, LG Gram 13Z980, HP Z2 Mini G4, Alienware Area-51m R2, Razer Blade and Honor MagicBook 14 Pro (2026). QEMU was queried only with `-device help`.
+
+These corrections now hold:
+- **Shared mailbox (last re-audit's 1).** The transport now states that the region is shared, that both mappings use one memory type, and which two admissions it needs. [P02M0196b carries both](/data/yellow/libersystem/docs/todo/P02M0196.md:167) and [the `_CRS` exception](/data/yellow/libersystem/docs/todo/P02M0196.md:187). All seven shipping SSDTs declare the mailbox region inside the `USBC000`/`PNP0CA0` device itself. Dell's EC query writes the mailbox through that device's fields. So the "own node" admission fits real firmware. The unobservable read check is gone. The gate now observes a missing function 2 by its effect, the spoiling profile, and a log of function 2 after a notification.
+- **`_CID` match (2).** The plan has match rows for both predicates, and the fixture uses `USBC000` with `_CID` `PNP0CA0`. P02M0196a has [the `cid` predicate](/data/yellow/libersystem/docs/todo/P02M0196.md:96).
+- **Hard Reset (3).** The exit rule is corrected, discharge is held off, the count is kept, and both gate cases and host tests are added.
+- **Invariants 1 and 6 (4).** A request now lies inside one sink PDO, the alarm envelope is staged, and the 5 V and 15 V board case and both transition cases are added.
+- **Ten-second bounds (5).** The ready-before-reset rule stands on DeviceManager's [two-second `READY` deadline](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:117) and on [its rule that an offer after `READY` is published at once](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:4308). The slow profile is its oracle.
+- **Operator grant (6).** `typeccheck` holds it, as [`powercheck` holds `power-control`](/data/yellow/libersystem/src/user/services/core/src/permission_manager.rs:367). Whether the shipping tool gets it is an owner question.
+- **Local ids and the voltage bound (7).** The local id is the connector number less one, a source is never removed ([the range check](/data/yellow/libersystem/src/user/services/logic/src/power_registry.rs:302), [the retired check](/data/yellow/libersystem/src/user/services/logic/src/power_registry.rs:339)), and the bound is 60 V with the adapter's invalid (range).
+- **Timer granule (8).** The plan states the 10 ms tick and no 1 ms granule.
+- **The planner's own changes.** Bundling the connector-change acknowledgement with the next completion matches Linux commit de52aca4d9d5. The new function-2 rule matches fa48d7e81624, 326e1c208f3f and 976e7e9bdc77. It also matches current `ucsi_acpi.c`, which evaluates function 2 only in `read_version` and `poll_cci`.
+
+1. **Medium - Neither driver has a step in P02M0197's suspend exchange, and P02M0197 refuses every sleep while such a binding is Online.**
+
+   The rule is in P02M0197:
+   - Each driver declares [a `suspend-deadline`](/data/yellow/libersystem/docs/todo/P02M0197.md:132) for [the driver contract](/data/yellow/libersystem/docs/todo/P02M0197.md:121).
+   - ["while a binding with no `suspend-deadline` is Online the sleep is refused"](/data/yellow/libersystem/docs/todo/P02M0197.md:140).
+   - That part adds the exchange only to [the drivers the image ships when it lands](/data/yellow/libersystem/docs/todo/P02M0197.md:143).
+
+   The plans created with this one carry the exchange, "by whichever of P02M0197 and this milestone lands second": [P02M0190](/data/yellow/libersystem/docs/todo/P02M0190.md:90) and [P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:157). P02M0202 never names P02M0197 or a sleep.
+
+   The consequences:
+   - `ucsi-acpi` binds on [every UCSI laptop through the `_CID` match](/data/yellow/libersystem/docs/todo/P02M0202.md:29). If this milestone lands second, no such laptop can sleep.
+   - P02M0197's own S3 case runs [through P02M0196d's SSDT fixture](/data/yellow/libersystem/docs/todo/P02M0197.md:360). That is [the fixture SSDT each owner adds its devices to](/data/yellow/libersystem/docs/todo/P02M0196.md:392), this plan's UCSI device included. So that gate would be refused too.
+   - A resume needs its own work: Linux's `ucsi_acpi` resume re-enables notifications and checks every connector again (`ucsi_resume_work` in https://github.com/torvalds/linux/blob/master/drivers/usb/typec/ucsi/ucsi.c).
+   - For TCPCI the contract's `SUSPEND` [masks the driver's interrupts](/data/yellow/libersystem/docs/todo/P02M0197.md:125). The engine enforces [invariants 5](/data/yellow/libersystem/docs/todo/P02M0202.md:228) and [6](/data/yellow/libersystem/docs/todo/P02M0202.md:232) by answering the alert. While it is suspended the sink path stays as it was, and nothing answers a VBUS alarm or a partner's message. The plan leaves open what holds them.
+
+   This is a new finding: a contradiction with P02M0197. The same gap is reported for P02M0198's fan driver and P02M0199's `acpi_als` in their re-audits of this date.
+
+   **Add a SUSPEND AND RESUME item.** Both drivers declare `suspend-deadline` and implement P02M0197's exchange, carried by whichever of the two milestones lands second:
+   - `ucsi-acpi` finishes the command in flight and sends none until `RESUME`. On `RESUME` it enables notifications and reads every connector again, as RECOVERY does.
+   - For `tcpci`, state what keeps invariants 5 and 6 true while the engine does not run. For example, the alert is armed as a wake source.
+
+2. **Medium - The TCPCI gate runs its full case list on aarch64 and riscv64 against a partner that keeps the specification's timers, but an emulated guest cannot answer within them.**
+
+   The partner is [written from the specification's source-side state machines](/data/yellow/libersystem/docs/todo/P02M0202.md:285). The plan itself says [a source sends Hard Reset once its SenderResponseTimer, 24 to 30 ms, runs out](/data/yellow/libersystem/docs/todo/P02M0202.md:246). The same cases run [on aarch64 and riscv64 in their emulated sweep](/data/yellow/libersystem/docs/todo/P02M0202.md:308), and only the budget is exempted there.
+
+   The emulated ports are far slower than the budget allows. Under KVM the budget already allows 15 ms at the 99th percentile. DeviceManager scales its deadlines because [the emulated boot windows are forty thousand ticks against x86_64's three thousand](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:120). It also records that [six drivers on riscv64 and seven on aarch64 missed a two-second `READY` deadline](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:128). A whole emulated run [costs 2877 s on aarch64 and 6104 s on riscv64 against about 100 s on x86_64](/data/yellow/libersystem/AI/CLAUDE.md:22).
+
+   So on those ports the Request arrives after the partner's timer, and the partner answers with Hard Reset. Every case that needs a contract then fails:
+   - [the 15 V contract](/data/yellow/libersystem/docs/todo/P02M0202.md:291);
+   - [the transitions](/data/yellow/libersystem/docs/todo/P02M0202.md:301);
+   - [the rebind through Soft_Reset](/data/yellow/libersystem/docs/todo/P02M0202.md:304).
+
+   The alarm span has the same problem. It must be widened after Accept and before the source starts its transition, which is tSrcTransition (25 to 35 ms) later.
+
+   The precedent the plan names, [P02M0195's `i2c-hid` gate](/data/yellow/libersystem/docs/todo/P02M0195.md:255), has no peer deadline, so it does not carry over. This is a new finding: a gate case that cannot pass as written.
+
+   **Correct the TCPCI gate.** On the emulated ports, either stretch the partner's timers that wait on the sink by the port's slowdown, or run the cases that need a timely answer only under KVM. Say which. The timers are SenderResponseTimer and the transition delay the alarm span must precede.
+
+3. **Medium - An absent `usb-c` source would carry a measured VBUS, which `canon::validate` refuses, and the refusal ends the provider.**
+
+   The plan keeps a connector's source for the whole binding: [an attach or a detach changes only `present`](/data/yellow/libersystem/docs/todo/P02M0202.md:51), and [`present` means a partner is attached](/data/yellow/libersystem/docs/todo/P02M0202.md:86). Yet the measurements are [a port controller's VBUS register "where it has one", and a UCSI 2.1 reading whenever its reading-ready bit is set](/data/yellow/libersystem/docs/todo/P02M0202.md:87), with no exception for an empty connector.
+
+   A TCPCI VBUS register reads about 0 V when nothing is attached. That happens in the first snapshot of an unplugged connector and after every detach. `canon::validate` refuses [a record whose `present` is no and which carries any known value](/data/yellow/libersystem/src/user/libs/power/model/src/canon.rs:200). PowerService [ends the provider on a record that is not canonical](/data/yellow/libersystem/src/user/services/core/src/power_service.rs:328).
+
+   So the TCPCI driver's `power-source` provider ends at its first snapshot on an unplugged connector. That also removes the source the gate's [`source-fault` checks](/data/yellow/libersystem/docs/todo/P02M0202.md:303) read.
+
+   This is a new finding of the same kind as the last re-audit's finding 7. The new rule that a source outlives every detach makes it certain.
+
+   **Correct the POWER item.** While `present` is no, the `usbc` adapter publishes no known measurement, because VBUS on an empty connector is not the partner's. Add host tests for an unplugged connector's first snapshot and for a detach.
+
+4. **Low - The UCSI gate checks the `usb-c` source beside an ACPI AC adapter in the fixture, but no plan adds that device and its driver is not a prerequisite here.**
+
+   The first UCSI case shows the source ["beside the fixture's ACPI AC adapter, which stays its own source"](/data/yellow/libersystem/docs/todo/P02M0202.md:271). Nothing provides that adapter:
+   - This QEMU has no AC adapter device (`-device help`).
+   - P02M0196d's fixture holds only [what each owner adds](/data/yellow/libersystem/docs/todo/P02M0196.md:392).
+   - The adapter's owner is [P02M0099's ACPI battery, AC and thermal item](/data/yellow/libersystem/docs/todo/P02M0099.md:4306). That item is still open and plans no fixture, so no plan adds an `ACPI0003` device.
+   - [The ORDER paragraph](/data/yellow/libersystem/docs/todo/P02M0202.md:17) names nothing of P02M0099 for this part.
+
+   An implementer who follows the ORDER could reach this case with no AC source to show. This is a new finding.
+
+   **Correct the UCSI gate and the ORDER paragraph.** Either add an `ACPI0003` device, with its `_PSR` read from the harness region, to the UCSI gate's SSDT and name P02M0099's AC adapter driver as that case's prerequisite, or drop the AC adapter from the case.
+
+Validation: plan, source and specification inspection only. The plan and its audit history were read in full, and the planner's latest round was read as a diff against commit eca3cbe7. The tree was read and searched: the power registry, PowerService, `power-model`, DeviceManager, PermissionManager, the power and device IDL, and the UEFI loader. Sibling plans were read from the working tree. Linux sources and commits and seven shipping UCSI SSDTs were fetched read-only into the scratchpad. QEMU was queried only with `-device help`. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0202 (2026-09-26T17:12:45Z):
+
+Verified read-only: P02M0197's refusal of an Online binding without `suspend-deadline` and its driver contract; P02M0190's and P02M0201's "whichever lands second" wording; `canon::validate`, which refuses an absent source carrying any known value, and PowerService's `drain_stream`, which ends a provider on a record that is not canonical; the power model's tags (known, unknown, unsupported, invalid); DeviceManager's `machine_scale` comment (boot windows of forty thousand ticks on the emulated ports against three thousand on x86_64, and drivers missing a two-second `READY` there) and the measured cost of an emulated run in `AI/CLAUDE.md`; P02M0196d's fixture (each owner adds its own devices) and P02M0099's open ACPI battery, AC and thermal item. Summary: four findings, all accepted.
+
+1. **ACCEPTED - neither driver had a step in P02M0197's exchange.** Plan changes: a new item in part a, "SUSPEND AND RESUME", each half landing with its driver's part and carried by whichever of P02M0197 and this milestone lands second:
+   - `ucsi-acpi` declares a `suspend-deadline` that covers the ten-second command bound, because a UCSI command is finished, never abandoned; `SUSPEND` finishes the command in flight and sends none until `RESUME`, a notification meanwhile waiting on the node channel; `RESUME` enables notifications again and reads every connector again, as RECOVERY does, each connector reported as not answering until its read completes.
+   - `tcpci`: I state what keeps invariants 5 and 6, and the answer is a refusal, not a wake source. The engine cannot run while its binding is suspended, because its alert arrives through the GPIO controller's binding, which is suspended after its consumers. So `SUSPEND` is REFUSED, naming the connector, while the sink path is enabled; with no partner attached it suspends with the sink path off and the alert unwatched; a partner attaching during the sleep finds the sink path off, which only the engine turns on; and `RESUME` reads the port afresh as a bind does, with Soft_Reset for a partner found with VBUS present. The finding's example, an alert armed as a wake source, would need a wake request in P02M0195's line contract and a GPIO controller binding that keeps one line live while suspended. Neither exists, and this engine serves only a board not yet named, so that capability goes to EXCLUDES ("a sleep with a partner attached") rather than into this plan.
+   - The verification adds "A SLEEP", carried the same way: on the UCSI fixture a suspend to idle and an S3 cycle, with the PPM's command log showing no command between `SUSPENDED` and `RESUMED` and the notifications and every connector's read after, and a detach made while the guest sleeps reported after the resume; on the TCPCI fixture, the sleep refused with a contract made, and with the charger detached a suspend to idle answered and a charger attached during it finding the sink path off, the contract made after the resume.
+   - The ORDER paragraph names the exchange as carried by whichever lands second.
+
+2. **ACCEPTED - the TCPCI gate's partner kept timers an emulated guest cannot meet.** Of the two fixes offered I took stretching, so that the emulated sweep still runs the whole case list and proves the device-tree path end to end. Plan change: on the emulated ports the partner's timers that wait on the sink - SenderResponseTimer and tSrcTransition, the one the alarm span must precede - are stretched by a factor the gate passes the partner and records with its result, proposed 100 (a whole emulated run costs about thirty times x86_64's on aarch64 and sixty on riscv64); the partner applies it to those two alone, every sink timer and the protocol are unchanged, and under KVM the partner keeps the specification's timers and the budget stays gated there alone.
+
+3. **ACCEPTED - an absent `usb-c` source would carry a measured VBUS, which ends the provider.** Plan changes: the POWER item now says WHILE `present` IS NO, NOTHING IS KNOWN - VBUS on an empty connector is not a partner's, and a known value there is refused and ends the provider with every connector's source - so the `usbc` adapter publishes a measurement the transport has as `unknown` while no partner is attached, in an unplugged connector's first snapshot and after every detach, and one the transport lacks stays unsupported. The host tests add an unplugged connector's first snapshot and a detach, each with the controller's VBUS register reading about 0 V, published canonical with no known measurement.
+
+4. **ACCEPTED - the UCSI gate checked an ACPI AC adapter no plan adds.** Of the two fixes offered I kept the check and gave it an owner, because "two reports, not one source" is the POWER item's own claim and needs the adapter beside the `usb-c` source to be shown. Plan changes: the first UCSI case's AC-adapter half is carried by whichever of this milestone and P02M0099's ACPI AC adapter driver lands second; that change adds an `ACPI0003` device to the gate's SSDT, its `_PSR` read from the harness region, and shows it in P02M0181's service as a source of its own, merged with nothing. The ORDER paragraph names this prerequisite.
+
+Coordinated change: P02M0197's "NO DRIVER IS SKIPPED" names `ucsi-acpi` and `tcpci` among the drivers that carry the exchange themselves; a `tcpci` refusal is a driver refusal, which P02M0197 already turns into an unwound suspend with the binding named.
+
+Re-check of the whole plan: every driver this milestone adds now meets P02M0197's contract, and the TCPCI safety invariants hold across a sleep because the sink path is never left on while the engine cannot run; every PowerService record the adapter can produce is canonical; every gate case can run on each machine it names and fail on the behaviour it checks. The ORDER, the exclusions and the other parts agree with P02M0195, P02M0196, P02M0197 and P02M0099. The file is ASCII, no line exceeds 112 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0202.md` (and P02M0197's list of drivers); no source was changed, and nothing was built or booted.

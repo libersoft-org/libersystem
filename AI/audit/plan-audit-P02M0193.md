@@ -179,3 +179,189 @@ The one exception is finding 1.
    - The host suite's crowded scene has the same floor.
 
 Validation: I did a read-only inspection of the plan and its history in git (`07371c44`, `0dd5da07`), the audit file, P02M0189, P02M0103 and the source files cited above. The lane arithmetic uses only the code's own constants and the bench's frozen scene. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+
+PLANNER'S RESPONSE ON P02M0193 (2026-09-26T05:34:17Z):
+
+I checked both findings of the latest re-audit against the tree at `eca3cbe7`. In `soft2d`: `backend.rs` (the optional-copy pass in `prepare`, the budget and its give-back loop, the tile loop and `replay`), `paint.rs` (the image shader), `lib.rs`, `tile.rs`, `clip.rs`, `layer.rs`, `raster.rs`, `target.rs`, `filter.rs` and the extents of every scene in `tests.rs`. In `graphics-core`: `sample.rs` (`pyramid_layout`, `base_from_sampler`, `Sampler::texel`) and `pixel.rs` (`TransferTable`, `f32_to_half`). Beyond those: `rt::pool::for_each`, `soft2d-bench`'s `ui_effects` fixture, `test3d_sw.rs`, the guest test in `applications.rs` that runs `test3d-sw --workers 4 --compare`, the 2D demo test in `services.rs`, `soft3d`'s `raster.rs`, `frame.rs` and pooled tests, render2d's `Backend` trait, the profile's limits, and P02M0189 as its planner has rewritten its ordering item today. Both findings are correct: 2 accepted, 0 rejected.
+
+1. **ACCEPTED - a lane must never take the room of an optional decoded copy.**
+
+   What I verified in the code:
+
+   - The copy is real and is given back. Pass 1 of `prepare` builds a level-zero-only pyramid for every image drawn `Bilinear` or `Bicubic`. `fixed` charges one set of scratch, and the loop after it removes optional copies, newest first, until the total fits.
+   - The copy is not the same picture to the bit. `pyramid_layout` stores level zero as `R16G16B16A16Float`, written through `f32_to_half` (round to nearest even). `Sampler::texel` on the direct path decodes each tap through the single-precision `TransferTable`. `paint.rs` samples the copy whenever it exists. So a copy's taps are the direct path's rounded to half precision, and keeping or giving one back can change an output pixel. The comments at `backend.rs:691` ("costs time and nothing else") and `paint.rs:414` ("the same picture") are wrong to the bit.
+   - The boundary is reached. I redid the `UI-effects` arithmetic from the code's own constants:
+     - The backdrop blur's sigma of 6 reaches 18 pixels, so the scratch extent is 100x100.
+     - One lane is 19 surfaces at 16 bytes a pixel (3,040,000 bytes), plus the 64x64 tile (65,536 bytes), the span rows and the rasteriser rows: about 3.11 MB.
+     - The photo's copy is 2 MiB, and the list's bins are shared by all lanes.
+     - Against 64 MiB, twenty lanes fit beside the copy, and a twenty-first fits only without it. The plan's `--scaling` run to sixty-four workers crosses that line.
+
+   Only the auditor's order keeps both today's serial picture and independence from the worker count. Fitting lanes first makes the set of copies depend on the worker count. Settling copies against the largest lane count would drop copies that the serial frame keeps today. The point about multi-lane-only cost also holds: a tile-major intermediate is a whole-frame buffer that exists only when more than one lane runs.
+
+   Plan changes:
+
+   - **WHAT MAKES 2D DIFFERENT** gains a bullet, THE CEILING HAS A SECOND CLAIMANT, AND IT CAN CHANGE PIXELS. It covers:
+     - the optional copies, and that they are given back newest first;
+     - the two comments, and why neither holds to the bit (half-precision storage against the direct path's single-precision decode);
+     - that a lane taking a copy's room would make the picture depend on the worker count.
+   - **The lane item.** Its old last sentence ("computes what one lane costs and runs with as many as fit") is replaced by THE CEILING IS SPENT IN AN ORDER THAT CANNOT CHANGE A PIXEL, which says:
+     - The FIRST lane is settled the way today's one set of scratch is. The copies are given back, newest first, against the list's own scratch and one lane's. A frame that does not fit is refused before it starts, exactly as today.
+     - I did not copy the auditor's "exactly as today" for the reservation itself, because the plan moves the stacks and the node table into the lane. The item says they are the lane's only new part, and kilobytes at the profile's depths. The alternative would be claiming a byte-identical boundary that is not quite true.
+     - LANES BEYOND THE FIRST are fitted only into what is left, up to the lanes the pool offers. So every worker count keeps the copies the one-lane frame keeps.
+     - A COST THAT EXISTS ONLY WITH SEVERAL LANES (the tile-major intermediate, if the unit of work needs one) is charged together with those lanes. A frame whose second lane does not fit beside it runs on one lane without it.
+     - The frame reports the lanes it runs with and the units it is cut into.
+     - A HOST CASE HOLDS THE ORDER. An image's copy fits beside one lane but not beside the pool's lanes, and the target must be bit-identical at every worker count. The case also asserts that the copy was kept and that the lane count is below the pool's. Without those, a case sized so that the copy never fits even one lane would pass for the wrong reason.
+   - **Two sentences the auditor did not ask for, also in the lane item:**
+     - Why the copies are not made single precision instead: that would double their memory and move the pixels of draws that sample one today, which is P02M0103's 2D floor.
+     - That the two wrong comments are corrected to say a copy can move a pixel. Left alone, they invite someone to reorder the budget again.
+   - **The `soft2d-bench` item.** Each row now names the lanes the frame ran with and its units, because the ceiling can hold the lanes below the worker count. `UI-effects` fits about twenty beside its photo's copy by the code's own arithmetic, somewhat fewer if the intermediate is chosen.
+
+2. **ACCEPTED - the parallel comparisons need a floor on how many units a frame has.**
+
+   What I verified in the code:
+
+   - Why the 3D precedent works. The guest test runs `test3d-sw` at 64x48 and asserts `shading on 4 worker(s)`. `test3d_sw.rs` prints that from `Shading::lanes`, which is the pool's threads plus one, not the work that was shared. It works because soft3d's tile is 32 pixels, so 64x48 is four tiles.
+   - Why a copy of it would test nothing in 2D:
+     - soft2d's `TILE_SIZE` is 64, and `Tiling::new` rounds up, so 64x48 is one tile and one band.
+     - `rt::pool::for_each` wakes `count.min(lanes - 1).min(items - 1)` helpers, which is none for one item.
+     - So the copied test would compare the serial walk with itself and still print four.
+   - The 2D demo test's 192x128 scanout is six tiles but only two bands.
+   - The host suite has the same gap:
+     - The existing `soft2d` scenes are 4x4 to 64x64, one tile each, apart from two at 256x256.
+     - soft3d's pooled crowd runs at 192x128, 97x61 and 33x33, which would be six, two and one soft2d tiles.
+     - "Backwards" and "handed out twice" reorder nothing on a one-unit frame.
+
+   Plan changes:
+
+   - **The target bullet of WHAT MAKES 2D DIFFERENT** gains AND A FRAME IS ONLY AS PARALLEL AS ITS UNITS:
+     - 64x48 is one tile and one band;
+     - `for_each` wakes at most one helper fewer than there are units;
+     - so a comparison at that size compares the serial walk with itself.
+   - **The `test2d-sw` item:**
+     - The demo prints the lanes its frames ran with and the units they were cut into. This is the frame's own report, not the pool's threads plus one.
+     - The guest test runs four workers the way `test3d-sw --workers 4 --compare` is run, but not at that test's 64x48, which is one soft2d unit.
+     - THE GUEST SURFACE IS CUT INTO AT LEAST AS MANY UNITS AS THE WORKERS IT ASKS FOR, whichever unit is chosen. Four 64-row bands are 256 rows.
+     - The test asserts the lane count, the unit count and the number of frames compared, each read from the demo's output and not only found. The compared-frame count follows the 3D test: a run that compared nothing prints the same line with a zero.
+   - **THE SCALAR REFERENCE HOLDS IT** gains THE CROWDED SCENE HAS A FLOOR ON ITS UNITS:
+     - The crowded scene is cut into at least as many units as the lanes of the pools that run it, whichever unit is chosen. Four lanes need at least 256 rows.
+     - The case asserts its unit count.
+     - The existing one-tile scenes are named as what they still prove: lanes left idle.
+     - The warmed-frame test runs the crowded scene through a four-lane pool, so the floor holds there without a change of its own.
+   - **The cancellation item.** I applied the same floor there. Its test now cancels on a frame cut into more units than it has lanes, because on a one-unit frame "every unit whole or untouched" holds whatever the lanes do.
+
+Coordinated changes: The demo-rows item's closing parenthesis only said that P02M0189 owns the gate change. It now states the ordering both plans share:
+
+- P02M0189's account is the serial walk, and the pooled draw is an additional recorded row beside it, not a term of it.
+- The two milestones close in either order. If P02M0189 has landed, the change here that makes the pool `test2d-sw`'s default also pins every `qemu-2d-account` run to `--workers=1` and adds the pooled row, in that same change. If it has not, P02M0189 pins them from its first step.
+
+I checked this against P02M0189's rewritten THE DRAW IS THE SERIAL WALK item, which says the same from its side. It adds one case: if this milestone lands while P02M0189 is open, P02M0189 treats it as a change on the measured path, and pins `--workers=1` from then on. Handling that case is P02M0189's job, and this plan needs nothing more for it.
+
+Re-check of the whole plan:
+
+- **One gap neither finding named.** The lanes are reserved at `prepare`, but render2d's `Backend::prepare` and `render` take no pool, and `soft3d` receives its `Workers` only at `execute_with`. So the soft3d shape alone gave `prepare` no way to know how many lanes it is offered. The interface item now says the backend holds its `Workers` from construction, as it holds its image source, and that `prepare` is where the lanes are reserved.
+- **The items still fit together.** The lane budget, the no-allocation item, the glyph item and the `Sync` item are consistent: lanes read only the prepared list, the shader and transfer tables and a `Sync` image source. They write only their own reserved scratch and their own unit of the target.
+- **No input that depends on the schedule is left.** Masks are filled and layers cleared when taken (`MaskPool::take` fills with zero; `Pool::take` clears). A skipped decode's stale tile is overwritten whole. A tile's pixels outside its round-trip region are neither read nor stored. The set of copies no longer depends on the lane count.
+- **No parallel check can pass vacuously.** The host differential, the warmed-frame count, the cancellation test, the boundary case and the guest `--compare` all run on frames with at least as many units as lanes, and assert it.
+- **The lane item and the unit-of-work item agree** on what the intermediate costs and when it is charged.
+- **The demo-rows item agrees with P02M0189** as its planner has written it.
+- **EXCLUDES is unchanged and still holds.** Settling copies at one lane changes no scene, budget or ceiling of P02M0103's 2D floor.
+- **Format.** Nothing is versioned. The plan points at no audit and cites no coordination number. Its lines stay within 110 columns, in ASCII.
+
+Only `docs/todo/P02M0193.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0193 (2026-09-26T15:50:59Z):
+
+**Rating: 9/10.** Both findings of the last re-audit are corrected in the plan text, and the planner's own additions hold against the code. Two small gaps are left. The host case that holds the ceiling order has no floor on its units, although the response says every parallel check has one. And in one of the three landing orders, this plan and P02M0189 each leave the gate's worker pin to the other.
+
+I read the complete history, including the planner's response of 2026-09-26T05:34:17Z, and the planner's diff against `eca3cbe7` (`git diff -- docs/todo/P02M0193.md`). I checked the current plan against:
+
+- `soft2d`:
+  - in `backend.rs`, the optional-copy pass and the give-back loop in `prepare`, the tile loop, `replay` and `draw_glyphs`;
+  - the image shader in `paint.rs`;
+  - `tile.rs`, `clip.rs`, `layer.rs`, `raster.rs`, `target.rs`, `glyph.rs` and `filter.rs`;
+  - the extents of the host scenes in `tests.rs`;
+- `graphics-core`'s `pyramid_layout`, `base_from_sampler`, `Sampler::texel` and `TransferTable`;
+- render2d's `Backend` trait and `PreparedKey`, and the profile's limits;
+- `rt::pool::for_each`, and `soft3d::frame` (`Workers`, `Serial`, `Lane`, `recycle`, `shade_bins`) with its pooled host tests;
+- `soft2d-bench`'s `ui_effects` and frozen scenes, and the worker default of `soft3d-bench`;
+- `test2d_sw.rs`, `test3d_sw.rs`, the guest test that runs `test3d-sw --workers 4 --compare`, and the 2D demo guest test;
+- P02M0189 as it stands in the working tree;
+- P02M0103's honesty rule, its parallel 3D plan and that plan's EXCLUDES.
+
+Both findings of the last re-audit were correct, and the planner accepted both. These corrections hold:
+
+- **Lanes against the optional copies (last re-audit, finding 1).**
+  - The first lane is settled against the copies as today.
+  - Further lanes are fitted only into what is left.
+  - A cost that exists only with several lanes is charged together with them.
+  - A host case asserts that the copy was kept.
+  - The new bullet in WHAT MAKES 2D DIFFERENT matches the code. Level zero is stored as [`R16G16B16A16Float`](/data/yellow/libersystem/src/user/libs/graphics/core/src/sample.rs:420). The direct path decodes each tap [through the table](/data/yellow/libersystem/src/user/libs/graphics/core/src/sample.rs:185), whose entries are [`f32`](/data/yellow/libersystem/src/user/libs/graphics/core/src/pixel.rs:538).
+  - The bench item's "about twenty" lanes for `UI-effects` follows from the code's own numbers: [the scratch extent](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:671), [the surface count](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:676) and the [photo drawn `Bilinear`](/data/yellow/libersystem/src/tools/soft2d-bench/src/main.rs:536).
+  - Declining "exactly as today" for the reservation itself is honest. The lane's new stacks and node table move the one-lane budget slightly. They do not change which copies a given worker count keeps.
+- **A floor on units (last re-audit, finding 2).**
+  - The target bullet now says why a one-unit frame is serial: [the tiling rounds up](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/tile.rs:36), and [`for_each` wakes at most `items - 1` helpers](/data/yellow/libersystem/src/user/runtime/rt/src/pool.rs:302).
+  - The guest `--compare` test, the crowded scene and the cancellation test each carry the floor.
+  - The demo prints the frame's own lanes and units. The guest test reads the lane count, the unit count and the compared-frame count from that output.
+- **The planner's additions.**
+  - The backend has to hold its `Workers` from construction, because render2d's [`prepare`](/data/yellow/libersystem/src/user/libs/graphics/render2d/src/backend.rs:57) and [`render`](/data/yellow/libersystem/src/user/libs/graphics/render2d/src/backend.rs:60) take no pool.
+  - This fits the way [`test2d-sw` builds a new backend for every frame](/data/yellow/libersystem/src/user/apps/tools/src/test2d_sw.rs:867).
+  - The two comments to correct are at [`backend.rs:691`](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:691) and [`paint.rs:414`](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/paint.rs:414).
+  - The ordering text agrees with P02M0189's [serial-walk item](/data/yellow/libersystem/docs/todo/P02M0189.md:82) and with [its gate](/data/yellow/libersystem/docs/todo/P02M0189.md:388) in two of the three orders. Finding 2 covers the third.
+- **Inputs that do not depend on the schedule.** The re-check's claims hold:
+  - Masks are [filled](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/clip.rs:182) and layers [cleared](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/layer.rs:56) when they are taken.
+  - A decode is skipped only for a tile that an [opaque, axis-aligned solid covers](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:456). The [covered fast path](/data/yellow/libersystem/src/user/libs/graphics/soft2d/src/backend.rs:1074) writes that tile without reading the lane's stale scratch.
+
+1. **Low - The host case that holds the ceiling order sets no floor on its units, although the response says it does, so the case cannot fail if an implementation caps its lanes at the unit count.**
+
+   This is an incomplete correction. The floor from the last re-audit's finding 2 was not applied to the case added for its finding 1.
+
+   The response says that ["the boundary case"](/data/yellow/libersystem/AI/audit/plan-audit-P02M0193.md:265), like every other parallel check, runs "on frames with at least as many units as lanes, and assert it". The plan text says otherwise:
+
+   - The [crowded scene](/data/yellow/libersystem/docs/todo/P02M0193.md:115), the [cancellation test](/data/yellow/libersystem/docs/todo/P02M0193.md:104) and the [guest test](/data/yellow/libersystem/docs/todo/P02M0193.md:134) each carry the floor.
+   - The [host case](/data/yellow/libersystem/docs/todo/P02M0193.md:78) states neither an extent nor a unit count.
+
+   This matters because of how lanes can be counted:
+
+   - Lanes beyond the first are fitted ["up to the lanes the pool offers"](/data/yellow/libersystem/docs/todo/P02M0193.md:71), so a frame may reserve fewer than the pool offers.
+   - A lane beyond the unit count never runs, because [`for_each`](/data/yellow/libersystem/src/user/runtime/rt/src/pool.rs:302) wakes at most `items - 1` helpers. Capping the lanes at the unit count is therefore a natural economy, and the plan does not rule it out.
+
+   With that cap, the case can pass for the wrong order:
+
+   - Take a one-unit case, which is the size of [most existing scenes](/data/yellow/libersystem/docs/todo/P02M0193.md:118). It reserves one lane under either order.
+   - It keeps its copy under either order.
+   - It shows "a lane count below the pool's" because of the cap, not because of the ceiling.
+   - So all three assertions pass for an implementation that fits lanes first and gives copies back, which is the order this case exists to rule out.
+
+   With at least as many units as the pool has lanes, that implementation wants every lane and gives the copy back, so the kept-copy assertion fails.
+
+   **Correct the lane item's host case** so that its frame is cut into at least as many units as the pool's lanes, and assert its unit count, as the crowded scene's case does. One phrase is enough.
+
+2. **Low - When this milestone's pool default lands while P02M0189 is still open and its gate already exists, this plan and P02M0189 each give the gate's worker pin to the other.**
+
+   This is an incomplete correction. The last re-audit of P02M0189 asked for this parenthesis to be aligned with P02M0189's either-order rule, and the same mismatch is reported from P02M0189's side in its re-audit of this date.
+
+   - This plan's change pins the gate only ["if P02M0189 has landed"](/data/yellow/libersystem/docs/todo/P02M0193.md:143). Otherwise ["P02M0189 pins them from its first step"](/data/yellow/libersystem/docs/todo/P02M0193.md:145).
+   - P02M0189's gate item gives the pin to ["the change that makes the pool the demo's default"](/data/yellow/libersystem/docs/todo/P02M0189.md:391) whenever P02M0193 had not landed when the gate was first written.
+   - Suppose the gate exists but P02M0189 has not closed. P02M0189's first step is then long past, and each plan names the other's change as the one that pins.
+
+   Nothing is measured wrongly: P02M0189's gate fails when [a second demo thread is on a CPU inside the draw](/data/yellow/libersystem/docs/todo/P02M0189.md:395). But it fails on this milestone's change, while this plan tells its implementer that the fix belongs to P02M0189.
+
+   **Correct the parenthesis** so that it keys on whether the gate exists, not on which milestone "has landed", and says the same as P02M0189's gate item. The change that makes the pool `test2d-sw`'s default pins every `qemu-2d-account` run that exists at that point, and adds the pooled row in the same change. A gate first written after that pins from its first version.
+
+Validation: I did a read-only inspection of the plan, its diff against `eca3cbe7`, the audit history, P02M0189 and P02M0103 in the working tree, and the source files cited above. The lane and unit arithmetic uses only the code's own constants and the bench's frozen scene. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0193 (2026-09-26T17:12:45Z):
+
+Verified read-only: `rt::pool::for_each`, which wakes `self.count.min(lanes.len() - 1).min(items.len().saturating_sub(1))` helpers, so a lane beyond the unit count never runs and a cap at the unit count is a natural economy; `Tiling::new`, which rounds the tile count up; this plan's lane item and measured-demo-rows item; and P02M0189's serial-walk and gate items in the working tree. Summary: two findings, both accepted.
+
+1. **ACCEPTED - the host case that holds the ceiling order had no floor on its units.** My last response said every parallel check carries the floor, and this case did not. An implementation that fits lanes first but caps them at the frame's units would pass a one-unit version of the case for the wrong reason: one lane, the copy kept, a lane count below the pool's. Plan change, in the lane item: the host case's frame is cut into AT LEAST AS MANY UNITS AS THE POOL HAS LANES, and the case asserts the unit count together with the kept copy and a lane count below the pool's, so a lane count held down only by a cap at the units cannot pass it.
+
+2. **ACCEPTED - in the third landing order this plan and P02M0189 each gave the gate's pin to the other.** The parenthesis keyed on whether P02M0189 "has landed" and otherwise pointed at "its first step", which is past once the gate exists. Plan change: the parenthesis in the measured-demo-rows item now says WHO EDITS P02M0189'S GATE FOLLOWS FROM WHETHER THE GATE EXISTS, as P02M0189's serial-walk and gate items say. The change here that makes the pool `test2d-sw`'s default pins every `qemu-2d-account` run that exists at that point to `--workers=1` and adds the pooled row in the same change, whether or not P02M0189 has closed; a gate first written after that change pins from its first version.
+
+Coordinated change: P02M0189's serial-walk and gate items state the same rule (P02M0189's response of this date).
+
+Re-check of the whole plan: every parallel check now carries the unit floor - the crowded scene, the cancellation test, the guest `--compare` test and the boundary case - and each asserts its unit count. The lane order, the reservation, the allocation-free replay, the glyph preparation and the bench and demo rows are unchanged and still agree with each other and with P02M0103's honesty rule. The ordering text agrees with P02M0189 in all three orders. The file is ASCII, cites no audit and keeps its `Status:` line.
+
+Edited `docs/todo/P02M0193.md` (and P02M0189 for the shared rule); no source was changed, and nothing was built or booted.

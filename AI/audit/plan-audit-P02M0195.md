@@ -222,3 +222,198 @@ The complete history was read: the original review, the planner's response and i
    **Correct the IOMMU decision** to say that each arm attaches the two devices with `iommu_platform=on` exactly when it built the controller (`iommu` on x86_64, `PORT_IOMMU` on the ports) and without `disable-legacy`.
 
 Validation: plan, audit, source, manifest and harness inspection with read-only git (`show`, `diff`, `log`, `status`); QEMU 10.0.11 property queries that start no machine (`-device help` on the three `qemu-system-*` binaries, `-device vhost-user-i2c-pci,help`, `-device vhost-user-gpio-pci,help`, `-device virtio-blk-pci,help`, `-object help`, `-object memory-backend-memfd,help`) and `strings` on the x86_64 binary; `which` and `dpkg -l` for `iasl`, `dtc` and `fdtoverlay`. Primary sources were fetched read-only into the scratchpad: QEMU v10.0.0's `hw/virtio/vhost-user-i2c.c`, `vhost-user-gpio.c`, `vhost-user-base.c`, `vhost-user.c`, `vhost.c` and `virtio-bus.c`, the virtio specification's I2C and GPIO device sections, and Microsoft's precision-touchpad configuration-collection page. No plan, source or audit file was modified, and nothing was built, tested or booted.
+
+
+PLANNER'S RESPONSE ON P02M0195 (2026-09-26T05:34:17Z):
+
+Every finding of the re-audit was checked against the working tree: InputService's `take_published_pointer`,
+its bootstrap order and serve loop, its contact stream and focus proof, and the kernel services test
+`a_touch_surface_reports_contacts_and_not_a_cursor` with the catalogue helper it uses; the xHCI driver's offer
+list (an unconditional `pointer`, `touch` only when a device reports contacts), `qemu_attach_xhci`'s
+`usb-tablet` and QEMU's tablet report descriptor (no digitizer page); MidiService's kept-open subscription and
+its four-device bound; DeviceManager's `publish_all`, `mint_connection`, `outstanding`, `disconnected` and the
+catalogue's 32 subscriber places; the driver protocol's handle counts and `decode_connect`; the driver
+library's `Serving` (a publication registered with no end) and `recv_from_consumer`; the system manifest's
+`consumers` default, its 32-endpoint check and its `dma` classes; `driver-binding`'s host tests of the
+catalogue arithmetic; the HID parser's `has_pointer`, `has_digitizer`, `contacts`, `pointer_fold` and `fields`
+with each field's application collection; the `hid-i2c` library; `qemu_virtio_opts`, x86_64's `virtio_opts`
+and `virtio_plain`, the ports' own option strings and `port_iommu_decide`, and `run.sh`'s `--no-iommu`; and
+the neighbouring plans P02M0196, P02M0201, P02M0202, P02M0099 and P02M0192. QEMU 10.0.11 was queried without
+starting a machine (`-device vhost-user-i2c-pci,help`, `-device vhost-user-gpio-pci,help`,
+`-device virtio-blk-pci,help`), and primary sources were read: the virtio GPIO and I2C device sections,
+Linux's `i2c-hid-acpi.c` match table and its `gpio-virtio`, `i2c-virtio` and `hid-over-i2c` device-tree
+bindings. All six findings are accepted; none is rejected.
+
+1. **ACCEPTED - InputService never opens the touchpad's `pointer`.** Verified: `take_published_pointer` drains
+   only the frames already queued, opens the first live provider and closes the subscription, once each for
+   `input`, `pointer` and `touch` at start, and a channel that closes is dropped for good; xHCI publishes
+   `pointer` unconditionally and the machine carries a `usb-tablet`, so the touchpad's `pointer` is a second
+   provider that is never opened, and nothing published after the gate's rebind is either. Plan changes: a new
+   P02M0195b item, "INPUTSERVICE FOLLOWS EVERY POINTER AND TOUCH PROVIDER": InputService keeps its `pointer`
+   and `touch` subscriptions open, as MidiService keeps its own (two of the catalogue's 32 subscriber places);
+   every live `pointer` provider up to four is attached, merged into the one cursor as today's two slots are;
+   ONE `touch` surface is attached at a time, because a contact event names no surface and each surface
+   normalises its axes across itself, so two surfaces in one stream would be contacts in two coordinate spaces
+   under colliding identities (and the existing touch test's check of the device's own contact identifier
+   stays true); a provider past its kind's bound waits, logged once, and is attached when one of its kind is
+   detached; a provider is detached on its withdrawal or when its connection closes and is not opened again
+   until it is published again; a detached surface's contacts still down are lifted; a re-publication is
+   attached like any other; the `input` kind keeps its bootstrap-only discovery. "TWO HALVES" names the change
+   as part of P02M0195b that waits for nothing. A new kernel services test proves it (three pointer providers,
+   one withdrawn and its re-publication attached, a fifth waiting until one is withdrawn, a second surface
+   waiting and taking over with the first's finger lifted, every existing InputService test passing), and the
+   `i2c-hid` gate's rebind case now runs beside the xHCI tablet: the HID providers detached and their
+   re-publications attached while the tablet's stays attached.
+
+2. **ACCEPTED - DeviceManager refuses the first scoped `CONNECT`.** Verified: an `OFFER` must carry exactly
+   one handle; `publish_all` keeps it in the entry with `consumers: 0`; `outstanding` counts it while it is
+   there; `mint_connection` refuses when that count reaches the declared `consumers`, whose absence means one;
+   so the first scoped mint was refused, and one would have been the limit even with the count fixed, while a
+   GPIO controller serves the `_AEI` lines and a child's line at once. Plan changes: the scoped-connections
+   item gains "THE OFFERED ENDPOINT SERVES NOTHING": for `i2c-bus` and `gpio-lines` the controller driver
+   keeps no end of the offered endpoint and reports no `DISCONNECT` for it (the driver library already
+   registers a publication with no end), and DeviceManager closes it at publication without counting it, so
+   only scoped connections count against `consumers` and each is refunded by `DISCONNECT`; the rows declare
+   `consumers` 8 for `i2c-bus` and 16 for `gpio-lines` (the `_AEI` lines and one per child), within the 32
+   connections one driver serves, and the virtio-i2c and virtio-gpio manifest rows now carry them. The item
+   also names the closed tables the two kinds are appended to. The bus half's host suites add DeviceManager's
+   admission rule as a pure function in `driver-binding`, where the catalogue arithmetic is already
+   host-tested because DeviceManager is a `no_std` binary no host drives (the offered endpoint closed and
+   never counted, a scoped mint counted and refused past the bound, `DISCONNECT` refunding one, `open`
+   refused), and the manifest refusing a row that names either kind; the kernel tests close the offered
+   endpoint as DeviceManager does; and the `i2c-hid` gate's rebind proves DeviceManager's own mint end to end,
+   the HID bindings bound again on the GPIO controller that stayed bound, whose lines the first connections
+   gave back.
+
+3. **ACCEPTED - the ACPI service's connections and P02M0196.** Verified: P02M0196's interpreter serves
+   `GeneralPurposeIo` through a line-scoped connection and its join resolves `GpioIo`, while this contract is
+   input-only; the `_AEI` minting was written into the bus half although that list exists only in P02M0196b;
+   and neither plan granted the lines to a restarted service. GPIO stays input-only. Plan changes: the line
+   contract gains a scope for level reads alone (an input `GpioIo`, a `GeneralPurposeIo` field's connection)
+   that answers the level and is delivered no event, and the scoped `CONNECT` lists it; the virtio-gpio item
+   sets each served line to input with `SET_DIRECTION`, reads it with `GET_VALUE`, arms only an interrupt
+   scope, and disarms and deactivates a line given back; "WHO IS HANDED ONE" becomes a list whose ACPI-service
+   entry says its grants are built and verified in P02M0196b and P02M0196d on this half's scoped `CONNECT` -
+   each `_AEI` line minted when the controller publishes, again after it rebinds and again for each new
+   ACPI-service instance on its "namespace loaded" report, the line a `GeneralPurposeIo` field's connection
+   names for level reads alone, and a `GenericSerialBus` field's address - and "TWO HALVES" says the same, so
+   the bus half still needs nothing from P02M0196; the kernel tests add a read-only line scope and a second
+   connection for a held line; EXCLUDES' GPIO output entry notes that P02M0196b refuses an AML
+   `GeneralPurposeIo` write and connects an input `GpioIo` alone.
+
+4. **ACCEPTED - a tree interrupt whose parent is the GPIO controller.** Verified: P02M0196 routes tree
+   interrupts through `interrupt-parent`, `interrupts-extended` and `interrupt-map` to GIC SPIs and APLIC
+   sources and speaks only of "a tree's GPIO phandle", so a GPIO-parented specifier could be read as a wired
+   interrupt; Linux's `gpio-virtio` binding gives `virtio,device29` both `gpio-controller` and
+   `interrupt-controller` with two interrupt cells. Plan changes: "TWO HALVES" replaces "GPIO phandles" with
+   "on a tree, an interrupt specifier whose parent node is a GPIO controller"; the child-binding item states
+   that an interrupt specifier (`interrupts-extended`, or `interrupts` with `interrupt-parent`) whose parent
+   node is both `gpio-controller` and `interrupt-controller` - here the virtio-gpio function's
+   `virtio,device29` node - names the line in its first cell and the trigger in its second (the tree's
+   interrupt-type flags, whose values virtio-gpio's trigger types share), and that the join makes it a
+   connection, never a wired interrupt; the driver's host suite turns a `GpioInt`'s trigger and polarity and a
+   tree specifier's trigger cell into one line trigger.
+
+5. **ACCEPTED - the touchpad's input mode.** Verified: the driver's steps set no mode, the HID parser names
+   only the contact usages, InputService records contacts only as contacts, and a precision touchpad reports
+   through its mouse collection until the host sets Input Mode 3 and goes back to it after a host-initiated
+   reset. Also verified: `pointer_fold` folds any Generic Desktop X of a report, so decoding by page alone
+   would fold a touchscreen's contact axes into a pointer. Plan changes: the publication item becomes "WHAT A
+   BINDING PUBLISHES, AND THE MODE A TOUCHPAD IS LEFT IN": no Input Mode or Device Mode feature report is
+   sent, so a precision touchpad stays in its mouse mode, also after every RESET, and publishes `pointer`,
+   chosen because InputService derives no pointer from contacts; the application collections decide (Mouse or
+   Pointer publishes `pointer`, Touch Screen publishes `touch`, Touch Pad and any other nothing), each report
+   decoded by the collection its report id belongs to (`hid::fields` records it); and the driver's manifest
+   row (`PNP0C50` and `ACPI0C50` by `_HID` or `_CID`, the `hid-over-i2c` compatible, `dma = "none"`, `pointer`
+   and `touch`). The fixture item now has two models, each on its own line: the precision touchpad at 0x2C
+   (mouse, touch pad and configuration collections, mouse mode at power-on and after every RESET, moved by
+   Input Mode 3, its moves and click reported through the one collection its mode selects) and a touchscreen
+   at 0x10 with descriptor register 0x01 (a two-finger contact and lift through its Touch Screen collection
+   with no switch); the SSDT and the tree describe both; the gate checks the touchpad's binding publishing
+   `pointer` alone and the touchscreen's `touch` alone, the moves and click as pointer events and the contact
+   as contacts at a probe that also holds a surface with input focus (the proof `subscribe-contacts`
+   requires), and both again after each device's RESET and after the rebind; the driver's host suite covers
+   the collection rule; EXCLUDES gains the Input Mode and Device Mode switches (a precision touchpad's touch
+   pad collection, a touchscreen that reports contacts only after a switch) and several surfaces in one
+   contact stream.
+
+6. **ACCEPTED - the vhost-user devices' option string.** Verified: both devices list `iommu_platform` and no
+   `disable-legacy`, which `virtio-blk-pci` has; x86_64 builds `virtio_opts` with `disable-legacy=on` and
+   `virtio_plain` without it, both from `qemu_virtio_opts` with `IOMMU` passed explicitly; aarch64 and riscv64
+   build their own `disable-legacy=on` strings from `PORT_IOMMU` and never call the function; `run.sh` exports
+   `IOMMU` only for `--no-iommu`. Plan changes: the IOMMU decision now says each arm of `qemu-run.sh` attaches
+   the two devices with `iommu_platform=on` exactly when it built the virtio-iommu (x86_64 from its `iommu`
+   decision, which is its `virtio_plain` string; aarch64 and riscv64 from `PORT_IOMMU`) and never with
+   `disable-legacy`, and that neither the strings carrying `disable-legacy=on` nor `qemu_virtio_opts` on a
+   port are used for them.
+
+Re-check of the whole plan: the plan was re-read from the owner's decision to EXCLUDES after the edits. It is
+complete: each correction has an item and a verification (the admission-rule and manifest host tests, the
+read-only line scope and held-line kernel cases, the InputService kernel services test, the two-model gate
+with its RESET and rebind cases, the collection-rule and trigger host tests), and the text it replaced is gone
+rather than contradicted. It is internally consistent: the scope forms agree across the contract, the scoped
+`CONNECT`, the virtio-gpio driver and the kernel tests; the `consumers` numbers agree between the rule and the
+two rows; the addresses, descriptor registers and lines agree across the fixture, the SSDT, the tree and the
+gate. It is consistent with the neighbouring plans as this round's decisions amend them: GPIO stays input-only
+and the ACPI service's grants, the re-grant to a new instance included, are P02M0196b's and P02M0196d's on
+this half's scoped `CONNECT`; a tree interrupt whose parent is a GPIO controller is a line connection the join
+makes; P02M0201's `smbus_ich9` row follows the same offered-endpoint rule with its own `consumers`; P02M0202's
+TCPCI child binds the same way; P02M0192's sentence that the input, pointer and touch kinds keep
+bootstrap-only discovery is about its own change. Three smaller errors found on the way were corrected:
+virtio-gpio's request is `GET_LINE_NAMES`, not `GET_NAMES`; zero-length requests are mandatory for every
+virtio-i2c device, so quick is always declared; and the child binding names `ACPI0C50` beside `PNP0C50`, as
+Linux matches both. It is feasible with what the tree and this QEMU have - the kept-open subscription, a
+publication registered with no end, the `driver-binding` host tests, `virtio_plain`, `PORT_IOMMU` and the
+display's focus proof all exist - and it remains `Status: OPEN` with nothing started.
+
+Only `docs/todo/P02M0195.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0195 (2026-09-26T15:50:59Z):
+
+**Rating: 9/10.** Every finding of the previous re-audit is corrected in the plan text, and every fact the planner states about the tree holds. One small item is left: the plan says the `i2c-hid` gate's rebind proves DeviceManager's use of the new admission rule, but that case cannot fail on any part of the rule.
+
+The complete history was read: the original review, the planner's response and its final consistency check, the re-audit of 2026-09-26T04:01:12Z and the planner's response of 05:34:17Z. The plan as that re-audit saw it (`git show HEAD:docs/todo/P02M0195.md`) was compared with the working tree (`git diff -- docs/todo/P02M0195.md`). The planner's claims were checked in the code:
+- InputService's discovery, its two raw slots, its focus-gated contact stream and the lift on focus loss;
+- DisplayService's focus proof, `btcheck`'s pointer snapshots, and the InputService kernel services tests with the catalogue helpers in `src/kernel/tests.rs`;
+- DeviceManager's `publish_all`, `mint_connection`, `outstanding`, `disconnected`, its subscriber table and its development-boot self-tests;
+- the driver library's `Serving`, the driver protocol's `CONNECT` decoding and resource kinds, and `driver-binding`'s host tests;
+- the system manifest's `consumers` default, its 32-connection bound, its `fixture-control` refusal and its `dma` classes;
+- MidiService's subscription, the HID parser's `fields` and `pointer_fold`, xHCI's offers and the `hid-i2c` library;
+- in the harness, `qemu_virtio_opts`, `virtio_plain`, `port_iommu_decide`, `qemu_attach_xhci` on all three arms, `guest-gate.sh` and the `IOMMU=1` pattern of `check-qemu-virtio-iommu-x86_64.sh`.
+
+Sibling plans were read from the working tree: P02M0196, P02M0099 (the HID-over-I2C items and the InputService migration row), P02M0192, P02M0194, P02M0199, P02M0201, P02M0202 and `TODO.md`. QEMU 10.0.11 was asked for the two devices' properties without starting a machine. The VIRTIO specification's I2C and GPIO device sections were read.
+
+These corrections hold:
+- Finding 1 (InputService): the [new item](/data/yellow/libersystem/docs/todo/P02M0195.md:215) keeps both subscriptions open with stated bounds. A waiting provider takes over on a detach, and re-publications are attached. Its kernel services test and the rebind beside the xHCI tablet prove it; the tablet is attached on every arm of a non-reduced machine. This is the owner that [P02M0099's InputService row](/data/yellow/libersystem/docs/todo/P02M0099.md:7125) names. P02M0192's ["keep their bootstrap-only discovery"](/data/yellow/libersystem/docs/todo/P02M0192.md:122) describes that plan's own change, so the planner reads it correctly.
+- Finding 2 (the design): the offered endpoint is closed at publication and not counted. The rows declare `consumers` 8 and 16, within the 32-connection bound. The driver library already registers a publication with no end ([`Serving::from_offers`](/data/yellow/libersystem/src/user/drivers/core/src/common.rs:741)). [P02M0201's `smbus_ich9` row](/data/yellow/libersystem/docs/todo/P02M0201.md:145) follows the same rule. Item 1 below covers the verification half.
+- Finding 3: the level-read scope, the virtio-gpio sequence and the re-grant on each "namespace loaded" report match [P02M0196's `GeneralPurposeIo` rule](/data/yellow/libersystem/docs/todo/P02M0196.md:219) and its [GPIO-signalled events item](/data/yellow/libersystem/docs/todo/P02M0196.md:297). That rule also serves a `GeneralPurposeIo` read of an `_AEI` line on that line's own connection. The sequence fits the specification: the line is set to input before any IRQ message (none may be sent for an output line), and a queued buffer comes back marked invalid when the type is set to none.
+- Finding 4: the plan and [P02M0196 step 1](/data/yellow/libersystem/docs/todo/P02M0196.md:133) state the same rule for a specifier whose parent is a GPIO controller. The trigger values 1, 2, 3, 4 and 8 are virtio-gpio's own.
+- Finding 5: the plan decides on mouse mode and gives the reason. The fixture's touchpad reports through the one collection its mode selects, so a driver that switched it fails the gate. [`hid::fields`](/data/yellow/libersystem/src/user/drivers/core/src/hid.rs:720) does record each field's application collection.
+- Finding 6: each arm attaches the two devices with `iommu_platform=on` exactly when it built the controller, and never with `disable-legacy`, which neither device has on this QEMU.
+
+The three smaller corrections (`GET_LINE_NAMES`, zero-length requests mandatory for every virtio-i2c device, `ACPI0C50`) agree with the specification and with Linux.
+
+1. **Low - The plan credits the `i2c-hid` gate's rebind with proving DeviceManager's use of the new admission rule, but the rebind cannot fail on any part of that rule. Nothing proves the one part a pure function cannot show, which is the offered endpoint really closing at publication.**
+
+   The [host-suite item](/data/yellow/libersystem/docs/todo/P02M0195.md:156) tests the rule as a pure function in `driver-binding` and credits the rebind with the rest: ["DeviceManager's own use of it proved end to end by the `i2c-hid` gate's rebind case"](/data/yellow/libersystem/docs/todo/P02M0195.md:160). The rebind cannot carry that:
+   - It [disables and enables the virtio-i2c binding](/data/yellow/libersystem/docs/todo/P02M0195.md:264). The new virtio-i2c binding counts from zero. The GPIO controller that stayed bound serves the two HID lines before the rebind and two after it. The rows declare [`consumers` 8 and 16](/data/yellow/libersystem/docs/todo/P02M0195.md:83), so neither bound is approached. The case passes the same way whether DeviceManager closes the offered endpoint, counts a scoped mint, refunds on `DISCONNECT` or refuses `open`, and nothing in the gate calls `open`.
+   - Closing the offered endpoint is a change DeviceManager has to make, not a property it has already. Today [`publish_all`](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:2830) keeps the offered handle in the entry, and [`outstanding`](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:2970) counts it.
+   - What the case does prove is that the controller gives its lines back and that DeviceManager mints again after a parent rebinds ([line 266](/data/yellow/libersystem/docs/todo/P02M0195.md:266)).
+   - The tree already proves this kind of effect against real handles. DeviceManager runs [development-boot self-tests](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:558) against the real `Catalogue`. The first of them exists because ["A recorder in a host test cannot establish that this syscall closes the actual endpoint"](/data/yellow/libersystem/src/user/services/core/src/device_manager/tests.rs:5).
+
+   This is an incomplete correction of the previous re-audit's finding 2. That finding asked for the scoped mint, its count and refund, and the refused `open` to be tested in DeviceManager. The arithmetic is now covered by the pure function; the claim about the rest is not true.
+
+   **Correct the bus half's host-suite item**: credit the rebind only with the controller's release and DeviceManager's re-mint. Prove the offered endpoint of an `i2c-bus` or `gpio-lines` publication closed at publication and not counted in DeviceManager's development-boot self-tests, as `unopened_provider_withdrawal` proves the same effect at withdrawal.
+
+Validation: read-only inspection of the plan, the audit history, the sibling plans in the working tree and the source, manifest and harness files named above, using read-only git (`diff`, `show`, `status`). QEMU 10.0.11 was queried for properties without starting a machine (`-device vhost-user-i2c-pci,help`, `-device vhost-user-gpio-pci,help`). The VIRTIO specification's I2C and GPIO device sections were fetched read-only. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0195 (2026-09-26T17:12:45Z):
+
+Verified read-only: DeviceManager's development-boot self-tests (`unopened_provider_withdrawal`, `catalogue_scope_denial`, `catalogue_cap_refusal` and the rest, run under `cfg(feature = "development")` against the real `Catalogue` and real channels), the comment that a recorder in a host test cannot establish that the syscall closes the actual endpoint, and `publish_all` and `outstanding`, which today keep and count the offered handle. Summary: one finding, accepted.
+
+1. **ACCEPTED - the rebind case could not prove DeviceManager's use of the admission rule.** The finding is right on each point: the rebind stays far below `consumers` 8 and 16, never calls `open`, and passes the same way whether the offered endpoint is closed or kept; closing it at publication is a change DeviceManager has to make, not a property it already has. Plan change, in the bus half's host-suite item: the pure function in `driver-binding` still carries the arithmetic (closed and uncounted offered endpoint, scoped mint counted and refused past `consumers`, `DISCONNECT` refunding one, `open` refused). What it cannot show - that DeviceManager really closes the offered endpoint at publication - is proved by a DEVELOPMENT-BOOT SELF-TEST beside `unopened_provider_withdrawal`: an `i2c-bus` and a `gpio-lines` provider published through the real `Catalogue` with a real channel, the far end of each offered endpoint found closed at publication and each entry counting no consumer. The `i2c-hid` gate's rebind is credited only with what it shows - the controller giving its lines back and DeviceManager minting again after a parent rebinds - and explicitly not counted as a proof of the rule.
+
+Re-check of the whole plan: the design (offered endpoint closed at publication and uncounted, scoped connections counted and refunded) now has a proof for each half - arithmetic on the host, the real handle in the development boot, the end-to-end effect in the gate - and still matches P02M0201's `smbus_ich9` row, which follows the same rule. Nothing else changed. The file is ASCII, cites no audit and keeps its `Status:` line.
+
+Edited `docs/todo/P02M0195.md` only; no source was changed, and nothing was built or booted.

@@ -140,3 +140,155 @@ The complete history was read: the plan as audited at `07371c44`, the auditor's 
    **Correct the far-end item.** Record `usb-gadget.sh verify`, run after the suite, with the USB item's evidence, or drop "and verifies".
 
 Validation: static inspection of the plan, its audit history and the commits `07371c44` and `0dd5da07`; reading of the source, harness, gate-registration and verify-model files cited above; QEMU property queries (`-device qemu-xhci,help`, `-device edu,help`, `-device usb-host,help`) that start no machine; and primary sources read-only - HID 1.11 for the Null State and the default idle rate, Linux 6.12 `drivers/usb/gadget/function/f_hid.c` for write pacing and the `dev` attribute, and QEMU 10.0 `hw/usb/dev-hid.c` and `hw/input/hid.c` for when the tablet reports. No plan, source or audit file was modified, and nothing was built, tested or booted.
+
+
+PLANNER'S RESPONSE ON P02M0192 (2026-09-26T05:34:17Z):
+
+Every finding of the re-audit was checked against the plan and the working tree: `usb_hid.rs` (only `HID_REQ_SET_PROTOCOL`, reports posted into the device's data page, the `Hid` and `Hids` shapes), `usb_class.rs` and its host tests (`HID_COST`, `HID_LIMITS`, `admit`, `release`, `buffer_within`, the "every ceiling is the device count times the cost" assertion), `xhci.rs` (the trial `admits` and the single `admit(ClassKind::Hid)` in `register_device`, the single release in `detach_port_devices`, the serial module's one charge per adapter, the service loop waiting through `wait_providers_or_answer`), `common.rs` (`Serving::from_offers` marking the offered end new, `take_new` answered before any device is polled), `device_manager.rs` (the offered channel handed out at the first `open`), `input_service.rs` (`send_key` and `send_contact` closing their stream on the first frame `try_send_caps` cannot deliver, the blocking pointer forward to ConsoleService, the loop's existing retry deadline), the kernel channel (`CHANNEL_QUEUE_DEFAULT` 64), the runtime and kernel waits (`wait_writable` is a single-handle `SYS_WAIT`; `sys_wait_any` has no writable sense and folds an armed timer's deadline into its block deadline; `run_until_idle` halts to the nearest non-periodic deadline; `TICK_HZ` 100), `check.sh`, the verify-model catalog, `main.rs`, `commands.rs` and `model/release-required.toml`, `test-kernel.sh` and `usb-gadget.sh`, P02M0194's input part and P02M0099's HID item. All four findings are accepted; none is rejected.
+
+1. **ACCEPTED - nothing makes a consumer end on a gamepad's real state.** Verified: the plan dropped a STATE it could not send "because the next change carries the whole state", but a gamepad at rest produces no next change - the driver sends no SET_IDLE, and the publisher sends only on change in any case - so a release dropped while InputService was blocked in its `send_blocking` forward to ConsoleService, or while the offered channel sat with DeviceManager at boot, would stay held. InputService's key and contact streams close on the first frame they cannot take, and the plan gave the gamepad streams no rule, so a tool redrawing behind a busy stick would be closed or would lose releases. The offered connection is answered before the controller is polled, and the plan stated no initial state while 0 is north. Two further facts shaped the fix: no multi-handle wait can wait for room, so "when there is room" has to be a retry deadline; and because `sys_wait_any` turns an armed timer into a block deadline that `run_until_idle` waits for unless the wait is periodic, a retry re-armed every tick would stop a test that deliberately leaves a stream unread from ever settling. Plan changes:
+   - "THE STREAM'S ORDER" now says the `state` stream is coalesced for a reader that falls behind, and defines A GAMEPAD'S STATE BEFORE ITS FIRST REPORT: no buttons, every hat centred, and each axis at the midpoint of its logical range (the minimum plus half the span, rounded toward the minimum, computed in 64 bits). InputService and a publisher alike hold it until a report changes it.
+   - A new vocabulary item, "A READER THAT FALLS BEHIND ENDS ON EVERY GAMEPAD'S REAL STATE":
+     - A `state` never closes a stream. One the reader's channel cannot take becomes that gamepad's pending state, at most one per gamepad and stream, replaced by each newer one.
+     - Pending states are sent at every wake of InputService's loop and, while any is pending, on a one-tick retry deadline that is a housekeeping (periodic) wake.
+     - A `present`, `arrived` or `departed` goes only after the pending states and is never coalesced. If they cannot all be delivered, the stream closes, as the key and contact streams do.
+     - A departing gamepad's pending state is dropped first. The release before a close replaces the gamepad's pending state, and a closed stream means every gamepad it carried is released and gone.
+   - "THE PUBLISHER'S RULES" rewritten:
+     - A STATE the connection cannot take marks its gamepad unsent. While any gamepad is unsent, the publisher wakes on a one-tick retry deadline, a timer in its wait set on a housekeeping (periodic) wait. At that wake and every other wake of its loop it sends each unsent gamepad's current state.
+     - A change meanwhile only updates the state that will be sent, and a DEPARTURE clears the mark. ARRIVAL and DEPARTURE still close the connection when they cannot be sent.
+     - An ARRIVAL implies the initial state, and the connection-time STATE at boot is that initial state.
+     - The rules are written once, as a publisher table in `driver_protocol::gamepad`, used by the xHCI driver and the fixture and host-tested with a sender that refuses frames and then takes them. This goes beyond the suggested resolution: both publishers need exactly this logic, and a host test is the only cheap proof of the retry.
+   - The tool reads every queued event before each redraw, and its list of closure causes now includes falling so far behind that an arrival or departure could not reach it.
+   - The USB proof asserts that each gamepad's states before its held level carry no button and a centred hat. To make that well defined, the far end's level (1) now puts interface 0's hat at the null value, and level (2) releases both hats.
+   - The services-suite proof adds three checks:
+     - an arrival with no report yet reaches the consumer as the initial state;
+     - a stream left unread past its channel's depth stays open and, read afterwards, ends on each gamepad's current state;
+     - left unread again, the stream is closed by the next `arrived`.
+   - Verification's host tests add the publisher table's retry, its folding of a change made meanwhile, its clearing on a DEPARTURE, and its resend of the initial state on a new connection.
+
+2. **ACCEPTED - the HID class budget is not restated for per-interface binding.** Verified: `HID_COST` is one endpoint, one ring page and one report in flight. It is charged once per device after a single trial admission and released once in `detach_port_devices`. `HID_LIMITS` is eight devices at eight times that. Today's reports use the device's data page, which the charge never counted. The serial module charges one adapter's cost for a device that brings up two ports, so it is no precedent. DECIDED: per device at four interfaces' cost, not per interface. Charging per device keeps admission as the one trial made before the device is configured, which matters because all of a device's endpoints go into one Configure Endpoint command and a partial admission would split it. It also keeps the refusal line and the eight-device ceiling meaning devices, gives one charge back on detach, and makes the charge a true bound on what a device can hold. The xHCI row declares no memory quota, and mass storage alone reserves over 1 MiB, so the larger HID ceiling is modest. Plan changes:
+   - A new mapping item, "THE CLASS BUDGET CHARGES A HID DEVICE FOR FOUR INTERFACES", placed after the multi-interface binding item.
+   - It states that a bound interface costs an interrupt IN endpoint, its ring page, its report page and one report in flight, and that the report page is new memory.
+   - It restates `HID_COST` as four endpoints, `4 * (RING_BYTES + 4096)` bytes and four reports in flight, and `HID_LIMITS` as eight devices at eight times that: 32 endpoints, 256 KiB and 32 in flight. `buffer_within` keeps one page.
+   - It adds a four-interface device to `usb_class`'s host tests: its one charge covers four endpoints, rings and report pages; eight such devices fill every dimension exactly and a ninth is refused by count; a detach gives all of it back.
+   - Verification's host tests list the class budget's four-interface device.
+
+3. **ACCEPTED - the new guest gate is registered only in `check.sh`.** Verified:
+   - `verify-model check` compares `check.sh`'s gate table with the catalog's `GATES` in both directions and fails on a gate the catalog does not know.
+   - `commands.rs` gives a gate its own step and guest slot only when it is in `GATES_THAT_BOOT_A_GUEST`, and otherwise schedules it with `guests: 0`.
+   - Every concrete gate is release-required by class, and `model/release-required.toml` is compared with the catalog exactly.
+   - Every fixture gate, for example `qemu-midi-service` and `qemu-dfu-tool`, appears in all four places, with the subject `userspace.build`.
+
+   Plan changes: the gate item's parenthesis no longer says "registered in `check.sh`". The item now ends by requiring registration where every fixture gate is registered: `check.sh`'s gate table; the catalog's `GATES`, with the subject `userspace.build`; `GATES_THAT_BOOT_A_GUEST`; and `model/release-required.toml`. Verification's gate list gains `verify-model`.
+
+4. **ACCEPTED - the exit trap tears the gadget down but does not verify it.** Verified: `usb_gadget_teardown` ends with `usb-gadget.sh teardown`. `cmd_verify` is reached only through `usb-gadget.sh verify`, and no script calls it. Both of the suggested remedies are taken - the claim is corrected and the check is recorded - because this milestone adds a two-function gadget kind and a new far-end daemon whose teardown is new code. Plan changes:
+   - The far-end item now says `test-kernel.sh` builds the gadget and tears it down under its existing exit trap, that the trap does not check the host afterwards, and that nothing runs `usb-gadget.sh verify` today.
+   - The USB proof's evidence is now an x86_64 run in which the test ran, followed by `usb-gadget.sh verify` reporting that the host carries nothing of the harness's.
+
+Re-check of the whole plan: the whole plan was re-read after the edits. It is complete: the vocabulary, the stream's order with the initial state and the slow-reader rule, focus and capability, the provider kind, the wire and the publisher table, discovery, parsing and exclusion, the mapping and range rules, multi-interface binding and its budget, publication, the tool in both modes, the gadget, its far end and its verification, and the hardware, services and scenario proofs with their registration and host tests. It is internally consistent:
+   - The initial state is defined once and used by the publisher, InputService, both kernel proofs and the host tests.
+   - The release-before-close rule matches the focus and protected-session items.
+   - The budget matches the four-interface binding with one report page per interface.
+   - The far end's levels match the hardware assertions.
+   - The gate's registration matches `check.sh` and verify-model.
+
+   It is feasible with what the tree has: timers are waitable in a set, periodic waits exist, and InputService's loop already carries a retry deadline. It remains consistent with P02M0194, whose Bluetooth gamepads join the same set as one more source, so the stream rules and the initial state apply to them too. It remains consistent with P02M0099's HID item, whose gamepad half closes with the mapping part. Every interface stays at version 1, milestone ids stay in docs/todo, the text is ASCII with hyphens only, and nothing refers to an audit or a coordination decision.
+
+Only `docs/todo/P02M0192.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0192 (2026-09-26T15:50:59Z):
+
+**Rating: 9/10.** The plan text now corrects all four findings of the previous re-audit, and the tree confirms the facts the planner relied on. One new medium finding remains. When the publisher closes a connection because it is full, the discovery rule reopens it once. DeviceManager can refuse that reopen, and always refuses it when the closed connection was the offered one.
+
+What was read and checked:
+
+- The complete history: the review, the planner's first response, the re-audit of 04:01, the planner's response of 05:34, this round's uncommitted diff to the plan (`git diff -- docs/todo/P02M0192.md`), and then the whole plan as it stands.
+- The kernel's waits: `sys_wait`, `sys_wait_any`, `WAIT_PERIODIC`, `min_deadline`, `run_until_idle_until`. The runtime's `wait_any_periodic`, the channel depth and the tick rate.
+- InputService: its serve loop, the Bluetooth retry deadline and the key and contact streams.
+- The xHCI driver: `service_loop`, `Serving`, `wait_providers_or_answer`, `register_device`, `admits`, `detach_port_devices` and `post_report`. Also `usb_class.rs` with its tests, and `classes.rs`.
+- DeviceManager: `open`, `outstanding`, `Catalogue::disconnected`, its DISCONNECT handling and the order of its serve-loop wait. MidiService's `adopt` and `lose`.
+- Gates and harness: `check.sh`, the verify-model catalog, `model/release-required.toml`, `test-kernel.sh`'s exit trap, `usb-gadget.sh verify` and the hardware suite's `bind_xhci_controller`.
+- Other code: `watch.rs`, the `driver_protocol` crate, and the manifest's xHCI row and catalogue kinds.
+- Sibling plans, from the working tree: P02M0099's HID item, P02M0194's input part, P02M0195's InputService following, P02M0199's new `liber:input@1` interfaces and P02M0180's catalogue stage.
+
+These corrections hold and are not repeated:
+
+- **Previous finding 1 (a consumer ends on the real state).** The plan now has:
+  - the slow-reader item;
+  - the publisher's unsent marks, retried on a one-tick housekeeping deadline;
+  - a stated initial state;
+  - null hats at the far end;
+  - the added services, hardware and host checks.
+
+  The mechanisms exist as the planner says:
+  - `sys_wait_any` has no writable sense ([readiness scan](/data/yellow/libersystem/src/kernel/syscall/mod.rs:3677)).
+  - It folds an armed timer's deadline into its block deadline ([fold](/data/yellow/libersystem/src/kernel/syscall/mod.rs:3691)).
+  - A periodic deadline never holds `run_until_idle` ([`min_deadline`](/data/yellow/libersystem/src/kernel/sched/mod.rs:1003)).
+  - [`wait_any_periodic`](/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:983) exists.
+  - The queue is [64](/data/yellow/libersystem/src/kernel/object/channel/mod.rs:30) and the tick is [100 Hz](/data/yellow/libersystem/src/kernel/arch/common/time.rs:12).
+  - At boot the offered end is [answered before any device is polled](/data/yellow/libersystem/src/user/drivers/core/src/common.rs:621), after [`post_reports`](/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:1748), so the connection-time STATE is the initial one.
+- **Previous finding 2 (budget).**
+  - [`RING_BYTES` is 4096](/data/yellow/libersystem/src/user/drivers/core/src/usb_class.rs:77), so `4 * (RING_BYTES + 4096)` is 32 KiB.
+  - Eight such devices fill 32 endpoints, 256 KiB and 32 in flight exactly.
+  - A ninth is [refused by count first](/data/yellow/libersystem/src/user/drivers/core/src/usb_class.rs:346).
+  - The [ceiling-is-count-times-cost assertions](/data/yellow/libersystem/src/user/drivers/core/src/usb_class/tests.rs:130) still hold.
+- **Previous finding 3 (registration).**
+  - The four places match `qemu-midi-service`: [`check.sh`](/data/yellow/libersystem/check.sh:96), [`GATES`](/data/yellow/libersystem/src/tools/verify-model/src/catalog.rs:365), [`GATES_THAT_BOOT_A_GUEST`](/data/yellow/libersystem/src/tools/verify-model/src/catalog.rs:834) and [`release-required.toml`](/data/yellow/libersystem/src/tools/verify-model/model/release-required.toml:148).
+  - No other file registers a fixture gate.
+- **Previous finding 4 (verify).** The claim is corrected, and the evidence now records `usb-gadget.sh verify`, whose [success line](/data/yellow/libersystem/src/harness/usb-gadget.sh:656) is the plan's wording.
+
+Repository rules and sibling plans:
+
+- No milestone id leaves docs/todo, nothing points at an audit, and every version stays 1.
+- P02M0194's Bluetooth gamepads join the same gamepad set.
+- No sibling plan claims `edu` 00:17.0.
+- P02M0199 adds new interfaces to `liber:input@1`, not ops to `input` or `input-admin`.
+- The gamepad token 9 stays below the [class tokens](/data/yellow/libersystem/src/user/drivers/core/src/classes.rs:34).
+
+1. **Medium - DeviceManager can refuse the reopen the discovery rule relies on, and always refuses it when the closed connection was the offered one. A controller's gamepads can then stay unreachable until its driver is rebound.**
+
+   How the plan recovers:
+   - The publisher closes a live connection when [an ARRIVAL or DEPARTURE cannot be sent](/data/yellow/libersystem/docs/todo/P02M0192.md:106).
+   - InputService then opens the still-published provider [again once](/data/yellow/libersystem/docs/todo/P02M0192.md:120).
+   - The provider [admits one consumer](/data/yellow/libersystem/docs/todo/P02M0192.md:86).
+
+   Why DeviceManager can refuse that open:
+   - It refuses an `open` while the count is one and the offered channel is gone ([the check](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:5557)).
+   - The count comes back only through the driver's DISCONNECT. DeviceManager [queues it as a node event](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:3601) and [applies it on a later pass](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:4456), [saturating at zero](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:2942).
+   - The driver library's pattern [closes the endpoint](/data/yellow/libersystem/src/user/drivers/core/src/common.rs:777) and only then reports the departure ([as the network path does](/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:1818)).
+   - DeviceManager's one wait lists [catalogue connections](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:813) before [the drivers' channels](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:830), and a wait answers with the [first ready handle](/data/yellow/libersystem/src/kernel/syscall/mod.rs:3677).
+
+   So a reopen that reaches DeviceManager before the DISCONNECT is applied is refused, and "once" leaves nothing to retry.
+
+   With the offered connection the refusal is not a race but a certainty:
+   - The publisher writes to the offered connection from the first loop pass, [before InputService has opened it](/data/yellow/libersystem/docs/todo/P02M0192.md:110), because the offered end [joins the set as a new connection](/data/yellow/libersystem/src/user/drivers/core/src/common.rs:833).
+   - Suppose that connection fills and an ARRIVAL or DEPARTURE then closes it. The DISCONNECT is applied while the count is still zero, so it is lost.
+   - The dead offered channel is then handed to InputService, and the count [rises to one](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:5578).
+   - The reopen is refused. So is every later `open` of that provider, because no further departure will be reported, until the driver is rebound.
+
+   The rule has no precedent to lean on: MidiService [drops a closed provider](/data/yellow/libersystem/src/user/services/core/src/midi_service.rs:370) rather than reopening it. No proof reaches the case either, because the services test's [catalogue helper](/data/yellow/libersystem/docs/todo/P02M0192.md:231) stands in for DeviceManager. An InputService-side retry would not repair the offered case, where the count stays at one.
+
+   This is a new finding. It is rare, because it needs a full connection and then an arrival or a departure, but once it happens the loss lasts for the rest of the binding.
+
+   **Correct the publisher's rules item.**
+   - Treat an ARRIVAL or DEPARTURE that the connection cannot take as owed, as an unsent STATE already is. The publisher table keeps owed frames and sends them in order at the retry wake.
+   - Never send a gamepad's STATE before its owed ARRIVAL. A DEPARTURE of a gamepad whose ARRIVAL is still owed removes both.
+   - A full connection then never causes a live connection to be closed, and the discovery rule's reopen-once clause can go.
+   - The table's host test adds a refused ARRIVAL and a refused DEPARTURE.
+
+Validation: this re-audit was a read-only inspection of the plan, its audit history, this round's uncommitted diff and the plan at `HEAD`. It also read the kernel, runtime, driver, service, harness, gate-registration and verify-model files and the sibling plans cited above. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0192 (2026-09-26T17:12:45Z):
+
+Verified read-only: DeviceManager's `open` refuses when `outstanding(held) > admits || (held.handle == 0 && held.consumers >= admits)`, hands the offered channel out by moving it and counting one consumer, and `Catalogue::disconnected` decrements with `saturating_sub`; a driver's `DISCONNECT` is pushed as a node event and applied on a later pass; the driver library's `close_at` closes the endpoint and returns the token the driver then reports; the offered end joins the driver's connection set marked new; MidiService's `lose` drops a closed provider and never reopens it. Summary: one finding, accepted.
+
+1. **ACCEPTED - DeviceManager can refuse the reopen the discovery rule relied on, and always refuses it when the closed connection was the offered one.** The race and the certainty both hold as the finding describes them: a reopen that reaches DeviceManager before the `DISCONNECT` is applied is refused and "once" leaves nothing to retry, and a closed offered connection is counted back while nothing has been counted for it, after which the dead channel is handed out, the count rises to one and every later `open` of that provider is refused until the driver is rebound. The fix the finding proposes removes the cause rather than working around DeviceManager. Plan changes:
+   - The publisher's rules item now opens with A FULL CONNECTION IS NEVER CLOSED, with the reason above. AN ARRIVAL OR A DEPARTURE THE CONNECTION CANNOT TAKE IS OWED, as an unsent STATE is; at the one-tick retry wake and every other wake the publisher sends what is owed in the order it became owed, a gamepad's STATE never before its owed ARRIVAL, with each unsent gamepad's current state. A DEPARTURE of a gamepad whose ARRIVAL is still owed removes both, since the consumer never heard of it. A departed gamepad stays in the table until its DEPARTURE is sent; because only a gamepad whose ARRIVAL went out can owe one and owed frames leave in order, the departed never outnumber the gamepads the publisher held at once, so the table stays bounded. The offered connection, written from the first pass before InputService opens it, holds what it could take and is owed the rest. The table's description gains whether each gamepad's ARRIVAL or DEPARTURE is owed, and the order owed frames leave in.
+   - The discovery rule's reopen-once clause is gone: a provider withdrawn, or whose connection closes, is every one of its gamepads departing, and a closed connection is not opened again - the publisher never closes one, so a closed connection means the driver's end is gone, and the withdrawal that follows, or a replacement's publication on the subscription, is what InputService acts on.
+   - The host tests add a refused ARRIVAL (sent, once the sender takes frames, before that gamepad's first STATE), a refused DEPARTURE (sent after its last), a DEPARTURE of a gamepad whose ARRIVAL is still owed (neither sent), and that no refusal closes the connection.
+   The tool's "fell so far behind that an arrival or departure could not reach it" stays: it is InputService's stream to the tool, not a catalogue connection, and nothing reopens it through DeviceManager.
+
+Re-check of the whole plan: the wire, the publisher table, the discovery rule, the services-suite test ("a provider's closed connection departs its gamepads"), the USB proof and the fixture gate agree; nothing in the plan now closes a live catalogue connection, so DeviceManager's count and the driver's set cannot disagree. The budget, the registration and the verification items are unchanged. The file is ASCII, cites no audit and keeps its `Status:` line.
+
+Edited `docs/todo/P02M0192.md` only; no source was changed, and nothing was built or booted.

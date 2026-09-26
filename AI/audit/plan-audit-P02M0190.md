@@ -131,3 +131,115 @@ I also read P02M0196 in full, P02M0196's audit and P02M0099's TPM item. For QEMU
    - Have `tpmprobe` hold one connection open across `lsdev --disable` and `--enable`. On that same connection, `random` answers a value before the restart, `unavailable` during it and a value after it.
 
 Validation: I inspected the plans, the audit history and the source with read-only git (`show`, `diff`, `log`), `grep`, `sed` and `awk`. QEMU was queried only with `-device help` on the three targets. I fetched the QEMU v10.0.0 sources read-only from gitlab.com into the scratchpad. No plan, source or audit file was modified, and nothing was built, tested or booted.
+
+
+PLANNER'S RESPONSE ON P02M0190 (2026-09-26T05:34:16Z):
+
+I verified both findings against the plan as it stands in the working tree and against the following sources:
+- P02M0196: the claim item, the `TPM2` bullet, the device-tree item and the aarch64/riscv64 check. I also read P02M0196's own latest re-audit, whose finding 4 raises the same point from its side.
+- P02M0197: the driver wire's `SUSPEND`/`RESUME` contract with `suspend-deadline`, and part e.
+- `src/tpm`: in `table.rs`, `REGION_LEN = 0x5000`, `FIFO_BASE` and the offset-0x40 control-area check; in `fifo.rs`, no register past `DID_VID` at 0xF00; in `crb.rs`, `inside` and `Buffer`; in `lib.rs`, no `CC_SHUTDOWN`; in `ops.rs`, `startup` accepting `RC_INITIALIZE`.
+- The QEMU v10.0.0 sources:
+  - `hw/core/sysbus-fdt.c` `add_tpm_tis_fdt_node` writes a `reg` size of 0x5000, and its comment says "Optional interrupt for command completion is not exposed".
+  - `hw/tpm/tpm_tis_sysbus.c` maps `TPM_TIS_NUM_LOCALITIES << TPM_TIS_LOCALITY_SHIFT`.
+  - `hw/tpm/tpm_tis_isa.c` has its `_CRS` interrupt commented out.
+  - The riscv and arm `virt` machines both admit `TYPE_TPM_TIS_SYSBUS` and give the platform bus `ranges`.
+- `qemu-system-{x86_64,aarch64,riscv64} -device help` on this machine (QEMU 10.0.11).
+- The smart-card precedent:
+  - `cardread.rs`, which calls `acquire` through the generated `smartcard::Client` and requires `Denied`.
+  - `check-smartcard-service.sh`, whose background `cardhold hold 4 &` and `cardhold slow &` hold connections while later lines run.
+  - PermissionManager's smart-card arm of `grant_for_task` and `cardread`'s read-only row.
+- The client crates (`bluetooth-client` and its provider: named trampolines over the generated clients).
+- `lsdev`'s `--disable N`/`--enable N`, the shell's `&` jobs, and `scenario.py`'s `key`, `expect` and `prompt` steps with the `dfu-tool` scenario.
+- `rt::connect_or_resolve`.
+- The manifest's catalogue-client demand, computed read-only: 27 of 32 today.
+
+Two findings accepted, none rejected.
+
+1. **ACCEPTED - The device-tree claim would be the node's whole `reg`, with its interrupt.** Confirmed. P02M0196a cuts only its `TPM2` row to the page and marks that rule x86_64-only. Its device-tree item publishes every node's translated `reg` and its interrupts, with no rule for a TPM node, and its claim mints one `DeviceMemory` per range. QEMU's `tcg,tpm-tis-mmio` node names 0x5000, which is all five localities (the library's own `REGION_LEN`). QEMU exposes no interrupt, but the binding allows one on a board. So on aarch64 and riscv64 the claim would carry the window this plan withholds, and neither plan cut it.
+
+   I took the first of the two corrections, agreed with P02M0196's planner: P02M0196a's device-tree item gives a `tcg,tpm-tis-mmio` node one range, the 4 KiB page at its translated `reg` base, and no interrupt, as its `TPM2` row does. I declined the second correction, which would have kept a 0x5000 `DeviceMemory` in the claim. That is exactly the authority the rule exists to withhold, and a driver that merely declines to map it does not remove it.
+
+   Plan changes:
+   - **The driver item's lead** now says the resource rule holds on all three targets. P02M0196a implements it on both paths: in its `TPM2` row, and in the row its device-tree item gives a `tcg,tpm-tis-mmio` node, cut to the page rather than carrying the translated `reg` whole.
+   - **ONE MMIO RANGE:** on the tree the base is that of the node's `reg`, translated through its parents' `ranges`. The page is all of that `reg` the row carries, although QEMU's node, and possibly a board's, names 0x5000. "Localities above 0 are excluded" therefore holds everywhere.
+   - **NO INTERRUPT:** the row carries none even where a board's tree node, or an `MSFT0101` node's `_CRS`, names one.
+   - **ONE DEVICE, NOT TWO:** the claim stays the page, with no interrupt.
+   - **The gate:** a new first step, in which `lsdev` lists the TPM as one platform row whose resources are one 4 KiB MMIO range at `0xFED40000` and no interrupt.
+   - **Runtime (aarch64 and riscv64):** now runs the `tpm-tis` run's scenario, bound through the row P02M0196a's device-tree item gives a `tcg,tpm-tis-mmio` node. Its first step shows that row as one 4 KiB range at the node's translated base with no interrupt, although the node's `reg` names 0x5000.
+
+2. **ACCEPTED - The gate cannot see TpmService's own enforcement, or a connection surviving a driver restart.** Confirmed:
+   - `tpm-client` answers `not-granted` itself for a call no held grant carries, and `tpmprobe` holds no `tpm-measure`. The gate's refused extend therefore never left the probe, and it catches only a PermissionManager row that wrongly mints `tpm-measure`.
+   - The host tests cover `service_logic::tpm` as a function, not the live service applying it.
+   - Every `tpm` command is a new launch with freshly minted grants. A TpmService that closed every application connection on the provider's withdrawal would still pass the restart step.
+   - The smart-card gate does make this check: `cardread` sends `acquire` through the generated client and requires the service's `Denied`.
+
+   Plan changes:
+   - **The refusal check:** `tpmprobe` is now refused `not-granted` twice on an extend of PCR 23, and PCR 23 stays unchanged.
+     - The first refusal comes through `tpm-client`, answered in the probe's own process because PermissionManager minted it no `tpm-measure` grant.
+     - The second comes through the contract's generated client on the probe's `tpm` connection. As with `cardread`, only TpmService can answer that call.
+     - I kept both because each catches a different defect.
+     - PCR 23 is a PCR that `pcr-extend` accepts, so the missing grant is the only possible refusal. It also leaves PCR 16 untouched for the later steps, which depend on it.
+   - **The restart check:** `tpmprobe hold`, started in the background before `lsdev --disable`, holds ONE `tpm` connection across the restart.
+     - On that connection, `random` answers a value before the disable, `unavailable` while the driver is down and a value after the enable.
+     - An `interrupted` is admitted for the one call the withdrawal overtook, because the plan's own restart rule answers `interrupted` for the operation in flight.
+     - The probe prints each change of answer, and the scenario waits for each one before its next step, as the scenario runner's `expect` allows.
+     - The existing checks around it stay: a newly launched `tpm random` while the driver is down, the start line logged again, and the sealed file still unsealing.
+   - **The client-library item** now says its local `not-granted` is a convenience, not the boundary: TpmService itself answers `not-granted` to any operation sent on a connection whose grant does not carry it, which is what a program that does not link `tpm-client` meets.
+
+Coordinated changes: the driver item gains one sentence for the TPM's sleep step, which P02M0197 names:
+- The driver implements P02M0197's `SUSPEND`/`RESUME` exchange, with a `suspend-deadline` in its registry entry. The work is carried by whichever of P02M0197 and this milestone lands second.
+- Its `SUSPEND` finishes the operation in hand and reads no other until its `RESUME`. For S3 it sends `TPM2_Shutdown(TPM_SU_STATE)`. The library has no `CC_SHUTDOWN`, so the sentence says this is a typed operation `src/tpm` gains with it.
+- Its `RESUME` sends no `Startup` when the firmware has already started the TPM with the saved state.
+- The developer-page item now also says that a resume from S3 resets PCRs 16 and 23 - the PC Client profile saves only PCRs 0 to 15 across `Shutdown(STATE)`, and libtpms, the engine `swtpm` runs, resets PCRs 16 to 23 at every `Startup` - so a secret sealed to either stays shut after a sleep too, while one sealed to PCRs 0 to 15 survives it. P02M0197's S3 case asserts both halves.
+
+Re-check of the whole plan:
+- **Resource rule:** it now states one rule for all three targets, with P02M0196a named as implementing it on both paths. This agrees with P02M0196a's `TPM2` bullet, its merge rule (the first description's resources are kept, so an `MSFT0101` `_CRS` adds no interrupt) and the device-tree row its planner is adding. The transports it relies on stay inside the page: every FIFO register is below 0xF04, and the CRB's buffers are checked by `Buffer`.
+- **Gate:** its order still keeps PCR 16 intact until the step that is meant to break the seal. The held connection ends before TpmService is stopped. Every probe and grant it uses is in the default rows (`tpmprobe hold` needs only `tpm`).
+- **Sleep sentence:** consistent with P02M0197a's contract and with part e, which resumes the TPM driver for its image key.
+- **Catalogue slots:** TpmService's transparent catalogue role raises the manifest's catalogue-client demand from 27 to 29 of 32, so this milestone alone needs no change to the bound.
+- **EXCLUDES:** one completeness fix from the re-read. The I2C exclusion now also names a device tree's `tcg,tpm-tis-i2c` node, since aarch64's QEMU offers `tpm-tis-i2c` and the driver matches only `tcg,tpm-tis-mmio`.
+- **One inconsistency outside this plan:** P02M0197e still says riscv64's QEMU has no TPM model and that riscv64 reports hibernation "not set up". `qemu-system-riscv64 -device help` lists `tpm-tis-device`, and riscv `virt` admits it, so that text is P02M0197's to correct.
+
+The plan is complete, correct, feasible, internally consistent, versions nothing, and is ready for implementation.
+
+Only `docs/todo/P02M0190.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0190 (2026-09-26T15:50:59Z):
+
+**Rating: 10/10.** No unresolved material findings. Both findings of the last re-audit are corrected in the plan, P02M0196a's own text now carries the device-tree half, and the planner's additions agree with P02M0197, the source tree and QEMU.
+
+I read the complete history: the original review, both planner responses and the re-audit of 2026-09-26T04:01:12Z. I read the plan as it stands in the working tree and the planner's latest edits (`git diff` against `eca3cbe7`). I checked it against:
+- the sibling plans as they stand in the working tree: P02M0196 (the merge rule, the claim, the `TPM2` row, the device-tree item and its checks), P02M0197 (the suspend transaction, the driver contract, the TPM driver's step, the S3 case and part e), P02M0099's TPM item and `TODO.md`. No other sibling mentions the TPM.
+- `src/tpm`: `table.rs`, `crb.rs`, `fifo.rs`, `lib.rs` and `ops.rs`.
+- The smart-card precedent (`cardread.rs`, `check-smartcard-service.sh`).
+- The scenario runner's `expect` step and teardown, the `dfu-tool` scenario and its gate, and `lsdev`'s policy verbs.
+- The TPM attachment in `qemu-run.sh` and the manifest's catalogue-client bound.
+- `qemu-system-{x86_64,aarch64,riscv64} -device help` on this machine (QEMU 10.0.11): `tpm-crb` and `tpm-tis` on x86_64, `tpm-tis-device` on aarch64 and riscv64, and `tpm-tis-i2c` on aarch64. No CRB sysbus model is offered.
+
+Both findings of the last re-audit are resolved:
+- **Finding 1 (the device-tree claim): corrected.**
+  - The plan now states one resource rule for all three targets ([driver item](/data/yellow/libersystem/docs/todo/P02M0190.md:67), [the page on the tree](/data/yellow/libersystem/docs/todo/P02M0190.md:74), [no interrupt](/data/yellow/libersystem/docs/todo/P02M0190.md:79)).
+  - P02M0196a now implements it on the tree ([device-tree item](/data/yellow/libersystem/docs/todo/P02M0196.md:129)) and tests it in its [host suites](/data/yellow/libersystem/docs/todo/P02M0196.md:361) and its [aarch64/riscv64 check](/data/yellow/libersystem/docs/todo/P02M0196.md:409).
+  - The merge rule [keeps the first description's resources](/data/yellow/libersystem/docs/todo/P02M0196.md:54), so an `MSFT0101` `_CRS` adds no range and no interrupt.
+  - The new first gate step and the aarch64/riscv64 runtime step fail if the row carries 0x5000 or an interrupt ([gate](/data/yellow/libersystem/docs/todo/P02M0190.md:195), [runtime](/data/yellow/libersystem/docs/todo/P02M0190.md:231)).
+  - Declining the second option was right.
+- **Finding 2 (the gate could not see TpmService's own checks): corrected.**
+  - The refused extend of PCR 23 now also goes through the generated client on the probe's `tpm` connection ([gate](/data/yellow/libersystem/docs/todo/P02M0190.md:199)). As with [`cardread`](/data/yellow/libersystem/src/user/services/core/src/cardread.rs:29), only TpmService can answer that call. PCR 23 is in the extend set, so the missing grant is the only possible refusal.
+  - `tpmprobe hold` keeps one connection open across the driver restart ([restart step](/data/yellow/libersystem/docs/todo/P02M0190.md:205)). A TpmService that closed it could not answer a value on it after the enable, so the step can fail.
+  - The mechanisms exist: [shell background jobs](/data/yellow/libersystem/src/harness/scenarios/dfu-tool.toml:21), [ordered `expect` steps](/data/yellow/libersystem/src/harness/scenario.py:767), and driver lines on the cold serial log, which the [DFU gate already reads](/data/yellow/libersystem/src/tools/check-dfu-tool.sh:88).
+
+The planner's other changes hold:
+- **The sleep sentence** ([driver item](/data/yellow/libersystem/docs/todo/P02M0190.md:90)) says what P02M0197a's [TPM driver step](/data/yellow/libersystem/docs/todo/P02M0197.md:157) and its [`suspend-deadline` contract](/data/yellow/libersystem/docs/todo/P02M0197.md:132) say. The library has no `CC_SHUTDOWN` ([lib.rs](/data/yellow/libersystem/src/tpm/src/lib.rs:48)). Its `startup` sends CLEAR and accepts `RC_INITIALIZE` ([ops.rs](/data/yellow/libersystem/src/tpm/src/ops.rs:181)). P02M0197's [S3 case](/data/yellow/libersystem/docs/todo/P02M0197.md:329) reads PCRs and unseals a secret, which only this milestone's service can do. So "whichever lands second" is in practice P02M0197, and that case covers the step.
+- **The developer page's S3 note** ([docs item](/data/yellow/libersystem/docs/todo/P02M0190.md:238)) agrees with the same S3 case and with libtpms, the engine `swtpm` runs. Its `PCR.c` marks only PCRs 0 to 15 as saved, and on a resume it resets 16 and 23 to zero.
+- **The catalogue arithmetic holds.** Today's demand is 27 of 32: 17 minting roles, 9 of them transparent, plus DeviceManager's own. One more transparent role adds two ([lib.rs](/data/yellow/libersystem/src/tools/system-manifest/src/lib.rs:1499)).
+- **The planner's note about P02M0197e is out of date.** Part e now binds riscv64 through the device tree ([part e](/data/yellow/libersystem/docs/todo/P02M0197.md:384), [its verification](/data/yellow/libersystem/docs/todo/P02M0197.md:436)).
+- **When `tpmprobe hold` ends.** The response says the held connection ends before TpmService is stopped, but the plan does not say so. This is harmless:
+  - A cold run starts its own list of scenarios already run ([lab.py](/data/yellow/libersystem/src/harness/lab.py:2959)), so the strict frame-loss check does not apply to it ([scenario.py](/data/yellow/libersystem/src/harness/scenario.py:676)).
+  - The teardown counts only registry artifacts and agent launches as held ([lab.py](/data/yellow/libersystem/src/harness/lab.py:2799)).
+- **Repository rules:** no milestone id is placed outside `docs/todo`, no audit is referenced, and nothing is versioned.
+
+No incomplete or incorrect correction, unjustified rejection, contradiction or newly discovered material defect remains to report.
+
+Validation: I inspected the plan, the sibling plans, the audit history and the source with read-only git (`diff`, `show`), `grep`, `sed` and a read-only Python parse of `manifest.toml` for the catalogue count. QEMU was queried only with `-device help` on the three targets. libtpms's `src/tpm2/PCR.c` (branch `stable-0.9`) was fetched read-only from GitHub. No plan, source or audit file was modified, and nothing was built, tested, benchmarked or booted.

@@ -229,3 +229,155 @@ The complete history was read: the original review's eight findings and the plan
    **Correct the oracle item.** Apply `pause` to the runs that have a QMP socket - the `lab` and scenario boots - and leave test-mode runs on the default, whose reset the runner already reports.
 
 Validation: inspection only. The plan, the audit history and the neighbouring plans were read at commit 0dd5da07, with a clean tree. Source files were read and searched. QEMU v10.0.0, v10.0.11 and master, edk2-stable202502 and Linux v6.16 sources were fetched read-only. The local QEMU 10.0.11 binaries were queried only with `-device help`, `-device i6300esb,help`, `-device ICH9-LPC,help`, `-machine q35,help` and `-help`. No plan, source or audit file was modified, no git state was changed, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0200 (2026-09-26T05:34:17Z):
+
+Every finding of the re-audit was checked against the plan at commit eca3cbe7 and against the tree. In the tree: ServiceManager's bring-up in `service_manager.rs` (services started in step 2, the test-boot drills in steps 3 and 3b, the online report after `all_settled` in step 4, and only then `supervise` in step 5); its standing loop and `handle_admin`, where `!poweroff`/`!reboot` run `shutdown_all` inline; `plan_relaunchable` and `relaunch_planned`; `qemu-run.sh` (the x86_64 test branch adds `-no-reboot` and returns QEMU's exit code before the monitor and QMP sockets are created; the aarch64 and riscv64 QMP sockets exist only inside the `DEV_PROFILE` branch; `DEV_PROFILE` and `TEST` are refused together; every aarch64 and riscv64 invocation passes `-no-reboot`); `test-kernel.sh` (`GUEST RESET` on an exit without the debug-exit signal, a 15-minute x86_64 bound); `lab.py` (per-batch QMP, the development ISO it boots, and "an emulated aarch64 or riscv64 guest takes minutes to bring its whole chain up"); `provider-info.name` in `device.lsidl`; and `MAX_CATALOGUE_CLIENTS` in the system-manifest crate. Primary sources, fetched read-only: Linux v6.16 `wdat_wdt.c` (`stopped_in_sleep`, "stopped by the firmware in S1-S5", and `wdat_wdt_suspend_noirq` stopping the timer for `ACPI_STATE_S0` whatever the flag says) and `iTCO_wdt.c` (the halt bit read back after a stop, and no use of TCO_LOCK); QEMU v10.0.11 `ich9_tco.c` (`TCO1_CNT_DEFAULT = 0x0000`, `can_start_tco_timer`, the reset on the second expiry) and `wdt_i6300esb.c` (its reset handler disables the timer and keeps the previous-reboot flag). The local QEMU 10.0.11 binaries were queried with `-device help` only: `ipmi-*` devices exist on x86_64 alone. The neighbouring plans P02M0197, P02M0201, P02M0198, P02M0196 and P02M0191 were read as they stand now, including P02M0197's and P02M0201's texts as their planners revised them today. Summary: all five findings are accepted and none is rejected.
+
+1. **ACCEPTED - which provider the one watchdog service arms when several are published.** Verified: the LPC row applies in every q35 boot whose ACPI decode is on and whose PM base matches the FADT, and only a WDAT suppresses it, so the x86_64 `i6300esb` run and the BMC case boot with the TCO's provider beside the device under test. `ipmi-*` exists only in the x86_64 QEMU, so the BMC case cannot leave q35. `query-status` says `watchdog` whichever timer fired. `TCO1_CNT_DEFAULT` is 0 in v10.0.11, so an upstream QEMU whose No-Reboot starts clear presents a TCO the driver counts as running. The old plan said nothing about several providers. Plan changes:
+   - The provider-kind item: each provider is PUBLISHED UNDER THE DEVICE'S NAME (`wdat`, `tco`, `i6300esb` or `bmc`), in the publication name the catalogue already carries, which is what `watchdog.device` names. An arm starts the count, so an arm is also a pet.
+   - A new item, SEVERAL PROVIDERS, ONE ARMED. The service takes every published provider, at most four; a fifth is logged and not opened. With the policy on, it arms ONE at its first answered `alive`: the device `watchdog.device` names, or, with the key unset, the first in the order WDAT, TCO, `i6300esb`, BMC whose arm succeeds (a TCO whose No-Reboot stays set answers `unsupported`, and the next is tried). The default order is asked of the owner when the part starts, with T, P and D. A named device that is absent or refuses the arm is reported, and nothing is armed in its place. Every other provider is disarmed where the device allows it and otherwise kept fed on the same schedule, at the configured timeout. A provider published later is armed only if nothing is armed and it would have been chosen; an armed timer is never switched. The log names the device armed and what was done with each other one. ONE PROVIDER PER DEVICE NAME: two interfaces to one BMC publish two `bmc` providers for ONE timer, so a provider published under a name the service already holds is left unopened and reported, never disarmed - a disarm through it would stop what was armed through the other - and P02M0201's report of the pair names the interface an operator may disable.
+   - ARMING IS POLICY: with the policy off, a running timer is disarmed as the service attaches, and one that cannot be disarmed is fed at the configured timeout from the first answered `alive`.
+   - ONCE ARMED: the replacement takes the providers again and chooses as the first instance did.
+   - THE ORDERLY SHUTDOWN NOTICE: the watchdog service answers for each running timer it holds.
+   - ACROSS A SLEEP: both steps cover every running timer the service holds and every binding that publishes a `watchdog`. The timed wake is capped below the earliest "awake by" bound.
+   - P02M0200c: every case sets `watchdog.device` to the device under test and reads the service's line naming the device it armed. The x86_64 `i6300esb` case runs beside q35's TCO and checks that the `i6300esb` is armed and the TCO disarmed. The reset case checks that the named device's provider reports the last reset and that no other provider reports one. The BMC case runs beside the TCO, and the next boot reports the reset as the BMC's, with none from the TCO. The host suites gain the choice rule: the named device, the default order, an arm answering `unsupported`, a named device absent, a provider published later, a fifth provider.
+
+2. **ACCEPTED - ServiceManager answers no `alive` during bring-up or during the suspend transaction.** Verified: `supervise` is entered only after bring-up and the online report. The power verb's whole teardown runs inside `handle_admin`, which the loop calls. P02M0197 has ServiceManager run the sleep transaction. Plan changes:
+   - WHO KEEPS IT FED gains two parts.
+     - THE FIRST ANSWER STARTS IT: the service arms, or takes a running timer over, at its first `alive` answered within D, never when it starts. The item says why: bring-up comes first and takes minutes on emulated targets. Until that answer, a running timer is fed by its driver's bridge.
+     - THE LOOP ANSWERS NOTHING WHILE IT RUNS A SEQUENCE: the orderly shutdown and the suspend transaction each carry their own watchdog step, the shutdown notice and the sleep notice.
+   - TAKEOVER: the driver's bridge ends at the consumer's first pet (an arm counts as one) or at its disarm, not when the consumer attaches. THE BRIDGE BOUND (120 s, equal to the proposed boot bound) is what a boot must beat from the driver's bind to that first pet.
+   - ONCE ARMED: the manifest row declares the orderly-shutdown notice and P02M0197's sleep notice. At a restart ServiceManager mints the `supervisor-liveness` channel again, and the new end replaces the old one in the standing loop's wait set; this matches P02M0201's supervisor channel, which is described as delivered "as P02M0200a delivers its `supervisor-liveness` channel".
+   - ACROSS A SLEEP, THE SERVICE'S STEP: at the sleep announcement the service sets the longest timeout on every running timer it holds and pets each once. The announcement itself comes from ServiceManager, so it stands in for that round's answer. The service answers at once and inhibits nothing. On the resume notice - or at its first answered `alive` after the announcement, if a sleep unwinds without a resume notice - it restores the configured timeout on each timer and pets once.
+   - A consequence for the driver's resume. The old re-arm, "the longer of the configured timeout and the resume transaction's bound", no longer works. After the announcement's hold, the driver's last armed timeout is the device's longest. Nothing gives the driver the resume transaction's bound either: P02M0197's `RESUME` says only whether the device may have lost power. The rule now reads: a binding whose timer was running when its suspend step began is re-armed with the bridge bound and petted. A hung resume is caught within that bound, a slow resume gets the time a boot gets, and the service restores T at the resume notice. This matches P02M0197's "re-armed FIRST, with a timeout that also catches a resume that hangs".
+
+3. **ACCEPTED - the shared sleep case has two halves.** Verified: P02M0197's case is "`running` after a suspend to idle longer than the timeout" and "`watchdog` after a resume made to hang (a test hook)". The plan stated only the first half, twice. That half passes a driver that disarms and never re-arms, because the service arms the device again at the resume notice anyway. Plan changes: ACROSS A SLEEP states both halves, carried by whichever of P02M0197 and P02M0200 lands second, with the first to land recording that the case is owed. P02M0200c's sleep case now reads as follows.
+   - `running` after a suspend to idle longer than the timeout.
+   - `watchdog` after a resume that a development hook stops between the watchdog binding's re-arm and the resume notice, within the bridge bound of that re-arm plus the margin.
+   The hook's position is fixed there, because after the resume notice the service's own restore would arm the device, and the case would no longer prove the driver's re-arm. The bridge bound keeps the wait to about two minutes. The device's longest timeout (about 34 minutes on the `i6300esb`) would not.
+
+4. **ACCEPTED - WDAT's `STOPPED` flag never covers suspend to idle.** Verified in Linux v6.16 `wdat_wdt.c`: the flag means "stopped by the firmware in S1-S5", and for `ACPI_STATE_S0` the driver stops the timer whatever the flag says. P02M0197 enters suspend to idle, S3, the platform suspends of aarch64 and riscv64 where offered, and hibernation - never S1 or S2 - so "S3 and deeper" is exact for this system. Plan changes:
+   - The WDAT item describes `STOPPED` as the firmware stopping the timer in the ACPI sleep states, never in suspend to idle.
+   - ACROSS A SLEEP says a device that stops counting answers no bound: a chipset timer that loses power in S3, and a WDAT with `STOPPED`. `STOPPED` covers only the ACPI sleep states, which among the states this system enters means S3 and deeper, and NEVER suspend to idle. So for suspend to idle, a WDAT that cannot be disarmed answers its "awake by" bound, as Linux's `wdat_wdt` stops the timer there.
+
+5. **ACCEPTED - `pause` belongs only on boots with a QMP socket.** Verified: x86_64's test branch passes `-no-reboot` and exits before the QMP socket is created. On aarch64 and riscv64 the QMP socket is created only under `DEV_PROFILE`, which `qemu-run.sh` refuses together with `TEST`. A test-mode reset is QEMU's exit, which `test-kernel.sh` reports at once as `GUEST RESET`; `pause` would turn it into a stall until the 15-minute bound. Plan changes, in the ORACLE item:
+   - every watchdog case is a boot with a QMP socket, either a `lab.py` boot or a scenario run;
+   - EVERY OTHER HARNESS BOOT WITH A QMP SOCKET passes `-action watchdog=pause`, and those boots use development images whose watchdog policy is off (`lab.py` boots `libersystem-dev.iso`, and scenario runs set the development profile);
+   - TEST-MODE RUNS KEEP THE DEFAULT `reset`. The item gives the reasons: test-mode runs have no QMP socket, and the kernel test runner already reports a reset as a `GUEST RESET`, with the guest log's last line naming the test.
+
+Re-check of the whole plan: every item was read again against the tree, the fetched sources and the neighbours' current texts. The corrections above introduced no new conflict. The re-check made these further changes:
+- The RESET CASE is stated as x86_64's. The harness passes `-no-reboot` to every aarch64 and riscv64 boot, so a second boot and its last-reset record can only be observed on x86_64. The device item says the `i6300esb` runs the reset case there only.
+- THE TCO'S DISARM no longer says "unless the TCO lock is set". It sets the halt bit and reads it back, answering `unsupported` if the bit did not stay set; this is the check Linux's `iTCO_wdt` makes. QEMU's TCO_LOCK locks only itself, so a firmware that sets TCO_LOCK would otherwise have made a haltable TCO look undisarmable.
+- The "awake by" bound is stated on P02M0197's boot-time clock, the clock its timed wake uses. The monotonic clock excludes the sleep.
+- The expiry window's lower edge is T0 + T - P - D, because the last pet can come up to P + D before T0. T is the effective timeout the arm answered.
+- The BMC provider item names the KCS and BT forms, ISA or PCI, and never SSIF. A watchdog binding is suspended last and resumed first, which a child of the SMBus controller cannot be. This matches P02M0201's current text.
+- ONCE ARMED records that the service's catalogue role takes two catalogue-client slots. If that pushes the demand past 32, the same change raises the bound to 64, as P02M0201 states for every plan it names.
+
+The plan is now consistent with:
+- P02M0197: the announcement hold, every watchdog binding last and first, `STOPPED` for S3 and deeper, the resume re-arm, both halves carried by whichever lands second;
+- P02M0201: its transport driver publishes, SSIF publishes nothing, the pair of interfaces is reported, the supervisor channel is minted again like `supervisor-liveness`, and its BMC case names the BMC in `watchdog.device` beside the TCO;
+- P02M0198d: one orderly sequence, and `power-off-within` stays notice-free;
+- P02M0196: WDAT read as a static table, with its memory registers as declared registers;
+- P02M0191: source (c), and configuration writes owned here.
+
+Owner questions remain for when the part starts: T, P and D, the default device order, the shipping arming default, the notice bound and the boot bound. Versions stay 1 and every interface change is additive. The text is ASCII with hyphens only, and names no audit and no coordination number. The plan is ready for its parts' own written plans.
+
+Only `docs/todo/P02M0200.md` was edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0200 (2026-09-26T15:50:59Z):
+
+**Rating: 8/10.** All five findings of the last re-audit are corrected, and every fact the planner cites from the tree holds. Two new gaps remain: the BMC case's notice-skipped half races the next boot's takeover, and the kernel suite's boots are not development images, so the plan gives them no unarmed default. One sentence about ServiceManager's loop also says more than the watchdog needs, and two sibling plans contradict it.
+
+The complete history was read. The planner's latest round was read as `git diff` of the plan and of this file against commit eca3cbe7, and the whole plan was read in the working tree. In the tree, the review covered:
+- ServiceManager's bring-up, standing loop, `handle_admin`, `restart_service`, `relaunch_planned` and `shutdown_all`;
+- DeviceManager's catalogue `open`, its per-provider consumer count and its boot window;
+- `provider-info` in `device.lsidl`, and the catalogue-client bound in the system-manifest crate;
+- `qemu-run.sh`, `test-kernel.sh`, `lab.py`, `build.sh` and `docs/TESTING.md`;
+- the kernel's test runner and its boot test.
+
+The working-tree texts of P02M0191, P02M0196, P02M0197, P02M0198, P02M0201 and P02M0099 were read, and QEMU v10.0.0's `ipmi_bmc_sim.c` was fetched.
+
+These corrections hold, and are not repeated:
+- several providers with one armed, each published under the name `provider-info` already carries ([device.lsidl](/data/yellow/libersystem/src/idl/device.lsidl:253)); the gates name the device under test ([gate](/data/yellow/libersystem/docs/todo/P02M0200.md:258)), and P02M0201 states the same rule ([P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:153));
+- arming at the first answered `alive` ([first answer](/data/yellow/libersystem/docs/todo/P02M0200.md:69)), the bridge ending at the first pet ([bridge](/data/yellow/libersystem/docs/todo/P02M0200.md:122)) and the service's step at the sleep announcement ([announcement](/data/yellow/libersystem/docs/todo/P02M0200.md:152)). These match ServiceManager entering `supervise` only after bring-up ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1065)) and P02M0197's watchdog step ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:145));
+- both halves of the shared sleep case. The hang is placed where only the driver's re-arm can end it in `watchdog` ([sleep case](/data/yellow/libersystem/docs/todo/P02M0200.md:282));
+- `STOPPED` limited to the ACPI sleep states, in both plans ([plan](/data/yellow/libersystem/docs/todo/P02M0200.md:163), [P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:153));
+- `pause` only on boots with a QMP socket ([oracle](/data/yellow/libersystem/docs/todo/P02M0200.md:251)), as [qemu-run.sh](/data/yellow/libersystem/src/harness/qemu-run.sh:2203), [qemu-run.sh](/data/yellow/libersystem/src/harness/qemu-run.sh:2476) and [qemu-run.sh](/data/yellow/libersystem/src/harness/qemu-run.sh:1511) show;
+- the planner's other changes:
+  - the TCO disarm is read back;
+  - the expiry window's lower edge is T0 + T - P - D;
+  - the reset case runs on x86_64 only, because every aarch64 and riscv64 boot gets `-no-reboot` ([qemu-run.sh](/data/yellow/libersystem/src/harness/qemu-run.sh:2549));
+  - the BMC is published without SSIF;
+  - the catalogue bound is 32 in both places ([lib.rs](/data/yellow/libersystem/src/tools/system-manifest/src/lib.rs:217), [device_manager.rs](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:6184)).
+
+1. **Medium - The BMC case's notice-skipped half needs the short timer to run out during the reboot, but this plan's takeover rule pets the timer as soon as the next boot's driver binds, and nothing orders the two.**
+
+   The case's failing half rests on the expiry flag. An orderly reboot "with the BMC timer armed short leaves no expiry flag ... and the same reboot with the notice step skipped by a development hook sets the flag - so this case can fail" ([BMC case](/data/yellow/libersystem/docs/todo/P02M0200.md:279)). The flag is set only if the timer expires before the next boot takes it over:
+   - a driver that finds a running timer pets it at once ([takeover](/data/yellow/libersystem/docs/todo/P02M0200.md:121)), and P02M0201's driver does the same ([P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:255));
+   - in the simulator, Reset Watchdog Timer restarts the whole countdown (`do_watchdog_reset`);
+   - the timer keeps counting across the host's reset, because it runs on the virtual clock and the device has no reset handler ([ipmi_bmc_sim.c](https://raw.githubusercontent.com/qemu/qemu/v10.0.0/hw/ipmi/ipmi_bmc_sim.c)).
+
+   "Short" cannot be made short enough to win that race:
+   - the BMC provider's range starts at 15 s ([P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:253)), and a request below a device's minimum is refused ([timeout](/data/yellow/libersystem/docs/todo/P02M0200.md:60));
+   - so at the reset the timer has at most 15 s left, less the time since the service's last pet;
+   - x86_64 guests run under KVM ([qemu-run.sh](/data/yellow/libersystem/src/harness/qemu-run.sh:1352)), and the port declares a whole boot's work in a 30 s window ([device_manager.rs](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:120)). The `ipmi` bind falls somewhere inside that window.
+
+   A boot that reaches the `ipmi` bind first leaves no flag, and the case fails although the notice works. This is a new finding.
+
+   **Correct the BMC case** so that the notice-skipped half does not depend on that race. The next boot's driver already reads Get Watchdog Timer at bind ([P02M0201](/data/yellow/libersystem/docs/todo/P02M0201.md:254)), and the simulator answers it with the initial countdown. Make that the oracle:
+   - after the notice, it is the boot bound;
+   - with the notice skipped, it is the short timeout, or the expiry flag if the timer ran out first.
+
+2. **Medium - Only development images default to unarmed, but the kernel suite's boots are not development images, so they take the shipping default, which the plan proposes to be on.**
+
+   The plan claims more than its rule gives: "DEVELOPMENT IMAGES DEFAULT TO OFF, so every harness boot but the watchdog cases runs unarmed; the default of a shipping image is asked of the owner ... (proposed: on)" ([arming](/data/yellow/libersystem/docs/todo/P02M0200.md:85)).
+
+   A test boot is not a development image:
+   - the tree's development switch is the `development` feature ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:1562)), which `build.sh` adds only under `LIBER_DEVELOPMENT=1` ([build.sh](/data/yellow/libersystem/build.sh:31));
+   - the lab sets that variable ([lab.py](/data/yellow/libersystem/src/harness/lab.py:1158)), but `test.sh` and `test-kernel.sh` do not;
+   - a test boot runs as `LIBER_RUN_MODE=test` ([TESTING.md](/data/yellow/libersystem/docs/TESTING.md:299)), and test mode refuses the development profile ([qemu-run.sh](/data/yellow/libersystem/src/harness/qemu-run.sh:1511)).
+
+   The watchdog runs in those boots:
+   - the suite brings every manifest service up inside a kernel test ([boot.rs](/data/yellow/libersystem/src/kernel/test_suites/boot.rs:107), [every service online](/data/yellow/libersystem/src/kernel/test_suites/boot.rs:275)), so the watchdog service and the watchdog drivers run too;
+   - the runner then runs every later test in the same boot, with no teardown between tests ([tests.rs](/data/yellow/libersystem/src/kernel/tests.rs:3442));
+   - with the key unset, the service arms the first device in the default order whose arm succeeds ([order](/data/yellow/libersystem/docs/todo/P02M0200.md:93)). On x86_64 that is q35's TCO, whose arm clears No-Reboot itself ([TCO arm](/data/yellow/libersystem/docs/todo/P02M0200.md:212)). On aarch64 and riscv64 it is the `i6300esb`, which the kernel-test item attaches on every target ([kernel tests](/data/yellow/libersystem/docs/todo/P02M0200.md:294)).
+
+   With the proposed default, every suite boot carries an armed timer for the rest of the suite, and an expiry there ends the suite as a `GUEST RESET`. Original finding 8 asked for those boots to stay unarmed, and the plan says they do. This is an incomplete correction of original finding 8, first found in this round.
+
+   **Correct the ARMING IS POLICY item**: say that a test boot is unarmed, as a development image is. ServiceManager already receives the boot mode ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:441)), so the default can follow it. The shipping default then applies only to a shipping image booted as one.
+
+3. **Low - "THE LOOP ANSWERS NOTHING WHILE IT RUNS A SEQUENCE" says more than the watchdog needs, and it contradicts P02M0198d and P02M0197's refusal of a second request.**
+
+   - The sentence covers every request: ["THE LOOP ANSWERS NOTHING WHILE IT RUNS A SEQUENCE: the orderly shutdown and P02M0197's suspend transaction both run inside it"](/data/yellow/libersystem/docs/todo/P02M0200.md:73).
+   - P02M0198d answers a power-off request that arrives while the shutdown sequence runs ["as already under way"](/data/yellow/libersystem/docs/todo/P02M0198.md:229).
+   - P02M0197 refuses a sleep request that arrives during a transaction as ["a transaction already running"](/data/yellow/libersystem/docs/todo/P02M0197.md:55). It needs that answer, because two of its requesters are participants the transaction waits on.
+   - What this plan relies on is narrower: no `alive` is answered while a sequence runs, which is why each sequence carries a watchdog notice. The sleep item already says it that way: ServiceManager ["answers no `alive` until it ends"](/data/yellow/libersystem/docs/todo/P02M0200.md:152).
+
+   P02M0197's re-audit of this date asks that plan to decide how ServiceManager answers during its transaction, and this sentence has to agree with the decision. This is a new finding.
+
+   **Correct the sentence** so that it states only what the watchdog relies on: ServiceManager answers no `alive` while it runs a sequence. How other requests are answered then is for P02M0197 and P02M0198d to state.
+
+Validation: inspection only. The audit history and the plan were read in the working tree, and the planner's round as `git diff` against commit eca3cbe7. Source files, harness scripts and the sibling plans were read and searched in the working tree. QEMU v10.0.0's `ipmi_bmc_sim.c` was fetched read-only. No plan, source or audit file was modified, no git state was changed, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0200 (2026-09-26T17:12:45Z):
+
+Verified read-only:
+- the takeover rule (a running timer petted at once at bind) here and in P02M0201's BMC item; P02M0201's range of 15 s to 6553.5 s; the x86_64 boot window of three thousand ticks in DeviceManager;
+- the test mode: `build.sh` adds `--features development` only under `LIBER_DEVELOPMENT=1`, which the lab sets and `test.sh` and `test-kernel.sh` do not; `qemu-run.sh` refuses `DEV_PROFILE` with `TEST`; `docs/TESTING.md`'s run modes; the boot suite bringing every manifest service up and the runner running every later test in the same boot; ServiceManager receiving the `MODE` flag at bootstrap;
+- P02M0197a and P02M0198d on how ServiceManager answers during a sequence.
+Summary: three findings, all accepted.
+
+1. **ACCEPTED - the BMC case's notice-skipped half raced the next boot's takeover.** Plan change, the BMC case: its oracle is now GET WATCHDOG TIMER AS THE NEXT BOOT'S DRIVER READS IT AT BIND - the expiration flags and the INITIAL COUNTDOWN, which that driver's bind line names - with the serial log's boot count. After the notice, the next bind finds no flag and the boot bound as the initial countdown; with the notice skipped by the development hook, it finds the short timeout, or the flag if the timer ran out first - so the case fails on a skipped notice whichever of the timer and the bind comes first. The item says why an expiry flag alone could not be the oracle. P02M0201's BMC watchdog item now has its driver name the initial countdown on its bind line, and its BMC watchdog case uses the same oracle.
+
+2. **ACCEPTED - the kernel suite's boots are not development images and would take the shipping default.** Plan changes: "ARMING IS POLICY" now reads DEVELOPMENT IMAGES AND TEST BOOTS DEFAULT TO OFF, with the reason (a test boot is built without the `development` feature and refuses the development profile, yet runs every manifest service and the rest of the suite in one boot, where an expiry would end the suite as a `GUEST RESET`). ServiceManager, which already receives the boot mode, hands it to the watchdog service as a payload role the plan resolves, so a relaunched instance gets it again, and the default follows it; the shipping default applies to a shipping image booted as one. "ONCE ARMED, IT STAYS ARMED" lists the boot mode's payload among the plan-resolved roles.
+
+3. **ACCEPTED - "the loop answers nothing while it runs a sequence" said more than the watchdog needs.** Plan change: the sentence now reads THE LOOP ANSWERS NO `alive` WHILE IT RUNS A SEQUENCE, and says the other answers are P02M0197's and P02M0198d's to state - a second sleep request refused as a transaction already running, a power-off ending a sleep transaction, and one during the shutdown answered as already under way.
+
+Coordinated changes: P02M0197a now decides how ServiceManager answers during its transaction (it keeps serving; its response of this date); P02M0201's BMC watchdog item and case use the initial-countdown oracle.
+
+Re-check of the whole plan: the liveness exchange, the arming policy and both sleep and shutdown steps agree with P02M0197 and P02M0198d; the harness text on test-mode runs (no QMP socket, the default `reset`) is consistent with test boots now being unarmed; every gate case still has a half that can fail. The file is ASCII, no line exceeds 112 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0200.md` (and P02M0201 for the oracle); no source was changed, and nothing was built or booted.

@@ -287,3 +287,236 @@ The complete history was read: the original review and the planner's response. T
    **Correct part e's constraints, key and verification items.** Drop the riscv64 exception, and verify riscv64 as aarch64 is verified: once P02M0190's driver binds its TPM through the device tree.
 
 Validation: This was a read-only inspection of the plan at commit 0dd5da07 (identical to the working tree), its complete audit history, the neighbouring plans, the kernel, services, drivers, manifest and harness sources. It included read-only `qemu-system-x86_64 -device ICH9-LPC,help` and `qemu-system-riscv64 -device help` queries and the harness firmware descriptor. Primary sources were fetched read-only: QEMU v10.0.0 (`hw/i386/pc.c`, `hw/i386/acpi-build.c`, `hw/acpi/core.c`, `hw/tpm/tpm_crb.c`, `hw/virtio/virtio-pci.c`, `hw/input/ps2.c`, `hw/usb/hcd-xhci.c`, `system/runstate.c`), edk2's `Tcg2Pei.c` and Linux's `tpm-interface.c`. No plan, source or audit file was modified, and nothing was built or booted.
+
+
+PLANNER'S RESPONSE ON P02M0197 (2026-09-26T05:34:17Z):
+
+Every finding of the re-audit was checked against the working tree and fetched primary sources rather than taken on trust. In the tree: ServiceManager's `start_service` (`spawn_in` for the pinned set, `launch_from_volume` or `launch_limited_from_volume` otherwise) and both restart paths in `service_manager.rs`; ProcessService's `start`, `launch` and `launch_prepared*` (Domain 0 unless limited) and its single `SERVE` root; the `run` tool; ConsoleService's and the shell's launches; the manifest (34 services, 10 pinned, 24 staged on the volume); `check_deadlines` and the idle deadline wait in `sched/mod.rs`; the SCI storm check and `platform_event::check_unread`; `poweroff`, `reset` and `boot_profile` in `arch/x86_64/mod.rs`; `src/smpboot` and `arch/x86_64/apboot.rs`; `device.rs` and each port's `program_msix_entry`; the FADT boot-architecture flags in `src/acpi`; TimeService's one-time seed; DeviceManager's synchronous power request; `lab.py`'s `qmp_command`; the harness's opt-in TPM and its `-no-reboot`. Plans read: P02M0196, P02M0198, P02M0199, P02M0200, P02M0190, P02M0181 and P02M0141. Primary sources: QEMU v10.0's `hw/i386/acpi-build.c` (`\_S5` is (0, 0), PM1a control at the PM base plus 4, only the 8042 boot flag), `hw/acpi/core.c` (an S4 write sends `SUSPEND_DISK`, then a guest shutdown), `system/runstate.c` (the durable `suspended` state), `hw/i386/pc.c` (the wakeup is a machine reset, not a reset request), `hw/tpm/tpm_crb.c` and `hw/virtio/virtio-pci.c`; edk2's `Tcg2Pei.c` (`Startup(STATE)` on S3, then `Startup(CLEAR)` with error separators in PCRs 0 to 7); and a read-only `-device help` of this machine's QEMU 10.0.11 (`tpm-tis-device` on aarch64 and riscv64). All ten findings are accepted; none is rejected.
+
+1. **ACCEPTED - the applications Domain was keyed to the operation, so the freeze stopped participants.** Verified: `start_service` raw-spawns only the pinned set (DeviceManager, the StorageService instances, LogService and ProcessService, 10 of 34). It loads the other 24 through ProcessService's `launch`, or `launch_prepared_limited` for a service with limits, and both restart paths take the same route. `start` is the `run` tool's. VT 1's shell, TimeService, the power-state service and ConsoleService are volume services, and P02M0200's watchdog service is plan-relaunchable. ProcessService serves every client on one `SERVE` root. Plan changes:
+   - WHAT EXISTS records that no launch operation separates services from applications: ServiceManager loads 24 of the 34 through `launch` or `launch-prepared-limited` and restarts them the same way, and `start` is `run`'s.
+   - The frozen-set item keys the Domain to WHO ASKS. ProcessService gains a second serve root that ServiceManager alone holds, and no manifest role is minted from it. Every launch on it, first start or restart, keeps the control-plane Domain as today and is never held. Every launch on the client root - `start`, `launch`, `launch_prepared` and the bounded and limited forms - lands in the one applications Domain. That takes in what `run` starts, ConsoleService's other shells, PermissionManager's launches and every job.
+   - The participants are listed as every service ServiceManager starts, naming TimeService, the power-state service, the watchdog service and VT 1's shell, plus every driver DeviceManager binds.
+   - The kernel-freeze item no longer holds new launches. A client's launch during the freeze is not refused; its process, created in the frozen subtree, runs at the thaw.
+   - ServiceManager restarts nothing while the drivers are suspended, because every launch reads the volume. A participant that dies during the transaction is restarted after the unwind where its death failed a step, and after the resume's driver step otherwise.
+   - A root of its own was chosen over marking ServiceManager's launcher connections. It fits the manifest's serve-root model, and no connection minted from the client root can claim it.
+
+2. **ACCEPTED - the monotonic clock between the entry and the rebase.** Verified: `check_deadlines` reads `ticks()` on every wake of the idle deadline wait, and so do the SCI's storm check and the platform-event unread check. P02M0198a keeps readings non-decreasing with one atomic maximum and rebases from the counter at resume. In suspend to idle the counter keeps running, so any reading in that window would push the maximum past the suspend value. The clock would then stall after the rebase, and the same deadline check would fire deadlines the plan says a sleep cannot pass. Plan changes:
+   - The clock item's lead says P02M0198a provides the rebase and the suspended state that holds the clock.
+   - A new bullet, HELD FROM THE ENTRY TO THE REBASE: from the entry's counter reading at suspend until the rebase, every reading of the tick counter and of `SYS_CLOCK_MONO_NS` answers the monotonic value at suspend. The rebase sets the offset and the atomic maximum from that value together. The suspend-to-idle wait runs no deadline check, the rebase is the first act on every exit from it, and an interrupt handled during the sleep sees the held clock.
+   - The kernel-entry item holds the clock before it parks the cores or enters S3.
+
+3. **ACCEPTED - the TPM driver had no sleep step.** Verified: neither the contract's `SUSPEND` duties nor step 4 name anything a TPM needs, and P02M0190's driver has no interrupt, no DMA and no word about sleep. QEMU's wakeup resets the machine, which runs `tpm_crb_reset` and restarts the backend. On an S3 boot, edk2's `Tcg2Pei.c` sends `Startup(STATE)`; when that fails it sends `Startup(CLEAR)` and extends an error separator into PCRs 0 to 7. The harness adds a TPM only when a run asks for one. Plan changes:
+   - A new part-a item, THE TPM DRIVER'S STEP. Its `SUSPEND` for S3 sends `TPM2_Shutdown(TPM_SU_STATE)`, and its `RESUME` sends no `Startup` when the firmware has already started the TPM with the saved state.
+   - The item states what happens without the step: after the first S3 of a boot, PCR 4 no longer holds the loader's measurement, and part e's key and every seal to PCRs 0 to 7 stay shut until the next boot.
+   - It says P02M0190's driver implements the exchange with this step, carried by whichever of the two milestones lands second.
+   - Step 4 names the TPM driver's step.
+   - Part d's S3 case gains checks with `swtpm` behind the CRB front-end: PCRs 0 to 7, read before the sleep, read back unchanged after it (the firmware's fallback would have extended an error separator into each), and a secret sealed to PCR 4 before the sleep unseals after it. The case also asserts that PCRs 16 and 23 read zero after the resume: the PC Client profile saves only PCRs 0 to 15 across `Shutdown(STATE)`, and libtpms, the engine `swtpm` runs, resets PCRs 16 to 23 at every `Startup` (`PlatformPcr.c`, "these PCRs are never saved"; `PCRStartup` in `PCR.c`). A check that PCR 16 survives the sleep, which was first proposed for this case, would fail even for a correct driver, so it is not in the plan.
+
+4. **ACCEPTED - when `suspend` answers.** Verified: DeviceManager's power-button path is a synchronous round trip with no deadline. Both sleep buttons' requesters must answer `SUSPEND` in step 4. A `suspend` that answered at the resume would leave the requester blocked in its own request, and every button sleep would abort at the step bound. Plan changes:
+   - The vocabulary item says `suspend` and `hibernate` answer when ServiceManager accepts or refuses the request - before any step runs and without waiting on any participant - and never at the resume.
+   - A refusal at that point names its reason: a transaction already running, or a request the grant does not carry.
+   - Everything after acceptance is read from the last sleep's record: a sleep refused before anything was frozen, one that slept and woke, and one that unwound, with where.
+   - Acceptance deliberately does not check the bindings. That check is a round trip to DeviceManager, which may itself be the requester, so a binding with no `suspend-deadline` is reported in the record instead.
+   - `sleepctl` returns at acceptance and, once it is thawed, prints how that sleep ended.
+
+5. **ACCEPTED - the soft-off case could not tell the two paths apart, and its fallback half ran the registered path.** Verified: q35's `\_S5` is (0, 0) and its PM1a control block is the PM base plus 4 (0x604). The registered path therefore writes exactly the fallback's first write, 0x2000 to 0x604. A registered value outlives the service, so killing the service leaves the registered path in force. The soft-off item's "absent, dead or not yet started" contradicted that rule. Plan changes:
+   - The soft-off item now reads "absent, not yet started, or dead before it registered", and says a service that dies after registering leaves its `\_S5` in force. The registration item says the same.
+   - Power-off now NAMES ITS PATH on the serial log - the registered `\_S5` or the fixed ports - among the last words it already flushes. The item gives the q35 reason.
+   - Part d's soft-off case proves each half by QEMU's exit and that line: the registered path with the ACPI service running, and the fixed ports with nothing registered.
+   - Nothing is registered because the development-build switch of finding 8 makes the kernel refuse the registration. This was chosen over keeping the ACPI service from starting, which would need a ServiceManager switch and would change the rest of the boot, including DeviceManager's bounded wait for the namespace. The fallback's condition is only "no `\_S5` registered".
+
+6. **ACCEPTED - the verification relied on QMP events the harness never receives.** Verified: `lab.py`'s `qmp_command` opens a connection per command, skips every event and closes. QEMU keeps `RUN_STATE_SUSPENDED` until a wakeup. Its S3 wakeup resets the machine directly, not through a reset request, so `-no-reboot` does not end the run. An S4 write sends `SUSPEND_DISK` and then a guest shutdown. Plan changes:
+   - The S3 case's oracle is QEMU's durable run state: `query-status`, polled, answers `suspended` in S3 and `running` after the wake. It sits beside the kernel's two lines, and the reason is written down.
+   - The suspend-to-idle case says `query-status` stays `running`.
+   - Soft-off is QEMU's exit together with the kernel's path line.
+   - The battery case is QEMU exiting within the forced deadline, with the orderly power-off in the log.
+   - An S4 exit looks like a soft-off, so part e's gate holds its own QMP connection from before the request until QEMU exits and reads `SUSPEND_DISK` on it. Where S4 is not offered, it checks QEMU's exit and the path line.
+
+7. **ACCEPTED - the suspend-to-idle oracle was satisfied by the freeze alone, and the serial ring could hide `sleep: entered`.** Verified: the counter program is an application, frozen at step 2 and thawed last. Its silence, the interval and the next-value check therefore all pass for an entry that waits while every core keeps its tick. On x86_64 the kernel's serial output is a ring drained by the idle pass and the tick, which `poweroff` flushes. P02M0198a caps an idle core's sleep at one tick only while that ring is non-empty. Plan changes:
+   - The kernel entry now writes its `sleep: entered` line and flushes the serial output synchronously, as `poweroff` does, before it holds the clock and parks or enters.
+   - The suspend-to-idle item says the one-shot is never capped by P02M0198a's housekeeping bound or its one-tick caps.
+   - The same item adds THE PARKED INTERVAL IS MEASURED. The entry takes each core's P02M0198a per-core record as the core parks and as it leaves, and the last sleep's record keeps the difference.
+   - The part-d case adds a check that can fail: the only wakeups any core took while parked are the timed wake and the IPIs that end the other cores' park. No periodic tick, no housekeeping bound and no device interrupt outside the wake set may appear.
+   - The difference is taken at the park rather than by a program before and after the sleep. The transaction's busy steps keep each core's tick, and would fill a before-and-after difference even for a correct implementation.
+   - `sleepctl`'s last-sleep report includes the per-core wakeups.
+
+8. **ACCEPTED - the Time and Alarm Device could not be reached on q35.** Verified: q35's FADT sets only the 8042 boot flag, and the tree reads "CMOS RTC not present" from bit 5. An SSDT cannot change the FADT. The kernel already reads the boot profile from a fw_cfg file. Plan changes:
+   - A new part-d item, A DEVELOPMENT-BUILD SWITCH, compiled into the development build only. It is a fw_cfg file of its own, read as the boot profile is, naming what the kernel treats as absent. The first fact is the CMOS RTC: no CMOS read and no CMOS alarm, so `SYS_CLOCK_RTC` answers the TAD's base and the TAD carries the S3 timed wake. The second is the sleep-type registration (finding 5).
+   - The fixture case is split. The lid and buttons stay as before.
+   - THE TIME AND ALARM DEVICE runs on a boot with the CMOS RTC switched off. The harness plays the TAD's clock at a time apart from the host's. Files written after boot and after a resume are stamped with that time; StorageService stamps from the kernel on every write, while TimeService may be disciplined by SNTP.
+   - The harness reads the alarm the driver programmed in its `SUSPEND` step and checks that it is the S3 timed wake `sleepctl` armed. It then wakes the guest at that time with `system_wakeup`, since QEMU has no TAD to raise the wake itself.
+   - The TAD item names the switch beside the FADT flag. It also closes a boot gap the case would expose: a TimeService that read 0 at its start, before the TAD's driver bound, reads again at each request until the kernel answers a time.
+
+9. **ACCEPTED - the wrong trampoline, and the MSI-X table entries.** Verified: `src/smpboot` is the logical-id bookkeeping of the two device-tree ports. The x86_64 real-mode trampoline is `arch/x86_64/apboot.rs`, position independent from CS. The kernel programs MSI-X table entries in a BAR on all three ports. QEMU's `x-pcie-pm-no-soft-reset` defaults to off, so virtio-pci functions reset at the wakeup. Plan changes:
+   - Before any driver runs, the kernel entry item saves and restores the MSI-X table entries the kernel itself programmed. They live in a BAR, not in the header, and no driver knows the message the kernel wrote there.
+   - The item names `src/kernel/arch/x86_64/apboot.rs`, which derives its own base from CS, as the S3 resume path.
+   - The per-core resume path item names the same file.
+
+10. **ACCEPTED - riscv64 has a TPM model.** Verified: this machine's `qemu-system-riscv64 -device help` and `qemu-system-aarch64 -device help` both list `tpm-tis-device, bus System`. P02M0190 binds that device on both targets through P02M0196a's device-tree half. Plan changes:
+   - Part e's key constraint drops "riscv64's QEMU has no TPM model". It says the TPM is reached on aarch64 and riscv64 through a `tcg,tpm-tis-mmio` node and P02M0196a's device-tree half, which QEMU's `tpm-tis-device` provides on both.
+   - The key item's exception list is now "no TPM bound, or `owner-hierarchy-unavailable`".
+   - The verification runs aarch64 and riscv64 alike, with `swtpm` behind `tpm-tis-device`, once P02M0190's driver binds it. Only a machine with no TPM reports "not set up".
+   - Because both device-tree targets are now verified, the snapshot item says the machine "otherwise powers off (through `\_S5` on an ACPI machine)".
+   - The restore item now continues along the resume path of a machine whose devices lost power: part b's S3 path on x86_64, and on the other two the same restore of the kernel's own devices and the per-core resume path.
+
+Coordinated changes: this plan now carries its side of three cross-plan decisions.
+- The platform steps. Step 5 and the resume paragraph use `platform-sleep`, an interface in `liber:process@1` beside `system-sleep`. The ACPI service serves it on the control channel ServiceManager holds for it, the one its sleep notice travels on.
+  - `prepare(state, wake nodes)` evaluates `_PRW` and `_DSW` or `_PSW` on the companions of the bindings that armed wake, sets their wake GPEs through P02M0196b's GPE interface, and then runs `_PTS` and `_SST`.
+  - `wake(state)` runs `_WAK` and `_SST` and clears the wake GPEs.
+  - The node-scoped channel still refuses `_PTS` and `_WAK`.
+  - Step 1 names the ACPI service among the services that declare the sleep notice, and the wake-set item routes device GPEs through `prepare` and `wake`.
+  - Part b's ORDER line says P02M0196c's platform half of sleep lands together with parts a and b.
+  - The registration item names P02M0196b's `FirmwareInterpreter` as the privilege that admits the call this part introduces.
+  - The S3 item runs `_PTS`, `_SST` and `_WAK` through `platform-sleep`.
+- The watchdog. The watchdog's step now has two halves.
+  - The service's half comes at the announcement. The watchdog service declares the sleep notice, sets the longest timeout on every running timer it holds and pets each once (a disarmed device is left alone, since setting a timeout would start it), because ServiceManager answers no `alive` until the resume notice. The resume notice restores the configured timeout.
+  - The driver's half applies to every binding that publishes a `watchdog`: suspended last, resumed first, returning the "awake by" bound.
+  - WDAT's `STOPPED` flag covers S3 and deeper, never suspend to idle, so a WDAT that cannot be disarmed answers its bound for suspend to idle.
+  - Step 4 and the resume paragraph say "every binding that publishes a `watchdog`", and part d's watchdog case keeps both of its halves.
+- The clock hold and the TPM step are items 2 and 3 above.
+
+Re-check of the whole plan: the plan was re-read whole after the edits, part against part and against P02M0196, P02M0198, P02M0199, P02M0200, P02M0190, P02M0181 and P02M0141. The re-check itself added one fix: on a machine whose RTC is the TAD's, the boot-time clock learns an S3 sleep's length only when the TAD's driver hands its base again in `RESUME`. The clock item now says so, and notes that nothing waits on that clock. Each point below was checked and holds:
+- Every participant named in the frozen-set item is launched through ServiceManager's root or bound by DeviceManager, so none is frozen.
+- No requester of `system-sleep` waits on a participant.
+- The clock is held across every read path the sleep can reach, and the entry's order (wake set, status, flushed line, held clock, park or save and enter) matches both clock items.
+- The TPM, watchdog and storage steps are all named in step 4, and the watchdog bindings go last and resume first.
+- Every gate names an oracle the harness can read - the run state, QEMU's exit, a serial line, and a gate-held QMP connection only for `SUSPEND_DISK` - and a check that can fail.
+- The two development-build facts are one switch, never shipped.
+- Every interface change is additive, and no version moves: the `SYS_DOMAIN_CREATE` parent argument, `SYS_DOMAIN_FREEZE`, `SYS_SYSTEM_SLEEP`, the registration call, `SYS_CLOCK_BOOT_NS`, the driver-wire opcodes, the appended `suspended` binding state, `platform-sleep` and ProcessService's second root.
+- No milestone id is proposed for source, test, gate or script names.
+- The owner questions stay asked when their part starts: the policy defaults, and the hibernation passphrase.
+- Parts a to d do not depend on part e.
+
+Only `docs/todo/P02M0197.md` and its row in `docs/todo/TODO.md` (S3's oracle is now QEMU's run state, and suspend to idle's the parked cores' wakeups) were edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0197 (2026-09-26T15:50:59Z):
+
+**Rating: 8/10.** The plan's text now corrects all ten findings of the last re-audit. Two decisions are still missing, and each leaves the plan in conflict with a sibling plan changed in this round. The first is whether ServiceManager answers requests while the transaction runs: P02M0200 says it answers nothing, and without the decision the fix for finding 4 holds only for the first request. The second is what the sleep entry's serial flush does, now that P02M0191 makes `poweroff`'s flush one-way. Part b also has two small omissions.
+
+What was checked:
+- The complete history (the review, both planner responses and the last re-audit), and `git diff` of the plan and its TODO.md row against HEAD, which is the text the last re-audit rated.
+- The sibling plans as they stand in the working tree:
+  - P02M0198: the suspended state, the per-core record and P02M0198d's forced deadline.
+  - P02M0196: `platform-sleep`, `FirmwareInterpreter`, the GPE interface and the fixture.
+  - P02M0200: the watchdog's two halves and ServiceManager's loop.
+  - P02M0190: the TPM step and the PCR notes.
+  - P02M0199's `input-activity`, P02M0201's sleep step and HOSTC, and P02M0181.
+- In the tree:
+  - ServiceManager's launch, restart, shutdown and standing-loop code, and ProcessService's roots and launch forms.
+  - DeviceManager's driver spawn and platform-event path, and the shell's, ConsoleService's and PermissionManager's launches.
+  - The kernel's serial, power-off, reset, boot-profile and fw_cfg code, `apboot.rs`, the SCI module and the configuration writes in the common PCI code.
+  - The harness's hot-plug ports and display device.
+- QEMU v10.0.0's `hw/i386/pc.c`, `hw/pci/pcie.c`, `hw/pci-bridge/pcie_root_port.c`, `hw/char/serial.c` and `hw/display/ramfb.c`.
+
+Corrections that hold:
+- Finding 1. The frozen set is now keyed to who asks, and no participant lands in it:
+  - ServiceManager already holds ProcessService's serve end ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:969)). It launches and restarts through that end ([here](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1500) and [here](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1574)).
+  - The shell and ConsoleService launch as clients ([shell.rs](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1344), [console_service.rs](/data/yellow/libersystem/src/user/services/core/src/console_service.rs:1953)).
+  - DeviceManager spawns every driver itself, into [a child Domain of its own](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:4098).
+- Finding 2. P02M0198a now defines [the same suspended state](/data/yellow/libersystem/docs/todo/P02M0198.md:30) and [the one exception to its halts](/data/yellow/libersystem/docs/todo/P02M0198.md:57).
+- Finding 3. P02M0190 carries [the same step](/data/yellow/libersystem/docs/todo/P02M0190.md:90). The planner was right not to take the PCR 16 check the last re-audit proposed. `Shutdown(STATE)` does not save PCR 16, so that check would fail even for a correct driver. The plan's checks are the right ones: PCRs 0 to 7 unchanged, PCRs 16 and 23 zero.
+- Findings 5, 6, 8 and 10 hold.
+- Finding 7 holds: P02M0198a's record [counts wakeups by cause](/data/yellow/libersystem/docs/todo/P02M0198.md:85), so a tick that keeps running fails the parking check.
+- Finding 9 holds for what it named: the trampoline and the MSI-X entries.
+- Finding 4 holds for a request made before a transaction starts; finding 1 below covers the rest.
+- The coordinated changes match [P02M0196c](/data/yellow/libersystem/docs/todo/P02M0196.md:320) and [P02M0200](/data/yellow/libersystem/docs/todo/P02M0200.md:151).
+- No repository rule is broken: nothing points at an audit, no milestone id is proposed for a name, and no version moves.
+
+1. **Medium - The plan does not decide whether ServiceManager answers requests while the transaction runs. P02M0200 says it answers nothing, so a second sleep request from a participant blocks that participant and aborts the sleep, the failure finding 4 removed.**
+
+   What the plan relies on:
+   - `suspend` answers at acceptance, because DeviceManager and the control-method sleep button's driver are requesters that must answer `SUSPEND` in step 4 ([the vocabulary item](/data/yellow/libersystem/docs/todo/P02M0197.md:51)).
+   - A request that arrives during a transaction is refused as ["a transaction already running"](/data/yellow/libersystem/docs/todo/P02M0197.md:55).
+   - Neither item says how ServiceManager answers while a transaction is under way. [WHO DOES WHAT](/data/yellow/libersystem/docs/todo/P02M0197.md:58) says only that it runs one transaction at a time.
+
+   What the other plans and the tree say about the loop:
+   - P02M0200 says ["THE LOOP ANSWERS NOTHING WHILE IT RUNS A SEQUENCE: the orderly shutdown and P02M0197's suspend transaction both run inside it"](/data/yellow/libersystem/docs/todo/P02M0200.md:73). This plan's watchdog item [builds on that loop](/data/yellow/libersystem/docs/todo/P02M0197.md:148).
+   - P02M0198d assumes the opposite for the shutdown sequence that runs in the same loop: ["A request while the sequence runs is answered as already under way"](/data/yellow/libersystem/docs/todo/P02M0198.md:229).
+   - Today the standing loop runs its one sequence inline: `!poweroff` [calls `shutdown_all`](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1921) and returns only when it is done.
+   - DeviceManager makes its power request inside its platform-event loop, as [a synchronous round trip with no deadline](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:5115). The sleep button is handled [beside it](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:5121).
+
+   Read with P02M0200, a second press of the sleep button during a sleep blocks DeviceManager in `suspend` until the transaction ends. A second press of the control-method button blocks its driver the same way. Step 4 then waits on the blocked participant until its scaled bound runs out. The sleep unwinds and names DeviceManager or the driver as the failure. The "already running" refusal is never sent. This is an incomplete correction of finding 4, and a contradiction with P02M0200.
+
+   **Correct the vocabulary item.** Either of two fixes works. P02M0200's sentence has to be aligned with whichever is chosen, and its re-audit of this date says so.
+   - Say that ServiceManager keeps serving `system-sleep` while a transaction runs, and refuses a new request at once as "already running". The transaction is then driven from the loop's wait set rather than run as a blocking sequence, and P02M0200's sentence narrows to "answers no `alive`".
+   - Or keep the blocking sequence, drop the "already running" refusal, and say that DeviceManager and the button drivers send their request without waiting for the answer.
+
+2. **Medium - The kernel's sleep entry flushes the serial output "as `poweroff` does", but P02M0191, changed in this round, makes that flush a one-way terminal writer. The suspend-to-idle oracle then rests on a rule that neither plan states.**
+
+   What this plan says:
+   - The entry is to ["write the kernel's `sleep: entered` line and flush the serial output synchronously, as `poweroff` does"](/data/yellow/libersystem/docs/todo/P02M0197.md:177).
+   - Suspend to idle is judged by [the serial log's timing](/data/yellow/libersystem/docs/todo/P02M0197.md:336), with that line on the wire before the cores park.
+   - DeviceManager has already sent `SUSPEND` to every binding in [step 4](/data/yellow/libersystem/docs/todo/P02M0197.md:101). Once P02M0191c lands, the 16550 driver that holds COM1 is one of them.
+
+   What P02M0191 now says:
+   - `flush_sync` [becomes the terminal-path writer](/data/yellow/libersystem/docs/todo/P02M0191.md:248), which power-off enters before it acts.
+   - That writer ignores the driver and [sets the owner to TERMINAL, which is never left](/data/yellow/libersystem/docs/todo/P02M0191.md:257).
+
+   So a flush "as `poweroff` does" leaves COM1 with two owners after the first sleep, and every later kernel line is synchronous. A flush that respects the driver leaves the line in the ring behind a suspended driver, so the oracle cannot see it before the cores park.
+
+   P02M0191's re-audit of this date reports the same conflict from the terminal writer's side, and the rule for COM1 across a sleep belongs there. This is a new finding: a contradiction between two changes made in this round.
+
+   **Correct the entry item** : refer to the rule P02M0191 states for the sleep entry, not to `poweroff`. Say what the oracle reads in each of that rule's two cases, the kernel owning COM1 and a driver holding it.
+
+3. **Low - The S3 save and restore list leaves out two things the kernel programs on its own devices, both of which QEMU's wakeup reset clears: the hot-plug slots' arming and the console UART's receive interrupt.**
+
+   The list:
+   - The entry saves the interrupt controllers, the timers, the IOMMU, ["every PCI function's configuration header ... (BARs, bridge windows, command register, the MSI-X capability)"](/data/yellow/libersystem/docs/todo/P02M0197.md:180) and the MSI-X table entries.
+   - It restores [exactly those](/data/yellow/libersystem/docs/todo/P02M0197.md:188) before any driver runs.
+
+   What the kernel also programs, and what the wakeup does to it:
+   - At boot the kernel [arms every hot-plug slot](/data/yellow/libersystem/src/kernel/arch/common/pci/mod.rs:759). [`slot_arm`](/data/yellow/libersystem/src/kernel/arch/common/pci/mod.rs:249) writes Slot Control in the PCI Express capability: the presence-change, hot-plug-interrupt and attention-button enables, the slot's power and its indicator. None of this is in the header or the MSI-X capability.
+   - QEMU's S3 wakeup [resets the machine](https://github.com/qemu/qemu/blob/v10.0.0/hw/i386/pc.c#L1739-L1743), which [resets every device](https://github.com/qemu/qemu/blob/v10.0.0/hw/i386/pc.c#L1727).
+   - The root port's reset [calls `pcie_cap_slot_reset` whatever the reset type](https://github.com/qemu/qemu/blob/v10.0.0/hw/pci-bridge/pcie_root_port.c#L46-L54). That function [clears HPIE, PDCE and ABPE, and powers an empty slot off](https://github.com/qemu/qemu/blob/v10.0.0/hw/pci/pcie.c#L738-L771).
+   - The harness's interactive x86_64 profile [turns native hot-plug on and adds an empty port](/data/yellow/libersystem/src/harness/qemu-run.sh:2140) for `device_add`.
+   - The kernel also [turns on COM1's receive interrupt](/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:71) once IRQ4 is routed ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:460)). QEMU's `serial_reset` [sets IER to zero](https://github.com/qemu/qemu/blob/v10.0.0/hw/char/serial.c#L854-L864), and it runs on every machine reset ([registered here](https://github.com/qemu/qemu/blob/v10.0.0/hw/char/serial.c#L929)).
+
+   After the first S3, a device plugged into that port is never seen. Typed input waits until something else wakes the idle boot core, although P02M0198a counts on [that interrupt](/data/yellow/libersystem/docs/todo/P02M0198.md:65) to wake an idle core. No part-d case checks either. This is a new finding, of the same kind as the last re-audit's finding 9.
+
+   **Correct the S3 entry item.** Add the hot-plug slots' Slot Control and the console UART's setup to what the kernel restores before any driver runs. Or state the rule itself: the kernel re-applies every register it programmed on its own devices at boot.
+
+4. **Low - P02M0198d says the kernel's sleep entry is refused while a forced power-off deadline is armed, but the entry item does not list that refusal.**
+
+   - P02M0198d, changed in this round: while a forced power-off deadline is armed, ["the kernel's sleep entry (P02M0197b) is refused, so a sleep's held clock cannot postpone it either"](/data/yellow/libersystem/docs/todo/P02M0198.md:224). That deadline is [counted in ticks](/data/yellow/libersystem/docs/todo/P02M0198.md:217), and this plan [holds the tick clock across the sleep](/data/yellow/libersystem/docs/todo/P02M0197.md:237).
+   - The entry item names only two refusals: ["a state that did not enter, or a wake event already pending"](/data/yellow/libersystem/docs/todo/P02M0197.md:193).
+   - This plan's own critical-battery path [arms that deadline, then asks for the orderly shutdown](/data/yellow/libersystem/docs/todo/P02M0197.md:304). A suspend already under way at that moment would enter the sleep with the deadline armed and postpone it.
+   - Neither plan says which of them implements the refusal, and P02M0198d may land before this part.
+
+   **Correct the entry item.** Add "or while a forced power-off deadline is armed (P02M0198d)" to its errors. Whichever of the two plans lands second implements the refusal.
+
+Validation: This was a read-only inspection of:
+- the plan in the working tree and its diff against HEAD;
+- the complete audit history;
+- the sibling plans in the working tree;
+- the source files linked above.
+
+QEMU v10.0.0's `hw/i386/pc.c`, `hw/pci/pcie.c`, `hw/pci-bridge/pcie_root_port.c`, `hw/char/serial.c` and `hw/display/ramfb.c` were fetched read-only. `ramfb.c` has no reset handler, so the framebuffer's setup survives the wakeup and the S3 case's display check can pass. No plan, source or audit file was modified. Nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0197 (2026-09-26T17:12:45Z):
+
+Verified read-only:
+- ServiceManager: `!poweroff` runs `shutdown_all` inline in the standing loop and returns only when it is done;
+- DeviceManager: its power request is a synchronous round trip with no deadline inside its platform-event loop, and the sleep button is handled beside it;
+- the kernel: `slot_arm` writes Slot Control (presence-change, hot-plug-interrupt and attention-button enables, the slot's power and indicator) at the boot scan, outside the header and the MSI-X capability; `serial.rs` turns on COM1's receive interrupt once IRQ 4 is routed; the SCI module arms PWRBTN and SLPBTN in PM1 enable;
+- QEMU v10.0.0: the wakeup's machine reset, `pcie_cap_slot_reset` clearing the slot enables and powering an empty slot off, `serial_reset` zeroing IER, and ICH9's `pm_reset` calling `acpi_pm1_evt_reset`, which zeroes PM1's enable bits;
+- the harness's interactive x86_64 profile, which turns native hot-plug on and adds an empty root port;
+- P02M0191c, P02M0198d and P02M0200 as they stand.
+Summary: four findings, all accepted.
+
+1. **ACCEPTED - the plan did not say how ServiceManager answers while the transaction runs.** THE CHOICE is the first fix offered: ServiceManager keeps serving. The second - a blocking sequence with fire-and-forget requesters - would leave a second press of the sleep button queued, to put the machine back to sleep right after it resumed, and would lose the refusal the vocabulary promises. Plan change, the vocabulary item gains "SERVICEMANAGER KEEPS SERVING WHILE A TRANSACTION RUNS": the transaction is driven from the standing loop's wait set, each step's answers awaited there under the step's deadline, never run as a blocking sequence; meanwhile a `system-sleep` request is refused at once as a transaction already running; a request that would start, stop or restart a service is refused the same way; no `alive` is answered until the transaction ends; everything else is answered as usual. ONE MORE REQUEST HAD TO BE DECIDED, because this plan's own critical-battery path sends it: a `system-shutdown` `power-off` is answered at once and ends the transaction at its next step - unwound as a failed step is, or resumed if the machine had already slept - and the orderly power-off follows, so neither a person's shutdown nor a critical battery's waits out a sleep (P02M0198d's forced deadline, armed first on the critical paths, refuses the kernel's entry anyway).
+
+2. **ACCEPTED - the entry's flush "as `poweroff` does" had become the one-way terminal writer.** Plan changes: the entry now writes `sleep: entered` "under P02M0191c's SLEEP-ENTRY RULE - NOT through the terminal-path writer `poweroff` enters": with the kernel owning COM1 it drains the ring and stays the owner, and with a driver holding it - suspended by then - it lends the port to the kernel until it returns and gives it back; either way that line is on the wire before the machine sleeps, and so is every kernel line until the entry returns, `sleep: resumed` among them; until P02M0191c lands this is today's `flush_sync`. The suspend-to-idle oracle states that the two lines are on the wire in both cases, and the three targets read both: aarch64 and riscv64 with the kernel owning its console, x86_64 with the 16550 driver holding COM1 once P02M0191c has landed.
+
+3. **ACCEPTED - the S3 save and restore list left out the hot-plug slots and the console UART.** Plan changes: the entry item now states THE RULE - every setting the kernel made on a device, at boot or since, that no driver owns - and lists, beyond the interrupt controllers, timers, IOMMU, headers and MSI-X entries: each hot-plug slot's Slot Control; PM1's enable bits, which ICH9's reset zeroes as well (not in the finding; the rule caught it, and without it the power button stops working after the first S3); the configuration registers the kernel writes for a claim (P02M0201's HOSTC); and, while the kernel owns it, the console UART's initialisation with its receive interrupt. Everything on that list is restored before any driver runs. The S3 case's after-wake checks add a line typed at the serial console answered without any other wake, and, on a boot with an empty native hot-plug port, a function `device_add`-ed into it after the wake seen by the kernel.
+
+4. **ACCEPTED - the entry did not list P02M0198d's refusal.** Plan change: the errors now read "a state that did not enter, a wake event already pending, or a FORCED POWER-OFF DEADLINE ARMED (P02M0198d - a sleep's held clock would postpone it)", and whichever of this part and P02M0198d lands second implements that refusal.
+
+A further change for the same class of gap reported in P02M0198, P02M0199 and P02M0202: "NO DRIVER IS SKIPPED" now says that a driver added after this part carries the exchange itself, and names the plans that say so for theirs - P02M0190's TPM driver, P02M0198's fan driver, P02M0199's `acpi_backlight`, `acpi_als` and xhci class module, P02M0201's `ipmi` and `smbus_ich9`, P02M0202's `ucsi-acpi` and `tcpci` - each carried by whichever of the two milestones lands second.
+
+Coordinated changes: P02M0191c's new sleep-entry item; P02M0200's loop sentence narrowed to "answers no `alive`", with the other answers named as this plan's and P02M0198d's; P02M0201's HOSTC write carried by whichever lands second; the sleep exchanges in P02M0198, P02M0199 and P02M0202.
+
+Re-check of the whole plan: the vocabulary, the transaction's order, the watchdog step and P02M0200 agree on what ServiceManager answers during a sequence; the entry's serial rule, its oracle and P02M0191c agree; the restore rule covers every register the kernel writes today and P02M0201's HOSTC; the forced-deadline refusal matches P02M0198d; the list of drivers carrying the exchange matches their plans. Part e is unchanged. The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0197.md`, and for coordination the plans named above; no source was changed, and nothing was built or booted.

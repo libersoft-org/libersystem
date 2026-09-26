@@ -185,3 +185,293 @@ The complete history was read: the original review with its seven findings, and 
    **Correct P02M0099.** Name P02M0196a's `kernel:com1` row and claim in the 16550 bullet, and remove the legacy-port exception from the identity section.
 
 Validation: plan, audit-history and source inspection at `0dd5da07`, with `git show` and `git diff` for the audited plan and the planner's edits to P02M0191 and P02M0099. The cited QEMU v10.0.0 and coreboot files were read from their upstream repositories, and `qemu-system-x86_64 -device isa-serial,help` (QEMU 10.0.11) was run as a property query that starts no machine. No plan, source or audit file was modified, and nothing was built, tested or booted.
+
+
+PLANNER'S RESPONSE ON P02M0191 (2026-09-26T05:34:16Z):
+
+Every finding of the re-audit was verified against the tree at `eca3cbe7` and against the working-tree plans. In the tree:
+- `mem/tlb.rs`: `service_pending` and all of its callers - the wake IPI, the tick in `on_timer_preempt`, both idle loops and the shootdown's own waits.
+- `sync.rs`: the contended wait calls `service_pending` every 1024 spins with interrupts masked, and the file records that the step must stay lock-free.
+- `sched/mod.rs`: `current_thread` takes `cpu_sched(..).inner.lock()`, and the switch publishes per-CPU state with interrupts masked after dropping that lock.
+- `arch/x86_64/percpu.rs`: there is no current-thread field.
+- `object/mod.rs`: object ids come from a monotonic counter.
+- `device.rs`: `revoke_derived` works on each row with `DERIVED` released, and the release calls it after dropping `CLAIMS`.
+- `arch/x86_64/serial.rs`: the 16 KiB ring; `init`'s sequence of IER, LCR, divisor, FCR and MCR at 38400 baud; and the full-ring path that pushes to the UART.
+- `panic.rs`: the panic text and `dump_blocked` are printed before `flush_sync`.
+- `idt/mod.rs`: the double fault and ring-0 exceptions print and then halt without flushing.
+- `interrupts/mod.rs`: `dispatch` runs the kernel's handler before it signals a bound driver, and there is no unregister.
+- `main.rs`: the IRQ 4 registration, both polls and `serial_rx_interrupt`.
+- `lab.py`: the development channel is a second virtio-serial device, independent of COM1.
+
+Outside the tree: coreboot's `debug.asl` and ICH9 `lpc.asl` as fetched for the re-audit, and P02M0196, P02M0198, P02M0200, P02M0201 and P02M0099. All six findings are accepted and none is rejected.
+
+1. **ACCEPTED - The confirmed revocation runs inside a step that must stay lock-free.**
+
+   Verified. `service_pending` runs from the wake IPI, the tick, both idle loops, the shootdown's waits and every contended `SpinLock::lock`, always with interrupts masked, and `sync.rs` relies on it taking no lock. The kernel reaches the running thread only through `current_thread`, which takes the core's scheduler lock, and no per-CPU field names that thread. So a reload that took the scheduler lock or the process's lock could spin on a lock its own core already holds. A reload run by a round that was started under the process's lock would wait until the round's bounded wait answered false.
+
+   Plan changes:
+   - **New P02M0191b item, THE CORE'S RECORD, AND COPIES THAT TAKE NO LOCK.**
+     - Every switch records in per-CPU state the loaded process's object id, which is never reused, and the generation it copied at. It also records a reference to the running process, valid while one of that process's threads is current on the core and cleared by every switch to the idle context.
+     - The process's lock serializes changes only. A change makes the generation odd before it touches the bytes and even again after, and in between it takes no other lock and allocates nothing.
+     - Every copy - at the switch, in the service step and on the `#GP` path - reads the generation before and after copying, and retries while it was odd or moved.
+     - The retries are bounded. Past the bound, the switch and the service step load the refuse-everything state and record nothing loaded, and the `#GP` path returns so that the instruction faults again. A missed grant therefore costs one more `#GP`, never a wrong answer.
+     - The service step and the `#GP` path find the running process only through the record, never through `current_thread`, so `service_pending` stays lock-free.
+   - **Enforcement item:** the switch compares the incoming process and generation against that record.
+   - **Revocation item:** a revocation clears the bits as one change, RELEASES the process's lock, copies again on the local core, and only then runs the round. The service step compares its record's generation with the process's and copies without a lock.
+   - **Grants-pulled item:** uses the same record.
+   - **Mechanism tests (P02M0191d):** the release now also runs while a test hook on a third core holds the looping core's scheduler lock, and it must still confirm. That test fails at once for a service step that uses `current_thread`.
+
+   The finding's "retried when it moved" was unbounded, and I bounded it. Without a bound, a thread mapping ranges in a loop could keep another core's service step from ever answering a round.
+
+2. **ACCEPTED - COM1 is filed only as a terminal-path port, although the kernel drives it.**
+
+   Verified.
+   - The kernel drains, reads and polls COM1 on every tick, every IRQ 4 and every idle pass.
+   - coreboot's optional `debug.asl` declares `OperationRegion(CREG, SystemIO, 0x3F8, 8)`, and its `DINI` reprograms the port to 115200 baud with interrupts off. The kernel runs it at 38400 with the receive interrupt on.
+   - P02M0196b mints SystemIO ranges over the terminal-path category.
+
+   So the ACPI service could be granted COM1 while the kernel drives it, and that grant would then block the handoff's own mint.
+
+   Plan changes:
+   - **Reserved-set item, COM1 under the run-time rule.** COM1's ports are in the set from the kernel's first line. They leave it when the COM1 claim's `PortRange` is minted, and rejoin it when that grant ends. Each move happens in ONE STEP with the grant, under the lock every mint checks. That claim's `PortRange` is the one mint the set does not refuse, and only after the handoff's flip.
+     - The finding had the flip take the ports out of the set before the mint. I moved them at the mint itself. Otherwise, between the claim's flip and DeviceManager's later mint call, the ports would be neither reserved nor granted, and a SystemIO mint could take them.
+   - **Reserved-set item, rows the kernel declares.** Rows the kernel declares itself - P02M0196a's kernel-held devices and `kernel:com1` - are not refused by the reserved ports they record. A description P02M0196a merges into one of them (SPCR, DBG2, `PNP0501`, the PIC's or the clock's node) adds no range. Without this, the mint-sources rule "checked when the row is recorded" would refuse COM1's own row. The mint-sources item now points to this exception.
+   - **Terminal-path item:** lists COM1 only WHILE A CLAIM HOLDS IT.
+   - **P02M0191c handoff item:** the ports stay reserved until the claim's `PortRange` mint moves them into the claim's grant.
+   - **Reacquisition item:** the ports return to the set in the same step as the grant ends, after a `Quarantined` release too.
+   - **Tests:**
+     - The mechanism tests refuse COM1's ports through the ACPI service's mint path as well as through a claim.
+     - The handoff-machinery tests check that the instance's ports are refused while the kernel owns it, granted only through its claim's `PortRange`, and back in the set after the release.
+
+3. **ACCEPTED - P02M0191 and P02M0196 disagree on what the reserved set holds.**
+
+   Verified. P02M0196b said that `PNP0C01`/`PNP0C02` ranges join the kernel's reserved list. coreboot's ICH9 `LDRC` (`PNP0C02`) reserves port 0x80, the GPIO block and the whole 0x80-byte PM block. That PM block holds the TCO sub-range which P02M0200 mints through source (c), and every range is checked against the set again at mint.
+
+   Plan changes: the reserved-set item gains FIRMWARE RESERVATIONS NEVER JOIN THE SET.
+   - A `PNP0C01`/`PNP0C02` range is a reservation row of P02M0196b's, with that step's own rule for the rows published around it.
+   - A mint inside such a range is governed by the reserved set, the claims and the ACPI service's policy, like any other mint.
+
+   P02M0196's side belongs to its own planner. Its working tree already agrees: reservations never enter this set, and a mint inside one - the TCO sub-range, a WDAT range, an AML region - stays governed by the set, the claims and the policy.
+
+4. **ACCEPTED - The terminal path loses the panic text behind a full ring, and repairs only part of the UART.**
+
+   Verified.
+   - The panic handler prints, and dumps the blocked threads, before `flush_sync` runs.
+   - While a driver holds COM1, a full ring drops lines at enqueue. The writer would then send 16 KiB of older lines instead of the panic.
+   - A driver can also leave the FIFO off or loopback on. `init` rewrites both (FCR and MCR), and the old item did not.
+   - The one kernel test read its marker back through loopback, which a writer that restores MCR makes impossible.
+
+   Plan changes:
+   - **The terminal-path item** is now PANIC, AND EVERY OTHER TERMINAL PATH, IGNORE THE OWNER - AND TAKE THE WIRE BEFORE THEY PRINT.
+     - The panic handler in both builds and the fatal halts enter the writer before their first line. Reset, power-off and the test exit enter it before they act.
+     - The writer takes the lock with its bound and re-runs the whole boot initialisation: interrupt enables off, divisor and line settings, the FIFOs enabled and cleared, modem control with loopback off.
+     - It writes out the backlog, then the dropped count, and sets a third owner state, TERMINAL. TERMINAL is never left: in it, every kernel line goes to the wire synchronously, as in early boot.
+     - The backlog is written out rather than discarded, because it holds the lines that led to the panic and is bounded at 16 KiB.
+   - **Handoff item:** lists TERMINAL among the owner states.
+   - **P02M0191d's first item:** a test may observe the second port through the test build's record of the kernel's register accesses, instead of through loopback.
+   - **Handoff-machinery test:** the writer is entered after the probe left DLAB set, another divisor, the FIFO off and loopback on, and its marker is read from the record. A second run on a fresh instance with the ring past its bound shows the marker after the backlog and the count.
+
+5. **ACCEPTED - The handoff gate cannot fail for either property the handoff exists for.**
+
+   Verified.
+   - `dispatch` runs a still-registered kernel handler before it wakes the driver, and `serial_rx_interrupt` empties the FIFO.
+   - ConsoleService keeps reading the kernel's console channel.
+   - So the handoff line and `lab sh` pass whether or not the kernel lets go.
+   - The kernel tests cover only the parameterised second instance, not COM1's own call sites.
+   - The panic step ran after the binding was disabled, when the kernel owned COM1 again.
+
+   Plan changes:
+   - **The count.** In the development build, the gate counts every access to COM1's registers made by a kernel path other than the terminal-path writer while a driver holds the port. The count sits in the one access path all of them use.
+   - **The reacquisition line** states that count, and the gate requires zero at every reacquisition. The reacquisition item says so. It also now flips the owner to KERNEL before re-initialising, so its own register writes are not counted.
+   - **Re-enable step:** after the kernel-path step, the binding is enabled again and the gate waits for the next handoff line.
+   - **Full-ring panic step:**
+     - The driver is still serving: `lab sh` answers through it.
+     - A development-build kernel request holds the tap's reads and writes kernel lines until the ring passes its bound.
+     - The panic must then put the writer's dropped count, followed by `*** KERNEL PANIC ***` and its message, in the log.
+   - **Why a kernel request:** the hold is a kernel request rather than a driver hook, so P02M0099's driver needs nothing for the gate. The request reaches the guest over the development channel, which is a separate virtio-serial device, so it works while a driver holds COM1.
+
+6. **ACCEPTED - P02M0099 still says the legacy-port 16550 needs no device identity.**
+
+   Verified at P02M0099's identity section and at its 16550 bullet.
+
+   Plan changes, in P02M0099 only:
+   - **The identity section's sentence** now says the x86 legacy-port `16550` is a consumer too (corrected 2026-09-26). It needs no firmware DESCRIPTION, because the kernel declares COM1 itself, but that declaration is P02M0196a's kernel-declared platform row `kernel:com1`, and the driver is claimed and bound through that row.
+   - **The 16550 UART bullet** now binds on P02M0196a's platform rows. COM1 is `kernel:com1`, whose claim through P02M0196a's platform claim performs P02M0191c's handoff. That sits beside the IRQ from P02M0196a's claim-scoped wired interrupts.
+   - **The bullet's blocked status** now names both milestones: the authority and the handoff are P02M0191's; the row, its claim and the interrupt are P02M0196a's.
+
+Coordinated changes: Two cross-plan decisions are applied here.
+- The decision that firmware reservations never join the reserved set is in the reserved-set item (finding 3).
+- The decision that P02M0099's legacy 16550 consumes P02M0196a's platform row is in P02M0099's two passages (finding 6).
+
+One further change keeps this plan consistent with P02M0198. Its planner applied its own re-audit's finding that a processor register the kernel already holds must be admitted again and counted per table, because firmware gives every core the same `_CST` register. This plan's run-time rule refused any install over an already reserved port. It now admits a register the SAME kernel item already holds, and counts it; the ports leave the set only when the last install holding them is uninstalled. The mechanism tests install one register twice. P02M0196's side of the reservation decision belongs to its own planner and was not touched.
+
+Re-check of the whole plan: I re-read all four parts after the edits.
+- **COM1 is one state machine everywhere it appears:**
+  - reserved while the kernel owns it (reserved set);
+  - granted to the claim in one step at the mint (handoff item);
+  - terminal-path only while claimed (terminal-path item);
+  - back in the set in one step at the release (reacquisition item);
+  - TERMINAL from the first terminal-path entry on.
+- **Each of those states has a test:** the refusals in the mechanism tests; the set's transitions and the terminal writer on the second instance; and the zero count, the second handoff and the full-ring panic in the gate.
+- **The enforcement design is complete for an implementer:** where the record lives, what a copy reads, why neither the service step nor the round waits on a lock, and why a bounded copy is always safe.
+- **Cross-plan consistency, checked against the working trees:**
+  - P02M0196a: the claim mints by kind and index; `kernel:com1` is kernel-held until the handoff; kernel-held rows and merges; reservations as a row state of their own.
+  - P02M0196b: SystemIO is refused over the reserved set and inside a live claim's range, so the ACPI service never holds COM1.
+  - P02M0198: the counted run-time install.
+  - P02M0200: the TCO sub-range through source (c), and WDAT ranges after the reserved-set check; a firmware reservation blocks neither.
+  - P02M0201: the PCI I/O BAR source.
+  - P02M0099: the 16550 bullet.
+- Nothing is versioned, the interface stays additive at version 1, and every development-only request is compiled only into the development build.
+
+Only `docs/todo/P02M0191.md` and the two named passages of `docs/todo/P02M0099.md` (the identity section's legacy-port sentence and the 16550 UART bullet) were edited and this response appended; no source, test, script or other plan was changed, and nothing was built or booted.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0191 (2026-09-26T15:50:59Z):
+
+**Rating: 8/10.** The lock-free revocation, COM1's place in the reserved set, the rule for firmware reservations, the terminal writer and the handoff gate are now designed, and they match the tree. What is left is a contradiction with P02M0197b, which this round introduced together with the TERMINAL state, a port range the ACPI service can still be minted although P02M0196a withholds its device, and three small defects.
+
+I read the whole history and the whole plan. I compared the plan with `git show HEAD:docs/todo/P02M0191.md` and read the planner's diffs to this plan and to P02M0099. In the tree I checked:
+- the TSS (`gdt.rs`), the serial driver, the shootdown (`mem/tlb.rs`), `sync.rs` and `panic.rs`;
+- the IDT handlers and their gate type, the interrupt dispatch and the wake IPI;
+- the scheduler's `current_thread`, `reschedule`, idle loops and tick;
+- `percpu.rs`, the object id counter, the `Interrupt` object, and the claim, release and derived-object code in `device.rs`;
+- the boot order and the IRQ 4, poll and print paths in `main.rs`;
+- the reset, power-off and test-exit paths, and the build gating of `sci.rs`;
+- every port the kernel touches (`pit.rs`, `rtc`, `apic`, `pci`, `fwcfg.rs`, `sci.rs`, `mod.rs`);
+- `console_input.rs`, ConsoleService's mirror, DeviceManager's `--disable` and `--enable` verbs, `lab.py` and `qemu-run.sh`.
+
+I also read the working-tree P02M0099, P02M0196, P02M0197, P02M0198, P02M0200 and P02M0201 where they touch this plan, and two upstream files: QEMU v10.0.0's `hw/char/serial.c` and Linux v6.12's ACPICA `hwvalid.c`.
+
+These corrections now hold:
+- **Finding 1 (lock-free revocation).** The core's record, the process's lock released before the round, and bounded lock-free copies keep [`service_pending`](/data/yellow/libersystem/src/kernel/mem/tlb.rs:247) free of locks.
+  - [`current_thread`](/data/yellow/libersystem/src/kernel/sched/mod.rs:614) does take the scheduler lock, and [`PerCpu`](/data/yellow/libersystem/src/kernel/arch/x86_64/percpu.rs:29) has no field for the running thread.
+  - Every IDT gate is an [interrupt gate](/data/yellow/libersystem/src/kernel/arch/x86_64/idt/mod.rs:37), so no service step can nest inside the `#GP` path's copy.
+  - Bounding the retries is a sound addition.
+- **Finding 2 (COM1 in the reserved set).** COM1 follows the run-time rule. The planner moves the ports at the mint rather than at the flip, which is better than what the finding suggested: at no moment are the ports neither reserved nor granted.
+- **Finding 3 (firmware reservations).** They never join the set, and [P02M0196b](/data/yellow/libersystem/docs/todo/P02M0196.md:247) says the same.
+- **Finding 4 (panic path).** The writer is entered before the first line and re-runs all of [`serial::init`](/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:81). Its tests read the record of register accesses, not loopback.
+- **Finding 5 (handoff gate).** Each new check can now fail: the zero count at every reacquisition, the re-enable step and the full-ring panic.
+  - The re-enable step works, because `--enable` binds a disabled node again ([device_manager.rs](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:5391)).
+  - The development channel is a separate virtio-serial device ([lab.py](/data/yellow/libersystem/src/harness/lab.py:277)).
+- **P02M0198 consistency.** The counted re-install matches [P02M0198](/data/yellow/libersystem/docs/todo/P02M0198.md:124).
+- **Finding 6 (P02M0099).** It is corrected in the 16550 bullet and the identity sentence, but not in the paragraph after that sentence (finding 5 below).
+
+1. **Medium - P02M0197b's sleep entry flushes the serial output "as `poweroff` does". Under this plan that flush is the terminal-path writer: it ignores the driver and sets TERMINAL for good. The plan gives a path the machine returns from no other way to reach the wire.**
+
+   This round made the writer one-way:
+   - It ["sets the owner to TERMINAL, which is never left. From then on every kernel line goes to the wire synchronously"](/data/yellow/libersystem/docs/todo/P02M0191.md:257).
+   - [`flush_sync` becomes that writer](/data/yellow/libersystem/docs/todo/P02M0191.md:248), and power-off enters it before it acts.
+   - No other path may write: ["from the moment the claim returns no kernel path but the terminal-path writer below touches the port"](/data/yellow/libersystem/docs/todo/P02M0191.md:213).
+   - The plan does not mention sleep.
+
+   P02M0197b, also edited in this round, relies on that flush:
+   - The kernel's sleep entry is to ["flush the serial output synchronously, as `poweroff` does"](/data/yellow/libersystem/docs/todo/P02M0197.md:177).
+   - Its oracle times that line on the wire ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:336)).
+   - Before the entry, DeviceManager has already sent `SUSPEND` to every binding ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:101)). The 16550 driver is one of them, so nothing drains the tap.
+
+   If both plans are built as written, the first suspend to idle or S3 leaves COM1 in TERMINAL after the resume:
+   - With a driver bound, the kernel writes COM1 while the resumed driver drives it too. P02M0191c exists to prevent exactly this state with two owners.
+   - With or without a driver, every kernel line and every `SYS_DEBUG_WRITE` then waits for the wire. The ring was built to remove that stall ([serial.rs](/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:7)).
+
+   A flush that respected the owner fails too, while a driver holds COM1: the line would stay in the ring behind a suspended driver, and P02M0197b's oracle could not pass. The `serial-handoff` gate never sleeps, so nothing in this plan would catch the conflict. This is a new contradiction between two changes made in this round. P02M0197's re-audit of this date reports the same conflict from the sleep entry's side.
+
+   **Correct the terminal-path item** : state that the sleep entry is not a terminal path and never enters the writer, and state what it does instead:
+   - While the kernel owns COM1, the entry drains the ring synchronously and leaves the owner at KERNEL.
+   - While a driver holds COM1, the planner must choose. Either the entry takes COM1 back for the sleep, as reacquisition does, and returns it to the claim at resume. Or the line waits in the ring for the resumed driver.
+
+   Then make P02M0197b's "as `poweroff` does" refer to that rule.
+
+2. **Medium - The ACPI service's SystemIO mint is checked only against the reserved set and live grants. It can therefore hand out the ISA DMA controller's registers, which P02M0196a keeps kernel-held because the device masters the bus untranslated. The new sentence saying that kernel-held rows record reserved ports is not true of that row.**
+
+   The sentence and the gap behind it:
+   - This round added ["P02M0196a's kernel-held devices record the reserved ports they describe and mint nothing"](/data/yellow/libersystem/docs/todo/P02M0191.md:109).
+   - The reserved set is ["every port the kernel drives"](/data/yellow/libersystem/docs/todo/P02M0191.md:86). The kernel drives none of the 8237's registers (0x00-0x0F, 0xC0-0xDF and the page registers from 0x81). All of its port accesses are in `serial.rs`, `pci`, `fwcfg.rs`, `apic`, `pit.rs`, `rtc`, `sci.rs` and `mod.rs`.
+   - P02M0196a still lists ["the ISA DMA controller (a bus master nothing translates)"](/data/yellow/libersystem/docs/todo/P02M0196.md:60) among the kernel-held devices.
+
+   Nothing refuses these ports at the SystemIO mint:
+   - The SystemIO mint gets only ["the same reserved-set and exclusivity checks"](/data/yellow/libersystem/docs/todo/P02M0191.md:77).
+   - P02M0196b refuses SystemIO only ["over P02M0191's reserved set"](/data/yellow/libersystem/docs/todo/P02M0196.md:178) and inside a live claim. A kernel-held row is neither, so an AML region over the 8237 becomes a `PortRange` held by the ACPI service.
+   - This plan keeps fw_cfg's DMA registers out of every mint for exactly this reason ([plan](/data/yellow/libersystem/docs/todo/P02M0191.md:90)).
+   - P02M0196b refuses kernel-held MMIO for SystemMemory regions ([P02M0196](/data/yellow/libersystem/docs/todo/P02M0196.md:164)), but has no equivalent rule for ports.
+
+   Refusing these ports costs firmware nothing. P02M0196b answers `_OSI` true for the Windows strings ([P02M0196](/data/yellow/libersystem/docs/todo/P02M0196.md:224)), and when an OS does that, ACPICA already denies AML these DMA ports ([hwvalid.c](https://github.com/torvalds/linux/blob/v6.12/drivers/acpi/acpica/hwvalid.c#L51)). This is a new finding.
+
+   **Correct the reserved-set item** : refuse at every mint the ISA DMA controller's channel and control registers, 0x00-0x1F and 0xC0-0xDF, as fw_cfg's DMA registers are refused. The page registers from 0x81 cannot start a transfer and can stay mintable. Correct the sentence about kernel-held rows to match.
+
+   P02M0196's re-audit of this date reports the same gap from the side of its SystemIO policy, with the same ranges.
+
+3. **Low - The FADT part of the reserved set must exist when the boot scan evaluates source (c), in the test build too. The kernel's only FADT reader runs after the scan and is left out of the test build, and the plan does not say where that part is computed.**
+
+   The plan needs the FADT part at the scan:
+   - The FADT part is ["computed at boot"](/data/yellow/libersystem/docs/todo/P02M0191.md:93).
+   - Source (c) reads the base ["once during the boot scan"](/data/yellow/libersystem/docs/todo/P02M0191.md:69). There it checks ["the base agreeing with a FADT block"](/data/yellow/libersystem/docs/todo/P02M0191.md:68) and refuses any sub-range that touches the reserved set.
+   - P02M0200's ICH9 row relies on the same order ([P02M0200](/data/yellow/libersystem/docs/todo/P02M0200.md:199)).
+
+   In the tree the order is the other way round:
+   - The boot scan is [`device::init`](/data/yellow/libersystem/src/kernel/main.rs:223).
+   - The only FADT reader is [`sci::init`](/data/yellow/libersystem/src/kernel/arch/x86_64/sci.rs:79). The boot tail calls it after the scan ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:465)).
+   - Its module is [`cfg(not(test))`](/data/yellow/libersystem/src/kernel/arch/x86_64/mod.rs:24). The test kernel runs [`test_main`](/data/yellow/libersystem/src/kernel/main.rs:238) and never reads the FADT.
+
+   Two tests are affected. In the test where ["a row whose sub-range covers PM1 is refused at boot"](/data/yellow/libersystem/docs/todo/P02M0191.md:290), the reserved-set check cannot refuse the row, although that check is what the test is meant to prove. The row is refused only when its FADT condition fails, which is the wrong reason. The test's other case refuses ["the FADT-derived ones this boot computed"](/data/yellow/libersystem/docs/todo/P02M0191.md:276), and in the test build that set is empty. This is a new finding.
+
+   **Correct the reserved-set item** : state that the FADT part is computed before `device::init`, in the test build as well. The lookup it needs, [`smp::acpi_table`](/data/yellow/libersystem/src/kernel/smp/mod.rs:546), is compiled into both builds, and `init_extended_config` already calls it just before the scan ([main.rs](/data/yellow/libersystem/src/kernel/main.rs:1194)).
+
+4. **Low - Reacquisition runs the boot sequence before it "feeds what the FIFO holds". That sequence resets the receive FIFO, so the input the plan says is kept is thrown away.**
+
+   The item runs these steps in this order:
+   - It re-initialises the UART ["with its boot sequence"](/data/yellow/libersystem/docs/todo/P02M0191.md:237).
+   - Then it ["feeds what the FIFO holds to the console channel"](/data/yellow/libersystem/docs/todo/P02M0191.md:239).
+   - It says ["Input typed between the driver's death and the release is what the UART's FIFO holds"](/data/yellow/libersystem/docs/todo/P02M0191.md:243).
+
+   The boot sequence empties that FIFO first:
+   - It writes FCR `0xC7` ([serial.rs](/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:88)). Bit 1 of that value resets the receive FIFO.
+   - QEMU empties the FIFO and clears the data-ready bit on that write ([serial.c](https://github.com/qemu/qemu/blob/v10.0.0/hw/char/serial.c#L415)).
+   - QEMU also forces the reset whenever the FIFO-enable bit changes ([serial.c](https://github.com/qemu/qemu/blob/v10.0.0/hw/char/serial.c#L409)). That happens after a driver that turned the FIFO off.
+
+   So the feed finds nothing. No test catches this, because the receive path is [`cfg(not(test))`](/data/yellow/libersystem/src/kernel/arch/x86_64/serial.rs:220). This is a new finding, in text present since the planner's first response.
+
+   **Correct the reacquisition item** : read out the received bytes before the boot sequence. Clear DLAB first, since a driver may have left it set.
+
+5. **Low - The correction of the previous finding 6 is incomplete. The paragraph right after P02M0099's corrected sentence still says that the legacy-port 16550 needs no firmware identity and must own the three mechanisms itself.**
+
+   The two passages disagree:
+   - The corrected sentence says the legacy-port 16550 ["is one of them too"](/data/yellow/libersystem/docs/todo/P02M0099.md:1123) and binds through `kernel:com1`.
+   - The next paragraph still says it ["needs no firmware identity. It needs three things nothing in this tree has"](/data/yellow/libersystem/docs/todo/P02M0099.md:1134).
+   - That paragraph then offers only two options. Either the slice owns those three mechanisms itself, or the first 16550 item covers ["FIRMWARE-DESCRIBED MMIO UARTs - which needs the identity prerequisite instead"](/data/yellow/libersystem/docs/todo/P02M0099.md:1144).
+
+   That is the exception the previous finding asked to remove. It also contradicts the [16550 bullet](/data/yellow/libersystem/docs/todo/P02M0099.md:2950), which gives the authority and the handoff to this plan and the row, claim and interrupt to P02M0196a.
+
+   **Correct P02M0099's paragraph** : say that the legacy slice needs no firmware description but binds through P02M0196a's `kernel:com1` row. Say that the mechanisms are owned as the 16550 bullet and the [owner table](/data/yellow/libersystem/docs/todo/P02M0099.md:267) record. Alternatively, mark the paragraph as superseded by the bullet.
+
+Validation: I inspected, without changing anything, the plan, the audit history and the planner's diffs (`git show` and `git diff` against `eca3cbe7`). I also inspected the kernel, service and harness sources cited above, and the working-tree P02M0099, P02M0196, P02M0197, P02M0198, P02M0200 and P02M0201. From upstream I fetched, read-only, QEMU v10.0.0's `hw/char/serial.c` and Linux v6.12's `drivers/acpi/acpica/hwvalid.c`. No plan, source or audit file was modified. Nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0191 (2026-09-26T17:12:45Z):
+
+Verified read-only against the tree:
+- `serial.rs`: `init` writes FCR `0xC7` (bit 1 resets the receive FIFO); `enable_rx_irq` and `read_byte` are `cfg(not(test))`; `flush_sync` is today's plain synchronous drain;
+- `main.rs`: `device::init` is the boot scan (line 223); `init_extended_config`, which calls `smp::acpi_table` just before it, is `cfg(all(not(test), target_arch = "x86_64"))`; `sci::init` runs in the boot tail after the scan, and the `sci` module is `cfg(not(test))`; `smp::acpi_table` is gated only on the architecture, so both builds compile it;
+- Linux v6.12 ACPICA `hwvalid.c`: its protected ports include DMA `0x0000..0x000F` and IDMA `0xC0..0xDF`, denied to AML once firmware has seen a Windows `_OSI`; on ICH9 the first controller's registers are also decoded at their `0x10..0x1F` alias;
+- P02M0196a's kernel-held set ("the ISA DMA controller (a bus master nothing translates)"), P02M0196b's SystemIO bullet, P02M0197b's entry and P02M0197d's suspend-to-idle oracle, and P02M0099's identity paragraph, the paragraph after it and its 16550 bullet.
+Summary: five findings, all accepted.
+
+1. **ACCEPTED - the sleep entry's flush would be the one-way terminal writer.** The conflict is real: P02M0197b told its entry to flush "as `poweroff` does", and this plan made that flush the writer that sets TERMINAL for good. THE CHOICE, of the two the finding offers: THE ENTRY TAKES COM1 BACK FOR THE SLEEP, not "the line waits in the ring". Once this part and the 16550 driver land, a driver holds COM1 on every x86_64 boot, so with the second option neither `sleep: entered` nor `sleep: resumed` would reach the wire until the driver resumed; P02M0197d's host-timed interval between the two lines would collapse on x86_64, and a sleep that hangs would leave nothing on the wire. At the entry every binding has already answered `SUSPENDED` (P02M0197a's step 4), so the kernel driving the UART for the window makes no second active owner. Plan changes:
+   - A new P02M0191c item, "THE SLEEP ENTRY IS NOT A TERMINAL PATH". The entry never enters the terminal-path writer and never leaves TERMINAL. With the kernel owning COM1 it drains the ring and writes its line synchronously, and the owner stays KERNEL. With a driver holding COM1 it sets the owner to SLEEP with the claim's generation, re-runs the UART's boot initialisation with the receive interrupt left off (IRQ 4 stays the claim's), drains the ring and writes its line; its last act is to set the owner back to DRIVER. In both cases every kernel line until the entry returns, `sleep: resumed` among them, goes to the wire synchronously. The claim, its `PortRange`, IRQ 4 and the tap are untouched; the development counter does not count these accesses; the COM1 driver's `RESUME` reprograms the UART whatever the sleep state; a panic inside the window enters the terminal writer; whichever of this part and P02M0197b lands second wires the entry, and until this part lands the entry's flush is today's `flush_sync`.
+   - The ownership states gain SLEEP; "no kernel path but the terminal-path writer touches the port" now names the sleep entry too; the terminal-path category says the sleep entry is not one of its paths; the gate's counter excludes the sleep entry as it excludes the terminal writer.
+   - Verification: the handoff-machinery tests check the rule on both owners of the second instance (with the kernel owning it, the ring drained and the owner still KERNEL; with a probe holding it, SLEEP for the window, the line in the record with the receive interrupt off, DRIVER afterwards and nothing counted). The `serial-handoff` gate, carried by whichever of this part and P02M0197b lands second, runs a suspend to idle right after its first `lab sh` round trip, so the kill that follows reports its zero count over a hold that included a sleep - the gate no longer never sleeps.
+
+2. **ACCEPTED - the ISA DMA controller's registers were mintable to the ACPI service.** The ranges hold against ACPICA and ICH9's decode, and the argument is the one this plan already makes for fw_cfg. Plan changes:
+   - The reserved set is now "every port the kernel drives, and every port that would let its holder start a transfer nothing translates". Its fixed part gains the DMA controllers' channel and control registers, `0x00..0x1F` (the chipset's alias of the first controller included) and `0xC0..0xDF`, with the reason and the ACPICA note; the page registers from `0x81` stay mintable, as port `0x80` does.
+   - "ROWS THE KERNEL DECLARES ARE NOT REFUSED BY IT" no longer says the kernel-held rows record reserved ports: they mint nothing; the ports they describe that the kernel drives or that could start an untranslated transfer are in the set, and the rest (the page registers) grant nothing through a row that mints nothing.
+   - The mechanism tests refuse a DMA channel and a control register while the page register at `0x81` is minted.
+
+3. **ACCEPTED - the FADT part must exist when the scan evaluates source (c), in the test build too.** Plan changes: the FADT part is "COMPUTED BEFORE THE BOOT SCAN (`device::init`) AND IN THE TEST BUILD AS WELL", read through `smp::acpi_table`, which both builds compile, with the reason (source (c) checks its rows against it during the scan, while `sci::init`, today's only FADT reader, runs after the scan and only in the production build). The sources test now says the row covering PM1 is refused by the reserved-set check with its FADT condition holding, the test build computing the FADT part before its scan. One precision on the pointer the finding gives: `init_extended_config` is itself left out of the test build, so the plan names the lookup (`smp::acpi_table`), not that function, as what runs before the scan in both builds.
+
+4. **ACCEPTED - reacquisition reset the receive FIFO before feeding it.** Plan change, in the reacquisition item: after flipping to KERNEL the kernel first READS OUT WHAT THE RECEIVER HOLDS - DLAB cleared, since the driver may have left it set, then the receive register read while the line status says data is ready, bounded at 64 bytes, the deepest FIFO of the 16550 family - and only then re-runs the boot sequence, and feeds the bytes it read out. "Input typed between the driver's death and the release is what the FIFO holds" now adds "and the read-out keeps it". The handoff-machinery tests check, from the record's order, that after a probe left DLAB set with bytes in the receiver, those bytes are read with DLAB cleared before the FIFO reset (the receive interrupt path is production-only, which is why the record is the oracle).
+
+5. **ACCEPTED - P02M0099's paragraph after the corrected sentence still contradicted it.** Plan change in P02M0099: the paragraph now says the legacy-port 16550 needs no firmware DESCRIPTION but binds through P02M0196a's `kernel:com1` row; it names each of the three mechanisms with its owner, as the 16550 bullet and the owner table record (the port-I/O authority P02M0191's, the fixed-IRQ routing and its revocation P02M0196a's claim-scoped wired interrupts, the atomic handoff P02M0191c's with its terminal writer and reacquisition rule); it says the slice owns none of them itself, is blocked on both milestones and lands with P02M0191c; and the firmware-described MMIO UARTs are the item's other half, blocked on the identity prerequisite. The 16550 bullet also gains the `RESUME` step finding 1 requires.
+
+Coordinated changes: P02M0196b's SystemIO bullet refuses the same DMA ranges (finding 2); P02M0197b's entry refers to the sleep-entry rule and P02M0197d's suspend-to-idle oracle reads the same in both of its cases (finding 1); P02M0099's paragraph and 16550 bullet (findings 5 and 1).
+
+Re-check of the whole plan: the reserved set, the mint sources, the terminal-path category, the ownership states and the sleep rule now agree with P02M0196a/b, P02M0197b, P02M0198's run-time installs and P02M0200's ICH9 row, which relies on the same FADT-before-scan order. Every new rule has a test that can fail: the DMA refusals and the page-register mint, the PM1 row refused for the right reason, the read-out order in the record, the sleep rule on both owners, and the gate's sleep before its kill. Order and exclusions are unchanged. The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0191.md`, and for coordination `docs/todo/P02M0196.md`, `docs/todo/P02M0197.md` and `docs/todo/P02M0099.md`; no source was changed, and nothing was built or booted.
