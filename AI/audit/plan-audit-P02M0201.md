@@ -1,0 +1,153 @@
+AUDITOR'S REVIEW OF PLAN P02M0201 (2026-09-25T22:57:24Z):
+
+**Rating: 3/10.** The BMC feature set is well chosen and QEMU's IPMI devices are described correctly, but the process boundary, the PCI and SMBus hardware paths and several of the promised proofs do not fit the existing system or the emulator.
+
+Reviewed [the plan](/data/yellow/libersystem/docs/todo/P02M0201.md) and its [originating requirement](/data/yellow/libersystem/docs/todo/P02M0099.md:355). Also reviewed the plans it builds on: [P02M0196](/data/yellow/libersystem/docs/todo/P02M0196.md), [P02M0195](/data/yellow/libersystem/docs/todo/P02M0195.md), [P02M0191](/data/yellow/libersystem/docs/todo/P02M0191.md), [P02M0188](/data/yellow/libersystem/docs/todo/P02M0188.md), [P02M0181](/data/yellow/libersystem/docs/todo/P02M0181.md) and [P02M0200](/data/yellow/libersystem/docs/todo/P02M0200.md). On the code side: the provider catalogue, the kernel's PCI scan and device table, the boot hand-off, AdminService, SystemManager and the power vocabulary, all at commit `07371c44af82a11c1d275b0cbd832899f712e62a`. Plans P02M0197 to P02M0202 exist only in the working tree (they are not yet committed), and P02M0190, P02M0196 and P02M0099 carry uncommitted edits; all were read as they stand there, and line numbers refer to the working tree. These were checked against the QEMU 10.0 IPMI and SMBus device sources and the QEMU 10.0.11 installed on this machine. The plan is a checklist written before implementation, so the findings concern decisions and prerequisites it needs, not the expected absence of feature code.
+
+1. **High - The plan never says which process is "the BMC service" or how it reaches the transports, yet three of its deliverables can only be published by a driver that holds a device claim.**
+
+   [The transports](/data/yellow/libersystem/docs/todo/P02M0201.md:21) and [the BMC service](/data/yellow/libersystem/docs/todo/P02M0201.md:32) are separate parts, with no provider kind, IDL or process boundary between them. The [closed provider vocabulary](/data/yellow/libersystem/src/idl/device.lsidl:154) has no IPMI kind.
+
+   Publication in this system belongs to a binding. DeviceManager [publishes only what a committed binding offered](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:2762), and the [catalogue](/data/yellow/libersystem/src/idl/device.lsidl:360) offers no publish path to anyone else. P02M0181 states that [a driver publishes through its authorized binding and never receives a writable power-service connection](/data/yellow/libersystem/docs/todo/P02M0181.md:40).
+
+   Yet the plan has the service deliver three things that need such a publication:
+   - [temperatures and power supplies as P02M0181 sources](/data/yellow/libersystem/docs/todo/P02M0201.md:35);
+   - [the BMC watchdog as a P02M0200 provider](/data/yellow/libersystem/docs/todo/P02M0201.md:44), which is a [`watchdog` provider kind](/data/yellow/libersystem/docs/todo/P02M0200.md:22);
+   - the AdminService actions (SEL clear, power control, LAN and user changes), whose executors are [`admin-executor` publications of drivers DeviceManager bound](/data/yellow/libersystem/src/user/services/core/src/admin_service.rs:6).
+
+   The vocabulary does not fit either:
+   - [`source-kind`](/data/yellow/libersystem/src/idl/power.lsidl:18) has no power-supply kind.
+   - Producers must convert through [the `power-model` leaf's adapters](/data/yellow/libersystem/docs/todo/P02M0181.md:77), which exist for ACPI and HID only.
+   - ["In the system graph"](/data/yellow/libersystem/docs/todo/P02M0201.md:36) has nowhere to go: [the graph](/data/yellow/libersystem/src/idl/observability.lsidl:90) holds components and trace spans, not sensors.
+
+   Work is missing under either reading of the plan. If the BMC service is a service, it can publish none of the three. If it lives in the transport driver, then the message layer, SDR/SEL/FRU parsing, watchdog pets and chassis control all share one driver process, and `bmc` still needs a new client-facing kind.
+
+   Either way, KCS and SSIF carry one message at a time. A watchdog pet queued behind SDR, FRU or SEL reads can therefore miss its period unless the plan states how the interface is shared.
+
+   **Correct the transport and service items** by choosing the process graph and its manifest declarations. One option: a driver per interface holds the claim, the message layer and the `power-source`, `watchdog` and `admin-executor` publications, and publishes an `ipmi` provider kind that a BMC service consumes for the tool. Also:
+   - State how pets take priority on the single-message interface.
+   - Map IPMI temperature sensors to a source kind and its trip kinds.
+   - Decide whether power supplies get an append-only kind or are left out.
+   - Add an IPMI adapter (SDR reading conversion) to `power-model`.
+   - Either add a sensor record to the observability vocabulary as an item, or drop "in the system graph".
+
+2. **High - The PCI forms and SSIF need I/O-space BARs, which no kernel path, device record or planned `PortRange` source covers.**
+
+   The plan reaches [`pci-ipmi-kcs` and `pci-ipmi-bt` through their claim](/data/yellow/libersystem/docs/todo/P02M0201.md:23), and [SSIF through a driver for q35's ICH9 SMBus controller](/data/yellow/libersystem/docs/todo/P02M0201.md:24). In QEMU 10.0 all three use I/O space:
+   - [`pci-ipmi-kcs`](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/pci_ipmi_kcs.c) and [`pci-ipmi-bt`](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/pci_ipmi_bt.c) register BAR 0 as I/O space.
+   - The [ICH9 SMBus function](https://github.com/qemu/qemu/blob/v10.0.0/hw/i2c/smbus_ich9.c) registers its SMBus base BAR as I/O space, and decodes it only while the host-enable bit in its configuration space is set.
+
+   None of this has a path in the system:
+   - The kernel [skips I/O BARs](/data/yellow/libersystem/src/kernel/arch/common/pci/mod.rs:920), and [`bar_address` answers `None` for one](/data/yellow/libersystem/src/kernel/arch/common/pci/mod.rs:845).
+   - [The families it resolves](/data/yellow/libersystem/src/kernel/arch/common/pci/mod.rs:43) all use memory BARs, and [a device record carries one MMIO BAR](/data/yellow/libersystem/src/kernel/device.rs:19). Every other function becomes [an identity row with no resources](/data/yellow/libersystem/src/kernel/device.rs:128).
+   - [A ring-3 driver cannot touch configuration space](/data/yellow/libersystem/src/kernel/device.rs:9), so the ICH9 driver cannot set the enable bit itself.
+   - P02M0191 mints ranges [only from ACPI `_CRS` descriptors and COM1-COM4](/data/yellow/libersystem/docs/todo/P02M0191.md:24), and [excludes ranges nobody described](/data/yellow/libersystem/docs/todo/P02M0191.md:55). PCI BARs are not among its sources.
+
+   So three of the five interface forms cannot be implemented under any existing or planned milestone. Neither can [the gate's "each interface ... ISA and PCI"](/data/yellow/libersystem/docs/todo/P02M0201.md:51). This needs kernel and DeviceManager work, not a driver change.
+
+   **Correct the transport items and the dependency on P02M0191** by adding PCI I/O BARs as a minting source: the kernel's own scan records their base and length, the range is handed over and revoked with the claim, and I/O decode is enabled at claim. Add a kernel-mediated way to set ICH9's host-enable bit. If that work is not wanted now, scope the plan to the ISA forms and mark the PCI forms and SSIF as waiting on it.
+
+3. **Medium - SSIF cannot run over P02M0195's bus contract, and the ICH9 controller cannot serve that contract.**
+
+   The plan has the ICH9 driver ["serving P02M0195's bus contract, and SSIF's ... messages over it"](/data/yellow/libersystem/docs/todo/P02M0201.md:24). This repeats P02M0099's claim that SSIF [takes that contract "as it stands"](/data/yellow/libersystem/docs/todo/P02M0099.md:5889).
+
+   The contract [as implemented](/data/yellow/libersystem/src/user/libs/driver/hid-i2c/src/lib.rs:134) is raw I2C: `write`, `read` and `write_read`, each into a buffer the caller sizes. SSIF uses SMBus block write and block read. QEMU's `smbus-ipmi` [checks the count byte and moves at most 32 bytes per block](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/smbus_ipmi.c). A response is as long as the count the device sends first, which `write_read` cannot express.
+
+   The ICH9 host has the opposite limit: it [performs only SMBus protocols](https://github.com/qemu/qemu/blob/v10.0.0/hw/i2c/pm_smbus.c). These are quick, byte, byte/word data, block data with a device-supplied count, and an I2C block read after one command byte. It cannot implement a plain multi-byte `read`, or a `write_read` with a two-byte register, which is what HID-over-I2C issues.
+
+   [The SSIF alert line](/data/yellow/libersystem/docs/todo/P02M0201.md:25) is the SMBus alert that [P02M0195 excludes](/data/yellow/libersystem/docs/todo/P02M0195.md:60), and QEMU's `smbus-ipmi` wires none.
+
+   One `write_read` cannot mean both "read N bytes" and "SMBus block read" on the same controller. So either the driver guesses which one was meant, or SSIF breaks.
+
+   **Correct the SSIF item** with a small SMBus block contract: block write, block read that returns the device's count, and optional PEC. The ICH9 driver serves it, a raw I2C master can emulate it, and SSIF consumes it. State that ICH9 does not serve the I2C contract. Drop the alert line or name the contract that carries it, and correct P02M0099's sentence in the same change.
+
+4. **Medium - Several proofs in the verification part cannot happen in QEMU, and others would pass without reaching the driver's checks.**
+
+   Chassis control: the gate wants [a power cycle "seen as QEMU's reset"](/data/yellow/libersystem/docs/todo/P02M0201.md:53). QEMU's [`ipmi_do_hw_op`](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/ipmi.c) answers power cycle and power on with completion code 0xD5, "not supported". Of the chassis-control verbs, only hard reset (a system reset), power down (a shutdown request) and the soft shutdown (an ACPI power-button request) act.
+
+   Watchdog: the plan proves the BMC watchdog ["through P02M0200's gate"](/data/yellow/libersystem/docs/todo/P02M0201.md:54), whose oracle is [`-watchdog-action none` and QMP's `WATCHDOG` event](/data/yellow/libersystem/docs/todo/P02M0200.md:50). But when [`ipmi-bmc-sim`'s watchdog](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/ipmi_bmc_sim.c) expires, it sets its sensor bits and calls the chassis operation directly. It never reaches QEMU's watchdog layer, so no event is raised and the action option is ignored.
+
+   Hostile and silent BMC: [these cases](/data/yellow/libersystem/docs/todo/P02M0201.md:55) never reach the guest as a raw answer, because QEMU's interface emulation rewrites them first:
+   - KCS and BT replace a response larger than their message buffers (300 bytes) with completion code 0xCA. SSIF truncates at 255 bytes with 0xC6.
+   - BT [writes back the sequence number the guest sent](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/ipmi_bt.c), and a response to a message not awaited is dropped.
+   - [An external BMC that stops answering](https://github.com/qemu/qemu/blob/v10.0.0/hw/ipmi/ipmi_bmc_extern.c) becomes 0xC3 after four seconds, and a disconnected one becomes 0xD2.
+   - `ipmi-bmc-sim` produces none of these cases, and the plan names no harness BMC behind `ipmi-bmc-extern`.
+
+   Features the simulator does not have:
+   - It implements no LAN configuration, user or chassis-identify command. So [LAN, users](/data/yellow/libersystem/docs/todo/P02M0201.md:45) and [the identify light](/data/yellow/libersystem/docs/todo/P02M0201.md:42) can be proved only by the [package-dependent cross-check](/data/yellow/libersystem/docs/todo/P02M0201.md:57).
+   - It gives the harness no way to change a sensor reading, so no live sensor change can reach P02M0181.
+
+   As written, the gate either fails on items the emulator refuses, or passes items it never exercises. "A sequence number it was never sent" passes without the driver ever being shown one.
+
+   **Correct the verification items:**
+   - Prove chassis control with hard reset, and with power down seen as QMP `SHUTDOWN`. Prove power cycle as a refusal that is reported.
+   - Prove the BMC watchdog by the reset on the serial log and by the BMC's own expiration flags, not by QMP.
+   - Add a harness BMC behind `ipmi-bmc-extern`, for oversize answers below QEMU's buffer sizes and for 0xC3 and 0xD2.
+   - Move the sequence-number and stuck-interface cases to host suites with a scripted register model.
+   - State that LAN, users, identify and live sensor changes are proved only if the owner approves the `ipmi_sim` path, or leave them out.
+
+5. **Medium - The AdminService actions are not itemized, and two of them collide with P02M0188 and with SystemManager.**
+
+   The plan adds [SEL clear](/data/yellow/libersystem/docs/todo/P02M0201.md:37), [power off, cycle and reset](/data/yellow/libersystem/docs/todo/P02M0201.md:42), and [changes to the BMC's LAN configuration and users](/data/yellow/libersystem/docs/todo/P02M0201.md:45). What AdminService offers today does not stretch that far:
+   - [`admin-action` has two values](/data/yellow/libersystem/src/idl/admin.lsidl:33), and [a request scope holds at most two actions](/data/yellow/libersystem/src/idl/admin.lsidl:101).
+   - [Each executor publication name maps to one action](/data/yellow/libersystem/src/user/services/core/src/admin_service.rs:68).
+   - The only policy rows are [DFU and the probes](/data/yellow/libersystem/src/user/services/core/src/permission_manager.rs:964), and [ordinary tools get no request grant](/data/yellow/libersystem/docs/todo/P02M0188.md:25).
+   - The protected screen [renders parameters as at most 32 hex bytes](/data/yellow/libersystem/src/user/services/logic/src/admin_descriptor.rs:153).
+
+   Changing BMC users means setting passwords, and P02M0188 [deliberately has no secret entry](/data/yellow/libersystem/docs/todo/P02M0188.md:10). A password placed in the parameters is shown on the screen, and a digest of the descriptor that contains it is [written to the journal](/data/yellow/libersystem/docs/todo/P02M0188.md:163), which is meant to [exclude secrets](/data/yellow/libersystem/docs/todo/P02M0188.md:167). Placed in the payload instead, it appears on screen only as a digest that nobody can check.
+
+   Power control through the BMC also bypasses [the one door to stopping the machine](/data/yellow/libersystem/src/idl/process.lsidl:172), which [stays with SystemManager](/data/yellow/libersystem/docs/todo/P02M0181.md:7). It is also a hard stop, with no flush first.
+
+   Each action needs IDL, executor, policy, rendering and gate work, and none of it is in the plan. The user-change action cannot be built on the path P02M0188 delivered.
+
+   **Correct the SEL, chassis and LAN/user items:**
+   - Keep the LAN configuration and users read-only, unless a secret-entry design is planned alongside them.
+   - Itemize the AdminService extension for SEL clear and chassis control: the new actions, the scope bound, several actions per executor, a `bmc` policy row, readable rendering and gate cases.
+   - State how BMC power control relates to SystemManager. For example, reset and cycle only after an orderly stop, or a descriptor that names the operation a hard stop.
+
+6. **Medium - The item that logs the system's own events relies on a shutdown notice and a kernel path to the BMC that do not exist and are not planned.**
+
+   [The item](/data/yellow/libersystem/docs/todo/P02M0201.md:40) logs three events: boot, orderly shutdown and kernel panic.
+
+   Orderly shutdown: SystemManager's [reboot and power-off are one kernel call each](/data/yellow/libersystem/src/user/services/system_manager/src/main.rs:434), and `system-power` [deliberately has no graceful shutdown](/data/yellow/libersystem/src/idl/process.lsidl:185). No service is told that a shutdown is coming.
+
+   Kernel panic: the [panic handler](/data/yellow/libersystem/src/kernel/panic.rs:5) prints to serial and halts. The interface belongs to a userspace driver through a `PortRange`, and the kernel knows neither the KCS protocol nor where the interface is: [AML runs in userspace by default](/data/yellow/libersystem/docs/todo/P02M0196.md:46), and no SMBIOS table reaches the kernel (finding 7). P02M0191 plans a polled panic path like this [for COM1 only](/data/yellow/libersystem/docs/todo/P02M0191.md:42).
+
+   The gate [checks only the boot event](/data/yellow/libersystem/docs/todo/P02M0201.md:53). So two of the three promised events have no mechanism, and the panic event, the one that matters most after a crash, has no owner and no test.
+
+   **Correct the system-events item:**
+   - Keep the boot event.
+   - Make the shutdown event depend on a named pre-shutdown notification, as an item here or in SystemManager's plan.
+   - Either drop the panic event or plan it as kernel work: the interface's location handed to the kernel at bind, a polled writer that aborts an in-flight transaction, and who owns the interface after a panic. Add a gate that panics on purpose and reads the log.
+
+7. **Low - SMBIOS type 38 cannot be read, because nothing carries the SMBIOS table to the system.**
+
+   [Discovery](/data/yellow/libersystem/docs/todo/P02M0201.md:29) uses the `IPI0001` device and SMBIOS type 38, "the second checking the first". P02M0196a lists [SMBIOS type 38 as a static source](/data/yellow/libersystem/docs/todo/P02M0196.md:36).
+
+   But the only firmware tables [the boot hand-off](/data/yellow/libersystem/src/boot/protocol/src/lib.rs:179) carries are the [RSDP](/data/yellow/libersystem/src/boot/protocol/src/lib.rs:218) and a [device tree](/data/yellow/libersystem/src/boot/protocol/src/lib.rs:232). The [x86 loader looks up only the ACPI tables](/data/yellow/libersystem/src/boot/loader/src/arch/x86_64/mod.rs:403) in the firmware's configuration table, and no source file under `src/` mentions SMBIOS.
+
+   So the cross-check cannot be built as written. SMBIOS is also the only route to the ISA interfaces that does not wait for the whole AML interpreter.
+
+   **Correct the discovery item**, which a small change fixes: make `IPI0001` sufficient and SMBIOS optional, or have P02M0196a itemize the loader and hand-off work and reference that item here.
+
+Validation was plan, source and QEMU source inspection, plus QEMU 10.0.11 `-device <name>,help` property queries, which start no VM. No plan or source code was modified, and no build or guest execution was performed for this audit.
+
+PLANNER'S RESPONSE ON P02M0201 (2026-09-26T02:52:54Z):
+
+Verified every finding against the working tree and the plans as they stand after this round's coordinated edits. Source: `src/idl/device.lsidl` (the closed `provider-kind` ends at `admin-executor = 20`, with no `ipmi` or `watchdog`), DeviceManager's `publish_all` (a publication exists only as a committed binding's declared `provides`), `power.lsidl` (`source-kind` is AC, battery, UPS, load, thermal zone; four trip kinds), `observability.lsidl` (the graph holds components and trace spans), `admin.lsidl` (two actions, `@bound(2)` scope), `admin_service.rs` (`action_of` maps one publication name to one action, `adopt` refuses a second executor for an action), `admin_descriptor.rs` (parameters shown as at most 32 hex bytes), `permission_manager.rs` `admin_policy` (DFU and the probes only), `process.lsidl` `system-power`, SystemManager's `PowerApi`, ServiceManager's `shutdown_all` (SIG_KILL in reverse order, no service told), `panic.rs` (serial, then halt), the kernel PCI scan (`probe_bar` and `bar_address` skip I/O BARs, `RESOURCED` is class-keyed memory BARs, every other function an identity row), `device.rs`, the boot protocol (`rsdp` and `dtb` only) and the x86 loader's ACPI-only configuration-table lookup. QEMU: the v10.0.0 sources of `ipmi.c` (`ipmi_do_hw_op`: 0xD5 for power cycle and power up), `ipmi_bmc_sim.c` (watchdog expiry calls `do_hw_op` directly; no reset handler; no LAN, user or identify command), `ipmi_bmc_extern.c` (0xC3 after 4 s, 0xD2 when disconnected), `ipmi_kcs.c`/`ipmi_bt.c` (0xCA past 300 bytes, BT sequence rewritten), `smbus_ipmi.c` (255 bytes/0xC6, no PEC), `pci_ipmi_kcs.c`/`pci_ipmi_bt.c` (I/O BAR 0, INTx only), `smbus_ich9.c` (BAR 4 decoded only while HOSTC.HST_EN is set), `hw/acpi/ipmi.c` (`IPI0001`, `I2cSerialBusV2` with resource source "^") and SMBIOS type 38, plus `qemu-system-x86_64 -device NAME,help` for the seven IPMI devices (no guest started). All seven findings are correct in substance and all are ACCEPTED; three take a smaller or different correction than the one recommended, stated below.
+
+1. **ACCEPTED - Process graph, publications and the sensor vocabulary.** Confirmed: no `ipmi` kind, publication only through a committed binding, no power-supply source kind, adapters only for ACPI and HID, no sensor record in the graph. Plan changes: a new "WHO HOLDS WHAT" section - `ipmi`, one driver program and one process per bound interface, holds the claim, the message layer and the `ipmi` (new kind, one consumer), `power-source`, `watchdog` and two `admin-executor` publications; `smbus_ich9` publishes P02M0195's `i2c-bus`; `bmc_service` holds no claim, publishes nothing and consumes `ipmi` through a kind-scoped catalogue connection; `bmc` is the tool. A "MANIFEST DECLARATIONS" item (matches, `dma = "none"`, `provides` with most/consumers, `ipmi` appended at version 1) and the BMC service's manifest row (catalogue factory for `ipmi`, supervisor read root, its serve root, the shutdown-notice declaration). PET PRIORITY: one queue in front of the single-message interface, a pet or re-arm at its head, long reads cut into bounded transactions, a 5 s transaction deadline and a 1 s KCS abort, so a pet waits at most 6 s and the BMC watchdog's shortest advertised timeout is 15 s (three deadlines); a host suite drives a stuck read ahead of a pet. SENSORS: temperatures become `thermal-zone` sources (at most sixteen, P02M0181's per-provider cap), upper non-critical/critical/non-recoverable as `passive`/`hot`/`critical` trips, `over-temperature` as a reported alarm; power supplies are LEFT OUT of P02M0181 (discrete sensors; no source kind fits) and shown by the tool, recorded in EXCLUDES. A `power_model::ipmi` adapter (SDR linear conversion in checked arithmetic, units to millidegrees Celsius, unknown/unsupported states) is itemized. "In the system graph" is dropped: sensors are the tool's. Two interfaces to one BMC are now stated (AdminService's existing refusal of a second executor, one watchdog held, the operator disables one); automatic de-duplication is excluded.
+
+2. **ACCEPTED - PCI I/O BARs and the ICH9 host enable.** Confirmed in `arch/common/pci/mod.rs` and `device.rs`, and in QEMU's sources. Per the cross-milestone decision the PCI I/O BAR source (every function's I/O BARs recorded by the scan, minted with the PCI claim, I/O decode set at claim) belongs to P02M0191, whose plan now carries it as its source (b); this plan depends on it and orders the PCI forms FIRST, since they need no firmware description. Plan changes: a "KERNEL'S RESOLVER ROWS" item - class 0x0C/0x07 interfaces 0x01 and 0x02 naming BAR 0 (an I/O BAR as a `PortRange`, a memory BAR as the existing MMIO grant), and `8086:2930` in the (vendor, device)-keyed table naming BAR 4, the kernel saving HOSTC, setting HST_EN and clearing I2C_EN AT CLAIM and restoring it at release (the `i2c-i801` sequence). Declined part: a runtime kernel-mediated configuration write - the claim-time write is enough and keeps this milestone independent of P02M0200's declared registers. Also stated: every form polls (the PCI models are INTx-only), and the PCI forms on aarch64/riscv64 are excluded because P02M0191 answers `unsupported` there.
+
+3. **ACCEPTED - SSIF and the bus contract.** Confirmed: `hid-i2c`'s `I2cBus` is three raw I2C operations, `smbus-ipmi` needs device-counted blocks of at most 32 bytes, `pm_smbus` performs SMBus protocols only, and P02M0099 says SSIF takes the contract "as it stands". Plan changes: SSIF uses the SMBus half of P02M0195's ONE contract with its declared functionality set; the ICH9 driver declares block write, block read returning the device's count, and PEC, and NO plain I2C (a HID device is refused on it); SSIF binds as P02M0195's child binding with an address-scoped connection, polls, and runs on ICH9 and not on virtio-i2c, which cannot serve a device-counted block read; the alert line is dropped and SMBus alert excluded. Declined part: a separate small SMBus block contract - one contract with a functionality set is smaller and is what P02M0195 now defines. P02M0099's sentence is not edited here (only this plan and this file are); its correction is passed to the coordinator as a cross-plan change.
+
+4. **ACCEPTED - What QEMU can and cannot prove.** Every QEMU behaviour cited was confirmed in the v10.0.0 sources. Plan changes: a "WHAT IT CANNOT SHOW" section; chassis control proved by hard reset (a second boot on the serial log), power down (the `shutdown` run state under `-no-shutdown`, read with `query-status`), soft shutdown (the same state after DeviceManager's power-button line) and power cycle as the BMC's reported 0xD5 refusal - DURABLE oracles instead of QMP events, because the harness holds no standing QMP listener; the BMC watchdog through P02M0200c's BMC case with the serial log's boot count and the simulator's own expiration flags, not QMP; a harness BMC, `ipmi-harness-bmc.py`, behind `ipmi-bmc-extern` over a Unix socket, with hostile modes QEMU passes through (a 273-300 byte KCS answer against the driver's 272-byte bound, silence as 0xC3, a closed socket as 0xD2, malformed records); host suites with a scripted register model for the sequence number never sent, the BT length past its buffer, stuck interfaces, SSIF block errors, PEC and the pet queue. Different part: LAN configuration, users, identify and the live sensor change are proved against the harness BMC's scripted answers (decoding per the specification's layouts), not only if the owner approves `ipmi_sim`; the `ipmi_sim`/`ipmitool` cross-check stays the one test against a second implementation and stays "asked when the part starts". Also: `smbus-ipmi` at 0x10 (its default 0 is the general-call address), the ISA forms with `irq=0`, all five interfaces in one boot.
+
+5. **ACCEPTED - Administrative actions, secrets and SystemManager.** Confirmed in `admin.lsidl`, `admin_service.rs`, `admin_descriptor.rs`, `permission_manager.rs` and P02M0188. Plan changes: LAN configuration and users are READ-ONLY; changing them is excluded with the reason (a user change is a password; P02M0188 has no secret entry and its journal excludes secrets). THE ADMINSERVICE EXTENSION is itemized: `bmc-sel-clear = 3` and `bmc-chassis-control = 4` appended at version 1; the `bmc` row in `admin_policy` with the `bmc:` prefix; what the executor freezes (target `bmc:<GUID>` at the binding's generation, the entry count or one operation byte, no payload) and revalidates; an `Operation:` line the service renders from a fixed table, with unrenderable parameters refused; the journal; host tests and gate cases; the tool's PermissionManager row (`Bmc` and `AdminRequest`). The relation to SystemManager is stated: `system-power` remains the only way the system stops itself and the shell's `shutdown`/`reboot` its orderly form; chassis control is the BMC acting from outside, reachable only through AdminService, and the screen names power down, cycle and reset as hard stops; soft shutdown takes the system's own power-button path; power up and the diagnostic interrupt are refused. Declined part: "several actions per executor" - two executor publications with one action each leave AdminService's adoption rule and its refusal of a second executor unchanged, and the existing `@bound(2)` scope already holds the tool's two actions.
+
+6. **ACCEPTED - The system's own events.** Confirmed: ServiceManager's orderly path kills services without telling them, `system-power` is one syscall, the panic handler prints and halts. Plan changes: BOOT COMPLETED keeps, with its trigger defined (the supervisor status the `online` report tests, read through the supervisor role, at most once per boot); the ORDERLY SHUTDOWN event rides P02M0200's orderly-shutdown notice - declared in the BMC service's manifest row, the driver sending the event, answered within the notice's bound - and immediate `system-power` calls and BMC hard stops log none, by design. The PANIC event is DROPPED to EXCLUDES with its reason: it needs an IPMI writer inside the kernel, and the BMC watchdog already records a machine that stopped. Declined part: planning the kernel panic path.
+
+7. **ACCEPTED - SMBIOS.** Confirmed: the hand-off carries only the RSDP and a device tree. Plan change: `IPI0001` is sufficient; SMBIOS type 38 is an optional cross-check through P02M0196a's SMBIOS item and its merge-by-resources rule (one device when both start at one base, refused and reported otherwise); a BMC that SMBIOS alone describes is excluded.
+
+Re-check of the whole plan: it is COMPLETE (each original deliverable is itemized or excluded with a reason, and each part names its prerequisites and order); CORRECT (every QEMU behaviour it relies on or works around is taken from the QEMU 10.0 sources, and every system fact from the current tree); FEASIBLE (the PCI forms need only P02M0191; the ISA forms add P02M0196a/b; SSIF adds P02M0195's bus half and P02M0196's companion join; part b needs P02M0200a, P02M0188 and the landed P02M0181); and CONSISTENT (the 272-byte bound sits below QEMU's 300-byte buffer, the 5 s deadline above `ipmi-bmc-extern`'s 4 s, the 15 s shortest watchdog timeout covers three deadlines, sixteen thermal zones match P02M0181's cap, two actions match the scope bound, nothing is versioned). The owner question already deferred - installing Debian's `openipmi` and `ipmitool` - stays asked when the part starts. No source code was changed; only the plan and this response were written.
