@@ -708,3 +708,31 @@ Re-check of the whole plan:
 - The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0197.md` only. No source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0197 (2026-09-27T03:51:12Z):
+
+**Rating: 10/10.** The last re-audit's one finding is corrected. The release condition is stronger than the one proposed, and the planner also closed the three gaps it found around the finding. No unresolved issue, contradiction or new material defect was found.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-27T02:02:40Z;
+- the plan at `dcc07154` (the working tree is identical), whole, and `git diff 29679ba1 dcc07154` for it;
+- in the tree:
+  - the shell's `graceful_power`, which prints its banner, sends `!poweroff` or `!reboot` and blocks ([shell.rs](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1026));
+  - the shell's trailing `&` ([shell.rs](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1078));
+  - ServiceManager's power-verb line, a `debug_write` ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1930));
+  - `rt::print`, which a process with no console channel sends to the kernel's debug port ([rt](/data/yellow/libersystem/src/user/runtime/rt/src/lib.rs:453));
+  - the development fixtures bound at a pinned address ([power_fixture.rs](/data/yellow/libersystem/src/user/drivers/core/src/power_fixture.rs:5));
+- in the harness: the `hotplug0` port on all three targets ([x86_64 suite](/data/yellow/libersystem/src/harness/qemu-run.sh:886), [x86_64 interactive](/data/yellow/libersystem/src/harness/qemu-run.sh:2141), [aarch64](/data/yellow/libersystem/src/harness/qemu-run.sh:2531)), and the hot-plug gate that already `device_add`s into it.
+
+These corrections hold:
+- **Finding 1 (the `shutdown` case).**
+  - The held binding is the last one bound, and step 4 now suspends ONE AT A TIME ([step 4](/data/yellow/libersystem/docs/todo/P02M0197.md:119)). So while the fixture holds, no binding that a typed line crosses has been asked.
+  - The release follows ServiceManager's line. As the planner says, that line is the only evidence that the verb arrived while step 4 was in flight. The shell's echo would prove only that ConsoleService had the line.
+  - The ORDERLY SEQUENCE bullet now says what ending at the next step means ([rule](/data/yellow/libersystem/docs/todo/P02M0197.md:67)), and the unwind is reported on the log, naming the sequence and its door ([unwind](/data/yellow/libersystem/docs/todo/P02M0197.md:188)). An implementation that queues the verb therefore prints `sleep: entered` and fails, and one that never takes the verb leaves the harness waiting ([case](/data/yellow/libersystem/docs/todo/P02M0197.md:401)).
+  - The run is feasible in this tree:
+    - A background `sleepctl` leaves VT 1's shell at its prompt, which a foreground one frozen at step 2 could not do.
+    - The fixture's "holds" line and ServiceManager's line reach the serial log through the kernel's debug port, so they depend neither on LogService nor on the writes step 3 holds.
+    - The port the fixture is matched at exists on every target.
+  - The case's "native hot-plug port" on x86_64 is the boot that carries `acpi-pci-hotplug-with-bridge-support=off` ([global](/data/yellow/libersystem/src/harness/qemu-run.sh:2140)), as the S3 case already requires. Without that global, P02M0196's `_OSC` rule leaves the slot unarmed.
+
+Validation: read-only inspection of the plan, its diff between the last two commits, the audit history, and the sources and harness files named above. No plan, source or existing audit content was modified, and nothing was built, tested, benchmarked or booted.

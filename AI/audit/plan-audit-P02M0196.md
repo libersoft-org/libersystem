@@ -612,3 +612,44 @@ Re-check of the whole plan:
 - The file is ASCII and cites no audit. The only lines over 110 columns are seven that HEAD already has. The `Status:` line is kept.
 
 Edited `docs/todo/P02M0196.md` and, for the coordinated sentence, `docs/todo/P02M0195.md`. No source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0196 (2026-09-27T03:51:12Z):
+
+**Rating: 8/10.** The last re-audit's finding is corrected. An instance's "namespace loaded" report is now the one point at which DeviceManager learns of a late companion and grants the `_AEI` lines, and every place in the plan names it. One gap is newly found, in the restart the plan designs and gates: nothing says what a new instance's walk does to the rows the dead instance published. For every row without a range, the text as written yields a second row and a second binding.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-27T02:02:40Z;
+- the plan at `dcc07154` (the working tree is identical), whole, and `git diff 29679ba1 dcc07154` for it;
+- the coordinated sentence in [P02M0195](/data/yellow/libersystem/docs/todo/P02M0195.md:88);
+- in the tree:
+  - the device-event kinds ([abi](/data/yellow/libersystem/src/abi/src/lib.rs:540)), and `serve_bus_events`, which dispatches only those three ([device_manager.rs](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:4995));
+  - `device_info`, which DeviceManager calls only in its two boot rounds and in `admit_arrival` ([device_manager.rs](/data/yellow/libersystem/src/user/services/core/src/device_manager.rs:5141));
+  - `plan_relaunchable`, `relaunch_planned`, `Kept::end_of` and the `DEVPERM` hand-off, which the stage paragraph cites.
+
+These corrections hold:
+- **Finding 1 (the trigger).** DeviceManager learns of a late companion at the instance's report, which the kernel passes after every row and every companion the walk published ([stage paragraph](/data/yellow/libersystem/docs/todo/P02M0196.md:181)).
+  - The planner's widening is right. For a phase-two GPIO controller the first `_AEI` grant had no trigger at all, not only a late one. The GPIO item, the companion join, the node-scoped channel, the x86_64 gate and P02M0195 now name the same point.
+  - Choosing the report over a per-companion event is sound. Only a walk attaches a companion, and the report is already the per-instance synchronisation point.
+  - "Had not yet read" keeps the restart case to one channel per driver.
+
+1. **Medium - Nothing says what a restarted instance's walk does to the rows, reservations and companions the dead instance published. For every row without a range, the text yields a second row with the same identity, and DeviceManager binds a second driver to it. Rows without a range include the battery, the AC adapter, the lid, the buttons, the thermal zones, the Time and Alarm Device, a video output, and a HID-over-I2C or SSIF device.**
+
+   What the plan says:
+   - When the service dies, the kernel disables its GPEs and revokes its regions. Its node channels close, "so each driver asks DeviceManager again", and its connections close ([restart](/data/yellow/libersystem/docs/todo/P02M0196.md:196)). So the bindings outlive the instance, and so do the rows under them. Nothing withdraws them.
+   - The new instance walks a fresh namespace and [reports each present device](/data/yellow/libersystem/docs/todo/P02M0196.md:287) through the call that [reports and withdraws rows](/data/yellow/libersystem/docs/todo/P02M0196.md:253).
+   - Only the merge rule makes two descriptions one row, and it needs overlapping ranges that start at the same base ([merge](/data/yellow/libersystem/docs/todo/P02M0196.md:51)). A reservation is "never merged", and it keeps every NEW row published after it out of its ranges ([reservations](/data/yellow/libersystem/docs/todo/P02M0196.md:291)).
+   - The plan compares a re-walk with the existing rows in one case only: a device-check or eject `Notify`, whose re-walk ["withdraws what left"](/data/yellow/libersystem/docs/todo/P02M0196.md:290).
+
+   What follows at the new instance's walk:
+   - A row with a range is reported again identically and merges into itself. That is harmless.
+   - A row with no range has nothing to merge on. A second row with the same `acpi:` identity is published and bound as its row arrives. That covers every class that P02M0099, P02M0197 and P02M0199 bind to a resource-less node: a second battery and AC producer, a second lid provider, a second power-button driver, a second `acpi_backlight`, and a second `i2c_hid` whose address the controller has already granted.
+   - A reservation reported again (q35's `DRAC`) is a new row inside the old one's range. It is either kept out, and so refused and reported at every restart, or recorded twice.
+   - A device an eject removed while no instance was running keeps its row and its binding, because no walk ever withdraws it.
+
+   The x86_64 gate kills and restarts the service ([gate](/data/yellow/libersystem/docs/todo/P02M0196.md:458)). The one device it checks afterwards has a range, so the gate passes either way. This is a new finding, in text that has stood since the restart was introduced.
+
+   **Correct the restart sentence.** Reconcile a new instance's walk with what the dead instance published, the way a device-check re-walk is reconciled with its subtree:
+   - A row, reservation or companion reported again under the same identity is the same one, and no new event is sent.
+   - At the instance's "namespace loaded" report, the kernel withdraws whatever that walk did not report again.
+
+Validation: read-only inspection of the plan, its diff between the last two commits, the audit history, the working-tree P02M0195, and the sources named above. No plan, source or existing audit content was modified, and nothing was built, tested, benchmarked or booted.
