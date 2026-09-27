@@ -31,6 +31,10 @@ entropy = { path = "../user/libs/entropy" }
 # in this tree where a fixture cannot be planted. The parsing is host-tested over tables no firmware
 # would write; the kernel takes the answers.
 acpi = { path = "../acpi" }
+# THE FRAME ACCOUNT'S RECORD BUFFER, for the same reason: its layout, its bound, its refusal count and
+# the line form the drain writes are what a collector on the host depends on, so they are host-tested
+# there and the kernel only gives the buffer its storage and its hooks.
+perfbuf = { path = "../perfbuf" }
 # THE TPM 2.0 TRANSPORTS AND OPERATIONS, for the in-guest fixture test only: the one oracle that drives the
 # library's FIFO and CRB state machines over QEMU's real front-ends, with swtpm behind them. The shipping kernel
 # calls none of it - no binding exists for a TPM until the firmware-node identity does.

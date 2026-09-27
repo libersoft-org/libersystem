@@ -230,7 +230,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 138] = [
+const GATES: [(&str, &str); 139] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -415,6 +415,9 @@ const GATES: [(&str, &str); 138] = [
 	// as pixels - the half of that proof a log cannot make, because a renderer that draws nothing
 	// reports exactly what a renderer that draws everything reports.
 	("qemu-2d-demo", "bin.test2d-sw"),
+	// THE FRAME ACCOUNT, on the same demo and the real driver: its subject is the demo, whose modes arm,
+	// drain and report, and the layers it accounts for are covered below.
+	("qemu-2d-account", "bin.test2d-sw"),
 	// THE 3D DEMO ON A REAL SCREEN, for the same reason and against a different stack: a rasteriser
 	// whose depth test, texture addressing or blend equation is wrong reports exactly what a correct
 	// one reports, and the difference is in the pixels.
@@ -822,7 +825,7 @@ pub const PROFILE_ROW_GATES: [&str; 32] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 44] = [
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 45] = [
 	"dma-mode-x86_64",
 	// THE IN-GUEST FIXTURE GATES: each boots the development image with its fixture's QEMU test
 	// device and types a scenario at its probes, so each needs a guest slot and leaves a guest log.
@@ -841,6 +844,7 @@ pub const GATES_THAT_BOOT_A_GUEST: [&str; 44] = [
 	"qemu-dfu-tool",
 	"virtio-multiport",
 	"qemu-2d-demo",
+	"qemu-2d-account",
 	"qemu-3d-demo",
 	"qemu-pcie-hotplug",
 	"qemu-pcie-aer",
@@ -978,6 +982,14 @@ impl Catalog {
 			// loop's pacing, so a change to any of them is a change this gate can catch.
 			if gate == "qemu-2d-demo" {
 				for component in ["render2d", "soft2d", "surface", "graphics-app"] {
+					covers.push(component.to_string());
+				}
+			}
+			// THE FRAME ACCOUNT COVERS EVERY LAYER IT NAMES A TERM FOR: the drawing stack the demo's frames
+			// cover, and DisplayService, the driver and the kernel whose sites and scheduler records the
+			// account is made of - a change to any of them moves a number this gate refuses on.
+			if gate == "qemu-2d-account" {
+				for component in ["render2d", "soft2d", "surface", "graphics-app", "bin.display_service", "bin.virtio_gpu", "kernel"] {
 					covers.push(component.to_string());
 				}
 			}

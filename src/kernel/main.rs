@@ -30,6 +30,8 @@ mod memlayout;
 mod object;
 mod panic;
 mod pkg;
+// The frame account's record buffer: attached only on a `development-trace` boot. See the module.
+mod perf;
 // Fixed-hardware platform events (the power button), and the channel they are delivered on.
 mod platform_event;
 mod product;
@@ -442,6 +444,8 @@ fn boot_main() {
 	if arch::boot_profile() == Some("development-trace") {
 		serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
 	}
+	// AND THE FRAME ACCOUNT'S BUFFER, under the same condition and on no other boot.
+	perf::init();
 	// WHAT IS ACTUALLY TRUE AT THIS POINT. The line said "entering the userspace shell" and was
 	// followed by every driver binding, every service starting and the product banner before a
 	// prompt appeared - so the one line a reader takes as "the boot finished" was printed in the

@@ -296,6 +296,7 @@ dependencies = [
  "network-proto",
  "partition",
  "pcm",
+ "perfbuf",
  "pix",
  "png",
  "power-proto",
@@ -409,6 +410,10 @@ version = "0.0.0"
 
 [[package]]
 name = "pcm"
+version = "0.0.0"
+
+[[package]]
+name = "perfbuf"
 version = "0.0.0"
 
 [[package]]

@@ -24,6 +24,13 @@
 #
 # Usage:
 #   harness/perf-trace.py [--sock /tmp/ls-ser.sock] [--cmd help] [--window 3.0]
+#   harness/perf-trace.py --frame-account LOG [--drain N] [--demo-report FILE] [--json OUT]
+#
+# THE FRAME-ACCOUNT MODE reads a serial log AFTER a run rather than a live socket: the kernel's record
+# buffer drains every record of an armed window to the debug serial as `\x1ePERF` lines
+# extended by the thread, the core and the kind, and `frame_account.py` joins them into frames and
+# terms. It shares this file's marker form and its `tsc_hz` conversion; the console tracer below keeps
+# accepting its three- and four-field markers and ignores the seven-field records.
 #
 # Typical session (start a guest of your own; do NOT pattern-kill QEMU - this used to say
 # `pkill -9 qemu-system-x86`, which takes down every QEMU the user owns, including ones this has
@@ -99,6 +106,13 @@ def parse_marker(line: bytes):
 
 
 def main() -> None:
+	if len(sys.argv) > 1 and sys.argv[1] == "--frame-account":
+		# The collector is a module of its own so the fixture tests and the gate import it without a
+		# socket; this is the same tool's other mode.
+		sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+		import frame_account
+
+		sys.exit(frame_account.main(sys.argv[2:]))
 	ap = argparse.ArgumentParser(description="LiberSystem console latency tracer")
 	ap.add_argument("--sock", default="/tmp/ls-ser.sock", help="QEMU serial unix socket")
 	ap.add_argument("--cmd", default="help", help="command to send and measure")

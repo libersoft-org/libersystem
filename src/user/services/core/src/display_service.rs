@@ -733,6 +733,10 @@ impl DisplayState {
 		}
 		self.surfaces[index].pending.push(Pending { serial: present_serial, image });
 		self.stats.presents = self.stats.presents.saturating_add(1);
+		// ACCEPTED, for the frame account: the serial the reply will carry back, which is what joins
+		// the application's present to everything this service and the driver did for it.
+		perf_site(b"ds-acc\0\0", present_serial);
+		perf_site(b"ds-accs\0", index as u64);
 
 		// A FRAME ACCEPTED WHILE HIDDEN COMPLETES IN ORDER AS DISCARDED. It kept its place and never
 		// reached a screen, which is a different fact from "it was refused" and is why the outcome
@@ -757,6 +761,9 @@ impl DisplayState {
 	fn copy_and_flush(&mut self, index: usize, slot: usize, rects: &[Rect]) -> PresentOutcome {
 		let source_pixels: u64 = rects.iter().map(|rect| rect.width as u64 * rect.height as u64).sum();
 		let start_ns: u64 = clock_ns();
+		// THE BLIT AND THE DEVICE CALL, recorded exactly where `presentation-stats` takes its clock, so
+		// the account and the counters cannot disagree about where one ends and the other begins.
+		perf_site(b"ds-blt0\0", 0);
 		let mut output_pixels: u64 = 0;
 		let mut direct: bool = true;
 		// EVERY RECTANGLE IS COPIED, THEN ALL OF THEM ARE PRESENTED IN ONE CALL. The blit's own
@@ -773,8 +780,19 @@ impl DisplayState {
 			transferred.push(blit.rect);
 		}
 		let blit_done_ns: u64 = clock_ns();
+		perf_site(b"ds-blt1\0", 0);
+		perf_site(b"ds-dev0\0", 0);
 		let result: Result<(), Error> = self.flush_damage(&transferred);
+		perf_site(b"ds-dev1\0", result.is_ok() as u64);
 		let done_ns: u64 = clock_ns();
+		// What the blit moved, after both boundaries so they stay where the counters' clock is: the
+		// source and output pixels, the direct (1) or scaled (0) path, and the scanout it drew into.
+		if perf_sites_live() {
+			perf_site(b"ds-srcpx", source_pixels);
+			perf_site(b"ds-outpx", output_pixels);
+			perf_site(b"ds-path\0", direct as u64);
+			perf_site(b"ds-scan\0", ((self.scanout.width as u64) << 32) | self.scanout.height as u64);
+		}
 		self.stats.blit_ns = self.stats.blit_ns.saturating_add(blit_done_ns.saturating_sub(start_ns));
 		self.stats.flush_ns = self.stats.flush_ns.saturating_add(done_ns.saturating_sub(blit_done_ns));
 		self.stats.max_present_ns = self.stats.max_present_ns.max(done_ns.saturating_sub(start_ns));
@@ -825,6 +843,8 @@ impl DisplayState {
 			let _ = try_send(done, &frame, 0);
 		}
 		self.notify_image_available(index);
+		// THE COMPLETION SENT - the event, the release and the image-available notice.
+		perf_site(b"ds-cmpl\0", serial);
 	}
 
 	/// Tell a client an image is available, which is what it waits on instead of blocking.
@@ -1932,7 +1952,11 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 		if state.trusted_session != 0 {
 			waits.push(state.trusted_session);
 		}
+		// EACH PASS OF THE LOOP'S WAIT, with the number of handles it waits on - the per-pass cost that
+		// grows with the surface count - and which one ended it.
+		perf_site(b"ds-wait\0", waits.len() as u64);
 		let ready: i64 = wait_any(&waits, 0);
+		perf_site(b"ds-woke\0", ready as u64);
 		if ready < 0 {
 			continue;
 		}
@@ -2236,13 +2260,20 @@ fn serve_display(root: u64, admin: u64, stats_root: u64, mut trusted_root: u64, 
 				ReceivedCaps::Message { len, handles: caps } => {
 					let mut handle = caps;
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+					// THE FRAME ACCOUNT'S SITES: each request received with its operation,
+					// and each reply sent. One cached-flag test each unless a measurement is armed.
+					perf_site(b"ds-req\0\0", op as u64);
 					if op == surface::OP_EVENTS {
 						open_events(chan, &request[..len], &mut handle, &mut state);
 					} else {
 						let mut reply_handle = proto::codec::Handles::new();
 						let mut call = SurfaceCall { state: &mut state, chan };
 						if let Some(n) = surface::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_reply(chan, &reply[..n], reply_handle.as_slice(), surface_grant(op)) {
+							// STAMPED BEFORE THE SEND: the client is woken by it and may run on another core
+							// before this thread records anything after it.
+							perf_site(b"ds-rply\0", op as u64);
+							let sent = send_reply(chan, &reply[..n], reply_handle.as_slice(), surface_grant(op));
+							if !sent {
 								for &leftover in reply_handle.as_slice() {
 									close(leftover);
 								}

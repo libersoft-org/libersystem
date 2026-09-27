@@ -8,7 +8,7 @@ use crate::pacing::{Pacing, Step};
 use base_proto::generated::liber::base::v1::Error;
 use graphics_core::geom::Extent2D;
 use graphics_core::layout::ImageLayout;
-use rt::{NANOS_PER_TICK, clock, clock_ns, wait_any};
+use rt::{NANOS_PER_TICK, clock, clock_ns, perf_site, wait_any};
 use surface::{AcquiredImage, Client, Surface, wire_extent};
 
 /// One acquired image, and what it is.
@@ -92,7 +92,19 @@ impl FrameLoop {
 	/// rebuild. A loop that treated any of them as "ask again" would spin against a service that is
 	/// deliberately not blocking.
 	pub fn acquire(&mut self) -> Option<Frame> {
-		match self.surface.acquire() {
+		// THE FRAME ACCOUNT'S SITES: the call to DisplayService begun and answered, with the
+		// image it answered or `u64::MAX` for none. One cached-flag test each unless a measurement is
+		// armed on a `development-trace` boot.
+		perf_site(b"acq-beg\0", 0);
+		let acquired = self.surface.acquire();
+		perf_site(
+			b"acq-end\0",
+			match acquired {
+				Some(Ok(AcquiredImage::Image(index))) => index as u64,
+				_ => u64::MAX,
+			},
+		);
+		match acquired {
 			Some(Ok(AcquiredImage::Image(index))) => {
 				let mapping = self.surface.image(index)?;
 				Some(Frame { index, layout: mapping.layout(), addr: mapping.addr() })
@@ -134,8 +146,20 @@ impl FrameLoop {
 		// direction, and this is the one the client owns: the present that follows says the same
 		// thing and carries damage with it, so the signal is what a client sends when it wants the
 		// fact on the wire without waiting for a call to return.
+		perf_site(b"ready\0\0\0", frame.index as u64);
 		surface::signal_ready(self.surface.producer_endpoint(), frame.index);
-		match self.surface.present_whole(frame.index) {
+		// The present call begun (the rectangle count, zero for the whole surface) and returned (the
+		// serial DisplayService answered, which is what joins this frame to the service's records).
+		perf_site(b"prs-beg\0", 0);
+		let presented = self.surface.present_whole(frame.index);
+		perf_site(
+			b"prs-end\0",
+			match presented {
+				Some(Ok(serial)) => serial,
+				_ => u64::MAX,
+			},
+		);
+		match presented {
 			Some(Ok(serial)) => {
 				self.pacing.on_present(serial, clock_ns());
 				true
@@ -146,8 +170,18 @@ impl FrameLoop {
 
 	/// Present a drawn image's damaged rectangles.
 	pub fn present_rects(&mut self, frame: Frame, rects: &[surface::Rect]) -> bool {
+		perf_site(b"ready\0\0\0", frame.index as u64);
 		surface::signal_ready(self.surface.producer_endpoint(), frame.index);
-		match self.surface.present_rects(frame.index, rects) {
+		perf_site(b"prs-beg\0", rects.len() as u64);
+		let presented = self.surface.present_rects(frame.index, rects);
+		perf_site(
+			b"prs-end\0",
+			match presented {
+				Some(Ok(serial)) => serial,
+				_ => u64::MAX,
+			},
+		);
+		match presented {
 			Some(Ok(serial)) => {
 				self.pacing.on_present(serial, clock_ns());
 				true
@@ -205,7 +239,16 @@ impl FrameLoop {
 		if count == 0 {
 			return;
 		}
-		let _ = wait_any(&handles[..count], Self::tick_deadline(until));
+		let deadline = Self::tick_deadline(until);
+		// EVERY PARK, for the frame account: the deadline asked for, in nanoseconds from now and in
+		// the ticks it became (zero for none), and how the wait ended - a handle's index when a
+		// message woke it, a negative error when the deadline did.
+		if rt::perf_sites_live() {
+			perf_site(b"park-ns\0", until.map_or(0, |until| until.saturating_sub(clock_ns())));
+			perf_site(b"park-tk\0", if deadline == 0 { 0 } else { deadline.saturating_sub(clock()) });
+		}
+		let woke = wait_any(&handles[..count], deadline);
+		perf_site(b"park-end", woke as u64);
 		self.poll_events();
 		// EVERY RELEASE THE COMPLETION ENDPOINT CARRIED, drained without blocking: it is the pair a
 		// frame loop waits on WITHOUT a dispatch, and a loop that read one per wake would fall

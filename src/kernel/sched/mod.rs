@@ -881,7 +881,7 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 // all do, and building a vector of the claimed threads meant a short heap could abort the kernel on
 // an ordinary event. Sixteen at a time also keeps the bucket lock held for a bounded stretch, which
 // the previous shape did not.
-fn drain_bucket_into_run_queue(koid: u64) {
+fn drain_bucket_into_run_queue(koid: u64, cause: u8) {
 	loop {
 		let mut batch: [Option<Arc<Thread>>; 16] = [const { None }; 16];
 		let taken = {
@@ -902,13 +902,19 @@ fn drain_bucket_into_run_queue(koid: u64) {
 		}
 		for slot in batch.iter_mut().take(taken) {
 			if let Some(thread) = slot.take() {
-				enqueue(thread);
+				enqueue(thread, cause);
 			}
 		}
 	}
 }
 
 pub fn wake_object(koid: u64) {
+	wake_object_for(koid, perfbuf::WOKEN_BY_OTHER);
+}
+
+// A wake whose cause the frame account records: a channel send says MESSAGE, and everything that
+// calls plain `wake_object` - a close, an event, an interrupt, a timer object - is OTHER.
+pub fn wake_object_for(koid: u64, cause: u8) {
 	// The sets watching this object, collected before anything is woken and NOT removed - an
 	// observer outlives the wake, which is the whole difference between it and a waiter.
 	// Into a fixed array, allocating NOTHING.
@@ -941,13 +947,13 @@ pub fn wake_object(koid: u64) {
 	// `push`: waking is what a send, a close and a timer expiry all do, so a short heap turned an
 	// ordinary event into a kernel abort. A fixed batch takes what it can, drops the lock, enqueues,
 	// and comes back for more - which also shortens the time the bucket is held.
-	drain_bucket_into_run_queue(koid);
+	drain_bucket_into_run_queue(koid, cause);
 	// One level, never a chain: a set may not contain a set, so a set's own wake reaches threads
 	// only. `WaitSet::add` is where that is refused.
 	for &set in sets.iter().take(set_count) {
 		// Same shape, same reason: a set's wake enqueues through the bounded drain rather than
 		// collecting into a vector under the lock.
-		drain_bucket_into_run_queue(set);
+		drain_bucket_into_run_queue(set, cause);
 	}
 }
 
@@ -959,7 +965,7 @@ pub fn wake_object(koid: u64) {
 // thread itself when it resumes.
 pub fn wake_thread(thread: &Arc<Thread>) {
 	if thread.try_claim_wake() {
-		enqueue(thread.clone());
+		enqueue(thread.clone(), perfbuf::WOKEN_BY_OTHER);
 	}
 }
 
@@ -990,7 +996,7 @@ pub fn check_deadlines() {
 		}
 		for slot in batch.iter_mut().take(taken) {
 			if let Some(thread) = slot.take() {
-				enqueue(thread);
+				enqueue(thread, perfbuf::WOKEN_BY_DEADLINE);
 			}
 		}
 	}
@@ -1005,7 +1011,7 @@ fn min_deadline() -> Option<u64> {
 }
 
 // Make a woken thread runnable again on the current core.
-fn enqueue(thread: Arc<Thread>) {
+fn enqueue(thread: Arc<Thread>, cause: u8) {
 	// A freshly claimed thread may still be completing its switch away: the block
 	// path zeroes the saved stack pointer before parking and the context switch
 	// writes the real value as its very first store. Wait for that store, so no
@@ -1015,6 +1021,10 @@ fn enqueue(thread: Arc<Thread>) {
 		core::hint::spin_loop();
 	}
 	thread.set_state(ThreadState::Ready);
+	// THE FRAME ACCOUNT'S WAKE RECORD, while a measurement is armed; otherwise one test of the flag.
+	if crate::perf::armed() {
+		crate::perf::wake(&thread, cause);
+	}
 	// The WAKER's run queue, which means a woken thread can resume on a different core
 	// than it left. That is migration, and it is deliberate: it puts the thread where the
 	// data that woke it is warm, and it needs no balancer.
@@ -1366,7 +1376,7 @@ pub fn on_timer_preempt(from_user: bool) {
 			return;
 		}
 	}
-	reschedule(Disposition::Requeue);
+	reschedule_as(Disposition::Requeue, perfbuf::LEFT_PREEMPTED);
 }
 
 // Load `want_cr3` into CR3 unless it is already active. All kernel code and
@@ -1394,6 +1404,17 @@ fn switch_address_space(want_cr3: u64) {
 
 // Core scheduling step: pick the next ready thread and context-switch to it.
 fn reschedule(disp: Disposition) {
+	let why = match disp {
+		Disposition::Requeue => perfbuf::LEFT_YIELDED,
+		Disposition::Retire => perfbuf::LEFT_EXITED,
+		Disposition::Block => perfbuf::LEFT_BLOCKED,
+	};
+	reschedule_as(disp, why);
+}
+
+// The same, with the reason the frame account records for the outgoing thread: a requeue is a YIELD
+// unless the tick preempted it, which only `on_timer_preempt` knows.
+fn reschedule_as(disp: Disposition, why: u8) {
 	// The whole switch runs with interrupts disabled so the timer ISR cannot fire
 	// between dropping the run-queue lock and completing switch_context (which would
 	// corrupt the half-switched stack). The interrupt flag is not part of the saved
@@ -1417,6 +1438,9 @@ fn reschedule(disp: Disposition) {
 		let prev = guard.current.take().expect("checked on the line above");
 		let old_sp = prev.kstack_ptr_addr();
 		prev.set_state(ThreadState::Ready);
+		if crate::perf::armed() {
+			crate::perf::switch(Some(&prev), None, why);
+		}
 		// ALLOC-OK: the intrusive `RunQueue` moves pointers - the link lives in the `Thread`.
 		guard.run_queue.push_back(prev);
 		let new_sp = sched.idle_sp.load(Ordering::Acquire);
@@ -1434,6 +1458,10 @@ fn reschedule(disp: Disposition) {
 
 	match next {
 		Some(next) => {
+			// THE FRAME ACCOUNT'S SWITCH RECORD, before the outgoing thread is stashed away.
+			if crate::perf::armed() {
+				crate::perf::switch(prev.as_deref(), Some(&next), why);
+			}
 			let old_sp = stash_prev(&mut guard, sched, prev, disp);
 			next.set_state(ThreadState::Running);
 			let new_sp = next.kstack_ptr_load();
@@ -1477,6 +1505,9 @@ fn reschedule(disp: Disposition) {
 					// while off their own CR3.
 					let old_sp = prev.kstack_ptr_addr();
 					prev.set_state(ThreadState::Exited);
+					if crate::perf::armed() {
+						crate::perf::switch(Some(&prev), None, why);
+					}
 					guard.zombie = Some(prev);
 					guard.current = None;
 					let new_sp = sched.idle_sp.load(Ordering::Acquire);
@@ -1503,6 +1534,9 @@ fn reschedule(disp: Disposition) {
 					// wait registry keeps us alive; we resume right here when woken
 					// and rescheduled onto a core.
 					let old_sp = prev.kstack_ptr_addr();
+					if crate::perf::armed() {
+						crate::perf::switch(Some(&prev), None, why);
+					}
 					guard.current = None;
 					let new_sp = sched.idle_sp.load(Ordering::Acquire);
 					drop(guard);

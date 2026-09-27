@@ -173,6 +173,10 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	// is bounded by `PROP_THREAD_LIMIT`, which a process cannot raise for itself, and the loading
 	// half of MANAGE is refused on a self handle rather than granted.
 	(SYS_PROCESS_SELF, 88),
+	// THE FRAME ACCOUNT'S RECORD BUFFER: append one record, and arm, disarm or drain the window. Both
+	// answer `ERR_UNSUPPORTED` on every boot but a `development-trace` one.
+	(SYS_PERF_RECORD, 89),
+	(SYS_PERF_CONTROL, 90),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.

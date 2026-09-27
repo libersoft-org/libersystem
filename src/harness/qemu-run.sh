@@ -21,6 +21,7 @@
 #             is why this is not x86_64-only. Refused together with TEST.
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
+#   GPU_SIZE=WxH  the x86_64 interactive `virtio-vga`'s scanout size (its xres and yres)
 #   MEM=      override RAM (default varies by arch)
 #   STRIP=    none | debug | all for a harness-created boot medium (default: all)
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
@@ -2237,7 +2238,18 @@ qemu_run_x86_64() {
 	# Interactive-only devices: virtio-input keyboard/tablet, virtio-vga, virtio-sound.
 	qemu_args+=(-device "virtio-keyboard-pci,$virtio_opts")
 	qemu_args+=(-device "virtio-tablet-pci,$virtio_opts")
-	qemu_args+=(-vga none -device "virtio-vga${virtio_plain:+,$virtio_plain}")
+	# GPU_SIZE=WxH sets the scanout's size, which the frame account varies together with
+	# the surface so the direct path is what scales. The size the driver actually reports is what an
+	# account records; this only asks the device for it.
+	local gpu_size_args=""
+	if [[ -n "${GPU_SIZE:-}" ]]; then
+		if [[ ! "$GPU_SIZE" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+			echo "qemu-run: GPU_SIZE must be WIDTHxHEIGHT, not '$GPU_SIZE'" >&2
+			exit 2
+		fi
+		gpu_size_args=",xres=${BASH_REMATCH[1]},yres=${BASH_REMATCH[2]}"
+	fi
+	qemu_args+=(-vga none -device "virtio-vga${virtio_plain:+,$virtio_plain}${gpu_size_args}")
 	qemu_append_audio qemu_args
 	qemu_args+=(-device "virtio-sound-pci,audiodev=snd0${virtio_plain:+,$virtio_plain}")
 

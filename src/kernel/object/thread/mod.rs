@@ -102,6 +102,9 @@ pub struct Thread {
 	// scheduler's own lock, so this one is never contended and exists to make the mutation sound
 	// rather than to order anything.
 	run_link: SpinLock<Option<Arc<Thread>>>,
+	// THE FRAME ACCOUNT'S WINDOW THIS THREAD WAS LAST NAMED IN (`crate::perf`), so its process's
+	// name is written once per armed window and the drain's table can name every thread it saw.
+	perf_window: AtomicU64,
 }
 
 // A kernel thread's stack, in its own virtual range with an unmapped page below it.
@@ -369,6 +372,7 @@ impl Thread {
 			started: AtomicBool::new(false),
 			process,
 			run_link: SpinLock::new(None),
+			perf_window: AtomicU64::new(0),
 		})?;
 		// Forward-link the thread to its process so signal delivery can reach it - and refuse to
 		// build the thread at all if the process is already tearing down. A thread that cannot be
@@ -423,6 +427,11 @@ impl Thread {
 	// The process this thread belongs to.
 	pub fn process(&self) -> &Arc<Process> {
 		&self.process
+	}
+
+	// The frame account's window this thread was last named in.
+	pub fn perf_window(&self) -> &AtomicU64 {
+		&self.perf_window
 	}
 
 	// Atomically claim the right to enqueue this thread for the first time. Returns

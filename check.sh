@@ -161,6 +161,11 @@ declare -A GATES=(
 	# colour glyph in its own palette. It boots its own guest unless one is up, and takes down only
 	# what it started.
 	["qemu-2d-demo"]="tools/check-qemu-2d-demo.sh"
+	# THE FRAME ACCOUNT: where a 2D frame's time goes, layer by layer, on the real virtio-gpu
+	# driver. Three boots of one image - the kernel's record buffer armed on `development-trace`, dormant
+	# on `development` - and a run refused unless every damage shape's named terms add up to its interval
+	# within five percent, each against the demo's own armed report.
+	["qemu-2d-account"]="tools/check-qemu-2d-account.sh"
 	# AND THE 3D ONE, which asks a different set of questions of a different kind of frame: that a lit
 	# object stands in front of a horizon in a bounded central region, that the ground's texture
 	# REPEATS, that the translucent panel is a mix rather than either of its operands, that the 2D

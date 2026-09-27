@@ -310,8 +310,9 @@ impl Channel {
 			super::trace::channel_event(super::trace::ENQUEUE, peer.trace_id, msg.id, 0, peer.limit as u32, super::trace::OK);
 			inbox.push_back(msg);
 		}
-		// The peer endpoint is now readable: wake any thread blocked waiting on it.
-		sched::wake_object(peer.header.koid());
+		// The peer endpoint is now readable: wake any thread blocked waiting on it - a MESSAGE, which
+		// is the one wake the frame account tells apart from the rest.
+		sched::wake_object_for(peer.header.koid(), perfbuf::WOKEN_BY_MESSAGE);
 		Ok(())
 	}
 

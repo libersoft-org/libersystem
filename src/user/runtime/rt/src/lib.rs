@@ -731,6 +731,87 @@ pub fn perf_mark_val(label: &[u8], val: u64) {
 	}
 }
 
+// THE FRAME ACCOUNT'S SITES, which are NOT `perf_mark`. A marker is a serial write, which
+// costs more than most of the terms a frame is made of; a site is one record appended to the
+// kernel's buffer, and only on a `development-trace` boot with a measurement armed.
+//
+// THE RUNTIME REQUEST IS THE BOOT PROFILE AND THERE IS NO BUILD FLAG. Every process reads the boot
+// profile once, on its first site, and caches the answer here: on every other boot a site is one
+// test of this flag and nothing else, so the ordinary build carries the sites and does not pay for
+// them. Under the profile a site is one `SYS_PERF_RECORD`, which the kernel drops unless a
+// measurement is armed.
+const SITES_UNKNOWN: u8 = 0;
+const SITES_DORMANT: u8 = 1;
+const SITES_LIVE: u8 = 2;
+static SITES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(SITES_UNKNOWN);
+
+// The clock a site is stamped with: the one the kernel stamps its own switch and wake records with.
+// That is `perf_now` on x86_64 and aarch64; on riscv64 `perf_now` reads the per-hart `rdcycle`, and
+// the kernel's clock is the global `time` counter, so a site reads that instead.
+#[cfg(not(target_arch = "riscv64"))]
+#[inline]
+pub fn perf_clock() -> u64 {
+	perf_now()
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub fn perf_clock() -> u64 {
+	let time: u64;
+	unsafe {
+		asm!("fence", "rdtime {}", out(reg) time, options(nostack, preserves_flags));
+	}
+	time
+}
+
+// Whether this boot records sites at all - for a caller that would otherwise compute a site's value
+// for nothing.
+#[inline]
+pub fn perf_sites_live() -> bool {
+	match SITES.load(Ordering::Relaxed) {
+		SITES_DORMANT => false,
+		SITES_LIVE => true,
+		_ => perf_sites_resolve(),
+	}
+}
+
+#[cold]
+fn perf_sites_resolve() -> bool {
+	let mut name = [0u8; 32];
+	let len = boot_profile(&mut name);
+	let live = &name[..len] == b"development-trace";
+	SITES.store(if live { SITES_LIVE } else { SITES_DORMANT }, Ordering::Relaxed);
+	live
+}
+
+// One site: an eight-byte tag, this moment on the site clock, and one value. A site with several
+// values records one site per value.
+#[inline]
+pub fn perf_site(site: &[u8; 8], value: u64) {
+	if SITES.load(Ordering::Relaxed) == SITES_DORMANT {
+		return;
+	}
+	perf_site_record(site, value);
+}
+
+#[inline(never)]
+fn perf_site_record(site: &[u8; 8], value: u64) {
+	let cycles = perf_clock();
+	if !perf_sites_live() {
+		return;
+	}
+	unsafe {
+		syscall(SYS_PERF_RECORD, u64::from_le_bytes(*site), cycles, value, 0);
+	}
+}
+
+// Arm, disarm or drain the kernel's record buffer (`PERF_CONTROL_*`). The drain writes every record
+// to the debug serial and answers how many; every operation answers `ERR_UNSUPPORTED` on a boot that
+// is not `development-trace`.
+pub fn perf_control(op: u64) -> i64 {
+	unsafe { syscall(SYS_PERF_CONTROL, op, 0, 0, 0) as i64 }
+}
+
 // Adopt a stdout console channel a launcher sent as the first bootstrap message
 // ("STDOUT" + the channel handle), so a spawned program's `print` output is routed to
 // the same console as its parent. The console is the program's controlling terminal, a

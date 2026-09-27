@@ -572,10 +572,15 @@ impl Queue {
 			fence(Ordering::SeqCst);
 			w16(avail + 2, old_avail.wrapping_add(1));
 			fence(Ordering::SeqCst);
+			// THE DEVICE'S ACKNOWLEDGEMENT, for the frame account: the notify, and the
+			// completion observed with the polls and the yields it took (`polls | yields << 32`) - the
+			// guest CPU a spin burned while the device worked, which is not guest work.
+			rt::perf_site(b"vq-ntfy\0", self.index as u64);
 			// Notify the device that this queue has work (the value is the queue index).
 			w16(self.notify_addr, self.index);
 			// Poll the used ring until the request completes.
 			let mut spins: u32 = 0;
+			let mut yields: u32 = 0;
 			loop {
 				fence(Ordering::SeqCst);
 				if r16(used + 2) != old_used {
@@ -592,8 +597,10 @@ impl Queue {
 				// (the console pipeline) is not starved while the present drains.
 				if spins % 4096 == 0 {
 					yield_now();
+					yields += 1;
 				}
 			}
+			rt::perf_site(b"vq-done\0", spins as u64 | (yields as u64) << 32);
 			// Acquire barrier: observing the used-index bump means the device has posted
 			// the completion, but on a weakly ordered core (RISC-V) the loads that read the
 			// device-written buffer may be reordered before the used-index load without a

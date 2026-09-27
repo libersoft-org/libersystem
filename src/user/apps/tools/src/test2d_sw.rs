@@ -420,11 +420,29 @@ struct Controls {
 	/// The logical size to ask for, or zero for the screen's own.
 	width: u32,
 	height: u32,
+	/// THE FRAME ACCOUNT'S MODES, each a measurement of the same program rather than a
+	/// second program. `--account` arms the kernel's record buffer after the warm-up and drains it
+	/// when the run ends; `--hidden-surfaces=N` opens N surfaces before the measured one and never
+	/// draws into them; `--offscreen` draws the same scene into private memory with no display at
+	/// all; `--primitives` measures what the frame path is built of, off the path.
+	account: bool,
+	hidden_surfaces: u32,
+	offscreen: bool,
+	primitives: bool,
 }
+
+/// How many presents a measured run lets pass before it arms: the first frames pay for the first
+/// touch of every image and every cache, which is a start-up cost and not a frame's.
+const ACCOUNT_WARM_UP: u32 = 8;
+
+/// The damage shapes a present takes, as the frame account groups them.
+const SHAPE_WHOLE: u64 = 0;
+const SHAPE_PARTIAL: u64 = 1;
+const SHAPE_MULTI_RECT: u64 = 2;
 
 impl Controls {
 	fn parse(args: &[u8]) -> Controls {
-		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT };
+		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT, account: false, hidden_surfaces: 0, offscreen: false, primitives: false };
 		for word in args.split(|byte| *byte == b' ' || *byte == 0) {
 			if let Some(value) = word.strip_prefix(b"--frames=") {
 				controls.frames = number(value);
@@ -434,6 +452,14 @@ impl Controls {
 				controls.input = false;
 			} else if word == b"--no-second-surface" {
 				controls.second_surface = false;
+			} else if word == b"--account" {
+				controls.account = true;
+			} else if word == b"--offscreen" {
+				controls.offscreen = true;
+			} else if word == b"--primitives" {
+				controls.primitives = true;
+			} else if let Some(value) = word.strip_prefix(b"--hidden-surfaces=") {
+				controls.hidden_surfaces = number(value);
 			} else if let Some(value) = word.strip_prefix(b"--size=") {
 				// A SIZE OF ITS OWN, for a MEASUREMENT run. A surface with a logical size is not
 				// reconfigured when the output changes, which is exactly wrong for the phase machine
@@ -470,6 +496,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let launch = recv_launch_bytes(bootstrap).unwrap_or_default();
 	let arguments = LaunchContext::decode(&launch).map(|context| context.arguments.clone().into_bytes()).unwrap_or_default();
 	let controls = Controls::parse(&arguments);
+	// THE TWO MODES WITH NO DISPLAY. Neither presents, so neither needs the display capability - and
+	// the offscreen run must not hold one, since what it measures is the drawing with the system taken
+	// away.
+	if controls.primitives {
+		measure_primitives();
+		exit();
+	}
+	if controls.offscreen {
+		draw_offscreen(&controls);
+		exit();
+	}
 	let display: u64 = recv_tagged(bootstrap, &mut buf, b"DISPLAY").unwrap_or(0);
 	if display == 0 {
 		print(b"test2d-sw: no display\n");
@@ -482,6 +519,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let input_channel: u64 = if controls.input { recv_tagged(bootstrap, &mut buf, b"INPUT_KEYS").unwrap_or(0) } else { 0 };
 
 	let client = surface::connect(display);
+	// THE HIDDEN SURFACES, OPENED FIRST, because the newest surface is the visible one. They are held
+	// for the whole run and never drawn into: what they cost is DisplayService's dispatch loop waiting
+	// on their channels on every pass, which is the thing measured.
+	let mut hidden: Vec<FrameLoop> = Vec::new();
+	for _ in 0..controls.hidden_surfaces {
+		match FrameLoop::open(&client, controls.width, controls.height, 2) {
+			Some(Ok(surface)) => hidden.push(surface),
+			_ => {
+				print(b"test2d-sw: a hidden surface was refused\n");
+				exit();
+			}
+		}
+	}
 	// TWO IMAGES, which is the fewest a present queue negotiates and the smallest number that can
 	// show a limit being reached at all.
 	let Some(Ok(mut frames)) = FrameLoop::open(&client, controls.width, controls.height, 2) else {
@@ -557,6 +607,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut previous_logical = (frames.surface().configuration().logical_extent.width, frames.surface().configuration().logical_extent.height);
 	let mut exit_requested = false;
 	let mut key_frame: [u8; 32] = [0; 32];
+	// THE ARMED WINDOW'S OWN REPORT, over the frames the account covers and nothing else: the draw of
+	// each armed frame, the interval up to each armed present, and how many presents took each shape.
+	let mut armed = false;
+	let mut armed_presents = [0u32; 3];
+	let mut armed_draw_total_ns: u64 = 0;
+	let mut armed_draw_count: u64 = 0;
+	let mut armed_interval_total_ns: u64 = 0;
+	let mut armed_interval_count: u64 = 0;
 
 	for _ in 0..ITERATIONS {
 		if exit_requested || frames.close_requested() {
@@ -587,18 +645,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let Some(frame) = frames.acquire() else { continue };
 				let extent = frame.layout.extent;
 				let phase = Phase::ORDER[phase_index];
+				perf_site(b"rec-beg\0", 0);
 				if scene.record(&mut canvas, &mut list, extent, phase, &images).is_err() {
 					print(b"test2d-sw: the scene was refused\n");
 					frames.abandon(frame);
 					break;
 				}
+				perf_site(b"rec-end\0", 0);
 				let drawing_began_ns = clock_ns();
+				perf_site(b"drw-beg\0", 0);
 				if !draw(&mut backend, &provider, &images, &list, &frame) {
 					print(b"test2d-sw: the backend refused the frame\n");
 					frames.abandon(frame);
 					break;
 				}
+				perf_site(b"drw-end\0", 0);
 				let drawing_took_ns = clock_ns().saturating_sub(drawing_began_ns);
+				if armed {
+					armed_draw_total_ns = armed_draw_total_ns.saturating_add(drawing_took_ns);
+					armed_draw_count += 1;
+				}
 				if matches!(phase, Phase::Scale) {
 					scaled_draw_total_ns = scaled_draw_total_ns.saturating_add(drawing_took_ns);
 					scaled_draw_worst_ns = scaled_draw_worst_ns.max(drawing_took_ns);
@@ -610,6 +676,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				// THE DAMAGE IS WHAT THE SCENE MOVED, and the phase says which shape that takes.
 				let movers = scene.movers(scene.tick, extent);
+				// THE DAMAGE SHAPE, said before the present so the account can group this frame by it:
+				// the whole surface, the partial phase's rectangles, or the two rectangles.
+				let shape = if full_frames_owed > 0 {
+					SHAPE_WHOLE
+				} else {
+					match phase {
+						Phase::Partial => SHAPE_PARTIAL,
+						Phase::MultiRect => SHAPE_MULTI_RECT,
+						_ => SHAPE_WHOLE,
+					}
+				};
+				perf_site(b"shape\0\0\0", shape);
 				let presented_ok = if full_frames_owed > 0 {
 					full_frames_owed -= 1;
 					frames.present_whole(frame)
@@ -652,8 +730,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						interval_total_ns = interval_total_ns.saturating_add(interval);
 						interval_worst_ns = interval_worst_ns.max(interval);
 						interval_count += 1;
+						if armed {
+							armed_interval_total_ns = armed_interval_total_ns.saturating_add(interval);
+							armed_interval_count += 1;
+						}
 					}
 					last_present_ns = now_ns;
+					if armed {
+						armed_presents[shape as usize] += 1;
+					}
+					// THE WARM-UP ENDS HERE. The buffer is armed right after the last warm-up present
+					// returned, and the moment it returned is recorded as the first armed frame's start
+					// - it happened a syscall before the window opened, and the frame it begins is in it.
+					if controls.account && !armed && presented == ACCOUNT_WARM_UP {
+						let returned = perf_clock();
+						if perf_control(PERF_CONTROL_ARM) == 0 {
+							armed = true;
+							perf_site(b"acct-beg", returned);
+						} else {
+							print(b"test2d-sw: the account cannot be armed - this boot is not `development-trace`\n");
+						}
+					}
 					recent_movers[1] = recent_movers[0];
 					recent_movers[0] = Some(movers);
 					if !scene.paused {
@@ -763,6 +860,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
+	// THE ACCOUNT'S DRAIN, before anything else can add to the window: the records go out on the debug
+	// serial, and the count comes back.
+	let mut drained: i64 = -1;
+	if armed {
+		perf_site(b"acct-end", 0);
+		drained = perf_control(PERF_CONTROL_DRAIN);
+	}
+	drop(hidden);
+
 	// WHAT IT DID, one line, which is what a harness reads.
 	let mut line: Vec<u8> = Vec::new();
 	line.extend_from_slice(b"test2d-sw:");
@@ -799,8 +905,250 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	line.push(b'\n');
 	print(&line);
+	// AND THE ARMED WINDOW'S OWN REPORT, a second line over the frames the account covers - which is
+	// what the account is checked against. Nanosecond totals as well as means, so the comparison is
+	// the clock conversion's and not a rounding's.
+	if armed {
+		let mut line: Vec<u8> = Vec::new();
+		line.extend_from_slice(b"test2d-sw: armed");
+		let configuration = frames.surface().configuration();
+		for (name, value) in [
+			(&b" presented="[..], (armed_presents[0] + armed_presents[1] + armed_presents[2]) as u64),
+			(b" whole=", armed_presents[SHAPE_WHOLE as usize] as u64),
+			(b" partial=", armed_presents[SHAPE_PARTIAL as usize] as u64),
+			(b" multi-rect=", armed_presents[SHAPE_MULTI_RECT as usize] as u64),
+			(b" surface-width=", configuration.physical_extent.width as u64),
+			(b" surface-height=", configuration.physical_extent.height as u64),
+			(b" hidden-surfaces=", controls.hidden_surfaces as u64),
+			(b" draw-count=", armed_draw_count),
+			(b" draw-total-ns=", armed_draw_total_ns),
+			(b" draw-mean-us=", armed_draw_total_ns / armed_draw_count.max(1) / 1_000),
+			(b" interval-count=", armed_interval_count),
+			(b" interval-total-ns=", armed_interval_total_ns),
+			(b" interval-mean-us=", armed_interval_total_ns / armed_interval_count.max(1) / 1_000),
+			(b" drained=", drained.max(0) as u64),
+		] {
+			line.extend_from_slice(name);
+			push_number64(&mut line, value);
+		}
+		line.push(b'\n');
+		print(&line);
+	}
 	print(b"test2d-sw: done\n");
 	exit()
+}
+
+fn push_number64(out: &mut Vec<u8>, value: u64) {
+	let mut digits = [0u8; 20];
+	let mut count = 0;
+	let mut value = value;
+	loop {
+		digits[count] = b'0' + (value % 10) as u8;
+		count += 1;
+		value /= 10;
+		if value == 0 {
+			break;
+		}
+	}
+	while count > 0 {
+		count -= 1;
+		out.push(digits[count]);
+	}
+}
+
+/// THE SAME DRAWING WORK IN ONE PROCESS, with the system taken away: the demo's own scene at the same
+/// size, recorded and drawn into private memory of a surface image's layout, with no DisplayService
+/// connection, no present and no pacing. Its frame is the recording and the draw, and the difference
+/// between it and the account's interval is what the system charges for being a system.
+fn draw_offscreen(controls: &Controls) {
+	if controls.width == 0 || controls.height == 0 {
+		print(b"test2d-sw: --offscreen needs --size=WxH - there is no screen to take a size from\n");
+		return;
+	}
+	let extent = Extent2D::new(controls.width, controls.height);
+	let pitch = controls.width.saturating_mul(4);
+	let Ok(layout) = ImageLayout::scanout(extent, pitch, PixelStorage::Known(PixelFormat::B8G8R8X8Unorm)) else {
+		print(b"test2d-sw: that size has no layout\n");
+		return;
+	};
+	let mut pixels: Vec<u8> = Vec::new();
+	if pixels.try_reserve_exact(pitch as usize * controls.height as usize).is_err() {
+		print(b"test2d-sw: no memory for the offscreen image\n");
+		return;
+	}
+	pixels.resize(pitch as usize * controls.height as usize, 0);
+	let Some(images) = Images::new() else {
+		print(b"test2d-sw: no scratch\n");
+		return;
+	};
+	let frames = if controls.frames == 0 { 160 } else { controls.frames };
+	let mut scene = Scene::new();
+	let mut canvas = Canvas::new();
+	let mut list = DrawList::default();
+	let mut backend = Soft2d::new();
+	let provider = Forms;
+	let target = graphics_app::Frame { index: 0, layout, addr: pixels.as_mut_ptr() as u64 };
+	let (mut frame_total, mut record_total, mut draw_total, mut counted) = (0u64, 0u64, 0u64, 0u64);
+	for index in 0..frames {
+		// THE SAME PHASE WALK AS THE LIVE RUN, so the scene draws the same work: each phase for its
+		// frames, then the next, stopping at the fourth.
+		let phase = Phase::ORDER[((index / controls.phase_frames.max(1)) as usize).min(3)];
+		let began = clock_ns();
+		if scene.record(&mut canvas, &mut list, extent, phase, &images).is_err() {
+			print(b"test2d-sw: the scene was refused\n");
+			return;
+		}
+		let recorded = clock_ns();
+		if !draw(&mut backend, &provider, &images, &list, &target) {
+			print(b"test2d-sw: the backend refused the frame\n");
+			return;
+		}
+		let drawn = clock_ns();
+		scene.tick = scene.tick.wrapping_add(1);
+		// The same warm-up as the account's, so the two are over the same kind of frame.
+		if index >= ACCOUNT_WARM_UP {
+			frame_total += drawn - began;
+			record_total += recorded - began;
+			draw_total += drawn - recorded;
+			counted += 1;
+		}
+	}
+	let mut line: Vec<u8> = Vec::new();
+	line.extend_from_slice(b"test2d-sw: offscreen");
+	for (name, value) in [
+		(&b" width="[..], controls.width as u64),
+		(b" height=", controls.height as u64),
+		(b" frames=", counted),
+		(b" frame-total-ns=", frame_total),
+		(b" frame-mean-us=", frame_total / counted.max(1) / 1_000),
+		(b" record-mean-us=", record_total / counted.max(1) / 1_000),
+		(b" draw-mean-us=", draw_total / counted.max(1) / 1_000),
+	] {
+		line.extend_from_slice(name);
+		push_number64(&mut line, value);
+	}
+	line.push(b'\n');
+	print(&line);
+	print(b"test2d-sw: done\n");
+}
+
+/// WHAT THE FRAME PATH IS BUILT OF, measured off the path in the same binary and profile: one
+/// syscall's floor, what a page of a surface image costs to create, map, touch, unmap and copy, the
+/// site clock's resolution, and one dormant instrument site. Each is reported in nanoseconds, with
+/// the clock readings it came from, so a layer's cost can be stated in these units.
+fn measure_primitives() {
+	const CALLS: u64 = 100_000;
+	let began = clock_ns();
+	for index in 0..CALLS {
+		// SAFETY: `SYS_DEBUG_NOOP` reads no memory and answers its first argument.
+		unsafe {
+			syscall(SYS_DEBUG_NOOP, index, 0, 0, 0);
+		}
+	}
+	let syscall_total = clock_ns() - began;
+	let mut line: Vec<u8> = Vec::new();
+	line.extend_from_slice(b"test2d-sw: primitives");
+	for (name, value) in [(&b" syscall-calls="[..], CALLS), (b" syscall-total-ns=", syscall_total), (b" syscall-ns=", syscall_total / CALLS)] {
+		line.extend_from_slice(name);
+		push_number64(&mut line, value);
+	}
+	// A SURFACE IMAGE'S WORTH OF PAGES, at the two sizes the account measures: 640x480 is 300 pages
+	// and the default 1280x800 scanout is 1,000.
+	for (width, height) in [(640u64, 480u64), (1280, 800)] {
+		let bytes = width * height * 4;
+		let pages = bytes.div_ceil(4096);
+		const ROUNDS: u64 = 20;
+		let (mut create, mut map, mut touch, mut unmap, mut copy) = (0u64, 0u64, 0u64, 0u64, 0u64);
+		let mut private: Vec<u8> = Vec::new();
+		private.resize(bytes as usize, 1);
+		for _ in 0..ROUNDS {
+			let t0 = clock_ns();
+			let handle = memory_object_create(bytes);
+			let t1 = clock_ns();
+			if handle < 0 {
+				print(b"test2d-sw: primitives could not create a memory object\n");
+				return;
+			}
+			// SAFETY: the mapping is used only between here and the unmap below, and for no longer.
+			let Some(base) = (unsafe { map_object(handle as u64) }) else {
+				close(handle as u64);
+				print(b"test2d-sw: primitives could not map a memory object\n");
+				return;
+			};
+			let t2 = clock_ns();
+			for page in 0..pages {
+				// SAFETY: every page is inside the mapping, which is live until the unmap below.
+				unsafe { core::ptr::write_volatile((base + page * 4096) as *mut u8, 1) };
+			}
+			let t3 = clock_ns();
+			// SAFETY: the mapping is `bytes` long and live, and `private` is exactly that long.
+			unsafe { core::ptr::copy_nonoverlapping(private.as_ptr(), base as *mut u8, bytes as usize) };
+			let t4 = clock_ns();
+			unmap_object(handle as u64);
+			let t5 = clock_ns();
+			close(handle as u64);
+			create += t1 - t0;
+			map += t2 - t1;
+			touch += t3 - t2;
+			copy += t4 - t3;
+			unmap += t5 - t4;
+		}
+		// Each field is prefixed with the image it is for: ` i640x480-map-ns=...`.
+		for (name, value) in [
+			(&b"-pages="[..], pages),
+			(b"-create-ns=", create / ROUNDS),
+			(b"-map-ns=", map / ROUNDS),
+			(b"-touch-ns=", touch / ROUNDS),
+			(b"-copy-ns=", copy / ROUNDS),
+			(b"-unmap-ns=", unmap / ROUNDS),
+		] {
+			line.extend_from_slice(b" i");
+			push_number64(&mut line, width);
+			line.push(b'x');
+			push_number64(&mut line, height);
+			line.extend_from_slice(name);
+			push_number64(&mut line, value);
+		}
+	}
+	// THE SITE CLOCK'S RESOLUTION: back-to-back reads, the smallest step and the median step, in the
+	// clock's own cycles - the account converts them with the kernel's published rate.
+	let mut steps: Vec<u64> = Vec::new();
+	let mut previous = perf_clock();
+	while steps.len() < 10_000 {
+		let now = perf_clock();
+		if now != previous {
+			steps.push(now - previous);
+			previous = now;
+		}
+	}
+	steps.sort_unstable();
+	// ONE DORMANT SITE: on a boot that is not `development-trace` a site is one test of a cached flag,
+	// and this is what that costs, in the loop that measures the syscall above.
+	const SITES: u64 = 1_000_000;
+	let began = clock_ns();
+	for index in 0..SITES {
+		perf_site(b"dormant\0", index);
+	}
+	let site_total = clock_ns() - began;
+	let began = clock_ns();
+	for index in 0..SITES {
+		core::hint::black_box(index);
+	}
+	let empty_total = clock_ns() - began;
+	for (name, value) in [
+		(&b" clock-min-cycles="[..], steps[0]),
+		(b" clock-median-cycles=", steps[steps.len() / 2]),
+		(b" site-live=", perf_sites_live() as u64),
+		(b" site-calls=", SITES),
+		(b" site-total-ns=", site_total),
+		(b" empty-loop-total-ns=", empty_total),
+	] {
+		line.extend_from_slice(name);
+		push_number64(&mut line, value);
+	}
+	line.push(b'\n');
+	print(&line);
+	print(b"test2d-sw: done\n");
 }
 
 /// What a key did.

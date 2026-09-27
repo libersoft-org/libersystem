@@ -670,6 +670,9 @@ fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, backin
 				match try_recv_caps(service, &mut req) {
 					PolledCaps::Message { len, mut handles } => {
 						let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
+						// THE FRAME ACCOUNT'S SITES: the call received and the reply sent; the
+						// device's acknowledgement of each command is recorded by the queue itself.
+						rt::perf_site(b"gp-call\0", op as u64);
 						if op == wire::display_device::OP_EVENTS {
 							open_event_stream(service, &req[..len], &mut handles, &mut scanout);
 						} else {
@@ -677,7 +680,11 @@ fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, backin
 							let mut reply_handles = Handles::new();
 							match wire::display_device::dispatch(&mut scanout, &req[..len], &mut handles, &mut reply, &mut reply_handles) {
 								Some(n) => {
-									if !send_caps_blocking(service, &reply[..n], reply_handles.as_slice()) {
+									// STAMPED BEFORE THE SEND, which wakes DisplayService - possibly on another
+									// core, before this thread could record anything after it.
+									rt::perf_site(b"gp-rply\0", op as u64);
+									let sent = send_caps_blocking(service, &reply[..n], reply_handles.as_slice());
+									if !sent {
 										for handle in reply_handles.as_slice() {
 											close(*handle);
 										}

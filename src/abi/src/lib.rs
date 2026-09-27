@@ -532,6 +532,29 @@ pub const SYS_PLATFORM_EVENTS: u64 = 87;
 // It takes no argument. There is no other process it could name and none it would be allowed to.
 pub const SYS_PROCESS_SELF: u64 = 88;
 
+// THE FRAME ACCOUNT'S RECORD BUFFER, and the two calls that reach it. They
+// answer `ERR_UNSUPPORTED` on every boot but a `development-trace` one, which is the only boot the
+// kernel gives the buffer its storage on - so the ordinary path pays one cached-flag test per site in
+// the runtime and never reaches the kernel at all.
+//
+// `SYS_PERF_RECORD(site, cycles, value)` appends one record: an eight-byte ASCII site tag packed
+// little-endian into `site`, the caller's own clock reading and one value; the kernel adds the thread
+// and the core. It answers 0 when the record was taken, `PERF_RECORD_UNARMED` when no window is open
+// (dropped, not counted) and `PERF_RECORD_REFUSED` when the buffer is full (refused AND counted - it
+// never wraps over an earlier record). An append never blocks, allocates or formats.
+//
+// `SYS_PERF_CONTROL(op)` ARMS the buffer (empties it and starts accepting - and from then on the
+// scheduler appends a record at every context switch and every wake), DISARMS it, or DRAINS it:
+// disarms, then writes every record to the debug serial as a `\x1ePERF` line, a table naming each
+// thread's process and one line of counts, and answers the number of records written.
+pub const SYS_PERF_RECORD: u64 = 89;
+pub const SYS_PERF_CONTROL: u64 = 90;
+pub const PERF_CONTROL_ARM: u64 = 1;
+pub const PERF_CONTROL_DISARM: u64 = 2;
+pub const PERF_CONTROL_DRAIN: u64 = 3;
+pub const PERF_RECORD_UNARMED: i64 = 1;
+pub const PERF_RECORD_REFUSED: i64 = 2;
+
 // What a platform event's one byte says.
 pub const PLATFORM_EVENT_POWER_BUTTON: u8 = 1;
 pub const PLATFORM_EVENT_SLEEP_BUTTON: u8 = 2;
