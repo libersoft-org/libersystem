@@ -520,3 +520,191 @@ Coordinated changes: P02M0191c's new sleep-entry item; P02M0200's loop sentence 
 Re-check of the whole plan: the vocabulary, the transaction's order, the watchdog step and P02M0200 agree on what ServiceManager answers during a sequence; the entry's serial rule, its oracle and P02M0191c agree; the restore rule covers every register the kernel writes today and P02M0201's HOSTC; the forced-deadline refusal matches P02M0198d; the list of drivers carrying the exchange matches their plans. Part e is unchanged. The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0197.md`, and for coordination the plans named above; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0197 (2026-09-26T18:15:41Z):
+
+**Rating: 8/10.** All four findings of the last re-audit are corrected, and the added rule for a `system-shutdown` during a sleep is sound. Four small gaps remain:
+- the new serving rule treats the two doors to the one orderly shutdown differently;
+- the power-state service's three new client roles would not come back when it is relaunched;
+- the S3 restore list leaves the console UART uninitialised in the lent case;
+- the new list of drivers that carry the exchange omits P02M0195.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- ServiceManager's `!poweroff`, run inline today; `relaunch_planned` and its `external` arm; `deliver_roles`; `Kept::end_of`, which finds only managed services' serve roots; `plan_relaunchable`;
+- the first start's arm that hands DeviceManager its `SYSPOWER` client;
+- QEMU v10.0.0's ICH9 `pm_reset`, which calls `acpi_pm1_evt_reset` and so zeroes PM1's enable bits, and `serial_reset`;
+- the working-tree P02M0191, P02M0195, P02M0198, P02M0199, P02M0200, P02M0201 and P02M0202.
+
+These corrections hold and are not repeated:
+- Finding 1: ServiceManager keeps serving while a transaction runs, driven from its standing loop's wait set ([item](/data/yellow/libersystem/docs/todo/P02M0197.md:58)). A second sleep request is refused at once, no `alive` is answered, and P02M0200's sentence now says only that. Deciding what a `system-shutdown` `power-off` does was necessary, since this plan's own critical-battery path sends one, and ending the transaction is the right answer.
+- Finding 2: the entry refers to P02M0191c's sleep-entry rule ([entry](/data/yellow/libersystem/docs/todo/P02M0197.md:192)), and the suspend-to-idle oracle reads the same in both owner cases.
+- Finding 3: the restore rule - every setting the kernel made on a device that no driver owns - now holds Slot Control, the claim's configuration writes and the console UART ([rule](/data/yellow/libersystem/docs/todo/P02M0197.md:203)). It also holds PM1's enable bits, which QEMU's ICH9 reset does zero; without that the power button would stop working after the first S3. The S3 case now checks typed input and a hot-plug arrival after the wake.
+- Finding 4: the entry refuses while a forced power-off deadline is armed ([errors](/data/yellow/libersystem/docs/todo/P02M0197.md:219)), carried by whichever of this part and P02M0198d lands second.
+
+1. **Low - The serving rule ends a sleep transaction for a `system-shutdown` `power-off`, but refuses the shell's `shutdown` and `reboot`, which run the same sequence through the admin channel.**
+
+   - The rule answers a `system-shutdown` `power-off` at once and ends the transaction, "so a person's shutdown or a critical battery's never waits out a sleep". It refuses "a request that would start, stop or restart a service" as a transaction already running ([rule](/data/yellow/libersystem/docs/todo/P02M0197.md:63), [refusal](/data/yellow/libersystem/docs/todo/P02M0197.md:67)).
+   - A person's shutdown does not come through `system-shutdown`. The shell's `shutdown` and `reboot` send `!poweroff` and `!reboot` on the admin channel, which is the one orderly sequence ([P02M0200](/data/yellow/libersystem/docs/todo/P02M0200.md:139), [one sequence](/data/yellow/libersystem/docs/todo/P02M0200.md:142)). `system-shutdown` exists precisely so that P02M0198d's policy need not use that channel ([P02M0198](/data/yellow/libersystem/docs/todo/P02M0198.md:251)).
+   - `!poweroff` stops every service, so under the refusal clause the person's shutdown is refused, which contradicts the rule's own reason. `!reboot`, which `system-shutdown` does not have, is refused too.
+
+   This is new, in text added this round.
+
+   **Correct the rule**: the orderly sequence is treated the same whichever door it comes through. The admin channel's `!poweroff` and `!reboot` and `system-shutdown`'s `power-off` all end the transaction and run once it has ended. Otherwise say that the admin verbs are refused, and drop "a person's shutdown" from the reason.
+
+2. **Low - The power-state service's new `system-sleep`, `system-power` and `system-shutdown` client roles would not be delivered again when it is relaunched.**
+
+   - The policy "requests through its own `system-sleep` client" and "gains a `system-power` and a `system-shutdown` client role" ([policy item](/data/yellow/libersystem/docs/todo/P02M0197.md:327)). All three are served by ServiceManager itself.
+   - The power-state service is `transparent` and plan-relaunchable ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1561)).
+   - A client role's end is found by `Kept::end_of` among the managed services' serve roots ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:64)). ServiceManager is not one of them, so the role falls to "an optional role delivers nothing, a required one fails". At the first start a hand-written arm supplies such a client, for DeviceManager's `SYSPOWER` and ProcessService's `REGISTRY` alone, both of them services that escalate. The relaunch path's only arm is AdminService's journal ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1582)).
+   - So after a restart the power-state service either stays failed or comes back without the three clients. The lid, idle and critical-battery policies then stop working, while the plan presents the service's restart as harmless.
+   - P02M0200 and P02M0201 state this step for their own supervisor channels ("mints again for a replacement"); this plan does not.
+
+   This is new; no earlier round raised it.
+
+   **Correct the policy item**: ServiceManager supplies these three clients at the service's first start and again at each relaunch, as P02M0200 states for its `supervisor-liveness` channel.
+
+3. **Low - The S3 restore list restores the console UART only "while the kernel owns it" and "with its receive interrupt", which leaves the lent case with a reset UART.**
+
+   The list reads "while the kernel owns it, the console UART's initialisation with its receive interrupt" ([list](/data/yellow/libersystem/docs/todo/P02M0197.md:208)). P02M0191c's lent window keeps the receive interrupt off and writes `sleep: resumed` through the UART before the entry returns. So after an S3 wake the lent case has no re-initialisation before that write, and "before any driver runs again" does not put it before the entry's first line in the kernel's own case either. P02M0191's re-audit of this date gives the details (QEMU's `serial_reset`, hardware).
+
+   **Correct the list**, as P02M0191's sleep-entry item will be corrected: after an S3 wake the console UART is re-initialised before the entry's first line, in both owner cases, with its receive interrupt only while the kernel owns COM1.
+
+4. **Low - The list of plans whose drivers carry the exchange omits P02M0195.**
+
+   The new sentence names "the plans written beside this one" ([list](/data/yellow/libersystem/docs/todo/P02M0197.md:156)). P02M0195's HID-over-I2C driver has no exchange yet, and it can land after this part. P02M0195's re-audit of this date asks for the exchange there. Once it is added, the list names P02M0195's HID-over-I2C driver too.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree sibling plans, and the sources named above; QEMU v10.0.0's `hw/acpi/core.c`, `hw/acpi/ich9.c` and `hw/char/serial.c` were fetched read-only. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0197 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- `shell.rs`: `shutdown`, `poweroff` and `reboot` are builtins that send `!poweroff` or `!reboot` on the admin channel;
+- `service_manager.rs`:
+  - the power verbs run inline under the reserved `!` names, logging "power verb - shutting down";
+  - `plan_relaunchable` names `power_service`;
+  - `relaunch_planned`'s only arm is AdminService's journal;
+  - `power`, from which DeviceManager's `SYSPOWER` is minted (`service_connect(power)`), is ServiceManager's client of the `system_power` service SystemManager serves;
+- `service_manager/bootstrap.rs`: `Kept::end_of` searches managed services' serve roots only, and `deliver_roles`' fallback fails a required role and sends an optional one empty;
+- the manifest: `power_service` is `transparent`, and a client role served through ServiceManager names `service_manager` as its provider, as `SYSPOWER` does;
+- QEMU v10.0.0 `serial_reset`;
+- the working-tree P02M0191, P02M0195, P02M0198d and P02M0200.
+Summary: four findings, all accepted.
+
+1. **ACCEPTED - the serving rule treated the two doors to the one orderly sequence differently.** VT 1's shell is a participant, not frozen, so a person's `shutdown` can reach ServiceManager in the middle of a transaction. Under the old refusal clause it was refused, against the rule's own reason, and `!reboot` has no other door. THE CHOICE: the orderly sequence is treated the same whichever door it comes through, not "the admin verbs are refused". Refusing would answer a person at the console with "transaction already running" for as long as any sleep is being attempted. Plan changes:
+   - The bullet now reads "THE ORDERLY SEQUENCE IS TREATED THE SAME WHICHEVER DOOR IT COMES THROUGH". The doors are the admin channel's `!poweroff` and `!reboot` (sent by the shell's `shutdown` and `reboot`) and `system-shutdown`'s `power-off`. The sequence is taken at once, never refused, and ENDS THE TRANSACTION at its next step - unwound, or resumed if the machine has already slept - and runs once the transaction has ended. The refusal clause now covers "any other request" that would start, stop or restart a service.
+   - The transaction's edges gain the case that can fail: `shutdown` typed at VT 1's shell while a test hook holds a driver's `SUSPENDED` answer. It shows the unwind, then ServiceManager's line for the power verb and QEMU's exit, never a refusal. The oracle is today's power-verb line, so the case does not wait for P02M0200's notice.
+   - Coordinated: P02M0200a's sentence on how the loop answers during a sequence now names the orderly sequence from either door.
+
+2. **ACCEPTED - the power-state service's three new client roles would not come back at a relaunch.** One precision: `system-power` is served by SystemManager, not ServiceManager. ServiceManager reaches it through its own client, as it does for DeviceManager's `SYSPOWER`. So it is the same kind of role - one only ServiceManager can fill - and `Kept::end_of` finds nothing for any of the three. Plan changes:
+   - The policy item gains "SERVICEMANAGER FILLS THE THREE CLIENT ROLES AT EVERY START". The power-state service gets `system-sleep`, `system-power` and `system-shutdown` at its first start and again at each relaunch, a fresh client each time, through ServiceManager's one function for the roles only it can fill. P02M0196b's stage paragraph states that function; whichever of P02M0196b, this part, P02M0198 and P02M0200a lands first builds it. The item also says what the omission would cost.
+   - Two cases can now fail on it. The lid case runs once more after the power-state service is killed and relaunched, and the lid's close must still suspend the machine through the relaunched instance's `system-sleep` client. The critical-battery case relaunches the service once before the discharge, so its deadline and orderly sequence go through the relaunched instance's `system-power` and `system-shutdown` clients.
+
+3. **ACCEPTED - the S3 restore list left the console UART reset in the lent case, and unordered before the entry's first line.** Plan changes:
+   - The list now holds the console UART's initialisation unconditionally, with what QEMU's `serial_reset` undoes (IER and LCR zero, the divisor at 9600 baud) and what hardware loses with power.
+   - The restore sentence now says THE CONSOLE UART FIRST OF ALL, before any kernel line after the wake, in both of P02M0191c's owner cases: with its receive interrupt while the kernel owns COM1, and with it left off while the port is lent, IRQ 4 staying the claim's. Until P02M0191c lands, the kernel always owns it. "First of all" answers the kernel-owned half of the finding as well.
+   - P02M0191c's sleep-entry item says the same, and its handoff-machinery tests check the order in the record.
+
+4. **ACCEPTED - the list of plans whose drivers carry the exchange omitted P02M0195.** Plan change: the list names P02M0195's `i2c_hid` driver, and its virtio-i2c and virtio-gpio drivers should that bus half land after this part. The finding's premise - that this part's own item covers the bus drivers - holds for one landing order only, and P02M0195's response of this date explains why.
+
+Re-check of the whole plan:
+- The serving rule now has one answer for each kind of request.
+- The transaction's participants, and every ServiceManager-filled role they hold, survive a relaunch.
+- The S3 restore order, P02M0191c's sleep-entry rule and P02M0197d's suspend-to-idle oracle agree.
+- Every driver a sibling plan adds is either in the list or covered by this part's own item.
+- P02M0198d's orderly sequence, P02M0200's shutdown notice and sleep step, and P02M0201's HOSTC row are unchanged.
+
+The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0197.md`, and for coordination `docs/todo/P02M0191.md`, `docs/todo/P02M0195.md` and `docs/todo/P02M0200.md`. No source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0197 (2026-09-26T20:02:40Z):
+
+**Rating: 9/10.** All four findings of the last re-audit are corrected, and the choice of one rule for both doors to the orderly sequence is right. One small defect is new: the `shutdown` case added to prove that rule passes just as well for an implementation that ignores it.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- the working-tree P02M0191c's sleep-entry item, P02M0195's new sleep item, and the rows of the one function in P02M0196b, P02M0198 and P02M0200a;
+- in the tree: the shell's power builtins, `relaunch_planned`, `deliver_roles` and `plan_relaunchable`.
+
+These corrections hold:
+- **Finding 1 (the two doors).** The orderly sequence is taken at once from either door and ends the transaction ([rule](/data/yellow/libersystem/docs/todo/P02M0197.md:63)). The shell's `shutdown` and `reboot` do send `!poweroff` and `!reboot` ([shell.rs](/data/yellow/libersystem/src/user/services/core/src/shell.rs:1032)). Refusing a person at VT 1 for as long as a sleep is being attempted would have been the worse choice.
+- **Finding 2 (the power-state service's clients).** The three clients are filled at both starts through the one function ([item](/data/yellow/libersystem/docs/todo/P02M0197.md:342)). The planner is right that `system-power` is SystemManager's, reached through ServiceManager's own client, and so it is the same kind of role. The lid case after a relaunch ([case](/data/yellow/libersystem/docs/todo/P02M0197.md:409)) and the relaunch before the discharge can each fail on a missing client.
+- **Finding 3 (the UART in the lent case).** The console UART is restored first of all after an S3 wake, in both owner cases ([list](/data/yellow/libersystem/docs/todo/P02M0197.md:220)), and P02M0191c now says the same.
+- **Finding 4 (the list of drivers).** The list names P02M0195's `i2c_hid` driver and, for one landing order, its bus drivers ([list](/data/yellow/libersystem/docs/todo/P02M0197.md:157)). P02M0195 carries the matching item.
+
+1. **Low - The `shutdown` case added this round cannot fail on the rule it was added for. It holds a driver's answer, so step 4 ends at its bound and the transaction unwinds whether or not the shutdown did anything.**
+
+   The rule and the case:
+   - The orderly sequence "ENDS THE TRANSACTION at its next step" and runs once the transaction has ended ([rule](/data/yellow/libersystem/docs/todo/P02M0197.md:66)).
+   - The case types `shutdown` at VT 1's shell "while a test hook holds a driver's `SUSPENDED` answer". Its oracle is the unwind, then the power verb's line, then QEMU's exit, and never a refusal ([case](/data/yellow/libersystem/docs/todo/P02M0197.md:392)).
+
+   Why it passes without the rule:
+   - While the hook holds the answer, step 4 can end only at its scaled bound, and a driver that does not answer in time aborts the suspend ([contract](/data/yellow/libersystem/docs/todo/P02M0197.md:157)). So the case always unwinds at that bound.
+   - An implementation that neither refuses the admin verb nor acts on it, and runs it only once the transaction has ended by itself, writes the same log: the unwind, the power verb, the exit. Only a refusal fails the case. The half of the rule that matters, "never waits out a sleep", is never exercised.
+
+   The input path makes this worse once P02M0191c lands:
+   - The typed line then crosses the 16550 driver.
+   - If that driver is suspended before the held binding in reverse bind order, the line sits in the UART's FIFO until the unwind resumes the driver. The shutdown then reaches ServiceManager only after the transaction, even when the implementation is correct.
+
+   This is new, in text added this round.
+
+   **Correct the case:**
+   - The hook holds the answer of a binding that is suspended before any binding the typed line crosses.
+   - The hook releases the answer once the shell has echoed the line, so step 4 completes.
+   - The oracle then requires no `sleep: entered` line, and an unwind that names the orderly sequence as its cause, not a driver.
+   - An implementation that queues the verb would enter the sleep and fail.
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history, the working-tree sibling plans and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0197 (2026-09-27T02:02:40Z):
+
+Verified read-only:
+- `shell.rs`: `graceful_power` prints its banner, sends `!poweroff` or `!reboot`, then blocks on the admin channel. It writes nothing to storage.
+- `service_manager.rs`: the power verb's line is a `debug_write`, which reaches the serial log without LogService or a volume. Step 3's held writes therefore cannot hide it.
+- `kernel/console_input.rs` and `console_service.rs`: today serial input reaches VT 1's shell through the kernel's console channel. P02M0191c moves it to the 16550 driver's `console-bytes` publication.
+- `harness/lab.py`: the harness types at the shell over the serial console.
+- `harness/qemu-run.sh` and `check-qemu-pcie-hotplug.sh`: the machines the harness boots carry the `hotplug0` root port on all three targets, and the hot-plug gate already `device_add`s a function into it.
+- `power_fixture.rs` and `admin_fixture.rs`: the existing pattern of a development-only driver, staged only into gate images and bound at a pinned address.
+- QEMU v10.0.0's `tests/qtest/ivshmem-test.c` and `hw/pci/pcie.c`: `ivshmem-plain` is hot-pluggable. A PCIe root port's plug callbacks check only the slot's hot-plug capability and its lock, not whether the function is PCI Express.
+
+Summary: one finding, accepted. The release condition is stronger than the one proposed, and the correction closes three gaps that would have stopped the corrected case from running as the finding describes.
+
+1. **ACCEPTED - the `shutdown` case could not fail on the rule it was added for.** Every fact holds.
+   - A hold that ends at step 4's bound unwinds the transaction whatever the verb did. So an implementation that queues the verb until the transaction ends writes the same log as a correct one.
+   - Once P02M0191c lands, the typed line can also sit in the UART's FIFO behind a suspended 16550 driver.
+
+   Three more gaps would have defeated a correction that only moved the hold:
+   - Step 4 said "reverse bind order" but never said the bindings are suspended one at a time. So "a binding suspended before any binding the typed line crosses" did not guarantee that the typed line's driver stayed running while the hold lasted.
+   - No plan fixes the bind order of `kernel:com1` against the PCI functions. So no binding present at boot is known to be suspended before it on every target.
+   - The case never said how the sleep is requested. A foreground `sleepctl` holds the shell and is frozen at step 2, so the typed `shutdown` would never be read.
+
+   THE RELEASE CONDITION is ServiceManager's line saying it took the orderly sequence, not the shell's echo. The echo proves only that ConsoleService has the line. A release on the echo can reach the fixture before the verb reaches ServiceManager, and a correct implementation would then go on into steps 5 and 6.
+
+   Plan changes:
+   - THE SERVING RULE: the orderly sequence is taken at once, and ServiceManager's log says so, naming the door. "ENDS THE TRANSACTION at its next step" now says what it means: the step in flight finishes, no later step starts, and the transaction is then unwound, or resumed if the machine has already slept. That is the behaviour the case tells apart from queueing.
+   - STEP 4: DeviceManager suspends ONE BINDING AT A TIME, and asks the next only once the last has answered. "Reverse bind order", together with the rule that a consumer is suspended before its provider, already implied this. It is now stated because the case depends on it.
+   - THE UNWIND ITEM: the unwind is reported on the log as well as in the system graph and the record. A transaction the orderly sequence ended names that sequence and its door, beside any step that failed.
+   - P02M0197d: the case leaves the edges bullet and becomes its own item, "A PERSON'S SHUTDOWN DURING A SLEEP THAT WOULD OTHERWISE SUCCEED".
+     - THE HELD STEP is a development-only SLEEP FIXTURE, staged only into gate images. It is a driver that carries the exchange, is matched only at the empty native hot-plug port, and binds an `ivshmem-plain` function the harness hot-plugs there after boot with its `memory-backend-file`.
+     - It is therefore the last binding on every target, and DeviceManager suspends it first. While it holds, no other binding has been asked, so every binding a typed line crosses is still running. That is none while the kernel owns the console UART, and the UART's driver after a handoff: P02M0191c on x86_64, P02M0099's PL011 and 16550 items on the other two.
+     - On `SUSPEND` the fixture logs that it is holding. It answers `SUSPENDED` once the harness writes a release word into the backing file.
+     - THE RUN: `sleepctl` asks for a suspend to idle with a timed wake, in the background at VT 1's shell. Once the fixture holds, `shutdown` is typed. Once ServiceManager's line says it took the orderly sequence, the harness releases the fixture, well inside its bound, and step 4 completes.
+     - REQUIRED:
+       - no `sleep: entered` line;
+       - the unwind's line naming the orderly sequence and its door, and no driver;
+       - the power verb's line after it;
+       - QEMU's exit;
+       - never a refusal.
+     - An implementation that queues the verb enters the sleep and prints `sleep: entered`, and its timed wake then ends it. One that never takes the verb leaves the harness waiting. Both fail.
+   - The edges bullet keeps its other cases unchanged.
+
+Re-check of the whole plan:
+- The serving rule, step 4's order, the unwind's record and the new case now describe one behaviour, and the case fails every implementation that departs from it.
+- P02M0191c's lent case still holds, because "every binding has answered `SUSPENDED` before the entry" is unchanged, and so is P02M0197b's entry.
+- P02M0200's sentence on the orderly sequence from either door is unaffected, and so is its watchdog step, which still suspends watchdog bindings last.
+- The S3, suspend-to-idle, soft-off, watchdog, lid and Time and Alarm Device cases are unchanged.
+- The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0197.md` only. No source was changed, and nothing was built or booted.

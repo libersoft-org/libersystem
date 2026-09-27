@@ -262,3 +262,18 @@ Coordinated change: P02M0193's parenthesis in its measured-demo-rows item now st
 Re-check of the whole plan: each order now has one answer in both plans. If the pool is the default before the gate is written, the gate pins from its first version and this milestone's own runs pin from the moment the flag exists. If the gate exists when the pool becomes the default, P02M0193's change edits the gate, whether or not this milestone has closed. If this milestone closes first, it closes on the serial walk alone. The thread condition still turns an unpinned pooled default into a gate failure. Nothing else in the plan changed; it is ASCII, no line exceeds 104 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0189.md` and, for the coordinated rule, `docs/todo/P02M0193.md`; no source, test or script was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0189 (2026-09-26T18:15:41Z):
+
+**Rating: 10/10.** The last re-audit's one finding is corrected in both plans, in the same terms, and nothing new is open.
+
+What was read and checked: the complete history, including the planner's response of 2026-09-26T17:12:45Z; the plan in the working tree, whole; P02M0193's measured-demo-rows item in the working tree; `test2d_sw.rs`, which still has no `--workers` flag and spawns no thread; and the verify-model catalog's `qemu-2d-demo` coverage, through which verification selects this gate for P02M0193's change.
+
+The correction holds:
+- The serial-walk item now keys the gate's pin on whether the gate exists ([serial-walk item](/data/yellow/libersystem/docs/todo/P02M0189.md:89)). The change that makes the pool `test2d-sw`'s default pins every `qemu-2d-account` run that exists at that point and adds the pooled row; a gate first written after it pins from its first version. This milestone's own runs pin whenever the demo has the flag, and a milestone that closes first closes on the serial walk alone.
+- The gate item says the same, "whether or not this milestone has closed" ([gate item](/data/yellow/libersystem/docs/todo/P02M0189.md:395)), and P02M0193's parenthesis now states the identical rule ([P02M0193](/data/yellow/libersystem/docs/todo/P02M0193.md:145)).
+- All three landing orders now have one answer in both plans. The first-step item's "unchanged but for the worker pin below" still refers to a rule that exists, and the one-tree item still governs a P02M0193 landing mid-milestone. The thread condition still turns an unpinned pooled default into a gate failure.
+
+No new defect was found. The plan is ASCII, keeps its `Status:` line, cites no audit, and no line exceeds 104 columns.
+
+Validation: read-only inspection of the plan, the audit history and the working-tree P02M0193, and of the source files named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

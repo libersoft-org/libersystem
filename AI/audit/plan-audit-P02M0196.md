@@ -433,3 +433,182 @@ Coordinated changes: P02M0191's reserved set holds the same DMA ranges (its resp
 Re-check of the whole plan: the service's stage now fixes how it is started, restarted and reached, and nothing in the plan waits for it; step 1's static rows (TPM2, WDAT, SPCR, the kernel-held set, `kernel:com1`) never needed the service and are unaffected. The SystemIO, SystemMemory, `_CRS` and reservation rules agree with P02M0191a and with each other. Every consumer plan read in this round still gets what it takes from this plan. The file is ASCII, cites no audit and keeps its `Status:` line.
 
 Edited `docs/todo/P02M0196.md` (and P02M0191 for the shared ranges); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0196 (2026-09-26T18:15:41Z):
+
+**Rating: 8/10.** Findings 2 and 3 of the last re-audit are corrected. Finding 1's correction chose the right stage, for a reason the last re-audit had missed, but it rests on a restart the tree cannot yet perform: the relaunch path cannot re-deliver the `FirmwareInterpreter` privilege. The late companion it introduces also has no way to reach its driver.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- ServiceManager's bring-up loop, which sends `DRIVERS` as soon as StorageService is ready and blocks in `drive_runtime_drivers` before ProcessService starts;
+- ServiceManager's restart paths: `restart_service`, `relaunch_planned` with its `external` arm, `plan_relaunchable`, `deliver_roles` and its fallback arm;
+- the first start's per-service arms in `service_manager/bootstrap.rs`, including DeviceManager's `CONSOLE`/`DEVPRIV` arm, `Kept::end_of`, and `check-bootstrap-plan.py`'s rule that every `transparent` service be relaunchable;
+- DeviceManager's control-channel hand-offs (`DEVPERM`, `DEVREG`) and its two bind phases;
+- QEMU v10.0.0's `build_q35_dram_controller`, and Linux v6.12 ACPICA's protected ports;
+- the working-tree P02M0191, P02M0195, P02M0197 and P02M0198.
+
+These corrections hold and are not repeated:
+- Finding 1, the stage itself. The planner found what the last re-audit's first option missed: phase two also runs before ProcessService exists, so a wait placed "before phase two" would still run to its bound on every ACPI boot.
+  - The chosen form - volume-staged, `transparent`, no manifest role on DeviceManager, a client handed over on DeviceManager's control channel as `DEVPERM` is, and no bind round waiting - is consistent with P02M0195's "again for each new ACPI-service instance" and with P02M0197's "SERVICEMANAGER RESTARTS NOTHING WHILE THE DRIVERS ARE SUSPENDED".
+  - The EXCLUDES entry for a system volume on a device described only in AML is a correct consequence.
+- Finding 2: the SystemIO bullet refuses the DMA controllers' channel and control registers through P02M0191's fixed set ([bullet](/data/yellow/libersystem/docs/todo/P02M0196.md:193)). P02M0191 says the same.
+- Finding 3: a reservation mints nothing and is not refused by the `_CRS` checks ([bullet](/data/yellow/libersystem/docs/todo/P02M0196.md:211)). The host suite and the x86_64 enumeration now show q35's `DRAC` recorded as a reservation.
+
+1. **Medium - "Restarted by ServiceManager's existing ladder" cannot be done as written: the relaunch path re-delivers no privilege, and the plan does not add the step or make the service relaunchable.**
+
+   The plan relies on the restart:
+   - The plan says the service holds `FirmwareInterpreter`, "which ServiceManager gives to it alone", and is "restarted by ServiceManager's existing ladder" ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:153)).
+   - The x86_64 gate needs the restart: its `_AEI` line is delivered again "after the ACPI service is killed and restarted" ([gate](/data/yellow/libersystem/docs/todo/P02M0196.md:425)).
+
+   The tree cannot do it as written:
+   - At the first start a privilege reaches a service only through a hand-written arm that duplicates the supervisor's own copy: DeviceManager's `CONSOLE` and `DEVPRIV` ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:867)), DisplayService's `DISPLAYCTL` ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:721)) and ConsoleService's `CONSOLESINK`. Every service that holds a privilege today escalates, so no privilege has ever had to reach a relaunched instance.
+   - The relaunch path for plan-driven services has one arm of its own, for AdminService's journal ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1582)).
+   - Every other role that is not a serve root, a client or factory of a managed service, or a payload reaches `deliver_roles`' fallback ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:225)). There a required role fails the relaunch and an optional one arrives empty.
+   - A `transparent` service must also be relaunchable, or `check-bootstrap-plan` fails ([check-bootstrap-plan.py](/data/yellow/libersystem/src/tools/check-bootstrap-plan.py:139)). `plan_relaunchable` is a hand-written list ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1561)).
+
+   As written, a crashed ACPI service therefore stays failed, or comes back without the privilege every one of its calls needs, and the gate's restart case cannot pass. The plan already names this kind of step for DeviceManager's client ("the ladder's step for this one service"), but not for the service's own privilege. This is an incomplete correction of the last re-audit's finding 1.
+
+   **Correct the WHERE AML RUNS item**:
+   - ServiceManager keeps the `FirmwareInterpreter` privilege and duplicates it into each instance, at the first start through an arm like DeviceManager's `DEVPRIV` and at every relaunch through an arm of the relaunch path like AdminService's journal;
+   - the service is one of the plan-relaunchable services.
+   P02M0198's ProcessorPowerService needs the same relaunch arm for its own privilege (its re-audit of this date). Whichever lands first builds it.
+
+2. **Low - A companion joined after its function's driver bound has no way to reach that driver.**
+
+   What the plans say:
+   - This round's text has the driver "ask for the node channel as it does after a restart" ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:166)).
+   - After a restart the trigger is the node channel closing: "the node channels it minted close, so each driver asks DeviceManager again".
+   - The node-scoped channel item has DeviceManager ask for a channel "with every claim" ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:295)).
+
+   Why a late companion falls between them: a PCI function bound in phase one or two, before the namespace existed, has neither a channel to close nor a claim still to come, and nothing tells it a companion now exists. So its driver never asks.
+
+   The plans in this round use companions this way only rarely: P02M0199's backlight and P02M0202's UCSI device are namespace platform devices, bound on arrival, and P02M0195's `_AEI` lines go to the service. So the gap costs little today. But the item states a mechanism that has no trigger. This is new, introduced by this round's removal of the bind-round wait.
+
+   **Correct the item**: say how a bound driver learns of a late companion. For example, DeviceManager, on attaching the companion, asks the service for the node channel and hands it to the bound binding, or tells the binding to ask.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree sibling plans, and the sources and scripts named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0196 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- `service_manager.rs`:
+  - `restart_service` calls `relaunch_service`, which hands a `plan_relaunchable` name to `relaunch_planned` and otherwise knows three hand-written bootstraps (ConfigService's storage step among them);
+  - `plan_relaunchable` is a hand-written list of seven names;
+  - `relaunch_planned`'s `external` answers one role, AdminService's `JOURNAL`;
+  - the `DEVPERM` and `DEVREG` late hand-offs go out on DeviceManager's control channel once PermissionManager is up;
+- `service_manager/bootstrap.rs`:
+  - `Kept::end_of` searches only the managed services' `ServeRoot` roles;
+  - `deliver_roles` sends a payload as its bare tag, and its fallback sends an optional role empty and fails a required one;
+  - the first start's arms are the only way a privilege or a payload's bytes reach a service: `DISPLAYCTL`, `CONSOLESINK`, and DeviceManager's `SYSPOWER`, `BOOTWIN`, `CONSOLE` and `DEVPRIV`;
+- `check-bootstrap-plan.py`: every `transparent` service must be re-runnable, through `relaunch_service`'s table or `plan_relaunchable`;
+- the manifest: DeviceManager's `SYSPOWER` is a client role whose provider is `service_manager`, and `power_service` is `transparent`;
+- DeviceManager's two bind phases, both before ProcessService starts.
+Summary: two findings, both accepted.
+
+1. **ACCEPTED - "restarted by ServiceManager's existing ladder" could not be done: no relaunch path re-delivers a privilege, and the service was not relaunchable.** Every fact holds. The old text was also wrong in a second place: "the ladder's step for this one service, as it has one for ConfigService's storage" names a step of the hand-written ladder, which `relaunch_planned` never reaches. Plan changes, in "ITS STAGE, AND WHAT FOLLOWS FROM IT":
+   - THE RESTART. The service is one of the PLAN-RELAUNCHABLE services: named in `plan_relaunchable`, as `check-bootstrap-plan` requires of a `transparent` service, and relaunched by `relaunch_planned` from the volume.
+   - A new bullet, "ITS PRIVILEGE AT EVERY START, AND SERVICEMANAGER'S ROLES IN GENERAL". It gives the tree's facts, then the rule: THE ROLES ONLY SERVICEMANAGER CAN FILL are answered by ONE FUNCTION that both `start_service`'s role delivery and `relaunch_planned`'s call. That function covers three kinds of role: a kernel privilege duplicated from the copy ServiceManager keeps; a client of an interface it serves or relays, minted afresh; and a payload's bytes, built again. The handles it needs are kept where both paths reach them. This service's `FirmwareInterpreter` is one row. The other rows are P02M0197c's three power-state clients, ProcessorPowerService's `ProcessorPower` privilege and three clients (P02M0198), and P02M0200a's `supervisor-liveness` channel and boot mode. Whichever of the four lands first builds the function, and the others add their rows.
+   - WHY ONE FUNCTION, not an arm per role as the finding describes: this round's findings name the same gap in four plans. Together they are ten rows. An arm per role in each of the two closures would be twenty hand-written arms, and the defect being corrected is exactly those two paths drifting apart.
+   - THE DEVICEMANAGER HAND-OFF is now a step after the instance starts, both at the first start and after `relaunch_planned` returns, sent on DeviceManager's control channel as `DEVPERM` is.
+   The x86_64 gate's restart case - the `_AEI` line delivered again after the service is killed and restarted - is the oracle, and it fails on either omission: a service missing from `plan_relaunchable` stays failed, and one relaunched without its privilege can map no region and run no method.
+
+2. **ACCEPTED - a companion joined after its function's driver bound had no way to reach that driver.** One correction to the finding's weighting: this is not the rare case. Every PCI function present at boot is bound in phase one or two, and both run before ProcessService, so before the ACPI service exists. On every ACPI boot, therefore, every companion of a function present at boot is joined late. Plan changes:
+   - The stage paragraph: DeviceManager, attaching a companion to a function whose binding is live, asks the service for the node channel itself. It sends the channel to that binding in the frame that answers a driver's own request for one. So the driver's one receive path serves the claim-time, restart and late cases alike. Chosen over "tell the binding to ask", which adds a round trip and a second message kind for the same result.
+   - The node-scoped channel item: DeviceManager asks for the channel "with every claim", and also, for a function whose companion is joined after its driver bound, when that companion is attached.
+   - The x86_64 gate: the virtio-gpio and virtio-i2c bindings, bound in phase two before the namespace existed, are each handed their companion's node channel when the companion is attached, as DeviceManager's line for each says.
+
+Coordinated changes: P02M0197c (the power-state service's three clients), P02M0198 (ProcessorPowerService's privilege and three clients) and P02M0200a (the boot mode's bytes and the liveness channel) each fill their roles through this function, in their responses of this date.
+
+Re-check of the whole plan: the service's stage now fixes how it is started, restarted, given its privilege and reached. P02M0197b's "a restarted service re-registers the same values", which needs the privilege, now holds. P02M0195's "again for each new ACPI-service instance" and P02M0197's "SERVICEMANAGER RESTARTS NOTHING WHILE THE DRIVERS ARE SUSPENDED" are unaffected. The late-companion rule and the restart rule ("the node channels it minted close, so each driver asks DeviceManager again") share one driver path. Step 1, the policy, the GPE split and the fixture are unchanged. The file is ASCII, cites no audit and keeps its `Status:` line.
+
+Edited `docs/todo/P02M0196.md`; the rows the other plans add are in `docs/todo/P02M0197.md`, `docs/todo/P02M0198.md` and `docs/todo/P02M0200.md`. No source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0196 (2026-09-26T20:02:40Z):
+
+**Rating: 9/10.** Both findings of the last re-audit are corrected, and the one function for the roles only ServiceManager can fill is a better correction than the per-role arms the finding described. One small gap remains in the second correction. The plan says how DeviceManager hands a late companion's node channel to the bound driver, but not what tells DeviceManager that the kernel has attached the companion.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- the working-tree P02M0195, P02M0197, P02M0198 and P02M0200, where they rely on this plan;
+- in the tree:
+  - `plan_relaunchable`, `relaunch_planned` with its `external` arm, `start_service`, and `deliver_roles` with its payload and fallback arms;
+  - the kernel's device-event kinds in the ABI.
+
+These corrections hold:
+- **Finding 1 (the restart).** The service is plan-relaunchable ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:153)), and its `FirmwareInterpreter` role is one row of ONE FUNCTION that both starts call ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:160)).
+  - The tree matches the facts the item gives. `plan_relaunchable` is a hand-written list ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1561)). `relaunch_planned`'s `external` answers only AdminService's journal ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1583)). `deliver_roles` sends an optional role empty and fails a required one ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:221)).
+  - The function is feasible. Both paths already pass an `external` closure to `deliver_roles`, and `start_service` receives the kept handles as parameters ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:524)).
+  - P02M0197c, P02M0198 and P02M0200a name the same function and the same "whichever lands first" rule.
+- **Finding 2, the planner's re-weighting.** Every PCI function present at boot is bound in phase one or two, before ProcessService and therefore before the ACPI service. So on every ACPI boot, every companion of such a function joins late. The late case is the ordinary one, as the planner says.
+- **Finding 2, the DeviceManager-to-driver half.** DeviceManager asks the service for the node channel and sends it in the frame that answers a driver's own request ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:181)), so one receive path serves all three cases. The x86_64 gate checks it on the virtio-gpio and virtio-i2c bindings ([gate](/data/yellow/libersystem/docs/todo/P02M0196.md:442)).
+
+1. **Low - Nothing tells DeviceManager that the kernel has attached a companion to a PCI row it has already bound. Both this round's late-companion path and a phase-two GPIO controller's `_AEI` grant start from that event.**
+
+   What the plan says:
+   - The kernel stores the companion, and "DeviceManager reads it with the row" ([join](/data/yellow/libersystem/docs/todo/P02M0196.md:295)).
+   - The stage paragraph has DeviceManager act "attaching it to a function whose binding is live" ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:181)).
+   - A GPIO controller's `_AEI` list "reaches DeviceManager with its companion or row" ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:312)).
+
+   What reaches DeviceManager:
+   - DeviceManager learns of rows from the kernel's device-event channel. Its events are ARRIVED, DEPARTED and FAULTED, each naming a row index ([abi](/data/yellow/libersystem/src/abi/src/lib.rs:540)).
+   - The plan adds only the "namespace loaded" report to that channel ([item](/data/yellow/libersystem/docs/todo/P02M0196.md:190)).
+   - A companion is not a new row. It is data attached to a PCI row that DeviceManager read in phase one or two, before the service existed. So no event and no read brings the attachment to DeviceManager, and the first link of the chain the last finding asked for is not stated.
+
+   The x86_64 gate would catch the omission, so an implementer would have to invent the trigger. This is an incomplete correction of the last re-audit's finding 2.
+
+   **Correct the stage paragraph** with one sentence naming the trigger. For example: on each instance's "namespace loaded" report, DeviceManager reads the companion of every live PCI binding again, and takes a GPIO controller's `_AEI` list with it. Or the kernel reports a companion attach on the device-event channel, naming the row.
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history, the working-tree sibling plans and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0196 (2026-09-27T02:02:40Z):
+
+Verified read-only:
+- `src/abi/src/lib.rs`: a device event is a kind byte and a row index, and the kinds are `DEVICE_EVENT_ARRIVED`, `DEVICE_EVENT_DEPARTED` and `DEVICE_EVENT_FAULTED`. `SYS_DEVICE_EVENTS` states the contract: "the INVENTORY is the truth and the event is the prompt".
+- `device_manager.rs`: `serve_bus_events` dispatches those three kinds. After the boot inventory, only `admit_arrival` reads a row (`device_info`), so nothing reads an already-bound row again.
+- The working-tree P02M0195: its list of the ACPI service's grants mints the `_AEI` lines "when that controller publishes".
+- The working-tree P02M0199 and P02M0202: they use the join for platform devices bound on arrival, and neither depends on the late case.
+
+Summary: one finding, accepted. The auditor's first option is taken, and the same gap is closed for the first `_AEI` grant.
+
+1. **ACCEPTED - nothing told DeviceManager that the kernel had attached a companion to a PCI row it had already bound.** Every fact holds. A companion is data on an existing row, so no ARRIVED names it, and DeviceManager never reads a bound row again.
+
+   The finding's second example is wider than one missing sentence. The GPIO item made the first `_AEI` grant "when the controller's driver is bound", and P02M0195 repeated it as "when that controller publishes". For the phase-two virtio-gpio controller that moment comes before the service exists, so no list existed yet. The first instance therefore got its `_AEI` lines on no trigger at all, not merely late.
+
+   THE CHOICE: the instance's "namespace loaded" report, not a new device-event kind per companion.
+   - The report is already DeviceManager's per-instance point: node-channel requests after a restart are answered there, and a new instance's `_AEI` lines are granted there.
+   - The kernel passes it after everything the walk published.
+   - Only a walk attaches a companion. ACPI-driven PCI hot-plug is excluded, and a natively hot-plugged function brings its row with ARRIVED.
+   - A per-companion event would have DeviceManager ask an instance for node channels before that instance's report, which the plan avoids everywhere else.
+
+   Plan changes:
+   - THE STAGE PARAGRAPH:
+     - A late companion - every companion of a function present at boot - is attached to a row the kernel already published, so no device event names it.
+     - DEVICEMANAGER LEARNS OF IT AT THAT INSTANCE'S "NAMESPACE LOADED" REPORT, which the kernel passes only after every row and every companion the walk published.
+     - At the report DeviceManager reads again the row of every PCI function whose binding is live. For each companion it had not yet read, it asks the service for the node channel and sends it to the binding in the frame that answers a driver's own request, as before.
+     - The same read gives it what a GPIO or serial-bus controller's companion carries: the `_AEI` lines, and the lines and addresses the service's fields name. It grants them at that report.
+     - "Had not yet read" leaves the restart case as it was. A companion DeviceManager already knows is not pushed again. The driver whose channel closed asks, is answered at the report, and never receives two channels.
+   - THE CLIENT HAND-OFF BULLET: DeviceManager acts on an instance's report once it also holds that instance's client, whichever reaches it first. The report comes from the kernel and the client from ServiceManager, and nothing orders the two.
+   - THE REPORT SENTENCE: the kernel passes the report "after every row that walk published and every companion it attached".
+   - THE COMPANION JOIN: DeviceManager reads the node path with the row "at the bind, or, for a function already bound, at the instance's namespace loaded report". A GPIO controller's `_AEI` list reaches it "with its row, or with its companion, read as the companion is".
+   - THE NODE-SCOPED CHANNEL: for a late companion, the channel is handed over "at the namespace loaded report that follows the attach".
+   - THE GPIO ITEM:
+     - The lines are granted AT EACH INSTANCE'S "NAMESPACE LOADED" REPORT, the first instance's included, for every controller bound by then. A PCI controller present at boot always is.
+     - A controller bound or rebound after the report gets its lines when it binds.
+     - This replaces "when the controller's driver is bound ... AGAIN for each new instance ... and after the controller rebinds".
+     - The lines and addresses the fields name follow the same rule.
+   - THE x86_64 GATE:
+     - The virtio-gpio and virtio-i2c bindings are handed their node channels at the service's report.
+     - The `_AEI` case says the line is granted to the first instance at its report, the controller having bound in phase two, and to the new instance at its report after the restart.
+     - So the first delivery fails if the trigger is missing.
+
+Coordinated change: P02M0195's list of the ACPI service's grants now names the same trigger instead of "when that controller publishes".
+
+Re-check of the whole plan:
+- Every place that says when DeviceManager learns of a companion or an `_AEI` list now names the same point, for the claim-time, late and restart paths alike. Those places are the stage paragraph, the report sentence, the companion join, the node-scoped channel, the GPIO item and the x86_64 gate. P02M0195 agrees with them.
+- No new event kind is needed: the plan already put the report on the device-event channel, and it is the one synchronisation point between DeviceManager and each instance.
+- Step 1, the kernel's policy, the GPE split, step 3 and the fixture are unchanged.
+- The edited gate and node-channel paragraphs were reflowed.
+- The file is ASCII and cites no audit. The only lines over 110 columns are seven that HEAD already has. The `Status:` line is kept.
+
+Edited `docs/todo/P02M0196.md` and, for the coordinated sentence, `docs/todo/P02M0195.md`. No source was changed, and nothing was built or booted.

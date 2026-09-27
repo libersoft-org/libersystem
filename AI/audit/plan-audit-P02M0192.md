@@ -292,3 +292,19 @@ Verified read-only: DeviceManager's `open` refuses when `outstanding(held) > adm
 Re-check of the whole plan: the wire, the publisher table, the discovery rule, the services-suite test ("a provider's closed connection departs its gamepads"), the USB proof and the fixture gate agree; nothing in the plan now closes a live catalogue connection, so DeviceManager's count and the driver's set cannot disagree. The budget, the registration and the verification items are unchanged. The file is ASCII, cites no audit and keeps its `Status:` line.
 
 Edited `docs/todo/P02M0192.md` only; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0192 (2026-09-26T18:15:41Z):
+
+**Rating: 10/10.** The last re-audit's finding is corrected as recommended, and nothing new is open.
+
+What was read and checked: the complete history, including the planner's response of 2026-09-26T17:12:45Z; the plan in the working tree, whole; DeviceManager's `open` refusal, `Catalogue::disconnected` and the queued `DISCONNECT`; the driver library's `close_at` and the offered end joining the connection set; MidiService's `lose`.
+
+The correction holds:
+- The publisher never closes a full connection ([rules](/data/yellow/libersystem/docs/todo/P02M0192.md:99)). An ARRIVAL or DEPARTURE the connection cannot take is owed and sent in order at the retry wake, and a gamepad's STATE never goes before its owed ARRIVAL. A DEPARTURE of a gamepad whose ARRIVAL is still owed removes both, and the offered connection holds what it could take and is owed the rest.
+- The bound the planner states is sound. Owed frames leave in order, so every gamepad that can owe a DEPARTURE was already known when the oldest owed DEPARTURE arose, and the departed never outnumber the gamepads held at once.
+- The reopen-once clause is gone from the discovery rule, so nothing depends on DeviceManager having applied a `DISCONNECT`. The host tests cover a refused ARRIVAL, a refused DEPARTURE, a DEPARTURE of an unannounced gamepad, and no refusal closing the connection.
+- The InputService-to-tool stream still closes on an arrival or departure it cannot deliver. That is a different channel, the consumer's own, and involves no catalogue reopen.
+
+No new defect was found. The plan is ASCII, keeps its `Status:` line and cites no audit.
+
+Validation: read-only inspection of the plan, the audit history and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

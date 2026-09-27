@@ -523,3 +523,59 @@ ALSO CORRECTED, though not raised as a finding: my last response said the servic
 Re-check of the whole plan: the bounds table is consistent with the links row (two controllers, eight links each) and with P02M0180; every other part is unchanged. The file is ASCII, cites no audit and keeps its `Status:` line.
 
 Edited `docs/todo/P02M0194.md` only; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0194 (2026-09-26T18:15:41Z):
+
+**Rating: 9/10.** The last re-audit's finding is corrected as recommended. The planner also corrected a wrong claim of its previous response, the one about crate dependencies, and in doing so wrote a new wrong fact into the console item.
+
+What was read and checked: the complete history, including the planner's response of 2026-09-26T17:12:45Z; the plan in the working tree, whole; P02M0180's bounds item; the storage arithmetic; the services crate's `Cargo.toml`; the drivers library's `lib.rs`; `keys.rs`; `usb_hid.rs`; `xhci.rs`.
+
+The correction holds:
+- The storage row now sizes one 1.5 MB aggregate, shared by both controllers as P02M0180's is, against the worst cases of their 16 links together ([storage row](/data/yellow/libersystem/docs/todo/P02M0194.md:81)).
+- The products are exact: 16 x 16 x 1691 = 432,896; 16 x 2 x 8 x 1691 = 432,896; 16 x 32 x 1028 = 526,336. That is 1,392,128 bytes in all.
+- The Domain row is unaffected.
+
+1. **Low - The console item now says the USB keyboard's usage-to-keycode table lives in the xHCI binary's `usb_hid` module and moves into the drivers library. The tables are already in that library.**
+
+   The item reads: "the USB keyboard's usage-to-keycode table, which lives in the xHCI binary's `usb_hid` module today and moves into that library beside `keys`" ([console item](/data/yellow/libersystem/docs/todo/P02M0194.md:192)).
+
+   In the tree:
+   - `usb_hid` is a module of the xHCI binary ([xhci.rs](/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:37)).
+   - What it holds is `usage_keycode`, a nine-line dispatcher ([usb_hid.rs](/data/yellow/libersystem/src/user/drivers/core/src/usb_hid.rs:383)).
+   - The dispatcher only calls into `drivers::keys`. It sends the modifier range to `keys::HID_MODIFIER_KEYCODES`, the keyboard page to `keys::hid_keycode` ([keys.rs](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:650)) and the consumer page to `keys::consumer_keycode` ([keys.rs](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:669)). All three are public items of the library the services crate already links.
+
+   So nothing that is a table has to move, and an implementer looking for one in `usb_hid` finds only the dispatcher. The plan still builds either way, and "nothing is copied" still holds. But the item states as a fact of the tree something the tree contradicts. This is new, introduced by this round's rewording.
+
+   **Correct the console item**: the usage tables are `drivers::keys`' public `hid_keycode`, `HID_MODIFIER_KEYCODES` and `consumer_keycode`, which InputService calls as they are. Only the nine-line `usage_keycode` dispatcher sits in the xHCI binary, and it moves beside them if InputService is to share it rather than dispatch the three pages itself.
+
+Validation: read-only inspection of the plan, the audit history and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0194 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- `xhci.rs`: `mod usb_hid` is a module of the xHCI binary;
+- `usb_hid.rs`: `usage_keycode` is a nine-line dispatcher that sends the keyboard page's modifier range to `keys::HID_MODIFIER_KEYCODES`, the rest of the keyboard page to `keys::hid_keycode` and the consumer page to `keys::consumer_keycode`;
+- `keys.rs`: `hid_keycode`, `consumer_keycode` and `HID_MODIFIER_KEYCODES` are public items, and `keys` is a public module of the drivers library (`lib.rs`), which the services crate already links.
+Summary: one finding, accepted.
+
+1. **ACCEPTED - the console item placed the usage tables in the xHCI binary, and they are already the library's.** Plan change, in THE TEXT CONSOLE item: the USB keyboard's usage tables are named as what they are - `keys`' public `hid_keycode`, `HID_MODIFIER_KEYCODES` and `consumer_keycode`, which InputService calls as they are - and only `usage_keycode`, the dispatcher, is said to sit in the xHCI binary's `usb_hid` module. OF THE TWO OPTIONS THE FINDING LEAVES, THE DISPATCHER MOVES: it goes beside the tables into `keys` as a public function, and `usb_hid` calls it there. The move is nine lines, it makes the two callers share the page dispatch as well as the tables, and so "nothing is copied" stays literally true, where InputService dispatching the three pages itself would be a second copy of the same nine lines.
+
+Re-check of the whole plan: the item's other facts - the services crate's dependency on the drivers library, the ConsoleInputSource delegated through a privilege role, the chords that do not act from a Bluetooth keyboard, the gate - are unchanged and still true; the bounds table, the storage arithmetic and every other part are unaffected. The file is ASCII, no line exceeds its 112 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0194.md` only; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0194 (2026-09-26T20:02:40Z):
+
+**Rating: 10/10.** The last re-audit's one finding is corrected, and the facts the corrected item now states about the tree are true. No unresolved issue, contradiction or new material defect was found.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- in the tree: `usb_hid.rs`, `keys.rs`, the drivers library's `lib.rs` and `xhci.rs`.
+
+The correction holds:
+- The console item names the usage tables as what they are ([item](/data/yellow/libersystem/docs/todo/P02M0194.md:183)): `keys`' public `hid_keycode` ([keys.rs](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:650)), `consumer_keycode` ([keys.rs](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:669)) and `HID_MODIFIER_KEYCODES` ([keys.rs](/data/yellow/libersystem/src/user/drivers/core/src/keys.rs:699)). They sit in a public module of the drivers library ([lib.rs](/data/yellow/libersystem/src/user/drivers/core/src/lib.rs:62)).
+- It places only the nine-line `usage_keycode` dispatcher in the xHCI binary's `usb_hid` module ([usb_hid.rs](/data/yellow/libersystem/src/user/drivers/core/src/usb_hid.rs:383), [xhci.rs](/data/yellow/libersystem/src/user/drivers/core/src/xhci.rs:37)). That is correct.
+- Moving the dispatcher into `keys` is the sound choice of the two the finding left open. The function is private and has one caller ([usb_hid.rs](/data/yellow/libersystem/src/user/drivers/core/src/usb_hid.rs:324)), so the move touches nothing else, and "nothing is copied" stays literally true.
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history and the source files named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

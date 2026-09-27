@@ -417,3 +417,87 @@ Verified read-only: DeviceManager's development-boot self-tests (`unopened_provi
 Re-check of the whole plan: the design (offered endpoint closed at publication and uncounted, scoped connections counted and refunded) now has a proof for each half - arithmetic on the host, the real handle in the development boot, the end-to-end effect in the gate - and still matches P02M0201's `smbus_ich9` row, which follows the same rule. Nothing else changed. The file is ASCII, cites no audit and keeps its `Status:` line.
 
 Edited `docs/todo/P02M0195.md` only; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0195 (2026-09-26T18:15:41Z):
+
+**Rating: 9/10.** The last re-audit's finding is corrected as recommended. One gap of the kind corrected this round in P02M0198, P02M0199 and P02M0202 is still open here: the HID-over-I2C driver has no step in P02M0197's suspend exchange.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z;
+- the plan in the working tree, whole;
+- DeviceManager's development-boot self-tests and `unopened_provider_withdrawal`;
+- `Catalogue::publish_all`, which takes a binding, a `&'static Entry` and the offers, so a self-test can drive the real publication path with a static entry and a real channel;
+- the working-tree P02M0196 (the fixture) and P02M0197 (the driver contract and its list of drivers that carry the exchange).
+
+The correction holds:
+- The bus half's host-suite item credits the rebind only with the controller giving its lines back and DeviceManager minting again after a parent rebinds ([host-suite item](/data/yellow/libersystem/docs/todo/P02M0195.md:153)).
+- The effect a pure function cannot show goes to a development-boot self-test beside `unopened_provider_withdrawal`: an `i2c-bus` and a `gpio-lines` publication through the real `Catalogue`, with each offered endpoint's far end found closed at publication and each entry counting no consumer.
+- This is feasible as written, since the closing belongs in `publish_all`, which the self-test can call.
+
+1. **Low - The HID-over-I2C driver has no step in P02M0197's exchange, and P02M0197's list of drivers that carry it omits this plan.**
+
+   The rule the driver would break:
+   - P02M0197 refuses every sleep while a binding with no `suspend-deadline` is Online.
+   - That plan implements the exchange only in the drivers the image ships when it lands. A driver added after it "CARRIES THE EXCHANGE ITSELF", and the list of "the plans written beside this one" names P02M0190, P02M0198, P02M0199, P02M0201 and P02M0202, not this one ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:156)).
+
+   Where this plan stands against that rule:
+   - The bus half lands before P02M0196d's fixture, and so before P02M0197's fixture gates. The virtio-i2c and virtio-gpio drivers are therefore covered by P02M0197's own item.
+   - The HID half waits only for P02M0196b and the companion join, so it can land after P02M0197.
+   - Its driver already has the pieces a sleep needs: `_PS3` "after sleep", `_PS0`, power on and the RESET handshake, and SET_POWER sleep "on `STOP`" ([driver item](/data/yellow/libersystem/docs/todo/P02M0195.md:201)). It has no `SUSPEND`, `RESUME` or `suspend-deadline`.
+   - P02M0196d's fixture SSDT "carries the devices the owners' gates need" ([P02M0196](/data/yellow/libersystem/docs/todo/P02M0196.md:415)). If the HID devices are there, a fixture boot that binds them refuses the sleeps P02M0197's lid and Time and Alarm Device cases take on that fixture.
+
+   This is new; no earlier round raised it for this plan.
+
+   **Add the exchange to the HID-over-I2C driver**:
+   - it declares a `suspend-deadline` and implements P02M0197's exchange, carried by whichever of P02M0197 and this milestone lands second;
+   - at `SUSPEND`: SET_POWER sleep, then `_PS3` where the node has it;
+   - at `RESUME`: `_PS0`, power on and the RESET handshake, as at bind.
+
+   P02M0197's list of plans should then name this one.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree P02M0196 and P02M0197, and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0195 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- P02M0197a: every sleep is refused while a binding with no `suspend-deadline` is Online; `SUSPEND` carries whether to arm wake, `RESUME` whether the device may have lost power; DeviceManager suspends a consumer before the provider it consumes and resumes in bind order; the list of drivers that carry the exchange named P02M0190, P02M0198, P02M0199, P02M0201 and P02M0202 only;
+- this plan: the driver item has `_PS0`, power on and the RESET handshake at bind, `_PS3` after sleep and SET_POWER sleep on `STOP`, and no `SUSPEND`, `RESUME` or `suspend-deadline`; the line contract delivers an event once and keeps the line masked until it is acknowledged; the ORDER paragraph ties the HID half to P02M0196b and the join only, and the bus half to P02M0196d's fixture only;
+- P02M0202's `tcpci` text and EXCLUDES, which record that a GPIO line kept as a wake source across a sleep needs a wake request the line contract lacks.
+Summary: one finding, accepted, with two additions its own premise calls for.
+
+1. **ACCEPTED - the HID-over-I2C driver had no step in P02M0197's exchange.** Without it every laptop this half targets would refuse every sleep. Plan changes:
+   - A new item, "ACROSS A SLEEP, P02M0197's SUSPEND AND RESUME EXCHANGE", carried by whichever of P02M0197 and this half lands second. The `i2c_hid` driver declares a `suspend-deadline` covering the transfer in flight and the commands of its step.
+     - At `SUSPEND` it finishes that transfer, takes no report from the line until `RESUME` (an event that arrives meanwhile stays unacknowledged, so the line stays masked), sends SET_POWER sleep, and then evaluates `_PS3` where the node has it. Asked to arm wake, it answers done without wake armed.
+     - At `RESUME` it first acknowledges an event held since `SUSPEND`, so the line is live again, then evaluates `_PS0` where the node has it and sends SET_POWER on. When `RESUME` says the device may have lost power (S3), it runs the RESET handshake as at bind. Then it reads reports again.
+     - DeviceManager suspends it before the two controllers whose providers it consumes and resumes it after them.
+   - ONE REFINEMENT OF THE RECOMMENDATION: the finding asks for "power on and the RESET handshake, as at bind" at every `RESUME`. The plan runs the RESET only when `RESUME` says the device may have lost power, and SET_POWER on always. The contract carries that flag for exactly this, and a device that kept its power across a suspend to idle keeps its state. The acknowledgement comes first because the RESET's indication arrives on the line: a held event would leave the line masked, and the handshake would run to its bound and fail the binding.
+   - ADDITION 1, THE BUS HALF'S DRIVERS. The finding takes them as covered by P02M0197's own item. That holds only if the bus half lands before P02M0197a, and nothing orders that: the fixture orders the gates, not P02M0197a's landing. So the same item says the virtio-i2c and virtio-gpio drivers carry the exchange as well should the bus half land after P02M0197a. Each finishes or holds its requests at `SUSPEND`. After a power loss, each initialises its device again at `RESUME`: the virtio-gpio driver sets every scoped line's direction and trigger again, and queues the event buffer again for each line not waiting on an acknowledgement.
+   - ADDITION 2, A CASE THAT CAN FAIL. Without one, a skipped step would pass unnoticed: QEMU's wakeup reset resets the virtio transport, not the touchpad the backend plays behind it, so a model that never loses its power or its awake state would answer a driver that skipped either step.
+     - The HID models honour SET_POWER: a model put to sleep reports nothing until it is set on. Each also takes a POWER LOSS a gate orders through the control socket, after which it reports nothing until a RESET.
+     - The `i2c-hid` gate gains an ACROSS A SLEEP case, carried by whichever of P02M0197 and this half lands second: a suspend to idle on all three, and on x86_64 an S3 cycle during which the touchpad's power loss is ordered. Both bindings answer `SUSPENDED` and `RESUMED`, and after each resume the touchpad's moves and the touchscreen's contact arrive. A driver that skipped SET_POWER on, or the RESET after the S3, cannot deliver them.
+   - EXCLUDES gains a HID-over-I2C device that wakes the machine: it needs its GPIO line kept live as a wake source across the sleep, the wake request P02M0202 records the line contract lacking.
+
+Coordinated change: P02M0197a's list of drivers that carry the exchange names P02M0195's `i2c_hid` driver, and its virtio-i2c and virtio-gpio drivers should the bus half land after that part (its response of this date).
+
+Re-check of the whole plan: the new item uses only what the plan already has (`_PS0`, `_PS3`, SET_POWER, the RESET handshake, the node-scoped channel) and P02M0197's contract as written. The suspend order DeviceManager already applies (dependants before providers) is what makes the acknowledgement and the handshake work at `RESUME`. The fixture additions are the backend's own state, driven through the control socket that already exists. The ORDER paragraph, both halves' gates and the InputService item are unchanged. The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0195.md`, and for coordination `docs/todo/P02M0197.md`; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0195 (2026-09-26T20:02:40Z):
+
+**Rating: 10/10.** The last re-audit's one finding is corrected. The planner's refinement of the recommendation and both additions are justified, and the new gate case can fail on each step it was added for. No unresolved issue, contradiction or new material defect was found.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- the working-tree P02M0197, whole (the driver contract, step 4's order, the list of drivers that carry the exchange, suspend to idle and S3), and P02M0196's companion join.
+
+The correction holds:
+- **The new item** ([item](/data/yellow/libersystem/docs/todo/P02M0195.md:209)) gives the `i2c_hid` driver a `suspend-deadline` and both halves of the exchange. At `SUSPEND` the driver holds events unacknowledged, so the line contract's own mask keeps the line quiet; then SET_POWER sleep, then `_PS3`. At `RESUME` it acknowledges first, then `_PS0`, SET_POWER on, and the RESET handshake after a power loss. Answering "done" when asked to arm wake is one of the outcomes P02M0197a defines ([contract](/data/yellow/libersystem/docs/todo/P02M0197.md:143)).
+- **The refinement is right.** The planner runs the RESET only when `RESUME` says the device may have lost power, instead of at every resume. P02M0197a's `RESUME` carries that flag for exactly this purpose. The acknowledge-first order is needed because the reset indication arrives on the same line, which a held event would leave masked.
+- **The suspend order is consistent.** "Suspended before the two controllers, resumed after them" ([order](/data/yellow/libersystem/docs/todo/P02M0195.md:218)) matches P02M0197a's step 4 ([step 4](/data/yellow/libersystem/docs/todo/P02M0197.md:118)) and the child being a dependant of each controller ([P02M0196](/data/yellow/libersystem/docs/todo/P02M0196.md:311)).
+- **Addition 1 is right.** Nothing orders the bus half against P02M0197a, only against P02M0196d's fixture. So the virtio-i2c and virtio-gpio drivers may have to carry the exchange themselves, and P02M0197a's list now names them ([list](/data/yellow/libersystem/docs/todo/P02M0197.md:157)). Re-queuing the event buffer only for lines not waiting on an acknowledgement matches the child's acknowledge-first `RESUME`.
+- **Addition 2 makes the case fail when it should.** The models honour SET_POWER and take a power loss ordered through the control socket ([fixture](/data/yellow/libersystem/docs/todo/P02M0195.md:255)). So the gate's sleep case ([gate](/data/yellow/libersystem/docs/todo/P02M0195.md:293)) fails on a skipped SET_POWER on or a skipped RESET after S3, where a model that kept its state would have hidden both.
+- **The EXCLUDES entry is consistent.** Excluding a HID device that wakes the machine agrees with the line contract, which has no wake request.
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history and the working-tree P02M0196 and P02M0197. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

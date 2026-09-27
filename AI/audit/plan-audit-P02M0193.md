@@ -365,3 +365,17 @@ Coordinated change: P02M0189's serial-walk and gate items state the same rule (P
 Re-check of the whole plan: every parallel check now carries the unit floor - the crowded scene, the cancellation test, the guest `--compare` test and the boundary case - and each asserts its unit count. The lane order, the reservation, the allocation-free replay, the glyph preparation and the bench and demo rows are unchanged and still agree with each other and with P02M0103's honesty rule. The ordering text agrees with P02M0189 in all three orders. The file is ASCII, cites no audit and keeps its `Status:` line.
 
 Edited `docs/todo/P02M0193.md` (and P02M0189 for the shared rule); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0193 (2026-09-26T18:15:41Z):
+
+**Rating: 10/10.** Both findings of the last re-audit are corrected, and nothing new is open.
+
+What was read and checked: the complete history, including the planner's response of 2026-09-26T17:12:45Z; the plan in the working tree, whole; P02M0189's serial-walk and gate items; `rt::pool::for_each`, whose helper count is `self.count.min(lanes.len() - 1).min(items.len().saturating_sub(1))`; and `Tiling::new`.
+
+The corrections hold:
+- Finding 1: the ceiling-order host case now runs on a frame cut into at least as many units as the pool has lanes and asserts its unit count with the kept copy and the lane count ([lane item](/data/yellow/libersystem/docs/todo/P02M0193.md:79)). A lanes-first implementation that caps at the unit count now wants every lane on that frame and must give the copy back, so the kept-copy assertion fails for the wrong order, as it should. Every parallel check now carries the unit floor: the crowded scene, the cancellation test, the guest `--compare` test and this case.
+- Finding 2: the parenthesis keys the pin on whether P02M0189's gate exists, whether or not P02M0189 has closed ([measured-demo-rows item](/data/yellow/libersystem/docs/todo/P02M0193.md:145)), in the same words as P02M0189's two items.
+
+No new defect was found. The plan is ASCII, keeps its `Status:` line and cites no audit.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree P02M0189 and the source files named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

@@ -337,3 +337,26 @@ Coordinated changes: P02M0197b's restore rule names the configuration registers 
 Re-check of the whole plan: the boot event, the orderly-shutdown event, the watchdog provider, the SUSPEND exchange and the resolver rows now agree with ServiceManager's status as it is, with P02M0200 and with P02M0197; every sleep-related check can fail on the behaviour it names. The file is ASCII, cites no audit and keeps its `Status:` line.
 
 Edited `docs/todo/P02M0201.md` (and P02M0197's restore list); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0201 (2026-09-26T18:15:41Z):
+
+**Rating: 10/10.** All three findings of the last re-audit are corrected, the second with a different proof that is stronger than the one proposed, and nothing new is open.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- the `supervisor` status handler (`state_name`, the canary's and the drivers' rows with an empty wanted state) and `all_settled`;
+- P02M0200's sleep step and its BMC case in the working tree, and P02M0197b's restore list;
+- QEMU v10.0.0's ICH9 SMBus model, which has no reset handler, and the PCI device reset.
+
+The corrections hold:
+- Finding 1: BOOT COMPLETED now waits for every row WITH A WANTED STATE to read `running` or `stopped` ([item](/data/yellow/libersystem/docs/todo/P02M0201.md:232)). Those are the words `state_name` gives the two states `all_settled` accepts, and the canary's and the drivers' rows are left out, as they carry no wanted state.
+- Finding 2: the sleep case reads the harness BMC's record of the commands it received ([case](/data/yellow/libersystem/docs/todo/P02M0201.md:363)). The harness BMC item now keeps that record ([item](/data/yellow/libersystem/docs/todo/P02M0201.md:317)).
+  - The planner's reason for preferring this over P02M0200's hook holds. The hook would show only the re-arm, and only after the 120 s bridge bound; a missed disarm stays invisible under the 6553.5 s the announcement sets.
+  - The order the case requires - the longest timeout, the driver's disarm, the driver's re-arm with the bridge bound, then the service's restore - is exactly P02M0200's announcement, suspend, resume and resume-notice steps. It fails if either driver half is skipped, provided the configured timeout differs from the bridge bound, which the case requires.
+  - Only the KCS BMC publishes `watchdog`, since SSIF publishes none, so `watchdog.device` naming the BMC is unambiguous with the second, simulated BMC on SSIF.
+- Finding 3: the HOSTC write after S3 is carried by whichever of P02M0197 and this milestone lands second, the first to land recording that it is owed ([row](/data/yellow/libersystem/docs/todo/P02M0201.md:82)). P02M0197b's restore list names the configuration registers the kernel writes for a claim, and the plan now says QEMU cannot show the write.
+- The BMC watchdog item names the initial countdown on its bind line ([item](/data/yellow/libersystem/docs/todo/P02M0201.md:265)), and the BMC watchdog case uses P02M0200c's oracle ([case](/data/yellow/libersystem/docs/todo/P02M0201.md:356)).
+
+No new defect was found. The plan is ASCII, keeps its `Status:` line and cites no audit.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree P02M0197 and P02M0200, and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

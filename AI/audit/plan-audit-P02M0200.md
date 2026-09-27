@@ -381,3 +381,70 @@ Coordinated changes: P02M0197a now decides how ServiceManager answers during its
 Re-check of the whole plan: the liveness exchange, the arming policy and both sleep and shutdown steps agree with P02M0197 and P02M0198d; the harness text on test-mode runs (no QMP socket, the default `reset`) is consistent with test boots now being unarmed; every gate case still has a half that can fail. The file is ASCII, no line exceeds 112 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0200.md` (and P02M0201 for the oracle); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0200 (2026-09-26T18:15:41Z):
+
+**Rating: 9/10.** All three findings of the last re-audit are corrected. One sentence of the second correction describes a mechanism the tree does not have: a payload role resolved by the plan carries no bytes, so the boot mode would not reach the watchdog service that way.
+
+What was read and checked: the complete history, including the planner's response of 2026-09-26T17:12:45Z; the plan in the working tree, whole; `deliver_roles`' payload arm; DeviceManager's `BOOTWIN` first-start arm; `relaunch_planned` and its `external` arm; ServiceManager's `MODE` bootstrap message; the working-tree P02M0197, P02M0198 and P02M0201.
+
+These corrections hold and are not repeated:
+- Finding 1: the BMC case reads Get Watchdog Timer at the next boot's bind - the expiration flags and the initial countdown the driver's bind line names ([case](/data/yellow/libersystem/docs/todo/P02M0200.md:285)). So its failing half no longer races the takeover, and P02M0201's BMC item and case use the same oracle.
+- Finding 2, in its rule: development images and test boots default to off, with the reason ([item](/data/yellow/libersystem/docs/todo/P02M0200.md:87)).
+- Finding 3: the loop answers no `alive` while it runs a sequence, and the other answers are left to P02M0197 and P02M0198d, which now state them ([sentence](/data/yellow/libersystem/docs/todo/P02M0200.md:73)).
+
+1. **Low - "A payload role the plan resolves, so a relaunched instance gets it again" would deliver the role's tag and not the boot mode.**
+
+   The item reads: "ServiceManager already receives the boot mode; it hands it to the watchdog service as a payload role the plan resolves, so a relaunched instance gets it again" ([item](/data/yellow/libersystem/docs/todo/P02M0200.md:92)).
+
+   What the tree does with a payload role:
+   - `deliver_roles` resolves a payload to its bare tag with no bytes ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:221)).
+   - A payload that carries content gets it from a hand-written arm, as DeviceManager's `BOOTWIN` does at the first start ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:858)).
+   - The relaunch path's only arm is AdminService's journal ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1582)).
+
+   So neither the first start nor a relaunch would carry the mode unless ServiceManager supplies it. A relaunched watchdog service in a test boot would then fall back to the shipping default, which is the arming the correction exists to prevent. This is new, in text added this round.
+
+   **Correct the ARMING IS POLICY item**: ServiceManager supplies the boot mode's bytes to the watchdog service at its first start and again at each relaunch, through arms of the two paths as DeviceManager's `BOOTWIN` is supplied. The payload's tag alone does not carry the mode.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree sibling plans and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0200 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- `service_manager/bootstrap.rs`: `deliver_roles` sends a `Payload` role as its bare tag, with no bytes; DeviceManager's `BOOTWIN` gets its deadline and window only from a hand-written first-start arm;
+- `service_manager.rs`:
+  - `relaunch_planned`'s one arm is AdminService's journal;
+  - the boot mode arrives as the `MODE` bootstrap message, "MODE" and one byte;
+  - the orderly `!poweroff` and `!reboot` run inline;
+- the working-tree P02M0196b, P02M0197 and P02M0201.
+Summary: one finding, accepted.
+
+1. **ACCEPTED - "a payload role the plan resolves" would deliver the role's tag and not the boot mode.** The gap was wider than the relaunch: the first start would have carried the tag alone as well, since a plan-resolved payload is its bare tag on either path. Plan changes:
+   - ARMING IS POLICY: ServiceManager, which already receives the boot mode as its `MODE` message, SUPPLIES ITS BYTES to the watchdog service at the first start and again at each relaunch. It does so in a payload role it fills itself, as it fills DeviceManager's `BOOTWIN`, through its one function for the roles only it can fill. P02M0196b's stage paragraph states that function; whichever of P02M0196b, P02M0197c, P02M0198 and this part lands first builds it. The item says why the tag alone carries nothing.
+   - ADDED, SO THE CORRECTION CAN FAIL A CHECK: a mode payload with no bytes is refused - the service fails its start rather than read a default. So the existing kill-and-restart case in part c fails on a relaunch that sent the tag alone: the replacement never starts, nobody pets, and the guest ends in `watchdog`. That case now also reads the replacement's line naming the device it armed again.
+   - ONCE ARMED no longer says "every role it has is plan-resolved". Its catalogue connection and config client are plan-resolved. Its `supervisor-liveness` channel and the boot mode's payload are filled by ServiceManager at both starts, through that function, and the restart sentence says the mode's bytes are handed again with the new channel.
+   - WHO KEEPS IT FED: the liveness channel is delivered in a role ServiceManager fills itself at each start, instead of "a channel the plan delivers".
+
+Coordinated change: the sentence on how the loop answers during a sequence now names the orderly sequence from either door - the admin channel's `!poweroff` and `!reboot` or `system-shutdown`'s `power-off` - ending a sleep transaction and running after it, as P02M0197a now states.
+
+Re-check of the whole plan: every role of the watchdog service now has a stated source at both starts. The default-off rule reaches a relaunched instance in a test boot. The kill-and-restart case fails on a missing row or missing bytes. P02M0201's "as P02M0200a delivers its `supervisor-liveness` channel" still describes this item. The devices, the shutdown notice, the sleep step and the other verification cases are unchanged. The file is ASCII, no line exceeds its 112 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0200.md`; the function it relies on is stated in `docs/todo/P02M0196.md`. No source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0200 (2026-09-26T20:02:40Z):
+
+**Rating: 10/10.** The last re-audit's one finding is corrected, the gap it found on the first start is closed too, and the kill-and-restart case now fails on a relaunch without the mode. No unresolved issue, contradiction or new material defect was found.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- the working-tree P02M0196b stage paragraph and P02M0197a's serving rule;
+- in the tree: `deliver_roles`' payload arm, DeviceManager's `BOOTWIN` arm, `relaunch_planned` and ServiceManager's `MODE` bootstrap message.
+
+The correction holds:
+- **Both starts are covered.** The planner was right that the gap covered the first start as well as the relaunch: `deliver_roles` sends a payload as its bare tag ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:221)), and only a hand-written arm adds bytes, as for `BOOTWIN` ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:858)). ServiceManager now supplies the mode's bytes at both starts through the one function ([item](/data/yellow/libersystem/docs/todo/P02M0200.md:94)).
+- **The mode can carry what the default needs.** `MODE` is one byte, and 1 means a test boot ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:441)). A development image is a build feature, so the service can derive its default from both.
+- **The refusal makes the case fail when it should.** An empty mode payload is refused, so a relaunch that sent the tag alone never starts. Nothing then pets, and the kill-and-restart case ([case](/data/yellow/libersystem/docs/todo/P02M0200.md:280)) ends in `watchdog` instead of `running`.
+- **The loop sentence agrees with P02M0197a.** It now names the orderly sequence from either door ([sentence](/data/yellow/libersystem/docs/todo/P02M0200.md:74)).
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history, the working-tree P02M0196 and P02M0197, and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

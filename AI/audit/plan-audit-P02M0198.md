@@ -499,3 +499,109 @@ Coordinated change: P02M0197's "NO DRIVER IS SKIPPED" now names this plan's fan 
 Re-check of the whole plan: every duty of today's tick now has a replacement that holds without it, the lost-wake race included, and each has a proof placed where its path is compiled - kernel tests for the scheduler, clock, deadline and transmit paths, the gate for receive, the shell loop and hot-plug. The forced power-off, the suspended state and the one-shot rules are unchanged and still agree with P02M0197b; the fan driver now meets P02M0197's contract. The file is ASCII, no line exceeds 114 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0198.md` (and P02M0197's list of drivers); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0198 (2026-09-26T18:15:41Z):
+
+**Rating: 8/10.** All three findings of the last re-audit are corrected, and the lost-wake duty is now designed for all three ports. Two small gaps are left. The new gate states a timing bound the host cannot observe. And ProcessorPowerService is declared transparent, but its privilege and its three ServiceManager-provided clients would not come back when it is relaunched.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- the scheduler's drain and `cpu_idle_loop`; `idle_halt` on all three ports; `start_thread_on`;
+- the remote-spawn test and its control, which spins until the unwoken thread runs;
+- the `cfg(not(test))` paths behind the typed-bytes and hot-plug cases;
+- `relaunch_planned` and its `external` arm, `deliver_roles` with its fallback, `Kept::end_of` and `plan_relaunchable`;
+- the working-tree P02M0196 and P02M0197.
+
+These corrections hold and are not repeated:
+- Finding 1: "THE WAKE THAT LANDS JUST BEFORE A HALT" ([duty](/data/yellow/libersystem/docs/todo/P02M0198.md:66)).
+  - Every halt masks before its last check and before it programs its one-shot, and waits in the form that wakes on an interrupt pending under the mask. On aarch64 that means `wfi` executed masked and the unmask after it, the order Linux's arm64 idle uses.
+  - The BSP's four halts move to that form, and `start_thread_on` gains the wake.
+  - The remote-spawn control can no longer hang on a tickless core: it waits a bounded number of ticks and then wakes the thread itself.
+  - The kernel test with a hook between the last check and the halt can fail on a missing mask.
+- Finding 2: the typed-bytes and hot-plug cases move to a gate on the development image, with the riscv64 pair in one boot, and the transmit burst stays a kernel test, correctly: the ring and its drain are compiled into both builds.
+- Finding 3: the fan driver implements the exchange, carried by whichever of P02M0197 and this milestone lands second ([item](/data/yellow/libersystem/docs/todo/P02M0198.md:181)). Its fixture case can fail: the harness clears the level during S3, and the driver's `RESUME` must restore it ([case](/data/yellow/libersystem/docs/todo/P02M0198.md:305)).
+
+1. **Low - The `tickless-idle` gate requires typed bytes to reach the shell "within a tick of their arrival", a time the host cannot observe and the emulated ports cannot meet.**
+
+   The problem with the bound:
+   - The case reads "bytes typed through `lab` at an idle guest reach the shell within a tick of their arrival on all three" ([gate](/data/yellow/libersystem/docs/todo/P02M0198.md:287)).
+   - The host sees when it wrote a byte and when the echo came back. When the byte arrived at the UART is invisible to it.
+   - A round trip under TCG costs many times a native one. The remote-spawn test's comment in this tree measured a woken cross-core trip at 3.3-3.6 ms on riscv64, with excursions past 5.7 ms, for work far smaller than a shell's echo. A 10 ms bound on the whole path would fail there with nothing wrong.
+
+   What the bound has to show instead: this item exists to prove that the receive interrupt wakes an idle BSP whose settled console loop now has no wake of its own. A bound much longer than any emulated echo, yet far shorter than "never", tells the two apart on every port.
+
+   This is new, added with this round's move of the case into a gate.
+
+   **Correct the gate item**: time the echo from the host's write, and state a bound the host can measure and the emulated ports can meet - for example one second - and say that without the receive interrupt the idle BSP would take no wake at all.
+
+2. **Low - ProcessorPowerService is `transparent`, but the relaunch path would re-deliver neither its `ProcessorPower` privilege nor its three clients served by ServiceManager.**
+
+   What the plan relies on:
+   - The service is "restart transparent" and holds "a new `ProcessorPower` privilege kind, delivered as a manifest `privilege` role from the kernel, as DeviceManager's DEVPRIV is"; "a restarted instance installs it again" ([item](/data/yellow/libersystem/docs/todo/P02M0198.md:115)).
+   - Its grants include a `system-power` client, a `system-shutdown` client and P02M0197's `system-sleep` client ([grants](/data/yellow/libersystem/docs/todo/P02M0198.md:235)). All three are served by ServiceManager itself.
+   - The fixture gate requires "every table installed again when ProcessorPowerService restarts, none refused" ([gate](/data/yellow/libersystem/docs/todo/P02M0198.md:296)).
+
+   What the tree does:
+   - DeviceManager's `DEVPRIV` reaches it through a first-start arm that duplicates the supervisor's copy ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:867)). DeviceManager escalates and is never relaunched, as every service that holds a privilege today does.
+   - The relaunch path's only arm is AdminService's journal ([service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1582)).
+   - A privilege role reaches `deliver_roles`' fallback ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:225)).
+   - A client of ServiceManager finds no end in `Kept::end_of`, which searches the managed services only ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:64)).
+   - Either way, a required role fails the relaunch and an optional one arrives empty.
+
+   Consequence: the restart case cannot pass as written, and after a restart the orderly half of `_CRT` and the `_HOT` request are lost. The kernel's forced deadline and the zone driver's fallback still stand. This is new; no earlier round raised it. P02M0196's re-audit of this date reports the same gap for the ACPI service's privilege.
+
+   **Correct the ONE USERSPACE HOLDER item**: ServiceManager duplicates the `ProcessorPower` privilege and supplies the three clients at the first start and again at each relaunch, and the service is one of the plan-relaunchable services. The relaunch arm for a kernel privilege is the same as P02M0196b's, and whichever lands first builds it.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree P02M0196 and P02M0197, and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0198 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- `sched/tests.rs`: the remote-spawn test's comment measured a woken cross-core trip at 3.3-3.6 ms on riscv64 (2026-08-20), with excursions past 5.7 ms;
+- `main.rs`: the kernel's console pass drains the UART's receive FIFO through `arch::serial::read_byte` on every wake, and runs `settle_pci_faults` on the same pass;
+- `arch::common::pci`: `poll_errors` reads and clears every function that carries an AER capability;
+- QEMU v10.0.0 `gen_pcie_root_port.c` and `pcie_root_port.c`: every generic PCIe root port carries AER, at 0x100;
+- `service_manager.rs` and `service_manager/bootstrap.rs`: `relaunch_planned`'s one arm (AdminService's journal), `Kept::end_of`, `deliver_roles`' fallback, and DeviceManager's first-start `DEVPRIV` arm;
+- `check-bootstrap-plan.py`'s rule that a `transparent` service be re-runnable;
+- the working-tree P02M0196 and P02M0197.
+Summary: two findings, both accepted; the first with a correction to part of its recommendation.
+
+1. **ACCEPTED, WITH A CORRECTION - the gate's bound "within a tick of their arrival" was one the host cannot observe.** The host sees only its own write and the echo, so the bound is now timed that way: bytes typed through `lab` at an idle guest are echoed by the shell within ONE SECOND of the host's write, on all three targets. The plan gives the measured cross-core cost as the reason one second has room.
+   THE RECOMMENDATION'S SECOND HALF IS NOT TRUE ON THE GATE'S MACHINE, and the plan does not state it. The finding would have the plan "say that without the receive interrupt the idle BSP would take no wake at all". But part a keeps a HOUSEKEEPING BOUND of 100 ms while polled housekeeping exists, and PCI error reporting is polled for every AER function. The gate's machine carries a PCIe root port for its own hot-plug case, and every QEMU root port has AER. On each of those wakes the console pass reads the UART. So with no receive interrupt at all, the bytes would still reach the shell within about 100 ms, and a one-second bound alone would pass a kernel that never armed the line.
+   The plan therefore proves the interrupt separately, from a record the guest already keeps. The per-core idle records (part a's accounting item) are read before and after the typing, and must attribute at least one wake per typed burst to the console UART's receive line:
+   - IRQ 4 on x86_64;
+   - the PL011's SPI on aarch64;
+   - on riscv64, the shared wired identity, with no slot event yet in that boot, which the gate's existing "typed bytes first" order already guarantees.
+   A kernel that never armed the line records none there. The one-second bound stays as the host-side half.
+
+2. **ACCEPTED - ProcessorPowerService is `transparent`, but a relaunch would re-deliver neither its privilege nor its three clients.** Every fact holds. Plan changes:
+   - THE ONE USERSPACE HOLDER item gains "IT GETS IT AGAIN AT EVERY RELAUNCH". The service is named among the plan-relaunchable services (`plan_relaunchable`, which `check-bootstrap-plan` requires). Its `ProcessorPower` role and its `system-power`, `system-shutdown` and `system-sleep` clients are filled by ServiceManager at the first start and again at each relaunch: the privilege duplicated from ServiceManager's copy, each client minted afresh. They go through ServiceManager's one function for the roles only it can fill, which P02M0196b's stage paragraph states; whichever of P02M0196b, P02M0197c, this milestone and P02M0200a lands first builds it, and the privilege row is the same kind as `FirmwareInterpreter`'s. The item says why DEVPRIV's arm is no precedent (it reaches a service that escalates and is never relaunched) and what the omission would cost.
+   - Two checks now fail on it:
+     - The fixture gate's "every table installed again when ProcessorPowerService restarts, none refused" needs the privilege.
+     - The thermal case now kills and relaunches ProcessorPowerService once before its heating. So `_PSV`, `_ACx` and `_CRT` all go through the relaunched instance, and at `_CRT` its log must name the forced deadline armed (`system-power`) before the orderly power-off (`system-shutdown`) appears.
+
+Coordinated changes: P02M0196b states the function; P02M0197c and P02M0200a add their rows (their responses of this date).
+
+Re-check of the whole plan: part a's housekeeping bound, its accounting item and the gate now agree - the gate relies on the accounting item for the receive interrupt, and part a's polled-housekeeping list for why latency cannot. ProcessorPowerService's grants, restart and fallback agree with P02M0197's policy and with P02M0196b's service stage. The kernel tests, the fan's sleep case and the fixture are unchanged. The file is ASCII, no line exceeds its 114 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0198.md`, and for coordination `docs/todo/P02M0196.md`, `docs/todo/P02M0197.md` and `docs/todo/P02M0200.md`. No source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0198 (2026-09-26T20:02:40Z):
+
+**Rating: 10/10.** Both findings of the last re-audit are corrected. The planner was right to decline half of the first recommendation, and both new checks can fail. No unresolved issue, contradiction or new material defect was found.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- the working-tree P02M0196b stage paragraph, and P02M0197c's and P02M0200a's rows of the same function;
+- in the tree: `plan_relaunchable`, `relaunch_planned` and its `external` arm, `start_service`, `deliver_roles` and its fallback, and `poll_errors` in the common PCI code.
+
+These corrections hold:
+- **Finding 1 (the gate's bound).** The `tickless-idle` gate now times the echo from the host's write, against a one-second bound the emulated ports meet ([gate](/data/yellow/libersystem/docs/todo/P02M0198.md:293)).
+  - The planner's correction to the recommendation is right. The plan keeps a 100 ms housekeeping bound while polled housekeeping exists, and PCI error reporting is polled ([pci](/data/yellow/libersystem/src/kernel/arch/common/pci/mod.rs:1724)). So on the gate's machine, with its root port, "no wake at all without the receive interrupt" would have been false, and a one-second bound alone would pass a kernel that never armed the line.
+  - The added check closes that gap. Part a's per-core record counts wakes by device vector ([accounting](/data/yellow/libersystem/docs/todo/P02M0198.md:102)) and attributes one to the UART's receive line on each typed burst, which a kernel that never armed the line cannot produce.
+- **Finding 2 (the relaunch).** ProcessorPowerService is plan-relaunchable ([item](/data/yellow/libersystem/docs/todo/P02M0198.md:117)). Its `ProcessorPower` privilege and its three ServiceManager-provided clients are filled at both starts through the one function P02M0196b states.
+  - The tree can host that function. `start_service` already receives the kept handles ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:524)), and both paths pass an `external` closure to `deliver_roles` ([bootstrap.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager/bootstrap.rs:108), [service_manager.rs](/data/yellow/libersystem/src/user/services/core/src/service_manager.rs:1582)).
+  - The thermal case now relaunches the service before heating ([case](/data/yellow/libersystem/docs/todo/P02M0198.md:320)), so a missing privilege or client fails it.
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history, the working-tree P02M0196, P02M0197 and P02M0200, and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

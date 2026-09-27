@@ -379,3 +379,25 @@ Coordinated change: P02M0197's "NO DRIVER IS SKIPPED" names `ucsi-acpi` and `tcp
 Re-check of the whole plan: every driver this milestone adds now meets P02M0197's contract, and the TCPCI safety invariants hold across a sleep because the sink path is never left on while the engine cannot run; every PowerService record the adapter can produce is canonical; every gate case can run on each machine it names and fail on the behaviour it checks. The ORDER, the exclusions and the other parts agree with P02M0195, P02M0196, P02M0197 and P02M0099. The file is ASCII, no line exceeds 112 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0202.md` (and P02M0197's list of drivers); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0202 (2026-09-26T18:15:41Z):
+
+**Rating: 10/10.** All four findings of the last re-audit are corrected. Where the planner chose differently from the finding's example, for `tcpci` across a sleep, the choice is justified and written into EXCLUDES. Nothing new is open.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- `canon::validate`'s rule for an absent source, PowerService's `drain_stream`, the power model's tags, and DeviceManager's `machine_scale` comment;
+- the working-tree P02M0197 (the driver contract, a refusal aborting the suspend, the list of drivers that carry the exchange), P02M0196d's fixture and P02M0099's ACPI battery, AC and thermal item.
+
+The corrections hold:
+- Finding 1: "SUSPEND AND RESUME" gives each driver its exchange, each half landing with its driver's part ([item](/data/yellow/libersystem/docs/todo/P02M0202.md:136)). The ORDER paragraph names the carrying rule ([order](/data/yellow/libersystem/docs/todo/P02M0202.md:17)).
+  - `ucsi-acpi`'s deadline covers the ten-second command bound. `RESUME` re-enables notifications and re-reads every connector.
+  - For `tcpci` the planner states what keeps invariants 5 and 6: nothing can while the engine does not run, so `SUSPEND` is refused while the sink path is enabled, and with no partner the sink path stays off until the engine turns it on. A wake-source alert would need a wake request in P02M0195's line contract and a GPIO controller that keeps one line live while its binding is suspended. Leaving that to EXCLUDES for a board not yet named is justified.
+  - The sleep case can fail on each half.
+- Finding 2: the partner's two timers that wait on the sink - SenderResponseTimer and tSrcTransition - are stretched on the emulated ports by a recorded factor ([gate](/data/yellow/libersystem/docs/todo/P02M0202.md:341)). Every sink timer and the protocol stay as specified, so the "not before" cases still measure the sink.
+- Finding 3: while `present` is no, the adapter publishes a measurement the transport has as `unknown` ([item](/data/yellow/libersystem/docs/todo/P02M0202.md:93)). `canon::validate` accepts that, and the host tests cover an unplugged connector's first snapshot and a detach.
+- Finding 4: the ACPI AC adapter half of the first UCSI case is carried by whichever of this milestone and P02M0099's AC adapter driver lands second, with the `ACPI0003` device it needs ([case](/data/yellow/libersystem/docs/todo/P02M0202.md:299)).
+
+No new defect was found. The plan is ASCII, keeps its `Status:` line and cites no audit.
+
+Validation: read-only inspection of the plan, the audit history, the working-tree sibling plans and the sources named above. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

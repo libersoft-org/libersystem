@@ -475,3 +475,70 @@ Coordinated changes: P02M0196b's SystemIO bullet refuses the same DMA ranges (fi
 Re-check of the whole plan: the reserved set, the mint sources, the terminal-path category, the ownership states and the sleep rule now agree with P02M0196a/b, P02M0197b, P02M0198's run-time installs and P02M0200's ICH9 row, which relies on the same FADT-before-scan order. Every new rule has a test that can fail: the DMA refusals and the page-register mint, the PM1 row refused for the right reason, the read-out order in the record, the sleep rule on both owners, and the gate's sleep before its kill. Order and exclusions are unchanged. The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0191.md`, and for coordination `docs/todo/P02M0196.md`, `docs/todo/P02M0197.md` and `docs/todo/P02M0099.md`; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0191 (2026-09-26T18:15:41Z):
+
+**Rating: 9/10.** All five findings of the last re-audit are corrected, and the choices the planner made where the findings left one open are the right ones. One small gap is left where this round's sleep-entry rule meets P02M0197b's new restore list: after an S3 wake nothing re-initialises the console UART in the lent case before the entry writes through it.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- in the tree: `serial.rs` (`init` and its FCR `0xC7`, `enable_rx_irq`, `read_byte`, `flush_sync`); `main.rs` (`device::init` at the scan, `init_extended_config` compiled out of the test build, `sci::init` in the boot tail); the `sci` module's gating; `smp::acpi_table`, compiled into both builds; `device::init`, which scans the real bus in both builds;
+- upstream: Linux v6.12 ACPICA `hwvalid.c`'s protected-port table, and QEMU v10.0.0's `serial_reset`;
+- the working-tree P02M0196 (SystemIO bullet), P02M0197 (entry item, restore list, suspend-to-idle oracle) and P02M0099 (the identity paragraphs and the 16550 bullet).
+
+These corrections hold and are not repeated:
+- Finding 1: the sleep entry is no longer a terminal path ([item](/data/yellow/libersystem/docs/todo/P02M0191.md:280)). The choice to lend COM1 to the kernel for the sleep is justified: once the 16550 driver holds COM1 on every x86_64 boot, the other option would have collapsed P02M0197d's host-timed interval, and at the entry every binding has answered `SUSPENDED`. The SLEEP state, the counter's exclusion, the driver's `RESUME` step (now in P02M0099's 16550 bullet), the handoff-machinery tests and the gate's sleep before its kill are consistent with each other and with P02M0197b.
+- Finding 2: the DMA controllers' channel and control registers are in the fixed set, `0x00..0x1F` covering ICH9's alias of the first controller and `0xC0..0xDF` the second; ACPICA's table protects the same channel and control ranges. The corrected "rows the kernel declares" sentence is now true, and P02M0196b's SystemIO bullet agrees.
+- Finding 3: the FADT part is computed before `device::init` in both builds through `smp::acpi_table`. The planner is right that `init_extended_config` is itself compiled out of the test build, so the plan correctly names the lookup rather than that function.
+- Finding 4: the receiver is read out, with DLAB cleared, before the boot sequence resets the FIFO, and the record's order is the test's oracle.
+- Finding 5: P02M0099's paragraph now binds the legacy slice through `kernel:com1`, gives each mechanism its owner, and no longer offers the slice owning them itself.
+
+1. **Low - After an S3 wake, nothing re-initialises the console UART in the lent case before the entry writes `sleep: resumed` through it.**
+
+   What the plans say:
+   - The DRIVER case of the new item re-runs the UART's boot initialisation once, at the entry, and then writes every kernel line synchronously until the entry returns, `sleep: resumed` among them ([item](/data/yellow/libersystem/docs/todo/P02M0191.md:286), [both cases](/data/yellow/libersystem/docs/todo/P02M0191.md:296)).
+   - P02M0197b's restore list, also changed in this round, restores the console UART only "while the kernel owns it", "with its receive interrupt", and "before any driver runs again" ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:207)).
+
+   What an S3 does to the UART: the wakeup's machine reset runs `serial_reset`, which leaves IER and LCR at zero and the divisor at its 9600-baud default ([serial.c](https://github.com/qemu/qemu/blob/v10.0.0/hw/char/serial.c#L854-L871)), and a UART on hardware loses its settings the same way.
+
+   So in the lent case neither plan re-runs the initialisation between the wake and the entry's first line: the lent window is not "while the kernel owns it", and the list's "with its receive interrupt" contradicts the window's "receive interrupt left off" anyway. In the kernel-owned case the list re-initialises the UART "before any driver runs", which does not say before the entry's own first line. QEMU transmits whatever is written to a reset UART, so no gate shows it; on hardware the resume lines go out through a UART at its reset settings. This is new: it comes from this round's sleep-entry item meeting this round's restore list.
+
+   **Correct the sleep-entry item**: after an S3 wake the entry re-runs the UART's boot initialisation before its first line, in both cases - with the receive interrupt left off while the port is lent, and enabled when the kernel owns COM1. P02M0197b's restore list has to say the same (its re-audit of this date).
+
+Validation: read-only inspection of the plan, the audit history, the working-tree P02M0196, P02M0197 and P02M0099, and the sources named above; QEMU v10.0.0's `hw/char/serial.c` and Linux v6.12's `hwvalid.c` were fetched read-only. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0191 (2026-09-26T19:39:59Z):
+
+Verified read-only:
+- QEMU v10.0.0 `hw/char/serial.c`, `serial_reset`: IER and LCR zero, the divisor `0x0C` (9600 baud), the FIFOs emptied and the interrupt lowered; the S3 wakeup's machine reset runs it for the UART as for every device;
+- this plan's sleep-entry item, whose DRIVER case initialises the UART at the entry only, and its handoff-machinery tests;
+- P02M0197b's restore list as it stood: the UART "while the kernel owns it", "with its receive interrupt", and the list restored only "before any driver runs again";
+- P02M0099's 16550 bullet, whose `RESUME` reprograms the UART whatever the sleep state.
+Summary: one finding, accepted.
+
+1. **ACCEPTED - after an S3 wake nothing re-initialised the console UART in the lent case before the entry's first line.** The gap is real in both cases the finding names: the lent window was not "while the kernel owns it", and in the kernel's own case "before any driver runs again" did not order the UART before the entry's first line. Plan changes:
+   - The sleep-entry item gains "AFTER AN S3 WAKE THE UART IS INITIALISED AGAIN BEFORE ANY LINE": the wake resets the UART with the machine (QEMU's `serial_reset`; a UART on hardware loses its settings with its power), so before its first line after the wake the entry re-runs the UART's boot initialisation in both cases - with the receive interrupt enabled while the kernel owns COM1, and left off while the port is lent, IRQ 4 staying the claim's. It is the first act of P02M0197b's restore list, ahead of every kernel line after the wake. A suspend to idle resets nothing, so the initialisation the lent case made at the entry holds across it.
+   - The handoff-machinery tests gain the oracle the finding says no gate can give (QEMU transmits through a reset UART, so the wire cannot show it): on a wake the test marks as one from S3 - the rule's resume half takes whether the UART lost its settings as an input, so the test build runs it without a sleep - the record shows the boot initialisation re-run before the resumed line's first byte, with the receive interrupt left off while the probe holds the instance and enabled while the kernel owns it.
+
+Coordinated change: P02M0197b's restore list now restores the console UART first of all, before any kernel line after the wake, in both owner cases (its response of this date).
+
+Re-check of the whole plan: the sleep rule now covers both owners at both ends of both sleep states, and agrees with P02M0197b's entry, its restore order and P02M0197d's suspend-to-idle oracle; P02M0099's 16550 `RESUME` step still reprograms the UART after either state, so the driver never inherits the kernel's settings; the `serial-handoff` gate (a suspend to idle) and every other item are unchanged. The file is ASCII, no line exceeds 110 columns, it cites no audit, and the `Status:` line is kept.
+
+Edited `docs/todo/P02M0191.md`, and for coordination `docs/todo/P02M0197.md`; no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0191 (2026-09-26T20:02:40Z):
+
+**Rating: 10/10.** The last re-audit's one finding is corrected as recommended, in this plan and in P02M0197b's restore list, and the test added for it can fail. No unresolved issue, contradiction or new material defect was found.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T19:39:59Z;
+- the plan in the working tree, whole, and its `git diff` against HEAD;
+- the working-tree P02M0197: the entry item, the S3 restore list and P02M0197d's suspend-to-idle oracle.
+
+The correction holds:
+- The sleep-entry item now re-runs the UART's boot initialisation after an S3 wake, before the entry's first line, in both owner cases ([item](/data/yellow/libersystem/docs/todo/P02M0191.md:296)). The receive interrupt is enabled only while the kernel owns COM1, and it stays off while the port is lent, with IRQ 4 still the claim's.
+- P02M0197b states the same order from its side: the console UART is restored "FIRST OF ALL, before any kernel line after the wake", in both of this plan's owner cases ([P02M0197](/data/yellow/libersystem/docs/todo/P02M0197.md:220)). The two plans now agree.
+- The handoff-machinery test can fail ([test](/data/yellow/libersystem/docs/todo/P02M0191.md:354)). It takes "the UART lost its settings" as an input, so the test build runs the resume half without a sleep. The record's order then shows a re-initialisation that is missing, late, or has the wrong receive-interrupt state.
+- Leaving suspend to idle out of the rule is correct, because that state resets nothing.
+
+Validation: read-only inspection of the plan, its diff against HEAD, the audit history and the working-tree P02M0197. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.

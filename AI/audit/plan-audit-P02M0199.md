@@ -477,3 +477,26 @@ Coordinated change: P02M0197's "NO DRIVER IS SKIPPED" names `acpi_backlight`, `a
 Re-check of the whole plan: the two verification runs now depend on no default the owner has yet to choose, and the restore check has a single possible winner; every driver piece this milestone adds meets P02M0197's contract; the ORDER still places the ACPI half, its sleep item among it, after P02M0196's prerequisites. The file is ASCII, no line exceeds 112 columns, it cites no audit, and the `Status:` line is kept.
 
 Edited `docs/todo/P02M0199.md` (and P02M0197's list of drivers); no source was changed, and nothing was built or booted.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0199 (2026-09-26T18:15:41Z):
+
+**Rating: 10/10.** Both findings of the last re-audit are corrected as recommended, the unsaid point the first one noted is now stated, and nothing new is open.
+
+What was read and checked:
+- the complete history, including the planner's response of 2026-09-26T17:12:45Z, and the plan in the working tree, whole;
+- the policy's restore, storage and automatic-brightness rules; `brightness_policy`'s roles, all clients of managed services or a catalogue factory, so its relaunch needs no supervisor arm;
+- the working-tree P02M0197 (the driver contract and its list of drivers that carry the exchange).
+
+The corrections hold:
+- Finding 1: the ACPI run begins with `idle off`, stored ([run](/data/yellow/libersystem/docs/todo/P02M0199.md:308)). After the automatic-brightness check it turns automatic brightness off, and it sets and holds a level past the two-second settle, so that level is the stored one ([sequence](/data/yellow/libersystem/docs/todo/P02M0199.md:314)).
+  - The second boot starts from the firmware default with both settings off, so the restore has a single possible winner.
+  - The USB `monitor` run's checks also start after `idle off` ([checks](/data/yellow/libersystem/docs/todo/P02M0199.md:292)).
+  - `ambient-light`'s stream now opens with the current reading ([contract](/data/yellow/libersystem/docs/todo/P02M0199.md:107)).
+- Finding 2: "ACROSS A SLEEP" covers `acpi_backlight`, `acpi_als` and the xhci module, carried by whichever of P02M0197 and this milestone lands second ([item](/data/yellow/libersystem/docs/todo/P02M0199.md:191)).
+  - The xhci module is included because the same gap existed there: a device reset clears the sensor's reporting and power state, and the module sets them again.
+  - P02M0197's list names all three.
+  - The sleep case can fail on a missing `_DOS` or `_BCM` step: the harness resets both during S3 ([case](/data/yellow/libersystem/docs/todo/P02M0199.md:318)).
+
+No new defect was found. The plan is ASCII, keeps its `Status:` line and cites no audit.
+
+Validation: read-only inspection of the plan, the audit history and the working-tree P02M0197. No plan, source or audit content was modified, and nothing was built, tested, benchmarked or booted.
