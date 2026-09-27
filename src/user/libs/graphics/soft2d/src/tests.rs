@@ -1851,7 +1851,9 @@ fn a_second_lane_never_displaces_a_decoded_copy() {
 	let prepared = probe.prepare(&draw_image(8), &description(&target(512, 448))).expect("a small preparation");
 	let base = render2d::backend::Prepared::scratch_bytes(&prepared) - 8 * 8 * 8;
 	let lane = {
-		let mut two = Soft2d::new().with_images(&small).with_workers(&Rotating(2));
+		// IN BANDS, which charge a second lane its scratch and nothing more - tiles charge it the
+		// intermediate as well.
+		let mut two = Soft2d::new().with_images(&small).with_workers(&Rotating(2)).with_units(UnitKind::Bands);
 		render2d::backend::Prepared::scratch_bytes(&two.prepare(&draw_image(8), &description(&target(512, 448))).expect("two lanes")) - 8 * 8 * 8 - base
 	};
 	assert!(lane > 0, "a second lane costs scratch");

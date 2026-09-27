@@ -302,7 +302,11 @@ impl Default for Soft2d<'_> {
 impl<'a> Soft2d<'a> {
 	/// A backend for a drawing that references no images and no glyphs.
 	pub fn new() -> Self {
-		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Bands, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), tables: Vec::new() }
+		// TILES BY DEFAULT, BECAUSE THEY WERE MEASURED FASTER: at every worker count from two to sixty-four
+		// on the five frozen scenes, bands capping at eight units of a 480-row frame while tiles went on
+		// to eighty (the numbers are in `docs/PERF.md`). A frame on one lane is cut into bands whatever
+		// this says, since only several lanes need the intermediate.
+		Self { images: &NoImages, glyphs: &NoGlyphs, cancellation: None, workers: &SERIAL, unit_kind: UnitKind::Tiles, cache: GlyphRaster::default(), lanes: Vec::new(), shader_table: Vec::new(), unit_table: Vec::new(), finished: Vec::new(), intermediate: Vec::new(), tables: Vec::new() }
 	}
 
 	/// Replay a frame's units on `workers`' lanes. `Serial` - this thread, unit after unit - is the

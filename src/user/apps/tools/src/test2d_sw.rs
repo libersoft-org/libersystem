@@ -432,6 +432,53 @@ struct Controls {
 	/// `--warm-core=MS` spins MS milliseconds before each draw, outside the draw's clock: a
 	/// measurement of what a draw pays for starting on a core that was idle.
 	warm_core_ms: u32,
+	/// `--workers=N` draws each frame on N lanes - this thread and N - 1 of `rt::pool`'s workers - and
+	/// zero, the default, is one lane per core up to `AUTO_WORKERS`. `--workers=1` is the serial walk,
+	/// which is the reference every other count is compared with.
+	workers: u32,
+	/// `--compare` draws every frame a second time, on this thread alone, into a spare image holding the
+	/// frame's pixels from before the draw, and requires the two to be the same bytes.
+	compare: bool,
+}
+
+/// How many lanes draw a frame when nobody said: one per core, and no more than this - the cap
+/// `test3d-sw` takes, for the same reason: past it a frame this size stops getting faster, and every
+/// worker holds a stack.
+const AUTO_WORKERS: usize = 32;
+
+/// Who replays a frame's units: this thread, and the workers `rt::pool` lent it - ONE LANE PER
+/// PARTICIPANT, this thread's included. With no workers the pool's caller takes every unit in order,
+/// which is the serial walk and `soft2d`'s scalar reference.
+struct Drawing {
+	pool: rt::pool::Pool,
+}
+
+impl soft2d::Workers for Drawing {
+	fn lanes(&self) -> usize {
+		self.pool.threads() + 1
+	}
+
+	fn run<'u>(&self, lanes: &mut [soft2d::Lane], units: &mut [soft2d::Unit<'u>], work: &(dyn Fn(&mut soft2d::Lane, &mut soft2d::Unit<'u>) + Sync)) {
+		self.pool.for_each(lanes, units, work);
+	}
+}
+
+impl Drawing {
+	/// The pool a run's `--workers` asks for, made once for the whole run.
+	fn for_run(controls: &Controls) -> Drawing {
+		let participants = if controls.workers == 0 { (cpu_info(&mut [0u64; 1]).max(1) as usize).min(AUTO_WORKERS) } else { controls.workers as usize };
+		Drawing { pool: rt::pool::Pool::new(participants.saturating_sub(1)) }
+	}
+}
+
+/// What the frames of a run were drawn with, as the frames themselves reported it: the lanes and the
+/// units of the last frame drawn, and `--compare`'s tally.
+#[derive(Default)]
+struct Drawn {
+	lanes: usize,
+	units: usize,
+	compared: u32,
+	differed: u32,
 }
 
 /// How many presents a measured run lets pass before it arms: the first frames pay for the first
@@ -445,7 +492,7 @@ const SHAPE_MULTI_RECT: u64 = 2;
 
 impl Controls {
 	fn parse(args: &[u8]) -> Controls {
-		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT, account: false, hidden_surfaces: 0, offscreen: false, primitives: false, warm_core_ms: 0 };
+		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT, account: false, hidden_surfaces: 0, offscreen: false, primitives: false, warm_core_ms: 0, workers: 0, compare: false };
 		for word in args.split(|byte| *byte == b' ' || *byte == 0) {
 			if let Some(value) = word.strip_prefix(b"--frames=") {
 				controls.frames = number(value);
@@ -463,6 +510,10 @@ impl Controls {
 				controls.primitives = true;
 			} else if let Some(value) = word.strip_prefix(b"--warm-core=") {
 				controls.warm_core_ms = number(value);
+			} else if let Some(value) = word.strip_prefix(b"--workers=") {
+				controls.workers = number(value);
+			} else if word == b"--compare" {
+				controls.compare = true;
 			} else if let Some(value) = word.strip_prefix(b"--hidden-surfaces=") {
 				controls.hidden_surfaces = number(value);
 			} else if let Some(value) = word.strip_prefix(b"--size=") {
@@ -564,6 +615,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// is the other half of the canvas being reused: together they are what makes "no steady-state
 	// allocation" a claim this demo can make rather than a hope.
 	let mut list = DrawList::default();
+	// THE WORKERS, ONCE, FOR THE WHOLE RUN - made before the backend that borrows them.
+	let drawing = Drawing::for_run(&controls);
+	let mut drawn = Drawn::default();
+	let mut spare: Option<Vec<u8>> = controls.compare.then(Vec::new);
 	let mut backend = Soft2d::new();
 	let provider = Forms;
 	let mut phase_index = 0usize;
@@ -668,7 +723,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				let drawing_began_ns = clock_ns();
 				perf_site(b"drw-beg\0", 0);
-				if !draw(&mut backend, &provider, &images, &list, &frame) {
+				if !draw(&mut backend, &provider, &images, &list, &frame, &drawing, &mut drawn, spare.as_mut()) {
 					print(b"test2d-sw: the backend refused the frame\n");
 					frames.abandon(frame);
 					break;
@@ -837,7 +892,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 							let Some(frame) = second.acquire() else { continue };
 							let extent = frame.layout.extent;
 							match scene.record(&mut canvas, &mut list, extent, Phase::Full, &images) {
-								Ok(()) if draw(&mut backend, &provider, &images, &list, &frame) => {
+								Ok(()) if draw(&mut backend, &provider, &images, &list, &frame, &drawing, &mut drawn, spare.as_mut()) => {
 									if second.present_whole(frame) {
 										second_presents += 1;
 									}
@@ -913,12 +968,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		(b" scale-draw-worst-us=", (scaled_draw_worst_ns / 1_000) as u32),
 		(b" interval-mean-us=", (interval_total_ns / interval_count.max(1) / 1_000) as u32),
 		(b" interval-worst-us=", (interval_worst_ns / 1_000) as u32),
+		// THE LANES AND UNITS THE FRAMES RAN WITH, as the last frame reported them - what the ceiling
+		// and the frame's size gave, which is not the pool's threads plus one.
+		(b" lanes=", drawn.lanes as u32),
+		(b" units=", drawn.units as u32),
 	] {
 		line.extend_from_slice(name);
 		push_number(&mut line, value);
 	}
 	line.push(b'\n');
 	print(&line);
+	// A DIFFERENCE IS A FAILED RUN, and says so where a launcher can read it.
+	let matched = report_compare(&drawn);
 	// AND THE ARMED WINDOW'S OWN REPORT, a second line over the frames the account covers - which is
 	// what the account is checked against. Nanosecond totals as well as means, so the comparison is
 	// the clock conversion's and not a rounding's.
@@ -949,6 +1010,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		print(&line);
 	}
 	print(b"test2d-sw: done\n");
+	if !matched {
+		exit_with(1);
+	}
 	exit()
 }
 
@@ -999,6 +1063,9 @@ fn draw_offscreen(controls: &Controls) {
 	let mut scene = Scene::new();
 	let mut canvas = Canvas::new();
 	let mut list = DrawList::default();
+	let drawing = Drawing::for_run(controls);
+	let mut drawn = Drawn::default();
+	let mut spare: Option<Vec<u8>> = controls.compare.then(Vec::new);
 	let mut backend = Soft2d::new();
 	let provider = Forms;
 	let target = graphics_app::Frame { index: 0, layout, addr: pixels.as_mut_ptr() as u64 };
@@ -1013,7 +1080,7 @@ fn draw_offscreen(controls: &Controls) {
 			return;
 		}
 		let recorded = clock_ns();
-		if !draw(&mut backend, &provider, &images, &list, &target) {
+		if !draw(&mut backend, &provider, &images, &list, &target, &drawing, &mut drawn, spare.as_mut()) {
 			print(b"test2d-sw: the backend refused the frame\n");
 			return;
 		}
@@ -1037,13 +1104,42 @@ fn draw_offscreen(controls: &Controls) {
 		(b" frame-mean-us=", frame_total / counted.max(1) / 1_000),
 		(b" record-mean-us=", record_total / counted.max(1) / 1_000),
 		(b" draw-mean-us=", draw_total / counted.max(1) / 1_000),
+		(b" lanes=", drawn.lanes as u64),
+		(b" units=", drawn.units as u64),
 	] {
 		line.extend_from_slice(name);
 		push_number64(&mut line, value);
 	}
 	line.push(b'\n');
 	print(&line);
+	if !report_compare(&drawn) {
+		return;
+	}
 	print(b"test2d-sw: done\n");
+}
+
+/// `--compare`'s verdict, one line: every frame drawn through the lanes was the serial walk's to the byte,
+/// or how many were not. FALSE WHEN ONE DIFFERED, which the caller turns into a failed run.
+fn report_compare(drawn: &Drawn) -> bool {
+	if drawn.compared == 0 && drawn.differed == 0 {
+		return true;
+	}
+	let mut line: Vec<u8> = Vec::new();
+	line.extend_from_slice(b"test2d-sw: compare frames=");
+	push_number(&mut line, drawn.compared);
+	line.extend_from_slice(b" lanes=");
+	push_number(&mut line, drawn.lanes as u32);
+	line.extend_from_slice(b" units=");
+	push_number(&mut line, drawn.units as u32);
+	if drawn.differed == 0 {
+		line.extend_from_slice(b" matched the serial walk\n");
+	} else {
+		line.extend_from_slice(b" DIFFERED=");
+		push_number(&mut line, drawn.differed);
+		line.extend_from_slice(b" from the serial walk\n");
+	}
+	print(&line);
+	drawn.differed == 0
 }
 
 /// WHAT THE FRAME PATH IS BUILT OF, measured off the path in the same binary and profile: one
@@ -1218,8 +1314,36 @@ fn read_key(stream: u64, frame: &mut [u8; 32]) -> Option<(u16, bool)> {
 	}
 }
 
-/// Replay the list into the acquired image.
-fn draw(backend: &mut Soft2d<'_>, provider: &Forms, images: &Images, list: &DrawList, frame: &graphics_app::Frame) -> bool {
+/// Replay the list into the acquired image, on `workers`' lanes - and under `--compare` once more on this
+/// thread alone, into a spare copy of what the image held before, the two required to be the same bytes.
+#[allow(clippy::too_many_arguments)]
+fn draw(backend: &mut Soft2d<'_>, provider: &Forms, images: &Images, list: &DrawList, frame: &graphics_app::Frame, workers: &dyn soft2d::Workers, drawn: &mut Drawn, spare: Option<&mut Vec<u8>>) -> bool {
+	let Some(spare) = spare else { return draw_once(backend, provider, images, list, frame, workers, drawn) };
+	let Some(span) = frame.layout.backend_access_span(true) else { return false };
+	if spare.len() != span as usize {
+		spare.resize(span as usize, 0);
+	}
+	// SAFETY: the mapping is live for as long as the frame is held, and the span is the layout's own
+	// answer for what a backend may touch.
+	spare.copy_from_slice(unsafe { core::slice::from_raw_parts(frame.addr as *const u8, span as usize) });
+	if !draw_once(backend, provider, images, list, frame, workers, drawn) {
+		return false;
+	}
+	let serial = graphics_app::Frame { index: frame.index, layout: frame.layout.clone(), addr: spare.as_mut_ptr() as u64 };
+	let mut reference = Drawn::default();
+	if !draw_once(backend, provider, images, list, &serial, &soft2d::Serial, &mut reference) {
+		return false;
+	}
+	drawn.compared += 1;
+	// SAFETY: as above.
+	if unsafe { core::slice::from_raw_parts(frame.addr as *const u8, span as usize) } != spare.as_slice() {
+		drawn.differed += 1;
+	}
+	true
+}
+
+/// One draw of the list into an image.
+fn draw_once(backend: &mut Soft2d<'_>, provider: &Forms, images: &Images, list: &DrawList, frame: &graphics_app::Frame, workers: &dyn soft2d::Workers, drawn: &mut Drawn) -> bool {
 	let span = match frame.layout.backend_access_span(true) {
 		Some(span) => span as usize,
 		None => return false,
@@ -1233,9 +1357,13 @@ fn draw(backend: &mut Soft2d<'_>, provider: &Forms, images: &Images, list: &Draw
 		_ => return false,
 	};
 	let description = TargetDescription { extent: frame.layout.extent, format, color_space: ColorSpace::Srgb, scale: 1.0, luminance: graphics_core::pixel::OutputLuminance::UNKNOWN };
-	let mut backend = core::mem::replace(backend, Soft2d::new()).with_images(images).with_glyphs(provider);
+	let mut backend = core::mem::replace(backend, Soft2d::new()).with_images(images).with_glyphs(provider).with_workers(workers);
 	let ok = match backend.prepare(list, &description) {
-		Ok(prepared) => backend.render(&prepared, &mut view).is_ok(),
+		Ok(prepared) => {
+			drawn.lanes = prepared.lanes();
+			drawn.units = prepared.units();
+			backend.render(&prepared, &mut view).is_ok()
+		}
 		Err(_) => false,
 	};
 	ok
