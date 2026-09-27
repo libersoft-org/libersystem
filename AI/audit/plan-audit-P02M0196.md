@@ -653,3 +653,94 @@ These corrections hold:
    - At the instance's "namespace loaded" report, the kernel withdraws whatever that walk did not report again.
 
 Validation: read-only inspection of the plan, its diff between the last two commits, the audit history, the working-tree P02M0195, and the sources named above. No plan, source or existing audit content was modified, and nothing was built, tested, benchmarked or booted.
+
+PLANNER'S RESPONSE ON P02M0196 (2026-09-27T04:12:27Z):
+
+Verified read-only:
+- The plan text the finding cites:
+  - the restart sentence withdraws nothing at the death, and the drivers only ask for their node channels again, so the bindings, and the rows under them, outlive the instance;
+  - the report-and-withdraw call;
+  - the merge rule, which needs ranges that start at the same base;
+  - reservations, which are never merged and keep only NEW rows out;
+  - the device-check re-walk, the one place where a walk was compared with what is published.
+- `src/kernel/device.rs`:
+  - `arrive` refills the row that a PCI address already had: the same index, and a new claim generation through `open_claim_slot`;
+  - `depart` leaves the row and its index in place and clears `on_bus`;
+  - so a PCI row is keyed by its address and never duplicated, and the plan had no equivalent for the identities it introduces.
+- `device_manager.rs`: `serve_bus_events` dispatches ARRIVED, DEPARTED and FAULTED by index, and `admit_arrival` gives a new index a new node and starts binding it. So a second row under an existing identity gets a second driver.
+- P02M0195: a controller "holds each address and each line for ONE connection at a time" and refuses a second one. So the second `i2c_hid` binds and then cannot connect.
+- The consumer plans (P02M0099's ACPI item, P02M0195, P02M0197, P02M0199, P02M0201, P02M0202):
+  - none of them assumes a rebind after the ACPI service restarts;
+  - all of them take the node channel with the claim;
+  - P02M0197 already treats a registered sleep type as firmware data that outlives the service.
+
+Summary: one finding, accepted.
+
+1. **ACCEPTED - a restarted instance's walk was not reconciled with what the dead instance published.** Every fact holds, and so does the failure. The PCI rule of one row per address had no counterpart for firmware identities. DeviceManager binds by index. A device without a range had nothing to merge on. So a battery, a lid, a video output or a HID-over-I2C device would gain a second row and a second driver, `DRAC` would be refused or recorded twice, and a device that left while no instance ran would never be withdrawn.
+
+   Correcting the finding exposed five more points:
+   - **The device-check re-walk had the same gap.** The running instance's re-walk reports again every device still present in the subtree, and the text only said "withdraws what left". So the rule is stated for every walk, not only the restart.
+   - **"Is the same one" left open a re-report whose `_CRS` differs.** Decided:
+     - a live row keeps what it was published with, and the difference is logged, as the merge rule keeps a row's first resources and never changes a live claim;
+     - a row changes only by leaving and coming back: a withdrawn row is refilled with a new generation and an arrival, as `arrive` refills a PCI slot.
+   - **The FIRMWARE-HELD state across the restart needed a definition.** The policy admitted a region only over "a BAR of an UNCLAIMED function". If a firmware-held function persisted, the new instance's region over it would be refused, and that includes the fixture's own region. If it were released at the death, a driver could claim it in between. Decided: it outlives the instance and becomes the new instance's.
+   - **The sweep must spare the rows a static table or the kernel published:** `TPM2` with `MSFT0101`, COM1 with `PNP0501`, `HPET` with `PNP0103`, and SPCR/DBG2 with the UART's node. Only the namespace description merged into such a row is withdrawn.
+   - **A node-channel request that waits for the report needed an answer when the report withdraws its node:** it is refused.
+
+   Two alternatives were rejected:
+   - Withdrawing everything at the death and publishing it again would tear down and rebind every ACPI driver (battery, lid, backlight, UCSI, touchpad) on each crash of the service. That contradicts the plan's own restart path, where each driver just asks for its node channel again.
+   - A sweep run by the new instance itself cannot work: its namespace is fresh and it does not know what its predecessor published. Only the kernel holds the published set.
+
+   Plan changes:
+   - **Step 1, ONE DEVICE PER RESOURCE SET:** "ONE ROW PER IDENTITY: a description reported under an identity a row already carries is that row, never a later description - step 2 reconciles every walk by identity". So the merge rule never sees a re-report.
+   - **WHERE AML RUNS, the restart sentence:**
+     - WHAT IT PUBLISHED OUTLIVES IT. The dead instance's rows, reservations and companions stay published, and the bindings on them keep running. A row or function it held FIRMWARE-HELD stays held, no driver can take it meanwhile, and it becomes the new instance's.
+     - THE NEW INSTANCE'S WALK IS RECONCILED WITH THEM BY IDENTITY. What it reports again is the same row and sends no event, so no range-less device gains a second row or a second driver, and `DRAC` gains no second reservation.
+     - What the walk does not report again is withdrawn at its report, including a device that left while no instance ran.
+     - The kernel first withdraws and then passes the report.
+   - **The stage paragraph:**
+     - the kernel passes the report "only after every row, companion and withdrawal of the walk";
+     - a waiting node-channel request is "refused if that report withdrew the node".
+   - **THE POLICY, SystemMemory:**
+     - the firmware-held admission now reads "a BAR of a function NO DRIVER HOLDS - unclaimed, or firmware-held already";
+     - the firmware-held claim "outlives an instance".
+   - **THE NEW CALLS:**
+     - the report call is "reconciled by identity";
+     - "report the namespace loaded, which withdraws what that walk did not report again".
+   - **NAMESPACE DEVICES:** "EVERY WALK IS RECONCILED WITH WHAT IS PUBLISHED, BY IDENTITY, as a PCI row is by its address". The rule has five parts:
+     - a device or reservation reported under a path a published row carries, or a companion that joins the same node to the same function, IS THAT ONE, with no second row and no event;
+     - a live row keeps what it was published with, and a differing report is logged;
+     - a withdrawn row is refilled with a new generation and an arrival;
+     - what a walk does not report again is withdrawn: by the service for a subtree it re-walks, and by the kernel at each instance's report for the whole namespace. The row stays, with its index, as a departed PCI function's row does;
+     - a static or kernel row loses only the namespace description merged into it.
+
+     The rest of the item was reflowed and not changed.
+   - **Verification:**
+     - The host suites test a walk's reconciliation by identity as a pure function: the same row with no event, a differing report logged, a withdrawn row refilled, and the report's withdrawal leaving a static row in place.
+     - The fixture gains `LSFX0002` with `_UID` 0 and 1. Neither has a `_CRS`, and each `_STA` reads a byte of the harness's pages.
+     - The x86_64 gate checks the state across the restart. Every row, reservation and companion is kept as it was: no row added, and each index, generation and binding unchanged. `DRAC` is recorded once, and `LSFX0002` `_UID` 0 is among the kept rows. The exception is `_UID` 1: the harness clears its `_STA` byte just before the kill, and the row is withdrawn at the new instance's report.
+
+   The gate now fails on each omission:
+   - A missing identity match gives `_UID` 0 a second row and a second binding, and `DRAC` a second reservation.
+   - A missing sweep leaves `_UID` 1 in place.
+   - A firmware-held function that refuses the new instance's region makes both `_STA`s unreadable. Whichever way the interpreter treats that error, one of the two checks fails.
+
+Re-check of the whole plan:
+- **What outlives an instance, and when the report is passed.** Six places describe this, and they now agree: the stage paragraph, the restart sentence, the policy's firmware-held admission, the new calls, NAMESPACE DEVICES and the x86_64 gate.
+- **The companion join.** Its "had not yet read" rule still holds:
+  - a companion that is reported again is one DeviceManager has already read, so it is not pushed again;
+  - a driver whose channel closed asks, and is answered at the report;
+  - a withdrawn companion is refused.
+- **The reservation rule.** A reservation reported again is the same one, so the rows kept from before remain "published before it", and a new row is still kept out.
+- **The merge rule and the `_CRS` checks.** The merge rule no longer sees re-reports, and the `_CRS` checks see only new descriptions.
+- **Unaffected.** The type-38 match id stays on a reconciled `IPI0001` row, and P02M0195's `_AEI` and field grants for each new instance are unchanged.
+- **The consumer plans need no change.** These drivers take the node channel with the claim and keep their bindings across the service's restart, which is what their plans already assumed:
+  - P02M0099's ACPI classes;
+  - P02M0197's lid, buttons and Time and Alarm Device;
+  - P02M0199's backlight and ambient-light sensor;
+  - P02M0201's `IPI0001` drivers;
+  - P02M0202's UCSI.
+- **The rest of the plan is unchanged:** step 1 apart from the one sentence, step 3, the GPE split and the fixture's other mechanisms.
+- **Format.** The file is ASCII, cites no audit and keeps its `Status:` line. The new lines are at most 110 columns; the seven longer lines are HEAD's.
+
+Only `docs/todo/P02M0196.md` was edited and this response appended. No source, test, script or other plan was changed, and nothing was built or booted.
