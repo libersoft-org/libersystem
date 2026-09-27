@@ -112,3 +112,54 @@ passed, after adding the gate and `host.perfbuf`); the collector fixtures (13 pa
 x86_64 passed; a manual `development-trace` boot and one `--account` run drained 10,960 records with 0
 refused, 0 incomplete, 0 stale, and the collector closed all three shapes with 0.00 % residue and agreed
 with the demo's armed report within the 1 % clock-conversion bound.
+
+## Continuation (2026-09-27, from 14:55Z): the instrument finished, the account measured
+
+The instrument above was committed by the owner at 15:06Z as it stood (11dfd1f2); every change below is on
+top of it.
+
+### Changes made to the instrument, and why each was needed
+
+- MILESTONE IDS REMOVED FROM SOURCE COMMENTS (`kernel/perf.rs`, `frame_account.py`, the gate, `rt`, the
+  frame loop, DisplayService, the drivers, `test2d-sw`, `check.sh`, `qemu-run.sh`, `abi`): the project's rule
+  keeps them in `docs/todo` and `AI/` only.
+- `--primitives` MEASURED A DORMANT SITE WRONG. It reported 29.8 ns per dormant site, fifty times a flag
+  test. Diagnosed in the guest, three steps: a loop of `perf_sites_live()` after it cost 0.6 ns per call (so
+  the image's view of the cached flag was right), and a SECOND loop of the same million sites cost 0.61 ms in
+  all - the whole 29.8 ms was the FIRST site of the process, which resolves the flag through
+  `SYS_BOOT_PROFILE`. The first site is now timed on its own (`site-first-ns`) and the loop after it is the
+  dormant site: 0.63 ns per site against a 0.59 ns empty loop.
+- THE FIRST SITE'S 29 ms IS A FINDING, NOT FIXED HERE: `arch::boot_profile()` on x86_64 re-reads the fw_cfg
+  file directory on every call (`fwcfg::read_file`, one `inb` from port 0x511 per byte of a 64-byte entry per
+  file, each a VM exit), so every `SYS_BOOT_PROFILE` costs ~29 ms of vCPU time. The reader also has one
+  selector and one cursor shared by every core with no lock, so two cores reading at once can interleave.
+  Written down for the account and left alone, as the plan's exception rule requires.
+- `--warm-core=MS` ADDED to `test2d-sw` (spins MS before each draw, outside the draw's clock): the draw
+  through the real path costs ~16 ms more than the same draw offscreen, and that excess is the same at
+  640x480 and 1280x800 (a fixed cost, not a per-pixel one). Four temporary experiments located it, then were
+  removed and only this mode kept, because it alone reproduces the evidence: drawing a second time into the
+  same frame right after the first cost 46.1 ms (the offscreen figure); drawing into private memory in the
+  live loop still cost 62.9 ms (so not the target memory); drawing offscreen in a process that had opened the
+  surface first cost 45.5 ms (so not the process's state); spinning 5 / 20 / 60 ms before each draw gave
+  58.5 / 50.3 / 45.9 ms. So the draw is slow because the CORE HAD BEEN IDLE: this host is itself a KVM guest
+  (`systemd-detect-virt` = kvm, no cpufreq in it), and after the L2 vCPU halts the physical core comes back
+  slower and takes tens of milliseconds of busy time to recover - a condition of the machine, entered every
+  frame because the frame loop idles between frames. The gate runs it once in the dormant boot.
+
+### The runs
+
+- `ordinary-1` (08:02Z, before the changes above) and `ordinary-2` (16:30Z, the final instrument):
+  `./check.sh --gate qemu-2d-account` PASSED both times (ordinary-2: 491 s). Results under
+  `.build/logs/qemu-2d-account/ordinary-2`.
+- THE DORMANT COMPARISON NEEDED A REFERENCE TAKEN UNDER THE SAME HOST CONDITIONS. The morning re-measure
+  (97.1 - 102.2 ms interval, draws 54.5 - 59.5) and the afternoon dormant runs (104.5 - 105.6, draws 61.6 -
+  63.6) differ mostly in the DRAW, which carries no site - the host drifted (the warm-core finding shows how
+  much the draw depends on the host core). So the pre-instrument tree ff08ea18 was extracted with
+  `git archive` to `/data/yellow/lsref` (no git state touched, no working file replaced) and built there, and
+  the dormant command was taken alternating between the two trees, three runs per boot, two rounds:
+  reference 103.0 / 103.6 / 104.4 / 103.8 / 104.8 / 104.1 ms (draw 60.5 - 61.8), instrumented 104.9 / 104.6 /
+  107.8 / 105.2 / 104.6 / 105.1 ms (draw 62.1 - 62.9). The ~1.2 ms draw difference is in code with no site in
+  it, and every library differs between the two builds - even `soft2d.lslib`, whose source is identical -
+  because the build path enters the binaries (crate disambiguators and path strings), so the two trees also
+  differ in code layout. A third tree, the instrumented source at the same-length path `/data/yellow/lsins`,
+  is being built to separate the instrument from the path (result below).

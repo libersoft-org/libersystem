@@ -20,7 +20,8 @@
 #      surfaces; then the same scene offscreen at 640x480 and 1280x800;
 #   2. `development-trace` with GPU_SIZE=640x480: the account at the screen's own size (direct);
 #   3. `development` (every site dormant): the 640x480 run without the account - the instrument's cost -
-#      and `--primitives`, so the dormant site is measured dormant.
+#      the same run with the core kept busy before each draw, and `--primitives`, so the dormant site is
+#      measured dormant.
 #
 # THE OPTIMISED ROW. With CARGO_PROFILE_DEV_OPT_LEVEL exported, and ACCOUNT_REFERENCE naming the
 # results directory of an ordinary run on the same tree, the gate takes the row only if the image digest
@@ -140,6 +141,9 @@ cp "$SERIAL_LOG" "$RESULTS/serial-small.log"
 
 boot dormant DEV_PROFILE=1
 run dormant --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 "${PIN[@]}"
+# THE SAME RUN WITH THE CORE KEPT BUSY BEFORE EACH DRAW: a draw that falls to the offscreen figure behind
+# the spin was paying for starting on a core that had been idle, which is the host's and not the draw's.
+run warm-core --no-input --no-second-surface --frames=160 --phase-frames=40 --size=640x480 --warm-core=60 "${PIN[@]}"
 run primitives --primitives
 cp "$SERIAL_LOG" "$RESULTS/serial-dormant.log"
 "$REPO_ROOT/lab.sh" quit >/dev/null 2>&1 || true

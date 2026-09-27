@@ -429,6 +429,9 @@ struct Controls {
 	hidden_surfaces: u32,
 	offscreen: bool,
 	primitives: bool,
+	/// `--warm-core=MS` spins MS milliseconds before each draw, outside the draw's clock: a
+	/// measurement of what a draw pays for starting on a core that was idle.
+	warm_core_ms: u32,
 }
 
 /// How many presents a measured run lets pass before it arms: the first frames pay for the first
@@ -442,7 +445,7 @@ const SHAPE_MULTI_RECT: u64 = 2;
 
 impl Controls {
 	fn parse(args: &[u8]) -> Controls {
-		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT, account: false, hidden_surfaces: 0, offscreen: false, primitives: false };
+		let mut controls = Controls { frames: 0, phase_frames: PHASE_FRAMES, input: true, second_surface: true, width: WIDTH, height: HEIGHT, account: false, hidden_surfaces: 0, offscreen: false, primitives: false, warm_core_ms: 0 };
 		for word in args.split(|byte| *byte == b' ' || *byte == 0) {
 			if let Some(value) = word.strip_prefix(b"--frames=") {
 				controls.frames = number(value);
@@ -458,6 +461,8 @@ impl Controls {
 				controls.offscreen = true;
 			} else if word == b"--primitives" {
 				controls.primitives = true;
+			} else if let Some(value) = word.strip_prefix(b"--warm-core=") {
+				controls.warm_core_ms = number(value);
 			} else if let Some(value) = word.strip_prefix(b"--hidden-surfaces=") {
 				controls.hidden_surfaces = number(value);
 			} else if let Some(value) = word.strip_prefix(b"--size=") {
@@ -652,6 +657,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					break;
 				}
 				perf_site(b"rec-end\0", 0);
+				// A CORE KEPT BUSY BEFORE THE DRAW, for a measurement and nothing else: the spin is outside
+				// the draw's clock and inside the interval, and a draw that gets faster behind it is a
+				// draw that was paying for the core it ran on having been idle, not for its own work.
+				if controls.warm_core_ms > 0 {
+					let until = clock_ns().saturating_add(controls.warm_core_ms as u64 * 1_000_000);
+					while clock_ns() < until {
+						core::hint::spin_loop();
+					}
+				}
 				let drawing_began_ns = clock_ns();
 				perf_site(b"drw-beg\0", 0);
 				if !draw(&mut backend, &provider, &images, &list, &frame) {
@@ -1123,8 +1137,14 @@ fn measure_primitives() {
 	}
 	steps.sort_unstable();
 	// ONE DORMANT SITE: on a boot that is not `development-trace` a site is one test of a cached flag,
-	// and this is what that costs, in the loop that measures the syscall above.
+	// and this is what that costs, in the loop that measures the syscall above. THE FIRST SITE A
+	// PROCESS PASSES IS NOT ONE OF THEM: it resolves the flag, which reads the boot profile through the
+	// kernel once, and that read is timed on its own - the loop that followed it used to carry it, and
+	// read as a dormant site fifty times dearer than one.
 	const SITES: u64 = 1_000_000;
+	let began = clock_ns();
+	perf_site(b"dormant\0", 0);
+	let first_site = clock_ns() - began;
 	let began = clock_ns();
 	for index in 0..SITES {
 		perf_site(b"dormant\0", index);
@@ -1139,6 +1159,7 @@ fn measure_primitives() {
 		(&b" clock-min-cycles="[..], steps[0]),
 		(b" clock-median-cycles=", steps[steps.len() / 2]),
 		(b" site-live=", perf_sites_live() as u64),
+		(b" site-first-ns=", first_site),
 		(b" site-calls=", SITES),
 		(b" site-total-ns=", site_total),
 		(b" empty-loop-total-ns=", empty_total),
